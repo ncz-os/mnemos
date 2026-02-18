@@ -1,0 +1,35 @@
+[Unit]
+Description=MNEMOS API Server - Memory System with Integrated Compression
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mnemos
+Environment="PATH=/opt/mnemos/venv/bin"
+EnvironmentFile=/opt/mnemos/.env
+ExecStart=/opt/mnemos/venv/bin/python -m uvicorn api_server:app \
+    --host 0.0.0.0 \
+    --port 5000 \
+    --workers 4 \
+    --log-level info
+
+# Auto-restart on failure
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=80%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mnemos
+
+# Security
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

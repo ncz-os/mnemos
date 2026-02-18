@@ -1,0 +1,596 @@
+"""
+MNEMOS Core Module
+Shared utilities: database, embeddings, tier selection, memory store, sync, cleanup
+"""
+
+import json
+import os
+import sys
+import time
+import glob
+import threading
+import requests
+import psycopg2
+import uuid
+from datetime import datetime, timedelta
+from psycopg2.extras import RealDictCursor
+from contextvars import ContextVar
+import config
+
+# Request ID context for tracing
+request_id_context: ContextVar[str] = ContextVar('request_id', default='')
+
+# ============================================================================
+# Database Manager
+# ============================================================================
+
+class DatabaseManager:
+    """PostgreSQL connection management and utilities"""
+
+    def __init__(self):
+        self.config = config.PG_CONFIG
+
+    def get_connection(self):
+        """Get a new database connection"""
+        try:
+            return psycopg2.connect(**self.config)
+        except Exception as e:
+            print(f"[DB] Connection error: {e}", file=sys.stderr, flush=True)
+            raise
+
+    def execute_query(self, sql, params=None, fetch=None):
+        """Execute query with error handling"""
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute(sql, params or ())
+
+            if fetch == 'one':
+                result = cur.fetchone()
+            elif fetch == 'all':
+                result = cur.fetchall()
+            else:
+                conn.commit()
+                result = None
+
+            cur.close()
+            conn.close()
+            return result
+        except Exception as e:
+            print(f"[DB] Query error: {e}", file=sys.stderr, flush=True)
+            raise
+
+    def init_schema(self):
+        """Verify schema exists"""
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM memories")
+            count = cur.fetchone()[0]
+            cur.close()
+            conn.close()
+            print(f"[DB] ✓ Connected ({count} memories)", file=sys.stderr, flush=True)
+            return True
+        except Exception as e:
+            print(f"[DB] ✗ Failed: {e}", file=sys.stderr, flush=True)
+            return False
+
+# ============================================================================
+# Embedding Service
+# ============================================================================
+
+class EmbeddingService:
+    """Ollama embedding integration"""
+
+    def __init__(self):
+        self.url = config.OLLAMA_EMBED_URL
+        self.model = config.OLLAMA_EMBED_MODEL
+        self.timeout = config.OLLAMA_EMBED_TIMEOUT
+
+    def embed(self, text):
+        """Get embedding for text"""
+        if not text or not str(text).strip():
+            return None
+
+        try:
+            response = requests.post(
+                self.url,
+                json={'model': self.model, 'prompt': str(text)[:2000]},
+                timeout=self.timeout
+            )
+
+            if response.status_code == 200:
+                return response.json().get('embedding')
+        except Exception as e:
+            print(f"[EMBED] Error: {e}", file=sys.stderr, flush=True)
+
+        return None
+
+    def embed_batch(self, texts):
+        """Get embeddings for multiple texts"""
+        results = []
+        for text in texts:
+            embedding = self.embed(text)
+            results.append(embedding)
+            time.sleep(0.1)  # Rate limiting
+        return results
+
+# ============================================================================
+# Tier Selector
+# ============================================================================
+
+class TierSelector:
+    """Task-based tier selection for context retrieval"""
+
+    def detect_task_type(self, query_text):
+        """Detect task type from query"""
+        if not query_text:
+            return 'general'
+
+        query_lower = query_text.lower()
+
+        # Check keywords
+        for task_type, keywords in config.TASK_TYPE_KEYWORDS.items():
+            if task_type == 'complex':
+                continue
+            if any(word in query_lower for word in keywords):
+                return task_type
+
+        # Long queries are complex
+        if len(query_text.split()) > 20:
+            return 'complex'
+
+        return 'general'
+
+    def select_tiers(self, task_type):
+        """Get tier categories for task type"""
+        return config.TIER_SELECTION.get(task_type, config.TIER_SELECTION['general'])
+
+# ============================================================================
+# Memory Store
+# ============================================================================
+
+class MemoryStore:
+    """Memory CRUD operations and search"""
+
+    def __init__(self):
+        self.db = DatabaseManager()
+        self.embedding = EmbeddingService()
+        self.tier_selector = TierSelector()
+        self.last_cleanup = time.time()
+
+    def create_memory(self, content, category='facts', memory_id=None):
+        """Create new memory"""
+        if not content or not str(content).strip():
+            raise ValueError("Memory content cannot be empty")
+
+        # Generate ID if not provided
+        if not memory_id:
+            memory_id = f"mem_{int(time.time() * 1000)}"
+
+        now = datetime.utcnow().isoformat()
+        clean_content = str(content).replace('\x00', '')
+
+        # Generate embedding
+        embedding = self.embedding.embed(clean_content)
+
+        # Write to PostgreSQL
+        conn = self.db.get_connection()
+        cur = conn.cursor()
+
+        try:
+            cur.execute("""
+                INSERT INTO memories (id, content, category, embedding, created, updated)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    category = EXCLUDED.category,
+                    embedding = EXCLUDED.embedding,
+                    updated = EXCLUDED.updated
+            """, (memory_id, clean_content, category, embedding, now, now))
+
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+            conn.close()
+
+        return {
+            'id': memory_id,
+            'content': clean_content,
+            'category': category,
+            'created': now,
+            'updated': now
+        }
+
+    def get_memory(self, memory_id):
+        """Get single memory by ID"""
+        conn = self.db.get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        cur.execute("""
+            SELECT id, content, category, created, updated
+            FROM memories WHERE id = %s
+        """, (memory_id,))
+
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        return dict(result) if result else None
+
+    def update_memory(self, memory_id, content=None, category=None):
+        """Update existing memory"""
+        existing = self.get_memory(memory_id)
+        if not existing:
+            raise ValueError(f"Memory {memory_id} not found")
+
+        new_content = content or existing['content']
+        new_category = category or existing['category']
+        now = datetime.utcnow().isoformat()
+
+        # Regenerate embedding if content changed
+        embedding = None
+        if content and content != existing['content']:
+            embedding = self.embedding.embed(new_content)
+
+        conn = self.db.get_connection()
+        cur = conn.cursor()
+
+        if embedding:
+            cur.execute("""
+                UPDATE memories
+                SET content = %s, category = %s, embedding = %s, updated = %s
+                WHERE id = %s
+            """, (new_content, new_category, embedding, now, memory_id))
+        else:
+            cur.execute("""
+                UPDATE memories
+                SET content = %s, category = %s, updated = %s
+                WHERE id = %s
+            """, (new_content, new_category, now, memory_id))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return self.get_memory(memory_id)
+
+    def delete_memory(self, memory_id):
+        """Delete memory by ID"""
+        conn = self.db.get_connection()
+        cur = conn.cursor()
+
+        cur.execute("DELETE FROM memories WHERE id = %s", (memory_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return memory_id
+
+    def list_memories(self, limit=100, offset=0):
+        """List all memories with pagination"""
+        conn = self.db.get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        cur.execute("""
+            SELECT id, content, category, created, updated
+            FROM memories
+            ORDER BY created DESC
+            LIMIT %s OFFSET %s
+        """, (limit, offset))
+
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        return [dict(r) for r in results]
+
+    def search(self, query_text, limit=10, category=None):
+        """Vector search with tier selection"""
+        # Get embedding for query
+        query_embedding = self.embedding.embed(query_text)
+        if not query_embedding:
+            # Fallback to keyword search
+            return self._keyword_search(query_text, limit, category)
+
+        # Detect task type and select tiers
+        task_type = self.tier_selector.detect_task_type(query_text)
+        selected_tiers = self.tier_selector.select_tiers(task_type)
+
+        conn = self.db.get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Search across selected tiers
+        tier_filter = "category IN ({})".format(
+            ','.join("'%s'" % t for t in selected_tiers)
+        )
+
+        cur.execute(f"""
+            SELECT
+                id,
+                content,
+                category,
+                created,
+                1 - (embedding <=> %s::vector) as similarity
+            FROM memories
+            WHERE embedding IS NOT NULL AND ({tier_filter} OR category = 'documentation')
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+        """, (query_embedding, query_embedding, limit))
+
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        return {
+            'results': [dict(r) for r in results],
+            'task_type': task_type,
+            'selected_tiers': selected_tiers,
+            'query': query_text,
+            'method': 'vector'
+        }
+
+    def _keyword_search(self, query_text, limit=10, category=None):
+        """Fallback keyword search"""
+        conn = self.db.get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        pattern = f'%{query_text}%'
+
+        if category:
+            cur.execute("""
+                SELECT id, content, category, created
+                FROM memories
+                WHERE (content ILIKE %s OR category ILIKE %s) AND category = %s
+                ORDER BY created DESC
+                LIMIT %s
+            """, (pattern, pattern, category, limit))
+        else:
+            cur.execute("""
+                SELECT id, content, category, created
+                FROM memories
+                WHERE content ILIKE %s OR category ILIKE %s
+                ORDER BY created DESC
+                LIMIT %s
+            """, (pattern, pattern, limit))
+
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        return {
+            'results': [dict(r) for r in results],
+            'query': query_text,
+            'method': 'keyword'
+        }
+
+# ============================================================================
+# Sync Service
+# ============================================================================
+
+class SyncService:
+    """JSON shard synchronization"""
+
+    def __init__(self):
+        self.shard_dir = config.SHARD_DIR
+        self.db = DatabaseManager()
+
+    def sync_json_shards(self):
+        """Sync JSON shards to PostgreSQL"""
+        try:
+            os.makedirs(self.shard_dir, exist_ok=True)
+            shard_files = sorted(glob.glob(os.path.join(self.shard_dir, 'shard_*.json')))
+            synced = 0
+
+            for shard_file in shard_files:
+                try:
+                    with open(shard_file, 'r') as f:
+                        data = json.load(f)
+                        if not isinstance(data, list):
+                            data = [data]
+
+                        for mem in data:
+                            mem_id = mem.get('id')
+                            if not mem_id:
+                                continue
+
+                            conn = self.db.get_connection()
+                            cur = conn.cursor()
+
+                            cur.execute('SELECT id FROM memories WHERE id = %s', (mem_id,))
+                            if not cur.fetchone():
+                                cur.execute("""
+                                    INSERT INTO memories (id, content, category, created, updated)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                """, (
+                                    mem_id,
+                                    mem.get('content', ''),
+                                    mem.get('category', 'facts'),
+                                    mem.get('created', ''),
+                                    mem.get('updated', mem.get('created', ''))
+                                ))
+                                conn.commit()
+                                synced += 1
+
+                            cur.close()
+                            conn.close()
+                except Exception as e:
+                    print(f"[SYNC] Error processing {shard_file}: {e}", file=sys.stderr, flush=True)
+                    continue
+
+            print(f"[SYNC] ✓ Synced {synced} from JSON shards", file=sys.stderr, flush=True)
+            return synced
+        except Exception as e:
+            print(f"[SYNC] ✗ Failed: {e}", file=sys.stderr, flush=True)
+            return 0
+
+# ============================================================================
+# Embedding Generator
+# ============================================================================
+
+class EmbeddingGenerator:
+    """Background embedding generation"""
+
+    def __init__(self):
+        self.db = DatabaseManager()
+        self.embedding = EmbeddingService()
+        self.running = False
+
+    def generate_missing(self):
+        """Generate embeddings for memories without them"""
+        try:
+            conn = self.db.get_connection()
+            cur = conn.cursor()
+
+            cur.execute("""
+                SELECT id, content FROM memories
+                WHERE embedding IS NULL
+                LIMIT %s
+            """, (config.EMBEDDING_BATCH_SIZE,))
+
+            missing = cur.fetchall()
+            cur.close()
+            conn.close()
+
+            if not missing:
+                return 0
+
+            generated = 0
+            for mem_id, content in missing:
+                if not content or not str(content).strip():
+                    continue
+
+                embedding = self.embedding.embed(str(content)[:2000])
+                if not embedding:
+                    continue
+
+                conn = self.db.get_connection()
+                cur = conn.cursor()
+
+                cur.execute("""
+                    UPDATE memories
+                    SET embedding = %s, updated = NOW()
+                    WHERE id = %s
+                """, (embedding, mem_id))
+
+                conn.commit()
+                cur.close()
+                conn.close()
+
+                generated += 1
+
+            if generated > 0:
+                print(f"[EMBED] Generated {generated} embeddings", file=sys.stderr, flush=True)
+
+            return generated
+        except Exception as e:
+            print(f"[EMBED] Error: {e}", file=sys.stderr, flush=True)
+            return 0
+
+    def start(self):
+        """Start background embedding thread"""
+        def loop():
+            while self.running:
+                try:
+                    self.generate_missing()
+                    time.sleep(config.EMBEDDING_CHECK_INTERVAL)
+                except Exception as e:
+                    print(f"[EMBED] Loop error: {e}", file=sys.stderr, flush=True)
+                    time.sleep(60)
+
+        self.running = True
+        thread = threading.Thread(target=loop, daemon=True)
+        thread.start()
+        print(f"[EMBED] Background generator started", file=sys.stderr, flush=True)
+
+    def stop(self):
+        """Stop background embedding thread"""
+        self.running = False
+
+# ============================================================================
+# Memory Maintenance
+# ============================================================================
+
+class MemoryMaintenance:
+    """Memory cleanup and optimization"""
+
+    def __init__(self):
+        self.db = DatabaseManager()
+
+    def cleanup_expired(self):
+        """Remove memories older than TTL"""
+        try:
+            ttl_seconds = config.MEMORY_TTL.total_seconds()
+            cutoff_time = datetime.utcnow() - config.MEMORY_TTL
+
+            conn = self.db.get_connection()
+            cur = conn.cursor()
+
+            cur.execute("""
+                DELETE FROM memories
+                WHERE created < %s
+            """, (cutoff_time.isoformat(),))
+
+            deleted = cur.rowcount
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            if deleted > 0:
+                print(f"[CLEANUP] Deleted {deleted} expired memories", file=sys.stderr, flush=True)
+
+            return deleted
+        except Exception as e:
+            print(f"[CLEANUP] Error: {e}", file=sys.stderr, flush=True)
+            return 0
+
+    def run(self):
+        """Run all maintenance tasks"""
+        deleted = self.cleanup_expired()
+        return deleted
+
+# ============================================================================
+# Request Tracer
+# ============================================================================
+
+class RequestTracer:
+    """Request ID tracking and timing"""
+
+    @staticmethod
+    def new_id():
+        """Generate new request ID"""
+        rid = str(uuid.uuid4())[:8]
+        request_id_context.set(rid)
+        return rid
+
+    @staticmethod
+    def get_id():
+        """Get current request ID"""
+        return request_id_context.get()
+
+    @staticmethod
+    def log(message, level='INFO'):
+        """Log message with request ID"""
+        rid = RequestTracer.get_id()
+        timestamp = datetime.utcnow().strftime('%H:%M:%S')
+        print(f"[{timestamp}] [{rid}] {message}", file=sys.stderr, flush=True)
+
+# ============================================================================
+# Initialization
+# ============================================================================
+
+def init_mnemos():
+    """Initialize MNEMOS on startup"""
+    print(f"[MNEMOS] Starting {config.API_VERSION}...", file=sys.stderr, flush=True)
+
+    # Verify database
+    db = DatabaseManager()
+    if not db.init_schema():
+        print(f"[MNEMOS] ✗ Database initialization failed", file=sys.stderr, flush=True)
+        return False
+
+    print(f"[MNEMOS] ✓ Core initialized", file=sys.stderr, flush=True)
+    return True
