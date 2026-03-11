@@ -1,0 +1,43 @@
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     Started parent process [2085205]
+INFO:     Started server process [2085210]
+INFO:     Waiting for application startup.
+2026-02-20 19:02:14,341 [INFO] api_server: Starting MNEMOS API Server v2.1.0 (Phase 2/5: Compression)
+INFO:     Started server process [2085207]
+INFO:     Waiting for application startup.
+2026-02-20 19:02:14,344 [INFO] api_server: Starting MNEMOS API Server v2.1.0 (Phase 2/5: Compression)
+INFO:     Started server process [2085208]
+INFO:     Waiting for application startup.
+2026-02-20 19:02:14,346 [INFO] api_server: Starting MNEMOS API Server v2.1.0 (Phase 2/5: Compression)
+INFO:     Started server process [2085209]
+INFO:     Waiting for application startup.
+2026-02-20 19:02:14,351 [INFO] api_server: Starting MNEMOS API Server v2.1.0 (Phase 2/5: Compression)
+2026-02-20 19:02:14,357 [INFO] httpx: HTTP Request: GET http://192.0.2.96:8000/health "HTTP/1.1 200 OK"
+2026-02-20 19:02:14,358 [INFO] api_server: ExternalInferenceProvider: CERBERUS llama-server CONNECTED
+INFO:     Application startup complete.
+2026-02-20 19:02:14,360 [INFO] httpx: HTTP Request: GET http://192.0.2.96:8000/health "HTTP/1.1 200 OK"
+2026-02-20 19:02:14,360 [INFO] api_server: ExternalInferenceProvider: CERBERUS llama-server CONNECTED
+INFO:     Application startup complete.
+2026-02-20 19:02:14,362 [INFO] httpx: HTTP Request: GET http://192.0.2.96:8000/health "HTTP/1.1 200 OK"
+2026-02-20 19:02:14,363 [INFO] api_server: ExternalInferenceProvider: CERBERUS llama-server CONNECTED
+INFO:     Application startup complete.
+2026-02-20 19:02:14,367 [INFO] httpx: HTTP Request: GET http://192.0.2.96:8000/health "HTTP/1.1 200 OK"
+2026-02-20 19:02:14,367 [INFO] api_server: ExternalInferenceProvider: CERBERUS llama-server CONNECTED
+INFO:     Application startup complete.
+INFO:     127.0.0.1:48258 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43220 - "GET /metrics HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:50414 - "GET /metrics HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:43226 - "GET /metrics HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:34588 - "GET /metrics HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:58236 - "GET /metrics HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:60804 - "GET /metrics HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:49982 - "GET /metrics HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:58590 - "GET /metrics HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:36136 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48636 - "GET /metrics HTTP/1.1" 404 Not Found
+2026-02-20 19:04:32,931 [INFO] httpx: HTTP Request: POST http://192.0.2.96:8000/v1/completions "HTTP/1.1 200 OK"
+2026-02-20 19:04:33,039 [INFO] httpx: HTTP Request: POST http://192.0.2.96:8000/v1/completions "HTTP/1.1 200 OK"
+2026-02-20 19:04:33,039 [INFO] api_server: [REHYDRATE] query='compression distillation' | memories=2 | original_tokens=670 | tokens_used=155 | ratio=23.20% | quality=80 | compressed=True
+INFO:     127.0.0.1:48642 - "POST /memories/rehydrate HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43646 - "GET /metrics HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:46936 - "GET /metrics HTTP/1.1" 404 Not Found

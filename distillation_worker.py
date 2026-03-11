@@ -1,116 +1,105 @@
 #!/usr/bin/env python3
 """
-Background worker for LLM-based memory distillation
-Runs continuously, processes unoptimized memories
+MNEMOS Background Memory Distillation Worker (v4 - Mistral Optimized)
+
+Configuration (2026-02-19):
+  - Mistral 7B Instruct v0.3 on CERBERUS Ollama (192.0.2.96:11434)
+  - Dynamic timeouts based on content size
+  - Transaction support & attempt tracking
+  - Progress monitoring
 """
 
 import asyncio
 import logging
+import os
 from datetime import datetime
 import httpx
 import json
 import psycopg
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# Config
+PG_HOST     = os.getenv("PG_HOST",     "localhost")
+PG_PORT     = os.getenv("PG_PORT",     "5432")
+PG_DATABASE = os.getenv("PG_DATABASE", "mnemos")
+PG_USER     = os.getenv("PG_USER",     "mnemos_user")
+PG_PASSWORD = os.getenv("PG_PASSWORD", "mnemos_secure_password")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://192.0.2.96:11434")
+
+# Tuning
+MODEL = "mistral:latest"
+SIZE_LIMIT_KB = 5
+BATCH_SIZE = 5
+CHECK_INTERVAL = 30
+DISTILL_TIMEOUT_BASE = 45
+DISTILL_TIMEOUT_PER_KB = 3
+QUALITY_TIMEOUT = 20
+MAX_ATTEMPTS = 3
+
+DB_DSN = f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}"
+
 
 class LLMDistillationService:
-    def __init__(self, base_url: str = "http://localhost:11434"):
+    def __init__(self, base_url: str = OLLAMA_HOST):
         self.base_url = base_url
-        self.model = None
-        self.client = httpx.AsyncClient()
-        self.models_to_try = [
-            "hf.co/microsoft/phi-3-mini-4k-instruct-gguf",
-            "tinyllama",
-            "mistral:latest",
-        ]
+        self.client = httpx.AsyncClient(timeout=180.0)
 
-    async def detect_best_model(self) -> str:
-        """Detect best available model on this system"""
-        if self.model:
-            return self.model
+    async def distill(self, text: str, content_len: int) -> str:
+        """Compress text to ~40% of original length using Mistral"""
+        timeout = DISTILL_TIMEOUT_BASE + (content_len / 1024) * DISTILL_TIMEOUT_PER_KB
 
-        # Try to get available models
-        try:
-            response = await asyncio.wait_for(
-                self.client.get(f"{self.base_url}/api/tags"),
-                timeout=5.0
-            )
-            if response.status_code == 200:
-                data = response.json()
-                installed_models = [m["name"] for m in data.get("models", [])]
-                logger.info(f"Available models: {installed_models}")
+        prompt = f"""Summarize this text to approximately 40% of original length.
+Preserve all critical facts, decisions, and technical details. Remove redundancy.
 
-                # Find first available model from our preference list
-                for model_name in self.models_to_try:
-                    if any(model_name in m for m in installed_models):
-                        self.model = model_name
-                        logger.info(f"✅ Using model: {model_name}")
-                        return model_name
-        except Exception as e:
-            logger.warning(f"Could not query Ollama: {e}")
-
-        # Fallback: use first model in preference list
-        self.model = self.models_to_try[0]
-        logger.info(f"Using fallback model: {self.model}")
-        return self.model
-
-    async def distill(self, text: str, max_length: int = None) -> str:
-        """Use LLM to intelligently compress text"""
-        if not self.model:
-            await self.detect_best_model()
-
-        prompt = f"""Summarize this text to {max_length or 40}% of original length.
-Keep critical information and context:
-
+TEXT:
 {text}
 
-Summary (keep only essential):"""
+SUMMARY:"""
 
         response = await self.client.post(
-            f"{self.base_url}/api/generate",
+            f"{self.base_url}/v1/completions",
             json={
-                "model": self.model,
+                "model": MODEL,
                 "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.3,
-                    "top_p": 0.9,
-                }
+                "temperature": 0.3,
+                "top_p": 0.9
             },
-            timeout=30.0
+            timeout=timeout
         )
-
         result = response.json()
-        return result.get("response", "").strip()
+        return result.get("choices", [{}])[0].get("text", "").strip()
 
     async def assess_quality(self, original: str, compressed: str) -> float:
-        """Use LLM to assess compression quality"""
-        if not self.model:
-            await self.detect_best_model()
+        """Score compression quality (0-100)"""
+        prompt = f"""Rate this compression quality 0-100.
+100 = all critical info preserved. 0 = info lost.
 
-        prompt = f"""Rate the quality of this compression (0-100).
-Original: {original[:200]}...
-Compressed: {compressed}
+ORIGINAL: {original[:300]}
+COMPRESSED: {compressed[:300]}
 
-Quality score (0-100 only):"""
+Score (0-100):"""
 
         response = await self.client.post(
-            f"{self.base_url}/api/generate",
+            f"{self.base_url}/v1/completions",
             json={
-                "model": self.model,
+                "model": MODEL,
                 "prompt": prompt,
                 "stream": False,
                 "options": {"temperature": 0.1}
             },
-            timeout=45.0
+            timeout=QUALITY_TIMEOUT
         )
-
         result = response.json()
         try:
-            score = int(result.get("response", "80").strip())
+            raw = result.get("response", "80").strip()
+            score = int(''.join(filter(str.isdigit, raw.split()[0])))
             return max(0, min(100, score))
-        except:
+        except Exception:
             return 80
 
 
@@ -118,109 +107,194 @@ class MemoryDistillationWorker:
     def __init__(self):
         self.db = None
         self.llm = LLMDistillationService()
-        self.check_interval = 30
-        self.batch_size = 5
+        self.stats = {
+            "processed": 0,
+            "successful": 0,
+            "timeouts": 0,
+            "errors": 0,
+            "total_bytes_saved": 0
+        }
 
     async def start(self):
         """Start background worker"""
-        # Connect as mnemos_user (the actual PostgreSQL role)
-        self.db = await psycopg.AsyncConnection.connect(
-            "postgresql://mnemos_user@localhost:5432/mnemos"
-        )
-        logger.info("Distillation worker started")
+        logger.info(f"Connecting to DB: {PG_HOST}:{PG_PORT}/{PG_DATABASE}")
+        self.db = await psycopg.AsyncConnection.connect(DB_DSN, autocommit=True)
+        
+        logger.info("✅ Distillation worker started")
+        logger.info(f"Model: {MODEL} | Endpoint: {OLLAMA_HOST}")
+        logger.info(f"Config: size_limit={SIZE_LIMIT_KB}KB, batch={BATCH_SIZE}, "
+                   f"distill_timeout={DISTILL_TIMEOUT_BASE}s+({DISTILL_TIMEOUT_PER_KB}s/KB)")
 
         while True:
             try:
                 await self.process_batch()
+                await self.log_stats()
             except Exception as e:
                 logger.error(f"Worker error: {e}", exc_info=True)
+                try:
+                    await self.db.close()
+                    self.db = await psycopg.AsyncConnection.connect(DB_DSN, autocommit=True)
+                except Exception as re:
+                    logger.error(f"DB reconnect failed: {re}")
 
-            await asyncio.sleep(self.check_interval)
+            await asyncio.sleep(CHECK_INTERVAL)
 
     async def process_batch(self):
-        """Process a batch of memories"""
+        """Process batch of unoptimized memories"""
         query = """
-        SELECT id, content, quality_rating
+        SELECT id, content, quality_rating, LENGTH(content) as len,
+               COALESCE((metadata->>'distillation_attempts')::int, 0) as attempts
         FROM memories
         WHERE llm_optimized = false
           AND content IS NOT NULL
           AND LENGTH(content) > 100
-        ORDER BY created DESC
+          AND LENGTH(content) <= %s
+          AND COALESCE((metadata->>'distillation_attempts')::int, 0) < %s
+        ORDER BY LENGTH(content) DESC, created DESC
         LIMIT %s
         """
 
         async with self.db.cursor() as cur:
-            await cur.execute(query, (self.batch_size,))
+            await cur.execute(query, (SIZE_LIMIT_KB * 1024, MAX_ATTEMPTS, BATCH_SIZE))
             rows = await cur.fetchall()
 
-        # Convert tuples to dicts for easier handling
-        memories = []
-        for row in rows:
-            memories.append({
-                'id': row[0],
-                'content': row[1],
-                'quality_rating': row[2] or 75
-            })
-
-        if not memories:
-            logger.debug("No memories to optimize")
+        if not rows:
+            logger.debug("No memories pending optimization")
             return
 
-        logger.info(f"Processing {len(memories)} memories")
+        memories = [
+            {
+                'id': row[0],
+                'content': row[1],
+                'quality_rating': row[2] or 75,
+                'len': row[3],
+                'attempts': row[4] or 0
+            }
+            for row in rows
+        ]
+
+        logger.info(f"Processing batch of {len(memories)} memories")
 
         for memory in memories:
             try:
                 await self.optimize_memory(memory)
             except Exception as e:
-                logger.error(f"Error optimizing {memory['id']}: {e}")
+                logger.error(f"Error processing {memory['id'][:8]}: {e}")
+                await self.increment_attempts(memory['id'])
 
-    async def optimize_memory(self, memory):
-        """Optimize single memory with LLM"""
+    async def optimize_memory(self, memory: dict):
+        """Compress and score a single memory"""
         memory_id = memory["id"]
         original_text = memory["content"]
+        original_len = memory["len"]
         current_quality = memory["quality_rating"]
 
         try:
-            # Generate better compression via LLM
-            llm_compression = await asyncio.wait_for(
-                self.llm.distill(
-                    original_text,
-                    max_length=int(len(original_text) * 0.4)
-                ),
-                timeout=45.0
+            # Compress
+            timeout = DISTILL_TIMEOUT_BASE + (original_len / 1024) * DISTILL_TIMEOUT_PER_KB
+            compressed = await asyncio.wait_for(
+                self.llm.distill(original_text, original_len),
+                timeout=timeout
             )
 
-            # Assess quality
+            if not compressed or len(compressed) < 10:
+                logger.warning(f"⚠️  Empty compression for {memory_id[:8]}")
+                return
+
+            # Score quality
             quality_score = await asyncio.wait_for(
-                self.llm.assess_quality(original_text, llm_compression),
-                timeout=30.0
+                self.llm.assess_quality(original_text, compressed),
+                timeout=QUALITY_TIMEOUT
             )
 
-            # Update database
+            compressed_len = len(compressed)
+            ratio = compressed_len / max(original_len, 1)
+            bytes_saved = original_len - compressed_len
+
+            # Persist
             update_query = """
             UPDATE memories
             SET compressed_content = %s,
                 quality_rating = %s,
                 llm_optimized = true,
-                optimized_at = NOW()
+                optimized_at = NOW(),
+                metadata = jsonb_set(
+                    metadata,
+                    '{distillation_success}',
+                    'true'
+                )
             WHERE id = %s
             """
-
             async with self.db.cursor() as cur:
                 await cur.execute(
                     update_query,
-                    (llm_compression, min(100, int(quality_score)), memory_id)
+                    (compressed, min(100, int(quality_score)), memory_id)
                 )
 
+            self.stats["successful"] += 1
+            self.stats["total_bytes_saved"] += bytes_saved
+
             logger.info(
-                f"Optimized {memory_id}: "
-                f"quality {current_quality} → {quality_score:.0f}"
+                f"✅ {memory_id[:8]}... | quality {current_quality}→{quality_score:.0f} "
+                f"| {original_len}→{compressed_len} chars ({ratio:.2%}) "
+                f"| saved {bytes_saved} bytes"
             )
 
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout optimizing {memory_id}")
+            self.stats["timeouts"] += 1
+            logger.warning(f"⏱ Timeout optimizing {memory_id[:8]} ({original_len} chars)")
+            await self.increment_attempts(memory_id)
+
         except Exception as e:
-            logger.error(f"Error optimizing {memory_id}: {e}")
+            self.stats["errors"] += 1
+            logger.error(f"❌ Error optimizing {memory_id[:8]}: {e}")
+            await self.increment_attempts(memory_id)
+
+        finally:
+            self.stats["processed"] += 1
+
+    async def increment_attempts(self, memory_id: str):
+        """Increment distillation_attempts in metadata"""
+        try:
+            async with self.db.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE memories
+                    SET metadata = jsonb_set(
+                        COALESCE(metadata, '{}'),
+                        '{distillation_attempts}',
+                        to_jsonb(COALESCE((metadata->>'distillation_attempts')::int, 0) + 1)
+                    )
+                    WHERE id = %s
+                    """,
+                    (memory_id,)
+                )
+        except Exception as e:
+            logger.error(f"Could not increment attempts for {memory_id}: {e}")
+
+    async def log_stats(self):
+        """Log current progress"""
+        try:
+            async with self.db.cursor() as cur:
+                await cur.execute("""
+                    SELECT 
+                        COUNT(*) as total,
+                        COUNT(CASE WHEN llm_optimized = true THEN 1 END) as optimized,
+                        COUNT(CASE WHEN llm_optimized = false THEN 1 END) as pending,
+                        AVG(quality_rating) as avg_quality
+                    FROM memories
+                """)
+                total, optimized, pending, avg_quality = await cur.fetchone()
+
+            if self.stats["processed"] > 0:
+                logger.info(
+                    f"📊 Progress: {optimized}/{total} optimized ({100*optimized/max(total,1):.1f}%) | "
+                    f"Session: {self.stats['successful']} success, {self.stats['timeouts']} timeouts, "
+                    f"{self.stats['errors']} errors | "
+                    f"Saved: {self.stats['total_bytes_saved']/1024:.1f}KB"
+                )
+        except Exception as e:
+            logger.debug(f"Could not log stats: {e}")
 
 
 async def main():
@@ -228,7 +302,10 @@ async def main():
     try:
         await worker.start()
     except KeyboardInterrupt:
-        logger.info("Worker shutting down")
+        logger.info("Worker shutting down gracefully")
+    finally:
+        if worker.db:
+            await worker.db.close()
 
 
 if __name__ == "__main__":
