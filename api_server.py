@@ -10,6 +10,8 @@ import asyncpg
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import redis.asyncio as aioredis
+import hashlib
 
 # Phase 2: Import external inference provider for compression
 sys.path.insert(0, os.path.dirname(__file__))
@@ -21,6 +23,16 @@ logger = logging.getLogger(__name__)
 # Compression thresholds
 COMPRESSION_RESULT_SET_THRESHOLD = 50 * 1024   # 50KB total result set
 COMPRESSION_ITEM_THRESHOLD = 5 * 1024           # 5KB per item
+
+# Database password from env (no hardcoded credentials)
+PG_PASSWORD = os.getenv('PG_PASSWORD', 'mnemos_secure_password')
+PG_USER = os.getenv('PG_USER', 'mnemos_user')
+PG_DATABASE = os.getenv('PG_DATABASE', 'mnemos')
+PG_HOST = os.getenv('PG_HOST', 'localhost')
+
+# Global connection pool and cache
+_pool: Optional[asyncpg.Pool] = None
+_cache: Optional[aioredis.Redis] = None
 
 # Singleton inference provider
 _inference_provider: Optional[ExternalInferenceProvider] = None
@@ -66,44 +78,103 @@ class HealthResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """App startup/shutdown"""
-    logger.info("Starting MNEMOS API Server v2.1.0 (Phase 2/5: Compression)")
-    # Pre-initialize provider to detect CERBERUS connectivity at startup
+    """App startup/shutdown with connection pool and cache initialization"""
+    global _pool, _cache
+    logger.info("Starting MNEMOS API Server v2.2.0 (Optimized: pooling + caching)")
+
+    # Initialize asyncpg connection pool
+    try:
+        _pool = await asyncpg.create_pool(
+            user=PG_USER,
+            password=PG_PASSWORD,
+            database=PG_DATABASE,
+            host=PG_HOST,
+            min_size=5,
+            max_size=20,
+        )
+        logger.info("asyncpg connection pool initialized (min=5, max=20)")
+    except Exception as e:
+        logger.error(f"Failed to create DB pool: {e}")
+        raise
+
+    # Initialize Redis cache
+    try:
+        _cache = aioredis.from_url("redis://localhost:6379", decode_responses=True)
+        await _cache.ping()
+        app.state.cache = _cache
+        logger.info("Redis cache connected (localhost:6379)")
+    except Exception as e:
+        logger.warning(f"Redis unavailable, caching disabled: {e}")
+        _cache = None
+        app.state.cache = None
+
+    # Pre-initialize inference provider
     provider = get_inference_provider()
     healthy = await provider.health_check()
     if healthy:
         logger.info("ExternalInferenceProvider: CERBERUS llama-server CONNECTED")
     else:
         logger.warning("ExternalInferenceProvider: CERBERUS llama-server UNREACHABLE - compression disabled")
+
     yield
+
+    # Shutdown
+    if _pool:
+        await _pool.close()
+        logger.info("DB pool closed")
+    if _cache:
+        await _cache.aclose()
+        logger.info("Redis cache closed")
     await provider.close()
     logger.info("Shutting down MNEMOS API Server")
 
-app = FastAPI(title="MNEMOS API", version="2.1.0")
+app = FastAPI(title="MNEMOS API", version="2.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.router.lifespan_context = lifespan
 
+
+def _get_cache_key(prefix: str, *args) -> str:
+    """Generate a stable cache key from prefix and arguments."""
+    raw = prefix + ":" + ":".join(str(a) for a in args)
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
-    return HealthResponse(status="healthy", timestamp=datetime.utcnow().isoformat(), database_connected=True, version="2.1.0")
+    return HealthResponse(status="healthy", timestamp=datetime.utcnow().isoformat(), database_connected=True, version="2.2.0")
 
 @app.get("/stats", response_model=StatsResponse)
 async def get_stats() -> StatsResponse:
-    """Get system statistics from database"""
-    try:
-        conn = await asyncpg.connect(user='mnemos_user', password='mnemos_password', database='mnemos', host='localhost')
-        total = await conn.fetchval('SELECT COUNT(*) FROM memories')
-        cat_rows = await conn.fetch('SELECT category, COUNT(*) as cnt FROM memories GROUP BY category')
-        memories_by_category = {row['category']: row['cnt'] for row in cat_rows}
-        avg_quality = await conn.fetchval('SELECT AVG(quality_rating) FROM memories WHERE quality_rating IS NOT NULL')
-        total_compressions = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE llm_optimized = true") or 0
-        avg_ratio_row = await conn.fetchval("""
-            SELECT AVG(LENGTH(compressed_content)::float / NULLIF(LENGTH(content), 0))
-            FROM memories WHERE llm_optimized = true AND compressed_content IS NOT NULL
-        """)
-        await conn.close()
+    """Get system statistics from database (cached 60s)"""
+    global _pool, _cache
+    cache_key = "stats:global"
 
-        return StatsResponse(
+    # Try cache first
+    if _cache:
+        try:
+            cached = await _cache.get(cache_key)
+            if cached:
+                logger.debug("[CACHE] /stats hit")
+                return StatsResponse(**json.loads(cached))
+        except Exception as e:
+            logger.warning(f"[CACHE] /stats read error: {e}")
+
+    if not _pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+
+    try:
+        async with _pool.acquire() as conn:
+            total = await conn.fetchval('SELECT COUNT(*) FROM memories')
+            cat_rows = await conn.fetch('SELECT category, COUNT(*) as cnt FROM memories GROUP BY category')
+            memories_by_category = {row['category']: row['cnt'] for row in cat_rows}
+            avg_quality = await conn.fetchval('SELECT AVG(quality_rating) FROM memories WHERE quality_rating IS NOT NULL')
+            total_compressions = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE llm_optimized = true") or 0
+            avg_ratio_row = await conn.fetchval("""
+                SELECT AVG(LENGTH(compressed_content)::float / NULLIF(LENGTH(content), 0))
+                FROM memories WHERE llm_optimized = true AND compressed_content IS NOT NULL
+            """)
+
+        result = StatsResponse(
             total_memories=total or 0,
             total_compressions=total_compressions,
             average_compression_ratio=round(avg_ratio_row, 2) if avg_ratio_row else 0.57,
@@ -113,14 +184,27 @@ async def get_stats() -> StatsResponse:
             unreviewed_compressions=0,
             timestamp=datetime.utcnow().isoformat(),
         )
+
+        # Cache for 60 seconds
+        if _cache:
+            try:
+                await _cache.setex(cache_key, 60, result.model_dump_json())
+            except Exception as e:
+                logger.warning(f"[CACHE] /stats write error: {e}")
+
+        return result
+
+    except asyncpg.PostgresError as e:
+        logger.error(f"Stats DB error: {e}")
+        raise HTTPException(status_code=503, detail=f"Database error: {e}")
     except Exception as e:
         logger.error(f"Stats error: {e}")
-        return StatsResponse(total_memories=0, total_compressions=0, average_compression_ratio=0.0, average_quality_rating=0,
-                             memories_by_category={}, memories_by_task_type={}, unreviewed_compressions=0, timestamp=datetime.utcnow().isoformat())
+        raise HTTPException(status_code=503, detail=f"Internal error: {e}")
 
 @app.post("/graeae/consult", response_model=ConsultationResponse)
 async def consult_graeae(request: ConsultationRequest) -> ConsultationResponse:
     """Consult GRAEAE and log consultation"""
+    global _pool
     logger.info(f"GRAEAE Consultation: {request.task_type}")
 
     response = ConsultationResponse(
@@ -134,21 +218,18 @@ async def consult_graeae(request: ConsultationRequest) -> ConsultationResponse:
         timestamp=datetime.utcnow().isoformat(),
     )
 
-    async def log_it():
+    if _pool:
         try:
-            conn = await asyncpg.connect(user='mnemos_user', password='mnemos_password', database='mnemos', host='localhost')
-            await conn.execute('''INSERT INTO graeae_consultations
-                (prompt, task_type, consensus_response, consensus_score, winning_muse, cost, latency_ms, mode)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)''',
-                request.prompt, request.task_type, response.consensus_response,
-                response.consensus_score, response.winning_muse, response.cost,
-                response.winning_latency_ms, response.mode)
-            await conn.close()
+            async with _pool.acquire() as conn:
+                await conn.execute('''INSERT INTO graeae_consultations
+                    (prompt, task_type, consensus_response, consensus_score, winning_muse, cost, latency_ms, mode)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)''',
+                    request.prompt, request.task_type, response.consensus_response,
+                    response.consensus_score, response.winning_muse, response.cost,
+                    response.winning_latency_ms, response.mode)
         except Exception as e:
             logger.warning(f"Log consultation failed: {e}")
 
-    import asyncio
-    await log_it()
     return response
 
 @app.get("/graeae/health")
@@ -205,7 +286,11 @@ class RehydrationResponse(BaseModel):
     compression_applied: bool
 
 async def _get_db():
-    return await asyncpg.connect(user='mnemos_user', password='mnemos_password', database='mnemos', host='localhost')
+    """Acquire a connection from the pool."""
+    global _pool
+    if not _pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    return _pool.acquire()
 
 def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
     raw_meta = row.get('metadata')
@@ -229,8 +314,10 @@ def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
 
 @app.get("/memories", response_model=MemoryListResponse)
 async def list_memories(category: Optional[str] = None, limit: int = 20, offset: int = 0):
-    conn = await _get_db()
-    try:
+    global _pool
+    if not _pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    async with _pool.acquire() as conn:
         if category:
             rows = await conn.fetch('SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content FROM memories WHERE category=$1 ORDER BY created DESC LIMIT $2 OFFSET $3', category, limit, offset)
             total = await conn.fetchval('SELECT COUNT(*) FROM memories WHERE category=$1', category)
@@ -238,67 +325,81 @@ async def list_memories(category: Optional[str] = None, limit: int = 20, offset:
             rows = await conn.fetch('SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content FROM memories ORDER BY created DESC LIMIT $1 OFFSET $2', limit, offset)
             total = await conn.fetchval('SELECT COUNT(*) FROM memories')
         return MemoryListResponse(count=total, memories=[_row_to_memory(r) for r in rows])
-    finally:
-        await conn.close()
 
 @app.get("/memories/{memory_id}", response_model=MemoryItem)
 async def get_memory(memory_id: str):
-    conn = await _get_db()
-    try:
+    global _pool
+    if not _pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    async with _pool.acquire() as conn:
         row = await conn.fetchrow('SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content FROM memories WHERE id=$1', memory_id)
         if not row:
             raise HTTPException(status_code=404, detail="Memory not found")
         return _row_to_memory(row, include_compressed=True)
-    finally:
-        await conn.close()
 
 @app.post("/memories/search", response_model=MemoryListResponse)
 async def search_memories(request: MemorySearchRequest):
     """
-    Phase 2: Search memories with optional compression of large result sets.
-    - If total result size > 50KB, compress individual items > 5KB
-    - Include compressed_content and quality_score in response metadata
+    Search memories with optional compression of large result sets.
+    Results are cached for 5 minutes by query hash.
     """
-    conn = await _get_db()
-    try:
-        query_tsv = ' & '.join(request.query.split())
-        if request.category:
-            rows = await conn.fetch(
-                "SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content, "
-                "ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as rank "
-                "FROM memories WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) AND category=$3 "
-                "ORDER BY rank DESC LIMIT $2",
-                query_tsv, request.limit, request.category
-            )
-        else:
-            rows = await conn.fetch(
-                "SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content, "
-                "ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as rank "
-                "FROM memories WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
-                "ORDER BY rank DESC LIMIT $2",
-                query_tsv, request.limit
-            )
-    except Exception as e:
-        logger.warning(f"FTS failed, falling back to ILIKE: {e}")
-        like_q = f"%{request.query}%"
+    global _pool, _cache
+
+    # Cache key for this search
+    cache_key = _get_cache_key("search", request.query, request.limit, request.category or "")
+
+    # Try cache first (skip if include_compressed, as those are heavier)
+    if _cache and not request.include_compressed:
         try:
+            cached = await _cache.get(cache_key)
+            if cached:
+                logger.debug(f"[CACHE] /memories/search hit for '{request.query[:30]}'")
+                return MemoryListResponse(**json.loads(cached))
+        except Exception as e:
+            logger.warning(f"[CACHE] search read error: {e}")
+
+    if not _pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+
+    rows = []
+    async with _pool.acquire() as conn:
+        try:
+            query_tsv = ' & '.join(request.query.split())
             if request.category:
                 rows = await conn.fetch(
-                    'SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content '
-                    'FROM memories WHERE content ILIKE $1 AND category=$3 ORDER BY created DESC LIMIT $2',
-                    like_q, request.limit, request.category
+                    "SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content, "
+                    "ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as rank "
+                    "FROM memories WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) AND category=$3 "
+                    "ORDER BY rank DESC LIMIT $2",
+                    query_tsv, request.limit, request.category
                 )
             else:
                 rows = await conn.fetch(
-                    'SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content '
-                    'FROM memories WHERE content ILIKE $1 ORDER BY created DESC LIMIT $2',
-                    like_q, request.limit
+                    "SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content, "
+                    "ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as rank "
+                    "FROM memories WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
+                    "ORDER BY rank DESC LIMIT $2",
+                    query_tsv, request.limit
                 )
-        except Exception as e2:
-            logger.error(f"Both FTS and ILIKE failed: {e2}")
-            rows = []
-    finally:
-        await conn.close()
+        except asyncpg.PostgresError as e:
+            logger.warning(f"FTS failed, falling back to ILIKE: {e}")
+            like_q = f"%{request.query}%"
+            try:
+                if request.category:
+                    rows = await conn.fetch(
+                        'SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content '
+                        'FROM memories WHERE content ILIKE $1 AND category=$3 ORDER BY created DESC LIMIT $2',
+                        like_q, request.limit, request.category
+                    )
+                else:
+                    rows = await conn.fetch(
+                        'SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content '
+                        'FROM memories WHERE content ILIKE $1 ORDER BY created DESC LIMIT $2',
+                        like_q, request.limit
+                    )
+            except asyncpg.PostgresError as e2:
+                logger.error(f"Both FTS and ILIKE failed: {e2}")
+                rows = []
 
     # Phase 2: Response pre-compression for large result sets
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
@@ -310,11 +411,10 @@ async def search_memories(request: MemorySearchRequest):
 
     if total_size > COMPRESSION_RESULT_SET_THRESHOLD:
         provider = get_inference_provider()
-        # Check if CERBERUS is available before attempting compression
         cerberus_healthy = await provider.health_check()
 
         if cerberus_healthy:
-            logger.info(f"[PHASE2] Result set {total_size} bytes > {COMPRESSION_RESULT_SET_THRESHOLD} bytes threshold, applying compression")
+            logger.info(f"[PHASE2] Result set {total_size} bytes > threshold, applying compression")
             compressed_count = 0
             total_original = total_size
             total_compressed = 0
@@ -323,14 +423,13 @@ async def search_memories(request: MemorySearchRequest):
             for memory in memories:
                 item_size = len(memory.content)
                 if item_size > COMPRESSION_ITEM_THRESHOLD and not memory.compressed_content:
-                    # Item > 5KB and not already compressed - compress it
                     result = await provider.compress(memory.content, target_ratio=0.35, min_quality=70)
                     if result['success']:
                         memory.compressed_content = result['compressed']
                         quality_scores.append(result['quality_score'])
                         total_compressed += result['compressed_length']
                         compressed_count += 1
-                        logger.info(f"[PHASE2] Compressed {memory.id[:8]}: {item_size} -> {result['compressed_length']} chars (quality={result['quality_score']})")
+                        logger.info(f"[PHASE2] Compressed {memory.id[:8]}: {item_size} -> {result['compressed_length']} chars")
                     else:
                         total_compressed += item_size
                         logger.warning(f"[PHASE2] Compression failed for {memory.id[:8]}: {result['error']}")
@@ -349,29 +448,47 @@ async def search_memories(request: MemorySearchRequest):
                     'average_quality_score': round(avg_quality, 1),
                     'threshold_triggered': COMPRESSION_RESULT_SET_THRESHOLD,
                 }
-                logger.info(f"[PHASE2] Compression complete: {compressed_count}/{len(memories)} items compressed, ratio={compression_metadata['compression_ratio']:.2%}, avg_quality={avg_quality:.1f}")
         else:
-            logger.warning("[PHASE2] CERBERUS unavailable, skipping compression for large result set")
+            logger.warning("[PHASE2] CERBERUS unavailable, skipping compression")
 
-    return MemoryListResponse(
+    response = MemoryListResponse(
         count=len(memories),
         memories=memories,
         compression_applied=compression_applied,
         compression_metadata=compression_metadata if compression_applied else None,
     )
 
+    # Cache result for 5 minutes (only uncompressed results)
+    if _cache and not request.include_compressed and not compression_applied:
+        try:
+            await _cache.setex(cache_key, 300, response.model_dump_json())
+        except Exception as e:
+            logger.warning(f"[CACHE] search write error: {e}")
+
+    return response
+
 @app.post("/memories", response_model=MemoryItem)
 async def create_memory(request: MemoryCreateRequest):
     import uuid
+    global _pool, _cache
     mem_id = f"mem_{uuid.uuid4().hex[:12]}"
-    conn = await _get_db()
-    try:
+
+    if not _pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+
+    async with _pool.acquire() as conn:
         meta = json.dumps(request.metadata or {"source": request.source})
         await conn.execute("INSERT INTO memories (id, content, category, metadata, quality_rating) VALUES ($1, $2, $3, $4::jsonb, 75)", mem_id, request.content, request.category, meta)
         row = await conn.fetchrow('SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content FROM memories WHERE id=$1', mem_id)
-        return _row_to_memory(row)
-    finally:
-        await conn.close()
+
+    # Invalidate stats cache on new memory
+    if _cache:
+        try:
+            await _cache.delete("stats:global")
+        except Exception:
+            pass
+
+    return _row_to_memory(row)
 
 
 # ============================================================
@@ -382,31 +499,15 @@ async def create_memory(request: MemoryCreateRequest):
 async def rehydrate_memories(request: RehydrationRequest):
     """
     Phase 5: Return memories optimized for Claude context injection.
-
-    Searches for relevant memories, concatenates them, and auto-compresses
-    to fit within the specified token budget. Returns formatted context
-    ready for injection into Claude prompts.
-
-    Input:
-      - query: Search term to find relevant memories
-      - budget_tokens: Maximum token budget (default 8000)
-      - category: Optional category filter
-      - limit: Max memories to retrieve before compression
-
-    Output:
-      - context: Compressed/formatted context ready for Claude injection
-      - tokens_used: Estimated tokens in final context
-      - original_tokens: Estimated tokens before compression
-      - compression_ratio: Final compression ratio
-      - quality_score: Compression quality (0-100)
-      - memories_included: Number of memories in context
-      - compression_applied: Whether compression was needed
     """
-    conn = await _get_db()
-    try:
-        # Retrieve relevant memories
-        query_tsv = ' & '.join(request.query.split())
+    global _pool
+    if not _pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+
+    rows = []
+    async with _pool.acquire() as conn:
         try:
+            query_tsv = ' & '.join(request.query.split())
             if request.category:
                 rows = await conn.fetch(
                     "SELECT id, content, category, created, compressed_content, quality_rating, "
@@ -423,7 +524,7 @@ async def rehydrate_memories(request: RehydrationRequest):
                     "ORDER BY rank DESC LIMIT $2",
                     query_tsv, request.limit
                 )
-        except Exception as e:
+        except asyncpg.PostgresError as e:
             logger.warning(f"[REHYDRATE] FTS failed, using ILIKE fallback: {e}")
             like_q = f"%{request.query}%"
             if request.category:
@@ -438,8 +539,6 @@ async def rehydrate_memories(request: RehydrationRequest):
                     'FROM memories WHERE content ILIKE $1 ORDER BY created DESC LIMIT $2',
                     like_q, request.limit
                 )
-    finally:
-        await conn.close()
 
     if not rows:
         return RehydrationResponse(
@@ -452,10 +551,8 @@ async def rehydrate_memories(request: RehydrationRequest):
             compression_applied=False,
         )
 
-    # Build context string from memories, preferring compressed_content when available
     context_parts = []
     for row in rows:
-        # Use compressed_content if available (already distilled), else use full content
         effective_content = row['compressed_content'] if row['compressed_content'] else row['content']
         created_str = row['created'].strftime('%Y-%m-%d') if row['created'] else 'unknown'
         context_parts.append(
@@ -465,7 +562,6 @@ async def rehydrate_memories(request: RehydrationRequest):
     combined_context = "\n\n---\n\n".join(context_parts)
     original_tokens = int(len(combined_context) / 4)
 
-    # Use ExternalInferenceProvider.prepare_context() to fit token budget
     provider = get_inference_provider()
     result = await provider.prepare_context(combined_context, max_tokens=request.budget_tokens)
 
@@ -509,52 +605,63 @@ class SessionIngestResponse(BaseModel):
 @app.post("/ingest/session", response_model=SessionIngestResponse)
 async def ingest_session(request: SessionIngestRequest):
     """Ingest Claude Code session data into MNEMOS"""
-    conn = await _get_db()
+    global _pool, _cache
+    if not _pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+
     stored_ids = []
 
     try:
         import uuid
-
         data = request.raw_data
 
-        # Store messages
-        if data.get("messages") or data.get("prompts"):
-            items = data.get("messages", []) or data.get("prompts", [])
-            if items:
-                content = f"Session {request.session_id} - {len(items)} messages\n{str(items)[:500]}"
-                mem_id = f"mem_{uuid.uuid4().hex[:12]}"
-                meta = json.dumps({"source": request.source, "session_id": request.session_id, "machine_id": request.machine_id, "agent_id": request.agent_id, "git_commit": request.git_commit, "item_count": len(items), "item_type": "messages"})
-                await conn.execute("INSERT INTO memories (id, content, category, metadata, quality_rating) VALUES ($1, $2, $3, $4::jsonb, 75)", mem_id, content, "session_activity", meta)
-                stored_ids.append(mem_id)
+        async with _pool.acquire() as conn:
+            # Store messages
+            if data.get("messages") or data.get("prompts"):
+                items = data.get("messages", []) or data.get("prompts", [])
+                if items:
+                    content = f"Session {request.session_id} - {len(items)} messages\n{str(items)[:500]}"
+                    mem_id = f"mem_{uuid.uuid4().hex[:12]}"
+                    meta = json.dumps({"source": request.source, "session_id": request.session_id, "machine_id": request.machine_id, "agent_id": request.agent_id, "git_commit": request.git_commit, "item_count": len(items), "item_type": "messages"})
+                    await conn.execute("INSERT INTO memories (id, content, category, metadata, quality_rating) VALUES ($1, $2, $3, $4::jsonb, 75)", mem_id, content, "session_activity", meta)
+                    stored_ids.append(mem_id)
 
-        # Store code blocks
-        if data.get("code_blocks"):
-            items = data.get("code_blocks", [])
-            if items:
-                content = f"Session {request.session_id} - {len(items)} code blocks\n{str(items)[:500]}"
-                mem_id = f"mem_{uuid.uuid4().hex[:12]}"
-                meta = json.dumps({"source": request.source, "session_id": request.session_id, "machine_id": request.machine_id, "agent_id": request.agent_id, "git_commit": request.git_commit, "item_count": len(items), "item_type": "code"})
-                await conn.execute("INSERT INTO memories (id, content, category, metadata, quality_rating) VALUES ($1, $2, $3, $4::jsonb, 75)", mem_id, content, "session_code", meta)
-                stored_ids.append(mem_id)
+            # Store code blocks
+            if data.get("code_blocks"):
+                items = data.get("code_blocks", [])
+                if items:
+                    content = f"Session {request.session_id} - {len(items)} code blocks\n{str(items)[:500]}"
+                    mem_id = f"mem_{uuid.uuid4().hex[:12]}"
+                    meta = json.dumps({"source": request.source, "session_id": request.session_id, "machine_id": request.machine_id, "agent_id": request.agent_id, "git_commit": request.git_commit, "item_count": len(items), "item_type": "code"})
+                    await conn.execute("INSERT INTO memories (id, content, category, metadata, quality_rating) VALUES ($1, $2, $3, $4::jsonb, 75)", mem_id, content, "session_code", meta)
+                    stored_ids.append(mem_id)
 
-        # Store tools
-        if data.get("tool_operations") or data.get("tools"):
-            items = data.get("tool_operations", []) or data.get("tools", [])
-            if items:
-                content = f"Session {request.session_id} - {len(items)} tool operations\n{str(items)[:500]}"
-                mem_id = f"mem_{uuid.uuid4().hex[:12]}"
-                meta = json.dumps({"source": request.source, "session_id": request.session_id, "machine_id": request.machine_id, "agent_id": request.agent_id, "git_commit": request.git_commit, "item_count": len(items), "item_type": "tools"})
-                await conn.execute("INSERT INTO memories (id, content, category, metadata, quality_rating) VALUES ($1, $2, $3, $4::jsonb, 75)", mem_id, content, "session_tools", meta)
-                stored_ids.append(mem_id)
+            # Store tools
+            if data.get("tool_operations") or data.get("tools"):
+                items = data.get("tool_operations", []) or data.get("tools", [])
+                if items:
+                    content = f"Session {request.session_id} - {len(items)} tool operations\n{str(items)[:500]}"
+                    mem_id = f"mem_{uuid.uuid4().hex[:12]}"
+                    meta = json.dumps({"source": request.source, "session_id": request.session_id, "machine_id": request.machine_id, "agent_id": request.agent_id, "git_commit": request.git_commit, "item_count": len(items), "item_type": "tools"})
+                    await conn.execute("INSERT INTO memories (id, content, category, metadata, quality_rating) VALUES ($1, $2, $3, $4::jsonb, 75)", mem_id, content, "session_tools", meta)
+                    stored_ids.append(mem_id)
+
+        # Invalidate stats cache
+        if _cache:
+            try:
+                await _cache.delete("stats:global")
+            except Exception:
+                pass
 
         logger.info(f"Session {request.session_id} ingested: {len(stored_ids)} records")
         return SessionIngestResponse(success=True, session_id=request.session_id, stored_count=len(stored_ids), memory_ids=stored_ids)
 
+    except asyncpg.PostgresError as e:
+        logger.error(f"Session ingestion DB error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         logger.error(f"Session ingestion failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await conn.close()
 
 
 if __name__ == "__main__":
