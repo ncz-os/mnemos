@@ -17,7 +17,7 @@ import uuid
 # Phase 2: Import external inference provider for compression
 sys.path.insert(0, os.path.dirname(__file__))
 from external_inference_provider import ExternalInferenceProvider
-from graeae_providers import GraeaeEngine, get_graeae_engine
+from graeae_providers import get_graeae_engine
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -332,6 +332,46 @@ def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
         compressed_content=row.get('compressed_content') if include_compressed else None,
     )
 
+
+async def _fts_fetch(conn, query: str, limit: int,
+                     category=None,
+                     select_cols="id, content, category, created, updated, metadata, quality_rating, compressed_content"):
+    """FTS search with ILIKE fallback. Shared by /memories/search and /memories/rehydrate."""
+    query_tsv = " & ".join(query.split())
+    rank_col = "ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as rank"
+    try:
+        if category:
+            return await conn.fetch(
+                f"SELECT {select_cols}, {rank_col} "
+                "FROM memories WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
+                "AND category=$3 ORDER BY rank DESC LIMIT $2",
+                query_tsv, limit, category,
+            )
+        return await conn.fetch(
+            f"SELECT {select_cols}, {rank_col} "
+            "FROM memories WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
+            "ORDER BY rank DESC LIMIT $2",
+            query_tsv, limit,
+        )
+    except Exception:
+        logger.warning(f"[FTS] falling back to ILIKE for: {query[:50]!r}")
+        like_q = f"%{query}%"
+        try:
+            if category:
+                return await conn.fetch(
+                    f"SELECT {select_cols} FROM memories "
+                    "WHERE content ILIKE $1 AND category=$3 ORDER BY created DESC LIMIT $2",
+                    like_q, limit, category,
+                )
+            return await conn.fetch(
+                f"SELECT {select_cols} FROM memories "
+                "WHERE content ILIKE $1 ORDER BY created DESC LIMIT $2",
+                like_q, limit,
+            )
+        except Exception as e2:
+            logger.error(f"[FTS] Both FTS and ILIKE failed: {e2}")
+            return []
+
 @app.get("/memories", response_model=MemoryListResponse)
 async def list_memories(category: Optional[str] = None, limit: int = 20, offset: int = 0):
     global _pool
@@ -383,44 +423,9 @@ async def search_memories(request: MemorySearchRequest):
 
     rows = []
     async with _pool.acquire() as conn:
-        try:
-            query_tsv = ' & '.join(request.query.split())
-            if request.category:
-                rows = await conn.fetch(
-                    "SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content, "
-                    "ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as rank "
-                    "FROM memories WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) AND category=$3 "
-                    "ORDER BY rank DESC LIMIT $2",
-                    query_tsv, request.limit, request.category
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content, "
-                    "ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as rank "
-                    "FROM memories WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
-                    "ORDER BY rank DESC LIMIT $2",
-                    query_tsv, request.limit
-                )
-        except asyncpg.PostgresError as e:
-            logger.warning(f"FTS failed, falling back to ILIKE: {e}")
-            like_q = f"%{request.query}%"
-            try:
-                if request.category:
-                    rows = await conn.fetch(
-                        'SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content '
-                        'FROM memories WHERE content ILIKE $1 AND category=$3 ORDER BY created DESC LIMIT $2',
-                        like_q, request.limit, request.category
-                    )
-                else:
-                    rows = await conn.fetch(
-                        'SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content '
-                        'FROM memories WHERE content ILIKE $1 ORDER BY created DESC LIMIT $2',
-                        like_q, request.limit
-                    )
-            except asyncpg.PostgresError as e2:
-                logger.error(f"Both FTS and ILIKE failed: {e2}")
-                rows = []
+        rows = await _fts_fetch(conn, request.query, request.limit, request.category)
 
+    # Phase 2: Response pre-compression
     # Phase 2: Response pre-compression for large result sets
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
     compression_applied = False
@@ -546,39 +551,10 @@ async def rehydrate_memories(request: RehydrationRequest):
 
     rows = []
     async with _pool.acquire() as conn:
-        try:
-            query_tsv = ' & '.join(request.query.split())
-            if request.category:
-                rows = await conn.fetch(
-                    "SELECT id, content, category, created, compressed_content, quality_rating, "
-                    "ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as rank "
-                    "FROM memories WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) AND category=$3 "
-                    "ORDER BY rank DESC LIMIT $2",
-                    query_tsv, request.limit, request.category
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT id, content, category, created, compressed_content, quality_rating, "
-                    "ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as rank "
-                    "FROM memories WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
-                    "ORDER BY rank DESC LIMIT $2",
-                    query_tsv, request.limit
-                )
-        except asyncpg.PostgresError as e:
-            logger.warning(f"[REHYDRATE] FTS failed, using ILIKE fallback: {e}")
-            like_q = f"%{request.query}%"
-            if request.category:
-                rows = await conn.fetch(
-                    'SELECT id, content, category, created, compressed_content, quality_rating '
-                    'FROM memories WHERE content ILIKE $1 AND category=$3 ORDER BY created DESC LIMIT $2',
-                    like_q, request.limit, request.category
-                )
-            else:
-                rows = await conn.fetch(
-                    'SELECT id, content, category, created, compressed_content, quality_rating '
-                    'FROM memories WHERE content ILIKE $1 ORDER BY created DESC LIMIT $2',
-                    like_q, request.limit
-                )
+        rows = await _fts_fetch(
+            conn, request.query, request.limit, request.category,
+            select_cols="id, content, category, created, compressed_content, quality_rating",
+        )
 
     if not rows:
         return RehydrationResponse(

@@ -266,6 +266,3 @@ def get_graeae_engine() -> GraeaeEngine:
         _graeae_engine = GraeaeEngine()
     return _graeae_engine
 
-
-# Backwards-compatibility alias (old typo)
-GraueaEngine = GraeaeEngine
