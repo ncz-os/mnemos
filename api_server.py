@@ -490,6 +490,8 @@ async def search_memories(request: MemorySearchRequest):
 @app.post("/memories", response_model=MemoryItem)
 async def create_memory(request: MemoryCreateRequest):
     global _pool, _cache
+    if not request.content or not request.content.strip():
+        raise HTTPException(status_code=422, detail="Memory content cannot be empty")
     mem_id = f"mem_{uuid.uuid4().hex[:12]}"
 
     if not _pool:
@@ -508,6 +510,25 @@ async def create_memory(request: MemoryCreateRequest):
             pass
 
     return _row_to_memory(row)
+
+
+
+
+@app.delete("/memories/{memory_id}", status_code=204)
+async def delete_memory(memory_id: str):
+    """Delete a memory by ID."""
+    global _pool, _cache
+    if not _pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    async with _pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM memories WHERE id = $1", memory_id)
+        if result == "DELETE 0":
+            raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+    if _cache:
+        try:
+            await _cache.delete("stats:global")
+        except Exception:
+            pass
 
 
 # ============================================================
