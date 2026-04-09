@@ -239,6 +239,7 @@ class BundleRouter:
 
         return {
             'detected_task_type': task_type,
+            'recommended_bundle': bundle.to_dict() if bundle else None,
             'bundle': bundle.to_dict() if bundle else None,
             'models': self.select_models(task_type),
             'primary_model': self.select_primary_model(task_type).to_dict() if self.select_primary_model(task_type) else None,

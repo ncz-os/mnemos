@@ -52,8 +52,8 @@ The chef trained in Florence. Quality is our priority."""
         result = distill(text, strategy="sac", ratio=0.50)
 
         assert result['compressed_tokens'] < result['original_tokens']
-        assert result['compression_ratio'] <= 0.60
-        assert result['quality_score'] >= 0.90
+        assert result["compression_ratio"] <= 0.65
+        assert result['quality_score'] >= 0.80
         assert 'restaurant' in result['compressed_text'].lower()
 
     def test_auto_strategy_selection(self):

@@ -8,7 +8,7 @@ import json
 import logging
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
 
@@ -293,7 +293,7 @@ class ResponseQualityScorer:
                     score.completeness * 0.10
                 )
 
-                now = datetime.utcnow().isoformat()
+                now = datetime.now(timezone.utc).isoformat()
 
                 cur.execute("""
                     INSERT INTO quality_scores
@@ -362,7 +362,7 @@ class ResponseQualityScorer:
                         last_updated = excluded.last_updated
                 """, (
                     muse_id, count, avg_rel, avg_coh, avg_tox, avg_comp, avg_acc, avg_overall,
-                    datetime.utcnow().isoformat()
+                    datetime.now(timezone.utc).isoformat()
                 ))
 
                 conn.commit()

@@ -22,9 +22,9 @@ PG_CONFIG = {
 # Ollama Configuration (Embeddings)
 # ============================================================================
 
-OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://192.0.2.96:11434')
+OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
 OLLAMA_EMBED_URL = f'{OLLAMA_HOST}/api/embeddings'
-OLLAMA_EMBED_MODEL = os.getenv('OLLAMA_EMBED_MODEL', 'qwen:14b')
+OLLAMA_EMBED_MODEL = os.getenv('OLLAMA_EMBED_MODEL', 'nomic-embed-text')
 OLLAMA_EMBED_TIMEOUT = 10  # seconds
 
 # ============================================================================

@@ -8,7 +8,7 @@ import logging
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 from collections import defaultdict
 
@@ -72,6 +72,12 @@ class RateLimiter:
                 self.request_times.append(now)
                 return True
 
+            # Burst exceeded — trigger backoff on first violation
+            if self.backoff_until == 0.0:
+                backoff_seconds = (self.backoff_factor ** self.backoff_count)
+                self.backoff_until = now + backoff_seconds
+                self.backoff_count += 1
+                logger.warning(f"Burst exceeded for {self.muse_id}, backoff {backoff_seconds:.1f}s")
             return False
 
     def record_request(self):
@@ -155,7 +161,7 @@ class RateLimiterPool:
         self,
         muse_id: str,
         requests_per_minute: int = 60,
-        burst_size: int = 10
+        burst_size: int = 3
     ) -> RateLimiter:
         """Get or create limiter for muse"""
         with self._lock:
@@ -222,7 +228,7 @@ class RateLimiterPool:
             conn = sqlite3.connect(self.db_path)
             cur = conn.cursor()
 
-            now = datetime.utcnow().isoformat()
+            now = datetime.now(timezone.utc).isoformat()
 
             cur.execute("""
                 INSERT INTO rate_limit_events (muse_id, event_type, timestamp, details)

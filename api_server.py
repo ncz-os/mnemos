@@ -16,6 +16,7 @@ import hashlib
 # Phase 2: Import external inference provider for compression
 sys.path.insert(0, os.path.dirname(__file__))
 from external_inference_provider import ExternalInferenceProvider
+from graeae_providers import GraueaEngine, get_graeae_engine
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -49,6 +50,8 @@ class ConsultationRequest(BaseModel):
     task_type: Optional[str] = "reasoning"
     context: Optional[str] = None
     mode: Optional[str] = "auto"
+    limit_chars: Optional[int] = None  # Limit response chars per provider
+    format: Optional[str] = "full"  # "full" or "best" (top provider only)
 
 class ConsultationResponse(BaseModel):
     consensus_response: str
@@ -201,36 +204,52 @@ async def get_stats() -> StatsResponse:
         logger.error(f"Stats error: {e}")
         raise HTTPException(status_code=503, detail=f"Internal error: {e}")
 
-@app.post("/graeae/consult", response_model=ConsultationResponse)
-async def consult_graeae(request: ConsultationRequest) -> ConsultationResponse:
-    """Consult GRAEAE and log consultation"""
+@app.post("/graeae/consult")
+async def consult_graeae(request: ConsultationRequest):
+    """Consult GRAEAE multi-provider consensus engine"""
     global _pool
-    logger.info(f"GRAEAE Consultation: {request.task_type}")
+    logger.info(f"GRAEAE Consultation: {request.task_type} (limit_chars={request.limit_chars}, format={request.format})")
+    
+    try:
+        engine = get_graeae_engine()
+        result = await engine.consult(request.prompt, request.task_type)
+        
+        # Apply limit_chars truncation if specified
+        if request.limit_chars and result.get("all_responses"):
+            for provider, resp in result["all_responses"].items():
+                if isinstance(resp.get("response_text"), str):
+                    resp["response_text"] = resp["response_text"][:request.limit_chars]
+                    resp["truncated"] = len(resp.get("response_text", "")) >= request.limit_chars
+        
+        # Apply format filter
+        if request.format == "best" and result.get("all_responses"):
+            best = max(result["all_responses"].items(), key=lambda x: x[1].get("final_score", 0))
+            result["all_responses"] = {best[0]: best[1]}
+        
+        # Log best response to database
+        if _pool and result.get("all_responses"):
+            try:
+                best_resp = max(result["all_responses"].items(), key=lambda x: x[1].get("final_score", 0))
+                async with _pool.acquire() as conn:
+                    await conn.execute("""INSERT INTO graeae_consultations
+                        (prompt, task_type, consensus_response, consensus_score, winning_muse, cost, latency_ms, mode)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+                        request.prompt, request.task_type,
+                        best_resp[1].get("response_text", "")[:500],
+                        best_resp[1].get("final_score", 0),
+                        best_resp[0], 0.02,
+                        best_resp[1].get("latency_ms", 0),
+                        request.mode or "auto"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to log consultation: {e}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"GRAEAE error: {e}", exc_info=True)
+        return {"error": str(e), "status": "error"}
 
-    response = ConsultationResponse(
-        consensus_response=request.prompt[:100] + "..." if len(request.prompt) > 100 else request.prompt,
-        consensus_score=0.85,
-        winning_muse="claude-opus",
-        winning_latency_ms=1200,
-        cost=0.02,
-        mode=request.mode or "auto",
-        task_type=request.task_type,
-        timestamp=datetime.utcnow().isoformat(),
-    )
-
-    if _pool:
-        try:
-            async with _pool.acquire() as conn:
-                await conn.execute('''INSERT INTO graeae_consultations
-                    (prompt, task_type, consensus_response, consensus_score, winning_muse, cost, latency_ms, mode)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)''',
-                    request.prompt, request.task_type, response.consensus_response,
-                    response.consensus_score, response.winning_muse, response.cost,
-                    response.winning_latency_ms, response.mode)
-        except Exception as e:
-            logger.warning(f"Log consultation failed: {e}")
-
-    return response
 
 @app.get("/graeae/health")
 async def graeae_health():

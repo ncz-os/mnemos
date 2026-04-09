@@ -28,7 +28,7 @@ class PromptSubmitHook:
         'refactoring': ['refactor', 'cleanup', 'optimize', 'improve', 'restructure'],
         'api_design': ['api', 'endpoint', 'rest', 'graphql', 'schema'],
         'data_modeling': ['database', 'schema', 'model', 'entity', 'relationship'],
-        'reasoning': ['why', 'how', 'explain', 'analyze', 'think', 'reason'],
+        'reasoning': ['why', 'how', 'explain', 'analyze', 'think', 'reason', 'architecture'],
         'documentation': ['document', 'readme', 'guide', 'tutorial', 'example'],
     }
 
@@ -178,7 +178,7 @@ class PromptSubmitHook:
             Approximate token count
         """
         # Simple heuristic: 1 token per 4 characters
-        return len(text) // 4
+        return (len(text) + 3) // 4
 
     @staticmethod
     def get_task_keywords() -> Dict[str, List[str]]:

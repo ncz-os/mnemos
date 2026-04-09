@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Secrets & API keys (never commit)
+graeae_providers.py
+.env
+.env.*
+*_secrets.py
+
+# Backup files
+*.bak
+*.bak.*
+*.backup
+*.orig
+
+# Logs & runtime data
+*.log
+*.db
+*.sqlite3
+
+# Audit / report files
+*_AUDIT_*.txt
+*_AUDIT_*.md
+
+# IDE
+.vscode/
+.idea/
+*.swp

@@ -81,7 +81,10 @@ class HookRegistry:
             self.hooks[event_type] = []
 
         self.hooks[event_type].append(callback)
-        logger.debug(f"Registered hook for {event_type}: {callback.__name__}")
+        # Auto-enable event type when globally enabled
+        if self.config.get('hooks', {}).get('enabled', True):
+            self.enabled_hooks.add(event_type)
+        logger.debug(f"Registered hook for {event_type}: {getattr(callback, '__name__', repr(callback))}")
 
     def unregister(self, event_type: str, callback: Callable) -> None:
         """Unregister a hook callback
@@ -92,7 +95,7 @@ class HookRegistry:
         """
         if event_type in self.hooks and callback in self.hooks[event_type]:
             self.hooks[event_type].remove(callback)
-            logger.debug(f"Unregistered hook for {event_type}: {callback.__name__}")
+            logger.debug(f"Unregistered hook for {event_type}: {getattr(callback, '__name__', repr(callback))}")
 
     def list_hooks(self, event_type: Optional[str] = None) -> Dict[str, List[str]]:
         """List all registered hooks
@@ -111,7 +114,7 @@ class HookRegistry:
             }
 
         return {
-            event: [cb.__name__ for cb in callbacks]
+            event: [getattr(cb, '__name__', repr(cb)) for cb in callbacks]
             for event, callbacks in self.hooks.items()
         }
 
@@ -165,11 +168,11 @@ class HookRegistry:
                 if isinstance(result, dict):
                     modified_context.update(result)
 
-                logger.debug(f"Hook {callback.__name__} completed successfully")
+                logger.debug(f"Hook {getattr(callback, '__name__', repr(callback))} completed successfully")
 
             except Exception as e:
                 # Log error but don't crash
-                logger.error(f"Error in hook {callback.__name__} for {event_type}: {e}",
+                logger.error(f"Error in hook {getattr(callback, '__name__', repr(callback))} for {event_type}: {e}",
                            exc_info=True)
                 # Continue with next hook
 

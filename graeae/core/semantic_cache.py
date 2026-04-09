@@ -8,7 +8,7 @@ import json
 import logging
 import sqlite3
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
 
@@ -184,7 +184,7 @@ class SemanticCache:
                 conn = sqlite3.connect(self.db_path)
                 cur = conn.cursor()
 
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 expires_at = (now + timedelta(seconds=self.ttl_seconds)).isoformat()
 
                 cur.execute("""

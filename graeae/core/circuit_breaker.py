@@ -7,7 +7,7 @@ import os
 import time
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List
 from enum import Enum
 from dataclasses import dataclass
@@ -68,7 +68,7 @@ class CircuitBreaker:
         """Record a successful muse request"""
         with self._lock:
             self.metrics.success_count += 1
-            self.metrics.last_success_time = datetime.utcnow().isoformat()
+            self.metrics.last_success_time = datetime.now(timezone.utc).isoformat()
             self.metrics.consecutive_failures = 0
 
             # Close circuit if in half-open and threshold met
@@ -86,7 +86,7 @@ class CircuitBreaker:
         """
         with self._lock:
             self.metrics.failure_count += 1
-            self.metrics.last_failure_time = datetime.utcnow().isoformat()
+            self.metrics.last_failure_time = datetime.now(timezone.utc).isoformat()
             self.metrics.consecutive_failures += 1
 
             logger.warning(
@@ -98,7 +98,7 @@ class CircuitBreaker:
             if self.metrics.consecutive_failures >= self.failure_threshold:
                 if self.state != CircuitState.OPEN:
                     self.state = CircuitState.OPEN
-                    self.open_time = datetime.utcnow()
+                    self.open_time = datetime.now(timezone.utc)
                     logger.error(f"Circuit OPENED for muse {self.muse_id}")
 
     def is_available(self) -> bool:
@@ -113,7 +113,7 @@ class CircuitBreaker:
             if self.state == CircuitState.OPEN:
                 # Check if cooldown expired
                 if self.open_time:
-                    elapsed = datetime.utcnow() - self.open_time
+                    elapsed = datetime.now(timezone.utc) - self.open_time
                     if elapsed >= timedelta(minutes=self.cooldown_minutes):
                         self.state = CircuitState.HALF_OPEN
                         self.metrics.consecutive_failures = 0

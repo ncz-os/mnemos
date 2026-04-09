@@ -128,7 +128,7 @@ class TierSelector:
 
         if complex_count > 3 or simple_count > 200:
             return 'complex'
-        elif simple_count > 100:
+        elif simple_count > 50:
             return 'medium'
         else:
             return 'simple'

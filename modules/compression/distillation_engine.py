@@ -80,6 +80,10 @@ class DistillationEngine:
         """
         start_time = time.time()
 
+        # Coerce string strategy to enum
+        if isinstance(strategy, str):
+            strategy = CompressionStrategy(strategy)
+
         # Use provided ratio or default
         target_ratio = ratio or self._get_ratio_for_task(task_type)
 
@@ -106,6 +110,11 @@ class DistillationEngine:
 
         # Add metadata
         result['strategy_used'] = strategy.value
+        # Normalize output: ensure both 'compressed' and 'compressed_text' keys exist
+        if 'compressed_text' in result and 'compressed' not in result:
+            result['compressed'] = result['compressed_text']
+        elif 'compressed' in result and 'compressed_text' not in result:
+            result['compressed_text'] = result['compressed']
         result['compression_time_ms'] = round(elapsed_ms, 2)
 
         logger.debug(

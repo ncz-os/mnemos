@@ -12,7 +12,7 @@ Responsibilities:
 import logging
 import asyncio
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ class SessionStartHook:
             logger.debug(f"Generated session_id: {context['session_id']}")
 
         # Record session start time
-        context['session_start_time'] = datetime.utcnow().isoformat()
+        context['session_start_time'] = datetime.now(timezone.utc).isoformat()
 
         # Initialize session metadata
         context['session_metadata'] = {
