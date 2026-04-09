@@ -11,8 +11,8 @@ Provides:
 
 from .quality_analyzer import QualityAnalyzer, QualityManifest
 from .manager import CompressionManager
-from .token_filter_compressor import extractive token filter
-from .sac_compressor import SACCompressor, StructureAnalyzer, CompressionStrategySelector
+from .token_filter import extractive token filter
+from .sac import SACCompressor, StructureAnalyzer, CompressionStrategySelector
 from .distillation_engine import (
     DistillationEngine,
     CompressionStrategy,

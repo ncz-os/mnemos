@@ -7,7 +7,7 @@ import logging
 from typing import Dict, Optional
 import asyncio
 
-from .token_filter_compressor import extractive token filter
+from .token_filter import extractive token filter
 from .quality_analyzer import QualityAnalyzer, QualityManifest
 
 logger = logging.getLogger(__name__)
@@ -133,7 +133,7 @@ class CompressionManager:
         """
         if not self.enabled:
             # Return uncompressed
-            from .token_filter_implementation import CompressionResult
+            from ._token_filter_impl import CompressionResult
             return CompressionResult(
                 compressed_text=text,
                 original_tokens=len(text.split()),
@@ -172,7 +172,7 @@ class CompressionManager:
         except Exception as e:
             logger.error(f"Compression failed: {e}, returning original")
             # Fallback: return original
-            from .token_filter_implementation import CompressionResult
+            from ._token_filter_impl import CompressionResult
             return CompressionResult(
                 compressed_text=text,
                 original_tokens=len(text.split()),
@@ -203,7 +203,7 @@ class CompressionManager:
         )
 
         # Convert to CompressionResult
-        from .token_filter_implementation import CompressionResult
+        from ._token_filter_impl import CompressionResult
         return CompressionResult(
             compressed_text=result['compressed_text'],
             original_tokens=result['original_tokens'],

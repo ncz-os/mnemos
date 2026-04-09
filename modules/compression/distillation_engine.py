@@ -50,7 +50,7 @@ class DistillationEngine:
     def hyco(self):
         """Get extractive token filter compressor (lazy load)"""
         if self._hyco is None:
-            from .token_filter_compressor import extractive token filter
+            from .token_filter import extractive token filter
             self._hyco = extractive token filter()
         return self._hyco
 
@@ -58,7 +58,7 @@ class DistillationEngine:
     def sac(self):
         """Get SENTENCE compressor (lazy load)"""
         if self._sac is None:
-            from .sac_compressor import SACCompressor
+            from .sac import SACCompressor
             self._sac = SACCompressor()
         return self._sac
 
@@ -154,7 +154,7 @@ class DistillationEngine:
         Returns:
             Selected strategy
         """
-        from .sac_compressor import StructureAnalyzer
+        from .sac import StructureAnalyzer
 
         # Use SENTENCE for structured text
         if StructureAnalyzer.is_structured(text):

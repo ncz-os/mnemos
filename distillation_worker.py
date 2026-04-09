@@ -12,6 +12,7 @@ Configuration (2026-02-19):
 import asyncio
 import logging
 import os
+import sys
 from datetime import datetime
 import httpx
 import json
@@ -24,12 +25,11 @@ logging.basicConfig(
 )
 
 # Config
-PG_HOST     = os.getenv("PG_HOST",     "localhost")
-PG_PORT     = os.getenv("PG_PORT",     "5432")
-PG_DATABASE = os.getenv("PG_DATABASE", "mnemos")
-PG_USER     = os.getenv("PG_USER",     "mnemos_user")
-PG_PASSWORD = os.getenv("PG_PASSWORD", "mnemos_secure_password")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://192.0.2.96:11434")
+# Config — loaded from config.py (single source of truth)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import PG_CONFIG as _PG_CONFIG
+from config import OLLAMA_HOST as _CFG_OLLAMA_HOST
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", _CFG_OLLAMA_HOST)
 
 # Tuning
 MODEL = "mistral:latest"
@@ -41,7 +41,10 @@ DISTILL_TIMEOUT_PER_KB = 3
 QUALITY_TIMEOUT = 20
 MAX_ATTEMPTS = 3
 
-DB_DSN = f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}"
+DB_DSN = (
+    f"postgresql://{_PG_CONFIG['user']}:{_PG_CONFIG['password']}"
+    f"@{_PG_CONFIG['host']}:{_PG_CONFIG['port']}/{_PG_CONFIG['database']}"
+)
 
 
 class LLMDistillationService:
@@ -117,7 +120,7 @@ class MemoryDistillationWorker:
 
     async def start(self):
         """Start background worker"""
-        logger.info(f"Connecting to DB: {PG_HOST}:{PG_PORT}/{PG_DATABASE}")
+        logger.info(f"Connecting to DB: {_PG_CONFIG['host']}:{_PG_CONFIG['port']}/{_PG_CONFIG['database']}")
         self.db = await psycopg.AsyncConnection.connect(DB_DSN, autocommit=True)
         
         logger.info("✅ Distillation worker started")

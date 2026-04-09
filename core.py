@@ -10,6 +10,11 @@ import time
 import glob
 import threading
 import requests
+# DB driver note: three drivers coexist intentionally —
+#   psycopg2      (this file)           — sync background tasks (embedding, cleanup, sync_shards)
+#   asyncpg       (api_server.py)       — async FastAPI request path (high concurrency)
+#   psycopg3      (distillation_worker) — async worker process (psycopg3 native binary protocol)
+# Unifying them is MOD-02 architectural debt; deferred until pgvector async path is benchmarked.
 import psycopg2
 import uuid
 from datetime import datetime, timezone

@@ -354,7 +354,7 @@ class CompressionStrategySelector:
             compressor = SACCompressor(ratio)
         else:
             # Import here to avoid circular import
-            from .token_filter_compressor import extractive token filter
+            from .token_filter import extractive token filter
             compressor = extractive token filter()
             result = compressor.compress(text, ratio)
             return result
