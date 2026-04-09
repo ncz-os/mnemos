@@ -15,7 +15,7 @@ async def main():
     try:
         conn = await asyncpg.connect(
             user='mnemos_user',
-            password='mnemos_password',
+            password='mnemos_secure_password',
             database='mnemos',
             host='localhost'
         )

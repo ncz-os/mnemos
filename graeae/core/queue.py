@@ -10,7 +10,7 @@ import sqlite3
 import logging
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List
 from enum import Enum
 from pathlib import Path
@@ -155,7 +155,7 @@ class PersistentQueue:
                 conn = sqlite3.connect(self.db_path)
                 cur = conn.cursor()
 
-                now = datetime.utcnow().isoformat()
+                now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
                 metadata_json = json.dumps(metadata or {})
 
                 cur.execute("""
@@ -224,7 +224,7 @@ class PersistentQueue:
 
                 # Update status to processing
                 request_id = row['request_id']
-                now = datetime.utcnow().isoformat()
+                now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
                 cur.execute("""
                     UPDATE request_queue
@@ -261,7 +261,7 @@ class PersistentQueue:
                 conn = sqlite3.connect(self.db_path)
                 cur = conn.cursor()
 
-                now = datetime.utcnow().isoformat()
+                now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
                 cur.execute("""
                     UPDATE request_queue
@@ -401,7 +401,7 @@ class PersistentQueue:
                 conn = sqlite3.connect(self.db_path)
                 cur = conn.cursor()
 
-                cutoff_time = (datetime.utcnow() - timedelta(minutes=timeout_minutes)).isoformat()
+                cutoff_time = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=timeout_minutes)).isoformat()
 
                 cur.execute("""
                     SELECT request_id FROM request_queue
@@ -450,7 +450,7 @@ class PersistentQueue:
                 conn = sqlite3.connect(self.db_path)
                 cur = conn.cursor()
 
-                cutoff_time = (datetime.utcnow() - timedelta(days=days)).isoformat()
+                cutoff_time = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)).isoformat()
 
                 cur.execute("""
                     DELETE FROM request_queue
@@ -476,7 +476,7 @@ class PersistentQueue:
                 conn = sqlite3.connect(self.db_path)
                 cur = conn.cursor()
 
-                now = datetime.utcnow().isoformat()
+                now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
                 cur.execute("""
                     INSERT INTO recovery_log (request_id, action, timestamp, details)

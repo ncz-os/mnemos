@@ -14,7 +14,7 @@ import logging
 import asyncio
 import aiohttp
 from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ class ProviderModels:
         # Check cache
         if provider in self._cache and not force_refresh:
             models, timestamp = self._cache[provider]
-            if datetime.utcnow() - timestamp < timedelta(minutes=self._cache_ttl_minutes):
+            if datetime.now(timezone.utc).replace(tzinfo=None) - timestamp < timedelta(minutes=self._cache_ttl_minutes):
                 logger.debug(f"Using cached models for {provider}")
                 return models
 
@@ -78,7 +78,7 @@ class ProviderModels:
 
         if models:
             # Cache results
-            self._cache[provider] = (models, datetime.utcnow())
+            self._cache[provider] = (models, datetime.now(timezone.utc).replace(tzinfo=None))
             logger.debug(f"Cached {len(models)} models from {provider}")
 
         return models
@@ -228,7 +228,7 @@ class ProviderModels:
             Dict with cache info
         """
         status = {}
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
 
         for provider, (models, timestamp) in self._cache.items():
             age = (now - timestamp).total_seconds() / 60  # Minutes

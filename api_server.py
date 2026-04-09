@@ -5,18 +5,19 @@ import sys
 import os
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncpg
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import redis.asyncio as aioredis
 import hashlib
+import uuid
 
 # Phase 2: Import external inference provider for compression
 sys.path.insert(0, os.path.dirname(__file__))
 from external_inference_provider import ExternalInferenceProvider
-from graeae_providers import GraueaEngine, get_graeae_engine
+from graeae_providers import GraeaeEngine, get_graeae_engine
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -132,7 +133,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down MNEMOS API Server")
 
 app = FastAPI(title="MNEMOS API", version="2.2.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.router.lifespan_context = lifespan
 
 
@@ -144,7 +145,7 @@ def _get_cache_key(prefix: str, *args) -> str:
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
-    return HealthResponse(status="healthy", timestamp=datetime.utcnow().isoformat(), database_connected=True, version="2.2.0")
+    return HealthResponse(status="healthy", timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), database_connected=True, version="2.2.0")
 
 @app.get("/stats", response_model=StatsResponse)
 async def get_stats() -> StatsResponse:
@@ -185,7 +186,7 @@ async def get_stats() -> StatsResponse:
             memories_by_category=memories_by_category,
             memories_by_task_type={},
             unreviewed_compressions=0,
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         )
 
         # Cache for 60 seconds
@@ -488,7 +489,6 @@ async def search_memories(request: MemorySearchRequest):
 
 @app.post("/memories", response_model=MemoryItem)
 async def create_memory(request: MemoryCreateRequest):
-    import uuid
     global _pool, _cache
     mem_id = f"mem_{uuid.uuid4().hex[:12]}"
 

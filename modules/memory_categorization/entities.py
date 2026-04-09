@@ -11,7 +11,7 @@ Provides:
 import logging
 from typing import List, Dict, Any, Optional, Set
 from uuid import uuid4
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +26,8 @@ class Entity:
         self.entity_type = entity_type
         self.name = name
         self.metadata = metadata or {}
-        self.created_at = datetime.utcnow()
-        self.updated_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        self.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -50,7 +50,7 @@ class EntityRelationship:
         self.entity2_id = entity2_id
         self.relation_type = relation_type  # 'works_on', 'related_to', 'depends_on', etc
         self.metadata = metadata or {}
-        self.created_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
     def to_dict(self) -> Dict[str, Any]:
         return {

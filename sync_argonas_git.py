@@ -27,7 +27,7 @@ def get_recent_commits(repo_path, limit=20):
                 hash_val, msg = line.split(' ', 1)
                 commits.append({'hash': hash_val, 'message': msg})
         return commits
-    except:
+    except Exception:
         return []
 
 def store_commit(commit, project_name):
@@ -42,7 +42,7 @@ Message: {commit["message"]}'
             timeout=5
         )
         return response.status_code == 201
-    except:
+    except Exception:
         return False
 
 def sync_all_repos():

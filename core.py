@@ -12,7 +12,7 @@ import threading
 import requests
 import psycopg2
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from psycopg2.extras import RealDictCursor
 from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,6 +24,9 @@ request_id_context: ContextVar[str] = ContextVar('request_id', default='')
 # ============================================================================
 # Database Manager
 # ============================================================================
+
+# Named constant: max chars sent to embedding model
+EMBED_CONTENT_MAX_CHARS = 2000
 
 class DatabaseManager:
     """PostgreSQL connection management and utilities"""
@@ -96,7 +99,7 @@ class EmbeddingService:
         try:
             response = requests.post(
                 self.url,
-                json={'model': self.model, 'prompt': str(text)[:2000]},
+                json={'model': self.model, 'prompt': str(text)[:EMBED_CONTENT_MAX_CHARS]},
                 timeout=self.timeout
             )
 
@@ -216,7 +219,7 @@ class EmbeddingService:
             batch_results = []
             for mem_id, content in batch_items:
                 if content and str(content).strip():
-                    embedding = self.embed(str(content)[:2000])
+                    embedding = self.embed(str(content)[:EMBED_CONTENT_MAX_CHARS])
                     if embedding:
                         batch_results.append((mem_id, embedding))
             return batch_results
@@ -311,7 +314,7 @@ class MemoryStore:
         if not memory_id:
             memory_id = f"mem_{int(time.time() * 1000)}"
 
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         clean_content = str(content).replace('\x00', '')
 
         # Generate embedding
@@ -352,15 +355,15 @@ class MemoryStore:
         """Get single memory by ID"""
         conn = self.db.get_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-
-        cur.execute("""
-            SELECT id, content, category, created, updated
-            FROM memories WHERE id = %s
-        """, (memory_id,))
-
-        result = cur.fetchone()
-        cur.close()
-        conn.close()
+        try:
+            cur.execute("""
+                SELECT id, content, category, created, updated
+                FROM memories WHERE id = %s
+            """, (memory_id,))
+            result = cur.fetchone()
+        finally:
+            cur.close()
+            conn.close()
 
         return dict(result) if result else None
 
@@ -372,7 +375,7 @@ class MemoryStore:
 
         new_content = content or existing['content']
         new_category = category or existing['category']
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
         # Regenerate embedding if content changed
         embedding = None
@@ -445,16 +448,13 @@ class MemoryStore:
 
         conn = self.db.get_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-
-        # Set optimal IVFFlat probes for lists=79 index (30 = 100% recall, 356 queries/sec)
-        cur.execute("SET ivfflat.probes = 30")
+        try:
+            # Set optimal IVFFlat probes for lists=79 index (30 = 100% recall, 356 queries/sec)
+            cur.execute("SET ivfflat.probes = 30")
 
         # Search across selected tiers
-        tier_filter = "category IN ({})".format(
-            ','.join("'%s'" % t for t in selected_tiers)
-        )
-
-        cur.execute(f"""
+        # Use ANY(%s::text[]) for parameterized tier filtering (no SQL injection risk)
+        cur.execute("""
             SELECT
                 id,
                 content,
@@ -462,14 +462,15 @@ class MemoryStore:
                 created,
                 1 - (embedding <=> %s::vector) as similarity
             FROM memories
-            WHERE embedding IS NOT NULL AND ({tier_filter} OR category = 'documentation')
+            WHERE embedding IS NOT NULL AND (category = ANY(%s::text[]) OR category = 'documentation')
             ORDER BY embedding <=> %s::vector
             LIMIT %s
-        """, (query_embedding, query_embedding, limit))
+        """, (query_embedding, list(selected_tiers), query_embedding, limit))
 
-        results = cur.fetchall()
-        cur.close()
-        conn.close()
+            results = cur.fetchall()
+        finally:
+            cur.close()
+            conn.close()
 
         return {
             'results': [dict(r) for r in results],
@@ -525,47 +526,49 @@ class SyncService:
         self.db = DatabaseManager()
 
     def sync_json_shards(self):
-        """Sync JSON shards to PostgreSQL"""
+        """Sync JSON shards to PostgreSQL (single connection per run, no N+1)"""
         try:
             os.makedirs(self.shard_dir, exist_ok=True)
             shard_files = sorted(glob.glob(os.path.join(self.shard_dir, 'shard_*.json')))
             synced = 0
 
-            for shard_file in shard_files:
-                try:
-                    with open(shard_file, 'r') as f:
-                        data = json.load(f)
-                        if not isinstance(data, list):
-                            data = [data]
+            conn = self.db.get_connection()
+            cur = conn.cursor()
+            try:
+                for shard_file in shard_files:
+                    try:
+                        with open(shard_file, 'r') as f:
+                            data = json.load(f)
+                            if not isinstance(data, list):
+                                data = [data]
 
-                        for mem in data:
-                            mem_id = mem.get('id')
-                            if not mem_id:
-                                continue
+                            for mem in data:
+                                mem_id = mem.get('id')
+                                if not mem_id:
+                                    continue
 
-                            conn = self.db.get_connection()
-                            cur = conn.cursor()
+                                cur.execute('SELECT id FROM memories WHERE id = %s', (mem_id,))
+                                if not cur.fetchone():
+                                    cur.execute("""
+                                        INSERT INTO memories (id, content, category, created, updated)
+                                        VALUES (%s, %s, %s, %s, %s)
+                                    """, (
+                                        mem_id,
+                                        mem.get('content', ''),
+                                        mem.get('category', 'facts'),
+                                        mem.get('created', ''),
+                                        mem.get('updated', mem.get('created', ''))
+                                    ))
+                                    synced += 1
 
-                            cur.execute('SELECT id FROM memories WHERE id = %s', (mem_id,))
-                            if not cur.fetchone():
-                                cur.execute("""
-                                    INSERT INTO memories (id, content, category, created, updated)
-                                    VALUES (%s, %s, %s, %s, %s)
-                                """, (
-                                    mem_id,
-                                    mem.get('content', ''),
-                                    mem.get('category', 'facts'),
-                                    mem.get('created', ''),
-                                    mem.get('updated', mem.get('created', ''))
-                                ))
-                                conn.commit()
-                                synced += 1
+                    except Exception as e:
+                        print(f"[SYNC] Error processing {shard_file}: {e}", file=sys.stderr, flush=True)
+                        continue
 
-                            cur.close()
-                            conn.close()
-                except Exception as e:
-                    print(f"[SYNC] Error processing {shard_file}: {e}", file=sys.stderr, flush=True)
-                    continue
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
 
             print(f"[SYNC] Synced {synced} from JSON shards", file=sys.stderr, flush=True)
             return synced
@@ -757,7 +760,7 @@ class MemoryMaintenance:
         """Remove memories older than TTL"""
         try:
             ttl_seconds = config.MEMORY_TTL.total_seconds()
-            cutoff_time = datetime.utcnow() - config.MEMORY_TTL
+            cutoff_time = datetime.now(timezone.utc).replace(tzinfo=None) - config.MEMORY_TTL
 
             conn = self.db.get_connection()
             cur = conn.cursor()
@@ -808,7 +811,7 @@ class RequestTracer:
     def log(message, level='INFO'):
         """Log message with request ID"""
         rid = RequestTracer.get_id()
-        timestamp = datetime.utcnow().strftime('%H:%M:%S')
+        timestamp = datetime.now(timezone.utc).replace(tzinfo=None).strftime('%H:%M:%S')
         print(f"[{timestamp}] [{rid}] {message}", file=sys.stderr, flush=True)
 
 # ============================================================================

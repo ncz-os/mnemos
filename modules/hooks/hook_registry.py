@@ -10,10 +10,11 @@ Manages lifecycle events:
 """
 
 import asyncio
+import inspect
 import logging
 from typing import Callable, Dict, List, Any, Optional
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +139,7 @@ class HookRegistry:
         # Create event
         event = HookEvent(
             event_type=event_type,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
             context=context.copy(),
             source=source,
         )
@@ -159,7 +160,7 @@ class HookRegistry:
         for callback in callbacks:
             try:
                 # Call hook (async if needed)
-                if asyncio.iscoroutinefunction(callback):
+                if inspect.iscoroutinefunction(callback):
                     result = await callback(modified_context)
                 else:
                     result = callback(modified_context)

@@ -136,7 +136,7 @@ class SemanticCache:
                         if similarity > best_similarity:
                             best_similarity = similarity
                             best_match = (cache_id, response)
-                    except:
+                    except Exception:
                         continue
 
                 if best_match and best_similarity >= similarity_threshold:

@@ -6,7 +6,6 @@ __pycache__/
 *.egg-info/
 
 # Secrets & API keys (never commit)
-graeae_providers.py
 .env
 .env.*
 *_secrets.py

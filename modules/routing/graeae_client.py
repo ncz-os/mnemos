@@ -13,7 +13,7 @@ import asyncio
 import aiohttp
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +139,7 @@ class GraeaeClient:
                             mode=data.get('mode', mode),
                             task_type=task_type,
                             all_responses=data.get('all_responses', {}),
-                            timestamp=datetime.utcnow().isoformat(),
+                            timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                         )
 
                         # Save to memory store if available
@@ -194,7 +194,7 @@ class GraeaeClient:
             mode='fallback',
             task_type=task_type,
             all_responses={},
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         )
 
     async def _save_consultation(self, result: ConsultationResult,

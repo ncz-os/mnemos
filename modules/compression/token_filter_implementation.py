@@ -45,14 +45,23 @@ except ImportError:
 @dataclass
 class CompressionResult:
     """Result of compression operation"""
-    original_text: str
-    compressed_text: str
-    original_tokens: int
-    compressed_tokens: int
-    compression_ratio: float
+    original_text: str = ""
+    compressed_text: str = ""
+    original_tokens: int = 0
+    compressed_tokens: int = 0
+    compression_ratio: float = 1.0
     method: str = "token_filter"
     stage1_tokens: int = 0  # Tokens after hard constraints
     stage2_tokens: int = 0  # Tokens after soft constraints
+    quality_rating: int = 100
+    quality_summary: dict = None
+    compression_manifest: dict = None
+
+    def __post_init__(self):
+        if self.quality_summary is None:
+            self.quality_summary = {}
+        if self.compression_manifest is None:
+            self.compression_manifest = {}
 
 
 class HardConstraintsEngine:
@@ -295,7 +304,7 @@ class SoftConstraintsOptimizer:
                     if token_embedding is not None:
                         similarity = util.pytorch_cos_sim(token_embedding, text_embedding)[0][0].item()
                         semantic_score = max(0, similarity)  # 0-1 range
-                except:
+                except Exception:
                     semantic_score = 0.5  # Default if embedding fails
             else:
                 semantic_score = 0.5  # Default score

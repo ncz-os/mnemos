@@ -10,7 +10,7 @@ Handles bidirectional synchronization:
 import logging
 import asyncio
 from typing import Dict, Any, Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 from hashlib import md5
 
 logger = logging.getLogger(__name__)
@@ -214,7 +214,7 @@ class StateSynchronizer:
             details: Details of sync
         """
         log_entry = {
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             'sync_type': sync_type,
             'details': details,
         }

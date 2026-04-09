@@ -15,7 +15,7 @@ PG_CONFIG = {
     'port': int(os.getenv('PG_PORT', 5432)),
     'database': os.getenv('PG_DATABASE', 'mnemos'),
     'user': os.getenv('PG_USER', 'mnemos_user'),
-    'password': os.getenv('PG_PASSWORD', 'mnemos_secure_pass')
+    'password': os.getenv('PG_PASSWORD', 'mnemos_secure_password')
 }
 
 # ============================================================================
@@ -100,3 +100,23 @@ TIER_SELECTION = {
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(message)s'
 REQUEST_ID_LENGTH = 8  # Show first 8 chars of request ID in logs
+
+# ============================================================================
+# TOML Configuration (config.toml overrides env-var defaults where present)
+# ============================================================================
+
+import tomllib as _tomllib
+from pathlib import Path as _Path
+
+def _load_toml() -> dict:
+    """Load config.toml if present, return empty dict otherwise."""
+    toml_path = _Path(__file__).parent / 'config.toml'
+    if toml_path.exists():
+        with open(toml_path, 'rb') as _f:
+            return _tomllib.load(_f)
+    return {}
+
+_TOML = _load_toml()
+
+# Compression configuration — sourced from config.toml, used by CompressionManager
+COMPRESSION_CONFIG: dict = _TOML.get('compression', {})

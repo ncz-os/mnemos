@@ -11,7 +11,7 @@ Listens for macrodata state changes and:
 import logging
 import asyncio
 from typing import Dict, Any, Optional, Callable
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ class MacrodataHookAdapter:
                 'metadata': {
                     'source': 'macrodata',
                     'event': 'identity_changed',
-                    'timestamp': datetime.utcnow().isoformat(),
+                    'timestamp': datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 },
             })
 
@@ -118,7 +118,7 @@ class MacrodataHookAdapter:
                 'metadata': {
                     'source': 'macrodata',
                     'event': 'today_changed',
-                    'timestamp': datetime.utcnow().isoformat(),
+                    'timestamp': datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 },
             })
 
@@ -157,7 +157,7 @@ class MacrodataHookAdapter:
                 'metadata': {
                     'source': 'macrodata',
                     'event': 'workspace_changed',
-                    'timestamp': datetime.utcnow().isoformat(),
+                    'timestamp': datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 },
             })
 
@@ -199,7 +199,7 @@ class MacrodataHookAdapter:
             try:
                 await self.hook_registry.trigger(
                     'rehydration.start',
-                    {'source': 'macrodata_sync', 'timestamp': datetime.utcnow().isoformat()}
+                    {'source': 'macrodata_sync', 'timestamp': datetime.now(timezone.utc).replace(tzinfo=None).isoformat()}
                 )
             except Exception as e:
                 logger.error(f"Error triggering rehydration hook: {e}")

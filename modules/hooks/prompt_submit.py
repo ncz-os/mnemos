@@ -11,7 +11,7 @@ Responsibilities:
 
 import logging
 from typing import Dict, Any, Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ class PromptSubmitHook:
         context['request_id'] = request_id
 
         # Record submission time
-        context['prompt_submitted_at'] = datetime.utcnow().isoformat()
+        context['prompt_submitted_at'] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
         # Detect task type
         task_type = self._detect_task_type(prompt)

@@ -10,7 +10,7 @@ Provides:
 
 import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -24,8 +24,8 @@ class JournalEntry:
         self.topic = topic
         self.content = content
         self.metadata = metadata or {}
-        self.created_at = datetime.utcnow()
-        self.updated_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        self.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -244,7 +244,7 @@ class JournalManager:
                     stats['topics'] = {row['topic']: row['count'] for row in topic_rows}
 
                     # Today
-                    today = datetime.utcnow().date()
+                    today = datetime.now(timezone.utc).date()
                     today_count = await conn.fetchval(
                         'SELECT COUNT(*) FROM journal WHERE date = $1',
                         today
@@ -252,7 +252,7 @@ class JournalManager:
                     stats['entries_today'] = today_count or 0
 
                     # This week
-                    week_ago = datetime.utcnow().date() - timedelta(days=7)
+                    week_ago = datetime.now(timezone.utc).date() - timedelta(days=7)
                     week_count = await conn.fetchval(
                         'SELECT COUNT(*) FROM journal WHERE date >= $1',
                         week_ago

@@ -14,74 +14,62 @@ pool_max_size = 20
 enabled = true
 default_strategy = "token_filter"  # 'token_filter' or 'sac'
 
-# Write path: auto-compress on storage
 [compression.storage]
 enabled = true
-# Task-specific compression ratios (keep X% of tokens)
-ratios = {
-    reasoning = 0.45,
-    code_generation = 0.30,
-    architecture_design = 0.50,
-    api_design = 0.40,
-    data_modeling = 0.45,
-    debugging = 0.35,
-    refactoring = 0.40,
-}
 
-# Read path: rehydration compression per tier
+[compression.storage.ratios]
+reasoning = 0.45
+code_generation = 0.30
+architecture_design = 0.50
+api_design = 0.40
+data_modeling = 0.45
+debugging = 0.35
+refactoring = 0.40
+
 [compression.rehydration]
 enabled = true
-# Tier-specific compression ratios
-tier_ratios = {
-    1 = 0.20,  # Tier 1: aggressive (20% tokens)
-    2 = 0.35,  # Tier 2: moderate (35% tokens)
-    3 = 0.50,  # Tier 3: light (50% tokens)
-    4 = 1.00,  # Tier 4: none (100% tokens - full archive)
-}
 
-# Graeae path: compression for consultation
+[compression.rehydration.tier_ratios]
+"1" = 0.20
+"2" = 0.35
+"3" = 0.50
+"4" = 1.00
+
 [compression.graeae]
 enabled = true
-store_uncompressed = true   # Always store full version
-store_compressed = true     # Always store compressed
-compression_ratio = 0.4     # Consultation compression ratio
+store_uncompressed = true
+store_compressed = true
+compression_ratio = 0.4
 
-# Quality assessment
 [compression.quality]
 enabled = true
-analyzer = "heuristic"      # 'semantic' or 'heuristic' (faster)
+analyzer = "heuristic"
 warn_if_rating_below = 80
 error_if_rating_below = 70
 
-# Quality requirements per task type (0-100%)
-quality_requirements = {
-    security_review = 95,
-    architecture_design = 90,
-    code_generation = 88,
-    reasoning = 85,
-    general = 80,
-}
+[compression.quality.requirements]
+security_review = 95
+architecture_design = 90
+code_generation = 88
+reasoning = 85
+general = 80
 
-# Always store original alongside compressed
 [compression.storage_strategy]
 always_store_original = true
 
-# Hooks system
 [hooks]
 enabled = true
 session_start = true
 prompt_submit = true
 memory_write = true
-memory_read = false  # Read hooks only if needed
+memory_read = false
 
-# Memory categorization (tiers)
 [memory]
-tier1_budget = 10000   # Tier 1 token budget
-tier2_budget = 20000   # Tier 2 token budget
-tier3_budget = 30000   # Tier 3 token budget
-tier4_budget = 50000   # Tier 4 token budget (archive)
+tier1_budget = 10000
+tier2_budget = 20000
+tier3_budget = 30000
+tier4_budget = 50000
 
-# Task type detection keywords for tier selection
 [memory.task_detection]
 infrastructure = ["deploy", "devops", "infrastructure", "kubernetes", "docker", "cloud"]
 reasoning = ["architecture", "design", "decision", "plan", "strategy", "analysis"]
@@ -89,83 +77,67 @@ code = ["code", "implementation", "debug", "refactor", "algorithm"]
 project = ["project", "planning", "timeline", "milestone", "task"]
 complex = ["complex", "sophisticated", "integration", "system"]
 
-# Consultation bundles
 [bundles]
 enabled = true
 fallback_on_no_graeae = true
 default_bundle = "general_reasoning"
 
-# Model variants per bundle
-[bundles.model_variants]
-code_generation = {
-    primary = "xai_grok_4_code",
-    secondary = "gpt_5_2_fast",
-    tertiary = "together_ai_code"
-}
+[bundles.model_variants.code_generation]
+primary = "xai_grok_4_code"
+secondary = "gpt_5_2_fast"
+tertiary = "together_ai_code"
 
-architecture_design = {
-    primary = "gpt_5_2",
-    secondary = "gemini_3_pro",
-    tertiary = "groq_llama_3_3"
-}
+[bundles.model_variants.architecture_design]
+primary = "gpt_5_2"
+secondary = "gemini_3_pro"
+tertiary = "groq_llama_3_3"
 
-api_design = {
-    primary = "gpt_5_2",
-    secondary = "gemini_3_pro",
-    tertiary = "groq_llama_3_3"
-}
+[bundles.model_variants.api_design]
+primary = "gpt_5_2"
+secondary = "gemini_3_pro"
+tertiary = "groq_llama_3_3"
 
-data_modeling = {
-    primary = "gemini_3_pro",
-    secondary = "gpt_5_2",
-    tertiary = "groq_llama_3_3"
-}
+[bundles.model_variants.data_modeling]
+primary = "gemini_3_pro"
+secondary = "gpt_5_2"
+tertiary = "groq_llama_3_3"
 
-reasoning = {
-    primary = "gpt_5_2",
-    secondary = "gemini_3_pro",
-    tertiary = "groq_llama_3_3"
-}
+[bundles.model_variants.reasoning]
+primary = "gpt_5_2"
+secondary = "gemini_3_pro"
+tertiary = "groq_llama_3_3"
 
-# Routing (Graeae integration)
 [routing]
 enabled = true
 graeae_url = "http://192.0.2.67:5001"
-fallback_timeout = 5  # seconds
+fallback_timeout = 5
 
-# Modes
 [routing.modes]
 local = "Use local VLLM (zero cost)"
 external = "Use multi-LLM consensus ($0.02-0.05)"
 auto = "Intelligent routing (adaptive)"
 
-# Macrodata integration
 [integrations.macrodata]
-enabled = false  # Enable when ready
+enabled = false
 hook_adapter = true
 state_sync = true
 
-# External LLM providers
 [integrations.external_lms]
 enabled = true
-# Will be populated from provider configs
 
-# Logging
 [logging]
 level = "INFO"
 format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 file = "/tmp/mnemos.log"
-max_bytes = 10485760  # 10MB
+max_bytes = 10485760
 backup_count = 5
 
-# API server
 [api]
 host = "0.0.0.0"
 port = 5000
 debug = false
 workers = 4
 
-# Feature flags
 [features]
 compression = true
 hooks = true

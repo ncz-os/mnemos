@@ -133,7 +133,7 @@ class CompressionManager:
         """
         if not self.enabled:
             # Return uncompressed
-            from ..core.memory_store import CompressionResult
+            from .token_filter_implementation import CompressionResult
             return CompressionResult(
                 compressed_text=text,
                 original_tokens=len(text.split()),
@@ -172,7 +172,7 @@ class CompressionManager:
         except Exception as e:
             logger.error(f"Compression failed: {e}, returning original")
             # Fallback: return original
-            from ..core.memory_store import CompressionResult
+            from .token_filter_implementation import CompressionResult
             return CompressionResult(
                 compressed_text=text,
                 original_tokens=len(text.split()),
@@ -203,7 +203,7 @@ class CompressionManager:
         )
 
         # Convert to CompressionResult
-        from ..core.memory_store import CompressionResult
+        from .token_filter_implementation import CompressionResult
         return CompressionResult(
             compressed_text=result['compressed_text'],
             original_tokens=result['original_tokens'],

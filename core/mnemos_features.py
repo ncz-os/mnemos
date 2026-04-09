@@ -14,7 +14,7 @@ import sqlite3
 import logging
 import hashlib
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Any, Tuple
 from enum import Enum
 import psycopg2
@@ -42,7 +42,7 @@ class MemoryDecayEngine:
             cur = conn.cursor()
 
             # Archive old memories (>1 year, low access)
-            cutoff_date = (datetime.utcnow() - timedelta(days=365)).isoformat()
+            cutoff_date = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=365)).isoformat()
 
             cur.execute("""
                 UPDATE memories
@@ -55,7 +55,7 @@ class MemoryDecayEngine:
             archived = cur.rowcount
 
             # Delete very old archived (>2 years)
-            very_old_date = (datetime.utcnow() - timedelta(days=730)).isoformat()
+            very_old_date = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=730)).isoformat()
 
             cur.execute("""
                 DELETE FROM memories
@@ -108,7 +108,7 @@ class MemoryDecayEngine:
                 else:
                     expiry = created + timedelta(days=365)
 
-            remaining = expiry - datetime.utcnow()
+            remaining = expiry - datetime.now(timezone.utc).replace(tzinfo=None)
             return remaining if remaining.total_seconds() > 0 else None
 
         except Exception as e:
@@ -227,7 +227,7 @@ class DeduplicationEngine:
             mag2 = sum(b*b for b in emb2) ** 0.5
 
             return dot / (mag1 * mag2) if mag1 * mag2 > 0 else 0.0
-        except:
+        except Exception:
             return 0.0
 
 
@@ -268,7 +268,7 @@ class ImportanceScorer:
             usage_score = min(access_count / 100, 1.0)
 
             # Recency score (0-1): age affects importance
-            age_days = (datetime.utcnow() - updated).days
+            age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - updated).days
             if age_days < 7:
                 recency_score = 1.0
             elif age_days < 30:
@@ -364,7 +364,7 @@ class IncrementalBackupManager:
             cur.close()
             conn.close()
 
-            timestamp = datetime.utcnow().isoformat()
+            timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             backup_file = os.path.join(self.backup_dir, f"full_backup_{timestamp}.jsonl")
 
             with open(backup_file, 'w') as f:
@@ -400,7 +400,7 @@ class IncrementalBackupManager:
                 """, (since_timestamp,))
             else:
                 # Last 24h
-                since = datetime.utcnow() - timedelta(hours=24)
+                since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24)
                 cur.execute("""
                     SELECT id, user_id, content, metadata, embedding, updated_at
                     FROM memories
@@ -411,7 +411,7 @@ class IncrementalBackupManager:
             cur.close()
             conn.close()
 
-            timestamp = datetime.utcnow().isoformat()
+            timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             backup_file = os.path.join(self.backup_dir, f"delta_backup_{timestamp}.jsonl")
 
             with open(backup_file, 'w') as f:
@@ -720,7 +720,7 @@ class PrivacyPolicyManager:
             conn = psycopg2.connect(**self.db_config)
             cur = conn.cursor()
 
-            cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+            cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)).isoformat()
 
             cur.execute("""
                 DELETE FROM memories

@@ -10,7 +10,7 @@ Provides:
 
 import logging
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 import asyncio
@@ -93,8 +93,8 @@ class StateManager:
             return self._cache['today']
 
         today = {
-            'date': datetime.utcnow().isoformat(),
-            'day_of_week': datetime.utcnow().strftime('%A'),
+            'date': datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            'day_of_week': datetime.now(timezone.utc).replace(tzinfo=None).strftime('%A'),
             'schedule': [],
             'events': [],
             'version': 1,
@@ -187,7 +187,7 @@ class StateManager:
         logger.debug(f"Saving state: {key}")
 
         # Add timestamp
-        state['updated_at'] = datetime.utcnow().isoformat()
+        state['updated_at'] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
         # Save to cache
         self._cache[key] = state
