@@ -6,7 +6,6 @@ import os
 import sys
 import tomllib
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from typing import Optional
 
 import asyncpg
@@ -134,7 +133,7 @@ async def lifespan(app):
 def _get_cache_key(prefix: str, *args) -> str:
     """Generate a stable cache key from prefix and arguments."""
     raw = prefix + ":" + ":".join(str(a) for a in args)
-    return hashlib.md5(raw.encode()).hexdigest()
+    return hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()
 
 
 async def _get_db():

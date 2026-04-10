@@ -8,7 +8,6 @@ Handles bidirectional synchronization:
 """
 
 import logging
-import asyncio
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
 from hashlib import md5
@@ -189,7 +188,7 @@ class StateSynchronizer:
             True if changed
         """
         import json
-        current_hash = md5(json.dumps(state, sort_keys=True).encode()).hexdigest()
+        current_hash = md5(json.dumps(state, sort_keys=True).encode(), usedforsecurity=False).hexdigest()
         previous_hash = self._state_hashes.get(key)
 
         return current_hash != previous_hash
@@ -203,7 +202,8 @@ class StateSynchronizer:
         """
         import json
         self._state_hashes[key] = md5(
-            json.dumps(state, sort_keys=True).encode()
+            json.dumps(state, sort_keys=True).encode(),
+            usedforsecurity=False
         ).hexdigest()
 
     def _log_sync(self, sync_type: str, details: Dict) -> None:
