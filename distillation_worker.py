@@ -29,10 +29,12 @@ logging.basicConfig(
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import PG_CONFIG as _PG_CONFIG
 from config import OLLAMA_HOST as _CFG_OLLAMA_HOST
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", _CFG_OLLAMA_HOST)
+# Phi-3.5 Mini runs locally on PYTHIA via OpenVINO (port 11435)
+# Override with OLLAMA_HOST env var to fall back to CERBERUS (:11434)
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11435")
 
 # Tuning
-MODEL = "mistral:latest"
+MODEL = "phi-3.5-mini"  # Phi-3.5 Mini INT4 via OpenVINO on PYTHIA GPU
 SIZE_LIMIT_KB = 5
 BATCH_SIZE = 5
 CHECK_INTERVAL = 30
