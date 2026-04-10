@@ -57,3 +57,7 @@ models/
 venv/
 data/
 .pytest_cache/
+
+# Internal/inactive feature code — not for public distribution
+contrib/
+export_to_json_shards.py
