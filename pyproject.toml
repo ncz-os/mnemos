@@ -47,3 +47,4 @@ include = ["api*", "graeae*", "modules*", "integrations*", "db*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--ignore=tests/test_live_e2e.py"
