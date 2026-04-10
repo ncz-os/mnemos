@@ -115,7 +115,7 @@ async def _get_db():
 
 _MEMORY_COLS = (
     "id, content, category, subcategory, created, updated, "
-    "metadata, quality_rating, compressed_content"
+    "metadata, quality_rating, compressed_content, verbatim_content"
 )
 
 
@@ -138,6 +138,7 @@ def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
         metadata=raw_meta if raw_meta else None,
         quality_rating=row.get('quality_rating'),
         compressed_content=row.get('compressed_content') if include_compressed else None,
+        verbatim_content=row.get('verbatim_content'),
     )
 
 

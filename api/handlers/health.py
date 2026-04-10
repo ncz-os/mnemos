@@ -45,6 +45,13 @@ async def get_stats() -> StatsResponse:
             total = await conn.fetchval('SELECT COUNT(*) FROM memories')
             cat_rows = await conn.fetch('SELECT category, COUNT(*) as cnt FROM memories GROUP BY category')
             memories_by_category = {row['category']: row['cnt'] for row in cat_rows}
+            sub_rows = await conn.fetch(
+                'SELECT category, subcategory, COUNT(*) as cnt FROM memories '
+                'WHERE subcategory IS NOT NULL GROUP BY category, subcategory ORDER BY cnt DESC'
+            )
+            memories_by_subcategory: dict = {}
+            for r in sub_rows:
+                memories_by_subcategory.setdefault(r['category'], {})[r['subcategory']] = r['cnt']
             avg_quality = await conn.fetchval(
                 'SELECT AVG(quality_rating) FROM memories WHERE quality_rating IS NOT NULL'
             )
@@ -62,6 +69,7 @@ async def get_stats() -> StatsResponse:
             average_compression_ratio=round(avg_ratio_row, 2) if avg_ratio_row else 0.57,
             average_quality_rating=int(avg_quality) if avg_quality else 75,
             memories_by_category=memories_by_category,
+            memories_by_subcategory=memories_by_subcategory,
             memories_by_task_type={},
             unreviewed_compressions=0,
             timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),

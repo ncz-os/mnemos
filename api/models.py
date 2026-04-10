@@ -29,6 +29,7 @@ class StatsResponse(BaseModel):
     average_compression_ratio: float
     average_quality_rating: int
     memories_by_category: Dict[str, int]
+    memories_by_subcategory: Dict[str, Dict[str, int]] = {}
     memories_by_task_type: Dict[str, int]
     unreviewed_compressions: int
     timestamp: str
@@ -51,6 +52,7 @@ class MemoryItem(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     quality_rating: Optional[int] = None
     compressed_content: Optional[str] = None
+    verbatim_content: Optional[str] = None
 
 
 class MemoryListResponse(BaseModel):
@@ -75,6 +77,7 @@ class MemoryCreateRequest(BaseModel):
     subcategory: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
     source: Optional[str] = "openclaw"
+    verbatim_content: Optional[str] = None   # explicit override; defaults to content if omitted
 
 
 class RehydrationRequest(BaseModel):
@@ -115,6 +118,7 @@ class MemoryUpdateRequest(BaseModel):
     category: Optional[str] = None
     subcategory: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    verbatim_content: Optional[str] = None
 
 
 # ── Knowledge Graph models ────────────────────────────────────────────────────
@@ -148,3 +152,23 @@ class KGTriple(BaseModel):
 class KGTripleListResponse(BaseModel):
     count: int
     triples: List[KGTriple]
+
+
+class KGTripleUpdate(BaseModel):
+    subject: Optional[str] = None
+    predicate: Optional[str] = None
+    object: Optional[str] = None
+    subject_type: Optional[str] = None
+    object_type: Optional[str] = None
+    valid_until: Optional[str] = None    # ISO8601; set to mark expired
+    confidence: Optional[float] = None
+
+
+class BulkCreateRequest(BaseModel):
+    memories: List[MemoryCreateRequest]
+
+
+class BulkCreateResponse(BaseModel):
+    created: int
+    memory_ids: List[str]
+    errors: List[str] = []

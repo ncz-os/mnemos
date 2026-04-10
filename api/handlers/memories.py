@@ -20,6 +20,8 @@ from api.lifecycle import (
     COMPRESSION_RESULT_SET_THRESHOLD,
 )
 from api.models import (
+    BulkCreateRequest,
+    BulkCreateResponse,
     MemoryCreateRequest,
     MemoryItem,
     MemoryListResponse,
@@ -222,10 +224,11 @@ async def create_memory(request: MemoryCreateRequest):
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         meta = json.dumps(request.metadata or {"source": request.source})
+        verbatim = request.verbatim_content if request.verbatim_content is not None else request.content
         await conn.execute(
-            "INSERT INTO memories (id, content, category, subcategory, metadata, quality_rating) "
-            "VALUES ($1, $2, $3, $4, $5::jsonb, 75)",
-            mem_id, request.content, request.category, request.subcategory, meta,
+            "INSERT INTO memories (id, content, category, subcategory, metadata, quality_rating, verbatim_content) "
+            "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6)",
+            mem_id, request.content, request.category, request.subcategory, meta, verbatim,
         )
         row = await conn.fetchrow(
             f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", mem_id,
@@ -236,6 +239,39 @@ async def create_memory(request: MemoryCreateRequest):
         except Exception:
             pass
     return _row_to_memory(row)
+
+
+@router.post("/memories/bulk", response_model=BulkCreateResponse, status_code=201)
+async def bulk_create_memories(request: BulkCreateRequest):
+    """Create multiple memories in one request. Per-item errors are collected, not raised."""
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    import uuid as _uuid, time as _time
+    created_ids: list[str] = []
+    errors: list[str] = []
+    async with _lc._pool.acquire() as conn:
+        for i, mem in enumerate(request.memories):
+            if not mem.content.strip():
+                errors.append(f"[{i}] content is empty")
+                continue
+            try:
+                mid = f"mem_{int(_time.time() * 1000)}_{_uuid.uuid4().hex[:6]}"
+                verbatim = mem.verbatim_content if mem.verbatim_content is not None else mem.content
+                await conn.execute(
+                    "INSERT INTO memories (id, content, category, subcategory, metadata, quality_rating, verbatim_content) "
+                    "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6)",
+                    mid, mem.content, mem.category, mem.subcategory,
+                    json.dumps(mem.metadata or {}), verbatim,
+                )
+                created_ids.append(mid)
+            except Exception as e:
+                errors.append(f"[{i}] {e}")
+    if _lc._cache:
+        try:
+            await _lc._cache.delete("stats:global")
+        except Exception:
+            pass
+    return BulkCreateResponse(created=len(created_ids), memory_ids=created_ids, errors=errors)
 
 
 @router.patch("/memories/{memory_id}", response_model=MemoryItem)
@@ -254,6 +290,8 @@ async def update_memory(memory_id: str, request: MemoryUpdateRequest):
         updates["subcategory"] = request.subcategory
     if request.metadata is not None:
         updates["metadata"] = json.dumps(request.metadata)
+    if request.verbatim_content is not None:
+        updates["verbatim_content"] = request.verbatim_content
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update")
 

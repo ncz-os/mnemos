@@ -217,6 +217,63 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["subject"],
             },
         ),
+        types.Tool(
+            name="update_triple",
+            description="Partially update a KG triple by ID. Supply only the fields to change.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "triple_id":    {"type": "string"},
+                    "subject":      {"type": "string"},
+                    "predicate":    {"type": "string"},
+                    "object":       {"type": "string"},
+                    "subject_type": {"type": "string"},
+                    "object_type":  {"type": "string"},
+                    "valid_until":  {"type": "string", "description": "ISO8601 — set to mark triple as expired"},
+                    "confidence":   {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                },
+                "required": ["triple_id"],
+            },
+        ),
+        types.Tool(
+            name="delete_triple",
+            description="Delete a KG triple by ID.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "triple_id": {"type": "string"},
+                },
+                "required": ["triple_id"],
+            },
+        ),
+        types.Tool(
+            name="bulk_create_memories",
+            description=(
+                "Create multiple memories in a single call. More efficient than repeated create_memory. "
+                "Returns IDs of created memories and any per-item errors."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memories": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content":          {"type": "string"},
+                                "category":         {"type": "string", "default": "facts"},
+                                "subcategory":      {"type": "string"},
+                                "metadata":         {"type": "object"},
+                                "verbatim_content": {"type": "string",
+                                                     "description": "Original verbatim text if content is processed/summarized"},
+                            },
+                            "required": ["content"],
+                        },
+                    },
+                },
+                "required": ["memories"],
+            },
+        ),
     ]
 
 
@@ -304,6 +361,17 @@ async def _dispatch(name: str, args: dict) -> Any:
             f"/kg/timeline/{args['subject']}",
             params={"limit": args.get("limit", 100)},
         )
+
+    elif name == "update_triple":
+        triple_id = args.pop("triple_id")
+        return await _post(f"/kg/triples/{triple_id}", {k: v for k, v in args.items() if v is not None}, method="PATCH")
+
+    elif name == "delete_triple":
+        status = await _delete(f"/kg/triples/{args['triple_id']}")
+        return {"deleted": True, "status": status}
+
+    elif name == "bulk_create_memories":
+        return await _post("/memories/bulk", {"memories": args["memories"]})
 
     else:
         raise ValueError(f"Unknown tool: {name}")

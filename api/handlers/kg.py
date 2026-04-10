@@ -7,7 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 import api.lifecycle as _lc
-from api.models import KGTriple, KGTripleCreate, KGTripleListResponse
+from api.models import KGTriple, KGTripleCreate, KGTripleListResponse, KGTripleUpdate
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/kg", tags=["knowledge-graph"])
@@ -121,6 +121,36 @@ async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000)):
             subject, limit,
         )
     return KGTripleListResponse(count=len(rows), triples=[_row_to_triple(r) for r in rows])
+
+
+@router.patch("/triples/{triple_id}", response_model=KGTriple)
+async def update_triple(triple_id: str, req: KGTripleUpdate):
+    """Partially update a KG triple."""
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    updates: dict = {}
+    for field in ("subject", "predicate", "object", "subject_type", "object_type", "confidence"):
+        val = getattr(req, field)
+        if val is not None:
+            updates[field] = val
+    if req.valid_until is not None:
+        try:
+            updates["valid_until"] = datetime.fromisoformat(req.valid_until)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="valid_until must be ISO8601")
+    if not updates:
+        raise HTTPException(status_code=422, detail="No fields to update")
+    set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
+    async with _lc._pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT 1 FROM kg_triples WHERE id=$1", triple_id)
+        if not exists:
+            raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
+        await conn.execute(
+            f"UPDATE kg_triples SET {', '.join(set_clauses)} WHERE id=$1",
+            triple_id, *list(updates.values()),
+        )
+        row = await conn.fetchrow("SELECT * FROM kg_triples WHERE id=$1", triple_id)
+    return _row_to_triple(row)
 
 
 @router.delete("/triples/{triple_id}", status_code=204)
