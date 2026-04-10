@@ -594,7 +594,7 @@ top -p $(pgrep -f "python")      # Monitor CPU/Memory
 
 ## Next Steps
 
-1. Deploy to PYTHIA following steps above
+1. Deploy to your target Linux host following the steps above
 2. Monitor service stability for 24-48 hours
 3. Setup automated health checks
 4. Configure backups and disaster recovery
@@ -605,6 +605,6 @@ top -p $(pgrep -f "python")      # Monitor CPU/Memory
 
 **Deployment Complete!**
 
-Your MNEMOS API is now running on PYTHIA at `http://your-host:5000`
+Your MNEMOS API is now running on your host at `http://your-host:5000`
 
 For API documentation, see `API_DOCUMENTATION.md`
