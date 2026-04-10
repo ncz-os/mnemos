@@ -8,7 +8,9 @@ The most recently maintained branch is the supported branch.
 
 Please do not open a public GitHub issue for suspected vulnerabilities.
 
-Instead, report security issues privately to the maintainer with:
+Instead, report security issues privately to the maintainer via GitHub: **@perlowja**
+
+Please include:
 - a description of the issue
 - impact assessment
 - reproduction steps
