@@ -1,221 +1,208 @@
 # MNEMOS + GRAEAE
 
-**Persistent memory and multi-LLM consensus reasoning for production agentic systems.**
+**Memory infrastructure for the agentic ecosystem.**
 
-MNEMOS is a memory store built for AI agents that need to remember across sessions, compress context intelligently, and retrieve the right information for the right task. GRAEAE is the reasoning layer on top — a multi-provider consensus engine that routes queries to the best available models, tracks quality, and fails gracefully when providers go down.
+Deploy MNEMOS once. Every agent in your stack — across tools, sessions, and providers — shares the same quality-tracked memory pool. With namespace isolation and per-owner provenance, each agent's memories are sovereign but accessible across the ecosystem when permitted.
 
-Together they form a substrate for agentic systems that need to reason reliably over time.
-
----
-
-## Why We Built This
-
-Every production agentic system hits the same wall: context windows are finite, LLM providers fail, and nothing guarantees the answer you got was actually good.
-
-Existing approaches each solve part of the problem:
-
-| Tool | What it does | What it misses |
-|------|-------------|----------------|
-| **MemGPT / Letta** | Hierarchical memory with paging | Single-provider, no quality tracking, no compression manifests |
-| **Mem0** | Simple persistent memory layer | No compression strategy, no multi-LLM consensus, no audit trail |
-| **LangChain Memory** | In-chain buffer/summary memory | Session-scoped only, no cross-session persistence, no quality scoring |
-| **RAG pipelines** | Vector retrieval from documents | Retrieval is not reasoning; no compression quality; no circuit breaking |
-| **LlamaIndex** | Document indexing and query | Document-centric, not agent-memory-centric; no compression manifests |
-| **MemPalace** | Spatial hierarchy (rooms/halls/wings) with verbatim storage | SQLite + ChromaDB only, no compression quality contracts, no multi-LLM consensus, single-model evaluation |
-
-None of them answer: *how much information was lost when you compressed that memory, and was it safe to lose?*
-
-None of them handle: *what happens when three of your six LLM providers go down simultaneously?*
-
-MNEMOS + GRAEAE were built to answer both questions in production.
+This is not an embedded library. It is a network service with a REST API, a PostgreSQL backend, and a multi-LLM reasoning engine. It runs alongside your agents the way Redis runs alongside your application — always available, always consistent, outliving any individual process.
 
 ---
 
-## What It Is
+## Why use this
 
-### MNEMOS — Quality-Tracked Persistent Memory
+The field of agent memory systems is crowded and getting more so. Here is the honest case for MNEMOS.
 
-MNEMOS stores, compresses, and retrieves agent memories with full audit trails. Every compression generates a **quality manifest** — a structured record of what was removed, what was preserved, the quality rating, and which use cases the compressed version is safe for.
+**Most memory systems answer one question badly:** "What did this agent say before?"
 
-Key capabilities:
+That is conversation history. It is useful, but it is not memory infrastructure. Conversation history dies when the session ends, scales to one agent, and tells you nothing about whether the information it contains is still accurate, still complete, or safe to rely on.
 
-- **Three compression pathways**: WRITE (on storage), READ (on rehydration), GRAEAE (on consultation)
-- **Two compression algorithms**: token-filter (semantic, GRAEAE-assisted) and SENTENCE (heuristic, always available)
+MNEMOS answers a different set of questions:
+
+- *What do all my agents collectively know, and who told them?*
+- *When I compressed that memory to fit in a context window, what did I throw away — and was it safe to throw away?*
+- *Which LLM actually produced this synthesis, and can I verify it?*
+- *If three of my providers go down, does my reasoning layer fail or degrade gracefully?*
+
+If none of those questions matter for your use case, a simpler tool is probably the right choice. If they do matter, MNEMOS is the only system that answers all four.
+
+### The specific gaps in the alternatives
+
+| System | What it does | What it cannot tell you |
+|--------|-------------|------------------------|
+| **MemGPT / Letta** | Hierarchical paging within a single agent session | What was lost in compression; what happens when the LLM provider fails |
+| **Mem0** | Store and retrieve memories via API | Compression quality; multi-agent provenance; reasoning consensus |
+| **Zep** | Conversation history + entity extraction | Compression manifests; multi-provider reasoning; cross-agent sharing |
+| **LangChain / LlamaIndex memory** | In-process buffer or summary | Anything after the process exits |
+| **MemPalace** | Spatial hierarchy with verbatim local storage | What was compressed and whether it was safe; multi-agent access; scale beyond one machine |
+| **CrewAI / AutoGen memory** | Per-crew or per-agent embedded memory | Cross-agent sharing; provenance; compression quality |
+
+### What MNEMOS does that none of them do
+
+**Quality contracts on compression.** Every time MNEMOS compresses a memory — on write, on rehydration, before a GRAEAE consultation — it produces a manifest: what was removed, what was preserved, the quality rating, and which use cases the compressed version is and is not safe for. You can query this manifest. You can flag compressions below a quality threshold for review. You can retrieve the original. No other memory system treats compression as something that requires a receipt.
+
+**Shared ecosystem memory with provenance.** Memories in MNEMOS are tagged with the user, group, namespace, source model, source provider, and source agent that created them. An InvestorClaw run writes analyst memories tagged `namespace=investorclaw, source_agent=background_enricher, source_model=gemma4-consult`. A separate agent reads across namespaces with appropriate permissions. The memory pool is shared infrastructure, not a per-agent silo.
+
+**A reasoning layer that degrades gracefully.** GRAEAE, the reasoning engine built into MNEMOS, distributes queries across up to six LLM providers simultaneously, scores responses on relevance, coherence, completeness, and toxicity, and returns the best result. Per-provider circuit breakers prevent a failing provider from degrading the pool. A semantic cache means identical questions skip inference entirely. An append-only, SHA-256 hash-chained audit log means every response is tamper-evident. This is not a load balancer — it is a quality-gated reasoning bus.
+
+---
+
+## What it is
+
+### MNEMOS — Quality-tracked shared memory
+
+MNEMOS stores, compresses, and retrieves agent memories with full audit trails across a multi-agent ecosystem.
+
+- **Three compression pathways**: WRITE (on storage), READ (on rehydration), GRAEAE (before consultation)
+- **Two compression algorithms**: token-filter² (semantic, GRAEAE-assisted) and SENTENCE (heuristic, always available offline)
 - **4-tier memory system**: Recent → Compressed → Archived → Permanent, with task-aware tier selection
-- **Quality manifests**: Every compression logs what was preserved, what was dropped, risk factors, and safe use cases
-- **Reversal support**: Original always retained; downgrade to original if quality falls below threshold
-- **PostgreSQL backend**: ACID-compliant, concurrent access, production-scale
+- **Quality manifests**: every compression records what was preserved, what was dropped, risk factors, and safe use cases
+- **Full provenance**: owner, group, namespace, source model, source provider, source session, source agent on every record
+- **UNIX-style access control**: permission modes (owner/group/world read-write) enforced at the PostgreSQL RLS layer
+- **Reversal support**: original always retained; retrieve pre-compression version at any time
 
-### GRAEAE — Multi-LLM Consensus Reasoning
+### GRAEAE — Multi-LLM consensus reasoning
 
-GRAEAE distributes reasoning queries across multiple LLM providers simultaneously, scores the responses, and returns a consensus result. It is not a load balancer — it is a quality-gated reasoning bus.
+GRAEAE distributes reasoning queries across multiple providers simultaneously and returns a quality-scored consensus result.
 
-Six providers in the default configuration: Perplexity, Together/DeepSeek-R1, Groq, OpenAI, xAI, Ollama.
-
-Key capabilities:
-
-- **Consensus mode**: Queries all available providers, scores responses on relevance/coherence/completeness/toxicity, returns best result
-- **Persistent queue**: All requests written to SQLite before dispatch — crash-safe, resumable
-- **Circuit breaker**: Per-provider CLOSED/OPEN/HALF_OPEN state machine; 5-minute cooldown; automatic recovery
-- **Semantic cache**: Embedding-similarity deduplication (0.85 threshold, 24hr TTL) — identical questions skip inference entirely
-- **Rate limiting with backpressure**: Four levels; request queuing before rejection
-- **Cryptographic audit log**: SHA-256 hash-chained append-only log; every response is tamper-evident
+- **Six providers**: Perplexity, Together/DeepSeek-R1, Groq, OpenAI, xAI, Ollama
+- **Persistent queue**: all requests written to SQLite before dispatch — crash-safe and resumable
+- **Circuit breaker**: per-provider CLOSED/OPEN/HALF_OPEN state machine, 5-minute cooldown, automatic recovery
+- **Semantic cache**: embedding-similarity deduplication at 0.85 threshold, 24-hour TTL
+- **Rate limiting with backpressure**: four levels, request queuing before rejection
+- **Cryptographic audit log**: SHA-256 hash-chained, append-only, tamper-evident
 
 ---
 
-## Target User
+## Deployment profiles
 
-**AI engineers and researchers building production agentic systems** that need:
+MNEMOS ships as a single codebase. The installer asks which profile fits your use case. You can grow from personal to enterprise without data migration.
 
-- Sessions that remember what happened before — not just in the current context window
-- Reasoning that does not collapse when a provider is rate-limited or down
-- Compression that tells you what it threw away
-- An audit trail that proves the system did not hallucinate its own history
+```
+? Select deployment profile:
+  ▸ Personal    — single user, localhost, no auth, Docker Compose setup
+    Team        — 2–20 users, API key auth, shared PostgreSQL
+    Enterprise  — 20+ users, OAuth/OIDC, RLS enforced, namespace isolation, compliance audit
+```
 
-This is not a tool for weekend experiments. It is designed for systems where a bad answer has a cost and a crashed provider cannot silently fail.
+### Personal
 
----
+One developer, one machine. MNEMOS + PostgreSQL + Ollama in a single `docker compose up`. No auth required — the API listens on localhost only. Full compression, full GRAEAE, all features available.
 
-## Architectural Decisions
+### Team
 
-### PostgreSQL over SQLite for the memory store
+Shared PostgreSQL instance. API key authentication per user. Memories are owned and namespaced. UNIX-style permission modes enforced. GRAEAE pools provider API keys across the team.
 
-SQLite is fine for single-writer, single-reader scenarios. Agentic systems that run background enrichers, foreground queries, and scheduled distillation jobs simultaneously need ACID isolation and concurrent write support. PostgreSQL also gives us partial indexes, materialized views for compression stats, and native JSONB for manifests — none of which SQLite handles well at scale.
+### Enterprise
 
-### token-filter + SENTENCE compression, not naive summarization
-
-Summarization with an LLM is expensive, slow, and produces a result with no quality contract. token-filter (Hybrid Compression Squared) uses GRAEAE to intelligently compress memories when the reasoning engine is available, falling back to SENTENCE (Semantic Adaptive Compression) — a heuristic that runs entirely locally with no external calls. The result always includes a manifest. Compression ratios are tuned per task type: code generation compresses more aggressively (0.30) than architecture design (0.50) because implementation details matter differently.
-
-### Multi-provider consensus over single-model routing
-
-Single-provider routing is fragile. When one provider rate-limits or goes down, single-provider systems stall. GRAEAE runs all available providers in parallel and returns the best-scored response. The circuit breaker ensures a flapping provider does not degrade the whole pool. Quality scoring means the system learns which providers perform best for which task types over time.
-
-### Quality manifests as a first-class concept
-
-Most compression pipelines discard information and move on. MNEMOS treats the compression manifest as a first-class artifact: stored in the database, queryable via API, reviewable by humans or agents. The manifest answers: *was it safe to compress this?* If the quality rating falls below a configurable threshold (default: 80%), the system flags the compression for review. Critical task types (security review: 95%, architecture design: 90%) have tighter floors.
-
-### 4-tier memory with task-aware selection
-
-Not all memories are equal. Recent memories (tier 1) are stored at 20% compression — mostly intact. Long-term memories (tier 4) are stored at full compression or archived. The tier selector chooses which tiers to load based on task type and complexity, so a quick code generation task does not pull the entire memory corpus.
-
-### REST API for language-agnostic integration
-
-MNEMOS and GRAEAE are API-first. Claude Code, custom Python scripts, and any HTTP client can use them without importing a Python package. The API is the interface; the implementation can evolve independently.
+Everything in Team, plus: OAuth/OIDC authentication, PostgreSQL Row Level Security enforced at the database layer (not just application middleware), full namespace isolation per agent/project, compliance-grade audit log.
 
 ---
 
-## How It Differs
+## Architecture
 
-### From MemGPT/Letta
+```
+Agents (any language, any framework)
+        │
+        │  REST API (port 5002)
+        ▼
+┌─────────────────────────────────┐
+│           MNEMOS API            │
+│  auth · namespaces · search     │
+│  compression · manifests · RLS  │
+└──────────────┬──────────────────┘
+               │
+    ┌──────────┴──────────┐
+    │                     │
+    ▼                     ▼
+PostgreSQL           GRAEAE (port 5001)
+memories             multi-LLM consensus
+compression_log      circuit breaker
+graeae_consults      semantic cache
+memory_versions      audit log
+users / groups
+```
 
-MemGPT introduced hierarchical memory paging — the right idea, but implemented as a single-agent framework tied to specific model APIs. MNEMOS is a standalone service: any agent, any framework. MemGPT has no compression quality tracking. MNEMOS manifests every compression with what was lost.
-
-### From Mem0
-
-Mem0 is a simple CRUD memory layer. It stores and retrieves. It does not compress, does not score quality, does not chain audit entries cryptographically, and does not route through a multi-provider consensus engine. MNEMOS is more opinionated about what it means for a memory to be *reliably* stored.
-
-### From LangChain/LlamaIndex memory modules
-
-These are in-process, session-scoped memory implementations. They do not persist across process restarts. They have no compression quality contracts. They are designed for single-session demos, not multi-day agentic runs.
-
-### From MemPalace
-
-MemPalace (April 2026) applies the method of loci — a spatial memory hierarchy of wings, halls, and rooms — to organize agent memories with verbatim storage. The spatial metaphor is interesting for navigability, but verbatim storage is not compression: it avoids the hard problem rather than solving it. MemPalace has no concept of what was lost or whether it was safe to lose, no quality threshold enforcement, and no multi-provider reasoning layer.
-
-The storage backend (SQLite + ChromaDB) is suitable for a single local agent. It is not designed for concurrent background jobs, scheduled distillation, or multiple agents sharing the same memory pool. There is also no equivalent to GRAEAE — a single model handles retrieval and reasoning, so provider failure means total unavailability.
-
-MemPalace and MNEMOS solve adjacent problems. If you need a lightweight local-first memory store with intuitive navigation and no infrastructure requirements, MemPalace is worth evaluating. If you need quality contracts on compression, multi-provider resilience, and production-scale concurrent access, MNEMOS is the right tool.
-
-### From plain RAG
-
-RAG retrieves from documents. MNEMOS stores *agent-generated* memories — synthesis, decisions, observations — and compresses them over time. Retrieval is semantic but the data source is the agent's own history, not a document corpus. The two complement each other; they are not the same problem.
+MNEMOS and GRAEAE are separate services that can be deployed on the same machine or across nodes. Agents communicate only with the MNEMOS API; GRAEAE is an internal implementation detail unless you want to query it directly.
 
 ---
 
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
-- Python 3.11+
-- PostgreSQL 14+
-- Ollama (optional, for local embedding and SENTENCE compression)
+- Docker and Docker Compose (personal install)
+- Python 3.11+ and PostgreSQL 14+ (manual install)
+- Ollama (optional — for local embedding and offline SENTENCE compression)
 
-### Installation
+### Personal install (Docker Compose)
 
 ```bash
 git clone <your-repo-url>
 cd mnemos-production
-pip install -r requirements.txt
+docker compose up
+# MNEMOS: http://localhost:5002
+# GRAEAE: http://localhost:5001
 ```
 
-### Database setup
+### Manual install
 
 ```bash
+pip install -r requirements.txt
 psql -U postgres -c "CREATE USER mnemos WITH PASSWORD 'yourpassword';"
 psql -U postgres -c "CREATE DATABASE mnemos OWNER mnemos;"
 psql -U mnemos -d mnemos -f db/migrations.sql
-```
-
-### Configuration
-
-Set environment variables or edit `config.toml`:
-
-```bash
-export MNEMOS_KEYS_PATH=~/.config/mnemos/api_keys.json
-export OLLAMA_EMBED_HOST=http://localhost:11434
-export GRAEAE_URL=http://localhost:5001
-```
-
-### Start the API
-
-```bash
 python api_server.py
-# Verify: curl http://localhost:5002/health
 ```
 
-### Start GRAEAE
+### Installer (interactive)
 
 ```bash
-python graeae/server.py
-# Verify: curl http://localhost:5001/health
+python install.py
+# Prompts for: deployment profile, database connection, provider API keys, Ollama endpoint
+# Writes config.toml and starts the service
 ```
 
 ---
 
-## API Reference
+## API reference
 
-### Memory Operations
+### Memory operations
 
 ```bash
 # Store a memory
 curl -X POST http://localhost:5002/memories \
   -H 'Content-Type: application/json' \
-  -d '{"content": "...", "category": "decisions", "tags": ["architecture"]}'
+  -d '{
+    "content": "...",
+    "category": "decisions",
+    "namespace": "investorclaw/analyst",
+    "tags": ["architecture"]
+  }'
 
 # Semantic search
 curl -X POST http://localhost:5002/memories/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "topic keywords", "limit": 10, "min_score": 0.3}'
 
-# Filtered search by category
+# Search within a namespace
 curl -X POST http://localhost:5002/memories/search \
   -H 'Content-Type: application/json' \
-  -d '{"query": "keywords", "category": "solutions", "limit": 5}'
+  -d '{"query": "keywords", "namespace": "investorclaw/analyst", "limit": 5}'
 
-# Quality check on a stored memory
+# Quality check a stored memory
 curl http://localhost:5002/memories/<id>/quality-check
 
-# Retrieve original (pre-compression)
+# Retrieve the original pre-compression version
 curl http://localhost:5002/memories/<id>/original
 ```
 
-### GRAEAE Reasoning
+### GRAEAE reasoning
 
 ```bash
 # Multi-LLM consensus
 curl -X POST http://localhost:5001/graeae/consult \
   -H 'Content-Type: application/json' \
-  -d '{"prompt": "Your question", "task_type": "architecture_design", "mode": "consensus"}'
+  -d '{"prompt": "Your question", "task_type": "architecture_design"}'
 
 # Extract best result by score
 curl -X POST http://localhost:5001/graeae/consult \
@@ -223,7 +210,7 @@ curl -X POST http://localhost:5001/graeae/consult \
   jq '.all_responses | to_entries | sort_by(-.[1].final_score)[0]'
 ```
 
-### Memory Categories
+### Memory categories
 
 | Category | Use for |
 |----------|---------|
@@ -234,7 +221,7 @@ curl -X POST http://localhost:5001/graeae/consult \
 | `projects` | Per-project context |
 | `standards` | Quality gates, conventions |
 
-### GRAEAE Task Types
+### GRAEAE task types
 
 | Task type | Notes |
 |-----------|-------|
@@ -245,9 +232,9 @@ curl -X POST http://localhost:5001/graeae/consult \
 
 ---
 
-## Compression Quality Reference
+## Compression quality
 
-Every compression returns a manifest:
+Every compression produces a manifest:
 
 ```json
 {
@@ -261,7 +248,7 @@ Every compression returns a manifest:
 }
 ```
 
-Quality thresholds (configurable in `config.toml`):
+Quality thresholds by task type (configurable in `config.toml`):
 
 | Task type | Minimum quality |
 |-----------|----------------|
@@ -273,17 +260,13 @@ Quality thresholds (configurable in `config.toml`):
 
 ---
 
-## GRAEAE Circuit Breaker
-
-Providers move through states automatically:
+## GRAEAE circuit breaker
 
 ```
 CLOSED --(5 failures)--> OPEN --(5 min cooldown)--> HALF_OPEN --(success)--> CLOSED
-                                                          |
-                                                     (failure)--> OPEN
+                                                           |
+                                                      (failure)--> OPEN
 ```
-
-Health status:
 
 ```bash
 curl http://localhost:5001/graeae/health
