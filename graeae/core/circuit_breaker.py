@@ -3,8 +3,6 @@ GRAEAE Feature 2: Muse Failover & Circuit Breaker
 Tracks muse failures and auto-disables with 5min cooldown to prevent cascades
 """
 
-import os
-import time
 import logging
 import threading
 from datetime import datetime, timedelta, timezone

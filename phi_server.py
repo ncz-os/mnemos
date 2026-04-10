@@ -14,12 +14,10 @@ Device: GPU (Intel Iris Xe via OpenVINO) with CPU fallback
 import asyncio
 import logging
 import os
-import sys
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
-import numpy as np
 import openvino_genai as ov_genai
 from fastembed import TextEmbedding
 from fastapi import FastAPI, HTTPException

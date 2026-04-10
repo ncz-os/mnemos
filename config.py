@@ -108,8 +108,8 @@ REQUEST_ID_LENGTH = 8  # Show first 8 chars of request ID in logs
 # TOML Configuration (config.toml overrides env-var defaults where present)
 # ============================================================================
 
-import tomllib as _tomllib
-from pathlib import Path as _Path
+import tomllib as _tomllib  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
 
 def _load_toml() -> dict:
     """Load config.toml if present, return empty dict otherwise."""

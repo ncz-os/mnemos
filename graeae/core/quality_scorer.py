@@ -4,12 +4,11 @@ Automated QA metrics for relevance, coherence, toxicity per-muse
 """
 
 import os
-import json
 import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -172,7 +171,7 @@ class ResponseQualityScorer:
         """
         # Simple heuristics
         lines = response.split('\n')
-        paragraphs = [l for l in lines if l.strip()]
+        paragraphs = [line for line in lines if line.strip()]
 
         if not paragraphs:
             return 0.0

@@ -137,10 +137,10 @@ def main() -> None:
 
     # 3. Collect service config
     print("\n--- Service ---")
-    listen_host = prompt("Listen host", "0.0.0.0")
+    _ = prompt("Listen host", "0.0.0.0")
     listen_port = prompt("Listen port", "5000")
-    graeae_url = prompt("GRAEAE URL", "http://localhost:5001")
-    ollama_host = prompt("Ollama host (for embeddings)", "http://localhost:11434")
+    _ = prompt("GRAEAE URL", "http://localhost:5001")
+    _ = prompt("Ollama host (for embeddings)", "http://localhost:11434")
 
     # 4. Determine auth/RLS settings
     auth_enabled = profile in ("team", "enterprise")

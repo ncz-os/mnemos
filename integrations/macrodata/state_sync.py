@@ -257,7 +257,7 @@ class StateSynchronizer:
         }
 
         try:
-            identity = await self.state_manager.load_identity()
+            _ = await self.state_manager.load_identity()
             # Could validate against macrodata here
             logger.debug("Identity validation passed")
         except Exception as e:
@@ -265,14 +265,14 @@ class StateSynchronizer:
             result['identity_in_sync'] = False
 
         try:
-            today = await self.state_manager.load_today()
+            _ = await self.state_manager.load_today()
             logger.debug("Today validation passed")
         except Exception as e:
             logger.error(f"Today validation failed: {e}")
             result['today_in_sync'] = False
 
         try:
-            workspace = await self.state_manager.load_workspace()
+            _ = await self.state_manager.load_workspace()
             logger.debug("Workspace validation passed")
         except Exception as e:
             logger.error(f"Workspace validation failed: {e}")

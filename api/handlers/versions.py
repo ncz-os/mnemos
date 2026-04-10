@@ -16,7 +16,7 @@ router = APIRouter()
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
-from pydantic import BaseModel
+from pydantic import BaseModel  # noqa: E402
 
 
 class MemoryVersion(BaseModel):

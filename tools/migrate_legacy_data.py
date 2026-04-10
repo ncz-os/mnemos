@@ -62,7 +62,7 @@ async def main():
         if prefs_file.exists():
             with open(prefs_file) as f:
                 prefs = json.load(f)
-            logger.info(f"Migrating preferences...")
+            logger.info("Migrating preferences...")
             for pref in prefs:
                 await conn.execute(
                     '''INSERT INTO memories (id, content, category, created, metadata)
@@ -73,7 +73,7 @@ async def main():
                     'preferences',
                     json.dumps({'source': 'preferences.json', **pref})
                 )
-            logger.info(f"✓ Preferences migrated")
+            logger.info("✓ Preferences migrated")
         
         # Verify
         count = await conn.fetchval('SELECT COUNT(*) FROM memories')

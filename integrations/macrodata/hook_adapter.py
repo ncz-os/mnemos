@@ -10,7 +10,7 @@ Listens for macrodata state changes and:
 
 import logging
 import asyncio
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Callable
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)

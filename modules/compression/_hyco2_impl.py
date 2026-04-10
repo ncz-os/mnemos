@@ -28,7 +28,7 @@ Expected Performance:
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 import re
 from dataclasses import dataclass
@@ -530,7 +530,7 @@ if __name__ == "__main__":
         print(f"    Final ratio: {result.compression_ratio:.1%}")
 
     # Show stats
-    print(f"\n[STATS]")
+    print("\n[STATS]")
     stats = compressor.get_stats()
     for key, value in stats.items():
         if isinstance(value, float):

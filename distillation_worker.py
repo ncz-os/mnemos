@@ -13,9 +13,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime
 import httpx
-import json
 import asyncpg
 
 logger = logging.getLogger(__name__)
@@ -27,8 +25,7 @@ logging.basicConfig(
 # Config
 # Config — loaded from config.py (single source of truth)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import PG_CONFIG as _PG_CONFIG
-from config import OLLAMA_HOST as _CFG_OLLAMA_HOST
+from config import PG_CONFIG as _PG_CONFIG  # noqa: E402
 # Phi-3.5 Mini runs locally on api-host via OpenVINO (port 11435)
 # Override with OLLAMA_HOST env var to fall back to inference-server (:11434)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11435")
@@ -285,7 +282,7 @@ class MemoryDistillationWorker:
                     AVG(quality_rating) as avg_quality
                 FROM memories
             """)
-            total, optimized, pending, avg_quality = row['total'], row['optimized'], row['pending'], row['avg_quality']
+            total, optimized = row['total'], row['optimized']
 
             if self.stats["processed"] > 0:
                 logger.info(

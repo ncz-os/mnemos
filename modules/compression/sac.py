@@ -12,8 +12,7 @@ Performance: 2-5ms per compression, ~50% reduction, high quality
 
 import re
 import logging
-from typing import List, Dict, Tuple, Set
-from collections import Counter
+from typing import List, Dict, Set
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +57,6 @@ class SACCompressor:
             }
 
         # Identify structure
-        paragraphs = self._identify_paragraphs(text)
         sentences = self._identify_sentences(text)
 
         # Find semantic anchors (key sentences)

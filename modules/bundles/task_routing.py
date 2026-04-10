@@ -9,7 +9,7 @@ Routes tasks to appropriate bundles based on:
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 from .bundle_definitions import BundleDefinition, get_bundle, BUNDLES
 from .model_variants import ModelVariants, ModelInfo
 

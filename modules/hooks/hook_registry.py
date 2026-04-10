@@ -9,7 +9,6 @@ Manages lifecycle events:
 - Graeae consultation
 """
 
-import asyncio
 import inspect
 import logging
 from typing import Callable, Dict, List, Any, Optional

@@ -9,12 +9,11 @@ import json
 import sqlite3
 import logging
 import threading
-import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from enum import Enum
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -420,7 +419,7 @@ class PersistentQueue:
                     self._log_recovery(
                         req_id,
                         'recovery',
-                        f'Recovered from stuck processing state'
+                        'Recovered from stuck processing state'
                     )
 
                 conn.commit()

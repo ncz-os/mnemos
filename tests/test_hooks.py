@@ -10,8 +10,6 @@ Tests:
 """
 
 import pytest
-import asyncio
-from datetime import datetime
 from unittest.mock import AsyncMock, Mock
 
 # Note: In actual deployment, these imports would work
@@ -84,7 +82,7 @@ async def test_hook_disabled():
 
     # Trigger should return original context without calling callback
     context = {'data': 'test'}
-    result = await registry.trigger('test.event', context)
+    _ = await registry.trigger('test.event', context)
 
     # Callback should not be called
     callback.assert_not_called()

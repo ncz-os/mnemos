@@ -35,11 +35,9 @@ Expected Performance:
     - Best for: Reasoning, architecture, analysis (structure-important)
 """
 
-import re
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
-from dataclasses import dataclass, field
-import json
+from dataclasses import dataclass
 
 # Try to import NLP and graph libraries
 try:
@@ -577,7 +575,7 @@ if __name__ == "__main__":
         print(f"    Final ratio: {result.compression_ratio:.1%}")
 
     # Show stats
-    print(f"\n[STATS]")
+    print("\n[STATS]")
     stats = compressor.get_stats()
     for key, value in stats.items():
         if isinstance(value, float):

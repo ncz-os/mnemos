@@ -10,8 +10,7 @@ Responsibilities:
 """
 
 import logging
-import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -104,7 +103,7 @@ class SessionStartHook:
             # Load identity
             if hasattr(self.state_manager, 'load_identity'):
                 state['identity'] = await self.state_manager.load_identity()
-                logger.debug(f"Loaded identity")
+                logger.debug("Loaded identity")
         except Exception as e:
             logger.debug(f"Could not load identity: {e}")
 
@@ -112,7 +111,7 @@ class SessionStartHook:
             # Load today
             if hasattr(self.state_manager, 'load_today'):
                 state['today'] = await self.state_manager.load_today()
-                logger.debug(f"Loaded today")
+                logger.debug("Loaded today")
         except Exception as e:
             logger.debug(f"Could not load today: {e}")
 
@@ -120,7 +119,7 @@ class SessionStartHook:
             # Load workspace
             if hasattr(self.state_manager, 'load_workspace'):
                 state['workspace'] = await self.state_manager.load_workspace()
-                logger.debug(f"Loaded workspace")
+                logger.debug("Loaded workspace")
         except Exception as e:
             logger.debug(f"Could not load workspace: {e}")
 

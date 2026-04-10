@@ -9,7 +9,7 @@ import logging
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)

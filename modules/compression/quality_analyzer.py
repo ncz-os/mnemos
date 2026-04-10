@@ -3,9 +3,8 @@ Quality Analyzer for Compression Operations
 Generates quality manifests tracking what was preserved/removed
 """
 
-import json
-from typing import Dict, List, Any, Optional
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Any
+from dataclasses import dataclass
 import logging
 
 logger = logging.getLogger(__name__)

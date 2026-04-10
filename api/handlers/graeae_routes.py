@@ -17,7 +17,7 @@ _GENESIS_HASH = hashlib.sha256(b"MNEMOS_AUDIT_GENESIS_v2").hexdigest()
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
-from api.models import ConsultationRequest
+from api.models import ConsultationRequest  # noqa: E402
 
 
 class AuditLogEntry(BaseModel):

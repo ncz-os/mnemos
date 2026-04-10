@@ -4,11 +4,13 @@ Orchestrates compression strategies (extractive token filter, SENTENCE) and qual
 """
 
 import logging
-from typing import Dict, Optional
-import asyncio
+from typing import Dict, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ._token_filter_impl import CompressionResult
 
 from .token_filter import extractive token filter
-from .quality_analyzer import QualityAnalyzer, QualityManifest
+from .quality_analyzer import QualityAnalyzer
 
 logger = logging.getLogger(__name__)
 

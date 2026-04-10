@@ -6,7 +6,6 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 
 import api.lifecycle as _lc
@@ -354,12 +353,12 @@ async def update_memory(
         raise HTTPException(status_code=422, detail="No fields to update")
 
     set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
-    set_clauses.append(f"updated=NOW()")
+    set_clauses.append("updated=NOW()")
     values = list(updates.values())
 
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
-            row = await conn.fetchrow(f"SELECT id FROM memories WHERE id=$1", memory_id)
+            row = await conn.fetchrow("SELECT id FROM memories WHERE id=$1", memory_id)
             if not row:
                 raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
             await conn.execute(

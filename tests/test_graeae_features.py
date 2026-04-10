@@ -5,16 +5,13 @@ Targeting 40+ test cases across all features
 """
 
 import pytest
-import json
 import time
-import sqlite3
 import tempfile
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import timedelta
 
 # Import GRAEAE modules
-from graeae.core.queue import PersistentQueue, RequestStatus, QueuedRequest
-from graeae.core.circuit_breaker import CircuitBreaker, CircuitBreakerPool, CircuitState
+from graeae.core.queue import PersistentQueue, RequestStatus
+from graeae.core.circuit_breaker import CircuitBreakerPool, CircuitState
 from graeae.core.quality_scorer import ResponseQualityScorer, QualityScore
 from graeae.core.semantic_cache import SemanticCache
 from graeae.core.rate_limiter import RateLimiter, RateLimiterPool, QueueBackpressure
@@ -359,7 +356,7 @@ class TestSemanticCache:
         time.sleep(0.1)
         
         # Should be expired
-        cached = cache_instant.get("query", sample_embedding)
+        _ = cache_instant.get("query", sample_embedding)
         # May not find due to expiration
 
     def test_cache_stats(self, semantic_cache, sample_embedding):

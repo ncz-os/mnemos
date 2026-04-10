@@ -329,7 +329,7 @@ class MemoryStore:
             """, (memory_id, clean_content, category, embedding, now, now))
 
             conn.commit()
-        except Exception as e:
+        except Exception:
             conn.rollback()
             raise
         finally:
@@ -731,7 +731,7 @@ class EmbeddingGenerator:
         self.running = True
         thread = threading.Thread(target=loop, daemon=True)
         thread.start()
-        print(f"[EMBED] Background generator started (parallel mode)", file=sys.stderr, flush=True)
+        print("[EMBED] Background generator started (parallel mode)", file=sys.stderr, flush=True)
 
     def stop(self):
         """Stop background embedding thread"""
@@ -750,7 +750,6 @@ class MemoryMaintenance:
     def cleanup_expired(self):
         """Remove memories older than TTL"""
         try:
-            ttl_seconds = config.MEMORY_TTL.total_seconds()
             cutoff_time = datetime.now(timezone.utc).replace(tzinfo=None) - config.MEMORY_TTL
 
             conn = self.db.get_connection()
@@ -816,8 +815,8 @@ def init_mnemos():
     # Verify database
     db = DatabaseManager()
     if not db.init_schema():
-        print(f"[MNEMOS] Database initialization failed", file=sys.stderr, flush=True)
+        print("[MNEMOS] Database initialization failed", file=sys.stderr, flush=True)
         return False
 
-    print(f"[MNEMOS] Core initialized", file=sys.stderr, flush=True)
+    print("[MNEMOS] Core initialized", file=sys.stderr, flush=True)
     return True
