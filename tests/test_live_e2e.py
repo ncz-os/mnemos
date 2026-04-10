@@ -251,6 +251,68 @@ if del_id:
 st, r, _ = req("DELETE", "/memories/mem_never_existed_abc123")
 check("DELETE nonexistent → 404", st == 404, f"got {st}")
 
+
+# --- 9b. SUBCATEGORY -------------------------------------------------------
+section("9b. Subcategory Filtering")
+
+st, r, _ = req("POST", "/memories", {
+    "content": "MNEMOS subcategory test: Kubernetes networking config.",
+    "category": "infrastructure",
+    "subcategory": "kubernetes",
+})
+check("POST /memories with subcategory -> 200", st == 200, f"got {st}")
+check("subcategory persisted", r and r.get("subcategory") == "kubernetes")
+sub_id = r.get("id") if r else None
+if sub_id:
+    created_ids.append(sub_id)
+
+st, r, _ = req("GET", "/memories?category=infrastructure&subcategory=kubernetes&limit=5")
+check("GET /memories?subcategory filter -> 200", st == 200, f"got {st}")
+check("subcategory memory in list",
+      sub_id in [m["id"] for m in (r or {}).get("memories", [])])
+
+st, r, _ = req("POST", "/memories/search", {
+    "query": "Kubernetes networking config",
+    "category": "infrastructure",
+    "subcategory": "kubernetes",
+    "limit": 5,
+})
+check("Search with subcategory filter -> 200", st == 200, f"got {st}")
+check("subcategory-filtered search finds memory",
+      sub_id in [m["id"] for m in (r or {}).get("memories", [])])
+
+# --- 9c. KNOWLEDGE GRAPH ---------------------------------------------------
+section("9c. Knowledge Graph")
+kg_id = None
+
+st, r, _ = req("POST", "/kg/triples", {
+    "subject": "PYTHIA",
+    "predicate": "runs",
+    "object": "MNEMOS",
+    "subject_type": "server",
+    "object_type": "service",
+    "confidence": 0.99,
+})
+check("POST /kg/triples -> 201", st == 201, f"got {st}: {r}")
+check("triple id starts with kg_", r and r.get("id", "").startswith("kg_"))
+kg_id = r.get("id") if r else None
+
+st, r, _ = req("GET", "/kg/triples?subject=PYTHIA")
+check("GET /kg/triples?subject -> 200", st == 200, f"got {st}")
+check("created triple in list",
+      r and any(t["id"] == kg_id for t in r.get("triples", [])))
+
+st, r, _ = req("GET", "/kg/timeline/PYTHIA")
+check("GET /kg/timeline/PYTHIA -> 200", st == 200, f"got {st}")
+check("timeline returns triples", r and r.get("count", 0) > 0)
+
+if kg_id:
+    st, _, _ = req("DELETE", f"/kg/triples/{kg_id}")
+    check("DELETE /kg/triples/{id} -> 204", st == 204, f"got {st}")
+
+check("DELETE nonexistent triple -> 404",
+      req("DELETE", "/kg/triples/kg_never_exists")[0] == 404)
+
 # ─── 9. CLEANUP ──────────────────────────────────────────────
 section("9. Cleanup (delete all test memories)")
 

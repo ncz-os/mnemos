@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 COMPRESSION_RESULT_SET_THRESHOLD = 50 * 1024   # 50 KB
 COMPRESSION_ITEM_THRESHOLD = 5 * 1024           # 5 KB per item
 
-# DB config from environment (single source of truth — mirrors config.py defaults)
+# DB config from environment (mirrors config.py defaults)
 PG_PASSWORD = os.getenv('PG_PASSWORD', 'mnemos_secure_password')
 PG_USER = os.getenv('PG_USER', 'mnemos_user')
 PG_DATABASE = os.getenv('PG_DATABASE', 'mnemos')
@@ -49,7 +49,7 @@ def get_inference_provider() -> ExternalInferenceProvider:
 async def lifespan(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, and inference provider."""
     global _pool, _cache
-    logger.info("Starting MNEMOS API Server v2.2.0 (Optimized: pooling + caching)")
+    logger.info("Starting MNEMOS API Server v2.3.0 (hierarchy + knowledge graph + MCP)")
 
     try:
         _pool = await asyncpg.create_pool(
@@ -100,11 +100,17 @@ def _get_cache_key(prefix: str, *args) -> str:
 
 
 async def _get_db():
-    """Acquire a connection from the pool (used by handlers that need explicit control)."""
+    """Acquire a connection from the pool."""
     global _pool
     if not _pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     return _pool.acquire()
+
+
+_MEMORY_COLS = (
+    "id, content, category, subcategory, created, updated, "
+    "metadata, quality_rating, compressed_content"
+)
 
 
 def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
@@ -120,6 +126,7 @@ def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
         id=row['id'],
         content=row['content'][:2000],
         category=row['category'],
+        subcategory=row.get('subcategory'),
         created=row['created'].isoformat() if row['created'] else '',
         updated=row['updated'].isoformat() if row.get('updated') else None,
         metadata=raw_meta if raw_meta else None,
@@ -130,39 +137,71 @@ def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
 
 async def _fts_fetch(conn, query: str, limit: int,
                      category=None,
-                     select_cols="id, content, category, created, updated, metadata, quality_rating, compressed_content"):
+                     subcategory=None,
+                     select_cols=None):
     """FTS search with ILIKE fallback. Shared by /memories/search and /memories/rehydrate."""
+    if select_cols is None:
+        select_cols = _MEMORY_COLS
     query_tsv = " & ".join(query.split())
     rank_col = "ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as rank"
     try:
-        if category:
+        if category and subcategory:
             return await conn.fetch(
-                f"SELECT {select_cols}, {rank_col} "
-                "FROM memories WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
+                f"SELECT {select_cols}, {rank_col} FROM memories "
+                "WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
+                "AND category=$3 AND subcategory=$4 ORDER BY rank DESC LIMIT $2",
+                query_tsv, limit, category, subcategory,
+            )
+        elif category:
+            return await conn.fetch(
+                f"SELECT {select_cols}, {rank_col} FROM memories "
+                "WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
                 "AND category=$3 ORDER BY rank DESC LIMIT $2",
                 query_tsv, limit, category,
             )
-        return await conn.fetch(
-            f"SELECT {select_cols}, {rank_col} "
-            "FROM memories WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
-            "ORDER BY rank DESC LIMIT $2",
-            query_tsv, limit,
-        )
+        elif subcategory:
+            return await conn.fetch(
+                f"SELECT {select_cols}, {rank_col} FROM memories "
+                "WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
+                "AND subcategory=$3 ORDER BY rank DESC LIMIT $2",
+                query_tsv, limit, subcategory,
+            )
+        else:
+            return await conn.fetch(
+                f"SELECT {select_cols}, {rank_col} FROM memories "
+                "WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
+                "ORDER BY rank DESC LIMIT $2",
+                query_tsv, limit,
+            )
     except Exception:
         logger.warning(f"[FTS] falling back to ILIKE for: {query[:50]!r}")
         like_q = f"%{query}%"
         try:
-            if category:
+            if category and subcategory:
+                return await conn.fetch(
+                    f"SELECT {select_cols} FROM memories "
+                    "WHERE content ILIKE $1 AND category=$3 AND subcategory=$4 "
+                    "ORDER BY created DESC LIMIT $2",
+                    like_q, limit, category, subcategory,
+                )
+            elif category:
                 return await conn.fetch(
                     f"SELECT {select_cols} FROM memories "
                     "WHERE content ILIKE $1 AND category=$3 ORDER BY created DESC LIMIT $2",
                     like_q, limit, category,
                 )
-            return await conn.fetch(
-                f"SELECT {select_cols} FROM memories "
-                "WHERE content ILIKE $1 ORDER BY created DESC LIMIT $2",
-                like_q, limit,
-            )
+            elif subcategory:
+                return await conn.fetch(
+                    f"SELECT {select_cols} FROM memories "
+                    "WHERE content ILIKE $1 AND subcategory=$3 ORDER BY created DESC LIMIT $2",
+                    like_q, limit, subcategory,
+                )
+            else:
+                return await conn.fetch(
+                    f"SELECT {select_cols} FROM memories "
+                    "WHERE content ILIKE $1 ORDER BY created DESC LIMIT $2",
+                    like_q, limit,
+                )
         except Exception as e2:
             logger.error(f"[FTS] Both FTS and ILIKE failed: {e2}")
             return []

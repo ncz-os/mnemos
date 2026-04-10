@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException
 
 import api.lifecycle as _lc
 from api.lifecycle import (
+    _MEMORY_COLS,
     _fts_fetch,
     _get_cache_key,
     _row_to_memory,
@@ -46,21 +47,44 @@ async def _persist_compression(memory_id: str, compressed_text: str) -> None:
 
 
 @router.get("/memories", response_model=MemoryListResponse)
-async def list_memories(category: Optional[str] = None, limit: int = 20, offset: int = 0):
+async def list_memories(
+    category: Optional[str] = None,
+    subcategory: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
-        if category:
+        if category and subcategory:
             rows = await conn.fetch(
-                "SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content "
-                "FROM memories WHERE category=$1 ORDER BY created DESC LIMIT $2 OFFSET $3",
+                f"SELECT {_MEMORY_COLS} FROM memories "
+                "WHERE category=$1 AND subcategory=$2 ORDER BY created DESC LIMIT $3 OFFSET $4",
+                category, subcategory, limit, offset,
+            )
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM memories WHERE category=$1 AND subcategory=$2",
+                category, subcategory,
+            )
+        elif category:
+            rows = await conn.fetch(
+                f"SELECT {_MEMORY_COLS} FROM memories "
+                "WHERE category=$1 ORDER BY created DESC LIMIT $2 OFFSET $3",
                 category, limit, offset,
             )
-            total = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE category=$1", category)
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM memories WHERE category=$1", category)
+        elif subcategory:
+            rows = await conn.fetch(
+                f"SELECT {_MEMORY_COLS} FROM memories "
+                "WHERE subcategory=$1 ORDER BY created DESC LIMIT $2 OFFSET $3",
+                subcategory, limit, offset,
+            )
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM memories WHERE subcategory=$1", subcategory)
         else:
             rows = await conn.fetch(
-                "SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content "
-                "FROM memories ORDER BY created DESC LIMIT $1 OFFSET $2",
+                f"SELECT {_MEMORY_COLS} FROM memories ORDER BY created DESC LIMIT $1 OFFSET $2",
                 limit, offset,
             )
             total = await conn.fetchval("SELECT COUNT(*) FROM memories")
@@ -73,9 +97,7 @@ async def get_memory(memory_id: str):
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content "
-            "FROM memories WHERE id=$1",
-            memory_id,
+            f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
         )
         if not row:
             raise HTTPException(status_code=404, detail="Memory not found")
@@ -85,7 +107,10 @@ async def get_memory(memory_id: str):
 @router.post("/memories/search", response_model=MemoryListResponse)
 async def search_memories(request: MemorySearchRequest):
     """Search memories with optional compression of large result sets (cached 5 min)."""
-    cache_key = _get_cache_key("search", request.query, request.limit, request.category or "")
+    cache_key = _get_cache_key(
+        "search", request.query, request.limit,
+        request.category or "", request.subcategory or "",
+    )
 
     if _lc._cache and not request.include_compressed:
         try:
@@ -100,7 +125,10 @@ async def search_memories(request: MemorySearchRequest):
         raise HTTPException(status_code=503, detail="Database pool not available")
 
     async with _lc._pool.acquire() as conn:
-        rows = await _fts_fetch(conn, request.query, request.limit, request.category)
+        rows = await _fts_fetch(
+            conn, request.query, request.limit,
+            request.category, request.subcategory,
+        )
 
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
     compression_applied = False
@@ -129,7 +157,6 @@ async def search_memories(request: MemorySearchRequest):
                             f"[PHASE2] Compressed {memory.id[:8]}: "
                             f"{item_size} -> {result['compressed_length']} chars"
                         )
-                        # Persist compression result back to DB (fire-and-forget)
                         asyncio.create_task(_persist_compression(memory.id, result['compressed']))
                     else:
                         total_compressed += item_size
@@ -177,14 +204,12 @@ async def create_memory(request: MemoryCreateRequest):
     async with _lc._pool.acquire() as conn:
         meta = json.dumps(request.metadata or {"source": request.source})
         await conn.execute(
-            "INSERT INTO memories (id, content, category, metadata, quality_rating) "
-            "VALUES ($1, $2, $3, $4::jsonb, 75)",
-            mem_id, request.content, request.category, meta,
+            "INSERT INTO memories (id, content, category, subcategory, metadata, quality_rating) "
+            "VALUES ($1, $2, $3, $4, $5::jsonb, 75)",
+            mem_id, request.content, request.category, request.subcategory, meta,
         )
         row = await conn.fetchrow(
-            "SELECT id, content, category, created, updated, metadata, quality_rating, compressed_content "
-            "FROM memories WHERE id=$1",
-            mem_id,
+            f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", mem_id,
         )
     if _lc._cache:
         try:

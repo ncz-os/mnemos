@@ -45,6 +45,7 @@ class MemoryItem(BaseModel):
     id: str
     content: str
     category: str
+    subcategory: Optional[str] = None
     created: str
     updated: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -63,12 +64,14 @@ class MemorySearchRequest(BaseModel):
     query: str
     limit: int = 10
     category: Optional[str] = None
+    subcategory: Optional[str] = None
     include_compressed: Optional[bool] = False
 
 
 class MemoryCreateRequest(BaseModel):
     content: str
     category: str = "facts"
+    subcategory: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
     source: Optional[str] = "openclaw"
 
@@ -104,3 +107,36 @@ class SessionIngestResponse(BaseModel):
     session_id: str
     stored_count: int
     memory_ids: List[str]
+
+
+# ── Knowledge Graph models ────────────────────────────────────────────────────
+
+class KGTripleCreate(BaseModel):
+    subject: str
+    predicate: str
+    object: str
+    subject_type: Optional[str] = None
+    object_type: Optional[str] = None
+    valid_from: Optional[str] = None     # ISO8601; defaults to NOW() if omitted
+    valid_until: Optional[str] = None    # ISO8601; NULL means still valid
+    memory_id: Optional[str] = None      # FK to memories.id
+    confidence: float = 1.0
+
+
+class KGTriple(BaseModel):
+    id: str
+    subject: str
+    predicate: str
+    object: str
+    subject_type: Optional[str] = None
+    object_type: Optional[str] = None
+    valid_from: str
+    valid_until: Optional[str] = None
+    memory_id: Optional[str] = None
+    confidence: float
+    created: str
+
+
+class KGTripleListResponse(BaseModel):
+    count: int
+    triples: List[KGTriple]
