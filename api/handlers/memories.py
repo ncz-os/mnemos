@@ -215,7 +215,7 @@ async def search_memories(request: MemorySearchRequest):
     return response
 
 
-@router.post("/memories", response_model=MemoryItem)
+@router.post("/memories", response_model=MemoryItem, status_code=201)
 async def create_memory(request: MemoryCreateRequest):
     if not request.content or not request.content.strip():
         raise HTTPException(status_code=422, detail="Memory content cannot be empty")
