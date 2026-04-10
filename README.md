@@ -1,28 +1,30 @@
 # MNEMOS + GRAEAE
 
-**Memory infrastructure for the agentic ecosystem.**
+**Production memory for serious agentic systems.**
 
-Deploy MNEMOS once. Every agent in your stack — across tools, sessions, and processes — shares the same quality-tracked memory pool. It runs alongside your agents the way Redis runs alongside your application — always available, always consistent, outliving any individual process.
+MNEMOS is a shared memory service for professional AI and agentic development. It is designed for teams building real systems, where memory has to be persistent, inspectable, attributable, and operationally reliable, not just convenient in a demo.
 
-This is not an embedded library. It is a network service with a REST API and a PostgreSQL backend, backed by a multi-LLM reasoning engine (GRAEAE) that runs separately on the same host or across your network.
+Deploy MNEMOS once, and every agent in your stack can share the same memory substrate across tools, sessions, and processes. It runs alongside your applications the way Redis, PostgreSQL, or a message bus would, as infrastructure, not as a prompt hack.
+
+This is not an embedded chat-memory helper. It is a network service with a REST API and PostgreSQL backend, designed for multi-agent workflows, provenance-aware memory, compression with quality controls, and optional multi-LLM reasoning via GRAEAE.
 
 ---
 
-## Origin
+## Why this exists
 
-MNEMOS started in December 2025 as a frustration with a very specific problem: every new AI agent session started from scratch.
+MNEMOS was built out of a very practical frustration: serious agentic systems keep losing context at exactly the moment reliability starts to matter.
 
-We were running a homelab spanning several machines — a dedicated GPU inference server for local models, a reasoning host, a compute node for batch workloads, NAS storage, and developer workstations. On top of that infrastructure we were building a stack of agentic tools: a multi-stage data pipeline, a domain-specific analysis system, a financial portfolio skill, and an agentic platform that coordinated them. Each project had its own infrastructure knowledge, its own architectural decisions, its own solved problems. And every time a new agent session started, all of that had to be rebuilt from scratch — re-explained, re-loaded, re-reasoned through — at the cost of context window and API spend.
+In most AI tooling, memory is still treated like a convenience feature. A session ends, context evaporates, and the next run has to reconstruct the same decisions, assumptions, architecture tradeoffs, and operating knowledge from scratch. That may be tolerable for hobby projects. It is not good enough for professional users building production systems.
 
-The first approach was the obvious one: a large context file injected as a system prompt. It worked, briefly. Then it hit 40K tokens and became the entire context budget. You could not selectively load the parts that mattered for the task at hand. Everything came in or nothing did. Compressing it manually was lossy and opaque — you never knew what you had thrown away.
+The first version of the problem looked simple. Keep a large context file, inject it into the prompt, and move on. That works until the context becomes expensive, stale, opaque, and impossible to selectively trust. When you compress it, you no longer know exactly what was removed. When multiple agents need it, the whole approach collapses into duplication and drift.
 
-The second problem arrived simultaneously: reasoning costs. A single frontier model query for architecture decisions ran $0.075 per thousand tokens. We were making those decisions constantly — pipeline stage design, multi-tier enrichment strategies, agent routing models — and the costs added up fast. And expensive model answers were no better than a well-run consensus of cheaper models. We knew this because we had run the comparison.
+The second version of the problem was operational. Real agentic development means multiple models, multiple providers, failure modes, cost pressure, and different classes of tasks. Memory that cannot survive provider failure, cannot be shared across agents, or cannot explain its own transformations is not really infrastructure.
 
-GRAEAE was the answer to the second problem: a multi-LLM consensus engine that distributed reasoning queries across multiple providers simultaneously, scored the responses, and returned the best result for a fraction of the cost — with better coverage of the solution space because no single model's blind spots dominated.
+MNEMOS was built to solve those problems in a way that reflects real platform experience: provenance matters, compression should be inspectable, shared systems need access controls, and memory should behave like a service you can operate, not a feature you hope keeps working.
 
-MNEMOS was the answer to the first problem: a PostgreSQL-backed memory service that stored what the agents learned, compressed it intelligently over time, and retrieved the right subset for the task at hand. The compression had to come with a receipt — a manifest saying what was removed, what was kept, and whether it was safe to use the compressed version for this particular task type.
+Its design is informed by years of enterprise platform work, large-vendor systems thinking, open-source infrastructure experience, and current work in the AI industry, without assuming that professional users want marketing language where they really need operational clarity.
 
-The first production commit landed on February 18, 2026. By April 2026 the system had stored **6,793 memories** and performed **3,077 compressions**, each with a quality manifest. It runs v2.3.0 in production today, backing multiple active agentic tools simultaneously. The tools it was built alongside are still running on it.
+The first production commit landed on February 18, 2026. By April 2026 the system had stored **6,793 memories** and performed **3,077 compressions**, each with a quality manifest. It runs v2.3.0 in production today, backing multiple active agentic tools simultaneously.
 
 ---
 
