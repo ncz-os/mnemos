@@ -65,13 +65,13 @@ If none of those questions matter for your use case, a simpler tool is probably 
 
 ## What works now
 
-This is the current state of v2.3.0. Features described here are implemented and running in production. Features in the roadmap section are not yet implemented.
+This is the current state of v2.3.0 + v1 multi-user. Features described here are implemented and running in production. Features in the roadmap section are not yet implemented.
 
 ### MNEMOS API
 
 | Endpoint | What it does |
 |----------|-------------|
-| `POST /memories` | Store a memory with category, subcategory, and content |
+| `POST /memories` | Store a memory with category, subcategory, content, and optional provenance |
 | `GET /memories` | List memories, filterable by category and subcategory |
 | `GET /memories/{id}` | Retrieve a single memory |
 | `POST /memories/search` | Semantic search with score threshold and category filter |
@@ -82,6 +82,41 @@ This is the current state of v2.3.0. Features described here are implemented and
 | `POST /ingest/session` | Ingest a session transcript |
 | `GET /health` | Health check |
 | `GET /stats` | Memory counts by category, compression statistics |
+
+### Multi-user and provenance (v1, shipped)
+
+Each memory carries full ownership and LLM provenance:
+
+- `owner_id` — which user owns this memory
+- `group_id` — optional group for shared access
+- `namespace` — logical partition (e.g. `investorclaw/analyst`)
+- `permission_mode` — UNIX-style octal (600 = owner only, 640 = group readable, 644 = world readable)
+- `source_model` — the LLM model that produced this memory
+- `source_provider` — the provider (openai, groq, ollama, etc.)
+- `source_session` — session ID at time of creation
+- `source_agent` — agent name or identifier
+
+**Row Level Security** is defined in PostgreSQL but inactive for personal installs. Team/enterprise installs activate it via `install.py`, which enforces per-row access at the database layer, not application middleware.
+
+**Deployment profiles** — selected at install time via `python install.py`:
+
+| Profile | Auth | RLS | Use case |
+|---------|------|-----|---------|
+| Personal | off | off | Single developer, localhost |
+| Team | API key | on | 2–20 users, shared PostgreSQL |
+| Enterprise | API key | on | 20+ users, full namespace isolation |
+
+### Admin API (v1)
+
+| Endpoint | What it does |
+|----------|-------------|
+| `POST /admin/users` | Create a user |
+| `GET /admin/users` | List all users |
+| `POST /admin/users/{id}/apikeys` | Generate an API key (raw key returned once) |
+| `GET /admin/users/{id}/apikeys` | List API keys for a user |
+| `DELETE /admin/apikeys/{id}` | Revoke an API key (soft-delete) |
+
+All admin endpoints require root role. On personal installs (no auth), they are accessible without a key.
 
 ### Knowledge graph
 
@@ -130,14 +165,6 @@ This is the current state of v2.3.0. Features described here are implemented and
 
 These features are designed and scoped but not yet implemented.
 
-**v1 — Multi-user and provenance (next)**
-- Per-memory ownership (`owner_id`, `group_id`, `namespace`)
-- LLM provenance on every record (`source_model`, `source_provider`, `source_session`, `source_agent`)
-- UNIX-style permission modes enforced at the PostgreSQL RLS layer
-- API key authentication per user, root role
-- Installer with interactive deployment profile selection (Personal / Team / Enterprise)
-- Docker Compose for local single-machine setup
-
 **v2 — Versioning and audit**
 - Memory version history (`memory_versions` table) — every mutation auto-snapshots previous state
 - Diff and revert API
@@ -155,11 +182,12 @@ These features are designed and scoped but not yet implemented.
 ```
 Agents (any language, any framework)
         │
-        │  REST API (port 5002)
+        │  REST API (port 5000)
         ▼
 ┌─────────────────────────────────┐
 │           MNEMOS API            │
-│  search · compression · ingest  │
+│  auth · namespaces · search     │
+│  compression · ingest · admin   │
 │  knowledge graph · rehydrate    │
 └──────────────┬──────────────────┘
                │
@@ -168,54 +196,53 @@ Agents (any language, any framework)
     ▼                     ▼
 PostgreSQL           GRAEAE (port 5001)
 memories             multi-LLM consensus
-compression_log      circuit breaker
-graeae_consults      semantic cache
-knowledge_graph      quality scorer
+users / groups       circuit breaker
+api_keys             semantic cache
+compression_log      quality scorer
+knowledge_graph
 ```
 
 ---
 
 ## Quick start
 
-### Prerequisites
+### Personal install (Docker Compose)
 
-- Python 3.11+
-- PostgreSQL 14+
-- Ollama (optional — for local embedding and offline SENTENCE compression)
+```bash
+git clone <your-repo-url>
+cd mnemos-production
+docker compose up
+# MNEMOS: http://localhost:5000
+# GRAEAE: http://localhost:5001 (if available)
+```
 
-### Install
+### Manual install
 
 ```bash
 git clone <your-repo-url>
 cd mnemos-production
 pip install -r requirements.txt
+python install.py
+# Prompts for: deployment profile, database connection, provider API keys
+# Writes config.toml, runs migrations, creates root API key (team/enterprise)
 ```
 
-### Database
+### Manual database setup (if not using install.py)
 
 ```bash
 psql -U postgres -c "CREATE USER mnemos WITH PASSWORD 'yourpassword';"
 psql -U postgres -c "CREATE DATABASE mnemos OWNER mnemos;"
 psql -U mnemos -d mnemos -f db/migrations.sql
-```
-
-### Configure
-
-Edit `config.toml` or set environment variables:
-
-```bash
-export MNEMOS_KEYS_PATH=~/.config/mnemos/api_keys.json
-export OLLAMA_EMBED_HOST=http://localhost:11434
-export GRAEAE_URL=http://localhost:5001
+psql -U mnemos -d mnemos -f db/migrations_v1_multiuser.sql
 ```
 
 ### Start
 
 ```bash
-python api_server.py        # MNEMOS on port 5002
+python api_server.py        # MNEMOS on port 5000
 python graeae/server.py     # GRAEAE on port 5001 (optional)
 
-curl http://localhost:5002/health
+curl http://localhost:5000/health
 ```
 
 ---
@@ -225,23 +252,63 @@ curl http://localhost:5002/health
 ### Store a memory
 
 ```bash
-curl -X POST http://localhost:5002/memories \
+# Basic
+curl -X POST http://localhost:5000/memories \
   -H 'Content-Type: application/json' \
   -d '{"content": "...", "category": "decisions", "subcategory": "architecture"}'
+
+# With provenance
+curl -X POST http://localhost:5000/memories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "content": "...",
+    "category": "decisions",
+    "namespace": "myagent/analyst",
+    "source_model": "gemma4-consult",
+    "source_agent": "background-enricher"
+  }'
+
+# Team/enterprise: include API key
+curl -X POST http://localhost:5000/memories \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <your-api-key>' \
+  -d '{"content": "...", "category": "decisions"}'
 ```
 
 ### Search
 
 ```bash
-# Semantic search
-curl -X POST http://localhost:5002/memories/search \
+# Full-text search
+curl -X POST http://localhost:5000/memories/search \
   -H 'Content-Type: application/json' \
-  -d '{"query": "topic keywords", "limit": 10, "min_score": 0.3}'
+  -d '{"query": "topic keywords", "limit": 10}'
 
 # Filtered by category
-curl -X POST http://localhost:5002/memories/search \
+curl -X POST http://localhost:5000/memories/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "keywords", "category": "solutions", "limit": 5}'
+
+# Semantic (vector) search
+curl -X POST http://localhost:5000/memories/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "keywords", "semantic": true, "limit": 10}'
+```
+
+### Admin: create user and API key
+
+```bash
+# Create a user
+curl -X POST http://localhost:5000/admin/users \
+  -H 'Content-Type: application/json' \
+  -d '{"id": "alice", "display_name": "Alice", "role": "user"}'
+
+# Generate API key — raw_key shown once only
+curl -X POST http://localhost:5000/admin/users/alice/apikeys \
+  -H 'Content-Type: application/json' \
+  -d '{"label": "cli-key"}'
+
+# Revoke a key
+curl -X DELETE http://localhost:5000/admin/apikeys/<key-id>
 ```
 
 ### GRAEAE reasoning
