@@ -217,15 +217,13 @@ class QualityAnalyzer:
     def _compute_semantic_similarity(self, text1: str, text2: str) -> float:
         """Compute semantic similarity using embeddings (0-100)"""
         try:
-            from sklearn.metrics.pairwise import cosine_similarity
             import numpy as np
 
-            emb1 = self.embedding_model.encode(text1)
-            emb2 = self.embedding_model.encode(text2)
-
-            similarity = cosine_similarity(
-                [emb1], [emb2]
-            )[0][0]
+            emb1 = np.asarray(self.embedding_model.encode(text1))
+            emb2 = np.asarray(self.embedding_model.encode(text2))
+            # cosine similarity via numpy (avoids sklearn dependency)
+            norm = np.linalg.norm(emb1) * np.linalg.norm(emb2)
+            similarity = float(np.dot(emb1, emb2) / norm) if norm > 0 else 0.0
 
             return float(similarity * 100)
         except Exception as e:

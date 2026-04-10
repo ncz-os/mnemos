@@ -7,7 +7,6 @@ Provides:
 - Consultation result storage
 """
 
-from .graeae_client import GraeaeClient, ConsultationResult
 from .fallbacks import get_fallback, list_fallbacks
 
 __all__ = [

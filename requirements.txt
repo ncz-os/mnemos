@@ -1,5 +1,36 @@
-flask>=2.3.0
-flask-cors>=4.0.0
-psycopg2-binary>=2.9.0
-requests>=2.31.0
+# MNEMOS production dependencies
+# Generated 2026-04-10 — reflects actual imports
+
+# API framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+starlette>=0.40.0
+pydantic>=2.8.0
+python-multipart>=0.0.9
+
+# Database
+asyncpg>=0.29.0          # async API path (lifecycle.py + handlers)
+psycopg[binary]>=3.1.0   # sync background tasks (core.py, export scripts) + distillation worker
+
+# HTTP client (single library — replaces requests + aiohttp)
+httpx>=0.27.0
+
+# Cache
+redis>=5.0.0
+
+# Memory/config
 python-dotenv>=1.0.0
+
+# MCP server
+mcp>=1.0.0
+
+# Inference (Phi server)
+openvino-genai>=2024.4.0
+fastembed>=0.3.0          # nomic-embed-text-v1.5, 768-dim; pulls onnxruntime transitively
+
+# Async utilities (transitive, pinned for stability)
+anyio>=4.4.0
+
+# Utilities
+numpy>=1.26.0
+psutil>=5.9.0

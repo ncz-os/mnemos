@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 from pathlib import Path
 from datetime import datetime
 import os
@@ -19,8 +19,8 @@ BACKUP_DIR = SHARD_DIR / 'backups'
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 def export_memories():
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor(cursor_factory=RealDictCursor)
+    conn = psycopg.connect(**DB_CONFIG, row_factory=dict_row)
+    cur = conn.cursor()
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     print(f'[EXPORT] Starting memory export at {timestamp}')

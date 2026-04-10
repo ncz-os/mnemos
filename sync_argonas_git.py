@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import subprocess
 import json
-import requests
+import httpx
 import os
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +14,7 @@ GIT_REPOS = [
 
 MNEMOS_URL = os.getenv('MNEMOS_URL', 'http://localhost:5000')
 
+
 def get_recent_commits(repo_path, limit=20):
     try:
         result = subprocess.run(
@@ -21,8 +22,7 @@ def get_recent_commits(repo_path, limit=20):
             capture_output=True, text=True, timeout=10
         )
         commits = []
-        for line in result.stdout.strip().split('
-'):
+        for line in result.stdout.strip().split('\n'):
             if line:
                 hash_val, msg = line.split(' ', 1)
                 commits.append({'hash': hash_val, 'message': msg})
@@ -30,23 +30,22 @@ def get_recent_commits(repo_path, limit=20):
     except Exception:
         return []
 
+
 def store_commit(commit, project_name):
     try:
-        content = f'[GIT COMMIT] {project_name}
-
-Hash: {commit["hash"][:8]}
-Message: {commit["message"]}'
-        response = requests.post(
+        content = f'[GIT COMMIT] {project_name}\n\nHash: {commit["hash"][:8]}\nMessage: {commit["message"]}'
+        response = httpx.post(
             f'{MNEMOS_URL}/memories',
             json={'content': content, 'category': 'git_commit', 'metadata': {'project': project_name}},
-            timeout=5
+            timeout=5,
         )
         return response.status_code == 201
     except Exception:
         return False
 
+
 def sync_all_repos():
-    print(f'[SYNC] Starting git sync')
+    print('[SYNC] Starting git sync')
     total = 0
     for repo_path in GIT_REPOS:
         if not os.path.exists(repo_path):
@@ -57,6 +56,7 @@ def sync_all_repos():
                 total += 1
     print(f'[SYNC] Synced {total} commits')
     return total
+
 
 if __name__ == '__main__':
     sync_all_repos()

@@ -9,16 +9,12 @@ import sys
 import time
 import glob
 import threading
-import requests
-# DB driver note: three drivers coexist intentionally —
-#   psycopg2      (this file)           — sync background tasks (embedding, cleanup, sync_shards)
-#   asyncpg       (api_server.py)       — async FastAPI request path (high concurrency)
-#   psycopg3      (distillation_worker) — async worker process (psycopg3 native binary protocol)
-# Unifying them is MOD-02 architectural debt; deferred until pgvector async path is benchmarked.
-import psycopg2
+import httpx
+# DB drivers: asyncpg (api/ path) + psycopg v3 (this file + distillation_worker)
+import psycopg
 import uuid
 from datetime import datetime, timezone
-from psycopg2.extras import RealDictCursor
+from psycopg.rows import dict_row
 from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import config
@@ -42,7 +38,7 @@ class DatabaseManager:
     def get_connection(self):
         """Get a new database connection"""
         try:
-            return psycopg2.connect(**self.config)
+            return psycopg.connect(**self.config, row_factory=dict_row)
         except Exception as e:
             print(f"[DB] Connection error: {e}", file=sys.stderr, flush=True)
             raise
@@ -50,21 +46,16 @@ class DatabaseManager:
     def execute_query(self, sql, params=None, fetch=None):
         """Execute query with error handling"""
         try:
-            conn = self.get_connection()
-            cur = conn.cursor(cursor_factory=RealDictCursor)
-            cur.execute(sql, params or ())
-
-            if fetch == 'one':
-                result = cur.fetchone()
-            elif fetch == 'all':
-                result = cur.fetchall()
-            else:
-                conn.commit()
-                result = None
-
-            cur.close()
-            conn.close()
-            return result
+            with psycopg.connect(**self.config, row_factory=dict_row) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params or ())
+                    if fetch == 'one':
+                        return cur.fetchone()
+                    elif fetch == 'all':
+                        return cur.fetchall()
+                    else:
+                        conn.commit()
+                        return None
         except Exception as e:
             print(f"[DB] Query error: {e}", file=sys.stderr, flush=True)
             raise
@@ -72,12 +63,10 @@ class DatabaseManager:
     def init_schema(self):
         """Verify schema exists"""
         try:
-            conn = self.get_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM memories")
-            count = cur.fetchone()[0]
-            cur.close()
-            conn.close()
+            with psycopg.connect(**self.config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM memories")
+                    count = cur.fetchone()[0]
             print(f"[DB] Connected ({count} memories)", file=sys.stderr, flush=True)
             return True
         except Exception as e:
@@ -102,12 +91,11 @@ class EmbeddingService:
             return None
 
         try:
-            response = requests.post(
+            response = httpx.post(
                 self.url,
                 json={'model': self.model, 'prompt': str(text)[:EMBED_CONTENT_MAX_CHARS]},
-                timeout=self.timeout
+                timeout=self.timeout,
             )
-
             if response.status_code == 200:
                 return response.json().get('embedding')
         except Exception as e:
@@ -359,7 +347,7 @@ class MemoryStore:
     def get_memory(self, memory_id):
         """Get single memory by ID"""
         conn = self.db.get_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur = conn.cursor()
         try:
             cur.execute("""
                 SELECT id, content, category, created, updated
@@ -424,7 +412,7 @@ class MemoryStore:
     def list_memories(self, limit=100, offset=0):
         """List all memories with pagination"""
         conn = self.db.get_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur = conn.cursor()
 
         cur.execute("""
             SELECT id, content, category, created, updated
@@ -452,33 +440,31 @@ class MemoryStore:
         selected_tiers = self.tier_selector.select_tiers(task_type)
 
         conn = self.db.get_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur = conn.cursor()
         try:
             # Set optimal IVFFlat probes for lists=79 index (30 = 100% recall, 356 queries/sec)
             cur.execute("SET ivfflat.probes = 30")
-
-        # Search across selected tiers
-        # Use ANY(%s::text[]) for parameterized tier filtering (no SQL injection risk)
-        cur.execute("""
-            SELECT
-                id,
-                content,
-                category,
-                created,
-                1 - (embedding <=> %s::vector) as similarity
-            FROM memories
-            WHERE embedding IS NOT NULL AND (category = ANY(%s::text[]) OR category = 'documentation')
-            ORDER BY embedding <=> %s::vector
-            LIMIT %s
-        """, (query_embedding, list(selected_tiers), query_embedding, limit))
-
-            results = cur.fetchall()
+            # Search across selected tiers
+            # Use ANY(%s::text[]) for parameterized tier filtering (no SQL injection risk)
+            cur.execute("""
+                SELECT
+                    id,
+                    content,
+                    category,
+                    created,
+                    1 - (embedding <=> %s::vector) as similarity
+                FROM memories
+                WHERE embedding IS NOT NULL AND (category = ANY(%s::text[]) OR category = 'documentation')
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (query_embedding, list(selected_tiers), query_embedding, limit))
+            results = [dict(r) for r in cur.fetchall()]
         finally:
             cur.close()
             conn.close()
 
         return {
-            'results': [dict(r) for r in results],
+            'results': results,
             'task_type': task_type,
             'selected_tiers': selected_tiers,
             'query': query_text,
@@ -488,7 +474,7 @@ class MemoryStore:
     def _keyword_search(self, query_text, limit=10, category=None):
         """Fallback keyword search"""
         conn = self.db.get_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur = conn.cursor()
 
         pattern = f'%{query_text}%'
 
