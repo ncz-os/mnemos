@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Migrate legacy MNEMOS JSON to new PostgreSQL schema"""
 import json
+import os
 from pathlib import Path
 import logging
 import asyncio
@@ -9,13 +10,13 @@ import asyncpg
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-BACKUP_DIR = Path('/mnt/argonas/backups/pythia/mnemos')
+BACKUP_DIR = Path(os.getenv('MNEMOS_BACKUP_DIR', '/var/backups/mnemos'))
 
 async def main():
     try:
         conn = await asyncpg.connect(
             user='mnemos_user',
-            password='mnemos_secure_password',
+            password=os.getenv('PG_PASSWORD', ''),
             database='mnemos',
             host='localhost'
         )

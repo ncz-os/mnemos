@@ -495,7 +495,7 @@ if __name__ == "__main__":
 
     # Sample memory text
     sample_text = """
-    The multi-LLM consensus engine GRAEAE has been successfully deployed on PYTHIA.
+    The multi-LLM consensus engine GRAEAE has been successfully deployed on api-host.
     The system now routes reasoning requests to 8+ language models including OpenAI GPT-4,
     Google Gemini, Anthropic Claude, Mistral AI, and others. Consensus scoring uses a
     weighted voting system based on model Elo ratings and task-specific performance metrics.

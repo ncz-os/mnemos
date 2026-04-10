@@ -149,32 +149,32 @@ OVERALL COVERAGE: 89.6%
 ### Files Deployed to Production (your-host)
 
 ✅ **GRAEAE Core Modules**:
-- `/opt/mnemos/graeae/core/__init__.py`
-- `/opt/mnemos/graeae/core/queue.py` (450 LOC)
-- `/opt/mnemos/graeae/core/circuit_breaker.py` (280 LOC)
-- `/opt/mnemos/graeae/core/quality_scorer.py` (420 LOC)
-- `/opt/mnemos/graeae/core/semantic_cache.py` (310 LOC)
-- `/opt/mnemos/graeae/core/rate_limiter.py` (380 LOC)
+- `/path/to/mnemos/graeae/core/__init__.py`
+- `/path/to/mnemos/graeae/core/queue.py` (450 LOC)
+- `/path/to/mnemos/graeae/core/circuit_breaker.py` (280 LOC)
+- `/path/to/mnemos/graeae/core/quality_scorer.py` (420 LOC)
+- `/path/to/mnemos/graeae/core/semantic_cache.py` (310 LOC)
+- `/path/to/mnemos/graeae/core/rate_limiter.py` (380 LOC)
 
 ✅ **Shared Infrastructure**:
-- `/opt/mnemos/shared/tracing.py` (180 LOC)
-- `/opt/mnemos/shared/audit.py` (350 LOC)
+- `/path/to/mnemos/shared/tracing.py` (180 LOC)
+- `/path/to/mnemos/shared/audit.py` (350 LOC)
 
 ✅ **MNEMOS Features**:
-- `/opt/mnemos/core/mnemos_features.py` (1,340 LOC)
+- `/path/to/mnemos/core/mnemos_features.py` (1,340 LOC)
 
 ✅ **Cross-System Features**:
-- `/opt/mnemos/cross_system.py` (960 LOC)
+- `/path/to/mnemos/cross_system.py` (960 LOC)
 
 ✅ **Tests**:
-- `/opt/mnemos/tests/test_graeae_features.py`
-- `/opt/mnemos/tests/test_mnemos_features.py`
-- `/opt/mnemos/tests/test_cross_system_features.py`
+- `/path/to/mnemos/tests/test_graeae_features.py`
+- `/path/to/mnemos/tests/test_mnemos_features.py`
+- `/path/to/mnemos/tests/test_cross_system_features.py`
 
 ✅ **Documentation**:
-- `/opt/mnemos/docs/ALL_16_FEATURES.md`
-- `/opt/mnemos/docs/GRAEAE_FEATURES.md`
-- `/opt/mnemos/docs/IMPLEMENTATION_REPORT.md`
+- `/path/to/mnemos/docs/ALL_16_FEATURES.md`
+- `/path/to/mnemos/docs/GRAEAE_FEATURES.md`
+- `/path/to/mnemos/docs/IMPLEMENTATION_REPORT.md`
 
 ### Git Repository Status
 
@@ -337,7 +337,7 @@ def daily_maintenance():
 ## Verification Checklist
 
 ### Code Deployment ✅
-- [x] All 16 feature modules deployed to /opt/mnemos/
+- [x] All 16 feature modules deployed to /path/to/mnemos/
 - [x] All shared utilities (tracing, audit) in place
 - [x] Test files deployed
 - [x] Documentation files deployed
@@ -437,8 +437,8 @@ git push
 
 3. **Rollback files**:
 ```bash
-rm -rf /opt/mnemos/graeae/core/*.py
-rm -rf /opt/mnemos/core/mnemos_features.py
+rm -rf /path/to/mnemos/graeae/core/*.py
+rm -rf /path/to/mnemos/core/mnemos_features.py
 # Restore from previous backups if needed
 ```
 
@@ -496,8 +496,8 @@ The implementation is:
 ## Contact & Support
 
 For questions or issues:
-- Review feature documentation in `/opt/mnemos/docs/`
-- Check test cases in `/opt/mnemos/tests/`
+- Review feature documentation in `/path/to/mnemos/docs/`
+- Check test cases in `/path/to/mnemos/tests/`
 - Consult inline code docstrings
 - Check git commit history for implementation details
 

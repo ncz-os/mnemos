@@ -5,10 +5,10 @@ MNEMOS MCP Server — Model Context Protocol interface to MNEMOS memory system.
 Transport: stdio (Claude Code spawns this process directly)
 Backend:   MNEMOS REST API (default http://localhost:5002, override via MNEMOS_BASE env var)
 
-For remote MNEMOS (e.g. from macOS connecting to PYTHIA):
+For remote MNEMOS (e.g. from macOS connecting to api-host):
   Set MNEMOS_BASE=http://<host>:5002 in the MCP server config,
   or use SSH transport: command=ssh, args=[user@host,
-  /opt/mnemos/venv/bin/python, /opt/mnemos/mcp_server.py]
+  /path/to/mnemos/venv/bin/python, /path/to/mnemos/mcp_server.py]
 
 IMPORTANT: All logging must go to stderr. Any stdout output corrupts MCP JSON-RPC framing.
 """
@@ -165,7 +165,7 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Add a knowledge graph triple (subject → predicate → object). "
                 "Records facts, relationships, and temporal knowledge. "
-                "Example: subject='PYTHIA', predicate='runs', object='MNEMOS', "
+                "Example: subject='web-server', predicate='runs', object='MNEMOS', "
                 "subject_type='server', object_type='service'."
             ),
             inputSchema={

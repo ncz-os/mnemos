@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Unified External Inference Provider
-Handles all compression and context preparation via CERBERUS llama.cpp
+Handles all compression and context preparation via inference-server llama.cpp
 
 Used for:
   - Memory distillation (compress large memories to 20-30% size)
@@ -31,7 +31,7 @@ MIN_GENERATION_TOKENS = 10    # Minimum meaningful generation
 
 
 class ExternalInferenceProvider:
-    """Unified interface for external LLM inference on CERBERUS llama.cpp"""
+    """Unified interface for external LLM inference on inference-server llama.cpp"""
 
     def __init__(self,
                  endpoint: Optional[str] = None,
@@ -288,7 +288,7 @@ Score (0-100):"""
         }
 
     async def health_check(self) -> bool:
-        """Verify CERBERUS llama-server is responding"""
+        """Verify inference-server llama-server is responding"""
         try:
             response = await self.client.get(
                 f"{self.endpoint}/health",

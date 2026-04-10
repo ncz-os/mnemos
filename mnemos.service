@@ -5,6 +5,8 @@ Wants=postgresql.service
 
 [Service]
 Type=simple
+# Change to the user that owns /opt/mnemos
+User=mnemos
 WorkingDirectory=/opt/mnemos
 Environment="PATH=/opt/mnemos/venv/bin"
 EnvironmentFile=/opt/mnemos/.env

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 Phi-3.5 Mini OpenVINO Inference Server
-Ollama-compatible API running locally on PYTHIA.
+Ollama-compatible API running locally on api-host.
 
 Endpoints:
   POST /api/generate   — text completion (stream=false only)
   GET  /api/tags       — list available models (health check)
   GET  /health         — simple health check
 
-Port: 11435 (distinct from CERBERUS Ollama at :11434)
+Port: 11435 (distinct from inference-server Ollama at :11434)
 Device: GPU (Intel Iris Xe via OpenVINO) with CPU fallback
 """
 import asyncio

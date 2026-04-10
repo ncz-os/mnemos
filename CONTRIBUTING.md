@@ -5,7 +5,7 @@ Thanks for your interest in MNEMOS.
 ## Development workflow
 
 - Use `launch-prep` or a feature branch for non-trivial changes.
-- Keep ARGONAS as authoritative Git storage, and use a compute node such as PYTHIA for development and test runs.
+- Keep the upstream remote as the authoritative Git source, and use a local checkout for development and test runs.
 - Run the default test suite before opening a PR:
 
 ```bash

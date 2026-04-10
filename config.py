@@ -15,7 +15,7 @@ PG_CONFIG = {
     'port': int(os.getenv('PG_PORT', 5432)),
     'database': os.getenv('PG_DATABASE', 'mnemos'),
     'user': os.getenv('PG_USER', 'mnemos_user'),
-    'password': os.getenv('PG_PASSWORD', 'mnemos_secure_password')
+    'password': os.getenv('PG_PASSWORD', 'changeme')
 }
 
 # ============================================================================
@@ -23,7 +23,7 @@ PG_CONFIG = {
 # ============================================================================
 
 OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
-# OLLAMA_EMBED_HOST is separate: embeddings stay on CERBERUS (nomic-embed-text, 768-dim)
+# OLLAMA_EMBED_HOST is separate: embeddings stay on inference-server (nomic-embed-text, 768-dim)
 # even when OLLAMA_HOST points to the local Phi inference server.
 OLLAMA_EMBED_HOST = os.getenv('OLLAMA_EMBED_HOST', 'http://localhost:11434')
 OLLAMA_EMBED_URL = f'{OLLAMA_EMBED_HOST}/api/embeddings'
@@ -82,7 +82,7 @@ TASK_TYPE_KEYWORDS = {
     'infrastructure': ['infrastructure', 'deploy', 'network', 'server', 'system', 'docker', 'kubernetes', 'cloud'],
     'reasoning': ['reasoning', 'think', 'design', 'architecture', 'plan', 'strategy', 'decision'],
     'code': ['code', 'debug', 'error', 'bug', 'fix', 'implement', 'function', 'class'],
-    'project': ['project', 'riskyeats', 'etlantis', 'rvmaps', 'argonaut'],
+    'project': ['project', 'research', 'work', 'personal', 'archive'],
     'complex': []  # Fallback: queries with >20 words
 }
 

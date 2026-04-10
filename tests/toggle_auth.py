@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Toggle auth.enabled in config.toml for testing. Usage: toggle_auth.py on|off"""
+import os
 import sys
 import re
 
-CONFIG = "/opt/mnemos/config.toml"
+CONFIG = os.getenv('MNEMOS_CONFIG', '/opt/mnemos/config.toml')
 
 def set_auth_enabled(enabled: bool):
     value = "true" if enabled else "false"

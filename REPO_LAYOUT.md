@@ -1,26 +1,46 @@
-# MNEMOS Repository Layout
+# Repository Layout
 
-Authoritative Git storage and working-copy layout for MNEMOS.
+## Top-level structure
 
-## Authoritative locations
+| Path | Purpose |
+|------|---------|
+| `api/` | FastAPI route handlers, auth middleware, request/response models |
+| `api/handlers/` | One module per resource group (memories, kg, graeae, admin, etc.) |
+| `db/` | Database schema, migrations, and connection utilities |
+| `modules/` | Core subsystems: compression, memory categorization, routing, hooks, bundles |
+| `graeae/` | GRAEAE consensus reasoning engine integration |
+| `integrations/` | Optional third-party integrations (external LLMs, macrodata hooks) |
+| `tests/` | pytest unit/integration tests; live E2E tests excluded from default run |
+| `tools/` | Maintenance and migration utilities |
+| `docs/` | Extended documentation |
 
-- Bare repository: `/mnt/datapool/git/mnemos-production.git`
-- Canonical working tree on ARGONAS: `/mnt/datapool/workspaces/mnemos/main`
+## Key files
 
-## Compatibility path
+| File | Purpose |
+|------|---------|
+| `api_server.py` | FastAPI app entry point; mounts all routers |
+| `core.py` | Shared database pool, embedding client, utilities |
+| `config.py` | Configuration loader (reads `config.toml` and env vars) |
+| `api_keys.py` | LLM provider API key loader |
+| `install.py` | Interactive installer -- sets up Postgres, creates tables, configures `.env` |
+| `distillation_worker.py` | Background worker: compresses old memories into summaries |
+| `phi_server.py` | Optional local embedding server (Intel OpenVINO) |
+| `mcp_server.py` | Model Context Protocol server for Claude integration |
 
-The legacy bare-repo path below is retained as a symlink for backward compatibility:
+## Configuration
 
-- `/mnt/argonas/git/mnemos-production.git` -> `/mnt/datapool/git/mnemos-production.git`
+Runtime configuration is controlled by `config.toml` (or env vars). See `DEPLOYMENT_GUIDE.md` for details.
 
-## Operational guidance
+## Adding a new API endpoint
 
-- Treat ARGONAS bare repo as the source of truth for Git history.
-- Treat the ARGONAS working tree above as the canonical cleanup/release workspace.
-- PYTHIA runtime checkout may be ahead or dirty during active development, but changes should be committed and pushed back to the authoritative ARGONAS bare repo.
-- Do not create additional bare repos for MNEMOS under alternate paths.
+1. Create a handler in `api/handlers/your_resource.py`
+2. Import and mount the router in `api_server.py`
+3. Add request/response models to `api/models.py`
+4. Add auth: `user: UserContext = Depends(get_current_user)` on any protected route
 
-## Historical note
+## Running tests
 
-A stale legacy bare repo previously existed at `/mnt/argonas/git/mnemos-production.git`.
-It was moved aside during standardization to avoid ambiguity.
+```bash
+pytest tests/          # unit + integration (no live infra needed)
+pytest tests/test_live_e2e.py  # requires running MNEMOS instance
+```

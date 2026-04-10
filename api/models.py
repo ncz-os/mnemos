@@ -85,7 +85,7 @@ class MemoryCreateRequest(BaseModel):
     category: str = "facts"
     subcategory: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
-    source: Optional[str] = "openclaw"
+    source: Optional[str] = None
     verbatim_content: Optional[str] = None   # explicit override; defaults to content if omitted
     # v1 provenance + ownership
     owner_id: Optional[str] = None

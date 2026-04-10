@@ -4,9 +4,10 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 import api.lifecycle as _lc
+from api.auth import UserContext, get_current_user
 from api.models import KGTriple, KGTripleCreate, KGTripleListResponse, KGTripleUpdate
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ def _row_to_triple(row) -> KGTriple:
 
 
 @router.post("/triples", response_model=KGTriple, status_code=201)
-async def create_triple(req: KGTripleCreate):
+async def create_triple(req: KGTripleCreate, user: UserContext = Depends(get_current_user)):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     triple_id = f"kg_{uuid.uuid4().hex[:12]}"
@@ -78,6 +79,7 @@ async def list_triples(
     object_type: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    user: UserContext = Depends(get_current_user),
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
@@ -111,7 +113,7 @@ async def list_triples(
 
 
 @router.get("/timeline/{subject}", response_model=KGTripleListResponse)
-async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000)):
+async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000), user: UserContext = Depends(get_current_user)):
     """Get all triples for a subject ordered by valid_from (chronological history)."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
@@ -124,7 +126,7 @@ async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000)):
 
 
 @router.patch("/triples/{triple_id}", response_model=KGTriple)
-async def update_triple(triple_id: str, req: KGTripleUpdate):
+async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext = Depends(get_current_user)):
     """Partially update a KG triple."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
@@ -154,7 +156,7 @@ async def update_triple(triple_id: str, req: KGTripleUpdate):
 
 
 @router.delete("/triples/{triple_id}", status_code=204)
-async def delete_triple(triple_id: str):
+async def delete_triple(triple_id: str, user: UserContext = Depends(get_current_user)):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:

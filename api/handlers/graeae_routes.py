@@ -91,7 +91,7 @@ async def _write_audit_entry(
 # ── Consultation endpoint ─────────────────────────────────────────────────────
 
 @router.post("/graeae/consult")
-async def consult_graeae(request: ConsultationRequest):
+async def consult_graeae(request: ConsultationRequest, user: UserContext = Depends(get_current_user)):
     """Consult GRAEAE multi-provider consensus engine."""
     logger.info(
         f"GRAEAE Consultation: {request.task_type} "

@@ -4,9 +4,10 @@ import logging
 import uuid
 
 import asyncpg
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 import api.lifecycle as _lc
+from api.auth import UserContext, get_current_user
 from api.models import SessionIngestRequest, SessionIngestResponse
 
 logger = logging.getLogger(__name__)
@@ -14,7 +15,7 @@ router = APIRouter()
 
 
 @router.post("/ingest/session", response_model=SessionIngestResponse)
-async def ingest_session(request: SessionIngestRequest):
+async def ingest_session(request: SessionIngestRequest, user: UserContext = Depends(get_current_user)):
     """Ingest Claude Code session data into MNEMOS."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")

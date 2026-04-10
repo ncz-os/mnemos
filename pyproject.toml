@@ -8,6 +8,7 @@ version = "2.3.0"
 description = "MNEMOS memory infrastructure with GRAEAE reasoning"
 readme = "README.md"
 requires-python = ">=3.11"
+authors = [{ name = "MNEMOS Contributors" }]
 dependencies = [
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.30.0",
@@ -24,7 +25,12 @@ dependencies = [
   "psutil>=5.9.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/mnemos-dev/mnemos"
+Repository = "https://github.com/mnemos-dev/mnemos"
+
 [project.optional-dependencies]
+phi = ["openvino-genai", "fastembed"]
 dev = [
   "pytest>=8.0.0",
   "pytest-asyncio>=0.23.0",

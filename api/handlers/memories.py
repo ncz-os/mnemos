@@ -225,7 +225,7 @@ async def search_memories(
                     'threshold_triggered': COMPRESSION_RESULT_SET_THRESHOLD,
                 }
         else:
-            logger.warning("[PHASE2] CERBERUS unavailable, skipping compression")
+            logger.warning("[PHASE2] inference-server unavailable, skipping compression")
 
     response = MemoryListResponse(
         count=len(memories),

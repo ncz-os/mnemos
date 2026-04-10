@@ -38,7 +38,7 @@ All 16 improvements have been implemented with production-ready code, comprehens
 ## File Structure
 
 ```
-/opt/mnemos/
+/path/to/mnemos/
 ├── shared/
 │   ├── tracing.py ...................... OpenTelemetry integration
 │   └── audit.py ........................ Immutable audit logging
@@ -694,7 +694,7 @@ if muse_availability < 0.5: alert("Too many muses down")
 ## Git Commits & Repository Status
 
 All code has been committed to:
-- **Production**: `/opt/mnemos/` on your-host
+- **Production**: `/path/to/mnemos/` on your-host
 - **Git Repos**: 
   - `/mnt/datapool/git/mnemos.git` (your-storage-host)
   - `/mnt/datapool/git/graeae.git` (your-storage-host)

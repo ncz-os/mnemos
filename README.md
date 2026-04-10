@@ -161,16 +161,17 @@ All admin endpoints require root role. On personal installs (no auth), they are 
 | 3 | Medium-term | 50% |
 | 4 | Long-term / archive | task-type dependent |
 
+### Versioning and audit (v2, shipped)
+
+- Memory version history (`memory_versions` table) — every mutation auto-snapshots previous state
+- Diff and revert API: `GET /memories/{id}/versions`, `GET /memories/{id}/versions/{n}`, `GET /memories/{id}/diff`, `POST /memories/{id}/revert/{n}`
+- SHA-256 hash-chained audit log for GRAEAE responses: `GET /graeae/audit`, `GET /graeae/audit/verify`
+
 ---
 
 ## Roadmap
 
 These features are designed and scoped but not yet implemented.
-
-**v2 — Versioning and audit**
-- Memory version history (`memory_versions` table) — every mutation auto-snapshots previous state
-- Diff and revert API
-- SHA-256 hash-chained audit log for GRAEAE responses
 
 **v3 — Scale and federation**
 - OAuth/OIDC for enterprise authentication
@@ -366,4 +367,4 @@ curl -X POST http://localhost:5001/graeae/consult \
 
 ## License
 
-Apache 2.0 — see `LICENSE`.
+MIT — see `LICENSE`.

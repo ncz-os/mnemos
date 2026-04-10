@@ -249,7 +249,7 @@ assert_http "apikeys for nonexistent user → 404" "404" \
 header "9. Auth mode (temporary enable → test → restore)"
 # ─────────────────────────────────────────────────────────────────────────────
 
-CONFIG_PATH="/opt/mnemos/config.toml"
+CONFIG_PATH="${MNEMOS_CONFIG:-/opt/mnemos/config.toml}"
 
 # Create a root key for auth testing
 sudo -u postgres psql -d mnemos -c "UPDATE users SET role='root' WHERE id='verify_user';" > /dev/null

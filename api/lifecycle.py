@@ -27,7 +27,7 @@ COMPRESSION_RESULT_SET_THRESHOLD = 50 * 1024   # 50 KB
 COMPRESSION_ITEM_THRESHOLD = 5 * 1024           # 5 KB per item
 
 # DB config from environment (mirrors config.py defaults)
-PG_PASSWORD = os.getenv('PG_PASSWORD', 'mnemos_secure_password')
+PG_PASSWORD = os.getenv('PG_PASSWORD', 'changeme')
 PG_USER = os.getenv('PG_USER', 'mnemos_user')
 PG_DATABASE = os.getenv('PG_DATABASE', 'mnemos')
 PG_HOST = os.getenv('PG_HOST', 'localhost')
@@ -113,9 +113,9 @@ async def lifespan(app):
     provider = get_inference_provider()
     healthy = await provider.health_check()
     if healthy:
-        logger.info("ExternalInferenceProvider: CERBERUS llama-server CONNECTED")
+        logger.info("ExternalInferenceProvider: inference-server llama-server CONNECTED")
     else:
-        logger.warning("ExternalInferenceProvider: CERBERUS llama-server UNREACHABLE - compression disabled")
+        logger.warning("ExternalInferenceProvider: inference-server llama-server UNREACHABLE - compression disabled")
 
     yield
 
@@ -185,7 +185,7 @@ def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
 
 
 async def _get_embedding(text: str) -> list:
-    """Get embedding vector from nomic-embed-text on CERBERUS. Returns [] on failure."""
+    """Get embedding vector from nomic-embed-text on inference-server. Returns [] on failure."""
     try:
         async with httpx.AsyncClient(timeout=_EMBED_TIMEOUT) as client:
             r = await client.post(
