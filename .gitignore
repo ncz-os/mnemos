@@ -61,3 +61,23 @@ data/
 # Internal/inactive feature code — not for public distribution
 contrib/
 export_to_json_shards.py
+
+# Local env and secrets
+.env
+.env.*
+
+# Local logs and reports
+api.log
+*_REPORT_*.txt
+*_FIXES_*.txt
+
+# Local backup files
+*.bak
+*.bak.*
+
+# Local pytest and caches
+.pytest_cache/
+
+# Internal repo layout notes for ops clones only
+*.stale_*
+!.env.example

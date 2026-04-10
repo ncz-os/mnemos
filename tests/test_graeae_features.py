@@ -13,14 +13,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # Import GRAEAE modules
-import sys
-sys.path.insert(0, '/opt/mnemos/graeae/core')
-
-from queue import PersistentQueue, RequestStatus, QueuedRequest
-from circuit_breaker import CircuitBreaker, CircuitBreakerPool, CircuitState
-from quality_scorer import ResponseQualityScorer, QualityScore
-from semantic_cache import SemanticCache
-from rate_limiter import RateLimiter, RateLimiterPool, QueueBackpressure
+from graeae.core.queue import PersistentQueue, RequestStatus, QueuedRequest
+from graeae.core.circuit_breaker import CircuitBreaker, CircuitBreakerPool, CircuitState
+from graeae.core.quality_scorer import ResponseQualityScorer, QualityScore
+from graeae.core.semantic_cache import SemanticCache
+from graeae.core.rate_limiter import RateLimiter, RateLimiterPool, QueueBackpressure
 
 
 # ============================================================================

@@ -4,7 +4,7 @@
 import json, os, time, sys, urllib.request, urllib.error
 from datetime import datetime
 
-BASE = os.getenv("MNEMOS_BASE", "http://localhost:5002")
+BASE = os.getenv("MNEMOS_BASE", "http://localhost:5000")
 PASS = FAIL = 0
 created_ids = []
 
@@ -75,7 +75,7 @@ mem_id_2 = r.get("id") if r else None
 if mem_id_2: created_ids.append(mem_id_2)
 
 st, r, _ = req("POST", "/memories", {
-    "content": "MNEMOS live test: PYTHIA server runs Ubuntu 25.10 with twelve cores and thirty gigabytes memory.",
+    "content": "MNEMOS live test: the primary application host runs Linux with a documented hardware profile.",
     "category": "system_tests",
 })
 check("POST /memories #3 → 200", st == 200)
@@ -144,7 +144,7 @@ check("pgvector memory in filtered results",
 
 # Infrastructure query
 st, r, _ = req("POST", "/memories/search", {
-    "query": "PYTHIA Ubuntu server cores gigabytes memory",
+    "query": "primary application host Linux hardware profile",
     "limit": 10
 })
 check("Infrastructure search → 200", st == 200)
@@ -286,7 +286,7 @@ section("9c. Knowledge Graph")
 kg_id = None
 
 st, r, _ = req("POST", "/kg/triples", {
-    "subject": "PYTHIA",
+    "subject": "primary-host",
     "predicate": "runs",
     "object": "MNEMOS",
     "subject_type": "server",
@@ -297,13 +297,13 @@ check("POST /kg/triples -> 201", st == 201, f"got {st}: {r}")
 check("triple id starts with kg_", r and r.get("id", "").startswith("kg_"))
 kg_id = r.get("id") if r else None
 
-st, r, _ = req("GET", "/kg/triples?subject=PYTHIA")
+st, r, _ = req("GET", "/kg/triples?subject=primary-host")
 check("GET /kg/triples?subject -> 200", st == 200, f"got {st}")
 check("created triple in list",
       r and any(t["id"] == kg_id for t in r.get("triples", [])))
 
-st, r, _ = req("GET", "/kg/timeline/PYTHIA")
-check("GET /kg/timeline/PYTHIA -> 200", st == 200, f"got {st}")
+st, r, _ = req("GET", "/kg/timeline/primary-host")
+check("GET /kg/timeline/primary-host -> 200", st == 200, f"got {st}")
 check("timeline returns triples", r and r.get("count", 0) > 0)
 
 if kg_id:

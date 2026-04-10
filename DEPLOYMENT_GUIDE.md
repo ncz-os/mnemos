@@ -1,6 +1,6 @@
-# MNEMOS Deployment Guide - Bare Metal on PYTHIA
+# MNEMOS Deployment Guide - Bare Metal Linux
 
-**Target**: PYTHIA (your-host)
+**Target**: Linux host (bare metal or VM)
 **OS**: Linux (Ubuntu/Debian)
 **Python**: 3.10+
 **Database**: PostgreSQL 13+
@@ -9,9 +9,9 @@
 
 ## Pre-Deployment Checklist
 
-- [ ] SSH access to PYTHIA (your-host)
+- [ ] SSH access to your Linux host
 - [ ] Python 3.10+ installed
-- [ ] PostgreSQL 13+ running on PYTHIA
+- [ ] PostgreSQL 13+ running on the target host
 - [ ] Network access to Graeae (your-host:5001)
 - [ ] API credentials for LLM providers (optional)
 
@@ -19,7 +19,7 @@
 
 ## Step 1: Prepare System
 
-### SSH into PYTHIA
+### SSH into the target host
 
 ```bash
 ssh user@your-host
@@ -594,7 +594,7 @@ top -p $(pgrep -f "python")      # Monitor CPU/Memory
 
 ## Next Steps
 
-1. Deploy to PYTHIA following steps above
+1. Deploy to your target Linux host following the steps above
 2. Monitor service stability for 24-48 hours
 3. Setup automated health checks
 4. Configure backups and disaster recovery
@@ -605,6 +605,6 @@ top -p $(pgrep -f "python")      # Monitor CPU/Memory
 
 **Deployment Complete!**
 
-Your MNEMOS API is now running on PYTHIA at `http://your-host:5000`
+Your MNEMOS API is now running on your host at `http://your-host:5000`
 
 For API documentation, see `API_DOCUMENTATION.md`
