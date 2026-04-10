@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """MNEMOS Live End-to-End Test Suite v2"""
 
-import json, os, time, sys, urllib.request, urllib.error
-from datetime import datetime
+import json
+import os
+import time
+import sys
+import urllib.request
+import urllib.error
 
 BASE = os.getenv("MNEMOS_BASE", "http://localhost:5000")
 PASS = FAIL = 0
@@ -20,8 +24,10 @@ def req(method, path, body=None, timeout=30):
             content = json.loads(raw) if raw.strip() else {}
             return status, content, None
     except urllib.error.HTTPError as e:
-        try: content = json.loads(e.read())
-        except Exception: content = {}
+        try:
+            content = json.loads(e.read())
+        except Exception:
+            content = {}
         return e.code, content, None
     except Exception as e:
         return None, None, str(e)
@@ -29,9 +35,11 @@ def req(method, path, body=None, timeout=30):
 def check(name, condition, detail=""):
     global PASS, FAIL
     if condition:
-        PASS += 1; print(f"  \u2713 {name}")
+        PASS += 1
+        print(f"  \u2713 {name}")
     else:
-        FAIL += 1; print(f"  \u2717 {name}" + (f": {detail}" if detail else ""))
+        FAIL += 1
+        print(f"  \u2717 {name}" + (f": {detail}" if detail else ""))
 
 def section(title):
     print(f"\n{'='*60}\n  {title}\n{'='*60}")
@@ -63,7 +71,8 @@ check("id starts with mem_", r and r.get("id","").startswith("mem_"))
 check("category persisted", r and r.get("category") == "system_tests")
 check("created timestamp present", r and bool(r.get("created")))
 mem_id_1 = r.get("id") if r else None
-if mem_id_1: created_ids.append(mem_id_1)
+if mem_id_1:
+    created_ids.append(mem_id_1)
 print(f"    id={mem_id_1}")
 
 st, r, _ = req("POST", "/memories", {
@@ -72,7 +81,8 @@ st, r, _ = req("POST", "/memories", {
 })
 check("POST /memories #2 → 200", st == 200)
 mem_id_2 = r.get("id") if r else None
-if mem_id_2: created_ids.append(mem_id_2)
+if mem_id_2:
+    created_ids.append(mem_id_2)
 
 st, r, _ = req("POST", "/memories", {
     "content": "MNEMOS live test: the primary application host runs Linux with a documented hardware profile.",
@@ -80,7 +90,8 @@ st, r, _ = req("POST", "/memories", {
 })
 check("POST /memories #3 → 200", st == 200)
 mem_id_3 = r.get("id") if r else None
-if mem_id_3: created_ids.append(mem_id_3)
+if mem_id_3:
+    created_ids.append(mem_id_3)
 
 time.sleep(2)  # Let FTS settle
 
@@ -206,7 +217,7 @@ check("POST /graeae/consult → 200", st == 200, err or st)
 check("all_responses present", r and "all_responses" in r)
 providers = r.get("all_responses",{}) if r else {}
 successes = [k for k,v in providers.items() if v.get("status") == "success"]
-check(f"All 6 providers queried", len(providers) == 6, f"got {len(providers)}")
+check("All 6 providers queried", len(providers) == 6, f"got {len(providers)}")
 check("≥4 providers succeeded", len(successes) >= 4, f"successes: {successes}")
 best = max(providers.items(), key=lambda x: x[1].get("final_score",0), default=(None,{}))
 check("best provider has response text", bool(best[1].get("response_text","")))
@@ -229,7 +240,8 @@ for label, content_val in [("empty string", ""), ("whitespace only", "   "), ("n
 long_content = "MNEMOS live test large content. " * 100  # ~3200 chars
 st, r, _ = req("POST", "/memories", {"content": long_content, "category": "system_tests"})
 check("Large content (3200 chars) accepted", st == 200)
-if r and r.get("id"): created_ids.append(r["id"])
+if r and r.get("id"):
+    created_ids.append(r["id"])
 
 # ─── 8. DELETE ───────────────────────────────────────────────
 section("8. DELETE endpoint")
@@ -319,7 +331,8 @@ section("9. Cleanup (delete all test memories)")
 deleted = 0
 for mid in created_ids:
     st, _, _ = req("DELETE", f"/memories/{mid}")
-    if st in (204, 404): deleted += 1
+    if st in (204, 404):
+        deleted += 1
 check(f"Cleaned {deleted}/{len(created_ids)} test memories",
       deleted == len(created_ids), f"only {deleted}/{len(created_ids)}")
 
