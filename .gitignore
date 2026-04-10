@@ -80,3 +80,4 @@ api.log
 
 # Internal repo layout notes for ops clones only
 *.stale_*
+!.env.example
