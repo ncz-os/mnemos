@@ -1,7 +1,7 @@
 # MNEMOS API Documentation
 
 **Base URL**: `http://localhost:5000`
-**Version**: 2.0.0
+**Version**: 2.3.0
 **Format**: JSON
 
 ---
@@ -23,9 +23,7 @@
 
 ## Authentication
 
-**Current**: No authentication required (deploy behind firewall)
-
-**Future**: JWT tokens will be supported
+**Current**: Personal installs may run without auth. Team and enterprise installs support API-key authentication with row-level security.
 
 ---
 
@@ -41,7 +39,7 @@ Check API server health
   "status": "healthy",
   "timestamp": "2026-02-05T14:30:00.000Z",
   "database_connected": true,
-  "version": "2.0.0"
+  "version": "2.3.0"
 }
 ```
 

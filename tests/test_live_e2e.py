@@ -4,7 +4,7 @@
 import json, os, time, sys, urllib.request, urllib.error
 from datetime import datetime
 
-BASE = os.getenv("MNEMOS_BASE", "http://localhost:5002")
+BASE = os.getenv("MNEMOS_BASE", "http://localhost:5000")
 PASS = FAIL = 0
 created_ids = []
 
@@ -75,7 +75,7 @@ mem_id_2 = r.get("id") if r else None
 if mem_id_2: created_ids.append(mem_id_2)
 
 st, r, _ = req("POST", "/memories", {
-    "content": "MNEMOS live test: PYTHIA server runs Ubuntu 25.10 with twelve cores and thirty gigabytes memory.",
+    "content": "MNEMOS live test: the primary application host runs Linux with a documented hardware profile.",
     "category": "system_tests",
 })
 check("POST /memories #3 → 200", st == 200)
@@ -144,7 +144,7 @@ check("pgvector memory in filtered results",
 
 # Infrastructure query
 st, r, _ = req("POST", "/memories/search", {
-    "query": "PYTHIA Ubuntu server cores gigabytes memory",
+    "query": "primary application host Linux hardware profile",
     "limit": 10
 })
 check("Infrastructure search → 200", st == 200)

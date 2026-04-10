@@ -1,6 +1,6 @@
-# MNEMOS Deployment Guide - Bare Metal on PYTHIA
+# MNEMOS Deployment Guide - Bare Metal Linux
 
-**Target**: PYTHIA (your-host)
+**Target**: Linux host (bare metal or VM)
 **OS**: Linux (Ubuntu/Debian)
 **Python**: 3.10+
 **Database**: PostgreSQL 13+
@@ -9,9 +9,9 @@
 
 ## Pre-Deployment Checklist
 
-- [ ] SSH access to PYTHIA (your-host)
+- [ ] SSH access to your Linux host
 - [ ] Python 3.10+ installed
-- [ ] PostgreSQL 13+ running on PYTHIA
+- [ ] PostgreSQL 13+ running on the target host
 - [ ] Network access to Graeae (your-host:5001)
 - [ ] API credentials for LLM providers (optional)
 
@@ -19,7 +19,7 @@
 
 ## Step 1: Prepare System
 
-### SSH into PYTHIA
+### SSH into the target host
 
 ```bash
 ssh user@your-host
