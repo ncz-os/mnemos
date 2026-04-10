@@ -23,7 +23,10 @@ PG_CONFIG = {
 # ============================================================================
 
 OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
-OLLAMA_EMBED_URL = f'{OLLAMA_HOST}/api/embeddings'
+# OLLAMA_EMBED_HOST is separate: embeddings stay on CERBERUS (nomic-embed-text, 768-dim)
+# even when OLLAMA_HOST points to the local Phi inference server.
+OLLAMA_EMBED_HOST = os.getenv('OLLAMA_EMBED_HOST', 'http://192.0.2.96:11434')
+OLLAMA_EMBED_URL = f'{OLLAMA_EMBED_HOST}/api/embeddings'
 OLLAMA_EMBED_MODEL = os.getenv('OLLAMA_EMBED_MODEL', 'nomic-embed-text')
 OLLAMA_EMBED_TIMEOUT = 10  # seconds
 

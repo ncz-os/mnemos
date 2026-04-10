@@ -19,7 +19,9 @@ import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import numpy as np
 import openvino_genai as ov_genai
+from fastembed import TextEmbedding
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -38,6 +40,7 @@ DEVICE = os.getenv("PHI_DEVICE", "GPU")   # GPU = Intel Iris Xe; CPU = fallback
 
 _pipe: Optional[ov_genai.LLMPipeline] = None
 _inference_lock: Optional[asyncio.Lock] = None   # created in lifespan; LLMPipeline is not concurrent-safe
+_embed_model: Optional[TextEmbedding] = None     # fastembed nomic-embed-text-v1.5, CPU, 768-dim
 
 
 @asynccontextmanager
@@ -53,6 +56,12 @@ async def lifespan(app: FastAPI):
         logger.warning(f"GPU load failed ({e}), falling back to CPU")
         _pipe = ov_genai.LLMPipeline(MODEL_PATH, "CPU")
         logger.info(f"Model loaded on CPU in {time.time() - t0:.1f}s")
+    # Load embedding model (CPU, runs independently of GPU LLM)
+    global _embed_model
+    logger.info("Loading nomic-embed-text-v1.5 embedding model (CPU)")
+    t1 = time.time()
+    _embed_model = TextEmbedding("nomic-ai/nomic-embed-text-v1.5")
+    logger.info(f"Embedding model ready in {time.time() - t1:.1f}s")
     yield
     logger.info("Phi server shutting down")
 
@@ -191,6 +200,24 @@ async def openai_completions(request: CompletionRequest):
         model=request.model,
         choices=[CompletionChoice(text=text)],
     )
+
+
+class EmbedRequest(BaseModel):
+    model: str = "nomic-embed-text"
+    prompt: str
+
+
+@app.post("/api/embeddings")
+async def embeddings(request: EmbedRequest):
+    """Ollama-compatible embeddings endpoint using fastembed nomic-embed-text-v1.5."""
+    if _embed_model is None:
+        raise HTTPException(status_code=503, detail="Embedding model not loaded")
+    loop = asyncio.get_running_loop()
+    vec = await loop.run_in_executor(
+        None,
+        lambda: list(_embed_model.embed([request.prompt]))[0].tolist(),
+    )
+    return {"embedding": vec}
 
 
 if __name__ == "__main__":

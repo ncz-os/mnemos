@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import asyncpg
+import httpx
 from fastapi import HTTPException
 import redis.asyncio as aioredis
 
@@ -29,6 +30,11 @@ PG_PASSWORD = os.getenv('PG_PASSWORD', 'mnemos_secure_password')
 PG_USER = os.getenv('PG_USER', 'mnemos_user')
 PG_DATABASE = os.getenv('PG_DATABASE', 'mnemos')
 PG_HOST = os.getenv('PG_HOST', 'localhost')
+
+# Embedding config (for vector search, MOD-02)
+_EMBED_HOST = os.getenv('OLLAMA_EMBED_HOST', 'http://192.0.2.96:11434')
+_EMBED_MODEL = os.getenv('OLLAMA_EMBED_MODEL', 'nomic-embed-text')
+_EMBED_TIMEOUT = float(os.getenv('OLLAMA_EMBED_TIMEOUT', '10'))
 
 # ── Singleton globals ────────────────────────────────────────────────────────
 _pool: Optional[asyncpg.Pool] = None
@@ -133,6 +139,57 @@ def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
         quality_rating=row.get('quality_rating'),
         compressed_content=row.get('compressed_content') if include_compressed else None,
     )
+
+
+async def _get_embedding(text: str) -> list:
+    """Get embedding vector from nomic-embed-text on CERBERUS. Returns [] on failure."""
+    try:
+        async with httpx.AsyncClient(timeout=_EMBED_TIMEOUT) as client:
+            r = await client.post(
+                f"{_EMBED_HOST}/api/embeddings",
+                json={"model": _EMBED_MODEL, "prompt": text[:2000]},
+            )
+            r.raise_for_status()
+            return r.json().get("embedding", [])
+    except Exception as e:
+        logger.warning(f"[EMBED] Failed to get embedding: {e}")
+        return []
+
+
+async def _vector_search(conn, embedding: list, limit: int,
+                         category=None, subcategory=None,
+                         select_cols=None) -> list:
+    """pgvector cosine similarity search. Returns rows ordered by similarity desc."""
+    if select_cols is None:
+        select_cols = _MEMORY_COLS
+    vec_literal = "[" + ",".join(str(x) for x in embedding) + "]"
+    sim_col = f"1 - (embedding <=> '{vec_literal}'::vector) AS similarity"
+    base = f"SELECT {select_cols}, {sim_col} FROM memories WHERE embedding IS NOT NULL"
+    try:
+        if category and subcategory:
+            return await conn.fetch(
+                f"{base} AND category=$1 AND subcategory=$2 "
+                "ORDER BY embedding <=> $3::vector LIMIT $4",
+                category, subcategory, vec_literal, limit,
+            )
+        elif category:
+            return await conn.fetch(
+                f"{base} AND category=$1 ORDER BY embedding <=> $2::vector LIMIT $3",
+                category, vec_literal, limit,
+            )
+        elif subcategory:
+            return await conn.fetch(
+                f"{base} AND subcategory=$1 ORDER BY embedding <=> $2::vector LIMIT $3",
+                subcategory, vec_literal, limit,
+            )
+        else:
+            return await conn.fetch(
+                f"{base} ORDER BY embedding <=> $1::vector LIMIT $2",
+                vec_literal, limit,
+            )
+    except Exception as e:
+        logger.error(f"[VECTOR] pgvector search failed: {e}")
+        return []
 
 
 async def _fts_fetch(conn, query: str, limit: int,

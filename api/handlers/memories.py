@@ -13,7 +13,9 @@ from api.lifecycle import (
     _MEMORY_COLS,
     _fts_fetch,
     _get_cache_key,
+    _get_embedding,
     _row_to_memory,
+    _vector_search,
     COMPRESSION_ITEM_THRESHOLD,
     COMPRESSION_RESULT_SET_THRESHOLD,
 )
@@ -22,6 +24,7 @@ from api.models import (
     MemoryItem,
     MemoryListResponse,
     MemorySearchRequest,
+    MemoryUpdateRequest,
     RehydrationRequest,
     RehydrationResponse,
 )
@@ -110,6 +113,7 @@ async def search_memories(request: MemorySearchRequest):
     cache_key = _get_cache_key(
         "search", request.query, request.limit,
         request.category or "", request.subcategory or "",
+        "semantic" if request.semantic else "fts",
     )
 
     if _lc._cache and not request.include_compressed:
@@ -125,10 +129,25 @@ async def search_memories(request: MemorySearchRequest):
         raise HTTPException(status_code=503, detail="Database pool not available")
 
     async with _lc._pool.acquire() as conn:
-        rows = await _fts_fetch(
-            conn, request.query, request.limit,
-            request.category, request.subcategory,
-        )
+        if request.semantic:
+            embedding = await _get_embedding(request.query)
+            if not embedding:
+                logger.warning("[VECTOR] Embedding failed, falling back to FTS")
+                rows = await _fts_fetch(
+                    conn, request.query, request.limit,
+                    request.category, request.subcategory,
+                )
+            else:
+                logger.info(f"[VECTOR] Semantic search: {len(embedding)}-dim vector")
+                rows = await _vector_search(
+                    conn, embedding, request.limit,
+                    request.category, request.subcategory,
+                )
+        else:
+            rows = await _fts_fetch(
+                conn, request.query, request.limit,
+                request.category, request.subcategory,
+            )
 
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
     compression_applied = False
@@ -217,6 +236,48 @@ async def create_memory(request: MemoryCreateRequest):
         except Exception:
             pass
     return _row_to_memory(row)
+
+
+@router.patch("/memories/{memory_id}", response_model=MemoryItem)
+async def update_memory(memory_id: str, request: MemoryUpdateRequest):
+    """Partially update a memory (content, category, subcategory, metadata)."""
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    updates = {}
+    if request.content is not None:
+        if not request.content.strip():
+            raise HTTPException(status_code=422, detail="Memory content cannot be empty")
+        updates["content"] = request.content
+    if request.category is not None:
+        updates["category"] = request.category
+    if request.subcategory is not None:
+        updates["subcategory"] = request.subcategory
+    if request.metadata is not None:
+        updates["metadata"] = json.dumps(request.metadata)
+    if not updates:
+        raise HTTPException(status_code=422, detail="No fields to update")
+
+    set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
+    set_clauses.append(f"updated=NOW()")
+    values = list(updates.values())
+
+    async with _lc._pool.acquire() as conn:
+        row = await conn.fetchrow(f"SELECT id FROM memories WHERE id=$1", memory_id)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+        await conn.execute(
+            f"UPDATE memories SET {', '.join(set_clauses)} WHERE id=$1",
+            memory_id, *values,
+        )
+        row = await conn.fetchrow(
+            f"SELECT {_lc._MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
+        )
+    if _lc._cache:
+        try:
+            await _lc._cache.delete("stats:global")
+        except Exception:
+            pass
+    return _lc._row_to_memory(row)
 
 
 @router.delete("/memories/{memory_id}", status_code=204)

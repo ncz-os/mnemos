@@ -66,6 +66,7 @@ class MemorySearchRequest(BaseModel):
     category: Optional[str] = None
     subcategory: Optional[str] = None
     include_compressed: Optional[bool] = False
+    semantic: Optional[bool] = False   # True = pgvector cosine similarity; False = FTS
 
 
 class MemoryCreateRequest(BaseModel):
@@ -107,6 +108,13 @@ class SessionIngestResponse(BaseModel):
     session_id: str
     stored_count: int
     memory_ids: List[str]
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: Optional[str] = None
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 # ── Knowledge Graph models ────────────────────────────────────────────────────

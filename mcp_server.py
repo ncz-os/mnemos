@@ -43,9 +43,12 @@ async def _get(path: str, params: dict | None = None) -> Any:
         return r.json() if r.content else {}
 
 
-async def _post(path: str, body: dict) -> Any:
+async def _post(path: str, body: dict, method: str = "POST") -> Any:
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.post(f"{MNEMOS_BASE}{path}", json=body)
+        if method == "PATCH":
+            r = await client.patch(f"{MNEMOS_BASE}{path}", json=body)
+        else:
+            r = await client.post(f"{MNEMOS_BASE}{path}", json=body)
         r.raise_for_status()
         return r.json() if r.content else {}
 
@@ -75,8 +78,28 @@ async def list_tools() -> list[types.Tool]:
                     "limit":       {"type": "integer", "default": 10},
                     "category":    {"type": "string",  "description": "Optional category filter"},
                     "subcategory": {"type": "string",  "description": "Optional subcategory filter"},
+                    "semantic":    {"type": "boolean", "default": False,
+                                   "description": "True = pgvector cosine similarity; False = full-text search"},
                 },
                 "required": ["query"],
+            },
+        ),
+        types.Tool(
+            name="update_memory",
+            description=(
+                "Partially update an existing memory. Supply only the fields you want to change. "
+                "At least one of content, category, subcategory, or metadata must be provided."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "string"},
+                    "content":     {"type": "string",  "description": "New content (replaces existing)"},
+                    "category":    {"type": "string",  "description": "New category"},
+                    "subcategory": {"type": "string",  "description": "New subcategory"},
+                    "metadata":    {"type": "object",  "description": "New metadata (replaces existing)"},
+                },
+                "required": ["memory_id"],
             },
         ),
         types.Tool(
@@ -229,7 +252,16 @@ async def _dispatch(name: str, args: dict) -> Any:
             body["category"] = args["category"]
         if args.get("subcategory"):
             body["subcategory"] = args["subcategory"]
+        if args.get("semantic"):
+            body["semantic"] = True
         return await _post("/memories/search", body)
+
+    elif name == "update_memory":
+        body = {}
+        for field in ("content", "category", "subcategory", "metadata"):
+            if args.get(field) is not None:
+                body[field] = args[field]
+        return await _post(f"/memories/{args['memory_id']}", body, method="PATCH")
 
     elif name == "get_memory":
         return await _get(f"/memories/{args['memory_id']}")
