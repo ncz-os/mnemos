@@ -32,7 +32,7 @@ PG_DATABASE = os.getenv('PG_DATABASE', 'mnemos')
 PG_HOST = os.getenv('PG_HOST', 'localhost')
 
 # Embedding config (for vector search, MOD-02)
-_EMBED_HOST = os.getenv('OLLAMA_EMBED_HOST', 'http://192.0.2.96:11434')
+_EMBED_HOST = os.getenv('OLLAMA_EMBED_HOST', 'http://localhost:11434')
 _EMBED_MODEL = os.getenv('OLLAMA_EMBED_MODEL', 'nomic-embed-text')
 _EMBED_TIMEOUT = float(os.getenv('OLLAMA_EMBED_TIMEOUT', '10'))
 

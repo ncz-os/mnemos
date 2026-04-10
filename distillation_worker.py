@@ -3,7 +3,7 @@
 MNEMOS Background Memory Distillation Worker (v4 - Mistral Optimized)
 
 Configuration (2026-02-19):
-  - Mistral 7B Instruct v0.3 on CERBERUS Ollama (192.0.2.96:11434)
+  - Mistral 7B Instruct v0.3 on Ollama (configured via OLLAMA_HOST)
   - Dynamic timeouts based on content size
   - Transaction support & attempt tracking
   - Progress monitoring

@@ -1,7 +1,9 @@
 import json
+import os
 from pathlib import Path
 
-API_KEYS_FILE = Path.home() / '.api_keys_master.json'
+_DEFAULT_KEYS_PATH = os.path.expanduser('~/.config/mnemos/api_keys.json')
+API_KEYS_FILE = Path(os.getenv('MNEMOS_KEYS_PATH', _DEFAULT_KEYS_PATH))
 
 # Aliases from graeae provider names to master JSON keys
 _PROVIDER_ALIASES = {

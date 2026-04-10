@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """MNEMOS Live End-to-End Test Suite v2"""
 
-import json, time, sys, urllib.request, urllib.error
+import json, os, time, sys, urllib.request, urllib.error
 from datetime import datetime
 
-BASE = "http://192.0.2.67:5002"
+BASE = os.getenv("MNEMOS_BASE", "http://localhost:5002")
 PASS = FAIL = 0
 created_ids = []
 

@@ -6,8 +6,8 @@ Transport: stdio (Claude Code spawns this process directly)
 Backend:   MNEMOS REST API (default http://localhost:5002, override via MNEMOS_BASE env var)
 
 For remote MNEMOS (e.g. from macOS connecting to PYTHIA):
-  Set MNEMOS_BASE=http://192.0.2.67:5002 in the MCP server config,
-  or use SSH transport: command=ssh, args=[jasonperlow@192.0.2.67,
+  Set MNEMOS_BASE=http://<host>:5002 in the MCP server config,
+  or use SSH transport: command=ssh, args=[user@host,
   /opt/mnemos/venv/bin/python, /opt/mnemos/mcp_server.py]
 
 IMPORTANT: All logging must go to stderr. Any stdout output corrupts MCP JSON-RPC framing.

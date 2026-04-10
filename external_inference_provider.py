@@ -10,7 +10,7 @@ Used for:
   - Embedding pre-processing (compress before embedding)
 
 Configuration:
-  - Endpoint: http://192.0.2.96:8000 (CERBERUS llama-server)
+  - Endpoint: <EXTERNAL_INFERENCE_ENDPOINT> (configure via env var)
   - Model: Llama-2-7B-Chat-Q4_K_M.gguf
   - Context window: 3072 tokens
   - Max safe prompt tokens: ~2000 (leaves room for generation)
@@ -39,7 +39,7 @@ class ExternalInferenceProvider:
                  timeout: float = 90.0):
         self.endpoint = endpoint or os.getenv(
             "EXTERNAL_INFERENCE_ENDPOINT",
-            "http://192.0.2.96:8000"
+            "http://localhost:8000"
         )
         self.model = model or os.getenv(
             "EXTERNAL_INFERENCE_MODEL",

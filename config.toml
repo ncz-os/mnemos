@@ -109,7 +109,7 @@ tertiary = "groq_llama_3_3"
 
 [routing]
 enabled = true
-graeae_url = "http://192.0.2.67:5001"
+graeae_url = "http://localhost:5001"  # Override via GRAEAE_URL env var
 fallback_timeout = 5
 
 [routing.modes]
