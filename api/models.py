@@ -53,6 +53,15 @@ class MemoryItem(BaseModel):
     quality_rating: Optional[int] = None
     compressed_content: Optional[str] = None
     verbatim_content: Optional[str] = None
+    # v1 provenance + ownership
+    owner_id: Optional[str] = None
+    group_id: Optional[str] = None
+    namespace: Optional[str] = None
+    permission_mode: Optional[int] = None
+    source_model: Optional[str] = None
+    source_provider: Optional[str] = None
+    source_session: Optional[str] = None
+    source_agent: Optional[str] = None
 
 
 class MemoryListResponse(BaseModel):
@@ -78,6 +87,13 @@ class MemoryCreateRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     source: Optional[str] = "openclaw"
     verbatim_content: Optional[str] = None   # explicit override; defaults to content if omitted
+    # v1 provenance + ownership
+    owner_id: Optional[str] = None
+    namespace: Optional[str] = None
+    source_model: Optional[str] = None
+    source_provider: Optional[str] = None
+    source_session: Optional[str] = None
+    source_agent: Optional[str] = None
 
 
 class RehydrationRequest(BaseModel):
@@ -172,3 +188,35 @@ class BulkCreateResponse(BaseModel):
     created: int
     memory_ids: List[str]
     errors: List[str] = []
+
+
+# ── Admin / auth models ───────────────────────────────────────────────────────
+
+class ApiKeyCreateRequest(BaseModel):
+    label: Optional[str] = None
+
+
+class ApiKeyResponse(BaseModel):
+    id: str
+    user_id: str
+    key_prefix: str
+    label: Optional[str] = None
+    created_at: str
+    last_used: Optional[str] = None
+    revoked: bool
+    raw_key: Optional[str] = None   # only present on creation; never returned again
+
+
+class UserCreateRequest(BaseModel):
+    id: str
+    display_name: Optional[str] = None
+    email: Optional[str] = None
+    role: str = "user"
+
+
+class UserResponse(BaseModel):
+    id: str
+    display_name: Optional[str] = None
+    email: Optional[str] = None
+    role: str
+    created_at: str

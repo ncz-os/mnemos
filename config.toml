@@ -144,3 +144,17 @@ hooks = true
 quality_tracking = true
 audit_logging = true
 semantic_search = true
+
+[deployment]
+profile = "personal"
+
+[auth]
+enabled = false
+personal_user_id = "default"
+default_namespace = "default"
+mode = "bearer"
+
+[multiuser]
+rls_enabled = false
+namespaces_enabled = false
+max_keys_per_user = 10

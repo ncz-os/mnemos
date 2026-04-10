@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import tomllib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -40,6 +41,7 @@ _EMBED_TIMEOUT = float(os.getenv('OLLAMA_EMBED_TIMEOUT', '10'))
 _pool: Optional[asyncpg.Pool] = None
 _cache: Optional[aioredis.Redis] = None
 _inference_provider: Optional[ExternalInferenceProvider] = None
+_rls_enabled: bool = False   # set from config at startup; read by handlers
 
 
 def get_inference_provider() -> ExternalInferenceProvider:
@@ -49,13 +51,31 @@ def get_inference_provider() -> ExternalInferenceProvider:
     return _inference_provider
 
 
+def _load_config() -> dict:
+    """Load config.toml from standard locations. Returns empty dict if not found."""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.toml"),
+        "/etc/mnemos/config.toml",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    return tomllib.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to parse {path}: {e}")
+    return {}
+
+
 # ── App lifespan ─────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, and inference provider."""
-    global _pool, _cache
+    global _pool, _cache, _rls_enabled
     logger.info("Starting MNEMOS API Server v2.3.0 (hierarchy + knowledge graph + MCP)")
+
+    config = _load_config()
 
     try:
         _pool = await asyncpg.create_pool(
@@ -63,10 +83,22 @@ async def lifespan(app):
             database=PG_DATABASE, host=PG_HOST,
             min_size=5, max_size=20,
         )
+        app.state.pool = _pool   # auth.py reads this via request.app.state.pool
         logger.info("asyncpg connection pool initialized (min=5, max=20)")
     except Exception as e:
         logger.error(f"Failed to create DB pool: {e}")
         raise
+
+    # Configure auth (personal profile: auth.enabled=false → no-op beyond singleton)
+    from api.auth import configure_auth
+    configure_auth(config.get("auth", {}))
+
+    # RLS enforcement flag
+    _rls_enabled = config.get("multiuser", {}).get("rls_enabled", False)
+    if _rls_enabled:
+        logger.info("Row Level Security: ENABLED (team/enterprise profile)")
+    else:
+        logger.info("Row Level Security: DISABLED (personal profile)")
 
     try:
         _cache = aioredis.from_url("redis://localhost:6379", decode_responses=True)
@@ -115,7 +147,9 @@ async def _get_db():
 
 _MEMORY_COLS = (
     "id, content, category, subcategory, created, updated, "
-    "metadata, quality_rating, compressed_content, verbatim_content"
+    "metadata, quality_rating, compressed_content, verbatim_content, "
+    "owner_id, group_id, namespace, permission_mode, "
+    "source_model, source_provider, source_session, source_agent"
 )
 
 
@@ -139,6 +173,14 @@ def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
         quality_rating=row.get('quality_rating'),
         compressed_content=row.get('compressed_content') if include_compressed else None,
         verbatim_content=row.get('verbatim_content'),
+        owner_id=row.get('owner_id'),
+        group_id=row.get('group_id'),
+        namespace=row.get('namespace'),
+        permission_mode=row.get('permission_mode'),
+        source_model=row.get('source_model'),
+        source_provider=row.get('source_provider'),
+        source_session=row.get('source_session'),
+        source_agent=row.get('source_agent'),
     )
 
 

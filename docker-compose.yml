@@ -1,0 +1,50 @@
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: mnemos_user
+      POSTGRES_PASSWORD: mnemos_local
+      POSTGRES_DB: mnemos
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/migrations.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./db/migrations_v1_multiuser.sql:/docker-entrypoint-initdb.d/02-multiuser.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mnemos_user -d mnemos"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    entrypoint: >
+      sh -c "ollama serve & sleep 5 && ollama pull nomic-embed-text && wait"
+
+  mnemos:
+    build:
+      context: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PG_USER: mnemos_user
+      PG_PASSWORD: mnemos_local
+      PG_DATABASE: mnemos
+      PG_HOST: postgres
+      OLLAMA_EMBED_HOST: http://ollama:11434
+      GRAEAE_URL: http://host.docker.internal:5001
+      MNEMOS_PROFILE: personal
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  ollama_data:
