@@ -101,7 +101,8 @@ Score (0-100):"""
         )
         result = response.json()
         try:
-            raw = result.get("response", "80").strip()
+            # /v1/completions returns choices[0].text
+            raw = result.get("choices", [{}])[0].get("text", "80").strip()
             score = int(''.join(filter(str.isdigit, raw.split()[0])))
             return max(0, min(100, score))
         except Exception:

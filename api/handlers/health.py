@@ -19,7 +19,7 @@ async def health_check() -> HealthResponse:
         status="healthy",
         timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         database_connected=True,
-        version="2.2.0",
+        version="2.3.0",
     )
 
 

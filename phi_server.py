@@ -37,11 +37,13 @@ MODEL_PATH = os.getenv(
 DEVICE = os.getenv("PHI_DEVICE", "GPU")   # GPU = Intel Iris Xe; CPU = fallback
 
 _pipe: Optional[ov_genai.LLMPipeline] = None
+_inference_lock: Optional[asyncio.Lock] = None   # created in lifespan; LLMPipeline is not concurrent-safe
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pipe
+    global _pipe, _inference_lock
+    _inference_lock = asyncio.Lock()
     logger.info(f"Loading Phi-3.5 Mini from {MODEL_PATH} on device={DEVICE}")
     t0 = time.time()
     try:
@@ -77,6 +79,30 @@ class GenerateResponse(BaseModel):
     eval_count: Optional[int] = None
 
 
+# OpenAI-compatible completions (used by distillation_worker.py)
+class CompletionRequest(BaseModel):
+    model: str = "phi-3.5-mini"
+    prompt: str
+    max_tokens: Optional[int] = None
+    temperature: float = 0.1
+    top_p: float = 0.9
+    stream: bool = False
+    options: Optional[dict] = None   # absorb Ollama-style options if passed
+
+
+class CompletionChoice(BaseModel):
+    text: str
+    index: int = 0
+    finish_reason: str = "stop"
+
+
+class CompletionResponse(BaseModel):
+    id: str = "cmpl-phi"
+    object: str = "text_completion"
+    model: str
+    choices: list[CompletionChoice]
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -101,48 +127,69 @@ async def list_models():
 
 @app.post("/api/generate", response_model=GenerateResponse)
 async def generate(request: GenerateRequest):
-    if _pipe is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+    """Ollama-compatible generation endpoint."""
     if request.stream:
         raise HTTPException(status_code=400, detail="Streaming not supported; use stream=false")
-
     opts = request.options or {}
-    config = ov_genai.GenerationConfig()
-    config.max_new_tokens = int(opts.get("num_predict", opts.get("max_new_tokens", 600)))
-    config.temperature = float(opts.get("temperature", 0.1))
-    if config.temperature < 0.05:
-        config.do_sample = False
-    else:
-        config.do_sample = True
-        config.top_p = float(opts.get("top_p", 0.9))
+    max_tokens = int(opts.get("num_predict", opts.get("max_new_tokens", 600)))
+    temperature = float(opts.get("temperature", 0.1))
+    top_p = float(opts.get("top_p", 0.9))
 
-    # Build prompt — prepend system message if provided
-    full_prompt = request.prompt
+    # Apply system message if provided
+    prompt = request.prompt
     if request.system:
-        full_prompt = f"<|system|>\n{request.system}<|end|>\n<|user|>\n{request.prompt}<|end|>\n<|assistant|>\n"
-    elif "<|user|>" not in request.prompt and "<|system|>" not in request.prompt:
-        # Auto-wrap bare prompts in Phi-3.5 chat template
-        full_prompt = f"<|user|>\n{request.prompt}<|end|>\n<|assistant|>\n"
+        prompt = f"<|system|>\n{request.system}<|end|>\n<|user|>\n{prompt}<|end|>\n<|assistant|>\n"
 
-    logger.info(f"Generating: {len(full_prompt)} chars prompt, max_tokens={config.max_new_tokens}")
-    t0 = time.time()
-
-    # Run inference in executor to avoid blocking the event loop
-    loop = asyncio.get_event_loop()
-    response_text = await loop.run_in_executor(
-        None, lambda: _pipe.generate(full_prompt, config)
-    )
-
-    elapsed_ns = int((time.time() - t0) * 1e9)
-    tokens = len(response_text.split())
+    text, elapsed_ns, tokens = await _run_inference(prompt, max_tokens, temperature, top_p)
     logger.info(f"Generated {tokens} tokens in {elapsed_ns/1e9:.2f}s")
-
     return GenerateResponse(
         model=request.model,
-        response=response_text,
+        response=text,
         done=True,
         total_duration=elapsed_ns,
         eval_count=tokens,
+    )
+
+
+async def _run_inference(prompt: str, max_tokens: int, temperature: float, top_p: float) -> tuple[str, int, int]:
+    """Shared inference helper. Returns (response_text, elapsed_ns, token_count)."""
+    if _pipe is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    config = ov_genai.GenerationConfig()
+    config.max_new_tokens = max_tokens
+    config.temperature = temperature
+    if temperature < 0.05:
+        config.do_sample = False
+    else:
+        config.do_sample = True
+        config.top_p = top_p
+
+    # Auto-wrap bare prompts in Phi-3.5 chat template
+    if "<|user|>" not in prompt and "<|system|>" not in prompt:
+        prompt = f"<|user|>\n{prompt}<|end|>\n<|assistant|>\n"
+
+    logger.info(f"Generating: {len(prompt)} chars, max_tokens={max_tokens}")
+    t0 = time.time()
+    loop = asyncio.get_running_loop()
+    async with _inference_lock:  # type: ignore[union-attr]  # serialize: LLMPipeline cannot handle concurrent calls
+        text = await loop.run_in_executor(None, lambda: _pipe.generate(prompt, config))
+    elapsed_ns = int((time.time() - t0) * 1e9)
+    return text, elapsed_ns, len(text.split())
+
+
+@app.post("/v1/completions", response_model=CompletionResponse)
+async def openai_completions(request: CompletionRequest):
+    """OpenAI-compatible completions endpoint (used by distillation_worker.py)."""
+    opts = request.options or {}
+    max_tokens = request.max_tokens or int(opts.get("num_predict", 600))
+    temperature = float(opts.get("temperature", request.temperature))
+    top_p = float(opts.get("top_p", request.top_p))
+
+    text, _, _ = await _run_inference(request.prompt, max_tokens, temperature, top_p)
+    return CompletionResponse(
+        model=request.model,
+        choices=[CompletionChoice(text=text)],
     )
 
 
