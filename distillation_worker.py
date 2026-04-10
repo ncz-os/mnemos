@@ -16,7 +16,7 @@ import sys
 from datetime import datetime
 import httpx
 import json
-import psycopg
+import asyncpg
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -124,7 +124,7 @@ class MemoryDistillationWorker:
     async def start(self):
         """Start background worker"""
         logger.info(f"Connecting to DB: {_PG_CONFIG['host']}:{_PG_CONFIG['port']}/{_PG_CONFIG['database']}")
-        self.db = await psycopg.AsyncConnection.connect(DB_DSN, autocommit=True)
+        self.db = await asyncpg.connect(dsn=DB_DSN)
         
         logger.info("✅ Distillation worker started")
         logger.info(f"Model: {MODEL} | Endpoint: {OLLAMA_HOST}")
@@ -139,7 +139,7 @@ class MemoryDistillationWorker:
                 logger.error(f"Worker error: {e}", exc_info=True)
                 try:
                     await self.db.close()
-                    self.db = await psycopg.AsyncConnection.connect(DB_DSN, autocommit=True)
+                    self.db = await asyncpg.connect(dsn=DB_DSN)
                 except Exception as re:
                     logger.error(f"DB reconnect failed: {re}")
 
@@ -154,15 +154,13 @@ class MemoryDistillationWorker:
         WHERE llm_optimized = false
           AND content IS NOT NULL
           AND LENGTH(content) > 100
-          AND LENGTH(content) <= %s
-          AND COALESCE((metadata->>'distillation_attempts')::int, 0) < %s
+          AND LENGTH(content) <= $1
+          AND COALESCE((metadata->>'distillation_attempts')::int, 0) < $2
         ORDER BY LENGTH(content) DESC, created DESC
-        LIMIT %s
+        LIMIT $3
         """
 
-        async with self.db.cursor() as cur:
-            await cur.execute(query, (SIZE_LIMIT_KB * 1024, MAX_ATTEMPTS, BATCH_SIZE))
-            rows = await cur.fetchall()
+        rows = await self.db.fetch(query, SIZE_LIMIT_KB * 1024, MAX_ATTEMPTS, BATCH_SIZE)
 
         if not rows:
             logger.debug("No memories pending optimization")
@@ -170,11 +168,11 @@ class MemoryDistillationWorker:
 
         memories = [
             {
-                'id': row[0],
-                'content': row[1],
-                'quality_rating': row[2] or 75,
-                'len': row[3],
-                'attempts': row[4] or 0
+                'id': row['id'],
+                'content': row['content'],
+                'quality_rating': row['quality_rating'] or 75,
+                'len': row['len'],
+                'attempts': row['attempts'] or 0
             }
             for row in rows
         ]
@@ -220,8 +218,8 @@ class MemoryDistillationWorker:
             # Persist
             update_query = """
             UPDATE memories
-            SET compressed_content = %s,
-                quality_rating = %s,
+            SET compressed_content = $1,
+                quality_rating = $2,
                 llm_optimized = true,
                 optimized_at = NOW(),
                 metadata = jsonb_set(
@@ -229,13 +227,12 @@ class MemoryDistillationWorker:
                     '{distillation_success}',
                     'true'
                 )
-            WHERE id = %s
+            WHERE id = $3
             """
-            async with self.db.cursor() as cur:
-                await cur.execute(
-                    update_query,
-                    (compressed, min(100, int(quality_score)), memory_id)
-                )
+            await self.db.execute(
+                update_query,
+                compressed, min(100, int(quality_score)), memory_id
+            )
 
             self.stats["successful"] += 1
             self.stats["total_bytes_saved"] += bytes_saved
@@ -262,35 +259,33 @@ class MemoryDistillationWorker:
     async def increment_attempts(self, memory_id: str):
         """Increment distillation_attempts in metadata"""
         try:
-            async with self.db.cursor() as cur:
-                await cur.execute(
-                    """
-                    UPDATE memories
-                    SET metadata = jsonb_set(
-                        COALESCE(metadata, '{}'),
-                        '{distillation_attempts}',
-                        to_jsonb(COALESCE((metadata->>'distillation_attempts')::int, 0) + 1)
-                    )
-                    WHERE id = %s
-                    """,
-                    (memory_id,)
+            await self.db.execute(
+                """
+                UPDATE memories
+                SET metadata = jsonb_set(
+                    COALESCE(metadata, '{}'),
+                    '{distillation_attempts}',
+                    to_jsonb(COALESCE((metadata->>'distillation_attempts')::int, 0) + 1)
                 )
+                WHERE id = $1
+                """,
+                memory_id
+            )
         except Exception as e:
             logger.error(f"Could not increment attempts for {memory_id}: {e}")
 
     async def log_stats(self):
         """Log current progress"""
         try:
-            async with self.db.cursor() as cur:
-                await cur.execute("""
-                    SELECT 
-                        COUNT(*) as total,
-                        COUNT(CASE WHEN llm_optimized = true THEN 1 END) as optimized,
-                        COUNT(CASE WHEN llm_optimized = false THEN 1 END) as pending,
-                        AVG(quality_rating) as avg_quality
-                    FROM memories
-                """)
-                total, optimized, pending, avg_quality = await cur.fetchone()
+            row = await self.db.fetchrow("""
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(CASE WHEN llm_optimized = true THEN 1 END) as optimized,
+                    COUNT(CASE WHEN llm_optimized = false THEN 1 END) as pending,
+                    AVG(quality_rating) as avg_quality
+                FROM memories
+            """)
+            total, optimized, pending, avg_quality = row['total'], row['optimized'], row['pending'], row['avg_quality']
 
             if self.stats["processed"] > 0:
                 logger.info(
