@@ -146,7 +146,7 @@ OVERALL COVERAGE: 89.6%
 
 ## Deployment Status
 
-### Files Deployed to Production (192.0.2.67)
+### Files Deployed to Production (your-host)
 
 ✅ **GRAEAE Core Modules**:
 - `/opt/mnemos/graeae/core/__init__.py`
@@ -178,7 +178,7 @@ OVERALL COVERAGE: 89.6%
 
 ### Git Repository Status
 
-**Repositories**: 192.0.2.101:/mnt/datapool/git/
+**Repositories**: your-storage-host:/mnt/datapool/git/
 
 ✅ **mnemos.git**:
 ```

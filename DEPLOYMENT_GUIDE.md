@@ -1,6 +1,6 @@
 # MNEMOS Deployment Guide - Bare Metal on PYTHIA
 
-**Target**: PYTHIA (192.0.2.67)
+**Target**: PYTHIA (your-host)
 **OS**: Linux (Ubuntu/Debian)
 **Python**: 3.10+
 **Database**: PostgreSQL 13+
@@ -9,10 +9,10 @@
 
 ## Pre-Deployment Checklist
 
-- [ ] SSH access to PYTHIA (192.0.2.67)
+- [ ] SSH access to PYTHIA (your-host)
 - [ ] Python 3.10+ installed
 - [ ] PostgreSQL 13+ running on PYTHIA
-- [ ] Network access to Graeae (192.0.2.67:5001)
+- [ ] Network access to Graeae (your-host:5001)
 - [ ] API credentials for LLM providers (optional)
 
 ---
@@ -22,7 +22,7 @@
 ### SSH into PYTHIA
 
 ```bash
-ssh jasonperlow@192.0.2.67
+ssh user@your-host
 ```
 
 ### Verify Python Version
@@ -148,7 +148,7 @@ MNEMOS_WORKERS=4
 MNEMOS_DEBUG=false
 
 # Graeae Integration
-GRAEAE_URL=http://192.0.2.67:5001
+GRAEAE_URL=http://your-host:5001
 GRAEAE_FALLBACK_ON_ERROR=true
 GRAEAE_TIMEOUT_SECONDS=30
 
@@ -261,7 +261,7 @@ sudo journalctl -u mnemos -f
 
 ```bash
 # Direct curl
-curl -X GET http://192.0.2.67:5000/health
+curl -X GET http://your-host:5000/health
 
 # Expected response:
 # {"status":"healthy","timestamp":"2026-02-05T...","database_connected":true,"version":"2.0.0"}
@@ -270,7 +270,7 @@ curl -X GET http://192.0.2.67:5000/health
 ### Test Memory Creation
 
 ```bash
-curl -X POST http://192.0.2.67:5000/memories \
+curl -X POST http://your-host:5000/memories \
   -H "Content-Type: application/json" \
   -d '{
     "content": "Test memory content",
@@ -300,7 +300,7 @@ sudo journalctl -u mnemos --since today
 
 ```bash
 # Allow API port (only from trusted networks)
-sudo ufw allow 5000/tcp from 192.0.2.0/24
+sudo ufw allow 5000/tcp from <your-subnet>/24
 
 # Verify
 sudo ufw status
@@ -541,7 +541,7 @@ psql -h localhost -U mnemos -d mnemos -f db/migrations.sql
 sudo systemctl start mnemos
 
 # Verify
-curl http://192.0.2.67:5000/health
+curl http://your-host:5000/health
 ```
 
 ---
@@ -569,9 +569,9 @@ psql -h localhost -U mnemos -d mnemos
 SELECT count(*) FROM memories;   # Count records
 
 # API Testing
-curl http://192.0.2.67:5000/health
-curl http://192.0.2.67:5000/stats
-curl http://192.0.2.67:5000/bundles
+curl http://your-host:5000/health
+curl http://your-host:5000/stats
+curl http://your-host:5000/bundles
 
 # Monitoring
 ps aux | grep mnemos             # Check process
@@ -605,6 +605,6 @@ top -p $(pgrep -f "python")      # Monitor CPU/Memory
 
 **Deployment Complete!**
 
-Your MNEMOS API is now running on PYTHIA at `http://192.0.2.67:5000`
+Your MNEMOS API is now running on PYTHIA at `http://your-host:5000`
 
 For API documentation, see `API_DOCUMENTATION.md`

@@ -694,10 +694,10 @@ if muse_availability < 0.5: alert("Too many muses down")
 ## Git Commits & Repository Status
 
 All code has been committed to:
-- **Production**: `/opt/mnemos/` on 192.0.2.67
+- **Production**: `/opt/mnemos/` on your-host
 - **Git Repos**: 
-  - `/mnt/datapool/git/mnemos.git` (192.0.2.101)
-  - `/mnt/datapool/git/graeae.git` (192.0.2.101)
+  - `/mnt/datapool/git/mnemos.git` (your-storage-host)
+  - `/mnt/datapool/git/graeae.git` (your-storage-host)
 
 **Commits** (pushed to git repos):
 ```
@@ -790,8 +790,8 @@ from shared.audit import AuditLog
 - Operational guidelines
 
 ✅ **Deployed**:
-- Code on production (192.0.2.67)
-- Pushed to git repos (192.0.2.101)
+- Code on production (your-host)
+- Pushed to git repos (your-storage-host)
 - Ready for activation
 
 **Status**: Ready for production deployment. All features can be enabled independently via environment variables with zero impact on existing functionality.

@@ -1,6 +1,6 @@
 # MNEMOS API Documentation
 
-**Base URL**: `http://192.0.2.67:5000`
+**Base URL**: `http://localhost:5000`
 **Version**: 2.0.0
 **Format**: JSON
 
@@ -47,7 +47,7 @@ Check API server health
 
 **Example**:
 ```bash
-curl -X GET http://192.0.2.67:5000/health
+curl -X GET http://localhost:5000/health
 ```
 
 ---
@@ -85,7 +85,7 @@ Get system statistics
 
 **Example**:
 ```bash
-curl -X GET http://192.0.2.67:5000/stats
+curl -X GET http://localhost:5000/stats
 ```
 
 ---
@@ -120,7 +120,7 @@ Create a new memory with automatic compression
 
 **Example**:
 ```bash
-curl -X POST http://192.0.2.67:5000/memories \
+curl -X POST http://localhost:5000/memories \
   -H "Content-Type: application/json" \
   -d '{
     "content": "User completed project X with 98% accuracy",
@@ -155,7 +155,7 @@ Retrieve a memory by ID
 
 **Example**:
 ```bash
-curl -X GET http://192.0.2.67:5000/memories/550e8400-e29b-41d4-a716-446655440000
+curl -X GET http://localhost:5000/memories/550e8400-e29b-41d4-a716-446655440000
 ```
 
 ---
@@ -198,7 +198,7 @@ Get memory with quality assessment
 
 **Example**:
 ```bash
-curl -X GET http://192.0.2.67:5000/memories/550e8400-e29b-41d4-a716-446655440000/quality-check
+curl -X GET http://localhost:5000/memories/550e8400-e29b-41d4-a716-446655440000/quality-check
 ```
 
 ---
@@ -222,7 +222,7 @@ Retrieve uncompressed original memory
 
 **Example**:
 ```bash
-curl -X GET http://192.0.2.67:5000/memories/550e8400-e29b-41d4-a716-446655440000/original
+curl -X GET http://localhost:5000/memories/550e8400-e29b-41d4-a716-446655440000/original
 ```
 
 ---
@@ -258,7 +258,7 @@ Search memories by semantic similarity
 
 **Example**:
 ```bash
-curl -X POST "http://192.0.2.67:5000/memories/search?query=project%20completion&limit=5"
+curl -X POST "http://localhost:5000/memories/search?query=project%20completion&limit=5"
 ```
 
 ---
@@ -295,7 +295,7 @@ Get compression audit trail
 
 **Example**:
 ```bash
-curl -X GET "http://192.0.2.67:5000/compression-log?task_type=reasoning&reviewed=false&limit=20"
+curl -X GET "http://localhost:5000/compression-log?task_type=reasoning&reviewed=false&limit=20"
 ```
 
 ---
@@ -327,7 +327,7 @@ Mark compression as reviewed
 
 **Example**:
 ```bash
-curl -X POST http://192.0.2.67:5000/memories/550e8400-e29b-41d4-a716-446655440000/quality-review \
+curl -X POST http://localhost:5000/memories/550e8400-e29b-41d4-a716-446655440000/quality-review \
   -H "Content-Type: application/json" \
   -d '{
     "approved": true,
@@ -375,7 +375,7 @@ Consult Graeae for multi-LLM consensus
 
 **Example**:
 ```bash
-curl -X POST http://192.0.2.67:5000/graeae/consult \
+curl -X POST http://localhost:5000/graeae/consult \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "How should I optimize database queries for millions of records?",
@@ -670,7 +670,7 @@ Get bundle recommendation for task
 ```bash
 #!/bin/bash
 
-BASE_URL="http://192.0.2.67:5000"
+BASE_URL="http://localhost:5000"
 
 # 1. Create memory
 MEMORY_ID=$(curl -s -X POST $BASE_URL/memories \
@@ -706,7 +706,7 @@ curl -s -X POST $BASE_URL/memories/$MEMORY_ID/quality-review \
 ```bash
 #!/bin/bash
 
-BASE_URL="http://192.0.2.67:5000"
+BASE_URL="http://localhost:5000"
 
 # 1. Get bundle recommendation
 BUNDLE=$(curl -s -X POST $BASE_URL/bundle/recommend \
@@ -732,7 +732,7 @@ curl -s -X POST $BASE_URL/graeae/consult \
 ```bash
 #!/bin/bash
 
-BASE_URL="http://192.0.2.67:5000"
+BASE_URL="http://localhost:5000"
 
 # Create multiple memories
 for i in {1..5}; do
