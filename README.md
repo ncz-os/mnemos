@@ -1,357 +1,287 @@
-# MNEMOS 2.0: Modular Memory System with Integrated Compression
+# MNEMOS + GRAEAE
 
-**Status**: Phase 1 ✅ Complete - Phase 2 ✅ Complete - Phase 3 ✅ Complete - **PRODUCTION READY**
+**Persistent memory and multi-LLM consensus reasoning for production agentic systems.**
 
-A production-grade memory and reasoning system with:
-- ✅ Modular architecture (independent, maintainable components)
-- ✅ Integrated compression (write/read/graeae paths)
-- ✅ Quality tracking (manifests, audit trail, reversal capability)
-- ✅ Hooks system (6 event types, configuration-driven)
-- ✅ Consultation bundles (8 bundles, 20+ model variants)
-- ✅ Memory categorization (4-tier system with task-aware selection)
-- ✅ Integrations (macrodata sync, Graeae routing, dynamic provider discovery)
+MNEMOS is a memory store built for AI agents that need to remember across sessions, compress context intelligently, and retrieve the right information for the right task. GRAEAE is the reasoning layer on top — a multi-provider consensus engine that routes queries to the best available models, tracks quality, and fails gracefully when providers go down.
 
-## Project Structure
+Together they form a substrate for agentic systems that need to reason reliably over time.
 
-```
-mnemos-production/
-├── core/                        # Core MNEMOS (no dependencies on modules)
-│   ├── memory_store.py         # MemoryStore with compression integration
-│   ├── config.py               # (to be created) Config loading
-│   └── __init__.py
-│
-├── modules/                     # Independent, pluggable modules
-│   ├── compression/            # Distillation/compression strategies
-│   │   ├── token_filter_graeae_integration.py      # token-filter² GRAEAE adapter
-│   │   ├── token_filter_implementation.py          # token-filter² algorithm
-│   │   ├── token_filter_compressor.py              # extractive token filter (fast heuristic)
-│   │   ├── sac_graeae_integration.py        # SENTENCE adapter
-│   │   ├── sac_implementation.py            # SENTENCE algorithm
-│   │   ├── manager.py                       # CompressionManager orchestrator
-│   │   ├── quality_analyzer.py              # QualityAnalyzer (manifests)
-│   │   └── __init__.py
-│   │
-│   ├── hooks/                  # (to be created) Hook system
-│   │   ├── hook_registry.py
-│   │   ├── session_start.py
-│   │   ├── prompt_submit.py
-│   │   └── __init__.py
-│   │
-│   ├── memory_categorization/ # (to be created) Memory tiers
-│   │   ├── tier_selector.py
-│   │   ├── tiers.py
-│   │   ├── state.py
-│   │   ├── journal.py
-│   │   └── __init__.py
-│   │
-│   ├── bundles/               # (to be created) Consultation bundles
-│   │   ├── bundle_definitions.py
-│   │   ├── model_variants.py
-│   │   ├── task_routing.py
-│   │   └── __init__.py
-│   │
-│   └── routing/              # (to be created) Graeae integration
-│       ├── graeae_client.py
-│       ├── fallbacks.py
-│       └── __init__.py
-│
-├── integrations/             # External integrations
-│   ├── macrodata/           # (to be created) Macrodata hook adapter
-│   └── external_lms/        # (to be created) Provider model listings
-│
-├── db/
-│   ├── migrations.sql       # Database schema
-│   └── __init__.py
-│
-├── tests/                    # Unit + integration tests
-│   └── __init__.py
-│
-├── graeae/                   # Graeae client interface
-│   └── __init__.py
-│
-├── config.toml             # Configuration (TOML format)
-├── api_server.py           # (to be created) Flask HTTP API
-└── __init__.py
-```
+---
 
-## Phase 1: Database & MemoryStore ✅
+## Why We Built This
 
-### Completed
+Every production agentic system hits the same wall: context windows are finite, LLM providers fail, and nothing guarantees the answer you got was actually good.
 
-1. **Database Schema** (`db/migrations.sql`)
-   - `memories`: Core table with compression & quality tracking
-   - `compression_quality_log`: Audit trail of all compressions
-   - `graeae_consultations`: Store consultations with both versions
-   - `state`, `journal`, `entities`: State management tables
-   - Views: Compression stats, unreviewed compressions
+Existing approaches each solve part of the problem:
 
-2. **MemoryStore** (`core/memory_store.py`)
-   - Three integrated pathways:
-     - **WRITE**: Auto-compress on storage with quality manifest
-     - **READ**: Load with tier-specific recompression
-     - **GRAEAE**: Store both uncompressed + compressed versions
-   - Compression audit trail
-   - Quality check endpoints
-   - Original retrieval for quality review
+| Tool | What it does | What it misses |
+|------|-------------|----------------|
+| **MemGPT / Letta** | Hierarchical memory with paging | Single-provider, no quality tracking, no compression manifests |
+| **Mem0** | Simple persistent memory layer | No compression strategy, no multi-LLM consensus, no audit trail |
+| **LangChain Memory** | In-chain buffer/summary memory | Session-scoped only, no cross-session persistence, no quality scoring |
+| **RAG pipelines** | Vector retrieval from documents | Retrieval is not reasoning; no compression quality; no circuit breaking |
+| **LlamaIndex** | Document indexing and query | Document-centric, not agent-memory-centric; no compression manifests |
 
-3. **Quality Analyzer** (`modules/compression/quality_analyzer.py`)
-   - Generates compression manifests with:
-     - Quality rating (0-100%)
-     - What was removed/preserved
-     - Risk factors per task type
-     - Safe/unsafe use cases
-   - Semantic analysis (if transformers available)
-   - Heuristic fallback (always available)
+None of them answer: *how much information was lost when you compressed that memory, and was it safe to lose?*
 
-4. **Compression Manager** (`modules/compression/manager.py`)
-   - Orchestrates compression strategies (extractive token filter, SENTENCE)
-   - Task-specific compression ratios
-   - Tier-aware ratios
-   - Fallback handling
-   - Statistics tracking
+None of them handle: *what happens when three of your six LLM providers go down simultaneously?*
 
-5. **Configuration** (`config.toml`)
-   - Database settings
-   - Compression strategy selection
-   - Quality requirements per task type
-   - Memory tier budgets
-   - Model variant mappings
+MNEMOS + GRAEAE were built to answer both questions in production.
 
-## Phase 2: Modules (In Progress)
+---
 
-### Next: Hooks System
+## What It Is
 
-```python
-# Usage example
-from mnemos.modules.hooks import HookRegistry, HOOK_MEMORY_WRITE
+### MNEMOS — Quality-Tracked Persistent Memory
 
-hooks = HookRegistry()
+MNEMOS stores, compresses, and retrieves agent memories with full audit trails. Every compression generates a **quality manifest** — a structured record of what was removed, what was preserved, the quality rating, and which use cases the compressed version is safe for.
 
-@hooks.on(HOOK_MEMORY_WRITE)
-def compress_before_write(memory):
-    # Compression happens automatically in MemoryStore
-    # This hook is optional for additional processing
-    return memory
-```
+Key capabilities:
 
-### Then: Memory Categorization
+- **Three compression pathways**: WRITE (on storage), READ (on rehydration), GRAEAE (on consultation)
+- **Two compression algorithms**: token-filter (semantic, GRAEAE-assisted) and SENTENCE (heuristic, always available)
+- **4-tier memory system**: Recent → Compressed → Archived → Permanent, with task-aware tier selection
+- **Quality manifests**: Every compression logs what was preserved, what was dropped, risk factors, and safe use cases
+- **Reversal support**: Original always retained; downgrade to original if quality falls below threshold
+- **PostgreSQL backend**: ACID-compliant, concurrent access, production-scale
 
-```python
-# Usage example
-from mnemos.modules.memory_categorization import TierSelector
+### GRAEAE — Multi-LLM Consensus Reasoning
 
-selector = TierSelector()
-tiers = selector.select_tiers(
-    task_type='reasoning',
-    complexity='complex'
-)
+GRAEAE distributes reasoning queries across multiple LLM providers simultaneously, scores the responses, and returns a consensus result. It is not a load balancer — it is a quality-gated reasoning bus.
 
-for tier in tiers:
-    memories = await memory_store.load_for_rehydration(
-        task_type='reasoning',
-        tier_level=tier.level,
-        tier_compression_ratio=tier.compression_ratio
-    )
+Six providers in the default configuration: Perplexity, Together/DeepSeek-R1, Groq, OpenAI, xAI, Ollama.
+
+Key capabilities:
+
+- **Consensus mode**: Queries all available providers, scores responses on relevance/coherence/completeness/toxicity, returns best result
+- **Persistent queue**: All requests written to SQLite before dispatch — crash-safe, resumable
+- **Circuit breaker**: Per-provider CLOSED/OPEN/HALF_OPEN state machine; 5-minute cooldown; automatic recovery
+- **Semantic cache**: Embedding-similarity deduplication (0.85 threshold, 24hr TTL) — identical questions skip inference entirely
+- **Rate limiting with backpressure**: Four levels; request queuing before rejection
+- **Cryptographic audit log**: SHA-256 hash-chained append-only log; every response is tamper-evident
+
+---
+
+## Target User
+
+**AI engineers and researchers building production agentic systems** that need:
+
+- Sessions that remember what happened before — not just in the current context window
+- Reasoning that does not collapse when a provider is rate-limited or down
+- Compression that tells you what it threw away
+- An audit trail that proves the system did not hallucinate its own history
+
+This is not a tool for weekend experiments. It is designed for systems where a bad answer has a cost and a crashed provider cannot silently fail.
+
+---
+
+## Architectural Decisions
+
+### PostgreSQL over SQLite for the memory store
+
+SQLite is fine for single-writer, single-reader scenarios. Agentic systems that run background enrichers, foreground queries, and scheduled distillation jobs simultaneously need ACID isolation and concurrent write support. PostgreSQL also gives us partial indexes, materialized views for compression stats, and native JSONB for manifests — none of which SQLite handles well at scale.
+
+### token-filter + SENTENCE compression, not naive summarization
+
+Summarization with an LLM is expensive, slow, and produces a result with no quality contract. token-filter (Hybrid Compression Squared) uses GRAEAE to intelligently compress memories when the reasoning engine is available, falling back to SENTENCE (Semantic Adaptive Compression) — a heuristic that runs entirely locally with no external calls. The result always includes a manifest. Compression ratios are tuned per task type: code generation compresses more aggressively (0.30) than architecture design (0.50) because implementation details matter differently.
+
+### Multi-provider consensus over single-model routing
+
+Single-provider routing is fragile. When one provider rate-limits or goes down, single-provider systems stall. GRAEAE runs all available providers in parallel and returns the best-scored response. The circuit breaker ensures a flapping provider does not degrade the whole pool. Quality scoring means the system learns which providers perform best for which task types over time.
+
+### Quality manifests as a first-class concept
+
+Most compression pipelines discard information and move on. MNEMOS treats the compression manifest as a first-class artifact: stored in the database, queryable via API, reviewable by humans or agents. The manifest answers: *was it safe to compress this?* If the quality rating falls below a configurable threshold (default: 80%), the system flags the compression for review. Critical task types (security review: 95%, architecture design: 90%) have tighter floors.
+
+### 4-tier memory with task-aware selection
+
+Not all memories are equal. Recent memories (tier 1) are stored at 20% compression — mostly intact. Long-term memories (tier 4) are stored at full compression or archived. The tier selector chooses which tiers to load based on task type and complexity, so a quick code generation task does not pull the entire memory corpus.
+
+### REST API for language-agnostic integration
+
+MNEMOS and GRAEAE are API-first. Claude Code, custom Python scripts, and any HTTP client can use them without importing a Python package. The API is the interface; the implementation can evolve independently.
+
+---
+
+## How It Differs
+
+### From MemGPT/Letta
+
+MemGPT introduced hierarchical memory paging — the right idea, but implemented as a single-agent framework tied to specific model APIs. MNEMOS is a standalone service: any agent, any framework. MemGPT has no compression quality tracking. MNEMOS manifests every compression with what was lost.
+
+### From Mem0
+
+Mem0 is a simple CRUD memory layer. It stores and retrieves. It does not compress, does not score quality, does not chain audit entries cryptographically, and does not route through a multi-provider consensus engine. MNEMOS is more opinionated about what it means for a memory to be *reliably* stored.
+
+### From LangChain/LlamaIndex memory modules
+
+These are in-process, session-scoped memory implementations. They do not persist across process restarts. They have no compression quality contracts. They are designed for single-session demos, not multi-day agentic runs.
+
+### From plain RAG
+
+RAG retrieves from documents. MNEMOS stores *agent-generated* memories — synthesis, decisions, observations — and compresses them over time. Retrieval is semantic but the data source is the agent's own history, not a document corpus. The two complement each other; they are not the same problem.
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.11+
+- PostgreSQL 14+
+- Ollama (optional, for local embedding and SENTENCE compression)
+
+### Installation
+
+```bash
+git clone <your-repo-url>
+cd mnemos-production
+pip install -r requirements.txt
 ```
 
-### Then: Consultation Bundles
+### Database setup
 
-```python
-# Usage example
-from mnemos.modules.bundles import BundleRouter
-
-router = BundleRouter()
-bundle = router.select_bundle('architecture_design')
-
-# Uses model variants from config:
-# primary: gpt-5.2 (reasoning)
-# secondary: gemini-3-pro (multimodal)
-# tertiary: groq-llama-3.3 (consensus)
+```bash
+psql -U postgres -c "CREATE USER mnemos WITH PASSWORD 'yourpassword';"
+psql -U postgres -c "CREATE DATABASE mnemos OWNER mnemos;"
+psql -U mnemos -d mnemos -f db/migrations.sql
 ```
 
-### Then: Routing (Graeae Integration)
+### Configuration
 
-```python
-# Usage example
-from mnemos.modules.routing import GraeaeClient
+Set environment variables or edit `config.toml`:
 
-client = GraeaeClient(memory_store, graeae_url)
-result = await client.consult(
-    prompt="Design a microservices architecture",
-    task_type="architecture_design",
-    context=uncompressed_context  # Full qualitative reference
-)
-
-# Stores:
-# - context_uncompressed (full version)
-# - context_compressed (for consultation)
-# - Both quality ratings and manifests
+```bash
+export MNEMOS_KEYS_PATH=~/.config/mnemos/api_keys.json
+export OLLAMA_EMBED_HOST=http://localhost:11434
+export GRAEAE_URL=http://localhost:5001
 ```
 
-## Key Features
+### Start the API
 
-### ✅ Compression as Cross-Cutting Concern
+```bash
+python api_server.py
+# Verify: curl http://localhost:5002/health
+```
 
-Compression happens at three levels:
+### Start GRAEAE
 
-1. **WRITE PATH** (Storage)
-   - Original stored (always)
-   - Compressed copy created (task-type specific ratio)
-   - Quality manifest generated
-   - Audit logged
+```bash
+python graeae/server.py
+# Verify: curl http://localhost:5001/health
+```
 
-2. **READ PATH** (Rehydration)
-   - Memory loaded from database
-   - Decompress if stored compressed
-   - Apply tier-specific ratio
-   - Return compressed for context injection
+---
 
-3. **GRAEAE PATH** (Consultation)
-   - Send compressed for efficiency
-   - Store uncompressed for qualitative reference
-   - Both have quality ratings
-   - Full audit trail
+## API Reference
 
-### ✅ Quality Tracking
+### Memory Operations
 
-Every compression generates a **manifest**:
+```bash
+# Store a memory
+curl -X POST http://localhost:5002/memories \
+  -H 'Content-Type: application/json' \
+  -d '{"content": "...", "category": "decisions", "tags": ["architecture"]}'
+
+# Semantic search
+curl -X POST http://localhost:5002/memories/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "topic keywords", "limit": 10, "min_score": 0.3}'
+
+# Filtered search by category
+curl -X POST http://localhost:5002/memories/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "keywords", "category": "solutions", "limit": 5}'
+
+# Quality check on a stored memory
+curl http://localhost:5002/memories/<id>/quality-check
+
+# Retrieve original (pre-compression)
+curl http://localhost:5002/memories/<id>/original
+```
+
+### GRAEAE Reasoning
+
+```bash
+# Multi-LLM consensus
+curl -X POST http://localhost:5001/graeae/consult \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "Your question", "task_type": "architecture_design", "mode": "consensus"}'
+
+# Extract best result by score
+curl -X POST http://localhost:5001/graeae/consult \
+  -d '{"prompt": "...", "task_type": "reasoning"}' | \
+  jq '.all_responses | to_entries | sort_by(-.[1].final_score)[0]'
+```
+
+### Memory Categories
+
+| Category | Use for |
+|----------|---------|
+| `infrastructure` | Configs, endpoints, system state |
+| `solutions` | Workarounds, resolved problems |
+| `patterns` | Reusable approaches |
+| `decisions` | Rationale and tradeoffs |
+| `projects` | Per-project context |
+| `standards` | Quality gates, conventions |
+
+### GRAEAE Task Types
+
+| Task type | Notes |
+|-----------|-------|
+| `architecture_design` | Full consensus, highest quality floor |
+| `reasoning` | Full consensus |
+| `code_generation` | Speed-optimized provider subset |
+| `web_search` | Real-time capable providers |
+
+---
+
+## Compression Quality Reference
+
+Every compression returns a manifest:
 
 ```json
 {
   "compression_id": "uuid",
-  "quality_rating": 92,  // 0-100%
-  "what_was_removed": [
-    "2 introductory sentences",
-    "3 supporting examples",
-    "145 tokens of explanation"
-  ],
-  "what_was_preserved": [
-    "Complete reasoning chain",
-    "All main conclusions",
-    "15/18 named entities"
-  ],
-  "risk_factors": [
-    "Missing supporting examples may reduce convincingness"
-  ],
+  "quality_rating": 92,
+  "what_was_removed": ["2 introductory sentences", "3 supporting examples"],
+  "what_was_preserved": ["Complete reasoning chain", "All main conclusions"],
+  "risk_factors": ["Missing examples may reduce convincingness"],
   "safe_for": ["Initial consultation", "Quick decision making"],
-  "not_safe_for": ["Detailed technical review", "Security-critical decisions"]
+  "not_safe_for": ["Security-critical decisions", "Detailed technical review"]
 }
 ```
 
-### ✅ Easy Reversal
+Quality thresholds (configurable in `config.toml`):
 
-If quality concerns arise:
+| Task type | Minimum quality |
+|-----------|----------------|
+| Security review | 95% |
+| Architecture design | 90% |
+| Code generation | 88% |
+| Reasoning | 85% |
+| General | 80% |
 
-```python
-# Get compressed version with quality info
-memory = await memory_store.get_with_quality_check(memory_id)
-print(f"Quality: {memory.quality_rating}%")
-print(f"Manifest: {memory.quality_manifest}")
+---
 
-# Retrieve original if needed
-if memory.quality_rating < 80:
-    original = await memory_store.get_original(memory.original_memory_id)
+## GRAEAE Circuit Breaker
+
+Providers move through states automatically:
+
+```
+CLOSED --(5 failures)--> OPEN --(5 min cooldown)--> HALF_OPEN --(success)--> CLOSED
+                                                          |
+                                                     (failure)--> OPEN
 ```
 
-### ✅ Modular Independence
-
-Each module:
-- Can be updated independently
-- Has isolated tests
-- Depends only on core
-- Can be disabled via config
-- Versioned semantically
-
-## Configuration
-
-See `config.toml` for all settings:
-
-```toml
-[compression]
-enabled = true
-default_strategy = "token_filter"
-
-[compression.storage]
-enabled = true
-ratios = { reasoning = 0.45, code_generation = 0.30, ... }
-
-[compression.rehydration]
-enabled = true
-tier_ratios = { 1 = 0.20, 2 = 0.35, 3 = 0.50, 4 = 1.00 }
-
-[compression.quality]
-enabled = true
-analyzer = "heuristic"
-warn_if_rating_below = 80
-```
-
-## Database
-
-Run migrations:
+Health status:
 
 ```bash
-psql -U mnemos -d mnemos -f db/migrations.sql
+curl http://localhost:5001/graeae/health
 ```
 
-Views available:
-- `v_compression_stats`: Per task-type compression statistics
-- `v_unreviewed_compressions`: Compressions with quality < 80 requiring review
-
-## API Endpoints (20+ implemented in Phase 3)
-
-**Health & Status**:
-```
-GET    /health                           # Health check
-GET    /stats                            # System statistics
-```
-
-**Memory Operations**:
-```
-POST   /memories                         # Create with auto-compression
-GET    /memories/<id>                    # Get memory
-GET    /memories/<id>/quality-check      # Quality assessment
-GET    /memories/<id>/original           # Retrieve original
-POST   /memories/search                  # Semantic search
-```
-
-**Compression & Audit**:
-```
-GET    /compression-log                  # Audit trail
-POST   /memories/<id>/quality-review     # Mark as reviewed
-```
-
-**Graeae Consultation**:
-```
-POST   /graeae/consult                   # Multi-LLM consensus
-```
-
-**Hooks, State, Bundles** (8 additional endpoints)
-
-See `API_DOCUMENTATION.md` for complete reference.
-
-## Testing
-
-Phase 2 will include:
-- Unit tests for each module
-- Integration tests (write → compress → read)
-- E2E tests (full pipeline)
-- Quality analyzer tests
-- Audit trail verification
-
-## Deployment
-
-1. Create PostgreSQL database and run migrations
-2. Install dependencies: `pip install -r requirements.txt`
-3. Configure `config.toml`
-4. Start API: `python api_server.py`
-5. Verify health: `curl http://localhost:5000/health`
+---
 
 ## License
 
-Personal project - All rights reserved
-
-## Progress Tracking
-
-- [x] Phase 1: Database schema, MemoryStore, quality analyzer, compression manager, config (5 files, 1,200+ lines)
-- [x] Phase 2: Hooks (4 files), memory categorization (5 files), bundles (4 files), routing (3 files), integrations (5 files) - 21 files, 2,200+ lines
-- [ ] Phase 3: API server with HTTP endpoints, comprehensive tests, deployment guide, documentation
+Apache 2.0 — see `LICENSE`.
