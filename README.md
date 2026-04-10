@@ -21,6 +21,7 @@ Existing approaches each solve part of the problem:
 | **LangChain Memory** | In-chain buffer/summary memory | Session-scoped only, no cross-session persistence, no quality scoring |
 | **RAG pipelines** | Vector retrieval from documents | Retrieval is not reasoning; no compression quality; no circuit breaking |
 | **LlamaIndex** | Document indexing and query | Document-centric, not agent-memory-centric; no compression manifests |
+| **MemPalace** | Spatial hierarchy (rooms/halls/wings) with verbatim storage | SQLite + ChromaDB only, no compression quality contracts, no multi-LLM consensus, single-model evaluation |
 
 None of them answer: *how much information was lost when you compressed that memory, and was it safe to lose?*
 
@@ -116,6 +117,14 @@ Mem0 is a simple CRUD memory layer. It stores and retrieves. It does not compres
 ### From LangChain/LlamaIndex memory modules
 
 These are in-process, session-scoped memory implementations. They do not persist across process restarts. They have no compression quality contracts. They are designed for single-session demos, not multi-day agentic runs.
+
+### From MemPalace
+
+MemPalace (April 2026) applies the method of loci — a spatial memory hierarchy of wings, halls, and rooms — to organize agent memories with verbatim storage. The spatial metaphor is interesting for navigability, but verbatim storage is not compression: it avoids the hard problem rather than solving it. MemPalace has no concept of what was lost or whether it was safe to lose, no quality threshold enforcement, and no multi-provider reasoning layer.
+
+The storage backend (SQLite + ChromaDB) is suitable for a single local agent. It is not designed for concurrent background jobs, scheduled distillation, or multiple agents sharing the same memory pool. There is also no equivalent to GRAEAE — a single model handles retrieval and reasoning, so provider failure means total unavailability.
+
+MemPalace and MNEMOS solve adjacent problems. If you need a lightweight local-first memory store with intuitive navigation and no infrastructure requirements, MemPalace is worth evaluating. If you need quality contracts on compression, multi-provider resilience, and production-scale concurrent access, MNEMOS is the right tool.
 
 ### From plain RAG
 
