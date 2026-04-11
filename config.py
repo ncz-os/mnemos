@@ -1,10 +1,12 @@
 """
 MNEMOS Configuration Module
-Centralized settings for PostgreSQL, Ollama, and system parameters
+Centralized settings for PostgreSQL and system parameters.
+
+Most constants here document available env-var overrides for deployers.
+Only PG_CONFIG and COMPRESSION_CONFIG are imported by application code.
 """
 
 import os
-from datetime import timedelta
 
 # ============================================================================
 # PostgreSQL Configuration
@@ -32,7 +34,7 @@ OLLAMA_EMBED_TIMEOUT = 10  # seconds
 
 # Memory management
 MAX_MEMORIES = int(os.getenv('MAX_MEMORIES', 10000))
-MEMORY_TTL = timedelta(days=int(os.getenv('MEMORY_TTL_DAYS', 7)))
+MEMORY_TTL_DAYS = int(os.getenv('MEMORY_TTL_DAYS', 7))
 
 # JSON Shard storage (legacy persistence)
 SHARD_DIR = os.getenv('MNEMOS_DATA_DIR', '/data/mnemos') + '/memories'
@@ -58,39 +60,6 @@ API_PORT = int(os.getenv('API_PORT', 5000))
 API_DEBUG = os.getenv('API_DEBUG', 'False').lower() == 'true'
 API_THREADED = True
 API_VERSION = '2.0-merged-modular'
-
-# ============================================================================
-# Feature Flags
-# ============================================================================
-
-ENABLE_TIER_SELECTION = True  # Task-based tier selection in search
-ENABLE_JSON_SHARD_SYNC = True  # Sync JSON shards on startup
-ENABLE_BACKGROUND_EMBEDDING = True  # Generate embeddings in background
-ENABLE_GRAEAE = True  # Multi-LLM reasoning endpoints
-ENABLE_DISTILLATION = True  # Memory distillation endpoints
-ENABLE_AUTONOMY = False  # Scheduler/reflection (future)
-
-# ============================================================================
-# Tier Detection Keywords
-# ============================================================================
-
-TASK_TYPE_KEYWORDS = {
-    'infrastructure': ['infrastructure', 'deploy', 'network', 'server', 'system', 'docker', 'kubernetes', 'cloud'],
-    'reasoning': ['reasoning', 'think', 'design', 'architecture', 'plan', 'strategy', 'decision'],
-    'code': ['code', 'debug', 'error', 'bug', 'fix', 'implement', 'function', 'class'],
-    'project': ['project', 'research', 'work', 'personal', 'archive'],
-    'complex': []  # Fallback: queries with >20 words
-}
-
-# Category tiers for different task types
-TIER_SELECTION = {
-    'infrastructure': ['documentation', 'facts', 'reasoning_outcome', 'session_consolidation', 'infrastructure', 'compression_tier1', 'compression_tier3', 'compression_tier2'],
-    'reasoning': ['documentation', 'facts', 'reasoning_outcome', 'consultation', 'compression_tier1', 'compression_tier2', 'compression_tier4'],
-    'code': ['documentation', 'facts', 'code', 'project', 'compression_tier1', 'compression_tier2'],
-    'project': ['documentation', 'facts', 'project', 'reasoning_outcome', 'compression_tier1', 'compression_tier2', 'compression_tier4'],
-    'complex': ['documentation', 'facts', 'reasoning_outcome', 'session_consolidation', 'consultation', 'infrastructure', 'projects', 'compression_tier1', 'compression_tier2', 'compression_tier3', 'compression_tier4'],
-    'general': ['documentation', 'facts', 'reasoning_outcome', 'session_consolidation', 'consultation', 'infrastructure', 'projects', 'compression_tier1', 'compression_tier2']
-}
 
 # ============================================================================
 # Logging Configuration
