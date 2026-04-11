@@ -66,14 +66,34 @@ def _claude_norm(name: str) -> str:
     """claude-opus-4-6-thinking → claude-opus-4-6"""
     return re.sub(r'-(thinking(-\d+k)?)$', '', name)
 
-def _together_norm(name: str) -> Optional[str]:
-    """
-    Arena: qwen3-235b-a22b-instruct-2507
-    Together API: Qwen/Qwen3-235B-A22B-Instruct-2507-tput
+# Together API IDs use vendor-prefixed capitalization and provider-specific
+# suffixes (-tput, -Turbo, -FP8) that can't be derived algorithmically.
+# Add entries here when new Together-hosted models appear in the Arena rankings.
+# Key: lowercase substring of Arena model name (first match wins)
+# Value: exact Together API model ID
+_TOGETHER_API_MAP: dict[str, str] = {
+    "qwen3-235b-a22b-instruct-2507":    "Qwen/Qwen3-235B-A22B-Instruct-2507-tput",
+    "qwen3-235b-a22b-thinking-2507":    "Qwen/Qwen3-235B-A22B-Thinking-2507",
+    "qwen3-235b":                        "Qwen/Qwen3-235B-A22B-Instruct-2507-tput",
+    "llama-4-maverick":                  "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "llama-4-scout":                     "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+    "llama-3.3-70b":                     "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "deepseek-v3":                       "deepseek-ai/DeepSeek-V3",
+    "deepseek-r1":                       "deepseek-ai/DeepSeek-R1",
+    "mistral-large":                     "mistralai/Mistral-Large-Instruct-2411",
+}
 
-    The capitalization and vendor prefix differ; can't reliably auto-map
-    without an explicit lookup. Return None → candidate only.
+def _together_norm(name: str) -> Optional[str]:
+    """Map Arena model name → Together API model ID via explicit lookup table.
+
+    Together uses vendor-prefixed, capitalized IDs with provider-specific suffixes
+    (-tput, -Turbo, -FP8) that can't be derived algorithmically. First matching
+    entry in _TOGETHER_API_MAP wins. Returns None if model is unknown → candidate only.
     """
+    name_lower = name.lower()
+    for key, api_id in _TOGETHER_API_MAP.items():
+        if key in name_lower:
+            return api_id
     return None
 
 
