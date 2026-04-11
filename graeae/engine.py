@@ -5,17 +5,28 @@ GRAEAE Multi-Provider Consensus Engine
 
 Queries multiple AI providers in parallel and returns all responses.
 
+Provider registry
+-----------------
+Providers are declared in config.toml under [graeae.providers.<name>] — no
+code changes needed to add or modify a provider. Keys are resolved from
+~/.api_keys_master.json (or $MNEMOS_KEYS_PATH). Built-in defaults are used
+as a fallback when config.toml has no [graeae.providers] section.
+
+API adapter styles (the "api" field in config.toml):
+  "openai"    — OpenAI-compatible chat completions (Perplexity, Groq, xAI, OpenAI)
+  "anthropic" — Anthropic Messages API
+  "gemini"    — Google Gemini generateContent API
+
+GPT-5 series is detected by model name ("gpt-5") and automatically uses
+max_completion_tokens instead of max_tokens — no separate api_type needed.
+
 Reliability stack (innermost to outermost):
-  _concurrency  — per-provider asyncio.Semaphore; sheds load when a provider
-                  is saturated rather than queueing (Triton instance-slot model)
-  _circuit_breaker — trips after N consecutive failures; auto-recovers after
-                  cooldown (prevents timeout storms against a down provider)
-  _rate_limiter — sliding-window RPM guard; stops us hammering a provider
-                  before it 429s us
-  _quality      — rolling success-rate multiplier on base weight; deprioritises
-                  flaky providers without removing them from the pool
-  _cache        — in-memory LRU keyed on normalized prompt hash; skips full
-                  round-trip for repeated identical queries (1h TTL)
+  _concurrency     — asyncio.Semaphore per provider; sheds load when saturated
+                     (Triton instance-slot model — skip, don't queue)
+  _circuit_breaker — trips after 5 failures; recovers via HALF_OPEN probe
+  _rate_limiter    — sliding-window RPM guard
+  _quality         — rolling success-rate multiplier on base weight
+  _cache           — in-memory LRU keyed on normalised prompt hash (1h TTL)
 """
 
 import asyncio
@@ -46,54 +57,79 @@ class ProviderResponse:
     final_score: float = 0.0
 
 
+
+# Built-in provider defaults — used when config.toml has no [graeae.providers] section.
+# Operators override these (or add new providers) via config.toml exclusively.
+_BUILTIN_PROVIDERS: dict[str, dict] = {
+    "perplexity": {
+        "url": "https://api.perplexity.ai/chat/completions",
+        "model": "sonar-pro", "weight": 0.88, "api": "openai", "key_name": "perplexity",
+    },
+    "groq": {
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "model": "llama-3.3-70b-versatile", "weight": 0.63, "api": "openai", "key_name": "groq",
+    },
+    "claude_opus": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "model": "claude-opus-4-6", "weight": 0.85, "api": "anthropic", "key_name": "claude-opus",
+    },
+    "xai": {
+        "url": "https://api.x.ai/v1/chat/completions",
+        "model": "grok-3", "weight": 0.48, "api": "openai", "key_name": "xai",
+    },
+    "openai": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "model": "gpt-5.2", "weight": 0.82, "api": "openai", "key_name": "openai",
+    },
+    "gemini": {
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent",
+        "model": "gemini-3.1-pro-preview", "weight": 0.81, "api": "gemini", "key_name": "gemini",
+    },
+}
+
+
+def _load_providers() -> dict[str, dict]:
+    """Load provider registry from config.toml [graeae.providers].
+
+    Falls back to _BUILTIN_PROVIDERS if the section is absent.
+    Providers with enabled=false are excluded.
+    The TOML 'api' field is kept as-is; dispatch in _query_provider() reads it.
+    """
+    try:
+        from config import GRAEAE_CONFIG
+        registry = GRAEAE_CONFIG.get("providers", {})
+    except ImportError:
+        registry = {}
+
+    if not registry:
+        logger.debug("[GRAEAE] no providers in config.toml — using built-in defaults")
+        return {k: dict(v) for k, v in _BUILTIN_PROVIDERS.items()}
+
+    providers: dict[str, dict] = {}
+    for name, cfg in registry.items():
+        if not cfg.get("enabled", True):
+            logger.info(f"[GRAEAE] provider '{name}' disabled in config.toml — skipping")
+            continue
+        required = {"url", "model", "weight", "api", "key_name"}
+        missing = required - cfg.keys()
+        if missing:
+            logger.warning(f"[GRAEAE] provider '{name}' missing fields {missing} — skipping")
+            continue
+        providers[name] = dict(cfg)
+
+    if not providers:
+        logger.warning("[GRAEAE] config.toml [graeae.providers] is empty — using built-in defaults")
+        return {k: dict(v) for k, v in _BUILTIN_PROVIDERS.items()}
+
+    logger.info(f"[GRAEAE] loaded {len(providers)} providers from config.toml: {list(providers)}")
+    return providers
+
+
 class GraeaeEngine:
     """Multi-provider consensus reasoning engine."""
 
     def __init__(self):
-        self.providers = {
-            "perplexity": {
-                "url": "https://api.perplexity.ai/chat/completions",
-                "model": "sonar-pro",
-                "weight": 0.88,
-                "api_type": "openai",
-                "key_name": "perplexity",
-            },
-            "groq": {
-                "url": "https://api.groq.com/openai/v1/chat/completions",
-                "model": "llama-3.3-70b-versatile",
-                "weight": 0.63,
-                "api_type": "openai",
-                "key_name": "groq",
-            },
-            "claude-opus": {
-                "url": "https://api.anthropic.com/v1/messages",
-                "model": "claude-opus-4-6",
-                "weight": 0.85,
-                "api_type": "anthropic",
-                "key_name": "claude-opus",
-            },
-            "xai": {
-                "url": "https://api.x.ai/v1/chat/completions",
-                "model": "grok-3",
-                "weight": 0.48,
-                "api_type": "openai",
-                "key_name": "xai",
-            },
-            "openai": {
-                "url": "https://api.openai.com/v1/chat/completions",
-                "model": "gpt-5.2",
-                "weight": 0.82,
-                "api_type": "openai_gpt5",
-                "key_name": "openai",
-            },
-            "gemini": {
-                "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent",
-                "model": "gemini-3.1-pro-preview",
-                "weight": 0.81,
-                "api_type": "gemini",
-                "key_name": "gemini",
-            },
-        }
+        self.providers = _load_providers()
         self._client: Optional[httpx.AsyncClient] = None
 
         # Reliability stack — instantiated here; _concurrency lazily initialised
@@ -199,16 +235,16 @@ class GraeaeEngine:
     ) -> Dict:
         provider = self.providers[provider_name]
         start = datetime.now(timezone.utc)
-        api_type = provider["api_type"]
+        api = provider["api"]
 
-        if api_type in ("openai", "openai_gpt5"):
+        if api == "openai":
             response = await self._query_openai_compatible(provider, prompt, timeout)
-        elif api_type == "anthropic":
+        elif api == "anthropic":
             response = await self._query_anthropic(provider, prompt, timeout)
-        elif api_type == "gemini":
+        elif api == "gemini":
             response = await self._query_gemini(provider, prompt, timeout)
         else:
-            raise ValueError(f"Unknown api_type: {api_type}")
+            raise ValueError(f"Unknown api style '{api}' for provider '{provider_name}'")
 
         latency = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
         response["latency_ms"] = latency
@@ -222,7 +258,8 @@ class GraeaeEngine:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        tokens_key = "max_completion_tokens" if provider["api_type"] == "openai_gpt5" else "max_tokens"
+        # GPT-5 series uses max_completion_tokens; all other OpenAI-compat APIs use max_tokens
+        tokens_key = "max_completion_tokens" if provider["model"].startswith("gpt-5") else "max_tokens"
         payload = {
             "model": provider["model"],
             "messages": [{"role": "user", "content": prompt}],

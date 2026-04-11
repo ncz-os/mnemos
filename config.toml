@@ -117,6 +117,70 @@ local = "Use local VLLM (zero cost)"
 external = "Use multi-LLM consensus ($0.02-0.05)"
 auto = "Intelligent routing (adaptive)"
 
+# ── GRAEAE provider registry ──────────────────────────────────────────────────
+# Add a new provider by adding a [graeae.providers.<name>] stanza here and
+# an entry under llm_providers in ~/.api_keys_master.json. No code changes needed.
+#
+# Fields:
+#   url      — API endpoint
+#   model    — model identifier sent in the request
+#   weight   — base consensus weight (0.0–1.0); adjusted dynamically by quality tracker
+#   api      — adapter style: "openai" | "anthropic" | "gemini"
+#   key_name — key under llm_providers in ~/.api_keys_master.json
+#   enabled  — set false to disable without removing the stanza
+
+[graeae]
+timeout = 30
+cache_ttl = 3600
+
+[graeae.providers.perplexity]
+url      = "https://api.perplexity.ai/chat/completions"
+model    = "sonar-pro"
+weight   = 0.88
+api      = "openai"
+key_name = "perplexity"
+enabled  = true
+
+[graeae.providers.groq]
+url      = "https://api.groq.com/openai/v1/chat/completions"
+model    = "llama-3.3-70b-versatile"
+weight   = 0.63
+api      = "openai"
+key_name = "groq"
+enabled  = true
+
+[graeae.providers.claude_opus]
+url      = "https://api.anthropic.com/v1/messages"
+model    = "claude-opus-4-6"
+weight   = 0.85
+api      = "anthropic"
+key_name = "claude-opus"
+enabled  = true
+
+[graeae.providers.xai]
+url      = "https://api.x.ai/v1/chat/completions"
+model    = "grok-3"
+weight   = 0.48
+api      = "openai"
+key_name = "xai"
+enabled  = true
+
+[graeae.providers.openai]
+url      = "https://api.openai.com/v1/chat/completions"
+model    = "gpt-5.2"
+weight   = 0.82
+api      = "openai"
+key_name = "openai"
+enabled  = true
+
+[graeae.providers.gemini]
+url      = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent"
+model    = "gemini-3.1-pro-preview"
+weight   = 0.81
+api      = "gemini"
+key_name = "gemini"
+enabled  = true
+
 [integrations.macrodata]
 enabled = false
 hook_adapter = true

@@ -100,3 +100,6 @@ PG_CONFIG = {
 
 # Compression configuration — sourced from config.toml, used by CompressionManager
 COMPRESSION_CONFIG: dict = _TOML.get('compression', {})
+
+# GRAEAE configuration — provider registry and engine settings
+GRAEAE_CONFIG: dict = _TOML.get('graeae', {})
