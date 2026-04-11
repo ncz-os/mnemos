@@ -55,16 +55,21 @@ _HF_ROWS_URL = (
 )
 
 # ── Provider → Arena model name substring (case-insensitive, first match) ─
+# Keys are GRAEAE provider names; values are substrings of how the model
+# appears in the Arena leaderboard — always the MODEL NAME, never the
+# inference host (e.g. "gpt-oss-120b" not "groq", "llama-3.3-70b" not "groq").
+# Providers whose models are not in Arena's top-100 snapshot will not match
+# and will silently retain their config.toml base weight.
 # Update these when provider models change in config.toml [graeae.providers].
 _ELO_MODEL_MAP: dict[str, str] = {
     "perplexity":  "sonar-pro",
-    "groq":        "gpt-oss-120b",
-    "claude_opus": "claude-opus",
+    "groq":        "gpt-oss-120b",        # openai/gpt-oss-120b served via Groq
+    "claude_opus": "claude-opus-4-6",
     "xai":         "grok-4.2",
     "openai":      "gpt-5.4",
     "gemini":      "gemini-3.1-pro",
-    "nvidia":      "nemotron",
-    "together":    "qwen3-235b",
+    "nvidia":      "nemotron-3-super",    # nvidia/nemotron-3-super-120b-a12b
+    "together":    "qwen3-235b",          # Qwen3-235B-A22B served via Together
 }
 
 # ── On-disk weight registry ───────────────────────────────────────────────
