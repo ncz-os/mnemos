@@ -143,8 +143,8 @@ enabled  = true
 
 [graeae.providers.groq]
 url      = "https://api.groq.com/openai/v1/chat/completions"
-model    = "llama-3.3-70b-versatile"
-weight   = 0.63
+model    = "openai/gpt-oss-120b"
+weight   = 0.78
 api      = "openai"
 key_name = "groq"
 enabled  = true
@@ -159,16 +159,8 @@ enabled  = true
 
 [graeae.providers.xai]
 url      = "https://api.x.ai/v1/chat/completions"
-model    = "grok-4-1-fast"
-weight   = 0.85
-api      = "openai"
-key_name = "xai"
-enabled  = true
-
-[graeae.providers.xai_grok42]
-url      = "https://api.x.ai/v1/chat/completions"
 model    = "grok-4.2"
-weight   = 0.87
+weight   = 0.90
 api      = "openai"
 key_name = "xai"
 enabled  = true
@@ -191,8 +183,8 @@ enabled  = true
 
 [graeae.providers.together]
 url      = "https://api.together.xyz/v1/chat/completions"
-model    = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
-weight   = 0.75
+model    = "Qwen/Qwen3-235B-A22B-Instruct-2507-tput"
+weight   = 0.78
 api      = "openai"
 key_name = "together_ai"
 enabled  = true

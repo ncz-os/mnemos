@@ -67,7 +67,7 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
     },
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
-        "model": "llama-3.3-70b-versatile", "weight": 0.63, "api": "openai", "key_name": "groq",
+        "model": "openai/gpt-oss-120b", "weight": 0.78, "api": "openai", "key_name": "groq",
     },
     "claude_opus": {
         "url": "https://api.anthropic.com/v1/messages",
@@ -75,11 +75,7 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
     },
     "xai": {
         "url": "https://api.x.ai/v1/chat/completions",
-        "model": "grok-4-1-fast", "weight": 0.85, "api": "openai", "key_name": "xai",
-    },
-    "xai_grok42": {
-        "url": "https://api.x.ai/v1/chat/completions",
-        "model": "grok-4.2", "weight": 0.87, "api": "openai", "key_name": "xai",
+        "model": "grok-4.2", "weight": 0.90, "api": "openai", "key_name": "xai",
     },
     "openai": {
         "url": "https://api.openai.com/v1/chat/completions",
@@ -91,7 +87,7 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
     },
     "together": {
         "url": "https://api.together.xyz/v1/chat/completions",
-        "model": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8", "weight": 0.75, "api": "openai", "key_name": "together_ai",
+        "model": "Qwen/Qwen3-235B-A22B-Instruct-2507-tput", "weight": 0.78, "api": "openai", "key_name": "together_ai",
     },
 }
 
