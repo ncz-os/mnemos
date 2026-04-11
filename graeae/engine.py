@@ -43,6 +43,7 @@ from graeae._rate_limiter import RateLimiterPool
 from graeae._quality import QualityTracker
 from graeae._cache import ResponseCache
 from graeae._concurrency import ConcurrencyLimiterPool
+from graeae.elo_sync import get_elo_weights
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,15 @@ class GraeaeEngine:
     def __init__(self):
         self.providers = _load_providers()
         self._client: Optional[httpx.AsyncClient] = None
+
+        # Seed base weights from Arena.ai Elo leaderboard if available.
+        # Uses on-disk cache — falls back to config.toml weights silently.
+        elo = get_elo_weights(force_refresh=False)
+        if elo:
+            for name, w in elo.items():
+                if name in self.providers:
+                    self.providers[name]["weight"] = w
+            logger.info(f"[GRAEAE] Elo weights applied for: {[p for p in elo if p in self.providers]}")
 
         # Reliability stack — instantiated here; _concurrency lazily initialised
         # on first consult() call because asyncio.Semaphore needs a running loop.
