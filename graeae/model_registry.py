@@ -225,6 +225,40 @@ def update_graeae_config(
     return changes
 
 
+# ── Model family detection ────────────────────────────────────────────────
+
+def _model_family(model_id: str) -> str:
+    """Extract the major version family from a model ID for update-vs-add decisions.
+
+    Same family = dot-version update → replace existing entry.
+    New family   = genuinely new model line → add alongside existing.
+
+    Examples:
+      grok-4.2          → grok-4
+      grok-4.1-fast     → grok-4
+      gpt-5.4           → gpt-5
+      gpt-5.3-chat-latest → gpt-5
+      gemini-3.1-pro-preview → gemini-3
+      gemini-3-flash    → gemini-3
+      claude-opus-4-6   → claude-opus-4
+      qwen3-235b-a22b   → qwen3-235b
+      llama-4-maverick  → llama-4
+    """
+    name = model_id.lower().strip()
+    # Match: word-chars + dash + single digit optionally followed by .digit
+    # Captures the "name-MAJOR" part before any further version/variant info
+    m = re.match(r'^((?:[a-z][a-z0-9]*-)*[a-z][a-z0-9]*-\d+)[\.\-]', name)
+    if m:
+        return m.group(1)
+    # Fallback: everything up to first dot
+    return name.split('.')[0]
+
+
+def _same_family(a: str, b: str) -> bool:
+    """True if two model IDs share the same major-version family."""
+    return _model_family(a) == _model_family(b)
+
+
 # ── OpenClaw openclaw.json update ─────────────────────────────────────────
 
 def update_openclaw_models(
@@ -233,7 +267,16 @@ def update_openclaw_models(
     default_context_window: int = 1000000,
     default_max_tokens: int = 32768,
 ) -> list[str]:
-    """Add new Arena top-models to openclaw.json providers. Never removes existing models."""
+    """Sync Arena top-models into openclaw.json per provider.
+
+    Update rules:
+      • Same model family (dot-version bump, same price tier) → REPLACE old entry.
+        Cost, contextWindow, maxTokens are inherited from the replaced entry so
+        the operator doesn't have to re-enter pricing for minor version bumps.
+      • New model family (entirely new architecture/line)     → ADD alongside existing.
+      • Model already present (exact or near-exact match)     → no-op.
+      • Never deletes entries that are not superseded.
+    """
     rows = _fetch_arena_rows()
     if not rows:
         logger.warning("[REGISTRY] no Arena data — openclaw.json unchanged")
@@ -255,20 +298,29 @@ def update_openclaw_models(
 
         api_id = normalize(arena_name)
         if api_id is None:
-            # For OpenClaw we can try using the Arena name directly
-            # (the user may need to verify cost/context manually)
-            api_id = arena_name
-            logger.info(
-                f"[REGISTRY] openclaw/{oc_provider}: using raw Arena name "
-                f"{api_id!r} (normalization not available)"
-            )
+            api_id = arena_name  # use raw Arena name; operator may need to verify cost
 
-        existing_ids = [m.get("id", "").lower() for m in providers[oc_provider].get("models", [])]
-        if any(api_id.lower() in eid or eid in api_id.lower() for eid in existing_ids):
-            logger.info(f"[REGISTRY] openclaw/{oc_provider}: {api_id!r} already present")
+        existing_models: list[dict] = providers[oc_provider].setdefault("models", [])
+        existing_ids = [entry.get("id", "") for entry in existing_models]
+
+        # ── Already present (exact or substring match) ─────────────────────
+        if any(
+            api_id.lower() == eid.lower()
+            or api_id.lower() in eid.lower()
+            or eid.lower() in api_id.lower()
+            for eid in existing_ids
+        ):
+            logger.info(f"[REGISTRY] openclaw/{oc_provider}: {api_id!r} already present — skip")
             continue
 
-        new_model = {
+        # ── Find same-family entry (dot-version update) ────────────────────
+        same_fam_idx: Optional[int] = None
+        for idx, entry in enumerate(existing_models):
+            if _same_family(entry.get("id", ""), api_id):
+                same_fam_idx = idx
+                break
+
+        new_model: dict = {
             "id": api_id,
             "name": arena_name,
             "api": oc_api,
@@ -279,15 +331,31 @@ def update_openclaw_models(
             "maxTokens": default_max_tokens,
         }
 
-        msg = f"openclaw/{oc_provider}: ADD {api_id!r} (Arena rank score {score:.0f})"
-        changes.append(msg)
-        logger.info(f"[REGISTRY] {msg}")
+        if same_fam_idx is not None:
+            old_entry = existing_models[same_fam_idx]
+            old_id = old_entry.get("id", "?")
+            # Inherit cost + limits from old entry so pricing doesn't go blank
+            new_model["cost"] = old_entry.get("cost", new_model["cost"])
+            new_model["contextWindow"] = old_entry.get("contextWindow", default_context_window)
+            new_model["maxTokens"] = old_entry.get("maxTokens", default_max_tokens)
 
-        if not dry_run:
-            providers[oc_provider].setdefault("models", []).append(new_model)
+            msg = f"openclaw/{oc_provider}: REPLACE {old_id!r} → {api_id!r}  (Arena score {score:.0f})"
+            changes.append(msg)
+            logger.info(f"[REGISTRY] {msg}")
+
+            if not dry_run:
+                existing_models[same_fam_idx] = new_model
+
+        else:
+            msg = f"openclaw/{oc_provider}: ADD {api_id!r}  (new model family, Arena score {score:.0f})"
+            changes.append(msg)
+            logger.info(f"[REGISTRY] {msg}")
+
+            if not dry_run:
+                existing_models.append(new_model)
 
     if changes and not dry_run:
         openclaw_path.write_text(json.dumps(config, indent=2))
-        logger.info(f"[REGISTRY] openclaw.json updated ({len(changes)} additions)")
+        logger.info(f"[REGISTRY] openclaw.json updated ({len(changes)} changes)")
 
     return changes
