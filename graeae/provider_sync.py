@@ -358,7 +358,7 @@ async def upsert_models(pool, models: list[dict], dry_run: bool = False) -> tupl
         return 0, 0, 0
 
     added = updated = deprecated = 0
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
 
     async with pool.acquire() as conn:
         async with conn.transaction():
