@@ -181,6 +181,14 @@ api      = "gemini"
 key_name = "gemini"
 enabled  = true
 
+[graeae.providers.together]
+url      = "https://api.together.xyz/v1/chat/completions"
+model    = "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
+weight   = 0.72
+api      = "openai"
+key_name = "together_ai"
+enabled  = true
+
 [integrations.macrodata]
 enabled = false
 hook_adapter = true
