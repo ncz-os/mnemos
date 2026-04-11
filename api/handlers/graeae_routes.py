@@ -153,8 +153,8 @@ async def consult_graeae(request: ConsultationRequest, user: UserContext = Depen
         return result
 
     except Exception as e:
-        logger.error(f"GRAEAE error: {e}", exc_info=True)
-        return {"error": str(e), "status": "error"}
+        logger.error(f"GRAEAE consultation error: {e}", exc_info=True)
+        return {"error": "Consultation failed — see server logs for details", "status": "error"}
 
 
 @router.get("/graeae/health")

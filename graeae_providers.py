@@ -223,14 +223,15 @@ class GraeaeEngine:
     async def _query_gemini(self, provider: Dict, prompt: str, timeout: int) -> Dict:
         """Query Google Gemini API"""
         api_key = get_key(provider["key_name"])
-        url = f"{provider['url']}?key={api_key}"
+        url = provider["url"]  # key sent in header, not query string
+        headers = {"x-goog-api-key": api_key}
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"maxOutputTokens": 2000, "temperature": 0.7},
         }
 
         client = await self._get_client()
-        resp = await client.post(url, json=payload, timeout=timeout)
+        resp = await client.post(url, headers=headers, json=payload, timeout=timeout)
 
         if resp.status_code != 200:
             return {

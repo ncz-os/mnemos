@@ -10,13 +10,9 @@ from datetime import timedelta
 # PostgreSQL Configuration
 # ============================================================================
 
-PG_CONFIG = {
-    'host': os.getenv('PG_HOST', 'localhost'),
-    'port': int(os.getenv('PG_PORT', 5432)),
-    'database': os.getenv('PG_DATABASE', 'mnemos'),
-    'user': os.getenv('PG_USER', 'mnemos_user'),
-    'password': os.getenv('PG_PASSWORD', 'changeme')
-}
+# DB config: env vars take precedence, then config.toml [database], then defaults.
+# _TOML is loaded below; we patch PG_CONFIG after loading it.
+PG_CONFIG: dict = {}  # populated after _TOML is loaded (see bottom of file)
 
 # ============================================================================
 # Ollama Configuration (Embeddings)
@@ -120,6 +116,18 @@ def _load_toml() -> dict:
     return {}
 
 _TOML = _load_toml()
+
+# Populate PG_CONFIG: env > config.toml [database] > hardcoded defaults
+_db_toml = _TOML.get('database', {})
+PG_CONFIG = {
+    'host':     os.getenv('PG_HOST',     str(_db_toml.get('host',     'localhost'))),
+    'port':     int(os.getenv('PG_PORT', str(_db_toml.get('port',     5432)))),
+    'database': os.getenv('PG_DATABASE', str(_db_toml.get('database', 'mnemos'))),
+    'user':     os.getenv('PG_USER',     str(_db_toml.get('user',     'mnemos_user'))),
+    'password': os.getenv('PG_PASSWORD', str(_db_toml.get('password', '') or 'changeme')),
+    'pool_min_size': int(os.getenv('PG_POOL_MIN', str(_db_toml.get('pool_min_size', 5)))),
+    'pool_max_size': int(os.getenv('PG_POOL_MAX', str(_db_toml.get('pool_max_size', 20)))),
+}
 
 # Compression configuration — sourced from config.toml, used by CompressionManager
 COMPRESSION_CONFIG: dict = _TOML.get('compression', {})

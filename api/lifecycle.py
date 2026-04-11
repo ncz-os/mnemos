@@ -14,6 +14,7 @@ from fastapi import HTTPException
 import redis.asyncio as aioredis
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from config import PG_CONFIG
 from external_inference_provider import ExternalInferenceProvider
 from graeae_providers import get_graeae_engine  # noqa: F401 — re-exported for handlers
 
@@ -25,11 +26,7 @@ logger = logging.getLogger(__name__)
 COMPRESSION_RESULT_SET_THRESHOLD = 50 * 1024   # 50 KB
 COMPRESSION_ITEM_THRESHOLD = 5 * 1024           # 5 KB per item
 
-# DB config from environment (mirrors config.py defaults)
-PG_PASSWORD = os.getenv('PG_PASSWORD', 'changeme')
-PG_USER = os.getenv('PG_USER', 'mnemos_user')
-PG_DATABASE = os.getenv('PG_DATABASE', 'mnemos')
-PG_HOST = os.getenv('PG_HOST', 'localhost')
+# DB config sourced from config.PG_CONFIG (env > config.toml > defaults)
 
 # Embedding config (for vector search, MOD-02)
 _EMBED_HOST = os.getenv('OLLAMA_EMBED_HOST', 'http://localhost:11434')
@@ -78,12 +75,19 @@ async def lifespan(app):
 
     try:
         _pool = await asyncpg.create_pool(
-            user=PG_USER, password=PG_PASSWORD,
-            database=PG_DATABASE, host=PG_HOST,
-            min_size=5, max_size=20,
+            user=PG_CONFIG['user'],
+            password=PG_CONFIG['password'],
+            database=PG_CONFIG['database'],
+            host=PG_CONFIG['host'],
+            port=PG_CONFIG['port'],
+            min_size=PG_CONFIG['pool_min_size'],
+            max_size=PG_CONFIG['pool_max_size'],
         )
         app.state.pool = _pool   # auth.py reads this via request.app.state.pool
-        logger.info("asyncpg connection pool initialized (min=5, max=20)")
+        logger.info(
+            f"asyncpg connection pool initialized "
+            f"(min={PG_CONFIG['pool_min_size']}, max={PG_CONFIG['pool_max_size']})"
+        )
     except Exception as e:
         logger.error(f"Failed to create DB pool: {e}")
         raise
