@@ -12,7 +12,7 @@ from typing import Dict, Optional
 
 import httpx
 
-from api_keys import get_key
+from graeae.api_keys import get_key
 
 logger = logging.getLogger(__name__)
 

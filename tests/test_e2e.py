@@ -311,48 +311,6 @@ class TestBundleSystem:
         assert rec['recommended_bundle'] is not None
 
 
-class TestIntegrations:
-    """Test integration modules"""
-
-    def test_macrodata_hook_adapter(self):
-        """Test macrodata integration"""
-        from integrations.macrodata import MacrodataHookAdapter
-
-        # Create mock dependencies
-        from unittest.mock import MagicMock
-
-        adapter = MacrodataHookAdapter(
-            memory_store=MagicMock(),
-            state_manager=MagicMock(),
-            compression_manager=MagicMock(),
-            quality_analyzer=MagicMock(),
-        )
-
-        assert adapter is not None
-
-    def test_state_synchronizer(self):
-        """Test state synchronization"""
-        from integrations.macrodata import StateSynchronizer
-
-        from unittest.mock import MagicMock
-
-        sync = StateSynchronizer(
-            state_manager=MagicMock(),
-            memory_store=MagicMock(),
-        )
-
-        assert sync is not None
-        assert sync._state_hashes == {}
-
-    @pytest.mark.asyncio
-    async def test_provider_models(self):
-        """Test external LLM provider integration"""
-        from integrations.external_lms import ProviderModels
-
-        provider_models = ProviderModels()
-        assert provider_models is not None
-
-
 class TestAPIEndpoints:
     """Test API server endpoints"""
 

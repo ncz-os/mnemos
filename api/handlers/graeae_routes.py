@@ -101,7 +101,7 @@ async def consult_graeae(request: ConsultationRequest, user: UserContext = Depen
         f"(limit_chars={request.limit_chars}, format={request.format})"
     )
     try:
-        from graeae_providers import get_graeae_engine
+        from graeae.engine import get_graeae_engine
         engine = get_graeae_engine()
         result = await engine.consult(request.prompt, request.task_type)
 

@@ -43,13 +43,12 @@ py-modules = [
   "config",
   "distillation_worker",
   "external_inference_provider",
-  "graeae_providers",
   "mcp_server",
   "phi_server",
 ]
 
 [tool.setuptools.packages.find]
-include = ["api*", "graeae*", "modules*", "integrations*", "db*"]
+include = ["api*", "graeae*", "modules*", "db*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

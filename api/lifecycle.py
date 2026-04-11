@@ -16,7 +16,7 @@ import redis.asyncio as aioredis
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import PG_CONFIG
 from external_inference_provider import ExternalInferenceProvider
-from graeae_providers import get_graeae_engine  # noqa: F401 — re-exported for handlers
+from graeae.engine import get_graeae_engine  # noqa: F401 — re-exported for handlers
 
 from .models import MemoryItem
 
