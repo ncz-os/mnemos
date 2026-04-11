@@ -75,15 +75,23 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
     },
     "xai": {
         "url": "https://api.x.ai/v1/chat/completions",
-        "model": "grok-3", "weight": 0.48, "api": "openai", "key_name": "xai",
+        "model": "grok-4-1-fast", "weight": 0.85, "api": "openai", "key_name": "xai",
+    },
+    "xai_grok42": {
+        "url": "https://api.x.ai/v1/chat/completions",
+        "model": "grok-4.2", "weight": 0.87, "api": "openai", "key_name": "xai",
     },
     "openai": {
         "url": "https://api.openai.com/v1/chat/completions",
-        "model": "gpt-5.2", "weight": 0.82, "api": "openai", "key_name": "openai",
+        "model": "gpt-5.4", "weight": 0.82, "api": "openai", "key_name": "openai",
     },
     "gemini": {
         "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent",
         "model": "gemini-3.1-pro-preview", "weight": 0.81, "api": "gemini", "key_name": "gemini",
+    },
+    "together": {
+        "url": "https://api.together.xyz/v1/chat/completions",
+        "model": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8", "weight": 0.75, "api": "openai", "key_name": "together_ai",
     },
 }
 
