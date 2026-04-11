@@ -551,6 +551,13 @@ async def update_arena_scores(
 
     scores: {provider: (api_model_id, arena_score, arena_rank)}
     graeae_weight is derived inline from the score using p10/p90 normalization.
+
+    Matching strategy (in order):
+      1. Exact match on model_id (e.g. openai/gpt-5.4 → gpt-5.4 in DB)
+      2. Family prefix match (e.g. xai/grok-4.2 → family "grok-4" matches
+         grok-4.20-0309-reasoning, grok-4.20-0309-non-reasoning, etc.)
+    This handles providers where the Arena normalizer produces an alias that
+    doesn't appear verbatim in the provider's /models response.
     """
     if not pool or not scores:
         return
@@ -565,12 +572,38 @@ async def update_arena_scores(
     async with pool.acquire() as conn:
         for prov, (model_id, arena_score, arena_rank) in scores.items():
             weight = round(max(0.50, min(1.00, 0.50 + 0.50 * (arena_score - p10) / span)), 4)
-            await conn.execute(
+
+            # 1. Exact match
+            result = await conn.execute(
                 """UPDATE model_registry
                    SET arena_score=$3, arena_rank=$4, graeae_weight=$5
                    WHERE provider=$1 AND model_id=$2""",
                 prov, model_id, arena_score, arena_rank, weight,
             )
+            rows_updated = int(result.split()[-1]) if result else 0
+
+            # 2. Family prefix match as fallback
+            if rows_updated == 0:
+                family = _model_family(model_id)
+                result = await conn.execute(
+                    """UPDATE model_registry
+                       SET arena_score=$3, arena_rank=$4, graeae_weight=$5
+                       WHERE provider=$1 AND family=$2""",
+                    prov, family, arena_score, arena_rank, weight,
+                )
+                rows_updated = int(result.split()[-1]) if result else 0
+                if rows_updated:
+                    logger.info(
+                        f"[SYNC] arena scores applied to family {prov}/{family!r} "
+                        f"({rows_updated} rows) score={arena_score:.0f} weight={weight}"
+                    )
+                else:
+                    logger.debug(
+                        f"[SYNC] arena: no rows matched for {prov}/{model_id!r} "
+                        f"(family={family!r}) — provider models not yet synced?"
+                    )
+                continue
+
             logger.info(
                 f"[SYNC] arena scores updated: {prov}/{model_id} "
                 f"score={arena_score:.0f} rank={arena_rank} weight={weight}"
