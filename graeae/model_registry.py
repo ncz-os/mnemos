@@ -18,7 +18,6 @@ Run via: scripts/update_model_registry.py
 import json
 import logging
 import re
-import tomllib
 from pathlib import Path
 from typing import Callable, Optional
 
