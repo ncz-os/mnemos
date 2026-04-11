@@ -162,7 +162,9 @@ async def consult_graeae(request: ConsultationRequest, user: UserContext = Depen
 
 @router.get("/graeae/health")
 async def graeae_health():
-    return {"status": "healthy", "service": "graeae"}
+    from graeae.engine import get_graeae_engine
+    engine = get_graeae_engine()
+    return {"status": "healthy", "service": "graeae", **engine.provider_status()}
 
 
 # ── Audit log endpoints ───────────────────────────────────────────────────────
