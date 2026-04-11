@@ -149,6 +149,14 @@ api      = "openai"
 key_name = "groq"
 enabled  = true
 
+[graeae.providers.claude_opus]
+url      = "https://api.anthropic.com/v1/messages"
+model    = "claude-opus-4-6"
+weight   = 0.85
+api      = "anthropic"
+key_name = "claude-opus"
+enabled  = true
+
 [graeae.providers.xai]
 url      = "https://api.x.ai/v1/chat/completions"
 model    = "grok-4.2"

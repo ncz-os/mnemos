@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 _PROVIDER_RPM: dict[str, int] = {
     "perplexity":  50,
     "groq":        60,
+    "claude_opus": 40,
     "xai":         30,
     "openai":      60,
     "gemini":      60,

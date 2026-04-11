@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 _PROVIDER_SLOTS: dict[str, int] = {
     "perplexity":  3,
     "groq":        4,
+    "claude_opus": 3,
     "xai":         3,
     "openai":      3,
     "gemini":      3,
