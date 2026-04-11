@@ -18,6 +18,7 @@ from api.handlers.ingest import router as ingest_router
 from api.handlers.kg import router as kg_router
 from api.handlers.admin import router as admin_router
 from api.handlers.versions import router as versions_router
+from api.handlers.model_registry_routes import router as model_registry_router
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
@@ -42,6 +43,7 @@ app.include_router(ingest_router)
 app.include_router(kg_router)
 app.include_router(admin_router)
 app.include_router(versions_router)
+app.include_router(model_registry_router)
 
 if __name__ == "__main__":
     import uvicorn

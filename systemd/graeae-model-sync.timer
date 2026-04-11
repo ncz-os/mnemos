@@ -1,0 +1,14 @@
+[Unit]
+Description=MNEMOS Model Registry — Daily Provider Sync Timer
+Requires=graeae-model-sync.service
+
+[Timer]
+# Run daily at 03:15 UTC (off-peak; avoids midnight hammering)
+OnCalendar=*-*-* 03:15:00 UTC
+# If system was off at scheduled time, run within 10 minutes of next boot
+Persistent=true
+# Spread load up to 5 minutes to avoid exact-second stampede
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
