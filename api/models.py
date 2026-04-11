@@ -12,17 +12,6 @@ class ConsultationRequest(BaseModel):
     format: Optional[str] = "full"
 
 
-class ConsultationResponse(BaseModel):
-    consensus_response: str
-    consensus_score: float
-    winning_muse: str
-    winning_latency_ms: int
-    cost: float
-    mode: str
-    task_type: str
-    timestamp: str
-
-
 class StatsResponse(BaseModel):
     total_memories: int
     total_compressions: int
@@ -30,7 +19,6 @@ class StatsResponse(BaseModel):
     average_quality_rating: int
     memories_by_category: Dict[str, int]
     memories_by_subcategory: Dict[str, Dict[str, int]] = {}
-    memories_by_task_type: Dict[str, int]
     unreviewed_compressions: int
     timestamp: str
 

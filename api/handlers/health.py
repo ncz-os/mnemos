@@ -70,7 +70,6 @@ async def get_stats() -> StatsResponse:
             average_quality_rating=int(avg_quality) if avg_quality else 75,
             memories_by_category=memories_by_category,
             memories_by_subcategory=memories_by_subcategory,
-            memories_by_task_type={},
             unreviewed_compressions=0,
             timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         )

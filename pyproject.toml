@@ -48,7 +48,7 @@ py-modules = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["api*", "graeae*", "modules*", "db*"]
+include = ["api*", "graeae*", "db*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
