@@ -10,7 +10,7 @@ User=mnemos
 Group=mnemos
 WorkingDirectory=/opt/mnemos
 ExecStart=/opt/mnemos/venv/bin/python3 scripts/sync_provider_models.py
-Environment=DATABASE_URL=postgresql://mnemos:mnemos@localhost/mnemos
+Environment=DATABASE_URL=postgresql://mnemos_user@localhost/mnemos
 # Inherit API_KEYS_FILE from environment or rely on default ~/.api_keys_master.json
 # Environment=API_KEYS_FILE=/etc/mnemos/api_keys.json
 
