@@ -69,10 +69,7 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
         "url": "https://api.groq.com/openai/v1/chat/completions",
         "model": "openai/gpt-oss-120b", "weight": 0.78, "api": "openai", "key_name": "groq",
     },
-    "claude_opus": {
-        "url": "https://api.anthropic.com/v1/messages",
-        "model": "claude-opus-4-6", "weight": 0.85, "api": "anthropic", "key_name": "claude-opus",
-    },
+
     "xai": {
         "url": "https://api.x.ai/v1/chat/completions",
         "model": "grok-4.2", "weight": 0.90, "api": "openai", "key_name": "xai",
