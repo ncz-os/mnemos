@@ -132,6 +132,20 @@ async def main() -> int:
                         for i, r in enumerate(sorted_rows)
                     }
 
+                    # Map GRAEAE internal provider names → DB provider column names.
+                    # These differ only for providers where GRAEAE uses a descriptive
+                    # key (claude_opus) but the registry stores the vendor name (anthropic).
+                    _GRAEAE_TO_DB_PROVIDER: dict[str, str] = {
+                        "claude_opus": "anthropic",
+                        "xai":         "xai",
+                        "openai":      "openai",
+                        "gemini":      "gemini",
+                        "together":    "together",
+                        "groq":        "groq",
+                        "nvidia":      "nvidia",
+                        "perplexity":  "perplexity",
+                    }
+
                     from graeae.model_registry import _PROVIDER_FAMILIES
                     for prov, (arena_name, score) in best.items():
                         fam = _PROVIDER_FAMILIES.get(prov, {})
@@ -141,7 +155,8 @@ async def main() -> int:
                         else:
                             api_id = arena_name
                         if api_id:
-                            arena_scores[prov] = (api_id, score, rank_map.get(arena_name, 0))
+                            db_prov = _GRAEAE_TO_DB_PROVIDER.get(prov, prov)
+                            arena_scores[db_prov] = (api_id, score, rank_map.get(arena_name, 0))
 
                     if pool and not args.dry_run and arena_scores:
                         from graeae.provider_sync import update_arena_scores
