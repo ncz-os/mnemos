@@ -12,7 +12,7 @@ from api.auth import UserContext, get_current_user
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-_GENESIS_HASH = hashlib.sha256(b"MNEMOS_AUDIT_GENESIS_v2").hexdigest()
+_GENESIS_HASH = hashlib.sha256(b"MNEMOS_AUDIT_GENESIS_v3").hexdigest()
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -72,8 +72,11 @@ async def _write_audit_entry(
                     prev_chain = _GENESIS_HASH
                     prev_id = None
 
+                # Chain covers prev_chain + prompt_hash + response_hash so that
+                # neither the prompt nor the response can be swapped without
+                # breaking chain integrity.
                 chain_hash = hashlib.sha256(
-                    (prev_chain + response_hash).encode()
+                    (prev_chain + prompt_hash + response_hash).encode()
                 ).hexdigest()
 
                 await conn.execute(
@@ -207,7 +210,7 @@ async def verify_audit_chain(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT sequence_num, response_hash, chain_hash, prev_id "
+            "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
             "FROM graeae_audit_log ORDER BY sequence_num ASC"
         )
 
@@ -221,7 +224,7 @@ async def verify_audit_chain(
     prev_chain = _GENESIS_HASH
     for row in rows:
         expected = hashlib.sha256(
-            (prev_chain + row["response_hash"]).encode()
+            (prev_chain + row["prompt_hash"] + row["response_hash"]).encode()
         ).hexdigest()
         if expected != row["chain_hash"]:
             return AuditVerifyResponse(
