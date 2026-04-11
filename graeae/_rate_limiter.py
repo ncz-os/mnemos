@@ -20,6 +20,7 @@ _PROVIDER_RPM: dict[str, int] = {
     "xai":         30,
     "openai":      60,
     "gemini":      60,
+    "nvidia":      50,
     "together":    60,
 }
 _DEFAULT_RPM = 50

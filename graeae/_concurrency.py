@@ -24,6 +24,7 @@ _PROVIDER_SLOTS: dict[str, int] = {
     "xai":         3,
     "openai":      3,
     "gemini":      3,
+    "nvidia":      3,
     "together":    3,
 }
 _DEFAULT_SLOTS = 3

@@ -63,6 +63,7 @@ _ELO_MODEL_MAP: dict[str, str] = {
     "xai":         "grok-4.2",
     "openai":      "gpt-5.4",
     "gemini":      "gemini-3.1-pro",
+    "nvidia":      "nemotron",
     "together":    "qwen3-235b",
 }
 

@@ -181,6 +181,14 @@ api      = "gemini"
 key_name = "gemini"
 enabled  = true
 
+[graeae.providers.nvidia]
+url      = "https://integrate.api.nvidia.com/v1/chat/completions"
+model    = "nvidia/nemotron-3-super-120b-a12b"
+weight   = 0.80
+api      = "openai"
+key_name = "nvidia"
+enabled  = true
+
 [graeae.providers.together]
 url      = "https://api.together.xyz/v1/chat/completions"
 model    = "Qwen/Qwen3-235B-A22B-Instruct-2507-tput"

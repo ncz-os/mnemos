@@ -87,6 +87,10 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
         "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent",
         "model": "gemini-3.1-pro-preview", "weight": 0.81, "api": "gemini", "key_name": "gemini",
     },
+    "nvidia": {
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "model": "nvidia/nemotron-3-super-120b-a12b", "weight": 0.80, "api": "openai", "key_name": "nvidia",
+    },
     "together": {
         "url": "https://api.together.xyz/v1/chat/completions",
         "model": "Qwen/Qwen3-235B-A22B-Instruct-2507-tput", "weight": 0.78, "api": "openai", "key_name": "together_ai",
