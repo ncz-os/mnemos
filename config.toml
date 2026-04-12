@@ -159,7 +159,7 @@ enabled  = true
 
 [graeae.providers.xai]
 url      = "https://api.x.ai/v1/chat/completions"
-model    = "grok-4.2"
+model    = "grok-4.20-0309-reasoning"
 weight   = 0.90
 api      = "openai"
 key_name = "xai"

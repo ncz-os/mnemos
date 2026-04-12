@@ -52,18 +52,24 @@ async def _write_audit_entry(
     provider: str,
     quality_score: float,
 ) -> None:
-    """Append a hash-chained entry to graeae_audit_log. Uses SELECT FOR UPDATE
-    on the last row to serialise concurrent inserts."""
+    """Append a hash-chained entry to graeae_audit_log.
+    Uses a PostgreSQL advisory lock to serialise concurrent inserts."""
     prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
     response_hash = hashlib.sha256(response.encode()).hexdigest()
 
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                # Lock the latest row to serialise chain computation
+                # Advisory lock serialises concurrent inserts.
+                # SELECT FOR UPDATE alone has a TOCTOU race: T2 reads the "last
+                # row" before blocking, then computes the chain against that stale
+                # row after T1 has already inserted a newer one.
+                # Advisory lock (magic key = 0x4772616561 = "Graea") ensures only
+                # one writer holds the chain tip at a time.
+                await conn.execute("SELECT pg_advisory_xact_lock(285734657)")
                 prev_row = await conn.fetchrow(
                     "SELECT id, chain_hash FROM graeae_audit_log "
-                    "ORDER BY sequence_num DESC LIMIT 1 FOR UPDATE"
+                    "ORDER BY sequence_num DESC LIMIT 1"
                 )
                 if prev_row:
                     prev_chain = prev_row["chain_hash"]

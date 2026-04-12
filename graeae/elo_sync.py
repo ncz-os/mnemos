@@ -65,7 +65,7 @@ _ELO_MODEL_MAP: dict[str, str] = {
     "perplexity":  "sonar-pro",
     "groq":        "gpt-oss-120b",        # openai/gpt-oss-120b served via Groq
     "claude_opus": "claude-opus-4-6",
-    "xai":         "grok-4.2",
+    "xai":         "grok-4.20-0309-reasoning",
     "openai":      "gpt-5.4",
     "gemini":      "gemini-3.1-pro",
     "nvidia":      "llama-4-maverick",     # meta/llama-4-maverick-17b-128e-instruct via NIM
