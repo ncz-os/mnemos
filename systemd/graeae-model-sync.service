@@ -6,11 +6,16 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=mnemos
-Group=mnemos
+User=jasonperlow
+Group=jasonperlow
 WorkingDirectory=/opt/mnemos
+# Step 1: Sync provider model catalogs → model_registry table
 ExecStart=/opt/mnemos/venv/bin/python3 scripts/sync_provider_models.py
+# Step 2: Update config.toml if any current models became deprecated
+ExecStart=/opt/mnemos/venv/bin/python3 scripts/update_graeae_config.py
 Environment=DATABASE_URL=postgresql://mnemos_user@localhost/mnemos
+Environment=MNEMOS_CONFIG=/opt/mnemos/config.toml
+Environment=MNEMOS_ELO_PATH=/opt/mnemos/graeae/elo_sync.py
 # Inherit API_KEYS_FILE from environment or rely on default ~/.api_keys_master.json
 # Environment=API_KEYS_FILE=/etc/mnemos/api_keys.json
 
@@ -18,5 +23,5 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=graeae-model-sync
 
-# Allow partial failures (provider timeouts) without marking the unit failed
+# Allow partial provider failures (timeouts, credit limits) without failing the unit
 SuccessExitStatus=0 2

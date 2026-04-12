@@ -80,7 +80,8 @@ async def _fetch_openai_compatible(
         return []
 
     models = []
-    for item in data.get("data", []):
+    items = data if isinstance(data, list) else data.get("data", [])
+    for item in items:
         mid = item.get("id", "")
         if not mid:
             continue
@@ -140,8 +141,8 @@ async def _fetch_groq(timeout: int = 20) -> list[dict]:
     return await _fetch_openai_compatible("https://api.groq.com/openai", key, "groq", _filter, timeout)
 
 
-async def _fetch_together(timeout: int = 20) -> list[dict]:
-    key = _load_key("together")
+async def _fetch_together(timeout: int = 60) -> list[dict]:
+    key = _load_key("together_ai")
     if not key:
         logger.warning("[SYNC:together] no API key — skipping")
         return []
@@ -169,7 +170,7 @@ async def _fetch_nvidia(timeout: int = 20) -> list[dict]:
 
 
 async def _fetch_gemini(timeout: int = 20) -> list[dict]:
-    key = _load_key("gemini")
+    key = _load_key("google_gemini")
     if not key:
         logger.warning("[SYNC:gemini] no API key — skipping")
         return []
