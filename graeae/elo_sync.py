@@ -68,7 +68,7 @@ _ELO_MODEL_MAP: dict[str, str] = {
     "xai":         "grok-4.2",
     "openai":      "gpt-5.4",
     "gemini":      "gemini-3.1-pro",
-    "nvidia":      "nemotron-3-super",    # nvidia/nemotron-3-super-120b-a12b
+    "nvidia":      "llama-4-maverick",     # meta/llama-4-maverick-17b-128e-instruct via NIM
     "together":    "qwen3-235b",          # Qwen3-235B-A22B served via Together
 }
 

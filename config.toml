@@ -183,7 +183,7 @@ enabled  = true
 
 [graeae.providers.nvidia]
 url      = "https://integrate.api.nvidia.com/v1/chat/completions"
-model    = "nvidia/nemotron-3-super-120b-a12b"
+model    = "meta/llama-4-maverick-17b-128e-instruct"
 weight   = 0.80
 api      = "openai"
 key_name = "nvidia"
