@@ -26,12 +26,9 @@ logging.basicConfig(
 # Config — loaded from config.py (single source of truth)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import PG_CONFIG as _PG_CONFIG  # noqa: E402
-# Phi-3.5 Mini runs locally on api-host via OpenVINO (port 11435)
-# Override with OLLAMA_HOST env var to fall back to inference-server (:11434)
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11435")
+from inference_backend import get_backend  # noqa: E402
 
 # Tuning
-MODEL = "phi-3.5-mini"  # Phi-3.5 Mini INT4 via OpenVINO on api-host GPU
 SIZE_LIMIT_KB = 5
 BATCH_SIZE = 5
 CHECK_INTERVAL = 30
@@ -46,70 +43,20 @@ DB_DSN = (
 )
 
 
-class LLMDistillationService:
-    def __init__(self, base_url: str = OLLAMA_HOST):
-        self.base_url = base_url
-        self.client = httpx.AsyncClient(timeout=180.0)
-
-    async def distill(self, text: str, content_len: int) -> str:
-        """Compress text to ~40% of original length using Mistral"""
-        timeout = DISTILL_TIMEOUT_BASE + (content_len / 1024) * DISTILL_TIMEOUT_PER_KB
-
-        prompt = f"""Summarize this text to approximately 40% of original length.
-Preserve all critical facts, decisions, and technical details. Remove redundancy.
-
-TEXT:
-{text}
-
-SUMMARY:"""
-
-        response = await self.client.post(
-            f"{self.base_url}/v1/completions",
-            json={
-                "model": MODEL,
-                "prompt": prompt,
-                "temperature": 0.3,
-                "top_p": 0.9
-            },
-            timeout=timeout
-        )
-        result = response.json()
-        return result.get("choices", [{}])[0].get("text", "").strip()
-
-    async def assess_quality(self, original: str, compressed: str) -> float:
-        """Score compression quality (0-100)"""
-        prompt = f"""Rate this compression quality 0-100.
-100 = all critical info preserved. 0 = info lost.
-
-ORIGINAL: {original[:300]}
-COMPRESSED: {compressed[:300]}
-
-Score (0-100):"""
-
-        response = await self.client.post(
-            f"{self.base_url}/v1/completions",
-            json={
-                "model": MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.1}
-            },
-            timeout=QUALITY_TIMEOUT
-        )
-        result = response.json()
-        try:
-            # /v1/completions returns choices[0].text
-            raw = result.get("choices", [{}])[0].get("text", "80").strip()
-            score = int(''.join(filter(str.isdigit, raw.split()[0])))
-            return max(0, min(100, score))
-        except Exception:
-            return 80
+async def _distill_backend_call(backend, text: str) -> str:
+    """Build distillation prompt and call backend.complete()."""
+    prompt = (
+        "Summarize this text to approximately 40% of original length. "
+        "Preserve all critical facts, decisions, and technical details. "
+        "Remove redundancy.\n\nTEXT:\n" + text + "\n\nSUMMARY:"
+    )
+    return await backend.complete(prompt)
 
 
 class MemoryDistillationWorker:
     def __init__(self):
         self.db = None
-        self.llm = LLMDistillationService()
+        self.llm = get_backend()
         self.stats = {
             "processed": 0,
             "successful": 0,
@@ -124,7 +71,7 @@ class MemoryDistillationWorker:
         self.db = await asyncpg.connect(dsn=DB_DSN)
         
         logger.info("✅ Distillation worker started")
-        logger.info(f"Model: {MODEL} | Endpoint: {OLLAMA_HOST}")
+        logger.info(f"Backend: {self.llm.__class__.__name__}")
         logger.info(f"Config: size_limit={SIZE_LIMIT_KB}KB, batch={BATCH_SIZE}, "
                    f"distill_timeout={DISTILL_TIMEOUT_BASE}s+({DISTILL_TIMEOUT_PER_KB}s/KB)")
 
@@ -194,7 +141,7 @@ class MemoryDistillationWorker:
             # Compress
             timeout = DISTILL_TIMEOUT_BASE + (original_len / 1024) * DISTILL_TIMEOUT_PER_KB
             compressed = await asyncio.wait_for(
-                self.llm.distill(original_text, original_len),
+                _distill_backend_call(self.llm, original_text),
                 timeout=timeout
             )
 
@@ -204,7 +151,7 @@ class MemoryDistillationWorker:
 
             # Score quality
             quality_score = await asyncio.wait_for(
-                self.llm.assess_quality(original_text, compressed),
+                self.llm.evaluate_quality(original_text, compressed),
                 timeout=QUALITY_TIMEOUT
             )
 

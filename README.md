@@ -2,7 +2,7 @@
 
 **Production memory for serious agentic systems.**
 
-MNEMOS is a shared memory service for professional AI and agentic development. It is designed for teams building real systems, where memory has to be persistent, inspectable, attributable, and operationally reliable, not just convenient in a demo.
+MNEMOS is a shared memory service for professional AI and agentic development. It stores, compresses, and reasons over memory with the same operational rigor you would apply to any production database: ACID guarantees, access controls, quality contracts on every transformation, and a cryptographically auditable reasoning layer. It is infrastructure, not a demo feature. It is designed for teams building real systems, where memory has to be persistent, inspectable, attributable, and operationally reliable, not just convenient in a demo.
 
 Deploy MNEMOS once, and every agent in your stack can share the same memory substrate across tools, sessions, and processes. It runs alongside your applications the way Redis, PostgreSQL, or a message bus would, as infrastructure, not as a prompt hack.
 
@@ -52,7 +52,7 @@ If none of those questions matter for your use case, a simpler tool is probably 
 | **Mem0** | Store and retrieve memories via API | Compression quality; reasoning consensus |
 | **Zep** | Conversation history + entity extraction | Compression manifests; multi-provider reasoning |
 | **LangChain / LlamaIndex memory** | In-process buffer or summary | Anything after the process exits |
-| **MemPalace** | Spatial hierarchy with verbatim local storage | What was compressed and whether it was safe; scale beyond one machine |
+| **MemPalace** | Python wrapper around ChromaDB; 96.6% LongMemEval benchmark is raw verbatim mode — AAAK compression mode regresses to 84.2% | Compression you can trust; multi-user access control; temporal fact resolution; auditable reasoning |
 | **CrewAI / AutoGen memory** | Per-crew or per-agent embedded memory | Cross-session persistence; compression quality |
 
 ### What MNEMOS does that none of them do
@@ -64,6 +64,31 @@ If none of those questions matter for your use case, a simpler tool is probably 
 **A knowledge graph alongside free-text memory.** MNEMOS stores structured triples (subject → predicate → object) with temporal validity windows alongside unstructured memories, and exposes a timeline API per subject. Most memory systems are text-only.
 
 ---
+
+### Why MemPalace is not the answer
+
+MemPalace gained immediate traction in the OpenClaw and agentic developer community by publishing a **96.6% R@5 score on the LongMemEval benchmark** alongside a local-only, zero-API-cost promise. In an ecosystem where long-term memory without context explosion is actively unsolved, that headline pulled immediate experimental integration from developers who assumed the problem was solved.
+
+The problem is where that score actually came from.
+
+MemPalace's benchmark was measured in **raw verbatim mode** — storing and retrieving unsummarized chat logs in ChromaDB, which is plain vector similarity over raw text. The headline innovations the community adopted — the AAAK abbreviation dialect (claiming 30x lossless compression) and the Palace spatial architecture (claiming improved retrieval through named rooms and wings) — are what developers integrated expecting to get the 96% score. MemPalace's own creators acknowledged on April 7, 2026 that AAAK mode **regresses retrieval accuracy to 84.2%** because abbreviation degrades embedding quality. The spatial architecture is standard ChromaDB metadata filtering.
+
+So the product getting integrated is raw ChromaDB wrapped in Python — with a real-world accuracy in the mid-80s — while developers believe they are getting the 96% version that does not exist in practice. This is a classic case of hype-driven development: the benchmark was real, but it measured a mode nobody uses, and the innovations that drove adoption actively make things worse.
+
+**The architectural gaps, specifically:**
+
+| Capability | MemPalace | MNEMOS |
+|---|---|---|
+| **Storage** | ChromaDB (SQLite-backed) — known segfault risk on macOS at scale | PostgreSQL + pgvector — ACID transactions, no corruption risk |
+| **Multi-user** | Single-process, no access control | Row Level Security, namespace isolation, API key auth |
+| **Compression** | AAAK abbreviation dialect — degrades retrieval by 12+ points | Async background distillation via local SLMs (Phi, Llama); quality manifest on every compression |
+| **Fact mutation** | Old and new facts coexist in vector space with no resolution mechanism | Temporal KG: triples with `valid_from`/`valid_until`; timeline API per subject |
+| **Reasoning audit** | Storage only — no reasoning layer | SHA-256 Merkle-like hash chain on every GRAEAE prompt/response; cryptographically tamper-evident |
+
+MemPalace is a reasonable choice for single-user local development where raw similarity search is sufficient. The moment you need compression you can verify, memory that multiple agents share safely, facts that can be updated without contradiction, or a reasoning layer you can audit, it cannot deliver — those capabilities were never in the design.
+
+MNEMOS took the harder path: PostgreSQL instead of SQLite, real async compression with quality gates and a manifest instead of abbreviation heuristics, and cryptographic audit instead of flat log files. Less flashy to demo, harder to `pip install`, and exactly what production agentic systems actually need.
+
 
 ## What works now
 
@@ -185,7 +210,7 @@ These features are designed and scoped but not yet implemented.
 ```
 Agents (any language, any framework)
         │
-        │  REST API (port 5000)
+        │  REST API (port 5002)
         ▼
 ┌─────────────────────────────────┐
 │           MNEMOS API            │
@@ -215,7 +240,7 @@ knowledge_graph
 git clone <your-repo-url>
 cd mnemos-production
 docker compose up
-# MNEMOS: http://localhost:5000
+# MNEMOS: http://localhost:5002
 # GRAEAE: http://localhost:5001 (if available)
 ```
 
@@ -242,10 +267,10 @@ psql -U mnemos -d mnemos -f db/migrations_v1_multiuser.sql
 ### Start
 
 ```bash
-python api_server.py        # MNEMOS on port 5000
+python api_server.py        # MNEMOS on port 5002
 python graeae/server.py     # GRAEAE on port 5001 (optional)
 
-curl http://localhost:5000/health
+curl http://localhost:5002/health
 ```
 
 ---
@@ -256,12 +281,12 @@ curl http://localhost:5000/health
 
 ```bash
 # Basic
-curl -X POST http://localhost:5000/memories \
+curl -X POST http://localhost:5002/memories \
   -H 'Content-Type: application/json' \
   -d '{"content": "...", "category": "decisions", "subcategory": "architecture"}'
 
 # With provenance
-curl -X POST http://localhost:5000/memories \
+curl -X POST http://localhost:5002/memories \
   -H 'Content-Type: application/json' \
   -d '{
     "content": "...",
@@ -272,7 +297,7 @@ curl -X POST http://localhost:5000/memories \
   }'
 
 # Team/enterprise: include API key
-curl -X POST http://localhost:5000/memories \
+curl -X POST http://localhost:5002/memories \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer <your-api-key>' \
   -d '{"content": "...", "category": "decisions"}'
@@ -282,17 +307,17 @@ curl -X POST http://localhost:5000/memories \
 
 ```bash
 # Full-text search
-curl -X POST http://localhost:5000/memories/search \
+curl -X POST http://localhost:5002/memories/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "topic keywords", "limit": 10}'
 
 # Filtered by category
-curl -X POST http://localhost:5000/memories/search \
+curl -X POST http://localhost:5002/memories/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "keywords", "category": "solutions", "limit": 5}'
 
 # Semantic (vector) search
-curl -X POST http://localhost:5000/memories/search \
+curl -X POST http://localhost:5002/memories/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "keywords", "semantic": true, "limit": 10}'
 ```
@@ -301,17 +326,17 @@ curl -X POST http://localhost:5000/memories/search \
 
 ```bash
 # Create a user
-curl -X POST http://localhost:5000/admin/users \
+curl -X POST http://localhost:5002/admin/users \
   -H 'Content-Type: application/json' \
   -d '{"id": "alice", "display_name": "Alice", "role": "user"}'
 
 # Generate API key — raw_key shown once only
-curl -X POST http://localhost:5000/admin/users/alice/apikeys \
+curl -X POST http://localhost:5002/admin/users/alice/apikeys \
   -H 'Content-Type: application/json' \
   -d '{"label": "cli-key"}'
 
 # Revoke a key
-curl -X DELETE http://localhost:5000/admin/apikeys/<key-id>
+curl -X DELETE http://localhost:5002/admin/apikeys/<key-id>
 ```
 
 ### GRAEAE reasoning

@@ -16,6 +16,8 @@ psycopg[binary]>=3.1.0   # sync background tasks (core.py, export scripts) + dis
 httpx>=0.27.0
 
 # Cache
+slowapi>=0.1.9
+limits>=3.6.0
 redis>=5.0.0
 
 # Memory/config

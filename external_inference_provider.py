@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 """
-Unified External Inference Provider
-Handles all compression and context preparation via inference-server llama.cpp
+External Inference Provider — llama.cpp / OpenAI-compatible backend.
 
-Used for:
-  - Memory distillation (compress large memories to 20-30% size)
-  - Response compression (compress LLM outputs before storage)
-  - Context preparation (compress context for Claude injection)
-  - Embedding pre-processing (compress before embedding)
+Backed by inference_backend.LlamaCppBackend. New code should use
+inference_backend.get_backend() directly; this class is kept for
+backward compatibility with existing callers.
 
-Configuration:
-  - Endpoint: <EXTERNAL_INFERENCE_ENDPOINT> (configure via env var)
-  - Model: Llama-2-7B-Chat-Q4_K_M.gguf
-  - Context window: 3072 tokens
-  - Max safe prompt tokens: ~2000 (leaves room for generation)
+Configuration (env vars passed through to LlamaCppBackend):
+  EXTERNAL_INFERENCE_ENDPOINT  default: http://localhost:8000
+  EXTERNAL_INFERENCE_MODEL     default: Llama-2-7B-Chat-Q4_K_M.gguf
 """
 
-import httpx
 import logging
 import os
 from typing import Dict, Optional
+
+from inference_backend import LlamaCppBackend
 
 logger = logging.getLogger(__name__)
 
@@ -37,16 +33,11 @@ class ExternalInferenceProvider:
                  endpoint: Optional[str] = None,
                  model: Optional[str] = None,
                  timeout: float = 90.0):
-        self.endpoint = endpoint or os.getenv(
-            "EXTERNAL_INFERENCE_ENDPOINT",
-            "http://localhost:8000"
-        )
-        self.model = model or os.getenv(
-            "EXTERNAL_INFERENCE_MODEL",
-            "Llama-2-7B-Chat-Q4_K_M.gguf"
-        )
-        self.timeout = timeout
-        self.client = httpx.AsyncClient(timeout=timeout)
+        self._backend = LlamaCppBackend(endpoint=endpoint, model=model, timeout=timeout)
+        # Expose for callers that read these attributes directly
+        self.endpoint = self._backend.endpoint
+        self.model    = self._backend.model
+        self.timeout  = timeout
 
     def _truncate_for_context(self, text: str, max_chars: int = MAX_PROMPT_CHARS) -> str:
         """Truncate text to fit within context window"""
@@ -98,33 +89,9 @@ TEXT:
 
 SUMMARY:"""
 
-            response = await self.client.post(
-                f"{self.endpoint}/v1/completions",
-                json={
-                    "prompt": prompt,
-                    "temperature": 0.3,
-                    "top_p": 0.9,
-                    "max_tokens": max_tokens
-                }
+            compressed_text = await self._backend.complete(
+                prompt, max_tokens=max_tokens, temperature=0.3
             )
-
-            if response.status_code != 200:
-                logger.warning(f"[EIP] Compression HTTP {response.status_code}: {response.text[:200]}")
-                return {
-                    'original': text,
-                    'compressed': text,
-                    'original_length': original_len,
-                    'compressed_length': original_len,
-                    'ratio': 1.0,
-                    'quality_score': 0,
-                    'tokens_saved': 0,
-                    'latency_ms': response.elapsed.total_seconds() * 1000 if response.elapsed else 0,
-                    'success': False,
-                    'error': f'HTTP {response.status_code}'
-                }
-
-            result = response.json()
-            compressed_text = result.get('choices', [{}])[0].get('text', '').strip()
 
             if not compressed_text:
                 return {
@@ -146,9 +113,7 @@ SUMMARY:"""
             actual_ratio = compressed_len / max(original_len, 1)
             success = quality_score >= min_quality
 
-            latency = 0
-            if hasattr(response, 'elapsed') and response.elapsed:
-                latency = response.elapsed.total_seconds() * 1000
+            latency = 0  # latency not available from backend.complete()
 
             return {
                 'original': text,
@@ -197,22 +162,7 @@ COMPRESSED: {comp_excerpt}
 
 Score (0-100):"""
 
-            response = await self.client.post(
-                f"{self.endpoint}/v1/completions",
-                json={
-                    "prompt": prompt,
-                    "temperature": 0.1,
-                    "max_tokens": 3
-                },
-                timeout=20.0
-            )
-
-            if response.status_code != 200:
-                logger.warning(f"[EIP] Quality eval HTTP {response.status_code}")
-                return 75
-
-            result = response.json()
-            response_text = result.get('choices', [{}])[0].get('text', '75').strip()
+            response_text = await self._backend.complete(prompt, max_tokens=3, temperature=0.1)
             # Extract first integer from response
             digits = ''.join(c for c in response_text.split()[0] if c.isdigit()) if response_text.split() else '75'
             if not digits:
@@ -288,20 +238,9 @@ Score (0-100):"""
         }
 
     async def health_check(self) -> bool:
-        """Verify inference-server llama-server is responding"""
-        try:
-            response = await self.client.get(
-                f"{self.endpoint}/health",
-                timeout=5.0
-            )
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('status') == 'ok'
-            return False
-        except Exception as e:
-            logger.error(f"[EIP] Health check failed: {e}")
-            return False
+        """Verify inference-server llama-server is responding."""
+        return await self._backend.health_check()
 
     async def close(self):
-        """Close HTTP client"""
-        await self.client.aclose()
+        """Close HTTP client."""
+        await self._backend.close()

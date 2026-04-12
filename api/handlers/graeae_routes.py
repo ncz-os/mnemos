@@ -3,11 +3,12 @@ import hashlib
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
+from api.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -100,7 +101,8 @@ async def _write_audit_entry(
 # ── Consultation endpoint ─────────────────────────────────────────────────────
 
 @router.post("/graeae/consult")
-async def consult_graeae(request: ConsultationRequest, user: UserContext = Depends(get_current_user)):
+@limiter.limit("60/minute")
+async def consult_graeae(http_request: Request, request: ConsultationRequest, user: UserContext = Depends(get_current_user)):
     """Consult GRAEAE multi-provider consensus engine."""
     logger.info(
         f"GRAEAE Consultation: {request.task_type} "

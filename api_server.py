@@ -10,6 +10,13 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.rate_limit import (
+    limiter,
+    SlowAPIMiddleware,
+    RateLimitExceeded,
+    _rate_limit_exceeded_handler,
+)
+
 from api.lifecycle import lifespan
 from api.handlers.health import router as health_router
 from api.handlers.graeae_routes import router as graeae_router
@@ -23,6 +30,11 @@ from api.handlers.model_registry_routes import router as model_registry_router
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
 app = FastAPI(title="MNEMOS API", version="2.3.0", lifespan=lifespan)
+
+# Rate limiting (opt-in via RATE_LIMIT_ENABLED=true — see api/rate_limit.py)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 # CORS: set CORS_ORIGINS env var to restrict in production (comma-separated list).
 # Defaults to "*" for local dev. Example: CORS_ORIGINS=https://app.example.com
@@ -47,8 +59,8 @@ app.include_router(model_registry_router)
 
 if __name__ == "__main__":
     import uvicorn
-    # NOTE: multi-process workers share nothing — each gets its own DB pool (min_size=5,
-    # max_size=20). With workers=4 that is up to 80 Postgres connections. Adjust
-    # pool sizes in config.toml [database] or run behind gunicorn with --workers 1
-    # if your Postgres max_connections is constrained.
-    uvicorn.run(app, host="0.0.0.0", port=5000, workers=4)
+    # workers=1 is required: GRAEAE circuit breakers, rate limiters, and semaphores
+    # are in-process state. Multiple workers each get their own copy and will not
+    # share limits. Use MNEMOS_PORT env var to override (default: 5002).
+    port = int(os.getenv("MNEMOS_PORT", "5002"))
+    uvicorn.run(app, host="0.0.0.0", port=port, workers=1)
