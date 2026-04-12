@@ -12,8 +12,8 @@ Environment="PATH=/opt/mnemos/venv/bin"
 EnvironmentFile=/opt/mnemos/.env
 ExecStart=/opt/mnemos/venv/bin/python -m uvicorn api_server:app \
     --host 0.0.0.0 \
-    --port 5000 \
-    --workers 4 \
+    --port 5002 \
+    --workers 1 \
     --log-level info
 
 # Auto-restart on failure

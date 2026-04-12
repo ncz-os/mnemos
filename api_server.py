@@ -5,10 +5,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-import os
-
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.rate_limit import (
     limiter,
@@ -30,6 +30,26 @@ from api.handlers.model_registry_routes import router as model_registry_router
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
 app = FastAPI(title="MNEMOS API", version="2.3.0", lifespan=lifespan)
+
+# ── Request body size limit (SEC-04) ──────────────────────────────────────────
+# Default 5 MB. Override via MAX_BODY_BYTES env var.
+_MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(5 * 1024 * 1024)))
+
+
+class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
+    """Reject requests whose Content-Length exceeds MAX_BODY_BYTES."""
+    async def dispatch(self, request: Request, call_next):
+        if request.method in ("POST", "PATCH", "PUT"):
+            cl = request.headers.get("content-length")
+            if cl and int(cl) > _MAX_BODY_BYTES:
+                return JSONResponse(
+                    {"detail": f"Request body exceeds {_MAX_BODY_BYTES // 1024 // 1024} MB limit"},
+                    status_code=413,
+                )
+        return await call_next(request)
+
+
+app.add_middleware(_BodySizeLimitMiddleware)
 
 # Rate limiting (opt-in via RATE_LIMIT_ENABLED=true — see api/rate_limit.py)
 app.state.limiter = limiter

@@ -1,12 +1,11 @@
 """Memory CRUD, search, and rehydration endpoints."""
-import asyncio
 import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
@@ -72,8 +71,8 @@ async def _persist_compression(memory_id: str, compressed_text: str) -> None:
 async def list_memories(
     category: Optional[str] = None,
     subcategory: Optional[str] = None,
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = Query(20, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     user: UserContext = Depends(get_current_user),
 ):
     if not _lc._pool:
@@ -138,8 +137,9 @@ async def search_memories(
     user: UserContext = Depends(get_current_user),
 ):
     """Search memories with optional compression of large result sets (cached 5 min)."""
+    request_limit = min(request.limit, 500)  # server-side cap regardless of model field
     cache_key = _get_cache_key(
-        "search", request.query, request.limit,
+        "search", request.query, request_limit,
         request.category or "", request.subcategory or "",
         "semantic" if request.semantic else "fts",
     )
@@ -163,18 +163,18 @@ async def search_memories(
                 if not embedding:
                     logger.warning("[VECTOR] Embedding failed, falling back to FTS")
                     rows = await _fts_fetch(
-                        conn, request.query, request.limit,
+                        conn, request.query, request_limit,
                         request.category, request.subcategory,
                     )
                 else:
                     logger.info(f"[VECTOR] Semantic search: {len(embedding)}-dim vector")
                     rows = await _vector_search(
-                        conn, embedding, request.limit,
+                        conn, embedding, request_limit,
                         request.category, request.subcategory,
                     )
             else:
                 rows = await _fts_fetch(
-                    conn, request.query, request.limit,
+                    conn, request.query, request_limit,
                     request.category, request.subcategory,
                 )
 
@@ -205,7 +205,7 @@ async def search_memories(
                             f"[PHASE2] Compressed {memory.id[:8]}: "
                             f"{item_size} -> {result['compressed_length']} chars"
                         )
-                        asyncio.create_task(_persist_compression(memory.id, result['compressed']))
+                        _lc._schedule_background(_persist_compression(memory.id, result['compressed']))
                     else:
                         total_compressed += item_size
                         logger.warning(f"[PHASE2] Compression failed for {memory.id[:8]}: {result['error']}")

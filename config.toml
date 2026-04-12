@@ -198,7 +198,7 @@ key_name = "together_ai"
 enabled  = true
 
 [integrations.macrodata]
-enabled = false
+enabled = true
 hook_adapter = true
 state_sync = true
 
@@ -229,7 +229,7 @@ semantic_search = true
 profile = "personal"
 
 [auth]
-enabled = false
+enabled = true
 personal_user_id = "default"
 default_namespace = "default"
 mode = "bearer"

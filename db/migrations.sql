@@ -11,8 +11,8 @@ CREATE TABLE IF NOT EXISTS memories (
   -- Metadata
   category VARCHAR(50) NOT NULL,
   task_type VARCHAR(100),
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW(),
+  created TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated TIMESTAMP DEFAULT NOW(),
 
   -- Compression fields
   compressed_content TEXT,
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
 CREATE INDEX IF NOT EXISTS idx_memories_task_type ON memories(task_type);
-CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_is_compressed ON memories(is_compressed);
 CREATE INDEX IF NOT EXISTS idx_memories_original_reference ON memories(original_reference);
 CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING ivfflat(embedding vector_cosine_ops);
@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS compression_quality_log (
   compression_manifest JSONB,
 
   -- Audit
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  created TIMESTAMP NOT NULL DEFAULT NOW(),
   reviewed BOOLEAN DEFAULT FALSE,
   review_notes TEXT,
   reviewed_by VARCHAR(100),
@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS graeae_consultations (
   mode VARCHAR(50),                          -- 'local', 'external', 'auto'
 
   -- Audit
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  created TIMESTAMP NOT NULL DEFAULT NOW(),
   model_variants JSONB,                      -- Which model variants were used
 
   CONSTRAINT valid_quality CHECK (context_quality_rating IS NULL OR (context_quality_rating >= 0 AND context_quality_rating <= 100)),
@@ -131,7 +131,7 @@ CREATE INDEX IF NOT EXISTS idx_graeae_consult_winning_muse ON graeae_consultatio
 CREATE TABLE IF NOT EXISTS state (
   key VARCHAR(100) PRIMARY KEY,
   value JSONB NOT NULL,
-  updated_at TIMESTAMP DEFAULT NOW(),
+  updated TIMESTAMP DEFAULT NOW(),
 
   -- Audit
   updated_by VARCHAR(100),
@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS journal (
   topic VARCHAR(100),
   content TEXT,
   metadata JSONB,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  created TIMESTAMP NOT NULL DEFAULT NOW(),
 
   CONSTRAINT fk_journal_date CHECK (entry_date = DATE(created_at))
 );
@@ -165,8 +165,8 @@ CREATE TABLE IF NOT EXISTS entities (
   -- Relationships
   related_entities UUID[],
 
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW(),
+  created TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated TIMESTAMP DEFAULT NOW(),
 
   UNIQUE(entity_type, name)
 );

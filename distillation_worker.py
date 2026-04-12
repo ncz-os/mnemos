@@ -37,10 +37,14 @@ DISTILL_TIMEOUT_PER_KB = 3
 QUALITY_TIMEOUT = 20
 MAX_ATTEMPTS = 3
 
-DB_DSN = (
-    f"postgresql://{_PG_CONFIG['user']}:{_PG_CONFIG['password']}"
-    f"@{_PG_CONFIG['host']}:{_PG_CONFIG['port']}/{_PG_CONFIG['database']}"
-)
+# DB connection kwargs — never build a DSN string with the password embedded
+_DB_CONNECT_ARGS = {
+    "user":     _PG_CONFIG["user"],
+    "password": _PG_CONFIG["password"],
+    "database": _PG_CONFIG["database"],
+    "host":     _PG_CONFIG["host"],
+    "port":     _PG_CONFIG["port"],
+}
 
 
 async def _distill_backend_call(backend, text: str) -> str:
@@ -55,7 +59,7 @@ async def _distill_backend_call(backend, text: str) -> str:
 
 class MemoryDistillationWorker:
     def __init__(self):
-        self.db = None
+        self.db_pool = None   # asyncpg Pool — set in start()
         self.llm = get_backend()
         self.stats = {
             "processed": 0,
@@ -68,7 +72,9 @@ class MemoryDistillationWorker:
     async def start(self):
         """Start background worker"""
         logger.info(f"Connecting to DB: {_PG_CONFIG['host']}:{_PG_CONFIG['port']}/{_PG_CONFIG['database']}")
-        self.db = await asyncpg.connect(dsn=DB_DSN)
+        self.db_pool = await asyncpg.create_pool(
+            min_size=1, max_size=3, command_timeout=60, **_DB_CONNECT_ARGS
+        )
         
         logger.info("✅ Distillation worker started")
         logger.info(f"Backend: {self.llm.__class__.__name__}")
@@ -83,7 +89,9 @@ class MemoryDistillationWorker:
                 logger.error(f"Worker error: {e}", exc_info=True)
                 try:
                     await self.db.close()
-                    self.db = await asyncpg.connect(dsn=DB_DSN)
+                    self.db_pool = await asyncpg.create_pool(
+            min_size=1, max_size=3, command_timeout=60, **_DB_CONNECT_ARGS
+        )
                 except Exception as re:
                     logger.error(f"DB reconnect failed: {re}")
 
@@ -104,7 +112,8 @@ class MemoryDistillationWorker:
         LIMIT $3
         """
 
-        rows = await self.db.fetch(query, SIZE_LIMIT_KB * 1024, MAX_ATTEMPTS, BATCH_SIZE)
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(query, SIZE_LIMIT_KB * 1024, MAX_ATTEMPTS, BATCH_SIZE)
 
         if not rows:
             logger.debug("No memories pending optimization")
@@ -173,10 +182,11 @@ class MemoryDistillationWorker:
                 )
             WHERE id = $3
             """
-            await self.db.execute(
-                update_query,
-                compressed, min(100, int(quality_score)), memory_id
-            )
+            async with self.db_pool.acquire() as conn:
+                await conn.execute(
+                    update_query,
+                    compressed, min(100, int(quality_score)), memory_id
+                )
 
             self.stats["successful"] += 1
             self.stats["total_bytes_saved"] += bytes_saved
@@ -203,7 +213,8 @@ class MemoryDistillationWorker:
     async def increment_attempts(self, memory_id: str):
         """Increment distillation_attempts in metadata"""
         try:
-            await self.db.execute(
+            async with self.db_pool.acquire() as conn:
+              await conn.execute(
                 """
                 UPDATE memories
                 SET metadata = jsonb_set(
@@ -214,21 +225,22 @@ class MemoryDistillationWorker:
                 WHERE id = $1
                 """,
                 memory_id
-            )
+              )
         except Exception as e:
             logger.error(f"Could not increment attempts for {memory_id}: {e}")
 
     async def log_stats(self):
         """Log current progress"""
         try:
-            row = await self.db.fetchrow("""
+            async with self.db_pool.acquire() as conn:
+              row = await conn.fetchrow("""
                 SELECT 
                     COUNT(*) as total,
                     COUNT(CASE WHEN llm_optimized = true THEN 1 END) as optimized,
                     COUNT(CASE WHEN llm_optimized = false THEN 1 END) as pending,
                     AVG(quality_rating) as avg_quality
                 FROM memories
-            """)
+              """)
             total, optimized = row['total'], row['optimized']
 
             if self.stats["processed"] > 0:
@@ -249,8 +261,8 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Worker shutting down gracefully")
     finally:
-        if worker.db:
-            await worker.db.close()
+        if worker.db_pool:
+            await worker.db_pool.close()
 
 
 if __name__ == "__main__":

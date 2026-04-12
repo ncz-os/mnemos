@@ -26,6 +26,22 @@ logger = logging.getLogger(__name__)
 COMPRESSION_RESULT_SET_THRESHOLD = 50 * 1024   # 50 KB
 COMPRESSION_ITEM_THRESHOLD = 5 * 1024           # 5 KB per item
 
+# Background task registry — prevents dangling tasks at shutdown
+_background_tasks: set = set()
+
+
+def _schedule_background(coro) -> None:
+    """Schedule a fire-and-forget coroutine with lifecycle tracking.
+
+    Unlike asyncio.create_task(), tasks created here are tracked in
+    _background_tasks so the lifespan teardown can await them before
+    closing the DB pool.
+    """
+    import asyncio as _asyncio
+    task = _asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
 # DB config sourced from config.PG_CONFIG (env > config.toml > defaults)
 
 # Embedding config (for vector search, MOD-02)
@@ -122,6 +138,11 @@ async def lifespan(app):
 
     yield
 
+    if _background_tasks:
+        logger.info(f"Draining {len(_background_tasks)} background task(s)…")
+        import asyncio as _asyncio
+        await _asyncio.gather(*list(_background_tasks), return_exceptions=True)
+
     if _pool:
         await _pool.close()
         logger.info("DB pool closed")
@@ -167,7 +188,7 @@ def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
         raw_meta = None
     return MemoryItem(
         id=row['id'],
-        content=row['content'][:2000],
+        content=row['content'],
         category=row['category'],
         subcategory=row.get('subcategory'),
         created=row['created'].isoformat() if row['created'] else '',
@@ -205,33 +226,40 @@ async def _get_embedding(text: str) -> list:
 async def _vector_search(conn, embedding: list, limit: int,
                          category=None, subcategory=None,
                          select_cols=None) -> list:
-    """pgvector cosine similarity search. Returns rows ordered by similarity desc."""
+    """pgvector cosine similarity search. Returns rows ordered by similarity desc.
+
+    The vector is always $1 — used in both the SELECT similarity expression and
+    the ORDER BY clause.  Passing it as a parameter (not interpolated into the
+    query string) eliminates any injection risk from a poisoned embedding response.
+    """
     if select_cols is None:
         select_cols = _MEMORY_COLS
-    vec_literal = "[" + ",".join(str(x) for x in embedding) + "]"
-    sim_col = f"1 - (embedding <=> '{vec_literal}'::vector) AS similarity"
+    # float() cast guards against non-numeric values in the embedding response
+    vec_str = "[" + ",".join(str(float(x)) for x in embedding) + "]"
+    # $1 is the vector — referenced in SELECT and ORDER BY, never interpolated
+    sim_col = "1 - (embedding <=> $1::vector) AS similarity"
     base = f"SELECT {select_cols}, {sim_col} FROM memories WHERE embedding IS NOT NULL"
     try:
         if category and subcategory:
             return await conn.fetch(
-                f"{base} AND category=$1 AND subcategory=$2 "
-                "ORDER BY embedding <=> $3::vector LIMIT $4",
-                category, subcategory, vec_literal, limit,
+                f"{base} AND category=$2 AND subcategory=$3 "
+                "ORDER BY embedding <=> $1::vector LIMIT $4",
+                vec_str, category, subcategory, limit,
             )
         elif category:
             return await conn.fetch(
-                f"{base} AND category=$1 ORDER BY embedding <=> $2::vector LIMIT $3",
-                category, vec_literal, limit,
+                f"{base} AND category=$2 ORDER BY embedding <=> $1::vector LIMIT $3",
+                vec_str, category, limit,
             )
         elif subcategory:
             return await conn.fetch(
-                f"{base} AND subcategory=$1 ORDER BY embedding <=> $2::vector LIMIT $3",
-                subcategory, vec_literal, limit,
+                f"{base} AND subcategory=$2 ORDER BY embedding <=> $1::vector LIMIT $3",
+                vec_str, subcategory, limit,
             )
         else:
             return await conn.fetch(
                 f"{base} ORDER BY embedding <=> $1::vector LIMIT $2",
-                vec_literal, limit,
+                vec_str, limit,
             )
     except Exception as e:
         logger.error(f"[VECTOR] pgvector search failed: {e}")
@@ -242,39 +270,45 @@ async def _fts_fetch(conn, query: str, limit: int,
                      category=None,
                      subcategory=None,
                      select_cols=None):
-    """FTS search with ILIKE fallback. Shared by /memories/search and /memories/rehydrate."""
+    """FTS search with ILIKE fallback. Shared by /memories/search and /memories/rehydrate.
+
+    Uses plainto_tsquery (not to_tsquery) so user input is treated as plain text —
+    tsquery operators like |, !, & are not interpreted.  This prevents tsquery
+    operator injection while preserving full-text search quality.
+    """
     if select_cols is None:
         select_cols = _MEMORY_COLS
-    query_tsv = " & ".join(query.split())
-    rank_col = "ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as rank"
+    # Pass the raw query directly — plainto_tsquery handles tokenisation safely
+    clean_query = query.strip()
+    rank_col = "ts_rank(to_tsvector('english', content), plainto_tsquery('english', $1)) as rank"
     try:
         if category and subcategory:
             return await conn.fetch(
                 f"SELECT {select_cols}, {rank_col} FROM memories "
-                "WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
+                "WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) "
                 "AND category=$3 AND subcategory=$4 ORDER BY rank DESC LIMIT $2",
-                query_tsv, limit, category, subcategory,
+                clean_query, limit, category, subcategory,
             )
         elif category:
             return await conn.fetch(
                 f"SELECT {select_cols}, {rank_col} FROM memories "
-                "WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
+                "WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) "
                 "AND category=$3 ORDER BY rank DESC LIMIT $2",
-                query_tsv, limit, category,
+                clean_query, limit, category,
             )
         elif subcategory:
             return await conn.fetch(
                 f"SELECT {select_cols}, {rank_col} FROM memories "
-                "WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
+                "WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) "
                 "AND subcategory=$3 ORDER BY rank DESC LIMIT $2",
-                query_tsv, limit, subcategory,
+                clean_query, limit, subcategory,
             )
         else:
             return await conn.fetch(
                 f"SELECT {select_cols}, {rank_col} FROM memories "
-                "WHERE to_tsvector('english', content) @@ to_tsquery('english', $1) "
+                "WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) "
                 "ORDER BY rank DESC LIMIT $2",
-                query_tsv, limit,
+                clean_query, limit,
             )
     except Exception:
         logger.warning(f"[FTS] falling back to ILIKE for: {query[:50]!r}")

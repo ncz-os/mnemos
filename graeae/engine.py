@@ -77,7 +77,7 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
     },
     "xai": {
         "url": "https://api.x.ai/v1/chat/completions",
-        "model": "grok-4.2", "weight": 0.90, "api": "openai", "key_name": "xai",
+        "model": "grok-4.20-0309-reasoning", "weight": 0.90, "api": "openai", "key_name": "xai",
     },
     "openai": {
         "url": "https://api.openai.com/v1/chat/completions",

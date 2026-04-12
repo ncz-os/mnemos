@@ -2,6 +2,7 @@
 import json
 import logging
 import uuid
+from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,6 +13,28 @@ from api.models import SessionIngestRequest, SessionIngestResponse
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _extract_readable(items: list, max_items: int = 20) -> str:
+    """Extract human-readable text from session items.
+
+    Handles common message formats ({role, content}, {type, text}, plain strings).
+    Caps at max_items to prevent unbounded memory growth.
+    Never calls str() on arbitrary objects — only extracts validated string fields.
+    """
+    parts = []
+    for item in items[:max_items]:
+        if isinstance(item, dict):
+            content = item.get("content") or item.get("text") or item.get("body") or ""
+            if not isinstance(content, str):
+                continue
+            role = item.get("role") or item.get("type") or ""
+            parts.append(f"[{role}] {content[:500]}" if role else content[:500])
+        elif isinstance(item, str):
+            parts.append(item[:500])
+    return "\n".join(parts) if parts else "(no readable content)"
+
+
 
 
 @router.post("/ingest/session", response_model=SessionIngestResponse)
@@ -26,7 +49,7 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
             if data.get("messages") or data.get("prompts"):
                 items = data.get("messages", []) or data.get("prompts", [])
                 if items:
-                    content = f"Session {request.session_id} - {len(items)} messages\n{str(items)[:500]}"
+                    content = f"Session {request.session_id} — {len(items)} messages\n{_extract_readable(items)}"
                     mem_id = f"mem_{uuid.uuid4().hex[:12]}"
                     meta = json.dumps({
                         "source": request.source, "session_id": request.session_id,
@@ -44,7 +67,7 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
             if data.get("code_blocks"):
                 items = data.get("code_blocks", [])
                 if items:
-                    content = f"Session {request.session_id} - {len(items)} code blocks\n{str(items)[:500]}"
+                    content = f"Session {request.session_id} — {len(items)} code blocks\n{_extract_readable(items)}"
                     mem_id = f"mem_{uuid.uuid4().hex[:12]}"
                     meta = json.dumps({
                         "source": request.source, "session_id": request.session_id,
@@ -62,7 +85,7 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
             if data.get("tool_operations") or data.get("tools"):
                 items = data.get("tool_operations", []) or data.get("tools", [])
                 if items:
-                    content = f"Session {request.session_id} - {len(items)} tool operations\n{str(items)[:500]}"
+                    content = f"Session {request.session_id} — {len(items)} tool operations\n{_extract_readable(items)}"
                     mem_id = f"mem_{uuid.uuid4().hex[:12]}"
                     meta = json.dumps({
                         "source": request.source, "session_id": request.session_id,

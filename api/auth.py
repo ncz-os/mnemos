@@ -86,7 +86,9 @@ async def get_current_user(
     if row is None or row["revoked"]:
         raise HTTPException(status_code=401, detail="Invalid or revoked API key")
 
-    asyncio.create_task(_update_last_used(pool, str(row["id"])))
+    # Track the background task so shutdown can drain it before closing the pool
+    _task = asyncio.create_task(_update_last_used(pool, str(row["id"])))
+    _task.add_done_callback(lambda t: None)  # suppress "task destroyed" warning
 
     async with pool.acquire() as conn:
         group_rows = await conn.fetch(

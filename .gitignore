@@ -81,3 +81,16 @@ api.log
 # Internal repo layout notes for ops clones only
 *.stale_*
 !.env.example
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+__pycache__/
+
+# Local scripts not for distribution
+sync_argonas_git.py
+git_sync_daily.sh
+run_monthly_export.sh
+monitor_distillation.sh
+deploy.sh
