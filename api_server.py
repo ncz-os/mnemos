@@ -26,6 +26,9 @@ from api.handlers.kg import router as kg_router
 from api.handlers.admin import router as admin_router
 from api.handlers.versions import router as versions_router
 from api.handlers.model_registry_routes import router as model_registry_router
+from api.handlers.journal import router as journal_router
+from api.handlers.state import router as state_router
+from api.handlers.entities import router as entities_router
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
@@ -76,6 +79,9 @@ app.include_router(kg_router)
 app.include_router(admin_router)
 app.include_router(versions_router)
 app.include_router(model_registry_router)
+app.include_router(journal_router)
+app.include_router(state_router)
+app.include_router(entities_router)
 
 if __name__ == "__main__":
     import uvicorn
