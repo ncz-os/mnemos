@@ -3,7 +3,7 @@
 
 -- memories table: Core memory storage with compression support
 CREATE TABLE IF NOT EXISTS memories (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  id TEXT PRIMARY KEY,
 
   -- Content (always store original)
   content TEXT NOT NULL,
@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS compression_quality_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_compression_log_memory_id ON compression_quality_log(memory_id);
-CREATE INDEX IF NOT EXISTS idx_compression_log_created_at ON compression_quality_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_compression_log_created ON compression_quality_log(created DESC);
 CREATE INDEX IF NOT EXISTS idx_compression_log_reviewed ON compression_quality_log(reviewed);
 CREATE INDEX IF NOT EXISTS idx_compression_log_quality_rating ON compression_quality_log(quality_rating);
 
@@ -123,7 +123,7 @@ CREATE TABLE IF NOT EXISTS graeae_consultations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_graeae_consult_task_type ON graeae_consultations(task_type);
-CREATE INDEX IF NOT EXISTS idx_graeae_consult_created_at ON graeae_consultations(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_graeae_consult_created ON graeae_consultations(created DESC);
 CREATE INDEX IF NOT EXISTS idx_graeae_consult_mode ON graeae_consultations(mode);
 CREATE INDEX IF NOT EXISTS idx_graeae_consult_winning_muse ON graeae_consultations(winning_muse);
 
@@ -147,12 +147,12 @@ CREATE TABLE IF NOT EXISTS journal (
   metadata JSONB,
   created TIMESTAMP NOT NULL DEFAULT NOW(),
 
-  CONSTRAINT fk_journal_date CHECK (entry_date = DATE(created_at))
+  CONSTRAINT fk_journal_date CHECK (entry_date = DATE(created))
 );
 
 CREATE INDEX IF NOT EXISTS idx_journal_entry_date ON journal(entry_date DESC);
 CREATE INDEX IF NOT EXISTS idx_journal_topic ON journal(topic);
-CREATE INDEX IF NOT EXISTS idx_journal_created_at ON journal(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_journal_created ON journal(created DESC);
 
 -- entities table: Track people, projects, etc.
 CREATE TABLE IF NOT EXISTS entities (
@@ -173,6 +173,24 @@ CREATE TABLE IF NOT EXISTS entities (
 
 CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
 CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+
+CREATE TABLE IF NOT EXISTS kg_triples (
+    id           TEXT PRIMARY KEY,
+    subject      TEXT NOT NULL,
+    predicate    TEXT NOT NULL,
+    object       TEXT NOT NULL,
+    subject_type TEXT,
+    object_type  TEXT,
+    valid_from   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    valid_until  TIMESTAMPTZ,
+    memory_id    TEXT,
+    confidence   FLOAT NOT NULL DEFAULT 1.0,
+    created      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_kg_subject    ON kg_triples(subject);
+CREATE INDEX IF NOT EXISTS idx_kg_predicate  ON kg_triples(predicate);
+CREATE INDEX IF NOT EXISTS idx_kg_memory_id  ON kg_triples(memory_id);
+
 
 -- Extension: Enable vector support if not already enabled
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -200,11 +218,11 @@ SELECT
   m.task_type,
   cql.quality_rating,
   cql.compression_ratio,
-  cql.created_at,
+  cql.created,
   m.content,
   cql.quality_summary
 FROM compression_quality_log cql
 JOIN memories m ON cql.memory_id = m.id
 WHERE cql.reviewed = FALSE
   AND cql.quality_rating < 80
-ORDER BY cql.quality_rating ASC, cql.created_at DESC;
+ORDER BY cql.quality_rating ASC, cql.created DESC;

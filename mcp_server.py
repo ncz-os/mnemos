@@ -29,6 +29,7 @@ logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 logger = logging.getLogger("mnemos-mcp")
 
 MNEMOS_BASE = os.getenv("MNEMOS_BASE", "http://localhost:5002").rstrip("/")
+MNEMOS_API_KEY = os.getenv("MNEMOS_API_KEY", "")
 HTTP_TIMEOUT = 30.0
 
 app = Server("mnemos")
@@ -37,25 +38,28 @@ app = Server("mnemos")
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 async def _get(path: str, params: dict | None = None) -> Any:
+    headers = {"Authorization": f"Bearer {MNEMOS_API_KEY}"} if MNEMOS_API_KEY else {}
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get(f"{MNEMOS_BASE}{path}", params=params)
+        r = await client.get(f"{MNEMOS_BASE}{path}", params=params, headers=headers)
         r.raise_for_status()
         return r.json() if r.content else {}
 
 
 async def _post(path: str, body: dict, method: str = "POST") -> Any:
+    headers = {"Authorization": f"Bearer {MNEMOS_API_KEY}"} if MNEMOS_API_KEY else {}
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         if method == "PATCH":
-            r = await client.patch(f"{MNEMOS_BASE}{path}", json=body)
+            r = await client.patch(f"{MNEMOS_BASE}{path}", json=body, headers=headers)
         else:
-            r = await client.post(f"{MNEMOS_BASE}{path}", json=body)
+            r = await client.post(f"{MNEMOS_BASE}{path}", json=body, headers=headers)
         r.raise_for_status()
         return r.json() if r.content else {}
 
 
 async def _delete(path: str) -> int:
+    headers = {"Authorization": f"Bearer {MNEMOS_API_KEY}"} if MNEMOS_API_KEY else {}
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.delete(f"{MNEMOS_BASE}{path}")
+        r = await client.delete(f"{MNEMOS_BASE}{path}", headers=headers)
         return r.status_code
 
 

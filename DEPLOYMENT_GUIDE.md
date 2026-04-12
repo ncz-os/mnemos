@@ -87,8 +87,11 @@ GRANT ALL PRIVILEGES ON DATABASE mnemos TO mnemos;
 # Install psql (if not available)
 sudo apt-get install postgresql-client
 
-# Run migrations
+# Run all 4 migrations in order
 psql -h localhost -U mnemos -d mnemos -f db/migrations.sql
+psql -h localhost -U mnemos -d mnemos -f db/migrations_v1_multiuser.sql
+psql -h localhost -U mnemos -d mnemos -f db/migrations_v2_versioning.sql
+psql -h localhost -U mnemos -d mnemos -f db/migrations_model_registry.sql
 ```
 
 ### Verify Database
@@ -135,16 +138,16 @@ python3 -c "import fastapi; print('FastAPI installed')"
 ```bash
 cat > /opt/mnemos/.env << 'EOF'
 # Database
-DATABASE_HOST=localhost
-DATABASE_PORT=5432
-DATABASE_NAME=mnemos
-DATABASE_USER=mnemos
-DATABASE_PASSWORD=secure_password_here
+PG_HOST=localhost
+PG_PORT=5432
+PG_DATABASE=mnemos
+PG_USER=mnemos
+PG_PASSWORD=secure_password_here
 
 # API Server
 MNEMOS_HOST=0.0.0.0
-MNEMOS_PORT=5000
-MNEMOS_WORKERS=4
+MNEMOS_PORT=5002
+MNEMOS_WORKERS=1
 MNEMOS_DEBUG=false
 
 # Graeae Integration
@@ -205,8 +208,8 @@ Environment="PATH=/opt/mnemos/venv/bin"
 EnvironmentFile=/opt/mnemos/.env
 ExecStart=/opt/mnemos/venv/bin/python -m uvicorn api_server:app \
     --host 0.0.0.0 \
-    --port 5000 \
-    --workers 4 \
+    --port 5002 \
+    --workers 1 \
     --log-level info
 
 # Auto-restart on failure
@@ -261,7 +264,7 @@ sudo journalctl -u mnemos -f
 
 ```bash
 # Direct curl
-curl -X GET http://your-host:5000/health
+curl -X GET http://your-host:5002/health
 
 # Expected response:
 # {"status":"healthy","timestamp":"2026-02-05T...","database_connected":true,"version":"2.0.0"}
@@ -270,7 +273,7 @@ curl -X GET http://your-host:5000/health
 ### Test Memory Creation
 
 ```bash
-curl -X POST http://your-host:5000/memories \
+curl -X POST http://your-host:5002/memories \
   -H "Content-Type: application/json" \
   -d '{
     "content": "Test memory content",
@@ -300,7 +303,7 @@ sudo journalctl -u mnemos --since today
 
 ```bash
 # Allow API port (only from trusted networks)
-sudo ufw allow 5000/tcp from <your-subnet>/24
+sudo ufw allow 5002/tcp from <your-subnet>/24
 
 # Verify
 sudo ufw status
@@ -396,7 +399,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # Check API health
-response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/health)
+response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5002/health)
 if [ "$response" != "200" ]; then
     echo "ERROR: API health check failed ($response)"
     exit 1
@@ -458,8 +461,8 @@ psql -h localhost -U mnemos -d mnemos -c "\dt"
 ### API Port Already in Use
 
 ```bash
-# Find process using port 5000
-lsof -i :5000
+# Find process using port 5002
+lsof -i :5002
 
 # Kill process (use with caution)
 kill -9 <PID>
@@ -488,7 +491,7 @@ sudo systemctl restart mnemos
 
 ```bash
 # Edit .env
-MNEMOS_WORKERS=8  # Increase if CPU allows
+MNEMOS_WORKERS=1  # Must be 1 — in-process rate limiters and circuit breakers are not multi-worker safe
 
 # Restart service
 sudo systemctl restart mnemos
@@ -541,7 +544,7 @@ psql -h localhost -U mnemos -d mnemos -f db/migrations.sql
 sudo systemctl start mnemos
 
 # Verify
-curl http://your-host:5000/health
+curl http://your-host:5002/health
 ```
 
 ---
@@ -569,13 +572,13 @@ psql -h localhost -U mnemos -d mnemos
 SELECT count(*) FROM memories;   # Count records
 
 # API Testing
-curl http://your-host:5000/health
-curl http://your-host:5000/stats
-curl http://your-host:5000/bundles
+curl http://your-host:5002/health
+curl http://your-host:5002/stats
+curl http://your-host:5002/bundles
 
 # Monitoring
 ps aux | grep mnemos             # Check process
-lsof -i :5000                    # Check port
+lsof -i :5002                    # Check port
 top -p $(pgrep -f "python")      # Monitor CPU/Memory
 ```
 
@@ -605,6 +608,6 @@ top -p $(pgrep -f "python")      # Monitor CPU/Memory
 
 **Deployment Complete!**
 
-Your MNEMOS API is now running on your host at `http://your-host:5000`
+Your MNEMOS API is now running on your host at `http://your-host:5002`
 
 For API documentation, see `API_DOCUMENTATION.md`

@@ -10,8 +10,10 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./db/migrations.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./db/migrations_v1_multiuser.sql:/docker-entrypoint-initdb.d/02-multiuser.sql
+      - ./db/migrations_v2_versioning.sql:/docker-entrypoint-initdb.d/03-versioning.sql
+      - ./db/migrations_model_registry.sql:/docker-entrypoint-initdb.d/04-model-registry.sql
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mnemos_user -d mnemos"]
       interval: 5s
@@ -42,7 +44,7 @@ services:
       GRAEAE_URL: http://host.docker.internal:5001
       MNEMOS_PROFILE: personal
     ports:
-      - "5000:5000"
+      - "5002:5002"
     restart: unless-stopped
 
 volumes:

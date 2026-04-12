@@ -164,15 +164,15 @@ All admin endpoints require root role. On personal installs (no auth), they are 
 
 **GRAEAE core modules (all operational):**
 - **Circuit breaker** — per-provider CLOSED/OPEN/HALF_OPEN state machine, 5-minute cooldown
-- **Persistent queue** — SQLite-backed, crash-safe, resumable
-- **Semantic cache** — embedding-similarity deduplication, 24-hour TTL
-- **Quality scorer** — relevance, coherence, toxicity, completeness scoring per provider
-- **Rate limiter** — four backpressure levels, request queuing before rejection
+- **Semantic cache** — embedding-similarity deduplication, 1-hour TTL
+- **Quality scorer** — success/failure + latency tracking per provider
+- **Rate limiter** — single-level request rate limit (no queuing)
 
 ### Compression
 
-- **token-filter²** (Hybrid Compression Squared) — GRAEAE-assisted semantic compression
-- **SENTENCE** (Semantic Adaptive Compression) — heuristic, runs offline with no external calls
+- **extractive token filter** (Hybrid Compression with Online Learning) — fast heuristic, ~0.5ms, no external calls; 57% reduction
+- **SENTENCE** (Semantic-Anchor Compression) — structure-preserving, ~2-5ms, no external calls; 50% reduction
+- **ExternalInferenceProvider** — LLM-assisted via llama.cpp/Ollama, highest quality; requires inference server (fallback only)
 - Quality manifest on every compression: what was removed, what was preserved, risk factors, safe/unsafe use cases
 - Original content always retained; compressed and original stored independently
 - Configurable quality thresholds per task type (security review: 95%, architecture: 90%, general: 80%)
@@ -268,7 +268,7 @@ psql -U mnemos -d mnemos -f db/migrations_v1_multiuser.sql
 
 ```bash
 python api_server.py        # MNEMOS on port 5002
-python graeae/server.py     # GRAEAE on port 5001 (optional)
+# GRAEAE is embedded in the MNEMOS API (port 5002) — no separate server needed
 
 curl http://localhost:5002/health
 ```

@@ -69,3 +69,8 @@ CREATE TABLE IF NOT EXISTS model_registry_sync_log (
 
 CREATE INDEX IF NOT EXISTS idx_model_registry_sync_log_provider   ON model_registry_sync_log(provider);
 CREATE INDEX IF NOT EXISTS idx_model_registry_sync_log_synced_at  ON model_registry_sync_log(synced_at DESC);
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON model_registry TO mnemos_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON model_registry_sync_log TO mnemos_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON model_registry TO mnemos;
+GRANT SELECT, INSERT, UPDATE, DELETE ON model_registry_sync_log TO mnemos;

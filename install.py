@@ -116,7 +116,12 @@ def create_root_api_key(db_name: str) -> str | None:
 def main() -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_dir, "config.toml")
-    migration_path = os.path.join(script_dir, "db", "migrations_v1_multiuser.sql")
+    migration_files = [
+        os.path.join(script_dir, "db", "migrations.sql"),
+        os.path.join(script_dir, "db", "migrations_v1_multiuser.sql"),
+        os.path.join(script_dir, "db", "migrations_v2_versioning.sql"),
+        os.path.join(script_dir, "db", "migrations_model_registry.sql"),
+    ]
 
     print("=" * 60)
     print("  MNEMOS v1 Installer")
@@ -167,13 +172,14 @@ def main() -> None:
     print("\n--- Writing config.toml ---")
     append_config(config_path, new_sections)
 
-    # 6. Run migration
-    print("\n--- Database migration ---")
-    if not os.path.exists(migration_path):
-        print(f"[ERROR] Migration file not found: {migration_path}")
-        sys.exit(1)
-    if not run_migration(db_user, db_name, migration_path):
-        sys.exit(1)
+    # 6. Run migrations in order
+    print("\n--- Database migrations ---")
+    for migration_path in migration_files:
+        if not os.path.exists(migration_path):
+            print(f"[ERROR] Migration file not found: {migration_path}")
+            sys.exit(1)
+        if not run_migration(db_user, db_name, migration_path):
+            sys.exit(1)
 
     # 7. Team/Enterprise: enable RLS + create root key
     if rls_enabled:

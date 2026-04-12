@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 import api.lifecycle as _lc
-from api.auth import UserContext, get_current_user
+from api.auth import UserContext, get_current_user, require_root
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/model-registry", tags=["model-registry"])
@@ -296,7 +296,7 @@ async def list_provider_models(
 @router.post("/sync", response_model=List[SyncResult])
 async def trigger_sync(
     request: SyncRequest,
-    user: UserContext = Depends(get_current_user),
+    user: UserContext = Depends(require_root),
 ):
     """Trigger an on-demand provider model sync.
 

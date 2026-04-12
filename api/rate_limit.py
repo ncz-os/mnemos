@@ -16,7 +16,7 @@ from slowapi.errors import RateLimitExceeded  # noqa: F401
 from slowapi.middleware import SlowAPIMiddleware  # noqa: F401
 from slowapi.util import get_remote_address
 
-RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "false").lower() == "true"
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
 RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "300/minute")
 RATE_LIMIT_STORAGE = os.getenv("RATE_LIMIT_STORAGE_URI", "memory://")
 

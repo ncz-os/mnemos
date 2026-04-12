@@ -27,6 +27,13 @@ logging.basicConfig(
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import PG_CONFIG as _PG_CONFIG  # noqa: E402
 from inference_backend import get_backend  # noqa: E402
+try:
+    from compression.distillation_engine import DistillationEngine, CompressionStrategy
+    from compression.manager import CompressionManager
+    _COMPRESSION_AVAILABLE = True
+except Exception as _ce:
+    logger.warning(f"Local compression unavailable: {_ce}")
+    _COMPRESSION_AVAILABLE = False
 
 # Tuning
 SIZE_LIMIT_KB = 5
@@ -61,6 +68,8 @@ class MemoryDistillationWorker:
     def __init__(self):
         self.db_pool = None   # asyncpg Pool — set in start()
         self.llm = get_backend()
+        # Local compression engine (extractive token filter + SENTENCE, no external calls)
+        self._compression_engine = DistillationEngine() if _COMPRESSION_AVAILABLE else None
         self.stats = {
             "processed": 0,
             "successful": 0,
@@ -88,7 +97,7 @@ class MemoryDistillationWorker:
             except Exception as e:
                 logger.error(f"Worker error: {e}", exc_info=True)
                 try:
-                    await self.db.close()
+                    await self.db_pool.close()
                     self.db_pool = await asyncpg.create_pool(
             min_size=1, max_size=3, command_timeout=60, **_DB_CONNECT_ARGS
         )
@@ -147,22 +156,46 @@ class MemoryDistillationWorker:
         current_quality = memory["quality_rating"]
 
         try:
-            # Compress
-            timeout = DISTILL_TIMEOUT_BASE + (original_len / 1024) * DISTILL_TIMEOUT_PER_KB
-            compressed = await asyncio.wait_for(
-                _distill_backend_call(self.llm, original_text),
-                timeout=timeout
-            )
+            compression_method = None
+            compressed = None
+            quality_score = None
+
+            # --- Primary path: local extractive token filter/SENTENCE compression (no external calls) ---
+            if _COMPRESSION_AVAILABLE and self._compression_engine is not None:
+                try:
+                    result = self._compression_engine.distill(original_text, strategy=CompressionStrategy.AUTO)
+                    compressed_candidate = result.get("compressed_text") or result.get("compressed", "")
+                    candidate_quality = float(result.get("quality_score", 0) or 0) * 100  # 0-1 -> 0-100
+                    strategy_used = result.get("strategy_used", "hyco")
+                    compression_method = "sac" if strategy_used == "sac" else "token_filter"
+                    if compressed_candidate and len(compressed_candidate) >= 10 and candidate_quality >= 60:
+                        compressed = compressed_candidate
+                        quality_score = candidate_quality
+                        logger.debug(f"Local compression ({compression_method}) quality={quality_score:.1f}")
+                    else:
+                        logger.debug(
+                            f"Local compression quality too low ({candidate_quality:.1f}), falling back to LLM"
+                        )
+                except Exception as ce:
+                    logger.warning(f"Local compression failed for {memory_id[:8]}: {ce}, falling back to LLM")
+
+            # --- Fallback: ExternalInferenceProvider / LLM-assisted compression ---
+            if compressed is None:
+                timeout = DISTILL_TIMEOUT_BASE + (original_len / 1024) * DISTILL_TIMEOUT_PER_KB
+                compressed = await asyncio.wait_for(
+                    _distill_backend_call(self.llm, original_text),
+                    timeout=timeout
+                )
+                if compressed:
+                    quality_score = await asyncio.wait_for(
+                        self.llm.evaluate_quality(original_text, compressed),
+                        timeout=QUALITY_TIMEOUT
+                    )
+                compression_method = "external"
 
             if not compressed or len(compressed) < 10:
                 logger.warning(f"⚠️  Empty compression for {memory_id[:8]}")
                 return
-
-            # Score quality
-            quality_score = await asyncio.wait_for(
-                self.llm.evaluate_quality(original_text, compressed),
-                timeout=QUALITY_TIMEOUT
-            )
 
             compressed_len = len(compressed)
             ratio = compressed_len / max(original_len, 1)
@@ -171,28 +204,29 @@ class MemoryDistillationWorker:
             # Persist
             update_query = """
             UPDATE memories
-            SET compressed_content = $1,
-                quality_rating = $2,
+            SET compressed_content = ,
+                quality_rating = ,
                 llm_optimized = true,
                 optimized_at = NOW(),
+                compression_method = ,
                 metadata = jsonb_set(
                     metadata,
                     '{distillation_success}',
                     'true'
                 )
-            WHERE id = $3
+            WHERE id = 
             """
             async with self.db_pool.acquire() as conn:
                 await conn.execute(
                     update_query,
-                    compressed, min(100, int(quality_score)), memory_id
+                    compressed, min(100, int(quality_score or 75)), memory_id, compression_method
                 )
 
             self.stats["successful"] += 1
             self.stats["total_bytes_saved"] += bytes_saved
 
             logger.info(
-                f"✅ {memory_id[:8]}... | quality {current_quality}→{quality_score:.0f} "
+                f"✅ {memory_id[:8]}... [{compression_method}] | quality {current_quality}→{quality_score:.0f} "
                 f"| {original_len}→{compressed_len} chars ({ratio:.2%}) "
                 f"| saved {bytes_saved} bytes"
             )

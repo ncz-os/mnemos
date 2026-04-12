@@ -58,7 +58,7 @@ app.add_middleware(SlowAPIMiddleware)
 
 # CORS: set CORS_ORIGINS env var to restrict in production (comma-separated list).
 # Defaults to "*" for local dev. Example: CORS_ORIGINS=https://app.example.com
-_cors_origins_raw = os.getenv("CORS_ORIGINS", "*")
+_cors_origins_raw = os.getenv("CORS_ORIGINS", "http://localhost,http://127.0.0.1,http://127.0.0.1:5002,http://localhost:5002")
 _cors_origins = [o.strip() for o in _cors_origins_raw.split(",")]
 app.add_middleware(
     CORSMiddleware,
@@ -83,4 +83,5 @@ if __name__ == "__main__":
     # are in-process state. Multiple workers each get their own copy and will not
     # share limits. Use MNEMOS_PORT env var to override (default: 5002).
     port = int(os.getenv("MNEMOS_PORT", "5002"))
-    uvicorn.run(app, host="0.0.0.0", port=port, workers=1)
+    host = os.getenv("MNEMOS_BIND", "127.0.0.1")
+    uvicorn.run(app, host=host, port=port, workers=1)
