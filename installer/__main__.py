@@ -125,8 +125,21 @@ def _write_config_toml(cfg, repo_path: str) -> None:
             "\n[api]\n"
             f"port = {cfg.listen_port}\n"
         )
-        with open(config_path, "w") as f:
-            f.write(content)
+        # Write with restricted permissions (contains DB password)
+        import tempfile as _tf
+        dir_ = os.path.dirname(config_path) or "."
+        fd, tmp_path = _tf.mkstemp(dir=dir_, suffix=".toml.tmp")
+        try:
+            os.chmod(tmp_path, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(content)
+            os.replace(tmp_path, config_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         print(f"[installer] Created {config_path}")
         return
 
@@ -136,12 +149,20 @@ def _write_config_toml(cfg, repo_path: str) -> None:
         """Replace key = ... inside the active [database] section."""
         nonlocal content
         pattern = rf'((?:^|\n)\[{section_active}\][^\[]*?)({re.escape(key)}\s*=\s*[^\n]*)'
-        quoted = f'"{value}"' if isinstance(value, str) else str(value)
+        if isinstance(value, str):
+            escaped = value.replace("\\", "\\\\").replace("", "\\")
+            quoted = f'"{escaped}"'
+        else:
+            quoted = str(value)
         replacement = rf'\1{key} = {quoted}'
         content, n = re.subn(pattern, replacement, content, flags=re.DOTALL)
         if n == 0:
             # Key absent — append to end of section (simplistic)
-            quoted = f'"{value}"' if isinstance(value, str) else str(value)
+            if isinstance(value, str):
+                _esc2 = value.replace("\\", "\\\\").replace("", "\\")
+                quoted = f'"{_esc2}"'
+            else:
+                quoted = str(value)
             content = re.sub(
                 rf'(\[{section_active}\])',
                 rf'\1\n{key} = {quoted}',
@@ -155,8 +176,20 @@ def _write_config_toml(cfg, repo_path: str) -> None:
     _set("database", "password", cfg.db_password)
     _set("api", "port", cfg.listen_port)
 
-    with open(config_path, "w") as f:
-        f.write(content)
+    import tempfile as _tf
+    _dir = os.path.dirname(config_path) or "."
+    _fd, _tmp = _tf.mkstemp(dir=_dir, suffix=".toml.tmp")
+    try:
+        os.chmod(_tmp, 0o600)
+        with os.fdopen(_fd, "w") as f:
+            f.write(content)
+        os.replace(_tmp, config_path)
+    except Exception:
+        try:
+            os.unlink(_tmp)
+        except OSError:
+            pass
+        raise
     print(f"[installer] Updated {config_path}")
 
 
@@ -346,14 +379,18 @@ def main() -> int:
         if sys.platform == "darwin":
             ok = install_launchd(cfg, repo_path)
             if ok:
-                enable_service(f"ai.{service_name}")
-                start_service(f"ai.{service_name}")
+                if not enable_service(f"ai.{service_name}"):
+                    print("[service] WARNING: service enable failed.", file=sys.stderr)
+                if not start_service(f"ai.{service_name}"):
+                    print("[service] WARNING: service start failed.", file=sys.stderr)
         else:
             if info.systemd:
                 ok = install_systemd(cfg, repo_path)
                 if ok:
-                    enable_service(service_name)
-                    start_service(service_name)
+                    if not enable_service(service_name):
+                        print("[service] WARNING: service enable failed.", file=sys.stderr)
+                    if not start_service(service_name):
+                        print("[service] WARNING: service start failed.", file=sys.stderr)
             else:
                 print("[service] No supported init system — service not installed.")
 
@@ -400,11 +437,13 @@ def _load_existing_config(repo_path: str):
         db = data.get("database", {})
         cfg.db_host = db.get("host", "localhost")
         cfg.db_port = db.get("port", 5432)
-        cfg.db_name = db.get("name", "mnemos")
+        # Key is "database" (matching what _write_config_toml writes), not "name"
+        cfg.db_name = db.get("database", db.get("name", "mnemos"))
         cfg.db_user = db.get("user", "mnemos_user")
         cfg.db_password = db.get("password", os.environ.get("MNEMOS_DB_PASSWORD", ""))
-        server = data.get("server", {})
-        cfg.listen_port = server.get("port", 5002)
+        # Key is under [api], not [server]
+        api = data.get("api", data.get("server", {}))
+        cfg.listen_port = api.get("port", 5002)
         return cfg
 
     return None

@@ -124,8 +124,9 @@ def detect_environment() -> SystemInfo:
 
     # GRAEAE reachability
     try:
+        graeae_url = os.environ.get("MNEMOS_GRAEAE_URL", "http://192.0.2.67:5001")
         req = urllib.request.Request(
-            "http://192.0.2.67:5001/health",
+            f"{graeae_url}/health",
             method="GET",
         )
         with urllib.request.urlopen(req, timeout=3):
@@ -168,6 +169,10 @@ class AgentInstaller:
         self._ollama_model: str = self._pick_ollama_model()
 
     # ── Backend detection ─────────────────────────────────────────────────────
+
+    GRAEAE_URL: str = os.environ.get(
+        "MNEMOS_GRAEAE_URL", "http://192.0.2.67:5001"
+    )
 
     def _detect_backend(self) -> str | None:
         if self.info.graeae_reachable:
@@ -236,7 +241,7 @@ class AgentInstaller:
         payload = {"prompt": prompt, "task_type": "reasoning"}
         try:
             req = urllib.request.Request(
-                "http://192.0.2.67:5001/graeae/consult",
+                f"{self.GRAEAE_URL}/graeae/consult",
                 data=json.dumps(payload).encode(),
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -309,8 +314,9 @@ class AgentInstaller:
         messages: list[dict] = list(self.history[-8:])
         messages.append({"role": "user", "content": prompt})
 
+        model_name = os.environ.get("MNEMOS_INSTALLER_CLAUDE_MODEL", "claude-haiku-4-5-20251001")
         payload: dict[str, Any] = {
-            "model": "claude-haiku-4-5-20251001",
+            "model": model_name,
             "max_tokens": 1024,
             "messages": messages,
         }
@@ -376,6 +382,40 @@ class AgentInstaller:
                     cfg.install_docling = bool(raw["install_docling"])
                 if "create_service" in raw:
                     cfg.create_service = bool(raw["create_service"])
+                # Validate safety-critical fields before returning
+                _safe_id = re.compile(r'[A-Za-z_][A-Za-z0-9_\-]{0,62}')
+                for field_name, val in [
+                    ("db_user", cfg.db_user),
+                    ("db_name", cfg.db_name),
+                    ("service_user", cfg.service_user),
+                ]:
+                    if not _safe_id.fullmatch(val):
+                        print(
+                            f"[AGENT] LLM returned unsafe {field_name}='{val}' — "
+                            "falling back to wizard.",
+                            file=sys.stderr,
+                        )
+                        return None
+                # Validate port range
+                if not (1024 <= cfg.listen_port <= 65535):
+                    print(
+                        f"[AGENT] LLM returned unsafe listen_port={cfg.listen_port} — "
+                        "falling back to wizard.",
+                        file=sys.stderr,
+                    )
+                    return None
+                # Validate db_host: allow hostname, IPv4, localhost
+                _safe_host = re.compile(
+                    r'localhost|127\.0\.0\.1|'
+                    r'[A-Za-z0-9][A-Za-z0-9\-\.]{0,253}'
+                )
+                if not _safe_host.fullmatch(cfg.db_host):
+                    print(
+                        f"[AGENT] LLM returned unsafe db_host='{cfg.db_host}' — "
+                        "falling back to wizard.",
+                        file=sys.stderr,
+                    )
+                    return None
                 return cfg
             except (json.JSONDecodeError, ValueError, TypeError):
                 return None
@@ -543,19 +583,19 @@ class AgentInstaller:
             print(f"  GRAEAE providers: {', '.join(cfg.graeae_providers.keys())}")
         print("=" * 60)
 
-        try:
-            answer = input("\nProceed? [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return None
-
-        if answer in ("", "y", "yes"):
-            return cfg
-        if answer in ("n", "no"):
-            print("[AGENT] Installation cancelled.")
-            return None
-        # Anything else: confirm again
-        print("[AGENT] Please enter Y or n.")
-        return self._confirm_config(cfg)
+        for _ in range(3):  # bounded — avoid unbounded recursion
+            try:
+                answer = input("\nProceed? [Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if answer in ("", "y", "yes"):
+                return cfg
+            if answer in ("n", "no"):
+                print("[AGENT] Installation cancelled.")
+                return None
+            print("[AGENT] Please enter Y or n.")
+        print("[AGENT] No valid response after 3 attempts — cancelling.")
+        return None
 
 
 # ── Module-level helper ───────────────────────────────────────────────────────

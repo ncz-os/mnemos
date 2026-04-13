@@ -11,8 +11,27 @@ from pathlib import Path
 from .wizard import Config
 
 
-def _run(cmd: list[str], timeout: int = 60, input_text: str = None) -> tuple[int, str, str]:
+def _validate_identifier(value: str, name: str = "identifier") -> str:
+    """Reject anything that is not a safe SQL identifier (letters/digits/underscore/hyphen)."""
+    import re
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_\-]{0,62}', value):
+        raise ValueError(
+            f"Unsafe SQL {name} '{value}': must match [A-Za-z_][A-Za-z0-9_-]{{0,62}}"
+        )
+    return value
+
+
+def _run(
+    cmd: list[str],
+    timeout: int = 60,
+    input_text: str = None,
+    env: dict = None,
+) -> tuple[int, str, str]:
     """Run a command, return (returncode, stdout, stderr). Never raises."""
+    import os as _os
+    merged_env = _os.environ.copy()
+    if env:
+        merged_env.update(env)
     try:
         r = subprocess.run(
             cmd,
@@ -20,6 +39,7 @@ def _run(cmd: list[str], timeout: int = 60, input_text: str = None) -> tuple[int
             text=True,
             timeout=timeout,
             input=input_text,
+            env=merged_env,
         )
         return r.returncode, r.stdout.strip(), r.stderr.strip()
     except subprocess.TimeoutExpired:
@@ -51,6 +71,7 @@ def verify_connection(config: Config) -> bool:
     env = os.environ.copy()
     env["PGPASSWORD"] = config.db_password
 
+    pg_env = {"PGPASSWORD": config.db_password}
     rc, out, err = _run(
         [
             "psql",
@@ -59,9 +80,10 @@ def verify_connection(config: Config) -> bool:
             "-U", config.db_user,
             "-d", config.db_name,
             "-c", "SELECT 1",
-            "-A", "-t", "--no-password",
+            "-A", "-t",
         ],
         timeout=10,
+        env=pg_env,
     )
     if rc == 0:
         return True
@@ -94,6 +116,7 @@ def pgvector_installed(config: Config) -> bool:
     """Check if pgvector extension is installed in the target database."""
     env = os.environ.copy()
     env["PGPASSWORD"] = config.db_password
+    pg_env = {"PGPASSWORD": config.db_password}
     rc, out, _ = _run(
         [
             "psql",
@@ -102,15 +125,23 @@ def pgvector_installed(config: Config) -> bool:
             "-U", config.db_user,
             "-d", config.db_name,
             "-c", "SELECT 1 FROM pg_extension WHERE extname='vector'",
-            "-A", "-t", "--no-password",
+            "-A", "-t",
         ],
         timeout=10,
+        env=pg_env,
     )
     return rc == 0 and out.strip() == "1"
 
 
 def setup_database(config: Config, info) -> bool:
     """Create the database user, database, and extensions. Idempotent."""
+
+    try:
+        _validate_identifier(config.db_user, "db_user")
+        _validate_identifier(config.db_name, "db_name")
+    except ValueError as exc:
+        print(f"[db] ERROR: {exc}", file=sys.stderr)
+        return False
 
     print(f"[db] Setting up database '{config.db_name}' as user '{config.db_user}'...")
 
@@ -180,6 +211,8 @@ def setup_database(config: Config, info) -> bool:
         f"GRANT ALL ON SCHEMA public TO {config.db_user}",
         dbname=config.db_name,
     )
+    if rc != 0:
+        print(f"[db] WARNING: schema grant failed: {err}", file=sys.stderr)
 
     return True
 
@@ -243,8 +276,8 @@ def create_api_key(config: Config) -> str | None:
             conn.commit()
         print(f"[db] API key created via psycopg.")
         return raw_key
-    except Exception:
-        pass
+    except Exception as _exc:
+        print(f"[db] psycopg create_api_key failed: {_exc}", file=sys.stderr)
 
     # Fallback: try psycopg2
     try:
@@ -273,13 +306,16 @@ def create_api_key(config: Config) -> str | None:
         conn.close()
         print("[db] API key created via psycopg2.")
         return raw_key
-    except Exception:
-        pass
+    except Exception as _exc:
+        print(f"[db] psycopg2 create_api_key failed: {_exc}", file=sys.stderr)
 
-    # Fallback: psql CLI
-    import hashlib
+    # Fallback: psql CLI — key_hash is a hex digest (safe for interpolation)
+    import hashlib, re as _re
 
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    if not _re.fullmatch(r'[0-9a-f]{64}', key_hash):
+        print("[db] ERROR: unexpected key_hash format", file=sys.stderr)
+        return None
     sql = (
         f"INSERT INTO api_keys (key_hash, name, permissions, created_at) "
         f"VALUES ('{key_hash}', 'installer-generated', '[\"read\", \"write\"]', NOW()) "

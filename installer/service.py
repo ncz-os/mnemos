@@ -77,25 +77,41 @@ def _write_env_file(config: Config, env_path: str) -> bool:
             lines.append(f"{provider.upper()}_API_KEY={key}")
 
         import tempfile
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".mnemos.env", delete=False
-        ) as _tf:
-            _tf.write("\n".join(lines) + "\n")
-            _tmp = _tf.name
-        # /etc/mnemos requires root; sudo-move the temp file in
-        _run(["sudo", "mv", _tmp, env_path])
-
-        # Restrict permissions — contains DB password
-        os.chmod(env_path, 0o640)
-
-        # chown to root:service_user if not root
-        if os.getuid() == 0:
-            import grp
-            try:
-                gid = grp.getgrnam(config.service_user).gr_gid
-                os.chown(env_path, 0, gid)
-            except KeyError:
-                pass
+        _tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".mnemos.env", delete=False
+            ) as _tf:
+                _tf.write("\n".join(lines) + "\n")
+                _tmp = _tf.name
+            # Restrict temp file immediately before moving
+            os.chmod(_tmp, 0o600)
+            # Atomically install with correct owner/mode (sudo install is atomic)
+            install_cmd = ["sudo", "install", "-m", "640", "-o", "root"]
+            # Try to set group to service_user for read access
+            rc_grp, grp_name, _ = _run(["getent", "group", config.service_user])
+            if rc_grp == 0 and grp_name.strip():
+                install_cmd += ["-g", config.service_user]
+            install_cmd += [_tmp, env_path]
+            rc_mv, _, err_mv = _run(install_cmd)
+            if rc_mv != 0:
+                # Fallback: plain sudo mv + chmod
+                rc_mv2, _, err_mv2 = _run(["sudo", "mv", _tmp, env_path])
+                if rc_mv2 != 0:
+                    print(f"[service] ERROR: failed to write env file: {err_mv2}", file=sys.stderr)
+                    return False
+                _run(["sudo", "chmod", "640", env_path])
+                _run(["sudo", "chown", f"root:{config.service_user}", env_path])
+                _tmp = None  # mv succeeded, no cleanup needed
+            else:
+                _tmp = None  # install succeeded
+        finally:
+            # Clean up temp file if it still exists (e.g. mv/install failed)
+            if _tmp and os.path.exists(_tmp):
+                try:
+                    os.unlink(_tmp)
+                except OSError:
+                    pass
 
         return True
     except Exception as exc:
@@ -173,9 +189,12 @@ WantedBy=multi-user.target
 
 def install_launchd(config: Config, repo_path: str) -> bool:
     """Write launchd plist for macOS. Return True on success."""
+    import plistlib
+    import tempfile
+
     repo = Path(repo_path)
-    venv_python = repo / "venv" / "bin" / "python"
-    api_server = repo / "api_server.py"
+    venv_python = str(repo / "venv" / "bin" / "python")
+    api_server = str(repo / "api_server.py")
 
     home = Path.home()
     launch_agents = home / "Library" / "LaunchAgents"
@@ -184,12 +203,16 @@ def install_launchd(config: Config, repo_path: str) -> bool:
 
     print("[service] Installing launchd plist...")
 
-    # Build env vars XML
-    env_lines = []
+    # Write credentials to a separate 0600 env file instead of embedding
+    # them in the plist (which is user-readable but avoids inline exposure)
+    mnemos_dir = home / ".mnemos"
+    mnemos_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    env_file = mnemos_dir / "mnemos.env"
+
     env_vars = {
         "PG_HOST": config.db_host,
         "PG_PORT": str(config.db_port),
-        "PG_DB": config.db_name,
+        "PG_DATABASE": config.db_name,
         "PG_USER": config.db_user,
         "PG_PASSWORD": config.db_password,
         "MNEMOS_LISTEN_PORT": str(config.listen_port),
@@ -198,55 +221,39 @@ def install_launchd(config: Config, repo_path: str) -> bool:
     for provider, key in config.graeae_providers.items():
         env_vars[f"{provider.upper()}_API_KEY"] = key
 
-    for k, v in env_vars.items():
-        env_lines.append(f"        <key>{k}</key>")
-        env_lines.append(f"        <string>{v}</string>")
+    # Write env file with restrictive permissions
+    try:
+        fd = os.open(str(env_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("# MNEMOS environment — managed by installer\n")
+            for k, v in env_vars.items():
+                fh.write(f"{k}={v}\n")
+        print(f"[service] Wrote env file: {env_file}")
+    except Exception as exc:
+        print(f"[service] ERROR writing env file: {exc}", file=sys.stderr)
+        return False
 
-    env_block = "\n".join(env_lines)
-
-    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>ai.mnemos</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>{venv_python}</string>
-        <string>{api_server}</string>
-    </array>
-
-    <key>WorkingDirectory</key>
-    <string>{repo_path}</string>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-{env_block}
-    </dict>
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>KeepAlive</key>
-    <dict>
-        <key>Crashed</key>
-        <true/>
-    </dict>
-
-    <key>StandardOutPath</key>
-    <string>{home}/Library/Logs/mnemos.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>{home}/Library/Logs/mnemos.error.log</string>
-</dict>
-</plist>
-"""
+    # Build plist using plistlib (properly escapes all values)
+    plist_data = {
+        "Label": "ai.mnemos",
+        "ProgramArguments": [venv_python, api_server],
+        "WorkingDirectory": repo_path,
+        # Only non-secret env vars in plist; secrets in env_file
+        "EnvironmentVariables": {
+            "MNEMOS_ENV_FILE": str(env_file),
+        },
+        "RunAtLoad": True,
+        "KeepAlive": {"Crashed": True},
+        "StandardOutPath": str(home / "Library" / "Logs" / "mnemos.log"),
+        "StandardErrorPath": str(home / "Library" / "Logs" / "mnemos.error.log"),
+    }
 
     try:
-        with open(plist_path, "w") as fh:
-            fh.write(plist_content)
+        plist_bytes = plistlib.dumps(plist_data, fmt=plistlib.FMT_XML)
+        # Write with 0o600 so only the owner can read credentials context
+        fd = os.open(str(plist_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(plist_bytes)
         print(f"[service] Wrote {plist_path}")
         return True
     except Exception as exc:
