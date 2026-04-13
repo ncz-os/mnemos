@@ -3,7 +3,7 @@ import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPBearer
@@ -14,7 +14,7 @@ _auth_enabled: bool = False
 _default_namespace: str = "default"
 _personal_user_id: str = "default"
 
-PERSONAL_SINGLETON: "UserContext" = None   # set by configure_auth()
+PERSONAL_SINGLETON: "Optional[UserContext]" = None   # set by configure_auth(); None before startup
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -63,6 +63,8 @@ async def get_current_user(
 ) -> UserContext:
     """FastAPI dependency — returns UserContext for every authenticated route."""
     if not _auth_enabled:
+        if PERSONAL_SINGLETON is None:
+            raise HTTPException(status_code=503, detail="Auth not yet configured — startup incomplete")
         return PERSONAL_SINGLETON
 
     if credentials is None:
@@ -86,9 +88,9 @@ async def get_current_user(
     if row is None or row["revoked"]:
         raise HTTPException(status_code=401, detail="Invalid or revoked API key")
 
-    # Track the background task so shutdown can drain it before closing the pool
-    _task = asyncio.create_task(_update_last_used(pool, str(row["id"])))
-    _task.add_done_callback(lambda t: None)  # suppress "task destroyed" warning
+    # Use _schedule_background so shutdown drains this before closing the pool
+    from api.lifecycle import _schedule_background
+    _schedule_background(_update_last_used(pool, str(row["id"])))
 
     async with pool.acquire() as conn:
         group_rows = await conn.fetch(
