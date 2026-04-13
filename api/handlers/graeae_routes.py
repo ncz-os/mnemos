@@ -102,24 +102,24 @@ async def _write_audit_entry(
 
 @router.post("/graeae/consult")
 @limiter.limit("60/minute")
-async def consult_graeae(http_request: Request, request: ConsultationRequest, user: UserContext = Depends(get_current_user)):
+async def consult_graeae(request: Request, body: ConsultationRequest, user: UserContext = Depends(get_current_user)):
     """Consult GRAEAE multi-provider consensus engine."""
     logger.info(
-        f"GRAEAE Consultation: {request.task_type} "
-        f"(limit_chars={request.limit_chars}, format={request.format})"
+        f"GRAEAE Consultation: {body.task_type} "
+        f"(limit_chars={body.limit_chars}, format={body.format})"
     )
     try:
         from graeae.engine import get_graeae_engine
         engine = get_graeae_engine()
-        result = await engine.consult(request.prompt, request.task_type)
+        result = await engine.consult(body.prompt, body.task_type)
 
-        if request.limit_chars and result.get("all_responses"):
+        if body.limit_chars and result.get("all_responses"):
             for provider, resp in result["all_responses"].items():
                 if isinstance(resp.get("response_text"), str):
-                    resp["response_text"] = resp["response_text"][:request.limit_chars]
-                    resp["truncated"] = len(resp.get("response_text", "")) >= request.limit_chars
+                    resp["response_text"] = resp["response_text"][:body.limit_chars]
+                    resp["truncated"] = len(resp.get("response_text", "")) >= body.limit_chars
 
-        if request.format == "best" and result.get("all_responses"):
+        if body.format == "best" and result.get("all_responses"):
             best = max(result["all_responses"].items(), key=lambda x: x[1].get("final_score", 0))
             result["all_responses"] = {best[0]: best[1]}
 
@@ -137,14 +137,14 @@ async def consult_graeae(http_request: Request, request: ConsultationRequest, us
                              winning_muse, cost, latency_ms, mode)
                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                            RETURNING id""",
-                        request.prompt,
-                        request.task_type,
+                        body.prompt,
+                        body.task_type,
                         best_resp[1].get("response_text", "")[:500],
                         best_resp[1].get("final_score", 0),
                         best_resp[0],
                         0.02,
                         best_resp[1].get("latency_ms", 0),
-                        request.mode or "auto",
+                        body.mode or "auto",
                     )
                     consultation_id = row["id"] if row else None
 
@@ -152,9 +152,9 @@ async def consult_graeae(http_request: Request, request: ConsultationRequest, us
                 await _write_audit_entry(
                     pool=_lc._pool,
                     consultation_id=consultation_id,
-                    prompt=request.prompt,
+                    prompt=body.prompt,
                     response=best_resp[1].get("response_text", ""),
-                    task_type=request.task_type or "reasoning",
+                    task_type=body.task_type or "reasoning",
                     provider=best_resp[0],
                     quality_score=best_resp[1].get("final_score", 0),
                 )
