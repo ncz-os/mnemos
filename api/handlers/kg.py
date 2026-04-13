@@ -65,7 +65,7 @@ async def create_triple(req: KGTripleCreate, user: UserContext = Depends(get_cur
             req.subject_type, req.object_type,
             valid_from, valid_until, req.memory_id, req.confidence,
         )
-        row = await conn.fetchrow("SELECT * FROM kg_triples WHERE id=$1", triple_id)
+        row = await conn.fetchrow("SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE id=$1", triple_id)
 
     return _row_to_triple(row)
 
@@ -100,7 +100,7 @@ async def list_triples(
 
     async with _lc._pool.acquire() as conn:
         rows = await conn.fetch(
-            f"SELECT * FROM kg_triples {where} ORDER BY created DESC "
+            f"SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples {where} ORDER BY created DESC "
             f"LIMIT ${idx} OFFSET ${idx + 1}",
             *filter_params, limit, offset,
         )
@@ -119,7 +119,7 @@ async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000), use
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT * FROM kg_triples WHERE subject=$1 ORDER BY valid_from ASC LIMIT $2",
+            "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 ORDER BY valid_from ASC LIMIT $2",
             subject, limit,
         )
     return KGTripleListResponse(count=len(rows), triples=[_row_to_triple(r) for r in rows])
@@ -151,7 +151,7 @@ async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext =
             f"UPDATE kg_triples SET {', '.join(set_clauses)} WHERE id=$1",
             triple_id, *list(updates.values()),
         )
-        row = await conn.fetchrow("SELECT * FROM kg_triples WHERE id=$1", triple_id)
+        row = await conn.fetchrow("SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE id=$1", triple_id)
     return _row_to_triple(row)
 
 

@@ -62,38 +62,39 @@ class ProviderResponse:
 # Built-in provider defaults — used when config.toml has no [graeae.providers] section.
 # Operators override these (or add new providers) via config.toml exclusively.
 _BUILTIN_PROVIDERS: dict[str, dict] = {
+    # These are conservative public defaults — override via config.toml [graeae.providers].
+    # Any provider with an invalid key or model will be skipped by the engine at runtime.
     "perplexity": {
         "url": "https://api.perplexity.ai/chat/completions",
         "model": "sonar-pro", "weight": 0.88, "api": "openai", "key_name": "perplexity",
     },
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
-        "model": "openai/gpt-oss-120b", "weight": 0.78, "api": "openai", "key_name": "groq",
+        "model": "llama-3.3-70b-versatile", "weight": 0.78, "api": "openai", "key_name": "groq",
     },
-
-    "claude_opus": {
+    "claude": {
         "url": "https://api.anthropic.com/v1/messages",
-        "model": "claude-opus-4-6", "weight": 0.85, "api": "anthropic", "key_name": "claude-opus",
+        "model": "claude-3-5-sonnet-20241022", "weight": 0.85, "api": "anthropic", "key_name": "claude",
     },
     "xai": {
         "url": "https://api.x.ai/v1/chat/completions",
-        "model": "grok-4.20-0309-reasoning", "weight": 0.90, "api": "openai", "key_name": "xai",
+        "model": "grok-2-latest", "weight": 0.84, "api": "openai", "key_name": "xai",
     },
     "openai": {
         "url": "https://api.openai.com/v1/chat/completions",
-        "model": "gpt-5.4", "weight": 0.82, "api": "openai", "key_name": "openai",
+        "model": "gpt-4o", "weight": 0.82, "api": "openai", "key_name": "openai",
     },
     "gemini": {
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent",
-        "model": "gemini-3.1-pro-preview", "weight": 0.81, "api": "gemini", "key_name": "gemini",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent",
+        "model": "gemini-1.5-pro", "weight": 0.81, "api": "gemini", "key_name": "gemini",
     },
     "nvidia": {
         "url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "model": "nvidia/nemotron-3-super-120b-a12b", "weight": 0.80, "api": "openai", "key_name": "nvidia",
+        "model": "meta/llama-3.3-70b-instruct", "weight": 0.80, "api": "openai", "key_name": "nvidia",
     },
     "together": {
         "url": "https://api.together.xyz/v1/chat/completions",
-        "model": "Qwen/Qwen3-235B-A22B-Instruct-2507-tput", "weight": 0.78, "api": "openai", "key_name": "together_ai",
+        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "weight": 0.78, "api": "openai", "key_name": "together_ai",
     },
 }
 

@@ -79,7 +79,10 @@ async def get_stats() -> StatsResponse:
             average_quality_rating=int(avg_quality) if avg_quality else 75,
             memories_by_category=memories_by_category,
             memories_by_subcategory=memories_by_subcategory,
-            unreviewed_compressions=0,
+            unreviewed_compressions=await conn.fetchval(
+                "SELECT COUNT(*) FROM memories "
+                "WHERE llm_optimized = true AND quality_rating IS NULL"
+            ) or 0,
             timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         )
 
