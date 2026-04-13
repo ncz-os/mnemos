@@ -1,0 +1,302 @@
+"""Database setup and migration operations for MNEMOS installer."""
+
+from __future__ import annotations
+
+import os
+import secrets
+import subprocess
+import sys
+from pathlib import Path
+
+from .wizard import Config
+
+
+def _run(cmd: list[str], timeout: int = 60, input_text: str = None) -> tuple[int, str, str]:
+    """Run a command, return (returncode, stdout, stderr). Never raises."""
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            input=input_text,
+        )
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 1, "", "timeout"
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def _psql_superuser(sql: str, dbname: str = "postgres", timeout: int = 30) -> tuple[int, str, str]:
+    """Run SQL as the postgres superuser via sudo."""
+    return _run(
+        ["sudo", "-u", "postgres", "psql", "-d", dbname, "-c", sql,
+         "--no-password", "-A", "-t"],
+        timeout=timeout,
+    )
+
+
+def _psql_superuser_file(filepath: str, dbname: str, timeout: int = 120) -> tuple[int, str, str]:
+    """Run a SQL file as postgres superuser."""
+    return _run(
+        ["sudo", "-u", "postgres", "psql", "-d", dbname, "-f", filepath,
+         "--no-password"],
+        timeout=timeout,
+    )
+
+
+def verify_connection(config: Config) -> bool:
+    """Verify we can connect to the target database."""
+    env = os.environ.copy()
+    env["PGPASSWORD"] = config.db_password
+
+    rc, out, err = _run(
+        [
+            "psql",
+            "-h", config.db_host,
+            "-p", str(config.db_port),
+            "-U", config.db_user,
+            "-d", config.db_name,
+            "-c", "SELECT 1",
+            "-A", "-t", "--no-password",
+        ],
+        timeout=10,
+    )
+    if rc == 0:
+        return True
+
+    # Fallback: try via asyncpg if available
+    try:
+        import asyncpg
+        import asyncio
+
+        async def _check() -> bool:
+            conn = await asyncpg.connect(
+                host=config.db_host,
+                port=config.db_port,
+                user=config.db_user,
+                password=config.db_password,
+                database=config.db_name,
+                timeout=10,
+            )
+            await conn.close()
+            return True
+
+        return asyncio.run(_check())
+    except Exception:
+        pass
+
+    return False
+
+
+def pgvector_installed(config: Config) -> bool:
+    """Check if pgvector extension is installed in the target database."""
+    env = os.environ.copy()
+    env["PGPASSWORD"] = config.db_password
+    rc, out, _ = _run(
+        [
+            "psql",
+            "-h", config.db_host,
+            "-p", str(config.db_port),
+            "-U", config.db_user,
+            "-d", config.db_name,
+            "-c", "SELECT 1 FROM pg_extension WHERE extname='vector'",
+            "-A", "-t", "--no-password",
+        ],
+        timeout=10,
+    )
+    return rc == 0 and out.strip() == "1"
+
+
+def setup_database(config: Config, info) -> bool:
+    """Create the database user, database, and extensions. Idempotent."""
+
+    print(f"[db] Setting up database '{config.db_name}' as user '{config.db_user}'...")
+
+    # 1. Create user (idempotent via DO block)
+    escaped_pw = config.db_password.replace("'", "''")
+    create_user_sql = (
+        f"DO $$ BEGIN "
+        f"  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{config.db_user}') THEN "
+        f"    CREATE USER {config.db_user} WITH PASSWORD '{escaped_pw}'; "
+        f"  ELSE "
+        f"    ALTER USER {config.db_user} WITH PASSWORD '{escaped_pw}'; "
+        f"  END IF; "
+        f"END $$;"
+    )
+    rc, out, err = _psql_superuser(create_user_sql)
+    if rc != 0:
+        print(f"[db] ERROR creating user: {err}", file=sys.stderr)
+        return False
+    print(f"[db] User '{config.db_user}' ready.")
+
+    # 2. Create database (idempotent)
+    rc, out, _ = _psql_superuser(
+        f"SELECT 1 FROM pg_database WHERE datname='{config.db_name}'"
+    )
+    if out.strip() != "1":
+        rc, out, err = _psql_superuser(
+            f"CREATE DATABASE {config.db_name} OWNER {config.db_user}"
+        )
+        if rc != 0:
+            print(f"[db] ERROR creating database: {err}", file=sys.stderr)
+            return False
+        print(f"[db] Database '{config.db_name}' created.")
+    else:
+        print(f"[db] Database '{config.db_name}' already exists.")
+
+    # 3. Grant privileges
+    rc, _, err = _psql_superuser(
+        f"GRANT ALL PRIVILEGES ON DATABASE {config.db_name} TO {config.db_user}",
+        dbname="postgres",
+    )
+    if rc != 0:
+        print(f"[db] WARNING granting privileges: {err}", file=sys.stderr)
+
+    # 4. Create vector extension
+    rc, _, err = _psql_superuser(
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        dbname=config.db_name,
+    )
+    if rc != 0:
+        print(f"[db] WARNING: pgvector extension not available: {err}", file=sys.stderr)
+        print("[db] Install with: apt install postgresql-16-pgvector (or your pg version)")
+    else:
+        print("[db] pgvector extension ready.")
+
+    # 5. Create pgcrypto extension
+    rc, _, err = _psql_superuser(
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto",
+        dbname=config.db_name,
+    )
+    if rc != 0:
+        print(f"[db] WARNING: pgcrypto extension not available: {err}", file=sys.stderr)
+    else:
+        print("[db] pgcrypto extension ready.")
+
+    # 6. Grant schema privileges to app user
+    rc, _, err = _psql_superuser(
+        f"GRANT ALL ON SCHEMA public TO {config.db_user}",
+        dbname=config.db_name,
+    )
+
+    return True
+
+
+def run_migrations(config: Config) -> bool:
+    """Run SQL migration files in order. Idempotent."""
+    repo_path = Path(__file__).parent.parent
+    migration_files = [
+        repo_path / "db" / "migrations.sql",
+        repo_path / "db" / "migrations_v1_multiuser.sql",
+        repo_path / "db" / "migrations_v2_versioning.sql",
+        repo_path / "db" / "migrations_model_registry.sql",
+    ]
+
+    print("[db] Running migrations...")
+    success = True
+
+    for mig_path in migration_files:
+        if not mig_path.exists():
+            print(f"[db] Skipping {mig_path.name} (not found)")
+            continue
+
+        print(f"[db] Applying {mig_path.name}...", end=" ")
+        rc, out, err = _psql_superuser_file(str(mig_path), config.db_name)
+        if rc != 0:
+            print("FAILED")
+            print(f"[db] ERROR in {mig_path.name}:\n{err}", file=sys.stderr)
+            success = False
+        else:
+            print("OK")
+
+    return success
+
+
+def create_api_key(config: Config) -> str | None:
+    """Create an initial API key. Returns the raw key string, or None on failure."""
+    raw_key = "mnemos_" + secrets.token_hex(32)
+
+    # Try via psycopg first
+    try:
+        import psycopg
+        import hashlib
+
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+
+        conn_str = (
+            f"host={config.db_host} port={config.db_port} "
+            f"dbname={config.db_name} user={config.db_user} "
+            f"password={config.db_password}"
+        )
+        with psycopg.connect(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO api_keys (key_hash, name, permissions, created_at)
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (key_hash) DO NOTHING
+                    """,
+                    (key_hash, "installer-generated", '["read", "write"]'),
+                )
+            conn.commit()
+        print(f"[db] API key created via psycopg.")
+        return raw_key
+    except Exception:
+        pass
+
+    # Fallback: try psycopg2
+    try:
+        import psycopg2
+        import hashlib
+
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        conn = psycopg2.connect(
+            host=config.db_host,
+            port=config.db_port,
+            dbname=config.db_name,
+            user=config.db_user,
+            password=config.db_password,
+        )
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO api_keys (key_hash, name, permissions, created_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (key_hash) DO NOTHING
+            """,
+            (key_hash, "installer-generated", '["read", "write"]'),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("[db] API key created via psycopg2.")
+        return raw_key
+    except Exception:
+        pass
+
+    # Fallback: psql CLI
+    import hashlib
+
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    sql = (
+        f"INSERT INTO api_keys (key_hash, name, permissions, created_at) "
+        f"VALUES ('{key_hash}', 'installer-generated', '[\"read\", \"write\"]', NOW()) "
+        f"ON CONFLICT (key_hash) DO NOTHING;"
+    )
+    rc, _, err = _psql_superuser(sql, dbname=config.db_name)
+    if rc == 0:
+        print("[db] API key created via psql CLI.")
+        return raw_key
+
+    # Check if api_keys table even exists — may not be needed for personal profile
+    rc2, out2, _ = _psql_superuser(
+        "SELECT to_regclass('public.api_keys')", dbname=config.db_name
+    )
+    if "api_keys" not in out2:
+        print("[db] No api_keys table found — skipping key creation (personal profile).")
+        return None
+
+    print(f"[db] WARNING: Could not create API key: {err}", file=sys.stderr)
+    return None

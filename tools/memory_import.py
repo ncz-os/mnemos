@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+"""
+memory_import.py - Generic memory importers for common formats into MNEMOS.
+
+Subcommands:
+  json      Import from MNEMOS JSON export or simplified array
+  csv       Import from CSV with column mapping
+  chatgpt   Import from OpenAI conversations.json export
+  obsidian  Import from Obsidian vault (.md files with YAML frontmatter)
+  text      Import plain text files (one per file or per paragraph)
+  stats     Show current MNEMOS memory statistics
+
+Usage:
+  python tools/memory_import.py json     --file memories.json --endpoint http://localhost:5002
+  python tools/memory_import.py csv      --file data.csv --content-col text --endpoint http://localhost:5002
+  python tools/memory_import.py chatgpt  --file conversations.json --endpoint http://localhost:5002
+  python tools/memory_import.py obsidian --vault /path/to/vault --endpoint http://localhost:5002
+  python tools/memory_import.py text     --source /path --category notes --endpoint http://localhost:5002
+  python tools/memory_import.py stats    --endpoint http://localhost:5002
+"""
+
+import argparse
+import csv
+import json
+import re
+import sys
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Base importer
+# ---------------------------------------------------------------------------
+
+class BaseImporter:
+    """Shared HTTP posting logic for all importers."""
+
+    def __init__(
+        self,
+        endpoint: str = "http://localhost:5002",
+        api_key: str = None,
+        category: str = "imported",
+        dry_run: bool = False,
+    ):
+        self.endpoint = endpoint.rstrip("/")
+        self.api_key = api_key
+        self.category = category
+        self.dry_run = dry_run
+
+    def _post(self, memories: list) -> tuple:
+        """POST a list of memories to MNEMOS.
+
+        Returns:
+            (ok_count, fail_count)
+        """
+        ok = 0
+        fail = 0
+        for mem in memories:
+            if self.dry_run:
+                preview = str(mem.get("content", ""))[:100].replace("\n", " ")
+                cat = mem.get("category", self.category)
+                tags = mem.get("tags", [])
+                print(f"  DRY RUN  cat={cat!r} tags={tags}  content={preview!r}")
+                ok += 1
+                continue
+
+            url = f"{self.endpoint}/memories"
+            data = json.dumps(mem).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    if 200 <= resp.status < 300:
+                        ok += 1
+                    else:
+                        print(f"  WARNING  HTTP {resp.status} for memory")
+                        fail += 1
+            except urllib.error.HTTPError as exc:
+                print(f"  WARNING  POST failed {exc.code}: {exc.reason}")
+                fail += 1
+            except urllib.error.URLError as exc:
+                print(f"  WARNING  POST error: {exc.reason}")
+                fail += 1
+            except Exception as exc:
+                print(f"  WARNING  POST exception: {exc}")
+                fail += 1
+
+        return ok, fail
+
+    def run(self) -> dict:
+        """Execute the import. Override in subclasses.
+
+        Returns:
+            {"imported": N, "failed": N, "skipped": N}
+        """
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# JSON importer
+# ---------------------------------------------------------------------------
+
+class JsonImporter(BaseImporter):
+    """Import MNEMOS JSON export or simplified array of memory objects."""
+
+    def __init__(self, file_path: str, **kwargs):
+        super().__init__(**kwargs)
+        self.file_path = Path(file_path)
+
+    def run(self) -> dict:
+        stats = {"imported": 0, "failed": 0, "skipped": 0}
+
+        raw = self.file_path.read_text(encoding="utf-8")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: Cannot parse JSON: {exc}", file=sys.stderr)
+            return stats
+
+        # Handle wrapped export format: {"memories": [...]}
+        if isinstance(data, dict):
+            data = data.get("memories", data.get("data", list(data.values())))
+
+        if not isinstance(data, list):
+            print("ERROR: JSON must be an array (or object with 'memories' key)", file=sys.stderr)
+            return stats
+
+        memories = []
+        for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                stats["skipped"] += 1
+                continue
+            content = item.get("content", "")
+            if not content or not str(content).strip():
+                stats["skipped"] += 1
+                continue
+
+            mem = {
+                "content": str(content).strip(),
+                "category": item.get("category", self.category),
+                "tags": item.get("tags", []),
+                "metadata": item.get("metadata", {}),
+            }
+            memories.append(mem)
+
+        print(f"Loaded {len(memories)} memories from {self.file_path.name} "
+              f"({stats['skipped']} skipped)")
+
+        ok, fail = self._post(memories)
+        stats["imported"] = ok
+        stats["failed"] = fail
+        print(f"Result: {ok} imported, {fail} failed")
+        return stats
+
+
+# ---------------------------------------------------------------------------
+# CSV importer
+# ---------------------------------------------------------------------------
+
+class CsvImporter(BaseImporter):
+    """Import rows from a CSV file with configurable column mapping."""
+
+    def __init__(
+        self,
+        file_path: str,
+        content_col: str,
+        category_col: str = None,
+        tags_col: str = None,
+        id_col: str = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.file_path = Path(file_path)
+        self.content_col = content_col
+        self.category_col = category_col
+        self.tags_col = tags_col
+        self.id_col = id_col
+
+    def run(self) -> dict:
+        stats = {"imported": 0, "failed": 0, "skipped": 0}
+
+        try:
+            fh = self.file_path.open(newline="", encoding="utf-8-sig")
+        except FileNotFoundError:
+            print(f"ERROR: File not found: {self.file_path}", file=sys.stderr)
+            return stats
+
+        with fh:
+            reader = csv.DictReader(fh)
+            if self.content_col not in (reader.fieldnames or []):
+                print(f"ERROR: Column '{self.content_col}' not in CSV. "
+                      f"Available: {reader.fieldnames}", file=sys.stderr)
+                return stats
+
+            memories = []
+            for row_num, row in enumerate(reader, start=2):
+                content = (row.get(self.content_col) or "").strip()
+                if not content:
+                    stats["skipped"] += 1
+                    continue
+
+                category = self.category
+                if self.category_col:
+                    category = (row.get(self.category_col) or self.category).strip()
+
+                tags = []
+                if self.tags_col:
+                    raw_tags = row.get(self.tags_col, "")
+                    tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+
+                meta = {"source_file": self.file_path.name, "row": row_num}
+                if self.id_col:
+                    meta["original_id"] = row.get(self.id_col, "")
+
+                memories.append({
+                    "content": content,
+                    "category": category,
+                    "tags": tags,
+                    "metadata": meta,
+                })
+
+        print(f"Loaded {len(memories)} rows from {self.file_path.name} "
+              f"({stats['skipped']} skipped)")
+
+        ok, fail = self._post(memories)
+        stats["imported"] = ok
+        stats["failed"] = fail
+        print(f"Result: {ok} imported, {fail} failed")
+        return stats
+
+
+# ---------------------------------------------------------------------------
+# ChatGPT importer
+# ---------------------------------------------------------------------------
+
+# Keywords that suggest a decision-type memory
+_DECISION_KEYWORDS = re.compile(
+    r'\b(decide[ds]?|decision|chose|chosen|pick|picked|select|selected|opt|opted|'
+    r'go with|going with|prefer|preferred|recommend|recommended|should|must|will use|'
+    r'architecture|strategy|approach|plan|design)\b',
+    re.IGNORECASE,
+)
+
+
+class ChatGPTImporter(BaseImporter):
+    """Import OpenAI conversations.json export into MNEMOS memories."""
+
+    def __init__(self, file_path: str, **kwargs):
+        super().__init__(**kwargs)
+        self.file_path = Path(file_path)
+
+    def _parse_message_content(self, content_obj) -> str:
+        """Extract text from a message content object (parts array or string)."""
+        if isinstance(content_obj, str):
+            return content_obj
+        if isinstance(content_obj, dict):
+            parts = content_obj.get("parts", [])
+            texts = []
+            for p in parts:
+                if isinstance(p, str):
+                    texts.append(p)
+                elif isinstance(p, dict):
+                    texts.append(p.get("text", "") or p.get("content", ""))
+            return "\n".join(t for t in texts if t)
+        return ""
+
+    def _classify_category(self, text: str) -> str:
+        """Classify memory as 'decisions' or 'patterns' based on content."""
+        if _DECISION_KEYWORDS.search(text):
+            return "decisions"
+        return "patterns"
+
+    def run(self) -> dict:
+        stats = {"imported": 0, "failed": 0, "skipped": 0}
+
+        try:
+            raw = self.file_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            print(f"ERROR: File not found: {self.file_path}", file=sys.stderr)
+            return stats
+
+        try:
+            conversations = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: Cannot parse JSON: {exc}", file=sys.stderr)
+            return stats
+
+        if not isinstance(conversations, list):
+            print("ERROR: Expected a top-level JSON array of conversations", file=sys.stderr)
+            return stats
+
+        memories = []
+
+        for conv in conversations:
+            title = conv.get("title", "Untitled")
+            create_time = conv.get("create_time")
+            conv_date = None
+            if create_time:
+                try:
+                    conv_date = datetime.fromtimestamp(
+                        float(create_time), tz=timezone.utc
+                    ).isoformat()
+                except (ValueError, TypeError, OSError):
+                    conv_date = None
+
+            mapping = conv.get("mapping", {})
+            if not mapping:
+                stats["skipped"] += 1
+                continue
+
+            # Build ordered list of messages from the mapping
+            # mapping is {node_id: {id, message, parent, children}}
+            ordered_nodes = []
+            node_map = {}
+            for node_id, node in mapping.items():
+                msg = node.get("message")
+                if msg:
+                    node_map[node_id] = msg
+
+            # Walk tree to get ordered messages (find root then traverse)
+            # Find nodes with no parent or parent not in mapping
+            child_ids = set()
+            for node in mapping.values():
+                for cid in node.get("children", []):
+                    child_ids.add(cid)
+
+            roots = [nid for nid in mapping if nid not in child_ids]
+
+            def _walk(nid, depth=0):
+                node = mapping.get(nid, {})
+                msg = node.get("message")
+                if msg:
+                    ordered_nodes.append(msg)
+                for child_id in node.get("children", []):
+                    _walk(child_id, depth + 1)
+
+            for root in roots:
+                _walk(root)
+
+            # Pair user → assistant messages
+            prev_user_text = None
+            for msg in ordered_nodes:
+                author = (msg.get("author") or {}).get("role", "")
+                content_obj = msg.get("content") or {}
+                text = self._parse_message_content(content_obj).strip()
+
+                if author == "user":
+                    prev_user_text = text
+                elif author == "assistant" and text and len(text) >= 100:
+                    combined = text
+                    if prev_user_text:
+                        combined = f"Q: {prev_user_text}\nA: {text}"
+                        prev_user_text = None
+
+                    category = self._classify_category(combined)
+                    meta = {
+                        "conversation_title": title,
+                        "source_file": self.file_path.name,
+                        "import_tool": "chatgpt_import",
+                    }
+                    if conv_date:
+                        meta["conversation_date"] = conv_date
+
+                    memories.append({
+                        "content": combined,
+                        "category": category,
+                        "tags": ["chatgpt", "conversation"],
+                        "metadata": meta,
+                    })
+
+        print(f"Extracted {len(memories)} assistant messages from "
+              f"{len(conversations)} conversation(s)")
+
+        ok, fail = self._post(memories)
+        stats["imported"] = ok
+        stats["failed"] = fail
+        stats["skipped"] += (len(conversations) - ok - fail)
+        print(f"Result: {ok} imported, {fail} failed")
+        return stats
+
+
+# ---------------------------------------------------------------------------
+# Obsidian importer
+# ---------------------------------------------------------------------------
+
+def _parse_yaml_frontmatter(text: str) -> tuple:
+    """Parse YAML frontmatter delimited by '---'.
+
+    Returns:
+        (frontmatter_dict, body_text)  — frontmatter_dict is {} if not present.
+    """
+    if not text.startswith("---"):
+        return {}, text
+
+    end_idx = text.find("\n---", 3)
+    if end_idx == -1:
+        return {}, text
+
+    fm_text = text[3:end_idx].strip()
+    body = text[end_idx + 4:].strip()
+
+    fm = {}
+    for line in fm_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" in line:
+            key, _, value = line.partition(":")
+            key = key.strip()
+            value = value.strip()
+
+            # Handle inline list: [a, b, c]
+            if value.startswith("[") and value.endswith("]"):
+                inner = value[1:-1]
+                fm[key] = [v.strip().strip('"\'') for v in inner.split(",") if v.strip()]
+            # Handle quoted string
+            elif value.startswith('"') and value.endswith('"'):
+                fm[key] = value[1:-1]
+            elif value.startswith("'") and value.endswith("'"):
+                fm[key] = value[1:-1]
+            # Handle YAML list continuation (simple single-line case)
+            else:
+                fm[key] = value
+
+    return fm, body
+
+
+class ObsidianImporter(BaseImporter):
+    """Import Obsidian vault (.md files with optional YAML frontmatter)."""
+
+    def __init__(self, vault_path: str, **kwargs):
+        super().__init__(**kwargs)
+        self.vault_path = Path(vault_path)
+
+    def run(self) -> dict:
+        stats = {"imported": 0, "failed": 0, "skipped": 0}
+
+        if not self.vault_path.is_dir():
+            print(f"ERROR: Not a directory: {self.vault_path}", file=sys.stderr)
+            return stats
+
+        md_files = [
+            p for p in self.vault_path.rglob("*.md")
+            if ".obsidian" not in p.parts
+        ]
+        md_files.sort()
+        print(f"Found {len(md_files)} markdown file(s) in vault (excluding .obsidian/)")
+
+        memories = []
+        for fpath in md_files:
+            try:
+                text = fpath.read_text(encoding="utf-8")
+            except Exception as exc:
+                print(f"  SKIP  {fpath.name}: cannot read ({exc})")
+                stats["skipped"] += 1
+                continue
+
+            fm, body = _parse_yaml_frontmatter(text)
+
+            if not body.strip():
+                stats["skipped"] += 1
+                continue
+
+            # Tags from frontmatter
+            raw_tags = fm.get("tags", fm.get("tag", []))
+            if isinstance(raw_tags, str):
+                tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+            elif isinstance(raw_tags, list):
+                tags = [str(t).strip() for t in raw_tags if t]
+            else:
+                tags = []
+
+            # Category from frontmatter, else parent directory name
+            category = fm.get("category", fm.get("type", None))
+            if not category:
+                parent = fpath.parent
+                if parent != self.vault_path:
+                    category = parent.name
+                else:
+                    category = self.category
+
+            meta = {
+                "source_file": fpath.name,
+                "source_path": str(fpath.resolve()),
+                "vault": str(self.vault_path.resolve()),
+                "import_tool": "obsidian_import",
+                "import_date": datetime.now(timezone.utc).isoformat(),
+            }
+            # Carry over any other frontmatter fields as metadata
+            for k, v in fm.items():
+                if k not in ("tags", "tag", "category", "type"):
+                    meta[f"fm_{k}"] = v
+
+            memories.append({
+                "content": body.strip(),
+                "category": str(category),
+                "tags": tags,
+                "metadata": meta,
+            })
+
+        print(f"Prepared {len(memories)} memories ({stats['skipped']} files skipped)")
+
+        ok, fail = self._post(memories)
+        stats["imported"] = ok
+        stats["failed"] = fail
+        print(f"Result: {ok} imported, {fail} failed")
+        return stats
+
+
+# ---------------------------------------------------------------------------
+# Text importer
+# ---------------------------------------------------------------------------
+
+class TextImporter(BaseImporter):
+    """Import plain .txt or .md files — one memory per file or per paragraph."""
+
+    SUPPORTED_EXTENSIONS = {'.txt', '.md'}
+
+    def __init__(
+        self,
+        source: str,
+        per_paragraph: bool = False,
+        min_paragraph_chars: int = 50,
+        recursive: bool = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.source = Path(source)
+        self.per_paragraph = per_paragraph
+        self.min_paragraph_chars = min_paragraph_chars
+        self.recursive = recursive
+
+    def _collect_files(self) -> list:
+        if self.source.is_file():
+            return [self.source]
+        if not self.source.is_dir():
+            print(f"ERROR: Not a file or directory: {self.source}", file=sys.stderr)
+            return []
+        glob = "**/*" if self.recursive else "*"
+        return sorted(
+            p for p in self.source.glob(glob)
+            if p.is_file() and p.suffix.lower() in self.SUPPORTED_EXTENSIONS
+        )
+
+    def run(self) -> dict:
+        stats = {"imported": 0, "failed": 0, "skipped": 0}
+
+        files = self._collect_files()
+        if not files:
+            print(f"No supported files found in {self.source}")
+            return stats
+
+        print(f"Found {len(files)} file(s)")
+        memories = []
+
+        for fpath in files:
+            try:
+                text = fpath.read_text(encoding="utf-8").strip()
+            except Exception as exc:
+                print(f"  SKIP  {fpath.name}: cannot read ({exc})")
+                stats["skipped"] += 1
+                continue
+
+            if not text:
+                stats["skipped"] += 1
+                continue
+
+            meta = {
+                "source_file": fpath.name,
+                "source_path": str(fpath.resolve()),
+                "import_tool": "text_import",
+                "import_date": datetime.now(timezone.utc).isoformat(),
+            }
+
+            if self.per_paragraph:
+                paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+                for para in paragraphs:
+                    if len(para) < self.min_paragraph_chars:
+                        continue
+                    memories.append({
+                        "content": para,
+                        "category": self.category,
+                        "tags": [fpath.suffix.lstrip("."), "text"],
+                        "metadata": dict(meta),
+                    })
+            else:
+                memories.append({
+                    "content": text,
+                    "category": self.category,
+                    "tags": [fpath.suffix.lstrip("."), "text"],
+                    "metadata": meta,
+                })
+
+        print(f"Prepared {len(memories)} memories")
+
+        ok, fail = self._post(memories)
+        stats["imported"] = ok
+        stats["failed"] = fail
+        print(f"Result: {ok} imported, {fail} failed")
+        return stats
+
+
+# ---------------------------------------------------------------------------
+# Stats command
+# ---------------------------------------------------------------------------
+
+class StatsCommand:
+    """Fetch and pretty-print MNEMOS statistics."""
+
+    def __init__(self, endpoint: str = "http://localhost:5002", api_key: str = None):
+        self.endpoint = endpoint.rstrip("/")
+        self.api_key = api_key
+
+    def run(self) -> None:
+        url = f"{self.endpoint}/stats"
+        headers = {"Accept": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            print(f"ERROR: HTTP {exc.code}: {exc.reason}", file=sys.stderr)
+            return
+        except urllib.error.URLError as exc:
+            print(f"ERROR: {exc.reason}", file=sys.stderr)
+            return
+
+        # Pretty-print
+        print("\n=== MNEMOS Statistics ===\n")
+        total = data.get("total_memories", data.get("total", "?"))
+        print(f"  Total memories : {total}")
+
+        by_category = data.get("by_category", data.get("categories", {}))
+        if by_category:
+            print("\n  By category:")
+            max_key = max((len(k) for k in by_category), default=10)
+            for cat, count in sorted(by_category.items(), key=lambda x: -x[1]):
+                print(f"    {cat:<{max_key}}  {count}")
+
+        compressions = data.get("compressions", data.get("compression_runs"))
+        if compressions is not None:
+            print(f"\n  Compression runs: {compressions}")
+
+        last_compression = data.get("last_compression")
+        if last_compression:
+            print(f"  Last compression: {last_compression}")
+
+        # Print any other top-level keys we haven't handled
+        known = {"total_memories", "total", "by_category", "categories",
+                 "compressions", "compression_runs", "last_compression"}
+        extras = {k: v for k, v in data.items() if k not in known}
+        if extras:
+            print("\n  Additional info:")
+            for k, v in extras.items():
+                print(f"    {k}: {v}")
+
+        print()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
+    """Add endpoint / api-key / dry-run to a subparser."""
+    parser.add_argument("--endpoint", default="http://localhost:5002",
+                        help="MNEMOS API base URL (default: http://localhost:5002)")
+    parser.add_argument("--api-key", metavar="KEY", default=None,
+                        help="Optional Bearer token for MNEMOS auth")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print what would be imported without POSTing")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="memory_import",
+        description="Import memories into MNEMOS from various formats.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="subcommand", required=True)
+
+    # --- json ---
+    p_json = sub.add_parser("json", help="Import from MNEMOS JSON export or array")
+    p_json.add_argument("--file", required=True, metavar="PATH",
+                        help="Path to JSON file")
+    p_json.add_argument("--category", default="imported",
+                        help="Default category if not present in records")
+    _add_common_args(p_json)
+
+    # --- csv ---
+    p_csv = sub.add_parser("csv", help="Import from CSV with column mapping")
+    p_csv.add_argument("--file", required=True, metavar="PATH",
+                       help="Path to CSV file")
+    p_csv.add_argument("--content-col", required=True, metavar="COL",
+                       help="Column name containing the memory content")
+    p_csv.add_argument("--category-col", default=None, metavar="COL",
+                       help="Column name for category (optional)")
+    p_csv.add_argument("--tags-col", default=None, metavar="COL",
+                       help="Column name for comma-separated tags (optional)")
+    p_csv.add_argument("--id-col", default=None, metavar="COL",
+                       help="Column name for an ID to store in metadata (optional)")
+    p_csv.add_argument("--category", default="imported",
+                       help="Default category when --category-col absent or empty")
+    _add_common_args(p_csv)
+
+    # --- chatgpt ---
+    p_cgpt = sub.add_parser("chatgpt", help="Import from OpenAI conversations.json export")
+    p_cgpt.add_argument("--file", required=True, metavar="PATH",
+                        help="Path to conversations.json")
+    p_cgpt.add_argument("--category", default=None,
+                        help="Override auto-detected category (decisions/patterns)")
+    _add_common_args(p_cgpt)
+
+    # --- obsidian ---
+    p_obs = sub.add_parser("obsidian", help="Import from Obsidian vault directory")
+    p_obs.add_argument("--vault", required=True, metavar="DIR",
+                       help="Path to Obsidian vault root directory")
+    p_obs.add_argument("--category", default="notes",
+                       help="Default category when not set in frontmatter")
+    _add_common_args(p_obs)
+
+    # --- text ---
+    p_txt = sub.add_parser("text", help="Import plain .txt or .md files")
+    p_txt.add_argument("--source", required=True, metavar="PATH",
+                       help="File or directory to import")
+    p_txt.add_argument("--category", default="notes",
+                       help="Memory category (default: notes)")
+    p_txt.add_argument("--per-paragraph", action="store_true",
+                       help="Create one memory per paragraph (min 50 chars) instead of per file")
+    p_txt.add_argument("--recursive", action="store_true",
+                       help="Recurse into sub-directories")
+    _add_common_args(p_txt)
+
+    # --- stats ---
+    p_stats = sub.add_parser("stats", help="Show MNEMOS memory statistics")
+    p_stats.add_argument("--endpoint", default="http://localhost:5002",
+                         help="MNEMOS API base URL")
+    p_stats.add_argument("--api-key", metavar="KEY", default=None,
+                         help="Optional Bearer token for MNEMOS auth")
+
+    return parser
+
+
+def main(argv=None):
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    common = dict(
+        endpoint=args.endpoint,
+        api_key=args.api_key,
+    )
+
+    if args.subcommand == "json":
+        importer = JsonImporter(
+            file_path=args.file,
+            category=args.category,
+            dry_run=args.dry_run,
+            **common,
+        )
+        importer.run()
+
+    elif args.subcommand == "csv":
+        importer = CsvImporter(
+            file_path=args.file,
+            content_col=args.content_col,
+            category_col=args.category_col,
+            tags_col=args.tags_col,
+            id_col=args.id_col,
+            category=args.category,
+            dry_run=args.dry_run,
+            **common,
+        )
+        importer.run()
+
+    elif args.subcommand == "chatgpt":
+        kwargs = dict(dry_run=args.dry_run, **common)
+        if args.category:
+            kwargs["category"] = args.category
+        importer = ChatGPTImporter(file_path=args.file, **kwargs)
+        importer.run()
+
+    elif args.subcommand == "obsidian":
+        importer = ObsidianImporter(
+            vault_path=args.vault,
+            category=args.category,
+            dry_run=args.dry_run,
+            **common,
+        )
+        importer.run()
+
+    elif args.subcommand == "text":
+        importer = TextImporter(
+            source=args.source,
+            category=args.category,
+            per_paragraph=args.per_paragraph,
+            recursive=args.recursive,
+            dry_run=args.dry_run,
+            **common,
+        )
+        importer.run()
+
+    elif args.subcommand == "stats":
+        cmd = StatsCommand(endpoint=args.endpoint, api_key=args.api_key)
+        cmd.run()
+
+
+if __name__ == "__main__":
+    main()
