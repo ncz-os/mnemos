@@ -2,7 +2,6 @@
 # NOT wired into production. Review README.md in this directory before integrating.
 # Source: see /opt/mnemos/archive/README.md
 
-#!/usr/bin/env python3
 """
 Embedding Cache for MNEMOS - Nomic Embeddings
 Caches 768-dimensional vectors to avoid recomputation
@@ -10,7 +9,6 @@ Caches 768-dimensional vectors to avoid recomputation
 
 import hashlib
 import threading
-import json
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 
@@ -18,7 +16,7 @@ from datetime import datetime, timedelta
 class EmbeddingCache:
     """Cache for embedding results with LRU eviction"""
 
-    def __init__(self, max_cache_size=1000, ttl_hours=None):
+    def __init__(self, max_cache_size: int = 1000, ttl_hours: Optional[float] = None) -> None:
         """
         Initialize embedding cache
 
@@ -26,8 +24,8 @@ class EmbeddingCache:
             max_cache_size: Maximum number of embeddings to keep (default 1000)
             ttl_hours: Time-to-live for cache entries (None = no expiration)
         """
-        self.cache = {}  # memory_id or text_hash -> embedding vector (768-dim)
-        self.access_times = {}  # memory_id -> last_access_time
+        self.cache: Dict[str, Any] = {}  # memory_id or text_hash -> embedding vector (768-dim)
+        self.access_times: Dict[str, datetime] = {}  # memory_id -> last_access_time
         self.max_size = max_cache_size
         self.ttl = timedelta(hours=ttl_hours) if ttl_hours else None
         self.lock = threading.RLock()
@@ -62,14 +60,17 @@ class EmbeddingCache:
         with self.lock:
             key = self.get_key(memory_id, text)
 
+            if not key:
+                return None
+
             if key not in self.cache:
                 self.stats['misses'] += 1
                 return None
 
             embedding = self.cache[key]
 
-            # Check if expired
-            if self.ttl and datetime.now() - embedding.get('created', datetime.now()) > self.ttl:
+            # Check if expired — missing 'created' always expires
+            if self.ttl and datetime.now() - embedding.get('created', datetime.min) > self.ttl:
                 del self.cache[key]
                 del self.access_times[key]
                 self.stats['misses'] += 1
@@ -112,7 +113,7 @@ class EmbeddingCache:
             self.stats['total_cached_vectors'] = len(self.cache)
             return True
 
-    def _evict_lru(self):
+    def _evict_lru(self) -> None:
         """Evict least recently used entry"""
         if not self.access_times:
             return
@@ -122,7 +123,7 @@ class EmbeddingCache:
         del self.access_times[lru_key]
         self.stats['evictions'] += 1
 
-    def clear(self):
+    def clear(self) -> None:
         """Clear all cached embeddings"""
         with self.lock:
             self.cache.clear()
@@ -134,9 +135,8 @@ class EmbeddingCache:
             total = self.stats['hits'] + self.stats['misses']
             hit_rate = self.stats['hits'] / max(total, 1)
 
-            # Estimate memory usage (each 768-dim float32 vector = ~3KB)
-            # Plus metadata overhead ~1KB per entry
-            estimated_memory_mb = (len(self.cache) * 4) / 1024  # 768 * 4 bytes / 1024 KB
+            # Correct MB calculation: 768-dim float32 vectors = 768 * 4 bytes each
+            estimated_memory_mb = (len(self.cache) * 768 * 4) / 1_048_576
 
             return {
                 'size': len(self.cache),

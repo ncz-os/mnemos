@@ -2,50 +2,52 @@
 # NOT wired into production. Review README.md in this directory before integrating.
 # Source: see /opt/mnemos/archive/README.md
 
-#!/usr/bin/env python3
 """
 Dual-Layer Cache for MNEMOS
 L1: Python dict in-memory (ultra-fast, <1ms)
-L2: PostgreSQL persistent (durable, survives restarts)
+L2: PostgreSQL persistent via asyncpg (durable, survives restarts)
 
 This replaces Redis with a more reliable architecture:
 - PostgreSQL is the source of truth
 - Python cache is the working set
-- Auto-recovery on restart (syncs from PostgreSQL)
+- Auto-recovery on restart (warm from PostgreSQL)
 """
 
+import asyncio
 import json
-import threading
+import logging
 import time
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
+
+import asyncpg
+
+logger = logging.getLogger(__name__)
 
 
 class DualLayerCache:
     """
-    Two-tier cache: L1 (Memory) + L2 (PostgreSQL)
+    Two-tier cache: L1 (Memory) + L2 (PostgreSQL via asyncpg)
 
     Pattern:
     1. Read: Check L1 (memory) → if miss, check L2 (PostgreSQL) → populate L1
     2. Write: Write to L2 (PostgreSQL) → immediately available in L1
-    3. Startup: Sync all from L2 to L1 (~1 second for 5,676 items)
+    3. Startup: warm_from_db() loads all from L2 to L1 (~1 second for 5,676 items)
     """
 
-    def __init__(self, pg_config: Dict[str, str], max_memory_size: int = 10000):
+    def __init__(self, pool: asyncpg.Pool, max_memory_size: int = 10_000) -> None:
         """
-        Initialize dual-layer cache
+        Initialize dual-layer cache.
 
         Args:
-            pg_config: PostgreSQL connection config (dbname, user, host, port)
-            max_memory_size: Max items in L1 memory (for LRU eviction if needed)
+            pool: asyncpg connection pool (from api.lifecycle._pool)
+            max_memory_size: Max items in L1 memory (LRU eviction when full)
         """
-        self.memory_cache = {}  # L1: Python dict (ultra-fast)
-        self.pg_config = pg_config  # L2: PostgreSQL connection
+        self.pool = pool
         self.max_memory_size = max_memory_size
-        self.lock = threading.RLock()  # Thread-safe operations
-        self.access_times = {}  # Track access times for LRU
+        self.memory_cache: Dict[str, Dict[str, Any]] = {}  # L1: Python dict
+        self.lock = asyncio.Lock()
+        self.access_times: Dict[str, float] = {}
         self.stats = {
             'l1_hits': 0,
             'l1_misses': 0,
@@ -53,15 +55,41 @@ class DualLayerCache:
             'l2_misses': 0,
         }
 
-    def _get_connection(self):
-        """Get PostgreSQL connection"""
-        return psycopg2.connect(**self.pg_config)
-
-    def get(self, key: str) -> Optional[Dict[str, Any]]:
+    async def warm_from_db(self) -> int:
         """
-        Get value from cache
-        L1: Memory (ultra-fast)
-        L2: PostgreSQL (durable)
+        Load memories from PostgreSQL into L1 cache on startup.
+
+        Returns:
+            Number of memories loaded
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT id, content, category, tags, metadata, created, updated
+                    FROM memories
+                    ORDER BY created DESC
+                    LIMIT 10000
+                """)
+
+            loaded_count = 0
+            now = time.time()
+            async with self.lock:
+                for row in rows:
+                    memory_id = row['id']
+                    self.memory_cache[memory_id] = self._row_to_dict(row)
+                    self.access_times[memory_id] = now
+                    loaded_count += 1
+
+            logger.info("Warmed %d memories from PostgreSQL into L1 cache", loaded_count)
+            return loaded_count
+
+        except Exception as exc:
+            logger.error("Cache warm_from_db failed: %s", exc)
+            return 0
+
+    async def get(self, key: str) -> Optional[Dict[str, Any]]:
+        """
+        Get value from cache (L1 first, then L2).
 
         Args:
             key: Memory ID (e.g., "mem_123")
@@ -69,33 +97,31 @@ class DualLayerCache:
         Returns:
             Memory dict or None if not found
         """
-        with self.lock:
-            # L1: Check memory cache first
+        async with self.lock:
             if key in self.memory_cache:
-                self.access_times[key] = time.time()  # Update LRU
+                self.access_times[key] = time.time()
                 self.stats['l1_hits'] += 1
                 return self.memory_cache[key]
-
-            # L1 miss - check L2 (PostgreSQL)
             self.stats['l1_misses'] += 1
-            value = self._fetch_from_db(key)
 
-            if value:
-                # L2 hit - populate L1 for future access
-                self._evict_lru_if_needed()  # Make room if cache full
+        # L1 miss — fetch from DB without holding the lock during I/O
+        value = await self._fetch_from_db(key)
+
+        if value is not None:
+            async with self.lock:
+                await self._evict_lru_if_needed()
                 self.memory_cache[key] = value
                 self.access_times[key] = time.time()
                 self.stats['l2_hits'] += 1
-                return value
-            else:
-                # L2 miss - not found
-                self.stats['l2_misses'] += 1
-                return None
+            return value
 
-    def set(self, key: str, value: Dict[str, Any]) -> bool:
+        async with self.lock:
+            self.stats['l2_misses'] += 1
+        return None
+
+    async def set(self, key: str, value: Dict[str, Any]) -> bool:
         """
-        Set value in cache
-        Writes to L2 (PostgreSQL) immediately, updates L1 cache
+        Set value in cache (write to L2, update L1).
 
         Args:
             key: Memory ID
@@ -104,187 +130,113 @@ class DualLayerCache:
         Returns:
             True if successful, False otherwise
         """
-        with self.lock:
-            try:
-                # L2: Write to PostgreSQL (source of truth)
-                self._write_to_db(key, value)
-
-                # L1: Update memory cache
-                self._evict_lru_if_needed()
+        try:
+            await self._write_to_db(key, value)
+            async with self.lock:
+                await self._evict_lru_if_needed()
                 self.memory_cache[key] = value
                 self.access_times[key] = time.time()
+            return True
+        except Exception as exc:
+            logger.warning("Cache set failed for key %s: %s", key, exc)
+            return False
 
-                return True
-            except Exception as e:
-                print(f"[CACHE] Error writing {key}: {e}", flush=True)
-                return False
-
-    def delete(self, key: str) -> bool:
-        """Delete value from cache"""
-        with self.lock:
-            try:
-                # L2: Delete from PostgreSQL
-                self._delete_from_db(key)
-
-                # L1: Remove from memory
-                if key in self.memory_cache:
-                    del self.memory_cache[key]
-                if key in self.access_times:
-                    del self.access_times[key]
-
-                return True
-            except Exception as e:
-                print(f"[CACHE] Error deleting {key}: {e}", flush=True)
-                return False
-
-    def sync_on_startup(self) -> int:
-        """
-        Sync all memories from PostgreSQL to Python cache on startup
-
-        Returns:
-            Number of memories loaded
-        """
-        with self.lock:
-            try:
-                conn = self._get_connection()
-                cur = conn.cursor(cursor_factory=RealDictCursor)
-
-                # Get ALL memories from PostgreSQL
-                cur.execute("""
-                    SELECT id, content, category, created, updated, metadata
-                    FROM memories
-                    ORDER BY created DESC
-                    LIMIT 10000
-                """)
-
-                loaded_count = 0
-                for row in cur.fetchall():
-                    memory_id = row['id']
-                    self.memory_cache[memory_id] = {
-                        'id': memory_id,
-                        'text': row['content'],
-                        'category': row['category'],
-                        'created_at': row['created'].isoformat() if row['created'] else None,
-                        'timestamp': row['updated'].timestamp() if row['updated'] else None,
-                        'tags': [],
-                        'metadata': row['metadata'] or {}
-                    }
-                    self.access_times[memory_id] = time.time()
-                    loaded_count += 1
-
-                cur.close()
-                conn.close()
-
-                print(f"[CACHE] ✓ Synced {loaded_count} memories from PostgreSQL to L1 cache", flush=True)
-                return loaded_count
-
-            except Exception as e:
-                print(f"[CACHE] ✗ Sync failed: {e}", flush=True)
-                return 0
-
-    def _fetch_from_db(self, memory_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch single memory from PostgreSQL"""
+    async def delete(self, key: str) -> bool:
+        """Delete value from both L1 and L2."""
         try:
-            conn = self._get_connection()
-            cur = conn.cursor(cursor_factory=RealDictCursor)
+            await self._delete_from_db(key)
+            async with self.lock:
+                self.memory_cache.pop(key, None)
+                self.access_times.pop(key, None)
+            return True
+        except Exception as exc:
+            logger.warning("Cache delete failed for key %s: %s", key, exc)
+            return False
 
-            cur.execute("""
-                SELECT id, content, category, created, updated, metadata
-                FROM memories
-                WHERE id = %s
-            """, (memory_id,))
-
-            row = cur.fetchone()
-            cur.close()
-            conn.close()
-
+    async def _fetch_from_db(self, key: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single memory from PostgreSQL."""
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow("""
+                    SELECT id, content, category, tags, metadata, created, updated
+                    FROM memories
+                    WHERE id = $1
+                """, key)
             if row:
-                return {
-                    'id': row['id'],
-                    'text': row['content'],
-                    'category': row['category'],
-                    'created_at': row['created'].isoformat() if row['created'] else None,
-                    'timestamp': row['updated'].timestamp() if row['updated'] else None,
-                    'tags': [],
-                    'metadata': row['metadata'] or {}
-                }
+                return self._row_to_dict(row)
+            return None
+        except Exception as exc:
+            logger.warning("Cache _fetch_from_db failed for key %s: %s", key, exc)
             return None
 
-        except Exception as e:
-            print(f"[CACHE] Error fetching {memory_id}: {e}", flush=True)
-            return None
+    async def _write_to_db(self, key: str, value: Dict[str, Any]) -> None:
+        """Write a memory to PostgreSQL."""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO memories (id, content, category, tags, metadata, created, updated)
+                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    content   = EXCLUDED.content,
+                    category  = EXCLUDED.category,
+                    tags      = EXCLUDED.tags,
+                    metadata  = EXCLUDED.metadata,
+                    updated   = NOW()
+            """,
+                key,
+                value.get('content', value.get('text', '')),
+                value.get('category', 'uncategorized'),
+                value.get('tags') or [],
+                json.dumps(value.get('metadata', {})),
+            )
 
-    def _write_to_db(self, memory_id: str, value: Dict[str, Any]):
-        """Write memory to PostgreSQL"""
-        conn = self._get_connection()
-        cur = conn.cursor()
+    async def _delete_from_db(self, key: str) -> None:
+        """Delete a memory from PostgreSQL."""
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM memories WHERE id = $1", key)
 
-        cur.execute("""
-            INSERT INTO memories (id, content, category, metadata, created, updated)
-            VALUES (%s, %s, %s, %s, NOW(), NOW())
-            ON CONFLICT (id) DO UPDATE SET
-                content = EXCLUDED.content,
-                category = EXCLUDED.category,
-                metadata = EXCLUDED.metadata,
-                updated = NOW()
-        """, (
-            memory_id,
-            value.get('text', ''),
-            value.get('category', 'uncategorized'),
-            json.dumps(value.get('metadata', {}))
-        ))
+    async def _evict_lru_if_needed(self) -> None:
+        """Evict least-recently-used item if L1 cache is full. Must be called under self.lock."""
+        if len(self.memory_cache) >= self.max_memory_size and self.access_times:
+            lru_key = min(self.access_times, key=lambda k: self.access_times[k])
+            self.memory_cache.pop(lru_key, None)
+            self.access_times.pop(lru_key, None)
+            logger.debug("LRU evicted cache key %s", lru_key)
+            # Best-effort background delete from DB (don't await in hot path)
+            asyncio.create_task(self._delete_from_db(lru_key))
 
-        conn.commit()
-        cur.close()
-        conn.close()
-
-    def _delete_from_db(self, memory_id: str):
-        """Delete memory from PostgreSQL"""
-        conn = self._get_connection()
-        cur = conn.cursor()
-
-        cur.execute("DELETE FROM memories WHERE id = %s", (memory_id,))
-
-        conn.commit()
-        cur.close()
-        conn.close()
-
-    def _evict_lru_if_needed(self):
-        """Evict least-recently-used item if cache is full"""
-        if len(self.memory_cache) >= self.max_memory_size:
-            # Find least recently accessed key
-            if self.access_times:
-                lru_key = min(self.access_times.keys(), key=lambda k: self.access_times[k])
-                del self.memory_cache[lru_key]
-                del self.access_times[lru_key]
-                print(f"[CACHE] LRU evicted {lru_key}", flush=True)
+    @staticmethod
+    def _row_to_dict(row: Any) -> Dict[str, Any]:
+        """Convert an asyncpg Record to a plain dict."""
+        return {
+            'id': row['id'],
+            'content': row['content'],
+            'category': row['category'],
+            'tags': row.get('tags') or [],
+            'metadata': row['metadata'] or {},
+            'created': row['created'].isoformat() if row['created'] else None,
+            'updated': row['updated'].isoformat() if row['updated'] else None,
+        }
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get cache statistics"""
-        with self.lock:
-            total_requests = sum([
-                self.stats['l1_hits'],
-                self.stats['l1_misses'],
-                self.stats['l2_hits'],
-                self.stats['l2_misses']
-            ])
+        """Get cache statistics."""
+        total_requests = sum(self.stats.values())
+        return {
+            'l1_size': len(self.memory_cache),
+            'l1_hits': self.stats['l1_hits'],
+            'l1_hit_rate': self.stats['l1_hits'] / max(total_requests, 1),
+            'l1_misses': self.stats['l1_misses'],
+            'l2_hits': self.stats['l2_hits'],
+            'l2_misses': self.stats['l2_misses'],
+            'combined_hit_rate': (
+                (self.stats['l1_hits'] + self.stats['l2_hits']) / max(total_requests, 1)
+            ),
+        }
 
-            return {
-                'l1_size': len(self.memory_cache),
-                'l1_hits': self.stats['l1_hits'],
-                'l1_hit_rate': self.stats['l1_hits'] / max(total_requests, 1),
-                'l1_misses': self.stats['l1_misses'],
-                'l2_hits': self.stats['l2_hits'],
-                'l2_misses': self.stats['l2_misses'],
-                'combined_hit_rate': (self.stats['l1_hits'] + self.stats['l2_hits']) / max(total_requests, 1)
-            }
-
-    def clear_stats(self):
-        """Reset cache statistics"""
-        with self.lock:
-            self.stats = {
-                'l1_hits': 0,
-                'l1_misses': 0,
-                'l2_hits': 0,
-                'l2_misses': 0,
-            }
+    def clear_stats(self) -> None:
+        """Reset cache statistics."""
+        self.stats = {
+            'l1_hits': 0,
+            'l1_misses': 0,
+            'l2_hits': 0,
+            'l2_misses': 0,
+        }

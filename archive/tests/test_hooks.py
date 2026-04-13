@@ -14,9 +14,6 @@ import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock, Mock
 
-# Note: In actual deployment, these imports would work
-# from modules.hooks import HookRegistry, HookEvent, HOOK_SESSION_START
-
 
 @pytest.mark.asyncio
 async def test_hook_registry_creation():
@@ -260,3 +257,34 @@ def test_task_keywords():
     assert 'code' in keywords['code_generation']
     assert 'reasoning' in keywords
     assert 'architecture' in keywords['reasoning']
+
+@pytest.mark.asyncio
+async def test_real_event_enable_disable():
+    """Test enable/disable using a real production event name (memory.write)."""
+    from modules.hooks import HookRegistry
+
+    config = {
+        'hooks': {
+            'enabled': True,
+            'memory_write': True,
+        }
+    }
+    registry = HookRegistry(config)
+
+    # memory.write should be enabled from config
+    assert registry.is_enabled('memory.write')
+
+    # Disable it
+    registry.disable_hook('memory.write')
+    assert not registry.is_enabled('memory.write')
+
+    # Re-enable it
+    registry.enable_hook('memory.write')
+    assert registry.is_enabled('memory.write')
+
+    # Verify that a disabled hook does not call its callback
+    callback = AsyncMock()
+    registry.register('memory.write', callback)
+    registry.disable_hook('memory.write')
+    await registry.trigger('memory.write', {'key': 'val'})
+    callback.assert_not_called()

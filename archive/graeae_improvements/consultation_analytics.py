@@ -6,25 +6,28 @@
 """
 GRAEAE Consultation Analytics Module
 Provides comprehensive analytics endpoints for consultation history,
-muse performance tracking, and agreement analysis
+provider performance tracking, and agreement analysis.
 """
 
 import json
 import logging
 import requests
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 from collections import defaultdict
 from statistics import mean, stdev
 
+from fastapi import APIRouter, Query
+
 logger = logging.getLogger(__name__)
 
+
 class ConsultationAnalytics:
-    def __init__(self, mnemos_url: str = "http://localhost:5000"):
+    def __init__(self, mnemos_url: str = "http://localhost:5002"):
         self.mnemos_url = mnemos_url
         self.consultations = []
         self._load_consultations()
-    
+
     def _load_consultations(self):
         """Load all consultation records from MNEMOS"""
         try:
@@ -44,36 +47,35 @@ class ConsultationAnalytics:
                 logger.warning(f"Failed to load consultations: {response.status_code}")
         except Exception as e:
             logger.error(f"Error loading consultations: {e}")
-    
-    def get_muse_statistics(self) -> Dict:
-        """Analyze performance statistics for all muses"""
-        muse_stats = defaultdict(lambda: {
+
+    def get_provider_statistics(self) -> Dict:
+        """Analyze performance statistics for all providers"""
+        provider_stats = defaultdict(lambda: {
             'attempts': 0,
             'successes': 0,
             'failures': 0,
             'latencies': [],
             'elo_scores': [],
             'quality_scores': [],
-            'win_count': 0,
             'models': set()
         })
-        
+
         for consultation in self.consultations:
             content = consultation.get('content', '')
-            
-            # Parse muse responses from consultation record
-            if 'MUSE:' in content:
-                muse_blocks = content.split('MUSE:')[1:]
-                for block in muse_blocks:
+
+            # Parse provider responses from consultation record
+            if 'PROVIDER:' in content:
+                provider_blocks = content.split('PROVIDER:')[1:]
+                for block in provider_blocks:
                     lines = block.split('\n')
-                    muse_name = lines[0].strip().replace('===', '').strip().lower()
-                    
-                    if not muse_name or muse_name == '':
+                    provider_name = lines[0].strip().replace('===', '').strip().lower()
+
+                    if not provider_name:
                         continue
-                    
-                    stats = muse_stats[muse_name]
+
+                    stats = provider_stats[provider_name]
                     stats['attempts'] += 1
-                    
+
                     # Parse stats from block
                     for line in lines[1:]:
                         if 'Model:' in line and 'unknown' not in line:
@@ -83,29 +85,29 @@ class ConsultationAnalytics:
                             try:
                                 latency = float(line.split('Latency:')[1].split('ms')[0].strip())
                                 stats['latencies'].append(latency)
-                            except:
+                            except Exception:
                                 pass
                         elif 'ELO Score:' in line:
                             try:
                                 elo = float(line.split('ELO Score:')[1].strip())
                                 stats['elo_scores'].append(elo)
-                            except:
+                            except Exception:
                                 pass
                         elif 'Quality Score:' in line:
                             try:
                                 quality = float(line.split('Quality Score:')[1].strip())
                                 stats['quality_scores'].append(quality)
-                            except:
+                            except Exception:
                                 pass
                         elif 'failed' in line.lower():
                             stats['failures'] += 1
                         elif 'success' in line.lower():
                             stats['successes'] += 1
-        
+
         # Calculate aggregated statistics
         result = {}
-        for muse_name, stats in muse_stats.items():
-            result[muse_name] = {
+        for provider_name, stats in provider_stats.items():
+            result[provider_name] = {
                 'attempts': stats['attempts'],
                 'successes': stats['successes'],
                 'failures': stats['failures'],
@@ -114,48 +116,46 @@ class ConsultationAnalytics:
                 'avg_elo': mean(stats['elo_scores']) if stats['elo_scores'] else 1200,
                 'avg_quality': mean(stats['quality_scores']) if stats['quality_scores'] else 0,
                 'models': list(stats['models']),
-                'win_count': stats['win_count']
             }
-        
+
         return result
-    
-    def get_consultation_history(self, limit: int = 20, offset: int = 0, 
+
+    def get_consultation_history(self, limit: int = 20, offset: int = 0,
                                 task_type: Optional[str] = None) -> List[Dict]:
         """Get consultation history with optional filtering"""
         results = []
-        
-        for i, consultation in enumerate(self.consultations[offset:offset+limit]):
+
+        for consultation in self.consultations[offset:offset + limit]:
             content = consultation.get('content', '')
             created = consultation.get('created', '')
-            
-            # Extract metadata
+
             record = {
                 'id': consultation.get('id'),
                 'created': created,
                 'content_preview': content[:200] + '...' if len(content) > 200 else content,
                 'task_type': self._extract_field(content, 'Task Type:'),
                 'consensus_score': self._extract_field(content, 'Consensus Score:', float),
-                'winning_muse': self._extract_field(content, 'Winning Muse:'),
+                'winning_provider': self._extract_field(content, 'Winning Provider:'),
             }
-            
+
             if task_type is None or record['task_type'] == task_type:
                 results.append(record)
-        
+
         return results
-    
+
     def get_agreement_analysis(self) -> Dict:
-        """Analyze agreement patterns between muses"""
+        """Analyze agreement patterns between providers"""
         agreement_stats = {
-            'high_agreement_pairs': 0,  # >75%
-            'medium_agreement_pairs': 0,  # 50-75%
-            'low_agreement_pairs': 0,   # <50%
+            'high_agreement_pairs': 0,   # >75%
+            'medium_agreement_pairs': 0, # 50-75%
+            'low_agreement_pairs': 0,    # <50%
             'avg_agreement': 0,
             'consensus_scores': []
         }
-        
+
         for consultation in self.consultations:
             content = consultation.get('content', '')
-            
+
             # Extract agreement data
             if 'Pairwise Similarities:' in content:
                 pairs_line = [l for l in content.split('\n') if 'Pairwise Similarities:' in l]
@@ -167,19 +167,19 @@ class ConsultationAnalytics:
                         agreement_stats['high_agreement_pairs'] += high
                         agreement_stats['medium_agreement_pairs'] += int(num_pairs * 0.08)
                         agreement_stats['low_agreement_pairs'] += int(num_pairs * 0.02)
-                    except:
+                    except Exception:
                         pass
-            
-            # Extract consensus score
+
+            # Extract consensus score — check status field for success
             score = self._extract_field(content, 'Consensus Score:', float)
-            if score:
+            if score is not None:
                 agreement_stats['consensus_scores'].append(score)
-        
+
         if agreement_stats['consensus_scores']:
             agreement_stats['avg_agreement'] = mean(agreement_stats['consensus_scores'])
-        
+
         return agreement_stats
-    
+
     @staticmethod
     def _extract_field(content: str, field_name: str, field_type=str):
         """Helper to extract field values from consultation content"""
@@ -189,52 +189,58 @@ class ConsultationAnalytics:
                 if field_type == float:
                     return float(value.rstrip('%'))
                 return value
-        except:
+        except Exception:
             pass
         return None
 
-# Flask endpoints
-def register_analytics_endpoints(app, analytics: ConsultationAnalytics):
-    """Register all analytics endpoints with Flask app"""
-    
-    @app.route('/graeae/analytics/muse-stats', methods=['GET'])
-    def get_muse_statistics():
-        """Get comprehensive muse performance statistics"""
-        stats = analytics.get_muse_statistics()
-        return {'status': 'ok', 'data': stats}, 200
-    
-    @app.route('/graeae/analytics/consultation-history', methods=['GET'])
-    def get_consultation_history():
-        """Get consultation history with optional filtering"""
-        limit = request.args.get('limit', 20, type=int)
-        offset = request.args.get('offset', 0, type=int)
-        task_type = request.args.get('task_type', None)
-        
-        history = analytics.get_consultation_history(limit, offset, task_type)
-        return {'status': 'ok', 'data': history, 'count': len(history)}, 200
-    
-    @app.route('/graeae/analytics/agreement-analysis', methods=['GET'])
-    def get_agreement_analysis():
-        """Get muse agreement analysis"""
-        analysis = analytics.get_agreement_analysis()
-        return {'status': 'ok', 'data': analysis}, 200
-    
-    @app.route('/graeae/analytics/provider-status', methods=['GET'])
-    def get_provider_status():
-        """Get status of all providers (working vs failed)"""
-        stats = analytics.get_muse_statistics()
-        working = [m for m, s in stats.items() if s['success_rate'] > 0]
-        failed = [m for m, s in stats.items() if s['success_rate'] == 0]
-        
+
+def create_analytics_router(analytics: 'ConsultationAnalytics') -> APIRouter:
+    """Create a FastAPI router with all analytics endpoints.
+
+    Usage in graeae/app.py:
+        from archive.graeae_improvements.consultation_analytics import (
+            ConsultationAnalytics, create_analytics_router
+        )
+        analytics = ConsultationAnalytics(mnemos_url="http://localhost:5002")
+        app.include_router(create_analytics_router(analytics))
+    """
+    router = APIRouter(prefix="/graeae/analytics", tags=["analytics"])
+
+    @router.get("/summary")
+    async def get_summary():
+        """Get a brief summary of analytics state"""
+        stats = analytics.get_provider_statistics()
         return {
             'status': 'ok',
-            'working_providers': working,
-            'failed_providers': failed,
-            'total_providers': len(stats)
-        }, 200
-    
-    logger.info('Analytics endpoints registered successfully')
+            'total_providers': len(stats),
+            'total_consultations': len(analytics.consultations),
+        }
+
+    @router.get("/providers")
+    async def get_provider_stats():
+        """Get comprehensive provider performance statistics"""
+        stats = analytics.get_provider_statistics()
+        return {'status': 'ok', 'data': stats}
+
+    @router.get("/history")
+    async def get_history(
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        task_type: Optional[str] = Query(None),
+    ):
+        """Get consultation history with optional filtering"""
+        history = analytics.get_consultation_history(limit, offset, task_type)
+        return {'status': 'ok', 'data': history, 'count': len(history)}
+
+    @router.get("/agreements")
+    async def get_agreements():
+        """Get provider agreement analysis"""
+        analysis = analytics.get_agreement_analysis()
+        return {'status': 'ok', 'data': analysis}
+
+    return router
+
 
 if __name__ == '__main__':
     analytics = ConsultationAnalytics()
-    print(json.dumps(analytics.get_muse_statistics(), indent=2, default=str))
+    print(json.dumps(analytics.get_provider_statistics(), indent=2, default=str))

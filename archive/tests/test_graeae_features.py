@@ -1,487 +1,379 @@
 """
-Comprehensive tests for all GRAEAE features
-Tests: Queue, Circuit Breaker, Quality Scoring, Semantic Cache, Rate Limiting
-Targeting 40+ test cases across all features
+GRAEAE Feature Tests — archive/tests edition
+Archived: 2026-04-12
+
+Tests production modules (graeae v2, no graeae.core.* sub-packages):
+  - graeae._circuit_breaker  : CircuitBreaker, CircuitBreakerPool, CircuitState
+  - graeae._rate_limiter     : RateLimiter, RateLimiterPool
+  - graeae._quality          : ProviderQuality, QualityTracker
+  - graeae._cache            : ResponseCache
+
+All modules are in-memory only; no db_path or SQLite fixtures required.
 """
 
-import pytest
-import json
 import time
-import sqlite3
-import tempfile
-from datetime import datetime, timedelta
-from pathlib import Path
+import pytest
 
-# Import GRAEAE modules
-from graeae.core.queue import PersistentQueue, RequestStatus, QueuedRequest
-from graeae.core.circuit_breaker import CircuitBreaker, CircuitBreakerPool, CircuitState
-from graeae.core.quality_scorer import ResponseQualityScorer, QualityScore
-from graeae.core.semantic_cache import SemanticCache
-from graeae.core.rate_limiter import RateLimiter, RateLimiterPool, QueueBackpressure
+from graeae._circuit_breaker import CircuitBreaker, CircuitBreakerPool, CircuitState
+from graeae._rate_limiter import RateLimiter, RateLimiterPool
+from graeae._quality import ProviderQuality, QualityTracker
+from graeae._cache import ResponseCache
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # Fixtures
-# ============================================================================
+# ---------------------------------------------------------------------------
 
-@pytest.fixture
-def temp_db():
-    """Temporary database for testing"""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield tmpdir
+PROVIDERS = ['perplexity', 'groq', 'xai', 'openai', 'gemini', 'together', 'nvidia', 'ollama']
+
+PROVIDER_WEIGHTS = {p: 1.0 for p in PROVIDERS}
 
 
 @pytest.fixture
-def queue(temp_db):
-    """Persistent queue instance"""
-    return PersistentQueue(db_path=f"{temp_db}/queue.db", max_retries=3)
+def cb_pool():
+    """CircuitBreakerPool with low threshold for fast tests."""
+    return CircuitBreakerPool(failure_threshold=3, cooldown_seconds=300)
 
 
 @pytest.fixture
-def circuit_pool():
-    """Circuit breaker pool instance"""
-    return CircuitBreakerPool(failure_threshold=3, cooldown_minutes=1)
+def cb():
+    """Single CircuitBreaker with low threshold."""
+    return CircuitBreaker('perplexity', failure_threshold=3, cooldown_seconds=300)
 
 
 @pytest.fixture
-def quality_scorer(temp_db):
-    """Quality scorer instance"""
-    return ResponseQualityScorer(db_path=f"{temp_db}/metrics.db")
+def rl():
+    """Single RateLimiter with small window for testing."""
+    return RateLimiter('perplexity', rpm=3)
 
 
 @pytest.fixture
-def semantic_cache(temp_db):
-    """Semantic cache instance"""
-    return SemanticCache(db_path=f"{temp_db}/cache.db", ttl_hours=24)
+def rl_pool():
+    """RateLimiterPool with default limits."""
+    return RateLimiterPool()
 
 
 @pytest.fixture
-def rate_limiter_pool(temp_db):
-    """Rate limiter pool instance"""
-    return RateLimiterPool(db_path=f"{temp_db}/limits.db")
+def qt():
+    """QualityTracker over the full provider set."""
+    return QualityTracker(PROVIDER_WEIGHTS)
 
 
 @pytest.fixture
-def sample_embedding():
-    """Sample embedding vector"""
-    return [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+def pq():
+    """ProviderQuality with base weight 1.0."""
+    return ProviderQuality(base_weight=1.0)
 
 
-# ============================================================================
-# Queue Tests (Feature 1)
-# ============================================================================
-
-class TestPersistentQueue:
-    """Test queue persistence and resumability"""
-
-    def test_enqueue_request(self, queue):
-        """Test adding request to queue"""
-        result = queue.enqueue(
-            request_id="req-1",
-            muse_id="muse-a",
-            query="Hello world",
-            metadata={"user": "test"}
-        )
-        assert result is True
-
-    def test_duplicate_request_rejected(self, queue):
-        """Test duplicate request handling"""
-        queue.enqueue("req-1", "muse-a", "query", {})
-        result = queue.enqueue("req-1", "muse-b", "query", {})
-        assert result is False
-
-    def test_dequeue_pending(self, queue):
-        """Test dequeueing pending request"""
-        queue.enqueue("req-1", "muse-a", "test query", {})
-        req = queue.dequeue()
-        
-        assert req is not None
-        assert req.request_id == "req-1"
-        assert req.status == RequestStatus.PROCESSING
-
-    def test_mark_completed(self, queue):
-        """Test marking request as completed"""
-        queue.enqueue("req-1", "muse-a", "query", {})
-        queue.dequeue()
-        
-        result = queue.mark_completed("req-1")
-        assert result is True
-
-    def test_mark_failed_with_retry(self, queue):
-        """Test marking request as failed with retry"""
-        queue.enqueue("req-1", "muse-a", "query", {})
-        queue.dequeue()
-        
-        # First failure
-        result = queue.mark_failed("req-1", "timeout")
-        assert result is True  # Should retry
-        
-        # Check status changed to retrying
-        req = queue.dequeue()
-        assert req.request_id == "req-1"
-
-    def test_abandon_after_max_retries(self, queue):
-        """Test request abandonment after max retries"""
-        queue.enqueue("req-1", "muse-a", "query", {})
-        
-        # Fail max times
-        for i in range(3):
-            queue.dequeue()
-            queue.mark_failed("req-1", f"failure {i}")
-        
-        # Should now be abandoned
-        next_req = queue.dequeue()
-        assert next_req is None
-
-    def test_queue_status(self, queue):
-        """Test queue status reporting"""
-        queue.enqueue("req-1", "muse-a", "q1", {})
-        queue.enqueue("req-2", "muse-a", "q2", {})
-        
-        status = queue.get_queue_status()
-        assert status['pending'] == 2
-
-    def test_recover_stuck_requests(self, queue):
-        """Test recovery of stuck processing requests"""
-        queue.enqueue("req-1", "muse-a", "query", {})
-        queue.dequeue()  # Mark as processing
-        
-        # Simulate stuck request (old attempted_at)
-        recovered = queue.recover_stuck_requests(timeout_minutes=0)
-        assert recovered >= 1
-
-    def test_cleanup_old_requests(self, queue):
-        """Test cleanup of old completed requests"""
-        queue.enqueue("req-1", "muse-a", "q", {})
-        queue.dequeue()
-        queue.mark_completed("req-1")
-        
-        cleaned = queue.cleanup_old_requests(days=0)
-        assert cleaned >= 1
+@pytest.fixture
+def cache():
+    """ResponseCache with short TTL for TTL tests."""
+    return ResponseCache(ttl_seconds=3600)
 
 
-# ============================================================================
-# Circuit Breaker Tests (Feature 2)
-# ============================================================================
+# ===========================================================================
+# Circuit Breaker Tests
+# ===========================================================================
 
 class TestCircuitBreaker:
-    """Test circuit breaker functionality"""
+    """Tests for CircuitBreaker and CircuitBreakerPool."""
 
-    def test_circuit_closed_initially(self, circuit_pool):
-        """Test circuit starts in CLOSED state"""
-        breaker = circuit_pool.get_breaker("muse-a")
-        assert breaker.state == CircuitState.CLOSED
-        assert breaker.is_available() is True
+    # --- 1. Initial state ---
+    def test_initial_state_closed(self, cb):
+        """Breaker starts in CLOSED state and allows requests."""
+        assert cb.state == CircuitState.CLOSED
+        assert cb.is_allowed() is True
 
-    def test_circuit_opens_after_threshold(self, circuit_pool):
-        """Test circuit opens after failure threshold"""
-        circuit_pool.record_failure("muse-a", "error 1")
-        circuit_pool.record_failure("muse-a", "error 2")
-        circuit_pool.record_failure("muse-a", "error 3")
-        
-        breaker = circuit_pool.get_breaker("muse-a")
-        assert breaker.state == CircuitState.OPEN
-        assert breaker.is_available() is False
-
-    def test_circuit_half_open_after_cooldown(self, circuit_pool):
-        """Test circuit transitions to HALF_OPEN after cooldown"""
-        # Fail and open circuit
+    # --- 2. Trip on failure threshold ---
+    def test_trips_to_open_after_threshold(self, cb):
+        """After failure_threshold failures the breaker opens."""
         for _ in range(3):
-            circuit_pool.record_failure("muse-a", "fail")
-        
-        breaker = circuit_pool.get_breaker("muse-a")
+            cb.record_failure()
+        assert cb.state == CircuitState.OPEN
+        assert cb.is_allowed() is False
+
+    # --- 3. Half-open recovery via _opened_at manipulation ---
+    def test_half_open_after_cooldown(self):
+        """Breaker transitions to HALF_OPEN once cooldown elapses."""
+        from datetime import datetime, timezone, timedelta
+        breaker = CircuitBreaker('groq', failure_threshold=2, cooldown_seconds=60)
+        breaker.record_failure()
+        breaker.record_failure()
         assert breaker.state == CircuitState.OPEN
-        
-        # Advance time past cooldown
-        breaker.open_time -= timedelta(minutes=2)
-        
-        # Next check should half-open
-        available = breaker.is_available()
-        assert available is True
+
+        # Wind back the clock so cooldown appears elapsed
+        breaker._opened_at = datetime.now(timezone.utc) - timedelta(seconds=61)
+
+        assert breaker.is_allowed() is True
         assert breaker.state == CircuitState.HALF_OPEN
 
-    def test_circuit_closes_after_successes(self, circuit_pool):
-        """Test circuit closes after successful recovery"""
-        # Open circuit
-        for _ in range(3):
-            circuit_pool.record_failure("muse-a", "fail")
-        
-        breaker = circuit_pool.get_breaker("muse-a")
-        breaker.open_time -= timedelta(minutes=2)  # Simulate cooldown
-        breaker.is_available()  # Transition to half-open
-        
-        # Record successes
-        circuit_pool.record_success("muse-a")
-        circuit_pool.record_success("muse-a")
-        
+    # --- 4. HALF_OPEN → CLOSED on success_threshold successes ---
+    def test_closes_after_probe_successes(self):
+        """Breaker returns to CLOSED after enough probe successes."""
+        from datetime import datetime, timezone, timedelta
+        breaker = CircuitBreaker('openai', failure_threshold=2, cooldown_seconds=60,
+                                 success_threshold=2)
+        breaker.record_failure()
+        breaker.record_failure()
+        breaker._opened_at = datetime.now(timezone.utc) - timedelta(seconds=61)
+        breaker.is_allowed()  # → HALF_OPEN
+        assert breaker.state == CircuitState.HALF_OPEN
+
+        breaker.record_success()
+        breaker.record_success()
         assert breaker.state == CircuitState.CLOSED
 
-    def test_available_muses_filtering(self, circuit_pool):
-        """Test filtering available muses"""
-        all_muses = ["muse-a", "muse-b", "muse-c"]
-        
-        # Fail muse-a
+    # --- 5. Pool: providers are independent ---
+    def test_pool_providers_independent(self, cb_pool):
+        """Tripping one provider does not affect others."""
         for _ in range(3):
-            circuit_pool.record_failure("muse-a", "fail")
-        
-        available = circuit_pool.get_available_muses(all_muses)
-        assert "muse-a" not in available
-        assert "muse-b" in available
-        assert "muse-c" in available
+            cb_pool.record_failure('perplexity')
+        assert cb_pool.is_allowed('perplexity') is False
+        assert cb_pool.is_allowed('groq') is True
+        assert cb_pool.is_allowed('openai') is True
 
-    def test_health_report(self, circuit_pool):
-        """Test health report generation"""
-        circuit_pool.get_breaker("muse-a")
-        circuit_pool.get_breaker("muse-b")
-        
-        for _ in range(3):
-            circuit_pool.record_failure("muse-a", "fail")
-        
-        health = circuit_pool.health_report()
-        assert health['total_muses'] == 2
-        assert health['disabled'] == 1
-        assert health['healthy'] == 1
+    # --- 6. Pool status dict ---
+    def test_pool_status_reflects_state(self, cb_pool):
+        """status() returns state and failure count for all seen providers."""
+        cb_pool.record_failure('xai')
+        status = cb_pool.status()
+        assert 'xai' in status
+        assert status['xai']['state'] == 'closed'  # 1 failure, threshold=3
+        assert status['xai']['failures'] == 1
 
+    # --- 7. Failure in HALF_OPEN re-opens ---
+    def test_failure_in_half_open_reopens(self):
+        """A failure during probe puts the breaker back to OPEN."""
+        from datetime import datetime, timezone, timedelta
+        breaker = CircuitBreaker('nvidia', failure_threshold=2, cooldown_seconds=60)
+        breaker.record_failure()
+        breaker.record_failure()
+        breaker._opened_at = datetime.now(timezone.utc) - timedelta(seconds=61)
+        breaker.is_allowed()  # → HALF_OPEN
+        assert breaker.state == CircuitState.HALF_OPEN
 
-# ============================================================================
-# Quality Scoring Tests (Feature 3)
-# ============================================================================
+        breaker.record_failure()  # back to OPEN (failures >= threshold again)
+        assert breaker.state == CircuitState.OPEN
 
-class TestQualityScorer:
-    """Test response quality scoring"""
-
-    def test_relevance_scoring(self, quality_scorer):
-        """Test relevance score computation"""
-        query = "What is Python"
-        response = "Python is a programming language"
-        
-        score = quality_scorer.compute_quality(query, response)
-        assert 0 <= score.relevance <= 1
-        assert score.relevance > 0.5  # Should be relevant
-
-    def test_coherence_scoring(self, quality_scorer):
-        """Test coherence score computation"""
-        query = "Tell me a story"
-        response = "Once upon a time. The end."  # Short, but coherent
-        
-        score = quality_scorer.compute_quality(query, response)
-        assert 0 <= score.coherence <= 1
-
-    def test_toxicity_detection(self, quality_scorer):
-        """Test toxicity detection"""
-        response_clean = "This is a helpful response"
-        response_toxic = "I hate everything and will harm people"
-        
-        score_clean = quality_scorer.compute_quality("query", response_clean)
-        score_toxic = quality_scorer.compute_quality("query", response_toxic)
-        
-        assert score_toxic.toxicity > score_clean.toxicity
-
-    def test_record_score(self, quality_scorer):
-        """Test recording quality scores"""
-        query = "Python"
-        response = "Python is a language"
-        score = QualityScore(
-            relevance=0.9,
-            coherence=0.8,
-            toxicity=0.0,
-            completeness=0.7
-        )
-        
-        result = quality_scorer.record_score(
-            "muse-a", "req-1", query, response, score
-        )
-        assert result is True
-
-    def test_muse_metrics_retrieval(self, quality_scorer):
-        """Test retrieving muse metrics"""
-        score = QualityScore(0.9, 0.8, 0.0, 0.7)
-        quality_scorer.record_score("muse-a", "req-1", "q", "r", score)
-        
-        metrics = quality_scorer.get_muse_metrics("muse-a")
-        assert metrics is not None
-        assert metrics['muse_id'] == "muse-a"
-
-    def test_best_muses_ranking(self, quality_scorer):
-        """Test ranking muses by quality"""
-        # Record scores for different muses
-        for muse_id in ["muse-a", "muse-b", "muse-c"]:
-            for i in range(10):
-                score = QualityScore(0.9, 0.8, 0.0, 0.7)
-                quality_scorer.record_score(muse_id, f"req-{i}", "q", "r", score)
-        
-        best = quality_scorer.get_best_muses(count=2, min_samples=5)
-        assert len(best) <= 2
+    # --- 8. Success in CLOSED decays failure count ---
+    def test_success_in_closed_decays_failures(self, cb):
+        """record_success in CLOSED state decrements failure count."""
+        cb.record_failure()
+        cb.record_failure()
+        assert cb._failures == 2
+        cb.record_success()
+        assert cb._failures == 1
 
 
-# ============================================================================
-# Semantic Cache Tests (Feature 4)
-# ============================================================================
-
-class TestSemanticCache:
-    """Test semantic caching"""
-
-    def test_cache_put_and_get(self, semantic_cache, sample_embedding):
-        """Test caching and retrieval"""
-        query = "What is AI?"
-        response = "AI is artificial intelligence"
-        
-        # Put in cache
-        result = semantic_cache.put(
-            query, response, sample_embedding, "muse-a"
-        )
-        assert result is True
-        
-        # Get from cache (identical embedding)
-        cached = semantic_cache.get(query, sample_embedding, "muse-a")
-        assert cached is not None
-
-    def test_similarity_matching(self, semantic_cache, sample_embedding):
-        """Test semantic similarity matching"""
-        query1 = "What is artificial intelligence?"
-        response1 = "AI is..."
-        
-        # Put original
-        semantic_cache.put(query1, response1, sample_embedding, "muse-a")
-        
-        # Query with similar embedding (slight variation)
-        similar_embedding = [x + 0.01 for x in sample_embedding]
-        cached = semantic_cache.get(query1, similar_embedding, "muse-a")
-        
-        # Should hit due to high similarity
-        assert cached is not None
-
-    def test_expiration(self, semantic_cache, sample_embedding):
-        """Test cache expiration"""
-        cache_instant = SemanticCache(ttl_hours=0)  # Instant expiry
-        
-        cache_instant.put("query", "response", sample_embedding, "muse-a")
-        time.sleep(0.1)
-        
-        # Should be expired
-        cached = cache_instant.get("query", sample_embedding)
-        # May not find due to expiration
-
-    def test_cache_stats(self, semantic_cache, sample_embedding):
-        """Test cache statistics"""
-        semantic_cache.put("q1", "r1", sample_embedding, "muse-a")
-        semantic_cache.put("q2", "r2", sample_embedding, "muse-a")
-        
-        stats = semantic_cache.get_stats()
-        assert stats['total_entries'] == 2
-        assert stats['valid_entries'] >= 0
-
-
-# ============================================================================
-# Rate Limiting Tests (Feature 5)
-# ============================================================================
+# ===========================================================================
+# Rate Limiter Tests
+# ===========================================================================
 
 class TestRateLimiter:
-    """Test rate limiting"""
+    """Tests for RateLimiter and RateLimiterPool."""
 
-    def test_initial_allow(self):
-        """Test requests are initially allowed"""
-        limiter = RateLimiter("muse-a", requests_per_minute=60)
-        assert limiter.is_allowed() is True
+    # --- 1. Requests under limit are allowed ---
+    def test_allows_under_limit(self, rl):
+        """Three requests against an rpm=3 limiter are all allowed."""
+        assert rl.is_allowed() is True
+        assert rl.is_allowed() is True
+        assert rl.is_allowed() is True
 
-    def test_burst_limit(self):
-        """Test burst size limit"""
-        limiter = RateLimiter("muse-a", burst_size=3)
-        
-        assert limiter.is_allowed() is True
-        assert limiter.is_allowed() is True
-        assert limiter.is_allowed() is True
-        # Fourth should potentially be blocked
+    # --- 2. Rejects when limit reached ---
+    def test_rejects_over_limit(self, rl):
+        """The 4th request against rpm=3 is rejected."""
+        rl.is_allowed()
+        rl.is_allowed()
+        rl.is_allowed()
+        assert rl.is_allowed() is False
 
-    def test_backoff_trigger(self):
-        """Test backoff activation"""
-        limiter = RateLimiter("muse-a", requests_per_minute=10, burst_size=2)
-        
-        # Record many requests quickly
+    # --- 3. current_rpm reflects window ---
+    def test_current_rpm_count(self, rl):
+        """current_rpm returns the number of requests in the window."""
+        rl.is_allowed()
+        rl.is_allowed()
+        assert rl.current_rpm() == 2
+
+    # --- 4. Window reset: old timestamps expire ---
+    def test_window_expiry_allows_new_requests(self):
+        """After the 60-second window, old entries expire and new requests are allowed."""
+        limiter = RateLimiter('gemini', rpm=2)
+        limiter.is_allowed()
+        limiter.is_allowed()
+        assert limiter.is_allowed() is False  # at limit
+
+        # Backdate all timestamps past the window
+        limiter._timestamps = [t - 61 for t in limiter._timestamps]
+        assert limiter.is_allowed() is True  # window cleared
+
+    # --- 5. Pool: per-provider independence ---
+    def test_pool_per_provider_independence(self, rl_pool):
+        """Different providers have independent rate limits."""
+        # Both should be allowed under default limits
+        assert rl_pool.is_allowed('perplexity') is True
+        assert rl_pool.is_allowed('groq') is True
+
+    # --- 6. Pool: unknown provider gets default limit ---
+    def test_pool_unknown_provider_default(self, rl_pool):
+        """An unlisted provider gets the default _DEFAULT_RPM limit."""
+        assert rl_pool.is_allowed('new_provider') is True
+
+    # --- 7. Pool status dict ---
+    def test_pool_status_returns_rpm_counts(self, rl_pool):
+        """status() returns current rpm counts for all limiters."""
+        rl_pool.is_allowed('together')
+        status = rl_pool.status()
+        assert 'together' in status
+        assert status['together'] >= 1
+
+    # --- 8. Exhausting pool limiter ---
+    def test_pool_exhausts_tight_provider(self):
+        """A pool entry with rpm=2 rejects the 3rd consecutive request."""
+        pool = RateLimiterPool(overrides={'tight_provider': 2})
+        assert pool.is_allowed('tight_provider') is True
+        assert pool.is_allowed('tight_provider') is True
+        assert pool.is_allowed('tight_provider') is False
+
+
+# ===========================================================================
+# Quality Tracker Tests
+# ===========================================================================
+
+class TestQualityTracker:
+    """Tests for ProviderQuality and QualityTracker."""
+
+    # --- 1. Fresh tracker returns base weight ---
+    def test_fresh_tracker_returns_base_weight(self, pq):
+        """With no outcomes recorded, dynamic_weight equals base_weight."""
+        assert pq.dynamic_weight() == 1.0
+
+    # --- 2. All successes keeps weight at base ---
+    def test_all_successes_full_weight(self, pq):
+        """100% success rate → multiplier 1.0 → weight unchanged."""
+        for _ in range(5):
+            pq.record_success(latency_ms=100)
+        assert pq.dynamic_weight() == 1.0
+
+    # --- 3. All failures halves the weight ---
+    def test_all_failures_halves_weight(self, pq):
+        """0% success rate → multiplier 0.5 → weight halved."""
+        for _ in range(5):
+            pq.record_failure()
+        assert pq.dynamic_weight() == pytest.approx(0.5, abs=1e-4)
+
+    # --- 4. avg_latency_ms tracks latency ---
+    def test_avg_latency(self, pq):
+        """avg_latency_ms is the mean of recorded latencies."""
+        pq.record_success(200)
+        pq.record_success(400)
+        assert pq.avg_latency_ms() == 300
+
+    # --- 5. QualityTracker record and dynamic_weight ---
+    def test_quality_tracker_record_success(self, qt):
+        """Recording successes via QualityTracker increases dynamic_weight."""
+        for _ in range(5):
+            qt.record_success('perplexity', latency_ms=50)
+        assert qt.dynamic_weight('perplexity') == 1.0
+
+    # --- 6. QualityTracker record failure lowers weight ---
+    def test_quality_tracker_record_failure_lowers_weight(self, qt):
+        """Recording failures reduces the dynamic weight toward 0.5."""
         for _ in range(10):
-            limiter.is_allowed()
-        
-        # Should trigger backoff
-        assert limiter.backoff_until > 0
+            qt.record_failure('groq')
+        weight = qt.dynamic_weight('groq')
+        assert weight < 1.0
+        assert weight >= 0.5
 
-    def test_rate_limiter_pool(self, rate_limiter_pool):
-        """Test rate limiter pool management"""
-        assert rate_limiter_pool.is_allowed("muse-a") is True
-        
-        metrics = rate_limiter_pool.get_all_metrics()
-        assert "muse-a" in metrics
+    # --- 7. QualityTracker status ---
+    def test_quality_tracker_status(self, qt):
+        """status() returns dict with dynamic_weight, base_weight, avg_latency_ms."""
+        qt.record_success('openai', 150)
+        status = qt.status()
+        assert 'openai' in status
+        entry = status['openai']
+        assert 'dynamic_weight' in entry
+        assert 'base_weight' in entry
+        assert 'avg_latency_ms' in entry
 
-    def test_queue_backpressure(self):
-        """Test queue backpressure mechanism"""
-        backpressure = QueueBackpressure(max_queue_size=1000)
-        
-        # Normal queue
-        backpressure.update_queue_depth(500)
-        assert backpressure.should_accept_request() is True
-        
-        # High queue depth
-        backpressure.update_queue_depth(900)
-        assert backpressure.degradation_level > 0
-
-    def test_graceful_degradation(self):
-        """Test graceful degradation levels"""
-        backpressure = QueueBackpressure(max_queue_size=1000)
-        
-        # Level 0 - normal
-        backpressure.update_queue_depth(300)
-        assert backpressure.get_batch_size(100) == 100
-        
-        # Level 1 - prefer cache
-        backpressure.update_queue_depth(600)
-        assert backpressure.should_accept_request('cache') is True
-        
-        # Level 3 - only cache
-        backpressure.update_queue_depth(950)
-        assert backpressure.should_accept_request('normal') is False
-        assert backpressure.should_accept_request('cache') is False
+    # --- 8. Unknown provider returns 0.0 ---
+    def test_unknown_provider_returns_zero(self, qt):
+        """Querying a provider not in the tracker returns 0.0."""
+        assert qt.dynamic_weight('unknown_llm') == 0.0
 
 
-# ============================================================================
-# Integration Tests
-# ============================================================================
+# ===========================================================================
+# Response Cache Tests
+# ===========================================================================
 
-class TestIntegration:
-    """Integration tests across multiple features"""
+class TestResponseCache:
+    """Tests for ResponseCache."""
 
-    def test_full_request_lifecycle(self, queue, circuit_pool):
-        """Test complete request processing lifecycle"""
-        # 1. Enqueue
-        queue.enqueue("req-1", "muse-a", "query", {})
-        
-        # 2. Check muse available (circuit check)
-        assert circuit_pool.is_muse_available("muse-a") is True
-        
-        # 3. Dequeue
-        req = queue.dequeue()
-        assert req is not None
-        
-        # 4. Success
-        circuit_pool.record_success("muse-a")
-        queue.mark_completed("req-1")
-        
-        # 5. Verify no pending
-        next_req = queue.dequeue()
-        assert next_req is None
+    # --- 1. Cache miss on empty cache ---
+    def test_cache_miss_on_empty(self, cache):
+        """get() returns None when no entry exists."""
+        result = cache.get('What is Python?', 'reasoning')
+        assert result is None
 
-    def test_failure_cascade_prevention(self, queue, circuit_pool, rate_limiter_pool):
-        """Test prevention of cascading failures"""
-        muse_id = "muse-a"
-        
-        # Simulate repeated failures
-        for i in range(5):
-            queue.enqueue(f"req-{i}", muse_id, "q", {})
-            queue.dequeue()
-            circuit_pool.record_failure(muse_id, "API error")
-            rate_limiter_pool.record_request(muse_id)
-        
-        # Circuit should be open, preventing further cascades
-        assert circuit_pool.is_muse_available(muse_id) is False
-        assert rate_limiter_pool.is_allowed(muse_id) is False
+    # --- 2. Cache hit after set ---
+    def test_cache_hit_after_set(self, cache):
+        """get() returns the stored value after set()."""
+        cache.set('What is Python?', 'reasoning', {'answer': 'A language'})
+        result = cache.get('What is Python?', 'reasoning')
+        assert result == {'answer': 'A language'}
+
+    # --- 3. Different keys do not collide ---
+    def test_different_keys_no_collision(self, cache):
+        """Two prompts with the same task_type are stored independently."""
+        cache.set('prompt A', 'architecture_design', 'response A')
+        cache.set('prompt B', 'architecture_design', 'response B')
+        assert cache.get('prompt A', 'architecture_design') == 'response A'
+        assert cache.get('prompt B', 'architecture_design') == 'response B'
+
+    # --- 4. Same prompt, different task_type → different keys ---
+    def test_task_type_differentiates_keys(self, cache):
+        """Same prompt with different task_type produces separate cache entries."""
+        cache.set('hello', 'reasoning', 'r1')
+        cache.set('hello', 'code_generation', 'r2')
+        assert cache.get('hello', 'reasoning') == 'r1'
+        assert cache.get('hello', 'code_generation') == 'r2'
+
+    # --- 5. Prompt normalisation (case-insensitive) ---
+    def test_prompt_normalisation(self, cache):
+        """Prompts are normalised to lowercase before hashing."""
+        cache.set('Hello World', 'reasoning', 'normalised')
+        assert cache.get('hello world', 'reasoning') == 'normalised'
+        assert cache.get('HELLO WORLD', 'reasoning') == 'normalised'
+
+    # --- 6. TTL expiry ---
+    def test_ttl_expiry(self):
+        """Entries expire after ttl_seconds."""
+        short_cache = ResponseCache(ttl_seconds=1)
+        short_cache.set('expiring', 'reasoning', 'soon gone')
+        assert short_cache.get('expiring', 'reasoning') == 'soon gone'
+        time.sleep(1.1)
+        assert short_cache.get('expiring', 'reasoning') is None
+
+    # --- 7. Stats: hits and misses tracked ---
+    def test_stats_tracks_hits_misses(self, cache):
+        """stats() correctly counts hits and misses."""
+        cache.set('q', 'reasoning', 'v')
+        cache.get('q', 'reasoning')   # hit
+        cache.get('missing', 'reasoning')  # miss
+        stats = cache.stats()
+        assert stats['hits'] == 1
+        assert stats['misses'] == 1
+
+    # --- 8. LRU eviction at max_entries ---
+    def test_lru_eviction(self):
+        """Old entries are evicted when max_entries is exceeded."""
+        tiny = ResponseCache(ttl_seconds=3600, max_entries=3)
+        tiny.set('a', 't', 'v1')
+        tiny.set('b', 't', 'v2')
+        tiny.set('c', 't', 'v3')
+        tiny.set('d', 't', 'v4')  # should evict 'a'
+        assert tiny.stats()['entries'] == 3
+        assert tiny.get('a', 't') is None
+        assert tiny.get('d', 't') == 'v4'
 
 
 if __name__ == '__main__':

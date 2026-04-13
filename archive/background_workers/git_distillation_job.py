@@ -17,12 +17,26 @@ from typing import List, Dict, Optional
 
 class GitDistiller:
     """Extract architectural facts from git history"""
-    
+
+    # Compile regex patterns at class level for efficiency
+    _CONCEPT_PATTERNS = {
+        'dual-write':       re.compile(r'dual.?write|redundant.*write|fallback', re.IGNORECASE),
+        'caching':          re.compile(r'cache|memoization|buffering', re.IGNORECASE),
+        'background-job':   re.compile(r'background.*job|async.*process|daemon', re.IGNORECASE),
+        'failover':         re.compile(r'failover|fallback|redundancy', re.IGNORECASE),
+        'api-design':       re.compile(r'endpoint|api|rest|graphql', re.IGNORECASE),
+        'database':         re.compile(r'postgresql|database|sql|query|schema', re.IGNORECASE),
+        'docker':           re.compile(r'docker|container|image|build', re.IGNORECASE),
+        'performance':      re.compile(r'performance|optimization|throughput|latency', re.IGNORECASE),
+        'reliability':      re.compile(r'reliability|robustness|fault.*tolerance', re.IGNORECASE),
+        'integration':      re.compile(r'integration|plugin|module', re.IGNORECASE),
+    }
+
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
         self.commits = []
         self.facts = []
-    
+
     def get_commit_history(self, limit: int = 100) -> List[Dict]:
         """Fetch commit history from repository"""
         try:
@@ -32,16 +46,16 @@ class GitDistiller:
                 "--date=short", f"-{limit}"
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            
+
             if result.returncode != 0:
                 print(f"Error fetching git log: {result.stderr}", file=sys.stderr)
                 return []
-            
+
             commits = []
             for line in result.stdout.strip().split('\n'):
                 if not line:
                     continue
-                parts = line.split('|', 4)
+                parts = line.split('|', 5)
                 if len(parts) >= 5:
                     commits.append({
                         'hash': parts[0][:8],
@@ -51,16 +65,16 @@ class GitDistiller:
                         'subject': parts[4],
                         'body': parts[5] if len(parts) > 5 else ''
                     })
-            
+
             return commits
         except Exception as e:
             print(f"Error getting commit history: {e}", file=sys.stderr)
             return []
-    
+
     def categorize_commit(self, commit: Dict) -> str:
         """Determine commit type from message"""
         subject = commit['subject'].lower()
-        
+
         if subject.startswith('fix'):
             return 'bugfix'
         elif subject.startswith('feat'):
@@ -75,47 +89,38 @@ class GitDistiller:
             return 'testing'
         else:
             return 'update'
-    
+
     def extract_architectural_concepts(self, text: str) -> List[str]:
         """Extract architectural patterns from commit message/body"""
         concepts = []
-        
-        patterns = {
-            'dual-write': r'dual.?write|redundant.*write|fallback',
-            'caching': r'cache|memoization|buffering',
-            'background-job': r'background.*job|async.*process|daemon',
-            'failover': r'failover|fallback|redundancy',
-            'api-design': r'endpoint|api|rest|graphql',
-            'database': r'postgresql|database|sql|query|schema',
-            'docker': r'docker|container|image|build',
-            'performance': r'performance|optimization|throughput|latency',
-            'reliability': r'reliability|robustness|fault.*tolerance',
-            'integration': r'integration|plugin|module',
-        }
-        
-        text_lower = text.lower()
-        for concept, pattern in patterns.items():
-            if re.search(pattern, text_lower):
+        for concept, pattern in self._CONCEPT_PATTERNS.items():
+            if pattern.search(text):
                 concepts.append(concept)
-        
         return concepts
-    
+
     def extract_facts(self, commits: Optional[List[Dict]] = None) -> List[Dict]:
         """Extract facts from commits"""
         if commits is None:
             commits = self.commits
-        
+
         facts = []
-        
+
         for commit in commits:
             commit_type = self.categorize_commit(commit)
             full_text = commit['subject'] + ' ' + commit['body']
             concepts = self.extract_architectural_concepts(full_text)
-            
+
+            # Build body excerpt with ellipsis only when truncated
+            if commit['body']:
+                body_excerpt = commit['body'][:200] + ('...' if len(commit['body']) > 200 else '')
+                content = f"{commit['subject']}\n\n{body_excerpt}"
+            else:
+                content = commit['subject']
+
             # Create memory-ready fact
             fact = {
-                'content': f"{commit['subject']}\n\n{commit['body'][:200]}..." if commit['body'] else commit['subject'],
-                'category': 'git_artifacts',
+                'content': content,
+                'category': 'decisions',
                 'tags': [commit_type] + concepts,
                 'metadata': {
                     'commit_hash': commit['hash'],
@@ -126,43 +131,41 @@ class GitDistiller:
                 },
                 'created': commit['date']
             }
-            
-            # Remove empty/None fields
-            fact = {k: v for k, v in fact.items() if v}
+
+            # Remove empty/None fields — preserve empty lists and zero values
+            fact = {k: v for k, v in fact.items() if v is not None and v != ''}
             facts.append(fact)
-        
+
         return facts
-    
+
     def run(self, limit: int = 50) -> List[Dict]:
         """Extract facts from git history"""
         print(f"[GIT-DISTILL] Fetching last {limit} commits from {self.repo_path}...")
         commits = self.get_commit_history(limit)
         print(f"[GIT-DISTILL] Found {len(commits)} commits")
-        
+
         if not commits:
             return []
-        
+
         print(f"[GIT-DISTILL] Extracting architectural facts...")
         facts = self.extract_facts(commits)
         print(f"[GIT-DISTILL] Extracted {len(facts)} facts")
-        
+
         for i, fact in enumerate(facts[:3]):
             print(f"\n[GIT-DISTILL] Sample fact {i+1}:")
             print(f"  Content: {fact['content'][:80]}...")
             print(f"  Tags: {fact.get('tags', [])}")
             print(f"  Commit: {fact['metadata']['commit_hash']} ({fact['metadata']['date']})")
-        
+
         return facts
 
 if __name__ == '__main__':
-    import sys
-    
-    repo_path = sys.argv[1] if len(sys.argv) > 1 else '/home/jasonperlow/mnemos-api-production'
+    repo_path = sys.argv[1] if len(sys.argv) > 1 else '/opt/mnemos'
     limit = int(sys.argv[2]) if len(sys.argv) > 2 else 50
-    
+
     distiller = GitDistiller(repo_path)
     facts = distiller.run(limit)
-    
+
     # Output as JSON for integration with MNEMOS
     print(f"\n[GIT-DISTILL] Output (JSON):")
     print(json.dumps(facts, indent=2))

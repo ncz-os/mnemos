@@ -2,7 +2,6 @@
 # NOT wired into production. Review README.md in this directory before integrating.
 # Source: see /opt/mnemos/archive/README.md
 
-#!/usr/bin/env python3
 """
 Compression Response Cache
 Caches compressed responses to avoid recomputation
@@ -17,9 +16,9 @@ from datetime import datetime, timedelta
 class CompressionCache:
     """Cache for compression results"""
 
-    def __init__(self, max_cache_size=2500, ttl_hours=24):
-        self.cache = {}  # query_hash -> compressed_response
-        self.access_times = {}  # query_hash -> last_access_time
+    def __init__(self, max_cache_size: int = 2500, ttl_hours: float = 24) -> None:
+        self.cache: Dict[str, Any] = {}  # query_hash -> compressed_response
+        self.access_times: Dict[str, datetime] = {}  # query_hash -> last_access_time
         self.max_size = max_cache_size
         self.ttl = timedelta(hours=ttl_hours)
         self.lock = threading.RLock()
@@ -32,7 +31,7 @@ class CompressionCache:
     def get_key(self, query: str, limit: int = 0) -> str:
         """Generate cache key from query"""
         cache_str = f"{query}:{limit}"
-        return hashlib.md5(cache_str.encode()).hexdigest()
+        return hashlib.sha256(cache_str.encode()).hexdigest()
 
     def get(self, query: str, limit: int = 0) -> Optional[Dict[str, Any]]:
         """Get cached compression result"""
@@ -73,17 +72,19 @@ class CompressionCache:
             self.access_times[key] = datetime.now()
             return True
 
-    def _evict_lru(self):
+    def _evict_lru(self) -> None:
         """Evict least recently used entry"""
         if not self.access_times:
             return
 
         lru_key = min(self.access_times.keys(), key=lambda k: self.access_times[k])
+        if lru_key not in self.cache:
+            return
         del self.cache[lru_key]
         del self.access_times[lru_key]
         self.stats['evictions'] += 1
 
-    def clear(self):
+    def clear(self) -> None:
         """Clear all cached entries"""
         with self.lock:
             self.cache.clear()

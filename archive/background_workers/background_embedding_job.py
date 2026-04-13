@@ -15,14 +15,19 @@ Phase 3 Enhancement:
   - Falls back to original content if compression fails
 """
 
-import psycopg2
-import requests
+import asyncio
 import sys
+import os
 import time
-import threading
 import logging
 import json
-from datetime import datetime
+import httpx
+import asyncpg
+
+# Config — loaded from config.py (single source of truth)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+from config import PG_CONFIG, OLLAMA_EMBED_URL  # noqa: E402
 
 # Configure logging
 logging.basicConfig(
@@ -31,43 +36,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# PostgreSQL configuration
-PG_CONFIG = {
-    'host': 'localhost',
-    'port': 5432,
-    'database': 'mnemos',
-    'user': 'mnemos_user',
-    'password': 'mnemos_secure_pass'
+# DB connection kwargs — never build a DSN string with the password embedded
+_DB_CONNECT_ARGS = {
+    "user":     PG_CONFIG["user"],
+    "password": PG_CONFIG["password"],
+    "database": PG_CONFIG["database"],
+    "host":     PG_CONFIG["host"],
+    "port":     PG_CONFIG["port"],
 }
 
-# Ollama configuration (for embeddings on PYTHIA local Ollama)
-OLLAMA_EMBED_URL = 'http://localhost:11434/api/embeddings'
-
-# Phase 3: CERBERUS llama-server for pre-compression
-CERBERUS_COMPLETIONS_URL = 'http://192.0.2.96:8000/v1/completions'
-CERBERUS_HEALTH_URL = 'http://192.0.2.96:8000/health'
+# Phase 3: CERBERUS vLLM for pre-compression
+CERBERUS_COMPLETIONS_URL = 'http://192.0.2.96:8000/v1/chat/completions'
+CERBERUS_HEALTH_URL = 'http://192.0.2.96:8000/v1/models'
 
 # Phase 3: Compression configuration
 COMPRESSION_THRESHOLD_BYTES = 10 * 1024    # 10KB - compress if content > 10KB
 COMPRESSION_TARGET_RATIO = 0.40            # Compress to 40% of original
-MAX_PROMPT_CHARS = 6000                    # Max chars to send to llama-server
+MAX_PROMPT_CHARS = 6000                    # Max chars to send to vLLM
 MAX_GENERATION_TOKENS = 600               # Max tokens to generate
 CERBERUS_TIMEOUT = 60                     # Timeout for CERBERUS requests
+CERBERUS_RECHECK_INTERVAL = 300          # Re-check CERBERUS every 5 minutes
 
 
-def check_cerberus_health() -> bool:
-    """Check if CERBERUS llama-server is available"""
+async def check_cerberus_health() -> bool:
+    """Check if CERBERUS vLLM is available"""
     try:
-        resp = requests.get(CERBERUS_HEALTH_URL, timeout=5)
-        return resp.status_code == 200 and resp.json().get('status') == 'ok'
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(CERBERUS_HEALTH_URL)
+            return resp.status_code == 200
     except Exception as e:
-        logger.debug(f"[PHASE3] CERBERUS health check failed: {e}")
+        logger.warning(f"[PHASE3] CERBERUS health check failed: {e}")
         return False
 
 
-def compress_content_sync(text: str, target_ratio: float = COMPRESSION_TARGET_RATIO) -> dict:
+async def compress_content_async(text: str, target_ratio: float = COMPRESSION_TARGET_RATIO) -> dict:
     """
-    Phase 3: Synchronously compress text using CERBERUS llama-server.
+    Phase 3: Asynchronously compress text using CERBERUS vLLM.
 
     Returns dict with:
       - compressed: compressed text (or original on failure)
@@ -93,16 +97,17 @@ TEXT:
 SUMMARY:"""
 
     try:
-        resp = requests.post(
-            CERBERUS_COMPLETIONS_URL,
-            json={
-                "prompt": prompt,
-                "temperature": 0.3,
-                "top_p": 0.9,
-                "max_tokens": max_tokens
-            },
-            timeout=CERBERUS_TIMEOUT
-        )
+        async with httpx.AsyncClient(timeout=CERBERUS_TIMEOUT) as client:
+            resp = await client.post(
+                CERBERUS_COMPLETIONS_URL,
+                json={
+                    "model": "gemma4-e4b-fp8",
+                    "messages": [{"role": "user", "content": f"Compress: {prompt}"}],
+                    "temperature": 0.3,
+                    "top_p": 0.9,
+                    "max_tokens": max_tokens
+                }
+            )
 
         if resp.status_code != 200:
             return {
@@ -114,7 +119,7 @@ SUMMARY:"""
                 'error': f'HTTP {resp.status_code}'
             }
 
-        compressed = resp.json().get('choices', [{}])[0].get('text', '').strip()
+        compressed = resp.json().get('choices', [{}])[0].get('message', {}).get('content', '').strip()
 
         if not compressed or len(compressed) < 10:
             return {
@@ -165,7 +170,7 @@ class BackgroundEmbeddingJob:
         self.sleep_interval = sleep_interval
         self.max_retries = max_retries
         self.running = False
-        self.thread = None
+        self.db_pool = None
         self.stats = {
             'processed': 0,
             'failed': 0,
@@ -176,27 +181,30 @@ class BackgroundEmbeddingJob:
             'compression_failures': 0,
             'bytes_saved': 0,
         }
-        # Phase 3: Check CERBERUS availability once at startup
-        self._cerberus_available = None
+        # Phase 3: CERBERUS availability caching with timestamp
+        self._cerberus_available: bool | None = None
+        self._cerberus_last_check: float = 0
 
-    def _is_cerberus_available(self) -> bool:
-        """Cache CERBERUS availability check (re-check periodically)"""
-        if self._cerberus_available is None:
-            self._cerberus_available = check_cerberus_health()
+    async def _is_cerberus_available(self) -> bool:
+        """Cache CERBERUS availability check; re-check every 5 minutes"""
+        now = time.monotonic()
+        if self._cerberus_available is None or (now - self._cerberus_last_check) >= CERBERUS_RECHECK_INTERVAL:
+            self._cerberus_available = await check_cerberus_health()
+            self._cerberus_last_check = now
             if self._cerberus_available:
-                logger.info("[PHASE3] CERBERUS llama-server available for pre-compression")
+                logger.info("[PHASE3] CERBERUS vLLM available for pre-compression")
             else:
                 logger.warning("[PHASE3] CERBERUS unavailable - embedding pre-compression disabled")
         return self._cerberus_available
 
-    def get_embedding(self, text, retry=0):
+    async def get_embedding(self, text: str, retry: int = 0):
         """Generate embedding via Ollama with retries"""
         try:
-            response = requests.post(
-                OLLAMA_EMBED_URL,
-                json={"model": "nomic-embed-text", "prompt": text},
-                timeout=10
-            )
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    OLLAMA_EMBED_URL,
+                    json={"model": "nomic-embed-text", "prompt": text}
+                )
 
             if response.status_code == 200:
                 embedding = response.json().get('embedding', [])
@@ -209,7 +217,7 @@ class BackgroundEmbeddingJob:
                 logger.warning(f"Ollama returned {response.status_code}")
                 return None
 
-        except requests.exceptions.ConnectionError as e:
+        except httpx.ConnectError as e:
             logger.warning(f"Ollama connection failed: {e}")
             self.stats['ollama_failures'] += 1
 
@@ -217,127 +225,120 @@ class BackgroundEmbeddingJob:
             if retry < self.max_retries:
                 wait_time = 5 * (retry + 1)
                 logger.info(f"Retrying in {wait_time}s (attempt {retry+1}/{self.max_retries})")
-                time.sleep(wait_time)
+                await asyncio.sleep(wait_time)
                 self.stats['retried'] += 1
-                return self.get_embedding(text, retry=retry+1)
+                return await self.get_embedding(text, retry=retry + 1)
             return None
 
         except Exception as e:
             logger.error(f"Embedding error: {e}")
             return None
 
-    def process_batch(self):
+    async def process_batch(self) -> bool:
         """Process one batch of memories with NULL embeddings"""
         try:
-            conn = psycopg2.connect(**PG_CONFIG)
-            cur = conn.cursor()
+            async with self.db_pool.acquire() as conn:
+                memories = await conn.fetch("""
+                    SELECT id, content, LENGTH(content) as content_len
+                    FROM memories
+                    WHERE embedding IS NULL
+                    ORDER BY created DESC
+                    LIMIT $1
+                """, self.batch_size)
 
-            # Get memories without embeddings
-            cur.execute("""
-                SELECT id, content, LENGTH(content) as content_len
-                FROM memories
-                WHERE embedding IS NULL
-                ORDER BY created DESC
-                LIMIT %s
-            """, (self.batch_size,))
+                if not memories:
+                    logger.debug("No memories with NULL embeddings")
+                    return False
 
-            memories = cur.fetchall()
+                logger.info(f"Processing batch of {len(memories)} memories")
 
-            if not memories:
-                logger.debug("No memories with NULL embeddings")
-                cur.close()
-                conn.close()
-                return False
+                # Phase 3: Check CERBERUS availability once per batch
+                cerberus_available = await self._is_cerberus_available()
 
-            logger.info(f"Processing batch of {len(memories)} memories")
+                processed_count = 0
+                failed_count = 0
 
-            # Phase 3: Check CERBERUS availability once per batch
-            cerberus_available = self._is_cerberus_available()
-
-            processed_count = 0
-            failed_count = 0
-
-            for memory_id, content, content_len in memories:
-                try:
-                    # Phase 3: Pre-compress if content > threshold and CERBERUS available
-                    text_for_embedding = content
-                    compressed_content = None
-                    compression_applied = False
-
-                    if cerberus_available and content_len > COMPRESSION_THRESHOLD_BYTES:
-                        logger.info(f"[PHASE3] Pre-compressing {memory_id[:8]} ({content_len} bytes > {COMPRESSION_THRESHOLD_BYTES} threshold)")
-
-                        compress_result = compress_content_sync(content, COMPRESSION_TARGET_RATIO)
-
-                        if compress_result['success']:
-                            compressed_content = compress_result['compressed']
-                            text_for_embedding = compressed_content  # Embed the compressed version
-                            compression_applied = True
-                            bytes_saved = compress_result['original_length'] - compress_result['compressed_length']
-                            self.stats['compressed'] += 1
-                            self.stats['bytes_saved'] += bytes_saved
-                            logger.info(
-                                f"[PHASE3] Compressed {memory_id[:8]}: "
-                                f"{compress_result['original_length']} -> {compress_result['compressed_length']} chars "
-                                f"(ratio={compress_result['ratio']:.2%}, saved {bytes_saved} bytes)"
-                            )
-                        else:
-                            self.stats['compression_failures'] += 1
-                            logger.warning(f"[PHASE3] Compression failed for {memory_id[:8]}: {compress_result['error']} - using original")
-                            # Re-check CERBERUS availability on repeated failures
-                            if self.stats['compression_failures'] % 5 == 0:
-                                self._cerberus_available = None
-
-                    # Get embedding (from compressed content if available, else original)
-                    embedding = self.get_embedding(text_for_embedding)
-
-                    if embedding:
-                        # Update memory with embedding and optionally compressed_content
-                        if compression_applied and compressed_content:
-                            cur.execute("""
-                                UPDATE memories
-                                SET embedding = %s,
-                                    compressed_content = %s,
-                                    updated = %s,
-                                    metadata = jsonb_set(
-                                        COALESCE(metadata, '{}'),
-                                        '{embedding_pre_compressed}',
-                                        'true'
-                                    )
-                                WHERE id = %s
-                            """, (
-                                str(embedding),  # psycopg2 needs list as string for vector type
-                                compressed_content,
-                                datetime.now().isoformat(),
-                                memory_id
-                            ))
-                        else:
-                            cur.execute("""
-                                UPDATE memories
-                                SET embedding = %s, updated = %s
-                                WHERE id = %s
-                            """, (str(embedding), datetime.now().isoformat(), memory_id))
-
-                        conn.commit()
-                        processed_count += 1
-                        if compression_applied:
-                            logger.info(f"[PHASE3] Updated {memory_id[:8]} with {len(embedding)}-dim embedding (pre-compressed)")
-                        else:
-                            logger.debug(f"Updated {memory_id[:8]} with {len(embedding)}-dim embedding")
-                    else:
-                        failed_count += 1
-                        logger.warning(f"Failed to get embedding for {memory_id}")
-
-                except Exception as e:
-                    failed_count += 1
-                    logger.error(f"Error processing {memory_id}: {e}")
+                for row in memories:
+                    memory_id = row['id']
+                    content = row['content']
+                    content_len = row['content_len']
                     try:
-                        conn.rollback()
-                    except Exception as rb_err:
-                        logger.warning(f"Rollback failed: {rb_err}")
+                        # Phase 3: Pre-compress if content > threshold and CERBERUS available
+                        text_for_embedding = content
+                        compressed_content = None
+                        compression_applied = False
 
-            cur.close()
-            conn.close()
+                        if cerberus_available and content_len > COMPRESSION_THRESHOLD_BYTES:
+                            logger.info(
+                                f"[PHASE3] Pre-compressing {memory_id[:8]} "
+                                f"({content_len} bytes > {COMPRESSION_THRESHOLD_BYTES} threshold)"
+                            )
+
+                            compress_result = await compress_content_async(content, COMPRESSION_TARGET_RATIO)
+
+                            if compress_result['success']:
+                                compressed_content = compress_result['compressed']
+                                text_for_embedding = compressed_content
+                                compression_applied = True
+                                bytes_saved = compress_result['original_length'] - compress_result['compressed_length']
+                                self.stats['compressed'] += 1
+                                self.stats['bytes_saved'] += bytes_saved
+                                logger.info(
+                                    f"[PHASE3] Compressed {memory_id[:8]}: "
+                                    f"{compress_result['original_length']} -> {compress_result['compressed_length']} chars "
+                                    f"(ratio={compress_result['ratio']:.2%}, saved {bytes_saved} bytes)"
+                                )
+                            else:
+                                self.stats['compression_failures'] += 1
+                                logger.warning(
+                                    f"[PHASE3] Compression failed for {memory_id[:8]}: "
+                                    f"{compress_result['error']} - using original"
+                                )
+                                # Re-check CERBERUS availability on repeated failures
+                                if self.stats['compression_failures'] % 5 == 0:
+                                    self._cerberus_available = None
+                                    self._cerberus_last_check = 0
+
+                        # Get embedding (from compressed content if available, else original)
+                        embedding = await self.get_embedding(text_for_embedding)
+
+                        if embedding:
+                            # Update memory with embedding and optionally compressed_content
+                            if compression_applied and compressed_content:
+                                await conn.execute("""
+                                    UPDATE memories
+                                    SET embedding = $1,
+                                        compressed_content = $2,
+                                        updated = DEFAULT,
+                                        metadata = jsonb_set(
+                                            COALESCE(metadata, '{}'),
+                                            '{embedding_pre_compressed}',
+                                            'true'
+                                        )
+                                    WHERE id = $3
+                                """, embedding, compressed_content, memory_id)
+                            else:
+                                await conn.execute("""
+                                    UPDATE memories
+                                    SET embedding = $1, updated = DEFAULT
+                                    WHERE id = $2
+                                """, embedding, memory_id)
+
+                            processed_count += 1
+                            if compression_applied:
+                                logger.info(
+                                    f"[PHASE3] Updated {memory_id[:8]} with "
+                                    f"{len(embedding)}-dim embedding (pre-compressed)"
+                                )
+                            else:
+                                logger.debug(f"Updated {memory_id[:8]} with {len(embedding)}-dim embedding")
+                        else:
+                            failed_count += 1
+                            logger.warning(f"Failed to get embedding for {memory_id}")
+
+                    except Exception as e:
+                        failed_count += 1
+                        logger.error(f"Error processing {memory_id}: {e}")
 
             self.stats['processed'] += processed_count
             self.stats['failed'] += failed_count
@@ -347,71 +348,69 @@ class BackgroundEmbeddingJob:
                 f"Phase3: {self.stats['compressed']} compressed, "
                 f"{self.stats['bytes_saved']} bytes saved total"
             )
-            return len(memories) > 0
+            return True
 
         except Exception as e:
             logger.error(f"Batch processing error: {e}")
             return False
 
-    def run_background(self):
+    async def run_background(self):
         """Main background job loop"""
         logger.info("Background embedding job started (Phase 3: Pre-compression enabled)")
 
         while self.running:
             try:
-                has_work = self.process_batch()
+                has_work = await self.process_batch()
 
                 if has_work:
                     logger.info(f"Sleeping for {self.sleep_interval}s before next batch")
                 else:
                     logger.info(f"No pending embeddings. Sleeping for {self.sleep_interval}s")
-                    # Re-check CERBERUS periodically when idle
-                    self._cerberus_available = None
 
-                time.sleep(self.sleep_interval)
+                await asyncio.sleep(self.sleep_interval)
 
             except Exception as e:
                 logger.error(f"Unexpected error in background loop: {e}")
-                time.sleep(self.sleep_interval)
+                await asyncio.sleep(self.sleep_interval)
 
         logger.info("Background embedding job stopped")
         logger.info(f"Final stats: {self.stats}")
 
-    def start(self):
+    async def start(self):
         """Start the background job"""
         if self.running:
             logger.warning("Background job already running")
             return
 
-        self.running = True
-        self.thread = threading.Thread(target=self.run_background, daemon=True)
-        self.thread.start()
-        logger.info("Background job thread started")
+        logger.info(f"Connecting to DB: {PG_CONFIG['host']}:{PG_CONFIG['port']}/{PG_CONFIG['database']}")
+        self.db_pool = await asyncpg.create_pool(
+            min_size=1, max_size=3, command_timeout=60, **_DB_CONNECT_ARGS
+        )
 
-    def stop(self):
+        self.running = True
+        await self.run_background()
+
+    async def stop(self):
         """Stop the background job"""
         self.running = False
-        if self.thread:
-            self.thread.join(timeout=10)
+        if self.db_pool:
+            await self.db_pool.close()
         logger.info("Background job stopped")
 
 
-# Global job instance
-background_job = BackgroundEmbeddingJob(
-    batch_size=20,       # Process 20 memories at a time
-    sleep_interval=30,   # Check every 30 seconds
-    max_retries=3        # Retry failed embeddings up to 3 times
-)
-
-if __name__ == '__main__':
-    # Manual testing
-    job = BackgroundEmbeddingJob()
-    job.start()
-
+async def main():
+    job = BackgroundEmbeddingJob(
+        batch_size=20,
+        sleep_interval=30,
+        max_retries=3
+    )
     try:
-        while True:
-            time.sleep(1)
+        await job.start()
     except KeyboardInterrupt:
         logger.info("Shutting down...")
-        job.stop()
+        await job.stop()
         logger.info(f"Final stats: {job.stats}")
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

@@ -4,11 +4,24 @@
 
 """Prometheus Metrics Module for MNEMOS/GRAEAE Production Monitoring"""
 
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, REGISTRY
-from prometheus_client.core import CollectorRegistry
-from flask import Blueprint, Response
-import time
+import asyncio
 import functools
+import inspect
+import time
+from typing import Any, Callable
+
+from fastapi import APIRouter
+from prometheus_client import (
+    Counter, Gauge, Histogram, generate_latest,
+    CONTENT_TYPE_LATEST,
+)
+from prometheus_client import CollectorRegistry
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+# Slow query threshold (seconds)
+SLOW_QUERY_THRESHOLD_SEC = 0.1
 
 # Custom registry to avoid conflicts
 metrics_registry = CollectorRegistry()
@@ -212,9 +225,10 @@ graeae_worker_active = Gauge(
     registry=metrics_registry
 )
 
-graeae_greenlet_count = Gauge(
-    'graeae_greenlet_count',
-    'Active gevent greenlets',
+# asyncio tasks gauge (replaces gevent greenlet gauge)
+asyncio_tasks_active = Gauge(
+    'asyncio_tasks_active',
+    'Number of active asyncio tasks',
     registry=metrics_registry
 )
 
@@ -222,141 +236,185 @@ graeae_greenlet_count = Gauge(
 # Utility Functions
 # ============================================================================
 
-def track_endpoint_latency(endpoint_name):
-    """Decorator to track endpoint latency and requests"""
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            start_time = time.time()
-            method = 'GET'  # Will be overridden by request context
-            
-            mnemos_active_requests.labels(endpoint=endpoint_name).inc()
-            
-            try:
-                result = func(*args, **kwargs)
+def track_endpoint_latency(endpoint_name: str) -> Callable:
+    """Decorator to track endpoint latency and requests (sync and async)."""
+    def decorator(func: Callable) -> Callable:
+        if inspect.iscoroutinefunction(func):
+            @functools.wraps(func)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                start_time = time.time()
+                method = kwargs.get('method', 'unknown')
+                mnemos_active_requests.labels(endpoint=endpoint_name).inc()
                 status = 200
-                return result
-            except Exception as e:
-                status = 500
-                raise
-            finally:
-                latency = time.time() - start_time
-                mnemos_active_requests.labels(endpoint=endpoint_name).dec()
-                mnemos_request_latency.labels(
-                    endpoint=endpoint_name,
-                    method=method
-                ).observe(latency)
-                mnemos_request_count.labels(
-                    endpoint=endpoint_name,
-                    method=method,
-                    status=status
-                ).inc()
-        
-        return wrapper
+                try:
+                    result = await func(*args, **kwargs)
+                    return result
+                except Exception:
+                    status = 500
+                    raise
+                finally:
+                    latency = time.time() - start_time
+                    mnemos_active_requests.labels(endpoint=endpoint_name).dec()
+                    mnemos_request_latency.labels(
+                        endpoint=endpoint_name,
+                        method=method
+                    ).observe(latency)
+                    mnemos_request_count.labels(
+                        endpoint=endpoint_name,
+                        method=method,
+                        status=status
+                    ).inc()
+            return async_wrapper
+        else:
+            @functools.wraps(func)
+            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                start_time = time.time()
+                method = kwargs.get('method', 'unknown')
+                mnemos_active_requests.labels(endpoint=endpoint_name).inc()
+                status = 200
+                try:
+                    result = func(*args, **kwargs)
+                    return result
+                except Exception:
+                    status = 500
+                    raise
+                finally:
+                    latency = time.time() - start_time
+                    mnemos_active_requests.labels(endpoint=endpoint_name).dec()
+                    mnemos_request_latency.labels(
+                        endpoint=endpoint_name,
+                        method=method
+                    ).observe(latency)
+                    mnemos_request_count.labels(
+                        endpoint=endpoint_name,
+                        method=method,
+                        status=status
+                    ).inc()
+            return sync_wrapper
     return decorator
 
 
-def track_db_query_latency(query_type):
-    """Decorator to track database query latency"""
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            start_time = time.time()
-            try:
-                result = func(*args, **kwargs)
-                return result
-            finally:
-                latency = time.time() - start_time
-                mnemos_db_query_latency.labels(query_type=query_type).observe(latency)
-                
-                if latency > 0.1:  # 100ms threshold
-                    mnemos_db_slow_queries.labels(query_type=query_type).inc()
-        
-        return wrapper
+def track_db_query_latency(query_type: str) -> Callable:
+    """Decorator to track database query latency (sync and async)."""
+    def decorator(func: Callable) -> Callable:
+        if inspect.iscoroutinefunction(func):
+            @functools.wraps(func)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                start_time = time.time()
+                try:
+                    result = await func(*args, **kwargs)
+                    return result
+                finally:
+                    latency = time.time() - start_time
+                    mnemos_db_query_latency.labels(query_type=query_type).observe(latency)
+                    if latency > SLOW_QUERY_THRESHOLD_SEC:
+                        mnemos_db_slow_queries.labels(query_type=query_type).inc()
+            return async_wrapper
+        else:
+            @functools.wraps(func)
+            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                start_time = time.time()
+                try:
+                    result = func(*args, **kwargs)
+                    return result
+                finally:
+                    latency = time.time() - start_time
+                    mnemos_db_query_latency.labels(query_type=query_type).observe(latency)
+                    if latency > SLOW_QUERY_THRESHOLD_SEC:
+                        mnemos_db_slow_queries.labels(query_type=query_type).inc()
+            return sync_wrapper
     return decorator
 
 
-def track_provider_latency(provider_name):
-    """Decorator to track GRAEAE provider latency"""
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            start_time = time.time()
-            try:
-                result = func(*args, **kwargs)
-                latency = time.time() - start_time
-                graeae_provider_latency.labels(provider=provider_name).observe(latency)
-                graeae_provider_success.labels(provider=provider_name).inc()
-                graeae_provider_last_success.labels(provider=provider_name).set_to_current_time()
-                return result
-            except Exception as e:
-                graeae_provider_failure.labels(
-                    provider=provider_name,
-                    error_type=type(e).__name__
-                ).inc()
-                raise
-        
-        return wrapper
+def track_provider_latency(provider_name: str) -> Callable:
+    """Decorator to track GRAEAE provider latency (sync and async)."""
+    def decorator(func: Callable) -> Callable:
+        if inspect.iscoroutinefunction(func):
+            @functools.wraps(func)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                start_time = time.time()
+                try:
+                    result = await func(*args, **kwargs)
+                    latency = time.time() - start_time
+                    graeae_provider_latency.labels(provider=provider_name).observe(latency)
+                    graeae_provider_success.labels(provider=provider_name).inc()
+                    graeae_provider_last_success.labels(provider=provider_name).set_to_current_time()
+                    return result
+                except Exception as e:
+                    graeae_provider_failure.labels(
+                        provider=provider_name,
+                        error_type=type(e).__name__
+                    ).inc()
+                    raise
+            return async_wrapper
+        else:
+            @functools.wraps(func)
+            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                start_time = time.time()
+                try:
+                    result = func(*args, **kwargs)
+                    latency = time.time() - start_time
+                    graeae_provider_latency.labels(provider=provider_name).observe(latency)
+                    graeae_provider_success.labels(provider=provider_name).inc()
+                    graeae_provider_last_success.labels(provider=provider_name).set_to_current_time()
+                    return result
+                except Exception as e:
+                    graeae_provider_failure.labels(
+                        provider=provider_name,
+                        error_type=type(e).__name__
+                    ).inc()
+                    raise
+            return sync_wrapper
     return decorator
 
 
-def create_metrics_blueprint():
-    """Create Flask blueprint for /metrics endpoint"""
-    bp = Blueprint('metrics', __name__)
-    
-    @bp.route('/metrics', methods=['GET'])
-    def metrics():
-        return Response(generate_latest(metrics_registry), mimetype='text/plain')
-    
-    return bp
+def create_metrics_router() -> APIRouter:
+    """Create FastAPI APIRouter with GET /metrics endpoint."""
+    router = APIRouter()
+
+    @router.get('/metrics')
+    async def metrics() -> Response:
+        asyncio_tasks_active.set(len(asyncio.all_tasks()))
+        return Response(
+            generate_latest(metrics_registry),
+            media_type=CONTENT_TYPE_LATEST
+        )
+
+    return router
 
 
 # ============================================================================
 # Initialization
 # ============================================================================
 
-def setup_prometheus_middleware(app):
-    """Setup Prometheus metrics middleware in Flask app"""
-    
-    # Register metrics blueprint
-    metrics_bp = create_metrics_blueprint()
-    app.register_blueprint(metrics_bp)
-    
-    # Before/after request hooks
-    @app.before_request
-    def before_request():
-        import time
-        from flask import request
-        request.start_time = time.time()
-        
-        endpoint = request.endpoint or 'unknown'
-        mnemos_active_requests.labels(endpoint=endpoint).inc()
-    
-    @app.after_request
-    def after_request(response):
-        import time
-        from flask import request
-        
-        if hasattr(request, 'start_time'):
-            latency = time.time() - request.start_time
-            endpoint = request.endpoint or 'unknown'
-            
-            mnemos_active_requests.labels(endpoint=endpoint).dec()
-            mnemos_request_latency.labels(
-                endpoint=endpoint,
-                method=request.method
-            ).observe(latency)
-            mnemos_request_count.labels(
-                endpoint=endpoint,
-                method=request.method,
-                status=response.status_code
-            ).inc()
-        
-        return response
-    
-    return app
+def setup_metrics_middleware(app: Any) -> None:
+    """Install Prometheus metrics middleware into a FastAPI app."""
 
+    class _MetricsMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next: Callable) -> Any:
+            start_time = time.time()
+            endpoint = request.url.path
+            method = request.method
 
-if __name__ == '__main__':
-    # Test metrics endpoint
-    print(generate_latest(metrics_registry).decode('utf-8'))
+            mnemos_active_requests.labels(endpoint=endpoint).inc()
+            try:
+                response = await call_next(request)
+                status = response.status_code
+            except Exception:
+                status = 500
+                raise
+            finally:
+                latency = time.time() - start_time
+                mnemos_active_requests.labels(endpoint=endpoint).dec()
+                mnemos_request_latency.labels(
+                    endpoint=endpoint,
+                    method=method
+                ).observe(latency)
+                mnemos_request_count.labels(
+                    endpoint=endpoint,
+                    method=method,
+                    status=status
+                ).inc()
+            return response
+
+    app.add_middleware(_MetricsMiddleware)
