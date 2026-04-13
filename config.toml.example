@@ -247,7 +247,7 @@ profile = "personal"
 
 # ── Auth (personal profile: disabled by default) ───────────────────────────────
 [auth]
-enabled = false
+enabled = true          # Enable bearer token auth; create root key with: python3 install.py
 personal_user_id = "default"
 default_namespace = "default"
 mode = "bearer"
