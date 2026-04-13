@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """
-MNEMOS Background Memory Distillation Worker (v4 - Mistral Optimized)
-
-Configuration (2026-02-19):
-  - Mistral 7B Instruct v0.3 on Ollama (configured via OLLAMA_HOST)
-  - Dynamic timeouts based on content size
-  - Transaction support & attempt tracking
-  - Progress monitoring
+Background distillation worker: compresses memories using extractive token filter/SENTENCE or LLM fallback,
+updates embeddings, and maintains compression quality metrics.
 """
 
 import asyncio
@@ -85,7 +80,7 @@ class MemoryDistillationWorker:
             min_size=1, max_size=3, command_timeout=60, **_DB_CONNECT_ARGS
         )
         
-        logger.info("✅ Distillation worker started")
+        logger.info("[OK] Distillation worker started")
         logger.info(f"Backend: {self.llm.__class__.__name__}")
         logger.info(f"Config: size_limit={SIZE_LIMIT_KB}KB, batch={BATCH_SIZE}, "
                    f"distill_timeout={DISTILL_TIMEOUT_BASE}s+({DISTILL_TIMEOUT_PER_KB}s/KB)")
@@ -155,6 +150,11 @@ class MemoryDistillationWorker:
         original_len = memory["len"]
         current_quality = memory["quality_rating"]
 
+        content_len = len(original_text)
+        if content_len > SIZE_LIMIT_KB * 1024:
+            logger.debug(f"Skipping {memory_id[:8]}: content {content_len}b exceeds {SIZE_LIMIT_KB}KB limit")
+            return
+
         try:
             compression_method = None
             compressed = None
@@ -194,7 +194,7 @@ class MemoryDistillationWorker:
                 compression_method = "external"
 
             if not compressed or len(compressed) < 10:
-                logger.warning(f"⚠️  Empty compression for {memory_id[:8]}")
+                logger.warning(f"[WARN]  Empty compression for {memory_id[:8]}")
                 return
 
             compressed_len = len(compressed)
@@ -204,17 +204,17 @@ class MemoryDistillationWorker:
             # Persist
             update_query = """
             UPDATE memories
-            SET compressed_content = ,
-                quality_rating = ,
+            SET compressed_content = $1,
+                quality_rating = $2,
                 llm_optimized = true,
                 optimized_at = NOW(),
-                compression_method = ,
+                compression_method = $4,
                 metadata = jsonb_set(
                     metadata,
                     '{distillation_success}',
                     'true'
                 )
-            WHERE id = 
+            WHERE id = $3
             """
             async with self.db_pool.acquire() as conn:
                 await conn.execute(
@@ -233,12 +233,12 @@ class MemoryDistillationWorker:
 
         except asyncio.TimeoutError:
             self.stats["timeouts"] += 1
-            logger.warning(f"⏱ Timeout optimizing {memory_id[:8]} ({original_len} chars)")
+            logger.warning(f"[TIMER] Timeout optimizing {memory_id[:8]} ({original_len} chars)")
             await self.increment_attempts(memory_id)
 
         except Exception as e:
             self.stats["errors"] += 1
-            logger.error(f"❌ Error optimizing {memory_id[:8]}: {e}")
+            logger.error(f"[ERROR] Error optimizing {memory_id[:8]}: {e}")
             await self.increment_attempts(memory_id)
 
         finally:

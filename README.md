@@ -116,7 +116,7 @@ Each memory carries full ownership and LLM provenance:
 
 - `owner_id` — which user owns this memory
 - `group_id` — optional group for shared access
-- `namespace` — logical partition (e.g. `investorclaw/analyst`)
+- `namespace` — logical partition (e.g. `myapp/analyst`)
 - `permission_mode` — UNIX-style octal (600 = owner only, 640 = group readable, 644 = world readable)
 - `source_model` — the LLM model that produced this memory
 - `source_provider` — the provider (openai, groq, ollama, etc.)
@@ -222,7 +222,7 @@ Agents (any language, any framework)
     ┌──────────┴──────────┐
     │                     │
     ▼                     ▼
-PostgreSQL           GRAEAE (port 5001)
+PostgreSQL           GRAEAE (embedded)
 memories             multi-LLM consensus
 users / groups       circuit breaker
 api_keys             semantic cache
@@ -241,7 +241,7 @@ git clone <your-repo-url>
 cd mnemos-production
 docker compose up
 # MNEMOS: http://localhost:5002
-# GRAEAE: http://localhost:5001 (if available)
+# GRAEAE is embedded in the MNEMOS API (port 5002) — no separate server
 ```
 
 ### Manual install
@@ -342,12 +342,12 @@ curl -X DELETE http://localhost:5002/admin/apikeys/<key-id>
 ### GRAEAE reasoning
 
 ```bash
-curl -X POST http://localhost:5001/graeae/consult \
+curl -X POST http://localhost:5002/graeae/consult \
   -H 'Content-Type: application/json' \
   -d '{"prompt": "Your question", "task_type": "architecture_design"}'
 
 # Extract best result by score
-curl -X POST http://localhost:5001/graeae/consult \
+curl -X POST http://localhost:5002/graeae/consult \
   -d '{"prompt": "...", "task_type": "reasoning"}' | \
   jq '.all_responses | to_entries | sort_by(-.[1].final_score)[0]'
 ```

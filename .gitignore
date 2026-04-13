@@ -94,3 +94,9 @@ git_sync_daily.sh
 run_monthly_export.sh
 monitor_distillation.sh
 deploy.sh
+
+# Runtime configuration (contains secrets — use config.toml.example as template)
+config.toml
+
+# API key files (never commit actual keys)
+api_keys.json

@@ -35,6 +35,7 @@ Expected Performance:
     - Best for: Reasoning, architecture, analysis (structure-important)
 """
 
+import logging
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
 from dataclasses import dataclass
@@ -45,14 +46,14 @@ try:
     SPACY_AVAILABLE = True
 except ImportError:
     SPACY_AVAILABLE = False
-    print("[WARNING] spaCy not installed. Install with: pip install spacy")
+    logging.getLogger(__name__).warning("spaCy not installed; install with: pip install spacy")
 
 try:
     import networkx as nx
     NETWORKX_AVAILABLE = True
 except ImportError:
     NETWORKX_AVAILABLE = False
-    print("[WARNING] NetworkX not installed. Install with: pip install networkx")
+    logging.getLogger(__name__).warning("NetworkX not installed; install with: pip install networkx")
 
 
 @dataclass
@@ -112,8 +113,7 @@ class AnchorDetectionEngine:
                 # Try to load model, fall back to blank if not available
                 self.nlp_model = spacy.load("en_core_web_sm")
             except OSError:
-                print("[WARNING] spaCy model 'en_core_web_sm' not found.")
-                print("         Install with: python -m spacy download en_core_web_sm")
+                logging.getLogger(__name__).warning("spaCy model 'en_core_web_sm' not found; install with: python -m spacy download en_core_web_sm")
                 # Continue with fallback (no NER)
                 SPACY_AVAILABLE = False
 
@@ -152,7 +152,7 @@ class AnchorDetectionEngine:
                             )
                             break
         except Exception as e:
-            print(f"[WARNING] NER extraction failed: {e}")
+            logging.getLogger(__name__).warning(f"NER extraction failed: {e}")
 
         return anchors
 
@@ -253,7 +253,7 @@ class SemanticGraphBuilder:
     def __init__(self):
         """Initialize graph builder."""
         if not NETWORKX_AVAILABLE:
-            print("[WARNING] NetworkX not available - using fallback tokenization")
+            logging.getLogger(__name__).warning("NetworkX not available - using fallback tokenization")
 
     def build_graph(self,
                     tokens: List[str],
@@ -298,7 +298,7 @@ class SemanticGraphBuilder:
 
             return G
         except Exception as e:
-            print(f"[WARNING] Graph construction failed: {e}")
+            logging.getLogger(__name__).warning(f"Graph construction failed: {e}")
             return None
 
     def calculate_node_importance(self, G: Any, anchors: Dict[int, SemanticAnchor]) -> Dict[int, float]:
@@ -340,7 +340,7 @@ class SemanticGraphBuilder:
 
             return pagerank_scores
         except Exception as e:
-            print(f"[WARNING] PageRank calculation failed: {e}")
+            logging.getLogger(__name__).warning(f"PageRank calculation failed: {e}")
             # Fallback to simple scoring
             return {i: 1.0 for i in range(G.number_of_nodes())}
 
@@ -533,7 +533,7 @@ class SACCompressor:
     def clear_cache(self):
         """Clear compression cache."""
         self.compression_cache.clear()
-        print("[INFO] SENTENCE compression cache cleared")
+        logging.getLogger(__name__).debug("SENTENCE compression cache cleared")
 
 
 # Example usage

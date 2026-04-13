@@ -27,7 +27,8 @@ async def list_state_keys(user: UserContext = Depends(get_current_user)):
             )
         return {"keys": [dict(r) for r in rows]}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error listing state keys: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/state/{key}")
@@ -45,7 +46,8 @@ async def get_state(key: str, user: UserContext = Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error getting state key: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.put("/state/{key}", status_code=200)
@@ -69,7 +71,7 @@ async def set_state(
         return dict(row)
     except Exception as e:
         logger.error(f"Error setting state key '{key}': {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete("/state/{key}", status_code=204)

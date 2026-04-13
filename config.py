@@ -93,7 +93,7 @@ PG_CONFIG = {
     'port':     int(os.getenv('PG_PORT', str(_db_toml.get('port',     5432)))),
     'database': os.getenv('PG_DATABASE', str(_db_toml.get('database', 'mnemos'))),
     'user':     os.getenv('PG_USER',     str(_db_toml.get('user',     'mnemos_user'))),
-    'password': os.getenv('PG_PASSWORD', str(_db_toml.get('password', '') or 'changeme')),
+    'password': os.getenv('PG_PASSWORD', str(_db_toml.get('password', ''))),  # No default — service will fail loudly if PG_PASSWORD is not set
     'pool_min_size': int(os.getenv('PG_POOL_MIN', str(_db_toml.get('pool_min_size', 5)))),
     'pool_max_size': int(os.getenv('PG_POOL_MAX', str(_db_toml.get('pool_max_size', 20)))),
 }

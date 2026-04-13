@@ -1,13 +1,13 @@
 [Unit]
 Description=MNEMOS Model Registry — Daily Provider Sync
-Documentation=https://github.com/your-org/mnemos
+Documentation=https://github.com/mnemos-dev/mnemos
 After=network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=jasonperlow
-Group=jasonperlow
+User=mnemos
+Group=mnemos
 WorkingDirectory=/opt/mnemos
 # Step 1: Sync provider model catalogs → model_registry table
 ExecStart=/opt/mnemos/venv/bin/python3 scripts/sync_provider_models.py

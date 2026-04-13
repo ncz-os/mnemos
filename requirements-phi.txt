@@ -1,0 +1,8 @@
+# Optional: Intel OpenVINO / phi_server.py dependencies
+# Install with: pip install -r requirements-phi.txt
+#
+# These packages are NOT required for the standard MNEMOS API server.
+# Only install if you plan to run phi_server.py for local Intel GPU inference.
+
+openvino-genai>=2024.4.0
+fastembed>=0.3.0          # nomic-embed-text-v1.5, 768-dim; pulls onnxruntime transitively

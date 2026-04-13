@@ -27,6 +27,7 @@ Expected Performance:
     - Quality: 90%+ preservation
 """
 
+import logging
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -39,7 +40,7 @@ try:
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
-    print("[WARNING] sentence_transformers not available. Install with: pip install sentence-transformers")
+    logging.getLogger(__name__).warning("sentence_transformers not available; install with: pip install sentence-transformers")
 
 
 @dataclass
@@ -220,9 +221,9 @@ class SoftConstraintsOptimizer:
         if TRANSFORMERS_AVAILABLE:
             try:
                 self.encoder = SentenceTransformer(model_name)
-                print(f"[INFO] Soft constraints optimizer loaded model: {model_name}")
+                logging.getLogger(__name__).debug(f"Soft constraints optimizer loaded model: {model_name}")
             except Exception as e:
-                print(f"[WARNING] Failed to load embedding model: {e}")
+                logging.getLogger(__name__).warning(f"Failed to load embedding model: {e}")
                 TRANSFORMERS_AVAILABLE = False
 
     def get_embedding(self, text: str, use_cache: bool = True) -> Optional[np.ndarray]:
@@ -484,7 +485,7 @@ class token-filterCompressor:
         """Clear compression cache."""
         self.compression_cache.clear()
         self.soft_constraints.embedding_cache.clear()
-        print("[INFO] token-filter² compression cache cleared")
+        logging.getLogger(__name__).debug("token-filter compression cache cleared")
 
 
 # Example usage

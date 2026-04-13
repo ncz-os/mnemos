@@ -45,9 +45,10 @@ _DB_CONNECT_ARGS = {
     "port":     PG_CONFIG["port"],
 }
 
-# Phase 3: CERBERUS vLLM for pre-compression
-CERBERUS_COMPLETIONS_URL = 'http://192.0.2.96:8000/v1/chat/completions'
-CERBERUS_HEALTH_URL = 'http://192.0.2.96:8000/v1/models'
+# Phase 3: Inference backend for pre-compression
+_INFERENCE_BASE = os.getenv('INFERENCE_BACKEND_URL', 'http://localhost:8000')
+CERBERUS_COMPLETIONS_URL = _INFERENCE_BASE + '/v1/chat/completions'
+CERBERUS_HEALTH_URL = _INFERENCE_BASE + '/v1/models'
 
 # Phase 3: Compression configuration
 COMPRESSION_THRESHOLD_BYTES = 10 * 1024    # 10KB - compress if content > 10KB

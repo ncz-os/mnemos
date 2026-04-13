@@ -1,12 +1,18 @@
-# MNEMOS Configuration
-# Modular system with integrated compression and quality tracking
+# MNEMOS Configuration Example
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy this file to config.toml and fill in your settings:
+#   cp config.toml.example config.toml
+#
+# API keys are stored separately in ~/.config/mnemos/api_keys.json
+# (see api_keys.json.example for the required format)
+# ─────────────────────────────────────────────────────────────────────────────
 
 [database]
 host = "localhost"
 port = 5432
 database = "mnemos"
 user = "mnemos"
-password = ""
+password = ""           # Set via PG_PASSWORD env var in production
 pool_min_size = 10
 pool_max_size = 20
 
@@ -77,36 +83,41 @@ code = ["code", "implementation", "debug", "refactor", "algorithm"]
 project = ["project", "planning", "timeline", "milestone", "task"]
 complex = ["complex", "sophisticated", "integration", "system"]
 
+# ── Bundle routing ─────────────────────────────────────────────────────────────
+# Bundles map task types to provider groups. Each task type has a primary,
+# secondary, and tertiary provider. Provider names must match [graeae.providers.*]
+# stanza names below.
 [bundles]
 enabled = true
 fallback_on_no_graeae = true
 default_bundle = "general_reasoning"
 
 [bundles.model_variants.code_generation]
-primary = "xai_grok_4_code"
-secondary = "gpt_5_2_fast"
-tertiary = "together_ai_code"
+primary = "xai"
+secondary = "openai"
+tertiary = "together"
 
 [bundles.model_variants.architecture_design]
-primary = "gpt_5_2"
-secondary = "gemini_3_pro"
-tertiary = "groq_llama_3_3"
+primary = "openai"
+secondary = "gemini"
+tertiary = "groq"
 
 [bundles.model_variants.api_design]
-primary = "gpt_5_2"
-secondary = "gemini_3_pro"
-tertiary = "groq_llama_3_3"
+primary = "openai"
+secondary = "gemini"
+tertiary = "groq"
 
 [bundles.model_variants.data_modeling]
-primary = "gemini_3_pro"
-secondary = "gpt_5_2"
-tertiary = "groq_llama_3_3"
+primary = "gemini"
+secondary = "openai"
+tertiary = "groq"
 
 [bundles.model_variants.reasoning]
-primary = "gpt_5_2"
-secondary = "gemini_3_pro"
-tertiary = "groq_llama_3_3"
+primary = "openai"
+secondary = "gemini"
+tertiary = "groq"
 
+# ── Routing ────────────────────────────────────────────────────────────────────
 [routing]
 enabled = true
 graeae_url = "http://localhost:5001"  # Override via GRAEAE_URL env var
@@ -119,14 +130,15 @@ auto = "Intelligent routing (adaptive)"
 
 # ── GRAEAE provider registry ──────────────────────────────────────────────────
 # Add a new provider by adding a [graeae.providers.<name>] stanza here and
-# an entry under llm_providers in ~/.api_keys_master.json. No code changes needed.
+# an entry under llm_providers in ~/.config/mnemos/api_keys.json.
+# No code changes needed.
 #
 # Fields:
 #   url      — API endpoint
-#   model    — model identifier sent in the request
+#   model    — model identifier sent in the request (use current stable models)
 #   weight   — base consensus weight (0.0–1.0); adjusted dynamically by quality tracker
 #   api      — adapter style: "openai" | "anthropic" | "gemini"
-#   key_name — key under llm_providers in ~/.api_keys_master.json
+#   key_name — key name in ~/.config/mnemos/api_keys.json
 #   enabled  — set false to disable without removing the stanza
 
 [graeae]
@@ -143,7 +155,7 @@ enabled  = true
 
 [graeae.providers.groq]
 url      = "https://api.groq.com/openai/v1/chat/completions"
-model    = "openai/gpt-oss-120b"
+model    = "llama-3.3-70b-versatile"
 weight   = 0.78
 api      = "openai"
 key_name = "groq"
@@ -151,15 +163,15 @@ enabled  = true
 
 [graeae.providers.claude_opus]
 url      = "https://api.anthropic.com/v1/messages"
-model    = "claude-opus-4-6"
+model    = "claude-3-5-sonnet-20241022"
 weight   = 0.85
 api      = "anthropic"
-key_name = "claude-opus"
+key_name = "anthropic"
 enabled  = true
 
 [graeae.providers.xai]
 url      = "https://api.x.ai/v1/chat/completions"
-model    = "grok-4.20-0309-reasoning"
+model    = "grok-beta"
 weight   = 0.90
 api      = "openai"
 key_name = "xai"
@@ -167,23 +179,23 @@ enabled  = true
 
 [graeae.providers.openai]
 url      = "https://api.openai.com/v1/chat/completions"
-model    = "gpt-5.4"
+model    = "gpt-4o"
 weight   = 0.82
 api      = "openai"
 key_name = "openai"
 enabled  = true
 
 [graeae.providers.gemini]
-url      = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent"
-model    = "gemini-3.1-pro-preview"
+url      = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent"
+model    = "gemini-1.5-pro"
 weight   = 0.81
 api      = "gemini"
-key_name = "gemini"
+key_name = "google"
 enabled  = true
 
 [graeae.providers.nvidia]
 url      = "https://integrate.api.nvidia.com/v1/chat/completions"
-model    = "meta/llama-4-maverick-17b-128e-instruct"
+model    = "meta/llama-3.3-70b-instruct"
 weight   = 0.80
 api      = "openai"
 key_name = "nvidia"
@@ -191,10 +203,10 @@ enabled  = true
 
 [graeae.providers.together]
 url      = "https://api.together.xyz/v1/chat/completions"
-model    = "Qwen/Qwen3-235B-A22B-Instruct-2507-tput"
+model    = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 weight   = 0.78
 api      = "openai"
-key_name = "together_ai"
+key_name = "together"
 enabled  = true
 
 [integrations.macrodata]
@@ -212,9 +224,10 @@ file = "/tmp/mnemos.log"
 max_bytes = 10485760
 backup_count = 5
 
+# ── API server settings ────────────────────────────────────────────────────────
 [api]
 host = "0.0.0.0"
-port = 5000
+port = 5002           # Default port; override with MNEMOS_PORT env var
 debug = false
 workers = 4
 
@@ -225,15 +238,21 @@ quality_tracking = true
 audit_logging = true
 semantic_search = true
 
+# ── Deployment profile ─────────────────────────────────────────────────────────
+# personal  — single user, no auth, no RLS
+# team      — multi-user, bearer auth, RLS enabled
+# enterprise — team + namespace isolation
 [deployment]
 profile = "personal"
 
+# ── Auth (personal profile: disabled by default) ───────────────────────────────
 [auth]
-enabled = true
+enabled = false
 personal_user_id = "default"
 default_namespace = "default"
 mode = "bearer"
 
+# ── Multi-user settings ────────────────────────────────────────────────────────
 [multiuser]
 rls_enabled = false
 namespaces_enabled = false

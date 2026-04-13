@@ -1,8 +1,9 @@
-"""Journal API: POST /journal, GET /journal, GET /journal/{date}"""
+"""Journal API: POST /journal, GET /journal, DELETE /journal/{entry_id}"""
 import logging
 from datetime import date
 from typing import Optional, List
 
+import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
@@ -36,7 +37,6 @@ async def create_journal_entry(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     try:
-        import uuid
         entry_id = str(uuid.uuid4())
         async with _lc._pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -48,7 +48,7 @@ async def create_journal_entry(
         return dict(row)
     except Exception as e:
         logger.error(f"Error creating journal entry: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/journal")
@@ -91,7 +91,7 @@ async def list_journal_entries(
         return {"entries": [dict(r) for r in rows], "count": len(rows)}
     except Exception as e:
         logger.error(f"Error listing journal entries: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete("/journal/{entry_id}", status_code=204)

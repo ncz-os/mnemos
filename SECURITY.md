@@ -8,7 +8,7 @@ The most recently maintained branch is the supported branch.
 
 Please do not open a public GitHub issue for suspected vulnerabilities.
 
-Instead, report security issues privately to the maintainer via GitHub: **@perlowja**
+Instead, report security issues privately via GitHub: **@mnemos-dev** or by email to **security@mnemos.dev** (configure this address before public release)
 
 Please include:
 - a description of the issue

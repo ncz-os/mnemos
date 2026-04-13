@@ -8,6 +8,10 @@ Provides:
 - get_by_date(): Get entries for specific date
 """
 
+# Library API: This module provides a programmatic interface to the journal/state/entities
+# subsystem for use in Python applications that embed MNEMOS directly.
+# The REST API handlers (api/handlers/) use direct asyncpg queries for performance.
+
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone

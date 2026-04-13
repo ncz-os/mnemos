@@ -4,7 +4,7 @@ Thanks for your interest in MNEMOS.
 
 ## Development workflow
 
-- Use `launch-prep` or a feature branch for non-trivial changes.
+- Use a feature branch for non-trivial changes.
 - Keep the upstream remote as the authoritative Git source, and use a local checkout for development and test runs.
 - Run the default test suite before opening a PR:
 

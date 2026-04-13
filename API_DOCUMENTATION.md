@@ -1,6 +1,6 @@
 # MNEMOS API Documentation
 
-**Base URL**: `http://localhost:5000`
+**Base URL**: `http://localhost:5002`
 **Version**: 2.3.0
 **Format**: JSON
 
@@ -15,7 +15,7 @@
 5. [Graeae Consultation](#graeae-consultation)
 6. [Hook Management](#hook-management)
 7. [State Management](#state-management)
-8. [Bundles & Routing](#bundles--routing)
+8. [Additional Endpoints](#additional-endpoints)
 9. [Error Handling](#error-handling)
 10. [Examples](#examples)
 
@@ -45,7 +45,7 @@ Check API server health
 
 **Example**:
 ```bash
-curl -X GET http://localhost:5000/health
+curl -X GET http://localhost:5002/health
 ```
 
 ---
@@ -83,7 +83,7 @@ Get system statistics
 
 **Example**:
 ```bash
-curl -X GET http://localhost:5000/stats
+curl -X GET http://localhost:5002/stats
 ```
 
 ---
@@ -118,13 +118,13 @@ Create a new memory with automatic compression
 
 **Example**:
 ```bash
-curl -X POST http://localhost:5000/memories \
+curl -X POST http://localhost:5002/memories \
   -H "Content-Type: application/json" \
   -d '{
     "content": "User completed project X with 98% accuracy",
     "category": "facts",
     "task_type": "reasoning",
-    "metadata": {"project": "RiskyEats", "date": "2026-02-05"}
+    "metadata": {"project": "MyProject", "date": "2026-02-05"}
   }'
 ```
 
@@ -153,74 +153,7 @@ Retrieve a memory by ID
 
 **Example**:
 ```bash
-curl -X GET http://localhost:5000/memories/550e8400-e29b-41d4-a716-446655440000
-```
-
----
-
-### GET /memories/{memory_id}/quality-check
-
-Get memory with quality assessment
-
-**Path Parameters**:
-- `memory_id` (required): UUID of memory
-
-**Response** (200):
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "content": "Compressed content",
-  "quality_rating": 92,
-  "quality_manifest": {
-    "compression_id": "uuid",
-    "what_was_removed": [
-      "2 introductory sentences",
-      "3 supporting examples"
-    ],
-    "what_was_preserved": [
-      "Core reasoning",
-      "All conclusions",
-      "15/18 entities"
-    ],
-    "risk_factors": [
-      "Missing examples may reduce convincingness"
-    ],
-    "safe_for": ["Quick decisions", "Pattern recognition"],
-    "not_safe_for": ["Detailed review", "Security-critical"]
-  },
-  "original_available": true,
-  "original_memory_id": "uuid-original",
-  "compression_ratio": 0.57
-}
-```
-
-**Example**:
-```bash
-curl -X GET http://localhost:5000/memories/550e8400-e29b-41d4-a716-446655440000/quality-check
-```
-
----
-
-### GET /memories/{memory_id}/original
-
-Retrieve uncompressed original memory
-
-**Path Parameters**:
-- `memory_id` (required): UUID of memory
-
-**Response** (200):
-```json
-{
-  "id": "uuid-original",
-  "content": "Full uncompressed content with all details",
-  "compression_ratio": 0.57,
-  "quality_rating": 92
-}
-```
-
-**Example**:
-```bash
-curl -X GET http://localhost:5000/memories/550e8400-e29b-41d4-a716-446655440000/original
+curl -X GET http://localhost:5002/memories/550e8400-e29b-41d4-a716-446655440000
 ```
 
 ---
@@ -256,82 +189,14 @@ Search memories by semantic similarity
 
 **Example**:
 ```bash
-curl -X POST "http://localhost:5000/memories/search?query=project%20completion&limit=5"
+curl -X POST "http://localhost:5002/memories/search?query=project%20completion&limit=5"
 ```
 
 ---
 
 ## Compression & Audit
 
-### GET /compression-log
-
-Get compression audit trail
-
-**Query Parameters**:
-- `task_type` (optional): Filter by task type
-- `reviewed` (optional): true/false for review status
-- `limit` (optional): Max entries (default: 50)
-
-**Response** (200):
-```json
-[
-  {
-    "id": "compression-uuid",
-    "memory_id": "memory-uuid",
-    "original_tokens": 2450,
-    "compressed_tokens": 980,
-    "compression_ratio": 0.40,
-    "quality_rating": 92,
-    "task_type": "reasoning",
-    "compression_method": "extractive token filter",
-    "created_at": "2026-02-05T14:30:00.000Z",
-    "reviewed": false,
-    "review_notes": null
-  }
-]
-```
-
-**Example**:
-```bash
-curl -X GET "http://localhost:5000/compression-log?task_type=reasoning&reviewed=false&limit=20"
-```
-
----
-
-### POST /memories/{memory_id}/quality-review
-
-Mark compression as reviewed
-
-**Path Parameters**:
-- `memory_id` (required): UUID of memory
-
-**Request Body**:
-```json
-{
-  "approved": true,
-  "notes": "Quality acceptable for this use case"
-}
-```
-
-**Response** (200):
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "reviewed": true,
-  "approved": true,
-  "timestamp": "2026-02-05T14:30:00.000Z"
-}
-```
-
-**Example**:
-```bash
-curl -X POST http://localhost:5000/memories/550e8400-e29b-41d4-a716-446655440000/quality-review \
-  -H "Content-Type: application/json" \
-  -d '{
-    "approved": true,
-    "notes": "Compression quality acceptable"
-  }'
-```
+> Note: The `/compress` trigger endpoint is internal. Use `GET /stats` for compression statistics.
 
 ---
 
@@ -348,7 +213,7 @@ Consult Graeae for multi-LLM consensus
   "task_type": "architecture_design (optional, default: reasoning)",
   "context": "Additional context for the prompt (optional)",
   "mode": "auto|local|external (optional, default: auto)",
-  "muses": ["gpt-5.2", "gemini-3-pro"] (optional, specific providers)
+  "muses": ["gpt-4o", "gemini-1.5-pro"] (optional, specific providers)
 }
 ```
 
@@ -357,7 +222,7 @@ Consult Graeae for multi-LLM consensus
 {
   "consensus_response": "Recommended approach: Use event-driven microservices with...",
   "consensus_score": 87.5,
-  "winning_muse": "gpt-5.2",
+  "winning_muse": "gpt-4o",
   "winning_latency_ms": 3200,
   "cost": 0.04,
   "mode": "external",
@@ -373,7 +238,7 @@ Consult Graeae for multi-LLM consensus
 
 **Example**:
 ```bash
-curl -X POST http://localhost:5000/graeae/consult \
+curl -X POST http://localhost:5002/graeae/consult \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "How should I optimize database queries for millions of records?",
@@ -455,183 +320,211 @@ Manually trigger a hook event
 
 ## State Management
 
-### GET /state/identity
+The state API provides generic key-value storage. Keys and values are arbitrary JSON.
 
-Get user identity state
+### GET /state
+
+List all state keys.
 
 **Response** (200):
 ```json
-{
-  "id": "user-123",
-  "name": "Jason Perlow",
-  "workspace": "RiskyEats",
-  "metadata": {
-    "role": "developer",
-    "team": "platform"
-  }
-}
+{"keys": [{"key": "identity", "updated": "2026-02-05T14:30:00", "version": 1}]}
+```
+
+**Example**:
+```bash
+curl http://localhost:5002/state
 ```
 
 ---
 
-### GET /state/today
+### GET /state/{key}
 
-Get today's state
+Get value for a state key.
 
 **Response** (200):
 ```json
-{
-  "date": "2026-02-05T00:00:00.000Z",
-  "day_of_week": "Wednesday",
-  "schedule": [
-    {
-      "time": "09:00",
-      "event": "Team standup"
-    },
-    {
-      "time": "14:00",
-      "event": "Architecture review"
-    }
-  ],
-  "events": []
-}
+{"key": "identity", "value": {"name": "Alice Developer"}, "updated": "2026-02-05T14:30:00", "version": 1}
+```
+
+**Example**:
+```bash
+curl http://localhost:5002/state/identity
 ```
 
 ---
 
-### GET /state/workspace
+### PUT /state/{key}
 
-Get workspace state
-
-**Response** (200):
-```json
-{
-  "id": "workspace-1",
-  "name": "RiskyEats",
-  "active_project": "dashboard-redesign",
-  "projects": [
-    "dashboard-redesign",
-    "api-optimization",
-    "mobile-app"
-  ],
-  "settings": {
-    "timezone": "UTC",
-    "language": "en"
-  }
-}
-```
-
----
-
-### POST /state/sync
-
-Sync state from macrodata
+Set value for a state key (upsert).
 
 **Request Body**:
 ```json
-{
-  "identity": {
-    "id": "user-123",
-    "name": "Jason Perlow"
-  },
-  "today": {
-    "date": "2026-02-05"
-  },
-  "workspace": {
-    "name": "RiskyEats",
-    "active_project": "dashboard"
-  }
-}
+{"value": {"name": "Alice Developer", "workspace": "MyProject"}}
 ```
 
-**Response** (200):
-```json
-{
-  "identity": true,
-  "today": true,
-  "workspace": true,
-  "timestamp": "2026-02-05T14:30:00.000Z"
-}
+**Response** (200): Updated key record.
+
+**Example**:
+```bash
+curl -X PUT http://localhost:5002/state/identity \
+  -H "Content-Type: application/json" \
+  -d '{"value": {"name": "Alice Developer"}}'
 ```
 
 ---
 
-## Bundles & Routing
+### DELETE /state/{key}
 
-### GET /bundles
+Delete a state key.
 
-List all consultation bundles
+**Response**: 204 No Content, or 404 if not found.
 
-**Response** (200):
-```json
-{
-  "code_generation": {
-    "description": "Code generation bundle",
-    "models": {
-      "xai_grok": "grok-4-code",
-      "openai": "gpt-5.2",
-      "together_ai": "meta/llama-3-70b"
-    }
-  },
-  "architecture_design": {
-    "description": "Architecture design bundle",
-    "models": {
-      "openai": "gpt-5.2",
-      "google": "gemini-3-pro",
-      "groq": "llama-3.3-70b"
-    }
-  }
-}
+**Example**:
+```bash
+curl -X DELETE http://localhost:5002/state/workspace
+```
+
+
+---
+
+## Additional Endpoints
+
+### Journal
+
+#### POST /journal
+
+Create a journal entry.
+
+**Request Body**: `{topic, content, metadata?}`
+
+**Example**:
+```bash
+curl -X POST http://localhost:5002/journal \
+  -H "Content-Type: application/json" \
+  -d '{"topic": "architecture", "content": "Decided on event-driven approach"}'
 ```
 
 ---
 
-### GET /bundles/{bundle_type}
+#### GET /journal
 
-Get specific bundle details
+List journal entries. Query params: `topic`, `date`, `search`, `limit`.
 
-**Path Parameters**:
-- `bundle_type` (required): Bundle name
-
-**Response** (200):
-```json
-{
-  "bundle_type": "architecture_design",
-  "description": "Multi-model consensus for system architecture",
-  "models": {
-    "openai": "gpt-5.2",
-    "google": "gemini-3-pro",
-    "groq": "llama-3.3-70b"
-  },
-  "consensus_score": 87,
-  "compression_ratio": 0.4,
-  "tags": ["system_design", "microservices"]
-}
+**Example**:
+```bash
+curl "http://localhost:5002/journal?topic=architecture&limit=10"
 ```
 
 ---
 
-### POST /bundle/recommend
+#### DELETE /journal/{entry_id}
 
-Get bundle recommendation for task
+Delete a journal entry.
 
-**Request Body**:
-```json
-{
-  "task_description": "I need to design a scalable API for handling restaurant data"
-}
+**Example**:
+```bash
+curl -X DELETE http://localhost:5002/journal/entry-uuid
 ```
 
-**Response** (200):
-```json
-{
-  "detected_task_type": "api_design",
-  "recommended_bundle": "api_design",
-  "primary_model": "gpt-5.2",
-  "secondary_model": "gemini-3-pro",
-  "confidence": 0.92
-}
+---
+
+### Entities
+
+#### POST /entities
+
+Create an entity. `entity_type` must be one of: `person`, `project`, `concept`, `document`, `decision`, `event`.
+
+**Request Body**: `{entity_type, name, description?, metadata?}`
+
+**Example**:
+```bash
+curl -X POST http://localhost:5002/entities \
+  -H "Content-Type: application/json" \
+  -d '{"entity_type": "project", "name": "MyProject", "description": "Main project"}'
 ```
+
+---
+
+#### GET /entities
+
+List or search entities. Query params: `entity_type`, `search`, `limit`.
+
+**Example**:
+```bash
+curl "http://localhost:5002/entities?entity_type=project"
+```
+
+---
+
+#### GET /entities/{id}
+
+Get a single entity.
+
+---
+
+#### PATCH /entities/{id}
+
+Update entity description or metadata.
+
+**Request Body**: `{description?, metadata?}`
+
+---
+
+#### POST /entities/{id}/link
+
+Link two entities bidirectionally.
+
+**Request Body**: `{related_id: "uuid"}`
+
+---
+
+#### DELETE /entities/{id}
+
+Delete an entity (also removes it from all related_entities arrays).
+
+---
+
+#### GET /entities/{id}/related
+
+Get all entities linked to this one.
+
+---
+
+### Model Registry
+
+#### GET /model-registry/
+
+List all tracked models.
+
+---
+
+#### GET /model-registry/best
+
+Get the best-performing model per provider (by ELO score).
+
+---
+
+#### GET /model-registry/providers
+
+List all tracked providers.
+
+---
+
+### GRAEAE Audit
+
+#### GET /graeae/audit
+
+Retrieve GRAEAE audit log entries.
+
+---
+
+#### GET /graeae/audit/verify
+
+Verify the cryptographic integrity of the GRAEAE audit chain. Returns pass/fail per entry.
+
+---
+
 
 ---
 
@@ -668,7 +561,7 @@ Get bundle recommendation for task
 ```bash
 #!/bin/bash
 
-BASE_URL="http://localhost:5000"
+BASE_URL="http://localhost:5002"
 
 # 1. Create memory
 MEMORY_ID=$(curl -s -X POST $BASE_URL/memories \
@@ -684,19 +577,10 @@ echo "Created memory: $MEMORY_ID"
 # 2. Retrieve memory
 curl -s -X GET $BASE_URL/memories/$MEMORY_ID | jq '.'
 
-# 3. Check quality
-curl -s -X GET $BASE_URL/memories/$MEMORY_ID/quality-check | jq '.quality_rating'
-
-# 4. Get original if needed
-curl -s -X GET $BASE_URL/memories/$MEMORY_ID/original | jq '.content'
-
-# 5. Mark as reviewed
-curl -s -X POST $BASE_URL/memories/$MEMORY_ID/quality-review \
+# 3. Search for related memories
+curl -s -X POST "$BASE_URL/memories/search" \
   -H "Content-Type: application/json" \
-  -d '{
-    "approved": true,
-    "notes": "Quality acceptable"
-  }' | jq '.'
+  -d '{"query": "architecture review", "limit": 5}' | jq '.'
 ```
 
 ### Consultation Workflow
@@ -704,23 +588,14 @@ curl -s -X POST $BASE_URL/memories/$MEMORY_ID/quality-review \
 ```bash
 #!/bin/bash
 
-BASE_URL="http://localhost:5000"
+BASE_URL="http://localhost:5002"
 
-# 1. Get bundle recommendation
-BUNDLE=$(curl -s -X POST $BASE_URL/bundle/recommend \
-  -H "Content-Type: application/json" \
-  -d '{
-    "task_description": "Design REST API for restaurants"
-  }' | jq '.recommended_bundle' -r)
-
-echo "Recommended bundle: $BUNDLE"
-
-# 2. Consult Graeae
+# Consult Graeae
 curl -s -X POST $BASE_URL/graeae/consult \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Design REST API for restaurants",
-    "task_type": "'$BUNDLE'",
+    "task_type": "architecture_design",
     "mode": "external"
   }' | jq '.'
 ```
@@ -730,7 +605,7 @@ curl -s -X POST $BASE_URL/graeae/consult \
 ```bash
 #!/bin/bash
 
-BASE_URL="http://localhost:5000"
+BASE_URL="http://localhost:5002"
 
 # Create multiple memories
 for i in {1..5}; do
@@ -777,5 +652,5 @@ For issues or questions:
 
 ---
 
-**API Documentation Version**: 2.0.0
+**API Documentation Version**: 2.3.0
 **Last Updated**: February 5, 2026

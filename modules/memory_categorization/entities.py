@@ -12,6 +12,10 @@ Provides:
 - delete_entity(): Remove entity
 """
 
+# Library API: This module provides a programmatic interface to the journal/state/entities
+# subsystem for use in Python applications that embed MNEMOS directly.
+# The REST API handlers (api/handlers/) use direct asyncpg queries for performance.
+
 import logging
 from typing import List, Dict, Any, Optional
 from uuid import uuid4
@@ -19,7 +23,7 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-ENTITY_TYPES = ['person', 'project', 'concept', 'document', 'decision', 'event']
+from modules.memory_categorization.constants import ENTITY_TYPES
 
 
 class EntityManager:

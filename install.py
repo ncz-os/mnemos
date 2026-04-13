@@ -94,10 +94,31 @@ def enable_rls(db_name: str) -> bool:
 
 
 def create_root_api_key(db_name: str) -> str | None:
-    """Insert a root API key for the default user and return the raw key."""
+    """Insert a root API key for the default user and return the raw key.
+
+    Uses psycopg parameterized queries to prevent SQL injection.
+    Falls back to the hex-safe psql approach if psycopg is not available.
+    """
     raw_key = secrets.token_hex(32)
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
     key_prefix = raw_key[:8]
+
+    try:
+        import psycopg  # type: ignore
+        conn_str = f"dbname={db_name} user=postgres"
+        with psycopg.connect(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO api_keys (user_id, key_hash, key_prefix, label) "
+                    "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                    ("default", key_hash, key_prefix, "root-install"),
+                )
+            conn.commit()
+        return raw_key
+    except ImportError:
+        pass
+
+    # Fallback: psql CLI — key_hash and key_prefix are hex-only (no SQL special chars)
     sql = (
         f"INSERT INTO api_keys (user_id, key_hash, key_prefix, label) "
         f"VALUES ('default', '{key_hash}', '{key_prefix}', 'root-install') "
@@ -124,7 +145,7 @@ def main() -> None:
     ]
 
     print("=" * 60)
-    print("  MNEMOS v1 Installer")
+    print("  MNEMOS v2.3.0 Installer")
     print("=" * 60)
 
     # 1. Choose deployment profile
@@ -142,10 +163,10 @@ def main() -> None:
 
     # 3. Collect service config
     print("\n--- Service ---")
-    _ = prompt("Listen host", "0.0.0.0")
-    listen_port = prompt("Listen port", "5000")
-    _ = prompt("GRAEAE URL", "http://localhost:5001")
-    _ = prompt("Ollama host (for embeddings)", "http://localhost:11434")
+    listen_port = prompt("Listen port", "5002")
+
+    # Note: GRAEAE URL and Ollama host are configured in config.toml
+    # Edit config.toml directly after installation (see config.toml.example)
 
     # 4. Determine auth/RLS settings
     auth_enabled = profile in ("team", "enterprise")
@@ -170,6 +191,11 @@ def main() -> None:
     }
 
     print("\n--- Writing config.toml ---")
+    if not os.path.exists(config_path):
+        print(f"  [NOTE] config.toml not found. Copy config.toml.example first:")
+        print(f"         cp config.toml.example config.toml")
+        print(f"         Then re-run this installer.")
+        sys.exit(1)
     append_config(config_path, new_sections)
 
     # 6. Run migrations in order

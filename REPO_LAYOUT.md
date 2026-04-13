@@ -9,7 +9,7 @@
 | `db/` | Database schema, migrations, and connection utilities |
 | `modules/` | Core subsystems: compression, memory categorization, routing, hooks, bundles |
 | `graeae/` | GRAEAE consensus reasoning engine integration |
-| `integrations/` | Optional third-party integrations (external LLMs, macrodata hooks) |
+| `integrations/` | Optional third-party integrations (external LLMs, external system hooks) |
 | `tests/` | pytest unit/integration tests; live E2E tests excluded from default run |
 | `tools/` | Maintenance and migration utilities |
 | `docs/` | Extended documentation |

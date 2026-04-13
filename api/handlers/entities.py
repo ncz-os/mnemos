@@ -2,6 +2,7 @@
 import logging
 from typing import Optional, List
 
+import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
@@ -11,7 +12,7 @@ from api.auth import UserContext, get_current_user
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["entities"])
 
-ENTITY_TYPES = ['person', 'project', 'concept', 'document', 'decision', 'event']
+from modules.memory_categorization.constants import ENTITY_TYPES
 
 
 class EntityCreateRequest(BaseModel):
@@ -40,7 +41,6 @@ async def create_entity(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     try:
-        import uuid
         entity_id = str(uuid.uuid4())
         async with _lc._pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -55,7 +55,7 @@ async def create_entity(
         return dict(row)
     except Exception as e:
         logger.error(f"Error creating entity: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/entities")
@@ -97,7 +97,7 @@ async def list_entities(
                 )
         return {"entities": [dict(r) for r in rows], "count": len(rows)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/entities/{entity_id}")
@@ -158,7 +158,7 @@ async def update_entity(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/entities/{entity_id}/link", status_code=200)
@@ -203,7 +203,7 @@ async def link_entities(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete("/entities/{entity_id}", status_code=204)
@@ -225,7 +225,7 @@ async def delete_entity(entity_id: str, user: UserContext = Depends(get_current_
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/entities/{entity_id}/related")

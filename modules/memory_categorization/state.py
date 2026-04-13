@@ -10,6 +10,10 @@ Provides:
 - save_state(key, value): Alias for set()
 """
 
+# Library API: This module provides a programmatic interface to the journal/state/entities
+# subsystem for use in Python applications that embed MNEMOS directly.
+# The REST API handlers (api/handlers/) use direct asyncpg queries for performance.
+
 import logging
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
@@ -71,7 +75,7 @@ class StateManager:
             logger.error(f"Error deleting state key '{key}': {e}", exc_info=True)
             return False
 
-    async def list_keys(self) -> List[str]:
+    async def list_keys(self) -> List[Dict[str, Any]]:
         """Return all state keys."""
         if not self.db_pool:
             return []

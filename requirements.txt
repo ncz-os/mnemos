@@ -26,13 +26,21 @@ python-dotenv>=1.0.0
 # MCP server
 mcp>=1.0.0
 
-# Inference (Phi server)
-openvino-genai>=2024.4.0
-fastembed>=0.3.0          # nomic-embed-text-v1.5, 768-dim; pulls onnxruntime transitively
-
 # Async utilities (transitive, pinned for stability)
 anyio>=4.4.0
 
 # Utilities
 numpy>=1.26.0
 psutil>=5.9.0
+
+# Optional: Intel OpenVINO / phi_server.py (local GPU inference)
+# Install separately: pip install -r requirements-phi.txt
+# openvino-genai>=2024.4.0
+# fastembed>=0.3.0
+
+# Optional: Full SENTENCE compression support (sentence-level compression)
+# sentence-transformers>=2.7.0
+# spacy>=3.7.0
+
+# Optional: Full extractive token filter compression support
+# networkx>=3.3

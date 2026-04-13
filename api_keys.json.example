@@ -1,0 +1,11 @@
+{
+  "_comment": "Copy to ~/.config/mnemos/api_keys.json and fill in your API keys",
+  "openai": "sk-...",
+  "anthropic": "sk-ant-...",
+  "groq": "gsk_...",
+  "perplexity": "pplx-...",
+  "together": "...",
+  "xai": "xai-...",
+  "google": "AIza...",
+  "nvidia": "nvapi-..."
+}
