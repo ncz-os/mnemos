@@ -40,14 +40,17 @@ async def create_journal_entry(
         raise HTTPException(status_code=503, detail="Database pool not available")
     try:
         entry_id = str(uuid.uuid4())
-        entry_date = req.date or "CURRENT_DATE"
         async with _lc._pool.acquire() as conn:
             if req.date:
+                try:
+                    entry_date = date.fromisoformat(req.date)
+                except ValueError:
+                    raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD")
                 row = await conn.fetchrow(
                     '''INSERT INTO journal (id, entry_date, topic, content, metadata)
-                       VALUES ($1, $2::date, $3, $4, $5::jsonb)
+                       VALUES ($1, $2, $3, $4, $5::jsonb)
                        RETURNING id, entry_date::text, topic, content, metadata, created::text''',
-                    entry_id, req.date, req.topic, req.content,
+                    entry_id, entry_date, req.topic, req.content,
                     json.dumps(req.metadata or {}),
                 )
             else:
@@ -77,10 +80,14 @@ async def list_journal_entries(
     try:
         async with _lc._pool.acquire() as conn:
             if date_str:
+                try:
+                    parsed_date = date.fromisoformat(date_str)
+                except ValueError:
+                    raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD")
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
                        FROM journal WHERE entry_date = $1 ORDER BY created DESC LIMIT $2''',
-                    date_str, limit
+                    parsed_date, limit
                 )
             elif topic:
                 rows = await conn.fetch(
