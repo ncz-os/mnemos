@@ -137,7 +137,11 @@ async def get_version(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM memory_versions WHERE memory_id = $1 AND version_num = $2",
+            "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
+            "verbatim_content, owner_id, namespace, permission_mode, "
+            "source_model, source_provider, source_session, source_agent, "
+            "snapshot_at, snapshot_by, change_type "
+            "FROM memory_versions WHERE memory_id = $1 AND version_num = $2",
             memory_id, version_num,
         )
     if not row:
@@ -201,7 +205,11 @@ async def revert_memory(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         ver_row = await conn.fetchrow(
-            "SELECT * FROM memory_versions WHERE memory_id = $1 AND version_num = $2",
+            "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
+            "verbatim_content, owner_id, namespace, permission_mode, "
+            "source_model, source_provider, source_session, source_agent, "
+            "snapshot_at, snapshot_by, change_type "
+            "FROM memory_versions WHERE memory_id = $1 AND version_num = $2",
             memory_id, version_num,
         )
         if not ver_row:
