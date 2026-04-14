@@ -213,11 +213,17 @@ W6 SEARCH: SEMANTIC + FTS + FILTERS
   PASS: all returned items category=solutions
   SUBCATEGORY FILTER: -d '{"query":"harness","subcategory":"harness","limit":3}'
   PASS: all returned items subcategory=harness (if seeds had subcategory set)
+  SOURCE_PROVIDER FILTER: -d '{"query":"test","source_provider":"anthropic","limit":5}'
+  PASS: only memories with source_provider=anthropic returned
+  NAMESPACE FILTER: -d '{"query":"test","namespace":"test_ns","limit":5}'
+  PASS: only memories with namespace=test_ns returned
+  COMBINED PROVENANCE FILTER: -d '{"query":"test","source_provider":"anthropic","namespace":"test_ns"}'
+  PASS: ANDs all filters — only memories matching all specified provenance fields returned
   PAGINATION: -d '{"query":"test","limit":2,"offset":0}' then offset=2
   PASS: non-overlapping result sets | total consistent
   LARGE RESULT COMPRESSION: seed 50+ memories, search broadly → result set may trigger compression manifest
   PASS: if compression triggered, response includes compression_manifest | memories still accessible
-  Capture: search_result_count | top_score | category_filter_respected | subcategory_filter_respected | pagination_works | embedding_present
+  Capture: search_result_count | top_score | category_filter_respected | subcategory_filter_respected | provenance_filter_works | pagination_works | embedding_present
 
 W7 KNOWLEDGE GRAPH TRIPLES + TIMELINE
   CREATE: curl -s -X POST $BASE_URL/kg/triples $AUTH_HDR \
@@ -397,14 +403,14 @@ W24 STATE MANAGEMENT
 
 W25 ENTITIES CRUD
   CREATE PERSON: curl -s -X POST $BASE_URL/entities $AUTH_HDR -H "Content-Type: application/json" \
-    -d '{"type":"person","name":"Harness TestUser","description":"Created by MN-RUN-<run_id>"}'
-  PASS: 201 | id + type=person + name + description
+    -d '{"entity_type":"person","name":"Harness TestUser","description":"Created by MN-RUN-<run_id>"}'
+  PASS: 201 | id + entity_type=person + name + description
   CREATE PROJECT: curl -s -X POST $BASE_URL/entities $AUTH_HDR \
-    -d '{"type":"project","name":"MNEMOS Harness","description":"Test project MN-RUN-<run_id>"}'
-  PASS: 201 | type=project
+    -d '{"entity_type":"project","name":"MNEMOS Harness","description":"Test project MN-RUN-<run_id>"}'
+  PASS: 201 | entity_type=project
   LIST ALL:    curl -s $BASE_URL/entities $AUTH_HDR
   PASS: both created entities present
-  FILTER TYPE: curl -s "$BASE_URL/entities?type=person" $AUTH_HDR
+  FILTER TYPE: curl -s "$BASE_URL/entities?entity_type=person" $AUTH_HDR
   PASS: only person entities returned
   SEARCH:  curl -s "$BASE_URL/entities?search=Harness" $AUTH_HDR
   PASS: both harness entities returned (name match)
@@ -526,8 +532,10 @@ W33 MODEL REGISTRY ENDPOINTS
   PASS: one model per provider | ranked by graeae_weight
   STATS: curl -s $BASE_URL/model-registry/stats $AUTH_HDR
   PASS: total_models + provider_count + deprecated_count present
-  SYNC (admin): curl -s -X POST $BASE_URL/model-registry/sync $AUTH_HDR
-  PASS: 200 | sync triggered (may be async) | no crash
+  SYNC (admin): curl -s -X POST $BASE_URL/model-registry/sync $AUTH_HDR \
+    -H "Content-Type: application/json" -d '{"dry_run":true}'
+  PASS: 200 | array of SyncResult objects per provider | models_found > 0 | no crash
+  NOTE: Requires api_keys.json with provider credentials. POST body is required (422 without it).
   Capture: registry_list_count | providers_count | best_per_provider_count | registry_stats_present | sync_status
 
 ═══════════════════════════════════════════════════════════ SUPPLEMENTAL ═══════════════════════════════════════════════════════════
