@@ -1,0 +1,956 @@
+MNEMOS TEST HARNESS V2.0.0 | MN-RUN-<YYYYMMDD>-<seq> | Session: mn-harness-v200
+Supersedes: mnemos_harness_v100.txt (install-only matrix, hardcoded infra, missing v2.x API surface)
+Changes: OSS-safe env-var creds | full v2.3.0 API coverage | multi-matrix (install × auth × search × resilience)
+         corrected endpoint URLs | Phase 6-10 new workflows | extended JSON schema + rejection codes
+
+═══════════════════════════════════════════════════════════ CAPABILITIES ═══════════════════════════════════════════════════════════
+CAP1 INSTALL    ssh $SSH_USER@$TEST_HOST "<command>"
+CAP2 REMEDIATE  Claude edits source → commit $GIT_HOST → re-pull $TEST_HOST → restart
+CAP3 API        curl -s $BASE_URL/<endpoint> (all API calls go here)
+CAP4 GRAEAE     curl -X POST $GRAEAE_URL/graeae/consult -d '{"prompt":"q","task_type":"reasoning"}'
+CAP5 TOOLS      python3 /opt/mnemos/tools/<tool>.py <args>  (via SSH to $TEST_HOST)
+CAP6 PROD       ssh $SSH_USER@$PROD_HOST "<command>"  (upgrade target only — never run W0.1 here)
+
+LIFECYCLE OPS (Claude via Bash SSH)
+  W0.1 Teardown: ssh $SSH_USER@$TEST_HOST "sudo systemctl stop mnemos 2>/dev/null; sudo systemctl disable mnemos 2>/dev/null; sudo rm -f /etc/systemd/system/mnemos.service; sudo systemctl daemon-reload; sudo rm -rf /opt/mnemos /etc/mnemos; sudo userdel -r mnemos 2>/dev/null; sudo -u postgres psql -c 'DROP DATABASE IF EXISTS mnemos_test;' 2>/dev/null; sudo -u postgres psql -c 'DROP USER IF EXISTS mnemos;' 2>/dev/null"
+  W0.2 Pull:     ssh $SSH_USER@$GIT_HOST "cd /opt/mnemos && git fetch origin && git reset --hard origin/master" 2>/dev/null || true
+  W0.3 Install:  ssh $SSH_USER@$TEST_HOST "cd /opt/mnemos && sudo python3 -m installer --unattended"
+NOT: fabricate API output | skip health gate | assume install succeeded | hardcode internal IPs
+
+═══════════════════════════════════════════════════════════ CREDENTIALS (OSS-SAFE ENV VARS) ═══════════════════════════════════════════════════════════
+Required before first run — export in shell or add to .zshrc/.bashrc:
+
+  export TEST_HOST=<ip-or-hostname>          # fresh-install test target (e.g. a Debian VM or spare server)
+  export PROD_HOST=<ip-or-hostname>          # production upgrade target (existing MNEMOS instance)
+  export GIT_HOST=<ip-or-hostname>           # git source-of-truth host (ARGONAS or any git server)
+  export SSH_USER=<your-username>            # SSH user on TEST_HOST and PROD_HOST
+  export GIT_REMOTE_PATH=<path>             # path to mnemos bare repo on GIT_HOST
+  export BASE_URL=http://$TEST_HOST:5002     # set after install; update if port differs
+  export GRAEAE_URL=http://<graeae-host>:5001  # if GRAEAE runs on a separate host, else same as BASE_URL minus port
+  export API_KEY=<captured-post-install>     # populated by W1; also: export MNEMOS_API_KEY=$API_KEY
+
+  # Capture after W1:
+  # export API_KEY=$(ssh $SSH_USER@$TEST_HOST "sudo -u postgres psql mnemos_test -t -c \"SELECT raw_key FROM api_keys ORDER BY created_at DESC LIMIT 1;\"" 2>/dev/null | tr -d ' ')
+
+  VERIFY: echo "TEST=${TEST_HOST} PROD=${PROD_HOST} GIT=${GIT_HOST} BASE_URL=${BASE_URL}"
+  NEVER COMMIT: API_KEY values | any .env files | private SSH keys
+
+═══════════════════════════════════════════════════════════ ROLES ═══════════════════════════════════════════════════════════
+CLAUDE        orchestrator + remediator: runs SSH commands, edits source, commits, interprets results
+TEST_HOST     fresh-install target: Debian/Ubuntu, Python 3.13+, PostgreSQL 17, 8GB+ RAM, 10GB+ disk
+PROD_HOST     production upgrade target: existing live MNEMOS instance with real data (W3 only)
+GIT_HOST      source-of-truth git remote: bare repo at $GIT_REMOTE_PATH (master branch)
+
+═══════════════════════════════════════════════════════════ SESSION ROUTING ═══════════════════════════════════════════════════════════
+Target selection    TEST_HOST: all install/fresh-start/matrix workflows | PROD_HOST: upgrade path (W3) only
+Endpoint base       BASE_URL=$BASE_URL (default http://$TEST_HOST:5002)
+Port conflicts      5002 reserved for MNEMOS; 5001 reserved for GRAEAE
+Version pin         Harness v200 ↔ git tag v2.0.0+ on $GIT_HOST master
+Run ID format       MN-RUN-YYYYMMDD-NNN (3-digit sequence, monotonic, never reused within date)
+Auth header         -H "Authorization: Bearer $API_KEY"  (omit when auth_mode=personal)
+
+═══════════════════════════════════════════════════════════ DRIFT STOP CONDITIONS ═══════════════════════════════════════════════════════════
+S1  "assume health OK"        → always verify curl /health before next workflow
+S2  "skip install, test API"  → W0 lifecycle is mandatory for fresh-install matrix cases
+S3  output missing/unexpected → do NOT fabricate; log as UNVERIFIED; classify blocker
+S4  step fails                → classify: ENVIRONMENTAL | CODE_DEFECT | CONFIG_ERROR | UNFIXABLE
+S5  "edit config by hand"     → all config through installer or documented override only
+S6  migration failure         → STOP; do not proceed to Phase 2+ with partial schema
+S7  "check in Python"         → parse JSON output in prose; report as-is
+S8  "use /history endpoint"   → WRONG; versioning uses /versions, /diff, /revert (v2 API)
+S9  "kg/timeline?subject="    → WRONG; timeline uses path param: /kg/timeline/{subject}
+S10 auth_mode=personal + Bearer header → WARN; personal mode ignores auth but test should omit header
+
+═══════════════════════════════════════════════════════════ BLOCKER HANDLING ═══════════════════════════════════════════════════════════
+ENVIRONMENTAL   Fix: restart service | reset DB | reinstall prereq | export missing env var
+                Max 2 retries → still blocked: surface + restart W0
+                Common: port bound | postgres auth fail | pgvector missing | systemd unit absent
+
+CODE_DEFECT     1. Capture exact error (stderr + exit code)
+                2. Identify root cause in source file:line
+                3. Edit source directly on TEST_HOST at /opt/mnemos/
+                4. git add + commit to $GIT_HOST (master) → log argonas_repair_commit_sha
+                5. Re-pull to TEST_HOST + restart → W0.1→W0.3; increment restart_count
+
+CONFIG_ERROR    1. Identify mismatched key (config.toml vs env var vs default)
+                2. Correct via installer --upgrade or direct config.toml edit
+                3. Restart → verify health
+                4. Log corrected_config_key + before_value + after_value
+
+UNFIXABLE       Log reason → surface to user → HALT
+
+═══════════════════════════════════════════════════════════ DIRECTIVE FORMAT (every response, before 📝) ═══════════════════════════════════════════════════════════
+🎯 DIRECTIVE: CAP1—Install | CAP2—Remediate | CAP3—API | CAP4—GRAEAE | CAP5—Tools | CAP6—Prod
+Action: <what> | Reason: <why>
+CAP2 only: root_cause: <file:line> | fix_applied: <description> | argonas_repair_commit_sha: <sha>
+
+═══════════════════════════════════════════════════════════ RESPONSE FORMAT (every step) ═══════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════ WORKFLOW [N]: [Name] ═══════════════════════════════════════════════════════════
+🎯 DIRECTIVE | 📝 COMMAND EXECUTED | ✅ HUMAN-READABLE | 📊 JSON | 🔍 WATCHDOG
+Rules: 5 sections required | 📊 complete JSON per schema | 🔍 explicit alert_level + next_action
+Missing 🎯/narrative → HUMAN_READABLE_VIOLATION | Missing JSON → JSON_BLOCK_MISSING_VIOLATION
+
+═══════════════════════════════════════════════════════════ PREREQS (before W0) ═══════════════════════════════════════════════════════════
+TEST_HOST CONN    ssh -o ConnectTimeout=3 $SSH_USER@$TEST_HOST "hostname"  → BLOCKED if unreachable
+GIT_HOST CONN     ssh -o ConnectTimeout=3 $SSH_USER@$GIT_HOST "hostname"   → warn if unreachable
+GRAEAE HEALTH     curl -s $GRAEAE_URL/health                                → BLOCKED for Phase 4 if down; warn-only otherwise
+DISK FREE         ssh $SSH_USER@$TEST_HOST "df -h /opt" → BLOCKED if < 4GB free
+POSTGRES UP       ssh $SSH_USER@$TEST_HOST "sudo -u postgres psql -c '\l'" → BLOCKED if postgres not running
+ENV VARS SET      [ -n "$TEST_HOST" ] && [ -n "$BASE_URL" ] && [ -n "$SSH_USER" ] → BLOCKED if any missing
+
+═══════════════════════════════════════════════════════════ LIFECYCLE W0 (mandatory every fresh-install run) ═══════════════════════════════════════════════════════════
+W0.1 TEARDOWN (fresh-install runs only — skip for upgrade runs on PROD_HOST)
+  ssh $SSH_USER@$TEST_HOST "sudo systemctl stop mnemos 2>/dev/null; sudo systemctl disable mnemos 2>/dev/null; sudo rm -f /etc/systemd/system/mnemos.service; sudo systemctl daemon-reload; sudo rm -rf /opt/mnemos /etc/mnemos; sudo userdel -r mnemos 2>/dev/null; sudo -u postgres psql -c 'DROP DATABASE IF EXISTS mnemos_test;' 2>/dev/null; sudo -u postgres psql -c 'DROP USER IF EXISTS mnemos;' 2>/dev/null"
+  Verify: ssh $SSH_USER@$TEST_HOST "test ! -d /opt/mnemos && echo CLEAN || echo DIRTY"
+  BLOCKED if DIRTY | teardown_status: succeeded | skipped_upgrade_run | failed | blocked
+
+W0.2 PULL LATEST (GIT_HOST → TEST_HOST)
+  ssh $SSH_USER@$GIT_HOST "cd $GIT_REMOTE_PATH && git log --oneline -1" 2>/dev/null || echo "GIT_HOST skip"
+  ssh $SSH_USER@$TEST_HOST "git clone ssh://$SSH_USER@$GIT_HOST/$GIT_REMOTE_PATH /opt/mnemos 2>/dev/null || (cd /opt/mnemos && git fetch origin && git reset --hard origin/master)"
+  Verify: ssh $SSH_USER@$TEST_HOST "cd /opt/mnemos && git rev-parse HEAD" → capture repo_head_sha
+
+W0.3 INSTALL
+  ssh $SSH_USER@$TEST_HOST "cd /opt/mnemos && sudo python3 -m installer --unattended"
+  BLOCKED if non-zero exit | capture: install_exit_code | install_stdout_tail | install_stderr_tail
+
+W0.4 HEALTH GATE
+  curl -s $BASE_URL/health
+  PASS: {"status":"healthy","database_connected":true,...}
+  FAIL → BLOCKED; do not proceed to Phase 2+
+  Capture: health_status | database_connected | version | mnemos_version
+
+W0.5 MIGRATION VERIFY
+  ssh $SSH_USER@$TEST_HOST "sudo -u postgres psql mnemos_test -c 'SELECT version FROM schema_migrations ORDER BY applied_at DESC LIMIT 1;'"
+  Expected: ≥ 4 migrations (001_initial, 002_versioning, 003_kg, 004_compression or equivalent)
+  BLOCKED if migration_count < 4 | capture: latest_migration | migration_count
+
+W0.6 AUTH SETUP (team mode only — skip when auth_mode=personal)
+  Extract API key after install: sudo -u postgres psql mnemos_test -t -c "SELECT raw_key FROM api_keys ORDER BY created_at DESC LIMIT 1;"
+  export API_KEY=<captured>
+  Verify: curl -s -H "Authorization: Bearer $API_KEY" $BASE_URL/health | grep healthy
+  capture: api_key_created | api_key_functional
+
+CLEANUP (end of run)
+  ssh $SSH_USER@$TEST_HOST "sudo systemctl stop mnemos; sudo rm -rf /tmp/mnemos-MN-RUN-<run_id>/"
+
+═══════════════════════════════════════════════════════════ INSTALL PACKAGE LAYOUT (V2.x) ═══════════════════════════════════════════════════════════
+installer/  __main__.py | __init__.py | agent.py | wizard.py | db.py | service.py | venv_setup.py | detect.py
+tools/      docling_import.py | memory_import.py
+api/        __init__.py | app.py | lifecycle.py | auth.py
+api/handlers/  memories.py | health.py | kg.py | graeae_routes.py | journal.py | ingest.py
+               state.py | entities.py | versions.py | model_registry_routes.py | admin.py
+graeae/     engine.py | providers/
+migrations/ 001_initial.sql | 002_versioning.sql | 003_kg.sql | 004_compression.sql
+install.sh  Bootstrap: apt/dnf/brew packages → python venv → python -m installer
+config.toml.example  [database] | [api] | [auth] | [graeae] | [embedding] | [compression]
+
+═══════════════════════════════════════════════════════════ WORKFLOW SEQUENCE ═══════════════════════════════════════════════════════════
+PHASE 0   W0 (lifecycle — mandatory every fresh-install run)
+PHASE 1   W1 (unattended install) | W2 (wizard mode) | W3 (upgrade path) | W4 (check mode)
+PHASE 2   W5 (memory CRUD + provenance) | W6 (search: semantic + FTS + filters) | W7 (KG triples + timeline)
+          W8 (versioning: list + retrieve + diff + revert) | W9 (bulk operations) | W10 (rehydration)
+PHASE 3   W11 (compression trigger) | W12 (compression verify) | W13 (distillation quality) | W14 (phase labels)
+PHASE 4   W15 (GRAEAE consult) | W16 (GRAEAE audit chain) | W17 (provider fallback) | W18 (KG temporal timeline)
+PHASE 5   W19 (docling import) | W20 (JSON/CSV import) | W21 (ChatGPT/Obsidian import) | W22 (stats verify)
+PHASE 6   W23 (journal CRUD) | W24 (state management) | W25 (entities CRUD)
+PHASE 7   W26 (session ingest) | W27 (bulk memory create)
+PHASE 8   W28 (auth guard — no-auth mode) | W29 (team mode API key gating) | W30 (RLS namespace isolation)
+PHASE 9   W31 (provenance + ownership fields) | W32 (source model/provider tracking)
+PHASE 10  W33 (model registry: list, providers, best, stats)
+SUPPLEMENTAL  WS1 (startup guard) | WS2 (background drain) | WS3 (SELECT * audit) | WS4 (service restart)
+              WS5 (config dead constants) | WS6 (concurrent inserts) | WS7 (request size limits) | WS8 (cache coherency)
+
+DEFAULT FLOW   W0 → W1 → W5 → W6 → W7 → W8 → W9 → W10 → W11 → W12 → W15 → W19 → W22 → W23 → W24 → W25 → W26 → W27
+FULL FLOW      W0 → W1 → W2 → W3 → W4 → W5–W33 → WS1–WS8
+
+═══════════════════════════════════════════════════════════ PHASE 1: INSTALL VERIFICATION ═══════════════════════════════════════════════════════════
+W1 UNATTENDED INSTALL
+  ssh $SSH_USER@$TEST_HOST "cd /opt/mnemos && sudo python3 -m installer --unattended"
+  PASS: exit 0 + health 200 + database_connected=true + service active
+  Capture: install_mode=unattended | install_exit_code | service_active | api_key_created
+
+W2 WIZARD MODE (interactive simulation)
+  MNEMOS_DB_HOST=localhost MNEMOS_DB_NAME=mnemos_test MNEMOS_DB_USER=mnemos MNEMOS_DB_PASSWORD=testpass \
+    ssh $SSH_USER@$TEST_HOST "cd /opt/mnemos && python3 -m installer --wizard 2>&1" || \
+    echo "wizard_mode_status: interactive_fallback_used"
+  PASS: same health gate as W1 | wizard_mode_status: completed | interactive_fallback_used: yes|no
+
+W3 UPGRADE PATH (PROD_HOST — never run W0.1 here)
+  Before: curl -s http://$PROD_HOST:5002/stats → capture memories_before
+  Upgrade: ssh $SSH_USER@$PROD_HOST "cd /opt/mnemos && sudo python3 -m installer --upgrade"
+  After: curl -s http://$PROD_HOST:5002/stats → capture memories_after
+  PASS: exit 0 + memories_after >= memories_before + health 200
+  Capture: memories_before | memories_after | upgrade_exit_code | migrations_run_count
+
+W4 CHECK MODE
+  ssh $SSH_USER@$TEST_HOST "cd /opt/mnemos && python3 -m installer --check"
+  PASS: exit 0 + structured report (Python OK | PostgreSQL OK | pgvector OK | service status)
+  Capture: check_python_ok | check_postgres_ok | check_pgvector_ok | check_service_active
+
+═══════════════════════════════════════════════════════════ PHASE 2: CORE API FUNCTIONAL ═══════════════════════════════════════════════════════════
+AUTH_HDR="-H 'Authorization: Bearer $API_KEY'"  # omit when auth_mode=personal
+
+W5 MEMORY CRUD + PROVENANCE
+  CREATE:  curl -s -X POST $BASE_URL/memories $AUTH_HDR -H "Content-Type: application/json" \
+             -d '{"content":"Harness test memory MN-RUN-<run_id>","category":"solutions","subcategory":"harness",
+                  "source":"mnemos_harness","source_provider":"internal","source_model":"test_agent",
+                  "source_session":"MN-RUN-<run_id>","metadata":{"harness_run":"<run_id>"}}'
+  PASS: id starts with mem_ | category=solutions | subcategory=harness | source_provider=internal | version=1
+  READ:    curl -s $BASE_URL/memories/<id> $AUTH_HDR
+  PASS: same id | content matches | version=1 | source_provider present
+  UPDATE:  curl -s -X PATCH $BASE_URL/memories/<id> $AUTH_HDR -d '{"content":"Updated harness MN-RUN-<run_id>"}'
+  PASS: version=2 | updated content returned
+  DELETE:  curl -s -X DELETE $BASE_URL/memories/<id> $AUTH_HDR  → 204
+  PASS: subsequent GET returns 404
+  Capture: memory_id | create_status | read_status | update_status | delete_status | version_after_update=2 | provenance_fields_present
+
+W6 SEARCH: SEMANTIC + FTS + FILTERS
+  Seed 4 memories with distinct categories: infrastructure | solutions | patterns | decisions
+  SEMANTIC: curl -s -X POST $BASE_URL/memories/search $AUTH_HDR \
+              -d '{"query":"infrastructure network config","limit":5,"min_score":0.3}'
+  PASS: results non-empty | each result has id+content+score+category | score ≤ 1.0 | top_score > 0.3
+  CATEGORY FILTER: -d '{"query":"test","category":"solutions","limit":3}'
+  PASS: all returned items category=solutions
+  SUBCATEGORY FILTER: -d '{"query":"harness","subcategory":"harness","limit":3}'
+  PASS: all returned items subcategory=harness (if seeds had subcategory set)
+  SOURCE_PROVIDER FILTER: -d '{"query":"test","source_provider":"anthropic","limit":5}'
+  PASS: only memories with source_provider=anthropic returned
+  NAMESPACE FILTER: -d '{"query":"test","namespace":"test_ns","limit":5}'
+  PASS: only memories with namespace=test_ns returned
+  COMBINED PROVENANCE FILTER: -d '{"query":"test","source_provider":"anthropic","namespace":"test_ns"}'
+  PASS: ANDs all filters — only memories matching all specified provenance fields returned
+  PAGINATION: -d '{"query":"test","limit":2,"offset":0}' then offset=2
+  PASS: non-overlapping result sets | total consistent
+  LARGE RESULT COMPRESSION: seed 50+ memories, search broadly → result set may trigger compression manifest
+  PASS: if compression triggered, response includes compression_manifest | memories still accessible
+  Capture: search_result_count | top_score | category_filter_respected | subcategory_filter_respected | provenance_filter_works | pagination_works | embedding_present
+
+W7 KNOWLEDGE GRAPH TRIPLES + TIMELINE
+  CREATE: curl -s -X POST $BASE_URL/kg/triples $AUTH_HDR \
+            -d '{"subject":"MNEMOS","predicate":"runs_on","object":"test_host","subject_type":"system",
+                 "object_type":"server","confidence":0.95,"valid_from":"2026-01-01"}'
+  PASS: response has id+subject+predicate+object+subject_type+object_type+valid_from+valid_until+memory_id+confidence+created (11 explicit columns)
+  LIST:   curl -s "$BASE_URL/kg/triples?subject=MNEMOS" $AUTH_HDR
+  PASS: array with created triple | all 11 columns per item | no SELECT * regression
+  UPDATE: curl -s -X PATCH $BASE_URL/kg/triples/<id> $AUTH_HDR -d '{"confidence":0.99}'
+  PASS: confidence updated | other fields unchanged
+  DELETE: curl -s -X DELETE $BASE_URL/kg/triples/<id> $AUTH_HDR → 204
+  PASS: subsequent list returns empty or excludes deleted triple
+  Capture: triple_id | kg_list_count | kg_update_status | kg_delete_status | columns_verified
+
+W8 VERSIONING: LIST, RETRIEVE, DIFF, REVERT
+  Setup: create memory → update twice (version 1→2→3)
+  LIST VERSIONS:    curl -s $BASE_URL/memories/<id>/versions $AUTH_HDR
+  PASS: array of 3 version objects | ordered oldest-first | each has content+version_num+created_at
+  RETRIEVE VERSION: curl -s $BASE_URL/memories/<id>/versions/1 $AUTH_HDR
+  PASS: version_num=1 | content = original create content (NOT current)
+  DIFF:   curl -s "$BASE_URL/memories/<id>/diff?from_version=1&to_version=3" $AUTH_HDR
+  PASS: unified diff format | shows added/removed lines between v1 and v3
+  REVERT: curl -s -X POST $BASE_URL/memories/<id>/revert/1 $AUTH_HDR
+  PASS: current content = v1 content | new version created (v4) | version_count=4
+  Capture: version_count | history_endpoint_status | version_retrieval_status | diff_status | revert_status
+
+W9 BULK OPERATIONS
+  BULK CREATE: curl -s -X POST $BASE_URL/memories/bulk $AUTH_HDR -H "Content-Type: application/json" \
+    -d '{"memories":[
+      {"content":"Bulk memory 1 MN-RUN-<run_id>","category":"facts","source":"harness"},
+      {"content":"Bulk memory 2 MN-RUN-<run_id>","category":"facts","source":"harness"},
+      {"content":"","category":"facts"}
+    ]}'
+  PASS: created=2 | errors=1 (empty content rejected) | memory_ids has 2 entries
+  Verify created: GET /memories/<id1> and <id2> → both exist
+  Empty body rejection: send {"memories":[]} → 201 with created=0, errors=[]
+  Capture: bulk_created_count=2 | bulk_error_count=1 | empty_content_rejected | ids_retrievable
+
+W10 REHYDRATION
+  Seed 10+ memories across categories
+  REHYDRATE: curl -s -X POST $BASE_URL/memories/rehydrate $AUTH_HDR -H "Content-Type: application/json" \
+    -d '{"query":"infrastructure solutions patterns","limit":10,"token_budget":4000}'
+  PASS: response has memories array | token_budget respected (total content ≤ token_budget chars) | compression_manifest present if truncated
+  Capture: rehydrate_result_count | token_budget_respected | compression_manifest_present
+
+═══════════════════════════════════════════════════════════ PHASE 3: COMPRESSION PIPELINE ═══════════════════════════════════════════════════════════
+PREREQ: backdate ≥ 10 memories to simulate age:
+  ssh $SSH_USER@$TEST_HOST "sudo -u postgres psql mnemos_test -c \"UPDATE memories SET created_at = NOW() - INTERVAL '120 days' WHERE category='solutions' LIMIT 5;\""
+
+W11 COMPRESSION TRIGGER
+  DRY RUN: curl -s -X POST $BASE_URL/compress $AUTH_HDR -d '{"dry_run":true}'
+  PASS: candidates_count > 0 | estimated_compressions > 0
+  LIVE:   curl -s -X POST $BASE_URL/compress $AUTH_HDR -d '{"dry_run":false}'
+  PASS: compressed_count ≥ 1 | compressed memories still GET-able
+  Capture: candidates_count | compressed_count | compression_dry_run_status | compression_run_status
+
+W12 COMPRESSION VERIFY — LIVE SQL COUNT (not hardcoded 0)
+  HEALTH CHECK: curl -s $BASE_URL/health $AUTH_HDR
+  PASS: unreviewed_compressions is integer (not hardcoded) | value reflects real DB count
+  SQL VERIFY:  ssh $SSH_USER@$TEST_HOST "sudo -u postgres psql mnemos_test -t -c 'SELECT COUNT(*) FROM memories WHERE llm_optimized=true AND quality_rating IS NULL;'"
+  PASS: health.unreviewed_compressions = SQL count | counts_match=yes
+  Capture: health_unreviewed_compressions | sql_unreviewed_count | counts_match
+
+W13 DISTILLATION QUALITY RATING
+  GET compressed memory: list llm_optimized=true items via GET /memories?category=solutions
+  RATE: curl -s -X POST $BASE_URL/memories/<compressed_id>/rate $AUTH_HDR -d '{"quality_rating":4}'
+  PASS: quality_rating updated | unreviewed_compressions decrements by 1 in next /health call
+  Capture: compressed_memory_has_summary | quality_rating_updated | unreviewed_decremented
+
+W14 COMPRESSION PHASE LABELS
+  ssh $SSH_USER@$TEST_HOST "sudo -u postgres psql mnemos_test -t -c 'SELECT DISTINCT compression_phase FROM memories;'"
+  PASS: at least Recent and archive phases present (given backdated seeds)
+  Also verify via API: GET $BASE_URL/memories?compression_phase=archive $AUTH_HDR
+  Capture: phases_present | archive_count | recent_count
+
+═══════════════════════════════════════════════════════════ PHASE 4: GRAEAE INTEGRATION ═══════════════════════════════════════════════════════════
+PREREQ: curl -s $GRAEAE_URL/health → BLOCKED for Phase 4 if down
+
+W15 GRAEAE CONSULT (via MNEMOS proxy)
+  curl -s -X POST $BASE_URL/graeae/consult $AUTH_HDR -H "Content-Type: application/json" \
+    -d '{"prompt":"What are best practices for memory categorization in knowledge management?","task_type":"reasoning"}'
+  PASS: HTTP 200 | response has result field | result.length > 50
+  ERROR HANDLING: send malformed request → expect HTTP 503 (NOT 200 with error body)
+  Capture: graeae_consult_status | graeae_response_length | error_returns_503
+
+W16 GRAEAE AUDIT CHAIN
+  Submit consultation → retrieve from audit log
+  curl -s $BASE_URL/graeae/audit $AUTH_HDR
+  PASS: audit entries present | each has prompt+response+provider+timestamp+memory_id
+  Verify consultation auto-saved as memory: POST /memories/search for consultation content
+  Capture: audit_entries_count | consultation_auto_saved | audit_has_provider
+
+W17 GRAEAE PROVIDER FALLBACK
+  web_search task: curl -s -X POST $BASE_URL/graeae/consult $AUTH_HDR \
+    -d '{"prompt":"current state of PostgreSQL pgvector","task_type":"web_search"}'
+  PASS: response returned | provider_used identified | non-empty result
+  Verify no speculative model IDs in _BUILTIN_PROVIDERS:
+    ssh $SSH_USER@$TEST_HOST "grep -r 'BUILTIN_PROVIDERS\|builtin_providers' /opt/mnemos/graeae/ | grep -v '.pyc' | head -20"
+  PASS: no model IDs that cannot be verified against public documentation
+  Capture: web_search_provider | web_search_result_present | builtin_models_verified
+
+W18 KG TEMPORAL TIMELINE (path param — NOT query param)
+  Create triples with temporal bounds:
+    curl -s -X POST $BASE_URL/kg/triples $AUTH_HDR -d '{"subject":"MNEMOS","predicate":"version","object":"2.0.0","valid_from":"2026-01-01","valid_until":"2026-06-01"}'
+    curl -s -X POST $BASE_URL/kg/triples $AUTH_HDR -d '{"subject":"MNEMOS","predicate":"version","object":"2.1.0","valid_from":"2026-06-01"}'
+  TIMELINE:  curl -s $BASE_URL/kg/timeline/MNEMOS $AUTH_HDR
+  PASS: ordered by valid_from | all 11 columns per entry | both triples returned
+  AS_OF FILTER: curl -s "$BASE_URL/kg/timeline/MNEMOS?as_of=2026-03-01" $AUTH_HDR
+  PASS: only triple valid on 2026-03-01 returned (version 2.0.0) | future triple excluded
+  Capture: timeline_count | timeline_temporal_filter_works | triples_in_range_count | triples_excluded_count
+
+═══════════════════════════════════════════════════════════ PHASE 5: IMPORT UTILITIES ═══════════════════════════════════════════════════════════
+PREREQ: Docling installed on TEST_HOST (installer --docling flag or manual pip install docling)
+Test files:
+  TXT:  ssh $SSH_USER@$TEST_HOST "echo 'Plain text memory for harness testing MN-RUN-<run_id>.' > /tmp/mn_test.txt"
+  CSV:  ssh $SSH_USER@$TEST_HOST "printf 'content,category\n\"CSV memory MN-RUN-<run_id>\",\"solutions\"' > /tmp/mn_test.csv"
+  JSON: ssh $SSH_USER@$TEST_HOST "echo '[{\"content\":\"JSON memory MN-RUN-<run_id>\",\"category\":\"patterns\"}]' > /tmp/mn_test.json"
+  PDF:  scp /path/to/sample.pdf $SSH_USER@$TEST_HOST:/tmp/mn_test.pdf  (optional — skip if unavailable)
+
+W19 DOCLING IMPORT
+  DRY RUN: ssh $SSH_USER@$TEST_HOST "python3 /opt/mnemos/tools/docling_import.py --file /tmp/mn_test.pdf --endpoint http://localhost:5002 --api-key $API_KEY --category solutions --tags harness,docling --dry-run 2>&1" || echo "docling_available: no"
+  PASS (dry-run): chunks_found > 0 | would_import_count > 0 | no errors
+  LIVE: remove --dry-run | search for imported content → PASS if retrievable
+  Capture: docling_available | chunks_found | memories_created | search_retrieval
+
+W20 JSON AND CSV IMPORT
+  JSON: ssh $SSH_USER@$TEST_HOST "python3 /opt/mnemos/tools/memory_import.py json --file /tmp/mn_test.json --endpoint http://localhost:5002 --api-key $API_KEY"
+  PASS: imported_count ≥ 1 | memory retrievable by content search
+  CSV:  ssh $SSH_USER@$TEST_HOST "python3 /opt/mnemos/tools/memory_import.py csv --file /tmp/mn_test.csv --content-col content --category-col category --endpoint http://localhost:5002 --api-key $API_KEY"
+  PASS: imported_count ≥ 1 | category=solutions respected
+  Capture: json_import_status | json_imported_count | csv_import_status | csv_imported_count | csv_category_respected
+
+W21 CHATGPT AND OBSIDIAN IMPORT
+  ChatGPT: skip if conversations.json unavailable (log chatgpt_test_status: skipped_no_source_file)
+    If available: ssh $SSH_USER@$TEST_HOST "python3 /opt/mnemos/tools/memory_import.py chatgpt --file /tmp/conversations.json --endpoint http://localhost:5002 --api-key $API_KEY"
+    PASS: imported_count > 0 | short replies (<100 chars) skipped | category assigned
+  Obsidian: skip if vault unavailable
+    PASS: imported_count > 0 | YAML frontmatter parsed | .obsidian/ dir skipped
+  Text: ssh $SSH_USER@$TEST_HOST "python3 /opt/mnemos/tools/memory_import.py text --file /tmp/mn_test.txt --per-paragraph --endpoint http://localhost:5002 --api-key $API_KEY"
+    PASS: imported_count ≥ 1 (paragraphs ≥ 50 chars only)
+  Capture: chatgpt_test_status | obsidian_test_status | text_import_status | text_imported_count
+
+W22 STATS VERIFY
+  API: curl -s $BASE_URL/stats $AUTH_HDR
+  PASS: total_memories ≥ (seed count + W5-W9 creates + W19-W21 imports) | category breakdown sums to total
+  Tool: ssh $SSH_USER@$TEST_HOST "python3 /opt/mnemos/tools/memory_import.py stats --endpoint http://localhost:5002 --api-key $API_KEY"
+  PASS: table output with total_memories | by_category breakdown | compression_stats
+  Capture: stats_total_memories | stats_by_category_count | api_stats_match_tool_stats
+
+═══════════════════════════════════════════════════════════ PHASE 6: JOURNAL, STATE, ENTITIES ═══════════════════════════════════════════════════════════
+W23 JOURNAL CRUD
+  CREATE: curl -s -X POST $BASE_URL/journal $AUTH_HDR -H "Content-Type: application/json" \
+    -d '{"topic":"harness_run","content":"MN-RUN-<run_id> journal entry: Phase 6 test","date":"2026-04-14"}'
+  PASS: 201 | response has id + topic + content + date
+  LIST:   curl -s "$BASE_URL/journal?topic=harness_run" $AUTH_HDR
+  PASS: array with created entry | topic filter respected
+  LIST DATE RANGE: curl -s "$BASE_URL/journal?date=2026-04-14" $AUTH_HDR
+  PASS: entries on that date returned
+  SEARCH: curl -s "$BASE_URL/journal?search=Phase+6" $AUTH_HDR
+  PASS: entry with "Phase 6" in content returned
+  DELETE: curl -s -X DELETE $BASE_URL/journal/<id> $AUTH_HDR → 204
+  PASS: subsequent list excludes deleted entry
+  Capture: journal_create_status | journal_list_status | journal_filter_status | journal_delete_status
+
+W24 STATE MANAGEMENT
+  SET:    curl -s -X PUT $BASE_URL/state/harness_run_id $AUTH_HDR -H "Content-Type: application/json" \
+            -d '"MN-RUN-<run_id>"'
+  PASS: 200 or 201 | key stored
+  GET:    curl -s $BASE_URL/state/harness_run_id $AUTH_HDR
+  PASS: value = "MN-RUN-<run_id>"
+  LIST:   curl -s $BASE_URL/state $AUTH_HDR
+  PASS: harness_run_id present in list
+  UPSERT: PUT again with new value → GET returns new value
+  DELETE: curl -s -X DELETE $BASE_URL/state/harness_run_id $AUTH_HDR → 204
+  PASS: subsequent GET returns 404
+  Capture: state_set_status | state_get_status | state_list_status | state_upsert_works | state_delete_status
+
+W25 ENTITIES CRUD
+  CREATE PERSON: curl -s -X POST $BASE_URL/entities $AUTH_HDR -H "Content-Type: application/json" \
+    -d '{"entity_type":"person","name":"Harness TestUser","description":"Created by MN-RUN-<run_id>"}'
+  PASS: 201 | id + entity_type=person + name + description
+  CREATE PROJECT: curl -s -X POST $BASE_URL/entities $AUTH_HDR \
+    -d '{"entity_type":"project","name":"MNEMOS Harness","description":"Test project MN-RUN-<run_id>"}'
+  PASS: 201 | entity_type=project
+  LIST ALL:    curl -s $BASE_URL/entities $AUTH_HDR
+  PASS: both created entities present
+  FILTER TYPE: curl -s "$BASE_URL/entities?entity_type=person" $AUTH_HDR
+  PASS: only person entities returned
+  SEARCH:  curl -s "$BASE_URL/entities?search=Harness" $AUTH_HDR
+  PASS: both harness entities returned (name match)
+  GET ONE: curl -s $BASE_URL/entities/<person_id> $AUTH_HDR
+  PASS: full entity object with all fields
+  UPDATE:  curl -s -X PATCH $BASE_URL/entities/<person_id> $AUTH_HDR -d '{"description":"Updated by harness"}'
+  PASS: description updated | other fields unchanged
+  Capture: entity_person_id | entity_project_id | entity_create_status | entity_list_count | entity_filter_works | entity_update_status
+
+═══════════════════════════════════════════════════════════ PHASE 7: SESSION INGEST + BULK ═══════════════════════════════════════════════════════════
+W26 SESSION INGESTION
+  POST /ingest/session $AUTH_HDR -H "Content-Type: application/json" -d '{
+    "source": "mnemos_harness",
+    "session_id": "MN-RUN-<run_id>",
+    "machine_id": "test_host",
+    "agent_id": "claude_code_test",
+    "git_commit": "test_sha",
+    "raw_data": {
+      "messages": [
+        {"role":"user","content":"Test harness ingest message 1 MN-RUN-<run_id>"},
+        {"role":"assistant","content":"Acknowledged. Harness ingest reply."}
+      ],
+      "code_blocks": [
+        {"type":"code","text":"def harness_fn(): pass"}
+      ],
+      "tool_operations": [
+        {"role":"tool","content":"bash: echo test"}
+      ]
+    }
+  }'
+  PASS: success=true | stored_count=3 (messages+code+tools) | memory_ids array has 3 entries
+  Verify: GET /memories/<msg_mem_id> → category=session_activity | item_type=messages
+  Capture: ingest_success | ingest_stored_count=3 | ingest_memory_ids_count | session_category_correct
+
+W27 BULK CREATE WITH MIXED VALIDITY
+  POST /memories/bulk $AUTH_HDR -d '{
+    "memories": [
+      {"content":"Bulk valid 1","category":"facts","source":"harness"},
+      {"content":"Bulk valid 2","category":"patterns","source":"harness","source_provider":"test"},
+      {"content":"","category":"facts"},
+      {"content":"Bulk valid 3","category":"decisions","source_session":"MN-RUN-<run_id>"}
+    ]
+  }'
+  PASS: created=3 | errors=1 | error message references empty content | all 3 valid ids retrievable
+  Verify categories: GET each id → fact/patterns/decisions correctly set
+  Verify provenance: source_provider=test on second memory | source_session set on fourth
+  Capture: bulk_created_count=3 | bulk_error_count=1 | empty_content_rejected | provenance_on_bulk_items
+
+═══════════════════════════════════════════════════════════ PHASE 8: AUTH / RLS SECURITY MATRIX ═══════════════════════════════════════════════════════════
+Note: Phase 8 workflows test auth_mode=team only. Skip if auth_mode=personal; log auth_mode_matrix_skipped.
+
+W28 AUTH GUARD — NO-CREDENTIAL REJECTION
+  curl -s $BASE_URL/memories (no Authorization header)
+  PASS (team mode): HTTP 401 or 403 (not 200) | returns error body, not memory list
+  curl -s -H "Authorization: Bearer invalid_key_abc123" $BASE_URL/memories
+  PASS: HTTP 401 or 403 | access denied
+  curl -s -H "Authorization: Bearer $API_KEY" $BASE_URL/memories
+  PASS: HTTP 200 | memory list returned
+  Note: if auth_mode=personal → all three return 200 (expected) | log no_auth_mode_confirmed
+  Capture: unauth_request_rejected | invalid_key_rejected | valid_key_accepted | auth_mode_confirmed
+
+W29 TEAM MODE API KEY LIFECYCLE
+  CREATE KEY: curl -s -X POST $BASE_URL/admin/users/default/apikeys $AUTH_HDR
+  PASS: 201 | raw_key present (only returned once) | key_prefix present
+  export NEW_KEY=<raw_key>
+  USE NEW KEY: curl -s -H "Authorization: Bearer $NEW_KEY" $BASE_URL/health
+  PASS: 200 healthy
+  LIST KEYS: curl -s $BASE_URL/admin/users/default/apikeys $AUTH_HDR
+  PASS: new key appears in list | raw_key NOT returned in list (only on creation)
+  REVOKE: curl -s -X DELETE $BASE_URL/admin/apikeys/<key_id> $AUTH_HDR → 204
+  USE REVOKED: curl -s -H "Authorization: Bearer $NEW_KEY" $BASE_URL/health
+  PASS: 401 or 403 (revoked key rejected)
+  Capture: api_key_creation_status | api_key_functional | raw_key_hidden_in_list | revoke_status | revoked_key_rejected
+
+W30 RLS NAMESPACE ISOLATION (team mode + rls_enabled=true only)
+  PREREQ: config.toml [auth] enabled=true, rls_enabled=true | Two separate API keys for different namespaces
+  CREATE user_a memories with owner_id=user_a and namespace=ns_a
+  CREATE user_b memories with owner_id=user_b and namespace=ns_b
+  GET /memories as user_a → PASS: only ns_a memories returned
+  GET /memories as user_b → PASS: only ns_b memories returned
+  Search as user_a for user_b content → PASS: no cross-namespace leakage
+  Capture: rls_tested | rls_namespace_isolation_verified | cross_namespace_leak_detected=no
+
+═══════════════════════════════════════════════════════════ PHASE 9: PROVENANCE + OWNERSHIP ═══════════════════════════════════════════════════════════
+W31 PROVENANCE FIELDS ON CREATE + SEARCH
+  CREATE with full provenance:
+    curl -s -X POST $BASE_URL/memories $AUTH_HDR -d '{
+      "content":"Provenance test MN-RUN-<run_id>",
+      "category":"solutions",
+      "source":"harness",
+      "source_model":"claude-sonnet-4-6",
+      "source_provider":"anthropic",
+      "source_session":"MN-RUN-<run_id>",
+      "source_agent":"test_orchestrator",
+      "owner_id":"test_user",
+      "namespace":"test_ns"
+    }'
+  PASS: all provenance fields stored and returned on GET
+  FILTER BY SOURCE_PROVIDER: POST /memories/search -d '{"query":"provenance","source_provider":"anthropic"}'
+  PASS: only memories with source_provider=anthropic returned
+  Capture: provenance_fields_stored | provenance_filter_works | source_model_present | namespace_set
+
+W32 VERBATIM CONTENT FIELD
+  CREATE with verbatim_content override:
+    -d '{"content":"Summary content","verbatim_content":"Full original content verbatim here","category":"facts"}'
+  PASS: content field = "Summary content" | verbatim_content field present and distinct
+  GET: GET /memories/<id> → PASS: both content and verbatim_content returned correctly
+  Capture: verbatim_content_stored | verbatim_content_distinct_from_content
+
+═══════════════════════════════════════════════════════════ PHASE 10: MODEL REGISTRY ═══════════════════════════════════════════════════════════
+W33 MODEL REGISTRY ENDPOINTS
+  LIST ALL: curl -s "$BASE_URL/model-registry/" $AUTH_HDR
+  PASS: array of model objects | each has provider + model_id + capabilities + graeae_weight
+  PROVIDERS: curl -s $BASE_URL/model-registry/providers $AUTH_HDR
+  PASS: provider names + model count per provider
+  BY PROVIDER: curl -s $BASE_URL/model-registry/openai $AUTH_HDR
+  PASS: only openai models returned
+  BEST PER PROVIDER: curl -s $BASE_URL/model-registry/best $AUTH_HDR
+  PASS: one model per provider | ranked by graeae_weight
+  STATS: curl -s $BASE_URL/model-registry/stats $AUTH_HDR
+  PASS: total_models + provider_count + deprecated_count present
+  SYNC (admin): curl -s -X POST $BASE_URL/model-registry/sync $AUTH_HDR \
+    -H "Content-Type: application/json" -d '{"dry_run":true}'
+  PASS: 200 | array of SyncResult objects per provider | models_found > 0 | no crash
+  NOTE: Requires api_keys.json with provider credentials. POST body is required (422 without it).
+  Capture: registry_list_count | providers_count | best_per_provider_count | registry_stats_present | sync_status
+
+═══════════════════════════════════════════════════════════ SUPPLEMENTAL ═══════════════════════════════════════════════════════════
+WS1 AUTH STARTUP GUARD
+  Restart service mid-flight to test cold-startup race
+  curl $BASE_URL/memories before health gate settles → expect HTTP 503 "startup incomplete" (not 500)
+  Capture: auth_startup_guard_fires | returns_503_not_500
+
+WS2 BACKGROUND TASK DRAIN
+  Access a memory (fires _update_last_used background task)
+  sudo systemctl stop mnemos → check logs for "background tasks drained" (no abandoned coroutine warnings)
+  ssh $SSH_USER@$TEST_HOST "sudo journalctl -u mnemos --since '1 minute ago' | grep -i 'background\|lifecycle\|drain'"
+  Capture: background_tasks_drain_on_shutdown | no_asyncio_warnings
+
+WS3 SELECT STAR AUDIT (production code only)
+  ssh $SSH_USER@$TEST_HOST "grep -rn 'SELECT \*' /opt/mnemos/api/ | grep -v test | grep -v '.pyc'"
+  PASS: zero matches | SELECT_STAR_REGRESSION if any found
+  KG explicit columns: id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created
+  Capture: select_star_count | kg_explicit_columns_verified
+
+WS4 SERVICE RESTART RECOVERY
+  ssh $SSH_USER@$TEST_HOST "sudo systemctl restart mnemos && sleep 3 && curl -s http://localhost:5002/health"
+  PASS: health within 5s | database_connected=true | spot-check 3 known mem IDs still retrievable
+  Capture: restart_recovery_seconds | post_restart_health_ok | data_integrity_spot_check
+
+WS5 CONFIG DEAD CONSTANT AUDIT
+  ssh $SSH_USER@$TEST_HOST "python3 -c 'import sys; sys.path.insert(0,\"/opt/mnemos\"); import config; print([x for x in dir(config) if not x.startswith(\"_\")])'"
+  PASS: only expected exports present (PG_CONFIG, GRAEAE_CONFIG, OLLAMA_EMBED_URL, etc.)
+  FAIL: removed constants present → DEAD_CONSTANT_REGRESSION
+  Capture: config_exports_list | dead_constants_found
+
+WS6 CONCURRENT INSERT SERIALIZATION
+  Launch 5 simultaneous POST /memories/bulk from separate curl processes
+  Verify: all memories land with unique IDs | no duplicate mem_ IDs | audit log entries monotonic
+  ssh $SSH_USER@$TEST_HOST for loop or background curl processes:
+    for i in 1 2 3 4 5; do curl -s -X POST $BASE_URL/memories/bulk $AUTH_HDR -d '{"memories":[{"content":"concurrent test '$i'","category":"facts"}]}' & done; wait
+  Capture: concurrent_insert_success | duplicate_ids_found=no | audit_log_monotonic
+
+WS7 REQUEST SIZE LIMITS
+  Oversized body (>5MB): send a POST /memories/bulk with content field ~6MB string
+  PASS: HTTP 413 Entity Too Large (not 500 or timeout)
+  Capture: size_limit_enforced | returns_413_not_500
+
+WS8 CACHE COHERENCY
+  POST /memories/search (caches result for 5 min)
+  Create new memory with content matching the search
+  POST /memories/search again immediately → new memory may or may not appear (cache window)
+  Wait 310 seconds OR POST /admin/cache/invalidate if endpoint exists
+  POST /memories/search again → new memory MUST appear (cache expired)
+  Capture: cache_ttl_observed | new_memory_appears_post_expiry
+
+═══════════════════════════════════════════════════════════ MULTI-MATRIX AXES ═══════════════════════════════════════════════════════════
+
+MATRIX A — INSTALLATION
+  install_mode:      unattended | wizard | upgrade | check
+  install_target:    fresh | upgrade
+  pg_version:        14 | 15 | 16 | 17
+  service_type:      systemd | launchd | none
+
+MATRIX B — AUTH & SECURITY
+  auth_mode:         personal (no-auth) | team (bearer-key)
+  rls_mode:          disabled | enabled   (only valid when auth_mode=team)
+  Note: personal×rls_enabled is invalid (skip)
+
+MATRIX C — SEARCH & RETRIEVAL
+  embedding_backend: ollama_local | remote | disabled (FTS fallback)
+  search_type:       semantic | fts | hybrid
+  result_size:       small (<10 seeds) | medium (10-100 seeds) | large (100+ seeds, compression triggers)
+
+MATRIX D — API COVERAGE (run W5–W33 for each auth_mode × embedding_backend combination)
+  Axis 1: auth_mode (personal | team)
+  Axis 2: embedding_backend (ollama_local | disabled)
+  Minimum: 2×2 = 4 API coverage combinations
+
+MATRIX E — RESILIENCE
+  graeae_available:  yes | no (fallback path)
+  db_pool_available: yes | no (503 path tested)
+  service_state:     clean_restart | simulated_crash (SIGKILL vs SIGTERM)
+
+CASE ID FORMAT:  <matrix>_<axis_values>
+  e.g. A_unattended_fresh_pg17_systemd | B_team_rls_enabled | C_semantic_medium_ollama | D_team_ollama
+
+MIN COVERAGE:   A: unattended×fresh×pg17×systemd | B: personal×rls_disabled | C: semantic×medium×ollama | D: 2×2 | E: graeae_yes×clean_restart
+FULL COVERAGE:  all A axes × B axes × C axes × D combinations × E failure modes
+
+═══════════════════════════════════════════════════════════ OUTPUT ARTIFACTS ═══════════════════════════════════════════════════════════
+GENERATED BY HARNESS (working dir: /tmp/mnemos-MN-RUN-<run_id>/)
+  install.log           Full install stdout/stderr
+  api_key.txt           API key captured post-install (mode 600)
+  health_baseline.json  /health snapshot at W0.4
+  test_memories.json    IDs of harness-created memories (for cleanup)
+  import_results.json   W19-W21 import stats
+  matrix_results.json   Per-matrix-case pass/fail summary
+
+NEVER COMMIT: api_key.txt | matrix_results.json | any file from /tmp/mnemos-MN-RUN-*/
+CLEANUP: rm -rf /tmp/mnemos-MN-RUN-<run_id>/ at end of run (or on W0.1 teardown of next run)
+
+═══════════════════════════════════════════════════════════ JSON SCHEMA V2.0.0 ═══════════════════════════════════════════════════════════
+{
+  "schema_version": "MNEMOS_JSON_V2_0_0",
+  "run_id": "string",
+  "restart_count": 0,
+  "step_type": "lifecycle|workflow|supplemental|cleanup|final_report",
+  "attempt_phase": "prereqs|w0_lifecycle|install|api_functional|compression|graeae|import|journal_state_entities|session_bulk|auth_rls|provenance|model_registry|reporting",
+  "workflow_number": 0,
+  "workflow_name": "string",
+  "target_system": "test_host|prod_host|both",
+  "target_url": "string",
+  "exact_command_executed": "string",
+  "execution_status": "success|failure|partial|blocked|skipped",
+  "errors": "string|none|unknown",
+  "final_run": false,
+  "matrix_axis": "A|B|C|D|E|none",
+  "matrix_case_id": "string|none",
+  "matrix_case_status": "success|failure|partial|blocked|skipped|not_applicable",
+  "auth_mode": "personal|team|not_applicable|unknown",
+  "rls_mode": "disabled|enabled|not_applicable|unknown",
+  "embedding_backend": "ollama_local|remote|disabled|not_applicable|unknown",
+  "search_type": "semantic|fts|hybrid|not_applicable|unknown",
+  "install_mode": "unattended|wizard|upgrade|check|not_applicable|unknown",
+  "install_exit_code": "integer|not_applicable|unknown",
+  "install_stdout_tail": "string|none|unknown",
+  "install_stderr_tail": "string|none|unknown",
+  "teardown_status": "succeeded|skipped_upgrade_run|failed|blocked|not_applicable",
+  "repo_head_sha": "string|none|unknown",
+  "source_of_truth_confirmed": "yes|no|not_checked",
+  "health_status": "healthy|degraded|unhealthy|unreachable|not_checked",
+  "database_connected": "true|false|not_checked",
+  "mnemos_version": "string|none|unknown",
+  "health_unreviewed_compressions": "integer|not_checked",
+  "sql_unreviewed_count": "integer|not_checked",
+  "counts_match": "yes|no|not_applicable",
+  "migration_count": "integer|unknown|not_checked",
+  "latest_migration": "string|none|unknown",
+  "service_active": "yes|no|not_checked",
+  "api_key_created": "yes|no|not_checked",
+  "api_key_functional": "yes|no|not_checked",
+  "wizard_mode_status": "completed|failed|skipped|not_applicable",
+  "interactive_fallback_used": "yes|no|not_applicable",
+  "memories_before": "integer|not_applicable|unknown",
+  "memories_after": "integer|not_applicable|unknown",
+  "upgrade_exit_code": "integer|not_applicable|unknown",
+  "check_python_ok": "yes|no|not_checked",
+  "check_postgres_ok": "yes|no|not_checked",
+  "check_pgvector_ok": "yes|no|not_checked",
+  "check_service_active": "yes|no|not_checked",
+  "memory_id": "string|none|not_applicable",
+  "create_status": "success|failure|not_run",
+  "read_status": "success|failure|not_run",
+  "update_status": "success|failure|not_run",
+  "delete_status": "success|failure|not_run",
+  "version_after_update": "integer|unknown|not_applicable",
+  "provenance_fields_present": "yes|no|not_checked",
+  "search_result_count": "integer|unknown|not_run",
+  "top_score": "number|unknown|not_run",
+  "category_filter_respected": "yes|no|not_run",
+  "subcategory_filter_respected": "yes|no|not_run",
+  "pagination_works": "yes|no|not_run",
+  "embedding_present": "yes|no|not_checked",
+  "rehydrate_result_count": "integer|unknown|not_run",
+  "token_budget_respected": "yes|no|not_run",
+  "compression_manifest_present": "yes|no|not_run",
+  "triple_id": "string|none|not_applicable",
+  "kg_list_count": "integer|unknown|not_run",
+  "kg_update_status": "success|failure|not_run",
+  "kg_delete_status": "success|failure|not_run",
+  "columns_verified": "yes|no|not_checked",
+  "version_count": "integer|unknown|not_run",
+  "history_endpoint_status": "success|failure|not_run",
+  "version_retrieval_status": "success|failure|not_run",
+  "diff_status": "success|failure|not_run",
+  "revert_status": "success|failure|not_run",
+  "bulk_created_count": "integer|unknown|not_run",
+  "bulk_error_count": "integer|unknown|not_run",
+  "empty_content_rejected": "yes|no|not_run",
+  "ids_retrievable": "yes|no|not_run",
+  "provenance_on_bulk_items": "yes|no|not_run",
+  "candidates_count": "integer|unknown|not_run",
+  "compressed_count": "integer|unknown|not_run",
+  "compression_dry_run_status": "success|failure|not_run",
+  "compression_run_status": "success|failure|not_run",
+  "compressed_memory_has_summary": "yes|no|not_checked",
+  "quality_rating_updated": "yes|no|not_run",
+  "unreviewed_decremented": "yes|no|not_run",
+  "phases_present": "string|none|not_checked",
+  "archive_count": "integer|unknown|not_checked",
+  "recent_count": "integer|unknown|not_checked",
+  "graeae_available": "yes|no|not_checked",
+  "graeae_consult_status": "success|failure|not_run|blocked",
+  "graeae_response_length": "integer|unknown|not_run",
+  "error_returns_503": "yes|no|not_checked",
+  "provider_used": "string|none|unknown",
+  "audit_entries_count": "integer|unknown|not_run",
+  "consultation_auto_saved": "yes|no|not_checked",
+  "audit_has_provider": "yes|no|not_checked",
+  "web_search_provider": "string|none|not_run",
+  "web_search_result_present": "yes|no|not_run",
+  "builtin_models_verified": "yes|no|not_checked",
+  "timeline_count": "integer|unknown|not_run",
+  "timeline_temporal_filter_works": "yes|no|not_run",
+  "triples_in_range_count": "integer|unknown|not_run",
+  "triples_excluded_count": "integer|unknown|not_run",
+  "docling_available": "yes|no|not_checked",
+  "chunks_found": "integer|unknown|not_run",
+  "memories_created_import": "integer|unknown|not_run",
+  "search_retrieval": "yes|no|not_run",
+  "json_import_status": "success|failure|skipped|not_run",
+  "json_imported_count": "integer|unknown|not_run",
+  "csv_import_status": "success|failure|skipped|not_run",
+  "csv_imported_count": "integer|unknown|not_run",
+  "csv_category_respected": "yes|no|not_run",
+  "chatgpt_test_status": "success|failure|skipped_no_source_file|not_run",
+  "obsidian_test_status": "success|failure|skipped_no_source_file|not_run",
+  "text_import_status": "success|failure|not_run",
+  "text_imported_count": "integer|unknown|not_run",
+  "stats_total_memories": "integer|unknown|not_run",
+  "stats_by_category_count": "integer|unknown|not_run",
+  "api_stats_match_tool_stats": "yes|no|not_run",
+  "journal_create_status": "success|failure|not_run",
+  "journal_list_status": "success|failure|not_run",
+  "journal_filter_status": "success|failure|not_run",
+  "journal_delete_status": "success|failure|not_run",
+  "state_set_status": "success|failure|not_run",
+  "state_get_status": "success|failure|not_run",
+  "state_list_status": "success|failure|not_run",
+  "state_upsert_works": "yes|no|not_run",
+  "state_delete_status": "success|failure|not_run",
+  "entity_person_id": "string|none|not_applicable",
+  "entity_project_id": "string|none|not_applicable",
+  "entity_create_status": "success|failure|not_run",
+  "entity_list_count": "integer|unknown|not_run",
+  "entity_filter_works": "yes|no|not_run",
+  "entity_update_status": "success|failure|not_run",
+  "ingest_success": "yes|no|not_run",
+  "ingest_stored_count": "integer|unknown|not_run",
+  "ingest_memory_ids_count": "integer|unknown|not_run",
+  "session_category_correct": "yes|no|not_run",
+  "unauth_request_rejected": "yes|no|not_run|not_applicable",
+  "invalid_key_rejected": "yes|no|not_run|not_applicable",
+  "valid_key_accepted": "yes|no|not_run",
+  "auth_mode_confirmed": "personal|team|unknown",
+  "api_key_creation_status": "success|failure|not_run|not_applicable",
+  "raw_key_hidden_in_list": "yes|no|not_run|not_applicable",
+  "revoke_status": "success|failure|not_run|not_applicable",
+  "revoked_key_rejected": "yes|no|not_run|not_applicable",
+  "rls_tested": "yes|no|not_applicable",
+  "rls_namespace_isolation_verified": "yes|no|not_applicable",
+  "cross_namespace_leak_detected": "yes|no|not_applicable",
+  "provenance_fields_stored": "yes|no|not_run",
+  "provenance_filter_works": "yes|no|not_run",
+  "source_model_present": "yes|no|not_checked",
+  "namespace_set": "yes|no|not_checked",
+  "verbatim_content_stored": "yes|no|not_run",
+  "verbatim_content_distinct_from_content": "yes|no|not_run",
+  "registry_list_count": "integer|unknown|not_run",
+  "providers_count": "integer|unknown|not_run",
+  "best_per_provider_count": "integer|unknown|not_run",
+  "registry_stats_present": "yes|no|not_run",
+  "sync_status": "success|failure|not_run",
+  "auth_startup_guard_fires": "yes|no|not_checked",
+  "returns_503_not_500": "yes|no|not_checked",
+  "background_tasks_drain_on_shutdown": "yes|no|not_checked",
+  "no_asyncio_warnings": "yes|no|not_checked",
+  "select_star_count": "integer|not_checked",
+  "kg_explicit_columns_verified": "yes|no|not_checked",
+  "restart_recovery_seconds": "number|unknown|not_checked",
+  "post_restart_health_ok": "yes|no|not_checked",
+  "data_integrity_spot_check": "yes|no|not_checked",
+  "config_exports_list": "string|none|not_checked",
+  "dead_constants_found": "yes|no|not_checked",
+  "concurrent_insert_success": "yes|no|not_run",
+  "duplicate_ids_found": "yes|no|not_run",
+  "audit_log_monotonic": "yes|no|not_run",
+  "size_limit_enforced": "yes|no|not_run",
+  "cache_ttl_observed": "yes|no|not_run",
+  "new_memory_appears_post_expiry": "yes|no|not_run",
+  "issues_observed": "none|yes",
+  "blocking_issues": "none|yes",
+  "blocker_type": "none|ENVIRONMENTAL|CODE_DEFECT|CONFIG_ERROR|UNFIXABLE|unknown",
+  "fix_attempted": "yes|no|not_applicable",
+  "fix_description": "string|none",
+  "fix_outcome": "succeeded|failed|not_applicable",
+  "fix_attempt_count": "integer|not_applicable",
+  "repair_applied": "yes|no|not_applicable",
+  "repair_file": "string|none",
+  "repair_description": "string|none",
+  "argonas_repair_commit_sha": "string|none|not_applicable",
+  "corrected_config_key": "string|none|not_applicable",
+  "downstream_risk": "none|yes",
+  "recommended_next_action": "string|none|unknown",
+  "contract_deviation_observed": "none|yes",
+  "deviation_details": "string|none",
+  "watchdog_alert_level": "none|warning|blocking",
+  "matrix_summary": {
+    "total_cases": "integer|unknown",
+    "passed_cases": "integer|unknown",
+    "failed_cases": "integer|unknown",
+    "blocked_cases": "integer|unknown",
+    "skipped_cases": "integer|unknown"
+  }
+}
+
+═══════════════════════════════════════════════════════════ VALIDATOR STAGES ═══════════════════════════════════════════════════════════
+1   format check: 5-section response (🎯📝✅📊🔍) present
+2   JSON parse: 📊 block is valid JSON
+3   exact key set: all schema keys present, no extras
+4   type checks: integers are integers, booleans are quoted "yes|no" per schema
+5   enum checks: all pipe-delimited fields use only declared values
+6   non-empty / no placeholder: no "<fill_in>" values; "unknown" permitted when genuinely unknown
+7   step semantics: step_type matches workflow_number range
+8   run consistency: run_id stable across steps; restart_count monotonic
+9   health gate: health_status=healthy AND database_connected=true before any Phase 2+ workflow
+10  migration gate: migration_count ≥ 4 before Phase 2+
+11A install gate: install_exit_code=0 before Phase 2+
+11B service gate: service_active=yes before API calls
+11C graeae gate: graeae_available=yes before Phase 4; skip Phase 4 (not FAIL) if unavailable
+12  dual evidence: exact_command_executed present + API response captured
+12A config dead constants: dead_constants_found=no before reporting clean install
+12B select star: select_star_count=0 in production API handlers
+12C graeae 503: error_returns_503=yes (not 200 with error body) when GRAEAE fails
+12D versioning endpoints: /versions not /history | /kg/timeline/{subject} path param not query param
+12E bulk partial accept: created+errors = total submitted; empty content must be in errors not silently dropped
+12F rls check: cross_namespace_leak_detected=no when rls_mode=enabled; NOT skipped silently
+13  import source guard: chatgpt/obsidian absent → skipped_no_source_file (not failure)
+14  no hardcoded IPs: TEST_HOST/PROD_HOST/GIT_HOST must be env vars; any literal 192.168.x.x in commands → HARDCODE_REGRESSION
+15  auth mode guard: no_auth_mode personal tests must NOT pass Authorization header
+
+═══════════════════════════════════════════════════════════ REJECTION CODES ═══════════════════════════════════════════════════════════
+FORMAT_VIOLATION | JSON_PARSE_FAILURE | MISSING_KEY_VIOLATION | EXTRA_KEY_VIOLATION
+TYPE_VIOLATION | ENUM_VIOLATION | BLANK_STRING_VIOLATION | PLACEHOLDER_VIOLATION
+STEP_TYPE_VIOLATION | RUN_ID_VIOLATION | RESTART_COUNT_VIOLATION | SCHEMA_DRIFT_VIOLATION
+HEALTH_GATE_VIOLATION | MIGRATION_GATE_VIOLATION | SERVICE_GATE_VIOLATION | GRAEAE_GATE_VIOLATION
+COMMAND_EVIDENCE_VIOLATION | DUAL_EVIDENCE_VIOLATION | HUMAN_READABLE_VIOLATION
+JSON_BLOCK_MISSING_VIOLATION | TEARDOWN_SKIP_VIOLATION | LIFECYCLE_ORDER_VIOLATION
+SELECT_STAR_REGRESSION | DEAD_CONSTANT_REGRESSION | GRAEAE_200_ON_FAILURE_REGRESSION
+AUTH_STARTUP_GUARD_MISSING | BACKGROUND_DRAIN_MISSING | KG_COLUMNS_REGRESSION
+MIGRATION_RERUN_DESTRUCTIVE | MEMORY_LOSS_ON_UPGRADE | CONFIG_TOML_NOT_WRITTEN
+INSTALL_FABRICATION | API_KEY_MISSING | VENV_PIP_FALLBACK_MISSING
+IMPORT_FALSE_FAILURE (chatgpt/obsidian absent → must be skipped_no_source_file, not failure)
+BLOCKER_UNCLASSIFIED | BLOCKER_UNFIXABLE_ESCALATED | CHECKPOINT_STOP | BLOCKING_STOP
+DATA_INTEGRITY_VIOLATION (memory content changed post-restart | version history missing | triple columns missing)
+COMPRESSION_HARDCODE (unreviewed_compressions=0 hardcoded in health — must be live SQL count)
+PROVIDER_ID_SPECULATIVE (any _BUILTIN_PROVIDERS model ID not matching publicly documented value)
+VERSIONING_ENDPOINT_WRONG (used /history instead of /versions — v1→v2 regression guard)
+KG_TIMELINE_QUERY_PARAM (used ?subject= instead of path param /kg/timeline/{subject})
+BULK_SILENT_DROP (empty content not in errors array — must be explicit per-item error)
+HARDCODE_REGRESSION (literal IP address in command instead of $TEST_HOST/$BASE_URL env var)
+AUTH_HEADER_IN_PERSONAL_MODE (Authorization header sent when auth_mode=personal — must be omitted)
+RLS_NOT_TESTED (rls_mode=enabled but cross-namespace test skipped without logging auth_mode_matrix_skipped)
+PROVENANCE_FIELDS_MISSING (source_model/source_provider/source_session not stored or returned)
+VERBATIM_CONTENT_MISSING (verbatim_content field absent from GET response when set on create)
+
+═══════════════════════════════════════════════════════════ RUN TRACKING ═══════════════════════════════════════════════════════════════
+run_id               MN-RUN-YYYYMMDD-NNN | constant across restarts within same run
+restart_count        starts 0 | +1 each W0.1 restart | log reason
+argonas_repair_commit_sha  captured whenever CODE_DEFECT fix committed to $GIT_HOST
+corrected_config_key captured whenever CONFIG_ERROR fix applied
+Matrix case ID       <matrix>_<axes_abbreviated>  e.g. A_unatnd_fresh_pg17_svc | B_team_rls_on
+
+═══════════════════════════════════════════════════════════ MATRIX EXECUTION LOOP ═══════════════════════════════════════════════════════════
+For each Matrix A case (install_mode × install_target × pg_version × service_type):
+  1.  Verify $TEST_HOST connectivity
+  2.  Verify $GIT_HOST reachable
+  3.  Check $TEST_HOST disk free ≥ 4GB
+  4.  W0.1 Teardown (fresh runs) → teardown_status
+  5.  W0.2 Pull latest from $GIT_HOST
+  6.  W0.3 Install → install_exit_code + stdout tail
+  7.  W0.4 Health gate → BLOCKED if not healthy
+  8.  W0.5 Migration verify → migration_count ≥ 4
+  9.  W1 Unattended verify (or W2 wizard, W3 upgrade, W4 check per install_mode)
+  10. W0.6 Auth setup (if auth_mode=team)
+  For each Matrix B case (auth_mode × rls_mode):
+    For each Matrix C combination (embedding_backend × search_type):
+      11. W5  Memory CRUD + provenance
+      12. W6  Search (semantic/FTS/hybrid per search_type)
+      13. W7  KG triples
+      14. W8  Versioning (list/retrieve/diff/revert)
+      15. W9  Bulk operations
+      16. W10 Rehydration
+      17. W11 Compression trigger
+      18. W12 Compression verify (live SQL count)
+      19. W15 GRAEAE consult (if graeae_available=yes)
+      20. W19 Docling import (if docling_available)
+      21. W20 JSON+CSV import
+      22. W22 Stats verify
+      23. W23 Journal CRUD
+      24. W24 State management
+      25. W25 Entities CRUD
+      26. W26 Session ingest
+      27. W27 Bulk with mixed validity
+      28. W28 Auth guard (if auth_mode=team)
+      29. W29 API key lifecycle (if auth_mode=team)
+      30. W30 RLS isolation (if auth_mode=team AND rls_mode=enabled)
+      31. W31 Provenance fields
+      32. W32 Verbatim content
+      33. W33 Model registry
+      34. Update matrix_results.json
+
+For each Matrix E resilience case:
+  35. WS1 Auth startup guard
+  36. WS2 Background drain
+  37. WS4 Service restart recovery
+
+SUPPLEMENTAL (once per full run, after all matrix cases):
+  SP1. WS3  SELECT * audit
+  SP2. WS5  Config dead constants
+  SP3. WS6  Concurrent inserts
+  SP4. WS7  Request size limits
+  SP5. WS8  Cache coherency
+  SP6. W2   Wizard mode (if not covered in matrix)
+  SP7. W3   Upgrade path ($PROD_HOST — separate target)
+  SP8. W4   Check mode
+  SP9. W13  Distillation quality + rate
+  SP10. W14 Compression phase labels
+  SP11. W16 GRAEAE audit chain
+  SP12. W17 Provider fallback + builtin model ID audit
+  SP13. W18 KG temporal timeline (as_of filter)
+  SP14. W21 ChatGPT + Obsidian import (if source files available)
