@@ -13,7 +13,7 @@ All notable changes to MNEMOS are documented here.
 - extractive token filter compression (Hybrid Compression with Online Learning) — 57% reduction at 0.48ms, no ML required
 - SENTENCE compression (Semantic-Anchor Compression) — structure-preserving sentence selection
 - DistillationEngine — AUTO strategy selects extractive token filter vs SENTENCE; LLM fallback on quality < 60
-- Background embedding worker (archive/) — NULL-embedding backfill with CERBERUS pre-compression
+- Background embedding worker (archive/) — NULL-embedding backfill with GPU inference pre-compression
 - Prometheus instrumentation (archive/) — request counters, latency histograms, pool utilization
 - Cryptographic audit chain — SHA-256 hash-chained GRAEAE prompt/response log
 - Per-provider circuit breakers, rate limiters, quality tracking in GRAEAE engine

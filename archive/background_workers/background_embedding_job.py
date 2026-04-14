@@ -47,32 +47,32 @@ _DB_CONNECT_ARGS = {
 
 # Phase 3: Inference backend for pre-compression
 _INFERENCE_BASE = os.getenv('INFERENCE_BACKEND_URL', 'http://localhost:8000')
-CERBERUS_COMPLETIONS_URL = _INFERENCE_BASE + '/v1/chat/completions'
-CERBERUS_HEALTH_URL = _INFERENCE_BASE + '/v1/models'
+INFERENCE_COMPLETIONS_URL = _INFERENCE_BASE + '/v1/chat/completions'
+INFERENCE_HEALTH_URL = _INFERENCE_BASE + '/v1/models'
 
 # Phase 3: Compression configuration
 COMPRESSION_THRESHOLD_BYTES = 10 * 1024    # 10KB - compress if content > 10KB
 COMPRESSION_TARGET_RATIO = 0.40            # Compress to 40% of original
 MAX_PROMPT_CHARS = 6000                    # Max chars to send to vLLM
 MAX_GENERATION_TOKENS = 600               # Max tokens to generate
-CERBERUS_TIMEOUT = 60                     # Timeout for CERBERUS requests
-CERBERUS_RECHECK_INTERVAL = 300          # Re-check CERBERUS every 5 minutes
+INFERENCE_TIMEOUT = 60                     # Timeout for inference requests
+INFERENCE_RECHECK_INTERVAL = 300          # Re-check inference backend every 5 minutes
 
 
 async def check_cerberus_health() -> bool:
-    """Check if CERBERUS vLLM is available"""
+    """Check if vLLM inference backend is available"""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(CERBERUS_HEALTH_URL)
+            resp = await client.get(INFERENCE_HEALTH_URL)
             return resp.status_code == 200
     except Exception as e:
-        logger.warning(f"[PHASE3] CERBERUS health check failed: {e}")
+        logger.warning(f"[PHASE3] inference backend health check failed: {e}")
         return False
 
 
 async def compress_content_async(text: str, target_ratio: float = COMPRESSION_TARGET_RATIO) -> dict:
     """
-    Phase 3: Asynchronously compress text using CERBERUS vLLM.
+    Phase 3: Asynchronously compress text using vLLM inference backend.
 
     Returns dict with:
       - compressed: compressed text (or original on failure)
@@ -98,9 +98,9 @@ TEXT:
 SUMMARY:"""
 
     try:
-        async with httpx.AsyncClient(timeout=CERBERUS_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=INFERENCE_TIMEOUT) as client:
             resp = await client.post(
-                CERBERUS_COMPLETIONS_URL,
+                INFERENCE_COMPLETIONS_URL,
                 json={
                     "model": "gemma4-e4b-fp8",
                     "messages": [{"role": "user", "content": f"Compress: {prompt}"}],
@@ -129,7 +129,7 @@ SUMMARY:"""
                 'compressed_length': original_len,
                 'ratio': 1.0,
                 'success': False,
-                'error': 'Empty response from CERBERUS'
+                'error': 'Empty response from inference backend'
             }
 
         compressed_len = len(compressed)
@@ -182,21 +182,21 @@ class BackgroundEmbeddingJob:
             'compression_failures': 0,
             'bytes_saved': 0,
         }
-        # Phase 3: CERBERUS availability caching with timestamp
-        self._cerberus_available: bool | None = None
-        self._cerberus_last_check: float = 0
+        # Phase 3: inference backend availability caching with timestamp
+        self._inference_available: bool | None = None
+        self._inference_last_check: float = 0
 
-    async def _is_cerberus_available(self) -> bool:
-        """Cache CERBERUS availability check; re-check every 5 minutes"""
+    async def _is_inference_available(self) -> bool:
+        """Cache inference backend availability check; re-check every 5 minutes"""
         now = time.monotonic()
-        if self._cerberus_available is None or (now - self._cerberus_last_check) >= CERBERUS_RECHECK_INTERVAL:
-            self._cerberus_available = await check_cerberus_health()
-            self._cerberus_last_check = now
-            if self._cerberus_available:
-                logger.info("[PHASE3] CERBERUS vLLM available for pre-compression")
+        if self._inference_available is None or (now - self._inference_last_check) >= INFERENCE_RECHECK_INTERVAL:
+            self._inference_available = await check_cerberus_health()
+            self._inference_last_check = now
+            if self._inference_available:
+                logger.info("[PHASE3] vLLM inference backend available for pre-compression")
             else:
-                logger.warning("[PHASE3] CERBERUS unavailable - embedding pre-compression disabled")
-        return self._cerberus_available
+                logger.warning("[PHASE3] inference backend unavailable - embedding pre-compression disabled")
+        return self._inference_available
 
     async def get_embedding(self, text: str, retry: int = 0):
         """Generate embedding via Ollama with retries"""
@@ -253,8 +253,8 @@ class BackgroundEmbeddingJob:
 
                 logger.info(f"Processing batch of {len(memories)} memories")
 
-                # Phase 3: Check CERBERUS availability once per batch
-                cerberus_available = await self._is_cerberus_available()
+                # Phase 3: Check inference backend availability once per batch
+                inference_available = await self._is_inference_available()
 
                 processed_count = 0
                 failed_count = 0
@@ -264,12 +264,12 @@ class BackgroundEmbeddingJob:
                     content = row['content']
                     content_len = row['content_len']
                     try:
-                        # Phase 3: Pre-compress if content > threshold and CERBERUS available
+                        # Phase 3: Pre-compress if content > threshold and inference backend available
                         text_for_embedding = content
                         compressed_content = None
                         compression_applied = False
 
-                        if cerberus_available and content_len > COMPRESSION_THRESHOLD_BYTES:
+                        if inference_available and content_len > COMPRESSION_THRESHOLD_BYTES:
                             logger.info(
                                 f"[PHASE3] Pre-compressing {memory_id[:8]} "
                                 f"({content_len} bytes > {COMPRESSION_THRESHOLD_BYTES} threshold)"
@@ -295,10 +295,10 @@ class BackgroundEmbeddingJob:
                                     f"[PHASE3] Compression failed for {memory_id[:8]}: "
                                     f"{compress_result['error']} - using original"
                                 )
-                                # Re-check CERBERUS availability on repeated failures
+                                # Re-check inference backend availability on repeated failures
                                 if self.stats['compression_failures'] % 5 == 0:
-                                    self._cerberus_available = None
-                                    self._cerberus_last_check = 0
+                                    self._inference_available = None
+                                    self._inference_last_check = 0
 
                         # Get embedding (from compressed content if available, else original)
                         embedding = await self.get_embedding(text_for_embedding)

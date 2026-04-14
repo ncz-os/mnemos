@@ -46,7 +46,7 @@ class SystemInfo:
             f"Disk free: {self.disk_free_gb:.1f} GB",
             f"Sudo: {'available' if self.has_sudo else 'not available'}",
             f"PostgreSQL: {'running' + (' (' + self.postgres_version + ')' if self.postgres_version else '') if self.postgres_running else 'not detected'}",
-            f"GRAEAE: {'reachable at 192.0.2.67:5001' if self.graeae_reachable else 'not reachable'}",
+            f"GRAEAE: {"reachable" if self.graeae_reachable else "not reachable"}",
             f"Ollama: {'running, models: ' + ', '.join(self.ollama_models[:5]) if self.ollama_reachable else 'not running'}",
             f"Anthropic API key: {'set' if self.anthropic_key_set else 'not set'}",
         ]
@@ -124,7 +124,7 @@ def detect_environment() -> SystemInfo:
 
     # GRAEAE reachability
     try:
-        graeae_url = os.environ.get("MNEMOS_GRAEAE_URL", "http://192.0.2.67:5001")
+        graeae_url = os.environ.get("MNEMOS_GRAEAE_URL", "http://localhost:5002")
         req = urllib.request.Request(
             f"{graeae_url}/health",
             method="GET",
@@ -171,7 +171,7 @@ class AgentInstaller:
     # ── Backend detection ─────────────────────────────────────────────────────
 
     GRAEAE_URL: str = os.environ.get(
-        "MNEMOS_GRAEAE_URL", "http://192.0.2.67:5001"
+        "MNEMOS_GRAEAE_URL", "http://localhost:5002"
     )
 
     def _detect_backend(self) -> str | None:

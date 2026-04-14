@@ -31,8 +31,6 @@ __pycache__/
 *.swp
 
 # Ops scripts — internal infrastructure only
-deploy.sh
-git_sync_daily.sh
 run_monthly_export.sh
 monitor_distillation.sh
 sync_argonas_git.py
@@ -90,10 +88,8 @@ __pycache__/
 
 # Local scripts not for distribution
 sync_argonas_git.py
-git_sync_daily.sh
 run_monthly_export.sh
 monitor_distillation.sh
-deploy.sh
 
 # Runtime configuration (contains secrets — use config.toml.example as template)
 config.toml

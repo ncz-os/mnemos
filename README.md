@@ -1,3 +1,7 @@
+<p align=center>
+  <img src=docs/images/logo.png alt=MNEMOS width=220 />
+</p>
+
 # MNEMOS + GRAEAE
 
 **Production memory for serious agentic systems.**

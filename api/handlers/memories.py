@@ -142,6 +142,8 @@ async def search_memories(
         "search", request.query, request_limit,
         request.category or "", request.subcategory or "",
         "semantic" if request.semantic else "fts",
+        request.source_provider or "", request.source_model or "",
+        request.source_agent or "", request.namespace or "",
     )
 
     if _lc._cache and not request.include_compressed:
@@ -158,6 +160,12 @@ async def search_memories(
 
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
+            _prov = dict(
+                source_provider=request.source_provider,
+                source_model=request.source_model,
+                source_agent=request.source_agent,
+                namespace=request.namespace,
+            )
             if request.semantic:
                 embedding = await _get_embedding(request.query)
                 if not embedding:
@@ -165,17 +173,20 @@ async def search_memories(
                     rows = await _fts_fetch(
                         conn, request.query, request_limit,
                         request.category, request.subcategory,
+                        **_prov,
                     )
                 else:
                     logger.info(f"[VECTOR] Semantic search: {len(embedding)}-dim vector")
                     rows = await _vector_search(
                         conn, embedding, request_limit,
                         request.category, request.subcategory,
+                        **_prov,
                     )
             else:
                 rows = await _fts_fetch(
                     conn, request.query, request_limit,
                     request.category, request.subcategory,
+                    **_prov,
                 )
 
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
@@ -258,22 +269,37 @@ async def create_memory(
 
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
-            meta = json.dumps(request.metadata or {"source": request.source})
-            verbatim = request.verbatim_content if request.verbatim_content is not None else request.content
-            await conn.execute(
-                "INSERT INTO memories "
-                "(id, content, category, subcategory, metadata, quality_rating, verbatim_content, "
-                "owner_id, namespace, permission_mode, "
-                "source_model, source_provider, source_session, source_agent) "
-                "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10, $11, $12, $13)",
-                mem_id, request.content, request.category, request.subcategory, meta, verbatim,
-                owner_id, namespace, 600,
-                request.source_model, request.source_provider,
-                request.source_session, request.source_agent,
-            )
-            row = await conn.fetchrow(
-                f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", mem_id,
-            )
+            async with conn.transaction():
+                meta = json.dumps(request.metadata or {"source": request.source})
+                verbatim = request.verbatim_content if request.verbatim_content is not None else request.content
+                await conn.execute(
+                    "INSERT INTO memories "
+                    "(id, content, category, subcategory, metadata, quality_rating, verbatim_content, "
+                    "owner_id, namespace, permission_mode, "
+                    "source_model, source_provider, source_session, source_agent) "
+                    "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10, $11, $12, $13)",
+                    mem_id, request.content, request.category, request.subcategory, meta, verbatim,
+                    owner_id, namespace, 600,
+                    request.source_model, request.source_provider,
+                    request.source_session, request.source_agent,
+                )
+                await conn.execute(
+                    "INSERT INTO memory_versions "
+                    "(memory_id, version_num, content, category, subcategory, metadata, verbatim_content, "
+                    "owner_id, namespace, permission_mode, "
+                    "source_model, source_provider, source_session, source_agent, "
+                    "snapshot_by, change_type) "
+                    "VALUES ($1, 1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'create') "
+                    "ON CONFLICT (memory_id, version_num) DO NOTHING",
+                    mem_id, request.content, request.category, request.subcategory, meta, verbatim,
+                    owner_id, namespace, 600,
+                    request.source_model, request.source_provider,
+                    request.source_session, request.source_agent,
+                    user.user_id,
+                )
+                row = await conn.fetchrow(
+                    f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", mem_id,
+                )
     if _lc._cache:
         try:
             await _lc._cache.delete("stats:global")
@@ -358,16 +384,40 @@ async def update_memory(
 
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
-            row = await conn.fetchrow("SELECT id FROM memories WHERE id=$1", memory_id)
-            if not row:
-                raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
-            await conn.execute(
-                f"UPDATE memories SET {', '.join(set_clauses)} WHERE id=$1",
-                memory_id, *values,
-            )
-            row = await conn.fetchrow(
-                f"SELECT {_lc._MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
-            )
+            async with conn.transaction():
+                row = await conn.fetchrow("SELECT id FROM memories WHERE id=$1", memory_id)
+                if not row:
+                    raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+                # Calculate next version BEFORE the UPDATE so trigger and app agree on the version number.
+                # On instances with the pg trigger, the trigger fires during UPDATE and writes next_ver;
+                # ON CONFLICT DO NOTHING ensures we skip cleanly. On instances without the trigger,
+                # our INSERT writes the version.
+                next_ver = await conn.fetchval(
+                    "SELECT COALESCE(MAX(version_num), 0) + 1 FROM memory_versions WHERE memory_id = $1",
+                    memory_id,
+                )
+                await conn.execute(
+                    f"UPDATE memories SET {', '.join(set_clauses)} WHERE id=$1",
+                    memory_id, *values,
+                )
+                row = await conn.fetchrow(
+                    f"SELECT {_lc._MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
+                )
+                # Snapshot the post-update state into version history
+                await conn.execute(
+                    "INSERT INTO memory_versions "
+                    "(memory_id, version_num, content, category, subcategory, metadata, verbatim_content, "
+                    "owner_id, namespace, permission_mode, "
+                    "source_model, source_provider, source_session, source_agent, "
+                    "snapshot_by, change_type) "
+                    "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'update') "
+                    "ON CONFLICT (memory_id, version_num) DO NOTHING",
+                    memory_id, next_ver, row["content"], row["category"], row["subcategory"],
+                    json.dumps(row["metadata"] or {}),
+                    row["verbatim_content"], row["owner_id"], row["namespace"], row["permission_mode"],
+                    row["source_model"], row["source_provider"], row["source_session"], row["source_agent"],
+                    user.user_id,
+                )
     if _lc._cache:
         try:
             await _lc._cache.delete("stats:global")
