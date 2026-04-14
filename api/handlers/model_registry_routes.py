@@ -74,6 +74,8 @@ class RegistryStats(BaseModel):
     total_models: int
     available_models: int
     providers_tracked: int
+    provider_count: int           # alias for providers_tracked (harness spec W33)
+    deprecated_count: int         # count of models with deprecated=true
     models_with_arena_scores: int
     last_sync: Optional[str] = None
 
@@ -238,6 +240,7 @@ async def registry_stats(
                 COUNT(*)                                  AS total_models,
                 COUNT(*) FILTER (WHERE available)         AS available_models,
                 COUNT(DISTINCT provider)                  AS providers_tracked,
+                COUNT(*) FILTER (WHERE deprecated)        AS deprecated_count,
                 COUNT(*) FILTER (WHERE arena_score IS NOT NULL) AS models_with_arena_scores,
                 MAX(last_synced)                          AS last_sync
             FROM model_registry
@@ -247,6 +250,8 @@ async def registry_stats(
         total_models=row["total_models"],
         available_models=row["available_models"],
         providers_tracked=row["providers_tracked"],
+        provider_count=row["providers_tracked"],   # alias
+        deprecated_count=row["deprecated_count"],
         models_with_arena_scores=row["models_with_arena_scores"],
         last_sync=row["last_sync"].isoformat() if row["last_sync"] else None,
     )
