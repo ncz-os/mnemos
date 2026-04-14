@@ -289,7 +289,8 @@ async def create_memory(
                     "owner_id, namespace, permission_mode, "
                     "source_model, source_provider, source_session, source_agent, "
                     "snapshot_by, change_type) "
-                    "VALUES ($1, 1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'create')",
+                    "VALUES ($1, 1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'create') "
+                    "ON CONFLICT (memory_id, version_num) DO NOTHING",
                     mem_id, request.content, request.category, request.subcategory, meta, verbatim,
                     owner_id, namespace, 600,
                     request.source_model, request.source_provider,
@@ -387,6 +388,13 @@ async def update_memory(
                 row = await conn.fetchrow("SELECT id FROM memories WHERE id=$1", memory_id)
                 if not row:
                     raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+                # Calculate next version BEFORE the UPDATE so trigger and app agree on the version number.
+                # On PYTHIA the trigger fires during UPDATE and writes next_ver; ON CONFLICT DO NOTHING
+                # ensures we skip cleanly.  On PROTEUS (no trigger) our INSERT writes the version.
+                next_ver = await conn.fetchval(
+                    "SELECT COALESCE(MAX(version_num), 0) + 1 FROM memory_versions WHERE memory_id = $1",
+                    memory_id,
+                )
                 await conn.execute(
                     f"UPDATE memories SET {', '.join(set_clauses)} WHERE id=$1",
                     memory_id, *values,
@@ -395,17 +403,14 @@ async def update_memory(
                     f"SELECT {_lc._MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
                 )
                 # Snapshot the post-update state into version history
-                next_ver = await conn.fetchval(
-                    "SELECT COALESCE(MAX(version_num), 0) + 1 FROM memory_versions WHERE memory_id = $1",
-                    memory_id,
-                )
                 await conn.execute(
                     "INSERT INTO memory_versions "
                     "(memory_id, version_num, content, category, subcategory, metadata, verbatim_content, "
                     "owner_id, namespace, permission_mode, "
                     "source_model, source_provider, source_session, source_agent, "
                     "snapshot_by, change_type) "
-                    "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'update')",
+                    "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'update') "
+                    "ON CONFLICT (memory_id, version_num) DO NOTHING",
                     memory_id, next_ver, row["content"], row["category"], row["subcategory"],
                     json.dumps(row["metadata"] or {}),
                     row["verbatim_content"], row["owner_id"], row["namespace"], row["permission_mode"],
