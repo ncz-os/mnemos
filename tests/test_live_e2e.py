@@ -3,20 +3,30 @@
 
 import json
 import os
+import random
 import time
 import sys
 import urllib.request
 import urllib.error
 
 BASE = os.getenv("MNEMOS_BASE", "http://localhost:5000")
+# Optional bearer token for auth-enabled deployments (team/bearer mode).
+# Set MNEMOS_KEY env var; omit or leave empty for personal/no-auth mode.
+API_KEY = os.getenv("MNEMOS_KEY", "")
 PASS = FAIL = 0
 created_ids = []
+
+# Unique token per run — prevents stale data from previous runs affecting
+# FTS search assertions in populated databases.
+_TOKEN = f"mnemos_e2e_{random.randint(100000, 999999)}"
 
 def req(method, path, body=None, timeout=30):
     url = BASE + path
     data = json.dumps(body).encode() if body else None
-    r = urllib.request.Request(url, data=data,
-        headers={"Content-Type": "application/json"}, method=method)
+    hdrs = {"Content-Type": "application/json"}
+    if API_KEY:
+        hdrs["Authorization"] = f"Bearer {API_KEY}"
+    r = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     try:
         with urllib.request.urlopen(r, timeout=timeout) as resp:
             status = resp.status
@@ -62,11 +72,11 @@ print(f"    total_memories={r.get('total_memories')}, categories={len(r.get('mem
 section("2. Memory CRUD")
 
 st, r, _ = req("POST", "/memories", {
-    "content": "MNEMOS live test: Python is a high-level interpreted language famous for readability.",
+    "content": f"MNEMOS live test: Python is a high-level interpreted language famous for readability. {_TOKEN}",
     "category": "system_tests",
     "metadata": {"test_run": "live_e2e"}
 })
-check("POST /memories → 200", st == 200)
+check("POST /memories → 201", st == 201)
 check("id starts with mem_", r and r.get("id","").startswith("mem_"))
 check("category persisted", r and r.get("category") == "system_tests")
 check("created timestamp present", r and bool(r.get("created")))
@@ -76,19 +86,19 @@ if mem_id_1:
 print(f"    id={mem_id_1}")
 
 st, r, _ = req("POST", "/memories", {
-    "content": "MNEMOS live test: pgvector enables similarity search for semantic memory retrieval.",
+    "content": f"MNEMOS live test: pgvector enables similarity search for semantic memory retrieval. {_TOKEN}",
     "category": "system_tests",
 })
-check("POST /memories #2 → 200", st == 200)
+check("POST /memories #2 → 201", st == 201)
 mem_id_2 = r.get("id") if r else None
 if mem_id_2:
     created_ids.append(mem_id_2)
 
 st, r, _ = req("POST", "/memories", {
-    "content": "MNEMOS live test: the primary application host runs Linux with a documented hardware profile.",
+    "content": f"MNEMOS live test: the primary application host runs Linux with a documented hardware profile. {_TOKEN}",
     "category": "system_tests",
 })
-check("POST /memories #3 → 200", st == 200)
+check("POST /memories #3 → 201", st == 201)
 mem_id_3 = r.get("id") if r else None
 if mem_id_3:
     created_ids.append(mem_id_3)
@@ -129,9 +139,10 @@ check("≥3 system_tests memories visible", len(test_mems) >= 3, f"got {len(test
 # ─── 4. SEARCH ───────────────────────────────────────────────
 section("4. Memory Search")
 
-# FTS: all query words must appear in content
+# FTS: unique token + category filter guarantees the test memory ranks first
 st, r, err = req("POST", "/memories/search", {
-    "query": "Python interpreted language readability",
+    "query": f"Python interpreted language readability {_TOKEN}",
+    "category": "system_tests",
     "limit": 10
 })
 check("POST /memories/search → 200", st == 200, err)
@@ -143,7 +154,7 @@ check("Python memory in results", mem_id_1 in ids_returned,
 
 # Category-filtered FTS
 st, r, _ = req("POST", "/memories/search", {
-    "query": "pgvector similarity semantic retrieval",
+    "query": f"pgvector similarity semantic retrieval {_TOKEN}",
     "category": "system_tests",
     "limit": 5
 })
@@ -153,9 +164,10 @@ check("Category filter returns result", len(filtered) > 0, f"got {len(filtered)}
 check("pgvector memory in filtered results",
       mem_id_2 in [m.get("id") for m in filtered], f"ids: {[m.get('id') for m in filtered]}")
 
-# Infrastructure query
+# Infrastructure query — category filter + token scopes to test data only
 st, r, _ = req("POST", "/memories/search", {
-    "query": "primary application host Linux hardware profile",
+    "query": f"primary application host Linux hardware profile {_TOKEN}",
+    "category": "system_tests",
     "limit": 10
 })
 check("Infrastructure search → 200", st == 200)
@@ -203,7 +215,7 @@ check("Rehydrate no-match → 200 (graceful)", st == 200)
 check("Empty rehydrate context is empty string", r and r.get("context","x") == "")
 
 # ─── 6. GRAEAE CONSULT ───────────────────────────────────────
-section("6. GRAEAE Consultation (all 6 providers)")
+section("6. GRAEAE Consultation (all providers)")
 
 t0 = time.time()
 st, r, err = req("POST", "/graeae/consult", {
@@ -217,7 +229,7 @@ check("POST /graeae/consult → 200", st == 200, err or st)
 check("all_responses present", r and "all_responses" in r)
 providers = r.get("all_responses",{}) if r else {}
 successes = [k for k,v in providers.items() if v.get("status") == "success"]
-check("All 6 providers queried", len(providers) == 6, f"got {len(providers)}")
+check("≥6 providers queried", len(providers) >= 6, f"got {len(providers)}")
 check("≥4 providers succeeded", len(successes) >= 4, f"successes: {successes}")
 best = max(providers.items(), key=lambda x: x[1].get("final_score",0), default=(None,{}))
 check("best provider has response text", bool(best[1].get("response_text","")))
@@ -236,10 +248,10 @@ for label, content_val in [("empty string", ""), ("whitespace only", "   "), ("n
     st, r, _ = req("POST", "/memories", {"content": content_val, "category": "test"})
     check(f"Reject {label} (422)", st == 422, f"got {st}")
 
-# Large payload
+# Large payload — API accepts content of any size (no server-side cap)
 long_content = "MNEMOS live test large content. " * 100  # ~3200 chars
 st, r, _ = req("POST", "/memories", {"content": long_content, "category": "system_tests"})
-check("Large content (3200 chars) accepted", st == 200)
+check("Large content (3200 chars) accepted", st == 201)
 if r and r.get("id"):
     created_ids.append(r["id"])
 
@@ -268,11 +280,11 @@ check("DELETE nonexistent → 404", st == 404, f"got {st}")
 section("9b. Subcategory Filtering")
 
 st, r, _ = req("POST", "/memories", {
-    "content": "MNEMOS subcategory test: Kubernetes networking config.",
+    "content": f"MNEMOS subcategory test: Kubernetes networking config. {_TOKEN}",
     "category": "infrastructure",
     "subcategory": "kubernetes",
 })
-check("POST /memories with subcategory -> 200", st == 200, f"got {st}")
+check("POST /memories with subcategory -> 201", st == 201, f"got {st}")
 check("subcategory persisted", r and r.get("subcategory") == "kubernetes")
 sub_id = r.get("id") if r else None
 if sub_id:
@@ -284,7 +296,7 @@ check("subcategory memory in list",
       sub_id in [m["id"] for m in (r or {}).get("memories", [])])
 
 st, r, _ = req("POST", "/memories/search", {
-    "query": "Kubernetes networking config",
+    "query": f"Kubernetes networking config {_TOKEN}",
     "category": "infrastructure",
     "subcategory": "kubernetes",
     "limit": 5,

@@ -1,4 +1,5 @@
 """Entities API: CRUD for tracked entities (people, projects, concepts)."""
+import json
 import logging
 from typing import Optional, List
 
@@ -45,12 +46,12 @@ async def create_entity(
         async with _lc._pool.acquire() as conn:
             row = await conn.fetchrow(
                 '''INSERT INTO entities (id, entity_type, name, description, metadata)
-                   VALUES ($1, $2, $3, $4, $5)
+                   VALUES ($1, $2, $3, $4, $5::jsonb)
                    ON CONFLICT (entity_type, name) DO UPDATE
                    SET description = COALESCE($4, entities.description),
                        updated = NOW()
                    RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
-                entity_id, req.entity_type, req.name, req.description, req.metadata or {}
+                entity_id, req.entity_type, req.name, req.description, json.dumps(req.metadata or {})
             )
         return dict(row)
     except Exception as e:
@@ -135,10 +136,10 @@ async def update_entity(
         async with _lc._pool.acquire() as conn:
             if 'description' in updates and 'metadata' in updates:
                 row = await conn.fetchrow(
-                    '''UPDATE entities SET description=$1, metadata=$2, updated=NOW()
+                    '''UPDATE entities SET description=$1, metadata=$2::jsonb, updated=NOW()
                        WHERE id=$3
                        RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
-                    updates['description'], updates['metadata'], entity_id
+                    updates['description'], json.dumps(updates['metadata']), entity_id
                 )
             elif 'description' in updates:
                 row = await conn.fetchrow(
@@ -148,9 +149,9 @@ async def update_entity(
                 )
             else:
                 row = await conn.fetchrow(
-                    '''UPDATE entities SET metadata=$1, updated=NOW() WHERE id=$2
+                    '''UPDATE entities SET metadata=$1::jsonb, updated=NOW() WHERE id=$2
                        RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
-                    updates['metadata'], entity_id
+                    json.dumps(updates['metadata']), entity_id
                 )
         if not row:
             raise HTTPException(status_code=404, detail="Entity not found")

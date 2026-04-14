@@ -1,4 +1,5 @@
 """Journal API: POST /journal, GET /journal, DELETE /journal/{entry_id}"""
+import json
 import logging
 from datetime import date
 from typing import Optional, List
@@ -17,6 +18,7 @@ router = APIRouter(tags=["journal"])
 class JournalCreateRequest(BaseModel):
     topic: str
     content: str
+    date: Optional[str] = None   # ISO date string; defaults to CURRENT_DATE if omitted
     metadata: Optional[dict] = None
 
 
@@ -39,12 +41,26 @@ async def create_journal_entry(
     try:
         entry_id = str(uuid.uuid4())
         async with _lc._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                '''INSERT INTO journal (id, entry_date, topic, content, metadata)
-                   VALUES ($1, CURRENT_DATE, $2, $3, $4)
-                   RETURNING id, entry_date::text, topic, content, metadata, created::text''',
-                entry_id, req.topic, req.content, req.metadata or {}
-            )
+            if req.date:
+                try:
+                    entry_date = date.fromisoformat(req.date)
+                except ValueError:
+                    raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD")
+                row = await conn.fetchrow(
+                    '''INSERT INTO journal (id, entry_date, topic, content, metadata)
+                       VALUES ($1, $2, $3, $4, $5::jsonb)
+                       RETURNING id, entry_date::text, topic, content, metadata, created::text''',
+                    entry_id, entry_date, req.topic, req.content,
+                    json.dumps(req.metadata or {}),
+                )
+            else:
+                row = await conn.fetchrow(
+                    '''INSERT INTO journal (id, entry_date, topic, content, metadata)
+                       VALUES ($1, CURRENT_DATE, $2, $3, $4::jsonb)
+                       RETURNING id, entry_date::text, topic, content, metadata, created::text''',
+                    entry_id, req.topic, req.content,
+                    json.dumps(req.metadata or {}),
+                )
         return dict(row)
     except Exception as e:
         logger.error(f"Error creating journal entry: {e}", exc_info=True)
@@ -64,10 +80,14 @@ async def list_journal_entries(
     try:
         async with _lc._pool.acquire() as conn:
             if date_str:
+                try:
+                    parsed_date = date.fromisoformat(date_str)
+                except ValueError:
+                    raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD")
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
                        FROM journal WHERE entry_date = $1 ORDER BY created DESC LIMIT $2''',
-                    date_str, limit
+                    parsed_date, limit
                 )
             elif topic:
                 rows = await conn.fetch(
