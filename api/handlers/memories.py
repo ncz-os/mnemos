@@ -142,6 +142,8 @@ async def search_memories(
         "search", request.query, request_limit,
         request.category or "", request.subcategory or "",
         "semantic" if request.semantic else "fts",
+        request.source_provider or "", request.source_model or "",
+        request.source_agent or "", request.namespace or "",
     )
 
     if _lc._cache and not request.include_compressed:
@@ -158,6 +160,12 @@ async def search_memories(
 
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
+            _prov = dict(
+                source_provider=request.source_provider,
+                source_model=request.source_model,
+                source_agent=request.source_agent,
+                namespace=request.namespace,
+            )
             if request.semantic:
                 embedding = await _get_embedding(request.query)
                 if not embedding:
@@ -165,17 +173,20 @@ async def search_memories(
                     rows = await _fts_fetch(
                         conn, request.query, request_limit,
                         request.category, request.subcategory,
+                        **_prov,
                     )
                 else:
                     logger.info(f"[VECTOR] Semantic search: {len(embedding)}-dim vector")
                     rows = await _vector_search(
                         conn, embedding, request_limit,
                         request.category, request.subcategory,
+                        **_prov,
                     )
             else:
                 rows = await _fts_fetch(
                     conn, request.query, request_limit,
                     request.category, request.subcategory,
+                    **_prov,
                 )
 
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]

@@ -224,13 +224,16 @@ async def _get_embedding(text: str) -> list:
 
 
 async def _vector_search(conn, embedding: list, limit: int,
-                         category=None, subcategory=None,
-                         select_cols=None) -> list:
+                         category=None, subcategory=None, select_cols=None,
+                         source_provider=None, source_model=None,
+                         source_agent=None, namespace=None) -> list:
     """pgvector cosine similarity search. Returns rows ordered by similarity desc.
 
     The vector is always $1 — used in both the SELECT similarity expression and
     the ORDER BY clause.  Passing it as a parameter (not interpolated into the
     query string) eliminates any injection risk from a poisoned embedding response.
+    Supports optional provenance filters (source_provider, source_model,
+    source_agent, namespace) ANDed into the WHERE clause.
     """
     if select_cols is None:
         select_cols = _MEMORY_COLS
@@ -238,107 +241,78 @@ async def _vector_search(conn, embedding: list, limit: int,
     vec_str = "[" + ",".join(str(float(x)) for x in embedding) + "]"
     # $1 is the vector — referenced in SELECT and ORDER BY, never interpolated
     sim_col = "1 - (embedding <=> $1::vector) AS similarity"
-    base = f"SELECT {select_cols}, {sim_col} FROM memories WHERE embedding IS NOT NULL"
+
+    # Dynamic WHERE builder: $1=vec_str, filter params at $2+, limit always last
+    params: list = [vec_str]
+    conditions: list = ["embedding IS NOT NULL"]
+    for col, val in [("category", category), ("subcategory", subcategory),
+                     ("source_provider", source_provider), ("source_model", source_model),
+                     ("source_agent", source_agent), ("namespace", namespace)]:
+        if val is not None:
+            params.append(val)
+            conditions.append(f"{col}=${len(params)}")
+    params.append(limit)
+    limit_ph = f"${len(params)}"
+
+    where = " AND ".join(conditions)
+    sql = (f"SELECT {select_cols}, {sim_col} FROM memories "
+           f"WHERE {where} ORDER BY embedding <=> $1::vector LIMIT {limit_ph}")
     try:
-        if category and subcategory:
-            return await conn.fetch(
-                f"{base} AND category=$2 AND subcategory=$3 "
-                "ORDER BY embedding <=> $1::vector LIMIT $4",
-                vec_str, category, subcategory, limit,
-            )
-        elif category:
-            return await conn.fetch(
-                f"{base} AND category=$2 ORDER BY embedding <=> $1::vector LIMIT $3",
-                vec_str, category, limit,
-            )
-        elif subcategory:
-            return await conn.fetch(
-                f"{base} AND subcategory=$2 ORDER BY embedding <=> $1::vector LIMIT $3",
-                vec_str, subcategory, limit,
-            )
-        else:
-            return await conn.fetch(
-                f"{base} ORDER BY embedding <=> $1::vector LIMIT $2",
-                vec_str, limit,
-            )
+        return await conn.fetch(sql, *params)
     except Exception as e:
         logger.error(f"[VECTOR] pgvector search failed: {e}")
         return []
 
 
 async def _fts_fetch(conn, query: str, limit: int,
-                     category=None,
-                     subcategory=None,
-                     select_cols=None):
+                     category=None, subcategory=None, select_cols=None,
+                     source_provider=None, source_model=None,
+                     source_agent=None, namespace=None):
     """FTS search with ILIKE fallback. Shared by /memories/search and /memories/rehydrate.
 
     Uses plainto_tsquery (not to_tsquery) so user input is treated as plain text —
     tsquery operators like |, !, & are not interpreted.  This prevents tsquery
     operator injection while preserving full-text search quality.
+    Supports optional provenance filters (source_provider, source_model,
+    source_agent, namespace) ANDed into the WHERE clause.
     """
     if select_cols is None:
         select_cols = _MEMORY_COLS
-    # Pass the raw query directly — plainto_tsquery handles tokenisation safely
     clean_query = query.strip()
     rank_col = "ts_rank(to_tsvector('english', content), plainto_tsquery('english', $1)) as rank"
+
+    # Dynamic WHERE builder: $1=query, $2=limit; filter params at $3+
+    params: list = [clean_query, limit]
+    conditions: list = ["to_tsvector('english', content) @@ plainto_tsquery('english', $1)"]
+    for col, val in [("category", category), ("subcategory", subcategory),
+                     ("source_provider", source_provider), ("source_model", source_model),
+                     ("source_agent", source_agent), ("namespace", namespace)]:
+        if val is not None:
+            params.append(val)
+            conditions.append(f"{col}=${len(params)}")
+
+    where = " AND ".join(conditions)
+    sql = (f"SELECT {select_cols}, {rank_col} FROM memories "
+           f"WHERE {where} ORDER BY rank DESC LIMIT $2")
     try:
-        if category and subcategory:
-            return await conn.fetch(
-                f"SELECT {select_cols}, {rank_col} FROM memories "
-                "WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) "
-                "AND category=$3 AND subcategory=$4 ORDER BY rank DESC LIMIT $2",
-                clean_query, limit, category, subcategory,
-            )
-        elif category:
-            return await conn.fetch(
-                f"SELECT {select_cols}, {rank_col} FROM memories "
-                "WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) "
-                "AND category=$3 ORDER BY rank DESC LIMIT $2",
-                clean_query, limit, category,
-            )
-        elif subcategory:
-            return await conn.fetch(
-                f"SELECT {select_cols}, {rank_col} FROM memories "
-                "WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) "
-                "AND subcategory=$3 ORDER BY rank DESC LIMIT $2",
-                clean_query, limit, subcategory,
-            )
-        else:
-            return await conn.fetch(
-                f"SELECT {select_cols}, {rank_col} FROM memories "
-                "WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) "
-                "ORDER BY rank DESC LIMIT $2",
-                clean_query, limit,
-            )
+        return await conn.fetch(sql, *params)
     except Exception:
         logger.warning(f"[FTS] falling back to ILIKE for: {query[:50]!r}")
         like_q = f"%{query}%"
+        # Rebuild for ILIKE: $1=like_q, $2=limit; filter params at $3+
+        ilike_params: list = [like_q, limit]
+        ilike_conditions: list = ["content ILIKE $1"]
+        for col, val in [("category", category), ("subcategory", subcategory),
+                         ("source_provider", source_provider), ("source_model", source_model),
+                         ("source_agent", source_agent), ("namespace", namespace)]:
+            if val is not None:
+                ilike_params.append(val)
+                ilike_conditions.append(f"{col}=${len(ilike_params)}")
+        ilike_where = " AND ".join(ilike_conditions)
+        ilike_sql = (f"SELECT {select_cols} FROM memories "
+                     f"WHERE {ilike_where} ORDER BY created DESC LIMIT $2")
         try:
-            if category and subcategory:
-                return await conn.fetch(
-                    f"SELECT {select_cols} FROM memories "
-                    "WHERE content ILIKE $1 AND category=$3 AND subcategory=$4 "
-                    "ORDER BY created DESC LIMIT $2",
-                    like_q, limit, category, subcategory,
-                )
-            elif category:
-                return await conn.fetch(
-                    f"SELECT {select_cols} FROM memories "
-                    "WHERE content ILIKE $1 AND category=$3 ORDER BY created DESC LIMIT $2",
-                    like_q, limit, category,
-                )
-            elif subcategory:
-                return await conn.fetch(
-                    f"SELECT {select_cols} FROM memories "
-                    "WHERE content ILIKE $1 AND subcategory=$3 ORDER BY created DESC LIMIT $2",
-                    like_q, limit, subcategory,
-                )
-            else:
-                return await conn.fetch(
-                    f"SELECT {select_cols} FROM memories "
-                    "WHERE content ILIKE $1 ORDER BY created DESC LIMIT $2",
-                    like_q, limit,
-                )
+            return await conn.fetch(ilike_sql, *ilike_params)
         except Exception as e2:
             logger.error(f"[FTS] Both FTS and ILIKE failed: {e2}")
             return []

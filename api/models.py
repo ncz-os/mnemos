@@ -66,6 +66,11 @@ class MemorySearchRequest(BaseModel):
     subcategory: Optional[str] = None
     include_compressed: Optional[bool] = False
     semantic: Optional[bool] = False   # True = pgvector cosine similarity; False = FTS
+    # Provenance filters (v2.3.0+) — all optional, ANDed together when set
+    source_provider: Optional[str] = None
+    source_model: Optional[str] = None
+    source_agent: Optional[str] = None
+    namespace: Optional[str] = None
 
 
 class MemoryCreateRequest(BaseModel):
