@@ -1,4 +1,5 @@
 """State API: GET/PUT/DELETE /state/{key}, GET /state"""
+import json
 import logging
 from typing import Any
 
@@ -66,7 +67,7 @@ async def set_state(
                    ON CONFLICT (key) DO UPDATE
                    SET value = $2::jsonb, updated = NOW(), version = state.version + 1
                    RETURNING key, value, updated::text, version''',
-                key, req.value
+                key, json.dumps(req.value)
             )
         return dict(row)
     except Exception as e:
