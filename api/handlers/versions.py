@@ -227,21 +227,40 @@ async def revert_memory(
         else:
             meta_str = "{}"
 
-        await conn.execute(
-            "UPDATE memories SET "
-            "content=$1, category=$2, subcategory=$3, metadata=$4::jsonb, "
-            "verbatim_content=$5, updated=NOW() "
-            "WHERE id=$6",
-            ver_row["content"],
-            ver_row["category"],
-            ver_row["subcategory"],
-            meta_str,
-            ver_row["verbatim_content"],
-            memory_id,
-        )
-        row = await conn.fetchrow(
-            f"SELECT {_lc._MEMORY_COLS} FROM memories WHERE id=$1", memory_id
-        )
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE memories SET "
+                "content=$1, category=$2, subcategory=$3, metadata=$4::jsonb, "
+                "verbatim_content=$5, updated=NOW() "
+                "WHERE id=$6",
+                ver_row["content"],
+                ver_row["category"],
+                ver_row["subcategory"],
+                meta_str,
+                ver_row["verbatim_content"],
+                memory_id,
+            )
+            row = await conn.fetchrow(
+                f"SELECT {_lc._MEMORY_COLS} FROM memories WHERE id=$1", memory_id
+            )
+            # Snapshot the reverted state as a new version in the audit trail
+            next_ver = await conn.fetchval(
+                "SELECT COALESCE(MAX(version_num), 0) + 1 FROM memory_versions WHERE memory_id = $1",
+                memory_id,
+            )
+            await conn.execute(
+                "INSERT INTO memory_versions "
+                "(memory_id, version_num, content, category, subcategory, metadata, verbatim_content, "
+                "owner_id, namespace, permission_mode, "
+                "source_model, source_provider, source_session, source_agent, "
+                "snapshot_by, change_type) "
+                "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'update')",
+                memory_id, next_ver, row["content"], row["category"], row["subcategory"],
+                json.dumps(row["metadata"] or {}),
+                row["verbatim_content"], row["owner_id"], row["namespace"], row["permission_mode"],
+                row["source_model"], row["source_provider"], row["source_session"], row["source_agent"],
+                user.user_id,
+            )
 
     logger.info(
         f"[VERSION] Reverted {memory_id} to v{version_num} "
