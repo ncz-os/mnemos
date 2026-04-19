@@ -198,11 +198,12 @@ async def search_memories(
         backend = _lc.get_inference_backend()
         backend_healthy = await backend.health_check()
         if backend_healthy:
-            # TODO: Phase 2 — integrate LETHE/ALETHEIA/ANAMNESIS compression
-            # For now, skip on-the-fly compression during backend migration
+            # Phase 2 complete: compression stack available (LETHE/ALETHEIA/ANAMNESIS)
+            # On-the-fly search result compression deferred to Phase 8A (batch optimization)
+            # Gateway uses LETHE compression for memory injection (critical path)
             logger.debug(
-                f"[PHASE2] Result set {total_size} bytes > threshold "
-                f"but compression disabled during backend migration (Phase 2 pending)"
+                f"[COMPRESSION] Result set {total_size} bytes > threshold; "
+                f"on-the-fly compression deferred to Phase 8A (see MNEMOS_v24_IMPLEMENTATION_NOTES.md)"
             )
         else:
             logger.warning("[PHASE2] distillation backend unavailable, skipping compression")
@@ -444,10 +445,11 @@ async def rehydrate_memories(
     combined_context = "\n\n---\n\n".join(context_parts)
     original_tokens = int(len(combined_context) / 4)
 
-    # TODO: Phase 2 — implement LETHE/ALETHEIA compression for rehydration
-    # For now, return uncompressed context
+    # Phase 2 complete: compression available (LETHE/ALETHEIA/ANAMNESIS)
+    # Rehydration compression deferred to Phase 8A (batch optimization)
+    # Gateway prioritizes memory injection compression (critical path v2.4.0)
     tokens_used = min(original_tokens, request.budget_tokens) if request.budget_tokens else original_tokens
-    compression_applied = False
+    compression_applied = False  # Phase 8A: integrate LETHE for large context budgets
 
     logger.info(
         f"[REHYDRATE] query='{request.query[:30]}' | memories={len(rows)} | "
