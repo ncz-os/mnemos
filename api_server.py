@@ -35,7 +35,7 @@ from api.handlers.dag import router as dag_router
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
-app = FastAPI(title="MNEMOS API", version="2.3.0", lifespan=lifespan)
+app = FastAPI(title="MNEMOS API", version="2.4.0", lifespan=lifespan)
 
 # ── Request body size limit (SEC-04) ──────────────────────────────────────────
 # Default 5 MB. Override via MAX_BODY_BYTES env var.
