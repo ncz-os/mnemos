@@ -32,7 +32,7 @@ async def health_check() -> HealthResponse:
         status="healthy" if db_ok else "degraded",
         timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         database_connected=db_ok,
-        version="2.3.0",
+        version="2.4.0",
         distillation_worker=worker_status,
     )
 
