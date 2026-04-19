@@ -29,6 +29,7 @@ class HealthResponse(BaseModel):
     timestamp: str
     database_connected: bool
     version: str
+    distillation_worker: Optional[str] = None  # idle, healthy, error, disabled, unavailable
 
 
 class MemoryItem(BaseModel):

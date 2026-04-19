@@ -15,7 +15,7 @@ router = APIRouter()
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
-    """Return healthy only when the DB pool is reachable."""
+    """Return health status including DB pool and background workers."""
     db_ok = False
     if _lc._pool:
         try:
@@ -24,11 +24,16 @@ async def health_check() -> HealthResponse:
             db_ok = True
         except Exception as e:
             logger.warning(f"[HEALTH] DB probe failed: {e}")
+
+    # Get worker status
+    worker_status = _lc._worker_status.get("distillation_worker", "unknown")
+
     return HealthResponse(
         status="healthy" if db_ok else "degraded",
         timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         database_connected=db_ok,
         version="2.3.0",
+        distillation_worker=worker_status,
     )
 
 

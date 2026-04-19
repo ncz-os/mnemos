@@ -29,6 +29,12 @@ COMPRESSION_ITEM_THRESHOLD = 5 * 1024           # 5 KB per item
 # Background task registry — prevents dangling tasks at shutdown
 _background_tasks: set = set()
 
+# Worker health tracking
+_worker_status: dict = {
+    "distillation_worker": "idle",  # idle, healthy, error
+    "last_heartbeat": None,
+}
+
 
 def _schedule_background(coro) -> None:
     """Schedule a fire-and-forget coroutine with lifecycle tracking.
@@ -80,13 +86,53 @@ def _load_config() -> dict:
     return {}
 
 
+# ── Distillation Worker Wrapper ─────────────────────────────────────────────────
+
+async def _run_distillation_worker():
+    """Background worker coroutine for memory compression and optimization.
+
+    Monitors for unoptimized memories and dispatches them to:
+    1. LETHE (local CPU compression, fast)
+    2. ALETHEIA (GPU token-level compression, offline batch)
+    3. ANAMNESIS (LLM fact extraction, archival)
+
+    This coroutine is scheduled during startup and tracked in _background_tasks.
+    """
+    global _worker_status
+    import asyncio as _asyncio
+
+    # Import here to avoid circular dependencies
+    try:
+        from distillation_worker import MemoryDistillationWorker
+    except ImportError as e:
+        logger.warning(f"Distillation worker not available: {e}")
+        _worker_status["distillation_worker"] = "unavailable"
+        return
+
+    worker = MemoryDistillationWorker()
+
+    try:
+        _worker_status["distillation_worker"] = "starting"
+        await worker.start()
+    except KeyboardInterrupt:
+        logger.info("Distillation worker shutting down gracefully")
+        _worker_status["distillation_worker"] = "idle"
+    except Exception as e:
+        logger.error(f"Distillation worker error: {e}")
+        _worker_status["distillation_worker"] = "error"
+    finally:
+        if worker.db_pool:
+            await worker.db_pool.close()
+        _worker_status["distillation_worker"] = "idle"
+
+
 # ── App lifespan ─────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app):
-    """FastAPI lifespan: initialize and teardown DB pool, Redis, and inference provider."""
-    global _pool, _cache, _rls_enabled
-    logger.info("Starting MNEMOS API Server v2.3.0 (hierarchy + knowledge graph + MCP)")
+    """FastAPI lifespan: initialize and teardown DB pool, Redis, inference provider, and workers."""
+    global _pool, _cache, _rls_enabled, _worker_status
+    logger.info("Starting MNEMOS API Server v2.3.0 (gateway + sessions + DAG + workers)")
 
     config = _load_config()
 
@@ -136,6 +182,17 @@ async def lifespan(app):
         logger.info("[backend] Distillation backend CONNECTED")
     else:
         logger.warning("[backend] Distillation backend UNREACHABLE - compression disabled")
+
+    # Start background distillation worker (optional)
+    worker_enabled = config.get("worker", {}).get("enabled", True)
+    if worker_enabled and _pool:
+        logger.info("Launching background distillation worker")
+        _schedule_background(_run_distillation_worker())
+        import asyncio as _asyncio
+        await _asyncio.sleep(0.5)  # Give worker time to initialize
+    else:
+        logger.info("Background distillation worker disabled")
+        _worker_status["distillation_worker"] = "disabled"
 
     yield
 
