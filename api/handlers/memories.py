@@ -195,47 +195,17 @@ async def search_memories(
     total_size = sum(len(m.content) for m in memories)
 
     if total_size > COMPRESSION_RESULT_SET_THRESHOLD:
-        provider = _lc.get_inference_provider()
-        cerberus_healthy = await provider.health_check()
-        if cerberus_healthy:
-            logger.info(f"[PHASE2] Result set {total_size} bytes > threshold, applying compression")
-            compressed_count = 0
-            total_original = total_size
-            total_compressed = 0
-            quality_scores = []
-            for memory in memories:
-                item_size = len(memory.content)
-                if item_size > COMPRESSION_ITEM_THRESHOLD and not memory.compressed_content:
-                    result = await provider.compress(memory.content, target_ratio=0.35, min_quality=70)
-                    if result['success']:
-                        memory.compressed_content = result['compressed']
-                        quality_scores.append(result['quality_score'])
-                        total_compressed += result['compressed_length']
-                        compressed_count += 1
-                        logger.info(
-                            f"[PHASE2] Compressed {memory.id[:8]}: "
-                            f"{item_size} -> {result['compressed_length']} chars"
-                        )
-                        _lc._schedule_background(_persist_compression(memory.id, result['compressed']))
-                    else:
-                        total_compressed += item_size
-                        logger.warning(f"[PHASE2] Compression failed for {memory.id[:8]}: {result['error']}")
-                else:
-                    total_compressed += item_size
-            if compressed_count > 0:
-                compression_applied = True
-                avg_quality = sum(quality_scores) / len(quality_scores) if quality_scores else 0
-                compression_metadata = {
-                    'items_compressed': compressed_count,
-                    'total_items': len(memories),
-                    'original_bytes': total_original,
-                    'compressed_bytes': total_compressed,
-                    'compression_ratio': round(total_compressed / max(total_original, 1), 3),
-                    'average_quality_score': round(avg_quality, 1),
-                    'threshold_triggered': COMPRESSION_RESULT_SET_THRESHOLD,
-                }
+        backend = _lc.get_inference_backend()
+        backend_healthy = await backend.health_check()
+        if backend_healthy:
+            # TODO: Phase 2 — integrate LETHE/ALETHEIA/ANAMNESIS compression
+            # For now, skip on-the-fly compression during backend migration
+            logger.debug(
+                f"[PHASE2] Result set {total_size} bytes > threshold "
+                f"but compression disabled during backend migration (Phase 2 pending)"
+            )
         else:
-            logger.warning("[PHASE2] inference-server unavailable, skipping compression")
+            logger.warning("[PHASE2] distillation backend unavailable, skipping compression")
 
     response = MemoryListResponse(
         count=len(memories),
@@ -473,21 +443,23 @@ async def rehydrate_memories(
         context_parts.append(f"[{row['category']} / {created_str}]\n{effective_content[:2000]}")
     combined_context = "\n\n---\n\n".join(context_parts)
     original_tokens = int(len(combined_context) / 4)
-    provider = _lc.get_inference_provider()
-    result = await provider.prepare_context(combined_context, max_tokens=request.budget_tokens)
-    compression_applied = result['ratio'] < 0.99
+
+    # TODO: Phase 2 — implement LETHE/ALETHEIA compression for rehydration
+    # For now, return uncompressed context
+    tokens_used = min(original_tokens, request.budget_tokens) if request.budget_tokens else original_tokens
+    compression_applied = False
+
     logger.info(
         f"[REHYDRATE] query='{request.query[:30]}' | memories={len(rows)} | "
-        f"original_tokens={original_tokens} | tokens_used={result['tokens_used']} | "
-        f"ratio={result['ratio']:.2%} | quality={result['quality_score']} | "
-        f"compressed={compression_applied}"
+        f"original_tokens={original_tokens} | tokens_used={tokens_used} | "
+        f"compression_applied={compression_applied}"
     )
     return RehydrationResponse(
-        context=result['context_for_injection'],
-        tokens_used=result['tokens_used'],
+        context=combined_context[:request.budget_tokens * 4] if request.budget_tokens else combined_context,
+        tokens_used=tokens_used,
         original_tokens=original_tokens,
-        compression_ratio=round(result['ratio'], 3),
-        quality_score=result['quality_score'],
+        compression_ratio=1.0,
+        quality_score=100,
         memories_included=len(rows),
         compression_applied=compression_applied,
     )

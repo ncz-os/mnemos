@@ -1,5 +1,6 @@
 """Pydantic models for MNEMOS API."""
 from typing import Optional, Dict, Any, List
+from datetime import datetime
 from pydantic import BaseModel
 
 
@@ -78,22 +79,31 @@ class MemoryCreateRequest(BaseModel):
     category: str = "facts"
     subcategory: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
-    source: Optional[str] = None
-    verbatim_content: Optional[str] = None   # explicit override; defaults to content if omitted
-    # v1 provenance + ownership
-    owner_id: Optional[str] = None
-    namespace: Optional[str] = None
-    source_model: Optional[str] = None
-    source_provider: Optional[str] = None
-    source_session: Optional[str] = None
-    source_agent: Optional[str] = None
+    verbatim_content: Optional[str] = None
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: Optional[str] = None
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    quality_rating: Optional[int] = None
+
+
+class BulkCreateRequest(BaseModel):
+    memories: List[MemoryCreateRequest]
+
+
+class BulkCreateResponse(BaseModel):
+    created: int
+    failed: int
+    details: List[Dict[str, Any]] = []
 
 
 class RehydrationRequest(BaseModel):
     query: str
-    budget_tokens: int = 8000
-    category: Optional[str] = None
-    limit: int = 20
+    limit: int = 5
+    budget_tokens: Optional[int] = None
 
 
 class RehydrationResponse(BaseModel):
@@ -106,110 +116,74 @@ class RehydrationResponse(BaseModel):
     compression_applied: bool
 
 
-class SessionIngestRequest(BaseModel):
-    source: str
+# ── Session Management Models (NEW) ────────────────────────────────────────
+
+class ChatMessage(BaseModel):
+    """Message in conversation history."""
+    role: str  # "user", "assistant", "system"
+    content: str
+    timestamp: Optional[str] = None
+    model: Optional[str] = None
+
+
+class SessionContext(BaseModel):
+    """Server-side context for a session."""
     session_id: str
-    machine_id: str
-    agent_id: str
-    raw_data: Dict[str, Any]
-    git_commit: Optional[str] = None
-
-
-class SessionIngestResponse(BaseModel):
-    success: bool
-    session_id: str
-    stored_count: int
-    memory_ids: List[str]
-
-
-class MemoryUpdateRequest(BaseModel):
-    content: Optional[str] = None
-    category: Optional[str] = None
-    subcategory: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-    verbatim_content: Optional[str] = None
-
-
-# ── Knowledge Graph models ────────────────────────────────────────────────────
-
-class KGTripleCreate(BaseModel):
-    subject: str
-    predicate: str
-    object: str
-    subject_type: Optional[str] = None
-    object_type: Optional[str] = None
-    valid_from: Optional[str] = None     # ISO8601; defaults to NOW() if omitted
-    valid_until: Optional[str] = None    # ISO8601; NULL means still valid
-    memory_id: Optional[str] = None      # FK to memories.id
-    confidence: float = 1.0
-
-
-class KGTriple(BaseModel):
-    id: str
-    subject: str
-    predicate: str
-    object: str
-    subject_type: Optional[str] = None
-    object_type: Optional[str] = None
-    valid_from: str
-    valid_until: Optional[str] = None
-    memory_id: Optional[str] = None
-    confidence: float
-    created: str
-
-
-class KGTripleListResponse(BaseModel):
-    count: int
-    triples: List[KGTriple]
-
-
-class KGTripleUpdate(BaseModel):
-    subject: Optional[str] = None
-    predicate: Optional[str] = None
-    object: Optional[str] = None
-    subject_type: Optional[str] = None
-    object_type: Optional[str] = None
-    valid_until: Optional[str] = None    # ISO8601; set to mark expired
-    confidence: Optional[float] = None
-
-
-class BulkCreateRequest(BaseModel):
-    memories: List[MemoryCreateRequest]
-
-
-class BulkCreateResponse(BaseModel):
-    created: int
-    memory_ids: List[str]
-    errors: List[str] = []
-
-
-# ── Admin / auth models ───────────────────────────────────────────────────────
-
-class ApiKeyCreateRequest(BaseModel):
-    label: Optional[str] = None
-
-
-class ApiKeyResponse(BaseModel):
-    id: str
     user_id: str
-    key_prefix: str
-    label: Optional[str] = None
     created_at: str
-    last_used: Optional[str] = None
-    revoked: bool
-    raw_key: Optional[str] = None   # only present on creation; never returned again
+    last_activity: str
+    message_count: int
+    total_tokens: int
+    model: str
+    compression_tier: int = 1  # 1=LETHE, 2=ALETHEIA, 3=ANAMNESIS
+    injected_memories: Optional[List[str]] = None
 
 
-class UserCreateRequest(BaseModel):
-    id: str
-    display_name: Optional[str] = None
-    email: Optional[str] = None
-    role: str = "user"
+class SessionRequest(BaseModel):
+    """Create a new session."""
+    model: Optional[str] = "gpt-4o"
+    compression_tier: Optional[int] = 1
+    initial_context: Optional[str] = None
 
 
-class UserResponse(BaseModel):
-    id: str
-    display_name: Optional[str] = None
-    email: Optional[str] = None
+class SessionResponse(BaseModel):
+    """Session created successfully."""
+    session_id: str
+    created_at: str
+    model: str
+    compression_tier: int
+
+
+class SessionMessage(BaseModel):
+    """Add a message to a session (stateful chat)."""
+    role: str  # "user" or "assistant"
+    content: str
+    model: Optional[str] = None  # Override session model
+
+
+class SessionMessageResponse(BaseModel):
+    """Response to a session message."""
+    session_id: str
+    message_id: str
     role: str
+    content: str
+    model: str
+    timestamp: str
+    tokens_used: int
+    memories_injected: int
+    compression_ratio: Optional[float] = None
+
+
+class SessionHistoryRequest(BaseModel):
+    """Get session conversation history."""
+    limit: int = 50
+    offset: int = 0
+
+
+class SessionHistoryResponse(BaseModel):
+    """Session conversation history."""
+    session_id: str
+    messages: List[ChatMessage]
+    total_messages: int
+    total_tokens: int
     created_at: str

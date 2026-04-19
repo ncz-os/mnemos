@@ -15,7 +15,7 @@ import redis.asyncio as aioredis
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import PG_CONFIG
-from external_inference_provider import ExternalInferenceProvider
+from inference_backend import get_backend as _get_backend
 from graeae.engine import get_graeae_engine  # noqa: F401 — re-exported for handlers
 
 from .models import MemoryItem
@@ -52,15 +52,16 @@ _EMBED_TIMEOUT = float(os.getenv('OLLAMA_EMBED_TIMEOUT', '10'))
 # ── Singleton globals ────────────────────────────────────────────────────────
 _pool: Optional[asyncpg.Pool] = None
 _cache: Optional[aioredis.Redis] = None
-_inference_provider: Optional[ExternalInferenceProvider] = None
+_inference_backend = None  # initialized on startup via _get_backend()
 _rls_enabled: bool = False   # set from config at startup; read by handlers
 
 
-def get_inference_provider() -> ExternalInferenceProvider:
-    global _inference_provider
-    if _inference_provider is None:
-        _inference_provider = ExternalInferenceProvider()
-    return _inference_provider
+def get_inference_backend():
+    """Get the distillation backend (Ollama or LlamaCpp)."""
+    global _inference_backend
+    if _inference_backend is None:
+        _inference_backend = _get_backend()
+    return _inference_backend
 
 
 def _load_config() -> dict:
@@ -129,12 +130,12 @@ async def lifespan(app):
         _cache = None
         app.state.cache = None
 
-    provider = get_inference_provider()
-    healthy = await provider.health_check()
+    backend = get_inference_backend()
+    healthy = await backend.health_check()
     if healthy:
-        logger.info("ExternalInferenceProvider: inference-server llama-server CONNECTED")
+        logger.info("[backend] Distillation backend CONNECTED")
     else:
-        logger.warning("ExternalInferenceProvider: inference-server llama-server UNREACHABLE - compression disabled")
+        logger.warning("[backend] Distillation backend UNREACHABLE - compression disabled")
 
     yield
 
@@ -149,7 +150,7 @@ async def lifespan(app):
     if _cache:
         await _cache.aclose()
         logger.info("Redis cache closed")
-    await provider.close()
+    await backend.close()
     logger.info("Shutting down MNEMOS API Server")
 
 

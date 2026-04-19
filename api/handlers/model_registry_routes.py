@@ -298,6 +298,105 @@ async def list_provider_models(
     return [_row_to_model_entry(r) for r in rows]
 
 
+@router.get("/recommend")
+async def recommend_model(
+    task_type: str = Query(..., description="Task type: code_generation, reasoning, architecture_design, etc."),
+    cost_budget: float = Query(10.0, description="Max cost per 1M tokens ($/MTok)"),
+    quality_floor: float = Query(0.85, description="Minimum quality score (0-1)"),
+    user: UserContext = Depends(get_current_user),
+):
+    """Recommend cheapest model meeting quality + capability requirements.
+
+    Returns model with lowest cost that:
+    - Has required capabilities for task_type
+    - Has quality (graeae_weight) >= quality_floor
+    - Costs <= cost_budget per 1M tokens
+    """
+    pool = _require_pool()
+
+    try:
+        # Query model registry for candidates
+        async with pool.acquire() as conn:
+            # Map task types to required capabilities
+            capability_map = {
+                "code_generation": ["coding"],
+                "reasoning": ["reasoning", "logic"],
+                "architecture_design": ["reasoning"],
+                "summarization": ["reasoning"],
+                "web_search": ["online", "search"],
+            }
+            required_caps = capability_map.get(task_type, ["reasoning"])
+
+            # Find models meeting criteria
+            models = await conn.fetch(
+                """
+                SELECT
+                    provider, model_id, display_name, input_cost_per_mtok,
+                    output_cost_per_mtok, capabilities, graeae_weight, context_window
+                FROM model_registry
+                WHERE available = true
+                AND deprecated = false
+                AND graeae_weight >= $1
+                AND (input_cost_per_mtok + output_cost_per_mtok) / 2.0 <= $2
+                AND capabilities @> $3
+                ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC
+                LIMIT 1
+                """,
+                quality_floor,
+                cost_budget,
+                required_caps,
+            )
+
+            if not models:
+                # Fallback: cheapest model available (ignore budget)
+                logger.info(
+                    f"[OPTIMIZER] No model found for {task_type} "
+                    f"(budget=${cost_budget}/MTok, quality>={quality_floor}), "
+                    f"using fallback cheapest model"
+                )
+                models = await conn.fetch(
+                    """
+                    SELECT
+                        provider, model_id, display_name, input_cost_per_mtok,
+                        output_cost_per_mtok, capabilities, graeae_weight, context_window
+                    FROM model_registry
+                    WHERE available = true AND deprecated = false
+                    ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC
+                    LIMIT 1
+                    """
+                )
+
+            if not models:
+                raise HTTPException(status_code=404, detail="No models available")
+
+            model = models[0]
+            avg_cost = (model["input_cost_per_mtok"] + model["output_cost_per_mtok"]) / 2.0
+
+            logger.info(
+                f"[OPTIMIZER] Recommended {model['provider']}/{model['model_id']} "
+                f"for {task_type} (cost=${avg_cost:.2f}/MTok)"
+            )
+
+            return {
+                "recommended": {
+                    "provider": model["provider"],
+                    "model_id": model["model_id"],
+                    "display_name": model.get("display_name"),
+                    "cost_per_mtok": avg_cost,
+                },
+                "reasoning": f"Cheapest model with {', '.join(required_caps)} capability "
+                f"above quality floor {quality_floor}",
+                "quality_score": model["graeae_weight"],
+                "context_window": model.get("context_window"),
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[OPTIMIZER] Recommendation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Recommendation failed: {str(e)}")
+
+
 @router.post("/sync", response_model=List[SyncResult])
 async def trigger_sync(
     request: SyncRequest,

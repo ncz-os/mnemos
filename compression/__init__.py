@@ -1,18 +1,19 @@
 """
-Compression Module: Distillation and quality tracking
+Compression Module: THE MOIRAI (Tier 1-3 compression)
 
 Provides:
-- extractive token filter: Fast, heuristic-based compression (0.48ms, 57% reduction)
-- SENTENCE: Semantic-Anchor Compression (structure-preserving, 50% reduction)
-- DistillationEngine: Integrated compression with strategy selection
-- QualityAnalyzer: Generates quality manifests
-- CompressionManager: Orchestrates compression strategies
+- LETHE: Fast CPU compression (Tier 1, 0.5-5ms, 30-57% reduction)
+- ALETHEIA: GPU token-level compression via PYTHIA (Tier 2, 200-500ms, 70% reduction)
+- ANAMNESIS: GPU fact extraction for archival (Tier 3, 500ms-2s, semantic compression)
+- CompressionManager: Orchestrates LETHE/ALETHEIA/ANAMNESIS with fallback
+- QualityAnalyzer: Quality manifest generation
 """
 
 from .quality_analyzer import QualityAnalyzer, QualityManifest
-from .manager import CompressionManager
-from .token_filter import extractive token filter
-from .sac import SACCompressor, StructureAnalyzer, CompressionStrategySelector
+from .manager import CompressionManager, CompressionResult
+from .lethe import LETHE
+from .aletheia import ALETHEIA
+from .anamnesis import ANAMNESIS
 from .distillation_engine import (
     DistillationEngine,
     CompressionStrategy,
@@ -22,16 +23,16 @@ from .distillation_engine import (
 )
 
 __all__ = [
-    'QualityAnalyzer',
-    'QualityManifest',
-    'CompressionManager',
-    'extractive token filter',
-    'SACCompressor',
-    'StructureAnalyzer',
-    'CompressionStrategySelector',
-    'DistillationEngine',
-    'CompressionStrategy',
-    'get_distillation_engine',
-    'distill',
-    'get_distillation_stats',
+    "QualityAnalyzer",
+    "QualityManifest",
+    "CompressionManager",
+    "CompressionResult",
+    "LETHE",
+    "ALETHEIA",
+    "ANAMNESIS",
+    "DistillationEngine",
+    "CompressionStrategy",
+    "get_distillation_engine",
+    "distill",
+    "get_distillation_stats",
 ]

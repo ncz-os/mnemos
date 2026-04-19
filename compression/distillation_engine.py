@@ -1,10 +1,10 @@
 """
 Distillation Engine: Integrated compression with intelligent strategy selection
 
-Combines:
-- extractive token filter: Fast heuristic compression
-- SENTENCE: Structure-preserving compression
-- Intelligent strategy selection
+Now uses LETHE (THE MOIRAI Tier 1) which combines:
+- Token mode (extractive token filter-style): Fast heuristic compression
+- Sentence mode (SENTENCE-style): Structure-preserving compression
+- Auto mode: Intelligent strategy selection
 - Performance monitoring
 """
 
@@ -13,18 +13,20 @@ import time
 from typing import Dict, Optional
 from enum import Enum
 
+from .lethe import LETHE
+
 logger = logging.getLogger(__name__)
 
 
 class CompressionStrategy(Enum):
-    """Compression strategy options"""
-    TOKEN = "hyco"           # Fast, ~57% reduction
-    SENTENCE = "sac"             # Structure-preserving, ~50% reduction
-    AUTO = "auto"           # Intelligent selection
+    """Compression strategy options (backward compat)"""
+    TOKEN = "token"           # Token mode (was extractive token filter), ~57% reduction
+    SENTENCE = "sentence"         # Sentence mode (was SENTENCE), ~50% reduction
+    AUTO = "auto"            # Auto-select based on structure
 
 
 class DistillationEngine:
-    """Integrated distillation/compression engine"""
+    """Integrated distillation/compression engine using LETHE"""
 
     def __init__(self, default_ratio: float = 0.45):
         """Initialize distillation engine
@@ -34,44 +36,29 @@ class DistillationEngine:
         """
         self.default_ratio = default_ratio
         self.stats = {
-            'total_compressions': 0,
-            'hyco_compressions': 0,
-            'sac_compressions': 0,
-            'total_input_tokens': 0,
-            'total_output_tokens': 0,
-            'total_time_ms': 0.0,
+            "total_compressions": 0,
+            "token_mode_compressions": 0,
+            "sentence_mode_compressions": 0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_time_ms": 0.0,
         }
 
-        # Lazy import to avoid circular dependencies
-        self._hyco = None
-        self._sac = None
+        # Initialize LETHE (auto mode)
+        self.lethe = LETHE(mode="auto")
 
-    @property
-    def hyco(self):
-        """Get extractive token filter compressor (lazy load)"""
-        if self._hyco is None:
-            from .token_filter import extractive token filter
-            self._hyco = extractive token filter()
-        return self._hyco
-
-    @property
-    def sac(self):
-        """Get SENTENCE compressor (lazy load)"""
-        if self._sac is None:
-            from .sac import SACCompressor
-            self._sac = SACCompressor()
-        return self._sac
-
-    def distill(self,
-               text: str,
-               strategy: CompressionStrategy = CompressionStrategy.AUTO,
-               ratio: Optional[float] = None,
-               task_type: Optional[str] = None) -> Dict:
-        """Distill/compress text
+    def distill(
+        self,
+        text: str,
+        strategy: CompressionStrategy = CompressionStrategy.AUTO,
+        ratio: Optional[float] = None,
+        task_type: Optional[str] = None,
+    ) -> Dict:
+        """Distill/compress text using LETHE
 
         Args:
             text: Text to compress
-            strategy: Compression strategy
+            strategy: Compression strategy (token, sentence, or auto)
             ratio: Target compression ratio (overrides default)
             task_type: Task type for ratio selection
 
@@ -82,53 +69,57 @@ class DistillationEngine:
 
         # Coerce string strategy to enum
         if isinstance(strategy, str):
-            strategy = CompressionStrategy(strategy)
+            try:
+                strategy = CompressionStrategy(strategy)
+            except ValueError:
+                strategy = CompressionStrategy.AUTO
 
         # Use provided ratio or default
         target_ratio = ratio or self._get_ratio_for_task(task_type)
 
-        # Select strategy if auto
+        # Map strategy to LETHE mode
         if strategy == CompressionStrategy.AUTO:
-            strategy = self._select_strategy(text)
+            lethe_mode = "auto"
+        elif strategy == CompressionStrategy.SENTENCE:
+            lethe_mode = "sentence"
+            self.stats["sentence_mode_compressions"] += 1
+        else:  # TOKEN
+            lethe_mode = "token"
+            self.stats["token_mode_compressions"] += 1
 
-        # Compress
-        if strategy == CompressionStrategy.SENTENCE:
-            result = self.sac.compress(text)
-            self.stats['sac_compressions'] += 1
-        else:
-            result = self.hyco.compress(text, target_ratio)
-            self.stats['hyco_compressions'] += 1
+        # Compress using LETHE
+        result = self.lethe.compress(text, target_ratio=target_ratio, mode=lethe_mode)
 
         # Record metrics
         end_time = time.time()
         elapsed_ms = (end_time - start_time) * 1000
 
-        self.stats['total_compressions'] += 1
-        self.stats['total_input_tokens'] += result['original_tokens']
-        self.stats['total_output_tokens'] += result['compressed_tokens']
-        self.stats['total_time_ms'] += elapsed_ms
+        self.stats["total_compressions"] += 1
+        self.stats["total_input_tokens"] += result["original_tokens"]
+        self.stats["total_output_tokens"] += result["compressed_tokens"]
+        self.stats["total_time_ms"] += elapsed_ms
 
-        # Add metadata
-        result['strategy_used'] = strategy.value
-        # Normalize output: ensure both 'compressed' and 'compressed_text' keys exist
-        if 'compressed_text' in result and 'compressed' not in result:
-            result['compressed'] = result['compressed_text']
-        elif 'compressed' in result and 'compressed_text' not in result:
-            result['compressed_text'] = result['compressed']
-        result['compression_time_ms'] = round(elapsed_ms, 2)
+        # Add metadata (normalize output for backward compat)
+        strategy_value = result.get("mode", lethe_mode)
+        result["strategy_used"] = strategy_value
+        if "compressed_text" in result and "compressed" not in result:
+            result["compressed"] = result["compressed_text"]
+        result["compression_time_ms"] = round(elapsed_ms, 2)
 
         logger.debug(
             f"Distilled {result['original_tokens']} tokens → "
             f"{result['compressed_tokens']} ({result['compression_ratio']:.2%}) "
-            f"using {strategy.value} in {elapsed_ms:.2f}ms"
+            f"using {strategy_value} in {elapsed_ms:.2f}ms"
         )
 
         return result
 
-    def batch_distill(self,
-                     texts: list,
-                     strategy: CompressionStrategy = CompressionStrategy.AUTO,
-                     ratio: Optional[float] = None) -> list:
+    def batch_distill(
+        self,
+        texts: list,
+        strategy: CompressionStrategy = CompressionStrategy.AUTO,
+        ratio: Optional[float] = None,
+    ) -> list:
         """Distill multiple texts
 
         Args:
@@ -145,24 +136,6 @@ class DistillationEngine:
             results.append(result)
         return results
 
-    def _select_strategy(self, text: str) -> CompressionStrategy:
-        """Intelligently select compression strategy
-
-        Args:
-            text: Text to analyze
-
-        Returns:
-            Selected strategy
-        """
-        from .sac import StructureAnalyzer
-
-        # Use SENTENCE for structured text
-        if StructureAnalyzer.is_structured(text):
-            return CompressionStrategy.SENTENCE
-
-        # Use extractive token filter for unstructured text (faster)
-        return CompressionStrategy.TOKEN
-
     def _get_ratio_for_task(self, task_type: Optional[str]) -> float:
         """Get compression ratio for task type
 
@@ -173,14 +146,14 @@ class DistillationEngine:
             Target compression ratio
         """
         ratios = {
-            'reasoning': 0.45,
-            'code_generation': 0.30,
-            'architecture_design': 0.50,
-            'api_design': 0.40,
-            'data_modeling': 0.45,
-            'debugging': 0.35,
-            'refactoring': 0.40,
-            'research': 0.40,
+            "reasoning": 0.45,
+            "code_generation": 0.30,
+            "architecture_design": 0.50,
+            "api_design": 0.40,
+            "data_modeling": 0.45,
+            "debugging": 0.35,
+            "refactoring": 0.40,
+            "research": 0.40,
         }
 
         return ratios.get(task_type, self.default_ratio)
@@ -191,35 +164,37 @@ class DistillationEngine:
         Returns:
             Statistics dict
         """
-        total_tokens = self.stats['total_input_tokens']
+        total_tokens = self.stats["total_input_tokens"]
         if total_tokens == 0:
             avg_ratio = 1.0
             avg_time = 0.0
         else:
-            avg_ratio = self.stats['total_output_tokens'] / total_tokens
-            avg_time = self.stats['total_time_ms'] / max(self.stats['total_compressions'], 1)
+            avg_ratio = self.stats["total_output_tokens"] / total_tokens
+            avg_time = self.stats["total_time_ms"] / max(
+                self.stats["total_compressions"], 1
+            )
 
         return {
-            'total_compressions': self.stats['total_compressions'],
-            'hyco_compressions': self.stats['hyco_compressions'],
-            'sac_compressions': self.stats['sac_compressions'],
-            'total_input_tokens': self.stats['total_input_tokens'],
-            'total_output_tokens': self.stats['total_output_tokens'],
-            'average_ratio': round(avg_ratio, 4),
-            'average_time_ms': round(avg_time, 2),
-            'total_time_ms': round(self.stats['total_time_ms'], 2),
-            'compression_efficiency': round((1 - avg_ratio) * 100, 2),
+            "total_compressions": self.stats["total_compressions"],
+            "token_mode_compressions": self.stats["token_mode_compressions"],
+            "sentence_mode_compressions": self.stats["sentence_mode_compressions"],
+            "total_input_tokens": self.stats["total_input_tokens"],
+            "total_output_tokens": self.stats["total_output_tokens"],
+            "average_ratio": round(avg_ratio, 4),
+            "average_time_ms": round(avg_time, 2),
+            "total_time_ms": round(self.stats["total_time_ms"], 2),
+            "compression_efficiency": round((1 - avg_ratio) * 100, 2),
         }
 
     def reset_stats(self) -> None:
         """Reset statistics"""
         self.stats = {
-            'total_compressions': 0,
-            'hyco_compressions': 0,
-            'sac_compressions': 0,
-            'total_input_tokens': 0,
-            'total_output_tokens': 0,
-            'total_time_ms': 0.0,
+            "total_compressions": 0,
+            "token_mode_compressions": 0,
+            "sentence_mode_compressions": 0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_time_ms": 0.0,
         }
         logger.info("Distillation statistics reset")
 

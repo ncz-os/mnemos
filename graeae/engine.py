@@ -250,6 +250,41 @@ class GraeaeEngine:
 
         return {"all_responses": all_responses}
 
+    async def route(
+        self, provider: str, model: str, prompt: str, task_type: str = "reasoning", timeout: int = 30
+    ) -> Dict:
+        """Single-provider pass-through (no consensus, no eligibility gates).
+
+        Used by MNEMOS gateway for explicit model selection or fallback.
+        Does NOT apply circuit breakers, rate limiters, or concurrency guards —
+        caller is responsible for load management.
+
+        Args:
+            provider: Provider name (must exist in self.providers)
+            model: Override model name (optional; uses provider config if None)
+            prompt: Query text
+            task_type: Task type for logging/tracking
+            timeout: Request timeout in seconds
+
+        Returns:
+            Dict with status, response_text, latency_ms, model_id
+        """
+        if provider not in self.providers:
+            logger.warning(f"[GRAEAE] unknown provider '{provider}' — returning unavailable")
+            return _unavailable(model or provider)
+
+        provider_config = dict(self.providers[provider])
+        if model:
+            provider_config["model"] = model
+
+        try:
+            result = await self._query_provider(provider, prompt, task_type, timeout)
+            logger.debug(f"[GRAEAE] route({provider}, {model or 'default'}) → {result['status']}")
+            return result
+        except Exception as e:
+            logger.error(f"[GRAEAE] route({provider}) failed: {e}")
+            return _unavailable(provider_config["model"])
+
     async def _query_provider(
         self, provider_name: str, prompt: str, task_type: str, timeout: int
     ) -> Dict:

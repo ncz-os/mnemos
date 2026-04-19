@@ -29,6 +29,8 @@ from api.handlers.model_registry_routes import router as model_registry_router
 from api.handlers.journal import router as journal_router
 from api.handlers.state import router as state_router
 from api.handlers.entities import router as entities_router
+from api.handlers.openai_compat import router as openai_compat_router
+from api.handlers.sessions import router as sessions_router
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
@@ -72,6 +74,8 @@ app.add_middleware(
 )
 
 app.include_router(health_router)
+app.include_router(openai_compat_router)  # Phase 0: OpenAI-compatible gateway
+app.include_router(sessions_router)  # Phase 0: Session management for stateful chat
 app.include_router(graeae_router)
 app.include_router(memories_router)
 app.include_router(ingest_router)
