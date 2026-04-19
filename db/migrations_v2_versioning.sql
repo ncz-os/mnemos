@@ -38,27 +38,42 @@ CREATE INDEX IF NOT EXISTS idx_mv_snapshot_at      ON memory_versions(snapshot_a
 
 -- ---------------------------------------------------------------------------
 -- 2. Trigger function — auto-snapshot on INSERT / meaningful UPDATE / DELETE
+--    Now with DAG support: commit_hash, parent_version_id, branch, branch HEAD
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION mnemos_version_snapshot() RETURNS TRIGGER
 LANGUAGE plpgsql AS $$
 DECLARE
-    _next_v  INTEGER;
-    _by      TEXT;
+    _next_v          INTEGER;
+    _by              TEXT;
+    _branch          TEXT;
+    _commit_hash     TEXT;
+    _parent_version  UUID;
+    _new_version_id  UUID;
 BEGIN
     _by := NULLIF(current_setting('mnemos.current_user_id', TRUE), '');
+    _branch := NULLIF(current_setting('mnemos.current_branch', TRUE), '') OR 'main';
 
     IF TG_OP = 'INSERT' THEN
+        -- Create initial version 1
+        _commit_hash := encode(sha256((NEW.id || '|1|' || NEW.content || '|' || NOW()::text)::bytea), 'hex');
+
         INSERT INTO memory_versions (
             memory_id, version_num, content, category, subcategory, metadata,
             verbatim_content, owner_id, namespace, permission_mode,
             source_model, source_provider, source_session, source_agent,
-            snapshot_by, change_type
+            snapshot_by, change_type, commit_hash, branch, parent_version_id
         ) VALUES (
             NEW.id, 1, NEW.content, NEW.category, NEW.subcategory, NEW.metadata,
             NEW.verbatim_content, NEW.owner_id, NEW.namespace, NEW.permission_mode,
             NEW.source_model, NEW.source_provider, NEW.source_session, NEW.source_agent,
-            _by, 'create'
-        );
+            _by, 'create', _commit_hash, _branch, NULL
+        ) RETURNING id INTO _new_version_id;
+
+        -- Create/update branch HEAD
+        INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
+        VALUES (NEW.id, _branch, _new_version_id, _by)
+        ON CONFLICT (memory_id, name) DO UPDATE
+        SET head_version_id = EXCLUDED.head_version_id;
 
     ELSIF TG_OP = 'UPDATE' THEN
         -- Only snapshot if meaningful fields changed
@@ -74,40 +89,72 @@ BEGIN
             SELECT COALESCE(MAX(version_num), 0) + 1
             INTO   _next_v
             FROM   memory_versions
-            WHERE  memory_id = NEW.id;
+            WHERE  memory_id = NEW.id AND branch = _branch;
+
+            -- Get parent (current HEAD of branch)
+            SELECT head_version_id INTO _parent_version
+            FROM memory_branches
+            WHERE memory_id = NEW.id AND name = _branch;
+
+            -- Compute commit hash
+            _commit_hash := encode(
+                sha256((NEW.id || '|' || _next_v::text || '|' || NEW.content || '|' || NOW()::text)::bytea),
+                'hex'
+            );
 
             INSERT INTO memory_versions (
                 memory_id, version_num, content, category, subcategory, metadata,
                 verbatim_content, owner_id, namespace, permission_mode,
                 source_model, source_provider, source_session, source_agent,
-                snapshot_by, change_type
+                snapshot_by, change_type, commit_hash, branch, parent_version_id
             ) VALUES (
                 NEW.id, _next_v,
                 OLD.content, OLD.category, OLD.subcategory, OLD.metadata,
                 OLD.verbatim_content, OLD.owner_id, OLD.namespace, OLD.permission_mode,
                 OLD.source_model, OLD.source_provider, OLD.source_session, OLD.source_agent,
-                _by, 'update'
-            );
+                _by, 'update', _commit_hash, _branch, _parent_version
+            ) RETURNING id INTO _new_version_id;
+
+            -- Update branch HEAD
+            UPDATE memory_branches
+            SET head_version_id = _new_version_id
+            WHERE memory_id = NEW.id AND name = _branch;
         END IF;
 
     ELSIF TG_OP = 'DELETE' THEN
         SELECT COALESCE(MAX(version_num), 0) + 1
         INTO   _next_v
         FROM   memory_versions
-        WHERE  memory_id = OLD.id;
+        WHERE  memory_id = OLD.id AND branch = _branch;
+
+        -- Get parent (current HEAD of branch)
+        SELECT head_version_id INTO _parent_version
+        FROM memory_branches
+        WHERE memory_id = OLD.id AND name = _branch;
+
+        -- Compute commit hash
+        _commit_hash := encode(
+            sha256((OLD.id || '|' || _next_v::text || '|' || OLD.content || '|' || NOW()::text)::bytea),
+            'hex'
+        );
 
         INSERT INTO memory_versions (
             memory_id, version_num, content, category, subcategory, metadata,
             verbatim_content, owner_id, namespace, permission_mode,
             source_model, source_provider, source_session, source_agent,
-            snapshot_by, change_type
+            snapshot_by, change_type, commit_hash, branch, parent_version_id
         ) VALUES (
             OLD.id, _next_v,
             OLD.content, OLD.category, OLD.subcategory, OLD.metadata,
             OLD.verbatim_content, OLD.owner_id, OLD.namespace, OLD.permission_mode,
             OLD.source_model, OLD.source_provider, OLD.source_session, OLD.source_agent,
-            _by, 'delete'
-        );
+            _by, 'delete', _commit_hash, _branch, _parent_version
+        ) RETURNING id INTO _new_version_id;
+
+        -- Update branch HEAD
+        UPDATE memory_branches
+        SET head_version_id = _new_version_id
+        WHERE memory_id = OLD.id AND name = _branch;
 
     END IF;
 
@@ -133,18 +180,21 @@ CREATE TRIGGER trg_memory_version_delete
 
 -- ---------------------------------------------------------------------------
 -- 3. Backfill version 1 for all existing memories (idempotent)
+--    Includes DAG columns if they exist (migrations_v3_dag.sql idempotent)
 -- ---------------------------------------------------------------------------
 INSERT INTO memory_versions (
     memory_id, version_num, content, category, subcategory, metadata,
     verbatim_content, owner_id, namespace, permission_mode,
     source_model, source_provider, source_session, source_agent,
-    snapshot_by, change_type
+    snapshot_by, change_type, branch, commit_hash
 )
 SELECT
     id, 1, content, category, subcategory, metadata,
     verbatim_content, owner_id, namespace, permission_mode,
     source_model, source_provider, source_session, source_agent,
-    'migration', 'create'
+    'migration', 'create',
+    'main',
+    encode(sha256((id || '|1|' || content || '|' || NOW()::text)::bytea), 'hex')
 FROM memories
 WHERE id NOT IN (SELECT memory_id FROM memory_versions)
 ON CONFLICT (memory_id, version_num) DO NOTHING;
