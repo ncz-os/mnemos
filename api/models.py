@@ -188,3 +188,106 @@ class SessionHistoryResponse(BaseModel):
     total_messages: int
     total_tokens: int
     created_at: str
+
+
+# ── Session Ingestion (Claude Code integration) ────────────────────────────────
+
+class SessionIngestRequest(BaseModel):
+    """Ingest session data from Claude Code."""
+    raw_data: Dict[str, Any]
+    session_id: str
+    source: Optional[str] = "claude-code"
+    machine_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    git_commit: Optional[str] = None
+
+
+class SessionIngestResponse(BaseModel):
+    """Response from session ingestion."""
+    success: bool
+    session_id: str
+    stored_count: int
+    memory_ids: List[str]
+
+
+# ── Knowledge Graph Models ────────────────────────────────────────────────────
+
+class KGTriple(BaseModel):
+    """Knowledge graph triple (subject → predicate → object)."""
+    id: str
+    subject: str
+    predicate: str
+    object: str
+    subject_type: Optional[str] = None
+    object_type: Optional[str] = None
+    valid_from: str
+    valid_until: Optional[str] = None
+    memory_id: Optional[str] = None
+    confidence: float = 1.0
+    created: str
+
+
+class KGTripleCreate(BaseModel):
+    """Create a knowledge graph triple."""
+    subject: str
+    predicate: str
+    object: str
+    subject_type: Optional[str] = None
+    object_type: Optional[str] = None
+    valid_from: Optional[str] = None
+    valid_until: Optional[str] = None
+    memory_id: Optional[str] = None
+    confidence: float = 1.0
+
+
+class KGTripleUpdate(BaseModel):
+    """Update a knowledge graph triple."""
+    object: Optional[str] = None
+    confidence: Optional[float] = None
+    valid_until: Optional[str] = None
+    subject_type: Optional[str] = None
+    object_type: Optional[str] = None
+    predicate: Optional[str] = None
+    subject: Optional[str] = None
+
+
+class KGTripleListResponse(BaseModel):
+    """List of knowledge graph triples."""
+    count: int
+    triples: List[KGTriple]
+
+
+# ── Admin Models (User & API Key Management) ──────────────────────────────────
+
+class UserCreateRequest(BaseModel):
+    """Create a new user."""
+    id: str
+    display_name: str
+    email: Optional[str] = None
+    role: str = "user"  # "user" or "root"
+
+
+class UserResponse(BaseModel):
+    """User response."""
+    id: str
+    display_name: str
+    email: Optional[str] = None
+    role: str
+    created_at: str
+
+
+class ApiKeyCreateRequest(BaseModel):
+    """Create an API key."""
+    label: Optional[str] = None
+
+
+class ApiKeyResponse(BaseModel):
+    """API key response."""
+    id: str
+    user_id: str
+    key_prefix: str
+    label: Optional[str] = None
+    created_at: str
+    last_used: Optional[str] = None
+    revoked: bool = False
+    raw_key: Optional[str] = None  # only returned on creation
