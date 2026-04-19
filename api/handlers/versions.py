@@ -46,6 +46,7 @@ class VersionSummary(BaseModel):
     snapshot_by: Optional[str] = None
     change_type: str
     content_preview: str   # first 120 chars
+    branch: Optional[str] = None  # branch name (Phase 3 DAG)
 
 
 class DiffResponse(BaseModel):
@@ -102,17 +103,22 @@ async def _assert_memory_exists(conn, memory_id: str) -> None:
 @router.get("/memories/{memory_id}/versions", response_model=List[VersionSummary])
 async def list_versions(
     memory_id: str,
+    branch: str = Query("main", description="Branch name (default: main)"),
     user: UserContext = Depends(get_current_user),
 ):
-    """List version history for a memory (oldest first)."""
+    """List version history for a memory on a specific branch (oldest first).
+
+    Query parameter branch defaults to 'main'. For feature branches, specify branch=name.
+    """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         await _assert_memory_exists(conn, memory_id)
         rows = await conn.fetch(
-            "SELECT version_num, snapshot_at, snapshot_by, change_type, content "
-            "FROM memory_versions WHERE memory_id = $1 ORDER BY version_num ASC",
+            "SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch "
+            "FROM memory_versions WHERE memory_id = $1 AND branch = $2 ORDER BY version_num ASC",
             memory_id,
+            branch,
         )
     return [
         VersionSummary(
@@ -121,6 +127,7 @@ async def list_versions(
             snapshot_by=r.get("snapshot_by"),
             change_type=r["change_type"],
             content_preview=r["content"][:120],
+            branch=r.get("branch"),
         )
         for r in rows
     ]
@@ -130,9 +137,10 @@ async def list_versions(
 async def get_version(
     memory_id: str,
     version_num: int,
+    branch: str = Query("main", description="Branch name (default: main)"),
     user: UserContext = Depends(get_current_user),
 ):
-    """Retrieve memory content at a specific version."""
+    """Retrieve memory content at a specific version on a branch."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
@@ -141,13 +149,13 @@ async def get_version(
             "verbatim_content, owner_id, namespace, permission_mode, "
             "source_model, source_provider, source_session, source_agent, "
             "snapshot_at, snapshot_by, change_type "
-            "FROM memory_versions WHERE memory_id = $1 AND version_num = $2",
-            memory_id, version_num,
+            "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3",
+            memory_id, version_num, branch,
         )
     if not row:
         raise HTTPException(
             status_code=404,
-            detail=f"Version {version_num} not found for memory {memory_id}",
+            detail=f"Version {version_num} not found for memory {memory_id} on branch '{branch}'",
         )
     return _row_to_version(row)
 
@@ -157,30 +165,34 @@ async def diff_versions(
     memory_id: str,
     from_version: int = Query(..., alias="from"),
     to_version: int = Query(..., alias="to"),
+    branch: str = Query("main", description="Branch name (default: main)"),
     user: UserContext = Depends(get_current_user),
 ):
-    """Return a unified diff between two versions of a memory."""
+    """Return a unified diff between two versions on a branch.
+
+    Both versions must exist on the specified branch.
+    """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT version_num, content FROM memory_versions "
-            "WHERE memory_id = $1 AND version_num = ANY($2::int[])",
-            memory_id, [from_version, to_version],
+            "WHERE memory_id = $1 AND version_num = ANY($2::int[]) AND branch = $3",
+            memory_id, [from_version, to_version], branch,
         )
     versions = {r["version_num"]: r["content"] for r in rows}
     if from_version not in versions:
-        raise HTTPException(status_code=404, detail=f"Version {from_version} not found")
+        raise HTTPException(status_code=404, detail=f"Version {from_version} not found on branch '{branch}'")
     if to_version not in versions:
-        raise HTTPException(status_code=404, detail=f"Version {to_version} not found")
+        raise HTTPException(status_code=404, detail=f"Version {to_version} not found on branch '{branch}'")
 
     # Ensure trailing newline so unified_diff doesn't concatenate last lines
     a = (versions[from_version] + "\n").splitlines(keepends=True)
     b = (versions[to_version] + "\n").splitlines(keepends=True)
     diff_lines = list(difflib.unified_diff(
         a, b,
-        fromfile=f"v{from_version}",
-        tofile=f"v{to_version}",
+        fromfile=f"{branch}/v{from_version}",
+        tofile=f"{branch}/v{to_version}",
     ))
     return DiffResponse(
         memory_id=memory_id,
@@ -194,12 +206,13 @@ async def diff_versions(
 async def revert_memory(
     memory_id: str,
     version_num: int,
+    branch: str = Query("main", description="Branch name (default: main)"),
     user: UserContext = Depends(get_current_user),
 ):
-    """Restore a memory to the content of a previous version.
+    """Restore a memory to the content of a previous version on a branch.
 
-    Creates a new memory record (triggering a new version snapshot) so the
-    revert itself is part of the audit trail.
+    Creates a new version snapshot on the same branch so the revert itself
+    is part of the audit trail. Updates the live memory record.
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
@@ -209,13 +222,13 @@ async def revert_memory(
             "verbatim_content, owner_id, namespace, permission_mode, "
             "source_model, source_provider, source_session, source_agent, "
             "snapshot_at, snapshot_by, change_type "
-            "FROM memory_versions WHERE memory_id = $1 AND version_num = $2",
-            memory_id, version_num,
+            "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3",
+            memory_id, version_num, branch,
         )
         if not ver_row:
             raise HTTPException(
                 status_code=404,
-                detail=f"Version {version_num} not found for memory {memory_id}",
+                detail=f"Version {version_num} not found for memory {memory_id} on branch '{branch}'",
             )
         # Confirm the live memory still exists
         live = await conn.fetchrow(
@@ -236,6 +249,9 @@ async def revert_memory(
             meta_str = "{}"
 
         async with conn.transaction():
+            # Set session variable for trigger to use correct branch
+            await conn.execute(f"SET mnemos.current_branch = '{branch}'")
+
             await conn.execute(
                 "UPDATE memories SET "
                 "content=$1, category=$2, subcategory=$3, metadata=$4::jsonb, "
@@ -251,27 +267,9 @@ async def revert_memory(
             row = await conn.fetchrow(
                 f"SELECT {_lc._MEMORY_COLS} FROM memories WHERE id=$1", memory_id
             )
-            # Snapshot the reverted state as a new version in the audit trail
-            next_ver = await conn.fetchval(
-                "SELECT COALESCE(MAX(version_num), 0) + 1 FROM memory_versions WHERE memory_id = $1",
-                memory_id,
-            )
-            await conn.execute(
-                "INSERT INTO memory_versions "
-                "(memory_id, version_num, content, category, subcategory, metadata, verbatim_content, "
-                "owner_id, namespace, permission_mode, "
-                "source_model, source_provider, source_session, source_agent, "
-                "snapshot_by, change_type) "
-                "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'update')",
-                memory_id, next_ver, row["content"], row["category"], row["subcategory"],
-                json.dumps(row["metadata"] or {}),
-                row["verbatim_content"], row["owner_id"], row["namespace"], row["permission_mode"],
-                row["source_model"], row["source_provider"], row["source_session"], row["source_agent"],
-                user.user_id,
-            )
 
     logger.info(
-        f"[VERSION] Reverted {memory_id} to v{version_num} "
+        f"[VERSION] Reverted {memory_id} to v{version_num} on branch '{branch}' "
         f"by {user.user_id or 'default'}"
     )
     return _lc._row_to_memory(row)
