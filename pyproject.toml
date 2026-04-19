@@ -3,12 +3,12 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mnemos"
-version = "2.3.0"
-description = "MNEMOS memory infrastructure with GRAEAE reasoning"
+name = "mnemos-os"
+version = "2.4.0"
+description = "MNEMOS-OS: Memory Operating System with gateway, sessions, DAG versioning, and cost-aware routing"
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
+license = "Apache-2.0"
 authors = [{ name = "MNEMOS Contributors" }]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -58,13 +58,22 @@ py-modules = [
   "api_server",
   "config",
   "distillation_worker",
-  "external_inference_provider",
   "mcp_server",
-  "phi_server",
+  "inference_backend",
 ]
 
 [tool.setuptools.packages.find]
-include = ["api*", "graeae*", "db*"]
+include = ["api*", "compression*", "graeae*", "db*"]
+
+[tool.uv]
+# uv: fast Python package installer for Docker builds
+# Install with: curl -LsSf https://astral.sh/uv/install.sh | sh
+python-version = "3.11"
+
+[[tool.uv.index]]
+# Optional: use official PyPI (default)
+name = "pypi"
+url = "https://pypi.org/simple"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
