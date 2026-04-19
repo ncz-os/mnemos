@@ -127,23 +127,88 @@ async def _get_model_recommendation(
     cost_budget: float = 10.0,
     quality_floor: float = 0.85,
 ) -> Optional[Dict[str, Any]]:
-    """Query model optimizer for cost-aware model recommendation."""
+    """Query model optimizer for cost-aware model recommendation.
+
+    Calls the /model-registry/recommend endpoint to find cheapest model
+    meeting quality + capability requirements for the task_type.
+    """
+    pool = _lc._pool
+    if not pool:
+        logger.warning("[OPTIMIZER] No DB pool available")
+        return None
+
     try:
-        # This endpoint is part of the same MNEMOS service
-        # In production, would be: https://mnemos.example.com/model-registry/recommend
-        # For now, we'll have to handle this inside the gateway logic
-        # (real implementation would be a separate route call)
-        logger.info(
-            f"[OPTIMIZER] Recommending model for {task_type} "
-            f"(budget=${cost_budget}/MTok, quality>={quality_floor})"
-        )
-        # Placeholder: actual implementation queries model_registry table
-        # Return recommended model format
-        return {
-            "recommended_model": "gpt-4o",  # Placeholder
-            "cost_per_mtok": 5.0,
-            "quality_score": 0.99,
-        }
+        async with pool.acquire() as conn:
+            # Map task types to required capabilities
+            capability_map = {
+                "code_generation": ["coding"],
+                "reasoning": ["reasoning", "logic"],
+                "architecture_design": ["reasoning"],
+                "summarization": ["reasoning"],
+                "web_search": ["online", "search"],
+            }
+            required_caps = capability_map.get(task_type, ["reasoning"])
+
+            # Find models meeting criteria
+            models = await conn.fetch(
+                """
+                SELECT
+                    provider, model_id, display_name, input_cost_per_mtok,
+                    output_cost_per_mtok, capabilities, graeae_weight, context_window
+                FROM model_registry
+                WHERE available = true
+                AND deprecated = false
+                AND graeae_weight >= $1
+                AND (input_cost_per_mtok + output_cost_per_mtok) / 2.0 <= $2
+                AND capabilities @> $3
+                ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC
+                LIMIT 1
+                """,
+                quality_floor,
+                cost_budget,
+                required_caps,
+            )
+
+            if not models:
+                # Fallback: cheapest model available (ignore budget)
+                logger.info(
+                    f"[OPTIMIZER] No model found for {task_type} "
+                    f"(budget=${cost_budget}/MTok, quality>={quality_floor}), "
+                    f"using fallback cheapest model"
+                )
+                models = await conn.fetch(
+                    """
+                    SELECT
+                        provider, model_id, display_name, input_cost_per_mtok,
+                        output_cost_per_mtok, capabilities, graeae_weight, context_window
+                    FROM model_registry
+                    WHERE available = true AND deprecated = false
+                    ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC
+                    LIMIT 1
+                    """
+                )
+
+            if not models:
+                logger.warning("[OPTIMIZER] No models available, using default gpt-4o")
+                return None
+
+            model = models[0]
+            avg_cost = (model["input_cost_per_mtok"] + model["output_cost_per_mtok"]) / 2.0
+
+            logger.info(
+                f"[OPTIMIZER] Recommended {model['provider']}/{model['model_id']} "
+                f"for {task_type} (cost=${avg_cost:.2f}/MTok)"
+            )
+
+            return {
+                "provider": model["provider"],
+                "model_id": model["model_id"],
+                "display_name": model.get("display_name"),
+                "cost_per_mtok": avg_cost,
+                "quality_score": model["graeae_weight"],
+                "context_window": model.get("context_window"),
+            }
+
     except Exception as e:
         logger.warning(f"[OPTIMIZER] Recommendation failed: {e}, using default")
         return None
@@ -264,10 +329,19 @@ async def chat_completions(
     if model in MODEL_ALIASES:
         model = MODEL_ALIASES[model]
 
-    # Handle auto model selection (Phase 5 placeholder)
+    # Handle auto model selection via optimizer
     if model == "auto":
-        logger.info("[MNEMOS] model=auto requested, using default gpt-4o")
-        model = "gpt-4o"
+        logger.info(f"[MNEMOS] model=auto requested, querying optimizer for task_type={task_type}")
+        recommendation = await _get_model_recommendation(task_type=task_type)
+        if recommendation:
+            model = f"{recommendation['provider']}/{recommendation['model_id']}"
+            logger.info(
+                f"[MNEMOS] Optimizer recommended {recommendation['model_id']} "
+                f"(cost=${recommendation['cost_per_mtok']:.2f}/MTok)"
+            )
+        else:
+            logger.info("[MNEMOS] Optimizer failed, using default gpt-4o")
+            model = "gpt-4o"
 
     logger.info(f"[MNEMOS] model={model}")
 
