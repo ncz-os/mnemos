@@ -10,7 +10,6 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 try:
     from docling.document_converter import DocumentConverter
-    from docling.parsers.pdf_parser import PdfParsersLibreOffice
     DOCLING_AVAILABLE = True
 except ImportError:
     DOCLING_AVAILABLE = False
