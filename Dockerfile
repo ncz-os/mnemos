@@ -20,8 +20,8 @@ COPY pyproject.toml .
 COPY requirements.txt .
 
 # Use uv to create a thin virtual environment with all deps
-# uv pip compile is ~100x faster than pip-tools
-RUN uv pip install --system-site-packages -r requirements.txt
+# uv pip install is ~10x faster than pip
+RUN uv pip install -r requirements.txt
 
 # Stage 2: Runtime (minimal footprint)
 FROM python:3.11-slim
