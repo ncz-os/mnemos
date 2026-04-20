@@ -1,4 +1,4 @@
-"""MNEMOS API Server v2.3.0 — thin entrypoint, routes in api/ package."""
+"""MNEMOS API Server v3.0.0 — unified service with consultations + providers + OpenAI-compat gateway."""
 import logging
 import os
 import sys
@@ -19,6 +19,8 @@ from api.rate_limit import (
 
 from api.lifecycle import lifespan
 from api.handlers.health import router as health_router
+from api.handlers.consultations import router as consultations_router
+from api.handlers.providers import router as providers_router
 from api.handlers.graeae_routes import router as graeae_router
 from api.handlers.memories import router as memories_router
 from api.handlers.ingest import router as ingest_router
@@ -35,7 +37,7 @@ from api.handlers.dag import router as dag_router
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
-app = FastAPI(title="MNEMOS API", version="2.4.0", lifespan=lifespan)
+app = FastAPI(title="MNEMOS API", version="3.0.0", description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway", lifespan=lifespan)
 
 # ── Request body size limit (SEC-04) ──────────────────────────────────────────
 # Default 5 MB. Override via MAX_BODY_BYTES env var.
@@ -75,10 +77,12 @@ app.add_middleware(
 )
 
 app.include_router(health_router)
+app.include_router(consultations_router)  # v3.0.0: Unified /v1/consultations (GRAEAE reasoning)
+app.include_router(providers_router)  # v3.0.0: Unified /v1/providers (model routing)
 app.include_router(openai_compat_router)  # Phase 0: OpenAI-compatible gateway
 app.include_router(sessions_router)  # Phase 0: Session management for stateful chat
 app.include_router(dag_router)  # Phase 3: DAG versioning (git-like)
-app.include_router(graeae_router)
+app.include_router(graeae_router)  # v2.x legacy: deprecated, use /v1/consultations
 app.include_router(memories_router)
 app.include_router(ingest_router)
 app.include_router(kg_router)
