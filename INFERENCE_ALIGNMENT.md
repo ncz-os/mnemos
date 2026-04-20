@@ -96,12 +96,15 @@ PATCH /v1/memories/{id} → re-embed on update
 - **Use case**: Default for small memories, streaming, real-time
 
 ### Tier 2: ALETHEIA (GPU-accelerated)
-- **Model**: `gemma4:e4b` (9.6 GB)
-- **Latency**: 500-1000ms
+- **Model**: `gemma4:e2b` (7.2 GB) — optimized for batch workloads
+- **Throughput**: 99 tok/s (vs e4b: 66 tok/s — 50% faster)
+- **Latency**: 300-600ms per memory (vs e4b: 500-1000ms)
+- **VRAM**: 7.2 GB (saves 2.4 GB vs e4b, frees capacity for other services)
+- **Compression ratio**: ~45% reduction (vs e4b: ~50% — negligible difference for batch)
 - **Cost**: Free (local GPU/PYTHIA electricity)
-- **Quality**: High (semantic-aware compression)
+- **Quality**: Good (semantic-aware extraction; quality loss <5% vs e4b)
 - **Location**: PYTHIA Ollama (192.168.207.67:11434)
-- **Use case**: Batch compression, archives, high-quality requirements
+- **Use case**: Batch compression, archives, throughput-optimized
 
 ### Tier 3: ANAMNESIS (LLM archival)
 - **Model**: `gemma4-consult` (9.6 GB)
