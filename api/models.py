@@ -81,6 +81,14 @@ class MemoryCreateRequest(BaseModel):
     subcategory: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
     verbatim_content: Optional[str] = None
+    # Optional provenance fields (default to user context)
+    owner_id: Optional[str] = None
+    namespace: Optional[str] = None
+    source: Optional[str] = None  # source system/origin
+    source_model: Optional[str] = None  # e.g., "gpt-4o", "claude-3-5-sonnet"
+    source_provider: Optional[str] = None  # e.g., "openai", "anthropic"
+    source_session: Optional[str] = None  # session_id if created during session
+    source_agent: Optional[str] = None  # agent name if created by autonomous agent
 
 
 class MemoryUpdateRequest(BaseModel):
@@ -89,6 +97,7 @@ class MemoryUpdateRequest(BaseModel):
     subcategory: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
     quality_rating: Optional[int] = None
+    verbatim_content: Optional[str] = None  # original uncompressed content
 
 
 class BulkCreateRequest(BaseModel):
@@ -97,8 +106,8 @@ class BulkCreateRequest(BaseModel):
 
 class BulkCreateResponse(BaseModel):
     created: int
-    failed: int
-    details: List[Dict[str, Any]] = []
+    memory_ids: List[str] = []  # IDs of successfully created memories
+    errors: List[str] = []  # Per-item error messages
 
 
 class RehydrationRequest(BaseModel):

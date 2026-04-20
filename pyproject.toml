@@ -68,15 +68,10 @@ py-modules = [
 [tool.setuptools.packages.find]
 include = ["api*", "compression*", "graeae*", "db*"]
 
-[tool.uv]
 # uv: fast Python package installer for Docker builds
 # Install with: curl -LsSf https://astral.sh/uv/install.sh | sh
-python-version = "3.11"
-
-[[tool.uv.index]]
-# Optional: use official PyPI (default)
-name = "pypi"
-url = "https://pypi.org/simple"
+# Note: uv does not support python-version in [tool.uv] (use pyproject.toml requires-python instead)
+# For Docker: use `uv pip install -r requirements.txt` (no --system-site-packages)
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

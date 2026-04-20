@@ -1,6 +1,10 @@
 -- MNEMOS Database Schema with Compression & Quality Tracking
 -- Phase 1: Core tables with integrated compression support
 
+-- Enable required extensions FIRST
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- memories table: Core memory storage with compression support
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
@@ -23,7 +27,7 @@ CREATE TABLE IF NOT EXISTS memories (
   compression_manifest JSONB,                -- Full quality details
   quality_rating INT,                        -- 0-100% (how much preserved)
   quality_summary JSONB,                     -- What was removed/preserved
-  original_reference UUID REFERENCES memories(id),
+  original_reference TEXT REFERENCES memories(id),
 
   -- Audit
   compressed_at TIMESTAMP,
@@ -55,7 +59,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING ivfflat(embe
 -- compression_quality_log: Audit trail of all compression operations
 CREATE TABLE IF NOT EXISTS compression_quality_log (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
 
   -- Compression metrics
   original_token_count INT NOT NULL,
