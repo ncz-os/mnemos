@@ -291,3 +291,79 @@ class ApiKeyResponse(BaseModel):
     last_used: Optional[str] = None
     revoked: bool = False
     raw_key: Optional[str] = None  # only returned on creation
+
+
+# ── v3.0.0 Consultations (GRAEAE Reasoning Domain) ────────────────────────────
+
+class ConsultationResponse(BaseModel):
+    """Response from GRAEAE consultation."""
+    consultation_id: Optional[str] = None
+    all_responses: Dict[str, Any]  # provider → response data
+    consensus_response: Optional[str] = None
+    consensus_score: Optional[float] = None
+    winning_muse: Optional[str] = None
+    cost: Optional[float] = None
+    latency_ms: Optional[float] = None
+    mode: str
+    timestamp: str
+
+
+class ConsultationArtifact(BaseModel):
+    """Structured output from consultation."""
+    consultation_id: str
+    citations: List[str]  # memory IDs referenced
+    memory_refs: List[Dict[str, Any]]  # {memory_id, relevance_score, content}
+    audit_hash: Optional[str] = None  # SHA-256 of prompt+response chain
+    created_at: str
+
+
+class ProviderResponse(BaseModel):
+    """Single provider's response in consensus."""
+    provider: str
+    model_id: str
+    status: str
+    response_text: str
+    latency_ms: float
+    final_score: float
+    quality_score: Optional[float] = None
+
+
+class AuditLogEntry(BaseModel):
+    """Hash-chained audit log entry."""
+    id: str
+    sequence_num: int
+    consultation_id: Optional[str] = None
+    prompt_hash: str
+    response_hash: str
+    chain_hash: str
+    prev_id: Optional[str] = None
+    task_type: Optional[str] = None
+    provider: Optional[str] = None
+    quality_score: Optional[float] = None
+    created_at: str
+
+
+class AuditVerifyResponse(BaseModel):
+    """Audit chain integrity verification."""
+    valid: bool
+    entries_checked: int
+    first_broken_sequence: Optional[int] = None
+    message: str
+
+
+# ── v3.0.0 Providers (Model Registry & Routing) ───────────────────────────────
+
+class ProviderListResponse(BaseModel):
+    """List of available LLM providers."""
+    providers: List[str]
+    total_models: int
+    last_sync: Optional[str] = None
+
+
+class ModelRecommendation(BaseModel):
+    """Model recommendation for a task type."""
+    recommended: Dict[str, Any]  # {provider, model_id, cost_per_mtok}
+    reasoning: str
+    quality_score: Optional[float] = None
+    context_window: Optional[int] = None
+    alternatives: Optional[List[Dict[str, Any]]] = None
