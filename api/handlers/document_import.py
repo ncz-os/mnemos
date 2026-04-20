@@ -16,7 +16,7 @@ except ImportError:
     DOCLING_AVAILABLE = False
 
 from api.auth import UserContext, get_current_user
-from api.lifecycle import _pool
+import api.lifecycle as _lc
 from api.models import MemoryCreateRequest, MemoryItem
 
 logger = logging.getLogger(__name__)
@@ -198,7 +198,7 @@ async def import_memories_from_document(
             detail="Docling not installed. Install with: pip install mnemos-os[docling]"
         )
 
-    if not _pool:
+    if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database not available")
 
     # Read file
@@ -216,7 +216,7 @@ async def import_memories_from_document(
     memory_ids = []
     errors = []
 
-    async with _pool.acquire() as conn:
+    async with _lc._pool.acquire() as conn:
         for chunk in chunks:
             try:
                 memory_id = str(uuid.uuid4())

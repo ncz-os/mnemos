@@ -21,13 +21,11 @@ from api.lifecycle import lifespan
 from api.handlers.health import router as health_router
 from api.handlers.consultations import router as consultations_router
 from api.handlers.providers import router as providers_router
-from api.handlers.graeae_routes import router as graeae_router
 from api.handlers.memories import router as memories_router
 from api.handlers.ingest import router as ingest_router
 from api.handlers.kg import router as kg_router
 from api.handlers.admin import router as admin_router
 from api.handlers.versions import router as versions_router
-from api.handlers.model_registry_routes import router as model_registry_router
 from api.handlers.journal import router as journal_router
 from api.handlers.state import router as state_router
 from api.handlers.entities import router as entities_router
@@ -89,13 +87,11 @@ app.include_router(providers_router)  # v3.0.0: Unified /v1/providers (model rou
 app.include_router(openai_compat_router)  # Phase 0: OpenAI-compatible gateway
 app.include_router(sessions_router)  # Phase 0: Session management for stateful chat
 app.include_router(dag_router)  # Phase 3: DAG versioning (git-like)
-app.include_router(graeae_router)  # v2.x legacy: deprecated, use /v1/consultations
 app.include_router(memories_router)
 app.include_router(ingest_router)
 app.include_router(kg_router)
 app.include_router(admin_router)
 app.include_router(versions_router)
-app.include_router(model_registry_router)
 app.include_router(journal_router)
 app.include_router(state_router)
 app.include_router(entities_router)
