@@ -12,7 +12,10 @@ import os
 # TOML Configuration (config.toml overrides env-var defaults where present)
 # ============================================================================
 
-import tomllib as _tomllib  # noqa: E402
+try:
+    import tomllib as _tomllib  # noqa: E402
+except ModuleNotFoundError:
+    import tomli as _tomllib  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
 
 

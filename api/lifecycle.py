@@ -4,7 +4,10 @@ import json
 import logging
 import os
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 from contextlib import asynccontextmanager
 from typing import Optional
 
