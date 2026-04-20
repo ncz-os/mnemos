@@ -208,7 +208,7 @@ class TestModelOptimizerIntegration:
     def test_model_registry_recommend_exists(self):
         """Model recommendation endpoint exists."""
         try:
-            from api.handlers.model_registry_routes import recommend_model
+            from api.handlers.providers import recommend_model
             assert callable(recommend_model)
         except ImportError as e:
             pytest.fail(f"Model recommendation endpoint missing: {e}")
