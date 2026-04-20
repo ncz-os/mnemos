@@ -1,4 +1,19 @@
-"""GRAEAE multi-provider consultation endpoints — v2 adds hash-chained audit log."""
+"""GRAEAE multi-provider consultation endpoints — v2 (DEPRECATED).
+
+⚠️  DEPRECATED in v3.0.0: Use `/v1/consultations` instead.
+
+This module is maintained for backward compatibility only.
+All new code should use the unified `/v1/consultations` endpoint which includes:
+- Hash-chained audit log
+- Memory injection tracking (consultation_memory_refs)
+- Cleaner RESTful API structure
+
+Migration path:
+  POST  /graeae/consult           → POST /v1/consultations
+  GET   /graeae/health            → GET /v1/providers/health
+  GET   /graeae/audit             → GET /v1/consultations/audit
+  GET   /graeae/audit/verify      → GET /v1/consultations/audit/verify
+"""
 import hashlib
 import logging
 from typing import List, Optional

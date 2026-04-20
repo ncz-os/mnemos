@@ -46,8 +46,10 @@ Repository = "https://github.com/mnemos-dev/mnemos"
 Documentation = "https://github.com/mnemos-dev/mnemos/blob/master/README.md"
 
 [project.optional-dependencies]
-phi = ["openvino-genai>=2024.4.0", "fastembed>=0.3.0"]
+docling = ["docling>=2.5.0", "docling-core>=2.0.0", "pillow>=10.0.0"]
 full = ["sentence-transformers>=2.7.0", "spacy>=3.7.0", "networkx>=3.3"]
+# Note: GPU inference (OpenVINO) skipped on PROTEUS — no GPU hardware. Use CERBERUS (RTX 4500 Ada) for GPU workloads.
+phi = ["openvino-genai>=2024.4.0", "fastembed>=0.3.0"]
 dev = [
   "pytest>=8.0.0",
   "pytest-asyncio>=0.23.0",
