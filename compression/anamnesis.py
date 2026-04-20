@@ -3,14 +3,13 @@
 ANAMNESIS: LLM fact extraction for long-term archival (Tier 3)
 
 Named for Platonic recollection — recovering what must not be forgotten.
-Extracts atomic facts from memories >30 days old via LLM on PYTHIA Intel GPU.
+Extracts atomic facts from memories >30 days old via LLM on GPU provider.
 
 Pattern: Mem0-style semantic chunking + fact extraction.
 Performance: 500ms-2s per memory (offline batch via distillation worker)
 Output: Compact JSON array of atomic facts + structured fields
 
-Routes to: PYTHIA (192.168.207.67) Intel GPU
-Fallback: Skip extraction if PYTHIA unreachable (non-critical for live paths)
+Recommended: Local GPU (vLLM/Ollama). Fallback: Skip extraction if unreachable (non-critical).
 """
 
 import asyncio
@@ -23,23 +22,29 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# PYTHIA GPU endpoint
-_PYTHIA_GPU_HOST = os.getenv("PYTHIA_GPU_HOST", "http://192.168.207.67:8000")
-_PYTHIA_GPU_TIMEOUT = float(os.getenv("PYTHIA_GPU_TIMEOUT", "30.0"))
+# GPU provider endpoint
+_GPU_PROVIDER_HOST = os.getenv("GPU_PROVIDER_HOST", "http://localhost")
+_GPU_PROVIDER_PORT = os.getenv("GPU_PROVIDER_PORT", "8000")
+_GPU_PROVIDER_TIMEOUT = float(os.getenv("GPU_PROVIDER_TIMEOUT", "30.0"))
 
 
 class ANAMNESIS:
-    """LLM-based fact extraction for archival via PYTHIA GPU."""
+    """LLM-based fact extraction for archival via GPU provider."""
 
-    def __init__(self, pythia_url: Optional[str] = None, timeout: float = _PYTHIA_GPU_TIMEOUT):
+    def __init__(self, gpu_url: Optional[str] = None, timeout: float = _GPU_PROVIDER_TIMEOUT):
         """
         Initialize ANAMNESIS extractor.
 
         Args:
-            pythia_url: PYTHIA GPU inference endpoint
+            gpu_url: GPU provider inference endpoint
             timeout: Request timeout in seconds
         """
-        self.pythia_url = (pythia_url or _PYTHIA_GPU_HOST).rstrip("/")
+        if gpu_url:
+            self.gpu_url = gpu_url.rstrip("/")
+        else:
+            host = _GPU_PROVIDER_HOST.rstrip("/")
+            port = _GPU_PROVIDER_PORT
+            self.gpu_url = f"{host}:{port}"
         self.timeout = timeout
         self._client: Optional[httpx.AsyncClient] = None
 
@@ -85,9 +90,9 @@ class ANAMNESIS:
             # Build extraction prompt (category-aware)
             prompt = self._build_extraction_prompt(text, category)
 
-            # Query PYTHIA
+            # Query GPU provider
             response = await client.post(
-                f"{self.pythia_url}/v1/completions",
+                f"{self.gpu_url}/v1/completions",
                 json={
                     "prompt": prompt,
                     "max_tokens": 1000,
@@ -155,7 +160,7 @@ Output ONLY valid JSON, no extra text:
 """
 
     def _parse_extraction_response(self, response: str) -> Dict:
-        """Parse PYTHIA's fact extraction response."""
+        """Parse GPU provider's fact extraction response."""
         try:
             # Extract JSON from response (handle markdown code blocks)
             json_str = response
@@ -215,10 +220,10 @@ Output ONLY valid JSON, no extra text:
         return output
 
     async def health_check(self) -> bool:
-        """Check if PYTHIA GPU is reachable."""
+        """Check if GPU provider is reachable."""
         try:
             client = await self._get_client()
-            resp = await client.get(f"{self.pythia_url}/health", timeout=5.0)
+            resp = await client.get(f"{self.gpu_url}/health", timeout=5.0)
             return resp.status_code == 200
         except Exception:
             return False

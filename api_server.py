@@ -35,6 +35,13 @@ from api.handlers.openai_compat import router as openai_compat_router
 from api.handlers.sessions import router as sessions_router
 from api.handlers.dag import router as dag_router
 
+try:
+    from api.handlers.document_import import router as document_import_router
+    _document_import_available = True
+except ImportError:
+    _document_import_available = False
+    document_import_router = None
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
 app = FastAPI(title="MNEMOS API", version="3.0.0", description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway", lifespan=lifespan)
@@ -92,6 +99,10 @@ app.include_router(model_registry_router)
 app.include_router(journal_router)
 app.include_router(state_router)
 app.include_router(entities_router)
+
+# Document import (Docling) — optional, requires docling extra
+if _document_import_available:
+    app.include_router(document_import_router)
 
 if __name__ == "__main__":
     import uvicorn

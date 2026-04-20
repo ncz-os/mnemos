@@ -1,5 +1,20 @@
-"""MNEMOS Model Registry API endpoints.
+"""MNEMOS Model Registry API endpoints — v2 (DEPRECATED).
 
+⚠️  DEPRECATED in v3.0.0: Use `/v1/providers` instead.
+
+This module is maintained for backward compatibility only.
+All new code should use the unified `/v1/providers` endpoint which includes:
+- Provider health status
+- Model recommendations with quality gates
+- Cleaner RESTful API structure
+
+Migration path:
+  GET  /model-registry/recommend  → GET /v1/providers/recommend
+  GET  /model-registry/           → GET /v1/providers
+  GET  /model-registry/providers  → GET /v1/providers
+  GET  /model-registry/health     → GET /v1/providers/health
+
+Legacy documentation:
 MNEMOS is the authoritative model registry: daily provider API sync keeps
 model_registry current; Arena.ai rankings decorate models with quality scores.
 

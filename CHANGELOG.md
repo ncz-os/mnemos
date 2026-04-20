@@ -2,6 +2,46 @@
 
 All notable changes to MNEMOS are documented here.
 
+## [3.0.0] — 2026-04-19
+
+### Added
+- **Unified `/v1/consultations` endpoint** — GRAEAE reasoning domain with hash-chained audit log
+- **Unified `/v1/providers` endpoint** — model registry and recommendation engine
+- **Unified `/v1/memories`, `/v1/versions` namespacing** — clean RESTful structure
+- **`consultation_memory_refs` table** — auditable memory injection tracking for consultations
+- **`consultation_memory_refs` table** — links consultations to injected memories for citation tracking
+- **Public sanitization** — removed all internal infrastructure references (PYTHIA, CERBERUS, PROTEUS, ARGONAS)
+- **Generic GPU provider config** — GPU_PROVIDER_HOST env var (optional, CPU-only fully functional)
+- **Free-tier LLM defaults** — Together AI and Groq prioritized as default providers
+- **DEPLOYMENT.md** — comprehensive public deployment guide (replaces internal implementation notes)
+- **`.env.example`** — complete configuration template with sensible defaults
+
+### Changed
+- **SBOM simplified** — FastAPI + asyncpg unified async stack (no Flask/gunicorn/sync psycopg legacy)
+- **Version bumped to 3.0.0** — reflects unified service architecture
+- **GPU marked optional** — system works perfectly on CPU with external LLM providers
+- **GRAEAE provider order** — Together, Groq first (free tiers); OpenAI, Claude, Perplexity as fallbacks
+- **Minimal setup** — 5 required env vars (PG_* + MNEMOS_API_KEY + one LLM provider)
+
+### Backward Compatibility
+- All v2.x endpoints (`/graeae/*`, `/memories/*`, `/model-registry/*`) remain unchanged
+- v2.x API fully functional, v3.0.0 endpoints available alongside
+- No breaking changes for existing MNEMOS deployments
+
+### Security
+- Hash-chained audit log for all consultations (tamper-evident reasoning trail)
+- Memory injection tracking per consultation (auditable context)
+
+## [2.4.0] — 2026-04-19 (intermediate, v3.0.0 baseline)
+
+**Note**: v2.4.0 was the development baseline for v3.0.0 unification. Features from v2.4.0 (OpenAI gateway, sessions, DAG versioning, compression tiers) are all included in v3.0.0 without modification.
+
+- OpenAI-compatible gateway with auto memory injection
+- Server-side session management with stateful chat
+- Git-like DAG versioning (branch, merge, revert)
+- THE MOIRAI compression (LETHE, ALETHEIA, ANAMNESIS)
+- Distillation worker for async compression
+
 ## [2.3.0] — 2026-04-12
 
 ### Added
