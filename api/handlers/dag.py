@@ -362,7 +362,11 @@ async def merge_branch(
             if request.strategy == "latest-wins":
                 # Create merge commit on target_branch with source content
                 next_version = target_head["version_num"] + 1
-                merge_hash = str(hash((source_head["commit_hash"], target_head["id"])))[:16]
+                # Compute merge hash from both parent commits (ensures uniqueness and tamper-evidence)
+                import hashlib
+                merge_hash = hashlib.sha256(
+                    f"{source_head['commit_hash']}{target_head['commit_hash']}{int(_time.time() * 1000)}".encode()
+                ).hexdigest()[:16]
 
                 new_commit_id = await conn.fetchval(
                     """
@@ -380,7 +384,7 @@ async def merge_branch(
                     next_version,
                     source_head["content"],
                     target_branch,
-                    source_head["commit_hash"],
+                    merge_hash,  # Use computed merge hash, not source hash
                     target_head["id"],
                     user.user_id,
                     source_head["id"],
@@ -394,11 +398,11 @@ async def merge_branch(
                     target_branch,
                 )
 
-                logger.info(f"[DAG] Merged {request.source_branch} → {target_branch} for {memory_id}")
+                logger.info(f"[DAG] Merged {request.source_branch} → {target_branch} for {memory_id} (merge_hash={merge_hash})")
 
                 return MergeResult(
                     success=True,
-                    new_commit_hash=source_head["commit_hash"],
+                    new_commit_hash=merge_hash,  # Return the new merge commit hash
                     message=f"Merged {request.source_branch} into {target_branch}",
                 )
 

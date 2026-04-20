@@ -164,14 +164,16 @@ async def test_schedule_background_tracks_task():
 # ─── Application instantiation ───────────────────────────────────────────────
 
 def test_app_routes_registered():
-    """All expected route prefixes should be present."""
+    """All expected route prefixes should be present (v3.0.0)."""
     from api_server import app
     paths = {r.path for r in app.routes}
+    # v3.0.0 unified routes
     assert "/health" in paths
-    assert "/memories" in paths
-    assert "/memories/search" in paths
-    assert "/memories/bulk" in paths
-    assert "/graeae/consult" in paths
+    assert "/v1/memories" in paths
+    assert "/v1/memories/search" in paths
+    assert "/v1/memories/bulk" in paths
+    assert "/v1/consultations" in paths  # Unified GRAEAE
+    assert "/v1/providers" in paths  # Provider routing
     assert "/kg/triples" in paths
     assert "/admin/users" in paths
 
