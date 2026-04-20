@@ -8,7 +8,9 @@ Implements git-like operations on memory history:
 - merge: Merge source_branch into target_branch
 """
 
+import hashlib
 import logging
+import time as _time
 from typing import Optional, List, Dict, Any
 from enum import Enum
 
