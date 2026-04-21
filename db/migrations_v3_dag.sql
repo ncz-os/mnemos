@@ -104,7 +104,7 @@ ON CONFLICT (memory_id, name) DO NOTHING;
 
 CREATE OR REPLACE VIEW v_compression_stats AS
 SELECT
-    COUNT(*) FILTER (WHERE compressed_at IS NOT NULL) AS total_compressions,
+    COUNT(*) AS total_compressions,
     COUNT(*) FILTER (WHERE quality_rating IS NOT NULL) AS reviewed,
     COUNT(*) FILTER (WHERE quality_rating IS NULL) AS unreviewed,
     AVG(CAST(quality_rating AS FLOAT)) FILTER (WHERE quality_rating IS NOT NULL) AS avg_quality,
@@ -115,16 +115,16 @@ CREATE OR REPLACE VIEW v_unreviewed_compressions AS
 SELECT
     cql.id,
     cql.memory_id,
-    cql.original_size,
-    cql.compressed_size,
+    cql.original_token_count,
+    cql.compressed_token_count,
     cql.compression_ratio,
-    cql.compressed_at,
+    cql.created,
     m.category,
     m.content
 FROM compression_quality_log cql
 LEFT JOIN memories m ON m.id = cql.memory_id
 WHERE cql.quality_rating IS NULL
-ORDER BY cql.compressed_at DESC;
+ORDER BY cql.created DESC;
 
 -- ────────────────────────────────────────────────────────────────────────────
 -- 9. Session table FK constraints (if sessions migration ran first)
