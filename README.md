@@ -102,14 +102,14 @@ This is the current state of v2.3.0 + v1 multi-user. Features described here are
 
 | Endpoint | What it does |
 |----------|-------------|
-| `POST /memories` | Store a memory with category, subcategory, content, and optional provenance |
-| `GET /memories` | List memories, filterable by category and subcategory |
-| `GET /memories/{id}` | Retrieve a single memory |
-| `POST /memories/search` | Semantic search with score threshold and category filter |
-| `POST /memories/bulk` | Bulk create memories |
-| `PATCH /memories/{id}` | Update memory content or metadata |
-| `DELETE /memories/{id}` | Delete a memory |
-| `POST /memories/rehydrate` | Load a compressed set of memories for context injection |
+| `POST /v1/memories` | Store a memory with category, subcategory, content, and optional provenance |
+| `GET /v1/memories` | List memories, filterable by category and subcategory |
+| `GET /v1/memories/{id}` | Retrieve a single memory |
+| `POST /v1/memories/search` | Semantic search with score threshold and category filter |
+| `POST /v1/memories/bulk` | Bulk create memories |
+| `PATCH /v1/memories/{id}` | Update memory content or metadata |
+| `DELETE /v1/memories/{id}` | Delete a memory |
+| `POST /v1/memories/rehydrate` | Load a compressed set of memories for context injection |
 | `POST /ingest/session` | Ingest a session transcript |
 | `GET /health` | Health check |
 | `GET /stats` | Memory counts by category, compression statistics |
@@ -311,17 +311,17 @@ curl -X POST http://localhost:5002/memories \
 
 ```bash
 # Full-text search
-curl -X POST http://localhost:5002/memories/search \
+curl -X POST http://localhost:5002/v1/memories/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "topic keywords", "limit": 10}'
 
 # Filtered by category
-curl -X POST http://localhost:5002/memories/search \
+curl -X POST http://localhost:5002/v1/memories/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "keywords", "category": "solutions", "limit": 5}'
 
 # Semantic (vector) search
-curl -X POST http://localhost:5002/memories/search \
+curl -X POST http://localhost:5002/v1/memories/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "keywords", "semantic": true, "limit": 10}'
 ```
@@ -346,12 +346,12 @@ curl -X DELETE http://localhost:5002/admin/apikeys/<key-id>
 ### GRAEAE reasoning
 
 ```bash
-curl -X POST http://localhost:5002/graeae/consult \
+curl -X POST http://localhost:5002/v1/consultations \
   -H 'Content-Type: application/json' \
   -d '{"prompt": "Your question", "task_type": "architecture_design"}'
 
 # Extract best result by score
-curl -X POST http://localhost:5002/graeae/consult \
+curl -X POST http://localhost:5002/v1/consultations \
   -d '{"prompt": "...", "task_type": "reasoning"}' | \
   jq '.all_responses | to_entries | sort_by(-.[1].final_score)[0]'
 ```

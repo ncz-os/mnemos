@@ -22,7 +22,7 @@ from api.auth import UserContext, get_current_user
 from api.models import MemoryItem
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/memories", tags=["dag"])
+router = APIRouter(prefix="/v1/memories", tags=["dag"])
 
 
 # ────────────────────────────────────────────────────────────────────────────

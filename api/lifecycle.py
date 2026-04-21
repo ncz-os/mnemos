@@ -135,7 +135,7 @@ async def _run_distillation_worker():
 async def lifespan(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, inference provider, and workers."""
     global _pool, _cache, _rls_enabled, _worker_status
-    logger.info("Starting MNEMOS API Server v2.3.0 (gateway + sessions + DAG + workers)")
+    logger.info("Starting MNEMOS API Server v3.0.0 (gateway + sessions + DAG + workers)")
 
     config = _load_config()
 
