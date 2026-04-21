@@ -3,13 +3,13 @@
 ALETHEIA: Token-level LLM compression via GPU (Tier 2)
 
 Named for "un-concealment / disclosure" — reveals the essential truth through LLM analysis.
-Uses LLMLingua-2-style token-level importance scoring via local LLM on PYTHIA Intel GPU.
+Uses LLMLingua-2-style token-level importance scoring via local LLM on the configured GPU inference host.
 
 Performance: 200-500ms per compression (batch mode), 95% quality, high reduction.
 Runs offline via distillation worker; not real-time.
 
-Routes to: PYTHIA (192.0.2.67) Intel GPU (TBD: Arc or integrated)
-Fallback: LETHE (CPU) if PYTHIA unreachable
+Routes to: the configured GPU inference host (GPU_PROVIDER_HOST env var)
+Fallback: LETHE (CPU) if the GPU host is unreachable
 """
 
 import asyncio
@@ -21,26 +21,26 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# PYTHIA GPU endpoint (Intel Arc or integrated)
-_PYTHIA_GPU_HOST = os.getenv("PYTHIA_GPU_HOST", "http://192.0.2.67:8000")
-_PYTHIA_GPU_TIMEOUT = float(os.getenv("PYTHIA_GPU_TIMEOUT", "30.0"))
+# GPU inference endpoint — set via GPU_PROVIDER_HOST env var
+_GPU_PROVIDER_HOST = os.getenv("GPU_PROVIDER_HOST", "")
+_GPU_PROVIDER_TIMEOUT = float(os.getenv("GPU_PROVIDER_TIMEOUT", "30.0"))
 
 # Fallback to CPU LETHE if GPU unavailable
 _FALLBACK_TO_LETHE = os.getenv("ALETHEIA_FALLBACK_LETHE", "true").lower() == "true"
 
 
 class ALETHEIA:
-    """GPU-based token-level compression via LLMLingua-2 on PYTHIA."""
+    """GPU-based token-level compression via LLMLingua-2 on a configured GPU host."""
 
-    def __init__(self, pythia_url: Optional[str] = None, timeout: float = _PYTHIA_GPU_TIMEOUT):
+    def __init__(self, gpu_host: Optional[str] = None, timeout: float = _GPU_PROVIDER_TIMEOUT):
         """
         Initialize ALETHEIA compressor.
 
         Args:
-            pythia_url: PYTHIA GPU inference endpoint (default: env PYTHIA_GPU_HOST)
+            gpu_host: the GPU inference host (default: env GPU_PROVIDER_HOST)
             timeout: Request timeout in seconds
         """
-        self.pythia_url = (pythia_url or _PYTHIA_GPU_HOST).rstrip("/")
+        self.gpu_host = (gpu_host or _GPU_PROVIDER_HOST).rstrip("/")
         self.timeout = timeout
         self._client: Optional[httpx.AsyncClient] = None
 
@@ -51,7 +51,7 @@ class ALETHEIA:
 
     async def compress(self, text: str, target_ratio: float = 0.3) -> Dict:
         """
-        Compress text using LLMLingua-2 via PYTHIA GPU.
+        Compress text using LLMLingua-2 via the GPU host.
 
         Args:
             text: Input text to compress
@@ -84,10 +84,10 @@ class ALETHEIA:
         try:
             client = await self._get_client()
 
-            # Query PYTHIA for token importance scoring
+            # Query the GPU host for token importance scoring
             prompt = self._build_scoring_prompt(text, target_ratio)
             response = await client.post(
-                f"{self.pythia_url}/v1/completions",
+                f"{self.gpu_host}/v1/completions",
                 json={
                     "prompt": prompt,
                     "max_tokens": 500,
@@ -101,7 +101,7 @@ class ALETHEIA:
             result = response.json()
             scoring_response = result.get("choices", [{}])[0].get("text", "").strip()
 
-            # Parse PYTHIA's token importance scores
+            # Parse the GPU host's token importance scores
             compressed_text, token_indices = self._parse_compressed_tokens(text, scoring_response)
 
             # Calculate metrics
@@ -142,7 +142,7 @@ class ALETHEIA:
                 }
 
     def _build_scoring_prompt(self, text: str, target_ratio: float) -> str:
-        """Build prompt for PYTHIA to score token importance."""
+        """Build prompt for the GPU host to score token importance."""
         target_count = max(5, int(len(text.split()) * target_ratio))
         return f"""Score the importance of each token in this text for compression to {target_count} tokens.
 Preserve critical information: names, numbers, verbs, key nouns.
@@ -156,7 +156,7 @@ Only output the indices, no explanation.
 """
 
     def _parse_compressed_tokens(self, text: str, scoring_response: str) -> tuple:
-        """Parse PYTHIA's token importance response."""
+        """Parse the GPU host's token importance response."""
         tokens = text.split()
         try:
             # Parse comma-separated indices
@@ -174,10 +174,10 @@ Only output the indices, no explanation.
             return " ".join(tokens[:target_count]), list(range(target_count))
 
     async def health_check(self) -> bool:
-        """Check if PYTHIA GPU is reachable."""
+        """Check if the GPU host is reachable."""
         try:
             client = await self._get_client()
-            resp = await client.get(f"{self.pythia_url}/health", timeout=5.0)
+            resp = await client.get(f"{self.gpu_host}/health", timeout=5.0)
             return resp.status_code == 200
         except Exception:
             return False

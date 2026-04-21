@@ -249,7 +249,7 @@ class CompressionManager:
     async def _compress_aletheia(
         self, text: str, task_type: str, target_ratio: float
     ) -> CompressionResult:
-        """Compress using ALETHEIA (Tier 2 GPU via PYTHIA)."""
+        """Compress using ALETHEIA (Tier 2 GPU via the configured GPU host)."""
         if self.aletheia is None:
             self.aletheia = ALETHEIA()
 
@@ -276,7 +276,7 @@ class CompressionManager:
     async def _compress_anamnesis(
         self, text: str, task_type: str
     ) -> CompressionResult:
-        """Extract facts using ANAMNESIS (Tier 3 GPU via PYTHIA)."""
+        """Extract facts using ANAMNESIS (Tier 3 GPU via the configured GPU host)."""
         if self.anamnesis is None:
             self.anamnesis = ANAMNESIS()
 

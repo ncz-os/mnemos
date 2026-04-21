@@ -145,7 +145,7 @@ def main() -> None:
     ]
 
     print("=" * 60)
-    print("  MNEMOS v2.3.0 Installer")
+    print("  MNEMOS v3.0.0 Installer")
     print("=" * 60)
 
     # 1. Choose deployment profile

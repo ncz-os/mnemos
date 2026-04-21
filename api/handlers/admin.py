@@ -10,6 +10,12 @@ import api.lifecycle as _lc
 from api.auth import UserContext, require_root
 from api.models import (
     ApiKeyCreateRequest,
+    OAuthIdentity,
+    OAuthIdentityListResponse,
+    OAuthProviderAdmin,
+    OAuthProviderAdminListResponse,
+    OAuthProviderCreateRequest,
+    OAuthProviderUpdateRequest,
     ApiKeyResponse,
     UserCreateRequest,
     UserResponse,
@@ -167,3 +173,145 @@ async def revoke_api_key(
     if result == "UPDATE 0":
         raise HTTPException(status_code=404, detail="API key not found or already revoked")
     logger.info(f"[ADMIN] Revoked API key id={key_id}")
+
+
+# ── OAuth provider management (root only) ────────────────────────────────────
+
+
+def _to_provider_admin(row) -> OAuthProviderAdmin:
+    return OAuthProviderAdmin(
+        name=row["name"],
+        display_name=row["display_name"],
+        kind=row["kind"],
+        issuer_url=row["issuer_url"],
+        client_id=row["client_id"],
+        client_secret_set=bool(row["client_secret"]),
+        scope=row["scope"],
+        authorize_url=row["authorize_url"],
+        token_url=row["token_url"],
+        userinfo_url=row["userinfo_url"],
+        enabled=row["enabled"],
+        created=row["created"].isoformat(),
+        updated=row["updated"].isoformat(),
+    )
+
+
+@router.post("/oauth/providers", response_model=OAuthProviderAdmin, status_code=201)
+async def create_oauth_provider(
+    request: OAuthProviderCreateRequest,
+    _: UserContext = Depends(require_root),
+):
+    """Register a new OAuth provider (root only)."""
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    if request.kind not in ("oidc", "oauth2"):
+        raise HTTPException(status_code=422, detail="kind must be 'oidc' or 'oauth2'")
+    if request.kind == "oidc" and not request.issuer_url:
+        raise HTTPException(status_code=422, detail="issuer_url required when kind='oidc'")
+    if request.kind == "oauth2" and not (request.authorize_url and request.token_url):
+        raise HTTPException(
+            status_code=422,
+            detail="authorize_url and token_url required when kind='oauth2'",
+        )
+    async with _lc._pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO oauth_providers
+              (name, display_name, kind, issuer_url, client_id, client_secret,
+               scope, authorize_url, token_url, userinfo_url, enabled)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING *
+            """,
+            request.name, request.display_name, request.kind, request.issuer_url,
+            request.client_id, request.client_secret, request.scope,
+            request.authorize_url, request.token_url, request.userinfo_url,
+            request.enabled,
+        )
+    return _to_provider_admin(row)
+
+
+@router.get("/oauth/providers", response_model=OAuthProviderAdminListResponse)
+async def list_oauth_providers(_: UserContext = Depends(require_root)):
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    async with _lc._pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM oauth_providers ORDER BY name")
+    items = [_to_provider_admin(r) for r in rows]
+    return OAuthProviderAdminListResponse(count=len(items), providers=items)
+
+
+@router.patch("/oauth/providers/{name}", response_model=OAuthProviderAdmin)
+async def update_oauth_provider(
+    name: str,
+    request: OAuthProviderUpdateRequest,
+    _: UserContext = Depends(require_root),
+):
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    updates = {k: v for k, v in request.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=422, detail="No fields to update")
+    set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
+    set_clauses.append("updated=NOW()")
+    async with _lc._pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"UPDATE oauth_providers SET {', '.join(set_clauses)} "
+            f"WHERE name=$1 RETURNING *",
+            name, *updates.values(),
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    return _to_provider_admin(row)
+
+
+@router.delete("/oauth/providers/{name}", status_code=204)
+async def delete_oauth_provider(
+    name: str,
+    _: UserContext = Depends(require_root),
+):
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    async with _lc._pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM oauth_providers WHERE name=$1", name,
+        )
+    if result == "DELETE 0":
+        raise HTTPException(status_code=404, detail="Provider not found")
+
+
+@router.get("/oauth/identities", response_model=OAuthIdentityListResponse)
+async def list_oauth_identities(
+    _: UserContext = Depends(require_root),
+    user_id: str = None,
+):
+    """List OAuth identities. Filter by user_id optional."""
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    async with _lc._pool.acquire() as conn:
+        if user_id:
+            rows = await conn.fetch(
+                "SELECT id::text, user_id, provider, external_id, email, "
+                "       display_name, last_login_at, created "
+                "FROM oauth_identities WHERE user_id=$1 ORDER BY created DESC",
+                user_id,
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT id::text, user_id, provider, external_id, email, "
+                "       display_name, last_login_at, created "
+                "FROM oauth_identities ORDER BY created DESC LIMIT 100",
+            )
+    items = [
+        OAuthIdentity(
+            id=r["id"],
+            user_id=r["user_id"],
+            provider=r["provider"],
+            external_id=r["external_id"],
+            email=r["email"],
+            display_name=r["display_name"],
+            last_login_at=r["last_login_at"].isoformat() if r["last_login_at"] else None,
+            created=r["created"].isoformat(),
+        )
+        for r in rows
+    ]
+    return OAuthIdentityListResponse(count=len(items), identities=items)

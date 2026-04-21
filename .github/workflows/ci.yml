@@ -27,7 +27,7 @@ jobs:
         run: ruff check .
 
       - name: Test
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/ -v --tb=short --ignore=tests/test_live_e2e.py
 
   docker-build:
     name: Docker build

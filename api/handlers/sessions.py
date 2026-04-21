@@ -118,8 +118,11 @@ async def get_session(
     async with pool.acquire() as conn:
         injections = await conn.fetch(
             """
-            SELECT DISTINCT memory_id FROM session_memory_injections
-            WHERE session_id = $1 ORDER BY injection_timestamp DESC LIMIT 10
+            SELECT memory_id FROM session_memory_injections
+            WHERE session_id = $1
+            GROUP BY memory_id
+            ORDER BY MAX(injection_timestamp) DESC
+            LIMIT 10
             """,
             session_id,
         )

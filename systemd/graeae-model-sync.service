@@ -1,6 +1,6 @@
 [Unit]
 Description=MNEMOS Model Registry — Daily Provider Sync
-Documentation=https://github.com/mnemos-dev/mnemos
+Documentation=https://github.com/perlowja/mnemos
 After=network-online.target postgresql.service
 Wants=network-online.target
 

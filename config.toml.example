@@ -18,7 +18,11 @@ pool_max_size = 20
 
 [compression]
 enabled = true
-default_strategy = "token_filter"  # 'token_filter' or 'sac'
+# LETHE is the Tier 1 CPU compressor. Mode selects between:
+#   "token"    — importance-weighted token filtering (~0.5ms, ~57% reduction)
+#   "sentence" — structure-preserving sentence extraction (~2-5ms, ~50% reduction)
+#   "auto"     — pick per content shape (default)
+default_strategy = "auto"  # 'auto' | 'token' | 'sentence'
 
 [compression.storage]
 enabled = true

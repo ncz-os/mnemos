@@ -1,0 +1,255 @@
+"""Webhook subsystem tests — structure, signature, validation, delivery state machine.
+
+Pure-Python where possible; integration tests that need a live DB are marked
+with `pytest.mark.integration` and skipped when MNEMOS_TEST_DB isn't set.
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+# ── Module import smoke tests ─────────────────────────────────────────────────
+
+
+class TestWebhookModuleWiring:
+    """Confirm modules exist and expose the expected surface."""
+
+    def test_handler_imports(self):
+        from api.handlers import webhooks
+        assert hasattr(webhooks, "router")
+        assert webhooks.router.prefix == "/v1/webhooks"
+
+    def test_dispatcher_imports(self):
+        from api import webhook_dispatcher
+        assert hasattr(webhook_dispatcher, "dispatch")
+        assert hasattr(webhook_dispatcher, "recovery_worker_loop")
+        assert hasattr(webhook_dispatcher, "_sign")
+
+    def test_models_imported(self):
+        from api.models import (
+            VALID_WEBHOOK_EVENTS,
+            WebhookCreateRequest,
+            WebhookCreateResponse,
+            WebhookItem,
+            WebhookListResponse,
+            WebhookDelivery,
+            WebhookDeliveryListResponse,
+        )
+        assert {"memory.created", "memory.updated", "memory.deleted",
+                "consultation.completed"} <= VALID_WEBHOOK_EVENTS
+
+    def test_router_registered_in_app(self):
+        import api_server
+        paths = {r.path for r in api_server.app.routes}
+        webhook_paths = [p for p in paths if p.startswith("/v1/webhooks")]
+        assert len(webhook_paths) >= 3, f"expected webhook routes, got: {webhook_paths}"
+
+
+# ── Signature correctness ────────────────────────────────────────────────────
+
+
+class TestWebhookSignature:
+    """HMAC-SHA256 signature over raw body bytes."""
+
+    def test_sign_matches_receiver_verification(self):
+        from api.webhook_dispatcher import _sign
+
+        secret = "test-secret-abc123"
+        body = '{"event":"memory.created","data":{"id":"mem_x"}}'
+
+        expected = hmac.new(
+            secret.encode("utf-8"),
+            body.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        assert _sign(secret, body) == expected
+
+    def test_sign_different_secrets_produce_different_signatures(self):
+        from api.webhook_dispatcher import _sign
+
+        body = '{"x": 1}'
+        assert _sign("secret-a", body) != _sign("secret-b", body)
+
+    def test_sign_different_bodies_produce_different_signatures(self):
+        from api.webhook_dispatcher import _sign
+
+        secret = "same"
+        assert _sign(secret, '{"a":1}') != _sign(secret, '{"a":2}')
+
+    def test_sign_is_hex_string_of_expected_length(self):
+        from api.webhook_dispatcher import _sign
+
+        sig = _sign("k", "body")
+        assert len(sig) == 64  # SHA-256 hex is 64 chars
+        int(sig, 16)  # must parse as hex
+
+
+# ── Event validation ─────────────────────────────────────────────────────────
+
+
+class TestEventValidation:
+    """The handler's event allowlist."""
+
+    def test_valid_events_accepted(self):
+        from api.handlers.webhooks import _validate_events
+
+        # None of these should raise
+        _validate_events(["memory.created"])
+        _validate_events(["memory.created", "memory.updated", "memory.deleted"])
+        _validate_events(["consultation.completed"])
+
+    def test_empty_events_rejected(self):
+        from api.handlers.webhooks import _validate_events
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc:
+            _validate_events([])
+        assert exc.value.status_code == 422
+
+    def test_unknown_event_rejected(self):
+        from api.handlers.webhooks import _validate_events
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc:
+            _validate_events(["memory.created", "totally.made.up"])
+        assert exc.value.status_code == 422
+        assert "totally.made.up" in str(exc.value.detail)
+
+    def test_url_must_be_http_or_https(self):
+        from api.handlers.webhooks import _validate_url
+        from fastapi import HTTPException
+
+        _validate_url("http://example.com/hook")   # ok
+        _validate_url("https://example.com/hook")  # ok
+
+        with pytest.raises(HTTPException):
+            _validate_url("ftp://example.com/hook")
+        with pytest.raises(HTTPException):
+            _validate_url("file:///etc/passwd")
+        with pytest.raises(HTTPException):
+            _validate_url("example.com")
+
+
+# ── Retry schedule constants ─────────────────────────────────────────────────
+
+
+class TestRetrySchedule:
+    """Retry schedule matches documented contract (1m / 5m / 30m / 2h)."""
+
+    def test_backoff_values(self):
+        from api.webhook_dispatcher import BACKOFF_SCHEDULE
+        assert BACKOFF_SCHEDULE == [60, 300, 1800, 7200]
+
+    def test_max_attempts_matches_schedule_length(self):
+        from api.webhook_dispatcher import BACKOFF_SCHEDULE, MAX_ATTEMPTS
+        assert MAX_ATTEMPTS == len(BACKOFF_SCHEDULE)
+
+    def test_delivery_timeout_reasonable(self):
+        from api.webhook_dispatcher import DELIVERY_TIMEOUT
+        assert 1.0 <= DELIVERY_TIMEOUT <= 60.0
+
+
+# ── Integration: live DB required ────────────────────────────────────────────
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    "MNEMOS_TEST_DB" not in os.environ,
+    reason="set MNEMOS_TEST_DB=postgres://... to run integration tests",
+)
+class TestWebhookIntegration:
+    """End-to-end tests requiring a live DB. Enable via MNEMOS_TEST_DB env."""
+
+    @pytest.mark.asyncio
+    async def test_webhook_crud_roundtrip(self):
+        import asyncpg
+        from api.handlers.webhooks import _to_item
+
+        conn = await asyncpg.connect(os.environ["MNEMOS_TEST_DB"])
+        try:
+            # Insert
+            row = await conn.fetchrow(
+                """
+                INSERT INTO webhook_subscriptions
+                  (url, events, secret, owner_id, namespace)
+                VALUES ($1, $2, $3, 'default', 'default')
+                RETURNING id, url, events, description, owner_id, namespace,
+                          created, revoked, revoked_at
+                """,
+                "https://test.example.com/hook",
+                ["memory.created"],
+                "test-secret",
+            )
+            item = _to_item(row)
+            assert item.url == "https://test.example.com/hook"
+            assert item.events == ["memory.created"]
+            assert not item.revoked
+
+            # Revoke
+            await conn.execute(
+                "UPDATE webhook_subscriptions SET revoked=TRUE, revoked_at=NOW() WHERE id=$1",
+                row["id"],
+            )
+            # Cleanup
+            await conn.execute(
+                "DELETE FROM webhook_subscriptions WHERE id=$1", row["id"]
+            )
+        finally:
+            await conn.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_writes_delivery_rows(self):
+        import asyncpg
+        from api.webhook_dispatcher import dispatch
+
+        conn = await asyncpg.connect(os.environ["MNEMOS_TEST_DB"])
+        try:
+            sub = await conn.fetchrow(
+                """
+                INSERT INTO webhook_subscriptions
+                  (url, events, secret, owner_id, namespace)
+                VALUES ('https://nonexistent.invalid/hook',
+                        ARRAY['memory.created']::TEXT[],
+                        'sec', 'default', 'default')
+                RETURNING id
+                """
+            )
+
+            try:
+                await dispatch(
+                    conn, "memory.created",
+                    {"memory_id": "mem_test"},
+                    owner_id="default", namespace="default",
+                )
+
+                rows = await conn.fetch(
+                    "SELECT id, status, event_type, attempt_num "
+                    "FROM webhook_deliveries WHERE subscription_id=$1",
+                    sub["id"],
+                )
+                assert len(rows) >= 1
+                assert rows[0]["event_type"] == "memory.created"
+                assert rows[0]["attempt_num"] == 1
+                # status starts pending; may become 'retrying' if the background
+                # attempt fires before we observe — accept either.
+                assert rows[0]["status"] in ("pending", "retrying", "abandoned")
+            finally:
+                await conn.execute(
+                    "DELETE FROM webhook_deliveries WHERE subscription_id=$1",
+                    sub["id"],
+                )
+                await conn.execute(
+                    "DELETE FROM webhook_subscriptions WHERE id=$1", sub["id"]
+                )
+        finally:
+            await conn.close()

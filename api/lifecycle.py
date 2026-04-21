@@ -132,7 +132,7 @@ async def _run_distillation_worker():
 async def lifespan(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, inference provider, and workers."""
     global _pool, _cache, _rls_enabled, _worker_status
-    logger.info("Starting MNEMOS API Server v2.3.0 (gateway + sessions + DAG + workers)")
+    logger.info("Starting MNEMOS API Server v3.0.0 (gateway + sessions + DAG + workers)")
 
     config = _load_config()
 
@@ -193,6 +193,35 @@ async def lifespan(app):
     else:
         logger.info("Background distillation worker disabled")
         _worker_status["distillation_worker"] = "disabled"
+
+    # Webhook delivery recovery worker (v3.0.0 — picks up pending/retrying deliveries)
+    if _pool:
+        logger.info('Launching webhook delivery recovery worker')
+        from api.webhook_dispatcher import recovery_worker_loop as _webhook_recovery
+        _schedule_background(_webhook_recovery(_pool))
+
+    # Federation sync worker (v3.0.0 — pulls from remote peers on their intervals)
+    if _pool:
+        logger.info('Launching federation sync worker')
+        from api.federation import federation_worker_loop as _federation_worker
+        _schedule_background(_federation_worker(_pool))
+
+    # OAuth expired-session GC worker (v3.0.0)
+    if _pool:
+        import asyncio as _asyncio
+        async def _oauth_gc_loop():
+            from api.oauth import gc_expired_sessions
+            while True:
+                try:
+                    await _asyncio.sleep(3600)  # hourly
+                    deleted = await gc_expired_sessions(_pool)
+                    if deleted:
+                        logger.info(f'oauth gc: deleted {deleted} expired sessions')
+                except _asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception('oauth gc iteration failed')
+        _schedule_background(_oauth_gc_loop())
 
     yield
 

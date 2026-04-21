@@ -3,7 +3,7 @@ Compression Module: THE MOIRAI (Tier 1-3 compression)
 
 Provides:
 - LETHE: Fast CPU compression (Tier 1, 0.5-5ms, 30-57% reduction)
-- ALETHEIA: GPU token-level compression via PYTHIA (Tier 2, 200-500ms, 70% reduction)
+- ALETHEIA: GPU token-level compression via the configured GPU host (Tier 2, 200-500ms, 70% reduction)
 - ANAMNESIS: GPU fact extraction for archival (Tier 3, 500ms-2s, semantic compression)
 - CompressionManager: Orchestrates LETHE/ALETHEIA/ANAMNESIS with fallback
 - QualityAnalyzer: Quality manifest generation

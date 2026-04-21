@@ -203,7 +203,7 @@ async def search_memories(
             # Gateway uses LETHE compression for memory injection (critical path)
             logger.debug(
                 f"[COMPRESSION] Result set {total_size} bytes > threshold; "
-                f"on-the-fly compression deferred to Phase 8A (see MNEMOS_v24_IMPLEMENTATION_NOTES.md)"
+                f"on-the-fly compression deferred to Phase 8A"
             )
         else:
             logger.warning("[PHASE2] distillation backend unavailable, skipping compression")
@@ -254,20 +254,8 @@ async def create_memory(
                     request.source_model, request.source_provider,
                     request.source_session, request.source_agent,
                 )
-                await conn.execute(
-                    "INSERT INTO memory_versions "
-                    "(memory_id, version_num, content, category, subcategory, metadata, verbatim_content, "
-                    "owner_id, namespace, permission_mode, "
-                    "source_model, source_provider, source_session, source_agent, "
-                    "snapshot_by, change_type) "
-                    "VALUES ($1, 1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'create') "
-                    "ON CONFLICT (memory_id, version_num) DO NOTHING",
-                    mem_id, request.content, request.category, request.subcategory, meta, verbatim,
-                    owner_id, namespace, 600,
-                    request.source_model, request.source_provider,
-                    request.source_session, request.source_agent,
-                    user.user_id,
-                )
+                # (trigger trg_memory_version_insert inserts version 1 automatically,
+                # computing commit_hash + branch; no explicit handler INSERT needed)
                 row = await conn.fetchrow(
                     f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", mem_id,
                 )
@@ -276,6 +264,19 @@ async def create_memory(
             await _lc._cache.delete("stats:global")
         except Exception:
             pass
+    try:
+        from api.webhook_dispatcher import dispatch as _dispatch_webhook
+        async with _lc._pool.acquire() as _wh_conn:
+            await _dispatch_webhook(_wh_conn, "memory.created", {
+                "memory_id": mem_id,
+                "category": request.category,
+                "subcategory": request.subcategory,
+                "content": request.content,
+                "owner_id": owner_id,
+                "namespace": namespace,
+            }, owner_id=owner_id, namespace=namespace)
+    except Exception:
+        logger.warning("webhook dispatch failed for memory.created %s", mem_id, exc_info=True)
     return _row_to_memory(row)
 
 
@@ -394,6 +395,19 @@ async def update_memory(
             await _lc._cache.delete("stats:global")
         except Exception:
             pass
+    try:
+        from api.webhook_dispatcher import dispatch as _dispatch_webhook
+        async with _lc._pool.acquire() as _wh_conn:
+            await _dispatch_webhook(_wh_conn, "memory.updated", {
+                "memory_id": memory_id,
+                "category": row["category"],
+                "subcategory": row["subcategory"],
+                "content": row["content"],
+                "owner_id": row["owner_id"],
+                "namespace": row["namespace"],
+            }, owner_id=row["owner_id"], namespace=row["namespace"])
+    except Exception:
+        logger.warning("webhook dispatch failed for memory.updated %s", memory_id, exc_info=True)
     return _lc._row_to_memory(row)
 
 
@@ -415,6 +429,16 @@ async def delete_memory(
             await _lc._cache.delete("stats:global")
         except Exception:
             pass
+    try:
+        from api.webhook_dispatcher import dispatch as _dispatch_webhook
+        async with _lc._pool.acquire() as _wh_conn:
+            await _dispatch_webhook(_wh_conn, "memory.deleted", {
+                "memory_id": memory_id,
+                "owner_id": user.user_id,
+                "namespace": user.namespace,
+            }, owner_id=user.user_id, namespace=user.namespace)
+    except Exception:
+        logger.warning("webhook dispatch failed for memory.deleted %s", memory_id, exc_info=True)
 
 
 @router.post("/memories/rehydrate", response_model=RehydrationResponse)

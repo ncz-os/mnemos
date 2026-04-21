@@ -1,4 +1,4 @@
-"""Integration tests for MNEMOS v2.4.0 — critical paths only.
+"""Integration tests for MNEMOS v3.0.0 — critical paths only.
 
 Tests verify:
 1. OpenAI gateway structure (no actual API calls)
@@ -147,7 +147,7 @@ class TestCompressionStackRename:
         """LETHE (CPU tier 1) module exists."""
         try:
             from compression import lethe
-            assert hasattr(lethe, 'compress')
+            assert hasattr(lethe, 'LETHE')
         except ImportError as e:
             pytest.fail(f"LETHE module missing: {e}")
 
@@ -155,7 +155,7 @@ class TestCompressionStackRename:
         """ALETHEIA (GPU tier 2) module exists."""
         try:
             from compression import aletheia
-            assert hasattr(aletheia, 'compress')
+            assert hasattr(aletheia, 'ALETHEIA')
         except ImportError as e:
             pytest.fail(f"ALETHEIA module missing: {e}")
 
@@ -163,7 +163,7 @@ class TestCompressionStackRename:
         """ANAMNESIS (archival tier 3) module exists."""
         try:
             from compression import anamnesis
-            assert hasattr(anamnesis, 'extract_facts')
+            assert hasattr(anamnesis, 'ANAMNESIS')
         except ImportError as e:
             pytest.fail(f"ANAMNESIS module missing: {e}")
 
@@ -276,7 +276,7 @@ class TestDockerIntegration:
         pyproject_path = Path(__file__).parent.parent / 'pyproject.toml'
         assert pyproject_path.exists(), "pyproject.toml not found"
         content = pyproject_path.read_text()
-        assert 'version = "2.4.0"' in content, "Version not updated to 2.4.0"
+        assert 'version = "3.0.0"' in content, "Version not at 3.0.0"
 
     def test_pyproject_toml_has_uv_config(self):
         """pyproject.toml has uv configuration."""

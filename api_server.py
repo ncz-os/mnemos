@@ -34,6 +34,9 @@ from api.handlers.entities import router as entities_router
 from api.handlers.openai_compat import router as openai_compat_router
 from api.handlers.sessions import router as sessions_router
 from api.handlers.dag import router as dag_router
+from api.handlers.webhooks import router as webhooks_router
+from api.handlers.oauth import router as oauth_router
+from api.handlers.federation import router as federation_router
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
@@ -68,6 +71,22 @@ app.add_middleware(SlowAPIMiddleware)
 # Defaults to "*" for local dev. Example: CORS_ORIGINS=https://app.example.com
 _cors_origins_raw = os.getenv("CORS_ORIGINS", "http://localhost,http://127.0.0.1,http://127.0.0.1:5002,http://localhost:5002")
 _cors_origins = [o.strip() for o in _cors_origins_raw.split(",")]
+# Starlette SessionMiddleware — required by authlib for OAuth state (PKCE verifier,
+# CSRF nonce) carried across the authorize -> callback redirect. This cookie is
+# DIFFERENT from the application session cookie set after successful login.
+import os as _os
+import secrets as _secrets
+from starlette.middleware.sessions import SessionMiddleware as _SessionMiddleware
+_oauth_state_secret = _os.environ.get('MNEMOS_SESSION_SECRET') or _secrets.token_urlsafe(48)
+app.add_middleware(
+    _SessionMiddleware,
+    secret_key=_oauth_state_secret,
+    session_cookie='mnemos_oauth_state',
+    max_age=600,  # 10 minutes — just for the redirect roundtrip
+    same_site='lax',
+    https_only=False,  # set MNEMOS_SESSION_HTTPS_ONLY=1 to harden in prod
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -82,6 +101,9 @@ app.include_router(providers_router)  # v3.0.0: Unified /v1/providers (model rou
 app.include_router(openai_compat_router)  # Phase 0: OpenAI-compatible gateway
 app.include_router(sessions_router)  # Phase 0: Session management for stateful chat
 app.include_router(dag_router)  # Phase 3: DAG versioning (git-like)
+app.include_router(webhooks_router)  # v3.0.0: Outbound webhook subscriptions
+app.include_router(oauth_router)  # v3.0.0: OAuth/OIDC browser login
+app.include_router(federation_router)  # v3.0.0: Cross-instance memory federation
 app.include_router(graeae_router)  # v2.x legacy: deprecated, use /v1/consultations
 app.include_router(memories_router)
 app.include_router(ingest_router)

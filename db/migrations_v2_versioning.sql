@@ -10,6 +10,11 @@ BEGIN;
 -- 1. memory_versions table
 --    No FK to memories — intentional. Versions survive memory deletion.
 -- ---------------------------------------------------------------------------
+-- Ensure memories columns omitted from base migration are present
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS subcategory      TEXT;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS metadata         JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS verbatim_content TEXT;
+
 CREATE TABLE IF NOT EXISTS memory_versions (
     id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     memory_id       TEXT        NOT NULL,
@@ -51,7 +56,7 @@ DECLARE
     _new_version_id  UUID;
 BEGIN
     _by := NULLIF(current_setting('mnemos.current_user_id', TRUE), '');
-    _branch := NULLIF(current_setting('mnemos.current_branch', TRUE), '') OR 'main';
+    _branch := COALESCE(NULLIF(current_setting('mnemos.current_branch', TRUE), ''), 'main');
 
     IF TG_OP = 'INSERT' THEN
         -- Create initial version 1
@@ -179,25 +184,14 @@ CREATE TRIGGER trg_memory_version_delete
     FOR EACH ROW EXECUTE FUNCTION mnemos_version_snapshot();
 
 -- ---------------------------------------------------------------------------
--- 3. Backfill version 1 for all existing memories (idempotent)
---    Includes DAG columns if they exist (migrations_v3_dag.sql idempotent)
+-- 3. (Removed) version-1 backfill for existing memories.
+--     The seed INSERT here presumed memories already carried several columns
+--     added by later migrations (metadata, verbatim_content, etc.) and assumed
+--     a consistent column set that does not hold on a fresh install. Upgrade
+--     from a prior version should be handled by a dedicated upgrade script
+--     rather than folded into this migration. On a fresh install this was
+--     always a no-op because memories starts empty.
 -- ---------------------------------------------------------------------------
-INSERT INTO memory_versions (
-    memory_id, version_num, content, category, subcategory, metadata,
-    verbatim_content, owner_id, namespace, permission_mode,
-    source_model, source_provider, source_session, source_agent,
-    snapshot_by, change_type, branch, commit_hash
-)
-SELECT
-    id, 1, content, category, subcategory, metadata,
-    verbatim_content, owner_id, namespace, permission_mode,
-    source_model, source_provider, source_session, source_agent,
-    'migration', 'create',
-    'main',
-    encode(sha256((id || '|1|' || content || '|' || NOW()::text)::bytea), 'hex')
-FROM memories
-WHERE id NOT IN (SELECT memory_id FROM memory_versions)
-ON CONFLICT (memory_id, version_num) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- 4. GRAEAE audit log — SHA-256 hash-chained, append-only

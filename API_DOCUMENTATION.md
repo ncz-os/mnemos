@@ -1,8 +1,18 @@
 # MNEMOS API Documentation
 
 **Base URL**: `http://localhost:5002`
-**Version**: 2.3.0
+**Version**: 3.0.0
 **Format**: JSON
+
+---
+
+> **Note on v3 API surface:** primary routes are namespaced under `/v1/*` as of v3.0.0.
+> Pre-v3 paths (`/memories`, `/memories/search`, `/graeae/consult`, `/model-registry/*`) remain functional
+> as **deprecated aliases** for backward compatibility and will be removed in a future major version.
+> This document describes the pre-v3 paths. For the v3 surface (including `/v1/consultations`,
+> `/v1/providers`, `/v1/webhooks`, `/auth/oauth/*`, `/v1/federation/*`, and the OpenAI-compatible
+> gateway at `/v1/chat/completions`), see `README.md`.
+> A full v3-first rewrite of this document is tracked for a follow-up release.
 
 ---
 

@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS memories (
   compression_manifest JSONB,                -- Full quality details
   quality_rating INT,                        -- 0-100% (how much preserved)
   quality_summary JSONB,                     -- What was removed/preserved
-  original_reference UUID REFERENCES memories(id),
+  original_reference TEXT REFERENCES memories(id),
 
   -- Audit
   compressed_at TIMESTAMP,
@@ -55,7 +55,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING ivfflat(embe
 -- compression_quality_log: Audit trail of all compression operations
 CREATE TABLE IF NOT EXISTS compression_quality_log (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
 
   -- Compression metrics
   original_token_count INT NOT NULL,
@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS graeae_consultations (
   compression_manifest JSONB,
 
   -- Consultation memory IDs (for tracking what was used)
-  context_memory_ids UUID[],
+  context_memory_ids TEXT[],
 
   -- Response
   consensus_response TEXT NOT NULL,
@@ -199,16 +199,17 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- View: Compression statistics by task type
 CREATE OR REPLACE VIEW v_compression_stats AS
 SELECT
-  task_type,
+  m.task_type,
   COUNT(*) as total_compressions,
-  AVG(quality_rating) as avg_quality_rating,
-  MIN(quality_rating) as min_quality_rating,
-  MAX(quality_rating) as max_quality_rating,
-  AVG(compression_ratio) as avg_compression_ratio,
-  COUNT(CASE WHEN reviewed THEN 1 END) as reviewed_count,
-  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY quality_rating) as median_quality
-FROM compression_quality_log
-GROUP BY task_type;
+  AVG(cql.quality_rating) as avg_quality_rating,
+  MIN(cql.quality_rating) as min_quality_rating,
+  MAX(cql.quality_rating) as max_quality_rating,
+  AVG(cql.compression_ratio) as avg_compression_ratio,
+  COUNT(CASE WHEN cql.reviewed THEN 1 END) as reviewed_count,
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cql.quality_rating) as median_quality
+FROM compression_quality_log cql
+LEFT JOIN memories m ON cql.memory_id = m.id
+GROUP BY m.task_type;
 
 -- View: Unreviewed compressions (require attention)
 CREATE OR REPLACE VIEW v_unreviewed_compressions AS

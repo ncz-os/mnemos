@@ -1,7 +1,7 @@
 """Pydantic models for MNEMOS API."""
 from typing import Optional, Dict, Any, List
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ConsultationRequest(BaseModel):
@@ -43,6 +43,7 @@ class MemoryItem(BaseModel):
     quality_rating: Optional[int] = None
     compressed_content: Optional[str] = None
     verbatim_content: Optional[str] = None
+    source: Optional[str] = "openclaw"
     # v1 provenance + ownership
     owner_id: Optional[str] = None
     group_id: Optional[str] = None
@@ -81,6 +82,14 @@ class MemoryCreateRequest(BaseModel):
     subcategory: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
     verbatim_content: Optional[str] = None
+    source: Optional[str] = "openclaw"
+    # v1 provenance + ownership (optional admin overrides; default to caller context)
+    owner_id: Optional[str] = None
+    namespace: Optional[str] = None
+    source_model: Optional[str] = None
+    source_provider: Optional[str] = None
+    source_session: Optional[str] = None
+    source_agent: Optional[str] = None
 
 
 class MemoryUpdateRequest(BaseModel):
@@ -105,6 +114,8 @@ class RehydrationRequest(BaseModel):
     query: str
     limit: int = 5
     budget_tokens: Optional[int] = None
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
 
 
 class RehydrationResponse(BaseModel):
@@ -367,3 +378,248 @@ class ModelRecommendation(BaseModel):
     quality_score: Optional[float] = None
     context_window: Optional[int] = None
     alternatives: Optional[List[Dict[str, Any]]] = None
+
+
+# ── v3.0.0 Webhooks ───────────────────────────────────────────────────────────
+
+VALID_WEBHOOK_EVENTS = frozenset({
+    'memory.created',
+    'memory.updated',
+    'memory.deleted',
+    'consultation.completed',
+})
+
+
+class WebhookCreateRequest(BaseModel):
+    url: str
+    events: List[str] = Field(..., description='Event types to subscribe to')
+    description: Optional[str] = None
+    namespace: Optional[str] = None
+
+
+class WebhookItem(BaseModel):
+    id: str
+    url: str
+    events: List[str]
+    description: Optional[str] = None
+    owner_id: str
+    namespace: str
+    created: str
+    revoked: bool
+    revoked_at: Optional[str] = None
+
+
+class WebhookCreateResponse(BaseModel):
+    id: str
+    url: str
+    events: List[str]
+    description: Optional[str] = None
+    owner_id: str
+    namespace: str
+    created: str
+    revoked: bool
+    secret: str = Field(
+        ..., description='HMAC signing secret — shown once only, store securely'
+    )
+
+
+class WebhookListResponse(BaseModel):
+    count: int
+    webhooks: List[WebhookItem]
+
+
+class WebhookDelivery(BaseModel):
+    id: str
+    subscription_id: str
+    event_type: str
+    attempt_num: int
+    status: str
+    response_status: Optional[int] = None
+    response_body: Optional[str] = None
+    error: Optional[str] = None
+    scheduled_at: str
+    delivered_at: Optional[str] = None
+    created: str
+
+
+class WebhookDeliveryListResponse(BaseModel):
+    count: int
+    deliveries: List[WebhookDelivery]
+
+
+# ── v3.0.0 OAuth / OIDC ───────────────────────────────────────────────────────
+
+class OAuthProviderCreateRequest(BaseModel):
+    name: str = Field(..., description="Unique provider name, e.g. 'google', 'github', 'company-sso'")
+    display_name: str
+    kind: str = Field("oidc", description="'oidc' | 'oauth2'")
+    issuer_url: Optional[str] = Field(None, description="Required for kind='oidc'")
+    client_id: str
+    client_secret: str = Field(..., description="Stored in DB; rotate periodically")
+    scope: str = "openid profile email"
+    # oauth2-only overrides
+    authorize_url: Optional[str] = None
+    token_url: Optional[str] = None
+    userinfo_url: Optional[str] = None
+    enabled: bool = True
+
+
+class OAuthProviderUpdateRequest(BaseModel):
+    display_name: Optional[str] = None
+    issuer_url: Optional[str] = None
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    scope: Optional[str] = None
+    authorize_url: Optional[str] = None
+    token_url: Optional[str] = None
+    userinfo_url: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+class OAuthProviderPublic(BaseModel):
+    """Provider info safe to expose to unauthenticated login UI (no secrets)."""
+    name: str
+    display_name: str
+    kind: str
+    enabled: bool
+
+
+class OAuthProviderAdmin(BaseModel):
+    """Full provider record for admin UI (client_id visible, client_secret redacted)."""
+    name: str
+    display_name: str
+    kind: str
+    issuer_url: Optional[str] = None
+    client_id: str
+    client_secret_set: bool = Field(..., description="True if secret is set; raw value never returned")
+    scope: str
+    authorize_url: Optional[str] = None
+    token_url: Optional[str] = None
+    userinfo_url: Optional[str] = None
+    enabled: bool
+    created: str
+    updated: str
+
+
+class OAuthProviderListResponse(BaseModel):
+    count: int
+    providers: List[OAuthProviderPublic]
+
+
+class OAuthProviderAdminListResponse(BaseModel):
+    count: int
+    providers: List[OAuthProviderAdmin]
+
+
+class OAuthIdentity(BaseModel):
+    id: str
+    user_id: str
+    provider: str
+    external_id: str
+    email: Optional[str] = None
+    display_name: Optional[str] = None
+    last_login_at: Optional[str] = None
+    created: str
+
+
+class OAuthIdentityListResponse(BaseModel):
+    count: int
+    identities: List[OAuthIdentity]
+
+
+class OAuthLogoutResponse(BaseModel):
+    logged_out: bool
+    sessions_revoked: int
+
+
+class OAuthMeResponse(BaseModel):
+    """Who am I — useful for web UIs after redirect-callback."""
+    user_id: str
+    role: str
+    namespace: str
+    authenticated: bool
+    auth_method: str      # 'api_key' | 'session' | 'personal'
+    identity: Optional[OAuthIdentity] = None
+
+
+# ── v3.0.0 Federation ─────────────────────────────────────────────────────────
+
+class FederationPeerCreateRequest(BaseModel):
+    name: str = Field(
+        ...,
+        description="Peer name (lowercase alnum + dash, 3-64 chars). Used in federated memory ids.",
+    )
+    base_url: str = Field(..., description="Peer base URL, e.g. https://peer.example.com")
+    auth_token: str = Field(..., description="Bearer token the peer issued us (role=federation)")
+    namespace_filter: Optional[List[str]] = None
+    category_filter: Optional[List[str]] = None
+    enabled: bool = True
+    sync_interval_secs: int = 300
+
+
+class FederationPeerUpdateRequest(BaseModel):
+    base_url: Optional[str] = None
+    auth_token: Optional[str] = None
+    namespace_filter: Optional[List[str]] = None
+    category_filter: Optional[List[str]] = None
+    enabled: Optional[bool] = None
+    sync_interval_secs: Optional[int] = None
+
+
+class FederationPeer(BaseModel):
+    id: str
+    name: str
+    base_url: str
+    namespace_filter: Optional[List[str]] = None
+    category_filter: Optional[List[str]] = None
+    enabled: bool
+    sync_interval_secs: int
+    last_sync_at: Optional[str] = None
+    last_sync_cursor: Optional[str] = None
+    last_error: Optional[str] = None
+    last_error_at: Optional[str] = None
+    total_pulled: int = 0
+    created: str
+    updated: str
+
+
+class FederationPeerListResponse(BaseModel):
+    count: int
+    peers: List[FederationPeer]
+
+
+class FederationSyncTriggerResponse(BaseModel):
+    pulled: int
+    new: int
+    updated: int
+
+
+class FederationSyncLogEntry(BaseModel):
+    id: str
+    started_at: str
+    finished_at: Optional[str] = None
+    memories_pulled: int
+    memories_new: int
+    memories_updated: int
+    error: Optional[str] = None
+    cursor_before: Optional[str] = None
+    cursor_after: Optional[str] = None
+
+
+class FederationSyncLogResponse(BaseModel):
+    count: int
+    entries: List[FederationSyncLogEntry]
+
+
+class FederationStatusResponse(BaseModel):
+    count: int
+    enabled_count: int
+    error_count: int
+    peers: List[FederationPeer]
+
+
+class FederationFeedResponse(BaseModel):
+    """Returned by /v1/federation/feed to remote peers pulling from us."""
+    memories: List[MemoryItem]
+    next_cursor: Optional[str] = None
+    has_more: bool = False

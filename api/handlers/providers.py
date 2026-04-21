@@ -125,6 +125,45 @@ async def recommend_model(
                 )
 
             if not models:
+                # Final fallback: no rows in model_registry at all (fresh install),
+                # recommend from the static graeae.providers config in config.toml.
+                try:
+                    from graeae.engine import get_graeae_engine
+                    engine = get_graeae_engine()
+                    providers = engine.providers
+                    # Pick the configured provider with the highest weight at/above the floor.
+                    candidates = [
+                        (name, cfg) for name, cfg in providers.items()
+                        if cfg.get("weight", 0.0) >= quality_floor
+                    ]
+                    if not candidates:
+                        # Relax the floor — pick overall highest weight.
+                        candidates = sorted(providers.items(),
+                                            key=lambda kv: kv[1].get("weight", 0.0),
+                                            reverse=True)
+                    if not candidates:
+                        raise HTTPException(status_code=404, detail="No providers configured")
+                    name, cfg = max(candidates, key=lambda kv: kv[1].get("weight", 0.0))
+                    return {
+                        "recommended": {
+                            "provider": name,
+                            "model_id": cfg.get("model"),
+                            "display_name": cfg.get("model"),
+                            "cost_per_mtok": None,
+                        },
+                        "reasoning": (
+                            f"model_registry empty; recommended highest-weight "
+                            f"configured provider ({name}, weight={cfg.get('weight', 0.0)})"
+                        ),
+                        "quality_score": cfg.get("weight"),
+                        "context_window": None,
+                    }
+                except HTTPException:
+                    raise
+                except Exception as fallback_err:
+                    logger.warning(
+                        f"[PROVIDERS] Fallback to graeae config failed: {fallback_err}"
+                    )
                 raise HTTPException(status_code=404, detail="No models available")
 
             model = models[0]

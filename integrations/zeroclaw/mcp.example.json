@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mnemos": {
+      "command": "python",
+      "args": ["/path/to/mnemos/mcp_server.py"],
+      "env": {
+        "MNEMOS_BASE": "http://<your-mnemos-host>:5000"
+      }
+    }
+  }
+}

@@ -53,6 +53,7 @@ models/
 
 # Runtime / generated
 venv/
+.venv/
 data/
 .pytest_cache/
 

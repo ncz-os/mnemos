@@ -173,6 +173,20 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
             except Exception as e:
                 logger.warning(f"[CONSULTATION] Failed to log consultation: {e}")
 
+        try:
+            from api.webhook_dispatcher import dispatch as _dispatch_webhook
+            if _lc._pool and consultation_id is not None:
+                async with _lc._pool.acquire() as _wh_conn:
+                    await _dispatch_webhook(_wh_conn, "consultation.completed", {
+                        "consultation_id": str(consultation_id),
+                        "task_type": body.task_type,
+                        "winning_muse": result.get("winning_muse"),
+                        "consensus_score": result.get("consensus_score"),
+                        "owner_id": user.user_id,
+                    }, owner_id=user.user_id)
+        except Exception:
+            logger.warning("webhook dispatch failed for consultation.completed %s", consultation_id, exc_info=True)
+
         return ConsultationResponse(
             consultation_id=consultation_id,
             all_responses=result.get("all_responses", {}),
@@ -190,80 +204,8 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         raise HTTPException(status_code=503, detail="Consultation failed — see server logs for details")
 
 
-@router.get("/consultations/{consultation_id}")
-async def get_consultation(
-    consultation_id: str,
-    user: UserContext = Depends(get_current_user),
-):
-    """Retrieve a consultation by ID."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
-
-    async with _lc._pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, prompt, task_type, consensus_response, consensus_score, "
-            "winning_muse, cost, latency_ms, mode, created_at "
-            "FROM graeae_consultations WHERE id = $1",
-            consultation_id,
-        )
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Consultation not found")
-
-    return {
-        "id": str(row["id"]),
-        "prompt": row["prompt"],
-        "task_type": row["task_type"],
-        "consensus_response": row["consensus_response"],
-        "consensus_score": row["consensus_score"],
-        "winning_muse": row["winning_muse"],
-        "cost": row["cost"],
-        "latency_ms": row["latency_ms"],
-        "mode": row["mode"],
-        "created_at": row["created_at"].isoformat(),
-    }
-
-
-@router.get("/consultations/{consultation_id}/artifacts")
-async def get_consultation_artifacts(
-    consultation_id: str,
-    user: UserContext = Depends(get_current_user),
-):
-    """Retrieve structured outputs and citations from a consultation."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
-
-    async with _lc._pool.acquire() as conn:
-        # Get consultation
-        consultation = await conn.fetchrow(
-            "SELECT id, created_at FROM graeae_consultations WHERE id = $1",
-            consultation_id,
-        )
-        if not consultation:
-            raise HTTPException(status_code=404, detail="Consultation not found")
-
-        # Get referenced memories
-        memory_refs = await conn.fetch(
-            "SELECT memory_id, injected_at FROM consultation_memory_refs "
-            "WHERE consultation_id = $1 ORDER BY injected_at",
-            consultation_id,
-        )
-
-    return ConsultationArtifact(
-        consultation_id=str(consultation["id"]),
-        citations=[str(ref["memory_id"]) for ref in memory_refs],
-        memory_refs=[
-            {
-                "memory_id": str(ref["memory_id"]),
-                "injected_at": ref["injected_at"].isoformat(),
-            }
-            for ref in memory_refs
-        ],
-        created_at=consultation["created_at"].isoformat(),
-    )
-
-
-# ── Audit log endpoints ───────────────────────────────────────────────────────
+# ── Audit log endpoints (declared before dynamic /{consultation_id} to prevent
+#    'audit' string being matched as a UUID path param) ───────────────────────
 
 @router.get("/consultations/audit", response_model=List[AuditLogEntry])
 async def list_audit_log(
@@ -343,3 +285,80 @@ async def verify_audit_chain(
         entries_checked=len(rows),
         message=f"All {len(rows)} entries verified — chain intact",
     )
+
+
+# ── Dynamic /{consultation_id} routes (declared after static /audit above) ────
+
+@router.get("/consultations/{consultation_id}")
+async def get_consultation(
+    consultation_id: str,
+    user: UserContext = Depends(get_current_user),
+):
+    """Retrieve a consultation by ID."""
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+
+    async with _lc._pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, prompt, task_type, consensus_response, consensus_score, "
+            "winning_muse, cost, latency_ms, mode, created AS created_at "
+            "FROM graeae_consultations WHERE id = $1",
+            consultation_id,
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Consultation not found")
+
+    return {
+        "id": str(row["id"]),
+        "prompt": row["prompt"],
+        "task_type": row["task_type"],
+        "consensus_response": row["consensus_response"],
+        "consensus_score": row["consensus_score"],
+        "winning_muse": row["winning_muse"],
+        "cost": row["cost"],
+        "latency_ms": row["latency_ms"],
+        "mode": row["mode"],
+        "created_at": row["created_at"].isoformat(),
+    }
+
+
+@router.get("/consultations/{consultation_id}/artifacts")
+async def get_consultation_artifacts(
+    consultation_id: str,
+    user: UserContext = Depends(get_current_user),
+):
+    """Retrieve structured outputs and citations from a consultation."""
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+
+    async with _lc._pool.acquire() as conn:
+        # Get consultation
+        consultation = await conn.fetchrow(
+            "SELECT id, created AS created_at FROM graeae_consultations WHERE id = $1",
+            consultation_id,
+        )
+        if not consultation:
+            raise HTTPException(status_code=404, detail="Consultation not found")
+
+        # Get referenced memories
+        memory_refs = await conn.fetch(
+            "SELECT memory_id, injected_at FROM consultation_memory_refs "
+            "WHERE consultation_id = $1 ORDER BY injected_at",
+            consultation_id,
+        )
+
+    return ConsultationArtifact(
+        consultation_id=str(consultation["id"]),
+        citations=[str(ref["memory_id"]) for ref in memory_refs],
+        memory_refs=[
+            {
+                "memory_id": str(ref["memory_id"]),
+                "injected_at": ref["injected_at"].isoformat(),
+            }
+            for ref in memory_refs
+        ],
+        created_at=consultation["created_at"].isoformat(),
+    )
+
+

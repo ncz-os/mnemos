@@ -1,0 +1,13 @@
+## Memory (MNEMOS)
+
+MNEMOS provides shared cross-session memory via the `mnemos` MCP server. When the `mnemos-memory` skill is registered, follow these rules:
+
+- **Before** making architectural decisions, run `search_memories` (category `decisions`) to check for prior rationale. Do not re-derive a decision the team has already made.
+- **Before** writing a workaround or fix, run `search_memories` (category `solutions`) to check for an existing resolution.
+- **Before** assuming an endpoint, hostname, port, or credential location, query category `infrastructure`.
+- **Before** introducing a pattern, query category `patterns` and `standards` to check conventions.
+- **After** solving a non-trivial problem or making a decision with tradeoffs, store it via `create_memory`. Include *why*, not just *what*.
+
+Treat MNEMOS memory as authoritative when it conflicts with your prior-turn guesses, but verify against current reality (files, endpoints, git state) before acting — the `ANTI_MEMORY_POISONING` guidance in the MNEMOS repo explains drift detection.
+
+Do not rely on ad-hoc `grep` or user recollection for facts that would plausibly live in memory. A search is cheap; duplicated work is not.

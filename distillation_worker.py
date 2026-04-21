@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Background distillation worker: compresses memories using extractive token filter/SENTENCE or LLM fallback,
+Background distillation worker: compresses memories using LETHE (token + sentence modes) or LLM fallback,
 updates embeddings, and maintains compression quality metrics.
 """
 
@@ -63,7 +63,7 @@ class MemoryDistillationWorker:
     def __init__(self):
         self.db_pool = None   # asyncpg Pool — set in start()
         self.llm = get_backend()
-        # Local compression engine (extractive token filter + SENTENCE, no external calls)
+        # Local compression engine (LETHE: token + sentence modes, no external calls)
         self._compression_engine = DistillationEngine() if _COMPRESSION_AVAILABLE else None
         self.stats = {
             "processed": 0,
@@ -160,14 +160,21 @@ class MemoryDistillationWorker:
             compressed = None
             quality_score = None
 
-            # --- Primary path: local extractive token filter/SENTENCE compression (no external calls) ---
+            # --- Primary path: local LETHE compression (no external calls) ---
             if _COMPRESSION_AVAILABLE and self._compression_engine is not None:
                 try:
                     result = self._compression_engine.distill(original_text, strategy=CompressionStrategy.AUTO)
                     compressed_candidate = result.get("compressed_text") or result.get("compressed", "")
                     candidate_quality = float(result.get("quality_score", 0) or 0) * 100  # 0-1 -> 0-100
-                    strategy_used = result.get("strategy_used", "hyco")
-                    compression_method = "sac" if strategy_used == "sac" else "token_filter"
+                    strategy_used = result.get("strategy_used", "token")
+                    # strategy_used is 'token', 'sentence', or the engine's internal label;
+                    # record as 'lethe-<mode>' for clarity in the compression log.
+                    if strategy_used in ("sentence", "sac"):
+                        compression_method = "lethe-sentence"
+                    elif strategy_used in ("token", "hyco", "token_filter"):
+                        compression_method = "lethe-token"
+                    else:
+                        compression_method = f"lethe-{strategy_used}"
                     if compressed_candidate and len(compressed_candidate) >= 10 and candidate_quality >= 60:
                         compressed = compressed_candidate
                         quality_score = candidate_quality

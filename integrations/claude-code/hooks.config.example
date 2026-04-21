@@ -1,0 +1,37 @@
+# MNEMOS hook configuration template
+#
+# Copy to one of these locations (first wins):
+#   ~/.claude/mnemos-hooks.config
+#   ./.claude/mnemos-hooks.config
+#
+# Source it from your shell or let the hook scripts source it automatically.
+#
+# MNEMOS is network infrastructure — there is no sensible localhost default.
+# Set MNEMOS_BASE explicitly. Hooks noop silently when it is unset.
+
+# ── Required ─────────────────────────────────────────────────────────────────
+
+# MNEMOS REST endpoint — point at wherever your MNEMOS runs.
+# Example (dedicated host): http://mnemos.internal:5000
+# Example (unified MNEMOS+GRAEAE install): http://mnemos.internal:5002
+export MNEMOS_BASE="http://<your-mnemos-host>:5000"
+
+# ── Optional ─────────────────────────────────────────────────────────────────
+
+# Bearer API key for team / enterprise profiles. Leave unset for personal.
+# export MNEMOS_API_KEY=""
+
+# Max memories injected on SessionStart (default: 5)
+# export MNEMOS_CONTEXT_LIMIT=5
+
+# Max semantic-search results injected on UserPromptSubmit (default: 3)
+# export MNEMOS_SEARCH_LIMIT=3
+
+# Skip UserPromptSubmit retrieval for prompts shorter than N chars (default: 20)
+# export MNEMOS_SEARCH_MIN_CHARS=20
+
+# Category tag for session transcripts written by the Stop hook
+# export MNEMOS_SESSION_CATEGORY="session_activity"
+
+# Hook log file
+# export MNEMOS_HOOK_LOG=/tmp/mnemos-hooks.log

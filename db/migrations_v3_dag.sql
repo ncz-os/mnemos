@@ -7,7 +7,14 @@
 BEGIN;
 
 -- ────────────────────────────────────────────────────────────────────────────
--- 1. Fix FK type mismatch: compression_quality_log.memory_id (UUID → TEXT)
+-- 1. Drop views first so ALTER COLUMN can retype referenced columns
+-- ────────────────────────────────────────────────────────────────────────────
+
+DROP VIEW IF EXISTS v_compression_stats CASCADE;
+DROP VIEW IF EXISTS v_unreviewed_compressions CASCADE;
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- 2. Fix FK type mismatch: compression_quality_log.memory_id (UUID → TEXT)
 -- ────────────────────────────────────────────────────────────────────────────
 
 ALTER TABLE compression_quality_log DROP CONSTRAINT IF EXISTS compression_quality_log_memory_id_fkey;
@@ -15,13 +22,6 @@ ALTER TABLE compression_quality_log ALTER COLUMN memory_id TYPE TEXT;
 ALTER TABLE compression_quality_log
     ADD CONSTRAINT compression_quality_log_memory_id_fkey
     FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE;
-
--- ────────────────────────────────────────────────────────────────────────────
--- 2. Drop problematic views (will recreate with correct types)
--- ────────────────────────────────────────────────────────────────────────────
-
-DROP VIEW IF EXISTS v_compression_stats CASCADE;
-DROP VIEW IF EXISTS v_unreviewed_compressions CASCADE;
 
 -- ────────────────────────────────────────────────────────────────────────────
 -- 3. DAG columns on memory_versions (additive)
@@ -104,27 +104,27 @@ ON CONFLICT (memory_id, name) DO NOTHING;
 
 CREATE OR REPLACE VIEW v_compression_stats AS
 SELECT
-    COUNT(*) FILTER (WHERE compressed_at IS NOT NULL) AS total_compressions,
-    COUNT(*) FILTER (WHERE quality_rating IS NOT NULL) AS reviewed,
-    COUNT(*) FILTER (WHERE quality_rating IS NULL) AS unreviewed,
-    AVG(CAST(quality_rating AS FLOAT)) FILTER (WHERE quality_rating IS NOT NULL) AS avg_quality,
-    AVG(compression_ratio) FILTER (WHERE compression_ratio IS NOT NULL) AS avg_ratio
+    COUNT(*) AS total_compressions,
+    COUNT(*) FILTER (WHERE reviewed) AS reviewed,
+    COUNT(*) FILTER (WHERE NOT reviewed) AS unreviewed,
+    AVG(CAST(quality_rating AS FLOAT)) AS avg_quality,
+    AVG(compression_ratio) AS avg_ratio
 FROM compression_quality_log;
 
 CREATE OR REPLACE VIEW v_unreviewed_compressions AS
 SELECT
     cql.id,
     cql.memory_id,
-    cql.original_size,
-    cql.compressed_size,
+    cql.original_token_count AS original_size,
+    cql.compressed_token_count AS compressed_size,
     cql.compression_ratio,
-    cql.compressed_at,
+    cql.created AS compressed_at,
     m.category,
     m.content
 FROM compression_quality_log cql
 LEFT JOIN memories m ON m.id = cql.memory_id
-WHERE cql.quality_rating IS NULL
-ORDER BY cql.compressed_at DESC;
+WHERE NOT cql.reviewed
+ORDER BY cql.created DESC;
 
 -- ────────────────────────────────────────────────────────────────────────────
 -- 9. Session table FK constraints (if sessions migration ran first)

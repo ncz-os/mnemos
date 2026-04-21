@@ -1,4 +1,8 @@
-"""MNEMOS v1 authentication — API key bearer tokens, personal profile bypass."""
+"""Replacement body for api/auth.py with session-cookie support.
+
+Drop-in replacement. Existing Bearer flow preserved; session-cookie flow
+added as a secondary path. Auth-disabled mode unchanged.
+"""
 import asyncio
 import hashlib
 import logging
@@ -57,53 +61,82 @@ async def _update_last_used(pool, key_id: str) -> None:
         logger.warning(f"[AUTH] Failed to update last_used for key {key_id}: {e}")
 
 
+async def _user_context_from_id(pool, user_id: str, authenticated: bool) -> "UserContext":
+    """Build a UserContext for a resolved user_id (role + groups from DB)."""
+    async with pool.acquire() as conn:
+        user_row = await conn.fetchrow(
+            "SELECT role FROM users WHERE id=$1", user_id,
+        )
+        group_rows = await conn.fetch(
+            "SELECT group_id FROM user_groups WHERE user_id=$1", user_id,
+        )
+    if user_row is None:
+        # Session references a user that no longer exists — treat as unauthenticated.
+        raise HTTPException(status_code=401, detail="User no longer exists")
+    return UserContext(
+        user_id=user_id,
+        group_ids=[r["group_id"] for r in group_rows],
+        role=user_row["role"],
+        namespace=_default_namespace,
+        authenticated=authenticated,
+    )
+
+
 async def get_current_user(
     request: Request,
     credentials=Depends(_bearer),
 ) -> UserContext:
-    """FastAPI dependency — returns UserContext for every authenticated route."""
+    """Auth dependency — Bearer token first, session cookie second."""
     if not _auth_enabled:
         if PERSONAL_SINGLETON is None:
             raise HTTPException(status_code=503, detail="Auth not yet configured — startup incomplete")
         return PERSONAL_SINGLETON
 
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    raw_key = credentials.credentials
-    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-
     pool = getattr(request.app.state, "pool", None)
     if pool is None:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT ak.id, ak.user_id, ak.revoked, u.role "
-            "FROM api_keys ak JOIN users u ON u.id = ak.user_id "
-            "WHERE ak.key_hash = $1",
-            key_hash,
+    # 1. API key (Bearer) — existing behaviour.
+    if credentials is not None:
+        raw_key = credentials.credentials
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT ak.id, ak.user_id, ak.revoked, u.role "
+                "FROM api_keys ak JOIN users u ON u.id = ak.user_id "
+                "WHERE ak.key_hash = $1",
+                key_hash,
+            )
+        if row is None or row["revoked"]:
+            raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+
+        from api.lifecycle import _schedule_background
+        _schedule_background(_update_last_used(pool, str(row["id"])))
+
+        async with pool.acquire() as conn:
+            group_rows = await conn.fetch(
+                "SELECT group_id FROM user_groups WHERE user_id = $1", row["user_id"]
+            )
+        return UserContext(
+            user_id=row["user_id"],
+            group_ids=[r["group_id"] for r in group_rows],
+            role=row["role"],
+            namespace=_default_namespace,
+            authenticated=True,
         )
 
-    if row is None or row["revoked"]:
-        raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+    # 2. Session cookie — new v3.0.0 path (only checked when no Bearer).
+    from api.oauth import SESSION_COOKIE_NAME, resolve_session
+    cookie_value = request.cookies.get(SESSION_COOKIE_NAME)
+    if cookie_value:
+        async with pool.acquire() as conn:
+            resolved = await resolve_session(conn, cookie_value)
+        if resolved is not None:
+            user_id, _identity_id = resolved
+            return await _user_context_from_id(pool, user_id, authenticated=True)
 
-    # Use _schedule_background so shutdown drains this before closing the pool
-    from api.lifecycle import _schedule_background
-    _schedule_background(_update_last_used(pool, str(row["id"])))
-
-    async with pool.acquire() as conn:
-        group_rows = await conn.fetch(
-            "SELECT group_id FROM user_groups WHERE user_id = $1", row["user_id"]
-        )
-
-    return UserContext(
-        user_id=row["user_id"],
-        group_ids=[r["group_id"] for r in group_rows],
-        role=row["role"],
-        namespace=_default_namespace,
-        authenticated=True,
-    )
+    # 3. No credentials.
+    raise HTTPException(status_code=401, detail="Authentication required")
 
 
 async def require_root(user: UserContext = Depends(get_current_user)) -> UserContext:

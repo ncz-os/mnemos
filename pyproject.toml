@@ -8,7 +8,7 @@ version = "3.0.0"
 description = "MNEMOS-OS v3: Unified memory operating system with GRAEAE reasoning, DAG versioning, compression, and cost-aware routing"
 readme = "README.md"
 requires-python = ">=3.11"
-license = "Apache-2.0"
+license = {file = "LICENSE"}
 authors = [{ name = "MNEMOS Contributors" }]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -38,12 +38,14 @@ dependencies = [
   "mcp>=1.0.0",
   "numpy>=1.26.0",
   "psutil>=5.9.0",
+  "authlib>=1.3.0",
+  "itsdangerous>=2.2.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/mnemos-dev/mnemos"
-Repository = "https://github.com/mnemos-dev/mnemos"
-Documentation = "https://github.com/mnemos-dev/mnemos/blob/master/README.md"
+Homepage = "https://github.com/perlowja/mnemos"
+Repository = "https://github.com/perlowja/mnemos"
+Documentation = "https://github.com/perlowja/mnemos/blob/master/README.md"
 
 [project.optional-dependencies]
 phi = ["openvino-genai>=2024.4.0", "fastembed>=0.3.0"]
@@ -79,3 +81,6 @@ url = "https://pypi.org/simple"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--ignore=tests/test_live_e2e.py"
+markers = [
+  "integration: integration tests requiring MNEMOS_TEST_DB (postgres://...)",
+]

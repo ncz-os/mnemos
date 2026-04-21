@@ -21,7 +21,7 @@ COPY requirements.txt .
 
 # Use uv to create a thin virtual environment with all deps
 # uv pip compile is ~100x faster than pip-tools
-RUN uv pip install --system-site-packages -r requirements.txt
+RUN uv pip install --system -r requirements.txt
 
 # Stage 2: Runtime (minimal footprint)
 FROM python:3.11-slim

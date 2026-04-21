@@ -28,7 +28,7 @@ MNEMOS was built to solve those problems in a way that reflects real platform ex
 
 Its design is informed by years of enterprise platform work, large-vendor systems thinking, open-source infrastructure experience, and current work in the AI industry, without assuming that professional users want marketing language where they really need operational clarity.
 
-The first production commit landed on February 18, 2026. By April 2026 the system had stored **6,793 memories** and performed **3,077 compressions**, each with a quality manifest. It runs v2.3.0 in production today, backing multiple active agentic tools simultaneously.
+The first production commit landed on February 18, 2026. By April 2026 the system had stored **6,793 memories** and performed **3,077 compressions**, each with a quality manifest. It ships today as v3.0.0, backing multiple active agentic tools simultaneously.
 
 ---
 
@@ -96,22 +96,28 @@ MNEMOS took the harder path: PostgreSQL instead of SQLite, real async compressio
 
 ## What works now
 
-This is the current state of v2.3.0 + v1 multi-user. Features described here are implemented and running in production. Features in the roadmap section are not yet implemented.
+This is the current state of v3.0.0. Features described here are implemented and running in production. Features listed in the Roadmap section that are "scheduled for v3.0.0" are under active development for this release.
 
-### MNEMOS API
+The primary API surface is namespaced under `/v1/*`. Pre-v3 endpoints (`/memories`, `/graeae/consult`, `/triples`, etc.) still work as deprecated aliases for backward compatibility but will be removed in a future major version. New integrations should target `/v1/*` exclusively.
+
+### Memory API (v1)
 
 | Endpoint | What it does |
 |----------|-------------|
-| `POST /memories` | Store a memory with category, subcategory, content, and optional provenance |
-| `GET /memories` | List memories, filterable by category and subcategory |
-| `GET /memories/{id}` | Retrieve a single memory |
-| `POST /memories/search` | Semantic search with score threshold and category filter |
-| `POST /memories/bulk` | Bulk create memories |
-| `PATCH /memories/{id}` | Update memory content or metadata |
-| `DELETE /memories/{id}` | Delete a memory |
-| `POST /memories/rehydrate` | Load a compressed set of memories for context injection |
-| `POST /ingest/session` | Ingest a session transcript |
-| `GET /health` | Health check |
+| `POST /v1/memories` | Store a memory with category, subcategory, content, and optional provenance |
+| `GET /v1/memories` | List memories, filterable by category and subcategory |
+| `GET /v1/memories/{id}` | Retrieve a single memory |
+| `POST /v1/memories/search` | Full-text or semantic search with category/score filters |
+| `POST /v1/memories/bulk` | Bulk create memories |
+| `PATCH /v1/memories/{id}` | Update memory content or metadata |
+| `DELETE /v1/memories/{id}` | Delete a memory |
+| `POST /v1/memories/rehydrate` | Token-budgeted compressed context load for prompt injection |
+| `POST /v1/ingest/session` | Ingest a session transcript |
+| `GET /v1/memories/{id}/log` | DAG commit history for a memory |
+| `POST /v1/memories/{id}/branch` | Create a branch from a specific commit |
+| `POST /v1/memories/{id}/merge` | Merge a branch back to main |
+| `GET /v1/memories/{id}/versions` | Version history |
+| `GET /health` | Health check (not namespaced) |
 | `GET /stats` | Memory counts by category, compression statistics |
 
 ### Multi-user and provenance (v1, shipped)
@@ -159,24 +165,137 @@ All admin endpoints require root role. On personal installs (no auth), they are 
 | `PATCH /triples/{id}` | Update a triple |
 | `DELETE /triples/{id}` | Delete a triple |
 
-### GRAEAE reasoning engine
+### Consultations — reasoning domain (v3, shipped)
+
+Multi-LLM consensus reasoning with cited memory artifacts and cryptographic audit chain.
 
 | Endpoint | What it does |
 |----------|-------------|
-| `POST /graeae/consult` | Multi-LLM consensus query |
-| `GET /graeae/health` | Provider availability and circuit breaker status |
+| `POST /v1/consultations` | Create a consultation (prompt + task_type) |
+| `GET /v1/consultations/{id}` | Retrieve a consultation record |
+| `GET /v1/consultations/{id}/artifacts` | Cited memories used to answer |
+| `GET /v1/consultations/audit` | Hash-chained audit log |
+| `GET /v1/consultations/audit/verify` | Verify audit chain integrity |
 
-**GRAEAE core modules (all operational):**
+Legacy `POST /graeae/consult` remains functional as a deprecated alias.
+
+### Providers — model routing domain (v3, shipped)
+
+Unified provider catalog with health tracking and task-aware recommendation.
+
+| Endpoint | What it does |
+|----------|-------------|
+| `GET /v1/providers` | List all configured providers with metadata |
+| `GET /v1/providers/{provider}` | Inspect a single provider |
+| `GET /v1/providers/health` | Per-provider availability + circuit-breaker state |
+| `GET /v1/providers/recommend` | Recommend a model for a task-type + budget |
+| `GET /v1/providers/best` | Highest-scoring provider right now |
+
+Legacy `/model-registry/*` paths remain functional as deprecated aliases.
+
+### OpenAI-compatible gateway (v3, shipped)
+
+Drop-in replacement for the OpenAI Chat Completions API — so any SDK that speaks OpenAI can speak to MNEMOS.
+
+| Endpoint | What it does |
+|----------|-------------|
+| `GET /v1/models` | List available models across all configured providers |
+| `GET /v1/models/{model_id}` | Model details |
+| `POST /v1/chat/completions` | Chat completion; routes to the appropriate provider; optional memory injection |
+
+### Stateful sessions (v3, shipped)
+
+Multi-turn conversation state with memory injection at turn boundaries. Sessions carry accumulated context across requests.
+
+| Endpoint | What it does |
+|----------|-------------|
+| `POST /v1/sessions` | Start a new session |
+| `GET /v1/sessions/{id}` | Retrieve session state |
+| `GET /v1/sessions/{id}/history` | Full message history |
+| `DELETE /v1/sessions/{id}` | End a session |
+
+### Webhooks (v3, shipped)
+
+Outbound notifications when events happen. Receivers verify an HMAC-SHA256 signature to trust the payload.
+
+| Endpoint | What it does |
+|----------|-------------|
+| `POST /v1/webhooks` | Subscribe; secret returned once |
+| `GET /v1/webhooks` | List the caller's subscriptions |
+| `GET /v1/webhooks/{id}` | Retrieve a subscription |
+| `DELETE /v1/webhooks/{id}` | Revoke (soft-delete) |
+| `GET /v1/webhooks/{id}/deliveries` | Recent delivery attempts |
+
+Events: `memory.created`, `memory.updated`, `memory.deleted`, `consultation.completed`. Delivery is durable: every attempt is logged to `webhook_deliveries`, retried 4 times with exponential backoff (1m / 5m / 30m / 2h), and replayed from disk on restart by the recovery worker.
+
+Signature header: `X-MNEMOS-Signature: sha256=<hex>`. Verify with `hmac.new(secret, body, sha256).hexdigest()`.
+
+### OAuth / OIDC authentication (v3, shipped)
+
+Browser-based login via external identity providers. Coexists with API-key auth — the same user can have both a key and an OIDC identity.
+
+| Endpoint | What it does |
+|----------|-------------|
+| `GET /auth/oauth/providers` | List enabled providers (public, no secrets) |
+| `GET /auth/oauth/{provider}/login` | Start authorization-code + PKCE flow |
+| `GET /auth/oauth/{provider}/callback` | Handle provider redirect; sets `mnemos_session` cookie |
+| `POST /auth/oauth/logout` | Revoke session (optionally `?all_devices=true`) |
+| `GET /auth/oauth/me` | Who am I (works with either auth method) |
+
+Admin side (`/admin/oauth/*` — root only):
+
+| Endpoint | What it does |
+|----------|-------------|
+| `POST /admin/oauth/providers` | Register a provider (Google, GitHub, Azure AD, or generic OIDC) |
+| `GET /admin/oauth/providers` | List configured providers (client_secret redacted) |
+| `PATCH /admin/oauth/providers/{name}` | Update provider config |
+| `DELETE /admin/oauth/providers/{name}` | Remove a provider |
+| `GET /admin/oauth/identities` | List all OAuth identities (optionally filter by user) |
+
+Sessions are DB-backed, revocable, and expire after 30 days by default. User provisioning: same external-id reuses the user; matching email links to an existing user; otherwise a fresh user is created.
+
+### Federation — cross-instance memory sync (v3, shipped)
+
+Pull-based one-way federation between MNEMOS instances. Remote peer exposes `/v1/federation/feed`; local instance pulls on a configurable interval, storing remote memories with ids of the form `fed:{peer_name}:{remote_id}` and `federation_source = peer_name`. Federated memories are read-only by application convention.
+
+| Endpoint | What it does |
+|----------|-------------|
+| `POST /v1/federation/peers` | Register a remote peer (root only) |
+| `GET /v1/federation/peers` | List registered peers |
+| `GET /v1/federation/peers/{id}` | Peer detail |
+| `PATCH /v1/federation/peers/{id}` | Update (enable/disable, filters, interval) |
+| `DELETE /v1/federation/peers/{id}` | Unregister |
+| `POST /v1/federation/peers/{id}/sync` | Manual sync trigger (blocks on completion) |
+| `GET /v1/federation/peers/{id}/log` | Sync history for a peer |
+| `GET /v1/federation/status` | Aggregate status across all peers |
+| `GET /v1/federation/feed` | Serve memories to remote peers (role=`federation` or `root`) |
+
+**Trust model:** mutual — each side registers the other. Side A issues Side B a Bearer token by creating a MNEMOS user with `role='federation'` and minting an API key via the admin API. Side B stores that token in its own `federation_peers.auth_token`. Side A's feed endpoint validates the token and `role IN ('federation', 'root')`.
+
+**Dedup:** re-pulls are safe. Local id `fed:{peer}:{remote_id}` is stable; only rows with a newer `federation_remote_updated` overwrite existing ones.
+
+**Filters:** `namespace_filter` and `category_filter` (both arrays) restrict what gets pulled from a peer; NULL = pull everything the peer will serve.
+
+**Loop prevention:** the feed endpoint excludes memories where `federation_source IS NOT NULL`, so federated memories don't propagate hop-by-hop through a chain of peers.
+
+### GRAEAE engine internals (all operational)
+
+The reasoning engine behind `/v1/consultations` provides:
+
 - **Circuit breaker** — per-provider CLOSED/OPEN/HALF_OPEN state machine, 5-minute cooldown
 - **Semantic cache** — embedding-similarity deduplication, 1-hour TTL
-- **Quality scorer** — success/failure + latency tracking per provider
-- **Rate limiter** — single-level request rate limit (no queuing)
+- **Quality scorer** — success/failure + latency tracking per provider; Arena.ai Elo scores feed dynamic weighting
+- **Rate limiter** — single-level request rate limit with graceful backoff
+- **Audit chain** — SHA-256 hash-chained prompt/response log for compliance
 
-### Compression
+### Compression — the MOIRAI tiers
 
-- **extractive token filter** (Hybrid Compression with Online Learning) — fast heuristic, ~0.5ms, no external calls; 57% reduction
-- **SENTENCE** (Semantic-Anchor Compression) — structure-preserving, ~2-5ms, no external calls; 50% reduction
-- **ExternalInferenceProvider** — LLM-assisted via llama.cpp/Ollama, highest quality; requires inference server (fallback only)
+Three-tier compression pipeline, each tier named after a Greek figure of memory.
+
+- **LETHE** (Tier 1, CPU, always on) — fast local compression with two modes: `token` (importance-weighted token filtering, ~0.5ms, ~57% reduction — the algorithm formerly called *extractive token filter*) and `sentence` (structure-preserving extraction, ~2–5ms, ~50% reduction — formerly *SENTENCE*). `auto` mode picks per content shape. Zero external calls.
+- **ALETHEIA** (Tier 2, optional GPU) — token-level importance scoring via a local LLM on a configured GPU host (`GPU_PROVIDER_HOST`); ~200-500ms, ~70% reduction. Runs offline via distillation worker; not on the live path. Falls back to LETHE when the GPU host is unreachable.
+- **ANAMNESIS** (Tier 3, optional GPU) — atomic-fact extraction for archival memories (>30 days old); semantic-level compression via LLM. Fallback: skip extraction if the GPU host is unreachable (non-critical).
+- **ExternalInferenceProvider** — LLM-assisted compression via llama.cpp / Ollama / any OpenAI-compatible endpoint; highest quality; used as fallback when heuristics dip below the quality threshold.
 - Quality manifest on every compression: what was removed, what was preserved, risk factors, safe/unsafe use cases
 - Original content always retained; compressed and original stored independently
 - Configurable quality thresholds per task type (security review: 95%, architecture: 90%, general: 80%)
@@ -200,12 +319,21 @@ All admin endpoints require root role. On personal installs (no auth), they are 
 
 ## Roadmap
 
-These features are designed and scoped but not yet implemented.
+### Scheduled for v3.0.0 (active development)
 
-**v3 — Scale and federation**
-- OAuth/OIDC for enterprise authentication
-- Cross-instance memory federation
-- Webhook subscriptions — notify agents on memory write
+Committed to ship with this release:
+
+- ✅ **Webhook subscriptions** — outbound notifications on memory write, consultation completion. HMAC-signed delivery, retry with exponential backoff. **Shipped.**
+- ✅ **OAuth/OIDC authentication** — browser-based login via Google, GitHub, Azure AD, or custom OIDC providers. Coexists with existing API-key auth. **Shipped.**
+- ✅ **Cross-instance memory federation** — pull-based peer sync with Bearer-authenticated peers. Federated memories stored locally with `federation_source` metadata, `fed:{peer}:{remote_id}` id prefix, and a background worker that respects per-peer sync intervals. **Shipped.**
+
+### Beyond v3.0.0
+
+Future work — not yet scoped:
+
+- Distributed consensus for multi-writer federation
+- Plugin model for external compression / ranking algorithms
+- Server-push streaming API for long-lived subscriptions
 
 ---
 
@@ -242,7 +370,7 @@ knowledge_graph
 
 ```bash
 git clone <your-repo-url>
-cd mnemos-production
+cd mnemos
 docker compose up
 # MNEMOS: http://localhost:5002
 # GRAEAE is embedded in the MNEMOS API (port 5002) — no separate server
@@ -252,7 +380,7 @@ docker compose up
 
 ```bash
 git clone <your-repo-url>
-cd mnemos-production
+cd mnemos
 pip install -r requirements.txt
 python install.py
 # Prompts for: deployment profile, database connection, provider API keys
@@ -266,6 +394,10 @@ psql -U postgres -c "CREATE USER mnemos WITH PASSWORD 'yourpassword';"
 psql -U postgres -c "CREATE DATABASE mnemos OWNER mnemos;"
 psql -U mnemos -d mnemos -f db/migrations.sql
 psql -U mnemos -d mnemos -f db/migrations_v1_multiuser.sql
+psql -U mnemos -d mnemos -f db/migrations_v3_graeae_unified.sql
+psql -U mnemos -d mnemos -f db/migrations_v3_webhooks.sql
+psql -U mnemos -d mnemos -f db/migrations_v3_oauth.sql
+psql -U mnemos -d mnemos -f db/migrations_v3_federation.sql
 ```
 
 ### Start
@@ -285,12 +417,12 @@ curl http://localhost:5002/health
 
 ```bash
 # Basic
-curl -X POST http://localhost:5002/memories \
+curl -X POST http://localhost:5002/v1/memories \
   -H 'Content-Type: application/json' \
   -d '{"content": "...", "category": "decisions", "subcategory": "architecture"}'
 
 # With provenance
-curl -X POST http://localhost:5002/memories \
+curl -X POST http://localhost:5002/v1/memories \
   -H 'Content-Type: application/json' \
   -d '{
     "content": "...",
@@ -301,7 +433,7 @@ curl -X POST http://localhost:5002/memories \
   }'
 
 # Team/enterprise: include API key
-curl -X POST http://localhost:5002/memories \
+curl -X POST http://localhost:5002/v1/memories \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer <your-api-key>' \
   -d '{"content": "...", "category": "decisions"}'
@@ -311,17 +443,17 @@ curl -X POST http://localhost:5002/memories \
 
 ```bash
 # Full-text search
-curl -X POST http://localhost:5002/memories/search \
+curl -X POST http://localhost:5002/v1/memories/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "topic keywords", "limit": 10}'
 
 # Filtered by category
-curl -X POST http://localhost:5002/memories/search \
+curl -X POST http://localhost:5002/v1/memories/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "keywords", "category": "solutions", "limit": 5}'
 
 # Semantic (vector) search
-curl -X POST http://localhost:5002/memories/search \
+curl -X POST http://localhost:5002/v1/memories/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "keywords", "semantic": true, "limit": 10}'
 ```
@@ -346,12 +478,12 @@ curl -X DELETE http://localhost:5002/admin/apikeys/<key-id>
 ### GRAEAE reasoning
 
 ```bash
-curl -X POST http://localhost:5002/graeae/consult \
+curl -X POST http://localhost:5002/v1/consultations \
   -H 'Content-Type: application/json' \
   -d '{"prompt": "Your question", "task_type": "architecture_design"}'
 
 # Extract best result by score
-curl -X POST http://localhost:5002/graeae/consult \
+curl -X POST http://localhost:5002/v1/consultations \
   -d '{"prompt": "...", "task_type": "reasoning"}' | \
   jq '.all_responses | to_entries | sort_by(-.[1].final_score)[0]'
 ```
@@ -396,4 +528,9 @@ curl -X POST http://localhost:5002/graeae/consult \
 
 ## License
 
-MIT — see `LICENSE`.
+MNEMOS is **dual-licensed**:
+
+- **Tier 1 — Free (Apache 2.0 + Commons Clause):** personal, team, educational, academic, non-profit, and internal-enterprise use. No license fee.
+- **Tier 2 — Commercial:** required for SaaS, hosted service, white-label, resale, or bundling in a commercial offering sold to third parties.
+
+See `LICENSE` for full terms.

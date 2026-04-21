@@ -57,40 +57,6 @@ clean:         ## Remove build artifacts and caches
 # ── Installer targets ─────────────────────────────────────────────────────────
 
 install-agent:  ## Run agentic LLM-guided installer (default)
-	 -m installer --agent
-
-install-wizard: ## Run traditional interactive wizard installer
-	 -m installer --wizard
-
-install-check:  ## Check environment prerequisites only (no changes)
-	 -m installer --check
-
-install-upgrade: ## Re-run migrations only (upgrade existing install)
-	 -m installer --upgrade
-
-bootstrap:      ## Run install.sh bootstrap (installs system packages first)
-	bash install.sh
-
-# ── Import utilities ─────────────────────────────────────────────────────────
-
-import-docling: ## Import documents via IBM Docling (--source DIR required)
-	/bin/python tools/docling_import.py 
-
-import-json:    ## Import memories from JSON file (ARGS='--file memories.json')
-	/bin/python tools/memory_import.py json 
-
-import-chatgpt: ## Import ChatGPT conversation export (ARGS='--file conversations.json')
-	/bin/python tools/memory_import.py chatgpt 
-
-import-obsidian: ## Import Obsidian vault (ARGS='--vault /path/to/vault')
-	/bin/python tools/memory_import.py obsidian 
-
-import-stats:   ## Show MNEMOS memory statistics
-	/bin/python tools/memory_import.py stats --endpoint http://localhost:5002
-
-# -- Installer targets --------------------------------------------------------
-
-install-agent:  ## Run agentic LLM-guided installer (default)
 	$(PYTHON) -m installer --agent
 
 install-wizard: ## Run traditional interactive wizard installer
@@ -105,7 +71,7 @@ install-upgrade: ## Re-run migrations only (upgrade existing install)
 bootstrap:      ## Run install.sh bootstrap (installs system packages first)
 	bash install.sh
 
-# -- Import utilities ---------------------------------------------------------
+# ── Import utilities ──────────────────────────────────────────────────────────-
 
 import-docling: ## Import documents via IBM Docling (ARGS='--source DIR')
 	$(VENV)/bin/python tools/docling_import.py $(ARGS)

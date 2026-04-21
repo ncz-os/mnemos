@@ -1,0 +1,10 @@
+# Merge this into ~/.hermes/config.yaml under the mcp_servers key.
+# Replace <your-mnemos-host> with your MNEMOS deployment's hostname or IP.
+
+mcp_servers:
+  mnemos:
+    command: python
+    args: ["/path/to/mnemos/mcp_server.py"]
+    env:
+      MNEMOS_BASE: "http://<your-mnemos-host>:5000"
+      # MNEMOS_API_KEY: "<optional-bearer-key-for-team-enterprise-profiles>"
