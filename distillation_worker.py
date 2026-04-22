@@ -2,6 +2,11 @@
 """
 Background distillation worker: compresses memories using LETHE (token + sentence modes) or LLM fallback,
 updates embeddings, and maintains compression quality metrics.
+
+Lifecycle supervision lives in `api/lifecycle.py::_run_distillation_worker` —
+this class knows how to do the work; that wrapper knows how to keep it alive
+(exponential-backoff restart, capped at 5 min). See EVOLUTION.md ADR-02 for
+the rationale behind the two-file separation.
 """
 
 import asyncio
