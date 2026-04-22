@@ -396,4 +396,9 @@ curl -X POST http://localhost:5002/v1/consultations \
 
 ## License
 
-MIT — see `LICENSE`.
+MNEMOS is dual-licensed:
+
+- Apache License 2.0 for the open source distribution in this repository
+- a separate proprietary commercial license for organizations that need alternative commercial terms
+
+See [`LICENSE`](/Users/jasonperlow/Projects/mnemos-prod-working/LICENSE) and [`LICENSE-PROPRIETARY.md`](/Users/jasonperlow/Projects/mnemos-prod-working/LICENSE-PROPRIETARY.md).

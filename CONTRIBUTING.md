@@ -2,6 +2,12 @@
 
 Thanks for your interest in MNEMOS.
 
+## License
+
+By contributing to this repository, you agree that your contribution may be
+distributed under the repository's Apache License 2.0 terms and referenced in
+the project's dual-license commercial offering.
+
 ## Development workflow
 
 - Use a feature branch for non-trivial changes.
