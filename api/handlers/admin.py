@@ -35,8 +35,11 @@ async def create_user(
     """Create a new user. id must be unique."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    if request.role not in ("user", "root"):
-        raise HTTPException(status_code=422, detail="role must be 'user' or 'root'")
+    if request.role not in ("user", "root", "federation"):
+        raise HTTPException(
+            status_code=422,
+            detail="role must be 'user', 'root', or 'federation'",
+        )
     async with _lc._pool.acquire() as conn:
         existing = await conn.fetchrow("SELECT id FROM users WHERE id=$1", request.id)
         if existing:
