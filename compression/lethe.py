@@ -13,8 +13,17 @@ No LLM, no GPU. Real-time performance <5ms.
 
 import re
 import logging
-from typing import Dict, List, Set
+import time
+from typing import Dict, List, Optional, Set
 import threading
+
+from .base import (
+    CompressionEngine,
+    CompressionRequest,
+    CompressionResult,
+    GPUIntent,
+    IdentifierPolicy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -355,3 +364,75 @@ class LETHE:
                 "total_output_tokens": self.stats["total_output_tokens"],
                 "average_ratio": round(self.stats["avg_ratio"], 4),
             }
+
+
+class LETHEEngine(CompressionEngine):
+    """LETHE under the v3.1 CompressionEngine ABC.
+
+    Composes the sync LETHE implementation and exposes it to the
+    competitive-selection manager via the async engine contract.
+    Existing sync callers (LETHE().compress(text, ratio)) continue to
+    work unchanged; new callers go through LETHEEngine().compress(request).
+
+    Identifier-preservation: LETHE does NOT preserve identifiers. The
+    token-mode scorer has a length bonus that incidentally keeps some
+    hashes and UUIDs, but that's not a guarantee. The result always
+    reports identifier_policy=IdentifierPolicy.OFF regardless of what
+    the request asked for — the manager decides whether to penalize
+    or disqualify on policy mismatch.
+    """
+
+    id = "lethe"
+    label = "LETHE — extractive token/sentence compression (CPU)"
+    version = "1.0"
+    gpu_intent = GPUIntent.CPU_ONLY
+
+    def __init__(
+        self,
+        mode: str = "auto",
+        aggressive: bool = True,
+        min_length: int = 5,
+        core: Optional[LETHE] = None,
+    ) -> None:
+        super().__init__()
+        self._core = core or LETHE(mode=mode, aggressive=aggressive, min_length=min_length)
+
+    async def compress(self, request: CompressionRequest) -> CompressionResult:
+        started = time.perf_counter()
+        try:
+            core_out = self._core.compress(
+                request.content,
+                target_ratio=request.target_ratio,
+            )
+        except Exception as exc:
+            elapsed = int((time.perf_counter() - started) * 1000)
+            logger.exception("LETHEEngine.compress failed for %s", request.memory_id)
+            return CompressionResult(
+                engine_id=self.id,
+                engine_version=self.version,
+                original_tokens=len(request.content.split()),
+                elapsed_ms=elapsed,
+                identifier_policy=IdentifierPolicy.OFF,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        return CompressionResult(
+            engine_id=self.id,
+            engine_version=self.version,
+            original_tokens=core_out["original_tokens"],
+            compressed_tokens=core_out["compressed_tokens"],
+            compressed_content=core_out["compressed_text"],
+            compression_ratio=core_out["compression_ratio"],
+            quality_score=core_out["quality_score"],
+            elapsed_ms=elapsed_ms,
+            judge_model=None,
+            gpu_used=False,
+            identifier_policy=IdentifierPolicy.OFF,
+            manifest={
+                "mode": core_out.get("mode", self._core.mode),
+                "aggressive": self._core.aggressive,
+                "min_length": self._core.min_length,
+                "compression_percentage": core_out.get("compression_percentage"),
+            },
+        )

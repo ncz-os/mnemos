@@ -22,7 +22,7 @@ from .base import (
 from .base import CompressionResult as EngineCompressionResult
 from .quality_analyzer import QualityAnalyzer, QualityManifest
 from .manager import CompressionManager, CompressionResult
-from .lethe import LETHE
+from .lethe import LETHE, LETHEEngine
 from .aletheia import ALETHEIA
 from .anamnesis import ANAMNESIS
 from .distillation_engine import (
@@ -51,6 +51,7 @@ __all__ = [
     "CompressionManager",
     "CompressionResult",
     "LETHE",
+    "LETHEEngine",
     "ALETHEIA",
     "ANAMNESIS",
     "DistillationEngine",
