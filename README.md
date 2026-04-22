@@ -51,6 +51,8 @@ Its design is informed by years of enterprise platform work, large-vendor system
 
 **MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By April 2026 the running install had stored **6,793 memories** and performed **3,077 compressions**, each with a written quality manifest. The v3.0.0 release unifies that production codebase into the single-service FastAPI shape shipped here.
 
+For the longer story — the original catalyzing moment, the architectural decisions (and mistakes) that took MNEMOS from a single-file prototype to a unified runtime, and the scrubs, refactors, and release-gate audits that landed the public cut — see [`EVOLUTION.md`](./EVOLUTION.md). Written for future contributors as much as for future readers who want to know what they're inheriting.
+
 ---
 
 ## Who this is for
@@ -336,7 +338,7 @@ Pull-based one-way federation between MNEMOS instances. Remote peer exposes `/v1
 The reasoning engine behind `/v1/consultations` provides:
 
 - **Circuit breaker** — per-provider CLOSED/OPEN/HALF_OPEN state machine, 5-minute cooldown
-- **Semantic cache** — embedding-similarity deduplication, 1-hour TTL
+- **Consensus response cache** — per-process LRU keyed on `sha256(task_type + normalized_prompt)`, 1-hour TTL, 500-entry cap. Exact-match dedup, not embedding similarity (embedding round-trip would negate the win for the less-common near-duplicate case).
 - **Quality scorer** — success / failure / latency tracking per provider, combined with Arena.ai Elo weights from the model registry (see next section) for dynamic consensus weighting
 - **Rate limiter** — single-level request rate limit with graceful backoff
 - **Audit chain** — SHA-256 hash-chained prompt/response log for compliance
