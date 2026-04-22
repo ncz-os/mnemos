@@ -1,309 +1,186 @@
-                               MNEMOS Dual License
-                              Effective April 21, 2026
-
-   Copyright 2026 MNEMOS Contributors
-
-   ═══════════════════════════════════════════════════════════════════════════
-   DUAL LICENSING STRUCTURE
-   ═══════════════════════════════════════════════════════════════════════════
-
-   MNEMOS is available under TWO distinct licenses:
-
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │ TIER 1: FREE TIER (Personal, team, educational, internal enterprise)    │
-   │ License: Apache License 2.0 + Commons Clause Restriction                │
-   │ Cost: Free                                                              │
-   │ Use: Non-commercial, self-hosted, internal, education, research         │
-   └─────────────────────────────────────────────────────────────────────────┘
-
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │ TIER 2: COMMERCIAL TIER (SaaS, resale, white-label, hosted service)     │
-   │ License: MNEMOS Proprietary Commercial License                          │
-   │ Cost: Commercial license fee required                                   │
-   │ Use: Commercial deployment, SaaS, white-labeling, managed service       │
-   │ Contact: licensing@<TBD>  (see README for current contact)              │
-   └─────────────────────────────────────────────────────────────────────────┘
-
-   ═══════════════════════════════════════════════════════════════════════════
-   QUICK REFERENCE
-   ═══════════════════════════════════════════════════════════════════════════
-
-   Are you...                                      → Use License:
-   ─────────────────────────────────────────────────────────────────────────
-   Running MNEMOS for yourself/your team?          → FREE TIER (Apache 2.0)
-   Using MNEMOS inside your company (not resold)?  → FREE TIER (Apache 2.0)
-   Building a commercial SaaS using MNEMOS?        → COMMERCIAL TIER
-   Hosting MNEMOS as a paid service for others?    → COMMERCIAL TIER
-   White-labeling MNEMOS inside a paid product?    → COMMERCIAL TIER
-   Redistributing MNEMOS as a paid product?        → COMMERCIAL TIER
-   Contributing to the project?                    → Contributor Agreement
-
-   ═══════════════════════════════════════════════════════════════════════════
-   TIER 1: FREE TIER LICENSE AGREEMENT
-   ═══════════════════════════════════════════════════════════════════════════
-
-                                 Apache License
-                           Version 2.0, January 2004
-                        http://www.apache.org/licenses/
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
-   ───────────────────────────────────────────────────────────────────────────
-   COMMONS CLAUSE RESTRICTION (Tier 1 Free Tier Only)
-   ───────────────────────────────────────────────────────────────────────────
-
-   The following restriction applies to the Free Tier only:
-
-   "The Software may not be used by any person or Legal Entity for the
-   purpose of providing a service, product, or capability to third parties
-   (whether for profit or not), including but not limited to:
-   - Offering MNEMOS as a standalone product or service
-   - Bundling MNEMOS with other products or services for commercial gain
-   - Reselling, white-labeling, or repackaging MNEMOS
-   - Operating MNEMOS as a SaaS, cloud service, or managed service
-   - Charging fees for access to MNEMOS features or functionality
-
-   For any such commercial use, a Proprietary Commercial License is required.
-   See Tier 2 below."
-
-   ───────────────────────────────────────────────────────────────────────────
-   PERMITTED FREE TIER USES
-   ───────────────────────────────────────────────────────────────────────────
-
-   ✓ Personal use — single developer, single machine
-   ✓ Internal team use — self-hosted inside a company for that company's own
-     work (not exposed or sold to third parties)
-   ✓ Educational use and teaching
-   ✓ Academic research and publication
-   ✓ Open-source contributions and modifications (for non-commercial purposes)
-   ✓ Non-profit organization use
-   ✓ Community projects that do not generate revenue
-
-   Attribution requested: "Powered by MNEMOS (Apache 2.0)"
-
-   ─────────────────────────────────────────────────────────────────────────
-
-   TIER 1 FULL TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
-
-   1. Definitions.
-
-      "License" means the terms and conditions for use, reproduction, and
-      distribution as defined in Sections 1 through 9 of this document.
-
-      "Licensor" means the copyright owner or entity authorized by the
-      copyright owner that is granting the License.
-
-      "Legal Entity" means the union of the acting entity and all other
-      entities that control, are controlled by, or are under common control
-      with that entity.
-
-      "You" means an individual or Legal Entity exercising permissions
-      granted by this License.
-
-      "Source" form means the preferred form for making modifications,
-      including but not limited to software source code, documentation
-      source, and configuration files.
-
-      "Object" form means any form resulting from mechanical transformation
-      or translation of a Source form, including but not limited to compiled
-      object code, generated documentation, and conversions to other media
-      types.
-
-      "Work" means the work of authorship, whether in Source or Object form,
-      made available under the License, as indicated by a copyright notice
-      that is included in or attached to the work.
-
-      "Derivative Works" means any work, whether in Source or Object form,
-      that is based on (or derived from) the Work and for which the editorial
-      revisions, annotations, elaborations, or other modifications represent,
-      as a whole, an original work of authorship.
-
-      "Contribution" means any work of authorship, including the original
-      Work and any Derivative Works thereof, that is intentionally submitted
-      to, or received by, Licensor for inclusion in the Work by the copyright
-      owner or by an individual or Legal Entity authorized to submit on behalf
-      of the copyright owner.
-
-      "Contributor" means Licensor and any individual or Legal Entity on
-      behalf of whom a Contribution has been received by Licensor and
-      subsequently incorporated within the Work.
-
-   2. Grant of Copyright License. Subject to the terms and conditions of this
-      License, each Contributor hereby grants to You a perpetual, worldwide,
-      non-exclusive, no-charge, royalty-free, irrevocable copyright license
-      to reproduce, prepare Derivative Works of, publicly display, publicly
-      perform, sublicense, and distribute the Work and such Derivative Works
-      in Source or Object form.
-
-   3. Grant of Patent License. Subject to the terms and conditions of this
-      License, each Contributor hereby grants to You a perpetual, worldwide,
-      non-exclusive, no-charge, royalty-free, irrevocable (except as stated in
-      this section) patent license to make, have made, use, offer to sell,
-      sell, import, and otherwise transfer the Work.
-
-   4. Redistribution. You may reproduce and distribute copies of the Work or
-      Derivative Works thereof in any medium, with or without modifications,
-      and in Source or Object form, provided that You meet the following
-      conditions:
-
-      (a) You must give any other recipients of the Work or Derivative Works
-          a copy of this License;
-
-      (b) You must cause any modified files to carry prominent notices stating
-          that You changed the files;
-
-      (c) You must retain, in the Source form of any Derivative Works that You
-          distribute, all copyright, patent, trademark, and attribution notices
-          from the Source form of the Work, excluding those notices that do not
-          pertain to any part of the Derivative Works;
-
-      (d) If the Work includes a "NOTICE" text file, then any Derivative Works
-          that You distribute must include a readable copy of the attribution
-          notices contained within such NOTICE file.
-
-   5. Submission of Contributions. Unless You explicitly state otherwise, any
-      Contribution intentionally submitted for inclusion in the Work by You to
-      the Licensor shall be under the terms and conditions of this License.
-
-   6. Trademarks. This License does not grant permission to use the trade names,
-      trademarks, service marks, or product names of the Licensor.
-
-   7. Disclaimer of Warranty. Unless required by applicable law or agreed to in
-      writing, Licensor provides the Work (and each Contributor provides its
-      Contributions) on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
-      ANY KIND, either express or implied, including, without limitation, any
-      warranties or conditions of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or
-      FITNESS FOR A PARTICULAR PURPOSE.
-
-   8. Limitation of Liability. In no event and under no legal theory, whether
-      in tort (including negligence), contract, or otherwise, unless required
-      by applicable law or agreed to in writing, shall any Contributor be
-      liable to You for damages of any character.
-
-   9. Accepting Warranty or Additional Liability. While redistributing the Work
-      or Derivative Works thereof, You may choose to offer acceptance of
-      support, warranty, indemnity, or other liability obligations consistent
-      with this License.
-
-   END OF TIER 1 APACHE LICENSE TERMS AND CONDITIONS
-
-   ═══════════════════════════════════════════════════════════════════════════
-   TIER 2: PROPRIETARY COMMERCIAL LICENSE AGREEMENT
-   ═══════════════════════════════════════════════════════════════════════════
-
-   MNEMOS Proprietary Commercial License
-   Version 1.0, April 21, 2026
-
-   GRANT OF RIGHTS
-
-   Subject to the terms and conditions of this Commercial License Agreement,
-   MNEMOS Contributors grant to Licensee a non-exclusive, non-transferable,
-   revocable license to:
-
-   (a) Use MNEMOS in commercial products and services (SaaS, cloud, hosted,
-       white-labeled, or bundled offerings)
-   (b) Distribute MNEMOS as part of Licensee's commercial offering
-   (c) Create derivative works of MNEMOS for commercial purposes
-   (d) Host MNEMOS on Licensee's infrastructure for fee-paying customers
-
-   COMMERCIAL USE RIGHTS
-
-   This license permits the following:
-
-   ✓ Operating MNEMOS as a SaaS or cloud memory service
-   ✓ White-labeling MNEMOS memory infrastructure in your product
-   ✓ Reselling MNEMOS to third parties
-   ✓ Creating proprietary derivative works based on MNEMOS
-   ✓ Bundling MNEMOS with other commercial products
-   ✓ Charging customers for access to MNEMOS-backed features
-   ✓ Multi-tenant hosting with per-customer namespace isolation
-   ✓ Federated memory networks offered as a managed service
-   ✓ Commercial support and SLA agreements
-   ✓ Custom integrations and enterprise deployments
-
-   RESTRICTIONS
-
-   This license does NOT permit:
-
-   ✗ Open-sourcing proprietary modifications under incompatible terms
-     (proprietary modifications stay proprietary)
-   ✗ GPL or other copyleft relicensing of the Work
-   ✗ Sublicensing to third parties without explicit written approval
-   ✗ Transferring the license without written consent
-   ✗ Removing or obscuring copyright and attribution notices
-
-   PAYMENT TERMS
-
-   Commercial licensing fees are based on:
-   - Annual subscription for commercial use
-   - Seats / monthly active users (if applicable)
-   - Revenue share model (optional)
-   - Enterprise support tiers
-
-   Specific pricing available upon request.
-
-   TERM AND TERMINATION
-
-   - Initial term: 12 months from purchase
-   - Renewal: Annual renewal required (pricing may change)
-   - Termination: Either party may terminate with 30 days written notice
-   - Effect of termination: Licensee must cease all commercial use within 30
-     days of termination
-
-   SUPPORT AND MAINTENANCE
-
-   Commercial licensees receive:
-   - Priority bug fix support
-   - Quarterly security updates
-   - Documentation and API access
-   - Optional: Custom development and integration services
-
-   LIABILITY DISCLAIMER
-
-   THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-   IMPLIED. IN NO EVENT SHALL MNEMOS CONTRIBUTORS BE LIABLE FOR ANY DAMAGES,
-   INCLUDING LOST PROFITS, BUSINESS INTERRUPTION, OR DATA LOSS.
-
-   ACCEPTANCE OF TERMS
-
-   By purchasing a Commercial License, Licensee accepts all terms of this
-   agreement. A formal Commercial License Agreement will be provided at
-   purchase, replacing this summary.
-
-   ═══════════════════════════════════════════════════════════════════════════
-   HOW TO CHOOSE YOUR LICENSE
-   ═══════════════════════════════════════════════════════════════════════════
-
-   FREE TIER (Apache 2.0 + Commons Clause):
-   → Use this if you're running MNEMOS for yourself, your team, your company
-     (for that company's own work), or for educational or non-profit purposes.
-     No license fee.
-
-   COMMERCIAL TIER (Proprietary):
-   → Use this if you're building a commercial product, SaaS, hosting service,
-     or resale offering that includes MNEMOS. License fee applies.
-
-   UNSURE? Open an issue at the project's GitHub repository.
-
-   ═══════════════════════════════════════════════════════════════════════════
-   TRADEMARK AND BRANDING
-   ═══════════════════════════════════════════════════════════════════════════
-
-   "MNEMOS" is a trademark of MNEMOS Contributors. You may use this mark in
-   reference to our software, but only with explicit permission for
-   white-label or commercial offerings. Commercial licensees should use
-   attribution: "Powered by MNEMOS" or similar branding.
-
-   ═══════════════════════════════════════════════════════════════════════════
-   END OF DUAL LICENSE AGREEMENT
-   ═══════════════════════════════════════════════════════════════════════════
+Apache License
+Version 2.0, January 2004
+http://www.apache.org/licenses/
+
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+1. Definitions.
+
+"License" shall mean the terms and conditions for use, reproduction, and
+distribution as defined by Sections 1 through 9 of this document.
+
+"Licensor" shall mean the copyright owner or entity authorized by the
+copyright owner that is granting the License.
+
+"Legal Entity" shall mean the union of the acting entity and all other
+entities that control, are controlled by, or are under common control with
+that entity. For the purposes of this definition, "control" means (i) the
+power, direct or indirect, to cause the direction or management of such
+entity, whether by contract or otherwise, or (ii) ownership of fifty percent
+(50%) or more of the outstanding shares, or (iii) beneficial ownership of
+such entity.
+
+"You" (or "Your") shall mean an individual or Legal Entity exercising
+permissions granted by this License.
+
+"Source" form shall mean the preferred form for making modifications,
+including but not limited to software source code, documentation source, and
+configuration files.
+
+"Object" form shall mean any form resulting from mechanical transformation or
+translation of a Source form, including but not limited to compiled object
+code, generated documentation, and conversions to other media types.
+
+"Work" shall mean the work of authorship, whether in Source or Object form,
+made available under the License, as indicated by a copyright notice that is
+included in or attached to the work (an example is provided in the Appendix
+below).
+
+"Derivative Works" shall mean any work, whether in Source or Object form,
+that is based on (or derived from) the Work and for which the editorial
+revisions, annotations, elaborations, or other modifications represent, as a
+whole, an original work of authorship. For the purposes of this License,
+Derivative Works shall not include works that remain separable from, or
+merely link (or bind by name) to the interfaces of, the Work and Derivative
+Works thereof.
+
+"Contribution" shall mean any work of authorship, including the original
+version of the Work and any modifications or additions to that Work or
+Derivative Works thereof, that is intentionally submitted to Licensor for
+inclusion in the Work by the copyright owner or by an individual or Legal
+Entity authorized to submit on behalf of the copyright owner. For the
+purposes of this definition, "submitted" means any form of electronic, verbal,
+or written communication sent to the Licensor or its representatives,
+including but not limited to communication on electronic mailing lists,
+source code control systems, and issue tracking systems that are managed by,
+or on behalf of, the Licensor for the purpose of discussing and improving the
+Work, but excluding communication that is conspicuously marked or otherwise
+designated in writing by the copyright owner as "Not a Contribution."
+
+"Contributor" shall mean Licensor and any individual or Legal Entity on
+behalf of whom a Contribution has been received by Licensor and subsequently
+incorporated within the Work.
+
+2. Grant of Copyright License. Subject to the terms and conditions of this
+License, each Contributor hereby grants to You a perpetual, worldwide,
+non-exclusive, no-charge, royalty-free, irrevocable copyright license to
+reproduce, prepare Derivative Works of, publicly display, publicly perform,
+sublicense, and distribute the Work and such Derivative Works in Source or
+Object form.
+
+3. Grant of Patent License. Subject to the terms and conditions of this
+License, each Contributor hereby grants to You a perpetual, worldwide,
+non-exclusive, no-charge, royalty-free, irrevocable (except as stated in this
+section) patent license to make, have made, use, offer to sell, sell, import,
+and otherwise transfer the Work, where such license applies only to those
+patent claims licensable by such Contributor that are necessarily infringed by
+their Contribution(s) alone or by combination of their Contribution(s) with
+the Work to which such Contribution(s) was submitted. If You institute patent
+litigation against any entity (including a cross-claim or counterclaim in a
+lawsuit) alleging that the Work or a Contribution incorporated within the Work
+constitutes direct or contributory patent infringement, then any patent
+licenses granted to You under this License for that Work shall terminate as of
+the date such litigation is filed.
+
+4. Redistribution. You may reproduce and distribute copies of the Work or
+Derivative Works thereof in any medium, with or without modifications, and in
+Source or Object form, provided that You meet the following conditions:
+
+(a) You must give any other recipients of the Work or Derivative Works a copy
+of this License; and
+
+(b) You must cause any modified files to carry prominent notices stating that
+You changed the files; and
+
+(c) You must retain, in the Source form of any Derivative Works that You
+distribute, all copyright, patent, trademark, and attribution notices from
+the Source form of the Work, excluding those notices that do not pertain to
+any part of the Derivative Works; and
+
+(d) If the Work includes a "NOTICE" text file as part of its distribution,
+then any Derivative Works that You distribute must include a readable copy of
+the attribution notices contained within such NOTICE file, excluding those
+notices that do not pertain to any part of the Derivative Works, in at least
+one of the following places: within a NOTICE text file distributed as part of
+the Derivative Works; within the Source form or documentation, if provided
+along with the Derivative Works; or, within a display generated by the
+Derivative Works, if and wherever such third-party notices normally appear.
+The contents of the NOTICE file are for informational purposes only and do not
+modify the License. You may add Your own attribution notices within Derivative
+Works that You distribute, alongside or as an addendum to the NOTICE text from
+the Work, provided that such additional attribution notices cannot be
+construed as modifying the License.
+
+You may add Your own copyright statement to Your modifications and may provide
+additional or different license terms and conditions for use, reproduction, or
+distribution of Your modifications, or for any such Derivative Works as a
+whole, provided Your use, reproduction, and distribution of the Work otherwise
+complies with the conditions stated in this License.
+
+5. Submission of Contributions. Unless You explicitly state otherwise, any
+Contribution intentionally submitted for inclusion in the Work by You to the
+Licensor shall be under the terms and conditions of this License, without any
+additional terms or conditions. Notwithstanding the above, nothing herein
+shall supersede or modify the terms of any separate license agreement you may
+have executed with Licensor regarding such Contributions.
+
+6. Trademarks. This License does not grant permission to use the trade names,
+trademarks, service marks, or product names of the Licensor, except as
+required for reasonable and customary use in describing the origin of the Work
+and reproducing the content of the NOTICE file.
+
+7. Disclaimer of Warranty. Unless required by applicable law or agreed to in
+writing, Licensor provides the Work (and each Contributor provides its
+Contributions) on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied, including, without limitation, any warranties
+or conditions of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+PARTICULAR PURPOSE. You are solely responsible for determining the
+appropriateness of using or redistributing the Work and assume any risks
+associated with Your exercise of permissions under this License.
+
+8. Limitation of Liability. In no event and under no legal theory, whether in
+tort (including negligence), contract, or otherwise, unless required by
+applicable law (such as deliberate and grossly negligent acts) or agreed to in
+writing, shall any Contributor be liable to You for damages, including any
+direct, indirect, special, incidental, or consequential damages of any
+character arising as a result of this License or out of the use or inability to
+use the Work (including but not limited to damages for loss of goodwill, work
+stoppage, computer failure or malfunction, or any and all other commercial
+damages or losses), even if such Contributor has been advised of the
+possibility of such damages.
+
+9. Accepting Warranty or Additional Liability. While redistributing the Work
+or Derivative Works thereof, You may choose to offer, and charge a fee for,
+acceptance of support, warranty, indemnity, or other liability obligations
+and/or rights consistent with this License. However, in accepting such
+obligations, You may act only on Your own behalf and on Your sole
+responsibility, not on behalf of any other Contributor, and only if You agree
+to indemnify, defend, and hold each Contributor harmless for any liability
+incurred by, or claims asserted against, such Contributor by reason of your
+accepting any such warranty or additional liability.
+
+END OF TERMS AND CONDITIONS
+
+APPENDIX: How to apply the Apache License to your work.
+
+To apply the Apache License to your work, attach the following boilerplate
+notice, with the fields enclosed by brackets "[]" replaced with your own
+identifying information. (Don't include the brackets!) The text should be
+enclosed in the appropriate comment syntax for the file format. We also
+recommend that a file or class name and description of purpose be included on
+the same "printed page" as the copyright notice for easier identification
+within third-party archives.
+
+Copyright 2026 Jason Perlow
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.

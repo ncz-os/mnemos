@@ -32,7 +32,7 @@ from api.models import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+router = APIRouter(prefix="/v1", tags=["memories"])
 
 
 @asynccontextmanager

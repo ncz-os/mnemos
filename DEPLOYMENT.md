@@ -1,0 +1,434 @@
+# MNEMOS v3.0.0: Deployment & Configuration Guide
+
+**Status**: Production Ready | **Version**: 3.0.0
+
+---
+
+## Quick Start
+
+### Prerequisites
+- PostgreSQL 12+ (for memory storage, audit logs, sessions, DAG versioning)
+- Python 3.10+
+- LLM provider API keys (Together AI or Groq free tier recommended)
+- (Optional) GPU for enhanced compression speeds (Tier 2-3)
+
+### Installation
+
+```bash
+# Clone repository
+git clone https://github.com/your-org/mnemos.git
+cd mnemos
+
+# Copy environment template
+cp .env.example .env
+
+# Edit .env with your configuration
+nano .env
+
+# Install dependencies (with uv)
+uv pip install -r requirements.txt
+
+# Apply database migrations
+psql $PG_DATABASE < db/migrations.sql
+psql $PG_DATABASE < db/migrations_v2_versioning.sql
+psql $PG_DATABASE < db/migrations_v2_sessions.sql
+psql $PG_DATABASE < db/migrations_v3_dag.sql
+
+# Start MNEMOS server
+export $(cat .env | grep -v '#' | xargs)
+python -m uvicorn api_server:app --host $MNEMOS_BIND --port $MNEMOS_PORT --workers $MNEMOS_WORKERS
+```
+
+The API will be available at `http://$MNEMOS_BIND:$MNEMOS_PORT`
+
+---
+
+## Configuration
+
+### Minimal Configuration (.env)
+
+This is enough to run MNEMOS with full functionality:
+
+```bash
+# Database (required)
+PG_HOST=localhost
+PG_DATABASE=mnemos
+PG_USER=mnemos
+PG_PASSWORD=your_secure_password
+
+# API key (required)
+MNEMOS_API_KEY=$(openssl rand -hex 32)
+
+# At least one LLM provider (required for /v1/consultations)
+# Sign up for free tier at Together AI or Groq
+TOGETHER_API_KEY=your_key    # Free tier available
+# OR
+GROQ_API_KEY=your_key         # Free tier available
+
+# That's it. Everything else is optional.
+```
+
+No GPU needed. No inference server needed. Just these 5 variables and you're running MNEMOS in production with full reasoning capability via GRAEAE.
+
+### Full configuration
+See `.env.example` for complete options including GPU setup, compression tiers, rate limiting, etc.
+
+---
+
+## GPU Setup (Optional)
+
+### When You Need GPU
+
+MNEMOS works great on CPU alone. GPU is only beneficial if:
+- You want faster compression (ALETHEIA Tier 2: 200-500ms vs CPU latency)
+- You want fact extraction (ANAMNESIS Tier 3: 500ms-2s)
+- You're running large local LLMs (70B+ parameters)
+
+**For most users**: Use external LLM providers (Together AI, Groq) instead. They're cheaper and faster than self-hosting.
+
+### If GPU Makes Sense
+
+**Recommended Hardware:**
+- **Mac Mini** (M1/M2/M3, unified memory)
+- **ASUS NUC i5** (Intel Arc GPU or iGPU)
+- **AMD Ryzen 7/9** (RDNA iGPU)
+- **Raspberry Pi 5** (with AI Accelerator kit)
+- **NVIDIA Jetson** (Orin, Nano)
+- **Any system running vLLM or Ollama**
+
+**Option 1: Ollama (CPU or GPU)**
+```bash
+# Install Ollama (https://ollama.ai)
+ollama serve &
+
+# Pull a small model (works on CPU)
+ollama pull phi  # 2.7B, fast on CPU
+
+# Configure MNEMOS (optional — only if using for embeddings)
+export GPU_PROVIDER_HOST=http://localhost
+export GPU_PROVIDER_PORT=11434
+
+# Start MNEMOS
+python -m uvicorn api_server:app
+```
+
+**Option 2: vLLM (CPU or GPU)**
+```bash
+# Install vLLM
+pip install vllm
+
+# Run vLLM (works on CPU, much faster on GPU)
+python -m vllm.entrypoints.openai.api_server \
+  --model mistralai/Mistral-7B-Instruct-v0.1 \
+  --port 8000 &
+
+# Configure MNEMOS
+export GPU_PROVIDER_HOST=http://localhost
+export GPU_PROVIDER_PORT=8000
+
+# Start MNEMOS
+python -m uvicorn api_server:app
+```
+
+**The real question:** Do you need any of this? **Probably not.** Just use Together AI or Groq (free tier).
+```bash
+export TOGETHER_API_KEY=your_key
+export GROQ_API_KEY=your_key
+
+python -m uvicorn api_server:app
+# That's it. No GPU, no inference server, no hassle.
+```
+
+---
+
+## Docker Deployment
+
+```bash
+# Build image
+docker build -t mnemos:latest .
+
+# Run with Docker Compose
+docker-compose up -d
+```
+
+See `docker-compose.yml` for services (PostgreSQL, Redis, MNEMOS).
+
+---
+
+## Core API Endpoints (v3.0.0)
+
+### Consultations (GRAEAE Reasoning)
+```bash
+# POST /v1/consultations - Create consultation
+curl -X POST http://localhost:5002/v1/consultations \
+  -H "Authorization: Bearer $MNEMOS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Explain memory systems",
+    "task_type": "reasoning"
+  }'
+
+# GET /v1/consultations/{id} - Get consultation
+curl -X GET http://localhost:5002/v1/consultations/{id} \
+  -H "Authorization: Bearer $MNEMOS_API_KEY"
+
+# GET /v1/consultations/audit - List audit log
+curl -X GET http://localhost:5002/v1/consultations/audit \
+  -H "Authorization: Bearer $MNEMOS_API_KEY"
+
+# GET /v1/consultations/audit/verify - Verify audit chain integrity
+curl -X GET http://localhost:5002/v1/consultations/audit/verify \
+  -H "Authorization: Bearer $MNEMOS_API_KEY"
+```
+
+### Memories (MNEMOS Storage)
+```bash
+# POST /v1/memories - Create memory
+curl -X POST http://localhost:5002/v1/memories \
+  -H "Authorization: Bearer $MNEMOS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "MNEMOS uses three compression tiers...",
+    "category": "solutions"
+  }'
+
+# POST /v1/memories/search - Search memories
+curl -X POST http://localhost:5002/v1/memories/search \
+  -H "Authorization: Bearer $MNEMOS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "compression", "limit": 5}'
+
+# GET /v1/memories/{id} - Retrieve memory
+curl -X GET http://localhost:5002/v1/memories/{id} \
+  -H "Authorization: Bearer $MNEMOS_API_KEY"
+
+# GET /v1/memories/{id}/log - DAG history (git-like)
+curl -X GET http://localhost:5002/v1/memories/{id}/log \
+  -H "Authorization: Bearer $MNEMOS_API_KEY"
+
+# POST /v1/memories/{id}/branch - Create branch
+curl -X POST http://localhost:5002/v1/memories/{id}/branch \
+  -H "Authorization: Bearer $MNEMOS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "experimental-v2"}'
+
+# POST /v1/memories/{id}/merge - Merge branch
+curl -X POST http://localhost:5002/v1/memories/{id}/merge \
+  -H "Authorization: Bearer $MNEMOS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"source_branch": "experimental-v2", "strategy": "latest-wins"}'
+```
+
+### Providers (Model Registry & Routing)
+```bash
+# GET /v1/providers - List available providers
+curl -X GET http://localhost:5002/v1/providers \
+  -H "Authorization: Bearer $MNEMOS_API_KEY"
+
+# GET /v1/providers/recommend - Get model recommendation
+curl -X GET "http://localhost:5002/v1/providers/recommend?task_type=code_generation&cost_budget=5.0" \
+  -H "Authorization: Bearer $MNEMOS_API_KEY"
+
+# GET /v1/providers/health - Provider health check
+curl -X GET http://localhost:5002/v1/providers/health \
+  -H "Authorization: Bearer $MNEMOS_API_KEY"
+```
+
+### OpenAI-Compatible Gateway
+```bash
+# POST /v1/chat/completions - OpenAI-compatible (with auto memory injection)
+curl -X POST http://localhost:5002/v1/chat/completions \
+  -H "Authorization: Bearer $MNEMOS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "What is MNEMOS?"}]
+  }'
+
+# GET /v1/models - List available models
+curl -X GET http://localhost:5002/v1/models \
+  -H "Authorization: Bearer $MNEMOS_API_KEY"
+```
+
+### Sessions (Stateful Chat)
+```bash
+# POST /sessions - Create session
+curl -X POST http://localhost:5002/sessions \
+  -H "Authorization: Bearer $MNEMOS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "auto", "compression_tier": 1}'
+
+# POST /sessions/{id}/messages - Add message to session
+curl -X POST http://localhost:5002/sessions/{id}/messages \
+  -H "Authorization: Bearer $MNEMOS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"role": "user", "content": "Hello"}'
+
+# GET /sessions/{id}/history - Get session history
+curl -X GET http://localhost:5002/sessions/{id}/history \
+  -H "Authorization: Bearer $MNEMOS_API_KEY"
+
+# DELETE /sessions/{id} - Close session
+curl -X DELETE http://localhost:5002/sessions/{id} \
+  -H "Authorization: Bearer $MNEMOS_API_KEY"
+```
+
+---
+
+## Production Deployment
+
+### 1. Database Setup
+```bash
+# Create database and user
+sudo -u postgres createdb mnemos
+sudo -u postgres createuser -P mnemos  # Enter password interactively
+
+# Run migrations (in order)
+psql -U mnemos -d mnemos < db/migrations.sql
+psql -U mnemos -d mnemos < db/migrations_v2_versioning.sql
+psql -U mnemos -d mnemos < db/migrations_v2_sessions.sql
+psql -U mnemos -d mnemos < db/migrations_v3_dag.sql
+
+# Verify
+psql -U mnemos -d mnemos -c "SELECT version();"
+```
+
+### 2. Environment Variables
+```bash
+# Production .env
+PG_HOST=db.example.com
+PG_DATABASE=mnemos_prod
+PG_USER=mnemos
+PG_PASSWORD=secure_password_here
+PG_POOL_SIZE=50
+
+MNEMOS_BIND=0.0.0.0
+MNEMOS_PORT=5002
+MNEMOS_WORKERS=1  # Keep at 1 for in-process state
+
+MNEMOS_API_KEY=$(openssl rand -hex 32)
+
+# LLM providers (minimum: one of these)
+TOGETHER_API_KEY=xxx      # Recommended free tier
+GROQ_API_KEY=xxx           # Recommended free tier
+OPENAI_API_KEY=xxx         # Optional, paid
+ANTHROPIC_API_KEY=xxx      # Optional, paid
+
+# GPU provider (OPTIONAL — only if using Tier 2-3 compression)
+# GPU_PROVIDER_HOST=http://gpu.example.com
+# GPU_PROVIDER_PORT=8000
+
+CORS_ORIGINS=https://app.example.com,https://api.example.com
+ENVIRONMENT=production
+LOG_LEVEL=INFO
+```
+
+### 3. Systemd Service (Linux)
+```ini
+# /etc/systemd/system/mnemos.service
+[Unit]
+Description=MNEMOS Memory System
+After=network.target postgresql.service
+
+[Service]
+Type=notify
+User=mnemos
+WorkingDirectory=/opt/mnemos
+EnvironmentFile=/opt/mnemos/.env
+ExecStart=/usr/bin/python3 -m uvicorn api_server:app \
+  --host ${MNEMOS_BIND} \
+  --port ${MNEMOS_PORT} \
+  --workers ${MNEMOS_WORKERS}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable mnemos
+sudo systemctl start mnemos
+sudo systemctl status mnemos
+```
+
+### 4. Reverse Proxy (Nginx)
+```nginx
+upstream mnemos {
+    server 127.0.0.1:5002;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/api.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://mnemos;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Authorization $http_authorization;
+        proxy_pass_header Authorization;
+    }
+}
+```
+
+### 5. Health Monitoring
+```bash
+# Check health
+curl http://localhost:5002/health
+
+# Monitor logs
+journalctl -u mnemos -f
+
+# Database statistics
+psql -U mnemos -d mnemos -c "SELECT COUNT(*) FROM memories;"
+```
+
+---
+
+## Troubleshooting
+
+### GPU Provider Not Found
+```bash
+# Verify GPU provider is running
+curl http://$GPU_PROVIDER_HOST:$GPU_PROVIDER_PORT/health
+
+# Check MNEMOS logs
+grep "GPU\|compression\|ALETHEIA" /var/log/mnemos.log
+```
+
+### Memory Search Slow
+```bash
+# Check indexes
+psql -d mnemos -c "SELECT schemaname, tablename, indexname FROM pg_indexes WHERE tablename = 'memories';"
+
+# Re-index if needed
+psql -d mnemos -c "REINDEX TABLE memories;"
+```
+
+### High Latency
+- Reduce `GRAEAE_CONSENSUS_QUORUM_SIZE` (default: 3 providers)
+- Enable response caching: `GRAEAE_CACHE_ENABLED=true`
+- Check network connectivity to LLM providers
+
+---
+
+## Upgrade Notes
+
+### v2.4.0 → v3.0.0
+- All v2.4.0 endpoints remain unchanged (backward compatible)
+- New v3.0.0 endpoints available at `/v1/` prefix
+- Database schema: Apply `db/migrations_v3_graeae_unified.sql`
+- Update GRAEAE defaults (now Together + Groq first)
+
+---
+
+## Support
+
+- GitHub: https://github.com/your-org/mnemos
+- Issues: https://github.com/your-org/mnemos/issues
+- Documentation: https://mnemos.readthedocs.io

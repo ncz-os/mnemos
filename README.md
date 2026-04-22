@@ -112,7 +112,7 @@ The primary API surface is namespaced under `/v1/*`. Pre-v3 endpoints (`/memorie
 | `PATCH /v1/memories/{id}` | Update memory content or metadata |
 | `DELETE /v1/memories/{id}` | Delete a memory |
 | `POST /v1/memories/rehydrate` | Token-budgeted compressed context load for prompt injection |
-| `POST /v1/ingest/session` | Ingest a session transcript |
+| `POST /ingest/session` | Ingest a session transcript |
 | `GET /v1/memories/{id}/log` | DAG commit history for a memory |
 | `POST /v1/memories/{id}/branch` | Create a branch from a specific commit |
 | `POST /v1/memories/{id}/merge` | Merge a branch back to main |
@@ -528,9 +528,9 @@ curl -X POST http://localhost:5002/v1/consultations \
 
 ## License
 
-MNEMOS is **dual-licensed**:
+MNEMOS is dual-licensed:
 
-- **Tier 1 — Free (Apache 2.0 + Commons Clause):** personal, team, educational, academic, non-profit, and internal-enterprise use. No license fee.
-- **Tier 2 — Commercial:** required for SaaS, hosted service, white-label, resale, or bundling in a commercial offering sold to third parties.
+- **Apache License 2.0** for the open-source distribution in this repository — see [`LICENSE`](./LICENSE).
+- **Proprietary commercial license** available by agreement for organizations that need alternative commercial terms — see [`LICENSE-PROPRIETARY.md`](./LICENSE-PROPRIETARY.md).
 
-See `LICENSE` for full terms.
+Possession of this repository does not automatically grant the proprietary commercial license; contact the maintainer for those terms.

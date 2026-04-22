@@ -21,13 +21,11 @@ from api.lifecycle import lifespan
 from api.handlers.health import router as health_router
 from api.handlers.consultations import router as consultations_router
 from api.handlers.providers import router as providers_router
-from api.handlers.graeae_routes import router as graeae_router
 from api.handlers.memories import router as memories_router
 from api.handlers.ingest import router as ingest_router
 from api.handlers.kg import router as kg_router
 from api.handlers.admin import router as admin_router
 from api.handlers.versions import router as versions_router
-from api.handlers.model_registry_routes import router as model_registry_router
 from api.handlers.journal import router as journal_router
 from api.handlers.state import router as state_router
 from api.handlers.entities import router as entities_router
@@ -37,6 +35,13 @@ from api.handlers.dag import router as dag_router
 from api.handlers.webhooks import router as webhooks_router
 from api.handlers.oauth import router as oauth_router
 from api.handlers.federation import router as federation_router
+
+try:
+    from api.handlers.document_import import router as document_import_router
+    _document_import_available = True
+except ImportError:
+    _document_import_available = False
+    document_import_router = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
@@ -104,16 +109,18 @@ app.include_router(dag_router)  # Phase 3: DAG versioning (git-like)
 app.include_router(webhooks_router)  # v3.0.0: Outbound webhook subscriptions
 app.include_router(oauth_router)  # v3.0.0: OAuth/OIDC browser login
 app.include_router(federation_router)  # v3.0.0: Cross-instance memory federation
-app.include_router(graeae_router)  # v2.x legacy: deprecated, use /v1/consultations
 app.include_router(memories_router)
 app.include_router(ingest_router)
 app.include_router(kg_router)
 app.include_router(admin_router)
 app.include_router(versions_router)
-app.include_router(model_registry_router)
 app.include_router(journal_router)
 app.include_router(state_router)
 app.include_router(entities_router)
+
+# Document import (Docling) — optional, requires docling extra
+if _document_import_available:
+    app.include_router(document_import_router)
 
 if __name__ == "__main__":
     import uvicorn
