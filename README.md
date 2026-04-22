@@ -112,7 +112,7 @@ If none of those questions matter for your use case, a simpler tool is probably 
 | [**Mem0**](https://github.com/mem0ai/mem0) | Store and retrieve memories via API | Compression quality; reasoning consensus |
 | [**Zep**](https://github.com/getzep/zep) | Conversation history + entity extraction | Compression manifests; multi-provider reasoning |
 | [**LangChain**](https://github.com/langchain-ai/langchain) / [**LlamaIndex**](https://github.com/run-llama/llama_index) memory | In-process buffer or summary | Anything after the process exits |
-| **MemPalace** | Desktop-library long-horizon memory with spatial retrieval and AAAK compression; single-user, in-process | Multi-process deployment; multi-user isolation; network-service semantics |
+| [**MemPalace**](https://github.com/mempalace/mempalace) | Desktop-library long-horizon memory with spatial retrieval and AAAK compression; single-user, in-process | Multi-process deployment; multi-user isolation; network-service semantics |
 | [**CrewAI**](https://github.com/crewAIInc/crewAI) / [**AutoGen**](https://github.com/microsoft/autogen) memory | Per-crew or per-agent embedded memory | Cross-session persistence; compression quality |
 
 ### What MNEMOS does that none of them do
