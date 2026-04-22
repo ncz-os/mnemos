@@ -97,3 +97,6 @@ config.toml
 
 # API key files (never commit actual keys)
 api_keys.json
+
+# uv lockfile — we install via uv pip install -e .[dev] (no uv sync), so the lockfile is a local artifact
+uv.lock
