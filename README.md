@@ -108,12 +108,12 @@ If none of those questions matter for your use case, a simpler tool is probably 
 
 | System | What it does | What it cannot tell you |
 |--------|-------------|------------------------|
-| **MemGPT / Letta** | Hierarchical paging within a single agent session | What was lost in compression; what happens when the LLM provider fails |
-| **Mem0** | Store and retrieve memories via API | Compression quality; reasoning consensus |
-| **Zep** | Conversation history + entity extraction | Compression manifests; multi-provider reasoning |
-| **LangChain / LlamaIndex memory** | In-process buffer or summary | Anything after the process exits |
+| [**MemGPT / Letta**](https://github.com/letta-ai/letta) | Hierarchical paging within a single agent session | What was lost in compression; what happens when the LLM provider fails |
+| [**Mem0**](https://github.com/mem0ai/mem0) | Store and retrieve memories via API | Compression quality; reasoning consensus |
+| [**Zep**](https://github.com/getzep/zep) | Conversation history + entity extraction | Compression manifests; multi-provider reasoning |
+| [**LangChain**](https://github.com/langchain-ai/langchain) / [**LlamaIndex**](https://github.com/run-llama/llama_index) memory | In-process buffer or summary | Anything after the process exits |
 | **MemPalace** | Desktop-library long-horizon memory with spatial retrieval and AAAK compression; single-user, in-process | Multi-process deployment; multi-user isolation; network-service semantics |
-| **CrewAI / AutoGen memory** | Per-crew or per-agent embedded memory | Cross-session persistence; compression quality |
+| [**CrewAI**](https://github.com/crewAIInc/crewAI) / [**AutoGen**](https://github.com/microsoft/autogen) memory | Per-crew or per-agent embedded memory | Cross-session persistence; compression quality |
 
 ### What MNEMOS does that none of them do
 
