@@ -5,12 +5,21 @@
 # MNEMOS + GRAEAE
 
 **Production memory for serious agentic systems.**
+**In daily production use since December 2025.**
 
-MNEMOS is a shared memory service for professional AI and agentic development. It stores, compresses, and reasons over memory with the same operational rigor you would apply to any production database: ACID guarantees, access controls, quality contracts on every transformation, and a cryptographically auditable reasoning layer. It is infrastructure, not a demo feature. It is designed for teams building real systems, where memory has to be persistent, inspectable, attributable, and operationally reliable, not just convenient in a demo.
+MNEMOS is a shared memory service for professional AI and agentic development. It stores, compresses, and reasons over memory with the same operational rigor you would apply to any production database: ACID guarantees, access controls, quality contracts on every transformation, and a cryptographically auditable reasoning layer. It is infrastructure, not a demo feature. It is designed for teams building real systems — where memory has to be persistent, inspectable, attributable, and operationally reliable, not just convenient in a demo.
 
-Deploy MNEMOS once, and every agent in your stack can share the same memory substrate across tools, sessions, and processes. It runs alongside your applications the way Redis, PostgreSQL, or a message bus would, as infrastructure, not as a prompt hack.
+**What it is, concretely:**
 
-This is not an embedded chat-memory helper. It is a network service with a REST API and PostgreSQL backend, designed for multi-agent workflows, provenance-aware memory, compression with quality controls, and optional multi-LLM reasoning via GRAEAE.
+- A FastAPI service (port 5002), PostgreSQL + pgvector backed. Python 3.11+. Apache-2.0.
+- A single `/v1/*` REST surface covering memories, consultations, providers, sessions, webhooks, federation, and an OpenAI-compatible chat-completions gateway.
+- A multi-LLM consensus reasoning layer (GRAEAE) that distributes one prompt across multiple providers, scores the responses, and writes a tamper-evident SHA-256 hash-chained audit entry — every time.
+- Git-like DAG versioning on memory: `log`, `branch`, `merge`, `revert`. Every mutation snapshots.
+- Three-tier compression pipeline (LETHE CPU / ALETHEIA GPU / ANAMNESIS archival) with a written quality manifest on every transformation.
+- Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in.
+- Runs alongside your applications the way Redis, PostgreSQL, or a message bus would. Deploy once, every agent in your stack shares the same memory substrate.
+
+This is not an embedded chat-memory helper. It is not a Python wrapper around ChromaDB with a marketing site. It is a network service with a REST API, a real database backend, quality contracts on every transformation, and a reasoning layer you can audit — built for multi-agent workflows, provenance-aware memory, and the kind of operator who reads commit logs.
 
 ---
 
@@ -28,7 +37,39 @@ MNEMOS was built to solve those problems in a way that reflects real platform ex
 
 Its design is informed by years of enterprise platform work, large-vendor systems thinking, open-source infrastructure experience, and current work in the AI industry, without assuming that professional users want marketing language where they really need operational clarity.
 
-The first production commit landed on February 18, 2026. By April 2026 the system had stored **6,793 memories** and performed **3,077 compressions**, each with a quality manifest. It ships today as v3.0.0, backing multiple active agentic tools simultaneously.
+**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By April 2026 the running install had stored **6,793 memories** and performed **3,077 compressions**, each with a written quality manifest. The v3.0.0 release unifies that production codebase into the single-service FastAPI shape shipped here.
+
+---
+
+## Who this is for
+
+MNEMOS is built for the teams and operators who have already outgrown the prototype memory layer.
+
+**You probably want MNEMOS if:**
+
+- You run multiple agents, or multiple LLM providers, and they need to share a consistent memory pool that survives process restarts and provider outages.
+- Your agents produce outputs someone downstream has to trust — an auditor, a regulator, a customer, a compliance team, yourself in six months.
+- You care whether your memory layer can corrupt, silently swallow writes, or quietly truncate things you wanted to keep.
+- You need real auth (API keys *and* OAuth/OIDC) and real multi-tenant isolation, not a bearer-token sticker over a single-user SQLite file.
+- You have regulatory pressure around reasoning traceability — EMIR Article 57, SOC-2 evidence, GDPR right-to-explanation, or internal model-governance review boards.
+- You need a memory substrate that survives schema migrations, provider circuit-breakers, and federation failures without hand-holding.
+
+**Who this is actually serving, concretely:**
+
+- **Agentic-tooling teams** running multi-agent stacks (crews, swarms, orchestrators) that keep losing shared context at the process boundary.
+- **Platform teams inside larger orgs** wiring LLM routing + memory into an internal developer platform and needing a substrate they can operate, not babysit.
+- **Regulated-industry AI teams** (finance, healthcare, legal, public sector) that need a cryptographic audit trail on every reasoning step and cannot ship without one.
+- **Research labs** exploring consensus-reasoning, long-horizon agent memory, and memory-poisoning defenses — MNEMOS ships DAG versioning and an anti-poisoning guide precisely because those problems are real.
+- **Founders building serious agentic products** who've already seen Mem0/Zep/ChromaDB wrappers break on their first real production incident.
+
+**You probably don't need MNEMOS if:**
+
+- You are building a single-user chatbot for personal note-taking and raw similarity search over ChromaDB is fine.
+- You only need short-term conversation history within a single session and your SDK already handles that.
+- You don't care whether compressed context is faithful to the original — the "toy" solutions are honest about not providing that guarantee.
+- The phrases *audit trail*, *tamper evidence*, *multi-tenant isolation*, and *compression manifest* don't mean anything to your use case and never will.
+
+If you're in the first list, MNEMOS is designed specifically for you. If you're in the second list, something lighter will serve you better — use Mem0, Zep, or in-process summary buffers. They exist because those use cases are real. MNEMOS is the answer to a different question.
 
 ---
 
