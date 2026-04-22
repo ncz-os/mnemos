@@ -380,6 +380,35 @@ A lot of the v3.0.0 surface is held up by background work that doesn't show up i
 - **Rate-limited audit endpoints** — `/v1/consultations/audit/verify` walks the entire chain from genesis; capped at 5/min so an authenticated caller cannot force O(N) scans on a large log. `/audit` list is capped at 30/min.
 - **Quality manifest on every compression** — LETHE, ALETHEIA, and ANAMNESIS each write a receipt: `{what_was_removed, what_was_preserved, quality_rating, risk_factors, safe_for, not_safe_for}`. Compression-as-data, not compression-as-side-effect.
 
+### Referential integrity (the -ism, spelled out)
+
+Every cross-table reference in the schema is a real PostgreSQL foreign key with an explicit `ON DELETE` semantic — not a loose string column you have to trust the application layer to honour. Twenty-two FK edges across the system, and every one carries a deliberate decision about what happens when the thing it points at goes away. The schema has opinions.
+
+Two patterns, picked per edge:
+
+**`ON DELETE CASCADE`** — when lifecycle is genuinely owned:
+
+- `api_keys.user_id → users(id)` — delete a user, their keys go with them.
+- `sessions.user_id → users(id)`, `session_messages.session_id → sessions(id)` — close a session, its messages go.
+- `user_groups.user_id → users(id)`, `user_groups.group_id → groups(id)` — membership is owned by both endpoints.
+- `webhook_subscriptions.owner_id → users(id)`, `webhook_deliveries.subscription_id → webhook_subscriptions(id)` — subscriber deletion collapses the whole delivery subtree (soft-delete via `revoked=true` is the normal path; CASCADE only matters on hard deletes).
+- `oauth_identities.user_id → users(id)`, `oauth_identities.provider → oauth_providers(name)`, `oauth_sessions.user_id → users(id)` — OAuth bindings follow their owner.
+- `federation_sync_log.peer_id → federation_peers(id)` — unregister a peer, its sync history goes.
+- `graeae_audit_log.consultation_id → graeae_consultations(id)`, `consultation_memory_refs.consultation_id → graeae_consultations(id)` — audit rows are owned by the consultation they describe. Chain integrity comes from the SHA-256 hash chain, not from the FK, so deleting a consultation does not break the chain's verifiability.
+
+**`ON DELETE SET NULL`** — when audit history has to *survive* the referenced row's deletion:
+
+- `memory_versions.parent_version_id → memory_versions(id)` — admin-path deletion of a mid-history commit leaves the DAG with a gap rather than cascading through every descendant.
+- `memory_branches.head_version_id → memory_versions(id)` — same reasoning; branches get re-pointed, not destroyed.
+- `session_memory_injections.memory_id → memories(id)` — if a memory is deleted later, the *record that we once injected it into a session* stays. The audit outlives the artifact.
+- `compression_quality_log.memory_id → memories(id)` — the quality manifest survives the thing it was a manifest for. Compliance cares that the transformation happened, not that the output still exists.
+- `consultation_memory_refs.memory_id → memories(id)` — a consultation's cited memory may be deleted; the *record of the citation* is an audit artifact and must not vanish.
+- `oauth_sessions.identity_id → oauth_identities(id)` — rotating an identity doesn't invalidate a session row that was already in flight.
+
+This is the part most projects that call themselves "memory" skip, because if the whole point is "store a blob, retrieve a blob", the relationships *between* blobs are out of scope. MNEMOS's design asserts the opposite: memories relate to consultations relate to audit entries relate to sessions relate to users, and the system has strong opinions about which of those relationships is load-bearing and which is historical.
+
+The constraints are enforced at the database level. Application bugs cannot violate them. Migration bugs cannot silently create orphan rows. The constraint travels with the row.
+
 ### Compression — the MOIRAI tiers
 
 Three-tier compression pipeline, each tier named after a Greek figure of memory.
