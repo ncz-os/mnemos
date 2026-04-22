@@ -568,6 +568,78 @@ curl -X POST http://localhost:5002/v1/consultations \
 
 ---
 
+## FAQ
+
+### Why is it called MNEMOS, and why are you using all these mythological names — who do you think you are, a fantasy novelist?
+
+Fair question, and we get it more than you'd think. Short answer: the names aren't set dressing. Each one is a functional tag that happens to line up with a real Greek concept, because memory is one of the domains where Greek already had the vocabulary we needed.
+
+- **MNEMOS** — short for Mnemosyne, the Titan goddess of memory and mother of the Muses. The system stores and retrieves memory. "MemoryService" felt like underselling it.
+- **GRAEAE** — the three sisters in the Perseus myth who shared one eye and one tooth, passing them back and forth to see and speak. GRAEAE is the multi-LLM consensus layer: several providers sharing one prompt and converging on one consolidated answer. The metaphor was already sitting there.
+- **THE MOIRAI** — the three Fates, who spin, measure, and cut the thread of life. The compression stack is collectively THE MOIRAI because each of its three tiers decides what part of a memory's thread survives:
+  - **LETHE** (river of forgetfulness) — Tier 1, CPU, fast, aggressive: throws away what you won't miss.
+  - **ALETHEIA** (literally *a-lethe*, "unforgetting" — truth, disclosure) — Tier 2, GPU, deeper: preserves what the first pass would have lost.
+  - **ANAMNESIS** (recollection) — Tier 3, archival, slowest: distills long-term facts so you can recover them years later.
+
+No, we are not fantasy novelists. The naming scheme is what happens when the domain you're working in is literally the thing a pre-Socratic culture wrote whole theogonies about, and you decide to use their vocabulary instead of inventing a worse one. Every name is aligned to what the component does, not chosen for atmosphere.
+
+If you strongly prefer `MemoryService` / `LLMRouter` / `CompressorTier1`, the code does exactly the same thing regardless of the label. They're just tags. We like ours.
+
+### Do I need GPU hardware?
+
+No. CPU-only installs run fine — LETHE (Tier 1 compression) runs on CPU, and the API server itself never needs a GPU. ALETHEIA (Tier 2 GPU compression) and the optional local GPU inference backends only kick in when `GPU_PROVIDER_HOST` is configured. For most deployments, CPU plus one external LLM provider is enough.
+
+### Does it work with [OpenAI / Anthropic / Groq / Together / local Ollama]?
+
+Yes. GRAEAE routes across any configured provider. Together AI and Groq are the default free-tier providers (no paid account required to get started). OpenAI, Anthropic, and Perplexity are supported as fallback providers. Local Ollama is first-class — MNEMOS can run fully offline with Ollama plus `nomic-embed-text` for embeddings.
+
+### Is there a hosted version?
+
+Not today. Self-hosted only. If you want a managed deployment, the proprietary commercial license covers custom arrangements — see `LICENSE-PROPRIETARY.md`.
+
+### How is this different from Mem0 / Zep / MemPalace / LangChain memory?
+
+See the *MemPalace and MNEMOS: different problems, not competitors* section above, plus the comparison table. Short version: those are in-process libraries or conversation-history stores designed for single-user / single-agent deployment. MNEMOS is a network service with multi-tenant isolation, a cryptographic audit chain, and a DAG-versioned memory model. Different form factor, different primary user.
+
+### Does it phone home or collect telemetry?
+
+No. There is no outbound telemetry of any kind. The only outbound traffic is the LLM provider calls you configure yourself, the webhook deliveries you register, and the federation syncs you set up. The code is all here; grep `httpx` if you want to confirm.
+
+### Can I use it in production?
+
+Yes — we have been since December 2025. v3.0.0-beta is the first public release, but the codebase is not a greenfield experiment. Real caveat: `-beta` reflects that the system has been single-operator-tested, not yet battle-tested across many independent deployments. File issues against the live install and we'll track them.
+
+### What's the migration story from [Mem0 / Zep / raw PostgreSQL]?
+
+Currently manual — write a one-shot script that hits `POST /v1/memories/bulk` with your source data. Direct-import adapters for major competitors are on the roadmap but not yet shipped.
+
+### Apache 2.0 vs the proprietary commercial license — which one do I use?
+
+- **Apache 2.0** (`LICENSE`) — the OSS distribution. Free to use, modify, redistribute, fork, run commercially, etc. Standard permissive OSS license. **This is what you use.**
+- **Proprietary commercial license** (`LICENSE-PROPRIETARY.md`) — only matters if you need terms beyond Apache 2.0 (custom indemnification, specific SLA language, managed-service arrangements, vendor-of-record requirements). Most users don't need this. Contact the maintainer if you do.
+
+If you're not sure, it's Apache 2.0.
+
+### Why port 5002 and not something normal like 8080?
+
+Historical. Earlier versions split MNEMOS (5000) and GRAEAE (5001) across two services; v3 unified them on 5002 to signal "this is the combined single service". Override with `MNEMOS_PORT` if 5002 is taken.
+
+### Does it run in Docker / Kubernetes?
+
+Yes. `Dockerfile` and `docker-compose.yml` ship in the repo; `docker compose up -d` gets you a working MNEMOS + PostgreSQL instance for local evaluation. For Kubernetes, the Docker image is the starting point — no Helm chart yet, but the service is stateless on its own (Postgres is the only state), so a standard Deployment + Service + ConfigMap pattern works.
+
+### How do I secure it in production?
+
+- Set `MNEMOS_API_KEY` and require Bearer auth on all requests.
+- Enable `RATE_LIMIT_ENABLED=true` (it's on by default).
+- Set `MNEMOS_SESSION_SECRET` to a stable value so OAuth flows survive restarts.
+- Set `OAUTH_TRUST_PROXY=true` + `RATE_LIMIT_TRUST_PROXY=true` only when you're behind a reverse proxy you control.
+- Keep `WEBHOOK_ALLOW_PRIVATE_HOSTS=false` (the default). SSRF defense is on by default.
+- Run behind a TLS-terminating reverse proxy. Don't expose the Uvicorn socket directly.
+- Review `SECURITY.md` for the full checklist.
+
+---
+
 ## License
 
 MNEMOS is dual-licensed:
