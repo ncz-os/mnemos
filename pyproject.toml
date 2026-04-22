@@ -57,6 +57,7 @@ dev = [
   "pytest>=8.0.0",
   "pytest-asyncio>=0.23.0",
   "pytest-cov>=5.0.0",
+  "ruff>=0.5.0",
 ]
 
 [tool.setuptools]
@@ -75,6 +76,33 @@ include = ["api*", "compression*", "graeae*", "db*"]
 # Install with: curl -LsSf https://astral.sh/uv/install.sh | sh
 # Note: uv does not support python-version in [tool.uv] (use pyproject.toml requires-python instead)
 # For Docker: use `uv pip install --system -r requirements.txt` (--system is required when no venv exists)
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = [
+  "archive",
+  "venv",
+  ".venv",
+  "dist",
+  "build",
+  "tools/export_memories_for_docling.py",  # generated helper
+]
+
+[tool.ruff.lint]
+# Default select is E+F+W; we add a tight ignore list for patterns that are
+# intentional in this codebase.
+ignore = [
+  "E402",  # module-level import not at top — legit with sys.path.insert + conditional imports
+  "E501",  # line-too-long — we set line-length above; trust that
+  "F541",  # f-string without placeholders — cosmetic noise
+]
+
+[tool.ruff.lint.per-file-ignores]
+# __init__.py files legitimately re-export symbols
+"**/__init__.py" = ["F401"]
+# Installer uses string forward references to lazily-imported Config
+"installer/__main__.py" = ["F821"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

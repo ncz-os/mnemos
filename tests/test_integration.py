@@ -11,7 +11,6 @@ Tests verify:
 
 import pytest
 import sys
-import os
 from pathlib import Path
 
 # Add project root to path
@@ -93,6 +92,9 @@ class TestSessionManagementStructure:
             # Verify BaseModel inheritance
             assert hasattr(SessionContext, 'model_fields')
             assert hasattr(SessionRequest, 'model_fields')
+            assert hasattr(SessionResponse, 'model_fields')
+            assert hasattr(SessionMessage, 'model_fields')
+            assert hasattr(SessionHistoryResponse, 'model_fields')
         except ImportError as e:
             pytest.fail(f"Session models missing: {e}")
 

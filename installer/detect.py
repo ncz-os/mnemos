@@ -7,7 +7,7 @@ import platform
 import socket
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass

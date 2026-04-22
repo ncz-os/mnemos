@@ -2,7 +2,6 @@
 import json
 import logging
 import uuid
-from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException

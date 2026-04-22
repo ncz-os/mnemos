@@ -205,9 +205,9 @@ def _print_completion(cfg: "Config", api_key: str | None, repo_path: str) -> Non
     if api_key:
         print(f"  API key:   {api_key}")
     if sys.platform != "darwin":
-        print(f"  Logs:      journalctl -u mnemos -f")
+        print("  Logs:      journalctl -u mnemos -f")
     else:
-        print(f"  Logs:      tail -f ~/Library/Logs/mnemos.log")
+        print("  Logs:      tail -f ~/Library/Logs/mnemos.log")
     print(f"  Config:    {repo_path}/config.toml")
     print()
 
@@ -251,7 +251,6 @@ def main() -> int:
     # ------------------------------------------------------------------ #
     if args.upgrade:
         from .db import run_migrations
-        from .wizard import Config
 
         # Load existing config from environment or config.toml
         cfg = _load_existing_config(repo_path)

@@ -27,7 +27,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -628,7 +628,6 @@ if __name__ == "__main__":
     async def _run() -> None:
         pool = None
         if not args.dry_run:
-            import asyncpg
             from api import lifecycle as _lc
             await _lc.startup()
             pool = _lc._pool

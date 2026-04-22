@@ -6,7 +6,7 @@ they establish it. Admin-side provider management is in api/handlers/oauth_admin
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.responses import JSONResponse, RedirectResponse

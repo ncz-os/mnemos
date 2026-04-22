@@ -43,15 +43,6 @@ class TestOAuthWiring:
     def test_oauth_models(self):
         from api.models import (
             OAuthProviderCreateRequest,
-            OAuthProviderUpdateRequest,
-            OAuthProviderPublic,
-            OAuthProviderAdmin,
-            OAuthProviderListResponse,
-            OAuthProviderAdminListResponse,
-            OAuthIdentity,
-            OAuthIdentityListResponse,
-            OAuthLogoutResponse,
-            OAuthMeResponse,
         )
         # Must instantiate with minimal args
         req = OAuthProviderCreateRequest(
@@ -142,7 +133,7 @@ class TestOAuthIntegration:
     async def test_session_create_and_resolve(self):
         import asyncpg
 
-        from api.oauth import SESSION_TTL, create_session, resolve_session, revoke_session
+        from api.oauth import create_session, resolve_session, revoke_session
         from unittest.mock import MagicMock
 
         conn = await asyncpg.connect(os.environ["MNEMOS_TEST_DB"])

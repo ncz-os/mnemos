@@ -12,22 +12,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
         with:
-          python-version: "3.11"
-          cache: "pip"
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
 
-      - name: Install dependencies
+      - name: Install dependencies (uv venv + dev extras)
         run: |
-          pip install -e ".[dev]"
-          pip install ruff
+          uv venv .venv --python 3.11
+          uv pip install --python .venv/bin/python -e ".[dev]"
 
       - name: Lint (ruff)
-        run: ruff check .
+        run: .venv/bin/ruff check .
 
       - name: Test
-        run: pytest tests/ -v --tb=short --ignore=tests/test_live_e2e.py
+        run: .venv/bin/pytest tests/ -v --tb=short --ignore=tests/test_live_e2e.py
 
   docker-build:
     name: Docker build

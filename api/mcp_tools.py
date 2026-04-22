@@ -8,9 +8,8 @@ Exposes key MNEMOS functionality as tools accessible from OpenClaw and other age
 - recommend_model: Query cost optimizer
 """
 
-import asyncio
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional
 
 import api.lifecycle as _lc
 from api.auth import UserContext

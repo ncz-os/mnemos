@@ -8,18 +8,15 @@ Implements git-like operations on memory history:
 - merge: Merge source_branch into target_branch
 """
 
-import hashlib
 import logging
 import time as _time
-from typing import Optional, List, Dict, Any
-from enum import Enum
+from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
-from api.models import MemoryItem
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/memories", tags=["dag"])
@@ -235,7 +232,7 @@ async def create_branch(
                     raise HTTPException(status_code=404, detail="main branch HEAD not found")
 
             # Create branch record
-            branch_id = await conn.fetchval(
+            await conn.fetchval(
                 """
                 INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
                 VALUES ($1, $2, $3, $4)

@@ -5,10 +5,9 @@ Replaces legacy graeae_routes.py (v2.x).
 """
 import hashlib
 import logging
-from typing import List, Optional
+from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user

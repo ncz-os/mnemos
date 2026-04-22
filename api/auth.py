@@ -3,7 +3,6 @@
 Drop-in replacement. Existing Bearer flow preserved; session-cookie flow
 added as a secondary path. Auth-disabled mode unchanged.
 """
-import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass

@@ -181,7 +181,7 @@ def run_wizard(info: SystemInfo, existing_config: dict = None) -> Config:
     # 4. Service user
     # ------------------------------------------------------------------ #
     _section("Service User")
-    print(f"  Default: dedicated 'mnemos' system user (recommended)")
+    print("  Default: dedicated 'mnemos' system user (recommended)")
     print(f"  Alternative: run as current user '{current_user}'")
 
     use_dedicated = _prompt_bool("Create dedicated 'mnemos' service user?", default=True)

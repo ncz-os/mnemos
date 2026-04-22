@@ -16,7 +16,6 @@ from api.lifecycle import (
     _get_embedding,
     _row_to_memory,
     _vector_search,
-    COMPRESSION_ITEM_THRESHOLD,
     COMPRESSION_RESULT_SET_THRESHOLD,
 )
 from api.models import (

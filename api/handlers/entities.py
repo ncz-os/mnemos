@@ -1,7 +1,7 @@
 """Entities API: CRUD for tracked entities (people, projects, concepts)."""
 import json
 import logging
-from typing import Optional, List
+from typing import Optional
 
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -97,7 +97,7 @@ async def list_entities(
                     limit
                 )
         return {"entities": [dict(r) for r in rows], "count": len(rows)}
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -158,7 +158,7 @@ async def update_entity(
         return dict(row)
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -203,7 +203,7 @@ async def link_entities(
         return {"status": "linked", "entity_id": entity_id, "related_id": req.related_id}
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -225,7 +225,7 @@ async def delete_entity(entity_id: str, user: UserContext = Depends(get_current_
             raise HTTPException(status_code=404, detail="Entity not found")
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

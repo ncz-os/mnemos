@@ -8,7 +8,6 @@ import asyncio
 import logging
 import os
 import sys
-import httpx
 import asyncpg
 
 logger = logging.getLogger(__name__)
@@ -24,7 +23,6 @@ from config import PG_CONFIG as _PG_CONFIG  # noqa: E402
 from inference_backend import get_backend  # noqa: E402
 try:
     from compression.distillation_engine import DistillationEngine, CompressionStrategy
-    from compression.manager import CompressionManager
     _COMPRESSION_AVAILABLE = True
 except Exception as _ce:
     logger.warning(f"Local compression unavailable: {_ce}")

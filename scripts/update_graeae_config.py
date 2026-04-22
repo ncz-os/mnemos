@@ -200,11 +200,11 @@ async def main() -> int:
                 )
                 if graeae_name in _URL_EMBEDS_MODEL:
                     # Also update the URL (Gemini pattern: .../models/<slug>:generateContent)
-                    old_url_match = re.search(
+                    re.search(
                         r'^url\s*=\s*"([^"]*)"',
                         "\n".join(
-                            l for l in config_content.splitlines()
-                            if re.match(r'url\s*=', l.strip())
+                            line for line in config_content.splitlines()
+                            if re.match(r"url\s*=", line.strip())
                         ),
                     )
                     new_url = re.sub(

@@ -1,5 +1,4 @@
 """Document import utilities using Docling for intelligent content extraction."""
-import io
 import json
 import logging
 import uuid
@@ -16,7 +15,6 @@ except ImportError:
 
 from api.auth import UserContext, get_current_user
 import api.lifecycle as _lc
-from api.models import MemoryCreateRequest, MemoryItem
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/documents", tags=["document-import"])

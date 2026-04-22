@@ -274,7 +274,7 @@ def create_api_key(config: Config) -> str | None:
                     (key_hash, "installer-generated", '["read", "write"]'),
                 )
             conn.commit()
-        print(f"[db] API key created via psycopg.")
+        print("[db] API key created via psycopg.")
         return raw_key
     except Exception as _exc:
         print(f"[db] psycopg create_api_key failed: {_exc}", file=sys.stderr)
@@ -310,7 +310,8 @@ def create_api_key(config: Config) -> str | None:
         print(f"[db] psycopg2 create_api_key failed: {_exc}", file=sys.stderr)
 
     # Fallback: psql CLI — key_hash is a hex digest (safe for interpolation)
-    import hashlib, re as _re
+    import hashlib
+    import re as _re
 
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
     if not _re.fullmatch(r'[0-9a-f]{64}', key_hash):

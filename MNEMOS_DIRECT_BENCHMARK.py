@@ -157,7 +157,7 @@ class DirectBenchmark:
 
                 if response.status_code == 200:
                     success_count += 1
-            except Exception as e:
+            except Exception:
                 pass
 
         elapsed = time.time() - start_time
@@ -180,7 +180,7 @@ class DirectBenchmark:
     def run(self):
         """Run all tests."""
         print(f"\n{'='*70}")
-        print(f"MNEMOS Direct API Benchmark")
+        print("MNEMOS Direct API Benchmark")
         print(f"{'='*70}")
         print(f"Endpoint: {ENDPOINT}")
         print(f"Models: {', '.join(MODELS[:2])}")
@@ -208,11 +208,11 @@ class DirectBenchmark:
 
         if "throughput" in self.results:
             t = self.results["throughput"]
-            print(f"\nThroughput Summary:")
+            print("\nThroughput Summary:")
             print(f"  {t['throughput_req_per_sec']:.2f} req/sec | Avg latency: {t['avg_latency_ms']:.1f}ms | P95: {t['p95_latency_ms']:.1f}ms")
 
         if self.results["model_switching"]:
-            print(f"\nModel Switching:")
+            print("\nModel Switching:")
             for switch in self.results["model_switching"]:
                 print(f"  {switch['from']} → {switch['to']}: overhead {switch['overhead_ms']:.1f}ms")
 

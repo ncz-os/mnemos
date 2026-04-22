@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import os
 import sys
 from pathlib import Path
@@ -37,12 +36,6 @@ class TestWebhookModuleWiring:
     def test_models_imported(self):
         from api.models import (
             VALID_WEBHOOK_EVENTS,
-            WebhookCreateRequest,
-            WebhookCreateResponse,
-            WebhookItem,
-            WebhookListResponse,
-            WebhookDelivery,
-            WebhookDeliveryListResponse,
         )
         assert {"memory.created", "memory.updated", "memory.deleted",
                 "consultation.completed"} <= VALID_WEBHOOK_EVENTS

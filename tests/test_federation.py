@@ -35,14 +35,6 @@ class TestFederationWiring:
     def test_federation_models(self):
         from api.models import (
             FederationPeerCreateRequest,
-            FederationPeer,
-            FederationPeerListResponse,
-            FederationPeerUpdateRequest,
-            FederationSyncTriggerResponse,
-            FederationSyncLogEntry,
-            FederationSyncLogResponse,
-            FederationStatusResponse,
-            FederationFeedResponse,
         )
         req = FederationPeerCreateRequest(
             name="peer-alpha",
