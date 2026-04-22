@@ -315,17 +315,17 @@ async def _dispatch(name: str, args: dict) -> Any:
             body["subcategory"] = args["subcategory"]
         if args.get("semantic"):
             body["semantic"] = True
-        return await _post("/memories/search", body)
+        return await _post("/v1/memories/search", body)
 
     elif name == "update_memory":
         body = {}
         for field in ("content", "category", "subcategory", "metadata"):
             if args.get(field) is not None:
                 body[field] = args[field]
-        return await _post(f"/memories/{args['memory_id']}", body, method="PATCH")
+        return await _post(f"/v1/memories/{args['memory_id']}", body, method="PATCH")
 
     elif name == "get_memory":
-        return await _get(f"/memories/{args['memory_id']}")
+        return await _get(f"/v1/memories/{args['memory_id']}")
 
     elif name == "create_memory":
         body = {"content": args["content"], "category": args.get("category", "facts")}
@@ -333,10 +333,10 @@ async def _dispatch(name: str, args: dict) -> Any:
             body["subcategory"] = args["subcategory"]
         if args.get("metadata"):
             body["metadata"] = args["metadata"]
-        return await _post("/memories", body)
+        return await _post("/v1/memories", body)
 
     elif name == "delete_memory":
-        status = await _delete(f"/memories/{args['memory_id']}")
+        status = await _delete(f"/v1/memories/{args['memory_id']}")
         return {"deleted": True, "status": status}
 
     elif name == "list_memories":
@@ -344,7 +344,7 @@ async def _dispatch(name: str, args: dict) -> Any:
         for k in ("category", "subcategory", "limit", "offset"):
             if args.get(k) is not None:
                 params[k] = args[k]
-        return await _get("/memories", params=params)
+        return await _get("/v1/memories", params=params)
 
     elif name == "get_stats":
         return await _get("/stats")
@@ -375,7 +375,7 @@ async def _dispatch(name: str, args: dict) -> Any:
         return {"deleted": True, "status": status}
 
     elif name == "bulk_create_memories":
-        return await _post("/memories/bulk", {"memories": args["memories"]})
+        return await _post("/v1/memories/bulk", {"memories": args["memories"]})
 
     else:
         raise ValueError(f"Unknown tool: {name}")
