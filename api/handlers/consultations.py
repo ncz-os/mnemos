@@ -324,7 +324,7 @@ async def get_consultation(
     async with _lc._pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, prompt, task_type, consensus_response, consensus_score, "
-            "winning_muse, cost, latency_ms, mode, created AS created_at "
+            "winning_muse, cost, latency_ms, mode, created "
             "FROM graeae_consultations WHERE id = $1",
             consultation_id,
         )
@@ -342,7 +342,7 @@ async def get_consultation(
         "cost": row["cost"],
         "latency_ms": row["latency_ms"],
         "mode": row["mode"],
-        "created_at": row["created_at"].isoformat(),
+        "created_at": row["created"].isoformat(),
     }
 
 
@@ -358,7 +358,7 @@ async def get_consultation_artifacts(
     async with _lc._pool.acquire() as conn:
         # Get consultation
         consultation = await conn.fetchrow(
-            "SELECT id, created AS created_at FROM graeae_consultations WHERE id = $1",
+            "SELECT id, created FROM graeae_consultations WHERE id = $1",
             consultation_id,
         )
         if not consultation:
@@ -381,5 +381,5 @@ async def get_consultation_artifacts(
             }
             for ref in memory_refs
         ],
-        created_at=consultation["created_at"].isoformat(),
+        created_at=consultation["created"].isoformat(),
     )

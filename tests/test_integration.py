@@ -309,35 +309,31 @@ class TestAntiMemoryPoisoning:
                 f"Guide doesn't mention '{concept}'"
 
 
-class TestBackwardCompatibility:
-    """Verify backward compatibility is maintained."""
+class TestV3Surface:
+    """Verify the v3 public surface is present."""
 
-    def test_existing_endpoints_unchanged(self):
-        """Existing endpoints still work without breaking changes."""
+    def test_expected_endpoints_present(self):
+        """Core v3 routes are mounted on the app."""
         try:
             import api_server
             route_paths = {route.path for route in api_server.app.routes}
-            # These should all still exist
-            expected_routes = {'/memories', '/graeae', '/health'}
+            expected_routes = {'/v1/memories', '/v1/consultations', '/health'}
             for route in expected_routes:
                 matching = {r for r in route_paths if route in r}
                 assert len(matching) > 0, f"Expected route pattern {route} not found"
         except Exception as e:
-            pytest.fail(f"Backward compatibility check failed: {e}")
+            pytest.fail(f"v3 surface check failed: {e}")
 
-    def test_memory_model_unchanged(self):
-        """MemoryItem model is backward compatible."""
+    def test_memory_model_fields(self):
+        """MemoryItem exposes the core v3 fields."""
         try:
             from api.models import MemoryItem
-            # Original fields should exist
-            original_fields = {
-                'id', 'content', 'category', 'created', 'metadata'
-            }
+            required_fields = {'id', 'content', 'category', 'created', 'metadata'}
             actual_fields = set(MemoryItem.model_fields.keys())
-            assert original_fields.issubset(actual_fields), \
-                f"Original MemoryItem fields changed"
+            assert required_fields.issubset(actual_fields), \
+                f"MemoryItem missing expected fields: {required_fields - actual_fields}"
         except Exception as e:
-            pytest.fail(f"MemoryItem backward compatibility check failed: {e}")
+            pytest.fail(f"MemoryItem field check failed: {e}")
 
 
 if __name__ == '__main__':

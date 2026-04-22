@@ -6,13 +6,13 @@
 
 ---
 
-> **Note on v3 API surface:** primary routes are namespaced under `/v1/*` as of v3.0.0.
-> Pre-v3 paths (`/memories`, `/memories/search`, `/graeae/consult`, `/model-registry/*`) remain functional
-> as **deprecated aliases** for backward compatibility and will be removed in a future major version.
-> This document describes the pre-v3 paths. For the v3 surface (including `/v1/consultations`,
-> `/v1/providers`, `/v1/webhooks`, `/auth/oauth/*`, `/v1/federation/*`, and the OpenAI-compatible
-> gateway at `/v1/chat/completions`), see `README.md`.
-> A full v3-first rewrite of this document is tracked for a follow-up release.
+> **Full OpenAPI reference**: once the server is running, the complete, live,
+> always-accurate endpoint list is at `http://localhost:5002/docs` (Swagger UI)
+> and `http://localhost:5002/redoc`. This document describes the core surface
+> and common examples; `/docs` is the source of truth.
+
+v3.0.0 is the first public release of MNEMOS. The unified `/v1/` namespace is
+the only supported API surface — there are no pre-v3 path aliases.
 
 ---
 
@@ -21,19 +21,31 @@
 1. [Authentication](#authentication)
 2. [Health & Status](#health--status)
 3. [Memory Operations](#memory-operations)
-4. [Compression & Audit](#compression--audit)
-5. [Graeae Consultation](#graeae-consultation)
-6. [Hook Management](#hook-management)
-7. [State Management](#state-management)
-8. [Additional Endpoints](#additional-endpoints)
-9. [Error Handling](#error-handling)
-10. [Examples](#examples)
+4. [Consultations (GRAEAE)](#consultations-graeae)
+5. [Providers & Models](#providers--models)
+6. [OpenAI-Compatible Gateway](#openai-compatible-gateway)
+7. [Sessions](#sessions)
+8. [Webhooks](#webhooks)
+9. [OAuth / OIDC](#oauth--oidc)
+10. [Federation](#federation)
+11. [Error Handling](#error-handling)
+12. [Examples](#examples)
 
 ---
 
 ## Authentication
 
-**Current**: Personal installs may run without auth. Team and enterprise installs support API-key authentication with row-level security.
+Two authentication surfaces coexist:
+
+- **Bearer API key** — set `MNEMOS_API_KEY` on the server and send
+  `Authorization: Bearer <key>` on every request. Suitable for service-to-service
+  and CLI access.
+- **Browser session** (cookie-based, see [OAuth / OIDC](#oauth--oidc)) — for
+  users who sign in through Google / GitHub / Azure AD / generic OIDC.
+  `get_current_user` checks Bearer first, then the `mnemos_session` cookie.
+
+Personal installs may run without auth; team and production installs should
+always set `MNEMOS_API_KEY` and/or enable OAuth.
 
 ---
 
@@ -41,15 +53,15 @@
 
 ### GET /health
 
-Check API server health
+Liveness + readiness check (no auth required).
 
 **Response** (200):
 ```json
 {
   "status": "healthy",
-  "timestamp": "2026-02-05T14:30:00.000Z",
+  "timestamp": "2026-04-21T14:30:00.000Z",
   "database_connected": true,
-  "version": "2.3.0"
+  "version": "3.0.0"
 }
 ```
 
@@ -58,609 +70,244 @@ Check API server health
 curl -X GET http://localhost:5002/health
 ```
 
----
-
 ### GET /stats
 
-Get system statistics
+System statistics — memory counts by category and task type, compression
+stats, unreviewed compressions.
 
-**Query Parameters**:
-- None
-
-**Response** (200):
-```json
-{
-  "total_memories": 1243,
-  "total_compressions": 1243,
-  "average_compression_ratio": 0.57,
-  "average_quality_rating": 92,
-  "memories_by_category": {
-    "facts": 500,
-    "identity": 200,
-    "preferences": 300,
-    "projects": 243
-  },
-  "memories_by_task_type": {
-    "reasoning": 600,
-    "code_generation": 300,
-    "architecture_design": 200,
-    "other": 143
-  },
-  "unreviewed_compressions": 15,
-  "timestamp": "2026-02-05T14:30:00.000Z"
-}
-```
-
-**Example**:
 ```bash
-curl -X GET http://localhost:5002/stats
+curl -H "Authorization: Bearer $MNEMOS_API_KEY" \
+  http://localhost:5002/stats
 ```
 
 ---
 
 ## Memory Operations
 
-### POST /memories
+All memory routes are under `/v1/memories`.
 
-Create a new memory with automatic compression
+### POST /v1/memories
+
+Create a memory. Distillation is triggered asynchronously.
 
 **Request Body**:
 ```json
 {
-  "content": "Memory content here (required)",
+  "content": "Memory content (required)",
   "category": "facts|identity|preferences|projects (required)",
-  "task_type": "reasoning (optional, default: reasoning)",
-  "metadata": {
-    "key": "value"
-  }
-}
-```
-
-**Response** (201):
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "created",
-  "compressed": true,
-  "quality_rating": 92
-}
-```
-
-**Example**:
-```bash
-curl -X POST http://localhost:5002/memories \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content": "User completed project X with 98% accuracy",
-    "category": "facts",
-    "task_type": "reasoning",
-    "metadata": {"project": "MyProject", "date": "2026-02-05"}
-  }'
-```
-
----
-
-### GET /memories/{memory_id}
-
-Retrieve a memory by ID
-
-**Path Parameters**:
-- `memory_id` (required): UUID of memory
-
-**Response** (200):
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "content": "Memory content (compressed)",
-  "compressed_content": "Compressed version",
-  "quality_rating": 92,
-  "category": "facts",
   "task_type": "reasoning",
-  "created_at": "2026-02-05T14:30:00.000Z",
-  "metadata": {}
+  "metadata": { "source": "import" }
 }
 ```
 
-**Example**:
-```bash
-curl -X GET http://localhost:5002/memories/550e8400-e29b-41d4-a716-446655440000
-```
+### GET /v1/memories/{memory_id}
 
----
+Retrieve a single memory.
 
-### POST /memories/search
+### POST /v1/memories/search
 
-Search memories by semantic similarity
+Semantic + keyword search.
 
-**Query Parameters**:
-- `query` (required): Search text
-- `limit` (optional): Max results (default: 10)
-- `min_similarity` (optional): Minimum similarity score (default: 0.3)
-
-**Response** (200):
 ```json
-[
-  {
-    "id": "uuid-1",
-    "content": "Similar memory content",
-    "similarity_score": 0.92,
-    "quality_rating": 88,
-    "category": "facts"
-  },
-  {
-    "id": "uuid-2",
-    "content": "Another related memory",
-    "similarity_score": 0.85,
-    "quality_rating": 90,
-    "category": "facts"
-  }
-]
+{ "query": "infrastructure", "limit": 5 }
 ```
 
-**Example**:
-```bash
-curl -X POST "http://localhost:5002/memories/search?query=project%20completion&limit=5"
-```
+### DAG versioning (git-like)
+
+- `GET /v1/memories/{id}/log` — commit history
+- `GET /v1/memories/{id}/commits/{commit}` — one commit
+- `POST /v1/memories/{id}/branch` — create a branch
+- `POST /v1/memories/{id}/merge` — merge two branches
+- `POST /v1/memories/{id}/revert/{n}` — revert to version n
+- `GET /v1/memories/{id}/diff` — diff between versions
+
+See `ANTI_MEMORY_POISONING.md` for the rationale and drift-detection
+workflow.
 
 ---
 
-## Compression & Audit
+## Consultations (GRAEAE)
 
-> Note: The `/compress` trigger endpoint is internal. Use `GET /stats` for compression statistics.
+### POST /v1/consultations
 
----
-
-## Graeae Consultation
-
-### POST /graeae/consult
-
-Consult Graeae for multi-LLM consensus
+Run a multi-LLM consensus consultation. Writes a tamper-evident audit row.
 
 **Request Body**:
 ```json
 {
-  "prompt": "Design a microservices architecture for a restaurant inspection system",
-  "task_type": "architecture_design (optional, default: reasoning)",
-  "context": "Additional context for the prompt (optional)",
-  "mode": "auto|local|external (optional, default: auto)",
-  "muses": ["gpt-4o", "gemini-1.5-pro"] (optional, specific providers)
-}
-```
-
-**Response** (200):
-```json
-{
-  "consensus_response": "Recommended approach: Use event-driven microservices with...",
-  "consensus_score": 87.5,
-  "winning_muse": "gpt-4o",
-  "winning_latency_ms": 3200,
-  "cost": 0.04,
-  "mode": "external",
+  "prompt": "Design a microservices architecture.",
   "task_type": "architecture_design",
-  "timestamp": "2026-02-05T14:30:00.000Z"
+  "mode": "auto",
+  "context": "optional context to prepend",
+  "inject_memories": true
 }
 ```
 
-**Response Codes**:
-- `200`: Successful consultation
-- `504`: All providers timed out, fallback response used
-- `500`: Server error
+**Response** includes: `id`, `consensus_response`, `consensus_score`,
+`winning_muse`, `cost`, `latency_ms`, `memory_refs` (citations).
 
-**Example**:
-```bash
-curl -X POST http://localhost:5002/graeae/consult \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "How should I optimize database queries for millions of records?",
-    "task_type": "architecture_design",
-    "mode": "external"
-  }'
-```
+### GET /v1/consultations/{consultation_id}
 
----
+Retrieve a consultation by ID.
 
-## Hook Management
+### GET /v1/consultations/{consultation_id}/artifacts
 
-### GET /hooks
+Retrieve citations and injected memory refs for a consultation
+(EMIR Article 57 audit support).
 
-List all registered hooks
+### Audit chain
 
-**Response** (200):
-```json
-{
-  "session.start": [],
-  "prompt.submit": [],
-  "memory.write": [],
-  "memory.read": [],
-  "rehydration.start": [],
-  "graeae.consult": []
-}
-```
+- `GET /v1/consultations/audit` — list audit entries
+- `GET /v1/consultations/audit/verify` — verify SHA-256 hash chain integrity
+
+Static `/audit` routes are mounted before dynamic `/{consultation_id}` so
+path-param matching does not shadow them.
 
 ---
 
-### GET /hooks/history
+## Providers & Models
 
-Get hook execution history
+- `GET /v1/providers` — unified catalog (health-tracked)
+- `GET /v1/providers/recommend?task_type=...&budget=...` — task-aware routing
+- `GET /v1/providers/best?task_type=...` — single best provider
+- Admin-only: `POST /v1/model-registry` (requires `role='root'`) — sync Arena.ai Elo scores
 
-**Query Parameters**:
-- `limit` (optional): Max entries (default: 50)
-
-**Response** (200):
-```json
-[
-  {
-    "event_type": "session.start",
-    "timestamp": "2026-02-05T14:30:00.000Z",
-    "context": {
-      "session_id": "uuid"
-    },
-    "source": "api"
-  }
-]
-```
+On a fresh install with an empty `model_registry` table, `/recommend` falls
+back to the static GRAEAE provider config so new deployments aren't 404.
 
 ---
 
-### POST /hooks/{event}/trigger
+## OpenAI-Compatible Gateway
 
-Manually trigger a hook event
+Drop-in for OpenAI SDK consumers. Point `OPENAI_BASE_URL` at MNEMOS.
 
-**Path Parameters**:
-- `event` (required): Hook event name
+- `POST /v1/chat/completions`
+- `GET /v1/models`
 
-**Request Body**:
-```json
-{
-  "session_id": "uuid",
-  "context_key": "value"
-}
-```
-
-**Response** (200):
-```json
-{
-  "event": "session.start",
-  "triggered": true,
-  "timestamp": "2026-02-05T14:30:00.000Z"
-}
-```
+Memory injection can be enabled per-request via header
+`X-MNEMOS-Inject-Memories: 1`.
 
 ---
 
-## State Management
+## Sessions
 
-The state API provides generic key-value storage. Keys and values are arbitrary JSON.
+Stateful multi-turn chat with memory injection at turn boundaries.
 
-### GET /state
-
-List all state keys.
-
-**Response** (200):
-```json
-{"keys": [{"key": "identity", "updated": "2026-02-05T14:30:00", "version": 1}]}
-```
-
-**Example**:
-```bash
-curl http://localhost:5002/state
-```
+- `POST /sessions` — create
+- `POST /sessions/{id}/messages` — post a turn
+- `GET /sessions/{id}` — retrieve transcript
+- `DELETE /sessions/{id}` — close
 
 ---
 
-### GET /state/{key}
+## Webhooks
 
-Get value for a state key.
+Outbound event delivery with HMAC-SHA256 signatures and a durable retry log
+(1m / 5m / 30m / 2h). Delivery log is replayed on server restart via the
+recovery worker.
 
-**Response** (200):
-```json
-{"key": "identity", "value": {"name": "Alice Developer"}, "updated": "2026-02-05T14:30:00", "version": 1}
-```
+- `POST /v1/webhooks` — subscribe
+- `GET /v1/webhooks` — list
+- `DELETE /v1/webhooks/{id}` — revoke (soft-delete; delivery log retained)
+- `GET /v1/webhooks/{id}/deliveries` — per-subscription delivery log
 
-**Example**:
-```bash
-curl http://localhost:5002/state/identity
-```
-
----
-
-### PUT /state/{key}
-
-Set value for a state key (upsert).
-
-**Request Body**:
-```json
-{"value": {"name": "Alice Developer", "workspace": "MyProject"}}
-```
-
-**Response** (200): Updated key record.
-
-**Example**:
-```bash
-curl -X PUT http://localhost:5002/state/identity \
-  -H "Content-Type: application/json" \
-  -d '{"value": {"name": "Alice Developer"}}'
-```
+Events emitted: `memory.created`, `memory.updated`, `memory.deleted`,
+`consultation.completed`.
 
 ---
 
-### DELETE /state/{key}
+## OAuth / OIDC
 
-Delete a state key.
+Browser-based sign-in for Google, GitHub, Azure AD, or any generic OIDC
+provider (Keycloak, Authentik, Auth0, Okta).
 
-**Response**: 204 No Content, or 404 if not found.
+- `GET /auth/oauth/{provider}/login` — redirect to provider
+- `GET /auth/oauth/{provider}/callback` — provider → MNEMOS
+- `POST /auth/oauth/logout` — invalidate session
+- `GET /auth/oauth/me` — current-user profile
+- Admin: `GET /admin/oauth/providers`, `GET /admin/oauth/identities`
 
-**Example**:
-```bash
-curl -X DELETE http://localhost:5002/state/workspace
-```
+Sessions are DB-backed (revocable, 30-day default TTL), with an hourly GC
+worker. Session cookies are `HttpOnly`, `SameSite=Lax`, and `Secure` when
+served over HTTPS.
 
-
----
-
-## Additional Endpoints
-
-### Journal
-
-#### POST /journal
-
-Create a journal entry.
-
-**Request Body**: `{topic, content, metadata?}`
-
-**Example**:
-```bash
-curl -X POST http://localhost:5002/journal \
-  -H "Content-Type: application/json" \
-  -d '{"topic": "architecture", "content": "Decided on event-driven approach"}'
-```
+OAuth state (PKCE verifier + CSRF nonce) lives in a separate short-lived
+signed cookie (`mnemos_oauth_state`, 10-min TTL) distinct from the
+application session cookie. Signing key via `MNEMOS_SESSION_SECRET`;
+auto-generated on startup if unset.
 
 ---
 
-#### GET /journal
+## Federation
 
-List journal entries. Query params: `topic`, `date`, `search`, `limit`.
+Pull-based one-way sync between MNEMOS instances. Federated memories are
+stored with IDs `fed:{peer_name}:{remote_id}`, `owner_id='federation'`, and
+are read-only by convention. Loop prevention via
+`federation_source IS NOT NULL` exclusion.
 
-**Example**:
-```bash
-curl "http://localhost:5002/journal?topic=architecture&limit=10"
-```
+- `GET/POST /v1/federation/peers` — admin peer CRUD
+- `DELETE /v1/federation/peers/{id}` — remove peer
+- `POST /v1/federation/peers/{id}/sync` — trigger sync
+- `GET /v1/federation/peers/{id}/log` — per-peer sync log
+- `GET /v1/federation/status` — aggregate status
+- `GET /v1/federation/feed` — outbound feed (requires `role IN ('federation','root')`)
 
----
-
-#### DELETE /journal/{entry_id}
-
-Delete a journal entry.
-
-**Example**:
-```bash
-curl -X DELETE http://localhost:5002/journal/entry-uuid
-```
-
----
-
-### Entities
-
-#### POST /entities
-
-Create an entity. `entity_type` must be one of: `person`, `project`, `concept`, `document`, `decision`, `event`.
-
-**Request Body**: `{entity_type, name, description?, metadata?}`
-
-**Example**:
-```bash
-curl -X POST http://localhost:5002/entities \
-  -H "Content-Type: application/json" \
-  -d '{"entity_type": "project", "name": "MyProject", "description": "Main project"}'
-```
-
----
-
-#### GET /entities
-
-List or search entities. Query params: `entity_type`, `search`, `limit`.
-
-**Example**:
-```bash
-curl "http://localhost:5002/entities?entity_type=project"
-```
-
----
-
-#### GET /entities/{id}
-
-Get a single entity.
-
----
-
-#### PATCH /entities/{id}
-
-Update entity description or metadata.
-
-**Request Body**: `{description?, metadata?}`
-
----
-
-#### POST /entities/{id}/link
-
-Link two entities bidirectionally.
-
-**Request Body**: `{related_id: "uuid"}`
-
----
-
-#### DELETE /entities/{id}
-
-Delete an entity (also removes it from all related_entities arrays).
-
----
-
-#### GET /entities/{id}/related
-
-Get all entities linked to this one.
-
----
-
-### Model Registry
-
-#### GET /model-registry/
-
-List all tracked models.
-
----
-
-#### GET /model-registry/best
-
-Get the best-performing model per provider (by ELO score).
-
----
-
-#### GET /model-registry/providers
-
-List all tracked providers.
-
----
-
-### GRAEAE Audit
-
-#### GET /graeae/audit
-
-Retrieve GRAEAE audit log entries.
-
----
-
-#### GET /graeae/audit/verify
-
-Verify the cryptographic integrity of the GRAEAE audit chain. Returns pass/fail per entry.
-
----
-
+Background sync runs every 60 seconds.
 
 ---
 
 ## Error Handling
 
-### Error Response Format
+Standard HTTP status codes. Error responses are JSON:
 
 ```json
-{
-  "detail": "Error message describing what went wrong",
-  "error_code": "INVALID_PARAMETER",
-  "timestamp": "2026-02-05T14:30:00.000Z"
-}
+{ "detail": "Consultation not found" }
 ```
 
-### Common HTTP Status Codes
+Common codes:
 
-| Code | Meaning | Example |
-|------|---------|---------|
-| 200 | Success | Memory retrieved successfully |
-| 201 | Created | Memory created successfully |
-| 400 | Bad Request | Invalid JSON or missing required field |
-| 404 | Not Found | Memory ID does not exist |
-| 408 | Timeout | Request took too long |
-| 500 | Server Error | Database connection failed |
-| 503 | Service Unavailable | Database is down |
+- `400` — request validation error
+- `401` — missing or invalid auth
+- `403` — role check failed
+- `404` — entity not found
+- `413` — request body exceeds `MAX_BODY_BYTES` (default 5 MB)
+- `429` — rate-limited (when `RATE_LIMIT_ENABLED=true`)
+- `503` — database pool unavailable
 
 ---
 
 ## Examples
 
-### Complete Memory Workflow
-
 ```bash
-#!/bin/bash
-
 BASE_URL="http://localhost:5002"
+AUTH="Authorization: Bearer $MNEMOS_API_KEY"
 
-# 1. Create memory
-MEMORY_ID=$(curl -s -X POST $BASE_URL/memories \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content": "Completed architecture design review",
-    "category": "facts",
-    "task_type": "architecture_design"
-  }' | jq -r '.id')
+# Health
+curl -s $BASE_URL/health | jq .
 
-echo "Created memory: $MEMORY_ID"
+# Create a memory
+curl -s -X POST $BASE_URL/v1/memories \
+  -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"content":"Example fact","category":"facts"}' | jq .
 
-# 2. Retrieve memory
-curl -s -X GET $BASE_URL/memories/$MEMORY_ID | jq '.'
+# Semantic search
+curl -s -X POST $BASE_URL/v1/memories/search \
+  -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"query":"project completion","limit":5}' | jq .
 
-# 3. Search for related memories
-curl -s -X POST "$BASE_URL/memories/search" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "architecture review", "limit": 5}' | jq '.'
+# Run a consultation
+curl -s -X POST $BASE_URL/v1/consultations \
+  -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"prompt":"Design a REST API for restaurant inspections","task_type":"architecture_design"}' | jq .
+
+# Verify the consultation audit chain
+curl -s -H "$AUTH" $BASE_URL/v1/consultations/audit/verify | jq .
+
+# OpenAI-compatible chat completion
+curl -s -X POST $BASE_URL/v1/chat/completions \
+  -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Hello"}]}' | jq .
 ```
 
-### Consultation Workflow
-
-```bash
-#!/bin/bash
-
-BASE_URL="http://localhost:5002"
-
-# Consult Graeae
-curl -s -X POST $BASE_URL/graeae/consult \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Design REST API for restaurants",
-    "task_type": "architecture_design",
-    "mode": "external"
-  }' | jq '.'
-```
-
-### Batch Memory Operations
-
-```bash
-#!/bin/bash
-
-BASE_URL="http://localhost:5002"
-
-# Create multiple memories
-for i in {1..5}; do
-  curl -s -X POST $BASE_URL/memories \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"content\": \"Memory $i content\",
-      \"category\": \"facts\",
-      \"task_type\": \"reasoning\"
-    }" | jq '.id'
-done
-
-# Search memories
-curl -s -X POST "$BASE_URL/memories/search?query=content&limit=10" | jq '.[] | .id'
-```
-
----
-
-## Rate Limiting
-
-**Current**: No rate limiting (deploy behind API gateway for production)
-
-**Recommended**: 1000 requests/minute per client IP
-
----
-
-## Versioning
-
-API versioning via URL prefix (future):
-- `/v1/memories`
-- `/v2/memories`
-
-Current: All endpoints at root level
-
----
-
-## Support
-
-For issues or questions:
-1. Check logs: `sudo journalctl -u mnemos -f`
-2. Review API_DOCUMENTATION.md
-3. Check DEPLOYMENT_GUIDE.md for troubleshooting
-4. Test endpoints manually with curl
-
----
-
-**API Documentation Version**: 2.3.0
-**Last Updated**: February 5, 2026
+For the full, always-accurate list of routes and schemas, use the live
+OpenAPI at `http://localhost:5002/docs`.

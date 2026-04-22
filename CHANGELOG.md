@@ -5,7 +5,7 @@ All notable changes to MNEMOS are documented here.
 ## [3.0.0] — 2026-04-21
 
 ### Added
-- **Unified API under `/v1/` namespace** — primary routes for consultations, providers, memories, versions, sessions. Pre-v3 paths (`/graeae/*`, `/memories/*`, `/model-registry/*`) remain functional as deprecated aliases for backward compatibility.
+- **Unified API under `/v1/` namespace** — primary routes for consultations, providers, memories, versions, sessions.
 - **Consultations domain (`/v1/consultations`)** — GRAEAE multi-LLM reasoning with cited memory artifacts, hash-chained audit log (SHA-256), `audit/verify` chain-integrity check. Memory injection tracking per consultation via `consultation_memory_refs` table (EMIR Article 57 audit support).
 - **Providers domain (`/v1/providers`)** — unified provider catalog, health tracking, task-aware model recommendation (`/recommend`, `/best`). Model registry with graceful fallback to static provider config when empty.
 - **OpenAI-compatible gateway** — `POST /v1/chat/completions`, `GET /v1/models`. Drop-in for OpenAI SDK consumers with automatic provider routing and optional memory injection.
@@ -50,18 +50,15 @@ All notable changes to MNEMOS are documented here.
 - v2_versioning trigger: `current_setting(...) OR 'main'` (invalid SQL) corrected to `COALESCE(NULLIF(...), 'main')`.
 - v3_dag migration: `DROP VIEW` now precedes `ALTER COLUMN` on `compression_quality_log.memory_id`.
 - `compression_quality_log.memory_id` type mismatch (UUID → TEXT) reconciled with `memories.id TEXT` in base migration.
-- `consultations.py` SQL aliases `created AS created_at` to align with handler response shape.
+- `consultations.py` response builder now maps DB column `created` to response field `created_at` in Python rather than via a SQL alias (simpler and matches the test harness).
 - `sessions.py`: SELECT DISTINCT + ORDER BY rewritten as GROUP BY + MAX.
 - `providers/recommend` falls back to static GRAEAE provider config when `model_registry` is empty (fresh-install case).
 - Docling import updated for v2.69+ API changes.
 - Python 3.9 `tomllib` → `tomli` fallback.
 - Lifecycle log line version string corrected to v3.0.0.
 
-### Backward Compatibility
-- All v2.x endpoints (`/graeae/*`, `/memories/*`, `/model-registry/*`) remain unchanged and functional.
-- v2.x API coexists with v3 — no breaking changes for existing MNEMOS deployments.
-
 ### Removed
+- Legacy pre-v3 path aliases (`/graeae/*`, `/memories/*` without `/v1` prefix, `/model-registry/*`). v3.0.0 is the first public release; the unified `/v1/` namespace is the only supported surface.
 - Internal-infrastructure references scrubbed from all public docs and code paths (PYTHIA / CERBERUS / PROTEUS / ARGONAS; hardcoded 192.168.207.x addresses). See `GPU_PROVIDER_HOST` for the generic alternative.
 - Pre-release `MNEMOS_v24_IMPLEMENTATION_NOTES.md` and its in-code reference in `api/handlers/memories.py`.
 
