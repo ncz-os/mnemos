@@ -19,7 +19,7 @@ Steps to reproduce the behavior:
 What you expected to happen.
 
 ## Environment
-- MNEMOS version: [e.g. 3.0.0-beta]
+- MNEMOS version: [e.g. 3.0.0]
 - Python version: [e.g. 3.11.8]
 - PostgreSQL version: [e.g. 16.2]
 - Deployment: [Docker / systemd / bare]
