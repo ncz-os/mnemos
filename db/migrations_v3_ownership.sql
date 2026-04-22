@@ -48,19 +48,39 @@ ALTER TABLE entities ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'de
 CREATE INDEX IF NOT EXISTS idx_entities_owner ON entities(owner_id);
 -- Existing unique constraint was (entity_type, name) cross-owner. Now each
 -- owner has their own namespace; replace with (owner_id, entity_type, name).
+-- Identify the old constraint by column set rather than by name, because the
+-- auto-generated name can vary across PG versions and manual schema tweaks.
 DO $$
+DECLARE
+    _entity_type_attnum SMALLINT;
+    _name_attnum        SMALLINT;
+    _owner_attnum       SMALLINT;
+    _old_conname        TEXT;
 BEGIN
-    IF EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'entities_entity_type_name_key'
-          AND conrelid = 'entities'::regclass
-    ) THEN
-        ALTER TABLE entities DROP CONSTRAINT entities_entity_type_name_key;
-    END IF;
+    SELECT attnum INTO _entity_type_attnum FROM pg_attribute
+     WHERE attrelid = 'entities'::regclass AND attname = 'entity_type';
+    SELECT attnum INTO _name_attnum FROM pg_attribute
+     WHERE attrelid = 'entities'::regclass AND attname = 'name';
+    SELECT attnum INTO _owner_attnum FROM pg_attribute
+     WHERE attrelid = 'entities'::regclass AND attname = 'owner_id';
+
+    -- Drop any UNIQUE constraint whose column set is exactly (entity_type, name).
+    FOR _old_conname IN
+        SELECT conname FROM pg_constraint
+         WHERE conrelid = 'entities'::regclass
+           AND contype  = 'u'
+           AND conkey   = ARRAY[_entity_type_attnum, _name_attnum]::SMALLINT[]
+    LOOP
+        EXECUTE format('ALTER TABLE entities DROP CONSTRAINT %I', _old_conname);
+    END LOOP;
+
+    -- Create the owner-scoped UNIQUE only if no constraint with the right
+    -- column set already exists.
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
-        WHERE conname = 'entities_owner_type_name_key'
-          AND conrelid = 'entities'::regclass
+         WHERE conrelid = 'entities'::regclass
+           AND contype  = 'u'
+           AND conkey   = ARRAY[_owner_attnum, _entity_type_attnum, _name_attnum]::SMALLINT[]
     ) THEN
         ALTER TABLE entities ADD CONSTRAINT entities_owner_type_name_key
             UNIQUE (owner_id, entity_type, name);
@@ -79,3 +99,15 @@ COMMENT ON COLUMN federation_peers.auth_token IS
     'Bearer token sent to remote peers. Stored in plaintext — protect with '
     'filesystem-level encryption or a wrapper view if your threat model '
     'requires at-rest encryption.';
+
+-- memories.permission_mode convention -----------------------------------------
+-- Decimal digits that read like octal Unix mode bits:
+--   600 = owner rw, no group/others         (default for local memories)
+--   644 = owner rw, group r, others r       (federated / publicly-readable)
+--   660 = owner rw, group rw                (group-editable)
+-- The federation feed uses `(permission_mode % 10) >= 4` so the "others"
+-- digit having the read bit opts a memory in. Do NOT store true octal
+-- values (PG SMALLINT 420 = 0o644) without updating the filter first.
+COMMENT ON COLUMN memories.permission_mode IS
+    'Decimal representation of Unix-style mode (600=owner-only, 644=federated-readable). '
+    'Federation feed filter: (permission_mode % 10) >= 4 means others-readable.';

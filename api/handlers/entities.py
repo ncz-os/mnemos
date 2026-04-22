@@ -169,25 +169,30 @@ async def update_entity(
         raise HTTPException(status_code=400, detail="No fields to update")
     try:
         async with _lc._pool.acquire() as conn:
-            await _assert_owned(conn, entity_id, user)
+            # _assert_owned returns the entity's owner_id; we re-assert in the
+            # UPDATE's WHERE clause so a concurrent ownership change between
+            # the assertion and the update can't land the write on the wrong row.
+            owner = await _assert_owned(conn, entity_id, user)
             if 'description' in updates and 'metadata' in updates:
                 row = await conn.fetchrow(
                     '''UPDATE entities SET description=$1, metadata=$2::jsonb, updated=NOW()
-                       WHERE id=$3::uuid
+                       WHERE id=$3::uuid AND owner_id=$4
                        RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
-                    updates['description'], json.dumps(updates['metadata']), entity_id
+                    updates['description'], json.dumps(updates['metadata']), entity_id, owner,
                 )
             elif 'description' in updates:
                 row = await conn.fetchrow(
-                    '''UPDATE entities SET description=$1, updated=NOW() WHERE id=$2::uuid
+                    '''UPDATE entities SET description=$1, updated=NOW()
+                       WHERE id=$2::uuid AND owner_id=$3
                        RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
-                    updates['description'], entity_id
+                    updates['description'], entity_id, owner,
                 )
             else:
                 row = await conn.fetchrow(
-                    '''UPDATE entities SET metadata=$1::jsonb, updated=NOW() WHERE id=$2::uuid
+                    '''UPDATE entities SET metadata=$1::jsonb, updated=NOW()
+                       WHERE id=$2::uuid AND owner_id=$3
                        RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
-                    json.dumps(updates['metadata']), entity_id
+                    json.dumps(updates['metadata']), entity_id, owner,
                 )
         if not row:
             raise HTTPException(status_code=404, detail="Entity not found")

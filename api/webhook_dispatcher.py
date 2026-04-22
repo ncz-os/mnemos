@@ -196,9 +196,11 @@ async def _attempt_delivery(delivery_id: str) -> None:
 
     # Re-validate URL at dispatch time (defense-in-depth against SSRF if a
     # subscription's url field was set outside the handler validation path).
+    # This narrows but does not fully close the DNS-rebinding window — see
+    # validate_webhook_url's docstring.
     try:
         from api.handlers.webhooks import validate_webhook_url
-        validate_webhook_url(delivery["url"])
+        await validate_webhook_url(delivery["url"])
     except Exception as e:
         error = f"url-rejected: {type(e).__name__}: {e}"
     else:

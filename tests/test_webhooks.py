@@ -118,19 +118,33 @@ class TestEventValidation:
         assert exc.value.status_code == 422
         assert "totally.made.up" in str(exc.value.detail)
 
-    def test_url_must_be_http_or_https(self):
+    @pytest.mark.asyncio
+    async def test_url_validation(self):
+        """URL validator rejects bad schemes, SSRF targets, and metadata hosts."""
         from api.handlers.webhooks import _validate_url
         from fastapi import HTTPException
 
-        _validate_url("http://example.com/hook")   # ok
-        _validate_url("https://example.com/hook")  # ok
+        # Public host — validate_webhook_url is async (resolves DNS via the
+        # event loop's getaddrinfo so a slow resolver doesn't block the worker).
+        await _validate_url("https://example.com/hook")
 
-        with pytest.raises(HTTPException):
-            _validate_url("ftp://example.com/hook")
-        with pytest.raises(HTTPException):
-            _validate_url("file:///etc/passwd")
-        with pytest.raises(HTTPException):
-            _validate_url("example.com")
+        for bad in (
+            "ftp://example.com/hook",
+            "file:///etc/passwd",
+            "example.com",
+        ):
+            with pytest.raises(HTTPException):
+                await _validate_url(bad)
+
+        # SSRF guards: loopback + link-local metadata IPs must be rejected.
+        for blocked in (
+            "http://localhost/hook",
+            "http://127.0.0.1/hook",
+            "http://169.254.169.254/latest/meta-data",
+            "http://metadata.google.internal/",
+        ):
+            with pytest.raises(HTTPException):
+                await _validate_url(blocked)
 
 
 # ── Retry schedule constants ─────────────────────────────────────────────────
