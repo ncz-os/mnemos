@@ -9,6 +9,17 @@ Provides:
 - QualityAnalyzer: Quality manifest generation
 """
 
+from .base import (
+    BASE_CHUNK_RATIO,
+    MIN_CHUNK_RATIO,
+    SAFETY_MARGIN,
+    SUMMARIZATION_OVERHEAD_TOKENS,
+    CompressionEngine,
+    CompressionRequest,
+    GPUIntent,
+    IdentifierPolicy,
+)
+from .base import CompressionResult as EngineCompressionResult
 from .quality_analyzer import QualityAnalyzer, QualityManifest
 from .manager import CompressionManager, CompressionResult
 from .lethe import LETHE
@@ -23,6 +34,18 @@ from .distillation_engine import (
 )
 
 __all__ = [
+    # v3.1 competitive-selection plugin ABC
+    "CompressionEngine",
+    "CompressionRequest",
+    "EngineCompressionResult",
+    "GPUIntent",
+    "IdentifierPolicy",
+    "BASE_CHUNK_RATIO",
+    "MIN_CHUNK_RATIO",
+    "SAFETY_MARGIN",
+    "SUMMARIZATION_OVERHEAD_TOKENS",
+    # v3.0 compression surface (still in use until LETHE/ALETHEIA/ANAMNESIS
+    # migrate to the ABC)
     "QualityAnalyzer",
     "QualityManifest",
     "CompressionManager",
