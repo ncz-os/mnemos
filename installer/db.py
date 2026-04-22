@@ -272,13 +272,17 @@ def create_api_key(config: Config) -> str | None:
         )
         with psycopg.connect(conn_str) as conn:
             with conn.cursor() as cur:
+                # Schema per db/migrations_v1_multiuser.sql:
+                # api_keys(id, user_id, key_hash, key_prefix, label, created_at, last_used, revoked)
+                # user_id references users(id) — the 'default' root user
+                # is seeded by the same migration.
                 cur.execute(
                     """
-                    INSERT INTO api_keys (key_hash, name, permissions, created_at)
-                    VALUES (%s, %s, %s, NOW())
+                    INSERT INTO api_keys (user_id, key_hash, key_prefix, label)
+                    VALUES (%s, %s, %s, %s)
                     ON CONFLICT (key_hash) DO NOTHING
                     """,
-                    (key_hash, "installer-generated", '["read", "write"]'),
+                    ("default", key_hash, raw_key[:8], "installer-generated"),
                 )
             conn.commit()
         print("[db] API key created via psycopg.")
@@ -302,11 +306,11 @@ def create_api_key(config: Config) -> str | None:
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO api_keys (key_hash, name, permissions, created_at)
-            VALUES (%s, %s, %s, NOW())
+            INSERT INTO api_keys (user_id, key_hash, key_prefix, label)
+            VALUES (%s, %s, %s, %s)
             ON CONFLICT (key_hash) DO NOTHING
             """,
-            (key_hash, "installer-generated", '["read", "write"]'),
+            ("default", key_hash, raw_key[:8], "installer-generated"),
         )
         conn.commit()
         cur.close()
@@ -324,9 +328,17 @@ def create_api_key(config: Config) -> str | None:
     if not _re.fullmatch(r'[0-9a-f]{64}', key_hash):
         print("[db] ERROR: unexpected key_hash format", file=sys.stderr)
         return None
+    # raw_key[:8] is the display prefix. We reject anything in it that
+    # isn't alphanumeric or `-`/`_` since we're interpolating into a SQL
+    # string (the psycopg paths parameterize; this psql-CLI fallback
+    # does not).
+    key_prefix = raw_key[:8]
+    if not _re.fullmatch(r'[A-Za-z0-9_-]{1,8}', key_prefix):
+        print("[db] ERROR: unexpected key_prefix format", file=sys.stderr)
+        return None
     sql = (
-        f"INSERT INTO api_keys (key_hash, name, permissions, created_at) "
-        f"VALUES ('{key_hash}', 'installer-generated', '[\"read\", \"write\"]', NOW()) "
+        f"INSERT INTO api_keys (user_id, key_hash, key_prefix, label) "
+        f"VALUES ('default', '{key_hash}', '{key_prefix}', 'installer-generated') "
         f"ON CONFLICT (key_hash) DO NOTHING;"
     )
     rc, _, err = _psql_superuser(sql, dbname=config.db_name)
