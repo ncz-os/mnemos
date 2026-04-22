@@ -185,16 +185,17 @@ class FakeConnection:
         if "SELECT id, chain_hash FROM graeae_audit_log" in compact:
             return self.state["audit_log"][-1] if self.state["audit_log"] else None
 
-        if "SELECT id FROM memories WHERE id=$1" in compact:
-            memory = self.state["memories"].get(args[0])
-            return {"id": memory["id"]} if memory else None
-
-        # owner-scoped ownership probe from memory PATCH
+        # owner-scoped ownership probe from memory PATCH — checked FIRST
+        # because the unscoped string below is a substring of this one.
         if "SELECT id FROM memories WHERE id=$1 AND owner_id=$2" in compact:
             memory = self.state["memories"].get(args[0])
             if memory and memory.get("owner_id") in (args[1], None):
                 return {"id": memory["id"]}
             return None
+
+        if "SELECT id FROM memories WHERE id=$1" in compact:
+            memory = self.state["memories"].get(args[0])
+            return {"id": memory["id"]} if memory else None
 
         # owner check used by DAG _assert_memory_access
         if compact.startswith("SELECT owner_id FROM memories WHERE id ="):

@@ -83,9 +83,11 @@ async def set_state(
     key: str,
     req: StateSetRequest,
     user: UserContext = Depends(get_current_user),
+    owner_id: Optional[str] = Query(None, description="Admin-only: write on behalf of another owner"),
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
+    target_owner = _scope_owner(user, owner_id)
     try:
         async with _lc._pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -94,9 +96,11 @@ async def set_state(
                    ON CONFLICT (owner_id, key) DO UPDATE
                    SET value = $3::jsonb, updated = NOW(), version = state.version + 1
                    RETURNING key, value, updated::text, version''',
-                user.user_id, key, json.dumps(req.value),
+                target_owner, key, json.dumps(req.value),
             )
         return dict(row)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error setting state key '{key}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")

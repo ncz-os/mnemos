@@ -186,7 +186,19 @@ async def provision_or_link_user(
     # email address. Providers that don't set it (or set false) cannot be used
     # to link a new identity to a pre-existing account — otherwise an attacker
     # who controls a permissive provider can claim any user by guessing email.
-    email_verified = bool(claims.get("email_verified"))
+    #
+    # Type handling: some OIDC providers emit the claim as a JSON string
+    # ("true" / "false") rather than a bool. A naive bool("false") returns
+    # True and would bypass the guard. Accept only the documented truthy
+    # forms; anything else — including missing, None, 0, empty string,
+    # string "false" — is treated as unverified.
+    _ev = claims.get("email_verified")
+    if isinstance(_ev, bool):
+        email_verified = _ev
+    elif isinstance(_ev, str):
+        email_verified = _ev.strip().lower() == "true"
+    else:
+        email_verified = False
 
     # 2. Email match — link this new identity to an existing user with matching
     #    email, BUT only when the provider attests the email is verified.

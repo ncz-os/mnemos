@@ -176,8 +176,8 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                         row = await conn.fetchrow(
                             """INSERT INTO graeae_consultations
                                 (prompt, task_type, consensus_response, consensus_score,
-                                 winning_muse, cost, latency_ms, mode)
-                               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                                 winning_muse, cost, latency_ms, mode, owner_id)
+                               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                                RETURNING id""",
                             body.prompt,
                             body.task_type,
@@ -187,6 +187,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                             engine_cost,
                             best_resp[1].get("latency_ms", 0),
                             body.mode or "auto",
+                            user.user_id,
                         )
                         consultation_id = row["id"] if row else None
 
@@ -204,6 +205,8 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                             consultation_id=consultation_id,
                             memory_ids=memory_ids,
                         )
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"[CONSULTATION] persist failed — aborting: {e}", exc_info=True)
                 raise HTTPException(
@@ -237,6 +240,8 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
             timestamp=result.get("timestamp", ""),
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[CONSULTATION] Error: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="Consultation failed — see server logs for details")
@@ -246,7 +251,9 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
 #    'audit' string being matched as a UUID path param) ───────────────────────
 
 @router.get("/consultations/audit", response_model=List[AuditLogEntry])
+@limiter.limit("30/minute")
 async def list_audit_log(
+    request: Request,
     limit: int = Query(20, le=100),
     offset: int = 0,
     user: UserContext = Depends(get_current_user),
@@ -280,12 +287,16 @@ async def list_audit_log(
 
 
 @router.get("/consultations/audit/verify", response_model=AuditVerifyResponse)
+@limiter.limit("5/minute")
 async def verify_audit_chain(
+    request: Request,
     user: UserContext = Depends(get_current_user),
 ):
     """Verify the integrity of the hash chain in the GRAEAE audit log.
 
-    Walks the entire chain from genesis, verifying each link.
+    Walks the entire chain from genesis, verifying each link. Rate-limited
+    because the cost grows linearly with audit-log size — otherwise any
+    authenticated caller can force an O(N) scan on a large table.
     Returns details of any broken sequences.
     """
     if not _lc._pool:
@@ -332,17 +343,30 @@ async def get_consultation(
     consultation_id: str,
     user: UserContext = Depends(get_current_user),
 ):
-    """Retrieve a consultation by ID."""
+    """Retrieve a consultation by ID.
+
+    Scoped to the calling user: non-root callers only see their own
+    consultations. Not-yours and not-exists both return 404 so we don't
+    leak which consultation IDs are in use across users.
+    """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
     async with _lc._pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, prompt, task_type, consensus_response, consensus_score, "
-            "winning_muse, cost, latency_ms, mode, created "
-            "FROM graeae_consultations WHERE id = $1",
-            consultation_id,
-        )
+        if user.role == "root":
+            row = await conn.fetchrow(
+                "SELECT id, prompt, task_type, consensus_response, consensus_score, "
+                "winning_muse, cost, latency_ms, mode, created "
+                "FROM graeae_consultations WHERE id = $1",
+                consultation_id,
+            )
+        else:
+            row = await conn.fetchrow(
+                "SELECT id, prompt, task_type, consensus_response, consensus_score, "
+                "winning_muse, cost, latency_ms, mode, created "
+                "FROM graeae_consultations WHERE id = $1 AND owner_id = $2",
+                consultation_id, user.user_id,
+            )
 
     if not row:
         raise HTTPException(status_code=404, detail="Consultation not found")
@@ -371,11 +395,18 @@ async def get_consultation_artifacts(
         raise HTTPException(status_code=503, detail="Database pool not available")
 
     async with _lc._pool.acquire() as conn:
-        # Get consultation
-        consultation = await conn.fetchrow(
-            "SELECT id, created FROM graeae_consultations WHERE id = $1",
-            consultation_id,
-        )
+        # Get consultation — scoped to caller unless root.
+        if user.role == "root":
+            consultation = await conn.fetchrow(
+                "SELECT id, created FROM graeae_consultations WHERE id = $1",
+                consultation_id,
+            )
+        else:
+            consultation = await conn.fetchrow(
+                "SELECT id, created FROM graeae_consultations "
+                "WHERE id = $1 AND owner_id = $2",
+                consultation_id, user.user_id,
+            )
         if not consultation:
             raise HTTPException(status_code=404, detail="Consultation not found")
 

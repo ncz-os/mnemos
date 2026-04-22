@@ -3,13 +3,14 @@
 Outbound notifications on memory and consultation events. Delivery is handled
 by `api.webhook_dispatcher`; this handler is CRUD only.
 """
+import asyncio
 import ipaddress
 import logging
 import os
 import secrets
 import socket
 import uuid as _uuid
-from typing import List
+from typing import List, Union
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -56,8 +57,24 @@ def _validate_events(events: List[str]) -> None:
 
 _WEBHOOK_ALLOW_PRIVATE = os.getenv("WEBHOOK_ALLOW_PRIVATE_HOSTS", "false").lower() == "true"
 
+# Cloud-provider instance-metadata hostnames we always refuse, even when
+# WEBHOOK_ALLOW_PRIVATE_HOSTS=true. Includes the link-local IP literals as a
+# belt check (they're also caught by the is_link_local / is_private tests).
+_BLOCKED_METADATA_HOSTS = frozenset({
+    "metadata.google.internal",
+    "metadata.goog",
+    "metadata.tencentyun.com",
+    "100-100-100-200.cn-hangzhou.ecs.aliyuncs.com",
+    "169.254.169.254",
+    "100.100.100.200",
+    "fd00:ec2::254",
+    "fe80::a9fe:a9fe",
+})
 
-def _is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
+_IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
+
+
+def _is_blocked_ip(ip: _IPAddress) -> bool:
     """SSRF defense: block loopback, private, link-local, multicast, reserved."""
     return (
         ip.is_loopback
@@ -69,13 +86,31 @@ def _is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
     )
 
 
-def validate_webhook_url(url: str) -> None:
+async def _resolve_addrs(host: str) -> List[str]:
+    """Resolve host asynchronously (non-blocking for the event loop).
+
+    Uses the running loop's getaddrinfo which wraps the system resolver in a
+    thread-executor so a slow DNS server doesn't freeze the ASGI worker.
+    """
+    loop = asyncio.get_event_loop()
+    infos = await loop.getaddrinfo(host, None)
+    return [info[4][0] for info in infos]
+
+
+async def validate_webhook_url(url: str) -> None:
     """Validate a webhook URL: scheme + host not pointing at internal services.
 
-    Called at both subscription create time (handler) and dispatch time
-    (webhook_dispatcher). Raises HTTPException(422) on bad input.
-    Set WEBHOOK_ALLOW_PRIVATE_HOSTS=true to permit private/loopback targets
-    (useful for local testing; unsafe in production).
+    Called at both subscription create time and dispatch time. Raises
+    HTTPException(422) on bad input. Set WEBHOOK_ALLOW_PRIVATE_HOSTS=true to
+    permit private/loopback targets (useful for local testing; unsafe in
+    production).
+
+    Caveat — DNS rebinding: between this validation and the subsequent
+    httpx connect, a hostile DNS server could switch the record from a
+    public address to an internal one. For genuinely untrusted subscription
+    creators, enforce server-side TLS pinning to a known egress proxy, or
+    pass the pre-resolved IP to httpx and keep the Host header. This
+    validator is a strong filter, not a complete mitigation on its own.
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -84,15 +119,14 @@ def validate_webhook_url(url: str) -> None:
     if not host:
         raise HTTPException(status_code=422, detail="url must include a host")
 
+    if host.lower() in _BLOCKED_METADATA_HOSTS:
+        raise HTTPException(status_code=422, detail="url host is not permitted")
+
     if _WEBHOOK_ALLOW_PRIVATE:
         return
 
-    # Reject cloud metadata endpoints by hostname.
-    if host in ("metadata.google.internal", "metadata.goog"):
-        raise HTTPException(status_code=422, detail="url host is not permitted")
-
     # If host is already an IP literal, check it directly. Otherwise resolve
-    # and check every returned address family.
+    # (asynchronously) and check every returned address family.
     try:
         ip = ipaddress.ip_address(host)
         if _is_blocked_ip(ip):
@@ -102,11 +136,10 @@ def validate_webhook_url(url: str) -> None:
         pass  # not a literal IP — resolve DNS
 
     try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror:
+        addrs = await _resolve_addrs(host)
+    except (socket.gaierror, OSError):
         raise HTTPException(status_code=422, detail="url host could not be resolved")
-    for info in infos:
-        addr = info[4][0]
+    for addr in addrs:
         try:
             ip = ipaddress.ip_address(addr)
         except ValueError:
@@ -145,7 +178,7 @@ async def create_webhook(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
-    _validate_url(request.url)
+    await _validate_url(request.url)
     _validate_events(request.events)
 
     secret = secrets.token_urlsafe(32)
