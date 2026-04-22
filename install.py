@@ -192,9 +192,9 @@ def main() -> None:
 
     print("\n--- Writing config.toml ---")
     if not os.path.exists(config_path):
-        print(f"  [NOTE] config.toml not found. Copy config.toml.example first:")
-        print(f"         cp config.toml.example config.toml")
-        print(f"         Then re-run this installer.")
+        print("  [NOTE] config.toml not found. Copy config.toml.example first:")
+        print("         cp config.toml.example config.toml")
+        print("         Then re-run this installer.")
         sys.exit(1)
     append_config(config_path, new_sections)
 

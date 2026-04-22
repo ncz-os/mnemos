@@ -2,7 +2,7 @@
 import json
 import logging
 from datetime import date
-from typing import Optional, List
+from typing import Optional
 
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query

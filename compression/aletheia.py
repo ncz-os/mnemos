@@ -11,7 +11,6 @@ Runs offline via distillation worker; not real-time.
 Recommended: Local GPU (vLLM/Ollama on host or LAN). Fallback: LETHE (CPU) if GPU unreachable.
 """
 
-import asyncio
 import logging
 import os
 from typing import Dict, Optional

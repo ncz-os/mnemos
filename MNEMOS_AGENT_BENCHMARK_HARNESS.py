@@ -12,14 +12,13 @@ Metrics:
   - Memory injection impact
 """
 
-import asyncio
 import json
 import subprocess
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Optional
 
 
 @dataclass
@@ -354,7 +353,7 @@ class MNEMOSBenchmarkHarness:
     def print_summary(self):
         """Print benchmark summary."""
         print(f"\n{'='*70}")
-        print(f"BENCHMARK SUMMARY")
+        print("BENCHMARK SUMMARY")
         print(f"{'='*70}")
         print(f"Platform: {self.report.platform}")
         print(f"Duration: {self.report.total_duration_seconds:.1f}s")
@@ -366,19 +365,19 @@ class MNEMOSBenchmarkHarness:
             latencies = [r.latency_ms for r in self.report.latency_results if r.success]
             if latencies:
                 latencies.sort()
-                print(f"\nLatency Stats:")
+                print("\nLatency Stats:")
                 print(f"  Min: {min(latencies):.1f}ms")
                 print(f"  Avg: {sum(latencies)/len(latencies):.1f}ms")
                 print(f"  P95: {latencies[int(len(latencies)*0.95)]:.1f}ms")
                 print(f"  Max: {max(latencies):.1f}ms")
 
         if self.report.throughput_results:
-            print(f"\nThroughput Stats:")
+            print("\nThroughput Stats:")
             for r in self.report.throughput_results:
                 print(f"  {r.model}: {r.throughput_req_per_sec:.2f} req/sec (success: {r.successful_requests}/{r.total_requests})")
 
         if self.report.model_switch_results:
-            print(f"\nModel Switching:")
+            print("\nModel Switching:")
             successful_switches = sum(1 for r in self.report.model_switch_results if r.success)
             print(f"  Success rate: {successful_switches}/{len(self.report.model_switch_results)}")
             avg_switch_time = sum(r.switch_time_ms for r in self.report.model_switch_results) / len(self.report.model_switch_results) if self.report.model_switch_results else 0
@@ -392,7 +391,7 @@ def main():
     platform = sys.argv[1] if len(sys.argv) > 1 else "openclaw"
 
     harness = MNEMOSBenchmarkHarness(platform=platform)
-    report = harness.run_benchmark()
+    harness.run_benchmark()
     harness.print_summary()
     harness.save_report()
 

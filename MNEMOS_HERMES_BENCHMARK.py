@@ -101,7 +101,7 @@ class HermesBenchmark:
 
                 if result.returncode == 0:
                     success_count += 1
-            except Exception as e:
+            except Exception:
                 pass
 
         elapsed = time.time() - start_time
@@ -124,7 +124,7 @@ class HermesBenchmark:
     def run(self):
         """Run all tests."""
         print(f"\n{'='*70}")
-        print(f"MNEMOS Hermes CLI Benchmark")
+        print("MNEMOS Hermes CLI Benchmark")
         print(f"{'='*70}")
         print(f"Endpoint: {ENDPOINT}")
 
@@ -150,7 +150,7 @@ class HermesBenchmark:
 
         if "throughput" in self.results:
             t = self.results["throughput"]
-            print(f"\nThroughput Summary:")
+            print("\nThroughput Summary:")
             print(f"  {t['throughput_req_per_sec']:.2f} req/sec | Avg latency: {t['avg_latency_ms']:.1f}ms | P95: {t['p95_latency_ms']:.1f}ms")
 
     def save_results(self):

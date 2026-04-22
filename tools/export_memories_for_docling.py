@@ -1,6 +1,4 @@
 """Export MNEMOS memories in Docling-compatible formats (Markdown, HTML, Plain Text)."""
-import json
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any

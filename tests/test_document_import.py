@@ -1,6 +1,4 @@
 """Integration tests for Docling document import functionality."""
-import io
-import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,7 +15,7 @@ class TestDoclingImporter:
         from api.handlers.document_import import DoclingImporter
 
         # Mock the DocumentConverter
-        with patch('api.handlers.document_import.DocumentConverter') as mock_converter:
+        with patch('api.handlers.document_import.DocumentConverter'):
             importer = DoclingImporter()
             assert importer.converter is not None
 

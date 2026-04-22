@@ -34,7 +34,7 @@ logger = logging.getLogger("refresh_elo_weights")
 def main() -> int:
     parser = argparse.ArgumentParser(description="Refresh GRAEAE provider weights from Arena.ai Elo leaderboard")
     parser.add_argument("--force", action="store_true", help="Bypass cache and fetch fresh data")
-    args = parser.parse_args()
+    parser.parse_args()
 
     from graeae.elo_sync import fetch_elo_weights, save_weights, _REGISTRY_PATH
 

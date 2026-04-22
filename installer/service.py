@@ -190,7 +190,6 @@ WantedBy=multi-user.target
 def install_launchd(config: Config, repo_path: str) -> bool:
     """Write launchd plist for macOS. Return True on success."""
     import plistlib
-    import tempfile
 
     repo = Path(repo_path)
     venv_python = str(repo / "venv" / "bin" / "python")
@@ -281,7 +280,7 @@ def enable_service(service_name: str) -> bool:
 def start_service(service_name: str) -> bool:
     """Start the service now."""
     if sys.platform == "darwin":
-        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{service_name}.plist"
+        Path.home() / "Library" / "LaunchAgents" / f"{service_name}.plist"
         rc, _, err = _run(["launchctl", "start", service_name])
         if rc != 0:
             print(f"[service] WARNING starting launchd service: {err}", file=sys.stderr)

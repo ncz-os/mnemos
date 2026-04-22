@@ -102,7 +102,6 @@ async def _run_distillation_worker():
     This coroutine is scheduled during startup and tracked in _background_tasks.
     """
     global _worker_status
-    import asyncio as _asyncio
 
     # Import here to avoid circular dependencies
     try:

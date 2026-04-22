@@ -4,7 +4,6 @@
 Replaces model_registry_routes.py (v2.x).
 """
 import logging
-from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 

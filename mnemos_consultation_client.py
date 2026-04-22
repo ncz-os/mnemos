@@ -297,7 +297,7 @@ class MNEMOSConsultationClient:
             error_body = ""
             try:
                 error_body = e.read().decode("utf-8")
-            except:
+            except Exception:
                 pass
 
             if e.code == 401:
@@ -434,7 +434,7 @@ if __name__ == "__main__":
             max_tokens=100
         )
 
-        print(f"✓ Inference successful:")
+        print("✓ Inference successful:")
         print(f"  Model: {result['model']}")
         print(f"  Latency: {result['inference_ms']}ms")
         print(f"  Tokens: {result['input_tokens']}/{result['output_tokens']}")

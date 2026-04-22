@@ -5,22 +5,19 @@ and track compression/cost metrics per session. Integrates with gateway memory i
 and compression tiers.
 """
 
-import json
 import logging
-from typing import Optional, List
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
 from api.models import (
     SessionRequest, SessionResponse, SessionMessage, SessionMessageResponse,
-    SessionHistoryRequest, SessionHistoryResponse, ChatMessage, SessionContext
+    SessionHistoryResponse, ChatMessage, SessionContext
 )
 from api.handlers.openai_compat import (
-    _search_mnemos_context, _route_to_provider, _get_model_recommendation
+    _search_mnemos_context, _route_to_provider
 )
 
 logger = logging.getLogger(__name__)
@@ -196,7 +193,6 @@ async def add_session_message(
 
     # Search MNEMOS for context
     memories_injected = 0
-    injected_memory_ids = []
     mnemos_context = ""
 
     try:
@@ -222,7 +218,7 @@ async def add_session_message(
 
             mnemos_context = "\n\n".join([f"[Memory]\n{doc['content'][:500]}" for doc in mnemos_docs])
             memories_injected = len(mnemos_docs)
-            injected_memory_ids = [doc.get("id") for doc in mnemos_docs]
+            [doc.get("id") for doc in mnemos_docs]
 
             logger.info(f"[SESSIONS] Injected {memories_injected} memories into session {session_id}")
 
