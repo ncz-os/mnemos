@@ -1,4 +1,4 @@
-.PHONY: install dev test lint docker-build docker-up docker-down clean help install-agent install-wizard install-check install-upgrade bootstrap import-docling import-json import-chatgpt import-obsidian import-stats test-archive test-all lint-fix setup-db docker-logs
+.PHONY: install dev test test-uv lint docker-build docker-up docker-down clean help install-agent install-wizard install-check install-upgrade bootstrap import-docling import-json import-chatgpt import-obsidian import-stats test-archive test-all lint-fix setup-db docker-logs
 
 PYTHON := python3
 VENV := venv
@@ -19,13 +19,21 @@ dev:           ## Install development dependencies
 	$(PIP) install --upgrade pip
 	$(PIP) install -e ".[dev]"
 
-test:          ## Run unit tests
+test:          ## Run unit tests (auto-installs dev deps on first run)
+	@test -x $(PYTEST) || $(MAKE) dev
 	$(PYTEST) tests/ -v --tb=short --ignore=tests/test_live_e2e.py
 
+test-uv:       ## Run tests in a fresh uv-managed .venv (reproducible, no pre-existing venv needed)
+	uv venv .venv
+	uv pip install --python .venv/bin/python -e '.[dev]'
+	.venv/bin/pytest tests/ -v --tb=short --ignore=tests/test_live_e2e.py
+
 test-archive:  ## Run archive salvage tests
+	@test -x $(PYTEST) || $(MAKE) dev
 	$(PYTEST) archive/tests/ -v --tb=short
 
 test-all:      ## Run all tests including archive
+	@test -x $(PYTEST) || $(MAKE) dev
 	$(PYTEST) tests/ archive/tests/ -v --tb=short --ignore=tests/test_live_e2e.py
 
 lint:          ## Run ruff linter

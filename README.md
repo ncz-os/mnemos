@@ -98,7 +98,7 @@ MNEMOS took the harder path: PostgreSQL instead of SQLite, real async compressio
 
 This is the current state of v3.0.0. Features described here are implemented and running in production. Features listed in the Roadmap section that are "scheduled for v3.0.0" are under active development for this release.
 
-The primary API surface is namespaced under `/v1/*`. Pre-v3 endpoints (`/memories`, `/graeae/consult`, `/triples`, etc.) still work as deprecated aliases for backward compatibility but will be removed in a future major version. New integrations should target `/v1/*` exclusively.
+The API surface is namespaced under `/v1/*`. v3.0.0 is the first public release — the unified `/v1/` namespace is the only supported surface, and there are no pre-v3 aliases.
 
 ### Memory API (v1)
 
@@ -176,8 +176,6 @@ Multi-LLM consensus reasoning with cited memory artifacts and cryptographic audi
 | `GET /v1/consultations/{id}/artifacts` | Cited memories used to answer |
 | `GET /v1/consultations/audit` | Hash-chained audit log |
 | `GET /v1/consultations/audit/verify` | Verify audit chain integrity |
-
-Legacy `POST /graeae/consult` remains functional as a deprecated alias.
 
 ### Providers — model routing domain (v3, shipped)
 
@@ -309,11 +307,12 @@ Three-tier compression pipeline, each tier named after a Greek figure of memory.
 | 3 | Medium-term | 50% |
 | 4 | Long-term / archive | task-type dependent |
 
-### Versioning and audit (v2, shipped)
+### Versioning and audit
 
 - Memory version history (`memory_versions` table) — every mutation auto-snapshots previous state
-- Diff and revert API: `GET /memories/{id}/versions`, `GET /memories/{id}/versions/{n}`, `GET /memories/{id}/diff`, `POST /memories/{id}/revert/{n}`
-- SHA-256 hash-chained audit log for GRAEAE responses: `GET /graeae/audit`, `GET /graeae/audit/verify`
+- Diff and revert API: `GET /v1/memories/{id}/versions`, `GET /v1/memories/{id}/versions/{n}`, `GET /v1/memories/{id}/diff`, `POST /v1/memories/{id}/revert/{n}`
+- DAG (git-like) versioning: `GET /v1/memories/{id}/log`, `POST /v1/memories/{id}/branch`, `POST /v1/memories/{id}/merge`, `GET /v1/memories/{id}/commits/{commit}`
+- SHA-256 hash-chained audit log for consultations: `GET /v1/consultations/audit`, `GET /v1/consultations/audit/verify`
 
 ---
 
