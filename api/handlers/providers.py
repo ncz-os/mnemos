@@ -1,7 +1,7 @@
 """Provider routing & model registry endpoints — v3.0.0.
 
 /v1/providers — GRAEAE provider management and model recommendation.
-Replaces model_registry_routes.py (v2.x).
+
 """
 import logging
 

@@ -43,7 +43,7 @@ else
         "SELECT to_regclass('graeae_audit_log');" 2>/dev/null | grep -q graeae_audit_log; then
         echo -e "${GREEN}✓ graeae_audit_log table exists${NC}"
     else
-        echo -e "${YELLOW}⚠ graeae_audit_log table not found (created inline in v2.x)${NC}"
+        echo -e "${YELLOW}⚠ graeae_audit_log table not found (check your migrations)${NC}"
     fi
 fi
 
@@ -128,52 +128,6 @@ elif [ "$MEMORIES_CODE" = "401" ] || [ "$MEMORIES_CODE" = "403" ]; then
     echo -e "${YELLOW}⚠ GET /v1/memories exists (auth required)${NC}"
 else
     echo -e "${RED}✗ GET /v1/memories returned $MEMORIES_CODE${NC}"
-fi
-
-echo ""
-
-# ==============================================================================
-# 4. BACKWARD COMPATIBILITY (v2.x endpoints)
-# ==============================================================================
-echo -e "${YELLOW}[4] Testing Backward Compatibility (v2.x)${NC}"
-
-# Test /graeae/health (v2)
-GRAEAE_HEALTH_CODE=$(curl -s -w "%{http_code}" -X GET "$API_URL/graeae/health" -o /dev/null)
-
-if [ "$GRAEAE_HEALTH_CODE" = "200" ]; then
-    echo -e "${GREEN}✓ GET /graeae/health (v2) still works${NC}"
-elif [ "$GRAEAE_HEALTH_CODE" = "301" ] || [ "$GRAEAE_HEALTH_CODE" = "308" ]; then
-    echo -e "${YELLOW}⚠ GET /graeae/health redirects (intentional deprecation)${NC}"
-else
-    echo -e "${RED}✗ GET /graeae/health returned $GRAEAE_HEALTH_CODE${NC}"
-fi
-
-# Test /model-registry endpoints (v2)
-MODEL_REG_CODE=$(curl -s -w "%{http_code}" -X GET "$API_URL/model-registry" \
-    -H "Authorization: Bearer $AUTH_KEY" \
-    -o /dev/null)
-
-if [ "$MODEL_REG_CODE" = "200" ]; then
-    echo -e "${GREEN}✓ GET /model-registry (v2) still works${NC}"
-elif [ "$MODEL_REG_CODE" = "401" ] || [ "$MODEL_REG_CODE" = "403" ]; then
-    echo -e "${YELLOW}⚠ GET /model-registry exists (auth required)${NC}"
-elif [ "$MODEL_REG_CODE" = "301" ] || [ "$MODEL_REG_CODE" = "308" ]; then
-    echo -e "${YELLOW}⚠ GET /model-registry redirects (intentional deprecation)${NC}"
-else
-    echo -e "${RED}✗ GET /model-registry returned $MODEL_REG_CODE${NC}"
-fi
-
-# Test /memories endpoints (v2)
-MEMORIES_V2_CODE=$(curl -s -w "%{http_code}" -X GET "$API_URL/memories" \
-    -H "Authorization: Bearer $AUTH_KEY" \
-    -o /dev/null)
-
-if [ "$MEMORIES_V2_CODE" = "200" ]; then
-    echo -e "${GREEN}✓ GET /memories (v2) still works${NC}"
-elif [ "$MEMORIES_V2_CODE" = "401" ] || [ "$MEMORIES_V2_CODE" = "403" ]; then
-    echo -e "${YELLOW}⚠ GET /memories exists (auth required)${NC}"
-else
-    echo -e "${YELLOW}⚠ GET /memories returned $MEMORIES_V2_CODE${NC}"
 fi
 
 echo ""

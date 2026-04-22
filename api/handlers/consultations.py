@@ -1,7 +1,7 @@
 """GRAEAE multi-provider consultation endpoints — v3.0.0 unified service.
 
 /v1/consultations — GRAEAE reasoning domain with hash-chained audit log and memory refs.
-Replaces legacy graeae_routes.py (v2.x).
+
 """
 import hashlib
 import logging

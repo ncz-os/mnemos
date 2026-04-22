@@ -539,7 +539,7 @@ async def rehydrate_memories(
 
     # Phase 2 complete: compression available (LETHE/ALETHEIA/ANAMNESIS)
     # Rehydration compression deferred to Phase 8A (batch optimization)
-    # Gateway prioritizes memory injection compression (critical path v2.4.0)
+    # Gateway prioritizes memory injection compression (critical path)
     tokens_used = min(original_tokens, request.budget_tokens) if request.budget_tokens else original_tokens
     compression_applied = False  # Phase 8A: integrate LETHE for large context budgets
 

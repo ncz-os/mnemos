@@ -19,7 +19,7 @@ MNEMOS is a shared memory service for professional AI and agentic development. I
 - Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in.
 - Runs alongside your applications the way Redis, PostgreSQL, or a message bus would. Deploy once, every agent in your stack shares the same memory substrate.
 
-This is not an embedded chat-memory helper. It is not a Python wrapper around ChromaDB with a marketing site. It is a network service with a REST API, a real database backend, quality contracts on every transformation, and a reasoning layer you can audit — built for multi-agent workflows, provenance-aware memory, and the kind of operator who reads commit logs.
+This is not a desktop library or an in-process chat-memory helper. It is a network service with a REST API, a real database backend, quality contracts on every transformation, and a reasoning layer you can audit — built for multi-agent workflows, provenance-aware memory, and the kind of operator who runs it alongside PostgreSQL and Redis on the same box.
 
 ---
 
@@ -60,7 +60,7 @@ MNEMOS is built for the teams and operators who have already outgrown the protot
 - **Platform teams inside larger orgs** wiring LLM routing + memory into an internal developer platform and needing a substrate they can operate, not babysit.
 - **Regulated-industry AI teams** (finance, healthcare, legal, public sector) that need a cryptographic audit trail on every reasoning step and cannot ship without one.
 - **Research labs** exploring consensus-reasoning, long-horizon agent memory, and memory-poisoning defenses — MNEMOS ships DAG versioning and an anti-poisoning guide precisely because those problems are real.
-- **Founders building serious agentic products** who've already seen Mem0/Zep/ChromaDB wrappers break on their first real production incident.
+- **Founders** who've already hit the ceiling of in-process memory libraries and need something that survives process restarts, schema changes, and multi-agent concurrency.
 
 **You probably don't need MNEMOS if:**
 
@@ -97,7 +97,7 @@ If none of those questions matter for your use case, a simpler tool is probably 
 | **Mem0** | Store and retrieve memories via API | Compression quality; reasoning consensus |
 | **Zep** | Conversation history + entity extraction | Compression manifests; multi-provider reasoning |
 | **LangChain / LlamaIndex memory** | In-process buffer or summary | Anything after the process exits |
-| **MemPalace** | Python wrapper around ChromaDB; 96.6% LongMemEval benchmark is raw verbatim mode — AAAK compression mode regresses to 84.2% | Compression you can trust; multi-user access control; temporal fact resolution; auditable reasoning |
+| **MemPalace** | Desktop-library long-horizon memory with spatial retrieval and AAAK compression; single-user, in-process | Multi-process deployment; multi-user isolation; network-service semantics |
 | **CrewAI / AutoGen memory** | Per-crew or per-agent embedded memory | Cross-session persistence; compression quality |
 
 ### What MNEMOS does that none of them do
@@ -110,36 +110,40 @@ If none of those questions matter for your use case, a simpler tool is probably 
 
 ---
 
-### Why MemPalace is not the answer
+### MemPalace and MNEMOS: different problems, not competitors
 
-MemPalace gained immediate traction in the OpenClaw and agentic developer community by publishing a **96.6% R@5 score on the LongMemEval benchmark** alongside a local-only, zero-API-cost promise. In an ecosystem where long-term memory without context explosion is actively unsolved, that headline pulled immediate experimental integration from developers who assumed the problem was solved.
+MemPalace, created by Mila Jovanovic, has pushed long-horizon agent memory into the ecosystem in a way few other projects have. The LongMemEval benchmark attention, the AAAK abbreviation research, and the Palace spatial-memory metaphor are real contributions to a problem — keeping agent memory useful across long time horizons without context explosion — that is genuinely unsolved and genuinely hard. It's work worth taking seriously, and MNEMOS has been influenced by several of its ideas.
 
-The problem is where that score actually came from.
+In particular, MNEMOS shares MemPalace's bets that:
 
-MemPalace's benchmark was measured in **raw verbatim mode** — storing and retrieving unsummarized chat logs in ChromaDB, which is plain vector similarity over raw text. The headline innovations the community adopted — the AAAK abbreviation dialect (claiming 30x lossless compression) and the Palace spatial architecture (claiming improved retrieval through named rooms and wings) — are what developers integrated expecting to get the 96% score. MemPalace's own creators acknowledged on April 7, 2026 that AAAK mode **regresses retrieval accuracy to 84.2%** because abbreviation degrades embedding quality. The spatial architecture is standard ChromaDB metadata filtering.
+- Memory deserves first-class treatment as a data structure, not as a side-effect of conversation history.
+- Compression is a design axis, not an afterthought: if you keep everything raw you lose the context-window fight, and if you compress naively you lose fidelity.
+- Long-horizon memory needs structure. Whether you call it a "palace", a DAG, or a temporal knowledge graph, the point is that flat vector similarity runs out of answers fast.
 
-So the product getting integrated is raw ChromaDB wrapped in Python — with a real-world accuracy in the mid-80s — while developers believe they are getting the 96% version that does not exist in practice. This is a classic case of hype-driven development: the benchmark was real, but it measured a mode nobody uses, and the innovations that drove adoption actively make things worse.
+**MNEMOS is not trying to replace MemPalace.** The two projects are solving adjacent problems with different shapes, for different users:
 
-**The architectural gaps, specifically:**
-
-| Capability | MemPalace | MNEMOS |
+| | MemPalace | MNEMOS |
 |---|---|---|
-| **Storage** | ChromaDB (SQLite-backed) — known segfault risk on macOS at scale | PostgreSQL + pgvector — ACID transactions, no corruption risk |
-| **Multi-user** | Single-process, no access control | Row Level Security, namespace isolation, API key auth |
-| **Compression** | AAAK abbreviation dialect — degrades retrieval by 12+ points | Async background distillation via local SLMs (Phi, Llama); quality manifest on every compression |
-| **Fact mutation** | Old and new facts coexist in vector space with no resolution mechanism | Temporal KG: triples with `valid_from`/`valid_until`; timeline API per subject |
-| **Reasoning audit** | Storage only — no reasoning layer | SHA-256 Merkle-like hash chain on every GRAEAE prompt/response; cryptographically tamper-evident |
+| **Form factor** | Desktop library, embedded in-process | Network service (FastAPI on port 5002), runs as a daemon |
+| **Deployment** | `pip install`, runs inside your agent | Deployed alongside your stack the way you'd run PostgreSQL or Redis; many agents and processes connect over REST |
+| **Storage** | ChromaDB (SQLite-backed vector store) | PostgreSQL + pgvector with ACID transactions |
+| **Primary user** | Individual developer on a single machine | Teams / platforms operating shared infrastructure |
+| **Concurrency model** | Single-process, single-user | Multi-tenant with per-owner isolation, multi-process clients |
+| **Audit surface** | Local logs | SHA-256 hash-chained audit chain, tamper-evident and externally reviewable |
+| **Reasoning** | Storage + retrieval | GRAEAE multi-LLM consensus with quality scoring and provider failover |
 
-MemPalace is a reasonable choice for single-user local development where raw similarity search is sufficient. The moment you need compression you can verify, memory that multiple agents share safely, facts that can be updated without contradiction, or a reasoning layer you can audit, it cannot deliver — those capabilities were never in the design.
+If you are one developer building a personal agent that runs on your laptop and you want it to work offline with no infrastructure overhead, MemPalace is designed exactly for that and is a legitimate, well-constructed choice.
 
-MNEMOS took the harder path: PostgreSQL instead of SQLite, real async compression with quality gates and a manifest instead of abbreviation heuristics, and cryptographic audit instead of flat log files. Less flashy to demo, harder to `pip install`, and exactly what production agentic systems actually need.
+If you are a team or a platform deploying shared agent memory that multiple processes need to access concurrently, with an audit trail that stands up to external review, a DB backend that survives crashes and schema migrations, and a reasoning layer you can point a regulator or auditor at, MNEMOS is designed for that.
+
+The shared premise — that agent memory deserves first-class treatment — is the same. The deployment target is not. Please don't read this section as a takedown; it's a map.
 
 
 ## What works now
 
 This is the current state of v3.0.0. Features described here are implemented and running in production. Features listed in the Roadmap section that are "scheduled for v3.0.0" are under active development for this release.
 
-The API surface is namespaced under `/v1/*`. v3.0.0 is the first public release — the unified `/v1/` namespace is the only supported surface, and there are no pre-v3 aliases.
+The API surface is namespaced under `/v1/*`.
 
 ### Memory API (v1)
 
