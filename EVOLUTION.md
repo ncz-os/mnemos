@@ -12,36 +12,34 @@ forward as architecture changes land.
 
 ---
 
-## Pre-history — the story that started it all
+## v1.0.0 — December 2025 — "a file that doesn't disappear"
+
+### The story that started it all
 
 > **TO FILL IN (from the author).** The original catalyzing moment —
-> the conversation with Claude (or the specific failure mode in a
-> Claude-assisted agent workflow) that made it obvious this had to be
-> a separate system rather than a convenience feature. Keep it concrete:
-> what did the agent forget, what broke because of it, what made
-> "just use a context file" look inadequate. This paragraph is more
-> important to future contributors than any of the architecture notes
-> below; it's the *why*.
+> the conversation with Claude, the specific failure mode, the exact
+> thing that made "just use a context file" stop being an adequate
+> answer. Keep it concrete: what did the agent forget, what broke
+> because of it, what got said in that session that made the problem
+> look permanent instead of incidental. This paragraph is the *why*
+> MNEMOS exists at all, and it's the paragraph future contributors
+> will remember from this document. Everything below it is
+> architecture; this one is the reason the architecture was ever
+> written.
 >
-> Placeholder to replace with the real story: a long-running Claude
-> session, an accumulating context file, an observable failure in
-> retrieval quality after some threshold, and the realization that
-> what was needed was not "bigger context" but "memory with operational
-> semantics." Whatever the actual details are, put them here.
+> Placeholder, to replace with the real anecdote in your own voice.
 
 What followed from that moment was the non-negotiable design commitment
 MNEMOS has carried through every subsequent version: **memory that is
 persistent, inspectable, attributable, and operationally reliable — not
 just convenient in a demo.**
 
----
+### What actually shipped in v1.0
 
-## v1.0.0 — December 2025 — "a file that doesn't disappear"
-
-**What shipped:** a single-file FastAPI server with a PostgreSQL + pgvector
-backend. GRAEAE ran as a separate service on port 5001; memory and
-reasoning were two processes that didn't know much about each other. The
-primary goal was the simplest thing that could survive a process restart.
+A single-file FastAPI server with a PostgreSQL + pgvector backend.
+GRAEAE ran as a separate service on port 5001; memory and reasoning
+were two processes that didn't know much about each other. The primary
+goal was the simplest thing that could survive a process restart.
 
 **Key design choices that survived into v3:**
 
@@ -338,6 +336,62 @@ original v3 PRs had claimed but not delivered. The ones worth remembering:
   The original was accurate on the narrow technical points but wrong
   in spirit for a first-public-release document. Competitors deserve
   respect; we would want the same.
+
+---
+
+## Architectural decisions made during the release-gate audit pass
+
+The release-gate pass caught two claims in the README that needed firm
+architectural calls, not just wording fixes. Recording them here so the
+reasoning survives:
+
+### ADR-01: Response cache stays exact-match, not semantic
+
+- **Context.** The README described the GRAEAE consultation cache as
+  "embedding-similarity deduplication". The code (`graeae/_cache.py`)
+  is an LRU keyed on `sha256(task_type + normalized_prompt)`, with a
+  comment explicitly saying semantic similarity is *not* used because
+  the embedding round-trip negates the win for near-duplicate cases.
+- **Decision.** Keep the exact-match implementation. Update the docs to
+  describe what the code actually does. Do not ship semantic / embedding
+  similarity lookup in v3.0.0-beta.
+- **Rationale.**
+  - Embedding lookup cost (~5–20 ms for nomic-embed-text / BGE) against
+    a provider round-trip (~500–2000 ms) is ~1% — cheap, not free.
+  - Agent workflows in practice repeat exactly-the-same constructed
+    prompts (system prompt + context block + templated question), so
+    exact-match on the normalized form plausibly catches most realistic
+    hits without added complexity.
+  - Aspirational docs that the code doesn't back is the exact class of
+    claim the audit pass was designed to catch. Calling it what it is
+    keeps the release honest.
+- **Upgrade trigger.** If instrumentation shows cache hit rate below
+  ~15% under real load, re-evaluate semantic lookup with a live
+  comparison of latency-saved-per-call.
+- **Reversibility.** The cache sits behind `ResponseCache.get` /
+  `.set`. Swapping the key function from `sha256(normalized)` to
+  `embedding_lookup(normalized)` is a localized change, not a schema
+  change. This is a cheap decision to revisit.
+
+### ADR-02: Distillation worker keeps the supervisor-wrapper pattern
+
+- **Context.** Two files, one feature — `distillation_worker.py` is the
+  worker class; `api/lifecycle.py::_run_distillation_worker` is the
+  supervisor that wraps it with exponential-backoff restart. An
+  auditor grep for "backoff" in the worker class came up empty and
+  suggested the feature was missing. It wasn't; it was in the wrapper.
+- **Decision.** Keep the two-file separation. Worker knows how to do
+  the work. Supervisor knows how to keep the worker alive. Two concerns,
+  two files.
+- **Rationale.** Conflating work and supervision inside a single class
+  is the pattern that produces workers that "never die because we can't
+  tell whether they died". Moving supervision out — to something that
+  is literally a `while True` loop with a `try/except Exception` and a
+  backoff counter — is what lets the worker class stay small and
+  testable.
+- **Mitigation for the audit confusion.** A docstring cross-reference
+  in `distillation_worker.py` pointing at the supervisor, so the next
+  person to grep finds both files without having to read this doc.
 
 ---
 
