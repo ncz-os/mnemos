@@ -199,7 +199,14 @@ async def add_session_message(
         mnemos_docs = await _search_mnemos_context(request.content, user, limit=3)
 
         if mnemos_docs:
-            # Store injection record for each memory
+            # Store injection record for each memory.
+            # compression_ratio is NULL because the session-injection path
+            # currently ships raw-slice truncation (doc['content'][:500] below),
+            # not real LETHE/ALETHEIA/ANAMNESIS compression. Writing a
+            # fabricated ratio (previously: 0.45 literal) turned
+            # `session_memory_injections.compression_ratio` into a fiction
+            # column. It stays NULL until v3.1 wires compression into this
+            # path with a real ratio derived from the compression manifest.
             async with pool.acquire() as conn:
                 for i, doc in enumerate(mnemos_docs):
                     memory_id = doc.get("id", f"doc_{i}")
@@ -213,7 +220,7 @@ async def add_session_message(
                         message_id,
                         memory_id,
                         0.9 - (i * 0.1),  # decreasing relevance
-                        0.45,  # assumed LETHE compression
+                        None,  # real ratio requires compression wired into the session path
                     )
 
             mnemos_context = "\n\n".join([f"[Memory]\n{doc['content'][:500]}" for doc in mnemos_docs])
@@ -260,7 +267,11 @@ async def add_session_message(
 
         # Estimate tokens (rough approximation: ~4 chars per token)
         tokens_used = len(response_text) // 4
-        compression_ratio = memories_injected / max(session["message_count"] + 1, 1)
+        # compression_ratio stays NULL at the session-message level until
+        # compression is actually wired into the session-injection path.
+        # Prior code computed `memories_injected / message_count` — a ratio
+        # with no semantic relationship to compression effectiveness.
+        compression_ratio = None
 
     except Exception as e:
         logger.error(f"[SESSIONS] Provider routing failed: {e}")

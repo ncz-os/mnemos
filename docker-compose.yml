@@ -8,10 +8,21 @@ services:
       POSTGRES_DB: mnemos
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Migration ordering must match installer/db.py::run_migrations()
+      # (see EVOLUTION.md "decisions we would revisit" — the two
+      # canonical ordering sites must stay in sync until we move to
+      # Alembic or sqitch).
       - ./db/migrations.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./db/migrations_v1_multiuser.sql:/docker-entrypoint-initdb.d/02-multiuser.sql
       - ./db/migrations_v2_versioning.sql:/docker-entrypoint-initdb.d/03-versioning.sql
-      - ./db/migrations_model_registry.sql:/docker-entrypoint-initdb.d/04-model-registry.sql
+      - ./db/migrations_v2_sessions.sql:/docker-entrypoint-initdb.d/04-sessions.sql
+      - ./db/migrations_model_registry.sql:/docker-entrypoint-initdb.d/05-model-registry.sql
+      - ./db/migrations_v3_dag.sql:/docker-entrypoint-initdb.d/06-dag.sql
+      - ./db/migrations_v3_graeae_unified.sql:/docker-entrypoint-initdb.d/07-graeae-unified.sql
+      - ./db/migrations_v3_webhooks.sql:/docker-entrypoint-initdb.d/08-webhooks.sql
+      - ./db/migrations_v3_oauth.sql:/docker-entrypoint-initdb.d/09-oauth.sql
+      - ./db/migrations_v3_federation.sql:/docker-entrypoint-initdb.d/10-federation.sql
+      - ./db/migrations_v3_ownership.sql:/docker-entrypoint-initdb.d/11-ownership.sql
     ports:
       - '127.0.0.1:5432:5432'
     healthcheck:

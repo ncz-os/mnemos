@@ -43,7 +43,7 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
-app = FastAPI(title="MNEMOS API", version="3.0.0", description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway", lifespan=lifespan)
+app = FastAPI(title="MNEMOS API", version="3.0.1", description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway", lifespan=lifespan)
 
 # ── Request body size limit (SEC-04) ──────────────────────────────────────────
 # Default 5 MB. Override via MAX_BODY_BYTES env var.

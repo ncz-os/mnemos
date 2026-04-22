@@ -216,6 +216,31 @@ async def _get_model_recommendation(
         return None
 
 
+def _flatten_messages_for_prompt(messages: List[Dict[str, str]]) -> str:
+    """Serialize a chat-completions ``messages`` array to a single prompt string.
+
+    Used as a fallback when GRAEAE's single-provider route accepts only a
+    flat prompt. Preserves role boundaries so a provider that was given a
+    system prompt, prior assistant turns, and a fresh user question sees
+    all three, not just the last user message (regression for #M31-02).
+    """
+    parts: List[str] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "") or ""
+        if not content:
+            continue
+        if role == "system":
+            parts.append(f"[System]\n{content}")
+        elif role == "assistant":
+            parts.append(f"[Assistant]\n{content}")
+        elif role == "tool":
+            parts.append(f"[Tool]\n{content}")
+        else:
+            parts.append(f"[User]\n{content}")
+    return "\n\n".join(parts)
+
+
 async def _route_to_provider(
     model: str,
     messages: List[Dict[str, str]],
@@ -225,7 +250,13 @@ async def _route_to_provider(
 ) -> str:
     """Route request to selected provider via GRAEAE single-provider mode."""
     graeae = get_graeae_engine()
-    prompt = messages[-1]["content"] if messages else ""
+    # Flatten the full messages array rather than keeping only
+    # messages[-1]. The prior behaviour silently dropped the system prompt,
+    # injected memory context, and every prior turn — multi-turn chat via
+    # /v1/chat/completions collapsed to single-shot.
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages required")
+    prompt = _flatten_messages_for_prompt(messages)
 
     # Determine provider from model name
     provider_map = {
@@ -245,7 +276,10 @@ async def _route_to_provider(
             provider = mapped
             break
 
-    logger.info(f"[MNEMOS] Route: model={model} → provider={provider}")
+    logger.info(
+        f"[MNEMOS] Route: model={model} → provider={provider} "
+        f"(messages={len(messages)}, prompt_chars={len(prompt)})"
+    )
 
     try:
         # Use GRAEAE single-provider route (no consensus, just direct call)
