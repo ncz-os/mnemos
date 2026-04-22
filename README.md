@@ -159,11 +159,11 @@ All admin endpoints require root role. On personal installs (no auth), they are 
 
 | Endpoint | What it does |
 |----------|-------------|
-| `POST /triples` | Create a subject → predicate → object triple |
-| `GET /triples` | List triples with filters |
-| `GET /timeline/{subject}` | All triples for a subject in temporal order |
-| `PATCH /triples/{id}` | Update a triple |
-| `DELETE /triples/{id}` | Delete a triple |
+| `POST /kg/triples` | Create a subject → predicate → object triple |
+| `GET /kg/triples` | List triples with filters |
+| `GET /kg/timeline/{subject}` | All triples for a subject in temporal order |
+| `PATCH /kg/triples/{id}` | Update a triple |
+| `DELETE /kg/triples/{id}` | Delete a triple |
 
 ### Consultations — reasoning domain (v3, shipped)
 
@@ -184,12 +184,8 @@ Unified provider catalog with health tracking and task-aware recommendation.
 | Endpoint | What it does |
 |----------|-------------|
 | `GET /v1/providers` | List all configured providers with metadata |
-| `GET /v1/providers/{provider}` | Inspect a single provider |
 | `GET /v1/providers/health` | Per-provider availability + circuit-breaker state |
 | `GET /v1/providers/recommend` | Recommend a model for a task-type + budget |
-| `GET /v1/providers/best` | Highest-scoring provider right now |
-
-Legacy `/model-registry/*` paths remain functional as deprecated aliases.
 
 ### OpenAI-compatible gateway (v3, shipped)
 
@@ -207,10 +203,11 @@ Multi-turn conversation state with memory injection at turn boundaries. Sessions
 
 | Endpoint | What it does |
 |----------|-------------|
-| `POST /v1/sessions` | Start a new session |
-| `GET /v1/sessions/{id}` | Retrieve session state |
-| `GET /v1/sessions/{id}/history` | Full message history |
-| `DELETE /v1/sessions/{id}` | End a session |
+| `POST /sessions` | Start a new session |
+| `GET /sessions/{id}` | Retrieve session state |
+| `POST /sessions/{id}/messages` | Post a turn; memory injection at turn boundary |
+| `GET /sessions/{id}/history` | Full message history |
+| `DELETE /sessions/{id}` | End a session |
 
 ### Webhooks (v3, shipped)
 

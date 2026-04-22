@@ -22,7 +22,7 @@ Required before first run — export in shell or add to .zshrc/.bashrc:
 
   export TEST_HOST=<ip-or-hostname>          # fresh-install test target (e.g. a Debian VM or spare server)
   export PROD_HOST=<ip-or-hostname>          # production upgrade target (existing MNEMOS instance)
-  export GIT_HOST=<ip-or-hostname>           # git source-of-truth host (ARGONAS or any git server)
+  export GIT_HOST=<ip-or-hostname>           # git source-of-truth host (any reachable git server)
   export SSH_USER=<your-username>            # SSH user on TEST_HOST and PROD_HOST
   export GIT_REMOTE_PATH=<path>             # path to mnemos bare repo on GIT_HOST
   export BASE_URL=http://$TEST_HOST:5002     # set after install; update if port differs
