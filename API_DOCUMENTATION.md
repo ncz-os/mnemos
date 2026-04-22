@@ -11,8 +11,7 @@
 > and `http://localhost:5002/redoc`. This document describes the core surface
 > and common examples; `/docs` is the source of truth.
 
-v3.0.0 is the first public release of MNEMOS. The unified `/v1/` namespace is
-the only supported API surface — there are no pre-v3 path aliases.
+The unified `/v1/` namespace is the supported API surface.
 
 ---
 

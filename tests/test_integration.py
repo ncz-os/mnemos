@@ -274,7 +274,7 @@ class TestDockerIntegration:
         assert 'Metal' in content or 'metal' in content.lower()
 
     def test_pyproject_toml_version_updated(self):
-        """pyproject.toml reflects v2.4.0."""
+        """pyproject.toml reflects current version."""
         pyproject_path = Path(__file__).parent.parent / 'pyproject.toml'
         assert pyproject_path.exists(), "pyproject.toml not found"
         content = pyproject_path.read_text()

@@ -15,7 +15,7 @@ set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-MNEMOS_VERSION="2.3.0"
+MNEMOS_VERSION="3.0.0-beta"
 MNEMOS_REPO="https://github.com/perlowja/mnemos"
 INSTALL_DIR="${MNEMOS_INSTALL_DIR:-/opt/mnemos}"
 INSTALLER_ARGS="${*:-}"

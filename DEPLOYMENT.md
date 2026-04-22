@@ -417,18 +417,7 @@ psql -d mnemos -c "REINDEX TABLE memories;"
 
 ---
 
-## Upgrade Notes
-
-### v2.4.0 → v3.0.0
-- All v2.4.0 endpoints remain unchanged (backward compatible)
-- New v3.0.0 endpoints available at `/v1/` prefix
-- Database schema: Apply `db/migrations_v3_graeae_unified.sql`
-- Update GRAEAE defaults (now Together + Groq first)
-
----
-
 ## Support
 
-- GitHub: https://github.com/your-org/mnemos
-- Issues: https://github.com/your-org/mnemos/issues
-- Documentation: https://mnemos.readthedocs.io
+- GitHub: https://github.com/perlowja/mnemos
+- Issues: https://github.com/perlowja/mnemos/issues
