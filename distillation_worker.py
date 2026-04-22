@@ -172,9 +172,9 @@ class MemoryDistillationWorker:
                     strategy_used = result.get("strategy_used", "token")
                     # strategy_used is 'token', 'sentence', or the engine's internal label;
                     # record as 'lethe-<mode>' for clarity in the compression log.
-                    if strategy_used in ("sentence", "sac"):
+                    if strategy_used == "sentence":
                         compression_method = "lethe-sentence"
-                    elif strategy_used in ("token", "hyco", "token_filter"):
+                    elif strategy_used == "token":
                         compression_method = "lethe-token"
                     else:
                         compression_method = f"lethe-{strategy_used}"

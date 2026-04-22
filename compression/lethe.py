@@ -4,8 +4,8 @@ LETHE: Fast CPU-based compression (Tier 1)
 
 Named for the river of forgetfulness — discards the inessential.
 Combines two modes:
-  - token mode: extractive token filter importance-weighted token filtering (~0.5ms, 57% reduction)
-  - sentence mode: SENTENCE structure-preserving sentence extraction (~2-5ms, 50% reduction)
+  - token mode: extractive token filter via stop-word removal + importance markers (~0.5ms, 57% reduction)
+  - sentence mode: sentence-boundary extraction with positional/marker scoring (~2-5ms, 50% reduction)
 
 Auto-selects based on text structure (structured → sentence, unstructured → token).
 No LLM, no GPU. Real-time performance <5ms.
@@ -27,7 +27,7 @@ class LETHE:
         Initialize LETHE compressor.
 
         Args:
-            mode: "token" (extractive token filter), "sentence" (SENTENCE), or "auto" (detect based on structure)
+            mode: "token", "sentence", or "auto" (detect based on structure)
             aggressive: If True, compress more aggressively (token mode: 57% reduction)
             min_length: Minimum token length to preserve (words < 5 chars often less important)
         """
@@ -129,7 +129,7 @@ class LETHE:
         return "sentence" if has_structure else "token"
 
     def _compress_token(self, text: str, target_ratio: float) -> Dict:
-        """Token-level compression (extractive token filter mode)."""
+        """Token-level compression (stop-word + importance-marker extractive filter)."""
         tokens = self._tokenize(text)
         original_count = len(tokens)
 
@@ -180,7 +180,7 @@ class LETHE:
         }
 
     def _compress_sentence(self, text: str, target_ratio: float) -> Dict:
-        """Sentence-level compression (SENTENCE mode)."""
+        """Sentence-level compression (boundary extraction with positional scoring)."""
         sentences = self._identify_sentences(text)
         original_tokens = len(text.split())
 

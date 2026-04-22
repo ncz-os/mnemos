@@ -17,7 +17,7 @@ class QualityManifest:
     timestamp: str
     source: str  # 'memory_storage', 'rehydration', 'graeae'
     task_type: str
-    method: str  # 'token_filter', 'sac'
+    method: str  # 'lethe', 'aletheia', 'anamnesis'
 
     original_tokens: int
     compressed_tokens: int

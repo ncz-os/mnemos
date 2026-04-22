@@ -191,7 +191,7 @@ class CompressionManager:
 
         # Execute compression
         try:
-            if method in ("lethe", "token_filter"):  # token_filter alias for backward compat
+            if method == "lethe":
                 result = await self._compress_lethe(text, task_type, target_ratio)
             elif method == "aletheia":
                 result = await self._compress_aletheia(text, task_type, target_ratio)

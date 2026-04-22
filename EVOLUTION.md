@@ -42,7 +42,7 @@ The non-obvious calls that proved out across every refactor:
 1. **PostgreSQL over anything else.** Every alternative memory system looked at had eventually regretted its SQLite / ChromaDB / duckdb foundation. This codebase has not.
 2. **Treat reasoning as its own named subsystem (GRAEAE)** rather than "MNEMOS plus an LLM call". This is what made the audit chain, the circuit breakers, and the Arena.ai weighting possible. A reasoning-as-a-feature design would have had to bolt all of that onto an existing call site.
 3. **Compression gets a receipt.** The per-transformation quality manifest is the single most operator-valued feature for audit-sensitive users. No other memory system treats compression as something that requires documentation.
-4. **Greek names are subsystem tags, not theming.** Every Greek name in the source tree maps to a real subsystem. When extractive token filter was rebranded to LETHE the change was load-bearing; when ANAMNESIS was added as Tier 3 it had to be its own file, its own code path, its own failure mode. The naming does work.
+4. **Greek names are subsystem tags, not theming.** Every Greek name in the source tree maps to a real subsystem. When subsystems get renamed (from internal development aliases to the Greek tags used in source), the change is load-bearing: every log line, migration, and test reference updates together. When ANAMNESIS was added as Tier 3 it had to be its own file, its own code path, its own failure mode. The naming does work.
 5. **Referential integrity at the database layer, not the app layer.** The FK edges and their `ON DELETE` choices are the spine of the data model. Applications pass through; the constraint stays.
 
 ---

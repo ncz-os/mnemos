@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS memories (
 
   -- Compression fields
   compressed_content TEXT,
-  compression_method VARCHAR(50),           -- 'token_filter', 'sac', etc
+  compression_method VARCHAR(50),           -- 'lethe', 'aletheia', 'anamnesis', etc
   compression_ratio FLOAT,                   -- 0.0-1.0 (compressed/original)
 
   -- Quality tracking
