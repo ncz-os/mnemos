@@ -5,6 +5,7 @@
 # MNEMOS + GRAEAE
 
 **A memory operating system for serious agentic work — not a memory-storage provider.**
+**The memory system for everyone. We interoperate.**
 **In daily production use since December 2025.**
 
 The distinction matters. A *storage provider* gives you a place to put bytes. An *operating system* gives you named subsystems — a scheduler, a compressor, a process manager, a security layer, an auditor — that manage the full lifecycle of a resource the application no longer has to babysit.
@@ -30,6 +31,29 @@ You can treat MNEMOS like a memory storage provider if you want — `POST /v1/me
 - Three-tier compression pipeline (LETHE CPU / ALETHEIA GPU / ANAMNESIS archival) with a written quality manifest on every transformation.
 - Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in.
 - Runs alongside your applications the way Redis, PostgreSQL, or a message bus would. Deploy once, every agent in your stack shares the same memory substrate.
+
+## Works with
+
+MNEMOS is designed to be the memory layer for the agentic tooling you already use — not a replacement for it. We interoperate on purpose, over three mechanisms, so there is no language lock-in and no pressure to rewrite your agent around us.
+
+### How we interoperate
+
+1. **MCP (Model Context Protocol).** MNEMOS ships a stdio MCP server (`mcp_server.py`) that exposes memory operations — search, create, update, delete, DAG versioning, model optimizer — as first-class tool calls. Register it in any MCP-aware client (Claude Code, OpenClaw, ZeroClaw, Hermes) and the agent gets persistent memory without your framework having to know MNEMOS exists at the code level.
+2. **OpenAI-compatible gateway.** `POST /v1/chat/completions` and `GET /v1/models` are drop-in for the OpenAI SDK. Point `OPENAI_BASE_URL` at your MNEMOS instance and any client that already speaks OpenAI gets memory injection, multi-provider routing, and consensus scoring with zero code change. This is the path for LangChain, LlamaIndex, CrewAI, AutoGen, and anything else that was written against the OpenAI wire protocol.
+3. **Native `/v1/*` REST surface.** For integrations that want to speak to MNEMOS directly: `/v1/memories`, `/v1/consultations`, `/v1/providers`, `/sessions`, `/v1/webhooks`, `/v1/federation`, `/kg/triples`. The full API is language-agnostic; pick your HTTP client and go.
+
+### Today's integration inventory
+
+- **[Claude Code](https://www.anthropic.com/claude-code)** — drop-in hooks (session-start / user-prompt-submit / stop), skill config, and MCP server. See `integrations/claude-code/`. *MCP.*
+- **[OpenClaw](https://github.com/openclaw/openclaw)** — AGENTS.md skill snippet + MCP registration. See `integrations/openclaw/`. *MCP.*
+- **[ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw)** — memory skill over MCP. Works without adding any Python dependency to ZeroClaw's Rust runtime — memory ops cross the wire to a MNEMOS instance running wherever. See `integrations/zeroclaw/`. *MCP.*
+- **[Hermes Agent](https://github.com/nousresearch/hermes-agent)** — optional persistence backend for team / multi-tenant / compliance-regulated Hermes deployments. See `integrations/hermes/`. *MCP + REST.*
+- **[MemPalace](https://github.com/MemPalace/mempalace)** — graduation path, not a replacement. A portability schema + importer lets a MemPalace user who grows into a team preserve their drawers and palaces rather than start over. See [RFC #1112 on MemPalace](https://github.com/MemPalace/mempalace/discussions/1112). *REST bulk import.*
+- **[Mem0](https://github.com/mem0ai/mem0) / [Letta](https://github.com/letta-ai/letta) / [Zep](https://github.com/getzep/zep)** — one-shot bulk consolidation via `POST /v1/memories/bulk`. If you already have a running memory store elsewhere and need to converge, MNEMOS is where they converge *to*. *REST bulk import.*
+- **[LangChain](https://github.com/langchain-ai/langchain) / [LlamaIndex](https://github.com/run-llama/llama_index)** — works today via the **OpenAI-compatible gateway**: point `OPENAI_BASE_URL` at MNEMOS and memory injection + multi-provider routing land automatically. A native `MnemosMemory` adapter class is on the roadmap. *OpenAI-compat today; native adapter roadmap.*
+- **[CrewAI](https://github.com/crewAIInc/crewAI) / [AutoGen](https://github.com/microsoft/autogen)** — shared memory across agents in a crew / group. Works today via the **OpenAI-compatible gateway**; native memory-backend adapter is roadmap. *OpenAI-compat today; native adapter roadmap.*
+
+The integrations bundle under [`integrations/`](./integrations/) is the living inventory. New integrations ship as SKILL.md + MCP config + enforcement snippet per framework, plus idempotent install/uninstall scripts where the target framework supports them.
 
 MNEMOS runs as a network service — you deploy it once, alongside PostgreSQL and Redis, and every agent in your stack shares the same memory kernel over REST. It is not a desktop library, not an in-process helper, not a framework you import. Different form factor, different user, and specifically not a replacement for projects like MemPalace that serve the desktop / single-user case well.
 
