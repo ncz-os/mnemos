@@ -22,18 +22,18 @@ The catalyzing moment was one question typed into a Claude Code session:
 
 > *"Who is Lonnie and what did he promise me?"*
 
-Lonnie is my boss at NVIDIA on the AI Accelerator team. He had promised me a DGX Spark to order internally. That promise had been discussed across half a dozen prior sessions, was sitting in the ChromaDB vector store fully intact, and still took **more than fifteen semantic searches** to piece back together into a single answer:
+Lonnie is a friend of mine who had promised to send me some equipment. That promise had been discussed across half a dozen prior sessions, was sitting in the ChromaDB vector store fully intact, and still took **more than fifteen semantic searches** to piece back together into a single answer:
 
-- *"boss"* → found fragments.
-- *"AI Accelerator team"* → more fragments.
-- *"DGX Spark"* → connected the promise.
-- *"order internally"* → finally reconstructed the story.
+- *"friend"* → found fragments.
+- *"promised"* → more fragments.
+- *"equipment"* → connected the promise.
+- *"going to send"* → finally reconstructed the story.
 
-It worked, eventually. It should not have taken fifteen searches to answer a question about a person. The problem was not retrieval quality — the vectors were fine. The problem was that vector search finds similar *text*, and my question was about connected *meaning*: **Lonnie → is boss of → me → promised → DGX Spark**. A flat chunked vector store has no way to traverse a graph like that. You can only hope the right fragments happen to be semantically nearby, and pray the re-assembly happens upstream in the model.
+It worked, eventually. It should not have taken fifteen searches to answer a question about a person. The problem was not retrieval quality — the vectors were fine. The problem was that vector search finds similar *text*, and my question was about connected *meaning*: **Lonnie → is friend of → me → promised → equipment**. A flat chunked vector store has no way to traverse a graph like that. You can only hope the right fragments happen to be semantically nearby, and pray the re-assembly happens upstream in the model.
 
 The written design review from December 3, 2025 (`DESIGN_REVIEW_FOR_GPT_GEMINI.md` in my notes) captured it in one line:
 
-> *"Vector search finds similar TEXT, not connected MEANING. Can't traverse relationships like 'Lonnie → is boss of → Jason → promised → DGX Spark'."*
+> *"Vector search finds similar TEXT, not connected MEANING. Can't traverse relationships like 'Lonnie → is friend of → Jason → promised → equipment'."*
 
 That one observation is the reason almost everything downstream exists. It's why v2.3 shipped with a knowledge-graph API (`/kg/triples`, `/kg/timeline/{subject}`) that stores subject → predicate → object triples with temporal validity windows alongside the vector memories. It's why v3.0 ships per-owner scoping on memories, consultations, state, and entities — because *"who"* and *"what's true of them"* and *"who said what to whom, when"* are not answered by similarity alone. It's why, when I eventually reached for a proper name, the Greek goddess of memory ended up feeling right: what I was building was not a database and not a cache; it was something that was supposed to remember *the way humans remember*, which is always relational.
 
