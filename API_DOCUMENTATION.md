@@ -168,9 +168,8 @@ path-param matching does not shadow them.
 ## Providers & Models
 
 - `GET /v1/providers` — unified catalog (health-tracked)
+- `GET /v1/providers/health` — per-provider availability + circuit-breaker state
 - `GET /v1/providers/recommend?task_type=...&budget=...` — task-aware routing
-- `GET /v1/providers/best?task_type=...` — single best provider
-- Admin-only: `POST /v1/model-registry` (requires `role='root'`) — sync Arena.ai Elo scores
 
 On a fresh install with an empty `model_registry` table, `/recommend` falls
 back to the static GRAEAE provider config so new deployments aren't 404.
