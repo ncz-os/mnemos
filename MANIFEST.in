@@ -27,20 +27,22 @@ include .env.example
 # SQL migrations (also included as db/ package-data for wheel installs)
 recursive-include db *.sql
 
-# Integrations bundle (claude-code / openclaw / zeroclaw / hermes)
-recursive-include integrations *.md *.json *.sh *.py *.yml
+# Integrations bundle (claude-code / openclaw / zeroclaw / hermes) —
+# include every file. These directories carry mixed extensions (*.md /
+# *.json / *.sh / *.yaml / *.snippet / hooks.config.example / dotfile-
+# directory descendants like .claude/skills/.../SKILL.md) and ship
+# entire. A graft is cleaner than trying to enumerate extensions.
+graft integrations
 
-# Docs tree
-recursive-include docs *.md *.png *.svg
+# Docs tree (README images, architecture notes). Only *.md and *.png today;
+# extend if/when docs/ starts carrying other asset types.
+recursive-include docs *.md *.png
 
 # Tests ride along in the sdist so `pytest` works out of a repo tarball
 recursive-include tests *.py
 
-# Systemd unit files (if any under systemd/)
+# Systemd unit files (service + timer for the model-registry sync jobs)
 recursive-include systemd *.service *.timer
-
-# Harness assets
-recursive-include harness *.py *.json *.yml
 
 # Exclude build artefacts + caches
 global-exclude __pycache__
