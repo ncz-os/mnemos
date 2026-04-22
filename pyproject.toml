@@ -60,6 +60,12 @@ dev = [
   "ruff>=0.5.0",
 ]
 
+[project.scripts]
+# Entry points that land in PATH after `pip install mnemos-os`. The installer
+# can then be invoked as `mnemos-install` without needing install.py on the
+# filesystem.
+mnemos-install = "installer.__main__:main"
+
 [tool.setuptools]
 py-modules = [
   "api_server",
@@ -68,9 +74,29 @@ py-modules = [
   "mcp_server",
   "inference_backend",
 ]
+# Ship every file listed in MANIFEST.in (SQL migrations, config example,
+# systemd unit) into the sdist and, via package-data below, into the wheel.
+include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["api*", "compression*", "graeae*", "db*"]
+# Include every Python subpackage we ship, not just the core API. Previously
+# `installer`, `modules*`, and `tools` were omitted, so `pip install mnemos-os`
+# couldn't run the install CLI or the docling-import helpers.
+include = [
+  "api*",
+  "compression*",
+  "graeae*",
+  "db*",
+  "installer*",
+  "modules*",
+  "tools*",
+]
+
+[tool.setuptools.package-data]
+# SQL migrations ride inside the `db` package so `pip install mnemos-os`
+# gives you the full v3 schema bootstrap, not just the Python code. Access
+# them via `importlib.resources.files('db')` at runtime.
+db = ["*.sql"]
 
 # uv: fast Python package installer for Docker builds
 # Install with: curl -LsSf https://astral.sh/uv/install.sh | sh

@@ -1,12 +1,18 @@
-"""Export MNEMOS memories in Docling-compatible formats (Markdown, HTML, Plain Text)."""
+"""Export MNEMOS memories in Docling-compatible formats (Markdown, HTML, Plain Text).
+
+This is a library of formatters. To fetch memories from a running server,
+set the following environment variables and use your own HTTP client:
+
+    MNEMOS_BASE      — API base URL (e.g. http://localhost:5002)
+    MNEMOS_API_KEY   — Bearer token for authentication
+
+Nothing in this module makes network calls or carries a default host/key —
+bring your own.
+"""
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any
 
-# Configuration
-MNEMOS_HOST = "192.168.207.67"
-MNEMOS_PORT = 5002
-MNEMOS_KEY = "<REDACTED-MNEMOS-TOKEN>"
 
 def export_memories_markdown(memories: List[Dict[str, Any]], output_file: Path) -> None:
     """Export memories as a single Markdown document (Docling-compatible)."""
@@ -15,7 +21,7 @@ def export_memories_markdown(memories: List[Dict[str, Any]], output_file: Path) 
         f.write(f"Exported: {datetime.now().isoformat()}\n")
         f.write(f"Total memories: {len(memories)}\n\n")
         f.write("---\n\n")
-        
+
         for mem in memories:
             f.write(f"## {mem.get('id', 'Unknown')}\n\n")
             f.write(f"**Category:** {mem.get('category', 'N/A')}\n\n")
@@ -26,6 +32,7 @@ def export_memories_markdown(memories: List[Dict[str, Any]], output_file: Path) 
             f.write(mem.get('content', '(empty)'))
             f.write("\n\n---\n\n")
 
+
 def export_memories_plaintext(memories: List[Dict[str, Any]], output_file: Path) -> None:
     """Export memories as plain text (Docling-compatible)."""
     with open(output_file, 'w') as f:
@@ -34,7 +41,7 @@ def export_memories_plaintext(memories: List[Dict[str, Any]], output_file: Path)
         f.write(f"Exported: {datetime.now().isoformat()}\n")
         f.write(f"Total memories: {len(memories)}\n\n")
         f.write("=" * 80 + "\n\n")
-        
+
         for mem in memories:
             f.write(f"ID: {mem.get('id', 'Unknown')}\n")
             f.write(f"Category: {mem.get('category', 'N/A')}\n")
@@ -44,6 +51,7 @@ def export_memories_plaintext(memories: List[Dict[str, Any]], output_file: Path)
             f.write("\n" + "-" * 80 + "\n\n")
             f.write(mem.get('content', '(empty)'))
             f.write("\n\n" + "=" * 80 + "\n\n")
+
 
 def export_memories_html(memories: List[Dict[str, Any]], output_file: Path) -> None:
     """Export memories as HTML (Docling-compatible)."""
@@ -63,7 +71,7 @@ def export_memories_html(memories: List[Dict[str, Any]], output_file: Path) -> N
         f.write("<h1>MNEMOS Memory Export</h1>\n")
         f.write(f"<p>Exported: {datetime.now().isoformat()}</p>\n")
         f.write(f"<p>Total memories: {len(memories)}</p>\n")
-        
+
         for mem in memories:
             f.write("<div class='memory'>\n")
             f.write(f"<div class='memory-id'>{mem.get('id', 'Unknown')}</div>\n")
@@ -77,8 +85,9 @@ def export_memories_html(memories: List[Dict[str, Any]], output_file: Path) -> N
             f.write(mem.get('content', '(empty)'))
             f.write("</div>\n")
             f.write("</div>\n")
-        
+
         f.write("</body>\n</html>\n")
+
 
 def print_usage():
     """Print usage instructions."""
@@ -86,33 +95,41 @@ def print_usage():
 MNEMOS Memory Export for Docling
 ================================
 
-This script exports MNEMOS memories in Docling-compatible formats.
-
-Required:
-  - MNEMOS running on 192.168.207.67:5002 (PYTHIA)
-  - Bearer token for authentication
+This module provides formatters to render MNEMOS memories as Markdown, plain
+text, or HTML suitable for ingestion by IBM Docling.
 
 Usage (from Python):
-  
-  from export_memories_for_docling import export_memories_*
-  
-  memories = [...]  # Load from MNEMOS
+
+  from tools.export_memories_for_docling import (
+      export_memories_markdown,
+      export_memories_plaintext,
+      export_memories_html,
+  )
+
+  memories = [...]  # fetched from your MNEMOS server
   export_memories_markdown(memories, Path('output.md'))
   export_memories_plaintext(memories, Path('output.txt'))
   export_memories_html(memories, Path('output.html'))
 
 Supported Docling input formats:
-  ✅ Markdown (.md)
-  ✅ Plain Text (.txt)
-  ✅ HTML (.html)
-  ✅ PDF (.pdf) - if Docling has PDF support
-  
-To export from MNEMOS CLI:
+  - Markdown (.md)
+  - Plain Text (.txt)
+  - HTML (.html)
+  - PDF (.pdf) — if Docling has PDF support
 
-  curl -X POST http://192.168.207.67:5002/memories/search \\
-    -H "Authorization: Bearer $MNEMOS_KEY" \\
-    -d '{"query":"*","limit":10000}' | python3 export_memories_for_docling.py
+Fetching memories from MNEMOS:
+
+  export MNEMOS_BASE=http://localhost:5002
+  export MNEMOS_API_KEY=<your-bearer-token>
+
+  curl -X POST "$MNEMOS_BASE/v1/memories/search" \\
+    -H "Authorization: Bearer $MNEMOS_API_KEY" \\
+    -H 'Content-Type: application/json' \\
+    -d '{"query":"*","limit":10000}'
+
+Feed the JSON result into one of the formatters above.
 """)
+
 
 if __name__ == "__main__":
     print_usage()
