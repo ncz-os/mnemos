@@ -1,0 +1,53 @@
+include README.md
+include CHANGELOG.md
+include LICENSE
+include LICENSE-PROPRIETARY.md
+include CONTRIBUTING.md
+include SECURITY.md
+include DEPLOYMENT.md
+include API_DOCUMENTATION.md
+include ANTI_MEMORY_POISONING.md
+include DOCUMENT_IMPORT_GUIDE.md
+
+# Installer + bootstrap scripts, config templates, systemd unit
+include install.py
+include install.sh
+include deploy.sh
+include Makefile
+include Dockerfile
+include docker-compose.yml
+include docker-gpu-setup.sh
+include config.toml.example
+include mnemos.service
+include requirements.txt
+include requirements-phi.txt
+include api_keys.json.example
+include .env.example
+
+# SQL migrations (also included as db/ package-data for wheel installs)
+recursive-include db *.sql
+
+# Integrations bundle (claude-code / openclaw / zeroclaw / hermes)
+recursive-include integrations *.md *.json *.sh *.py *.yml
+
+# Docs tree
+recursive-include docs *.md *.png *.svg
+
+# Tests ride along in the sdist so `pytest` works out of a repo tarball
+recursive-include tests *.py
+
+# Systemd unit files (if any under systemd/)
+recursive-include systemd *.service *.timer
+
+# Harness assets
+recursive-include harness *.py *.json *.yml
+
+# Exclude build artefacts + caches
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store
+prune archive
+prune venv
+prune .venv
+prune build
+prune dist
