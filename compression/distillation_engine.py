@@ -2,8 +2,8 @@
 Distillation Engine: Integrated compression with intelligent strategy selection
 
 Now uses LETHE (THE MOIRAI Tier 1) which combines:
-- Token mode (extractive token filter-style): Fast heuristic compression
-- Sentence mode (SENTENCE-style): Structure-preserving compression
+- Token mode: extractive filter — fast heuristic compression
+- Sentence mode: boundary extraction — structure-preserving compression
 - Auto mode: Intelligent strategy selection
 - Performance monitoring
 """
@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 
 
 class CompressionStrategy(Enum):
-    """Compression strategy options (backward compat)"""
-    TOKEN = "token"           # Token mode (was extractive token filter), ~57% reduction
-    SENTENCE = "sentence"         # Sentence mode (was SENTENCE), ~50% reduction
+    """Compression strategy options"""
+    TOKEN = "token"          # Token mode: extractive filter, ~57% reduction
+    SENTENCE = "sentence"    # Sentence mode: boundary extraction, ~50% reduction
     AUTO = "auto"            # Auto-select based on structure
 
 
@@ -223,7 +223,7 @@ def distill(text: str,
 
     Args:
         text: Text to compress
-        strategy: 'hyco', 'sac', or 'auto'
+        strategy: 'token', 'sentence', or 'auto'
         ratio: Target compression ratio
         task_type: Task type for ratio selection
 
@@ -234,8 +234,8 @@ def distill(text: str,
 
     # Convert string strategy to enum
     strategy_enum = {
-        'hyco': CompressionStrategy.TOKEN,
-        'sac': CompressionStrategy.SENTENCE,
+        'token': CompressionStrategy.TOKEN,
+        'sentence': CompressionStrategy.SENTENCE,
         'auto': CompressionStrategy.AUTO,
     }.get(strategy, CompressionStrategy.AUTO)
 

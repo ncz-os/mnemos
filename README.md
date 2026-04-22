@@ -439,7 +439,7 @@ The constraints are enforced at the database level. Application bugs cannot viol
 
 Three-tier compression pipeline, each tier named after a Greek figure of memory.
 
-- **LETHE** (Tier 1, CPU, always on) — fast local compression with two modes: `token` (importance-weighted token filtering, ~0.5ms, ~57% reduction — the algorithm formerly called *extractive token filter*) and `sentence` (structure-preserving extraction, ~2–5ms, ~50% reduction — formerly *SENTENCE*). `auto` mode picks per content shape. Zero external calls.
+- **LETHE** (Tier 1, CPU, always on) — fast local compression with two modes: token mode (stop-word + importance-marker extractive filtering, ~0.5ms, ~57% reduction on functional-word-heavy prose) and sentence mode (structure-preserving sentence-boundary extraction, ~2–5ms, ~50% reduction). `auto` mode picks per content shape. Zero external calls.
 - **ALETHEIA** (Tier 2, optional GPU) — token-level importance scoring via a local LLM on a configured GPU host (`GPU_PROVIDER_HOST`); ~200-500ms, ~70% reduction. Runs offline via distillation worker; not on the live path. Falls back to LETHE when the GPU host is unreachable.
 - **ANAMNESIS** (Tier 3, optional GPU) — atomic-fact extraction for archival memories (>30 days old); semantic-level compression via LLM. Fallback: skip extraction if the GPU host is unreachable (non-critical).
 - **ExternalInferenceProvider** — LLM-assisted compression via llama.cpp / Ollama / any OpenAI-compatible endpoint; highest quality; used as fallback when heuristics dip below the quality threshold.
