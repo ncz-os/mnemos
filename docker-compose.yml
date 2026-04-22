@@ -23,6 +23,7 @@ services:
       - ./db/migrations_v3_oauth.sql:/docker-entrypoint-initdb.d/09-oauth.sql
       - ./db/migrations_v3_federation.sql:/docker-entrypoint-initdb.d/10-federation.sql
       - ./db/migrations_v3_ownership.sql:/docker-entrypoint-initdb.d/11-ownership.sql
+      - ./db/migrations_v3_1_compression.sql:/docker-entrypoint-initdb.d/12-compression.sql
     ports:
       - '127.0.0.1:5432:5432'
     healthcheck:
