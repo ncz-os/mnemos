@@ -28,9 +28,11 @@ You can treat MNEMOS like a memory storage provider if you want — `POST /v1/me
 - A single `/v1/*` REST surface covering memories, consultations, providers, sessions, webhooks, federation, and an OpenAI-compatible chat-completions gateway.
 - A multi-LLM consensus reasoning layer (GRAEAE) that distributes one prompt across multiple providers, scores the responses, and writes a tamper-evident SHA-256 hash-chained audit entry — every time.
 - Git-like DAG versioning on memory: `log`, `branch`, `merge`, `revert`. Every mutation snapshots.
-- Three-tier compression pipeline (LETHE CPU / ALETHEIA GPU / ANAMNESIS archival) with a written quality manifest on every transformation.
+- Three-tier compression pipeline (LETHE CPU / ALETHEIA GPU / ANAMNESIS archival) with a written quality manifest on every transformation. Runs in the background distillation worker in v3.0; hot-path invocation (rehydration, gateway inject, session context) is scheduled for v3.1 — see [`ROADMAP.md`](./ROADMAP.md).
 - Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in.
 - Runs alongside your applications the way Redis, PostgreSQL, or a message bus would. Deploy once, every agent in your stack shares the same memory substrate.
+
+Next release ([v3.1](./ROADMAP.md)) is the compression platform release: four engines with competitive per-memory selection, GPU-batched inference that runs on integrated graphics through to datacenter cards, and tenancy fixes that make the "per-owner scoping" claim true across every state-bearing subsystem.
 
 ## Works with
 
@@ -141,7 +143,7 @@ If none of those questions matter for your use case, a simpler tool is probably 
 
 ### What MNEMOS does that none of them do
 
-**Quality contracts on compression.** Every time MNEMOS compresses a memory — on write, on rehydration, or before a GRAEAE consultation — it produces a manifest: what was removed, what was preserved, the quality rating, and which use cases the compressed version is and is not safe for. No other memory system treats compression as something that requires a receipt.
+**Quality contracts on compression.** When MNEMOS compresses a memory, it produces a manifest: what was removed, what was preserved, the quality rating, and which use cases the compressed version is and is not safe for. No other memory system treats compression as something that requires a receipt. In v3.0 the compression pipeline runs in the background distillation worker; v3.1 extends the same manifest contract to rehydration, gateway injection, and session context — see [`ROADMAP.md`](./ROADMAP.md).
 
 **A reasoning layer that degrades gracefully.** GRAEAE distributes queries across multiple LLM providers simultaneously, scores responses on relevance, coherence, completeness, and toxicity, and returns the best result. Per-provider circuit breakers prevent a failing provider from degrading the pool. A semantic cache means identical questions skip inference entirely. This is not a load balancer — it is a quality-gated reasoning bus.
 
@@ -195,7 +197,7 @@ The API surface is namespaced under `/v1/*`.
 | `POST /v1/memories/bulk` | Bulk create memories |
 | `PATCH /v1/memories/{id}` | Update memory content or metadata |
 | `DELETE /v1/memories/{id}` | Delete a memory |
-| `POST /v1/memories/rehydrate` | Token-budgeted compressed context load for prompt injection |
+| `POST /v1/memories/rehydrate` | Token-budgeted context load for prompt injection (v3.1 wires the compression pipeline into this path) |
 | `POST /ingest/session` | Ingest a session transcript |
 | `GET /v1/memories/{id}/log` | DAG commit history for a memory |
 | `POST /v1/memories/{id}/branch` | Create a branch from a specific commit |
@@ -439,7 +441,7 @@ The constraints are enforced at the database level. Application bugs cannot viol
 
 Three-tier compression pipeline, each tier named after a Greek figure of memory.
 
-- **LETHE** (Tier 1, CPU, always on) — fast local compression with two modes: token mode (stop-word + importance-marker extractive filtering, ~0.5ms, ~57% reduction on functional-word-heavy prose) and sentence mode (structure-preserving sentence-boundary extraction, ~2–5ms, ~50% reduction). `auto` mode picks per content shape. Zero external calls.
+- **LETHE** (Tier 1, CPU, runs in the distillation worker) — fast local compression with two modes: token mode (stop-word + importance-marker extractive filtering, ~0.5ms, ~57% reduction on functional-word-heavy prose) and sentence mode (structure-preserving sentence-boundary extraction, ~2–5ms, ~50% reduction). `auto` mode picks per content shape. Zero external calls. v3.1 moves LETHE onto hot paths (search, rehydration, gateway inject) via a competitive-selection scorer across all four engines — see [`ROADMAP.md`](./ROADMAP.md).
 - **ALETHEIA** (Tier 2, optional GPU) — token-level importance scoring via a local LLM on a configured GPU host (`GPU_PROVIDER_HOST`); ~200-500ms, ~70% reduction. Runs offline via distillation worker; not on the live path. Falls back to LETHE when the GPU host is unreachable.
 - **ANAMNESIS** (Tier 3, optional GPU) — atomic-fact extraction for archival memories (>30 days old); semantic-level compression via LLM. Fallback: skip extraction if the GPU host is unreachable (non-critical).
 - **ExternalInferenceProvider** — LLM-assisted compression via llama.cpp / Ollama / any OpenAI-compatible endpoint; highest quality; used as fallback when heuristics dip below the quality threshold.
