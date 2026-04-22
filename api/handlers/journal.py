@@ -1,10 +1,14 @@
-"""Journal API: POST /journal, GET /journal, DELETE /journal/{entry_id}"""
+"""Journal API: POST /journal, GET /journal, DELETE /journal/{entry_id}
+
+Per-owner journal. Each entry is scoped to the creating user's `user_id` and
+visible only to that user (root can cross-read by passing `?owner_id=...`).
+"""
 import json
 import logging
+import uuid
 from datetime import date
 from typing import Optional
 
-import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
@@ -31,6 +35,14 @@ class JournalEntry(BaseModel):
     created: str
 
 
+def _scope_owner(user: UserContext, override: Optional[str]) -> str:
+    if override and override != user.user_id:
+        if user.role != "root":
+            raise HTTPException(status_code=403, detail="owner_id override requires root")
+        return override
+    return user.user_id
+
+
 @router.post("/journal", status_code=201)
 async def create_journal_entry(
     req: JournalCreateRequest,
@@ -47,21 +59,23 @@ async def create_journal_entry(
                 except ValueError:
                     raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD")
                 row = await conn.fetchrow(
-                    '''INSERT INTO journal (id, entry_date, topic, content, metadata)
-                       VALUES ($1, $2, $3, $4, $5::jsonb)
+                    '''INSERT INTO journal (id, owner_id, entry_date, topic, content, metadata)
+                       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
                        RETURNING id, entry_date::text, topic, content, metadata, created::text''',
-                    entry_id, entry_date, req.topic, req.content,
+                    entry_id, user.user_id, entry_date, req.topic, req.content,
                     json.dumps(req.metadata or {}),
                 )
             else:
                 row = await conn.fetchrow(
-                    '''INSERT INTO journal (id, entry_date, topic, content, metadata)
-                       VALUES ($1, CURRENT_DATE, $2, $3, $4::jsonb)
+                    '''INSERT INTO journal (id, owner_id, entry_date, topic, content, metadata)
+                       VALUES ($1, $2, CURRENT_DATE, $3, $4, $5::jsonb)
                        RETURNING id, entry_date::text, topic, content, metadata, created::text''',
-                    entry_id, req.topic, req.content,
+                    entry_id, user.user_id, req.topic, req.content,
                     json.dumps(req.metadata or {}),
                 )
         return dict(row)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating journal entry: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -74,9 +88,11 @@ async def list_journal_entries(
     search: Optional[str] = None,
     limit: int = Query(20, ge=1, le=200),
     user: UserContext = Depends(get_current_user),
+    owner_id: Optional[str] = Query(None),
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
+    target_owner = _scope_owner(user, owner_id)
     try:
         async with _lc._pool.acquire() as conn:
             if date_str:
@@ -86,29 +102,34 @@ async def list_journal_entries(
                     raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD")
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
-                       FROM journal WHERE entry_date = $1 ORDER BY created DESC LIMIT $2''',
-                    parsed_date, limit
+                       FROM journal WHERE owner_id = $1 AND entry_date = $2
+                       ORDER BY created DESC LIMIT $3''',
+                    target_owner, parsed_date, limit
                 )
             elif topic:
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
-                       FROM journal WHERE topic = $1 ORDER BY created DESC LIMIT $2''',
-                    topic, limit
+                       FROM journal WHERE owner_id = $1 AND topic = $2
+                       ORDER BY created DESC LIMIT $3''',
+                    target_owner, topic, limit
                 )
             elif search:
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
-                       FROM journal WHERE content ILIKE $1 OR topic ILIKE $1
-                       ORDER BY created DESC LIMIT $2''',
-                    f'%{search}%', limit
+                       FROM journal WHERE owner_id = $1 AND (content ILIKE $2 OR topic ILIKE $2)
+                       ORDER BY created DESC LIMIT $3''',
+                    target_owner, f'%{search}%', limit
                 )
             else:
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
-                       FROM journal ORDER BY created DESC LIMIT $1''',
-                    limit
+                       FROM journal WHERE owner_id = $1
+                       ORDER BY created DESC LIMIT $2''',
+                    target_owner, limit
                 )
         return {"entries": [dict(r) for r in rows], "count": len(rows)}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error listing journal entries: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -122,6 +143,14 @@ async def delete_journal_entry(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
-        result = await conn.execute('DELETE FROM journal WHERE id = $1', entry_id)
+        if user.role == "root":
+            result = await conn.execute(
+                'DELETE FROM journal WHERE id = $1', entry_id,
+            )
+        else:
+            result = await conn.execute(
+                'DELETE FROM journal WHERE id = $1 AND owner_id = $2',
+                entry_id, user.user_id,
+            )
     if result == 'DELETE 0':
         raise HTTPException(status_code=404, detail="Entry not found")

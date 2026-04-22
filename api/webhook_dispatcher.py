@@ -194,19 +194,27 @@ async def _attempt_delivery(delivery_id: str) -> None:
     response_body: Optional[str] = None
     error: Optional[str] = None
 
+    # Re-validate URL at dispatch time (defense-in-depth against SSRF if a
+    # subscription's url field was set outside the handler validation path).
     try:
-        async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT) as client:
-            r = await client.post(
-                delivery["url"],
-                content=delivery["payload"].encode("utf-8"),
-                headers=headers,
-            )
-            response_status = r.status_code
-            response_body = r.text[:2048]
-    except httpx.HTTPError as e:
-        error = f"{type(e).__name__}: {e}"
-    except Exception as e:  # pragma: no cover
-        error = f"{type(e).__name__}: {e}"
+        from api.handlers.webhooks import validate_webhook_url
+        validate_webhook_url(delivery["url"])
+    except Exception as e:
+        error = f"url-rejected: {type(e).__name__}: {e}"
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT, follow_redirects=False) as client:
+                r = await client.post(
+                    delivery["url"],
+                    content=delivery["payload"].encode("utf-8"),
+                    headers=headers,
+                )
+                response_status = r.status_code
+                response_body = r.text[:2048]
+        except httpx.HTTPError as e:
+            error = f"{type(e).__name__}: {e}"
+        except Exception as e:  # pragma: no cover
+            error = f"{type(e).__name__}: {e}"
 
     succeeded = response_status is not None and 200 <= response_status < 300
 

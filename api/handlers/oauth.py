@@ -102,17 +102,36 @@ async def oauth_callback(provider: str, request: Request):
 
     # Where to send the browser now.
     post_login_redirect = request.query_params.get("next") or "/"
-    # Sanity: only allow local paths as redirect targets to prevent open-redirect.
-    if not post_login_redirect.startswith("/"):
+    # Open-redirect defense: only allow local absolute paths. Reject:
+    #   - anything not starting with "/" (absolute URLs, javascript:, etc.)
+    #   - protocol-relative targets like "//evil.com" (browsers treat as URL)
+    #   - backslash variants "/\evil.com" (some browsers normalize)
+    if (
+        not post_login_redirect.startswith("/")
+        or post_login_redirect.startswith("//")
+        or post_login_redirect.startswith("/\\")
+    ):
         post_login_redirect = "/"
 
+    # Determine whether to set the Secure flag. Behind a TLS-terminating proxy
+    # `request.url.scheme` is "http" even when the client is on HTTPS — trust
+    # X-Forwarded-Proto when OAUTH_TRUST_PROXY is set (and the proxy is
+    # configured to rewrite the header).
+    import os as _os
+    _trust_proxy = _os.getenv("OAUTH_TRUST_PROXY", "false").lower() == "true"
+    _xfp = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    is_https = (
+        request.url.scheme == "https"
+        or (_trust_proxy and _xfp == "https")
+        or _os.getenv("MNEMOS_SESSION_HTTPS_ONLY", "").lower() in ("1", "true")
+    )
     response: RedirectResponse = RedirectResponse(url=post_login_redirect, status_code=303)
     response.set_cookie(
         key=_oauth.SESSION_COOKIE_NAME,
         value=session_id,
         max_age=_oauth.SESSION_COOKIE_MAX_AGE,
         httponly=True,
-        secure=request.url.scheme == "https",
+        secure=is_https,
         samesite="lax",
         path="/",
     )

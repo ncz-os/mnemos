@@ -28,8 +28,8 @@ _GENESIS_HASH = hashlib.sha256(b"MNEMOS_AUDIT_GENESIS_v3").hexdigest()
 
 # ── Audit helpers ─────────────────────────────────────────────────────────────
 
-async def _write_audit_entry(
-    pool,
+async def _write_audit_entry_on_conn(
+    conn,
     consultation_id,
     prompt: str,
     response: str,
@@ -37,73 +37,73 @@ async def _write_audit_entry(
     provider: str,
     quality_score: float,
 ) -> None:
-    """Append a hash-chained entry to graeae_audit_log.
-    Uses PostgreSQL advisory lock to serialize concurrent inserts."""
+    """Append a hash-chained entry to graeae_audit_log on an existing connection.
+
+    Expects to be called inside an open transaction on `conn`. Raises on
+    failure — callers must let the exception propagate so the surrounding
+    consultation transaction aborts (tamper-evidence requires the audit row
+    and the consultation row to commit atomically).
+    """
     prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
     response_hash = hashlib.sha256(response.encode()).hexdigest()
 
-    try:
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                # Advisory lock serializes concurrent inserts.
-                # SELECT FOR UPDATE alone has a TOCTOU race: T2 reads the "last row"
-                # before blocking, then computes the chain against that stale row after
-                # T1 has already inserted a newer one.
-                # Advisory lock (magic key = 0x4772616561 = "Graea") ensures only
-                # one writer holds the chain tip at a time.
-                await conn.execute("SELECT pg_advisory_xact_lock(285734657)")
-                prev_row = await conn.fetchrow(
-                    "SELECT id, chain_hash FROM graeae_audit_log "
-                    "ORDER BY sequence_num DESC LIMIT 1"
-                )
-                if prev_row:
-                    prev_chain = prev_row["chain_hash"]
-                    prev_id = prev_row["id"]
-                else:
-                    prev_chain = _GENESIS_HASH
-                    prev_id = None
+    # Advisory lock serializes concurrent inserts.
+    # SELECT FOR UPDATE alone has a TOCTOU race: T2 reads the "last row"
+    # before blocking, then computes the chain against that stale row after
+    # T1 has already inserted a newer one.
+    # Advisory lock (magic key = 0x4772616561 = "Graea") ensures only
+    # one writer holds the chain tip at a time.
+    await conn.execute("SELECT pg_advisory_xact_lock(285734657)")
+    prev_row = await conn.fetchrow(
+        "SELECT id, chain_hash FROM graeae_audit_log "
+        "ORDER BY sequence_num DESC LIMIT 1"
+    )
+    if prev_row:
+        prev_chain = prev_row["chain_hash"]
+        prev_id = prev_row["id"]
+    else:
+        prev_chain = _GENESIS_HASH
+        prev_id = None
 
-                # Chain covers prev_chain + prompt_hash + response_hash so that
-                # neither the prompt nor the response can be swapped without
-                # breaking chain integrity.
-                chain_hash = hashlib.sha256(
-                    (prev_chain + prompt_hash + response_hash).encode()
-                ).hexdigest()
+    # Chain covers prev_chain + prompt_hash + response_hash so that
+    # neither the prompt nor the response can be swapped without
+    # breaking chain integrity.
+    chain_hash = hashlib.sha256(
+        (prev_chain + prompt_hash + response_hash).encode()
+    ).hexdigest()
 
-                await conn.execute(
-                    "INSERT INTO graeae_audit_log "
-                    "(consultation_id, prompt, prompt_hash, provider, response_text, "
-                    "response_hash, chain_hash, prev_id, prev_chain_hash, "
-                    "task_type, quality_score) "
-                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-                    consultation_id, prompt, prompt_hash, provider, response,
-                    response_hash, chain_hash, prev_id, prev_chain,
-                    task_type, quality_score,
-                )
-    except Exception as e:
-        logger.warning(f"[AUDIT] Failed to write audit entry: {e}")
+    await conn.execute(
+        "INSERT INTO graeae_audit_log "
+        "(consultation_id, prompt, prompt_hash, provider, response_text, "
+        "response_hash, chain_hash, prev_id, prev_chain_hash, "
+        "task_type, quality_score) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        consultation_id, prompt, prompt_hash, provider, response,
+        response_hash, chain_hash, prev_id, prev_chain,
+        task_type, quality_score,
+    )
 
 
-async def _write_memory_refs(
-    pool,
+async def _write_memory_refs_on_conn(
+    conn,
     consultation_id: str,
     memory_ids: List[str],
 ) -> None:
-    """Record which memories were injected into this consultation."""
-    if not memory_ids or not pool:
+    """Record which memories were injected into this consultation, on an open conn.
+
+    Raises on failure; caller's transaction aborts so memory-ref bookkeeping
+    stays consistent with the consultation row.
+    """
+    if not memory_ids:
         return
-    try:
-        async with pool.acquire() as conn:
-            for memory_id in memory_ids:
-                await conn.execute(
-                    "INSERT INTO consultation_memory_refs "
-                    "(consultation_id, memory_id, injected_at) "
-                    "VALUES ($1, $2, NOW()) "
-                    "ON CONFLICT DO NOTHING",
-                    consultation_id, memory_id,
-                )
-    except Exception as e:
-        logger.warning(f"[CONSULTATION] Failed to write memory refs: {e}")
+    for memory_id in memory_ids:
+        await conn.execute(
+            "INSERT INTO consultation_memory_refs "
+            "(consultation_id, memory_id, injected_at) "
+            "VALUES ($1, $2, NOW()) "
+            "ON CONFLICT DO NOTHING",
+            consultation_id, memory_id,
+        )
 
 
 def _extract_memory_ids(result: dict) -> List[str]:
@@ -144,8 +144,9 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         if body.limit_chars and result.get("all_responses"):
             for provider, resp in result["all_responses"].items():
                 if isinstance(resp.get("response_text"), str):
+                    original_len = len(resp["response_text"])
                     resp["response_text"] = resp["response_text"][:body.limit_chars]
-                    resp["truncated"] = len(resp.get("response_text", "")) >= body.limit_chars
+                    resp["truncated"] = original_len > body.limit_chars
 
         if body.format == "best" and result.get("all_responses"):
             best = max(result["all_responses"].items(), key=lambda x: x[1].get("final_score", 0))
@@ -154,46 +155,61 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         consultation_id = None
         memory_ids = _extract_memory_ids(result)
         if _lc._pool and result.get("all_responses"):
-            try:
-                best_resp = max(
-                    result["all_responses"].items(),
-                    key=lambda x: x[1].get("final_score", 0),
-                )
-                async with _lc._pool.acquire() as conn:
-                    row = await conn.fetchrow(
-                        """INSERT INTO graeae_consultations
-                            (prompt, task_type, consensus_response, consensus_score,
-                             winning_muse, cost, latency_ms, mode)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                           RETURNING id""",
-                        body.prompt,
-                        body.task_type,
-                        best_resp[1].get("response_text", "")[:500],
-                        best_resp[1].get("final_score", 0),
-                        best_resp[0],
-                        0.02,
-                        best_resp[1].get("latency_ms", 0),
-                        body.mode or "auto",
-                    )
-                    consultation_id = row["id"] if row else None
+            best_resp = max(
+                result["all_responses"].items(),
+                key=lambda x: x[1].get("final_score", 0),
+            )
+            # Prefer the engine's reported cost (per-provider, token-aware)
+            # and fall back to 0.0 if the engine didn't surface one. This was
+            # previously hardcoded to 0.02 which made the cost column useless.
+            engine_cost = result.get("cost")
+            if engine_cost is None:
+                engine_cost = best_resp[1].get("cost", 0.0)
 
-                # Write hash-chained audit entry
-                await _write_audit_entry(
-                    pool=_lc._pool,
-                    consultation_id=consultation_id,
-                    prompt=body.prompt,
-                    response=best_resp[1].get("response_text", ""),
-                    task_type=body.task_type or "reasoning",
-                    provider=best_resp[0],
-                    quality_score=best_resp[1].get("final_score", 0),
-                )
-                await _write_memory_refs(
-                    pool=_lc._pool,
-                    consultation_id=consultation_id,
-                    memory_ids=memory_ids,
-                )
+            # All three writes — consultation row, audit entry, memory refs —
+            # must commit as a single unit. If the audit write fails we MUST
+            # abort the consultation row: tamper-evidence requires that a
+            # committed consultation implies a committed audit chain link.
+            try:
+                async with _lc._pool.acquire() as conn:
+                    async with conn.transaction():
+                        row = await conn.fetchrow(
+                            """INSERT INTO graeae_consultations
+                                (prompt, task_type, consensus_response, consensus_score,
+                                 winning_muse, cost, latency_ms, mode)
+                               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                               RETURNING id""",
+                            body.prompt,
+                            body.task_type,
+                            best_resp[1].get("response_text", "")[:500],
+                            best_resp[1].get("final_score", 0),
+                            best_resp[0],
+                            engine_cost,
+                            best_resp[1].get("latency_ms", 0),
+                            body.mode or "auto",
+                        )
+                        consultation_id = row["id"] if row else None
+
+                        await _write_audit_entry_on_conn(
+                            conn=conn,
+                            consultation_id=consultation_id,
+                            prompt=body.prompt,
+                            response=best_resp[1].get("response_text", ""),
+                            task_type=body.task_type or "reasoning",
+                            provider=best_resp[0],
+                            quality_score=best_resp[1].get("final_score", 0),
+                        )
+                        await _write_memory_refs_on_conn(
+                            conn=conn,
+                            consultation_id=consultation_id,
+                            memory_ids=memory_ids,
+                        )
             except Exception as e:
-                logger.warning(f"[CONSULTATION] Failed to log consultation: {e}")
+                logger.error(f"[CONSULTATION] persist failed — aborting: {e}", exc_info=True)
+                raise HTTPException(
+                    status_code=503,
+                    detail="Consultation persistence failed; audit trail is required.",
+                )
 
         try:
             from api.webhook_dispatcher import dispatch as _dispatch_webhook

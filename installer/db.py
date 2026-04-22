@@ -224,7 +224,14 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations.sql",
         repo_path / "db" / "migrations_v1_multiuser.sql",
         repo_path / "db" / "migrations_v2_versioning.sql",
+        repo_path / "db" / "migrations_v2_sessions.sql",
         repo_path / "db" / "migrations_model_registry.sql",
+        repo_path / "db" / "migrations_v3_dag.sql",
+        repo_path / "db" / "migrations_v3_graeae_unified.sql",
+        repo_path / "db" / "migrations_v3_webhooks.sql",
+        repo_path / "db" / "migrations_v3_oauth.sql",
+        repo_path / "db" / "migrations_v3_federation.sql",
+        repo_path / "db" / "migrations_v3_ownership.sql",
     ]
 
     print("[db] Running migrations...")

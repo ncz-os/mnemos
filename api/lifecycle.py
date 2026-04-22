@@ -92,18 +92,21 @@ def _load_config() -> dict:
 # ── Distillation Worker Wrapper ─────────────────────────────────────────────────
 
 async def _run_distillation_worker():
-    """Background worker coroutine for memory compression and optimization.
+    """Supervised distillation worker loop — restarts on unhandled errors.
 
-    Monitors for unoptimized memories and dispatches them to:
-    1. LETHE (local CPU compression, fast)
-    2. ALETHEIA (GPU token-level compression, offline batch)
-    3. ANAMNESIS (LLM fact extraction, archival)
+    Dispatches unoptimized memories through the compression stack:
+      1. LETHE (local CPU compression, fast)
+      2. ALETHEIA (GPU token-level compression, offline batch)
+      3. ANAMNESIS (LLM fact extraction, archival)
 
-    This coroutine is scheduled during startup and tracked in _background_tasks.
+    Previously a single crash set status to 'idle' and left the worker
+    permanently dead for the rest of the process lifetime. We now restart
+    with exponential backoff up to 5 minutes. asyncio.CancelledError (shutdown)
+    propagates so the lifespan drain works correctly.
     """
+    import asyncio
     global _worker_status
 
-    # Import here to avoid circular dependencies
     try:
         from distillation_worker import MemoryDistillationWorker
     except ImportError as e:
@@ -111,21 +114,34 @@ async def _run_distillation_worker():
         _worker_status["distillation_worker"] = "unavailable"
         return
 
-    worker = MemoryDistillationWorker()
-
-    try:
-        _worker_status["distillation_worker"] = "starting"
-        await worker.start()
-    except KeyboardInterrupt:
-        logger.info("Distillation worker shutting down gracefully")
-        _worker_status["distillation_worker"] = "idle"
-    except Exception as e:
-        logger.error(f"Distillation worker error: {e}")
-        _worker_status["distillation_worker"] = "error"
-    finally:
-        if worker.db_pool:
-            await worker.db_pool.close()
-        _worker_status["distillation_worker"] = "idle"
+    backoff = 1.0
+    while True:
+        worker = MemoryDistillationWorker()
+        try:
+            _worker_status["distillation_worker"] = "starting"
+            await worker.start()
+            # Graceful exit (worker.start() returned) — stop supervising.
+            _worker_status["distillation_worker"] = "idle"
+            return
+        except asyncio.CancelledError:
+            logger.info("Distillation worker cancelled (shutdown)")
+            _worker_status["distillation_worker"] = "idle"
+            raise
+        except Exception as e:
+            _worker_status["distillation_worker"] = "error"
+            logger.exception(f"Distillation worker crashed: {e} — restarting in {backoff:.0f}s")
+        finally:
+            try:
+                if getattr(worker, "db_pool", None):
+                    await worker.db_pool.close()
+            except Exception:
+                pass
+        try:
+            await asyncio.sleep(backoff)
+        except asyncio.CancelledError:
+            _worker_status["distillation_worker"] = "idle"
+            raise
+        backoff = min(backoff * 2, 300.0)  # cap at 5 minutes
 
 
 # ── App lifespan ─────────────────────────────────────────────────────────────
@@ -168,13 +184,14 @@ async def lifespan(app):
     else:
         logger.info("Row Level Security: DISABLED (personal profile)")
 
+    _redis_url = os.getenv("MNEMOS_REDIS_URL") or os.getenv("REDIS_URL") or "redis://localhost:6379"
     try:
-        _cache = aioredis.from_url("redis://localhost:6379", decode_responses=True)
+        _cache = aioredis.from_url(_redis_url, decode_responses=True)
         await _cache.ping()
         app.state.cache = _cache
-        logger.info("Redis cache connected (localhost:6379)")
+        logger.info(f"Redis cache connected ({_redis_url})")
     except Exception as e:
-        logger.warning(f"Redis unavailable, caching disabled: {e}")
+        logger.warning(f"Redis unavailable at {_redis_url}, caching disabled: {e}")
         _cache = None
         app.state.cache = None
 
@@ -245,9 +262,14 @@ async def lifespan(app):
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 def _get_cache_key(prefix: str, *args) -> str:
-    """Generate a stable cache key from prefix and arguments."""
+    """Generate a stable, prefixed cache key.
+
+    The namespace prefix ("mnemos:<prefix>:") is preserved so a pattern-based
+    invalidation (SCAN MATCH "mnemos:search:*") can target only our keys.
+    """
     raw = prefix + ":" + ":".join(str(a) for a in args)
-    return hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()
+    digest = hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()
+    return f"mnemos:{prefix}:{digest}"
 
 
 async def _get_db():

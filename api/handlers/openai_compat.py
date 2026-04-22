@@ -98,13 +98,16 @@ async def _search_mnemos_context(query: str, user: UserContext, limit: int = 5) 
 
     try:
         async with _lc._pool.acquire() as conn:
-            # Full-text search on content + category filtering
+            # Full-text search on content + category filtering. Explicit
+            # to_tsvector so we match the 'english' dictionary regardless of
+            # the cluster's default_text_search_config and so the index (if
+            # present) can actually be used.
             memories = await conn.fetch(
                 """
                 SELECT id, content, category FROM memories
                 WHERE owner_id = $1
                 AND (
-                    content @@ plainto_tsquery('english', $2)
+                    to_tsvector('english', content) @@ plainto_tsquery('english', $2)
                     OR category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
                 )
                 ORDER BY updated DESC NULLS LAST

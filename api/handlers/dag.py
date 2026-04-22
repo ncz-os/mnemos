@@ -18,6 +18,21 @@ from pydantic import BaseModel
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
 
+
+async def _assert_memory_access(conn, memory_id: str, user: UserContext) -> None:
+    """Ensure the caller can read/modify this memory. Raises 404 otherwise.
+
+    Root can access any memory; other users only their own. We return 404 (not
+    403) to avoid leaking existence of memories owned by other users.
+    """
+    row = await conn.fetchrow(
+        "SELECT owner_id FROM memories WHERE id = $1", memory_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    if user.role != "root" and row["owner_id"] != user.user_id:
+        raise HTTPException(status_code=404, detail="Memory not found")
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/memories", tags=["dag"])
 
@@ -88,6 +103,7 @@ async def get_memory_log(
 
     try:
         async with pool.acquire() as conn:
+            await _assert_memory_access(conn, memory_id, user)
             # Recursive CTE: walk from HEAD backward through parent_version_id
             rows = await conn.fetch(
                 """
@@ -113,18 +129,17 @@ async def get_memory_log(
                         cw.depth + 1
                     FROM memory_versions mv
                     INNER JOIN commit_walk cw ON mv.id = cw.parent_version_id
-                    WHERE cw.depth < $4
+                    WHERE cw.depth < $3
                 )
                 SELECT
                     commit_hash, version_num, branch, content, category, subcategory,
                     snapshot_at, snapshot_by, change_type
                 FROM commit_walk
                 ORDER BY depth ASC
-                LIMIT $4
+                LIMIT $3
                 """,
                 memory_id,
                 branch,
-                memory_id,  # re-check owner in WHERE? Optional: add owner_id filter
                 limit,
             )
 
@@ -157,7 +172,7 @@ async def get_memory_log(
         raise
     except Exception as e:
         logger.error(f"[DAG] Log failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="internal server error")
 
 
 @router.get("/{memory_id}/branches", response_model=List[BranchInfo])
@@ -170,6 +185,7 @@ async def get_memory_branches(
 
     try:
         async with pool.acquire() as conn:
+            await _assert_memory_access(conn, memory_id, user)
             branches = await conn.fetch(
                 """
                 SELECT
@@ -194,7 +210,7 @@ async def get_memory_branches(
 
     except Exception as e:
         logger.error(f"[DAG] Branches failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="internal server error")
 
 
 @router.post("/{memory_id}/branch", response_model=BranchInfo)
@@ -208,6 +224,7 @@ async def create_branch(
 
     try:
         async with pool.acquire() as conn:
+            await _assert_memory_access(conn, memory_id, user)
             # Resolve starting point (HEAD or specific commit)
             if request.from_commit:
                 start_version = await conn.fetchrow(
@@ -231,13 +248,23 @@ async def create_branch(
                 if not start_version:
                     raise HTTPException(status_code=404, detail="main branch HEAD not found")
 
-            # Create branch record
+            # Refuse to silently overwrite an existing branch — previous
+            # behaviour (ON CONFLICT DO UPDATE) let any caller hijack a named
+            # branch. Callers that want to move a branch head should merge
+            # instead.
+            existing = await conn.fetchrow(
+                "SELECT id FROM memory_branches WHERE memory_id = $1 AND name = $2",
+                memory_id, request.name,
+            )
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Branch '{request.name}' already exists",
+                )
             await conn.fetchval(
                 """
                 INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
                 VALUES ($1, $2, $3, $4)
-                ON CONFLICT (memory_id, name) DO UPDATE
-                SET head_version_id = EXCLUDED.head_version_id
                 RETURNING id
                 """,
                 memory_id,
@@ -259,7 +286,7 @@ async def create_branch(
         raise
     except Exception as e:
         logger.error(f"[DAG] Branch creation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="internal server error")
 
 
 @router.get("/{memory_id}/commits/{commit_hash}", response_model=CommitInfo)
@@ -273,6 +300,7 @@ async def get_commit(
 
     try:
         async with pool.acquire() as conn:
+            await _assert_memory_access(conn, memory_id, user)
             row = await conn.fetchrow(
                 """
                 SELECT
@@ -307,7 +335,7 @@ async def get_commit(
         raise
     except Exception as e:
         logger.error(f"[DAG] Commit fetch failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="internal server error")
 
 
 @router.post("/{memory_id}/merge", response_model=MergeResult)
@@ -327,92 +355,96 @@ async def merge_branch(
     if request.strategy not in ("latest-wins", "manual"):
         raise HTTPException(status_code=400, detail="Invalid merge strategy")
 
+    # Pre-compute advisory lock key from (memory_id, target_branch) so concurrent
+    # merges against the same branch serialize. Signed int64 range for postgres.
+    import hashlib as _hashlib
+    _lock_bytes = _hashlib.sha256(
+        f"dag-merge:{memory_id}:{target_branch}".encode("utf-8")
+    ).digest()[:8]
+    _lock_key = int.from_bytes(_lock_bytes, "big", signed=False)
+    if _lock_key >= 2**63:
+        _lock_key -= 2**64
+
     try:
         async with pool.acquire() as conn:
-            # Get source and target branch HEADs
-            source_head = await conn.fetchrow(
-                """
-                SELECT mv.id, mv.commit_hash, mv.content, mv.version_num
-                FROM memory_versions mv
-                INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
-                WHERE mv.memory_id = $1 AND mb.name = $2
-                """,
-                memory_id,
-                request.source_branch,
-            )
+            await _assert_memory_access(conn, memory_id, user)
+            async with conn.transaction():
+                # Serialize concurrent merges on this (memory, branch).
+                await conn.execute("SELECT pg_advisory_xact_lock($1)", _lock_key)
 
-            target_head = await conn.fetchrow(
-                """
-                SELECT mv.id, mv.version_num
-                FROM memory_versions mv
-                INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
-                WHERE mv.memory_id = $1 AND mb.name = $2
-                """,
-                memory_id,
-                target_branch,
-            )
-
-            if not source_head:
-                raise HTTPException(status_code=404, detail=f"Source branch '{request.source_branch}' not found")
-            if not target_head:
-                raise HTTPException(status_code=404, detail=f"Target branch '{target_branch}' not found")
-
-            # Apply merge strategy
-            if request.strategy == "latest-wins":
-                # Create merge commit on target_branch with source content
-                next_version = target_head["version_num"] + 1
-                # Compute merge hash from both parent commits (ensures uniqueness and tamper-evidence)
-                import hashlib
-                merge_hash = hashlib.sha256(
-                    f"{source_head['commit_hash']}{target_head['commit_hash']}{int(_time.time() * 1000)}".encode()
-                ).hexdigest()[:16]
-
-                new_commit_id = await conn.fetchval(
+                source_head = await conn.fetchrow(
                     """
-                    INSERT INTO memory_versions (
-                        memory_id, version_num, content, category, subcategory,
-                        branch, commit_hash, parent_version_id, snapshot_by, change_type
-                    )
-                    SELECT
-                        $1, $2, $3, category, subcategory,
-                        $4, $5, $6, $7, 'merge'
-                    FROM memory_versions WHERE id = $8
-                    RETURNING id
+                    SELECT mv.id, mv.commit_hash, mv.content, mv.version_num
+                    FROM memory_versions mv
+                    INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
+                    WHERE mv.memory_id = $1 AND mb.name = $2
                     """,
-                    memory_id,
-                    next_version,
-                    source_head["content"],
-                    target_branch,
-                    merge_hash,  # Use computed merge hash, not source hash
-                    target_head["id"],
-                    user.user_id,
-                    source_head["id"],
+                    memory_id, request.source_branch,
                 )
-
-                # Update target branch HEAD
-                await conn.execute(
-                    "UPDATE memory_branches SET head_version_id = $1 WHERE memory_id = $2 AND name = $3",
-                    new_commit_id,
-                    memory_id,
-                    target_branch,
+                target_head = await conn.fetchrow(
+                    """
+                    SELECT mv.id, mv.version_num
+                    FROM memory_versions mv
+                    INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
+                    WHERE mv.memory_id = $1 AND mb.name = $2
+                    """,
+                    memory_id, target_branch,
                 )
+                if not source_head:
+                    raise HTTPException(status_code=404, detail=f"Source branch '{request.source_branch}' not found")
+                if not target_head:
+                    raise HTTPException(status_code=404, detail=f"Target branch '{target_branch}' not found")
 
-                logger.info(f"[DAG] Merged {request.source_branch} → {target_branch} for {memory_id} (merge_hash={merge_hash})")
+                if request.strategy == "latest-wins":
+                    next_version = target_head["version_num"] + 1
+                    # Full SHA-256 (64 hex chars) — previously truncated to 16 which
+                    # reduced collision tolerance from ~2^128 to ~2^32.
+                    merge_hash = _hashlib.sha256(
+                        f"{source_head['commit_hash']}"
+                        f"{target_head['commit_hash']}"
+                        f"{int(_time.time() * 1_000_000)}".encode()
+                    ).hexdigest()
 
-                return MergeResult(
-                    success=True,
-                    new_commit_hash=merge_hash,  # Return the new merge commit hash
-                    message=f"Merged {request.source_branch} into {target_branch}",
-                )
+                    new_commit_id = await conn.fetchval(
+                        """
+                        INSERT INTO memory_versions (
+                            memory_id, version_num, content, category, subcategory,
+                            branch, commit_hash, parent_version_id, snapshot_by, change_type
+                        )
+                        SELECT
+                            $1, $2, $3, category, subcategory,
+                            $4, $5, $6, $7, 'merge'
+                        FROM memory_versions WHERE id = $8
+                        RETURNING id
+                        """,
+                        memory_id, next_version, source_head["content"],
+                        target_branch, merge_hash, target_head["id"],
+                        user.user_id, source_head["id"],
+                    )
 
-            else:  # manual
-                return MergeResult(
-                    success=False,
-                    message="Manual merge strategy not yet implemented",
-                )
+                    await conn.execute(
+                        "UPDATE memory_branches SET head_version_id = $1 "
+                        "WHERE memory_id = $2 AND name = $3",
+                        new_commit_id, memory_id, target_branch,
+                    )
+
+                    logger.info(
+                        f"[DAG] Merged {request.source_branch} -> {target_branch} "
+                        f"for {memory_id} (merge_hash={merge_hash[:12]}...)"
+                    )
+                    return MergeResult(
+                        success=True,
+                        new_commit_hash=merge_hash,
+                        message=f"Merged {request.source_branch} into {target_branch}",
+                    )
+                else:  # manual
+                    return MergeResult(
+                        success=False,
+                        message="Manual merge strategy not yet implemented",
+                    )
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"[DAG] Merge failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="internal server error")

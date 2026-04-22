@@ -141,7 +141,14 @@ def main() -> None:
         os.path.join(script_dir, "db", "migrations.sql"),
         os.path.join(script_dir, "db", "migrations_v1_multiuser.sql"),
         os.path.join(script_dir, "db", "migrations_v2_versioning.sql"),
+        os.path.join(script_dir, "db", "migrations_v2_sessions.sql"),
         os.path.join(script_dir, "db", "migrations_model_registry.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_dag.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_graeae_unified.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_webhooks.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_oauth.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_federation.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_ownership.sql"),
     ]
 
     print("=" * 60)

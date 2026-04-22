@@ -3,11 +3,26 @@
 Outbound notifications on memory and consultation events. Delivery is handled
 by `api.webhook_dispatcher`; this handler is CRUD only.
 """
+import ipaddress
 import logging
+import os
 import secrets
+import socket
+import uuid as _uuid
 from typing import List
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
+
+
+def _parse_uuid_or_404(value: str, what: str = "resource") -> str:
+    """Validate a UUID path parameter. Raises 404 on malformed input so we
+    don't surface internal driver errors (`InvalidTextRepresentation`) as 500s."""
+    try:
+        _uuid.UUID(value)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=404, detail=f"{what} not found")
+    return value
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
@@ -39,9 +54,69 @@ def _validate_events(events: List[str]) -> None:
         )
 
 
-def _validate_url(url: str) -> None:
-    if not (url.startswith("http://") or url.startswith("https://")):
+_WEBHOOK_ALLOW_PRIVATE = os.getenv("WEBHOOK_ALLOW_PRIVATE_HOSTS", "false").lower() == "true"
+
+
+def _is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
+    """SSRF defense: block loopback, private, link-local, multicast, reserved."""
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def validate_webhook_url(url: str) -> None:
+    """Validate a webhook URL: scheme + host not pointing at internal services.
+
+    Called at both subscription create time (handler) and dispatch time
+    (webhook_dispatcher). Raises HTTPException(422) on bad input.
+    Set WEBHOOK_ALLOW_PRIVATE_HOSTS=true to permit private/loopback targets
+    (useful for local testing; unsafe in production).
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
         raise HTTPException(status_code=422, detail="url must start with http:// or https://")
+    host = parsed.hostname
+    if not host:
+        raise HTTPException(status_code=422, detail="url must include a host")
+
+    if _WEBHOOK_ALLOW_PRIVATE:
+        return
+
+    # Reject cloud metadata endpoints by hostname.
+    if host in ("metadata.google.internal", "metadata.goog"):
+        raise HTTPException(status_code=422, detail="url host is not permitted")
+
+    # If host is already an IP literal, check it directly. Otherwise resolve
+    # and check every returned address family.
+    try:
+        ip = ipaddress.ip_address(host)
+        if _is_blocked_ip(ip):
+            raise HTTPException(status_code=422, detail="url host resolves to a non-routable address")
+        return
+    except ValueError:
+        pass  # not a literal IP — resolve DNS
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise HTTPException(status_code=422, detail="url host could not be resolved")
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if _is_blocked_ip(ip):
+            raise HTTPException(status_code=422, detail="url host resolves to a non-routable address")
+
+
+# Kept as `_validate_url` alias for callers inside this module.
+_validate_url = validate_webhook_url
 
 
 def _to_item(row) -> WebhookItem:
@@ -153,6 +228,7 @@ async def get_webhook(
     webhook_id: str,
     user: UserContext = Depends(get_current_user),
 ):
+    _parse_uuid_or_404(webhook_id, "webhook")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
@@ -177,6 +253,7 @@ async def revoke_webhook(
     user: UserContext = Depends(get_current_user),
 ):
     """Soft-delete: marks the subscription revoked. Delivery log preserved."""
+    _parse_uuid_or_404(webhook_id, "webhook")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
@@ -204,6 +281,7 @@ async def list_deliveries(
     limit: int = 50,
 ):
     """List recent delivery attempts for a subscription."""
+    _parse_uuid_or_404(webhook_id, "webhook")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 

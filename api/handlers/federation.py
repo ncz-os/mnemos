@@ -7,10 +7,19 @@ Two halves:
 from __future__ import annotations
 
 import logging
+import uuid as _uuid
 from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+
+
+def _parse_uuid_or_404(value: str) -> str:
+    try:
+        _uuid.UUID(value)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=404, detail="peer not found")
+    return value
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user, require_root
@@ -66,12 +75,36 @@ def _to_peer(row) -> FederationPeer:
 # ── Admin: peer CRUD ─────────────────────────────────────────────────────────
 
 
+def _validate_peer_base_url(base_url: str) -> None:
+    """Require https:// for peer base URLs. Set FEDERATION_ALLOW_INSECURE=true
+    to permit http:// (lab/local testing only — the peer auth token ships
+    in clear over HTTP)."""
+    import os as _os
+    from urllib.parse import urlparse
+    allow_insecure = _os.getenv("FEDERATION_ALLOW_INSECURE", "false").lower() == "true"
+    parsed = urlparse(base_url)
+    if parsed.scheme == "https":
+        return
+    if parsed.scheme == "http" and allow_insecure:
+        logger.warning(
+            "federation: registering insecure peer base_url=%s — "
+            "auth token will be sent in cleartext", base_url,
+        )
+        return
+    raise HTTPException(
+        status_code=422,
+        detail="peer base_url must use https:// "
+               "(set FEDERATION_ALLOW_INSECURE=true to permit http, not for prod)",
+    )
+
+
 @router.post("/peers", response_model=FederationPeer, status_code=201)
 async def register_peer(
     request: FederationPeerCreateRequest,
     _: UserContext = Depends(require_root),
 ):
     """Register a remote peer to pull from."""
+    _validate_peer_base_url(request.base_url)
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
@@ -104,6 +137,7 @@ async def list_peers(_: UserContext = Depends(require_root)):
 
 @router.get("/peers/{peer_id}", response_model=FederationPeer)
 async def get_peer(peer_id: str, _: UserContext = Depends(require_root)):
+    _parse_uuid_or_404(peer_id)
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
@@ -121,11 +155,24 @@ async def update_peer(
     request: FederationPeerUpdateRequest,
     _: UserContext = Depends(require_root),
 ):
+    _parse_uuid_or_404(peer_id)
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
     if not updates:
         raise HTTPException(status_code=422, detail="no fields to update")
+    if "base_url" in updates:
+        _validate_peer_base_url(updates["base_url"])
+    # Defense-in-depth: allow only whitelisted column names in the dynamic SET
+    # clause. Keys come from a Pydantic model today but this prevents future
+    # additions from accidentally enabling injection.
+    _ALLOWED_PEER_COLS = {
+        "name", "base_url", "auth_token", "namespace_filter", "category_filter",
+        "enabled", "sync_interval_secs",
+    }
+    bad = set(updates.keys()) - _ALLOWED_PEER_COLS
+    if bad:
+        raise HTTPException(status_code=422, detail=f"unknown fields: {sorted(bad)}")
     set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
     set_clauses.append("updated=NOW()")
     async with _lc._pool.acquire() as conn:
@@ -141,6 +188,7 @@ async def update_peer(
 
 @router.delete("/peers/{peer_id}", status_code=204)
 async def delete_peer(peer_id: str, _: UserContext = Depends(require_root)):
+    _parse_uuid_or_404(peer_id)
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
@@ -157,6 +205,7 @@ async def trigger_sync(
     _: UserContext = Depends(require_root),
 ):
     """Run a sync against a peer right now (blocks on completion)."""
+    _parse_uuid_or_404(peer_id)
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     try:
@@ -174,6 +223,7 @@ async def peer_sync_log(
     _: UserContext = Depends(require_root),
     limit: int = 50,
 ):
+    _parse_uuid_or_404(peer_id)
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
@@ -247,8 +297,21 @@ async def federation_feed(
     namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
     categories = [s.strip() for s in category.split(",") if s.strip()] if category else []
 
-    # Exclude memories we ourselves pulled from another federation (no loops).
-    query_parts = ["federation_source IS NULL"]
+    # Only share memories explicitly marked for federation. `permission_mode`
+    # is stored as a Unix-style mode integer (decimal 644 = "owner-rw,
+    # group-r, others-r"; 600 = "owner-only"). We treat memories with the
+    # others-read bit set (ones digit >= 4) as opt-in for federation; local
+    # memories default to 600 and are invisible to peers unless the owner
+    # explicitly sets something like 644. This replaces the previous
+    # behaviour where any non-federation-sourced memory was served to any
+    # peer with role='federation' — effectively a full read grant.
+    #
+    # `federation_source IS NULL` prevents loops (don't re-export memories
+    # we ourselves pulled from another peer).
+    query_parts = [
+        "federation_source IS NULL",
+        "(permission_mode % 10) >= 4",
+    ]
     args: list = []
     if since_ts is not None:
         args.append(since_ts)
