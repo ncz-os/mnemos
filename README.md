@@ -325,9 +325,48 @@ The reasoning engine behind `/v1/consultations` provides:
 
 - **Circuit breaker** — per-provider CLOSED/OPEN/HALF_OPEN state machine, 5-minute cooldown
 - **Semantic cache** — embedding-similarity deduplication, 1-hour TTL
-- **Quality scorer** — success/failure + latency tracking per provider; Arena.ai Elo scores feed dynamic weighting
+- **Quality scorer** — success / failure / latency tracking per provider, combined with Arena.ai Elo weights from the model registry (see next section) for dynamic consensus weighting
 - **Rate limiter** — single-level request rate limit with graceful backoff
 - **Audit chain** — SHA-256 hash-chained prompt/response log for compliance
+
+### Model registry and dynamic provider weighting (self-maintaining)
+
+Most multi-LLM routers hardcode a provider list. MNEMOS ships a **self-populating PostgreSQL-backed model registry** that keeps itself current.
+
+**What's in the registry.** Every known model from every configured provider — OpenAI, Groq, xAI, Together, Nvidia, Gemini, Anthropic — with per-model metadata: provider + model_id, display name, family (grok-4, gpt-5, gemini-3, …), capabilities (`chat`, `vision`, `code`, `reasoning`, `web_search`), context window, max output tokens, input / output / cache pricing (USD per million tokens), availability, deprecation flag, **Arena.ai Elo score**, **Arena.ai rank**, and the normalized `graeae_weight` (0.50–1.00) actually used by the consensus scorer.
+
+**How it populates.**
+
+- **Daily provider sync** — `graeae.provider_sync` hits each provider's `/v1/models` endpoint (Gemini uses `/v1beta/models`; Anthropic uses a static list because Anthropic does not expose a public `/models` surface) and upserts into `model_registry`. New models appear automatically; deprecated ones get flagged. No manual curation required.
+- **Quarterly Elo sync** — `scripts/refresh_elo_weights.py` (systemd: `graeae-elo-sync.timer`) fetches the Arena.ai leaderboard, maps ranks back to providers + models, and writes `arena_score`, `arena_rank`, and `graeae_weight` into the registry.
+- **Online quality signals** — the GRAEAE engine tracks per-provider success / failure / latency in memory; those signals combine with the registry's Elo-derived `graeae_weight` to pick the winning response on each consultation.
+
+**What it's used for.**
+
+- **`/v1/providers/recommend?task_type=...&budget=...`** — returns the cheapest available model that meets the task's capability + quality floor. Uses `graeae_weight` as the quality signal and `input_cost_per_mtok + output_cost_per_mtok` as the cost signal.
+- **GRAEAE consensus scoring** — provider responses are weighted by `graeae_weight` before the consensus pick. A provider that drops on Arena.ai also drops in MNEMOS's internal routing on the next timer tick, without any human touching a config file.
+- **OpenAI-compatible gateway model routing** — when a caller passes `model="auto"`, `model="best-coding"`, `model="best-reasoning"`, `model="fastest"`, `model="cheapest"`, the gateway resolves against the registry rather than a hardcoded alias table.
+
+**Fresh-install behavior.** If the registry is empty (first boot, no sync run yet), `/v1/providers/recommend` falls back to the static GRAEAE provider config so new deployments don't 404. The first `provider_sync` run typically populates 30–50 models depending on which provider API keys you've configured.
+
+### What runs under the hood (infrastructure you don't have to think about)
+
+A lot of the v3.0.0 surface is held up by background work that doesn't show up in the route table but does show up in the failure modes it prevents. For anyone who wants to know what's there:
+
+- **Webhook delivery recovery worker** — on startup, walks `webhook_deliveries` and re-drains any rows stuck in `pending` or `retrying` with a `scheduled_at` in the past. Handles the crash-mid-retry case; subscribers get the delivery eventually rather than never.
+- **Distillation worker supervision** — the compression worker runs under an exponential-backoff supervisor (1s → 2s → 4s → … capped at 5 min). A crash is logged and retried; the worker does not silently die and leave memories un-compressed for the rest of the process lifetime.
+- **OAuth session garbage collector** — hourly sweep of expired and long-revoked sessions. Bounds the `oauth_sessions` table so a long-running install doesn't accumulate dead rows forever.
+- **Federation sync worker** — iterates enabled peers on their individual sync intervals, pulls batches, reconciles local + remote timestamps before overwriting, logs per-sync results to `federation_sync_log`.
+- **Advisory-lock-serialized audit chain writer** — the hash chain writer takes `pg_advisory_xact_lock` before reading the chain tip, so concurrent consultations cannot compute against the same stale previous hash. Closes a TOCTOU window in tamper-evident logging that most implementations leave open.
+- **Advisory-lock-serialized DAG merges** — merges take a per-`(memory_id, target_branch)` advisory lock, so concurrent merges on the same branch cannot produce orphan commits or duplicate version numbers.
+- **ASGI body-size middleware** — native ASGI (not `BaseHTTPMiddleware`), so it rejects chunked uploads whose running byte count exceeds `MAX_BODY_BYTES` *as they arrive*, before the full body lands in memory. Content-Length–declared uploads are rejected before the app is even invoked.
+- **SSRF-hardened webhook dispatch** — URLs are re-validated at send time (not just at subscription time); DNS resolves asynchronously so a slow resolver can't freeze the event loop; cloud metadata hostnames (AWS IMDS, Google `metadata.google.internal`, Tencent, Alibaba, IPv6 variants) are on a deny list alongside the RFC1918 / loopback / link-local filter.
+- **Rate limiter with X-Forwarded-For trust** — default keys on direct socket peer (safe behind no proxy); set `RATE_LIMIT_TRUST_PROXY=true` only when you run behind a proxy you control. Prevents clients from blowing out the global limit via spoofed headers.
+- **pgvector query sanitization** — embedding vectors returned by the embedder are `float()`-cast before being stringified into the query. A poisoned embedder cannot inject SQL via a non-numeric vector "component".
+- **Full-text search operator filtering** — `/v1/memories/search` uses `plainto_tsquery` rather than `to_tsquery`, so `|`, `&`, `!` and friends get treated as literal text instead of tsquery operators. User input cannot construct adversarial FTS queries.
+- **Federation size caps** — an abusive peer cannot fill your disk: pulled content capped at 1 MB per memory, metadata at 64 KB, name fields at 256 chars.
+- **Rate-limited audit endpoints** — `/v1/consultations/audit/verify` walks the entire chain from genesis; capped at 5/min so an authenticated caller cannot force O(N) scans on a large log. `/audit` list is capped at 30/min.
+- **Quality manifest on every compression** — LETHE, ALETHEIA, and ANAMNESIS each write a receipt: `{what_was_removed, what_was_preserved, quality_rating, risk_factors, safe_for, not_safe_for}`. Compression-as-data, not compression-as-side-effect.
 
 ### Compression — the MOIRAI tiers
 
