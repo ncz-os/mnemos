@@ -2,7 +2,7 @@
 
 All notable changes to MNEMOS are documented here.
 
-## [3.0.0-beta] — 2026-04-22
+## [3.0.0] — 2026-04-22
 
 First public release.
 

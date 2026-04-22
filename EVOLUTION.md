@@ -2,7 +2,7 @@
 
 The version numbers on releases are tidy. The actual path was not. This
 document is the honest version — decisions, refactors, mistakes, and the
-reasoning that got us from the original prototype to v3.0.0-beta. If you
+reasoning that got us from the original prototype to v3.0.0. If you
 are considering MNEMOS for your own stack, you should know where it came
 from; if you are contributing, you should know which doors have been closed
 and why.
@@ -225,7 +225,7 @@ security hardening on top.
 
 ---
 
-## v3.0.0-beta — April 22, 2026 — "one service, no aliases, production-grade"
+## v3.0.0 — April 22, 2026 — "one service, no aliases, production-grade"
 
 The release. Everything between v2.4 and v3.0 is one of: unification,
 security hardening, multi-tenant scoping, or honesty (removing claims
@@ -361,7 +361,7 @@ reasoning survives:
   the embedding round-trip negates the win for near-duplicate cases.
 - **Decision.** Keep the exact-match implementation. Update the docs to
   describe what the code actually does. Do not ship semantic / embedding
-  similarity lookup in v3.0.0-beta.
+  similarity lookup in v3.0.0.
 - **Rationale.**
   - Embedding lookup cost (~5–20 ms for nomic-embed-text / BGE) against
     a provider round-trip (~500–2000 ms) is ~1% — cheap, not free.

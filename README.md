@@ -689,7 +689,7 @@ No. There is no outbound telemetry of any kind. The only outbound traffic is the
 
 ### Can I use it in production?
 
-Yes — we have been since December 2025. v3.0.0-beta is the first public release, but the codebase is not a greenfield experiment. Real caveat: `-beta` reflects that the system has been single-operator-tested, not yet battle-tested across many independent deployments. File issues against the live install and we'll track them.
+Yes — we have been since December 2025. v3.0.0 is the first public release, not a greenfield experiment; the codebase has been operated continuously for roughly four months before being cut for open source. The honest caveat: it has been single-operator-tested, not yet battle-tested across many independent deployments. File issues against the live install and we'll track them.
 
 ### What's the migration story from [Mem0 / Zep / raw PostgreSQL]?
 
