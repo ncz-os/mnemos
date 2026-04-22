@@ -5,10 +5,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.rate_limit import (
     limiter,
@@ -49,23 +47,83 @@ app = FastAPI(title="MNEMOS API", version="3.0.0", description="Unified service:
 
 # ── Request body size limit (SEC-04) ──────────────────────────────────────────
 # Default 5 MB. Override via MAX_BODY_BYTES env var.
+# Implemented as a pure ASGI middleware (not BaseHTTPMiddleware) so we can
+# reject oversized bodies as they stream in, including requests that use
+# Transfer-Encoding: chunked and omit Content-Length. The previous
+# BaseHTTPMiddleware version only inspected Content-Length and was bypassed
+# by chunked uploads, which Starlette then buffered into memory unbounded.
 _MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(5 * 1024 * 1024)))
 
 
-class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
-    """Reject requests whose Content-Length exceeds MAX_BODY_BYTES."""
-    async def dispatch(self, request: Request, call_next):
-        if request.method in ("POST", "PATCH", "PUT"):
-            cl = request.headers.get("content-length")
-            if cl and int(cl) > _MAX_BODY_BYTES:
-                return JSONResponse(
-                    {"detail": f"Request body exceeds {_MAX_BODY_BYTES // 1024 // 1024} MB limit"},
-                    status_code=413,
-                )
-        return await call_next(request)
+class _BodySizeLimitASGI:
+    """Reject HTTP requests whose body exceeds MAX_BODY_BYTES.
+
+    Works for both Content-Length-declared and chunked uploads: we intercept
+    `http.request` messages as they stream past and short-circuit with 413
+    as soon as the running byte count exceeds the limit.
+    """
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] not in ("POST", "PATCH", "PUT"):
+            await self.app(scope, receive, send)
+            return
+
+        # Fast-path: trust a declared Content-Length.
+        headers = dict(scope.get("headers") or [])
+        cl_bytes = headers.get(b"content-length")
+        if cl_bytes is not None:
+            try:
+                if int(cl_bytes) > self.max_bytes:
+                    await self._send_413(send)
+                    return
+            except ValueError:
+                pass  # malformed CL, fall through to streaming check
+
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                body = message.get("body") or b""
+                received += len(body)
+                if received > self.max_bytes:
+                    # Drain any remaining body so the client doesn't hang,
+                    # then signal the app via a closed channel.
+                    while message.get("more_body"):
+                        message = await receive()
+                    raise _BodyTooLarge()
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _BodyTooLarge:
+            await self._send_413(send)
+
+    async def _send_413(self, send):
+        msg = f'{{"detail":"Request body exceeds {self.max_bytes // 1024 // 1024} MB limit"}}'
+        await send({
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(msg)).encode("ascii")),
+            ],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": msg.encode("utf-8"),
+        })
 
 
-app.add_middleware(_BodySizeLimitMiddleware)
+class _BodyTooLarge(Exception):
+    """Internal signal used by _BodySizeLimitASGI to short-circuit."""
+
+
+app.add_middleware(_BodySizeLimitASGI, max_bytes=_MAX_BODY_BYTES)
 
 # Rate limiting (opt-in via RATE_LIMIT_ENABLED=true — see api/rate_limit.py)
 app.state.limiter = limiter
@@ -79,10 +137,21 @@ _cors_origins = [o.strip() for o in _cors_origins_raw.split(",")]
 # Starlette SessionMiddleware — required by authlib for OAuth state (PKCE verifier,
 # CSRF nonce) carried across the authorize -> callback redirect. This cookie is
 # DIFFERENT from the application session cookie set after successful login.
+#
+# IMPORTANT: set MNEMOS_SESSION_SECRET to a stable value in production. When
+# unset we generate a random one at startup, which invalidates any in-flight
+# OAuth login on every server restart (the 10-min redirect roundtrip breaks).
 import os as _os
 import secrets as _secrets
 from starlette.middleware.sessions import SessionMiddleware as _SessionMiddleware
-_oauth_state_secret = _os.environ.get('MNEMOS_SESSION_SECRET') or _secrets.token_urlsafe(48)
+_oauth_state_secret = _os.environ.get('MNEMOS_SESSION_SECRET')
+if not _oauth_state_secret:
+    logging.getLogger(__name__).warning(
+        "MNEMOS_SESSION_SECRET is not set — generating a random key for this "
+        "process. In-flight OAuth logins will break on restart. Set a stable "
+        "value in your environment for production."
+    )
+    _oauth_state_secret = _secrets.token_urlsafe(48)
 app.add_middleware(
     _SessionMiddleware,
     secret_key=_oauth_state_secret,

@@ -182,15 +182,31 @@ async def provision_or_link_user(
 
     email = claims.get("email")
     display_name = claims.get("name") or claims.get("preferred_username")
+    # OIDC standard: email_verified indicates the provider has attested the
+    # email address. Providers that don't set it (or set false) cannot be used
+    # to link a new identity to a pre-existing account — otherwise an attacker
+    # who controls a permissive provider can claim any user by guessing email.
+    email_verified = bool(claims.get("email_verified"))
 
-    # 2. Email match — link this new identity to an existing user with matching email.
+    # 2. Email match — link this new identity to an existing user with matching
+    #    email, BUT only when the provider attests the email is verified.
     user_id: Optional[str] = None
-    if email:
+    if email and email_verified:
         link_target = await conn.fetchrow(
             "SELECT id FROM users WHERE email=$1", email,
         )
         if link_target:
             user_id = link_target["id"]
+            logger.info(
+                "oauth: linking verified email %s to existing user_id=%s via provider=%s",
+                email, user_id, provider,
+            )
+    elif email and not email_verified:
+        logger.warning(
+            "oauth: email=%s present but email_verified is false/missing for "
+            "provider=%s — minting fresh user instead of linking",
+            email, provider,
+        )
 
     # 3. Create a new user if no match.
     if user_id is None:

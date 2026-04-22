@@ -52,6 +52,14 @@ class _AsyncNullContext:
         return False
 
 
+# ── FakePool coverage note ────────────────────────────────────────────────────
+# FakeConnection dispatches on substring matches against the SQL fragments our
+# handlers issue today. If a handler's SQL drifts (column renames, alias
+# changes, new WHERE clauses) this dispatch silently misses — returning None
+# or the wrong canned response — and the regression only surfaces against
+# real postgres. That's what produced the `created AS created_at` issue in
+# v3.0.0. When you change a handler query, add a matching branch below. For
+# deeper safety, run the suite against a real postgres container in CI.
 class FakeConnection:
     def __init__(self, state: dict[str, Any]):
         self.state = state
@@ -129,6 +137,14 @@ class FakeConnection:
             )
             return "INSERT 0 1"
 
+        if compact.startswith("DELETE FROM memories WHERE id = $1 AND owner_id = $2"):
+            memory_id = args[0]
+            memory = self.state["memories"].get(memory_id)
+            if memory and memory.get("owner_id") in (args[1], None):
+                self.state["memories"].pop(memory_id, None)
+                return "DELETE 1"
+            return "DELETE 0"
+
         if compact.startswith("DELETE FROM memories WHERE id = $1"):
             memory_id = args[0]
             if self.state["memories"].pop(memory_id, None):
@@ -172,6 +188,22 @@ class FakeConnection:
         if "SELECT id FROM memories WHERE id=$1" in compact:
             memory = self.state["memories"].get(args[0])
             return {"id": memory["id"]} if memory else None
+
+        # owner-scoped ownership probe from memory PATCH
+        if "SELECT id FROM memories WHERE id=$1 AND owner_id=$2" in compact:
+            memory = self.state["memories"].get(args[0])
+            if memory and memory.get("owner_id") in (args[1], None):
+                return {"id": memory["id"]}
+            return None
+
+        # owner check used by DAG _assert_memory_access
+        if compact.startswith("SELECT owner_id FROM memories WHERE id ="):
+            memory = self.state["memories"].get(args[0])
+            return {"owner_id": memory.get("owner_id")} if memory else None
+
+        # branch existence check used by create_branch
+        if compact.startswith("SELECT id FROM memory_branches WHERE memory_id = $1 AND name = $2"):
+            return None  # tests don't pre-populate branches
 
         if "SELECT cmr.consultation_id, cmr.memory_id, cmr.relevance_score FROM consultation_memory_refs" in compact:
             return self.state["memory_refs"][0] if self.state["memory_refs"] else None

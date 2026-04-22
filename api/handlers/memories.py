@@ -137,8 +137,13 @@ async def search_memories(
 ):
     """Search memories with optional compression of large result sets (cached 5 min)."""
     request_limit = min(request.limit, 500)  # server-side cap regardless of model field
+    # Cache key MUST include user.user_id and namespace: when RLS is enabled,
+    # different users get different row sets for the same query — caching
+    # without scoping was an RLS bypass.
     cache_key = _get_cache_key(
-        "search", request.query, request_limit,
+        "search",
+        user.user_id, user.namespace,
+        request.query, request_limit,
         request.category or "", request.subcategory or "",
         "semantic" if request.semantic else "fts",
         request.source_provider or "", request.source_model or "",
@@ -234,6 +239,13 @@ async def create_memory(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
+    # Only root may create a memory attributed to a different owner or namespace
+    # than the caller. Previously any user could set request.owner_id and
+    # ghost-write memories under someone else's identity.
+    if request.owner_id and request.owner_id != user.user_id and user.role != "root":
+        raise HTTPException(status_code=403, detail="owner_id override requires root")
+    if request.namespace and request.namespace != user.namespace and user.role != "root":
+        raise HTTPException(status_code=403, detail="namespace override requires root")
     owner_id = request.owner_id or user.user_id
     namespace = request.namespace or user.namespace
 
@@ -261,6 +273,14 @@ async def create_memory(
     if _lc._cache:
         try:
             await _lc._cache.delete("stats:global")
+            # Invalidate per-user search caches on mutation. Keys are
+            # namespaced "mnemos:search:*" so SCAN MATCH is bounded to our
+            # entries and safe against shared Redis.
+            try:
+                async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
+                    await _lc._cache.delete(_k)
+            except Exception:
+                pass
         except Exception:
             pass
     try:
@@ -297,6 +317,12 @@ async def bulk_create_memories(
                     errors.append(f"[{i}] content is empty")
                     continue
                 try:
+                    if mem.owner_id and mem.owner_id != user.user_id and user.role != "root":
+                        errors.append(f"[{i}] owner_id override requires root")
+                        continue
+                    if mem.namespace and mem.namespace != user.namespace and user.role != "root":
+                        errors.append(f"[{i}] namespace override requires root")
+                        continue
                     mid = f"mem_{int(_time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
                     verbatim = mem.verbatim_content if mem.verbatim_content is not None else mem.content
                     owner_id = mem.owner_id or user.user_id
@@ -319,6 +345,14 @@ async def bulk_create_memories(
     if _lc._cache:
         try:
             await _lc._cache.delete("stats:global")
+            # Invalidate per-user search caches on mutation. Keys are
+            # namespaced "mnemos:search:*" so SCAN MATCH is bounded to our
+            # entries and safe against shared Redis.
+            try:
+                async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
+                    await _lc._cache.delete(_k)
+            except Exception:
+                pass
         except Exception:
             pass
     return BulkCreateResponse(created=len(created_ids), memory_ids=created_ids, errors=errors)
@@ -356,7 +390,18 @@ async def update_memory(
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
             async with conn.transaction():
-                row = await conn.fetchrow("SELECT id FROM memories WHERE id=$1", memory_id)
+                # Defense-in-depth: don't rely exclusively on RLS. Explicitly
+                # check ownership so that an install with rls_enabled=false
+                # still prevents cross-user edits.
+                if user.role == "root":
+                    row = await conn.fetchrow(
+                        "SELECT id FROM memories WHERE id=$1", memory_id,
+                    )
+                else:
+                    row = await conn.fetchrow(
+                        "SELECT id FROM memories WHERE id=$1 AND owner_id=$2",
+                        memory_id, user.user_id,
+                    )
                 if not row:
                     raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
                 # Calculate next version BEFORE the UPDATE so trigger and app agree on the version number.
@@ -392,6 +437,14 @@ async def update_memory(
     if _lc._cache:
         try:
             await _lc._cache.delete("stats:global")
+            # Invalidate per-user search caches on mutation. Keys are
+            # namespaced "mnemos:search:*" so SCAN MATCH is bounded to our
+            # entries and safe against shared Redis.
+            try:
+                async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
+                    await _lc._cache.delete(_k)
+            except Exception:
+                pass
         except Exception:
             pass
     try:
@@ -420,12 +473,28 @@ async def delete_memory(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
-            result = await conn.execute("DELETE FROM memories WHERE id = $1", memory_id)
+            if user.role == "root":
+                result = await conn.execute(
+                    "DELETE FROM memories WHERE id = $1", memory_id,
+                )
+            else:
+                result = await conn.execute(
+                    "DELETE FROM memories WHERE id = $1 AND owner_id = $2",
+                    memory_id, user.user_id,
+                )
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
     if _lc._cache:
         try:
             await _lc._cache.delete("stats:global")
+            # Invalidate per-user search caches on mutation. Keys are
+            # namespaced "mnemos:search:*" so SCAN MATCH is bounded to our
+            # entries and safe against shared Redis.
+            try:
+                async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
+                    await _lc._cache.delete(_k)
+            except Exception:
+                pass
         except Exception:
             pass
     try:

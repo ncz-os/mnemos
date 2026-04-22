@@ -25,6 +25,18 @@ logger = logging.getLogger(__name__)
 FEDERATION_HTTP_TIMEOUT = 30.0
 FEDERATION_BATCH_LIMIT = 100
 FEDERATION_ID_PREFIX = "fed:"
+# Per-field size caps for incoming peer payloads. Hostile peers can otherwise
+# fill disk by pushing 50MB blobs; these caps bound a single memory to ~1.5MB.
+FEDERATION_MAX_CONTENT = 1_000_000  # 1 MB per content body
+FEDERATION_MAX_METADATA = 64 * 1024  # 64 KB metadata json
+FEDERATION_MAX_NAME = 256            # category/subcategory/namespace length
+
+
+def _cap(value, limit: int):
+    """Truncate strings above `limit`. Pass-through for None/non-string."""
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit]
+    return value
 
 
 # ── Pull + store ─────────────────────────────────────────────────────────────
@@ -181,6 +193,15 @@ async def _store_memories(
         remote_id = mem.get("id")
         if not remote_id or not isinstance(remote_id, str):
             continue
+        # Cap inbound strings. A hostile peer otherwise fills the disk.
+        content = _cap(mem.get("content", ""), FEDERATION_MAX_CONTENT)
+        verbatim = _cap(
+            mem.get("verbatim_content") or mem.get("content", ""),
+            FEDERATION_MAX_CONTENT,
+        )
+        category = _cap(mem.get("category", "federation"), FEDERATION_MAX_NAME)
+        subcategory = _cap(mem.get("subcategory"), FEDERATION_MAX_NAME)
+        namespace = _cap(mem.get("namespace", "default"), FEDERATION_MAX_NAME)
         local_id = f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}"
         remote_updated_raw = mem.get("updated") or mem.get("created")
         if remote_updated_raw:
@@ -205,6 +226,10 @@ async def _store_memories(
         else:
             meta_raw = {"federation_remote_id": remote_id}
         meta_json = json.dumps(meta_raw)
+        if len(meta_json) > FEDERATION_MAX_METADATA:
+            # Drop metadata if it's absurdly large; keep the remote_id pointer.
+            meta_json = json.dumps({"federation_remote_id": remote_id,
+                                    "_metadata_truncated": True})
 
         if existing is None:
             await conn.execute(
@@ -218,13 +243,13 @@ async def _store_memories(
                         $9, $10, $11, $12, $13, $14, NOW(), $14)
                 """,
                 local_id,
-                mem.get("content", ""),
-                mem.get("category", "federation"),
-                mem.get("subcategory"),
+                content,
+                category,
+                subcategory,
                 meta_json,
-                mem.get("verbatim_content") or mem.get("content", ""),
+                verbatim,
                 mem.get("quality_rating") or 75,
-                mem.get("namespace", "default"),
+                namespace,
                 mem.get("source_model"),
                 mem.get("source_provider"),
                 mem.get("source_session"),
@@ -249,13 +274,13 @@ async def _store_memories(
                     WHERE id = $1
                     """,
                     local_id,
-                    mem.get("content", ""),
-                    mem.get("category", "federation"),
-                    mem.get("subcategory"),
+                    content,
+                    category,
+                    subcategory,
                     meta_json,
-                    mem.get("verbatim_content") or mem.get("content", ""),
+                    verbatim,
                     mem.get("quality_rating") or 75,
-                    mem.get("namespace", "default"),
+                    namespace,
                     remote_updated,
                 )
                 upd_n += 1
