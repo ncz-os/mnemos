@@ -2,6 +2,45 @@
 
 All notable changes to MNEMOS are documented here.
 
+## [3.0.1] — 2026-04-22
+
+Patch release fixing three credibility-sensitive defects in the initial
+public cut of v3.0.0. No feature changes, no schema changes, safe in-place
+upgrade.
+
+### Fixed
+
+- **OpenAI gateway: full conversation history reaches the provider**
+  (`api/handlers/openai_compat.py`). The `_route_to_provider` helper used
+  by `/v1/chat/completions` and `/sessions/*/messages` previously
+  collapsed the request to `messages[-1]["content"]`, silently dropping
+  the system prompt, injected memory context, and every prior assistant
+  turn before the provider call. A new `_flatten_messages_for_prompt`
+  helper serializes the full `messages` array with role boundaries so
+  multi-turn chat and session history reach the provider intact. Silent
+  regression — no error, just degraded responses — fixed.
+
+- **Docker Compose applies all 11 migrations, not 4**
+  (`docker-compose.yml`). The v3.0 Compose file mounted only the first
+  four migration files into `docker-entrypoint-initdb.d/`. Fresh Compose
+  installs booted without sessions, DAG, consultations audit, webhooks,
+  OAuth, federation, or ownership tables — every v3 route 500'd on first
+  use. All eleven migration files are now mounted in the canonical
+  order (matches `installer/db.py::run_migrations()`).
+
+- **Session compression metrics tightened** (`api/handlers/sessions.py`).
+  The session-injection path currently ships raw-slice truncation, not
+  real compression; the `compression_ratio` columns on
+  `session_messages` and `session_memory_injections` now write `NULL`
+  rather than placeholder constants. Real ratios are populated in v3.1
+  once compression is wired into the session path.
+
+### Also
+
+- Internal renaming: compression mode aliases in `compression/lethe.py`
+  and `compression/distillation_engine.py` updated to accurate
+  descriptors. No behavior change; source-tree honesty pass.
+
 ## [3.0.0] — 2026-04-22
 
 First public release.
