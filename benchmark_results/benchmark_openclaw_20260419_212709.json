@@ -1,0 +1,98 @@
+{
+  "run_id": "benchmark_openclaw_20260419_212709",
+  "platform": "openclaw",
+  "endpoint": "http://192.168.207.25:5002",
+  "models_tested": [
+    "mnemos-proteus/llama-3.3-70b-versatile",
+    "mnemos-proteus/gpt-4o",
+    "mnemos-proteus/sonar-pro",
+    "mnemos-proteus/claude-3-5-sonnet-20241022"
+  ],
+  "latency_results": [
+    {
+      "model": "mnemos-proteus/llama-3.3-70b-versatile",
+      "provider": "mnemos-proteus",
+      "prompt": "What is 2+2?",
+      "latency_ms": 31306.25319480896,
+      "tokens_output": 0,
+      "success": true,
+      "error": null,
+      "timestamp": "2026-04-19T21:27:40.418413"
+    },
+    {
+      "model": "mnemos-proteus/llama-3.3-70b-versatile",
+      "provider": "mnemos-proteus",
+      "prompt": "Explain quantum computing in 1 sentence.",
+      "latency_ms": 29556.638956069946,
+      "tokens_output": 0,
+      "success": true,
+      "error": null,
+      "timestamp": "2026-04-19T21:28:09.975137"
+    },
+    {
+      "model": "mnemos-proteus/gpt-4o",
+      "provider": "mnemos-proteus",
+      "prompt": "What is 2+2?",
+      "latency_ms": 31258.241891860962,
+      "tokens_output": 0,
+      "success": true,
+      "error": null,
+      "timestamp": "2026-04-19T21:28:41.233483"
+    },
+    {
+      "model": "mnemos-proteus/gpt-4o",
+      "provider": "mnemos-proteus",
+      "prompt": "Explain quantum computing in 1 sentence.",
+      "latency_ms": 30853.067874908447,
+      "tokens_output": 0,
+      "success": true,
+      "error": null,
+      "timestamp": "2026-04-19T21:29:12.086637"
+    }
+  ],
+  "throughput_results": [
+    {
+      "model": "mnemos-proteus/llama-3.3-70b-versatile",
+      "concurrent_requests": 3,
+      "duration_seconds": 20.020726919174194,
+      "total_requests": 2,
+      "successful_requests": 0,
+      "throughput_req_per_sec": 0.0,
+      "avg_latency_ms": 0,
+      "p95_latency_ms": 0,
+      "p99_latency_ms": 0,
+      "timestamp": "2026-04-19T21:29:32.107501"
+    }
+  ],
+  "model_switch_results": [
+    {
+      "initial_model": "llama-3.3-70b-versatile",
+      "switched_model": "gpt-4o",
+      "switch_time_ms": 4540.215015411377,
+      "inference_time_ms": 29869.95029449463,
+      "success": true,
+      "error": null,
+      "timestamp": "2026-04-19T21:30:12.112119"
+    },
+    {
+      "initial_model": "gpt-4o",
+      "switched_model": "sonar-pro",
+      "switch_time_ms": 0,
+      "inference_time_ms": 0,
+      "success": false,
+      "error": "Command '['openclaw', 'agent', '--session-id', 'bench_switch_benchmark_openclaw_20260419_212709', '-",
+      "timestamp": "2026-04-19T21:30:52.084982"
+    },
+    {
+      "initial_model": "sonar-pro",
+      "switched_model": "claude-3-5-sonnet-20241022",
+      "switch_time_ms": 0,
+      "inference_time_ms": 0,
+      "success": false,
+      "error": "Command '['openclaw', 'agent', '--session-id', 'bench_switch_benchmark_openclaw_20260419_212709', '-",
+      "timestamp": "2026-04-19T21:31:32.087900"
+    }
+  ],
+  "total_duration_seconds": 262.9758868217468,
+  "timestamp": "2026-04-19T21:27:09.112124"
+}

@@ -46,7 +46,7 @@ class SystemInfo:
             f"Disk free: {self.disk_free_gb:.1f} GB",
             f"Sudo: {'available' if self.has_sudo else 'not available'}",
             f"PostgreSQL: {'running' + (' (' + self.postgres_version + ')' if self.postgres_version else '') if self.postgres_running else 'not detected'}",
-            f"GRAEAE: {"reachable" if self.graeae_reachable else "not reachable"}",
+            f"GRAEAE: {'reachable' if self.graeae_reachable else 'not reachable'}",
             f"Ollama: {'running, models: ' + ', '.join(self.ollama_models[:5]) if self.ollama_reachable else 'not running'}",
             f"Anthropic API key: {'set' if self.anthropic_key_set else 'not set'}",
         ]

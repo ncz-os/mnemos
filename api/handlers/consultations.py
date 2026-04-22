@@ -73,11 +73,13 @@ async def _write_audit_entry(
 
                 await conn.execute(
                     "INSERT INTO graeae_audit_log "
-                    "(consultation_id, prompt_hash, response_hash, chain_hash, "
-                    "prev_id, task_type, provider, quality_score) "
-                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                    consultation_id, prompt_hash, response_hash, chain_hash,
-                    prev_id, task_type, provider, quality_score,
+                    "(consultation_id, prompt, prompt_hash, provider, response_text, "
+                    "response_hash, chain_hash, prev_id, prev_chain_hash, "
+                    "task_type, quality_score) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                    consultation_id, prompt, prompt_hash, provider, response,
+                    response_hash, chain_hash, prev_id, prev_chain,
+                    task_type, quality_score,
                 )
     except Exception as e:
         logger.warning(f"[AUDIT] Failed to write audit entry: {e}")
@@ -103,6 +105,22 @@ async def _write_memory_refs(
                 )
     except Exception as e:
         logger.warning(f"[CONSULTATION] Failed to write memory refs: {e}")
+
+
+def _extract_memory_ids(result: dict) -> List[str]:
+    """Collect injected/reference memory IDs from known result shapes."""
+    raw_ids = (
+        result.get("memory_ids")
+        or result.get("injected_memory_ids")
+        or result.get("citations")
+        or []
+    )
+    memory_ids: list[str] = []
+    for raw_id in raw_ids:
+        memory_id = str(raw_id).strip()
+        if memory_id and memory_id not in memory_ids:
+            memory_ids.append(memory_id)
+    return memory_ids
 
 
 # ── Consultation endpoint ─────────────────────────────────────────────────────
@@ -135,7 +153,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
             result["all_responses"] = {best[0]: best[1]}
 
         consultation_id = None
-        memory_ids = []
+        memory_ids = _extract_memory_ids(result)
         if _lc._pool and result.get("all_responses"):
             try:
                 best_resp = max(
@@ -169,6 +187,11 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                     task_type=body.task_type or "reasoning",
                     provider=best_resp[0],
                     quality_score=best_resp[1].get("final_score", 0),
+                )
+                await _write_memory_refs(
+                    pool=_lc._pool,
+                    consultation_id=consultation_id,
+                    memory_ids=memory_ids,
                 )
             except Exception as e:
                 logger.warning(f"[CONSULTATION] Failed to log consultation: {e}")
@@ -360,5 +383,3 @@ async def get_consultation_artifacts(
         ],
         created_at=consultation["created_at"].isoformat(),
     )
-
-

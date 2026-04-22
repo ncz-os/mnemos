@@ -1,0 +1,28 @@
+{
+  "latency": {
+    "llama-3.3-70b-versatile": {
+      "avg_ms": 6804.898738861084,
+      "min_ms": 6166.263103485107,
+      "max_ms": 7252.616167068481,
+      "median_ms": 6995.816946029663,
+      "samples": 3
+    },
+    "gpt-4o": {
+      "avg_ms": 5932.55877494812,
+      "min_ms": 4979.286193847656,
+      "max_ms": 7252.33793258667,
+      "median_ms": 5566.052198410034,
+      "samples": 3
+    }
+  },
+  "throughput": {
+    "successful_requests": 2,
+    "total_duration_sec": 15.060995101928711,
+    "throughput_req_per_sec": 0.13279335040377777,
+    "avg_latency_ms": 7530.495643615723,
+    "p95_latency_ms": 8733.533143997192
+  },
+  "model_switching": [],
+  "timestamp": "2026-04-19T23:08:19.289113",
+  "endpoint": "http://192.168.207.25:5002"
+}

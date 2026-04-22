@@ -1,6 +1,10 @@
 -- MNEMOS Database Schema with Compression & Quality Tracking
 -- Phase 1: Core tables with integrated compression support
 
+-- Enable required extensions FIRST
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- memories table: Core memory storage with compression support
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,

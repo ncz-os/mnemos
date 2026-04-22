@@ -61,40 +61,42 @@ class ProviderResponse:
 
 # Built-in provider defaults — used when config.toml has no [graeae.providers] section.
 # Operators override these (or add new providers) via config.toml exclusively.
+# Default configuration prioritizes free/cheap tier access: Together AI and Groq are recommended
+# starting points for self-hosted deployments.
 _BUILTIN_PROVIDERS: dict[str, dict] = {
     # These are conservative public defaults — override via config.toml [graeae.providers].
     # Any provider with an invalid key or model will be skipped by the engine at runtime.
-    "perplexity": {
-        "url": "https://api.perplexity.ai/chat/completions",
-        "model": "sonar-pro", "weight": 0.88, "api": "openai", "key_name": "perplexity",
+    "together": {
+        "url": "https://api.together.xyz/v1/chat/completions",
+        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "weight": 0.80, "api": "openai", "key_name": "together_ai",
     },
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
-        "model": "llama-3.3-70b-versatile", "weight": 0.78, "api": "openai", "key_name": "groq",
+        "model": "llama-3.3-70b-versatile", "weight": 0.80, "api": "openai", "key_name": "groq",
+    },
+    "openai": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "model": "gpt-4o", "weight": 0.85, "api": "openai", "key_name": "openai",
     },
     "claude": {
         "url": "https://api.anthropic.com/v1/messages",
         "model": "claude-3-5-sonnet-20241022", "weight": 0.85, "api": "anthropic", "key_name": "claude",
     },
+    "perplexity": {
+        "url": "https://api.perplexity.ai/chat/completions",
+        "model": "sonar-pro", "weight": 0.88, "api": "openai", "key_name": "perplexity",
+    },
     "xai": {
         "url": "https://api.x.ai/v1/chat/completions",
         "model": "grok-2-latest", "weight": 0.84, "api": "openai", "key_name": "xai",
-    },
-    "openai": {
-        "url": "https://api.openai.com/v1/chat/completions",
-        "model": "gpt-4o", "weight": 0.82, "api": "openai", "key_name": "openai",
-    },
-    "gemini": {
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent",
-        "model": "gemini-1.5-pro", "weight": 0.81, "api": "gemini", "key_name": "gemini",
     },
     "nvidia": {
         "url": "https://integrate.api.nvidia.com/v1/chat/completions",
         "model": "meta/llama-3.3-70b-instruct", "weight": 0.80, "api": "openai", "key_name": "nvidia",
     },
-    "together": {
-        "url": "https://api.together.xyz/v1/chat/completions",
-        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "weight": 0.78, "api": "openai", "key_name": "together_ai",
+    "gemini": {
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent",
+        "model": "gemini-1.5-pro", "weight": 0.81, "api": "gemini", "key_name": "gemini",
     },
 }
 

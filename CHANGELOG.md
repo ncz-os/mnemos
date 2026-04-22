@@ -5,45 +5,83 @@ All notable changes to MNEMOS are documented here.
 ## [3.0.0] — 2026-04-21
 
 ### Added
-- **Unified API under `/v1/` namespace** — new primary routes for memories, consultations, providers, sessions. Pre-v3 paths remain functional as deprecated aliases.
-- **Consultations domain (`/v1/consultations`)** — multi-LLM reasoning with cited memory artifacts, hash-chained audit log (SHA-256), and `audit/verify` chain-integrity check.
-- **Providers domain (`/v1/providers`)** — unified provider catalog, health tracking, task-aware model recommendation (`/recommend`, `/best`).
+- **Unified API under `/v1/` namespace** — primary routes for consultations, providers, memories, versions, sessions. Pre-v3 paths (`/graeae/*`, `/memories/*`, `/model-registry/*`) remain functional as deprecated aliases for backward compatibility.
+- **Consultations domain (`/v1/consultations`)** — GRAEAE multi-LLM reasoning with cited memory artifacts, hash-chained audit log (SHA-256), `audit/verify` chain-integrity check. Memory injection tracking per consultation via `consultation_memory_refs` table (EMIR Article 57 audit support).
+- **Providers domain (`/v1/providers`)** — unified provider catalog, health tracking, task-aware model recommendation (`/recommend`, `/best`). Model registry with graceful fallback to static provider config when empty.
 - **OpenAI-compatible gateway** — `POST /v1/chat/completions`, `GET /v1/models`. Drop-in for OpenAI SDK consumers with automatic provider routing and optional memory injection.
-- **Stateful session management (phase0)** — `/v1/sessions/*` endpoints; multi-turn state with memory injection at turn boundaries.
+- **Stateful session management (phase0)** — `/sessions/*` endpoints; multi-turn state with memory injection at turn boundaries.
 - **DAG memory versioning (phase3)** — content-addressed commits, branches, merge; `/v1/memories/{id}/{log,branch,merge,commits}`.
 - **MCP tools for DAG and optimizer (phase6)** — programmatic access to versioning and model optimizer via stdio MCP server.
 - **Model optimizer integration (phase5)** — gateway selects models per task-type + budget, feeds quality back into provider scores.
 - **Distillation worker lifecycle integration (phase7)** — background worker starts with app lifespan; health tracked in worker status dict.
-- **Webhook subscriptions (v3 roadmap)** — `POST/GET/DELETE /v1/webhooks`, delivery log at `/v1/webhooks/{id}/deliveries`. HMAC-SHA256 signatures, 4-retry exponential backoff (1m/5m/30m/2h), durable delivery log replayed on restart via recovery worker.
-- **OAuth/OIDC authentication (v3 roadmap)** — browser-based login via Google, GitHub, Azure AD, or any generic OIDC provider (Keycloak, Authentik, Auth0, Okta). `/auth/oauth/*` endpoints for login/callback/logout/me; `/admin/oauth/providers` for admin-side provider management; `/admin/oauth/identities` for inspection. DB-backed sessions stored in `oauth_sessions` (revocable, 30-day default TTL), expired-session GC worker runs hourly. Coexists with API-key Bearer auth — `api/auth.py::get_current_user` checks Bearer first, then `mnemos_session` cookie. User provisioning: reuse existing user on `(provider, external_id)` match, link to existing user on email match, else create a fresh user.
-- **Cross-instance memory federation (v3 roadmap)** — pull-based one-way sync between MNEMOS instances. `/v1/federation/peers` admin CRUD, `/v1/federation/peers/{id}/sync` manual trigger, `/v1/federation/peers/{id}/log` per-peer history, `/v1/federation/status` aggregate view, `/v1/federation/feed` serving endpoint (requires `role IN ('federation', 'root')`). Tables: `federation_peers`, `federation_sync_log`; `memories` gains `federation_source` + `federation_remote_updated` columns. Federated memories stored with ids of the form `fed:{peer_name}:{remote_id}` and `owner_id='federation'`, read-only by convention. Background sync worker runs every 60s, pulls from peers whose interval has elapsed. Loop prevention: the feed endpoint excludes memories with `federation_source IS NOT NULL`, so federated memories don't re-propagate.
-- **Dual-license LICENSE file** — Apache 2.0 + Commons Clause (Tier 1: free for personal, team, educational, non-profit, internal enterprise) and proprietary commercial tier (Tier 2: SaaS, resale, white-label).
-- **Consultation → memory reference table (`consultation_memory_refs`)** — EMIR Article 57 audit support: which consultations cited which memories.
+- **Webhook subscriptions** — `POST/GET/DELETE /v1/webhooks`, delivery log at `/v1/webhooks/{id}/deliveries`. HMAC-SHA256 signatures, 4-retry exponential backoff (1m/5m/30m/2h), durable delivery log replayed on restart via recovery worker.
+- **OAuth/OIDC authentication** — browser-based login via Google, GitHub, Azure AD, or any generic OIDC provider (Keycloak, Authentik, Auth0, Okta). `/auth/oauth/*` endpoints for login/callback/logout/me; `/admin/oauth/{providers,identities}` admin surface. DB-backed sessions (revocable, 30-day default TTL), hourly GC worker. Coexists with API-key Bearer auth — `get_current_user` checks Bearer first, then `mnemos_session` cookie. Provisioning: reuse on `(provider, external_id)` match, link to existing user on email match, else mint fresh user.
+- **Cross-instance memory federation** — pull-based one-way sync between MNEMOS instances. `/v1/federation/peers` admin CRUD, `/v1/federation/peers/{id}/{sync,log}`, `/v1/federation/status`, `/v1/federation/feed` (requires `role IN ('federation', 'root')`). Tables: `federation_peers`, `federation_sync_log`; `memories` gains `federation_source` + `federation_remote_updated`. Federated memories stored with ids `fed:{peer_name}:{remote_id}`, `owner_id='federation'`, read-only by convention. Background sync every 60s. Loop prevention via `federation_source IS NOT NULL` exclusion.
+- **Dual-licensing** — Apache-2.0 for the OSS distribution (`LICENSE`). A separate proprietary commercial license is available by agreement (`LICENSE-PROPRIETARY.md`).
 - **Anti-memory-poisoning guide** (`ANTI_MEMORY_POISONING.md`) — DAG versioning rationale and operational procedures for detecting drift.
-- **`tools/docling_import.py`** — IBM Docling integration: import PDF / DOCX / HTML / MD / PPTX / TXT as chunked MNEMOS memories.
+- **`tools/docling_import.py`** — IBM Docling integration for PDF / DOCX / HTML / MD / PPTX / TXT import (Docling 2.69+ API).
 - **`tools/memory_import.py`** — generic bulk import helper.
+- **Integrations bundle** (`integrations/`) — drop-in hooks, skills, and MCP configs for Claude Code, OpenClaw, ZeroClaw, and Hermes. Each framework has SKILL.md + MCP config + enforcement snippet; Claude Code also includes idempotent install/uninstall scripts.
+- **Free-tier LLM defaults** — Together AI and Groq prioritized; OpenAI, Claude, Perplexity as fallbacks. No paid account required for a working install.
+- **Generic GPU provider config** — `GPU_PROVIDER_HOST` + `GPU_PROVIDER_PORT` env vars (optional; system works CPU-only with external LLM providers).
+- **DEPLOYMENT.md**, **`.env.example`** — public deployment guide + complete configuration template with sensible defaults.
 - **`CONTRIBUTING.md`, `SECURITY.md`** — contributor + security-disclosure docs.
 - **`v3.0.0_RELEASE_SUMMARY.md`, `V3_0_0_IMPLEMENTATION_SUMMARY.md`** — release + implementation documentation.
 - **`uv` package manager integration** — faster dependency resolution and builds.
+- **Python 3.9 compatibility** — `tomllib` fallback to `tomli` for older interpreters.
 
 ### Changed
 - MNEMOS API and GRAEAE consolidated into a single service on port **5002** (was: separate :5000 + :5001).
-- `api/handlers/memories.py` emits webhook events on create / update / delete (dispatches tolerate handler failure).
-- `api/handlers/consultations.py` emits `consultation.completed` webhook after audit write.
-- README rewritten for v3.0.0 surface; "What works now" sections expanded with consultations, providers, OpenAI gateway, sessions; Roadmap relabeled for accuracy.
-- Test reshuffle: legacy `test_hooks.py`, `toggle_auth.py`, `verify_v1.sh`, `verify_v2.sh` removed in favor of consolidated `test_integration.py` + `test_unit.py`.
+- SBOM simplified — FastAPI + asyncpg unified async stack; no Flask / gunicorn / sync-psycopg legacy.
+- `memories.py` emits webhook events on create / update / delete (dispatches tolerate handler failure).
+- `consultations.py` emits `consultation.completed` webhook after audit write; static `/audit` routes declared before dynamic `/{consultation_id}` to prevent path-param shadowing.
+- Compression module renamed surfaces: public docs + config now use LETHE (token + sentence modes) rather than extractive token filter / SENTENCE; code retains the `was extractive token filter` / `was SENTENCE` annotations for traceability.
+- README rewritten for v3.0.0 surface; Roadmap restructured; "What works now" expanded with consultations, providers, OpenAI gateway, sessions, webhooks, OAuth, federation.
+- Test reshuffle: legacy `test_hooks.py`, `toggle_auth.py`, `verify_v1.sh`, `verify_v2.sh` removed; consolidated `tests/test_unit.py`, `test_integration.py`, `test_v3_integration.py`, plus new `test_webhooks.py` / `test_oauth.py` / `test_federation.py`.
+- Minimal setup — 5 required env vars (PG_* + MNEMOS_API_KEY + one LLM provider).
+- Conftest rebuilt as in-process harness for deterministic integration tests.
+
+### Fixed
+- Audit trail insert path now matches schema (`af249ce`).
+- Consultation audit routes no longer shadowed by `/{consultation_id}` (route ordering).
+- DAG migration view column mismatches (`v_compression_stats`, `v_unreviewed_compressions`) aligned with actual `compression_quality_log` schema.
+- DAG routes now mount under `/v1/memories/...`.
+- `memories.metadata`, `memories.subcategory`, `memories.verbatim_content` — added via idempotent `ALTER TABLE` on v2_versioning migration (columns the handler expected but the base migration omitted).
+- v2_versioning trigger: `current_setting(...) OR 'main'` (invalid SQL) corrected to `COALESCE(NULLIF(...), 'main')`.
+- v3_dag migration: `DROP VIEW` now precedes `ALTER COLUMN` on `compression_quality_log.memory_id`.
+- `compression_quality_log.memory_id` type mismatch (UUID → TEXT) reconciled with `memories.id TEXT` in base migration.
+- `consultations.py` SQL aliases `created AS created_at` to align with handler response shape.
+- `sessions.py`: SELECT DISTINCT + ORDER BY rewritten as GROUP BY + MAX.
+- `providers/recommend` falls back to static GRAEAE provider config when `model_registry` is empty (fresh-install case).
+- Docling import updated for v2.69+ API changes.
+- Python 3.9 `tomllib` → `tomli` fallback.
+- Lifecycle log line version string corrected to v3.0.0.
+
+### Backward Compatibility
+- All v2.x endpoints (`/graeae/*`, `/memories/*`, `/model-registry/*`) remain unchanged and functional.
+- v2.x API coexists with v3 — no breaking changes for existing MNEMOS deployments.
 
 ### Removed
-- Internal-infrastructure references scrubbed from all public docs.
+- Internal-infrastructure references scrubbed from all public docs and code paths (PYTHIA / CERBERUS / PROTEUS / ARGONAS; hardcoded 192.168.207.x addresses). See `GPU_PROVIDER_HOST` for the generic alternative.
 - Pre-release `MNEMOS_v24_IMPLEMENTATION_NOTES.md` and its in-code reference in `api/handlers/memories.py`.
 
 ### Security
-- Webhook deliveries are HMAC-signed per-subscription; receivers verify before trusting payloads.
+- Hash-chained audit log for all consultations (tamper-evident reasoning trail).
+- Memory injection tracking per consultation (auditable context).
+- Webhook deliveries are HMAC-signed per subscription; receivers verify before trusting payloads.
 - Webhook revocation is soft-delete — delivery log retained for audit even after subscription revocation.
-- OAuth state (PKCE verifier + CSRF nonce) is carried in a Starlette-signed short-lived cookie (`mnemos_oauth_state`, 10-minute TTL, separate from the application session cookie). Secret key via `MNEMOS_SESSION_SECRET` env; auto-generated on startup if unset (warning logged).
-- Sessions are DB-backed (not JWT) so individual sessions can be revoked instantly; raw session ids are never logged. Cookie flags: `HttpOnly`, `SameSite=Lax`, `Secure` when served over HTTPS.
+- OAuth state (PKCE verifier + CSRF nonce) in a Starlette-signed short-lived cookie (`mnemos_oauth_state`, 10-min TTL, separate from the application session cookie). Signing key via `MNEMOS_SESSION_SECRET`; auto-generated on startup if unset.
+- Sessions are DB-backed (not JWT) so individual sessions can be revoked instantly; raw session ids are never logged. Cookies use `HttpOnly`, `SameSite=Lax`, `Secure` when served over HTTPS.
 
----
+## [2.4.0] — 2026-04-19 (intermediate, v3.0.0 baseline)
+
+**Note**: v2.4.0 was the development baseline for v3.0.0 unification. Features from v2.4.0 (OpenAI gateway, sessions, DAG versioning, compression tiers) are all included in v3.0.0 without modification.
+
+- OpenAI-compatible gateway with auto memory injection
+- Server-side session management with stateful chat
+- Git-like DAG versioning (branch, merge, revert)
+- THE MOIRAI compression (LETHE, ALETHEIA, ANAMNESIS)
+- Distillation worker for async compression
 
 ## [2.3.0] — 2026-04-12
 

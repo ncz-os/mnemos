@@ -8,7 +8,8 @@ version = "3.0.0"
 description = "MNEMOS-OS v3: Unified memory operating system with GRAEAE reasoning, DAG versioning, compression, and cost-aware routing"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {file = "LICENSE"}
+license = "Apache-2.0"
+license-files = ["LICENSE", "LICENSE-PROPRIETARY.md"]
 authors = [{ name = "MNEMOS Contributors" }]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -48,8 +49,10 @@ Repository = "https://github.com/perlowja/mnemos"
 Documentation = "https://github.com/perlowja/mnemos/blob/master/README.md"
 
 [project.optional-dependencies]
-phi = ["openvino-genai>=2024.4.0", "fastembed>=0.3.0"]
+docling = ["docling>=2.5.0", "docling-core>=2.0.0", "pillow>=10.0.0"]
 full = ["sentence-transformers>=2.7.0", "spacy>=3.7.0", "networkx>=3.3"]
+# Note: the `phi` extras are optional GPU-dependent OpenVINO/FastEmbed support. Most installs don't need it.
+phi = ["openvino-genai>=2024.4.0", "fastembed>=0.3.0"]
 dev = [
   "pytest>=8.0.0",
   "pytest-asyncio>=0.23.0",
@@ -68,15 +71,10 @@ py-modules = [
 [tool.setuptools.packages.find]
 include = ["api*", "compression*", "graeae*", "db*"]
 
-[tool.uv]
 # uv: fast Python package installer for Docker builds
 # Install with: curl -LsSf https://astral.sh/uv/install.sh | sh
-python-version = "3.11"
-
-[[tool.uv.index]]
-# Optional: use official PyPI (default)
-name = "pypi"
-url = "https://pypi.org/simple"
+# Note: uv does not support python-version in [tool.uv] (use pyproject.toml requires-python instead)
+# For Docker: use `uv pip install --system -r requirements.txt` (--system is required when no venv exists)
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
