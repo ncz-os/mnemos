@@ -4,10 +4,22 @@
 
 # MNEMOS + GRAEAE
 
-**Production memory for serious agentic systems.**
+**A memory operating system for serious agentic work — not a memory-storage provider.**
 **In daily production use since December 2025.**
 
-MNEMOS is a shared memory service for professional AI and agentic development. It stores, compresses, and reasons over memory with the same operational rigor you would apply to any production database: ACID guarantees, access controls, quality contracts on every transformation, and a cryptographically auditable reasoning layer. It is infrastructure, not a demo feature. It is designed for teams building real systems — where memory has to be persistent, inspectable, attributable, and operationally reliable, not just convenient in a demo.
+The distinction matters. A *storage provider* gives you a place to put bytes. An *operating system* gives you named subsystems — a scheduler, a compressor, a process manager, a security layer, an auditor — that manage the full lifecycle of a resource the application no longer has to babysit.
+
+MNEMOS is the second thing. It is the operating system for agent memory: a runtime composed of named subsystems that cooperate to manage the full lifecycle of memory across multiple agents, providers, and time horizons — **write, embed, compress, version, reason-over, audit, federate, archive** — each one a first-class citizen of the runtime, not a feature bolted onto a vector store.
+
+- **MNEMOS** is the memory kernel and the overall system name. Storage, versioning, tiered compression, and lifecycle sit here.
+- **GRAEAE** is the reasoning bus — a multi-provider consensus layer that scores and selects across live LLM backends with a cryptographic audit chain on every decision.
+- **THE MOIRAI** (**LETHE**, **ALETHEIA**, **ANAMNESIS**) is the compression subsystem — three tiers that decide what part of a memory's thread survives, with a written receipt on every transformation.
+- A **self-maintaining model registry** keeps itself current from provider APIs and Arena.ai Elo rankings, so the kernel always knows what models exist, what they cost, and how good they currently are.
+- **Federation**, **webhooks**, **OAuth**, **RLS**, **DAG versioning**, and the **/v1/** REST surface are services built on top of that kernel, not retrofits onto a library.
+
+This is not vocabulary borrowed from a dictionary of compelling words. Each of those names is a subsystem with an actual code path, an actual SQL table, an actual lifecycle worker, and an actual failure mode. Read the source tree; it's laid out that way.
+
+You can treat MNEMOS like a memory storage provider if you want — `POST /v1/memories`, `GET /v1/memories/{id}`, you're done. The system will happily oblige. But the reason it holds up in production is that everything underneath that surface is operating-system-shaped: write-ahead transactions on the audit chain, supervised workers for distillation, per-provider circuit breakers, hash-chained reasoning logs, named compression tiers with quality manifests, advisory-locked DAG merges, SSRF-hardened outbound webhooks, a dynamically-weighted model registry that updates itself. It is infrastructure built to operate, not a demo feature built to demo.
 
 **What it is, concretely:**
 
@@ -19,7 +31,7 @@ MNEMOS is a shared memory service for professional AI and agentic development. I
 - Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in.
 - Runs alongside your applications the way Redis, PostgreSQL, or a message bus would. Deploy once, every agent in your stack shares the same memory substrate.
 
-This is not a desktop library or an in-process chat-memory helper. It is a network service with a REST API, a real database backend, quality contracts on every transformation, and a reasoning layer you can audit — built for multi-agent workflows, provenance-aware memory, and the kind of operator who runs it alongside PostgreSQL and Redis on the same box.
+MNEMOS runs as a network service — you deploy it once, alongside PostgreSQL and Redis, and every agent in your stack shares the same memory kernel over REST. It is not a desktop library, not an in-process helper, not a framework you import. Different form factor, different user, and specifically not a replacement for projects like MemPalace that serve the desktop / single-user case well.
 
 ---
 
