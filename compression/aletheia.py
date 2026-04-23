@@ -25,6 +25,7 @@ from .base import (
     GPUIntent,
     IdentifierPolicy,
 )
+from .gpu_guard import get_guard
 
 logger = logging.getLogger(__name__)
 
@@ -125,12 +126,22 @@ class ALETHEIA:
             scoring_response = result.get("choices", [{}])[0].get("text", "").strip()
 
             # Parse GPU provider's token importance scores
-            compressed_text, token_indices = self._parse_compressed_tokens(text, scoring_response)
+            compressed_text, token_indices, used_fallback = self._parse_compressed_tokens(
+                text, scoring_response
+            )
 
             # Calculate metrics
             original_tokens = len(text.split())
             compressed_tokens = len(compressed_text.split())
             compression_ratio = compressed_tokens / original_tokens if original_tokens > 0 else 1.0
+
+            # Honest quality reporting: 0.95 for real LLM-scored importance;
+            # 0.60 when we fell back to first-N tokens because the model's
+            # response was unparseable. A quality-first scoring profile
+            # should see the fallback penalty clearly; balanced will mostly
+            # still value the speed/ratio advantage over the cost.
+            quality_score = 0.60 if used_fallback else 0.95
+            method = "aletheia_parse_fallback" if used_fallback else "aletheia"
 
             return {
                 "original_tokens": original_tokens,
@@ -138,8 +149,8 @@ class ALETHEIA:
                 "compression_ratio": compression_ratio,
                 "compression_percentage": (1.0 - compression_ratio) * 100,
                 "compressed_text": compressed_text,
-                "quality_score": 0.95,  # LLM-scored compression maintains high quality
-                "method": "aletheia",
+                "quality_score": quality_score,
+                "method": method,
                 "error": None,
             }
 
@@ -179,22 +190,39 @@ Only output the indices, no explanation.
 """
 
     def _parse_compressed_tokens(self, text: str, scoring_response: str) -> tuple:
-        """Parse GPU provider's token importance response."""
+        """Parse GPU provider's token importance response.
+
+        Returns (compressed_text, indices, used_fallback). used_fallback is
+        True when the parser couldn't recover valid token indices from the
+        model's output — an exception during parsing, OR a successful
+        parse that produced zero valid indices (which happens when the
+        model returns whitespace, punctuation, or off-spec text, as
+        Qwen2.5-Coder routinely does against ALETHEIA's index-list
+        prompt). The caller uses this flag to report an honest
+        quality_score and method label.
+        """
         tokens = text.split()
         try:
             # Parse comma-separated indices
             indices = [int(x.strip()) for x in scoring_response.split(",") if x.strip().isdigit()]
             indices = [i for i in indices if i < len(tokens)]
+            if not indices:
+                # Parse "succeeded" but yielded no valid indices — treat
+                # as parse failure so we hit the first-N fallback below.
+                # Before this check the engine silently returned empty
+                # content with quality_score=0.95, which live testing
+                # exposed as an adapter/contest-visible degenerate.
+                raise ValueError("no valid token indices in scoring response")
             indices.sort()
 
             selected_tokens = [tokens[i] for i in indices]
             compressed_text = " ".join(selected_tokens)
-            return compressed_text, indices
+            return compressed_text, indices, False
         except Exception as e:
             logger.warning(f"[ALETHEIA] Failed to parse scoring response: {e}")
             # Fallback: return first N tokens
             target_count = max(5, int(len(tokens) * 0.3))
-            return " ".join(tokens[:target_count]), list(range(target_count))
+            return " ".join(tokens[:target_count]), list(range(target_count)), True
 
     async def health_check(self) -> bool:
         """Check if GPU provider is reachable."""
@@ -254,6 +282,24 @@ class ALETHEIAEngine(CompressionEngine):
 
     async def compress(self, request: CompressionRequest) -> CompressionResult:
         started = time.perf_counter()
+        guard = get_guard(self._core.gpu_url)
+        if not await guard.is_available():
+            elapsed = int((time.perf_counter() - started) * 1000)
+            return CompressionResult(
+                engine_id=self.id,
+                engine_version=self.version,
+                original_tokens=len(request.content.split()),
+                elapsed_ms=elapsed,
+                gpu_used=False,
+                identifier_policy=IdentifierPolicy.OFF,
+                manifest={
+                    "gpu_url": self._core.gpu_url,
+                    "circuit_state": guard.state.value,
+                    "circuit_last_error": guard.last_error,
+                },
+                error=f"gpu_guard circuit open for {self._core.gpu_url}",
+            )
+
         try:
             core_out = await self._core.compress(
                 request.content,
@@ -262,6 +308,7 @@ class ALETHEIAEngine(CompressionEngine):
         except Exception as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
             logger.exception("ALETHEIAEngine.compress raised for %s", request.memory_id)
+            await guard.record_failure(exc)
             return CompressionResult(
                 engine_id=self.id,
                 engine_version=self.version,
@@ -275,6 +322,7 @@ class ALETHEIAEngine(CompressionEngine):
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         err = core_out.get("error")
         if err is not None:
+            await guard.record_failure(None)
             return CompressionResult(
                 engine_id=self.id,
                 engine_version=self.version,
@@ -286,6 +334,7 @@ class ALETHEIAEngine(CompressionEngine):
                 error=err,
             )
 
+        await guard.record_success()
         return CompressionResult(
             engine_id=self.id,
             engine_version=self.version,

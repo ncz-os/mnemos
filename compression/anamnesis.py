@@ -28,6 +28,7 @@ from .base import (
     GPUIntent,
     IdentifierPolicy,
 )
+from .gpu_guard import get_guard
 
 logger = logging.getLogger(__name__)
 
@@ -352,6 +353,24 @@ class ANAMNESISEngine(CompressionEngine):
         started = time.perf_counter()
         category = self._resolve_category(request)
         original_tokens = len(request.content.split())
+        guard = get_guard(self._core.gpu_url)
+        if not await guard.is_available():
+            elapsed = int((time.perf_counter() - started) * 1000)
+            return CompressionResult(
+                engine_id=self.id,
+                engine_version=self.version,
+                original_tokens=original_tokens,
+                elapsed_ms=elapsed,
+                gpu_used=False,
+                identifier_policy=IdentifierPolicy.OFF,
+                manifest={
+                    "category": category,
+                    "gpu_url": self._core.gpu_url,
+                    "circuit_state": guard.state.value,
+                    "circuit_last_error": guard.last_error,
+                },
+                error=f"gpu_guard circuit open for {self._core.gpu_url}",
+            )
         try:
             core_out = await self._core.extract_facts(
                 text=request.content,
@@ -363,6 +382,7 @@ class ANAMNESISEngine(CompressionEngine):
             logger.exception(
                 "ANAMNESISEngine.compress raised for %s", request.memory_id
             )
+            await guard.record_failure(exc)
             return CompressionResult(
                 engine_id=self.id,
                 engine_version=self.version,
