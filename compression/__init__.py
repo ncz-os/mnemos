@@ -28,6 +28,7 @@ from .contest import (
     load_scoring_profile,
     run_contest,
 )
+from .contest_store import persist_contest
 from .quality_analyzer import QualityAnalyzer, QualityManifest
 from .manager import CompressionManager, CompressionResult
 from .lethe import LETHE, LETHEEngine
@@ -59,6 +60,7 @@ __all__ = [
     "ContestCandidate",
     "ContestOutcome",
     "run_contest",
+    "persist_contest",
     # v3.0 compression surface (still in use until LETHE/ALETHEIA/ANAMNESIS
     # migrate to the ABC)
     "QualityAnalyzer",
