@@ -177,8 +177,17 @@ def test_load_custom_invalid_toml_falls_back(caplog):
         (None, 0.0),             # engine produced no output
         (1.0, 0.0),              # no compression
         (0.5, 0.5),
-        (0.2, 0.8),
+        (0.2, 0.8),              # inside the operational band
         (1.5, 0.0),              # expanded output (loser)
+        # Degenerate-output floor (caught by the live-GPU test where a
+        # bad importance-score response fell back to empty content
+        # with ratio=0.0 and would have otherwise scored 1.0):
+        (0.0, 0.0),
+        (0.10, 0.0),             # below MIN_CHUNK_RATIO (0.15)
+        (0.14, 0.0),             # still below the floor
+        (0.15, 0.85),            # AT the floor: at the edge of the
+                                  # allowed band, still rewarded
+        (0.16, 0.84),            # just above the floor
     ],
 )
 def test_ratio_term(ratio, expected):
