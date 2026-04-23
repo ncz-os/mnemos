@@ -1,0 +1,34 @@
+# /etc/mnemos-backup.conf — per-host backup configuration
+#
+# Sourced by mnemos-backup-daily.sh as shell variables. Copy this file to
+# /etc/mnemos-backup.conf on each host and adjust.
+
+# Target directory for backups. Typically an NFS-mounted ARGONAS path.
+# Hostname will be appended automatically.
+BACKUP_TARGET=/mnt/argonas/datapool/backups
+
+# Override the hostname used as the subdirectory name (defaults to `hostname -s`).
+# BACKUP_HOSTNAME=pythia
+
+# Colon-separated list of absolute paths to rsync. Each path is mirrored into
+# $BACKUP_TARGET/<hostname>/fs/<flattened-path>/ with --delete scoped to that
+# subtree only.
+BACKUP_DIRECTORIES=/home/jasonperlow/.claude:/etc/mnemos:/opt/mnemos
+
+# Postgres dump toggle.
+INCLUDE_PG=true
+
+# Comma-separated list of database names to dump.
+PG_DATABASES=mnemos
+
+# Standard options passed to pg_dump (custom format by default).
+PG_DUMP_OPTS=-Fc
+
+# Docker container name if Postgres runs in a container. Leave empty for host Postgres.
+# PG_CONTAINER=mnemos-prod-pg
+
+# Required when PG_CONTAINER is set.
+# PG_USER=mnemos
+
+# Extra rsync options appended after defaults. Quote values that contain spaces.
+# RSYNC_EXTRA_OPTS=--bwlimit=20000
