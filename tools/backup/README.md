@@ -155,26 +155,83 @@ No scripts needed — this is a native macOS feature.
 ## Off-site replication (ARGONAS itself)
 
 Everything backs up *to* ARGONAS. If ARGONAS fails, you lose
-everything. Choose one:
+everything. Use whatever cloud storage you already pay for; the
+format below works with any rclone remote.
 
-### Option A — Backblaze B2 via TrueNAS Cloud Sync (~$6/TB/month)
+**Important — Google Drive and other per-file-API stores:** uploading
+a tree of many small files is *glacial* (one API call per file, rate
+limited to ~3/sec). Always tar the backup tree into a single archive
+before uploading. This section assumes that pattern.
 
-1. Create a B2 bucket (`mnemos-offsite` or similar), lifecycle rule:
-   keep latest version, expire noncurrent after 30 days.
-2. Create an Application Key restricted to that bucket.
-3. TrueNAS → Data Protection → Cloud Sync Tasks → Add:
-   - Provider: Backblaze B2
+### Option A — Google Drive via TrueNAS Cloud Sync (recommended)
+
+Zero marginal cost if you already have a Google One plan (5 TB is
+more than enough for the full ARGONAS backup corpus for years).
+
+**Step 1 — ARGONAS-side nightly tar script.** Run after the daily
+retention sweep. Outputs one encrypted tarball per day into a staging
+dir that Cloud Sync watches.
+
+```bash
+#!/bin/bash
+# /usr/local/bin/mnemos-offsite-pack.sh
+set -u -o pipefail
+STAGE=/mnt/datapool/offsite-stage
+STAMP=$(date -u +%Y-%m-%d)
+PASS_FILE=/root/.mnemos-offsite.passphrase   # chmod 600
+
+mkdir -p "$STAGE"
+tar -cf - /mnt/datapool/backups /mnt/datapool/git \
+    | gpg --batch --yes --symmetric --cipher-algo AES256 \
+          --passphrase-file "$PASS_FILE" \
+    > "$STAGE/mnemos-offsite-${STAMP}.tar.gpg"
+
+# Keep last 14 local copies (Cloud Sync uploads from here)
+ls -1t "$STAGE"/mnemos-offsite-*.tar.gpg | tail -n +15 | xargs -r rm -f
+```
+
+Schedule via systemd timer or cron, 05:00 daily (after the retention
+sweep at 04:00).
+
+**Step 2 — TrueNAS Cloud Sync task:**
+1. **Credentials → Backup Credentials → Cloud Credentials → Add**
+   - Provider: Google Drive
+   - Authenticate: opens OAuth flow in browser; sign in with the
+     Google account whose quota you want to use
+2. **Data Protection → Cloud Sync Tasks → Add**
    - Direction: PUSH
-   - Transfer mode: SYNC
-   - Source: `/mnt/datapool/backups` (and `/mnt/datapool/git` if you
-     want repos off-site too)
+   - Transfer mode: SYNC (mirrors staging dir → Drive)
+   - Source: `/mnt/datapool/offsite-stage/`
+   - Remote path: `mnemos-offsite/` (auto-creates on Drive)
    - Schedule: daily 06:00
-   - Encryption: enable client-side with a passphrase you store
-     separately from ARGONAS.
+   - Encryption: unnecessary (GPG already handled it at tar time)
+   - Remote Encryption (rclone `crypt`): **disable** — tarball is
+     already encrypted, double-encrypting wastes CPU
 
-At ~100 GB of critical data, monthly cost is <$1.
+**Step 3 — verify restore path.** Pick a random tarball from Drive,
+download, `gpg --decrypt`, `tar -tf` to list contents. Do this on a
+host that doesn't share a passphrase filesystem with ARGONAS — if
+ARGONAS dies and takes the passphrase with it, you're locked out.
+Store the GPG passphrase in a password manager (1Password, etc.).
 
-### Option B — Second NAS via `zfs send | receive`
+### Option B — rclone on ARGOS (fallback if TrueNAS UI is unavailable)
+
+ARGOS already has `/mnt/argonas/datapool` NFS-mounted, so it can read
+the tarball staging dir. rclone handles Google Drive natively.
+
+```bash
+# One-time setup (interactive OAuth via SSH port-forward)
+sudo apt install -y rclone
+rclone config        # add "gdrive" remote, follow prompts
+# Test
+rclone ls gdrive:mnemos-offsite/
+
+# Scheduled (systemd timer or cron, 06:00 daily)
+rclone sync /mnt/argonas/datapool/offsite-stage gdrive:mnemos-offsite \
+    --log-file /var/log/rclone-mnemos.log --log-level INFO
+```
+
+### Option C — Second NAS via `zfs send | receive`
 
 If you have a second physical box, periodic snapshot replication is
 free and faster than cloud:
@@ -186,9 +243,9 @@ zfs send -i datapool/backups@<prev> datapool/backups@<new> \
     | ssh root@backup-box zfs receive datapool/argonas-backups
 ```
 
-### Option C — External USB rotated weekly
+### Option D — External USB rotated weekly
 
-Cheapest but manual. Plug in disk, `zfs send` snapshot, unplug,
+Cheapest manual fallback. Plug in disk, `zfs send` snapshot, unplug,
 take off-site, repeat with a second disk next week.
 
 ---
