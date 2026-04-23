@@ -718,7 +718,7 @@ Yes. GRAEAE routes across any configured provider. Together AI and Groq are the 
 
 ### Is there a hosted version?
 
-Not today. Self-hosted only. If you want a managed deployment, the proprietary commercial license covers custom arrangements — see `LICENSE-PROPRIETARY.md`.
+Not today. Self-hosted only.
 
 ### How is this different from Mem0 / Zep / MemPalace / LangChain memory?
 
@@ -735,13 +735,6 @@ Yes — we have been since December 2025. v3.0 is the first public release line,
 ### What's the migration story from [Mem0 / Zep / raw PostgreSQL]?
 
 Currently manual — write a one-shot script that hits `POST /v1/memories/bulk` with your source data. Direct-import adapters for major competitors are on the roadmap but not yet shipped.
-
-### Apache 2.0 vs the proprietary commercial license — which one do I use?
-
-- **Apache 2.0** (`LICENSE`) — the OSS distribution. Free to use, modify, redistribute, fork, run commercially, etc. Standard permissive OSS license. **This is what you use.**
-- **Proprietary commercial license** (`LICENSE-PROPRIETARY.md`) — only matters if you need terms beyond Apache 2.0 (custom indemnification, specific SLA language, managed-service arrangements, vendor-of-record requirements). Most users don't need this. Contact the maintainer if you do.
-
-If you're not sure, it's Apache 2.0.
 
 ### Why port 5002 and not something normal like 8080?
 
@@ -765,9 +758,6 @@ Yes. `Dockerfile` and `docker-compose.yml` ship in the repo; `docker compose up 
 
 ## License
 
-MNEMOS is dual-licensed:
+MNEMOS is licensed under the Apache License, Version 2.0. See [`LICENSE`](./LICENSE) for the full text.
 
-- **Apache License 2.0** for the open-source distribution in this repository — see [`LICENSE`](./LICENSE).
-- **Proprietary commercial license** available by agreement for organizations that need alternative commercial terms — see [`LICENSE-PROPRIETARY.md`](./LICENSE-PROPRIETARY.md).
-
-Possession of this repository does not automatically grant the proprietary commercial license; contact the maintainer for those terms.
+Contributions are accepted under the Developer Certificate of Origin (DCO) — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).

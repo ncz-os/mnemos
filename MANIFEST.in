@@ -1,7 +1,6 @@
 include README.md
 include CHANGELOG.md
 include LICENSE
-include LICENSE-PROPRIETARY.md
 include CONTRIBUTING.md
 include SECURITY.md
 include DEPLOYMENT.md
