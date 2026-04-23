@@ -156,6 +156,67 @@ def test_load_custom_partial_toml_fills_defaults_from_balanced():
         path.unlink()
 
 
+def test_load_custom_negative_weight_clamped_to_zero(caplog):
+    """v3.1.1: out-of-range weights are clamped, not passed through."""
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write("[custom]\nquality_weight = -5.0\n")
+        path = Path(fh.name)
+    try:
+        with caplog.at_level("WARNING"):
+            prof = load_scoring_profile("custom", config_path=path)
+        assert prof.quality_weight == 0.0
+        assert any("below allowed minimum" in rec.message for rec in caplog.records)
+    finally:
+        path.unlink()
+
+
+def test_load_custom_excessive_weight_clamped_to_max(caplog):
+    """Weight above the 10.0 ceiling is clamped, with an operator-
+    visible warning.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write("[custom]\nspeed_weight = 1000.0\n")
+        path = Path(fh.name)
+    try:
+        with caplog.at_level("WARNING"):
+            prof = load_scoring_profile("custom", config_path=path)
+        assert prof.speed_weight == 10.0
+        assert any("above allowed maximum" in rec.message for rec in caplog.records)
+    finally:
+        path.unlink()
+
+
+def test_load_custom_quality_floor_at_one_clamped_to_point_99(caplog):
+    """quality_floor = 1.0 would reject every candidate (no contest can
+    ever have a winner). Clamped to 0.99 so operators aren't mystified.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write("[custom]\nquality_floor = 1.0\n")
+        path = Path(fh.name)
+    try:
+        with caplog.at_level("WARNING"):
+            prof = load_scoring_profile("custom", config_path=path)
+        assert prof.quality_floor == 0.99
+    finally:
+        path.unlink()
+
+
+def test_load_custom_non_numeric_falls_back_to_balanced_default(caplog):
+    """A non-numeric string for a weight should NOT crash; fall back
+    to the balanced default with a warning.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write('[custom]\nratio_weight = "fast"\n')
+        path = Path(fh.name)
+    try:
+        with caplog.at_level("WARNING"):
+            prof = load_scoring_profile("custom", config_path=path)
+        assert prof.ratio_weight == BUILT_IN_PROFILES["balanced"].ratio_weight
+        assert any("is not a number" in rec.message for rec in caplog.records)
+    finally:
+        path.unlink()
+
+
 def test_load_custom_invalid_toml_falls_back(caplog):
     with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
         fh.write("this is not valid toml [[[")
@@ -239,12 +300,15 @@ def test_quality_first_profile_rewards_quality_over_speed():
     # 0.50 candidate is still disqualified (floor), and between
     # fast_good (q=0.85) and slow_great (q=0.95) the latter's quality
     # advantage matters more.
-    # composite fast_good   = (2*0.85)*(1*0.6)*(0.5*1.0)      = 0.510
-    # composite slow_great  = (2*0.95)*(1*0.7)*(0.5*0.0333)   = 0.022
-    # The 1/30 speed ratio still wins for fast_good — the
-    # quality weight can't fully close a 30x speed gap. This test
-    # pins that behavior: profile shifts shape the outcome but don't
-    # overrule wide-margin speed differences.
+    #
+    # v3.1.1 speed_factor is log-space: 10/300 ≈ 0.033, log-compressed
+    # to 1 + log10(0.033)/2 ≈ 0.26 (above the SPEED_FACTOR_FLOOR of 0.1).
+    # composite fast_good   = (2*0.85)*(1*0.6)*(0.5*1.0)     = 0.510
+    # composite slow_great  = (2*0.95)*(1*0.7)*(0.5*0.26)    = 0.173
+    # fast_good still wins the 30x speed gap, but slow_great is much
+    # closer than the v3.1.0 linear scoring (0.022 vs 0.173). A larger
+    # quality gap at the same speed ratio could now flip the result —
+    # that's the point of log-space: stop crushing slow-but-good engines.
     engines = [
         MockEngine("fast_good", quality=0.85, ratio=0.4, elapsed_ms=10),
         MockEngine("slow_great", quality=0.95, ratio=0.3, elapsed_ms=300),
@@ -253,15 +317,22 @@ def test_quality_first_profile_rewards_quality_over_speed():
     assert outcome.winner.result.engine_id == "fast_good"
 
 
-def test_speed_factor_normalized_to_fastest():
+def test_speed_factor_log_space_compressed():
+    # v3.1.1: speed_factor is now log-compressed rather than raw linear.
+    # 10x slower maps to 0.5 (was 0.1 under linear), 100x slower maps
+    # to the floor 0.1 (was 0.01). This lets quality_first weighting
+    # actually reward quality against a clear-but-not-catastrophic
+    # speed gap.
     engines = [
         MockEngine("a", quality=0.9, ratio=0.4, elapsed_ms=10),
-        MockEngine("b", quality=0.9, ratio=0.4, elapsed_ms=100),
+        MockEngine("b", quality=0.9, ratio=0.4, elapsed_ms=100),  # 10x slower
+        MockEngine("c", quality=0.9, ratio=0.4, elapsed_ms=1000),  # 100x slower
     ]
     outcome = asyncio.run(run_contest(engines, _request()))
     sf = {c.result.engine_id: c.speed_factor for c in outcome.candidates if c.reject_reason in (None, "inferior")}
-    assert abs(sf["a"] - 1.0) < 0.001
-    assert abs(sf["b"] - 0.1) < 0.001
+    assert abs(sf["a"] - 1.0) < 0.001           # fastest
+    assert abs(sf["b"] - 0.5) < 0.001           # 10x slower -> 0.5
+    assert abs(sf["c"] - 0.1) < 0.001           # 100x slower -> floor
 
 
 def test_zero_composite_survivor_is_not_a_winner():
