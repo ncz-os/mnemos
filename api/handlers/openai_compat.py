@@ -336,11 +336,13 @@ def _owned_by(provider: Optional[str]) -> str:
 # been seeded yet. Matches the shape the old hardcoded list used; new
 # deployments should run `update_model_registry.py` to populate real
 # rows, but /v1/models stays usable in the meantime.
+# Refreshed 2026-04-23 (v3.1.2 Defect 3) — aligned with the GRAEAE
+# built-in provider defaults in graeae/engine.py._BUILTIN_PROVIDERS.
 _FALLBACK_MODELS: list[dict] = [
-    {"model_id": "gpt-5", "provider": "openai"},
-    {"model_id": "claude-4.5-sonnet", "provider": "anthropic"},
-    {"model_id": "gemini-2.5-pro", "provider": "gemini"},
-    {"model_id": "grok-4", "provider": "xai"},
+    {"model_id": "gpt-5.2-chat-latest", "provider": "openai"},
+    {"model_id": "claude-opus-4-6", "provider": "anthropic"},
+    {"model_id": "gemini-3-pro-preview", "provider": "gemini"},
+    {"model_id": "grok-4-1-fast", "provider": "xai"},
     {"model_id": "sonar-pro", "provider": "perplexity"},
     {"model_id": "llama-3.3-70b-versatile", "provider": "groq"},
 ]
