@@ -229,7 +229,9 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
             logger.warning("webhook dispatch failed for consultation.completed %s", consultation_id, exc_info=True)
 
         return ConsultationResponse(
-            consultation_id=consultation_id,
+            # asyncpg returns UUID columns as uuid.UUID objects, not strings.
+            # ConsultationResponse.consultation_id is typed str, so coerce.
+            consultation_id=str(consultation_id) if consultation_id is not None else None,
             all_responses=result.get("all_responses", {}),
             consensus_response=result.get("consensus_response"),
             consensus_score=result.get("consensus_score"),
