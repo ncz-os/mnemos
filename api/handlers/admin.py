@@ -391,20 +391,27 @@ async def compression_enqueue(
 
     async with _lc._pool.acquire() as conn:
         async with conn.transaction():
+            # Pull (id, owner_id) so the queue row carries the memory's
+            # REAL owner instead of a blanket 'default'. On multi-user
+            # installs this stamped ownership flows into
+            # memory_compression_candidates and memory_compressed_variants
+            # and must reflect the underlying memory. Single-user installs
+            # (memories.owner_id DEFAULT 'default') keep working unchanged.
             known = await conn.fetch(
-                "SELECT id FROM memories WHERE id = ANY($1::text[])",
+                "SELECT id, owner_id FROM memories WHERE id = ANY($1::text[])",
                 request.memory_ids,
             )
-            known_ids = {r["id"] for r in known}
+            owner_by_id = {r["id"]: r["owner_id"] for r in known}
             enqueued_ids: list[str] = []
             for mid in request.memory_ids:
-                if mid not in known_ids:
+                if mid not in owner_by_id:
                     continue
                 await conn.execute(
                     "INSERT INTO memory_compression_queue "
                     "(memory_id, owner_id, reason, priority, scoring_profile) "
                     "VALUES ($1, $2, $3, $4, $5)",
-                    mid, "default", request.reason, request.priority, request.scoring_profile,
+                    mid, owner_by_id[mid], request.reason, request.priority,
+                    request.scoring_profile,
                 )
                 enqueued_ids.append(mid)
 
@@ -494,10 +501,13 @@ async def compression_enqueue_all(
     profile_idx = len(params) - 1
     limit_idx = len(params)
 
+    # owner_id flows from memories.owner_id (not a blanket 'default') so
+    # multi-user installs get truthful ownership metadata on every queue
+    # row + downstream contest candidate + variant.
     sql = (
         "INSERT INTO memory_compression_queue "
         "(memory_id, owner_id, reason, priority, scoring_profile) "
-        "SELECT m.id, 'default', "
+        "SELECT m.id, m.owner_id, "
         f"${reason_idx}, ${priority_idx}, ${profile_idx} "
         f"FROM memories m{where_sql} "
         "ORDER BY LENGTH(m.content) DESC "
