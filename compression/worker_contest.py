@@ -99,6 +99,7 @@ async def process_contest_queue(
     *,
     batch_size: int = 5,
     max_attempts: int = _MAX_ATTEMPTS,
+    min_content_length: int = 0,
     judge_model: Optional[str] = None,
 ) -> Dict[str, int]:
     """Drain up to `batch_size` pending queue rows via the contest path.
@@ -111,8 +112,23 @@ async def process_contest_queue(
     row (default 3, matching the legacy distillation worker's
     MAX_ATTEMPTS).
 
+    `min_content_length` (default 0 = no gate) skips memories below
+    the threshold BEFORE running the contest. Surfaced by the 2026-04-23
+    CERBERUS benchmark: short templated content (git commit headers,
+    GRAEAE consultation stubs) can't be meaningfully compressed by any
+    engine at the balanced profile's floor — LETHE returns ratio~1.0,
+    ANAMNESIS's summary+bullet rendering inflates past ratio=1.0,
+    both score composite=0, contest fails with 'no winner'. On slower
+    GPU systems this wastes ANAMNESIS's multi-second call per memory
+    for a guaranteed failure. Setting this to e.g. 500 tells the worker
+    to mark those rows `failed` immediately with
+    `error='too_short: N chars < threshold M'` and move on. Recommended
+    for GPU-constrained installs; leave at 0 for full-contest behavior
+    matching v3.1 GA default.
+
     Returns a dict {'dequeued', 'succeeded', 'failed', 'skipped_max_attempts',
-    'missing_memory'} for the caller to log and for metrics.
+    'missing_memory', 'skipped_too_short'} for the caller to log and
+    for metrics.
     """
 
     counts: Counter[str] = Counter()
@@ -157,6 +173,7 @@ async def process_contest_queue(
                 engines=engines,
                 counts=counts,
                 judge_model=judge_model,
+                min_content_length=min_content_length,
             )
         except Exception as exc:
             logger.exception(
@@ -183,6 +200,7 @@ async def _process_one(
     engines: Sequence[CompressionEngine],
     counts: Counter[str],
     judge_model: Optional[str],
+    min_content_length: int = 0,
 ) -> None:
     """Run the contest for a single dequeued queue row + persist + update."""
 
@@ -201,6 +219,22 @@ async def _process_one(
         logger.warning(
             "contest_queue[%s]: memory not found or empty, marking failed",
             memory_id,
+        )
+        return
+
+    content_len = len(mem["content"])
+    if min_content_length > 0 and content_len < min_content_length:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                _MARK_FAILED_SQL,
+                queue_id,
+                f"too_short: {content_len} chars < threshold {min_content_length}",
+            )
+        counts["skipped_too_short"] += 1
+        counts["failed"] += 1
+        logger.info(
+            "contest_queue[%s]: skipped, content %d chars < threshold %d",
+            memory_id, content_len, min_content_length,
         )
         return
 

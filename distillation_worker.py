@@ -66,6 +66,18 @@ _CONTEST_ENABLED = os.getenv("MNEMOS_CONTEST_ENABLED", "true").lower() == "true"
 # work, not v3.1. See docs/benchmarks/compression-2026-04-23.md.
 _ALETHEIA_ENABLED = os.getenv("MNEMOS_ALETHEIA_ENABLED", "false").lower() == "true"
 
+# Optional minimum-content-length gate for the v3.1 contest path.
+# Memories shorter than this value are marked 'failed' with
+# error='too_short' BEFORE any engine runs, avoiding the multi-second
+# ANAMNESIS GPU round-trip on content that cannot be meaningfully
+# compressed (git commit headers, GRAEAE consultation stubs, and
+# other short templated blurbs — see the 2026-04-23 CERBERUS
+# benchmark for the analysis). Default 0 = no gate (full v3.1 GA
+# behavior). Recommended 500 for GPU-constrained installs.
+_CONTEST_MIN_CONTENT_LENGTH = int(
+    os.getenv("MNEMOS_CONTEST_MIN_CONTENT_LENGTH", "0")
+)
+
 # Tuning
 SIZE_LIMIT_KB = 5
 BATCH_SIZE = 5
@@ -186,6 +198,7 @@ class MemoryDistillationWorker:
                 self._contest_engines,
                 batch_size=BATCH_SIZE,
                 max_attempts=MAX_ATTEMPTS,
+                min_content_length=_CONTEST_MIN_CONTENT_LENGTH,
             )
             if counts:
                 logger.info("contest queue drain: %s", counts)

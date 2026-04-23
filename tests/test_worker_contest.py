@@ -250,6 +250,74 @@ def test_empty_content_marks_failed():
     assert counts["failed"] == 1
 
 
+# ---- too-short gate --------------------------------------------------------
+
+
+def test_too_short_gate_skips_contest_when_threshold_set():
+    # Threshold=500, memory content is 100 chars → should be gated
+    # out before the contest runs.
+    q = _queue_row()
+    pool = _mock_pool(
+        queue_rows=[q],
+        memory_content_by_id={q["memory_id"]: _memory_row(q["memory_id"], content="x" * 100)},
+    )
+    engine_called = False
+
+    class _Watcher(CompressionEngine):
+        id = "watch"
+        label = "Watcher"
+        version = "1"
+        gpu_intent = GPUIntent.CPU_ONLY
+
+        async def compress(self, req):
+            nonlocal engine_called
+            engine_called = True
+            return CompressionResult(
+                engine_id=self.id, engine_version=self.version, original_tokens=10,
+                compressed_content="x", compression_ratio=0.5, quality_score=0.9,
+            )
+
+    counts = asyncio.run(process_contest_queue(pool, [_Watcher()], min_content_length=500))
+    assert engine_called is False, "threshold gate should skip the contest entirely"
+    assert counts["dequeued"] == 1
+    assert counts["skipped_too_short"] == 1
+    assert counts["failed"] == 1
+
+    failed = _mark_failed_calls(pool)
+    assert len(failed) == 1
+    assert "too_short" in failed[0][1]
+    assert "100 chars" in failed[0][1]
+    assert "500" in failed[0][1]
+
+
+def test_too_short_gate_off_by_default():
+    # min_content_length=0 (default) → even very short content runs
+    # through the contest normally.
+    q = _queue_row()
+    pool = _mock_pool(
+        queue_rows=[q],
+        memory_content_by_id={q["memory_id"]: _memory_row(q["memory_id"], content="x" * 10)},
+    )
+    engines = [_StubEngine("e1", result_factory=_good_result("e1"))]
+    counts = asyncio.run(process_contest_queue(pool, engines))  # no min_content_length
+    assert counts.get("skipped_too_short", 0) == 0
+    assert counts["succeeded"] == 1
+
+
+def test_too_short_gate_at_threshold_passes_through():
+    # Content length EXACTLY at threshold should NOT be gated —
+    # gate triggers strictly below.
+    q = _queue_row()
+    pool = _mock_pool(
+        queue_rows=[q],
+        memory_content_by_id={q["memory_id"]: _memory_row(q["memory_id"], content="x" * 500)},
+    )
+    engines = [_StubEngine("e1", result_factory=_good_result("e1"))]
+    counts = asyncio.run(process_contest_queue(pool, engines, min_content_length=500))
+    assert counts.get("skipped_too_short", 0) == 0
+    assert counts["succeeded"] == 1
+
+
 # ---- no winner -------------------------------------------------------------
 
 
