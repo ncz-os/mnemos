@@ -13,9 +13,10 @@ Composite score (per ScoringProfile):
               * (r_w * ratio_term)
               * (s_w * speed_factor)
 
-    ratio_term  = max(0, 1 - min(compression_ratio, 1.0))
-                  rewards reduction; 1.0 ratio (no compression) scores
-                  zero; >1.0 (expanded output) also zero
+    ratio_term  rewards reduction within [MIN_CHUNK_RATIO, 1.0). Below
+                  the floor (degenerate/empty output) scores zero;
+                  >= 1.0 (no compression or expanded) also zero.
+                  Inside the band, ratio_term = 1 - ratio.
     speed_factor = fastest_elapsed_ms / this_elapsed_ms
                   normalized per-contest; fastest engine gets 1.0
     quality_floor applied as a pre-filter — candidates below the floor
@@ -43,6 +44,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from .base import (
+    MIN_CHUNK_RATIO,
     CompressionEngine,
     CompressionRequest,
     CompressionResult,
@@ -186,11 +188,26 @@ class ContestOutcome:
 
 
 def _ratio_term(ratio: Optional[float]) -> float:
-    """Reward reduction. 1.0 ratio (no compression) = 0 points;
-    >1.0 (expanded) = 0 points; 0.2 ratio = 0.8 points."""
+    """Reward reduction within [MIN_CHUNK_RATIO, 1.0).
+
+    Below MIN_CHUNK_RATIO the output is almost certainly degenerate
+    (empty content, or a parse failure that produced ~nothing). Above
+    or equal to 1.0 the engine did not compress or actively expanded.
+    Both tails score zero. The operational sweet spot is a ratio in
+    [0.2, 0.6] — ratio_term returns [0.4, 0.8] across that band.
+
+    This floor catches a real regression found in live testing: when
+    an LLM-assisted engine's importance-score response is unparseable,
+    the adapter can silently return empty content with ratio=0.0. The
+    naive "1 - ratio" would score that as maximum reward; with the
+    floor applied, degenerate output lands with composite_score=0 and
+    is classified 'inferior' (or lower) in the contest.
+    """
     if ratio is None:
         return 0.0
-    return max(0.0, 1.0 - min(ratio, 1.0))
+    if ratio < MIN_CHUNK_RATIO or ratio >= 1.0:
+        return 0.0
+    return 1.0 - ratio
 
 
 def _classify_failure(result: CompressionResult) -> str:
