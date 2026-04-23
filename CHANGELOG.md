@@ -2,6 +2,213 @@
 
 All notable changes to MNEMOS are documented here.
 
+## [Unreleased]
+
+Post-3.1.0 work staging into v3.1.1 (ops hardening) and v3.1.2 (Tier 3
+tenancy), plus a round of provider-routing fixes that landed in
+response to a field-ops handoff. Not yet tagged.
+
+### Ops hardening — v3.1.1 candidate
+
+- **Stranded-running queue recovery sweep**
+  (`compression/worker_contest.py`, `distillation_worker.py`). The
+  v3.1 contest path had a belt-and-suspenders gap: if the
+  fresh-connection mark-failed fallback ALSO failed (pool
+  exhausted, SIGKILL mid-txn, host reboot), a queue row sat in
+  `running` forever because the dequeue only matched `pending`.
+  New `_sweep_stale_running()` runs at the top of every batch,
+  reclaiming rows stale longer than
+  `MNEMOS_CONTEST_STALE_THRESHOLD_SECS` (default 600). Rows below
+  retry ceiling go back to `pending`; rows at ceiling go terminal
+  `failed` with `stranded_running: ...` marker.
+
+- **Sweep-vs-late-finisher race defense.** `_process_one` opens its
+  persist transaction with `SELECT ... FOR UPDATE` against
+  `memory_compression_queue` and checks both `status='running'` AND
+  `attempts == <dequeue-time value>`. If the sweep reclaimed or
+  another worker re-dequeued after reset, the fingerprint mismatches
+  and the worker bails cleanly — no duplicate audit rows, no
+  overwrite. New `race_abandoned` metric counter.
+
+- **GPUGuard single-probe in HALF_OPEN** (`compression/gpu_guard.py`).
+  The circuit breaker's HALF_OPEN state admitted every concurrent
+  caller as the probe — thundering herd against a possibly-still-
+  broken endpoint. Added `_probe_in_flight` coordination so exactly
+  one probe is admitted at a time. Subsequent callers fast-fail
+  until the probe resolves via `record_success` / `record_failure`.
+  Auto-replacement of a wedged probe is intentionally NOT included
+  in v3.1.x — avoiding an identity-tracking handshake that would
+  have been needed to prevent late-completion races. Operators
+  recover a wedged HALF_OPEN via `reset()`.
+
+- **Richer error metadata in candidate manifests**
+  (`compression/contest_store.py`). `persist_contest()` now runs
+  every non-winner candidate through `_enriched_manifest()`, which
+  preserves engine-authored manifest keys and ADDS a namespaced
+  `_audit` block: `reject_reason`, `engine_version`, `error`
+  (full exception text, previously lost from the DB), `quality_score`
+  on floor rejections, `compression_ratio`, `elapsed_ms`, `gpu_used`.
+  Winners are not enriched — their typed columns are authoritative.
+  Non-dict engine-authored `_audit` values are preserved under
+  `_audit_original` rather than crashing persist.
+
+- **Log-space `speed_factor` to stop multiplicative speed dominance**
+  (`compression/contest.py`). Raw linear `fastest_ms/elapsed_ms`
+  crushed slow-but-accurate engines — a 10x-slower candidate
+  scored 0.1 and multiplied through the composite made
+  quality_first weighting unable to recover. Now:
+  `factor = clamp(1 + log10(ratio)/2, [SPEED_FACTOR_FLOOR=0.1, 1.0])`.
+  10x-slower maps to 0.5, 100x-slower bottoms at the floor. This
+  is a scoring-breaking change for the `speed_factor` column;
+  existing v3.1.0 rows are on a different scale.
+
+- **Scoring-profile validation** (`compression/contest.py`).
+  Custom TOML profiles previously accepted any `float()`-able
+  value. Negative weights, 1000x weights, `quality_floor >= 1.0`,
+  non-numeric strings, and NaN/Inf all produced surprising
+  behavior. New `_validated_profile()` clamps weights to
+  `[0.0, 10.0]` and `quality_floor` to `[0.0, 0.99]` with loud
+  WARNING logs on every clamp. Explicit NaN/Inf rejection
+  (they compare False to any numeric bound and would silently
+  poison composite scores for every candidate).
+
+- **`docs/SYSTEM_REQUIREMENTS.md`** — per-tier (Server / Workstation
+  / Edge) resource floor reference. CPU / RAM / disk / GPU per
+  tier, baseline (Python / Postgres / pgvector), environment
+  knobs (`MNEMOS_CONTEST_ENABLED`, `MNEMOS_ALETHEIA_ENABLED`,
+  `MNEMOS_CONTEST_STALE_THRESHOLD_SECS`), observed resource
+  usage from live deployments as sanity check.
+
+### Tier 3 tenancy rollup — v3.1.2 candidate
+
+- **KG triples carry `owner_id` + `namespace`**
+  (`db/migrations_v3_1_2_kg_tenancy.sql`, `api/handlers/kg.py`).
+  Previously `kg_triples` had no tenancy columns and the `/kg`
+  read/mutate paths had NO owner filter at all — every
+  authenticated caller saw every row. Added columns idempotently
+  (ADD COLUMN without DEFAULT, backfill from linked memory
+  rows via `memories.memory_id` join, residual NULLs → 'default',
+  THEN SET DEFAULT + NOT NULL — sequencing matters because
+  ADD COLUMN DEFAULT would have made the backfill a no-op).
+  Handlers now filter on BOTH owner AND namespace for non-root
+  callers; cross-tenant `memory_id` references on create are
+  rejected 404 (not 403 — existence is invisible to non-owners).
+
+- **App-layer namespace enforcement on `list_memories` and
+  `get_memory`** (`api/handlers/memories.py`). RLS policies from
+  v1_multiuser scope `owner_id` + `group_id` but never filter by
+  `namespace`. Personal-mode installs with RLS disabled had no
+  tenancy filter at all. Non-root callers now get
+  `AND namespace = user.namespace` appended to every WHERE
+  branch (combined with category/subcategory filters). Root
+  bypasses.
+
+- **Owner + namespace pinning on `/memories/search` and
+  `/memories/rehydrate`** (`api/handlers/memories.py`,
+  `api/lifecycle.py`). `_fts_fetch` and `_vector_search` gained
+  an `owner_id` kwarg. Non-root searches force `owner_id =
+  user.user_id` and `namespace = user.namespace` regardless of
+  the request body. Cross-namespace request from non-root →
+  HTTP 403 (explicit rejection rather than silent narrowing).
+  Cache key now hashes the EFFECTIVE pinned values, not the
+  raw request.
+
+- **Namespace enforcement on mutation precheck paths**
+  (`api/handlers/memories.py`). `update_memory`,
+  `delete_memory`, and `get_compression_manifests` now check
+  BOTH owner AND namespace for non-root callers.
+
+- **Registry-backed `/v1/models`** (`api/handlers/openai_compat.py`).
+  Replaces the hardcoded six-entry list with
+  `SELECT … FROM model_registry WHERE available AND NOT deprecated
+  ORDER BY graeae_weight DESC`. Fallback to a built-in list when
+  the registry is empty (fresh install) or the query fails.
+  `get_model` resolves aliases first, then registry lookup;
+  unregistered IDs still return with `owned_by="Unknown"` since
+  operators may route to locally configured models.
+
+### Provider routing + audit fixes — handoff work
+
+- **Provider-unavailability errors now explain the cause**
+  (`graeae/engine.py`, `api/handlers/openai_compat.py`).
+  `_unavailable()` gained an `error: str` field; `route()` populates
+  it for each failure class (provider not registered, missing
+  api_key, upstream exception). `/v1/chat/completions` surfaces
+  the cause in the 503 detail so operators don't have to tail
+  debug logs:
+  ```
+  HTTP 503 {"detail": "Provider anthropic unavailable: HTTP 401 Unauthorized"}
+  ```
+  Missing-key case is caught pre-dispatch with a targeted hint
+  at the standard env var to set.
+
+- **MNEMOS-native Provider Registry File + env-var fallback**
+  (`graeae/api_keys.py`). The key-file loader was too rigid and
+  too permissive in the wrong ways: it only accepted the canonical
+  `{"llm_providers": {...}}` shape AND logged only a generic
+  warning on missing files. Replaced with:
+  - Canonical shape only (MNEMOS-owned format, self-contained,
+    no symlinks to third-party service key files).
+  - Per-provider environment variable fallback using standard
+    names every vendor SDK uses — `OPENAI_API_KEY`,
+    `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`,
+    `GROQ_API_KEY`, `PERPLEXITY_API_KEY`, `TOGETHER_API_KEY`,
+    `NVIDIA_API_KEY`. Env vars win when both are set.
+  - Search-path order swapped so `~/.config/mnemos/api_keys.json`
+    is preferred over the legacy `~/.api_keys_master.json`.
+  - `load_api_keys()` → `load_provider_registry()` with a
+    backward-compat alias.
+
+- **Refreshed frontier model defaults** (`graeae/engine.py`,
+  `api/handlers/openai_compat.py`). v3.1.0 shipped with 2024-era
+  model IDs. Updated to current:
+  - `openai: gpt-4o → gpt-5.2-chat-latest`
+  - `claude: claude-3-5-sonnet-20241022 → claude-opus-4-6`
+  - `gemini: gemini-1.5-pro → gemini-3-pro-preview` (URL too)
+  - `xai: grok-2-latest → grok-4-1-fast`
+  - `perplexity: sonar-pro` (unchanged)
+  - `groq: llama-3.3-70b-versatile` (unchanged)
+
+  GPT-5 series requires `temperature=1` (returns 400 on any other
+  value). `_query_openai_compatible` now omits the temperature
+  field for `gpt-5*` models, matching the existing
+  `max_completion_tokens` branching.
+
+- **`graeae_audit_log` schema backfill**
+  (`db/migrations_v3_1_2_audit_log_columns.sql`). Databases that
+  applied `migrations_v2_versioning.sql` first got the v2 table
+  shape; `migrations_v3_graeae_unified.sql` used `CREATE TABLE IF
+  NOT EXISTS` so the six new columns (`prompt`, `response_text`,
+  `prev_chain_hash`, `model`, `latency_ms`, `cost_usd`) never
+  landed. The consultations handler INSERT referenced these by
+  name, so `/v1/consultations` returned 503 with "audit trail
+  is required" and an `UndefinedColumnError` in the log.
+  Added all six via `ALTER TABLE … ADD COLUMN IF NOT EXISTS`.
+  All nullable so existing hash-only audit rows aren't
+  retroactively invalidated.
+
+- **UUID → str coercion on consultation response**
+  (`api/handlers/consultations.py`). asyncpg returns UUID columns
+  as `uuid.UUID` objects; `ConsultationResponse.consultation_id`
+  is typed `Optional[str]` and pydantic strict mode rejected the
+  UUID. One-line coercion at the construction site.
+
+### Tests
+
+Suite: 282 → 295 → 303 → 309 → 317 → 318 → 318 across the series.
+All targeted tests green, full suite 0 regressions.
+
+### Deferred to later releases (v3.2+)
+
+- DAG handlers (`api/handlers/dag.py`) still check `owner_id` only
+  — Tier 3 namespace enforcement on the DAG surface is a follow-up.
+- GPUGuard probe-identity handshake — v3.2 candidate. See v3.1.1
+  single-probe commit for the rationale on why auto-replacement
+  was dropped rather than patched.
+- Custom Query mode on `/graeae/consult` — caller-specified
+  providers / models / tier (frontier / premium / budget) instead
+  of the default auto lineup. Design in MNEMOS `mem_ad879ef01095`.
+
 ## [3.1.0] — 2026-04-23
 
 Compression platform release. Adds a plugin `CompressionEngine` ABC open
