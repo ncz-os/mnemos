@@ -28,11 +28,11 @@ You can treat MNEMOS like a memory storage provider if you want — `POST /v1/me
 - A single `/v1/*` REST surface covering memories, consultations, providers, sessions, webhooks, federation, and an OpenAI-compatible chat-completions gateway.
 - A multi-LLM consensus reasoning layer (GRAEAE) that distributes one prompt across multiple providers, scores the responses, and writes a tamper-evident SHA-256 hash-chained audit entry — every time.
 - Git-like DAG versioning on memory: `log`, `branch`, `merge`, `revert`. Every mutation snapshots.
-- Three-tier compression pipeline (LETHE CPU / ALETHEIA GPU / ANAMNESIS archival) with a written quality manifest on every transformation. Runs in the background distillation worker in v3.0; hot-path invocation (rehydration, gateway inject, session context) is scheduled for v3.1 — see [`ROADMAP.md`](./ROADMAP.md).
+- Three-tier compression pipeline (LETHE CPU / ALETHEIA GPU / ANAMNESIS archival) with a written quality manifest on every transformation. Runs in the background distillation worker. v3.1 adds a plugin `CompressionEngine` ABC, competitive per-memory selection, and a persisted audit log of winners and losers; hot-path invocation (rehydration, gateway inject, session context reading winner variants) is scheduled for v3.2 — see [`ROADMAP.md`](./ROADMAP.md).
 - Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in.
 - Runs alongside your applications the way Redis, PostgreSQL, or a message bus would. Deploy once, every agent in your stack shares the same memory substrate.
 
-Next release ([v3.1](./ROADMAP.md)) is the compression platform release: four engines with competitive per-memory selection, GPU-batched inference that runs on integrated graphics through to datacenter cards, and tenancy fixes that make the "per-owner scoping" claim true across every state-bearing subsystem.
+Next release ([v3.1](./ROADMAP.md)) is the compression platform release: a plugin `CompressionEngine` ABC open to operator-registered engines, three built-in engines running under a competitive-selection contest, a persisted audit log recording every winner and loser with its score, and GPU-batched inference that runs on integrated graphics through to datacenter cards. A fourth first-party engine, **APOLLO** — schema-aware dense encoding for LLM-to-LLM wire use — is staged across v3.2–v3.4 (the "Apollo Program"), alongside hot-path wiring that reads winner variants on rehydrate / gateway inject / session context.
 
 ## Works with
 
@@ -52,8 +52,8 @@ MNEMOS is designed to be the memory layer for the agentic tooling you already us
 - **[Hermes Agent](https://github.com/nousresearch/hermes-agent)** — optional persistence backend for team / multi-tenant / compliance-regulated Hermes deployments. See `integrations/hermes/`. *MCP + REST.*
 - **[MemPalace](https://github.com/MemPalace/mempalace)** — graduation path, not a replacement. A portability schema + importer lets a MemPalace user who grows into a team preserve their drawers and palaces rather than start over. See [RFC #1112 on MemPalace](https://github.com/MemPalace/mempalace/discussions/1112). *REST bulk import.*
 - **[Mem0](https://github.com/mem0ai/mem0) / [Letta](https://github.com/letta-ai/letta) / [Zep](https://github.com/getzep/zep)** — one-shot bulk consolidation via `POST /v1/memories/bulk`. If you already have a running memory store elsewhere and need to converge, MNEMOS is where they converge *to*. *REST bulk import.*
-- **[LangChain](https://github.com/langchain-ai/langchain) / [LlamaIndex](https://github.com/run-llama/llama_index)** — works today via the **OpenAI-compatible gateway**: point `OPENAI_BASE_URL` at MNEMOS and memory injection + multi-provider routing land automatically. A native `MnemosMemory` adapter class is on the roadmap. *OpenAI-compat today; native adapter roadmap.*
-- **[CrewAI](https://github.com/crewAIInc/crewAI) / [AutoGen](https://github.com/microsoft/autogen)** — shared memory across agents in a crew / group. Works today via the **OpenAI-compatible gateway**; native memory-backend adapter is roadmap. *OpenAI-compat today; native adapter roadmap.*
+- **[LangChain](https://github.com/langchain-ai/langchain) / [LlamaIndex](https://github.com/run-llama/llama_index)** — works today via the **OpenAI-compatible gateway**: point `OPENAI_BASE_URL` at MNEMOS and memory injection + multi-provider routing land automatically. *OpenAI-compat.*
+- **[CrewAI](https://github.com/crewAIInc/crewAI) / [AutoGen](https://github.com/microsoft/autogen)** — shared memory across agents in a crew / group. Works today via the **OpenAI-compatible gateway**. *OpenAI-compat.*
 
 The integrations bundle under [`integrations/`](./integrations/) is the living inventory. New integrations ship as SKILL.md + MCP config + enforcement snippet per framework, plus idempotent install/uninstall scripts where the target framework supports them.
 
@@ -75,7 +75,7 @@ MNEMOS was built to solve those problems in a way that reflects real platform ex
 
 Its design is informed by years of enterprise platform work, large-vendor systems thinking, open-source infrastructure experience, and current work in the AI industry, without assuming that professional users want marketing language where they really need operational clarity.
 
-**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By April 2026 the running install had stored **6,793 memories** and performed **3,077 compressions**, each with a written quality manifest. The v3.0.0 release unifies that production codebase into the single-service FastAPI shape shipped here.
+**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unifies that production codebase into the single-service FastAPI shape shipped here; v3.0.1 is the current patch with the three credibility-sensitive fixes listed in [`CHANGELOG.md`](./CHANGELOG.md).
 
 For the longer story — the original catalyzing moment, the architectural decisions (and mistakes) that took MNEMOS from a single-file prototype to a unified runtime, and the scrubs, refactors, and release-gate audits that landed the public cut — see [`EVOLUTION.md`](./EVOLUTION.md). Written for future contributors as much as for future readers who want to know what they're inheriting.
 
@@ -143,7 +143,7 @@ If none of those questions matter for your use case, a simpler tool is probably 
 
 ### What MNEMOS does that none of them do
 
-**Quality contracts on compression.** When MNEMOS compresses a memory, it produces a manifest: what was removed, what was preserved, the quality rating, and which use cases the compressed version is and is not safe for. No other memory system treats compression as something that requires a receipt. In v3.0 the compression pipeline runs in the background distillation worker; v3.1 extends the same manifest contract to rehydration, gateway injection, and session context — see [`ROADMAP.md`](./ROADMAP.md).
+**Quality contracts on compression.** When MNEMOS compresses a memory, it produces a manifest: what was removed, what was preserved, the quality rating, and which use cases the compressed version is and is not safe for. No other memory system treats compression as something that requires a receipt. In v3.0 the compression pipeline runs in the background distillation worker with a single engine per memory. v3.1 adds a plugin `CompressionEngine` ABC, a competitive per-memory contest across three engines, and a persisted audit log recording every winner AND loser with its score and disqualification reason — not just the chosen output. Hot-path reads (rehydration, gateway inject, session context) serving winner variants is scheduled for v3.2 alongside the APOLLO engine — see [`ROADMAP.md`](./ROADMAP.md).
 
 **A reasoning layer that degrades gracefully.** GRAEAE distributes queries across multiple LLM providers simultaneously, scores responses on relevance, coherence, completeness, and toxicity, and returns the best result. Per-provider circuit breakers prevent a failing provider from degrading the pool. A semantic cache means identical questions skip inference entirely. This is not a load balancer — it is a quality-gated reasoning bus.
 
@@ -182,7 +182,7 @@ The shared premise — that agent memory deserves first-class treatment — is t
 
 ## What works now
 
-This is the current state of v3.0.0. Features described here are implemented and running in production. Features listed in the Roadmap section that are "scheduled for v3.0.0" are under active development for this release.
+This is the current state of v3.0 (patch version v3.0.1). Features described here are implemented and running in production. Forward-looking scope for v3.1 and beyond is in [`ROADMAP.md`](./ROADMAP.md).
 
 The API surface is namespaced under `/v1/*`.
 
@@ -197,7 +197,7 @@ The API surface is namespaced under `/v1/*`.
 | `POST /v1/memories/bulk` | Bulk create memories |
 | `PATCH /v1/memories/{id}` | Update memory content or metadata |
 | `DELETE /v1/memories/{id}` | Delete a memory |
-| `POST /v1/memories/rehydrate` | Token-budgeted context load for prompt injection (v3.1 wires the compression pipeline into this path) |
+| `POST /v1/memories/rehydrate` | Token-budgeted context load for prompt injection (v3.2 wires the compression contest's winner variants into this path) |
 | `POST /ingest/session` | Ingest a session transcript |
 | `GET /v1/memories/{id}/log` | DAG commit history for a memory |
 | `POST /v1/memories/{id}/branch` | Create a branch from a specific commit |
@@ -391,7 +391,7 @@ Most multi-LLM routers hardcode a provider list. MNEMOS ships a **self-populatin
 
 ### What runs under the hood (infrastructure you don't have to think about)
 
-A lot of the v3.0.0 surface is held up by background work that doesn't show up in the route table but does show up in the failure modes it prevents. For anyone who wants to know what's there:
+A lot of the v3.0 surface is held up by background work that doesn't show up in the route table but does show up in the failure modes it prevents. For anyone who wants to know what's there:
 
 - **Webhook delivery recovery worker** — on startup, walks `webhook_deliveries` and re-drains any rows stuck in `pending` or `retrying` with a `scheduled_at` in the past. Handles the crash-mid-retry case; subscribers get the delivery eventually rather than never.
 - **Distillation worker supervision** — the compression worker runs under an exponential-backoff supervisor (1s → 2s → 4s → … capped at 5 min). A crash is logged and retried; the worker does not silently die and leave memories un-compressed for the rest of the process lifetime.
@@ -441,13 +441,13 @@ The constraints are enforced at the database level. Application bugs cannot viol
 
 Three-tier compression pipeline, each tier named after a Greek figure of memory.
 
-- **LETHE** (Tier 1, CPU, runs in the distillation worker) — fast local compression with two modes: token mode (stop-word + importance-marker extractive filtering, ~0.5ms, ~57% reduction on functional-word-heavy prose) and sentence mode (structure-preserving sentence-boundary extraction, ~2–5ms, ~50% reduction). `auto` mode picks per content shape. Zero external calls. v3.1 moves LETHE onto hot paths (search, rehydration, gateway inject) via a competitive-selection scorer across all four engines — see [`ROADMAP.md`](./ROADMAP.md).
-- **ALETHEIA** (Tier 2, optional GPU) — token-level importance scoring via a local LLM on a configured GPU host (`GPU_PROVIDER_HOST`); ~200-500ms, ~70% reduction. Runs offline via distillation worker; not on the live path. Falls back to LETHE when the GPU host is unreachable.
+- **LETHE** (Tier 1, CPU, runs in the distillation worker) — fast local compression with two modes: token mode (stop-word + importance-marker extractive filtering, ~0.5ms, ~57% reduction on functional-word-heavy prose) and sentence mode (structure-preserving sentence-boundary extraction, ~2–5ms, ~50% reduction). `auto` mode picks per content shape. Zero external calls.
+- **ALETHEIA** (Tier 2, optional GPU) — token-level importance scoring via a local LLM on a configured GPU host (`GPU_PROVIDER_HOST`); ~200-500ms, ~70% reduction. Runs offline via distillation worker; not on the live path. Falls back to LETHE when the GPU host is unreachable (v3.0 behavior; the v3.1 `ALETHEIAEngine` on the plugin ABC disables the silent fallback so LETHE's contest entry isn't shadowed).
 - **ANAMNESIS** (Tier 3, optional GPU) — atomic-fact extraction for archival memories (>30 days old); semantic-level compression via LLM. Fallback: skip extraction if the GPU host is unreachable (non-critical).
-- **ExternalInferenceProvider** — LLM-assisted compression via llama.cpp / Ollama / any OpenAI-compatible endpoint; highest quality; used as fallback when heuristics dip below the quality threshold.
-- Quality manifest on every compression: what was removed, what was preserved, risk factors, safe/unsafe use cases
-- Original content always retained; compressed and original stored independently
-- Configurable quality thresholds per task type (security review: 95%, architecture: 90%, general: 80%)
+- Quality manifest on every compression: what was removed, what was preserved, risk factors, safe/unsafe use cases.
+- Original content always retained; compressed and original stored independently.
+- Configurable quality thresholds per task type (security review: 95%, architecture: 90%, general: 80%).
+- v3.1 adds a plugin `CompressionEngine` ABC (open to operator-registered engines), a competitive per-memory contest across every eligible engine, and a persisted audit log of winner + every loser with its score and rejection reason. See [`ROADMAP.md`](./ROADMAP.md).
 
 ### Memory tiers (4-tier system)
 
@@ -469,21 +469,23 @@ Three-tier compression pipeline, each tier named after a Greek figure of memory.
 
 ## Roadmap
 
-### Scheduled for v3.0.0 (active development)
+### Shipped in v3.0
 
-Committed to ship with this release:
+Landed with the v3.0 release line (current patch version: v3.0.1):
 
-- ✅ **Webhook subscriptions** — outbound notifications on memory write, consultation completion. HMAC-signed delivery, retry with exponential backoff. **Shipped.**
-- ✅ **OAuth/OIDC authentication** — browser-based login via Google, GitHub, Azure AD, or custom OIDC providers. Coexists with existing API-key auth. **Shipped.**
-- ✅ **Cross-instance memory federation** — pull-based peer sync with Bearer-authenticated peers. Federated memories stored locally with `federation_source` metadata, `fed:{peer}:{remote_id}` id prefix, and a background worker that respects per-peer sync intervals. **Shipped.**
+- ✅ **Webhook subscriptions** — outbound notifications on memory write, consultation completion. HMAC-signed delivery, retry with exponential backoff.
+- ✅ **OAuth/OIDC authentication** — browser-based login via Google, GitHub, Azure AD, or custom OIDC providers. Coexists with existing API-key auth.
+- ✅ **Cross-instance memory federation** — pull-based peer sync with Bearer-authenticated peers. Federated memories stored locally with `federation_source` metadata, `fed:{peer}:{remote_id}` id prefix, and a background worker that respects per-peer sync intervals.
 
-### Beyond v3.0.0
+### Beyond v3.0
 
-Future work — not yet scoped:
+Forward-looking scope is maintained in [`ROADMAP.md`](./ROADMAP.md), which lists committed v3.1 scope, the v3.2–v3.4 Apollo Program staged rollout, and items explicitly deferred with rationale.
+
+Near-term not-yet-scoped candidates (v3.5+):
 
 - Distributed consensus for multi-writer federation
-- Plugin model for external compression / ranking algorithms
 - Server-push streaming API for long-lived subscriptions
+- Direct-import adapters for major memory competitors (beyond the current `POST /v1/memories/bulk` manual path)
 
 ---
 
@@ -715,7 +717,7 @@ No. There is no outbound telemetry of any kind. The only outbound traffic is the
 
 ### Can I use it in production?
 
-Yes — we have been since December 2025. v3.0.0 is the first public release, not a greenfield experiment; the codebase has been operated continuously for roughly four months before being cut for open source. The honest caveat: it has been single-operator-tested, not yet battle-tested across many independent deployments. File issues against the live install and we'll track them.
+Yes — we have been since December 2025. v3.0 is the first public release line, not a greenfield experiment; the codebase has been operated continuously for roughly four months before being cut for open source. The honest caveat: it has been single-operator-tested, not yet battle-tested across many independent deployments. File issues against the live install and we'll track them.
 
 ### What's the migration story from [Mem0 / Zep / raw PostgreSQL]?
 
