@@ -22,15 +22,21 @@ from api.auth import UserContext, get_current_user
 async def _assert_memory_access(conn, memory_id: str, user: UserContext) -> None:
     """Ensure the caller can read/modify this memory. Raises 404 otherwise.
 
-    Root can access any memory; other users only their own. We return 404 (not
-    403) to avoid leaking existence of memories owned by other users.
+    Root can access any memory; non-root callers are scoped to both their
+    owner_id AND their namespace — matching the two-dimensional tenancy
+    gate that list/get/search/KG handlers apply (v3.1.2 Tier 3). We
+    return 404 (not 403) to avoid leaking existence of memories belonging
+    to other tenants.
     """
     row = await conn.fetchrow(
-        "SELECT owner_id FROM memories WHERE id = $1", memory_id,
+        "SELECT owner_id, namespace FROM memories WHERE id = $1", memory_id,
     )
     if not row:
         raise HTTPException(status_code=404, detail="Memory not found")
-    if user.role != "root" and row["owner_id"] != user.user_id:
+    if user.role != "root" and (
+        row["owner_id"] != user.user_id
+        or row["namespace"] != user.namespace
+    ):
         raise HTTPException(status_code=404, detail="Memory not found")
 
 logger = logging.getLogger(__name__)

@@ -197,7 +197,18 @@ class FakeConnection:
             memory = self.state["memories"].get(args[0])
             return {"id": memory["id"]} if memory else None
 
-        # owner check used by DAG _assert_memory_access
+        # owner + namespace check used by DAG _assert_memory_access
+        # (v3.1.2 Tier 3 follow-up extended this to two-dimensional tenancy)
+        if compact.startswith("SELECT owner_id, namespace FROM memories WHERE id ="):
+            memory = self.state["memories"].get(args[0])
+            if not memory:
+                return None
+            return {
+                "owner_id": memory.get("owner_id"),
+                "namespace": memory.get("namespace"),
+            }
+
+        # Legacy single-column path kept for any handler still on it
         if compact.startswith("SELECT owner_id FROM memories WHERE id ="):
             memory = self.state["memories"].get(args[0])
             return {"owner_id": memory.get("owner_id")} if memory else None
