@@ -20,6 +20,14 @@ from .base import (
     IdentifierPolicy,
 )
 from .base import CompressionResult as EngineCompressionResult
+from .contest import (
+    BUILT_IN_PROFILES,
+    ContestCandidate,
+    ContestOutcome,
+    ScoringProfile,
+    load_scoring_profile,
+    run_contest,
+)
 from .quality_analyzer import QualityAnalyzer, QualityManifest
 from .manager import CompressionManager, CompressionResult
 from .lethe import LETHE, LETHEEngine
@@ -44,6 +52,13 @@ __all__ = [
     "MIN_CHUNK_RATIO",
     "SAFETY_MARGIN",
     "SUMMARIZATION_OVERHEAD_TOKENS",
+    # v3.1 competitive-selection orchestrator
+    "ScoringProfile",
+    "BUILT_IN_PROFILES",
+    "load_scoring_profile",
+    "ContestCandidate",
+    "ContestOutcome",
+    "run_contest",
     # v3.0 compression surface (still in use until LETHE/ALETHEIA/ANAMNESIS
     # migrate to the ABC)
     "QualityAnalyzer",
