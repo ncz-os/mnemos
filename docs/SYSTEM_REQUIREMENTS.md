@@ -1,0 +1,133 @@
+# System Requirements
+
+Reference for operators planning a MNEMOS deployment. Covers the
+resource floor for each of the operating modes that v3.1.x supports
+today, plus what drops off at each tier.
+
+Profiles are **descriptive** in v3.1.x — the `MNEMOS_INSTALL_PROFILE`
+env-flag plumbing lands in v3.2. For now, the feature set is controlled
+by the individual env vars in the "Environment knobs" section at the
+bottom, and this document maps those knobs to deployment shapes.
+
+## Tiers at a glance
+
+| Tier          | CPU     | RAM    | Disk (data) | GPU        | Notes                                              |
+| ------------- | ------- | ------ | ----------- | ---------- | -------------------------------------------------- |
+| **Server**    | 8+ cores| 16 GB+ | 50 GB+ SSD  | CUDA 12+ GPU w/ 8 GB+ VRAM (recommended) | Full v3.1 contest path with ALETHEIA + ANAMNESIS + LETHE; Postgres 15+ on same host or nearby |
+| **Workstation** | 4+ cores | 8 GB  | 20 GB SSD  | Optional GPU (4 GB+ VRAM acceptable)     | Full v3.1 contest path; ALETHEIA / ANAMNESIS on CPU fallback are slow but functional |
+| **Edge**      | 2 cores | 4 GB   | 10 GB       | None       | v3.1 contest path disabled via `MNEMOS_CONTEST_ENABLED=false`; v3.0 distillation worker only |
+
+Embedded Pi-class is explicitly a **v3.3 target** (SQLite + sqlite-vec
+backend) and is out of scope for v3.1.x. Pi 4 class is the intended
+floor for the embedded tier when it lands.
+
+## Baseline requirements (all tiers)
+
+* **Python**: 3.11+ (`tomllib` stdlib dependency)
+* **Postgres**: 15+ with `pgvector` extension. Either co-located or on
+  a local network (latency < 5 ms for the worker's dequeue path to
+  keep up with production ingest).
+* **Disk**: corpus + manifests + backups.
+  - Memory text: ~1 KB/row average; 100k rows ≈ 100 MB.
+  - v3.1 compression candidates: ~1.5x the memory row count, ~2 KB/row.
+  - Backups: see `tools/backup/` — daily pg_dump + weekly rsync
+    pattern uses another ~2x the live corpus size in rolling storage.
+* **Network**: internal only for the v3.1 contest path; outbound only
+  required if using an externally hosted embedding/LLM endpoint.
+
+## Server tier — full v3.1 feature set
+
+Intended for the primary deployment host that runs the API + worker
+for production ingest.
+
+* **CPU**: 8+ cores (4 for API, 2+ for worker, headroom for Postgres
+  if co-located).
+* **RAM**: 16 GB minimum. Postgres tuned for the working-set size
+  of the memories + candidates tables + indexes. `shared_buffers`
+  ≈ 25% of RAM is a fine default.
+* **Disk**: 50 GB+ SSD for a year of daily ops at moderate ingest
+  (~10k memories/day). NVMe strongly preferred — the v3_dag manifest
+  writes are write-heavy.
+* **GPU**:
+  - **Recommended**: NVIDIA RTX 4000-class or better, 8 GB+ VRAM, CUDA 12+.
+    Observed on CERBERUS (RTX 4500 ADA): ANAMNESIS completes in ~3-8
+    seconds/memory; ALETHEIA ~0.5 s/memory; contest throughput ~10
+    memories/minute with all three engines enabled.
+  - **Sufficient**: any CUDA-capable GPU with enough VRAM to load
+    the chosen embedding/LLM model. The default models (see
+    `CLAUDE.md` at the repo root) fit on 8 GB.
+* **Ancillary**: Redis/memcached NOT required in v3.1 — the contest
+  path is single-worker per the DEPLOYMENT scaling note. Multi-worker
+  coordination is v3.2.
+
+## Workstation tier — full feature set, CPU-only acceptable
+
+Dev machines, solo researchers, small teams.
+
+* **CPU**: 4+ cores. CPU-only ALETHEIA / ANAMNESIS work but are slow
+  — expect ~30-60 s per memory instead of 3-8 s.
+* **RAM**: 8 GB. CPU-only ALETHEIA loads the full embedding model into
+  RAM; 8 GB is the comfortable floor.
+* **Disk**: 20 GB SSD for mid-scale personal corpora.
+* **GPU**: optional. A 4 GB VRAM GPU is enough to dramatically speed
+  up ALETHEIA; ANAMNESIS on a small GPU is acceptable if you accept
+  longer ingest latency.
+
+## Edge tier — v3.1 contest disabled
+
+Minimal deployments: a Jetson Orin Nano or similar x86 edge node
+running the API + v3.0 distillation loop only. No multi-engine
+contest, no GPU required.
+
+* **CPU**: 2 cores.
+* **RAM**: 4 GB. Postgres + Python API server + v3.0 worker fit here;
+  leave 1 GB headroom for the OS.
+* **Disk**: 10 GB for the corpus + rolling 7-day backup.
+* **GPU**: explicitly none. Set `MNEMOS_CONTEST_ENABLED=false` to skip
+  registering the v3.1 contest engines.
+* **Features dropped**:
+  - v3.1 contest path (multi-engine compression)
+  - ALETHEIA / ANAMNESIS (GPU-leaning engines)
+  - scoring profiles (N/A without contest)
+  - memory_compression_candidates / memory_compressed_variants tables
+    migrate cleanly but stay empty
+
+## Environment knobs (v3.1.x)
+
+Until v3.2 profile plumbing lands, these env vars control which
+features a running worker will exercise. Defaults are the server-tier
+shape.
+
+| Env var                                | Default  | Purpose                                                             |
+| -------------------------------------- | -------- | ------------------------------------------------------------------- |
+| `MNEMOS_CONTEST_ENABLED`               | `true`   | Toggle the v3.1 contest path                                        |
+| `MNEMOS_ALETHEIA_ENABLED`              | `false`  | Register the ALETHEIA engine (off by default — opt-in)              |
+| `MNEMOS_CONTEST_MIN_CONTENT_LENGTH`    | `0`      | Skip contests for memories shorter than N chars (GPU-constrained installs) |
+| `MNEMOS_CONTEST_STALE_THRESHOLD_SECS`  | `600`    | Stale-running queue-row reclaim threshold (v3.1.1)                  |
+
+Set them via the service-unit environment file or `docker run -e …`.
+
+## Observed resource usage (v3.1)
+
+From real deployments as of 2026-04-23:
+
+| Host      | Tier        | CPU avg  | RAM resident | Disk (live) | GPU util                     |
+| --------- | ----------- | -------- | ------------ | ----------- | ---------------------------- |
+| PYTHIA    | Server      | ~15% of 12 cores | ~8 GB (pg + api + worker) | ~12 GB (corpus 5k+ memories, backups separate) | N/A (no GPU; offloads to CERBERUS) |
+| CERBERUS  | Server + GPU | ~20% of 24 cores | ~18 GB (pg + api + worker + vLLM) | ~30 GB | 60-80% during active contest, idle otherwise |
+
+These are operational rather than prescriptive — real workloads will
+differ. Use these as a sanity check when sizing a new host.
+
+## v3.2 roadmap note
+
+`MNEMOS_INSTALL_PROFILE=server|workstation|edge` will group the env
+knobs above under a single profile name, with runtime detection that
+picks a sensible default (GPU present → server; else workstation;
+`MNEMOS_CONTEST_ENABLED=false` → edge). The tier names above are
+the proposed names — final choice lands in v3.2.0 alongside the
+plumbing work.
+
+---
+
+*Last updated: 2026-04-23 (v3.1.1)*
