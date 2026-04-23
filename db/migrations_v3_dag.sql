@@ -40,10 +40,22 @@ ALTER TABLE memory_versions
 -- Deterministic: same row always produces same hash
 -- ────────────────────────────────────────────────────────────────────────────
 
+-- Use convert_to(text, 'UTF8') instead of (text)::bytea so content
+-- containing backslash-escape-like sequences (\x47, \d+, \0, \n)
+-- doesn't crash. Same fix as migrations_v3_1_versioning_fix.sql for
+-- the trigger function — see that file's header for the bytea-cast
+-- rationale. This UPDATE happens before v3.1's trigger fix can land,
+-- so the fix has to live here too. Both fixes produce identical
+-- commit_hash values for content that WOULD have succeeded under the
+-- old cast (UTF-8 bytes are the same either way); the only change is
+-- that content containing escape-like sequences no longer crashes.
 UPDATE memory_versions
 SET commit_hash = encode(
     sha256(
-        (memory_id || '|' || version_num::text || '|' || content || '|' || snapshot_at::text)::bytea
+        convert_to(
+            memory_id || '|' || version_num::text || '|' || content || '|' || snapshot_at::text,
+            'UTF8'
+        )
     ),
     'hex'
 )
