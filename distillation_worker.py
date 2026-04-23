@@ -33,6 +33,22 @@ except Exception as _ce:
     logger.warning(f"Local compression unavailable: {_ce}")
     _COMPRESSION_AVAILABLE = False
 
+# v3.1 contest path: drains memory_compression_queue via the plugin
+# CompressionEngine ABC + run_contest + persist_contest. Runs alongside
+# the v3.0 direct-memory-polling path; does not replace it. Operators
+# can disable the v3.1 path by setting MNEMOS_CONTEST_ENABLED=false.
+try:
+    from compression.lethe import LETHEEngine
+    from compression.aletheia import ALETHEIAEngine
+    from compression.anamnesis import ANAMNESISEngine
+    from compression.worker_contest import process_contest_queue
+    _CONTEST_AVAILABLE = True
+except Exception as _ce:
+    logger.warning(f"v3.1 contest path unavailable: {_ce}")
+    _CONTEST_AVAILABLE = False
+
+_CONTEST_ENABLED = os.getenv("MNEMOS_CONTEST_ENABLED", "true").lower() == "true"
+
 # Tuning
 SIZE_LIMIT_KB = 5
 BATCH_SIZE = 5
@@ -68,6 +84,8 @@ class MemoryDistillationWorker:
         self.llm = get_backend()
         # Local compression engine (LETHE: token + sentence modes, no external calls)
         self._compression_engine = DistillationEngine() if _COMPRESSION_AVAILABLE else None
+        # v3.1 contest engines — populated in start() once config is loaded
+        self._contest_engines = []
         self.stats = {
             "processed": 0,
             "successful": 0,
@@ -82,7 +100,24 @@ class MemoryDistillationWorker:
         self.db_pool = await asyncpg.create_pool(
             min_size=1, max_size=3, command_timeout=60, **_DB_CONNECT_ARGS
         )
-        
+
+        # Construct v3.1 contest engines if available. Each engine is
+        # lazy about creating HTTP clients — construction itself is
+        # cheap and doesn't touch the network, so we always build all
+        # three and let the gpu_guard handle endpoint unavailability.
+        if _CONTEST_AVAILABLE and _CONTEST_ENABLED:
+            self._contest_engines = [
+                LETHEEngine(),
+                ALETHEIAEngine(),
+                ANAMNESISEngine(),
+            ]
+            logger.info("[OK] v3.1 contest path enabled (3 engines on the plugin ABC)")
+        else:
+            logger.info(
+                "v3.1 contest path disabled (available=%s, enabled=%s)",
+                _CONTEST_AVAILABLE, _CONTEST_ENABLED,
+            )
+
         logger.info("[OK] Distillation worker started")
         logger.info(f"Backend: {self.llm.__class__.__name__}")
         logger.info(f"Config: size_limit={SIZE_LIMIT_KB}KB, batch={BATCH_SIZE}, "
@@ -90,7 +125,10 @@ class MemoryDistillationWorker:
 
         while True:
             try:
+                # v3.0 direct-memory-polling path (backward compat)
                 await self.process_batch()
+                # v3.1 queue-driven contest path (runs alongside, failure-isolated)
+                await self.process_contest_queue_batch()
                 await self.log_stats()
             except Exception as e:
                 logger.error(f"Worker error: {e}", exc_info=True)
@@ -103,6 +141,29 @@ class MemoryDistillationWorker:
                     logger.error(f"DB reconnect failed: {re}")
 
             await asyncio.sleep(CHECK_INTERVAL)
+
+    async def process_contest_queue_batch(self):
+        """Drain up to BATCH_SIZE rows from memory_compression_queue via
+        the v3.1 contest path. No-op if contest engines aren't configured.
+
+        Failures here do not propagate — the contest path is additive
+        to v3.0 behavior and must not kill the worker loop if something
+        goes wrong. Errors are logged and the next loop iteration tries
+        again.
+        """
+        if not self._contest_engines:
+            return
+        try:
+            counts = await process_contest_queue(
+                self.db_pool,
+                self._contest_engines,
+                batch_size=BATCH_SIZE,
+                max_attempts=MAX_ATTEMPTS,
+            )
+            if counts:
+                logger.info("contest queue drain: %s", counts)
+        except Exception as e:
+            logger.error("contest queue drain error: %s", e, exc_info=True)
 
     async def process_batch(self):
         """Process batch of unoptimized memories"""
