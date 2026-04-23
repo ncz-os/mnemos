@@ -95,10 +95,20 @@ async def persist_contest(
 ) -> Dict[str, Any]:
     """Write the contest outcome to the v3.1 compression tables.
 
-    `conn` is an asyncpg Connection (not a Pool). Callers who hold a
-    Pool should acquire a connection themselves — requiring a single
-    connection here keeps the transaction semantics obvious (no
-    cross-connection .transaction() confusion).
+    `conn` is an asyncpg Connection (not a Pool), and the CALLER is
+    responsible for opening a transaction around this call. Persistence
+    must be atomic with any follow-on queue-state update the worker
+    issues; keeping the transaction boundary at the caller avoids a
+    window where contest rows commit but the queue row never transitions
+    to done/failed (see commit 9dfcdbf analysis: the v3.1.0-rc Codex
+    review flagged this as a blocker).
+
+    Typical caller shape:
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await persist_contest(conn, outcome, judge_model=...)
+                await conn.execute(_MARK_DONE_SQL, queue_id)
 
     `judge_model` is used as a fallback for candidates whose result
     didn't record one (e.g., LETHE which self-assesses quality without
@@ -112,56 +122,55 @@ async def persist_contest(
     winner_candidate_db_id: Optional[Any] = None
     candidates_written = 0
 
-    async with conn.transaction():
-        for cand in outcome.candidates:
-            r = cand.result
-            manifest_json = json.dumps(r.manifest or {})
-            row = await conn.fetchrow(
-                _INSERT_CANDIDATE_SQL,
-                outcome.memory_id,
-                outcome.owner_id,
-                outcome.contest_id,
-                r.engine_id,
-                r.engine_version,
-                r.compressed_content,
-                r.original_tokens,
-                r.compressed_tokens,
-                r.compression_ratio,
-                r.quality_score,
-                _nullable_positive(cand.speed_factor),
-                _nullable_positive(cand.composite_score),
-                outcome.scoring_profile,
-                r.elapsed_ms if r.elapsed_ms > 0 else None,
-                r.judge_model or judge_model,
-                r.gpu_used,
-                cand.is_winner,
-                cand.reject_reason,
-                manifest_json,
-            )
-            candidates_written += 1
-            if cand.is_winner:
-                winner_candidate_db_id = row["id"]
+    for cand in outcome.candidates:
+        r = cand.result
+        manifest_json = json.dumps(r.manifest or {})
+        row = await conn.fetchrow(
+            _INSERT_CANDIDATE_SQL,
+            outcome.memory_id,
+            outcome.owner_id,
+            outcome.contest_id,
+            r.engine_id,
+            r.engine_version,
+            r.compressed_content,
+            r.original_tokens,
+            r.compressed_tokens,
+            r.compression_ratio,
+            r.quality_score,
+            _nullable_positive(cand.speed_factor),
+            _nullable_positive(cand.composite_score),
+            outcome.scoring_profile,
+            r.elapsed_ms if r.elapsed_ms > 0 else None,
+            r.judge_model or judge_model,
+            r.gpu_used,
+            cand.is_winner,
+            cand.reject_reason,
+            manifest_json,
+        )
+        candidates_written += 1
+        if cand.is_winner:
+            winner_candidate_db_id = row["id"]
 
-        variant_written = False
-        if outcome.winner is not None and winner_candidate_db_id is not None:
-            w = outcome.winner
-            r = w.result
-            await conn.execute(
-                _UPSERT_VARIANT_SQL,
-                outcome.memory_id,
-                outcome.owner_id,
-                winner_candidate_db_id,
-                r.engine_id,
-                r.engine_version,
-                r.compressed_content,
-                r.compressed_tokens,
-                r.compression_ratio,
-                r.quality_score,
-                w.composite_score,
-                outcome.scoring_profile,
-                r.judge_model or judge_model,
-            )
-            variant_written = True
+    variant_written = False
+    if outcome.winner is not None and winner_candidate_db_id is not None:
+        w = outcome.winner
+        r = w.result
+        await conn.execute(
+            _UPSERT_VARIANT_SQL,
+            outcome.memory_id,
+            outcome.owner_id,
+            winner_candidate_db_id,
+            r.engine_id,
+            r.engine_version,
+            r.compressed_content,
+            r.compressed_tokens,
+            r.compression_ratio,
+            r.quality_score,
+            w.composite_score,
+            outcome.scoring_profile,
+            r.judge_model or judge_model,
+        )
+        variant_written = True
 
     return {
         "contest_id": str(outcome.contest_id),

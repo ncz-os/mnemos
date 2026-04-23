@@ -113,8 +113,12 @@ def test_happy_path_writes_every_candidate_and_upserts_variant():
 
     result = asyncio.run(persist_contest(conn, outcome))
 
-    # Transaction was opened exactly once
-    assert conn.transaction.call_count == 1
+    # persist_contest no longer opens its own transaction — caller
+    # (worker_contest._process_one) owns the transaction boundary so
+    # persistence + queue-finalization commit atomically. See the
+    # test_contest_store docstring and worker_contest.py for the
+    # caller-owns-transaction contract.
+    assert conn.transaction.call_count == 0
 
     # One fetchrow per candidate (5 total)
     assert conn.fetchrow.await_count == 5

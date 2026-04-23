@@ -248,46 +248,75 @@ async def _process_one(
     )
     outcome = await run_contest(engines, request)
 
-    async with pool.acquire() as conn:
-        try:
-            await persist_contest(conn, outcome, judge_model=judge_model)
-        except Exception as exc:
-            logger.exception(
-                "contest_queue[%s]: persist_contest failed", memory_id
-            )
-            await conn.execute(
-                _MARK_FAILED_SQL,
-                queue_id,
-                f"persist failed: {type(exc).__name__}: {exc}",
-            )
-            counts["failed"] += 1
-            return
+    # persist + queue-finalization must commit together so a failure
+    # between them cannot leave a contest durable with the queue row
+    # stuck in 'running'. Codex review surfaced this: previously the
+    # queue UPDATE ran outside persist_contest's transaction, so any
+    # mid-commit failure would strand the row (dequeue only selects
+    # 'pending', the running row would never be retried). Fix: one
+    # outer transaction wraps both.
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await persist_contest(conn, outcome, judge_model=judge_model)
 
-        if outcome.winner is None:
-            reasons = Counter(
-                c.reject_reason or "unknown" for c in outcome.candidates
-            )
-            reason_summary = ", ".join(
-                f"{reason}={count}" for reason, count in reasons.most_common()
-            )
-            await conn.execute(
-                _MARK_FAILED_SQL,
-                queue_id,
-                f"no winner: {reason_summary}",
-            )
-            counts["failed"] += 1
-            logger.info(
-                "contest_queue[%s]: no winner (%s)", memory_id, reason_summary
-            )
-        else:
-            await conn.execute(_MARK_DONE_SQL, queue_id)
-            counts["succeeded"] += 1
-            logger.info(
-                "contest_queue[%s]: winner=%s score=%.4f",
+                if outcome.winner is None:
+                    reasons = Counter(
+                        c.reject_reason or "unknown"
+                        for c in outcome.candidates
+                    )
+                    reason_summary = ", ".join(
+                        f"{reason}={count}"
+                        for reason, count in reasons.most_common()
+                    )
+                    await conn.execute(
+                        _MARK_FAILED_SQL,
+                        queue_id,
+                        f"no winner: {reason_summary}",
+                    )
+                    mark_result = ("no_winner", reason_summary)
+                else:
+                    await conn.execute(_MARK_DONE_SQL, queue_id)
+                    mark_result = ("winner",)
+    except Exception as exc:
+        # Atomic rollback: no partial contest rows, no queue update —
+        # the row stays 'running'. Mark it failed in a FRESH transaction
+        # (separate connection, since the failed txn's connection is
+        # being released). The dequeue's next pass won't touch it
+        # because status is now 'failed' not 'pending'.
+        logger.exception(
+            "contest_queue[%s]: contest persistence failed, rolled back", memory_id
+        )
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    _MARK_FAILED_SQL,
+                    queue_id,
+                    f"persist failed: {type(exc).__name__}: {exc}",
+                )
+        except Exception:
+            logger.exception(
+                "contest_queue[%s]: mark-failed also failed; row stranded at 'running' — "
+                "recovery on next worker start via stale-running sweep (v3.1.1)",
                 memory_id,
-                outcome.winner.result.engine_id,
-                outcome.winner.composite_score,
             )
+        counts["failed"] += 1
+        return
+
+    # Transaction committed cleanly. Log + count outside the txn.
+    if mark_result[0] == "winner":
+        counts["succeeded"] += 1
+        logger.info(
+            "contest_queue[%s]: winner=%s score=%.4f",
+            memory_id,
+            outcome.winner.result.engine_id,
+            outcome.winner.composite_score,
+        )
+    else:
+        counts["failed"] += 1
+        logger.info(
+            "contest_queue[%s]: no winner (%s)", memory_id, mark_result[1]
+        )
 
 
 __all__ = ["process_contest_queue"]

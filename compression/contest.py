@@ -286,7 +286,23 @@ async def run_contest(
     raw_results: list[CompressionResult] = []
     for eng, res in zip(eligible, gathered):
         if isinstance(res, BaseException):
-            logger.exception("Engine %r raised in compress(): %r", eng.id, res)
+            # Only demote ordinary Exception subclasses to contest losers.
+            # asyncio.CancelledError (BaseException subclass in 3.8+),
+            # SystemExit, KeyboardInterrupt, GeneratorExit all bypass
+            # Exception and must propagate so the event loop / process
+            # manager can act on them. Swallowing them here would let a
+            # shutdown signal be silently demoted to an "engine error"
+            # row while the worker continues happily.
+            if not isinstance(res, Exception):
+                raise res
+            # Preserve the engine's traceback in the log — logger.exception
+            # would log the active exception context (empty here, since we
+            # captured via return_exceptions=True). exc_info=res attaches
+            # the original traceback so diagnostics aren't thinned out.
+            logger.error(
+                "Engine %r raised in compress(): %r", eng.id, res,
+                exc_info=(type(res), res, res.__traceback__),
+            )
             raw_results.append(
                 CompressionResult(
                     engine_id=eng.id,
