@@ -198,6 +198,148 @@ def test_manifest_serialized_as_json_string():
         # Must round-trip as JSON
         parsed = json.loads(manifest_arg)
         assert isinstance(parsed, dict)
+        # Engine-provided keys survive enrichment
+        assert parsed.get("engine") == call_args.args[4]
+
+
+# ---- manifest enrichment (v3.1.1) -----------------------------------------
+
+
+def _manifest_for_engine(conn, engine_id: str) -> dict:
+    """Pull the serialized manifest JSON for a given engine_id and
+    decode it back to a dict.
+    """
+    for call_args in conn.fetchrow.call_args_list:
+        if call_args.args[4] == engine_id:
+            return json.loads(call_args.args[19])
+    raise AssertionError(f"no insert for engine_id={engine_id!r}")
+
+
+def test_errored_candidate_gets_error_in_audit_block():
+    """A candidate with reject_reason='error' and result.error set must
+    have the error text persisted into manifest._audit.error. Without
+    this, the DB only records the 'error' bucket label — the actual
+    exception message lives only in logs.
+    """
+    conn = _make_conn()
+    outcome = _make_outcome(winner_engine_id="fast_good")
+
+    asyncio.run(persist_contest(conn, outcome))
+
+    manifest = _manifest_for_engine(conn, "broken")
+    assert "_audit" in manifest
+    audit = manifest["_audit"]
+    assert audit["reject_reason"] == "error"
+    assert audit["error"] == "boom"
+    assert audit["engine_version"] == "1"
+
+
+def test_quality_floor_candidate_records_quality_score():
+    """quality_floor rejections drop the below-floor quality_score into
+    obscurity — the typed quality_score column captures it, but
+    operators scanning for near-misses want the value in the manifest
+    audit block too.
+    """
+    conn = _make_conn()
+    outcome = _make_outcome(winner_engine_id="fast_good")
+
+    asyncio.run(persist_contest(conn, outcome))
+
+    manifest = _manifest_for_engine(conn, "low_q")
+    audit = manifest["_audit"]
+    assert audit["reject_reason"] == "quality_floor"
+    assert audit["quality_score"] == 0.50
+
+
+def test_disabled_candidate_has_no_elapsed_or_gpu_fields():
+    """A 'disabled' candidate (supports()=False) never ran, so
+    elapsed_ms and gpu_used shouldn't pollute the audit block.
+    The 'unsupp' fixture has elapsed_ms=50, so it WILL get those
+    fields; this test uses a dedicated candidate.
+    """
+    conn = _make_conn()
+    outcome = _make_outcome(winner_engine_id="fast_good")
+    # Force one candidate to look genuinely disabled (never dispatched)
+    disabled = ContestCandidate(
+        result=CompressionResult(
+            engine_id="truly_disabled",
+            engine_version="1",
+            original_tokens=100,
+            elapsed_ms=0,
+            gpu_used=False,
+        ),
+        reject_reason="disabled",
+    )
+    outcome.candidates.insert(0, disabled)
+
+    asyncio.run(persist_contest(conn, outcome))
+
+    manifest = _manifest_for_engine(conn, "truly_disabled")
+    audit = manifest["_audit"]
+    assert audit["reject_reason"] == "disabled"
+    assert "elapsed_ms" not in audit
+    assert "gpu_used" not in audit
+
+
+def test_inferior_candidate_records_its_scores():
+    """A candidate that lost on composite score ('inferior') records
+    its achieved ratio + quality + elapsed for post-hoc comparison
+    with the winner.
+    """
+    conn = _make_conn()
+    # Two-winner configs: fast_good wins, slow_great is 'inferior'
+    outcome = _make_outcome(winner_engine_id="fast_good")
+
+    asyncio.run(persist_contest(conn, outcome))
+
+    manifest = _manifest_for_engine(conn, "slow_great")
+    audit = manifest["_audit"]
+    assert audit["reject_reason"] == "inferior"
+    assert audit["quality_score"] == 0.95
+    assert audit["compression_ratio"] == 0.3
+    assert audit["elapsed_ms"] == 300
+    assert audit["gpu_used"] is False
+
+
+def test_winner_manifest_is_not_enriched():
+    """Winners already have every useful field in typed columns —
+    enrichment would clutter their manifest with redundant data.
+    """
+    conn = _make_conn()
+    outcome = _make_outcome(winner_engine_id="fast_good")
+
+    asyncio.run(persist_contest(conn, outcome))
+
+    manifest = _manifest_for_engine(conn, "fast_good")
+    assert "_audit" not in manifest
+    # Engine-provided keys still present.
+    assert manifest.get("engine") == "fast_good"
+
+
+def test_engine_authored_audit_block_not_clobbered():
+    """Defensive: if an engine populated `_audit.*` intentionally, we
+    use setdefault — we ADD fields but never overwrite. (Unlikely but
+    guarded to keep the contract clean.)
+    """
+    conn = _make_conn()
+    outcome = _make_outcome(winner_engine_id="fast_good")
+
+    # Pre-populate the 'broken' candidate's manifest with an engine-
+    # authored _audit.error value different from result.error.
+    for c in outcome.candidates:
+        if c.result.engine_id == "broken":
+            c.result.manifest = {
+                "engine": "broken",
+                "_audit": {"error": "engine_authored_error"},
+            }
+
+    asyncio.run(persist_contest(conn, outcome))
+
+    manifest = _manifest_for_engine(conn, "broken")
+    # Engine-authored 'error' value wins over result.error='boom'.
+    assert manifest["_audit"]["error"] == "engine_authored_error"
+    # But new audit keys still get added.
+    assert manifest["_audit"]["reject_reason"] == "error"
 
 
 def test_judge_model_fallback_applied_when_result_is_silent():
