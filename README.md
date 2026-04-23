@@ -203,6 +203,7 @@ The API surface is namespaced under `/v1/*`.
 | `POST /v1/memories/{id}/branch` | Create a branch from a specific commit |
 | `POST /v1/memories/{id}/merge` | Merge a branch back to main |
 | `GET /v1/memories/{id}/versions` | Version history |
+| `GET /v1/memories/{id}/compression-manifests` | v3.1 contest audit: current winning variant + every historical contest's candidates with scoring fields and reject reasons. `?include_content=true` for full content, default is a 200-char preview |
 | `GET /health` | Health check (not namespaced) |
 | `GET /stats` | Memory counts by category, compression statistics |
 
@@ -238,6 +239,8 @@ Each memory carries full ownership and LLM provenance:
 | `POST /admin/users/{id}/apikeys` | Generate an API key (raw key returned once) |
 | `GET /admin/users/{id}/apikeys` | List API keys for a user |
 | `DELETE /admin/apikeys/{id}` | Revoke an API key (soft-delete) |
+| `POST /admin/compression/enqueue` | v3.1: enqueue specific memories into `memory_compression_queue` for the contest path. Body: `{memory_ids, reason, scoring_profile, priority}`. Silently skips unknown IDs |
+| `POST /admin/compression/enqueue-all` | v3.1: bulk-enqueue up to `limit` (default 500, max 10,000) memories. `only_uncompressed=true` (default) skips memories that already have a variant; set `false` to re-contest under new rules |
 
 All admin endpoints require root role. On personal installs (no auth), they are accessible without a key.
 
