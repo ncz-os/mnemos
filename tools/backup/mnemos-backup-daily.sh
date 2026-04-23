@@ -89,8 +89,11 @@ if [ -n "$BACKUP_DIRECTORIES" ]; then
         DEST="$FS_DIR/$REL_NAME"
 
         log "rsync src=$SRC_TRIM -> $DEST"
+        # -rlptDH = recurse, links, perms, times, devices, hardlinks
+        # --no-owner --no-group: NFS with id-squash rejects chown/chgrp, so
+        #   we preserve content + perms but accept the target's ownership.
         # shellcheck disable=SC2086
-        rsync -aH --delete --numeric-ids \
+        rsync -rlptDH --delete --no-owner --no-group \
             --exclude='.cache/' --exclude='__pycache__/' --exclude='node_modules/' \
             --exclude='*.pyc' --exclude='.venv/' --exclude='venv/' \
             $RSYNC_EXTRA_OPTS \
