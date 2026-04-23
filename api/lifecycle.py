@@ -337,14 +337,18 @@ async def _get_embedding(text: str) -> list:
 async def _vector_search(conn, embedding: list, limit: int,
                          category=None, subcategory=None, select_cols=None,
                          source_provider=None, source_model=None,
-                         source_agent=None, namespace=None) -> list:
+                         source_agent=None, namespace=None,
+                         owner_id=None) -> list:
     """pgvector cosine similarity search. Returns rows ordered by similarity desc.
 
     The vector is always $1 — used in both the SELECT similarity expression and
     the ORDER BY clause.  Passing it as a parameter (not interpolated into the
     query string) eliminates any injection risk from a poisoned embedding response.
     Supports optional provenance filters (source_provider, source_model,
-    source_agent, namespace) ANDed into the WHERE clause.
+    source_agent, namespace) ANDed into the WHERE clause. `owner_id` (v3.1.2
+    Tier 3 app-layer filter) similarly scopes the result set when the caller
+    passes it — non-root callers from /memories/search pin this to their
+    user_id for defense-in-depth against RLS being disabled.
     """
     if select_cols is None:
         select_cols = _MEMORY_COLS
@@ -358,7 +362,8 @@ async def _vector_search(conn, embedding: list, limit: int,
     conditions: list = ["embedding IS NOT NULL"]
     for col, val in [("category", category), ("subcategory", subcategory),
                      ("source_provider", source_provider), ("source_model", source_model),
-                     ("source_agent", source_agent), ("namespace", namespace)]:
+                     ("source_agent", source_agent), ("namespace", namespace),
+                     ("owner_id", owner_id)]:
         if val is not None:
             params.append(val)
             conditions.append(f"{col}=${len(params)}")
@@ -378,14 +383,17 @@ async def _vector_search(conn, embedding: list, limit: int,
 async def _fts_fetch(conn, query: str, limit: int,
                      category=None, subcategory=None, select_cols=None,
                      source_provider=None, source_model=None,
-                     source_agent=None, namespace=None):
+                     source_agent=None, namespace=None,
+                     owner_id=None):
     """FTS search with ILIKE fallback. Shared by /memories/search and /memories/rehydrate.
 
     Uses plainto_tsquery (not to_tsquery) so user input is treated as plain text —
     tsquery operators like |, !, & are not interpreted.  This prevents tsquery
     operator injection while preserving full-text search quality.
     Supports optional provenance filters (source_provider, source_model,
-    source_agent, namespace) ANDed into the WHERE clause.
+    source_agent, namespace) ANDed into the WHERE clause. `owner_id` (v3.1.2
+    Tier 3) scopes the result set to a single owner when supplied; callers
+    from non-root /memories/search pin it to user.user_id.
     """
     if select_cols is None:
         select_cols = _MEMORY_COLS
@@ -397,7 +405,8 @@ async def _fts_fetch(conn, query: str, limit: int,
     conditions: list = ["to_tsvector('english', content) @@ plainto_tsquery('english', $1)"]
     for col, val in [("category", category), ("subcategory", subcategory),
                      ("source_provider", source_provider), ("source_model", source_model),
-                     ("source_agent", source_agent), ("namespace", namespace)]:
+                     ("source_agent", source_agent), ("namespace", namespace),
+                     ("owner_id", owner_id)]:
         if val is not None:
             params.append(val)
             conditions.append(f"{col}=${len(params)}")
@@ -415,7 +424,8 @@ async def _fts_fetch(conn, query: str, limit: int,
         ilike_conditions: list = ["content ILIKE $1"]
         for col, val in [("category", category), ("subcategory", subcategory),
                          ("source_provider", source_provider), ("source_model", source_model),
-                         ("source_agent", source_agent), ("namespace", namespace)]:
+                         ("source_agent", source_agent), ("namespace", namespace),
+                         ("owner_id", owner_id)]:
             if val is not None:
                 ilike_params.append(val)
                 ilike_conditions.append(f"{col}=${len(ilike_params)}")
