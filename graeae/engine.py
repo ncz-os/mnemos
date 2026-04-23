@@ -37,7 +37,14 @@ from typing import Dict, Optional
 
 import httpx
 
-from graeae.api_keys import get_key
+from graeae.api_keys import _PROVIDER_ENV_VARS, get_key
+
+
+def _env_var_hint(key_name: str) -> str:
+    """Return the env-var name an operator would export to bypass
+    the Provider Registry File for a given key_name. Used in error
+    messages so the hint is actionable."""
+    return _PROVIDER_ENV_VARS.get(key_name, f"<{key_name.upper()}_API_KEY>")
 from graeae._circuit_breaker import CircuitBreakerPool
 from graeae._rate_limiter import RateLimiterPool
 from graeae._quality import QualityTracker
@@ -61,11 +68,11 @@ class ProviderResponse:
 
 # Built-in provider defaults — used when config.toml has no [graeae.providers] section.
 # Operators override these (or add new providers) via config.toml exclusively.
-# Default configuration prioritizes free/cheap tier access: Together AI and Groq are recommended
-# starting points for self-hosted deployments.
+#
+# Model IDs refreshed 2026-04-23 to current frontier (v3.1.2 Defect 3).
+# Operators who want earlier generations override via config.toml.
+# Defaults assume each provider's "flagship available to API" tier.
 _BUILTIN_PROVIDERS: dict[str, dict] = {
-    # These are conservative public defaults — override via config.toml [graeae.providers].
-    # Any provider with an invalid key or model will be skipped by the engine at runtime.
     "together": {
         "url": "https://api.together.xyz/v1/chat/completions",
         "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "weight": 0.80, "api": "openai", "key_name": "together_ai",
@@ -76,11 +83,11 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
     },
     "openai": {
         "url": "https://api.openai.com/v1/chat/completions",
-        "model": "gpt-4o", "weight": 0.85, "api": "openai", "key_name": "openai",
+        "model": "gpt-5.2-chat-latest", "weight": 0.88, "api": "openai", "key_name": "openai",
     },
     "claude": {
         "url": "https://api.anthropic.com/v1/messages",
-        "model": "claude-3-5-sonnet-20241022", "weight": 0.85, "api": "anthropic", "key_name": "claude",
+        "model": "claude-opus-4-6", "weight": 0.90, "api": "anthropic", "key_name": "claude",
     },
     "perplexity": {
         "url": "https://api.perplexity.ai/chat/completions",
@@ -88,15 +95,15 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
     },
     "xai": {
         "url": "https://api.x.ai/v1/chat/completions",
-        "model": "grok-2-latest", "weight": 0.84, "api": "openai", "key_name": "xai",
+        "model": "grok-4-1-fast", "weight": 0.86, "api": "openai", "key_name": "xai",
     },
     "nvidia": {
         "url": "https://integrate.api.nvidia.com/v1/chat/completions",
         "model": "meta/llama-3.3-70b-instruct", "weight": 0.80, "api": "openai", "key_name": "nvidia",
     },
     "gemini": {
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent",
-        "model": "gemini-1.5-pro", "weight": 0.81, "api": "gemini", "key_name": "gemini",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent",
+        "model": "gemini-3-pro-preview", "weight": 0.88, "api": "gemini", "key_name": "gemini",
     },
 }
 
@@ -289,8 +296,12 @@ class GraeaeEngine:
         if not api_key:
             logger.error(
                 "[GRAEAE] route(%s) failed: missing api_key (key_name=%s) — "
-                "check ~/.api_keys_master.json or MNEMOS_KEYS_PATH",
-                provider, provider_config["key_name"],
+                "set the %s environment variable or add the key to the "
+                "Provider Registry File (MNEMOS_KEYS_PATH / "
+                "~/.config/mnemos/api_keys.json / ~/.api_keys_master.json)",
+                provider,
+                provider_config["key_name"],
+                _env_var_hint(provider_config["key_name"]),
             )
             return _unavailable(
                 provider_config["model"],
@@ -339,14 +350,19 @@ class GraeaeEngine:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        # GPT-5 series uses max_completion_tokens; all other OpenAI-compat APIs use max_tokens
-        tokens_key = "max_completion_tokens" if provider["model"].startswith("gpt-5") else "max_tokens"
-        payload = {
+        # GPT-5 series has two API quirks:
+        #   1. Uses max_completion_tokens instead of max_tokens.
+        #   2. Only accepts temperature=1 (returns 400 on any other value).
+        # Other OpenAI-compat providers take the traditional shape.
+        is_gpt5 = provider["model"].startswith("gpt-5")
+        tokens_key = "max_completion_tokens" if is_gpt5 else "max_tokens"
+        payload: Dict = {
             "model": provider["model"],
             "messages": [{"role": "user", "content": prompt}],
             tokens_key: 2000,
-            "temperature": 0.7,
         }
+        if not is_gpt5:
+            payload["temperature"] = 0.7
         client = await self._get_client()
         resp = await client.post(provider["url"], json=payload, headers=headers, timeout=timeout)
         if resp.status_code != 200:

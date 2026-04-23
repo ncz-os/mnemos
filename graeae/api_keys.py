@@ -1,38 +1,35 @@
 """API key loader for GRAEAE providers.
 
-Key file resolution order (first found wins):
-  1. $MNEMOS_KEYS_PATH          — explicit override
-  2. ~/.api_keys_master.json    — standard location (shared across machines)
-  3. ~/.config/mnemos/api_keys.json — legacy fallback
+Resolution order (first hit wins per provider):
 
-Three file shapes are accepted (first match wins):
+  1. Standard per-provider environment variables — the widely-accepted
+     convention every LLM SDK uses:
+        OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY,
+        XAI_API_KEY, GROQ_API_KEY, PERPLEXITY_API_KEY,
+        TOGETHER_API_KEY, NVIDIA_API_KEY
+  2. Canonical MNEMOS key file (first readable path below):
+       $MNEMOS_KEYS_PATH                   — explicit override
+       ~/.config/mnemos/api_keys.json      — preferred standard location
+       ~/.api_keys_master.json             — legacy fallback
 
-  1. Canonical (MNEMOS-native, matches OpenClaw):
-     {
-       "llm_providers": {
-         "perplexity":     { "api_key": "pplx-..." },
-         "anthropic":      { "api_key": "sk-ant-..." },
-         ...
-       }
-     }
+File format (MNEMOS-native, self-contained — do not symlink to
+third-party service key files):
 
-  2. Flat with api_key wrapper:
-     {
-       "perplexity":    { "api_key": "..." },
-       "anthropic":     { "api_key": "..." },
-       ...
-     }
+  {
+    "llm_providers": {
+      "openai":         { "api_key": "sk-..." },
+      "anthropic":      { "api_key": "sk-ant-..." },
+      "google_gemini":  { "api_key": "AIza..." },
+      "xai":            { "api_key": "xai-..." },
+      "groq":           { "api_key": "gsk_..." },
+      "perplexity":     { "api_key": "pplx-..." },
+      "together_ai":    { "api_key": "tog_..." }
+    }
+  }
 
-  3. Flat with raw string values (Triton-native):
-     {
-       "perplexity":    "pplx-...",
-       "anthropic":     "sk-ant-...",
-       ...
-     }
-
-The canonical shape is preferred. The flat shapes are accepted so
-operators whose fleet already has Triton-style key files don't have
-to maintain a second copy just for MNEMOS.
+Environment variables win over the file when both are set, so an
+operator can override a single provider's key per-process without
+rewriting the shared file.
 """
 from __future__ import annotations
 
@@ -45,15 +42,29 @@ logger = logging.getLogger(__name__)
 
 _SEARCH_PATHS = [
     os.getenv("MNEMOS_KEYS_PATH", ""),
-    os.path.expanduser("~/.api_keys_master.json"),
     os.path.expanduser("~/.config/mnemos/api_keys.json"),
+    os.path.expanduser("~/.api_keys_master.json"),  # legacy fallback
 ]
 
-# Canonical names in ~/.api_keys_master.json may differ from GRAEAE provider names.
+# Canonical names in the key file may differ from GRAEAE provider names.
 _PROVIDER_ALIASES: dict[str, str] = {
     "claude-opus": "anthropic",
     "claude":      "anthropic",
     "gemini":      "google_gemini",
+}
+
+# Per-provider environment variable fallback. Variables here match the
+# conventions used by each vendor's official SDK so an operator can
+# drop MNEMOS into an environment where keys are already exported.
+_PROVIDER_ENV_VARS: dict[str, str] = {
+    "openai":        "OPENAI_API_KEY",
+    "anthropic":     "ANTHROPIC_API_KEY",
+    "google_gemini": "GEMINI_API_KEY",
+    "xai":           "XAI_API_KEY",
+    "groq":          "GROQ_API_KEY",
+    "perplexity":    "PERPLEXITY_API_KEY",
+    "together_ai":   "TOGETHER_API_KEY",
+    "nvidia":        "NVIDIA_API_KEY",
 }
 
 
@@ -64,68 +75,82 @@ def _find_key_file() -> Path | None:
     return None
 
 
-def load_api_keys() -> dict:
-    """Load the key file. Returns the raw JSON dict or {} if no file
-    is found / file is unparseable. Callers use `_extract_providers`
-    to normalize across on-disk shapes."""
+def load_provider_registry() -> dict:
+    """Load the MNEMOS Provider Registry File.
+
+    Returns the `llm_providers` mapping (`{provider_name:
+    {api_key: ...}}`) or {} if no file is found / unparseable /
+    missing the expected wrapper. Unrecognized top-level shapes are
+    rejected loudly so operators know their file is wrong rather
+    than silently discovering empty keys at the first request.
+    """
     key_file = _find_key_file()
     if key_file is None:
-        logger.warning(
-            "[GRAEAE] no API key file found in search paths (%s) — providers "
-            "will have empty keys. Set MNEMOS_KEYS_PATH or create "
-            "~/.api_keys_master.json.",
+        logger.info(
+            "[GRAEAE] no Provider Registry File found in search paths (%s); "
+            "falling back to per-provider environment variables "
+            "(OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.)",
             [p for p in _SEARCH_PATHS if p],
         )
         return {}
     try:
         with open(key_file) as f:
             data = json.load(f)
-        logger.debug(f"[GRAEAE] loaded API keys from {key_file}")
-        return data
     except Exception as e:
-        logger.error(f"[GRAEAE] failed to load API keys from {key_file}: {e}")
-        return {}
-
-
-def _extract_providers(data: dict) -> dict:
-    """Normalize the on-disk shape to {provider_name: {api_key: ...}}.
-
-    Accepts three shapes (see module docstring). Flat detection walks
-    the top-level keys once and infers the shape from the first
-    entry: dict-valued with `api_key` → shape 2; non-empty string
-    value → shape 3 (wrapped into {"api_key": "..."}); anything else
-    ignored. Avoids misreading a genuinely-empty / wrong-schema file
-    as a flat provider map.
-    """
-    if not isinstance(data, dict):
-        return {}
-
-    if "llm_providers" in data:
-        nested = data.get("llm_providers")
-        return nested if isinstance(nested, dict) else {}
-
-    flat: dict = {}
-    for name, entry in data.items():
-        if isinstance(entry, dict) and "api_key" in entry:
-            # Shape 2: already wrapped.
-            flat[name] = entry
-        elif isinstance(entry, str) and entry:
-            # Shape 3: raw string — wrap it so downstream get_key()
-            # can treat all shapes uniformly.
-            flat[name] = {"api_key": entry}
-    if flat:
-        logger.info(
-            "[GRAEAE] key file in flat shape (no 'llm_providers' wrapper); "
-            "loaded %d providers: %s", len(flat), sorted(flat.keys()),
+        logger.error(
+            f"[GRAEAE] failed to parse Provider Registry File {key_file}: {e}"
         )
-    return flat
+        return {}
+
+    if not isinstance(data, dict) or "llm_providers" not in data:
+        logger.warning(
+            "[GRAEAE] Provider Registry File %s has no 'llm_providers' "
+            "wrapper — expected shape is "
+            '{"llm_providers": {"<name>": {"api_key": "..."}, ...}}. '
+            "Falling back to environment variables.",
+            key_file,
+        )
+        return {}
+
+    nested = data.get("llm_providers")
+    if not isinstance(nested, dict):
+        logger.warning(
+            "[GRAEAE] Provider Registry File %s: llm_providers is not an "
+            "object — ignoring", key_file,
+        )
+        return {}
+
+    logger.debug(
+        "[GRAEAE] loaded Provider Registry File from %s (%d providers)",
+        key_file, len(nested),
+    )
+    return nested
 
 
-# Loaded once at module import; refresh by calling load_api_keys() again if needed.
-_LLM_PROVIDERS: dict = _extract_providers(load_api_keys())
+# Backward-compat alias: the function was called `load_api_keys()` in
+# earlier releases. Keep the old name importable so out-of-tree
+# callers don't break on upgrade. Internal call sites use the new name.
+load_api_keys = load_provider_registry
+
+
+# Loaded once at module import; refresh by calling load_provider_registry() again if needed.
+_LLM_PROVIDERS: dict = load_provider_registry()
 
 
 def get_key(provider: str) -> str:
-    """Return the api_key for a provider name, resolving aliases."""
+    """Return the api_key for a provider.
+
+    Resolution: environment variable first (per-provider SDK
+    convention), then the Provider Registry File. An operator can
+    override a single provider's key by exporting its env var
+    without rewriting the shared file.
+    """
     canonical = _PROVIDER_ALIASES.get(provider, provider)
+
+    env_var = _PROVIDER_ENV_VARS.get(canonical)
+    if env_var:
+        env_val = os.getenv(env_var, "").strip()
+        if env_val:
+            return env_val
+
     return _LLM_PROVIDERS.get(canonical, {}).get("api_key", "")
