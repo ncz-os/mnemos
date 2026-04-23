@@ -78,6 +78,18 @@ _CONTEST_MIN_CONTENT_LENGTH = int(
     os.getenv("MNEMOS_CONTEST_MIN_CONTENT_LENGTH", "0")
 )
 
+# Stale-running sweep threshold (v3.1.1). Queue rows stuck in 'running'
+# longer than this are reclaimed at the top of each batch — reset to
+# 'pending' (if attempts < max) or marked 'failed' (if attempts >= max).
+# Covers the rare case where a worker crashed after dequeue but before
+# any terminal status was recorded (both the contest-transaction commit
+# AND the fresh-connection fallback mark-failed failed — pool exhausted,
+# SIGKILL, etc.). Default 600s is safe for typical runs that finish in
+# seconds. Set to 0 to disable the sweep entirely.
+_CONTEST_STALE_THRESHOLD_SECS = int(
+    os.getenv("MNEMOS_CONTEST_STALE_THRESHOLD_SECS", "600")
+)
+
 # Tuning
 SIZE_LIMIT_KB = 5
 BATCH_SIZE = 5
@@ -199,6 +211,7 @@ class MemoryDistillationWorker:
                 batch_size=BATCH_SIZE,
                 max_attempts=MAX_ATTEMPTS,
                 min_content_length=_CONTEST_MIN_CONTENT_LENGTH,
+                stale_threshold_secs=_CONTEST_STALE_THRESHOLD_SECS,
             )
             if counts:
                 logger.info("contest queue drain: %s", counts)
