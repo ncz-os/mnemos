@@ -155,86 +155,109 @@ No scripts needed — this is a native macOS feature.
 ## Off-site replication (ARGONAS itself)
 
 Everything backs up *to* ARGONAS. If ARGONAS fails, you lose
-everything. Use whatever cloud storage you already pay for; the
-format below works with any rclone remote.
+everything. The recommended setup is **restic** for block-level
+dedup + client-side encryption, with rclone as the transport to
+whatever cloud storage you already pay for (Google Drive, Backblaze
+B2, S3, etc.).
 
-**Important — Google Drive and other per-file-API stores:** uploading
-a tree of many small files is *glacial* (one API call per file, rate
-limited to ~3/sec). Always tar the backup tree into a single archive
-before uploading. This section assumes that pattern.
+**Why restic beats tar+gpg+Cloud-Sync at scale:** encrypted tarballs
+have random bytes, so cloud-sync tools can't binary-diff them. Every
+nightly run re-uploads the full encrypted tarball. On a 400 GB+
+corpus that's hours of daily upload. Restic does block-level content
+addressing — typical nightly increment is <1 GB because most of the
+corpus is stable.
 
-### Option A — Google Drive via TrueNAS Cloud Sync (recommended)
+### Option A — restic over rclone Google Drive (recommended)
 
 Zero marginal cost if you already have a Google One plan (5 TB is
-more than enough for the full ARGONAS backup corpus for years).
+more than enough for the full backup corpus for years).
 
-**Step 1 — ARGONAS-side nightly tar script.** Run after the daily
-retention sweep. Outputs one encrypted tarball per day into a staging
-dir that Cloud Sync watches.
+**One-time setup.**
 
 ```bash
-#!/bin/bash
-# /usr/local/bin/mnemos-offsite-pack.sh
-set -u -o pipefail
-STAGE=/mnt/datapool/offsite-stage
-STAMP=$(date -u +%Y-%m-%d)
-PASS_FILE=/root/.mnemos-offsite.passphrase   # chmod 600
+# Configure rclone remote (interactive OAuth via SSH port-forward)
+rclone config           # choose: n, name=gdrive-mnemos-offsite,
+                        # storage=drive, then OAuth flow
 
-mkdir -p "$STAGE"
-tar -cf - /mnt/datapool/backups /mnt/datapool/git \
-    | gpg --batch --yes --symmetric --cipher-algo AES256 \
-          --passphrase-file "$PASS_FILE" \
-    > "$STAGE/mnemos-offsite-${STAMP}.tar.gpg"
+# Store the restic passphrase (must be backed up OUT OF BAND — see below)
+echo "<strong random passphrase>" > /mnt/datapool/scripts/.mnemos-offsite.passphrase
+chmod 600 /mnt/datapool/scripts/.mnemos-offsite.passphrase
 
-# Keep last 14 local copies (Cloud Sync uploads from here)
-ls -1t "$STAGE"/mnemos-offsite-*.tar.gpg | tail -n +15 | xargs -r rm -f
+# Initialize the restic repository on Drive
+export RESTIC_REPOSITORY="rclone:gdrive-mnemos-offsite:mnemos-restic"
+export RESTIC_PASSWORD_FILE=/mnt/datapool/scripts/.mnemos-offsite.passphrase
+restic init
+
+# Install the nightly script
+install -m 0755 tools/backup/mnemos-offsite-restic.sh \
+    /mnt/datapool/scripts/mnemos-offsite-restic.sh
 ```
 
-Schedule via systemd timer or cron, 05:00 daily (after the retention
-sweep at 04:00).
+**TrueNAS config.** If you're already running a TrueNAS Cloud Sync
+task for Google Drive, you can reuse its stored OAuth token directly
+instead of running `rclone config`. The provider credentials are
+queryable via `midclt call cloudsync.query` — extract `client_id`,
+`client_secret`, and the stringified `token`, then write
+`/root/.config/rclone/rclone.conf`:
 
-**Step 2 — TrueNAS Cloud Sync task:**
-1. **Credentials → Backup Credentials → Cloud Credentials → Add**
-   - Provider: Google Drive
-   - Authenticate: opens OAuth flow in browser; sign in with the
-     Google account whose quota you want to use
-2. **Data Protection → Cloud Sync Tasks → Add**
-   - Direction: PUSH
-   - Transfer mode: SYNC (mirrors staging dir → Drive)
-   - Source: `/mnt/datapool/offsite-stage/`
-   - Remote path: `mnemos-offsite/` (auto-creates on Drive)
-   - Schedule: daily 06:00
-   - Encryption: unnecessary (GPG already handled it at tar time)
-   - Remote Encryption (rclone `crypt`): **disable** — tarball is
-     already encrypted, double-encrypting wastes CPU
+```ini
+[gdrive-mnemos-offsite]
+type = drive
+client_id = <from TrueNAS>
+client_secret = <from TrueNAS>
+scope = drive
+token = <stringified OAuth JSON from TrueNAS>
+```
 
-**Step 3 — verify restore path.** Pick a random tarball from Drive,
-download, `gpg --decrypt`, `tar -tf` to list contents. Do this on a
-host that doesn't share a passphrase filesystem with ARGONAS — if
-ARGONAS dies and takes the passphrase with it, you're locked out.
-Store the GPG passphrase in a password manager (1Password, etc.).
+rclone auto-refreshes the access token using the refresh token, so
+this config stays valid indefinitely.
 
-### Option B — rclone on ARGOS (fallback if TrueNAS UI is unavailable)
+**Schedule via TrueNAS cron** (System Settings → Advanced → Cron Jobs):
 
-ARGOS already has `/mnt/argonas/datapool` NFS-mounted, so it can read
-the tarball staging dir. rclone handles Google Drive natively.
+- Description: `MNEMOS nightly off-site (restic + rclone gdrive)`
+- Command: `/mnt/datapool/scripts/mnemos-offsite-restic.sh`
+- User: `root`
+- Schedule: daily 05:30
+- Hide Standard Output/Error: unchecked (you want the log)
+
+**Disable or remove any pre-existing Cloud Sync task** for the
+off-site — restic talks to Drive directly via rclone and doesn't
+need Cloud Sync as a middleman.
+
+**Verify restore path.** Periodically (monthly) prove the backup
+works end-to-end:
 
 ```bash
-# One-time setup (interactive OAuth via SSH port-forward)
-sudo apt install -y rclone
-rclone config        # add "gdrive" remote, follow prompts
-# Test
-rclone ls gdrive:mnemos-offsite/
+# On a host that doesn't share the passphrase fs with the NAS
+export RESTIC_REPOSITORY="rclone:gdrive-mnemos-offsite:mnemos-restic"
+export RESTIC_PASSWORD="<paste from password manager>"
 
-# Scheduled (systemd timer or cron, 06:00 daily)
-rclone sync /mnt/argonas/datapool/offsite-stage gdrive:mnemos-offsite \
-    --log-file /var/log/rclone-mnemos.log --log-level INFO
+restic snapshots                              # list what's in the repo
+restic restore latest --target /tmp/restore   # restore the latest
+ls /tmp/restore/                              # verify contents
+rm -rf /tmp/restore/
 ```
+
+If the passphrase lives only in ARGONAS and ARGONAS dies, the
+off-site is unrecoverable. **Put the restic passphrase in a
+password manager** (1Password, LastPass) before production.
+
+### Option B — restic to Backblaze B2 or S3 (if not using Google Drive)
+
+Same restic script, different rclone remote:
+
+```bash
+rclone config       # add: name=b2-mnemos-offsite, storage=b2
+# then change RESTIC_REPOSITORY in mnemos-offsite-restic.sh
+export RESTIC_REPOSITORY="rclone:b2-mnemos-offsite:mnemos-restic"
+```
+
+Cost at ~200 GB of deduped corpus + history: ~$1.20/month on B2.
 
 ### Option C — Second NAS via `zfs send | receive`
 
-If you have a second physical box, periodic snapshot replication is
-free and faster than cloud:
+If you have a second physical box on the LAN, periodic snapshot
+replication is free and often faster than cloud:
 
 ```bash
 # on the source NAS (ARGONAS)
