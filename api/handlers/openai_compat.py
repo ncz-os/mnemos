@@ -296,21 +296,91 @@ async def _route_to_provider(
         raise HTTPException(status_code=503, detail=f"Routing error: {str(e)}")
 
 
+# Provider key -> display name for the `owned_by` field in OpenAI
+# /v1/models responses. Keys match the `provider` column values in
+# db/migrations_model_registry.sql (xai, openai, gemini, groq, …).
+# Unknown provider keys fall back to the key capitalized.
+_PROVIDER_DISPLAY = {
+    "xai": "xAI",
+    "openai": "OpenAI",
+    "gemini": "Google",
+    "groq": "Groq",
+    "anthropic": "Anthropic",
+    "perplexity": "Perplexity",
+    "together": "Together",
+    "mistral": "Mistral",
+    "deepseek": "DeepSeek",
+}
+
+
+def _owned_by(provider: Optional[str]) -> str:
+    """Turn a provider key into an OpenAI-style owned_by display string."""
+    if not provider:
+        return "Unknown"
+    return _PROVIDER_DISPLAY.get(provider.lower(), provider.capitalize())
+
+
+# Defensive fallback for fresh installs whose model_registry hasn't
+# been seeded yet. Matches the shape the old hardcoded list used; new
+# deployments should run `update_model_registry.py` to populate real
+# rows, but /v1/models stays usable in the meantime.
+_FALLBACK_MODELS: list[dict] = [
+    {"model_id": "gpt-5", "provider": "openai"},
+    {"model_id": "claude-4.5-sonnet", "provider": "anthropic"},
+    {"model_id": "gemini-2.5-pro", "provider": "gemini"},
+    {"model_id": "grok-4", "provider": "xai"},
+    {"model_id": "sonar-pro", "provider": "perplexity"},
+    {"model_id": "llama-3.3-70b-versatile", "provider": "groq"},
+]
+
+
+def _row_model_id(r) -> str:
+    """Support both dict fallback rows and asyncpg Record objects."""
+    return r["model_id"] if hasattr(r, "__getitem__") else r.get("model_id")
+
+
+def _row_provider(r) -> Optional[str]:
+    return r["provider"] if hasattr(r, "__getitem__") else r.get("provider")
+
+
 @router.get("/v1/models", response_model=ModelsResponse)
 async def list_models(
     authorization: Optional[str] = Header(None),
     user: UserContext = Depends(get_current_user),
 ):
-    """List available models in OpenAI format."""
-    # Load from model_registry table (Phase 5)
-    # For now, return built-in models
+    """List available models from the model_registry table (v3.1.2).
+
+    Returns every row where available=true AND deprecated=false,
+    ordered by graeae_weight DESC so higher-quality models lead the
+    response. On a fresh install where the registry is empty (or the
+    query fails), falls back to a short built-in list so the endpoint
+    stays usable until `update_model_registry.py` seeds the table.
+    """
+    rows: list = []
+    if _lc._pool is not None:
+        try:
+            async with _lc._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT provider, model_id, display_name
+                    FROM model_registry
+                    WHERE available = true AND deprecated = false
+                    ORDER BY graeae_weight DESC NULLS LAST, model_id ASC
+                    """
+                )
+        except Exception as exc:
+            logger.warning(
+                "[/v1/models] model_registry query failed, "
+                "falling back to built-in list: %s", exc,
+            )
+            rows = []
+
+    if not rows:
+        rows = _FALLBACK_MODELS
+
     models = [
-        ModelInfo(id="claude-3-5-sonnet-20241022", owned_by="Anthropic"),
-        ModelInfo(id="gpt-4o", owned_by="OpenAI"),
-        ModelInfo(id="llama-3.3-70b-versatile", owned_by="Groq"),
-        ModelInfo(id="grok-2-latest", owned_by="xAI"),
-        ModelInfo(id="sonar-pro", owned_by="Perplexity"),
-        ModelInfo(id="gemini-1.5-pro", owned_by="Google"),
+        ModelInfo(id=_row_model_id(r), owned_by=_owned_by(_row_provider(r)))
+        for r in rows
     ]
     return ModelsResponse(data=models)
 
@@ -321,10 +391,41 @@ async def get_model(
     authorization: Optional[str] = Header(None),
     user: UserContext = Depends(get_current_user),
 ):
-    """Get info about a specific model."""
-    # Resolve alias
+    """Look up a single model in the registry (v3.1.2).
+
+    Aliases resolve first (best-coding etc. → concrete model), then
+    the resolved id is checked against model_registry. If the model
+    isn't in the registry the handler still returns it with
+    owned_by='Unknown' — this is a passthrough API and operators
+    sometimes route to locally configured models that aren't
+    registered globally.
+    """
     resolved_model = MODEL_ALIASES.get(model_id, model_id)
-    return ModelInfo(id=resolved_model, owned_by="Unknown")
+    provider: Optional[str] = None
+
+    if _lc._pool is not None:
+        try:
+            async with _lc._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT provider
+                    FROM model_registry
+                    WHERE model_id = $1
+                      AND available = true
+                      AND deprecated = false
+                    LIMIT 1
+                    """,
+                    resolved_model,
+                )
+                if row is not None:
+                    provider = row["provider"]
+        except Exception as exc:
+            logger.warning(
+                "[/v1/models/%s] registry lookup failed: %s",
+                model_id, exc,
+            )
+
+    return ModelInfo(id=resolved_model, owned_by=_owned_by(provider))
 
 
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
