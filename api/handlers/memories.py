@@ -66,6 +66,14 @@ async def _persist_compression(memory_id: str, compressed_text: str) -> None:
         logger.warning(f"[PHASE2] Failed to persist compression for {memory_id}: {e}")
 
 
+def _is_root(user: UserContext) -> bool:
+    """Root callers see all rows regardless of namespace — they're
+    the operational tier. Everyone else is scoped to their own
+    namespace at the app layer, as defense-in-depth against RLS
+    being disabled in personal-mode installs."""
+    return user.role == "root"
+
+
 @router.get("/memories", response_model=MemoryListResponse)
 async def list_memories(
     category: Optional[str] = None,
@@ -76,40 +84,94 @@ async def list_memories(
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
+
+    # v3.1.2: app-layer namespace enforcement. When RLS is disabled
+    # (personal mode), the memory handlers previously saw every row
+    # regardless of the caller's namespace. The filter below scopes
+    # non-root callers to their namespace without needing RLS.
+    scope_to_ns = not _is_root(user)
+
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
             if category and subcategory:
-                rows = await conn.fetch(
-                    f"SELECT {_MEMORY_COLS} FROM memories "
-                    "WHERE category=$1 AND subcategory=$2 ORDER BY created DESC LIMIT $3 OFFSET $4",
-                    category, subcategory, limit, offset,
-                )
-                total = await conn.fetchval(
-                    "SELECT COUNT(*) FROM memories WHERE category=$1 AND subcategory=$2",
-                    category, subcategory,
-                )
+                if scope_to_ns:
+                    rows = await conn.fetch(
+                        f"SELECT {_MEMORY_COLS} FROM memories "
+                        "WHERE category=$1 AND subcategory=$2 AND namespace=$3 "
+                        "ORDER BY created DESC LIMIT $4 OFFSET $5",
+                        category, subcategory, user.namespace, limit, offset,
+                    )
+                    total = await conn.fetchval(
+                        "SELECT COUNT(*) FROM memories WHERE category=$1 AND subcategory=$2 AND namespace=$3",
+                        category, subcategory, user.namespace,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"SELECT {_MEMORY_COLS} FROM memories "
+                        "WHERE category=$1 AND subcategory=$2 ORDER BY created DESC LIMIT $3 OFFSET $4",
+                        category, subcategory, limit, offset,
+                    )
+                    total = await conn.fetchval(
+                        "SELECT COUNT(*) FROM memories WHERE category=$1 AND subcategory=$2",
+                        category, subcategory,
+                    )
             elif category:
-                rows = await conn.fetch(
-                    f"SELECT {_MEMORY_COLS} FROM memories "
-                    "WHERE category=$1 ORDER BY created DESC LIMIT $2 OFFSET $3",
-                    category, limit, offset,
-                )
-                total = await conn.fetchval(
-                    "SELECT COUNT(*) FROM memories WHERE category=$1", category)
+                if scope_to_ns:
+                    rows = await conn.fetch(
+                        f"SELECT {_MEMORY_COLS} FROM memories "
+                        "WHERE category=$1 AND namespace=$2 "
+                        "ORDER BY created DESC LIMIT $3 OFFSET $4",
+                        category, user.namespace, limit, offset,
+                    )
+                    total = await conn.fetchval(
+                        "SELECT COUNT(*) FROM memories WHERE category=$1 AND namespace=$2",
+                        category, user.namespace,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"SELECT {_MEMORY_COLS} FROM memories "
+                        "WHERE category=$1 ORDER BY created DESC LIMIT $2 OFFSET $3",
+                        category, limit, offset,
+                    )
+                    total = await conn.fetchval(
+                        "SELECT COUNT(*) FROM memories WHERE category=$1", category)
             elif subcategory:
-                rows = await conn.fetch(
-                    f"SELECT {_MEMORY_COLS} FROM memories "
-                    "WHERE subcategory=$1 ORDER BY created DESC LIMIT $2 OFFSET $3",
-                    subcategory, limit, offset,
-                )
-                total = await conn.fetchval(
-                    "SELECT COUNT(*) FROM memories WHERE subcategory=$1", subcategory)
+                if scope_to_ns:
+                    rows = await conn.fetch(
+                        f"SELECT {_MEMORY_COLS} FROM memories "
+                        "WHERE subcategory=$1 AND namespace=$2 "
+                        "ORDER BY created DESC LIMIT $3 OFFSET $4",
+                        subcategory, user.namespace, limit, offset,
+                    )
+                    total = await conn.fetchval(
+                        "SELECT COUNT(*) FROM memories WHERE subcategory=$1 AND namespace=$2",
+                        subcategory, user.namespace,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"SELECT {_MEMORY_COLS} FROM memories "
+                        "WHERE subcategory=$1 ORDER BY created DESC LIMIT $2 OFFSET $3",
+                        subcategory, limit, offset,
+                    )
+                    total = await conn.fetchval(
+                        "SELECT COUNT(*) FROM memories WHERE subcategory=$1", subcategory)
             else:
-                rows = await conn.fetch(
-                    f"SELECT {_MEMORY_COLS} FROM memories ORDER BY created DESC LIMIT $1 OFFSET $2",
-                    limit, offset,
-                )
-                total = await conn.fetchval("SELECT COUNT(*) FROM memories")
+                if scope_to_ns:
+                    rows = await conn.fetch(
+                        f"SELECT {_MEMORY_COLS} FROM memories "
+                        "WHERE namespace=$1 ORDER BY created DESC LIMIT $2 OFFSET $3",
+                        user.namespace, limit, offset,
+                    )
+                    total = await conn.fetchval(
+                        "SELECT COUNT(*) FROM memories WHERE namespace=$1",
+                        user.namespace,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"SELECT {_MEMORY_COLS} FROM memories ORDER BY created DESC LIMIT $1 OFFSET $2",
+                        limit, offset,
+                    )
+                    total = await conn.fetchval("SELECT COUNT(*) FROM memories")
     return MemoryListResponse(count=total, memories=[_row_to_memory(r) for r in rows])
 
 
@@ -122,9 +184,19 @@ async def get_memory(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
-            row = await conn.fetchrow(
-                f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
-            )
+            if _is_root(user):
+                row = await conn.fetchrow(
+                    f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
+                )
+            else:
+                # Non-root: 404 on namespace mismatch. Returning 403
+                # would leak existence of memories in other namespaces;
+                # 404 is uniform with the "not found" response.
+                row = await conn.fetchrow(
+                    f"SELECT {_MEMORY_COLS} FROM memories "
+                    "WHERE id=$1 AND namespace=$2",
+                    memory_id, user.namespace,
+                )
     if not row:
         raise HTTPException(status_code=404, detail="Memory not found")
     return _row_to_memory(row, include_compressed=True)
