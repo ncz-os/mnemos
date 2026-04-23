@@ -1,0 +1,19 @@
+# Run: pre-commit install
+# After that, every `git commit` auto-runs ruff/ruff-format before the commit lands.
+# Matches the CI Lint + Test / Lint (ruff) step so pushes don't surprise-fail CI.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
