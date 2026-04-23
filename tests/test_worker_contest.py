@@ -93,22 +93,32 @@ def _memory_row(memory_id: str, *, content: str = "hello world " * 50) -> dict:
     }
 
 
-def _mock_pool(*, queue_rows: list[dict], memory_content_by_id: dict[str, dict]) -> MagicMock:
+def _mock_pool(
+    *,
+    queue_rows: list[dict],
+    memory_content_by_id: dict[str, dict],
+    sweep_rows: list[dict] | None = None,
+) -> MagicMock:
     """Build a mock Pool whose acquire() yields a mock Connection.
 
     The connection dispatches on SQL text: dequeue returns queue_rows
-    then [] on subsequent calls; fetchrow returns memory rows; execute
-    records MARK_DONE / MARK_FAILED calls; transaction() is a no-op
-    async ctx (persist_contest uses it).
+    then [] on subsequent calls; sweep returns sweep_rows (default []);
+    fetchrow returns memory rows; execute records MARK_DONE / MARK_FAILED
+    calls; transaction() is a no-op async ctx (persist_contest uses it).
     """
 
     dequeue_calls = [queue_rows, []]  # first call returns rows, second returns []
+    sweep_calls = [list(sweep_rows) if sweep_rows else []]
     execute_log: list[tuple[str, tuple]] = []
     fetchrow_calls: list[tuple[str, tuple]] = []
     persist_fetchrow_calls = 0
 
     async def fetch(sql, *args):
-        if "memory_compression_queue" in sql and "FOR UPDATE SKIP LOCKED" in sql:
+        # sweep_stale_running: SELECT ... WHERE status = 'running'
+        if "status = 'running'" in sql:
+            return sweep_calls.pop(0) if sweep_calls else []
+        # process_contest_queue dequeue: SELECT ... WHERE status = 'pending'
+        if "status = 'pending'" in sql and "FOR UPDATE SKIP LOCKED" in sql:
             return dequeue_calls.pop(0) if dequeue_calls else []
         raise AssertionError(f"unexpected fetch: {sql!r}")
 
@@ -117,6 +127,17 @@ def _mock_pool(*, queue_rows: list[dict], memory_content_by_id: dict[str, dict])
         if sql.strip().startswith("SELECT id, content, category, task_type"):
             fetchrow_calls.append((sql, args))
             return memory_content_by_id.get(args[0])
+        # _process_one precondition: SELECT status, attempts ... FOR UPDATE.
+        # Default: row still 'running' with its dequeue-time attempts
+        # value (i.e. the queue_row's attempts, which represents the
+        # POST-bump value — mirroring the real dequeue's RETURNING).
+        # Tests that simulate a sweep reclaim override this branch via
+        # pool._conn.fetchrow = AsyncMock(...).
+        if sql.strip().startswith("SELECT status, attempts"):
+            match = next((r for r in queue_rows if r["id"] == args[0]), None)
+            if match is None:
+                return None
+            return {"status": "running", "attempts": match["attempts"]}
         # persist_contest's INSERT ... RETURNING id
         if "INSERT INTO memory_compression_candidates" in sql:
             persist_fetchrow_calls += 1
@@ -395,3 +416,233 @@ def test_persist_raising_marks_failed():
     assert len(failed) == 1
     assert "persist failed" in failed[0][1]
     assert "db exploded" in failed[0][1]
+
+
+# ---- stale-running sweep (v3.1.1) -----------------------------------------
+
+
+from compression.worker_contest import _sweep_stale_running  # noqa: E402
+
+
+def _sweep_row(*, attempts: int, status: str) -> dict:
+    """Simulated RETURNING row from the sweep UPDATE."""
+    return {"id": uuid.uuid4(), "status": status, "attempts": attempts}
+
+
+def test_sweep_reclaims_row_under_max_to_pending():
+    stale = _sweep_row(attempts=1, status="pending")
+    pool = _mock_pool(queue_rows=[], memory_content_by_id={}, sweep_rows=[stale])
+    counts = asyncio.run(_sweep_stale_running(pool))
+    assert counts == {"stranded_reset": 1}
+
+
+def test_sweep_marks_row_at_max_as_failed():
+    stale = _sweep_row(attempts=3, status="failed")
+    pool = _mock_pool(queue_rows=[], memory_content_by_id={}, sweep_rows=[stale])
+    counts = asyncio.run(_sweep_stale_running(pool))
+    assert counts == {"stranded_failed": 1}
+
+
+def test_sweep_empty_returns_empty_dict():
+    pool = _mock_pool(queue_rows=[], memory_content_by_id={}, sweep_rows=[])
+    counts = asyncio.run(_sweep_stale_running(pool))
+    assert counts == {}
+
+
+def test_sweep_mixed_batch_counts_both_outcomes():
+    reset_row = _sweep_row(attempts=1, status="pending")
+    failed_row = _sweep_row(attempts=3, status="failed")
+    pool = _mock_pool(
+        queue_rows=[], memory_content_by_id={},
+        sweep_rows=[reset_row, failed_row],
+    )
+    counts = asyncio.run(_sweep_stale_running(pool))
+    assert counts == {"stranded_reset": 1, "stranded_failed": 1}
+
+
+def test_sweep_sql_receives_threshold_and_max_attempts():
+    """Sweep must pass through stale_threshold_secs and max_attempts
+    as SQL parameters so the CASE expression reclaims vs fails correctly.
+    """
+    captured_args = []
+
+    async def capture_fetch(sql, *args):
+        if "status = 'running'" in sql:
+            captured_args.append(args)
+            return []
+        raise AssertionError(f"unexpected fetch: {sql!r}")
+
+    pool = _mock_pool(queue_rows=[], memory_content_by_id={})
+    pool._conn.fetch = AsyncMock(side_effect=capture_fetch)
+
+    asyncio.run(_sweep_stale_running(
+        pool, stale_threshold_secs=900, max_attempts=5,
+    ))
+
+    assert captured_args == [(900, 5)]
+
+
+def test_process_contest_queue_runs_sweep_before_dequeue():
+    """Default stale_threshold_secs > 0 ⇒ sweep runs, counts merged."""
+    reset_row = _sweep_row(attempts=1, status="pending")
+    pool = _mock_pool(
+        queue_rows=[], memory_content_by_id={}, sweep_rows=[reset_row],
+    )
+    engines = [_StubEngine("e1", result_factory=_good_result("e1"))]
+
+    counts = asyncio.run(process_contest_queue(pool, engines))
+
+    assert counts.get("stranded_reset") == 1
+    assert "dequeued" not in counts
+
+
+def test_process_contest_queue_sweep_disabled_when_threshold_zero():
+    """stale_threshold_secs=0 must skip the sweep entirely — no fetch
+    call matching the sweep SQL should happen.
+    """
+    fetch_sqls = []
+
+    async def recording_fetch(sql, *args):
+        fetch_sqls.append(sql)
+        if "status = 'pending'" in sql:
+            return []
+        raise AssertionError(f"unexpected fetch: {sql!r}")
+
+    pool = _mock_pool(queue_rows=[], memory_content_by_id={})
+    pool._conn.fetch = AsyncMock(side_effect=recording_fetch)
+
+    engines = [_StubEngine("e1", result_factory=_good_result("e1"))]
+    asyncio.run(process_contest_queue(pool, engines, stale_threshold_secs=0))
+
+    assert not any("status = 'running'" in s for s in fetch_sqls)
+
+
+def test_sweep_failure_does_not_block_dequeue():
+    """If the sweep raises (e.g. transient DB blip), process_contest_queue
+    must still run the dequeue. Sweep error is logged, not propagated.
+    """
+    q = _queue_row()
+
+    async def fetch_sweep_raises(sql, *args):
+        if "status = 'running'" in sql:
+            raise RuntimeError("sweep db blip")
+        if "status = 'pending'" in sql and "FOR UPDATE SKIP LOCKED" in sql:
+            return [q]
+        raise AssertionError(f"unexpected fetch: {sql!r}")
+
+    pool = _mock_pool(
+        queue_rows=[q],
+        memory_content_by_id={q["memory_id"]: _memory_row(q["memory_id"])},
+    )
+    pool._conn.fetch = AsyncMock(side_effect=fetch_sweep_raises)
+
+    engines = [_StubEngine("e1", result_factory=_good_result("e1"))]
+    counts = asyncio.run(process_contest_queue(pool, engines))
+
+    # Sweep errored, but dequeue still ran and the row succeeded.
+    assert counts.get("dequeued") == 1
+    assert counts.get("succeeded") == 1
+
+
+# ---- sweep-vs-late-finisher race (v3.1.1) ---------------------------------
+
+
+def _install_precondition_fetchrow(pool, *, returning):
+    """Override the mock's fetchrow to return a forged precondition row.
+
+    `returning` is the dict the SELECT status, attempts query should
+    return (or None). Everything else falls back to the original
+    fetchrow behavior.
+    """
+    original = pool._conn.fetchrow.side_effect
+
+    async def override(sql, *args):
+        if sql.strip().startswith("SELECT status, attempts"):
+            return returning
+        return await original(sql, *args)
+
+    pool._conn.fetchrow = AsyncMock(side_effect=override)
+
+
+def test_precondition_status_mismatch_abandons_work():
+    """Sweep reclaimed the row to 'pending' before the worker's persist
+    transaction opened. The worker must NOT persist the contest, NOT
+    mark the queue row, and record race_abandoned.
+    """
+    q = _queue_row()
+    pool = _mock_pool(
+        queue_rows=[q],
+        memory_content_by_id={q["memory_id"]: _memory_row(q["memory_id"])},
+    )
+    # Sweep reclaimed → status flipped to 'pending'.
+    _install_precondition_fetchrow(
+        pool, returning={"status": "pending", "attempts": q["attempts"]}
+    )
+
+    engines = [_StubEngine("e1", result_factory=_good_result("e1"))]
+    counts = asyncio.run(process_contest_queue(pool, engines))
+
+    assert counts.get("dequeued") == 1
+    assert counts.get("race_abandoned") == 1
+    # No persist, no MARK_DONE/MARK_FAILED fired.
+    assert _mark_done_calls(pool) == []
+    assert _mark_failed_calls(pool) == []
+
+
+def test_precondition_attempts_mismatch_abandons_work():
+    """Sweep reset row, another worker re-dequeued (bumping attempts).
+    Our worker's fingerprint (expected_attempts=N) no longer matches
+    the DB's N+1 — abandon work cleanly.
+    """
+    q = _queue_row(attempts=1)
+    pool = _mock_pool(
+        queue_rows=[q],
+        memory_content_by_id={q["memory_id"]: _memory_row(q["memory_id"])},
+    )
+    # Row is 'running' again (worker-2 re-dequeued) but attempts bumped.
+    _install_precondition_fetchrow(
+        pool, returning={"status": "running", "attempts": q["attempts"] + 1}
+    )
+
+    engines = [_StubEngine("e1", result_factory=_good_result("e1"))]
+    counts = asyncio.run(process_contest_queue(pool, engines))
+
+    assert counts.get("race_abandoned") == 1
+    assert _mark_done_calls(pool) == []
+    assert _mark_failed_calls(pool) == []
+
+
+def test_precondition_row_vanished_abandons_work():
+    """Row was deleted (ON DELETE CASCADE from memories drop, etc.)
+    between dequeue and persist. Treat as race_abandoned, not crash.
+    """
+    q = _queue_row()
+    pool = _mock_pool(
+        queue_rows=[q],
+        memory_content_by_id={q["memory_id"]: _memory_row(q["memory_id"])},
+    )
+    _install_precondition_fetchrow(pool, returning=None)
+
+    engines = [_StubEngine("e1", result_factory=_good_result("e1"))]
+    counts = asyncio.run(process_contest_queue(pool, engines))
+
+    assert counts.get("race_abandoned") == 1
+
+
+def test_precondition_match_proceeds_normally():
+    """Sanity: when precondition matches (status='running' + attempts
+    unchanged), the contest persists and the queue row is marked done
+    as before. This is the hot path regression guard.
+    """
+    q = _queue_row(attempts=2)
+    pool = _mock_pool(
+        queue_rows=[q],
+        memory_content_by_id={q["memory_id"]: _memory_row(q["memory_id"])},
+    )
+
+    engines = [_StubEngine("e1", result_factory=_good_result("e1"))]
+    counts = asyncio.run(process_contest_queue(pool, engines))
+
+    assert counts.get("succeeded") == 1
+    assert counts.get("race_abandoned", 0) == 0
+    assert len(_mark_done_calls(pool)) == 1
