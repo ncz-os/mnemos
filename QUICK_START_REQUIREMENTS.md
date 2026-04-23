@@ -1,4 +1,4 @@
-# MNEMOS v3.0.0 Quick Start Requirements
+# MNEMOS v3.1.0 Quick Start Requirements
 
 **TL;DR**: Python 3.11+, PostgreSQL 16, 8GB RAM, 50GB disk  
 **Full Details**: See `SYSTEM_REQUIREMENTS.md`
@@ -20,7 +20,7 @@ sudo apt install -y postgresql-16 postgresql-16-pgvector postgresql-client
 sudo apt install -y git curl build-essential libpq-dev
 
 # 4. MNEMOS code (2 minutes)
-git clone https://github.com/mnemos-dev/mnemos
+git clone https://github.com/perlowja/mnemos
 cd mnemos
 python3.11 -m venv venv
 source venv/bin/activate
@@ -54,7 +54,7 @@ curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER
 
 # 2. Clone and configure (5 minutes)
-git clone https://github.com/mnemos-dev/mnemos
+git clone https://github.com/perlowja/mnemos
 cd mnemos
 cp .env.example .env
 # Edit .env if needed
@@ -180,7 +180,7 @@ curl https://api.groq.com 2>/dev/null | grep -q "html" && echo "✓ Groq reachab
 
 # 4. Check MNEMOS
 curl http://localhost:5002/health | jq '.version'
-# Expected: "3.0.0"
+# Expected: "3.1.0"
 ```
 
 ---
@@ -300,12 +300,12 @@ kill -9 <PID>
 
 ## Support
 
-- **GitHub Issues**: https://github.com/mnemos-dev/mnemos/issues
-- **Documentation**: https://github.com/mnemos-dev/mnemos#readme
+- **GitHub Issues**: https://github.com/perlowja/mnemos/issues
+- **Documentation**: https://github.com/perlowja/mnemos#readme
 - **Community**: Discord/Slack (if applicable)
 
 ---
 
-**Version**: 3.0.0  
+**Version**: 3.1.0  
 **Updated**: 2026-04-19  
 **Accuracy**: Production-verified

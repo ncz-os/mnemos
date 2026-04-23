@@ -14,7 +14,7 @@
    hermes mcp add mnemos \
      --command python \
      --args "/path/to/mnemos/mcp_server.py" \
-     --env MNEMOS_BASE=http://mnemos.internal:5000
+     --env MNEMOS_BASE=http://mnemos.internal:5002
    ```
 
    Or merge `mcp_servers.example.yaml` into `~/.hermes/config.yaml` under the `mcp_servers` key. Replace `<your-mnemos-host>` with your MNEMOS deployment URL — there is no default.

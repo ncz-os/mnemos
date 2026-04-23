@@ -6,9 +6,8 @@ Two integration modes. You can use either or both.
 
 Set `MNEMOS_BASE` to your MNEMOS deployment's URL. **There is no default** — MNEMOS is network infrastructure, not an embedded library. Typical values:
 
-- `http://mnemos.internal:5000` — single-process MNEMOS
-- `http://mnemos.internal:5002` — unified MNEMOS+GRAEAE
-- `http://127.0.0.1:5000` — loopback-only personal dev
+- `http://mnemos.internal:5002` — unified MNEMOS+GRAEAE (default in v3)
+- `http://127.0.0.1:5002` — loopback-only personal dev
 
 ## 1. MCP server (recommended)
 
@@ -59,7 +58,7 @@ Re-running is safe — already-present hooks are not duplicated.
 After `install.sh`, edit `~/.claude/mnemos-hooks.config`:
 
 ```bash
-export MNEMOS_BASE="http://mnemos.internal:5000"     # required
+export MNEMOS_BASE="http://mnemos.internal:5002"     # required
 export MNEMOS_API_KEY=""                             # optional (team/enterprise)
 ```
 
@@ -73,7 +72,7 @@ echo '[ -f "$HOME/.claude/mnemos-hooks.config" ] && source "$HOME/.claude/mnemos
 
 ```bash
 # Dry-run a hook (should exit 0 and either emit context or print {})
-MNEMOS_BASE=http://mnemos.internal:5000 ~/.claude/mnemos-hooks/mnemos-session-start.sh <<< '{}'
+MNEMOS_BASE=http://mnemos.internal:5002 ~/.claude/mnemos-hooks/mnemos-session-start.sh <<< '{}'
 
 # After Claude Code restart, check hook activity
 tail -n 20 /tmp/mnemos-hooks.log

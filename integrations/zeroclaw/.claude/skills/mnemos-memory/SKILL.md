@@ -25,7 +25,7 @@ If the user's task looks like something that might have been solved before, sear
 - **Start broad with full-text:** `search_memories(query="topic keywords", limit=10)` before narrowing
 - **Filter by category** when you know the domain: `search_memories(query="auth flow", category="decisions")`
 - **Use semantic search** for concept-level matches: `search_memories(query="...", semantic=true)`
-- **Rehydrate for large context loads:** `rehydrate_memories(query="...", budget_tokens=8000)` — returns compressed context fitted to a token budget
+- **Large context loads:** use `POST /v1/memories/rehydrate` directly via the REST API (this path is not an MCP tool in the current `mcp_server.py`). Chain multiple `search_memories` calls with a running token tally if you need to stay within MCP.
 
 ## When to store
 
@@ -61,7 +61,7 @@ Content rules:
 
 ## Knowledge graph
 
-For relational facts (`X owns Y`, `A depends on B`, `deadline of X is Y`), use `create_triple` instead of a free-text memory. Triples support temporal validity windows — mark `valid_until` when a fact goes stale rather than deleting.
+For relational facts (`X owns Y`, `A depends on B`, `deadline of X is Y`), use `kg_create_triple` instead of a free-text memory. Triples support temporal validity windows — mark `valid_until` when a fact goes stale rather than deleting.
 
 ## Avoid poisoning
 
@@ -76,10 +76,14 @@ Before acting on a returned memory, check that it is still current:
 | Tool | Purpose |
 |------|---------|
 | `search_memories` | Full-text or semantic search, category/subcategory filters |
+| `list_memories` | List memories with optional category / limit filters |
 | `get_memory` | Fetch a single memory by ID |
 | `create_memory` | Store a new memory |
+| `bulk_create_memories` | Create many memories in one call (bulk ingest) |
 | `update_memory` | Edit content or metadata |
 | `delete_memory` | Remove a memory |
-| `rehydrate_memories` | Token-budgeted context load for injection into prompts |
-| `create_triple` / `list_triples` / `get_timeline` | Knowledge-graph ops |
+| `kg_create_triple` / `update_triple` / `delete_triple` | Knowledge-graph write ops |
+| `kg_search` / `kg_timeline` | Knowledge-graph read ops (list triples, subject timeline) |
 | `get_stats` | Category counts, compression statistics |
+
+Rehydration (token-budgeted context load) is a REST-only endpoint (`POST /v1/memories/rehydrate`); not exposed as an MCP tool in the current `mcp_server.py`.
