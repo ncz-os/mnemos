@@ -33,7 +33,6 @@ def _make(endpoint: str = "http://test:8000", **cfg) -> GPUGuard:
     merged = GuardConfig(
         failure_threshold=cfg.get("failure_threshold", base.failure_threshold),
         cooldown_seconds=cfg.get("cooldown_seconds", base.cooldown_seconds),
-        probe_timeout_seconds=cfg.get("probe_timeout_seconds", base.probe_timeout_seconds),
         log_throttle_seconds=cfg.get("log_throttle_seconds", base.log_throttle_seconds),
     )
     return GPUGuard(endpoint, config=merged)
@@ -302,30 +301,28 @@ def test_probe_failure_clears_in_flight_flag_and_reopens():
     asyncio.run(drive())
 
 
-def test_abandoned_probe_admits_new_probe_after_timeout():
-    """If a probe caller crashed/was cancelled without recording
-    success/failure, the in_flight flag would sit forever and wedge
-    HALF_OPEN. After `probe_timeout_seconds` elapses since
-    probe_started_at, a fresh call must admit a new probe.
+def test_abandoned_probe_stays_wedged_until_reset():
+    """If a probe caller crashes/is cancelled without recording
+    success/failure, the circuit stays HALF_OPEN with probe_in_flight
+    set. This is deliberate: auto-admitting a replacement probe would
+    create a race where the abandoned caller's late completion
+    pollutes shared state relative to the replacement's result (no
+    probe-identity handshake in v3.1). Operators recover with reset().
     """
-    guard = _make(
-        failure_threshold=2,
-        cooldown_seconds=0.05,
-        probe_timeout_seconds=0.1,
-    )
+    guard = _make(failure_threshold=2, cooldown_seconds=0.05)
 
     async def drive():
         await guard.record_failure(RuntimeError("a"))
         await guard.record_failure(RuntimeError("b"))
         await asyncio.sleep(0.1)  # cooldown to reach HALF_OPEN
-        # First probe admitted, then caller simulates crash (no record).
+        # First probe admitted, caller then simulates crash (no record).
         assert await guard.is_available() is True
-        assert guard.snapshot()["probe_in_flight"] is True
-        # Second caller within the probe window: rejected.
-        assert await guard.is_available() is False
-        # Wait past probe_timeout_seconds.
-        await asyncio.sleep(0.15)
-        # Now a new caller gets admitted as the fresh probe.
+        # Subsequent callers rejected indefinitely.
+        for _ in range(5):
+            assert await guard.is_available() is False
+            await asyncio.sleep(0.05)
+        # Only reset() unsticks it.
+        guard.reset()
         assert await guard.is_available() is True
 
     asyncio.run(drive())

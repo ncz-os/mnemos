@@ -91,7 +91,21 @@ _QUALITY_FLOOR_MAX: float = 0.99
 def _clamp(value: float, *, lo: float, hi: float, field_name: str, profile_name: str) -> float:
     """Clamp `value` into [lo, hi]. Log a warning if the value had to
     be coerced — silently clamping is rude to operators who may have
-    typoed a config value."""
+    typoed a config value.
+
+    NaN and infinity are rejected explicitly — both values compare
+    False against any numeric bound (so `<` / `>` would silently admit
+    them), and propagating either into multiplicative scoring poisons
+    composite_score for every candidate. We coerce to `lo` (the
+    minimum) on NaN/Inf with a loud warning so the operator's misconfig
+    is visible.
+    """
+    if math.isnan(value) or math.isinf(value):
+        logger.warning(
+            "scoring_profile[%s].%s = %r is not finite; coerced to %g",
+            profile_name, field_name, value, lo,
+        )
+        return lo
     if value < lo:
         logger.warning(
             "scoring_profile[%s].%s = %g below allowed minimum %g; clamped to %g",

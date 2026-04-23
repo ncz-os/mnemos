@@ -342,6 +342,31 @@ def test_engine_authored_audit_block_not_clobbered():
     assert manifest["_audit"]["reject_reason"] == "error"
 
 
+def test_non_dict_audit_from_engine_does_not_crash():
+    """Pathological: an engine returns manifest['_audit'] as a string
+    (or list, or any non-dict). Enrichment must not raise; instead
+    it stashes the engine's value in _audit_original and builds a
+    fresh dict.
+    """
+    conn = _make_conn()
+    outcome = _make_outcome(winner_engine_id="fast_good")
+
+    for c in outcome.candidates:
+        if c.result.engine_id == "broken":
+            c.result.manifest = {
+                "engine": "broken",
+                "_audit": "not a dict — pathological engine output",
+            }
+
+    # Should not raise
+    asyncio.run(persist_contest(conn, outcome))
+
+    manifest = _manifest_for_engine(conn, "broken")
+    assert isinstance(manifest["_audit"], dict)
+    assert manifest["_audit"]["reject_reason"] == "error"
+    assert manifest["_audit_original"] == "not a dict — pathological engine output"
+
+
 def test_judge_model_fallback_applied_when_result_is_silent():
     conn = _make_conn()
     outcome = _make_outcome(winner_engine_id="fast_good")

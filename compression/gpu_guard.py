@@ -48,10 +48,13 @@ Circuit states:
                  still-broken endpoint isn't flooded. Probe success
                  transitions back to CLOSED; probe failure re-opens
                  the circuit for another cooldown window. If a probe
-                 is in flight longer than `probe_timeout_seconds`
-                 (caller crashed / was cancelled without recording
-                 success/failure), the flag is abandoned and the
-                 next call is admitted as a fresh probe.
+                 caller crashes or is cancelled without calling
+                 record_success / record_failure, the circuit stays
+                 HALF_OPEN until an operator calls reset() — we
+                 don't auto-admit a replacement, because a late
+                 completion from the original caller would race with
+                 the replacement without a probe-identity handshake
+                 (that's a v3.2 candidate).
 
 The guard is per-endpoint (keyed by URL) and lives in a process-local
 registry. Multiple engines sharing the same `GPU_PROVIDER_HOST` share
@@ -94,13 +97,6 @@ class GuardConfig:
 
     failure_threshold: int = 3
     cooldown_seconds: float = 30.0
-    # Upper bound on how long a single HALF_OPEN probe can stay
-    # "in flight" before the next caller is admitted as a fresh probe.
-    # Covers the case where the probe caller is cancelled (asyncio
-    # timeout higher in the stack) or otherwise fails to invoke
-    # record_success / record_failure. Default 120s is ~4x the default
-    # cooldown and roomy above a realistic GPU handler timeout (~30s).
-    probe_timeout_seconds: float = 120.0
     # Minimum time between state-transition log messages. Prevents log
     # floods when many concurrent tasks hit a recently-opened circuit.
     log_throttle_seconds: float = 5.0
@@ -195,31 +191,24 @@ class GPUGuard:
 
             if self._state is CircuitState.HALF_OPEN:
                 if not self._probe_in_flight:
-                    # Probe slot is free (prior probe resolved to
-                    # HALF_OPEN without re-admitting us? defensive).
+                    # Probe slot is free (probe resolved via reset() or
+                    # the previous OPEN->HALF_OPEN transition never
+                    # stamped the flag; defensive path).
                     self._probe_in_flight = True
                     self._probe_started_at = now
                     return True
-                # A probe is in flight. Admit only if it has been
-                # outstanding longer than `probe_timeout_seconds` —
-                # at that point we treat the original caller as
-                # abandoned (cancelled / crashed / never called
-                # record_*) and let this caller re-probe. Otherwise
-                # fast-fail to protect the endpoint from concurrent
-                # probes (the "single-probe" guarantee).
-                if (
-                    self._probe_started_at is not None
-                    and now - self._probe_started_at
-                    >= self.config.probe_timeout_seconds
-                ):
-                    logger.warning(
-                        "gpu_guard[%s]: prior probe abandoned after %.1fs, "
-                        "admitting new probe",
-                        self.endpoint,
-                        now - self._probe_started_at,
-                    )
-                    self._probe_started_at = now
-                    return True
+                # A probe is in flight. Fast-fail the caller; the
+                # circuit admits exactly one probe until record_success
+                # / record_failure resolves it.
+                #
+                # If the probe caller crashed / was cancelled without
+                # recording a result, the circuit will stay HALF_OPEN
+                # indefinitely. Operators recover with reset() rather
+                # than auto-admitting a replacement probe: a late
+                # completion from the original caller would otherwise
+                # race with the replacement and pollute shared state
+                # without a probe-identity handshake (a v3.2 candidate;
+                # see Codex review 019dbc67 for the analysis).
                 return False
 
             # CLOSED

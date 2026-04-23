@@ -120,7 +120,18 @@ def _enriched_manifest(cand) -> Dict[str, Any]:
     if cand.is_winner:
         return base
 
-    audit: Dict[str, Any] = base.setdefault("_audit", {})
+    # Defensive: if an engine populated `_audit` with a non-dict value
+    # (pathological but possible from a custom engine), start a fresh
+    # dict rather than crashing on setdefault. The engine's prior value
+    # is dropped into `_audit_original` for audit.
+    existing = base.get("_audit")
+    if not isinstance(existing, dict):
+        if existing is not None:
+            base["_audit_original"] = existing
+        audit: Dict[str, Any] = {}
+        base["_audit"] = audit
+    else:
+        audit = existing
 
     # Only set keys we don't already have, so engines that deliberately
     # populated `_audit.*` (unlikely but possible) aren't clobbered.
