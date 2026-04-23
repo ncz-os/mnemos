@@ -273,11 +273,32 @@ class GraeaeEngine:
         """
         if provider not in self.providers:
             logger.warning(f"[GRAEAE] unknown provider '{provider}' — returning unavailable")
-            return _unavailable(model or provider)
+            return _unavailable(
+                model or provider,
+                error=f"provider '{provider}' not registered in this deployment",
+            )
 
         provider_config = dict(self.providers[provider])
         if model:
             provider_config["model"] = model
+
+        # Key-missing is a common failure and silently produces a 401/403
+        # upstream with no visible reason. Pre-check the key and emit a
+        # targeted error so operators don't have to tail debug logs.
+        api_key = get_key(provider_config["key_name"])
+        if not api_key:
+            logger.error(
+                "[GRAEAE] route(%s) failed: missing api_key (key_name=%s) — "
+                "check ~/.api_keys_master.json or MNEMOS_KEYS_PATH",
+                provider, provider_config["key_name"],
+            )
+            return _unavailable(
+                provider_config["model"],
+                error=(
+                    f"missing api_key for provider '{provider}' "
+                    f"(key_name={provider_config['key_name']})"
+                ),
+            )
 
         try:
             result = await self._query_provider(provider, prompt, task_type, timeout)
@@ -285,7 +306,10 @@ class GraeaeEngine:
             return result
         except Exception as e:
             logger.error(f"[GRAEAE] route({provider}) failed: {e}")
-            return _unavailable(provider_config["model"])
+            return _unavailable(
+                provider_config["model"],
+                error=f"{type(e).__name__}: {e}",
+            )
 
     async def _query_provider(
         self, provider_name: str, prompt: str, task_type: str, timeout: int
@@ -400,13 +424,21 @@ class GraeaeEngine:
         return status
 
 
-def _unavailable(model_id: str) -> Dict:
+def _unavailable(model_id: str, error: str = "") -> Dict:
+    """Uniform shape for provider failures.
+
+    `error` (v3.1.2 diagnostic) is a short human-readable cause — e.g.
+    "missing api_key", "HTTP 401 Unauthorized", "timeout after 30s" —
+    surfaced by callers in logs and 503 responses so operators can
+    diagnose without running the stack under DEBUG logging.
+    """
     return {
         "status": "unavailable",
         "response_text": "",
         "latency_ms": 0,
         "model_id": model_id,
         "final_score": 0.0,
+        "error": error,
     }
 
 

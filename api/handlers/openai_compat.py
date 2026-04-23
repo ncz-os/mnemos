@@ -287,10 +287,22 @@ async def _route_to_provider(
 
         if response.get("status") == "success":
             return response.get("response_text", "")
-        else:
-            logger.error(f"[MNEMOS] Provider {provider} returned error: {response.get('status')}")
-            raise HTTPException(status_code=503, detail=f"Provider {provider} unavailable")
+        # GRAEAE returns unavailable shape with an `error` field (v3.1.2).
+        # Surface the cause in both the log line and the 503 detail so
+        # operators see WHY the provider failed (missing key, 401, etc.)
+        # without tailing debug logs.
+        cause = response.get("error") or response.get("status") or "unknown"
+        logger.error(
+            "[MNEMOS] Provider %s unavailable: %s (status=%s)",
+            provider, cause, response.get("status"),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Provider {provider} unavailable: {cause}",
+        )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[MNEMOS] Routing to {provider} failed: {e}")
         raise HTTPException(status_code=503, detail=f"Routing error: {str(e)}")
