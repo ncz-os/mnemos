@@ -201,6 +201,40 @@ def test_load_custom_quality_floor_at_one_clamped_to_point_99(caplog):
         path.unlink()
 
 
+def test_load_custom_nan_coerced_to_minimum(caplog):
+    """NaN comparisons return False against any numeric bound, so a
+    naive clamp would let NaN through and poison every composite score
+    downstream. Validation must explicitly reject non-finite values.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write("[custom]\nquality_weight = nan\n")
+        path = Path(fh.name)
+    try:
+        with caplog.at_level("WARNING"):
+            prof = load_scoring_profile("custom", config_path=path)
+        # NaN coerced to the minimum (0.0 for weights).
+        assert prof.quality_weight == 0.0
+        assert any("not finite" in rec.message for rec in caplog.records)
+    finally:
+        path.unlink()
+
+
+def test_load_custom_inf_coerced_to_minimum(caplog):
+    """Same treatment for +inf / -inf — both poison multiplicative
+    scoring. Coerce to minimum with a warning.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write("[custom]\nspeed_weight = inf\n")
+        path = Path(fh.name)
+    try:
+        with caplog.at_level("WARNING"):
+            prof = load_scoring_profile("custom", config_path=path)
+        assert prof.speed_weight == 0.0
+        assert any("not finite" in rec.message for rec in caplog.records)
+    finally:
+        path.unlink()
+
+
 def test_load_custom_non_numeric_falls_back_to_balanced_default(caplog):
     """A non-numeric string for a weight should NOT crash; fall back
     to the balanced default with a warning.
