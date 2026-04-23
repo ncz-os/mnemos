@@ -244,13 +244,22 @@ async def get_compression_manifests(
 
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
-            # Enforce memory visibility under RLS before returning manifests.
-            # Avoids leaking manifest existence for memories the caller
-            # cannot see.
-            exists = await conn.fetchval(
-                "SELECT 1 FROM memories WHERE id = $1",
-                memory_id,
-            )
+            # Enforce memory visibility — check owner + namespace for
+            # non-root so manifests for cross-tenant memories don't
+            # leak their existence. RLS (when enabled) scopes owner_id
+            # but never namespace; the app-layer filter here is
+            # defense-in-depth for the RLS-disabled case too.
+            if _is_root(user):
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM memories WHERE id = $1",
+                    memory_id,
+                )
+            else:
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM memories "
+                    "WHERE id = $1 AND owner_id = $2 AND namespace = $3",
+                    memory_id, user.user_id, user.namespace,
+                )
             if not exists:
                 raise HTTPException(status_code=404, detail="Memory not found")
 
@@ -369,30 +378,6 @@ async def search_memories(
 ):
     """Search memories with optional compression of large result sets (cached 5 min)."""
     request_limit = min(request.limit, 500)  # server-side cap regardless of model field
-    # Cache key MUST include user.user_id and namespace: when RLS is enabled,
-    # different users get different row sets for the same query — caching
-    # without scoping was an RLS bypass.
-    cache_key = _get_cache_key(
-        "search",
-        user.user_id, user.namespace,
-        request.query, request_limit,
-        request.category or "", request.subcategory or "",
-        "semantic" if request.semantic else "fts",
-        request.source_provider or "", request.source_model or "",
-        request.source_agent or "", request.namespace or "",
-    )
-
-    if _lc._cache and not request.include_compressed:
-        try:
-            cached = await _lc._cache.get(cache_key)
-            if cached:
-                logger.debug(f"[CACHE] /memories/search hit for '{request.query[:30]}'")
-                return MemoryListResponse(**json.loads(cached))
-        except Exception as e:
-            logger.warning(f"[CACHE] search read error: {e}")
-
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
 
     # v3.1.2 Tier 3: pin owner_id + namespace to the caller's identity
     # for non-root searches. Previously request.namespace was caller-
@@ -412,6 +397,33 @@ async def search_memories(
                 detail="cross-namespace search requires root",
             )
         search_namespace = user.namespace
+
+    # Cache key MUST include user.user_id and the EFFECTIVE namespace +
+    # owner_id — the server-resolved filter values, not the caller's
+    # raw request. Using request.namespace (possibly None) would create
+    # duplicate cache entries for identical result sets.
+    cache_key = _get_cache_key(
+        "search",
+        user.user_id, user.namespace,
+        request.query, request_limit,
+        request.category or "", request.subcategory or "",
+        "semantic" if request.semantic else "fts",
+        request.source_provider or "", request.source_model or "",
+        request.source_agent or "",
+        search_namespace or "", search_owner_id or "",
+    )
+
+    if _lc._cache and not request.include_compressed:
+        try:
+            cached = await _lc._cache.get(cache_key)
+            if cached:
+                logger.debug(f"[CACHE] /memories/search hit for '{request.query[:30]}'")
+                return MemoryListResponse(**json.loads(cached))
+        except Exception as e:
+            logger.warning(f"[CACHE] search read error: {e}")
+
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
 
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
@@ -650,9 +662,13 @@ async def update_memory(
                         "SELECT id FROM memories WHERE id=$1", memory_id,
                     )
                 else:
+                    # Two-dimensional check: owner_id AND namespace.
+                    # RLS enforces the former when enabled; we add the
+                    # latter as app-layer defense.
                     row = await conn.fetchrow(
-                        "SELECT id FROM memories WHERE id=$1 AND owner_id=$2",
-                        memory_id, user.user_id,
+                        "SELECT id FROM memories "
+                        "WHERE id=$1 AND owner_id=$2 AND namespace=$3",
+                        memory_id, user.user_id, user.namespace,
                     )
                 if not row:
                     raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
@@ -730,9 +746,14 @@ async def delete_memory(
                     "DELETE FROM memories WHERE id = $1", memory_id,
                 )
             else:
+                # Two-dimensional check: non-root can only delete
+                # rows in their own namespace, preventing a namespace
+                # A user from deleting a namespace B row even under
+                # the same owner_id.
                 result = await conn.execute(
-                    "DELETE FROM memories WHERE id = $1 AND owner_id = $2",
-                    memory_id, user.user_id,
+                    "DELETE FROM memories "
+                    "WHERE id = $1 AND owner_id = $2 AND namespace = $3",
+                    memory_id, user.user_id, user.namespace,
                 )
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
