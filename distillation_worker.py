@@ -49,6 +49,23 @@ except Exception as _ce:
 
 _CONTEST_ENABLED = os.getenv("MNEMOS_CONTEST_ENABLED", "true").lower() == "true"
 
+# ALETHEIA is disabled by default in v3.1. The engine's v3.0 index-list
+# scoring prompt ("output comma-separated token indices to KEEP")
+# doesn't survive instruction-tuned chat models — verified against
+# Qwen2.5-Coder-7B on TYPHON and gemma-4-E4B-it on CERBERUS, both
+# returned whitespace/punctuation instead of an index list. The parser
+# fallback emits first-N tokens with honest quality_score=0.60, which
+# the balanced-profile 0.70 quality_floor correctly rejects — so the
+# engine never wins but still burns ~0.2-0.5s of GPU round-trip per
+# memory. Disabling by default skips the waste. Operators with a
+# model/prompt that actually handles importance scoring opt-in via:
+#
+#   MNEMOS_ALETHEIA_ENABLED=true
+#
+# The engine's prompt redesign ("direct compression mode") is v3.x
+# work, not v3.1. See docs/benchmarks/compression-2026-04-23.md.
+_ALETHEIA_ENABLED = os.getenv("MNEMOS_ALETHEIA_ENABLED", "false").lower() == "true"
+
 # Tuning
 SIZE_LIMIT_KB = 5
 BATCH_SIZE = 5
@@ -103,15 +120,25 @@ class MemoryDistillationWorker:
 
         # Construct v3.1 contest engines if available. Each engine is
         # lazy about creating HTTP clients — construction itself is
-        # cheap and doesn't touch the network, so we always build all
-        # three and let the gpu_guard handle endpoint unavailability.
+        # cheap and doesn't touch the network, so we always build the
+        # enabled set and let the gpu_guard handle endpoint
+        # unavailability at runtime.
         if _CONTEST_AVAILABLE and _CONTEST_ENABLED:
-            self._contest_engines = [
-                LETHEEngine(),
-                ALETHEIAEngine(),
-                ANAMNESISEngine(),
-            ]
-            logger.info("[OK] v3.1 contest path enabled (3 engines on the plugin ABC)")
+            self._contest_engines = [LETHEEngine()]
+            if _ALETHEIA_ENABLED:
+                self._contest_engines.append(ALETHEIAEngine())
+            self._contest_engines.append(ANAMNESISEngine())
+            engine_ids = [e.id for e in self._contest_engines]
+            logger.info(
+                "[OK] v3.1 contest path enabled (engines: %s)",
+                ", ".join(engine_ids),
+            )
+            if not _ALETHEIA_ENABLED:
+                logger.info(
+                    "ALETHEIA is disabled by default in v3.1 (set "
+                    "MNEMOS_ALETHEIA_ENABLED=true to opt in). See "
+                    "docs/benchmarks/compression-2026-04-23.md for rationale."
+                )
         else:
             logger.info(
                 "v3.1 contest path disabled (available=%s, enabled=%s)",

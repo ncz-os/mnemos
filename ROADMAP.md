@@ -31,7 +31,7 @@ Three engines ship under the platform: LETHE (extractive, CPU), ALETHEIA (LLM-as
 - Every Tier 1 item already on master (verified).
 - Every Tier 2 item lands with unit tests plus at least one live integration test against real infrastructure (no mocks-only coverage on the success path for any GPU-touching engine).
 - End-to-end contract tests for MCP stdio wire compatibility (already shipped) and the new compression contest path.
-- `docs/benchmarks/compression-2026-04-22.md` with measured numbers across a real stratified memory sample from the production install — not single-input anecdata.
+- `docs/benchmarks/compression-2026-04-23.md` with measured numbers across a real stratified memory sample from the production install — not single-input anecdata. **Shipped.** 49 memories from PYTHIA, three engines against gemma-4-E4B-it on CERBERUS. LETHE won 30, ANAMNESIS won 18, ALETHEIA won 0 (disabled by default on the finding that its index-list prompt doesn't survive instruction-tuned models). See `docs/benchmarks/compression-2026-04-23.md` for full findings including one real bug surfaced and fixed.
 - `CHANGELOG.md` entry listing every item above, with SHA references.
 - `DEPLOYMENT.md` updated with the single-worker constraint and the scaling roadmap pointer.
 
