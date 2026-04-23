@@ -42,9 +42,16 @@ Circuit states:
   * OPEN       — circuit tripped; `is_available()` returns False
                  until the cooldown window elapses. Engines fast-fail
                  or route around.
-  * HALF_OPEN  — cooldown elapsed; the NEXT request is treated as a
-                 probe. Success transitions back to CLOSED; failure
-                 re-opens the circuit for another cooldown window.
+  * HALF_OPEN  — cooldown elapsed; exactly ONE probe request is
+                 admitted. While that probe is in flight, concurrent
+                 `is_available()` calls return False so the possibly-
+                 still-broken endpoint isn't flooded. Probe success
+                 transitions back to CLOSED; probe failure re-opens
+                 the circuit for another cooldown window. If a probe
+                 is in flight longer than `probe_timeout_seconds`
+                 (caller crashed / was cancelled without recording
+                 success/failure), the flag is abandoned and the
+                 next call is admitted as a fresh probe.
 
 The guard is per-endpoint (keyed by URL) and lives in a process-local
 registry. Multiple engines sharing the same `GPU_PROVIDER_HOST` share
@@ -87,6 +94,13 @@ class GuardConfig:
 
     failure_threshold: int = 3
     cooldown_seconds: float = 30.0
+    # Upper bound on how long a single HALF_OPEN probe can stay
+    # "in flight" before the next caller is admitted as a fresh probe.
+    # Covers the case where the probe caller is cancelled (asyncio
+    # timeout higher in the stack) or otherwise fails to invoke
+    # record_success / record_failure. Default 120s is ~4x the default
+    # cooldown and roomy above a realistic GPU handler timeout (~30s).
+    probe_timeout_seconds: float = 120.0
     # Minimum time between state-transition log messages. Prevents log
     # floods when many concurrent tasks hit a recently-opened circuit.
     log_throttle_seconds: float = 5.0
@@ -127,6 +141,12 @@ class GPUGuard:
         self._opened_at: Optional[float] = None
         self._last_log_at: float = 0.0
         self._last_error: Optional[str] = None
+        # Single-probe coordination: when the circuit transitions
+        # OPEN -> HALF_OPEN, exactly one concurrent caller is admitted
+        # as the probe. Subsequent concurrent callers see
+        # _probe_in_flight and fast-fail until the probe resolves.
+        self._probe_in_flight: bool = False
+        self._probe_started_at: Optional[float] = None
         self._lock = asyncio.Lock()
 
     @property
@@ -138,20 +158,33 @@ class GPUGuard:
         return self._last_error
 
     async def is_available(self) -> bool:
-        """True if the endpoint is CLOSED or HALF_OPEN (probe-eligible).
+        """True if the caller may proceed with a request.
 
-        When the cooldown window has elapsed on an OPEN circuit, this
-        call transitions the state to HALF_OPEN and returns True — the
-        caller's request becomes the probe.
+        State-dependent admission:
+          * CLOSED:    always admit.
+          * OPEN:      admit iff cooldown has elapsed (the admitted
+                       caller becomes the probe; state transitions to
+                       HALF_OPEN).
+          * HALF_OPEN: admit iff no probe currently in flight
+                       (single-probe guarantee) OR the prior probe
+                       has been "in flight" longer than
+                       `cooldown_seconds` (caller abandoned — admit a
+                       fresh probe).
         """
         async with self._lock:
+            now = time.monotonic()
+
             if self._state is CircuitState.OPEN:
                 if self._opened_at is None:
                     # Shouldn't happen, but stay defensive.
                     self._state = CircuitState.HALF_OPEN
+                    self._probe_in_flight = True
+                    self._probe_started_at = now
                     return True
-                if time.monotonic() - self._opened_at >= self.config.cooldown_seconds:
+                if now - self._opened_at >= self.config.cooldown_seconds:
                     self._state = CircuitState.HALF_OPEN
+                    self._probe_in_flight = True
+                    self._probe_started_at = now
                     self._log_throttled(
                         "circuit HALF_OPEN: probe request may now proceed "
                         "against %s",
@@ -159,12 +192,44 @@ class GPUGuard:
                     )
                     return True
                 return False
-            # CLOSED and HALF_OPEN both permit requests.
+
+            if self._state is CircuitState.HALF_OPEN:
+                if not self._probe_in_flight:
+                    # Probe slot is free (prior probe resolved to
+                    # HALF_OPEN without re-admitting us? defensive).
+                    self._probe_in_flight = True
+                    self._probe_started_at = now
+                    return True
+                # A probe is in flight. Admit only if it has been
+                # outstanding longer than `probe_timeout_seconds` —
+                # at that point we treat the original caller as
+                # abandoned (cancelled / crashed / never called
+                # record_*) and let this caller re-probe. Otherwise
+                # fast-fail to protect the endpoint from concurrent
+                # probes (the "single-probe" guarantee).
+                if (
+                    self._probe_started_at is not None
+                    and now - self._probe_started_at
+                    >= self.config.probe_timeout_seconds
+                ):
+                    logger.warning(
+                        "gpu_guard[%s]: prior probe abandoned after %.1fs, "
+                        "admitting new probe",
+                        self.endpoint,
+                        now - self._probe_started_at,
+                    )
+                    self._probe_started_at = now
+                    return True
+                return False
+
+            # CLOSED
             return True
 
     async def record_success(self) -> None:
         """Note a successful request. Resets failure counter; if the
-        circuit was HALF_OPEN, transitions back to CLOSED."""
+        circuit was HALF_OPEN, transitions back to CLOSED. Clears the
+        single-probe in-flight flag so future OPEN -> HALF_OPEN
+        transitions can admit a new probe."""
         async with self._lock:
             if self._state is CircuitState.HALF_OPEN:
                 logger.info(
@@ -175,10 +240,13 @@ class GPUGuard:
             self._consecutive_failures = 0
             self._opened_at = None
             self._last_error = None
+            self._probe_in_flight = False
+            self._probe_started_at = None
 
     async def record_failure(self, exc: Optional[BaseException] = None) -> None:
         """Note a failure. Increments the failure counter; if the counter
-        crosses the threshold (or if we were HALF_OPEN), OPEN the circuit."""
+        crosses the threshold (or if we were HALF_OPEN), OPEN the circuit.
+        Clears the single-probe in-flight flag on HALF_OPEN resolution."""
         async with self._lock:
             self._last_error = (
                 f"{type(exc).__name__}: {exc}" if exc is not None else "unspecified"
@@ -188,6 +256,8 @@ class GPUGuard:
                 # Probe failed — immediately re-open for another cooldown window.
                 self._opened_at = time.monotonic()
                 self._state = CircuitState.OPEN
+                self._probe_in_flight = False
+                self._probe_started_at = None
                 logger.warning(
                     "gpu_guard[%s]: probe failed, circuit re-OPEN (%s)",
                     self.endpoint,
@@ -224,6 +294,8 @@ class GPUGuard:
             "consecutive_failures": self._consecutive_failures,
             "opened_at": self._opened_at,
             "last_error": self._last_error,
+            "probe_in_flight": self._probe_in_flight,
+            "probe_started_at": self._probe_started_at,
         }
 
     def reset(self) -> None:
@@ -234,6 +306,8 @@ class GPUGuard:
         self._consecutive_failures = 0
         self._opened_at = None
         self._last_error = None
+        self._probe_in_flight = False
+        self._probe_started_at = None
 
 
 # ---- process-local registry -------------------------------------------------
