@@ -130,6 +130,166 @@ async def get_memory(
     return _row_to_memory(row, include_compressed=True)
 
 
+def _render_content_preview(content: Optional[str], include_content: bool) -> Optional[str]:
+    """Full content when the caller asked for it, first-200-chars preview
+    otherwise. Returning None stays None — the engine produced no output."""
+    if content is None:
+        return None
+    if include_content:
+        return content
+    return content if len(content) <= 200 else content[:200] + "…"
+
+
+@router.get("/memories/{memory_id}/compression-manifests")
+async def get_compression_manifests(
+    memory_id: str,
+    include_content: bool = Query(
+        False,
+        description=(
+            "Return full compressed_content for the winning variant and "
+            "every candidate. Default returns a 200-character preview to "
+            "keep responses small; flip for deep audit inspection."
+        ),
+    ),
+    user: UserContext = Depends(get_current_user),
+):
+    """Return the v3.1 compression audit trail for a memory.
+
+    Two sections:
+      * `variant`  — the current winning dense form (or null if no contest
+                     has produced a winner yet). Pointer into the contest
+                     candidate that "won" most recently.
+      * `contests` — every historical contest, grouped by contest_id,
+                     ordered most recent first. Each contest lists every
+                     engine attempt with scoring fields and reject_reason.
+
+    The response shape mirrors the v3.1 compression schema exactly so
+    operators can reason about what was tried, what scored how, and why
+    each engine was or wasn't picked.
+    """
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+
+    async with _lc._pool.acquire() as conn:
+        async with _rls_context(conn, user):
+            # Enforce memory visibility under RLS before returning manifests.
+            # Avoids leaking manifest existence for memories the caller
+            # cannot see.
+            exists = await conn.fetchval(
+                "SELECT 1 FROM memories WHERE id = $1",
+                memory_id,
+            )
+            if not exists:
+                raise HTTPException(status_code=404, detail="Memory not found")
+
+            variant_row = await conn.fetchrow(
+                """
+                SELECT engine_id, engine_version, compressed_content,
+                       compressed_tokens, compression_ratio, quality_score,
+                       composite_score, scoring_profile, judge_model,
+                       selected_at, winner_candidate_id
+                FROM memory_compressed_variants
+                WHERE memory_id = $1
+                """,
+                memory_id,
+            )
+
+            candidate_rows = await conn.fetch(
+                """
+                SELECT contest_id, engine_id, engine_version,
+                       compressed_content, original_tokens, compressed_tokens,
+                       compression_ratio, quality_score, speed_factor,
+                       composite_score, scoring_profile, elapsed_ms,
+                       judge_model, gpu_used, is_winner, reject_reason,
+                       manifest, created
+                FROM memory_compression_candidates
+                WHERE memory_id = $1
+                ORDER BY created ASC, is_winner DESC, engine_id
+                """,
+                memory_id,
+            )
+
+    variant: Optional[dict] = None
+    if variant_row is not None:
+        variant = {
+            "engine_id": variant_row["engine_id"],
+            "engine_version": variant_row["engine_version"],
+            "compressed_content": _render_content_preview(
+                variant_row["compressed_content"], include_content,
+            ),
+            "compressed_tokens": variant_row["compressed_tokens"],
+            "compression_ratio": variant_row["compression_ratio"],
+            "quality_score": variant_row["quality_score"],
+            "composite_score": variant_row["composite_score"],
+            "scoring_profile": variant_row["scoring_profile"],
+            "judge_model": variant_row["judge_model"],
+            "selected_at": (
+                variant_row["selected_at"].isoformat()
+                if variant_row["selected_at"] else None
+            ),
+            "winner_candidate_id": (
+                str(variant_row["winner_candidate_id"])
+                if variant_row["winner_candidate_id"] else None
+            ),
+        }
+
+    contests: dict[str, dict] = {}
+    for row in candidate_rows:
+        cid = str(row["contest_id"])
+        bucket = contests.setdefault(cid, {
+            "contest_id": cid,
+            "started_at": row["created"],
+            "candidates": [],
+        })
+        # earliest created row's timestamp represents the contest start
+        if row["created"] < bucket["started_at"]:
+            bucket["started_at"] = row["created"]
+
+        manifest_field = row["manifest"]
+        if isinstance(manifest_field, str):
+            try:
+                manifest_field = json.loads(manifest_field)
+            except Exception:
+                manifest_field = {"_raw": manifest_field}
+
+        bucket["candidates"].append({
+            "engine_id": row["engine_id"],
+            "engine_version": row["engine_version"],
+            "compressed_content": _render_content_preview(
+                row["compressed_content"], include_content,
+            ),
+            "original_tokens": row["original_tokens"],
+            "compressed_tokens": row["compressed_tokens"],
+            "compression_ratio": row["compression_ratio"],
+            "quality_score": row["quality_score"],
+            "speed_factor": row["speed_factor"],
+            "composite_score": row["composite_score"],
+            "scoring_profile": row["scoring_profile"],
+            "elapsed_ms": row["elapsed_ms"],
+            "judge_model": row["judge_model"],
+            "gpu_used": row["gpu_used"],
+            "is_winner": row["is_winner"],
+            "reject_reason": row["reject_reason"],
+            "manifest": manifest_field,
+            "created": row["created"].isoformat(),
+        })
+
+    contests_list = sorted(
+        (
+            {**bucket, "started_at": bucket["started_at"].isoformat()}
+            for bucket in contests.values()
+        ),
+        key=lambda c: c["started_at"],
+        reverse=True,
+    )
+
+    return {
+        "memory_id": memory_id,
+        "variant": variant,
+        "contests": contests_list,
+    }
+
+
 @router.post("/memories/search", response_model=MemoryListResponse)
 async def search_memories(
     request: MemorySearchRequest,
