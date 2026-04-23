@@ -123,16 +123,25 @@ def test_half_open_success_closes_circuit():
 
 
 def test_half_open_failure_reopens_circuit():
-    guard = _make(failure_threshold=2, cooldown_seconds=0.0)
+    # Small but non-zero cooldown: long enough that the re-opened
+    # circuit stays OPEN when the post-probe is_available() fires
+    # immediately; short enough the test finishes fast.
+    guard = _make(failure_threshold=2, cooldown_seconds=0.1)
 
     async def drive():
         await guard.record_failure(RuntimeError("a"))
         await guard.record_failure(RuntimeError("b"))
-        await guard.is_available()  # -> HALF_OPEN
+        # Wait past the cooldown window so the next is_available()
+        # transitions OPEN -> HALF_OPEN.
+        await asyncio.sleep(0.15)
+        assert await guard.is_available() is True
+        assert guard.state is CircuitState.HALF_OPEN
+        # Probe fails -> circuit re-opens with a FRESH cooldown window.
         await guard.record_failure(RuntimeError("probe failed"))
 
     asyncio.run(drive())
     assert guard.state is CircuitState.OPEN
+    # The fresh cooldown just started; is_available must still be False.
     assert asyncio.run(guard.is_available()) is False
     assert "probe failed" in (guard.last_error or "")
 
