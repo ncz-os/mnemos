@@ -15,7 +15,7 @@ Three artifacts. Skill (discovery), MCP (access), AGENTS.md snippet (enforcement
    ```bash
    cat integrations/openclaw/mcp.example.json
    ```
-   Set `MNEMOS_BASE` in the env to your MNEMOS instance (e.g. `http://mnemos.internal:5000`). There is no default.
+   Set `MNEMOS_BASE` in the env to your MNEMOS instance (e.g. `http://mnemos.internal:5002`). There is no default.
 
 3. **Append the enforcement snippet** to your repo's root `AGENTS.md`:
    ```bash

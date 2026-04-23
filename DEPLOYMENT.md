@@ -1,6 +1,6 @@
-# MNEMOS v3.0.0: Deployment & Configuration Guide
+# MNEMOS v3.1.0: Deployment & Configuration Guide
 
-**Status**: Production Ready | **Version**: 3.0.0
+**Status**: Production Ready | **Version**: 3.1.0
 
 ---
 
@@ -16,7 +16,7 @@
 
 ```bash
 # Clone repository
-git clone https://github.com/your-org/mnemos.git
+git clone https://github.com/perlowja/mnemos.git
 cd mnemos
 
 # Copy environment template
@@ -155,7 +155,7 @@ See `docker-compose.yml` for services (PostgreSQL, Redis, MNEMOS).
 
 ---
 
-## Core API Endpoints (v3.0.0)
+## Core API Endpoints (v3.1.0)
 
 ### Consultations (GRAEAE Reasoning)
 ```bash

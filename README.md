@@ -32,7 +32,7 @@ You can treat MNEMOS like a memory storage provider if you want — `POST /v1/me
 - Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in.
 - Runs alongside your applications the way Redis, PostgreSQL, or a message bus would. Deploy once, every agent in your stack shares the same memory substrate.
 
-Next release ([v3.1](./ROADMAP.md)) is the compression platform release: a plugin `CompressionEngine` ABC open to operator-registered engines, three built-in engines running under a competitive-selection contest, a persisted audit log recording every winner and loser with its score, and GPU-batched inference that runs on integrated graphics through to datacenter cards. A fourth first-party engine, **APOLLO** — schema-aware dense encoding for LLM-to-LLM wire use — is staged across v3.2–v3.4 (the "Apollo Program"), alongside hot-path wiring that reads winner variants on rehydrate / gateway inject / session context.
+The [v3.1 release](./ROADMAP.md) is the compression platform release: a plugin `CompressionEngine` ABC open to operator-registered engines, three built-in engines running under a competitive-selection contest (LETHE + ANAMNESIS active by default; ALETHEIA opt-in via `MNEMOS_ALETHEIA_ENABLED=true` — its v3.0 index-list prompt doesn't survive instruction-tuned chat models, and a prompt redesign is v3.x work), a persisted audit log recording every winner and loser with its score, and GPU-batched inference that runs on integrated graphics through to datacenter cards. A fourth first-party engine, **APOLLO** — schema-aware dense encoding for LLM-to-LLM wire use — is staged across v3.2–v3.4 (the "Apollo Program"), alongside hot-path wiring that reads winner variants on rehydrate / gateway inject / session context.
 
 ## Works with
 
@@ -75,7 +75,7 @@ MNEMOS was built to solve those problems in a way that reflects real platform ex
 
 Its design is informed by years of enterprise platform work, large-vendor systems thinking, open-source infrastructure experience, and current work in the AI industry, without assuming that professional users want marketing language where they really need operational clarity.
 
-**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unifies that production codebase into the single-service FastAPI shape shipped here; v3.0.1 is the current patch with the three credibility-sensitive fixes listed in [`CHANGELOG.md`](./CHANGELOG.md).
+**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape shipped here; v3.1.0 is the current shipping version and adds a plugin `CompressionEngine` ABC, a competitive per-memory contest across three built-in engines, and a persisted audit log of every winner and loser. See [`CHANGELOG.md`](./CHANGELOG.md) for the full v3.0.x / v3.1 release history.
 
 For the longer story — the original catalyzing moment, the architectural decisions (and mistakes) that took MNEMOS from a single-file prototype to a unified runtime, and the scrubs, refactors, and release-gate audits that landed the public cut — see [`EVOLUTION.md`](./EVOLUTION.md). Written for future contributors as much as for future readers who want to know what they're inheriting.
 
@@ -182,7 +182,7 @@ The shared premise — that agent memory deserves first-class treatment — is t
 
 ## What works now
 
-This is the current state of v3.0 (patch version v3.0.1). Features described here are implemented and running in production. Forward-looking scope for v3.1 and beyond is in [`ROADMAP.md`](./ROADMAP.md).
+This is the current state of v3.1.0 — the compression platform release. Features described here are implemented and running in production. Forward-looking scope for v3.1.1 (Tier 3 tenancy fixes) and v3.2–v3.4 (the Apollo Program) is in [`ROADMAP.md`](./ROADMAP.md).
 
 The API surface is namespaced under `/v1/*`.
 
@@ -394,7 +394,7 @@ Most multi-LLM routers hardcode a provider list. MNEMOS ships a **self-populatin
 
 ### What runs under the hood (infrastructure you don't have to think about)
 
-A lot of the v3.0 surface is held up by background work that doesn't show up in the route table but does show up in the failure modes it prevents. For anyone who wants to know what's there:
+A lot of the v3.x surface is held up by background work that doesn't show up in the route table but does show up in the failure modes it prevents. For anyone who wants to know what's there:
 
 - **Webhook delivery recovery worker** — on startup, walks `webhook_deliveries` and re-drains any rows stuck in `pending` or `retrying` with a `scheduled_at` in the past. Handles the crash-mid-retry case; subscribers get the delivery eventually rather than never.
 - **Distillation worker supervision** — the compression worker runs under an exponential-backoff supervisor (1s → 2s → 4s → … capped at 5 min). A crash is logged and retried; the worker does not silently die and leave memories un-compressed for the rest of the process lifetime.
@@ -474,13 +474,23 @@ Three-tier compression pipeline, each tier named after a Greek figure of memory.
 
 ### Shipped in v3.0
 
-Landed with the v3.0 release line (current patch version: v3.0.1):
+Landed with the v3.0 release line:
 
 - ✅ **Webhook subscriptions** — outbound notifications on memory write, consultation completion. HMAC-signed delivery, retry with exponential backoff.
 - ✅ **OAuth/OIDC authentication** — browser-based login via Google, GitHub, Azure AD, or custom OIDC providers. Coexists with existing API-key auth.
 - ✅ **Cross-instance memory federation** — pull-based peer sync with Bearer-authenticated peers. Federated memories stored locally with `federation_source` metadata, `fed:{peer}:{remote_id}` id prefix, and a background worker that respects per-peer sync intervals.
 
-### Beyond v3.0
+### Shipped in v3.1 (current)
+
+- ✅ **Plugin `CompressionEngine` ABC** — open extension point; operators register additional engines alongside the three built-ins (LETHE / ALETHEIA / ANAMNESIS).
+- ✅ **Competitive-selection compression contest** — every eligible engine runs per memory; highest composite_score wins; every loser recorded with its reject_reason. Scoring profile is operator-configurable (`balanced` | `quality_first` | `speed_first` | `custom`).
+- ✅ **Persisted audit log** — three new tables (`memory_compression_queue`, `memory_compression_candidates`, `memory_compressed_variants`) with full history queryable via `GET /v1/memories/{id}/compression-manifests`.
+- ✅ **GPU circuit breaker** — per-endpoint three-state breaker (CLOSED → OPEN → HALF_OPEN → CLOSED); gpu_required engines fast-fail during outages instead of piling requests onto a dead endpoint.
+- ✅ **Admin enqueue endpoints** — `POST /admin/compression/enqueue` (specific memory IDs) and `POST /admin/compression/enqueue-all` (bulk with filters) for operators to drive the contest from the API layer.
+- ✅ **Optional too-short content gate** — `MNEMOS_CONTEST_MIN_CONTENT_LENGTH` skips memories below a threshold before spending GPU time on content that can't be meaningfully compressed.
+- ✅ **v2 versioning trigger bytea fix** — the `mnemos_version_snapshot()` trigger no longer crashes on memories containing backslash sequences (common in code, paths, regex, logs).
+
+### Beyond v3.1
 
 Forward-looking scope is maintained in [`ROADMAP.md`](./ROADMAP.md), which lists committed v3.1 scope, the v3.2–v3.4 Apollo Program staged rollout, and items explicitly deferred with rationale.
 

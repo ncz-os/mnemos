@@ -12,9 +12,9 @@
 # ── Required ─────────────────────────────────────────────────────────────────
 
 # MNEMOS REST endpoint — point at wherever your MNEMOS runs.
-# Example (dedicated host): http://mnemos.internal:5000
-# Example (unified MNEMOS+GRAEAE install): http://mnemos.internal:5002
-export MNEMOS_BASE="http://<your-mnemos-host>:5000"
+# MNEMOS v3 runs the unified MNEMOS+GRAEAE service on port 5002.
+# Example (dedicated host): http://mnemos.internal:5002
+export MNEMOS_BASE="http://<your-mnemos-host>:5002"
 
 # ── Optional ─────────────────────────────────────────────────────────────────
 

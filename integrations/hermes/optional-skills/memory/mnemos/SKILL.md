@@ -33,7 +33,7 @@ MNEMOS is persistent memory infrastructure running as a separate network service
 hermes mcp add mnemos \
   --command python \
   --args "/path/to/mnemos/mcp_server.py" \
-  --env MNEMOS_BASE=http://mnemos.internal:5000
+  --env MNEMOS_BASE=http://mnemos.internal:5002
 ```
 
 Or edit `~/.hermes/config.yaml` directly (replace placeholder with your MNEMOS host):
@@ -44,7 +44,7 @@ mcp_servers:
     command: python
     args: ["/path/to/mnemos/mcp_server.py"]
     env:
-      MNEMOS_BASE: http://<your-mnemos-host>:5000
+      MNEMOS_BASE: http://<your-mnemos-host>:5002
 ```
 
 ### Verify
@@ -77,11 +77,12 @@ results = mcp.call("mnemos", "search_memories", {
     "limit": 5
 })
 
-# Large context load under a token budget
-context = mcp.call("mnemos", "rehydrate_memories", {
-    "query": "current project state",
-    "budget_tokens": 8000
-})
+# Large context load under a token budget — REST endpoint (not an MCP tool
+# in the current mcp_server.py). Use via httpx against MNEMOS directly, or
+# chain several search_memories calls with a running token tally.
+#
+# POST /v1/memories/rehydrate
+#   { "query": "current project state", "budget_tokens": 8000 }
 ```
 
 ## Write pattern
@@ -111,7 +112,7 @@ Write rules:
 For relational facts with temporal meaning, use triples:
 
 ```python
-mcp.call("mnemos", "create_triple", {
+mcp.call("mnemos", "kg_create_triple", {
     "subject": "hermes-agent",
     "predicate": "depends_on",
     "object": "mnemos-api",
@@ -131,7 +132,7 @@ Before acting on a retrieved memory:
 
 - If it names a file or endpoint, verify it's still reachable
 - If current reality contradicts the memory, **trust current reality** and update the memory — don't act on stale data
-- MNEMOS has a DAG versioning model (see `ANTI_MEMORY_POISONING.md` in the MNEMOS repo); use `log_memory` and `diff_memory_commits` to investigate drift
+- MNEMOS has a DAG versioning model (see `ANTI_MEMORY_POISONING.md` in the MNEMOS repo). For drift investigation use the REST endpoints: `GET /v1/memories/{id}/log` for commit history, `GET /v1/memories/{id}/versions/{n}` for specific snapshots, `GET /v1/memories/{id}/diff` for content comparison. Plus v3.1's `GET /v1/memories/{id}/compression-manifests` for the compression audit trail
 
 ## Troubleshooting
 
@@ -139,7 +140,7 @@ Before acting on a retrieved memory:
 MNEMOS API is not running, or `MNEMOS_BASE` points to the wrong host/port. Check with `curl $MNEMOS_BASE/health`.
 
 **Authentication errors on team/enterprise profiles**
-Current `mcp_server.py` does not forward Bearer tokens. Workaround: run the MCP server on the same host as MNEMOS with MNEMOS bound to loopback, or use SSH transport (see MNEMOS `mcp_server.py` docstring).
+`mcp_server.py` forwards Bearer tokens when `MNEMOS_API_KEY` is set in its environment. Ensure the env block in your Hermes MCP config includes `MNEMOS_API_KEY` alongside `MNEMOS_BASE`. If you can't put the token in the MCP config, run the MCP server on the same host as MNEMOS with MNEMOS bound to loopback, or use SSH transport (see MNEMOS `mcp_server.py` docstring).
 
 **Memories returned but low relevance**
 Try `semantic: true` for concept-level search, or narrow with `category` filter.

@@ -25,18 +25,35 @@ MNEMOS is designed to run as a shared network service on a dedicated host (a "me
 
 Pick your deployment URL:
 
-- **Single-process MNEMOS on its own port:** `http://mnemos.internal:5000`
-- **Unified MNEMOS+GRAEAE on one port:** `http://mnemos.internal:5002`
-- **Loopback-only personal dev:** `http://127.0.0.1:5000`
+- **Unified MNEMOS+GRAEAE:** `http://mnemos.internal:5002` (default in v3)
+- **Loopback-only personal dev:** `http://127.0.0.1:5002`
 
 Use the same `MNEMOS_BASE` value everywhere. If you run team or enterprise profile, set `MNEMOS_API_KEY` too.
 
 ## Authentication
 
-The bundled MCP config examples omit `MNEMOS_API_KEY`. For team / enterprise profiles, current `mcp_server.py` does not forward Bearer tokens. Workarounds:
+Set `MNEMOS_API_KEY` in the MCP server's environment — `mcp_server.py` attaches `Authorization: Bearer $MNEMOS_API_KEY` on every outbound HTTP request when the var is set, and omits the header when it isn't. For personal-profile installs (no auth) leave it unset.
 
-1. Run the MCP server on the same host as MNEMOS, with MNEMOS bound to loopback only (`listen_host = "127.0.0.1"`). Local MCP connects without auth; external network can't reach MNEMOS directly.
-2. Use SSH transport: set `command: ssh` and `args: ["user@host", "/opt/mnemos/venv/bin/python", "/opt/mnemos/mcp_server.py"]`.
-3. Patch `mcp_server.py` to read `MNEMOS_API_KEY` from env and attach `Authorization: Bearer $MNEMOS_API_KEY` — tracked as a TODO; not landed.
+The bundled MCP config examples may still omit `MNEMOS_API_KEY` — add it to the `env` block of each framework's MCP server entry if you run team or enterprise profile:
+
+```jsonc
+{
+  "mcpServers": {
+    "mnemos": {
+      "command": "python",
+      "args": ["/opt/mnemos/mcp_server.py"],
+      "env": {
+        "MNEMOS_BASE": "http://mnemos.internal:5002",
+        "MNEMOS_API_KEY": "mnemos_..."   // only if MNEMOS has auth enabled
+      }
+    }
+  }
+}
+```
 
 The Claude Code hooks (bundle in `claude-code/hooks/`) already handle `MNEMOS_API_KEY` correctly — they attach the Bearer header when the key is set and omit it when unset.
+
+Alternative transports for operators who don't want the token in a local env file:
+
+1. Run the MCP server on the same host as MNEMOS with MNEMOS bound to loopback (`listen_host = "127.0.0.1"`). Local MCP connects without auth; external network can't reach MNEMOS directly.
+2. Use SSH transport: `command: ssh` and `args: ["user@host", "/opt/mnemos/venv/bin/python", "/opt/mnemos/mcp_server.py"]`. Credentials ride the SSH channel, not the MCP config.
