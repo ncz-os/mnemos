@@ -87,6 +87,71 @@ def _nullable_positive(value: Optional[float]) -> Optional[float]:
     return value if value > 0 else None
 
 
+def _enriched_manifest(cand) -> Dict[str, Any]:
+    """Return the engine's manifest augmented with a `_audit` block for
+    non-winner candidates.
+
+    Winners already carry every useful field in the typed columns
+    (compression_ratio, quality_score, composite_score, elapsed_ms,
+    gpu_used, engine_version). Non-winners lose data: errored
+    candidates have empty manifests (the engine raised before it could
+    populate one), quality_floor rejections drop the below-floor
+    quality_score into obscurity, and the error text on failed runs
+    only lives in `reject_reason='error'` (a bucket label, not the
+    actual exception message).
+
+    This function preserves every engine-authored manifest key and
+    ADDS a single `_audit` object with:
+
+      * reject_reason           — duplicated for programmatic access
+      * error                   — full exception text when present
+      * quality_score           — raw score that tripped the floor
+      * compression_ratio       — achieved ratio even when rejected
+      * elapsed_ms              — non-zero signals engine ran and failed
+      * gpu_used                — whether GPU was consumed before failure
+      * engine_version          — for post-hoc root-cause across deploys
+
+    Keeping the audit under a namespaced key (`_audit`) avoids colliding
+    with engine-chosen keys and makes it greppable in JSONB queries.
+    """
+    base = dict(cand.result.manifest or {})
+
+    # Winners don't need enrichment — the typed columns are authoritative.
+    if cand.is_winner:
+        return base
+
+    audit: Dict[str, Any] = base.setdefault("_audit", {})
+
+    # Only set keys we don't already have, so engines that deliberately
+    # populated `_audit.*` (unlikely but possible) aren't clobbered.
+    audit.setdefault("reject_reason", cand.reject_reason)
+    audit.setdefault("engine_version", cand.result.engine_version)
+
+    if cand.result.error is not None:
+        audit.setdefault("error", cand.result.error)
+
+    # quality_score is the most useful single piece of context for
+    # quality_floor rejections — captures how close the candidate came.
+    if cand.result.quality_score is not None:
+        audit.setdefault("quality_score", cand.result.quality_score)
+
+    # compression_ratio survives even on quality_floor / inferior paths
+    # and is useful for "engine X produced a ratio of Y but scored too
+    # low on quality" forensics.
+    if cand.result.compression_ratio is not None:
+        audit.setdefault("compression_ratio", cand.result.compression_ratio)
+
+    # Non-zero elapsed_ms on a failed candidate signals the engine
+    # reached GPU / LLM before failing — useful for resource accounting.
+    # Zero elapsed_ms on a 'disabled' or 'error' candidate means the
+    # engine never dispatched (supports()=False or raised pre-call).
+    if cand.result.elapsed_ms:
+        audit.setdefault("elapsed_ms", cand.result.elapsed_ms)
+        audit.setdefault("gpu_used", cand.result.gpu_used)
+
+    return base
+
+
 async def persist_contest(
     conn: Any,
     outcome: ContestOutcome,
@@ -124,7 +189,7 @@ async def persist_contest(
 
     for cand in outcome.candidates:
         r = cand.result
-        manifest_json = json.dumps(r.manifest or {})
+        manifest_json = json.dumps(_enriched_manifest(cand))
         row = await conn.fetchrow(
             _INSERT_CANDIDATE_SQL,
             outcome.memory_id,
