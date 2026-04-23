@@ -33,7 +33,7 @@ from .quality_analyzer import QualityAnalyzer, QualityManifest
 from .manager import CompressionManager, CompressionResult
 from .lethe import LETHE, LETHEEngine
 from .aletheia import ALETHEIA, ALETHEIAEngine
-from .anamnesis import ANAMNESIS
+from .anamnesis import ANAMNESIS, ANAMNESISEngine
 from .distillation_engine import (
     DistillationEngine,
     CompressionStrategy,
@@ -72,6 +72,7 @@ __all__ = [
     "ALETHEIA",
     "ALETHEIAEngine",
     "ANAMNESIS",
+    "ANAMNESISEngine",
     "DistillationEngine",
     "CompressionStrategy",
     "get_distillation_engine",
