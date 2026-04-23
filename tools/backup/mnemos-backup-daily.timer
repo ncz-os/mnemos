@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily timer for mnemos-backup-daily.service
+
+[Timer]
+# Stagger start times across hosts by overriding this per-host in a drop-in
+# (/etc/systemd/system/mnemos-backup-daily.timer.d/override.conf).
+# Default: 03:00 local with up to 30 minutes randomized delay.
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=30min
+# Catch up after downtime / suspended hosts (laptops).
+Persistent=true
+Unit=mnemos-backup-daily.service
+
+[Install]
+WantedBy=timers.target

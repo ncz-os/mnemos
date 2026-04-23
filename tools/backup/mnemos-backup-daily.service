@@ -1,0 +1,21 @@
+[Unit]
+Description=MNEMOS daily backup (rsync + optional pg_dump)
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jasonperlow
+Group=jasonperlow
+ExecStart=/usr/local/bin/mnemos-backup-daily.sh
+StandardOutput=journal
+StandardError=journal
+# Nice the process so it doesn't fight with live workloads.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# Hard time cap so a stuck rsync doesn't block the next cycle.
+TimeoutStartSec=6h
+
+[Install]
+WantedBy=multi-user.target
