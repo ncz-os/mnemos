@@ -332,8 +332,6 @@ gateway.
 - All eleven SQL migrations ride inside the wheel as `db/*.sql`
   package data — accessible at runtime via
   `importlib.resources.files("db")`.
-- Dual-licensed: Apache-2.0 for the OSS distribution; a separate
-  proprietary commercial license is available by agreement.
 
 **Integrations**
 
@@ -375,5 +373,6 @@ gateway.
 
 ### License
 
-Apache-2.0 for the OSS distribution (`LICENSE`). A separate proprietary
-commercial license is available by agreement (`LICENSE-PROPRIETARY.md`).
+Apache License 2.0 — see [`LICENSE`](./LICENSE). Contributions accepted
+under the Developer Certificate of Origin (DCO), see
+[`CONTRIBUTING.md`](./CONTRIBUTING.md).
