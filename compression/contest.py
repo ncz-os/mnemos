@@ -343,16 +343,30 @@ async def run_contest(
             )
         )
 
-    if survivors:
-        winner = max(survivors, key=lambda c: c.composite_score)
+    # Winner eligibility also requires composite_score > 0. A zero
+    # composite means "achieved nothing" — ratio_term killed it (ratio
+    # at or below MIN_CHUNK_RATIO or >= 1.0) or the quality/speed
+    # multipliers did. Calling such a candidate a winner triggers the
+    # mcc_winner_has_output CHECK in the DB (persist coerces 0 to NULL
+    # for audit clarity, and NULL composite on a winner row is invalid
+    # by design). Found in the 49-memory CERBERUS drain on 2026-04-23
+    # where a short memory produced LETHE ratio=1.0 -> composite=0.
+    winning_pool = [c for c in survivors if c.composite_score > 0]
+    for c in survivors:
+        outcome.candidates.append(c)
+    if winning_pool:
+        winner = max(winning_pool, key=lambda c: c.composite_score)
         winner.is_winner = True
         outcome.winner = winner
-        for c in survivors:
-            if c is winner:
-                c.reject_reason = None
-            else:
+        for c in winning_pool:
+            if c is not winner:
                 c.reject_reason = "inferior"
-            outcome.candidates.append(c)
+    # Survivors with composite == 0 fall through to 'inferior' too —
+    # they were eligible (passed the quality floor, produced output)
+    # but scored nothing.
+    for c in survivors:
+        if not c.is_winner and c.reject_reason is None:
+            c.reject_reason = "inferior"
 
     return outcome
 

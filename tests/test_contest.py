@@ -264,6 +264,27 @@ def test_speed_factor_normalized_to_fastest():
     assert abs(sf["b"] - 0.1) < 0.001
 
 
+def test_zero_composite_survivor_is_not_a_winner():
+    # Regression from the CERBERUS 49-memory drain (2026-04-23):
+    # a short memory produced LETHE ratio=1.0 (no compression),
+    # ratio_term=0, composite=0. With ALETHEIA and ANAMNESIS both
+    # disqualified, LETHE was the only survivor and "won" with
+    # composite=0 — which later violated the mcc_winner_has_output
+    # check in the DB (persist coerces 0 to NULL; NULL on a winner
+    # row is invalid). Fix: survivors with composite_score == 0
+    # are not winner-eligible; they fall through to reject_reason=
+    # 'inferior' and outcome.winner becomes None.
+    engines = [
+        MockEngine("lethe", quality=1.0, ratio=1.0, elapsed_ms=1),   # ratio_term=0 -> composite=0
+        MockEngine("low_q", quality=0.50, ratio=0.3, elapsed_ms=50), # below quality_floor
+    ]
+    outcome = asyncio.run(run_contest(engines, _request()))
+    assert outcome.winner is None
+    reasons = {c.result.engine_id: c.reject_reason for c in outcome.candidates}
+    assert reasons["lethe"] == "inferior"
+    assert reasons["low_q"] == "quality_floor"
+
+
 def test_all_fail_returns_no_winner():
     engines = [
         MockEngine("low1", quality=0.5, ratio=0.4, elapsed_ms=10),
