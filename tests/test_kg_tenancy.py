@@ -108,6 +108,18 @@ class _RecorderConn:
 
     async def fetchrow(self, sql: str, *args):
         self.fetchrows.append((sql, args))
+        # update/delete precheck: SELECT owner_id, namespace FROM kg_triples
+        if sql.strip().startswith("SELECT owner_id, namespace FROM kg_triples"):
+            t = self._triples.get(args[0])
+            if t is None:
+                return None
+            return {"owner_id": t.get("owner_id"), "namespace": t.get("namespace", "default")}
+        # create_triple's cross-tenant memory check
+        if sql.strip().startswith("SELECT owner_id, namespace FROM memories"):
+            m = self._memories.get(args[0])
+            if m is None:
+                return None
+            return {"owner_id": m.get("owner_id"), "namespace": m.get("namespace", "default")}
         if "FROM kg_triples WHERE id=$1" in sql:
             triple_id = args[0]
             t = self._triples.get(triple_id)
@@ -122,12 +134,6 @@ class _RecorderConn:
 
     async def fetchval(self, sql: str, *args):
         self.fetchvals.append((sql, args))
-        if "SELECT owner_id FROM memories WHERE id=$1" in sql:
-            m = self._memories.get(args[0])
-            return m.get("owner_id") if m else None
-        if "SELECT owner_id FROM kg_triples WHERE id=$1" in sql:
-            t = self._triples.get(args[0])
-            return t.get("owner_id") if t else None
         if "SELECT 1 FROM memories WHERE id=$1" in sql:
             return 1 if args[0] in self._memories else None
         if "COUNT(*) FROM kg_triples" in sql:
@@ -176,7 +182,9 @@ def test_create_triple_stamps_owner_id_and_namespace(monkeypatch):
 
 def test_create_triple_rejects_cross_owner_memory_id(monkeypatch):
     """Alice can't attach a triple to Bob's memory."""
-    conn = _RecorderConn(memories={"mem_bob": {"id": "mem_bob", "owner_id": "bob"}})
+    conn = _RecorderConn(memories={
+        "mem_bob": {"id": "mem_bob", "owner_id": "bob", "namespace": "default"},
+    })
     _install_pool(monkeypatch, conn)
     req = KGTripleCreate(
         subject="x", predicate="y", object="z", memory_id="mem_bob",
@@ -191,9 +199,27 @@ def test_create_triple_rejects_cross_owner_memory_id(monkeypatch):
     assert not any("INSERT INTO kg_triples" in e[0] for e in conn.executes)
 
 
+def test_create_triple_rejects_cross_namespace_memory_id(monkeypatch):
+    """Same owner, different namespace — still rejected."""
+    conn = _RecorderConn(memories={
+        "mem_x": {"id": "mem_x", "owner_id": "alice", "namespace": "other-ns"},
+    })
+    _install_pool(monkeypatch, conn)
+    req = KGTripleCreate(
+        subject="x", predicate="y", object="z", memory_id="mem_x",
+    )
+
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(kg_handlers.create_triple(req, user=_alice()))
+    assert exc.value.status_code == 404
+    assert not any("INSERT INTO kg_triples" in e[0] for e in conn.executes)
+
+
 def test_create_triple_allows_own_memory_id(monkeypatch):
     conn = _RecorderConn(
-        memories={"mem_alice": {"id": "mem_alice", "owner_id": "alice"}},
+        memories={"mem_alice": {"id": "mem_alice", "owner_id": "alice", "namespace": "default"}},
     )
     _install_pool(monkeypatch, conn)
     req = KGTripleCreate(
@@ -206,7 +232,7 @@ def test_create_triple_allows_own_memory_id(monkeypatch):
 
 def test_create_triple_root_can_reference_any_memory(monkeypatch):
     conn = _RecorderConn(
-        memories={"mem_alice": {"id": "mem_alice", "owner_id": "alice"}},
+        memories={"mem_alice": {"id": "mem_alice", "owner_id": "alice", "namespace": "default"}},
     )
     _install_pool(monkeypatch, conn)
     req = KGTripleCreate(
@@ -220,7 +246,7 @@ def test_create_triple_root_can_reference_any_memory(monkeypatch):
 # ---- list_triples / get_timeline filtering --------------------------------
 
 
-def test_list_triples_filters_by_owner_for_non_root(monkeypatch):
+def test_list_triples_filters_by_owner_and_namespace_for_non_root(monkeypatch):
     conn = _RecorderConn(triples={
         "kg_alice1": {"id": "kg_alice1", "owner_id": "alice", "subject": "A",
                       "predicate": "p", "object": "o", "confidence": 1.0,
@@ -233,12 +259,16 @@ def test_list_triples_filters_by_owner_for_non_root(monkeypatch):
 
     asyncio.run(kg_handlers.list_triples(user=_alice()))
 
-    # At least one fetch query must have owner_id clause against alice
-    owner_fetches = [
+    # At least one fetch must filter on BOTH owner_id and namespace
+    scoped_fetches = [
         f for f in conn.fetches
-        if ("owner_id=$" in f[0] or "owner_id = $" in f[0]) and "alice" in f[1]
+        if "owner_id=$" in f[0] and "namespace=$" in f[0]
     ]
-    assert owner_fetches, "expected an owner_id filter on list_triples"
+    assert scoped_fetches, "expected owner_id + namespace filter on list_triples"
+    # And the args include the caller's user_id AND namespace
+    args = scoped_fetches[0][1]
+    assert "alice" in args
+    assert "default" in args
 
 
 def test_list_triples_no_owner_filter_for_root(monkeypatch):
@@ -255,7 +285,7 @@ def test_list_triples_no_owner_filter_for_root(monkeypatch):
     assert not any("owner_id=$" in f[0] or "owner_id = $" in f[0] for f in conn.fetches)
 
 
-def test_timeline_filters_by_owner_for_non_root(monkeypatch):
+def test_timeline_filters_by_owner_and_namespace_for_non_root(monkeypatch):
     conn = _RecorderConn()
     _install_pool(monkeypatch, conn)
 
@@ -263,7 +293,9 @@ def test_timeline_filters_by_owner_for_non_root(monkeypatch):
 
     tl_fetch = conn.fetches[-1]
     assert "owner_id=$" in tl_fetch[0]
+    assert "namespace=$" in tl_fetch[0]
     assert "alice" in tl_fetch[1]
+    assert "default" in tl_fetch[1]
 
 
 def test_timeline_no_owner_filter_for_root(monkeypatch):

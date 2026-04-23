@@ -10,10 +10,16 @@
 -- Safe to re-run against a v3.1.2+ database.
 
 -- ---------------------------------------------------------------------------
--- 1. Additive columns on kg_triples
+-- 1. Additive columns on kg_triples — NO DEFAULT during add.
+--    PostgreSQL ADD COLUMN with DEFAULT populates existing rows
+--    immediately (in PG11+ via metadata; pre-11 via table rewrite),
+--    which would null-coalesce the subsequent backfill `WHERE
+--    owner_id IS NULL` filter into matching zero rows. Adding the
+--    columns as nullable, doing the backfill against NULL, then
+--    stamping DEFAULT + NOT NULL is the correct sequence.
 -- ---------------------------------------------------------------------------
-ALTER TABLE kg_triples ADD COLUMN IF NOT EXISTS owner_id  TEXT DEFAULT 'default';
-ALTER TABLE kg_triples ADD COLUMN IF NOT EXISTS namespace TEXT DEFAULT 'default';
+ALTER TABLE kg_triples ADD COLUMN IF NOT EXISTS owner_id  TEXT;
+ALTER TABLE kg_triples ADD COLUMN IF NOT EXISTS namespace TEXT;
 
 -- ---------------------------------------------------------------------------
 -- 2. Backfill: existing v3.1.x rows have no owner / namespace.
@@ -35,8 +41,12 @@ SET owner_id  = 'default',
 WHERE owner_id IS NULL;
 
 -- ---------------------------------------------------------------------------
--- 3. Set NOT NULL after backfill
+-- 3. Pin DEFAULT (for fresh INSERTs that omit owner/namespace) + NOT NULL.
+--    These ALTERs are idempotent: a second run against a v3.1.2+
+--    database finds DEFAULT and NOT NULL already set and is a no-op.
 -- ---------------------------------------------------------------------------
+ALTER TABLE kg_triples ALTER COLUMN owner_id  SET DEFAULT 'default';
+ALTER TABLE kg_triples ALTER COLUMN namespace SET DEFAULT 'default';
 ALTER TABLE kg_triples ALTER COLUMN owner_id  SET NOT NULL;
 ALTER TABLE kg_triples ALTER COLUMN namespace SET NOT NULL;
 

@@ -73,16 +73,20 @@ async def create_triple(req: KGTripleCreate, user: UserContext = Depends(get_cur
 
     async with _lc._pool.acquire() as conn:
         if req.memory_id:
-            # Cross-owner memory_id references are rejected: a triple's
-            # memory_id must point at a memory the caller can see.
-            # Without this, a caller could attach triples to memories
-            # they don't own and leak them into cross-owner queries.
-            mem_owner = await conn.fetchval(
-                "SELECT owner_id FROM memories WHERE id=$1", req.memory_id,
+            # Cross-tenant memory_id references are rejected: a triple's
+            # memory_id must point at a memory the caller can see. We
+            # check BOTH owner_id and namespace so a caller can't attach
+            # triples across either tenancy boundary.
+            mem_row = await conn.fetchrow(
+                "SELECT owner_id, namespace FROM memories WHERE id=$1",
+                req.memory_id,
             )
-            if mem_owner is None:
+            if mem_row is None:
                 raise HTTPException(status_code=404, detail=f"memory_id {req.memory_id} not found")
-            if not _is_root(user) and mem_owner != user.user_id:
+            if not _is_root(user) and (
+                mem_row["owner_id"] != user.user_id
+                or mem_row["namespace"] != user.namespace
+            ):
                 raise HTTPException(status_code=404, detail=f"memory_id {req.memory_id} not found")
 
         await conn.execute(
@@ -118,10 +122,15 @@ async def list_triples(
     filter_params = []
     idx = 1
 
-    # Tenancy filter: non-root callers only see their own triples.
+    # Tenancy filter: non-root callers are scoped to both their
+    # owner_id AND their namespace — the same two-dimensional gate as
+    # the memories handlers now apply.
     if not _is_root(user):
         conditions.append(f"owner_id=${idx}")
         filter_params.append(user.user_id)
+        idx += 1
+        conditions.append(f"namespace=${idx}")
+        filter_params.append(user.namespace)
         idx += 1
 
     for col, val in [
@@ -162,8 +171,8 @@ async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000), use
             )
         else:
             rows = await conn.fetch(
-                "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 AND owner_id=$2 ORDER BY valid_from ASC LIMIT $3",
-                subject, user.user_id, limit,
+                "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 AND owner_id=$2 AND namespace=$3 ORDER BY valid_from ASC LIMIT $4",
+                subject, user.user_id, user.namespace, limit,
             )
     return KGTripleListResponse(count=len(rows), triples=[_row_to_triple(r) for r in rows])
 
@@ -188,10 +197,16 @@ async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext =
         raise HTTPException(status_code=422, detail="No fields to update")
     set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
     async with _lc._pool.acquire() as conn:
-        owner = await conn.fetchval("SELECT owner_id FROM kg_triples WHERE id=$1", triple_id)
-        if owner is None:
+        row = await conn.fetchrow(
+            "SELECT owner_id, namespace FROM kg_triples WHERE id=$1",
+            triple_id,
+        )
+        if row is None:
             raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
-        if not _is_root(user) and owner != user.user_id:
+        if not _is_root(user) and (
+            row["owner_id"] != user.user_id
+            or row["namespace"] != user.namespace
+        ):
             # Non-owner: 404 (same response as missing — don't leak existence).
             raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
         await conn.execute(
@@ -207,9 +222,15 @@ async def delete_triple(triple_id: str, user: UserContext = Depends(get_current_
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
-        owner = await conn.fetchval("SELECT owner_id FROM kg_triples WHERE id=$1", triple_id)
-        if owner is None:
+        row = await conn.fetchrow(
+            "SELECT owner_id, namespace FROM kg_triples WHERE id=$1",
+            triple_id,
+        )
+        if row is None:
             raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
-        if not _is_root(user) and owner != user.user_id:
+        if not _is_root(user) and (
+            row["owner_id"] != user.user_id
+            or row["namespace"] != user.namespace
+        ):
             raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
         await conn.execute("DELETE FROM kg_triples WHERE id=$1", triple_id)
