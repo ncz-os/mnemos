@@ -17,8 +17,14 @@ Composite score (per ScoringProfile):
                   the floor (degenerate/empty output) scores zero;
                   >= 1.0 (no compression or expanded) also zero.
                   Inside the band, ratio_term = 1 - ratio.
-    speed_factor = fastest_elapsed_ms / this_elapsed_ms
-                  normalized per-contest; fastest engine gets 1.0
+    speed_factor log-space compression of fastest_elapsed_ms /
+                  this_elapsed_ms, bounded [SPEED_FACTOR_FLOOR, 1.0].
+                  Fastest engine: 1.0. 10x slower: 0.5. 100x slower
+                  or worse: SPEED_FACTOR_FLOOR. The log transform
+                  prevents multiplicative speed-dominance: a 10x-
+                  slower but meaningfully higher-quality engine can
+                  still win under quality_first weighting, instead
+                  of being crushed by a raw 0.1 linear factor.
     quality_floor applied as a pre-filter — candidates below the floor
                   are disqualified with reject_reason='quality_floor'
                   before scoring
@@ -38,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +66,77 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_CONFIG_PATH = Path.home() / ".mnemos" / "compression_scoring.toml"
+
+
+# ---- scoring-profile validation bounds (v3.1.1) ----------------------------
+#
+# Weights multiply the per-engine sub-scores. A negative weight would
+# invert the reward (worse = higher score); a huge weight would let one
+# dimension swamp the others. 10x was chosen as the upper bound because
+# the spread between the built-in profiles is already 4x (speed_first
+# speed_weight=2.0 vs quality_first speed_weight=0.5), and 10x leaves
+# room for aggressive custom profiles without letting operators
+# accidentally configure a degenerate scoring function.
+_WEIGHT_MIN: float = 0.0
+_WEIGHT_MAX: float = 10.0
+
+# quality_floor rejects every candidate with quality_score below the
+# floor. 1.0 means "reject everything"; 0.0 means "accept anything with
+# output." 0.99 upper bound prevents the mistake of setting it to 1.0
+# and being surprised that no contest ever has a winner.
+_QUALITY_FLOOR_MIN: float = 0.0
+_QUALITY_FLOOR_MAX: float = 0.99
+
+
+def _clamp(value: float, *, lo: float, hi: float, field_name: str, profile_name: str) -> float:
+    """Clamp `value` into [lo, hi]. Log a warning if the value had to
+    be coerced — silently clamping is rude to operators who may have
+    typoed a config value."""
+    if value < lo:
+        logger.warning(
+            "scoring_profile[%s].%s = %g below allowed minimum %g; clamped to %g",
+            profile_name, field_name, value, lo, lo,
+        )
+        return lo
+    if value > hi:
+        logger.warning(
+            "scoring_profile[%s].%s = %g above allowed maximum %g; clamped to %g",
+            profile_name, field_name, value, hi, hi,
+        )
+        return hi
+    return value
+
+
+def _validated_profile(
+    *,
+    name: str,
+    quality_weight: float,
+    ratio_weight: float,
+    speed_weight: float,
+    quality_floor: float,
+) -> "ScoringProfile":
+    """Construct a ScoringProfile with each field clamped to its valid
+    range. A malformed custom profile still yields a usable profile
+    rather than a runtime crash deep in the scoring loop."""
+    return ScoringProfile(
+        name=name,
+        quality_weight=_clamp(
+            quality_weight, lo=_WEIGHT_MIN, hi=_WEIGHT_MAX,
+            field_name="quality_weight", profile_name=name,
+        ),
+        ratio_weight=_clamp(
+            ratio_weight, lo=_WEIGHT_MIN, hi=_WEIGHT_MAX,
+            field_name="ratio_weight", profile_name=name,
+        ),
+        speed_weight=_clamp(
+            speed_weight, lo=_WEIGHT_MIN, hi=_WEIGHT_MAX,
+            field_name="speed_weight", profile_name=name,
+        ),
+        quality_floor=_clamp(
+            quality_floor, lo=_QUALITY_FLOOR_MIN, hi=_QUALITY_FLOOR_MAX,
+            field_name="quality_floor", profile_name=name,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -140,12 +218,25 @@ def load_scoring_profile(
 
         custom = data.get("custom", {})
         base = BUILT_IN_PROFILES["balanced"]
-        return ScoringProfile(
+
+        def _as_float(key: str, default: float) -> float:
+            raw = custom.get(key, default)
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "scoring_profile[custom].%s = %r is not a number; "
+                    "falling back to balanced default %g",
+                    key, raw, default,
+                )
+                return default
+
+        return _validated_profile(
             name="custom",
-            quality_weight=float(custom.get("quality_weight", base.quality_weight)),
-            ratio_weight=float(custom.get("ratio_weight", base.ratio_weight)),
-            speed_weight=float(custom.get("speed_weight", base.speed_weight)),
-            quality_floor=float(custom.get("quality_floor", base.quality_floor)),
+            quality_weight=_as_float("quality_weight", base.quality_weight),
+            ratio_weight=_as_float("ratio_weight", base.ratio_weight),
+            speed_weight=_as_float("speed_weight", base.speed_weight),
+            quality_floor=_as_float("quality_floor", base.quality_floor),
         )
 
     logger.warning("Unknown scoring profile %r; falling back to 'balanced'", name)
@@ -185,6 +276,40 @@ class ContestOutcome:
     scoring_profile: str
     candidates: List[ContestCandidate] = field(default_factory=list)
     winner: Optional[ContestCandidate] = None
+
+
+# Log-space speed-factor floor (v3.1.1). A raw linear speed_factor
+# (fastest / elapsed) gives a 10x-slower engine 0.1, which — multiplied
+# into the composite — dominates even quality_first weighting. The log-
+# space transform compresses that to 0.5 for 10x-slower and bottoms out
+# at this floor for very slow engines. 0.1 lets a 1000x-slower engine
+# still have some non-zero score, rather than getting zeroed out and
+# classified 'inferior' just for being slow.
+SPEED_FACTOR_FLOOR: float = 0.1
+
+
+def _speed_factor(fastest_ms: float, elapsed_ms: float) -> float:
+    """Compute speed_factor in log space, bounded [SPEED_FACTOR_FLOOR, 1.0].
+
+    Inputs are elapsed milliseconds from the fastest contest participant
+    (`fastest_ms`) and this engine (`elapsed_ms`). Both must be > 0 —
+    callers with missing timing data should pass 1.0 directly (see the
+    fallback branch at the call site).
+
+    Transform: factor = 1.0 + log10(fastest_ms / elapsed_ms) / 2.0, then
+    clamped to [SPEED_FACTOR_FLOOR, 1.0]. The /2 divisor spreads the
+    penalty so that 100x-slower maps to 0 (which clamps to floor), 10x-
+    slower to 0.5, 3.16x-slower to 0.75, and same-speed to 1.0.
+    """
+    if fastest_ms <= 0 or elapsed_ms <= 0:
+        return 1.0
+    ratio = fastest_ms / elapsed_ms
+    if ratio >= 1.0:
+        return 1.0  # this engine was the fastest (or tied)
+    factor = 1.0 + math.log10(ratio) / 2.0
+    if factor < SPEED_FACTOR_FLOOR:
+        return SPEED_FACTOR_FLOOR
+    return factor
 
 
 def _ratio_term(ratio: Optional[float]) -> float:
@@ -341,10 +466,7 @@ async def run_contest(
             )
             continue
 
-        if fastest > 0 and r.elapsed_ms > 0:
-            speed_factor = fastest / r.elapsed_ms
-        else:
-            speed_factor = 1.0
+        speed_factor = _speed_factor(fastest, r.elapsed_ms)
 
         composite = (
             (prof.quality_weight * q)
