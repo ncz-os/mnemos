@@ -13,9 +13,18 @@ Recommended: Local GPU (vLLM/Ollama on host or LAN). Fallback: LETHE (CPU) if GP
 
 import logging
 import os
+import time
 from typing import Dict, Optional
 
 import httpx
+
+from .base import (
+    CompressionEngine,
+    CompressionRequest,
+    CompressionResult,
+    GPUIntent,
+    IdentifierPolicy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +40,22 @@ _FALLBACK_TO_LETHE = os.getenv("ALETHEIA_FALLBACK_LETHE", "true").lower() == "tr
 class ALETHEIA:
     """GPU-based token-level compression via LLMLingua-2 (OpenAI-compatible endpoint)."""
 
-    def __init__(self, gpu_url: Optional[str] = None, timeout: float = _GPU_PROVIDER_TIMEOUT):
+    def __init__(
+        self,
+        gpu_url: Optional[str] = None,
+        timeout: float = _GPU_PROVIDER_TIMEOUT,
+        disable_fallback: bool = False,
+    ):
         """
         Initialize ALETHEIA compressor.
 
         Args:
             gpu_url: GPU provider inference endpoint (default: env GPU_PROVIDER_HOST:PORT)
             timeout: Request timeout in seconds
+            disable_fallback: When True, GPU failure returns an error result
+                rather than silently falling back to LETHE. ALETHEIAEngine
+                in the v3.1 competitive-selection path sets this True so
+                LETHE's contest entry isn't shadowed by ALETHEIA's fallback.
         """
         if gpu_url:
             self.gpu_url = gpu_url.rstrip("/")
@@ -46,6 +64,7 @@ class ALETHEIA:
             port = _GPU_PROVIDER_PORT
             self.gpu_url = f"{host}:{port}"
         self.timeout = timeout
+        self.disable_fallback = disable_fallback
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -126,7 +145,7 @@ class ALETHEIA:
 
         except Exception as e:
             logger.error(f"[ALETHEIA] GPU compression failed: {e}")
-            if _FALLBACK_TO_LETHE:
+            if _FALLBACK_TO_LETHE and not self.disable_fallback:
                 logger.info("[ALETHEIA] Falling back to LETHE (CPU)")
                 from .lethe import LETHE
                 lethe = LETHE(mode="token")
@@ -190,3 +209,101 @@ Only output the indices, no explanation.
         """Clean up HTTP client."""
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+
+
+class ALETHEIAEngine(CompressionEngine):
+    """ALETHEIA under the v3.1 CompressionEngine ABC.
+
+    Composes the async ALETHEIA HTTP client with disable_fallback=True
+    so a GPU outage becomes an honest error result rather than a
+    silent LETHE output. LETHE runs as its own peer in the contest;
+    letting ALETHEIA fall back to LETHE would shadow LETHE's entry and
+    distort the audit log.
+
+    Identifier-preservation: the current ALETHEIA implementation relies
+    on a small-LLM importance-score pass, which paraphrases tokens
+    freely. Honest reported policy is IdentifierPolicy.OFF — the
+    judge can penalize policy mismatch when the request asks for
+    STRICT.
+
+    gpu_intent=GPU_REQUIRED: this engine has no self-contained CPU
+    path. Task #6's gpu_batcher pre-checks endpoint availability and
+    skips gpu_required engines with reject_reason='disabled' when the
+    GPU endpoint is unreachable. Until the batcher lands, ALETHEIA
+    returns an error result in the GPU-down case and the contest
+    records it with reject_reason='error'.
+    """
+
+    id = "aletheia"
+    label = "ALETHEIA — LLM-assisted token compression (GPU)"
+    version = "1.0"
+    gpu_intent = GPUIntent.GPU_REQUIRED
+
+    def __init__(
+        self,
+        gpu_url: Optional[str] = None,
+        timeout: float = _GPU_PROVIDER_TIMEOUT,
+        core: Optional[ALETHEIA] = None,
+    ) -> None:
+        super().__init__()
+        self._core = core or ALETHEIA(
+            gpu_url=gpu_url,
+            timeout=timeout,
+            disable_fallback=True,
+        )
+
+    async def compress(self, request: CompressionRequest) -> CompressionResult:
+        started = time.perf_counter()
+        try:
+            core_out = await self._core.compress(
+                request.content,
+                target_ratio=request.target_ratio,
+            )
+        except Exception as exc:
+            elapsed = int((time.perf_counter() - started) * 1000)
+            logger.exception("ALETHEIAEngine.compress raised for %s", request.memory_id)
+            return CompressionResult(
+                engine_id=self.id,
+                engine_version=self.version,
+                original_tokens=len(request.content.split()),
+                elapsed_ms=elapsed,
+                gpu_used=False,
+                identifier_policy=IdentifierPolicy.OFF,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        err = core_out.get("error")
+        if err is not None:
+            return CompressionResult(
+                engine_id=self.id,
+                engine_version=self.version,
+                original_tokens=core_out.get("original_tokens", 0),
+                elapsed_ms=elapsed_ms,
+                gpu_used=False,
+                identifier_policy=IdentifierPolicy.OFF,
+                manifest={"method": core_out.get("method"), "gpu_url": self._core.gpu_url},
+                error=err,
+            )
+
+        return CompressionResult(
+            engine_id=self.id,
+            engine_version=self.version,
+            original_tokens=core_out["original_tokens"],
+            compressed_tokens=core_out["compressed_tokens"],
+            compressed_content=core_out["compressed_text"],
+            compression_ratio=core_out["compression_ratio"],
+            quality_score=core_out["quality_score"],
+            elapsed_ms=elapsed_ms,
+            judge_model=None,
+            gpu_used=True,
+            identifier_policy=IdentifierPolicy.OFF,
+            manifest={
+                "method": core_out.get("method"),
+                "gpu_url": self._core.gpu_url,
+                "compression_percentage": core_out.get("compression_percentage"),
+            },
+        )
+
+    async def close(self) -> None:
+        await self._core.close()
