@@ -2,9 +2,10 @@
 import hashlib
 import logging
 import secrets
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 
 import api.lifecycle as _lc
 from api.auth import UserContext, require_root
@@ -318,3 +319,197 @@ async def list_oauth_identities(
         for r in rows
     ]
     return OAuthIdentityListResponse(count=len(items), identities=items)
+
+
+# ── v3.1 compression queue admin ─────────────────────────────────────────────
+#
+# The v3.1 compression contest reads from memory_compression_queue. Without a
+# way to put rows into that queue, the whole pipeline is disconnected from
+# the application layer — operators would need manual SQL. These endpoints
+# give root users the minimum surface to drive the contest: enqueue
+# specific memories, or enqueue every memory that doesn't yet have a
+# compressed variant. Per-memory enqueue on write is v3.2 hot-path work.
+
+
+_VALID_REASONS = {"on_write", "manual", "scheduled", "reprocess"}
+_VALID_PROFILES = {"balanced", "quality_first", "speed_first", "custom"}
+
+
+class CompressionEnqueueRequest(BaseModel):
+    memory_ids: List[str] = Field(
+        ...,
+        description="Memory IDs to enqueue. Each row becomes a pending task "
+                    "in memory_compression_queue; the distillation worker drains "
+                    "them on its next tick.",
+        min_length=1,
+        max_length=1000,
+    )
+    reason: str = Field(
+        default="manual",
+        description="Queue row reason. One of: on_write | manual | scheduled | reprocess",
+    )
+    scoring_profile: str = Field(
+        default="balanced",
+        description="Scoring profile for this batch. One of: "
+                    "balanced | quality_first | speed_first | custom",
+    )
+    priority: int = Field(default=0, description="Higher = drained sooner")
+
+
+class CompressionEnqueueResponse(BaseModel):
+    enqueued: int
+    skipped_unknown: int
+    memory_ids: List[str]
+
+
+@router.post("/compression/enqueue", response_model=CompressionEnqueueResponse, status_code=201)
+async def compression_enqueue(
+    request: CompressionEnqueueRequest,
+    _: UserContext = Depends(require_root),
+):
+    """Enqueue specific memories into memory_compression_queue.
+
+    Memories that don't exist in `memories` are silently skipped
+    (counted in `skipped_unknown`); this lets operators feed a mixed
+    batch without pre-validating every ID. Enqueuing the same memory
+    twice creates two pending rows — both run, the last-written winner
+    supersedes on the variant. Operators who want dedupe should check
+    for existing pending rows first.
+    """
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    if request.reason not in _VALID_REASONS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"reason must be one of {sorted(_VALID_REASONS)}",
+        )
+    if request.scoring_profile not in _VALID_PROFILES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"scoring_profile must be one of {sorted(_VALID_PROFILES)}",
+        )
+
+    async with _lc._pool.acquire() as conn:
+        async with conn.transaction():
+            known = await conn.fetch(
+                "SELECT id FROM memories WHERE id = ANY($1::text[])",
+                request.memory_ids,
+            )
+            known_ids = {r["id"] for r in known}
+            enqueued_ids: list[str] = []
+            for mid in request.memory_ids:
+                if mid not in known_ids:
+                    continue
+                await conn.execute(
+                    "INSERT INTO memory_compression_queue "
+                    "(memory_id, owner_id, reason, priority, scoring_profile) "
+                    "VALUES ($1, $2, $3, $4, $5)",
+                    mid, "default", request.reason, request.priority, request.scoring_profile,
+                )
+                enqueued_ids.append(mid)
+
+    return CompressionEnqueueResponse(
+        enqueued=len(enqueued_ids),
+        skipped_unknown=len(request.memory_ids) - len(enqueued_ids),
+        memory_ids=enqueued_ids,
+    )
+
+
+class CompressionEnqueueAllRequest(BaseModel):
+    reason: str = Field(
+        default="manual",
+        description="Reason stamped on every queued row.",
+    )
+    scoring_profile: str = Field(default="balanced")
+    priority: int = Field(default=0)
+    category: Optional[str] = Field(
+        default=None,
+        description="Optional: only enqueue memories in this category.",
+    )
+    only_uncompressed: bool = Field(
+        default=True,
+        description="When True (default), skip memories that already have a "
+                    "row in memory_compressed_variants. Flip to False to "
+                    "force re-running the contest on every matching memory.",
+    )
+    limit: int = Field(
+        default=500,
+        ge=1,
+        le=10000,
+        description="Cap on how many memories this call enqueues. Default 500; "
+                    "max 10,000. Run the endpoint repeatedly to drain a larger "
+                    "corpus.",
+    )
+
+
+class CompressionEnqueueAllResponse(BaseModel):
+    enqueued: int
+    reason: str
+
+
+@router.post("/compression/enqueue-all", response_model=CompressionEnqueueAllResponse, status_code=201)
+async def compression_enqueue_all(
+    request: CompressionEnqueueAllRequest,
+    _: UserContext = Depends(require_root),
+):
+    """Bulk-enqueue matching memories.
+
+    Default behavior: enqueue up to 500 memories that don't yet have a
+    compressed variant. Operators who want to re-run the contest over
+    every memory (e.g., after flipping scoring_profile defaults, or
+    after updating an engine's prompt) set only_uncompressed=False and
+    raise limit — but run the endpoint repeatedly rather than trying to
+    enqueue the full corpus in one call.
+    """
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    if request.reason not in _VALID_REASONS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"reason must be one of {sorted(_VALID_REASONS)}",
+        )
+    if request.scoring_profile not in _VALID_PROFILES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"scoring_profile must be one of {sorted(_VALID_PROFILES)}",
+        )
+
+    # Build WHERE clause incrementally. Avoid f-string injection by binding
+    # every user-controlled value via asyncpg parameters.
+    where_parts: list[str] = []
+    params: list = []
+    if request.only_uncompressed:
+        where_parts.append(
+            "NOT EXISTS (SELECT 1 FROM memory_compressed_variants v WHERE v.memory_id = m.id)"
+        )
+    if request.category is not None:
+        params.append(request.category)
+        where_parts.append(f"m.category = ${len(params)}")
+    where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    # Priority, reason, scoring_profile, limit — bind next.
+    params.extend([request.reason, request.priority, request.scoring_profile, request.limit])
+    reason_idx = len(params) - 3
+    priority_idx = len(params) - 2
+    profile_idx = len(params) - 1
+    limit_idx = len(params)
+
+    sql = (
+        "INSERT INTO memory_compression_queue "
+        "(memory_id, owner_id, reason, priority, scoring_profile) "
+        "SELECT m.id, 'default', "
+        f"${reason_idx}, ${priority_idx}, ${profile_idx} "
+        f"FROM memories m{where_sql} "
+        "ORDER BY LENGTH(m.content) DESC "
+        f"LIMIT ${limit_idx}"
+    )
+
+    async with _lc._pool.acquire() as conn:
+        result = await conn.execute(sql, *params)
+        # asyncpg returns "INSERT 0 <n>" — parse the row count
+        try:
+            n = int(result.rsplit(" ", 1)[-1])
+        except ValueError:
+            n = 0
+
+    return CompressionEnqueueAllResponse(enqueued=n, reason=request.reason)
