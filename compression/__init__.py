@@ -32,7 +32,7 @@ from .contest_store import persist_contest
 from .quality_analyzer import QualityAnalyzer, QualityManifest
 from .manager import CompressionManager, CompressionResult
 from .lethe import LETHE, LETHEEngine
-from .aletheia import ALETHEIA
+from .aletheia import ALETHEIA, ALETHEIAEngine
 from .anamnesis import ANAMNESIS
 from .distillation_engine import (
     DistillationEngine,
@@ -70,6 +70,7 @@ __all__ = [
     "LETHE",
     "LETHEEngine",
     "ALETHEIA",
+    "ALETHEIAEngine",
     "ANAMNESIS",
     "DistillationEngine",
     "CompressionStrategy",
