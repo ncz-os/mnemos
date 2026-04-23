@@ -85,6 +85,28 @@ LLM-to-LLM wire use) is staged across v3.2–v3.4 per `ROADMAP.md`.
     flip to `false`.
   - `MNEMOS_ALETHEIA_ENABLED` (default `false`) — see "Changed"
     below.
+  - `MNEMOS_CONTEST_MIN_CONTENT_LENGTH` (default `0` = off) —
+    optional threshold below which the worker marks queue rows
+    `failed` with `error='too_short'` before running any engine.
+    Surfaced by the 2026-04-23 benchmark: ~8% of real production
+    memories are short templated blurbs (git commit headers,
+    consultation stubs) that cannot be meaningfully compressed under
+    any engine at the balanced profile's floor — LETHE returns
+    ratio~1.0, ANAMNESIS's rendering inflates past 1.0, contest
+    fails "no winner" after burning ANAMNESIS's multi-second GPU
+    round-trip. Recommended value `500` for GPU-constrained installs;
+    default `0` preserves the full-contest behavior.
+
+- **Admin compression-queue endpoints** (`api/handlers/admin.py`):
+  - `POST /admin/compression/enqueue` — enqueue specific memory IDs
+    into `memory_compression_queue`. Skips unknown IDs silently
+    (reports count in response).
+  - `POST /admin/compression/enqueue-all` — bulk enqueue up to
+    `limit` (default 500, max 10,000) memories. Default filters to
+    memories without an existing variant; `only_uncompressed=false`
+    forces re-contest.
+  Without these, the v3.1 contest pipeline has no application-layer
+  entry point — operators would need manual SQL to exercise it.
 
 - **First real benchmark**:
   `docs/benchmarks/compression-2026-04-23.md`. 464 stratified memories
