@@ -394,13 +394,33 @@ async def search_memories(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
+    # v3.1.2 Tier 3: pin owner_id + namespace to the caller's identity
+    # for non-root searches. Previously request.namespace was caller-
+    # controlled (a non-root user could search any namespace) and
+    # owner_id was never passed at all. Root callers may pass any
+    # namespace / owner to support cross-tenant audit.
+    if _is_root(user):
+        search_owner_id = None  # no owner filter for root
+        search_namespace = request.namespace  # honor caller's request
+    else:
+        search_owner_id = user.user_id
+        # If the caller asked for a different namespace than theirs,
+        # reject explicitly — don't silently scope and hide rows.
+        if request.namespace and request.namespace != user.namespace:
+            raise HTTPException(
+                status_code=403,
+                detail="cross-namespace search requires root",
+            )
+        search_namespace = user.namespace
+
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
             _prov = dict(
                 source_provider=request.source_provider,
                 source_model=request.source_model,
                 source_agent=request.source_agent,
-                namespace=request.namespace,
+                namespace=search_namespace,
+                owner_id=search_owner_id,
             )
             if request.semantic:
                 embedding = await _get_embedding(request.query)
@@ -749,11 +769,18 @@ async def rehydrate_memories(
     """Return memories optimized for Claude context injection (Phase 5)."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
+    # Same v3.1.2 Tier 3 pinning as /memories/search — rehydrate is a
+    # read path for the caller's own corpus.
+    rehydrate_owner_id = None if _is_root(user) else user.user_id
+    rehydrate_namespace = None if _is_root(user) else user.namespace
+
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
             rows = await _fts_fetch(
                 conn, request.query, request.limit, request.category,
                 select_cols="id, content, category, created, compressed_content, quality_rating",
+                owner_id=rehydrate_owner_id,
+                namespace=rehydrate_namespace,
             )
     if not rows:
         return RehydrationResponse(
