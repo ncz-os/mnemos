@@ -13,8 +13,8 @@ bottom, and this document maps those knobs to deployment shapes.
 
 | Tier          | CPU     | RAM    | Disk (data) | GPU        | Notes                                              |
 | ------------- | ------- | ------ | ----------- | ---------- | -------------------------------------------------- |
-| **Server**    | 8+ cores| 16 GB+ | 50 GB+ SSD  | CUDA 12+ GPU w/ 8 GB+ VRAM (recommended) | Full v3.1 contest path with ALETHEIA + ANAMNESIS + LETHE; Postgres 15+ on same host or nearby |
-| **Workstation** | 4+ cores | 8 GB  | 20 GB SSD  | Optional GPU (4 GB+ VRAM acceptable)     | Full v3.1 contest path; ALETHEIA / ANAMNESIS on CPU fallback are slow but functional |
+| **Server**    | 8+ cores| 16 GB+ | 50 GB+ SSD  | CUDA 12+ GPU w/ 8 GB+ VRAM (recommended) | Full contest path (LETHE + ANAMNESIS; APOLLO in v3.3+); Postgres 15+ on same host or nearby |
+| **Workstation** | 4+ cores | 8 GB  | 20 GB SSD  | Optional GPU (4 GB+ VRAM acceptable)     | Full contest path; ANAMNESIS on CPU fallback is slow but functional |
 | **Edge**      | 2 cores | 4 GB   | 10 GB       | None       | v3.1 contest path disabled via `MNEMOS_CONTEST_ENABLED=false`; v3.0 distillation worker only |
 
 Embedded Pi-class is explicitly a **v3.3 target** (SQLite + sqlite-vec
@@ -51,8 +51,10 @@ for production ingest.
 * **GPU**:
   - **Recommended**: NVIDIA RTX 4000-class or better, 8 GB+ VRAM, CUDA 12+.
     Observed on CERBERUS (RTX 4500 ADA): ANAMNESIS completes in ~3-8
-    seconds/memory; ALETHEIA ~0.5 s/memory; contest throughput ~10
-    memories/minute with all three engines enabled.
+    seconds/memory; contest throughput ~10 memories/minute on the
+    current two-engine default (LETHE + ANAMNESIS). APOLLO's v3.3
+    schema-aware fast path is expected to bring rule-detectable
+    memories down to ~10 ms.
   - **Sufficient**: any CUDA-capable GPU with enough VRAM to load
     the chosen embedding/LLM model. The default models (see
     `CLAUDE.md` at the repo root) fit on 8 GB.
@@ -64,14 +66,14 @@ for production ingest.
 
 Dev machines, solo researchers, small teams.
 
-* **CPU**: 4+ cores. CPU-only ALETHEIA / ANAMNESIS work but are slow
+* **CPU**: 4+ cores. CPU-only ANAMNESIS works but is slow
   — expect ~30-60 s per memory instead of 3-8 s.
-* **RAM**: 8 GB. CPU-only ALETHEIA loads the full embedding model into
+* **RAM**: 8 GB. CPU-only inference loads the full embedding model into
   RAM; 8 GB is the comfortable floor.
 * **Disk**: 20 GB SSD for mid-scale personal corpora.
 * **GPU**: optional. A 4 GB VRAM GPU is enough to dramatically speed
-  up ALETHEIA; ANAMNESIS on a small GPU is acceptable if you accept
-  longer ingest latency.
+  up ANAMNESIS; APOLLO's LLM fallback on a small GPU is acceptable if
+  you accept longer ingest latency on schema-less content.
 
 ## Edge tier — v3.1 contest disabled
 
@@ -86,8 +88,8 @@ contest, no GPU required.
 * **GPU**: explicitly none. Set `MNEMOS_CONTEST_ENABLED=false` to skip
   registering the v3.1 contest engines.
 * **Features dropped**:
-  - v3.1 contest path (multi-engine compression)
-  - ALETHEIA / ANAMNESIS (GPU-leaning engines)
+  - contest path (multi-engine compression)
+  - ANAMNESIS (and APOLLO's LLM fallback in v3.3+) — both GPU-leaning
   - scoring profiles (N/A without contest)
   - memory_compression_candidates / memory_compressed_variants tables
     migrate cleanly but stay empty
@@ -101,7 +103,7 @@ shape.
 | Env var                                | Default  | Purpose                                                             |
 | -------------------------------------- | -------- | ------------------------------------------------------------------- |
 | `MNEMOS_CONTEST_ENABLED`               | `true`   | Toggle the v3.1 contest path                                        |
-| `MNEMOS_ALETHEIA_ENABLED`              | `false`  | Register the ALETHEIA engine (off by default — opt-in)              |
+| `MNEMOS_ALETHEIA_ENABLED`              | `false`  | [DEPRECATED v3.2 tail] Opt-in gate for the retired ALETHEIA engine. Kept only for operators who had it enabled before retirement; emits a `DeprecationWarning`. v4.0 removes. |
 | `MNEMOS_CONTEST_MIN_CONTENT_LENGTH`    | `0`      | Skip contests for memories shorter than N chars (GPU-constrained installs) |
 | `MNEMOS_CONTEST_STALE_THRESHOLD_SECS`  | `600`    | Stale-running queue-row reclaim threshold (v3.1.1)                  |
 

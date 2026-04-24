@@ -49,9 +49,6 @@ except Exception as _ce:
 
 _CONTEST_ENABLED = os.getenv("MNEMOS_CONTEST_ENABLED", "true").lower() == "true"
 
-# ALETHEIA is disabled by default in v3.1. The engine's v3.0 index-list
-# scoring prompt ("output comma-separated token indices to KEEP")
-# doesn't survive instruction-tuned chat models — verified against
 # ALETHEIA is DEPRECATED. v3.2 tail retirement:
 #
 # The 2026-04-23 CERBERUS benchmark across 49 PYTHIA memories recorded

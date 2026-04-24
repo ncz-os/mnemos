@@ -14,7 +14,7 @@ MNEMOS is the second thing. It is the operating system for agent memory: a runti
 
 - **MNEMOS** is the memory kernel and the overall system name. Storage, versioning, tiered compression, and lifecycle sit here.
 - **GRAEAE** is the reasoning bus — a multi-provider consensus layer that scores and selects across live LLM backends with a cryptographic audit chain on every decision.
-- **THE MOIRAI** (**LETHE**, **ALETHEIA**, **ANAMNESIS**) is the compression subsystem — three tiers that decide what part of a memory's thread survives, with a written receipt on every transformation.
+- **THE MOIRAI** (**LETHE**, **ANAMNESIS**, and **APOLLO** in v3.3+) is the compression subsystem — tiered engines that decide what part of a memory's thread survives, with a written receipt on every transformation. A fourth engine, **ALETHEIA**, shipped with v3.1 but was retired in the v3.2 tail after losing every contest in the 2026-04-23 benchmark; see [`ROADMAP.md`](./ROADMAP.md) for the going-forward stack.
 - A **self-maintaining model registry** keeps itself current from provider APIs and Arena.ai Elo rankings, so the kernel always knows what models exist, what they cost, and how good they currently are.
 - **Federation**, **webhooks**, **OAuth**, **RLS**, **DAG versioning**, and the **/v1/** REST surface are services built on top of that kernel, not retrofits onto a library.
 
@@ -28,11 +28,11 @@ You can treat MNEMOS like a memory storage provider if you want — `POST /v1/me
 - A single `/v1/*` REST surface covering memories, consultations, providers, sessions, webhooks, federation, and an OpenAI-compatible chat-completions gateway.
 - A multi-LLM consensus reasoning layer (GRAEAE) that distributes one prompt across multiple providers, scores the responses, and writes a tamper-evident SHA-256 hash-chained audit entry — every time.
 - Git-like DAG versioning on memory: `log`, `branch`, `merge`, `revert`. Every mutation snapshots.
-- Three-tier compression pipeline (LETHE CPU / ALETHEIA GPU / ANAMNESIS archival) with a written quality manifest on every transformation. Runs in the background distillation worker. v3.1 adds a plugin `CompressionEngine` ABC, competitive per-memory selection, and a persisted audit log of winners and losers; hot-path invocation (rehydration, gateway inject, session context reading winner variants) is scheduled for v3.2 — see [`ROADMAP.md`](./ROADMAP.md).
+- Tiered compression pipeline (LETHE CPU / ANAMNESIS archival / APOLLO schema-aware in v3.3+) with a written quality manifest on every transformation. Runs in the background distillation worker. v3.1 introduced the plugin `CompressionEngine` ABC, competitive per-memory selection, and a persisted audit log of winners and losers; v3.2 wired hot-path invocation (rehydrate / gateway inject / session context read the winning variant). ALETHEIA shipped with v3.1 but was retired in the v3.2 tail — see [`ROADMAP.md`](./ROADMAP.md).
 - Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in.
 - Runs alongside your applications the way Redis, PostgreSQL, or a message bus would. Deploy once, every agent in your stack shares the same memory substrate.
 
-The [v3.1 release](./ROADMAP.md) is the compression platform release: a plugin `CompressionEngine` ABC open to operator-registered engines, three built-in engines running under a competitive-selection contest (LETHE + ANAMNESIS active by default; ALETHEIA opt-in via `MNEMOS_ALETHEIA_ENABLED=true` — its v3.0 index-list prompt doesn't survive instruction-tuned chat models, and a prompt redesign is v3.x work), a persisted audit log recording every winner and loser with its score, and GPU-batched inference that runs on integrated graphics through to datacenter cards. A fourth first-party engine, **APOLLO** — schema-aware dense encoding for LLM-to-LLM wire use — is staged across v3.2–v3.4 (the "Apollo Program"), alongside hot-path wiring that reads winner variants on rehydrate / gateway inject / session context.
+The [v3.2 release](./ROADMAP.md) builds on v3.1's compression platform: per-user namespace tenancy end-to-end, full observability stack (request-ID correlation / Prometheus metrics / OpenTelemetry traces / opt-in structured JSON logs), registry-backed OpenAI-compatible gateway with no default-to-Groq, MPF v0.1 export/import, Custom Query mode on `/v1/consultations`, self-healing contest queue with stale-running sweep, and probe-identity handshake on the GPUGuard circuit breaker. The going-forward compression stack is **LETHE + ANAMNESIS + APOLLO** (APOLLO in v3.3+). **ALETHEIA** shipped as the v3.1 third engine but was retired in the v3.2 tail after zero contest wins in the 2026-04-23 CERBERUS benchmark — its index-list scoring prompt doesn't survive instruction-tuned generalist LLMs; kept importable via `MNEMOS_ALETHEIA_ENABLED=true` for operators who had it opted in, scheduled for v4.0 removal. **APOLLO** — schema-aware dense encoding for LLM-to-LLM wire use — is staged across v3.3–v3.4 (the "Apollo Program").
 
 ## Works with
 
@@ -409,7 +409,7 @@ A lot of the v3.x surface is held up by background work that doesn't show up in 
 - **Full-text search operator filtering** — `/v1/memories/search` uses `plainto_tsquery` rather than `to_tsquery`, so `|`, `&`, `!` and friends get treated as literal text instead of tsquery operators. User input cannot construct adversarial FTS queries.
 - **Federation size caps** — an abusive peer cannot fill your disk: pulled content capped at 1 MB per memory, metadata at 64 KB, name fields at 256 chars.
 - **Rate-limited audit endpoints** — `/v1/consultations/audit/verify` walks the entire chain from genesis; capped at 5/min so an authenticated caller cannot force O(N) scans on a large log. `/audit` list is capped at 30/min.
-- **Quality manifest on every compression** — LETHE, ALETHEIA, and ANAMNESIS each write a receipt: `{what_was_removed, what_was_preserved, quality_rating, risk_factors, safe_for, not_safe_for}`. Compression-as-data, not compression-as-side-effect.
+- **Quality manifest on every compression** — every compression engine in the stack (LETHE, ANAMNESIS, APOLLO in v3.3+) writes a receipt: `{what_was_removed, what_was_preserved, quality_rating, risk_factors, safe_for, not_safe_for}`. Compression-as-data, not compression-as-side-effect.
 
 ### Referential integrity (the -ism, spelled out)
 
@@ -442,11 +442,12 @@ The constraints are enforced at the database level. Application bugs cannot viol
 
 ### Compression — the MOIRAI tiers
 
-Three-tier compression pipeline, each tier named after a Greek figure of memory.
+Tiered compression pipeline, each tier named after a Greek figure of memory.
 
 - **LETHE** (Tier 1, CPU, runs in the distillation worker) — fast local compression with two modes: token mode (stop-word + importance-marker extractive filtering, ~0.5ms, ~57% reduction on functional-word-heavy prose) and sentence mode (structure-preserving sentence-boundary extraction, ~2–5ms, ~50% reduction). `auto` mode picks per content shape. Zero external calls.
-- **ALETHEIA** (Tier 2, optional GPU) — token-level importance scoring via a local LLM on a configured GPU host (`GPU_PROVIDER_HOST`); ~200-500ms, ~70% reduction. Runs offline via distillation worker; not on the live path. Falls back to LETHE when the GPU host is unreachable (v3.0 behavior; the v3.1 `ALETHEIAEngine` on the plugin ABC disables the silent fallback so LETHE's contest entry isn't shadowed).
 - **ANAMNESIS** (Tier 3, optional GPU) — atomic-fact extraction for archival memories (>30 days old); semantic-level compression via LLM. Fallback: skip extraction if the GPU host is unreachable (non-critical).
+- **APOLLO** (v3.3+, Tier 2 replacement) — schema-aware dense encoding for LLM-to-LLM wire use. Rule-based schema detection with LLM fallback for fact-shaped content that misses a known schema. See [`ROADMAP.md`](./ROADMAP.md) Apollo Program.
+- **ALETHEIA** (v3.1, retired v3.2 tail) — token-level importance scoring via LLM. Lost every contest in the 2026-04-23 CERBERUS benchmark (index-list prompt incompatible with instruction-tuned generalist LLMs). Kept importable via `MNEMOS_ALETHEIA_ENABLED=true` for operators who had it opted in; emits a `DeprecationWarning` on construction; v4.0 removes.
 - Quality manifest on every compression: what was removed, what was preserved, risk factors, safe/unsafe use cases.
 - Original content always retained; compressed and original stored independently.
 - Configurable quality thresholds per task type (security review: 95%, architecture: 90%, general: 80%).
@@ -482,7 +483,7 @@ Landed with the v3.0 release line:
 
 ### Shipped in v3.1 (current)
 
-- ✅ **Plugin `CompressionEngine` ABC** — open extension point; operators register additional engines alongside the three built-ins (LETHE / ALETHEIA / ANAMNESIS).
+- ✅ **Plugin `CompressionEngine` ABC** — open extension point; operators register additional engines alongside the built-ins (LETHE, ANAMNESIS; APOLLO in v3.3+; ALETHEIA retired from the default contest in v3.2 tail).
 - ✅ **Competitive-selection compression contest** — every eligible engine runs per memory; highest composite_score wins; every loser recorded with its reject_reason. Scoring profile is operator-configurable (`balanced` | `quality_first` | `speed_first` | `custom`).
 - ✅ **Persisted audit log** — three new tables (`memory_compression_queue`, `memory_compression_candidates`, `memory_compressed_variants`) with full history queryable via `GET /v1/memories/{id}/compression-manifests`.
 - ✅ **GPU circuit breaker** — per-endpoint three-state breaker (CLOSED → OPEN → HALF_OPEN → CLOSED); gpu_required engines fast-fail during outages instead of piling requests onto a dead endpoint.
@@ -699,10 +700,11 @@ Fair question, and we get it more than you'd think. Short answer: the names aren
 
 - **MNEMOS** — short for Mnemosyne, the Titan goddess of memory and mother of the Muses. The system stores and retrieves memory. "MemoryService" felt like underselling it.
 - **GRAEAE** — the three sisters in the Perseus myth who shared one eye and one tooth, passing them back and forth to see and speak. GRAEAE is the multi-LLM consensus layer: several providers sharing one prompt and converging on one consolidated answer. The metaphor was already sitting there.
-- **THE MOIRAI** — the three Fates, who spin, measure, and cut the thread of life. The compression stack is collectively THE MOIRAI because each of its three tiers decides what part of a memory's thread survives:
+- **THE MOIRAI** — the three Fates, who spin, measure, and cut the thread of life. The compression stack is collectively THE MOIRAI because each tier decides what part of a memory's thread survives:
   - **LETHE** (river of forgetfulness) — Tier 1, CPU, fast, aggressive: throws away what you won't miss.
-  - **ALETHEIA** (literally *a-lethe*, "unforgetting" — truth, disclosure) — Tier 2, GPU, deeper: preserves what the first pass would have lost.
   - **ANAMNESIS** (recollection) — Tier 3, archival, slowest: distills long-term facts so you can recover them years later.
+  - **APOLLO** (god of oracles — schema-aware prophecy) — v3.3+, the third going-forward tier: schema-typed dense encoding for LLM-to-LLM wire use; humans read through a narrator at read time.
+  - **ALETHEIA** (literally *a-lethe*, "unforgetting" — truth, disclosure) — v3.1 third engine, retired in the v3.2 tail (0 contest wins in the 2026-04-23 benchmark); kept importable, v4.0 removes.
 
 No, we are not fantasy novelists. The naming scheme is what happens when the domain you're working in is literally the thing a pre-Socratic culture wrote whole theogonies about, and you decide to use their vocabulary instead of inventing a worse one. Every name is aligned to what the component does, not chosen for atmosphere.
 
@@ -710,7 +712,7 @@ If you strongly prefer `MemoryService` / `LLMRouter` / `CompressorTier1`, the co
 
 ### Do I need GPU hardware?
 
-No. CPU-only installs run fine — LETHE (Tier 1 compression) runs on CPU, and the API server itself never needs a GPU. ALETHEIA (Tier 2 GPU compression) and the optional local GPU inference backends only kick in when `GPU_PROVIDER_HOST` is configured. For most deployments, CPU plus one external LLM provider is enough.
+No. CPU-only installs run fine — LETHE (Tier 1 compression) runs on CPU, and the API server itself never needs a GPU. ANAMNESIS (GPU-optional, archival fact extraction) and the optional local GPU inference backends only kick in when `GPU_PROVIDER_HOST` is configured. For most deployments, CPU plus one external LLM provider is enough.
 
 ### Does it work with [OpenAI / Anthropic / Groq / Together / local Ollama]?
 
