@@ -90,11 +90,18 @@ class ModelsResponse(BaseModel):
 async def _search_mnemos_context(query: str, user: UserContext, limit: int = 5) -> List[Dict[str, Any]]:
     """Search MNEMOS for relevant context based on user query.
 
-    Returns list of dicts with 'id' and 'content' keys for memory injection.
+    Returns list of dicts with 'id' and 'content' keys for memory
+    injection into /v1/chat/completions. Non-root callers are scoped
+    to their owner_id AND namespace (v3.1.2 Tier 3 two-dimensional
+    gate). Previously this path filtered on owner_id alone, which
+    let cross-namespace memories leak into the gateway's injected
+    context under the same owner.
     """
     if not _lc._pool:
         logger.debug("[MNEMOS] No DB pool available")
         return []
+
+    is_root = user.role == "root"
 
     try:
         async with _lc._pool.acquire() as conn:
@@ -102,21 +109,37 @@ async def _search_mnemos_context(query: str, user: UserContext, limit: int = 5) 
             # to_tsvector so we match the 'english' dictionary regardless of
             # the cluster's default_text_search_config and so the index (if
             # present) can actually be used.
-            memories = await conn.fetch(
-                """
-                SELECT id, content, category FROM memories
-                WHERE owner_id = $1
-                AND (
-                    to_tsvector('english', content) @@ plainto_tsquery('english', $2)
-                    OR category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
+            if is_root:
+                # Root sees every memory regardless of tenancy.
+                memories = await conn.fetch(
+                    """
+                    SELECT id, content, category FROM memories
+                    WHERE
+                        to_tsvector('english', content) @@ plainto_tsquery('english', $1)
+                        OR category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
+                    ORDER BY updated DESC NULLS LAST
+                    LIMIT $2
+                    """,
+                    query,
+                    limit,
                 )
-                ORDER BY updated DESC NULLS LAST
-                LIMIT $3
-                """,
-                user.user_id,
-                query,
-                limit,
-            )
+            else:
+                memories = await conn.fetch(
+                    """
+                    SELECT id, content, category FROM memories
+                    WHERE owner_id = $1 AND namespace = $2
+                    AND (
+                        to_tsvector('english', content) @@ plainto_tsquery('english', $3)
+                        OR category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
+                    )
+                    ORDER BY updated DESC NULLS LAST
+                    LIMIT $4
+                    """,
+                    user.user_id,
+                    user.namespace,
+                    query,
+                    limit,
+                )
             logger.info(f"[MNEMOS] Found {len(memories)} memories for query '{query[:30]}...'")
             return [{"id": m["id"], "content": m["content"]} for m in memories]
     except Exception as e:
