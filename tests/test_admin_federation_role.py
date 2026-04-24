@@ -46,6 +46,7 @@ def fake_db_pool(monkeypatch):
             "display_name": "Peer B",
             "email": None,
             "role": "federation",
+            "namespace": "default",
             "created_at": __import__("datetime").datetime(2026, 4, 22, 19, 30),
         },
     ])
