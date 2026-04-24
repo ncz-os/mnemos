@@ -42,7 +42,7 @@ try:
     from compression.aletheia import ALETHEIAEngine  # deprecated — opt-in only
     from compression.anamnesis import ANAMNESISEngine
     from compression.apollo import APOLLOEngine
-    from compression.judge import LLMJudge, NullJudge
+    from compression.judge import CrossEncoderJudge, EnsembleJudge, LLMJudge, NullJudge
     from compression.worker_contest import process_contest_queue
     _CONTEST_AVAILABLE = True
 except Exception as _ce:
@@ -112,6 +112,21 @@ _APOLLO_LLM_FALLBACK_ENABLED = (
 # judge's id onto every scored candidate (default 'judge-default').
 _JUDGE_ENABLED = os.getenv("MNEMOS_JUDGE_ENABLED", "false").lower() == "true"
 _JUDGE_MODEL = os.getenv("MNEMOS_JUDGE_MODEL", "judge-default")
+
+# Judge mode selects the scoring implementation:
+#   llm        — LLMJudge only (v3.3 S-II default; reasoning + fidelity)
+#   cross      — CrossEncoderJudge only (fast CPU-only, no reasoning)
+#   ensemble   — LLMJudge primary + CrossEncoderJudge secondary; primary
+#                authoritative, secondary captured on the manifest for
+#                correlation telemetry over a corpus
+# Cross / ensemble modes require the `full` optional extra
+# (sentence-transformers). Ensemble is the benchmark-gathering mode —
+# run it for a window, compare primary/secondary agreement, decide
+# whether to eventually promote the cross-encoder to the fast path.
+_JUDGE_MODE = os.getenv("MNEMOS_JUDGE_MODE", "llm").lower()
+_CROSS_ENCODER_MODEL = os.getenv(
+    "MNEMOS_CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-12-v2",
+)
 
 # Stale-running sweep threshold (v3.1.1). Queue rows stuck in 'running'
 # longer than this are reclaimed at the top of each batch — reset to
@@ -217,14 +232,39 @@ class MemoryDistillationWorker:
                         enable_llm_fallback=_APOLLO_LLM_FALLBACK_ENABLED,
                     )
                 )
-            # Judge-LLM fidelity scoring (v3.3 S-II). LLMJudge when
-            # MNEMOS_JUDGE_ENABLED=true; NullJudge (no-op) otherwise.
-            # NullJudge keeps the contest using engine-self-reported
-            # scores — behavioral equivalent to pre-S-II.
-            if _JUDGE_ENABLED:
-                self._judge = LLMJudge(model_id=_JUDGE_MODEL)
-            else:
+            # Judge fidelity scoring (v3.3 S-II). Selected by
+            # MNEMOS_JUDGE_MODE (default 'llm') when enabled.
+            # NullJudge when disabled — keeps the contest using
+            # engine-self-reported scores (pre-S-II behavior).
+            if not _JUDGE_ENABLED:
                 self._judge = NullJudge()
+            elif _JUDGE_MODE == "cross":
+                try:
+                    self._judge = CrossEncoderJudge(_CROSS_ENCODER_MODEL)
+                except ImportError as exc:
+                    logger.warning(
+                        "CrossEncoderJudge unavailable (%s); falling back "
+                        "to LLMJudge. Install mnemos-os[full] to enable.",
+                        exc,
+                    )
+                    self._judge = LLMJudge(model_id=_JUDGE_MODEL)
+            elif _JUDGE_MODE == "ensemble":
+                primary = LLMJudge(model_id=_JUDGE_MODEL)
+                try:
+                    secondary = CrossEncoderJudge(_CROSS_ENCODER_MODEL)
+                    self._judge = EnsembleJudge(
+                        primary=primary, secondaries=[secondary],
+                    )
+                except ImportError as exc:
+                    logger.warning(
+                        "Ensemble mode requested but CrossEncoderJudge "
+                        "unavailable (%s); falling back to LLMJudge-only. "
+                        "Install mnemos-os[full] to enable ensemble.",
+                        exc,
+                    )
+                    self._judge = primary
+            else:  # default and 'llm'
+                self._judge = LLMJudge(model_id=_JUDGE_MODEL)
             engine_ids = [e.id for e in self._contest_engines]
             logger.info(
                 "[OK] contest path enabled (engines: %s) judge=%s",

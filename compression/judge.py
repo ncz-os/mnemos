@@ -43,7 +43,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, List, Optional
 
 import httpx
 
@@ -282,3 +282,226 @@ def _parse_judge_output(raw: str) -> Optional[JudgeScore]:
     # _parse_judge_output returns a bare JudgeScore for the parsing
     # layer only. The Judge implementation re-wraps with its model_id.
     return JudgeScore(fidelity=clamped, model_id="", reasoning=reasoning[:500])
+
+
+# ── CrossEncoderJudge — specialized small-model scorer ────────────────────
+#
+# Purpose-built reranker / STS models are 20–500M params — 10–100× smaller
+# than an LLM judge. They produce a scalar similarity score directly
+# instead of free-form reasoning + JSON, so they're dramatically faster
+# (<50ms CPU) but lose the audit-trail narrative an LLM judge produces.
+#
+# Design choice: keep LLMJudge as the authoritative judge for scoring
+# (reasoning narrative matters); use CrossEncoderJudge either stand-alone
+# when latency dominates, or as the secondary scorer inside EnsembleJudge
+# to gather correlation telemetry across two independent measurement
+# paths. When the LLM and cross-encoder agree on most memories, that's
+# evidence the LLM judge can eventually be relegated to disagreement-
+# review mode. Until we have that evidence, the LLM stays primary.
+
+
+_DEFAULT_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-12-v2"
+
+
+class CrossEncoderJudge(Judge):
+    """Sentence-Transformers CrossEncoder as a fidelity scorer.
+
+    Loads the cross-encoder model lazily on first score() call. Runs
+    on CPU by default (the default model is 33M params, <50ms per
+    pair on any modern CPU). Normalizes the raw logit output via
+    sigmoid so the fidelity lands in [0, 1] and is directly
+    comparable to an LLM judge's fidelity rating.
+
+    The cross-encoder sees (original, candidate_narrated) as a pair.
+    For APOLLO candidates the contest narrates the dense form first
+    (same plumbing LLMJudge uses); for LETHE/ANAMNESIS candidates
+    the prose content is passed through. That's consistent with
+    LLMJudge's behavior — both judges score the SAME narrated pair.
+
+    Reasoning is empty: cross-encoders produce no narrative. Callers
+    that need a reason should use LLMJudge primary; CrossEncoderJudge
+    is deliberately a thin numeric scorer.
+
+    Soft-optional dependency: if sentence-transformers is not
+    installed, construction raises ImportError with a clear message
+    pointing at the `full` extra.
+    """
+
+    model_id: str = "cross-encoder"
+
+    def __init__(
+        self,
+        model_name: str = _DEFAULT_CROSS_ENCODER_MODEL,
+        *,
+        device: Optional[str] = None,
+        activation_fn: str = "sigmoid",
+    ) -> None:
+        try:
+            from sentence_transformers import CrossEncoder  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "CrossEncoderJudge requires sentence-transformers. "
+                "Install with: pip install 'mnemos-os[full]'"
+            ) from exc
+        self.model_name = model_name
+        self.model_id = model_name
+        self._device = device  # None means auto-detect (CPU default)
+        self._activation_fn = activation_fn
+        # Model loaded on first score() call — construction itself is
+        # cheap and shouldn't block worker startup.
+        self._model = None
+
+    def _load(self):
+        if self._model is not None:
+            return self._model
+        from sentence_transformers import CrossEncoder
+        kwargs = {}
+        if self._device is not None:
+            kwargs["device"] = self._device
+        self._model = CrossEncoder(self.model_name, **kwargs)
+        logger.info(
+            "CrossEncoderJudge loaded model=%r device=%r",
+            self.model_name, getattr(self._model, "device", self._device),
+        )
+        return self._model
+
+    async def score(
+        self,
+        *,
+        original: str,
+        candidate_encoded: str,  # noqa: ARG002 — part of the Judge ABC
+        candidate_narrated: str,
+        candidate_engine_id: str,  # noqa: ARG002
+    ) -> Optional[JudgeScore]:
+        if not original or not candidate_narrated:
+            return None
+        try:
+            model = self._load()
+            # CrossEncoder.predict is synchronous + CPU-bound; offload to
+            # the default executor so the contest's asyncio.gather doesn't
+            # block. Small overhead for the <50ms call is fine.
+            import asyncio
+            raw = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: model.predict(
+                    [(original[:4000], candidate_narrated[:4000])],
+                    activation_fn=self._activation_fn,
+                    show_progress_bar=False,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — judge MUST NOT crash the contest
+            logger.warning(
+                "CrossEncoderJudge: score failed (%s): %s",
+                type(exc).__name__, exc,
+            )
+            return None
+
+        # raw is a 1-element numpy array or list; coerce to float.
+        try:
+            score = float(raw[0])
+        except (TypeError, IndexError, ValueError):
+            return None
+        # Clamp to [0, 1]. With sigmoid activation the score is already
+        # in range; with activation_fn=None it's a logit and needs
+        # sigmoid — but we default activation to sigmoid.
+        fidelity = max(0.0, min(1.0, score))
+        return JudgeScore(
+            fidelity=fidelity,
+            model_id=self.model_id,
+            reasoning="",  # cross-encoders produce no narrative
+        )
+
+
+# ── EnsembleJudge — primary + secondary with correlation telemetry ───────
+
+
+class EnsembleJudge(Judge):
+    """Wrap a primary Judge + one or more secondary judges.
+
+    The primary judge's fidelity score drives the contest's
+    quality_score; secondary judges' scores are captured on the
+    candidate's manifest under ``judge_secondary[<model_id>]`` for
+    later correlation analysis.
+
+    Use case: run LLMJudge primary (authoritative, produces reasoning)
+    alongside CrossEncoderJudge secondary (fast telemetry). Over a
+    corpus, compare the two distributions. If agreement is high,
+    that's the evidence for eventually promoting the cross-encoder
+    to the fast path.
+
+    The primary's failure (returns None) is treated as a whole-
+    ensemble failure — we don't silently promote a secondary.
+    Failure modes in the secondary are logged but don't affect the
+    returned score; the manifest just lacks that secondary's entry.
+    """
+
+    model_id: str = "ensemble"
+
+    def __init__(
+        self,
+        primary: Judge,
+        secondaries: Optional[List[Judge]] = None,
+    ) -> None:
+        self._primary = primary
+        self._secondaries: List[Judge] = secondaries or []
+        self.model_id = primary.model_id  # audit log shows the authoritative id
+
+    async def score(
+        self,
+        *,
+        original: str,
+        candidate_encoded: str,
+        candidate_narrated: str,
+        candidate_engine_id: str,
+    ) -> Optional[JudgeScore]:
+        primary_score = await self._primary.score(
+            original=original,
+            candidate_encoded=candidate_encoded,
+            candidate_narrated=candidate_narrated,
+            candidate_engine_id=candidate_engine_id,
+        )
+        if primary_score is None:
+            return None
+
+        # Run secondaries for telemetry. Each runs independently; a
+        # single secondary failure does not affect the returned score
+        # or the other secondaries' captures.
+        secondary_scores: Dict[str, float] = {}
+        for sec in self._secondaries:
+            try:
+                s = await sec.score(
+                    original=original,
+                    candidate_encoded=candidate_encoded,
+                    candidate_narrated=candidate_narrated,
+                    candidate_engine_id=candidate_engine_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "EnsembleJudge: secondary %s raised: %s",
+                    type(sec).__name__, exc,
+                )
+                continue
+            if s is not None:
+                secondary_scores[sec.model_id or type(sec).__name__] = s.fidelity
+
+        # Piggyback secondaries in the reasoning field as a structured
+        # prefix — the contest's _apply_judge_scores writes
+        # ``judge_reasoning`` onto the candidate manifest, so this
+        # gives operators access to secondary scores without a schema
+        # change. Format: "[secondaries: {name=0.91, ...}] <primary reasoning>"
+        # Backwards-compatible consumers read the primary reasoning from
+        # after the bracket; new consumers parse the prefix.
+        if secondary_scores:
+            suffix = ",".join(
+                f"{name}={val:.3f}" for name, val in secondary_scores.items()
+            )
+            primary_score = JudgeScore(
+                fidelity=primary_score.fidelity,
+                model_id=primary_score.model_id,
+                reasoning=(
+                    f"[secondaries: {suffix}] {primary_score.reasoning}"
+                ),
+            )
+        return primary_score
+
+
