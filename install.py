@@ -159,6 +159,7 @@ def main() -> None:
         os.path.join(script_dir, "db", "migrations_v3_1_2_kg_tenancy.sql"),
         os.path.join(script_dir, "db", "migrations_v3_1_2_audit_log_columns.sql"),
         os.path.join(script_dir, "db", "migrations_v3_2_user_namespace.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_2_entities_namespace.sql"),
     ]
 
     print("=" * 60)

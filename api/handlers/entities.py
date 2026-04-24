@@ -45,17 +45,38 @@ def _scope_owner(user: UserContext, override: Optional[str]) -> str:
     return user.user_id
 
 
-async def _assert_owned(conn, entity_id: str, user: UserContext) -> str:
-    """Return the entity's owner_id if the caller can access it, else raise 404/403.
+def _scope_namespace(
+    user: UserContext, override: Optional[str] = None
+) -> str:
+    """Resolve the target namespace for a write / list. Non-root callers
+    are pinned to `user.namespace`; any attempt to pass a different
+    override returns 403 explicit rejection rather than silent
+    narrowing — same pattern as /v1/memories/search (v3.1.2)."""
+    if override and override != user.namespace:
+        if user.role != "root":
+            raise HTTPException(
+                status_code=403,
+                detail="cross-namespace access requires root",
+            )
+        return override
+    return user.namespace
 
-    Root users can access any entity; other users only their own.
+
+async def _assert_owned(conn, entity_id: str, user: UserContext) -> str:
+    """Return the entity's owner_id if the caller can access it, else
+    raise 404/403. Two-dimensional tenancy (v3.2): non-root must
+    match BOTH owner_id AND namespace. Root bypasses both.
     """
     row = await conn.fetchrow(
-        "SELECT owner_id FROM entities WHERE id = $1::uuid", entity_id,
+        "SELECT owner_id, namespace FROM entities WHERE id = $1::uuid",
+        entity_id,
     )
     if not row:
         raise HTTPException(status_code=404, detail="Entity not found")
-    if user.role != "root" and row["owner_id"] != user.user_id:
+    if user.role != "root" and (
+        row["owner_id"] != user.user_id
+        or row["namespace"] != user.namespace
+    ):
         # Don't leak existence to non-owner; return 404 as if it didn't exist.
         raise HTTPException(status_code=404, detail="Entity not found")
     return row["owner_id"]
@@ -74,13 +95,14 @@ async def create_entity(
         entity_id = str(uuid.uuid4())
         async with _lc._pool.acquire() as conn:
             row = await conn.fetchrow(
-                '''INSERT INTO entities (id, owner_id, entity_type, name, description, metadata)
-                   VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                '''INSERT INTO entities (id, owner_id, namespace, entity_type, name, description, metadata)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
                    ON CONFLICT (owner_id, entity_type, name) DO UPDATE
-                   SET description = COALESCE($5, entities.description),
+                   SET description = COALESCE($6, entities.description),
                        updated = NOW()
                    RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
-                entity_id, user.user_id, req.entity_type, req.name,
+                entity_id, user.user_id, user.namespace,
+                req.entity_type, req.name,
                 req.description, json.dumps(req.metadata or {})
             )
         return dict(row)
@@ -96,39 +118,45 @@ async def list_entities(
     limit: int = Query(50, ge=1, le=500),
     user: UserContext = Depends(get_current_user),
     owner_id: Optional[str] = Query(None),
+    namespace: Optional[str] = Query(None),
 ):
+    """List entities. Non-root callers see only their own
+    (owner_id, namespace) slice. Root may pass ?owner_id= and/or
+    ?namespace= to target another tenant for audit/support.
+    """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     target_owner = _scope_owner(user, owner_id)
+    target_ns = _scope_namespace(user, namespace)
     try:
         async with _lc._pool.acquire() as conn:
             if entity_type and search:
                 rows = await conn.fetch(
                     '''SELECT id::text, entity_type, name, description, metadata, created::text, updated::text
-                       FROM entities WHERE owner_id=$1 AND entity_type=$2 AND name ILIKE $3
-                       ORDER BY name LIMIT $4''',
-                    target_owner, entity_type, f'%{search}%', limit
+                       FROM entities WHERE owner_id=$1 AND namespace=$2 AND entity_type=$3 AND name ILIKE $4
+                       ORDER BY name LIMIT $5''',
+                    target_owner, target_ns, entity_type, f'%{search}%', limit
                 )
             elif entity_type:
                 rows = await conn.fetch(
                     '''SELECT id::text, entity_type, name, description, metadata, created::text, updated::text
-                       FROM entities WHERE owner_id=$1 AND entity_type=$2
-                       ORDER BY name LIMIT $3''',
-                    target_owner, entity_type, limit
+                       FROM entities WHERE owner_id=$1 AND namespace=$2 AND entity_type=$3
+                       ORDER BY name LIMIT $4''',
+                    target_owner, target_ns, entity_type, limit
                 )
             elif search:
                 rows = await conn.fetch(
                     '''SELECT id::text, entity_type, name, description, metadata, created::text, updated::text
-                       FROM entities WHERE owner_id=$1 AND (name ILIKE $2 OR description ILIKE $2)
-                       ORDER BY name LIMIT $3''',
-                    target_owner, f'%{search}%', limit
+                       FROM entities WHERE owner_id=$1 AND namespace=$2 AND (name ILIKE $3 OR description ILIKE $3)
+                       ORDER BY name LIMIT $4''',
+                    target_owner, target_ns, f'%{search}%', limit
                 )
             else:
                 rows = await conn.fetch(
                     '''SELECT id::text, entity_type, name, description, metadata, created::text, updated::text
-                       FROM entities WHERE owner_id=$1
-                       ORDER BY entity_type, name LIMIT $2''',
-                    target_owner, limit
+                       FROM entities WHERE owner_id=$1 AND namespace=$2
+                       ORDER BY entity_type, name LIMIT $3''',
+                    target_owner, target_ns, limit
                 )
         return {"entities": [dict(r) for r in rows], "count": len(rows)}
     except Exception:
