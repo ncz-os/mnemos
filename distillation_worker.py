@@ -39,8 +39,9 @@ except Exception as _ce:
 # can disable the v3.1 path by setting MNEMOS_CONTEST_ENABLED=false.
 try:
     from compression.lethe import LETHEEngine
-    from compression.aletheia import ALETHEIAEngine
+    from compression.aletheia import ALETHEIAEngine  # deprecated — opt-in only
     from compression.anamnesis import ANAMNESISEngine
+    from compression.apollo import APOLLOEngine
     from compression.worker_contest import process_contest_queue
     _CONTEST_AVAILABLE = True
 except Exception as _ce:
@@ -81,6 +82,22 @@ _ALETHEIA_ENABLED = os.getenv("MNEMOS_ALETHEIA_ENABLED", "false").lower() == "tr
 # behavior). Recommended 500 for GPU-constrained installs.
 _CONTEST_MIN_CONTENT_LENGTH = int(
     os.getenv("MNEMOS_CONTEST_MIN_CONTENT_LENGTH", "0")
+)
+
+# APOLLO joined the default contest in v3.3 S-II. The engine is
+# GPU_OPTIONAL (schema fast path is pure regex; LLM fallback uses
+# the GPU host when reachable, short-circuits on a closed circuit,
+# returns error on parse failure — see compression/apollo.py). The
+# env var lets operators disable APOLLO entirely (e.g. while
+# benchmarking the LETHE/ANAMNESIS baseline) without editing code.
+_APOLLO_ENABLED = os.getenv("MNEMOS_APOLLO_ENABLED", "true").lower() == "true"
+
+# When APOLLO is on but the LLM fallback is unwanted (operators who
+# want only the pure schema fast path — no GPU calls from APOLLO),
+# flip this off. supports() then falls back to the S-IC shape:
+# APOLLO skips non-schema-matching memories entirely.
+_APOLLO_LLM_FALLBACK_ENABLED = (
+    os.getenv("MNEMOS_APOLLO_LLM_FALLBACK_ENABLED", "true").lower() == "true"
 )
 
 # Stale-running sweep threshold (v3.1.1). Queue rows stuck in 'running'
@@ -170,7 +187,7 @@ class MemoryDistillationWorker:
         # enabled set and let the gpu_guard handle endpoint
         # unavailability at runtime.
         if _CONTEST_AVAILABLE and _CONTEST_ENABLED:
-            # Going-forward stack: LETHE + ANAMNESIS (+ APOLLO in v3.3).
+            # Going-forward stack: LETHE + ANAMNESIS + APOLLO.
             # ALETHEIA is retired — kept opt-in behind
             # MNEMOS_ALETHEIA_ENABLED=true for operators who had it
             # enabled before retirement; emits a DeprecationWarning on
@@ -179,6 +196,12 @@ class MemoryDistillationWorker:
             if _ALETHEIA_ENABLED:
                 self._contest_engines.append(ALETHEIAEngine())
             self._contest_engines.append(ANAMNESISEngine())
+            if _APOLLO_ENABLED:
+                self._contest_engines.append(
+                    APOLLOEngine(
+                        enable_llm_fallback=_APOLLO_LLM_FALLBACK_ENABLED,
+                    )
+                )
             engine_ids = [e.id for e in self._contest_engines]
             logger.info(
                 "[OK] contest path enabled (engines: %s)",
@@ -190,6 +213,13 @@ class MemoryDistillationWorker:
                     "default stack. You have MNEMOS_ALETHEIA_ENABLED=true "
                     "set; v4.0 will remove the engine entirely. See "
                     "docs/benchmarks/compression-2026-04-23.md."
+                )
+            if _APOLLO_ENABLED and not _APOLLO_LLM_FALLBACK_ENABLED:
+                logger.info(
+                    "APOLLO registered with LLM fallback DISABLED — "
+                    "engine runs only on schema-matching memories. "
+                    "Flip MNEMOS_APOLLO_LLM_FALLBACK_ENABLED=true to "
+                    "cover all memories."
                 )
         else:
             logger.info(
