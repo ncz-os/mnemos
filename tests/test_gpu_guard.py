@@ -33,6 +33,7 @@ def _make(endpoint: str = "http://test:8000", **cfg) -> GPUGuard:
     merged = GuardConfig(
         failure_threshold=cfg.get("failure_threshold", base.failure_threshold),
         cooldown_seconds=cfg.get("cooldown_seconds", base.cooldown_seconds),
+        probe_timeout_seconds=cfg.get("probe_timeout_seconds", base.probe_timeout_seconds),
         log_throttle_seconds=cfg.get("log_throttle_seconds", base.log_throttle_seconds),
     )
     return GPUGuard(endpoint, config=merged)
@@ -44,7 +45,7 @@ def _make(endpoint: str = "http://test:8000", **cfg) -> GPUGuard:
 def test_initial_state_is_closed():
     guard = _make()
     assert guard.state is CircuitState.CLOSED
-    assert asyncio.run(guard.is_available()) is True
+    assert asyncio.run(guard.is_available())[0] is True
     assert guard.last_error is None
 
 
@@ -60,7 +61,7 @@ def test_threshold_failures_open_the_circuit():
 
     asyncio.run(drive())
     assert guard.state is CircuitState.OPEN
-    assert asyncio.run(guard.is_available()) is False
+    assert asyncio.run(guard.is_available())[0] is False
     assert guard.last_error is not None and "oops" in guard.last_error
 
 
@@ -73,7 +74,7 @@ def test_below_threshold_failures_stay_closed():
 
     asyncio.run(drive())
     assert guard.state is CircuitState.CLOSED
-    assert asyncio.run(guard.is_available()) is True
+    assert asyncio.run(guard.is_available())[0] is True
 
 
 def test_success_resets_failure_counter():
@@ -102,8 +103,8 @@ def test_cooldown_elapses_to_half_open():
         await guard.record_failure(RuntimeError("b"))
         assert guard.state is CircuitState.OPEN
         # After any elapsed time >= 0, is_available() triggers HALF_OPEN
-        available = await guard.is_available()
-        return available
+        admitted, _token = await guard.is_available()
+        return admitted
 
     assert asyncio.run(drive()) is True
     assert guard.state is CircuitState.HALF_OPEN
@@ -134,7 +135,7 @@ def test_half_open_failure_reopens_circuit():
         # Wait past the cooldown window so the next is_available()
         # transitions OPEN -> HALF_OPEN.
         await asyncio.sleep(0.15)
-        assert await guard.is_available() is True
+        assert (await guard.is_available())[0] is True
         assert guard.state is CircuitState.HALF_OPEN
         # Probe fails -> circuit re-opens with a FRESH cooldown window.
         await guard.record_failure(RuntimeError("probe failed"))
@@ -142,7 +143,7 @@ def test_half_open_failure_reopens_circuit():
     asyncio.run(drive())
     assert guard.state is CircuitState.OPEN
     # The fresh cooldown just started; is_available must still be False.
-    assert asyncio.run(guard.is_available()) is False
+    assert asyncio.run(guard.is_available())[0] is False
     assert "probe failed" in (guard.last_error or "")
 
 
@@ -156,7 +157,7 @@ def test_open_rejects_within_cooldown_window():
     async def drive():
         await guard.record_failure(RuntimeError("a"))
         await guard.record_failure(RuntimeError("b"))
-        return [await guard.is_available() for _ in range(3)]
+        return [(await guard.is_available())[0] for _ in range(3)]
 
     results = asyncio.run(drive())
     assert results == [False, False, False]
@@ -197,7 +198,7 @@ def test_reset_returns_to_closed():
     guard.reset()
     assert guard.state is CircuitState.CLOSED
     assert guard.last_error is None
-    assert asyncio.run(guard.is_available()) is True
+    assert asyncio.run(guard.is_available())[0] is True
 
 
 # ---- registry --------------------------------------------------------------
@@ -245,14 +246,15 @@ def test_half_open_admits_only_one_concurrent_probe():
         await guard.record_failure(RuntimeError("a"))
         await guard.record_failure(RuntimeError("b"))
         # First caller admitted as probe.
-        first = await guard.is_available()
+        first, first_token = await guard.is_available()
         # All subsequent callers rejected until probe resolves.
-        second = await guard.is_available()
-        third = await guard.is_available()
-        return first, second, third
+        second, _ = await guard.is_available()
+        third, _ = await guard.is_available()
+        return first, first_token, second, third
 
-    first, second, third = asyncio.run(drive())
+    first, first_token, second, third = asyncio.run(drive())
     assert first is True
+    assert isinstance(first_token, int) and first_token > 0
     assert second is False
     assert third is False
     assert guard.state is CircuitState.HALF_OPEN
@@ -288,7 +290,7 @@ def test_probe_failure_clears_in_flight_flag_and_reopens():
         await guard.record_failure(RuntimeError("a"))
         await guard.record_failure(RuntimeError("b"))
         await asyncio.sleep(0.1)  # cooldown elapses
-        assert await guard.is_available() is True  # probe admitted
+        assert (await guard.is_available())[0] is True  # probe admitted
         assert guard.snapshot()["probe_in_flight"] is True
         await guard.record_failure(RuntimeError("probe died"))
         # Circuit re-opened with FRESH cooldown; probe flag cleared.
@@ -296,34 +298,54 @@ def test_probe_failure_clears_in_flight_flag_and_reopens():
         assert snap["state"] == "open"
         assert snap["probe_in_flight"] is False
         # Within new cooldown, no admission.
-        assert await guard.is_available() is False
+        assert (await guard.is_available())[0] is False
 
     asyncio.run(drive())
 
 
-def test_abandoned_probe_stays_wedged_until_reset():
-    """If a probe caller crashes/is cancelled without recording
-    success/failure, the circuit stays HALF_OPEN with probe_in_flight
-    set. This is deliberate: auto-admitting a replacement probe would
-    create a race where the abandoned caller's late completion
-    pollutes shared state relative to the replacement's result (no
-    probe-identity handshake in v3.1). Operators recover with reset().
+def test_abandoned_probe_admits_replacement_after_timeout():
+    """v3.2: probe-identity handshake makes auto-replacement safe.
+    If a probe caller crashes/is cancelled without recording a result,
+    the next is_available() after `probe_timeout_seconds` admits a
+    replacement probe with a FRESH token. A late record_* call from
+    the abandoned probe carries the stale token and is discarded.
     """
-    guard = _make(failure_threshold=2, cooldown_seconds=0.05)
+    guard = _make(
+        failure_threshold=2,
+        cooldown_seconds=0.05,
+        probe_timeout_seconds=0.1,
+    )
 
     async def drive():
         await guard.record_failure(RuntimeError("a"))
         await guard.record_failure(RuntimeError("b"))
         await asyncio.sleep(0.1)  # cooldown to reach HALF_OPEN
-        # First probe admitted, caller then simulates crash (no record).
-        assert await guard.is_available() is True
-        # Subsequent callers rejected indefinitely.
-        for _ in range(5):
-            assert await guard.is_available() is False
-            await asyncio.sleep(0.05)
-        # Only reset() unsticks it.
-        guard.reset()
-        assert await guard.is_available() is True
+        # First probe admitted.
+        admitted_a, token_a = await guard.is_available()
+        assert admitted_a is True
+
+        # Concurrent caller during probe window: rejected.
+        rejected, rejected_token = await guard.is_available()
+        assert rejected is False
+        assert rejected_token is None
+
+        # Wait past probe_timeout_seconds without reporting.
+        await asyncio.sleep(0.15)
+
+        # Replacement probe admitted with a FRESH token.
+        admitted_b, token_b = await guard.is_available()
+        assert admitted_b is True
+        assert token_b != token_a
+
+        # The original probe's late success arrives. Token is stale;
+        # call is discarded, circuit stays HALF_OPEN.
+        await guard.record_success(probe_token=token_a)
+        assert guard.state is CircuitState.HALF_OPEN
+
+        # The replacement probe's success with the current token
+        # closes the circuit as intended.
+        await guard.record_success(probe_token=token_b)
+        assert guard.state is CircuitState.CLOSED
 
     asyncio.run(drive())
 
@@ -347,3 +369,140 @@ def test_reset_clears_probe_flags():
     assert snap["probe_in_flight"] is False
     assert snap["probe_started_at"] is None
     assert snap["state"] == "closed"
+
+
+# ---- probe-identity handshake (v3.2) ---------------------------------------
+
+
+def test_is_available_returns_token_on_half_open_admission():
+    """First admission after cooldown returns a monotonically
+    increasing non-zero token. Rejected callers get None."""
+    guard = _make(failure_threshold=2, cooldown_seconds=0.0)
+
+    async def drive():
+        await guard.record_failure(RuntimeError("a"))
+        await guard.record_failure(RuntimeError("b"))
+        admitted, token = await guard.is_available()
+        rejected, no_token = await guard.is_available()
+        return admitted, token, rejected, no_token
+
+    admitted, token, rejected, no_token = asyncio.run(drive())
+    assert admitted is True
+    assert isinstance(token, int) and token > 0
+    assert rejected is False
+    assert no_token is None
+
+
+def test_closed_state_admission_returns_no_token():
+    """CLOSED callers don't need a token — they're not probes."""
+    guard = _make()
+
+    async def drive():
+        return await guard.is_available()
+
+    admitted, token = asyncio.run(drive())
+    assert admitted is True
+    assert token is None
+
+
+def test_stale_probe_success_discarded():
+    """A late record_success from an abandoned probe carries a stale
+    token; the call must NOT close the circuit if a replacement probe
+    is already in flight.
+    """
+    guard = _make(failure_threshold=2, cooldown_seconds=0.0, probe_timeout_seconds=0.05)
+
+    async def drive():
+        await guard.record_failure(RuntimeError("a"))
+        await guard.record_failure(RuntimeError("b"))
+        _, stale_token = await guard.is_available()
+        await asyncio.sleep(0.1)  # past probe_timeout
+        # Replacement probe admitted; stale token is now invalid.
+        _, fresh_token = await guard.is_available()
+        assert stale_token != fresh_token
+
+        # Stale caller finally reports success — must be discarded.
+        await guard.record_success(probe_token=stale_token)
+        # Circuit still HALF_OPEN because the fresh probe hasn't resolved.
+        assert guard.state is CircuitState.HALF_OPEN
+
+    asyncio.run(drive())
+
+
+def test_stale_probe_failure_discarded():
+    """Mirror of success test: a late record_failure from an abandoned
+    probe must not re-open a circuit that the replacement probe already
+    closed."""
+    guard = _make(failure_threshold=2, cooldown_seconds=0.0, probe_timeout_seconds=0.05)
+
+    async def drive():
+        await guard.record_failure(RuntimeError("a"))
+        await guard.record_failure(RuntimeError("b"))
+        _, stale_token = await guard.is_available()
+        await asyncio.sleep(0.1)
+        _, fresh_token = await guard.is_available()
+        # Replacement probe succeeds; circuit closes.
+        await guard.record_success(probe_token=fresh_token)
+        assert guard.state is CircuitState.CLOSED
+
+        # Stale caller's late failure arrives. Must NOT re-open.
+        await guard.record_failure(
+            RuntimeError("stale failure"), probe_token=stale_token,
+        )
+        assert guard.state is CircuitState.CLOSED
+
+    asyncio.run(drive())
+
+
+def test_record_without_token_keeps_legacy_behavior():
+    """A caller that doesn't opt into the identity handshake (passes
+    no probe_token) still affects the state — legacy compatibility."""
+    guard = _make(failure_threshold=2, cooldown_seconds=0.0)
+
+    async def drive():
+        await guard.record_failure(RuntimeError("a"))
+        await guard.record_failure(RuntimeError("b"))
+        admitted, token = await guard.is_available()
+        assert admitted is True
+        # Record without the token — still closes the circuit
+        await guard.record_success()
+
+    asyncio.run(drive())
+    assert guard.state is CircuitState.CLOSED
+
+
+def test_reset_invalidates_outstanding_probe_token():
+    """reset() must advance the token so any in-flight record_* with
+    the old token is discarded after operator intervention."""
+    guard = _make(failure_threshold=2, cooldown_seconds=0.0)
+
+    async def drive():
+        await guard.record_failure(RuntimeError("a"))
+        await guard.record_failure(RuntimeError("b"))
+        _, token_pre_reset = await guard.is_available()
+        # Operator intervenes.
+        guard.reset()
+        # Old caller returns with success using the pre-reset token.
+        await guard.record_success(probe_token=token_pre_reset)
+        # Circuit stays CLOSED (reset's target) — the stale record is
+        # discarded by the token check, not actioned.
+        assert guard.state is CircuitState.CLOSED
+
+    asyncio.run(drive())
+
+
+def test_snapshot_exposes_probe_token():
+    """Operators reading the snapshot JSON get both the derived
+    `probe_in_flight` bool and the underlying `probe_token` int.
+    """
+    guard = _make(failure_threshold=2, cooldown_seconds=0.0)
+
+    async def drive():
+        await guard.record_failure(RuntimeError("a"))
+        await guard.record_failure(RuntimeError("b"))
+        await guard.is_available()  # admit probe
+
+    asyncio.run(drive())
+    snap = guard.snapshot()
+    assert snap["probe_in_flight"] is True
+    assert isinstance(snap["probe_token"], int) and snap["probe_token"] > 0

@@ -354,7 +354,8 @@ class ANAMNESISEngine(CompressionEngine):
         category = self._resolve_category(request)
         original_tokens = len(request.content.split())
         guard = get_guard(self._core.gpu_url)
-        if not await guard.is_available():
+        admitted, probe_token = await guard.is_available()
+        if not admitted:
             elapsed = int((time.perf_counter() - started) * 1000)
             return CompressionResult(
                 engine_id=self.id,
@@ -382,7 +383,7 @@ class ANAMNESISEngine(CompressionEngine):
             logger.exception(
                 "ANAMNESISEngine.compress raised for %s", request.memory_id
             )
-            await guard.record_failure(exc)
+            await guard.record_failure(exc, probe_token=probe_token)
             return CompressionResult(
                 engine_id=self.id,
                 engine_version=self.version,
