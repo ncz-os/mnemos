@@ -283,7 +283,8 @@ class ALETHEIAEngine(CompressionEngine):
     async def compress(self, request: CompressionRequest) -> CompressionResult:
         started = time.perf_counter()
         guard = get_guard(self._core.gpu_url)
-        if not await guard.is_available():
+        admitted, probe_token = await guard.is_available()
+        if not admitted:
             elapsed = int((time.perf_counter() - started) * 1000)
             return CompressionResult(
                 engine_id=self.id,
@@ -308,7 +309,7 @@ class ALETHEIAEngine(CompressionEngine):
         except Exception as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
             logger.exception("ALETHEIAEngine.compress raised for %s", request.memory_id)
-            await guard.record_failure(exc)
+            await guard.record_failure(exc, probe_token=probe_token)
             return CompressionResult(
                 engine_id=self.id,
                 engine_version=self.version,
@@ -322,7 +323,7 @@ class ALETHEIAEngine(CompressionEngine):
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         err = core_out.get("error")
         if err is not None:
-            await guard.record_failure(None)
+            await guard.record_failure(None, probe_token=probe_token)
             return CompressionResult(
                 engine_id=self.id,
                 engine_version=self.version,
@@ -334,7 +335,7 @@ class ALETHEIAEngine(CompressionEngine):
                 error=err,
             )
 
-        await guard.record_success()
+        await guard.record_success(probe_token=probe_token)
         return CompressionResult(
             engine_id=self.id,
             engine_version=self.version,

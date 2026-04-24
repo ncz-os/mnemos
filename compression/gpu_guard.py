@@ -73,7 +73,7 @@ import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,13 @@ class GuardConfig:
 
     failure_threshold: int = 3
     cooldown_seconds: float = 30.0
+    # Upper bound on how long a HALF_OPEN probe can be in flight before
+    # the guard treats it as abandoned and admits a replacement (v3.2
+    # probe-identity handshake). Default 120s is roomy above realistic
+    # GPU handler timeouts (~30s). A late completion from an abandoned
+    # probe will have a stale token and be ignored by record_* calls,
+    # so auto-replacement is safe.
+    probe_timeout_seconds: float = 120.0
     # Minimum time between state-transition log messages. Prevents log
     # floods when many concurrent tasks hit a recently-opened circuit.
     log_throttle_seconds: float = 5.0
@@ -110,19 +117,26 @@ class GPUGuard:
     compute the cooldown-elapsed check atomically with a possible
     state transition to HALF_OPEN.
 
-    Intended usage from an engine's compress() method:
+    Intended usage from an engine's compress() method (v3.2 shape,
+    probe-identity handshake):
 
         guard = get_guard(self._core.gpu_url)
-        if not await guard.is_available():
+        admitted, probe_token = await guard.is_available()
+        if not admitted:
             return CompressionResult(... error="gpu_guard: circuit open ...")
         try:
             result = await self._core.extract_facts(...)
         except Exception as exc:
-            await guard.record_failure(exc)
+            await guard.record_failure(exc, probe_token=probe_token)
             raise
         else:
-            await guard.record_success()
+            await guard.record_success(probe_token=probe_token)
             return result
+
+    `probe_token` is None for CLOSED-state admissions and an opaque
+    integer when the caller was admitted as a probe in HALF_OPEN.
+    Callers that don't pass the token on record_* calls keep legacy
+    behavior — the token check is an opt-in identity guard.
     """
 
     def __init__(
@@ -137,11 +151,14 @@ class GPUGuard:
         self._opened_at: Optional[float] = None
         self._last_log_at: float = 0.0
         self._last_error: Optional[str] = None
-        # Single-probe coordination: when the circuit transitions
-        # OPEN -> HALF_OPEN, exactly one concurrent caller is admitted
-        # as the probe. Subsequent concurrent callers see
-        # _probe_in_flight and fast-fail until the probe resolves.
-        self._probe_in_flight: bool = False
+        # Single-probe coordination. `_probe_token` is a monotonically
+        # increasing generation counter that advances every time a new
+        # probe is admitted. The admitted caller receives the current
+        # token; subsequent record_* calls must pass the same token
+        # or they're discarded as "stale probe" — this is the v3.2
+        # identity handshake that makes auto-replacement of an
+        # abandoned probe safe.
+        self._probe_token: int = 0
         self._probe_started_at: Optional[float] = None
         self._lock = asyncio.Lock()
 
@@ -153,19 +170,27 @@ class GPUGuard:
     def last_error(self) -> Optional[str]:
         return self._last_error
 
-    async def is_available(self) -> bool:
-        """True if the caller may proceed with a request.
+    async def is_available(self) -> Tuple[bool, Optional[int]]:
+        """Admission check. Returns (admitted, probe_token).
+
+          admitted     — True if the caller may proceed.
+          probe_token  — Opaque identity for HALF_OPEN probe admissions
+                         (pass back to record_success / record_failure).
+                         None for CLOSED-state admissions and for
+                         rejected callers.
 
         State-dependent admission:
-          * CLOSED:    always admit.
+          * CLOSED:    always admit, probe_token=None.
           * OPEN:      admit iff cooldown has elapsed (the admitted
-                       caller becomes the probe; state transitions to
-                       HALF_OPEN).
-          * HALF_OPEN: admit iff no probe currently in flight
-                       (single-probe guarantee) OR the prior probe
-                       has been "in flight" longer than
-                       `cooldown_seconds` (caller abandoned — admit a
-                       fresh probe).
+                       caller becomes a probe; state transitions to
+                       HALF_OPEN; probe_token advances and is
+                       returned).
+          * HALF_OPEN: admit iff no probe currently in flight, OR
+                       the prior probe has been in flight longer than
+                       `probe_timeout_seconds` — in which case the
+                       token advances (invalidating the stale probe's
+                       identity) and the new caller becomes the
+                       replacement probe.
         """
         async with self._lock:
             now = time.monotonic()
@@ -174,69 +199,108 @@ class GPUGuard:
                 if self._opened_at is None:
                     # Shouldn't happen, but stay defensive.
                     self._state = CircuitState.HALF_OPEN
-                    self._probe_in_flight = True
+                    self._probe_token += 1
                     self._probe_started_at = now
-                    return True
+                    return True, self._probe_token
                 if now - self._opened_at >= self.config.cooldown_seconds:
                     self._state = CircuitState.HALF_OPEN
-                    self._probe_in_flight = True
+                    self._probe_token += 1
                     self._probe_started_at = now
                     self._log_throttled(
                         "circuit HALF_OPEN: probe request may now proceed "
-                        "against %s",
+                        "against %s (token=%d)",
                         self.endpoint,
+                        self._probe_token,
                     )
-                    return True
-                return False
+                    return True, self._probe_token
+                return False, None
 
             if self._state is CircuitState.HALF_OPEN:
-                if not self._probe_in_flight:
+                if self._probe_started_at is None:
                     # Probe slot is free (probe resolved via reset() or
-                    # the previous OPEN->HALF_OPEN transition never
-                    # stamped the flag; defensive path).
-                    self._probe_in_flight = True
+                    # defensive path through an unusual transition).
+                    self._probe_token += 1
                     self._probe_started_at = now
-                    return True
-                # A probe is in flight. Fast-fail the caller; the
-                # circuit admits exactly one probe until record_success
-                # / record_failure resolves it.
-                #
-                # If the probe caller crashed / was cancelled without
-                # recording a result, the circuit will stay HALF_OPEN
-                # indefinitely. Operators recover with reset() rather
-                # than auto-admitting a replacement probe: a late
-                # completion from the original caller would otherwise
-                # race with the replacement and pollute shared state
-                # without a probe-identity handshake (a v3.2 candidate;
-                # see Codex review 019dbc67 for the analysis).
-                return False
+                    return True, self._probe_token
+
+                # Probe is in flight. Admit a replacement only if the
+                # prior probe has been outstanding longer than the
+                # abandonment timeout — and advance the token so the
+                # stale probe's record_* calls become no-ops.
+                if (
+                    now - self._probe_started_at
+                    >= self.config.probe_timeout_seconds
+                ):
+                    stale_token = self._probe_token
+                    self._probe_token += 1
+                    self._probe_started_at = now
+                    logger.warning(
+                        "gpu_guard[%s]: prior probe abandoned (token=%d -> "
+                        "%d), admitting replacement",
+                        self.endpoint, stale_token, self._probe_token,
+                    )
+                    return True, self._probe_token
+
+                # Single-probe guarantee: reject concurrent callers
+                # while a probe is still within its window.
+                return False, None
 
             # CLOSED
-            return True
+            return True, None
 
-    async def record_success(self) -> None:
+    async def record_success(self, probe_token: Optional[int] = None) -> None:
         """Note a successful request. Resets failure counter; if the
-        circuit was HALF_OPEN, transitions back to CLOSED. Clears the
-        single-probe in-flight flag so future OPEN -> HALF_OPEN
-        transitions can admit a new probe."""
+        circuit was HALF_OPEN, transitions back to CLOSED.
+
+        `probe_token` opts into the v3.2 identity handshake. When
+        supplied, the call is a no-op unless the token matches the
+        guard's current generation — late completions from abandoned
+        probes carry a stale token and can't pollute the replacement
+        probe's resolution. Callers that pass None keep legacy
+        behavior (any success counts).
+        """
         async with self._lock:
+            if probe_token is not None and probe_token != self._probe_token:
+                logger.debug(
+                    "gpu_guard[%s]: discarding stale probe success "
+                    "(token=%d, current=%d)",
+                    self.endpoint, probe_token, self._probe_token,
+                )
+                return
+
             if self._state is CircuitState.HALF_OPEN:
                 logger.info(
-                    "gpu_guard[%s]: probe succeeded, circuit CLOSED",
-                    self.endpoint,
+                    "gpu_guard[%s]: probe succeeded, circuit CLOSED (token=%d)",
+                    self.endpoint, self._probe_token,
                 )
                 self._state = CircuitState.CLOSED
             self._consecutive_failures = 0
             self._opened_at = None
             self._last_error = None
-            self._probe_in_flight = False
             self._probe_started_at = None
 
-    async def record_failure(self, exc: Optional[BaseException] = None) -> None:
+    async def record_failure(
+        self,
+        exc: Optional[BaseException] = None,
+        probe_token: Optional[int] = None,
+    ) -> None:
         """Note a failure. Increments the failure counter; if the counter
         crosses the threshold (or if we were HALF_OPEN), OPEN the circuit.
-        Clears the single-probe in-flight flag on HALF_OPEN resolution."""
+
+        `probe_token` opts into the v3.2 identity handshake — see
+        record_success for details. A stale token discards the call so
+        a late failure from an abandoned probe can't re-open a circuit
+        that the replacement probe already closed.
+        """
         async with self._lock:
+            if probe_token is not None and probe_token != self._probe_token:
+                logger.debug(
+                    "gpu_guard[%s]: discarding stale probe failure "
+                    "(token=%d, current=%d)",
+                    self.endpoint, probe_token, self._probe_token,
+                )
+                return
+
             self._last_error = (
                 f"{type(exc).__name__}: {exc}" if exc is not None else "unspecified"
             )
@@ -245,7 +309,6 @@ class GPUGuard:
                 # Probe failed — immediately re-open for another cooldown window.
                 self._opened_at = time.monotonic()
                 self._state = CircuitState.OPEN
-                self._probe_in_flight = False
                 self._probe_started_at = None
                 logger.warning(
                     "gpu_guard[%s]: probe failed, circuit re-OPEN (%s)",
@@ -276,26 +339,37 @@ class GPUGuard:
             self._last_log_at = now
 
     def snapshot(self) -> Dict[str, object]:
-        """Diagnostic snapshot for the manifest-read endpoint / admin UI."""
+        """Diagnostic snapshot for the manifest-read endpoint / admin UI.
+
+        `probe_in_flight` is a derived boolean for operators reading
+        the snapshot JSON: true iff a probe token has been issued and
+        not yet resolved. `probe_token` and `probe_started_at` are the
+        underlying fields — exposed for ops debugging of the identity
+        handshake.
+        """
         return {
             "endpoint": self.endpoint,
             "state": self._state.value,
             "consecutive_failures": self._consecutive_failures,
             "opened_at": self._opened_at,
             "last_error": self._last_error,
-            "probe_in_flight": self._probe_in_flight,
+            "probe_in_flight": self._probe_started_at is not None,
+            "probe_token": self._probe_token,
             "probe_started_at": self._probe_started_at,
         }
 
     def reset(self) -> None:
         """Force the circuit back to CLOSED. Operator escape hatch — not
         used by engine code. Synchronous; caller is responsible for
-        coordinating with in-flight requests."""
+        coordinating with in-flight requests.
+
+        Advances the probe token so any in-flight record_* call with
+        the old token is discarded."""
         self._state = CircuitState.CLOSED
         self._consecutive_failures = 0
         self._opened_at = None
         self._last_error = None
-        self._probe_in_flight = False
+        self._probe_token += 1  # invalidate any outstanding probe
         self._probe_started_at = None
 
 
