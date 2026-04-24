@@ -284,6 +284,12 @@ class UserCreateRequest(BaseModel):
     display_name: str
     email: Optional[str] = None
     role: str = "user"  # "user" or "root"
+    # Per-user tenancy namespace. v3.2 added users.namespace (2aa41ea)
+    # and wired non-root reads to filter on it; the admin provisioning
+    # API still silently defaulted every new user to 'default' which
+    # collapsed multi-tenant installs. Operators now set this at
+    # create-time.
+    namespace: str = "default"
 
 
 class UserResponse(BaseModel):
@@ -292,6 +298,7 @@ class UserResponse(BaseModel):
     display_name: str
     email: Optional[str] = None
     role: str
+    namespace: str
     created_at: str
 
 

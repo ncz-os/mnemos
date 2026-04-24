@@ -46,15 +46,18 @@ async def create_user(
         if existing:
             raise HTTPException(status_code=409, detail=f"User '{request.id}' already exists")
         row = await conn.fetchrow(
-            "INSERT INTO users (id, display_name, email, role) "
-            "VALUES ($1, $2, $3, $4) RETURNING id, display_name, email, role, created_at",
+            "INSERT INTO users (id, display_name, email, role, namespace) "
+            "VALUES ($1, $2, $3, $4, $5) "
+            "RETURNING id, display_name, email, role, namespace, created_at",
             request.id, request.display_name, request.email, request.role,
+            request.namespace,
         )
     return UserResponse(
         id=row["id"],
         display_name=row["display_name"],
         email=row["email"],
         role=row["role"],
+        namespace=row["namespace"],
         created_at=row["created_at"].isoformat(),
     )
 
@@ -66,7 +69,8 @@ async def list_users(_: UserContext = Depends(require_root)):
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, display_name, email, role, created_at FROM users ORDER BY created_at"
+            "SELECT id, display_name, email, role, namespace, created_at "
+            "FROM users ORDER BY created_at"
         )
     return [
         UserResponse(
@@ -74,6 +78,7 @@ async def list_users(_: UserContext = Depends(require_root)):
             display_name=r["display_name"],
             email=r["email"],
             role=r["role"],
+            namespace=r["namespace"],
             created_at=r["created_at"].isoformat(),
         )
         for r in rows
