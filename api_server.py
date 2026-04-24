@@ -52,11 +52,19 @@ from api.observability import (  # noqa: E402
     RequestIDMiddleware,
     TracingMiddleware,
     install_log_correlation,
+    install_structured_logging,
     install_tracing,
     metrics_router,
 )
 install_log_correlation()
 install_tracing()  # no-op unless opentelemetry is installed
+# Structured JSON logs are OPT-IN via env var — enabling changes
+# every log line's shape and would break operators whose log
+# parsers expect the default format. Without `structlog` installed,
+# or without the env flag set, the standard formatter (with
+# [req:<id>]) is used.
+if os.getenv("MNEMOS_STRUCTURED_LOGS", "").lower() in ("1", "true", "yes"):
+    install_structured_logging()
 
 app = FastAPI(title="MNEMOS API", version="3.1.0", description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway", lifespan=lifespan)
 

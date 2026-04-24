@@ -41,6 +41,8 @@ from typing import Awaitable, Callable, Optional
 
 from fastapi import APIRouter
 from starlette.middleware.base import BaseHTTPMiddleware
+
+logger = logging.getLogger(__name__)
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -69,6 +71,14 @@ except ImportError:  # pragma: no cover
     Resource = None
     TracerProvider = None
     BatchSpanProcessor = None
+
+try:  # Soft-optional — if structlog isn't installed, install_structured_logging
+      # is a no-op and logs stay in the human-readable format.
+    import structlog
+    _STRUCTLOG_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _STRUCTLOG_AVAILABLE = False
+    structlog = None
 
 
 # The header name operators see and can override from upstream proxies.
@@ -436,6 +446,95 @@ class TracingMiddleware(BaseHTTPMiddleware):
                 span.set_attribute("http.status_code", status_code)
 
 
+# ─── structlog JSON rendering (v3.2 observability slice 4) ────────────────
+
+_STRUCTLOG_INSTALLED: bool = False
+
+
+def _structlog_add_request_id(_logger, _method, event_dict):
+    """structlog processor: inject the bound request_id onto every
+    record. Runs after standard logging's LoggerAdapter so
+    request_id is already set by _RequestIDLogFilter, but the
+    processor also handles the case where structlog is used
+    directly (not via standard logging) by reading from our
+    ContextVar."""
+    if "request_id" not in event_dict:
+        rid = current_request_id()
+        if rid:
+            event_dict["request_id"] = rid
+        else:
+            event_dict["request_id"] = "-"
+    return event_dict
+
+
+def install_structured_logging(
+    *,
+    stream: Optional[object] = None,
+) -> None:
+    """Switch log rendering to JSON via structlog.
+
+    No-op when `structlog` isn't installed. When it is, this:
+
+      * Configures structlog's render chain to emit JSON.
+      * Replaces every root handler's formatter with one that
+        delegates to structlog's ProcessorFormatter, so code using
+        plain `logging.getLogger(...)` ALSO produces JSON.
+      * Registers `_structlog_add_request_id` as a processor so
+        every event carries the request_id from our ContextVar.
+
+    Intended call site: operators who want structured log output
+    for a collector (Loki, Elasticsearch, Datadog). They import
+    and invoke at startup; no env-var magic — it's an explicit opt-in.
+    """
+    global _STRUCTLOG_INSTALLED
+
+    if _STRUCTLOG_INSTALLED:
+        return
+
+    if not _STRUCTLOG_AVAILABLE:
+        logger.info(
+            "[observability] structlog not installed; "
+            "install_structured_logging is a no-op"
+        )
+        _STRUCTLOG_INSTALLED = True
+        return
+
+    timestamper = structlog.processors.TimeStamper(fmt="iso", utc=True)
+
+    shared_processors = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        _structlog_add_request_id,
+        timestamper,
+    ]
+
+    structlog.configure(
+        processors=[
+            *shared_processors,
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+
+    # Pipe standard-logging records through structlog's formatter so
+    # legacy `logger.info(...)` call sites also render as JSON.
+    formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=shared_processors,
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            structlog.processors.JSONRenderer(),
+        ],
+    )
+
+    root = logging.getLogger()
+    for handler in root.handlers:
+        handler.setFormatter(formatter)
+
+    _STRUCTLOG_INSTALLED = True
+
+
 __all__ = [
     "REQUEST_ID_HEADER",
     "RequestIDMiddleware",
@@ -443,6 +542,7 @@ __all__ = [
     "TracingMiddleware",
     "current_request_id",
     "install_log_correlation",
+    "install_structured_logging",
     "install_tracing",
     "metrics_router",
     "HTTP_REQUESTS_TOTAL",

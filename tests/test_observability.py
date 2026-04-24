@@ -423,3 +423,108 @@ def test_tracing_middleware_passthrough_when_otel_missing(monkeypatch):
     resp = client.get("/ok")
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
+
+
+# ---- structlog JSON rendering (v3.2 observability slice 4) ----------------
+
+
+def test_install_structured_logging_is_idempotent():
+    """Calling install_structured_logging twice is a no-op on the
+    second invocation. Prevents double-install when a dev-server
+    reloads and re-imports the module."""
+    pytest.importorskip("structlog")
+    from api.observability import install_structured_logging
+    import api.observability as obs
+
+    obs._STRUCTLOG_INSTALLED = False  # reset so first call does work
+    install_structured_logging()
+    assert obs._STRUCTLOG_INSTALLED is True
+    # Second call no-ops
+    install_structured_logging()
+    assert obs._STRUCTLOG_INSTALLED is True
+
+
+def test_install_structured_logging_noop_when_structlog_missing(monkeypatch):
+    """If structlog isn't installed, install_structured_logging
+    doesn't raise — it logs + returns. Matches the soft-optional
+    contract for OTel and prometheus_client."""
+    import api.observability as obs
+
+    monkeypatch.setattr(obs, "_STRUCTLOG_AVAILABLE", False)
+    obs._STRUCTLOG_INSTALLED = False
+
+    # Must not raise
+    obs.install_structured_logging()
+    assert obs._STRUCTLOG_INSTALLED is True
+
+
+def test_structured_logging_renders_json_with_request_id(caplog):
+    """When structured logging is active AND a request_id is bound,
+    the emitted log line carries that request_id in the event dict.
+    We read the formatter's output via caplog — if it's valid JSON
+    and contains request_id + event, the pipeline is wired."""
+    pytest.importorskip("structlog")
+
+    import json as _json
+    import logging as _logging
+
+    from api.observability import (
+        install_structured_logging,
+        _request_id_ctx,
+    )
+    import api.observability as obs
+
+    # Force a clean install
+    obs._STRUCTLOG_INSTALLED = False
+    install_structured_logging()
+
+    root = _logging.getLogger()
+    # Find a handler with the structlog formatter to capture its
+    # output. We add a dedicated StreamHandler with the same formatter
+    # and a StringIO buffer so we can assert on the rendered text.
+    import io
+    import structlog as _structlog
+
+    buf = io.StringIO()
+    capture_handler = _logging.StreamHandler(buf)
+    # The formatter installed on existing handlers is the structlog
+    # ProcessorFormatter; reuse one from an existing root handler.
+    existing_fmt = next(
+        (h.formatter for h in root.handlers if h.formatter is not None),
+        None,
+    )
+    if existing_fmt is None:
+        pytest.skip("no formatter attached to root — structlog setup raced")
+    capture_handler.setFormatter(existing_fmt)
+    capture_handler.setLevel(_logging.INFO)
+    root.addHandler(capture_handler)
+
+    try:
+        token = _request_id_ctx.set("struct-rid-abc")
+        try:
+            test_logger = _logging.getLogger("mnemos.test.struct")
+            test_logger.setLevel(_logging.INFO)
+            # Ensure root level permits INFO in case basicConfig
+            # locked it at WARNING from a prior test.
+            root.setLevel(_logging.INFO)
+            test_logger.info("hello structured world")
+            capture_handler.flush()
+        finally:
+            _request_id_ctx.reset(token)
+    finally:
+        root.removeHandler(capture_handler)
+
+    output = buf.getvalue().strip()
+    # Output is JSON. Parse and assert the expected fields.
+    # structlog ProcessorFormatter may emit trailing newline per record.
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parsed = _json.loads(line)
+        if parsed.get("event") == "hello structured world":
+            assert parsed["request_id"] == "struct-rid-abc"
+            assert "timestamp" in parsed
+            assert parsed.get("level", "").lower() == "info"
+            break
+    else:
+        pytest.fail(f"expected log event not found in rendered output: {output!r}")

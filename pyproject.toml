@@ -60,6 +60,12 @@ tracing = [
   "opentelemetry-sdk>=1.27.0",
   "opentelemetry-exporter-otlp-proto-http>=1.27.0",
 ]
+# Structured JSON log rendering via structlog. Enables
+# MNEMOS_STRUCTURED_LOGS=true at runtime to opt in. Without this
+# extra, install_structured_logging() is a no-op.
+structlog = [
+  "structlog>=25.0.0",
+]
 full = ["sentence-transformers>=2.7.0", "spacy>=3.7.0", "networkx>=3.3"]
 # Note: the `phi` extras are optional GPU-dependent OpenVINO/FastEmbed support. Most installs don't need it.
 phi = ["openvino-genai>=2024.4.0", "fastembed>=0.3.0"]
