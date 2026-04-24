@@ -124,10 +124,16 @@ async def _search_mnemos_context(query: str, user: UserContext, limit: int = 5) 
                     limit,
                 )
             else:
+                # v3.2 H1 fix: federated memories carry owner_id='federation'.
+                # Include them alongside the caller's own rows so gateway
+                # context injection surfaces knowledge pulled from peers.
+                # Mutation paths keep the owner_id=$1 hard filter so
+                # federated rows aren't writable by non-root.
                 memories = await conn.fetch(
                     """
                     SELECT id, content, category FROM memories
-                    WHERE owner_id = $1 AND namespace = $2
+                    WHERE (owner_id = $1 OR federation_source IS NOT NULL)
+                      AND namespace = $2
                     AND (
                         to_tsvector('english', content) @@ plainto_tsquery('english', $3)
                         OR category IN ('solutions', 'patterns', 'decisions', 'infrastructure')

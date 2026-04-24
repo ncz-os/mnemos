@@ -305,16 +305,32 @@ class GraeaeEngine:
         if any(r["status"] == "success" for r in all_responses.values()):
             self._cache.set(prompt, cache_key_task, all_responses)
 
-        return {"all_responses": all_responses}
+        # ── Compute consensus fields (v3.2) ──────────────────────────────────
+        # ConsultationResponse has exposed consensus_response,
+        # consensus_score, winning_muse, cost, latency_ms since v3.0
+        # but the engine only emitted all_responses; consultation_id
+        # callers saw all five as None. Compute them here from
+        # all_responses so the contract is honored instead of
+        # aspirational.
+        consensus = _compute_consensus(all_responses)
+        return {"all_responses": all_responses, **consensus}
 
     async def route(
         self, provider: str, model: str, prompt: str, task_type: str = "reasoning", timeout: int = 30
     ) -> Dict:
-        """Single-provider pass-through (no consensus, no eligibility gates).
+        """Single-provider pass-through — consensus skipped, eligibility
+        gates applied.
 
-        Used by MNEMOS gateway for explicit model selection or fallback.
-        Does NOT apply circuit breakers, rate limiters, or concurrency guards —
-        caller is responsible for load management.
+        Used by MNEMOS gateway (`/v1/chat/completions`) for explicit
+        model selection. Before v3.2 this path deliberately skipped
+        the reliability stack "caller responsible for load management";
+        operators pointed out that the gateway was effectively the
+        weakest surface of the service because openai_compat did not
+        actually implement any load management. v3.2 closes that gap:
+        the circuit breaker, rate limiter, and concurrency guard are
+        applied here exactly as they are in consult(), so one
+        misbehaving provider can't take down the gateway while
+        consultations keep working.
 
         Args:
             provider: Provider name (must exist in self.providers)
@@ -324,7 +340,7 @@ class GraeaeEngine:
             timeout: Request timeout in seconds
 
         Returns:
-            Dict with status, response_text, latency_ms, model_id
+            Dict with status, response_text, latency_ms, model_id, error
         """
         if provider not in self.providers:
             logger.warning(f"[GRAEAE] unknown provider '{provider}' — returning unavailable")
@@ -359,16 +375,54 @@ class GraeaeEngine:
                 ),
             )
 
-        try:
-            result = await self._query_provider(provider, prompt, task_type, timeout)
-            logger.debug(f"[GRAEAE] route({provider}, {model or 'default'}) → {result['status']}")
-            return result
-        except Exception as e:
-            logger.error(f"[GRAEAE] route({provider}) failed: {e}")
+        # v3.2 reliability gate: circuit-breaker → rate-limiter →
+        # concurrency. Mirrors the consult() eligibility loop so
+        # gateway traffic is first-class not second-class.
+        if not self._circuit_breakers.is_allowed(provider):
+            logger.info("[GRAEAE] route(%s) refused: circuit open", provider)
             return _unavailable(
                 provider_config["model"],
-                error=f"{type(e).__name__}: {e}",
+                error=f"provider '{provider}' circuit open",
             )
+        if not self._rate_limiters.is_allowed(provider):
+            logger.info("[GRAEAE] route(%s) refused: rate limited", provider)
+            return _unavailable(
+                provider_config["model"],
+                error=f"provider '{provider}' rate-limited",
+            )
+        concurrency = self._get_concurrency()
+        if not await concurrency.acquire(provider):
+            logger.info("[GRAEAE] route(%s) refused: concurrency saturated", provider)
+            return _unavailable(
+                provider_config["model"],
+                error=f"provider '{provider}' concurrency saturated",
+            )
+
+        try:
+            try:
+                result = await self._query_provider(provider, prompt, task_type, timeout)
+            except Exception as e:
+                # Record the failure against the breaker so repeated
+                # gateway-path failures actually trip it, and quality
+                # tracker so the weight reflects reality.
+                self._circuit_breakers.record_failure(provider)
+                self._quality.record_failure(provider)
+                logger.error(f"[GRAEAE] route({provider}) failed: {e}")
+                return _unavailable(
+                    provider_config["model"],
+                    error=f"{type(e).__name__}: {e}",
+                )
+            # Success path — credit the breaker + quality tracker so
+            # the gateway's successes count toward reopening a
+            # half-open circuit, not just consultations' successes.
+            self._circuit_breakers.record_success(provider)
+            self._quality.record_success(provider, result.get("latency_ms", 0))
+            logger.debug(
+                f"[GRAEAE] route({provider}, {model or 'default'}) → {result['status']}"
+            )
+            return result
+        finally:
+            concurrency.release(provider)
 
     async def _query_provider(
         self, provider_name: str, prompt: str, task_type: str, timeout: int
@@ -486,6 +540,62 @@ class GraeaeEngine:
         if self._concurrency:
             status["concurrency"] = self._concurrency.status()
         return status
+
+
+def _compute_consensus(all_responses: Dict[str, Dict]) -> Dict:
+    """Roll up per-provider responses into consensus fields.
+
+    Emits:
+      consensus_response — text of the highest-scoring successful
+                           provider (winning muse). Empty string if
+                           no provider succeeded.
+      consensus_score    — the winner's final_score, or 0.0.
+      winning_muse       — the provider name of the winner, or None.
+      cost               — sum of per-provider `cost` fields (0.0
+                           when a provider didn't report one). Matches
+                           the consultation-persist path's existing
+                           fallback that used the engine-reported cost
+                           when present.
+      latency_ms         — max latency across providers (parallel
+                           fan-out: wall-clock to all_responses is
+                           dominated by the slowest successful call).
+
+    Contract: returns ALL keys even when there's no winner so callers
+    never have to check for "field present" vs "field set". A
+    no-winner consultation has consensus_response="", consensus_score=
+    0.0, winning_muse=None, cost=0.0, latency_ms=0.
+    """
+    successes = [
+        (name, resp)
+        for name, resp in all_responses.items()
+        if resp.get("status") == "success"
+    ]
+    if successes:
+        winner_name, winner_resp = max(
+            successes, key=lambda kv: kv[1].get("final_score", 0.0)
+        )
+    else:
+        winner_name, winner_resp = None, None
+
+    total_cost = 0.0
+    for resp in all_responses.values():
+        c = resp.get("cost")
+        if isinstance(c, (int, float)):
+            total_cost += float(c)
+
+    latencies = [
+        int(resp.get("latency_ms", 0) or 0)
+        for resp in all_responses.values()
+    ]
+    max_latency = max(latencies) if latencies else 0
+
+    return {
+        "consensus_response": winner_resp.get("response_text", "") if winner_resp else "",
+        "consensus_score": float(winner_resp.get("final_score", 0.0)) if winner_resp else 0.0,
+        "winning_muse": winner_name,
+        "cost": total_cost,
+        "latency_ms": max_latency,
+    }
 
 
 def _selection_cache_tag(selection: Optional[Dict[str, Optional[str]]]) -> str:
