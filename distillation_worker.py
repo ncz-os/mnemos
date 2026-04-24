@@ -42,6 +42,7 @@ try:
     from compression.aletheia import ALETHEIAEngine  # deprecated — opt-in only
     from compression.anamnesis import ANAMNESISEngine
     from compression.apollo import APOLLOEngine
+    from compression.judge import LLMJudge, NullJudge
     from compression.worker_contest import process_contest_queue
     _CONTEST_AVAILABLE = True
 except Exception as _ce:
@@ -99,6 +100,18 @@ _APOLLO_ENABLED = os.getenv("MNEMOS_APOLLO_ENABLED", "true").lower() == "true"
 _APOLLO_LLM_FALLBACK_ENABLED = (
     os.getenv("MNEMOS_APOLLO_LLM_FALLBACK_ENABLED", "true").lower() == "true"
 )
+
+# Judge-LLM fidelity scoring (v3.3 S-II). When enabled, every
+# successful contest candidate gets its quality_score replaced by a
+# judge-rated fidelity score against the original memory. This is
+# what lets APOLLO's LLM fallback (currently pinned at 0.65) actually
+# win on fact-shaped content where its dense encoding preserves
+# meaning better than LETHE's extract. Off by default to match v3.2
+# behavior on upgrade; operators opt in per the judge's own GPU
+# cost profile. When on, the MNEMOS_JUDGE_MODEL env var stamps the
+# judge's id onto every scored candidate (default 'judge-default').
+_JUDGE_ENABLED = os.getenv("MNEMOS_JUDGE_ENABLED", "false").lower() == "true"
+_JUDGE_MODEL = os.getenv("MNEMOS_JUDGE_MODEL", "judge-default")
 
 # Stale-running sweep threshold (v3.1.1). Queue rows stuck in 'running'
 # longer than this are reclaimed at the top of each batch — reset to
@@ -166,6 +179,8 @@ class MemoryDistillationWorker:
         self._compression_engine = DistillationEngine() if _COMPRESSION_AVAILABLE else None
         # v3.1 contest engines — populated in start() once config is loaded
         self._contest_engines = []
+        # v3.3 S-II judge — populated alongside engines in start()
+        self._judge = None
         self.stats = {
             "processed": 0,
             "successful": 0,
@@ -202,10 +217,18 @@ class MemoryDistillationWorker:
                         enable_llm_fallback=_APOLLO_LLM_FALLBACK_ENABLED,
                     )
                 )
+            # Judge-LLM fidelity scoring (v3.3 S-II). LLMJudge when
+            # MNEMOS_JUDGE_ENABLED=true; NullJudge (no-op) otherwise.
+            # NullJudge keeps the contest using engine-self-reported
+            # scores — behavioral equivalent to pre-S-II.
+            if _JUDGE_ENABLED:
+                self._judge = LLMJudge(model_id=_JUDGE_MODEL)
+            else:
+                self._judge = NullJudge()
             engine_ids = [e.id for e in self._contest_engines]
             logger.info(
-                "[OK] contest path enabled (engines: %s)",
-                ", ".join(engine_ids),
+                "[OK] contest path enabled (engines: %s) judge=%s",
+                ", ".join(engine_ids), type(self._judge).__name__,
             )
             if _ALETHEIA_ENABLED:
                 logger.warning(
@@ -270,6 +293,8 @@ class MemoryDistillationWorker:
                 max_attempts=MAX_ATTEMPTS,
                 min_content_length=_CONTEST_MIN_CONTENT_LENGTH,
                 stale_threshold_secs=_CONTEST_STALE_THRESHOLD_SECS,
+                judge=self._judge,
+                judge_model=_JUDGE_MODEL if _JUDGE_ENABLED else None,
             )
             if counts:
                 logger.info("contest queue drain: %s", counts)
