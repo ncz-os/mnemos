@@ -278,11 +278,17 @@ def test_load_custom_invalid_toml_falls_back(caplog):
         # bad importance-score response fell back to empty content
         # with ratio=0.0 and would have otherwise scored 1.0):
         (0.0, 0.0),
-        (0.10, 0.0),             # below MIN_CHUNK_RATIO (0.15)
-        (0.14, 0.0),             # still below the floor
-        (0.15, 0.85),            # AT the floor: at the edge of the
-                                  # allowed band, still rewarded
-        (0.16, 0.84),            # just above the floor
+        # Floor set tight (0.001) so APOLLO's legitimate schema-dense
+        # encoding (~99% reduction, ratio 0.002-0.01) is not
+        # miscategorised as degenerate. Live PYTHIA contest
+        # 2026-04-24 found APOLLO 0-wins because ratio=0.002 hit
+        # the old 0.15 floor. Anything ≥ 0.001 is rewarded.
+        (0.0005, 0.0),           # below floor: empty / parse failure
+        (0.001, 0.999),          # AT floor: smallest real output
+        (0.005, 0.995),          # APOLLO's typical dense-encoding ratio
+        (0.14, 0.86),             # previously below old floor, now rewarded
+        (0.15, 0.85),             # operational sweet spot
+        (0.16, 0.84),             # just above (legacy sanity)
     ],
 )
 def test_ratio_term(ratio, expected):
