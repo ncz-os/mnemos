@@ -320,15 +320,38 @@ def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
 
 
 async def _get_embedding(text: str) -> list:
-    """Get embedding vector from nomic-embed-text on inference-server. Returns [] on failure."""
+    """Get embedding vector from nomic-embed-text. Returns [] on failure.
+
+    Accepts either wire format from the configured OLLAMA_EMBED_HOST:
+      * Ollama-compat /api/embeddings: {"prompt": ...} → {"embedding": [...]}
+        (phi_server.py fastembed, Ollama itself)
+      * OpenAI-compat /v1/embeddings: {"input": ...} →
+        {"data": [{"embedding": [...]}]} (llama.cpp server embeddings mode,
+        OpenAI, vLLM)
+
+    Tries OpenAI first (newer; faster llama.cpp SYCL path on PYTHIA),
+    falls through to Ollama on 404. Same model (nomic-embed-text-v1.5),
+    same 768-dim output — only the wire shape differs.
+    """
+    truncated = text[:2000]
     try:
         async with httpx.AsyncClient(timeout=_EMBED_TIMEOUT) as client:
             r = await client.post(
-                f"{_EMBED_HOST}/api/embeddings",
-                json={"model": _EMBED_MODEL, "prompt": text[:2000]},
+                f"{_EMBED_HOST}/v1/embeddings",
+                json={"model": _EMBED_MODEL, "input": truncated},
             )
+            if r.status_code == 404:
+                r = await client.post(
+                    f"{_EMBED_HOST}/api/embeddings",
+                    json={"model": _EMBED_MODEL, "prompt": truncated},
+                )
+                r.raise_for_status()
+                return r.json().get("embedding", [])
             r.raise_for_status()
-            return r.json().get("embedding", [])
+            data = r.json().get("data") or []
+            if data and isinstance(data[0], dict):
+                return data[0].get("embedding", [])
+            return []
     except Exception as e:
         logger.warning(f"[EMBED] Failed to get embedding: {e}")
         return []
