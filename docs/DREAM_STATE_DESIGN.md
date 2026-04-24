@@ -37,6 +37,60 @@ for new thought*.
 
 ---
 
+## 1a. Relationship to APOLLO — dreams ride on APOLLO's substrate
+
+APOLLO is the convergent half of the same architecture; dream state is
+the divergent half. Both sides share the bulk of their infrastructure,
+and dreams are *practical* only once APOLLO's later stages have
+landed. This is the headline dependency to capture before anything
+else in the design — every other section assumes it.
+
+### 1a.1 What APOLLO provides that dreams reuse
+
+| APOLLO capability                                   | Dream state use                                                                                      |
+|-----------------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| Dense schema-typed encoding (12 tokens vs 50 prose) | **Seed packing.** 4× more memories fit per ideation call → `MNEMOS_DREAM_DAILY_BUDGET_USD` buys 4× the dream volume at equivalent cost |
+| Schema-aware fields (portfolio, decision, person, event) | **Schema-native seed strategies.** Structural gap detection ("all `person` memories at org X with no edge to any `project` memory") only works when seeds are typed, not free-form prose |
+| Judge-LLM fidelity-scoring pipeline                 | **Coherence rating.** Dreams reuse the judge-harness to score internal coherence instead of re-building a parallel critic |
+| DAG branch-writer (`distilled` / `narrated`)        | **`dream/<kind>` writer.** Exact same code path; dreams extend the branch taxonomy, not the writer |
+| Narration endpoint (dense → prose)                  | **Dense-form dream readback.** Dreams that end up in dense form (a `connection` that emits a typed edge, a `synthesis` that emits a schema-shaped summary) render to prose for human review with no new machinery |
+| `CompressionEngine` ABC + contest harness           | **`IdeationEngine` ABC / divergent mode of the contest.** Multi-muse fan-out, result persistence, engine lineage tracking — all reusable |
+
+### 1a.2 What APOLLO does not provide
+
+A few things dream state still has to build itself:
+
+- The **divergent-reasoning prompt family** (opposite register from
+  APOLLO's fidelity-first prompts).
+- **Octopus-merge promotion semantics** (N-parent merges for
+  `connection` / `synthesis` / `contradiction` dreams — APOLLO is 1:1
+  parent per branch).
+- The **`include_dreams` retrieval contract** and the gateway's
+  `Adjacent (dreamt)` inject section.
+- The **`memory_dream_queue`** worker (mirror of the compression queue,
+  but driving divergent runs instead of contest runs).
+
+### 1a.3 Practical implication
+
+Dream state is not a v3.3 drop-in. A pre-APOLLO implementation would:
+
+- Seed from raw prose (4× the token cost per dream call).
+- Use embedding distance only (no schema-aware gaps → poorer
+  seed quality, more paraphrase-grade dreams, higher novelty-reject
+  rates).
+- Build its own coherence critic (duplicating work APOLLO's v3.2
+  judge-LLM already does).
+- Store dream content as prose only (no dense form, no narration
+  round-trip).
+
+Each of those throws away work once APOLLO's S-IVB stage lands. The
+right move is to align the main dream-state implementation with
+APOLLO's arrival — **v3.4 is the real v1 of dream state; an optional
+v3.3 "preview slice" is possible but explicitly scoped to throw away
+the parts that get subsumed.** See §13 for the revised roadmap split.
+
+---
+
 ## 2. Surfaceability — the core principle
 
 **Dreams must be visible to agents performing retrieval.** This is the
@@ -259,6 +313,13 @@ Find pairs of memories whose embeddings are close but which *don't*
 share a KG triple. "Structurally adjacent, logically disconnected" —
 the most fertile ground for a `dream/connection`.
 
+Pre-APOLLO (v3.3 preview slice): embedding distance only. Post-APOLLO
+(v3.4): same predicate *plus* schema-field joins — pairs of `person`
+memories sharing an `org` but not an edge, pairs of `decision`
+memories with overlapping `alternatives_considered`, etc. The dense
+form makes these structural gaps directly queryable; the prose form
+makes them guesswork.
+
 ```sql
 SELECT m1.id, m2.id, m1.embedding <-> m2.embedding AS dist
 FROM memories m1
@@ -298,6 +359,23 @@ Dream generation reuses GRAEAE as the ideation engine, but with a
 divergent-reasoning prompt and **consensus disabled**. The value is in
 the *spread* of perspectives across muses, not the majority vote.
 
+### Seed content form
+
+Seeds ride into the ideation prompt in whatever form the memory
+currently carries. Post-APOLLO, the dense-encoded variant (12 tokens
+for a portfolio entry vs. ~50 prose) is preferred — this is the
+cost-multiplier called out in §1a. The dream-writer prefers in this
+order:
+
+1. `memory_compressed_variants` winner (APOLLO dense form if a
+   schema fit existed; ANAMNESIS/LETHE/ALETHEIA output otherwise).
+2. v3.0 legacy compression column if present.
+3. Raw `memories.content` as last resort.
+
+This is the same three-tier COALESCE the gateway and rehydrate paths
+use, so dreams inherit the same compression visibility contract as
+the rest of the retrieval pipeline.
+
 ### Request shape
 
 ```
@@ -318,9 +396,13 @@ Each muse response becomes one candidate dream. Post-processing:
 2. **Novelty check** — embed the candidate; reject if cosine similarity
    to any existing memory OR existing dream > 0.92 (paraphrase, not
    dream).
-3. **Coherence check** — optional judge-LLM rating, stored on the
-   version row's `metadata` jsonb. Low-coherence dreams still persist
-   with a flag so they're discountable, not missing.
+3. **Coherence check** — judge-LLM rating via APOLLO's fidelity-judge
+   harness (v3.2 delivery). Dreams reuse the same critic infra;
+   prompt swaps "is this a faithful distillation?" for "is this an
+   internally coherent hypothesis given the seeds?" Rating stored on
+   the version row's `metadata` jsonb. Low-coherence dreams still
+   persist with a flag so they're discountable, not missing.
+   Pre-APOLLO: skip this step — the critic does not exist yet.
 4. **Persist** as a new `memory_versions` row with the appropriate
    `branch`, `parent_version_id` / `merge_parents`, `dream_*` columns,
    and `commit_hash` auto-computed.
@@ -541,30 +623,59 @@ Even with surfaceability as a principle, invariants must hold:
 
 ---
 
-## 13. Roadmap slot
+## 13. Roadmap slot — aligned to APOLLO's arrival
 
-**v3.3** — foundations:
+Dream state is gated on APOLLO. The real first-class implementation
+lands in v3.4, paired with APOLLO's S-IVB stage. A v3.3 preview slice
+is possible but explicitly MVP — some of it gets thrown away when
+APOLLO arrives and dreams migrate onto the dense substrate.
+
+### v3.3 — optional preview slice (throwaway-scoped)
+
+Only worth building if we want dream-state signal before APOLLO's
+full depth lands. Everything marked *[provisional]* will be replaced
+in v3.4.
+
 - Migration for `memory_versions` dream columns + `memory_dream_queue`.
 - Dream worker + queue drain reusing `process_contest_queue` shape.
-- Seed strategies: `random`, `category_scoped`.
+- Seed strategies: `random`, `category_scoped`, `recent`. (No
+  schema-aware `cluster_gap` yet — that needs APOLLO-typed seeds.)
 - Retrieval surfacing: `POST /memories/search` facts/dreams split.
 - Manual promotion via merge commit (single-parent dreams only).
 - Manual trigger endpoint (`/admin/dreams/run`); no idle scheduler.
+- Prose-form seeds only *[provisional — replaced by APOLLO dense in
+  v3.4]*.
+- No coherence critic *[provisional — replaced by APOLLO judge-LLM
+  harness in v3.4]*.
 
-**v3.4** — depth:
-- Seed strategies: `cluster_gap`, `co_access`, `orphan`, `recent`.
-- Idle scheduler lifespan-managed with GPU-idle gate.
-- Gateway inject-path "Adjacent (dreamt)" section.
+Operators who skip v3.3 and wait for v3.4 lose nothing — every v3.3
+capability is re-delivered in v3.4 in a cleaner form.
+
+### v3.4 — real v1, paired with APOLLO S-IVB
+
+- APOLLO dense-form seeds via the three-tier COALESCE
+  (`memory_compressed_variants` → v3.0 column → raw).
+- Schema-aware seed strategies: `cluster_gap` (now including
+  same-field joins across typed memories), `co_access`, `orphan`.
+- Coherence critic via APOLLO's judge-LLM harness; rating stored on
+  every dream's version row.
+- Idle scheduler lifespan-managed with GPU-idle gate; rotates seed
+  strategies.
+- Gateway inject-path `Adjacent (dreamt)` section with provenance
+  labels.
 - Agent-driven acknowledgement feedback loop.
 - Octopus-merge promotion path (multi-parent dreams → new memory or
   speculative KG triple).
 - Speculative KG triple emission for `dream/connection` kind.
+- Narration of dense-form dream outputs (reuses APOLLO's narration
+  endpoint — `connection` and `synthesis` dreams that emit typed
+  edges/summaries get prose readback for free).
 
 Additive to the APOLLO program, not in conflict. APOLLO writes
 `distilled` and `narrated` branches; dreams write `dream/<kind>`
-branches. All land in the same DAG. A mature MNEMOS eventually has
-both — facts compressed via APOLLO for efficient retrieval, dreams
-branched from them for generative context.
+branches. All land in the same DAG. A mature MNEMOS ends with both
+— facts distilled into dense form for efficient retrieval, dreams
+branched from those same distillations for generative context.
 
 ---
 
