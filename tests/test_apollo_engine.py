@@ -29,36 +29,46 @@ def _req(content: str) -> CompressionRequest:
 # ── supports() ─────────────────────────────────────────────────────────────
 
 def test_supports_true_when_portfolio_schema_matches():
-    engine = APOLLOEngine()
+    engine = APOLLOEngine(enable_llm_fallback=False)
     req = _req("Portfolio: AAPL 100 at 150 now 175. MSFT 50 at 300 now 310.")
     assert engine.supports(req) is True
 
 
-def test_supports_false_when_no_schema_matches():
-    engine = APOLLOEngine()
+def test_supports_true_when_fallback_enabled_even_without_match():
+    """S-II default: LLM fallback on → APOLLO supports everything,
+    so the contest records APOLLO's decision on every memory."""
+    engine = APOLLOEngine()  # default enable_llm_fallback=True
     req = _req("The fox jumped over the lazy dog. No portfolio content here.")
-    assert engine.supports(req) is False, (
-        "APOLLO in v3.3 S-IC should be skipped (not a contest loser) "
-        "on content that doesn't match any schema."
-    )
+    assert engine.supports(req) is True
 
 
-def test_supports_false_on_empty_content():
-    engine = APOLLOEngine()
+def test_supports_false_when_fallback_disabled_and_no_match():
+    """Operator who turns off LLM fallback gets the S-IC behavior:
+    APOLLO only supports schema-matching content."""
+    engine = APOLLOEngine(enable_llm_fallback=False)
+    req = _req("The fox jumped over the lazy dog. No portfolio content here.")
+    assert engine.supports(req) is False
+
+
+def test_supports_false_on_empty_content_without_fallback():
+    engine = APOLLOEngine(enable_llm_fallback=False)
     assert engine.supports(_req("")) is False
 
 
 # ── compress() happy path ──────────────────────────────────────────────────
 
 def test_compress_emits_dense_form_and_manifest():
-    engine = APOLLOEngine()
+    # fallback off so the test isolates the schema path without any
+    # chance of HTTP being attempted against a fake URL.
+    engine = APOLLOEngine(enable_llm_fallback=False)
     req = _req("Portfolio: AAPL 100 at 150.25 now 175.50. MSFT 50 at 300 now 310.")
     result: CompressionResult = asyncio.run(engine.compress(req))
 
     assert result.error is None
     assert result.succeeded() is True
     assert result.engine_id == "apollo"
-    assert result.engine_version == "0.1"
+    # Version bumped to 0.2 when S-II landed the LLM fallback.
+    assert result.engine_version == "0.2"
     assert result.compressed_content is not None
     assert "AAPL:100@150.25/175.50" in result.compressed_content
     assert "MSFT" in result.compressed_content
@@ -74,11 +84,10 @@ def test_compress_emits_dense_form_and_manifest():
     assert "schema_confidence" in result.manifest
 
 
-def test_compress_no_match_returns_clean_error_result():
-    """If compress() is called directly on non-matching content
-    (bypassing the supports() gate), the engine MUST return an
-    error result rather than raise."""
-    engine = APOLLOEngine()
+def test_compress_no_match_no_fallback_returns_clean_error_result():
+    """With fallback disabled and no schema matching, compress()
+    returns an error result rather than raising."""
+    engine = APOLLOEngine(enable_llm_fallback=False)
     req = _req("No portfolio content in this prose.")
     result = asyncio.run(engine.compress(req))
 
@@ -86,6 +95,7 @@ def test_compress_no_match_returns_clean_error_result():
     assert result.succeeded() is False
     assert result.compressed_content is None
     assert result.manifest.get("schemas_tried") == ["portfolio"]
+    assert result.manifest.get("path") == "schema_only_no_match"
 
 
 # ── gpu_intent contract ────────────────────────────────────────────────────
@@ -122,7 +132,7 @@ def test_engine_respects_custom_schema_registry():
     """Operators must be able to register custom schemas in the
     constructor — part of the 'open to operator-registered schemas'
     contract from the CompressionEngine ABC doc."""
-    engine = APOLLOEngine(schemas=[_StubSchema()])
+    engine = APOLLOEngine(schemas=[_StubSchema()], enable_llm_fallback=False)
     req = _req("some arbitrary content that wouldn't match portfolio")
     assert engine.supports(req) is True
     result = asyncio.run(engine.compress(req))
@@ -140,7 +150,10 @@ def test_engine_first_match_wins_ordering():
     )
     # Register stub FIRST; it always matches.
     from compression.apollo_schemas import PortfolioSchema
-    engine = APOLLOEngine(schemas=[_StubSchema(), PortfolioSchema()])
+    engine = APOLLOEngine(
+        schemas=[_StubSchema(), PortfolioSchema()],
+        enable_llm_fallback=False,
+    )
     result = asyncio.run(engine.compress(_req(portfolio_content)))
     assert result.manifest["schema_id"] == "stub", (
         "First-matching schema must win — specific ordering is the "
