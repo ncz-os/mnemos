@@ -146,32 +146,34 @@ class _BodyTooLarge(Exception):
     """Internal signal used by _BodySizeLimitASGI to short-circuit."""
 
 
+# ── Middleware stack (LIFO: last add_middleware = outermost on the wire) ───
+#
+# Desired evaluation order on an incoming request (outer → inner):
+#
+#   RequestIDMiddleware      bind request_id ContextVar BEFORE anything logs
+#     CORSMiddleware         preflight + CORS headers on every response
+#       SessionMiddleware    authlib OAuth-state cookie for /oauth/*
+#         SlowAPIMiddleware  rate-limit rejections tagged with request_id
+#           TracingMiddleware  span reads current_request_id() into attrs
+#             PrometheusMiddleware  histogram tagged
+#               _BodySizeLimitASGI  413 for oversized bodies (innermost)
+#                 <handler>
+#
+# Codex v3.2 re-audit found that the earlier version added
+# RequestIDMiddleware BEFORE SlowAPI / Session / CORS, which under LIFO
+# makes it INNER to all three — so a 429 from the rate limiter, a CORS
+# rejection, or an OAuth session decode would log with no request_id.
+# Fix: add RequestIDMiddleware LAST so it's truly outermost.
+
 app.add_middleware(_BodySizeLimitASGI, max_bytes=_MAX_BODY_BYTES)
-# Request-ID should be the outermost middleware so EVERY log line
-# produced by subsequent middleware (rate limit, CORS, auth) or any
-# handler is already tagged. In Starlette/FastAPI, add_middleware
-# wraps the app LIFO — so the last-added runs first. We add it near
-# the end of the middleware stack below via `app.add_middleware`.
-# Starlette's add_middleware is LIFO: last added = outermost (runs
-# FIRST on incoming requests). We want the request_id bound before
-# tracing creates its span, so:
-#   RequestID (outermost)  -> sets the ContextVar
-#     TracingMiddleware    -> reads current_request_id() into span attrs
-#       PrometheusMiddleware (innermost) -> times just the handler
-# Therefore add them in REVERSE of the desired evaluation order.
 app.add_middleware(PrometheusMiddleware)
 app.add_middleware(TracingMiddleware)
-app.add_middleware(RequestIDMiddleware)
 
 # Rate limiting (opt-in via RATE_LIMIT_ENABLED=true — see api/rate_limit.py)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
-# CORS: set CORS_ORIGINS env var to restrict in production (comma-separated list).
-# Defaults to "*" for local dev. Example: CORS_ORIGINS=https://app.example.com
-_cors_origins_raw = os.getenv("CORS_ORIGINS", "http://localhost,http://127.0.0.1,http://127.0.0.1:5002,http://localhost:5002")
-_cors_origins = [o.strip() for o in _cors_origins_raw.split(",")]
 # Starlette SessionMiddleware — required by authlib for OAuth state (PKCE verifier,
 # CSRF nonce) carried across the authorize -> callback redirect. This cookie is
 # DIFFERENT from the application session cookie set after successful login.
@@ -199,6 +201,10 @@ app.add_middleware(
     https_only=False,  # set MNEMOS_SESSION_HTTPS_ONLY=1 to harden in prod
 )
 
+# CORS: set CORS_ORIGINS env var to restrict in production (comma-separated list).
+# Defaults to "*" for local dev. Example: CORS_ORIGINS=https://app.example.com
+_cors_origins_raw = os.getenv("CORS_ORIGINS", "http://localhost,http://127.0.0.1,http://127.0.0.1:5002,http://localhost:5002")
+_cors_origins = [o.strip() for o in _cors_origins_raw.split(",")]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -206,6 +212,10 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
     allow_credentials=_cors_origins != ["*"],
 )
+
+# RequestIDMiddleware MUST be the final add_middleware call so it ends up
+# outermost under Starlette LIFO. See the stack diagram above.
+app.add_middleware(RequestIDMiddleware)
 
 app.include_router(health_router)
 app.include_router(metrics_router)  # v3.2 observability: Prometheus /metrics
