@@ -152,14 +152,22 @@ _FALLBACK_RE = re.compile(
 
 
 # QUALITY SCORE for LLM-fallback results.
-# The balanced contest profile uses a 0.70 quality floor; pinning
-# fallback at 0.65 makes APOLLO lose to a schema-matching peer
-# (confidence typically >0.80) and also lose to ANAMNESIS on memories
-# where ANAMNESIS produces a cleaner extraction. The floor ensures
-# fallback never wins by default when a better-shaped output exists.
-# The judge-LLM scoring work in S-II tail replaces this pin with
-# narrated-derivative-vs-root fidelity.
-_FALLBACK_QUALITY_SCORE = 0.65
+#
+# Pin BELOW every built-in profile's quality_floor so an unreviewed
+# fallback candidate never wins on aggressive ratio alone:
+#   balanced      floor=0.70
+#   quality_first floor=0.80
+#   speed_first   floor=0.60  ← tightest constraint
+#
+# Setting 0.55 puts the fallback under all three floors. The judge
+# (when enabled) overwrites this pin with narrated-derivative-vs-root
+# fidelity, so a genuinely-good fallback output still gets credit.
+# Without the judge, the contest pins fallback at "parseable but
+# trust-the-judge-to-tell-us-if-it-mattered" — which is correct,
+# because `_normalize_fallback_output()` is structural-only and
+# Codex caught syntactically-valid-but-semantically-empty lines
+# slipping past 0.65 under speed_first in the prior pin.
+_FALLBACK_QUALITY_SCORE = 0.55
 
 
 class APOLLOEngine(CompressionEngine):
