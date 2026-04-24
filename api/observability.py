@@ -32,6 +32,7 @@ is absent or fails validation, we generate a fresh UUID4 hex.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 import uuid
@@ -55,6 +56,19 @@ try:  # Soft-optional — if prometheus_client isn't installed, the
 except ImportError:  # pragma: no cover — dev environments that skip the dep
     _PROMETHEUS_AVAILABLE = False
     CONTENT_TYPE_LATEST = "text/plain; version=0.0.4"
+
+try:  # Soft-optional — if opentelemetry isn't installed, tracing is a no-op.
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    _OTEL_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _OTEL_AVAILABLE = False
+    _otel_trace = None
+    Resource = None
+    TracerProvider = None
+    BatchSpanProcessor = None
 
 
 # The header name operators see and can override from upstream proxies.
@@ -292,12 +306,144 @@ async def prometheus_metrics() -> Response:
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
+# ─── OpenTelemetry tracing (v3.2 observability slice 3) ────────────────────
+
+_TRACING_INSTALLED: bool = False
+
+
+def install_tracing(service_name: str = "mnemos") -> None:
+    """Install the global OpenTelemetry TracerProvider.
+
+    Idempotent — repeat calls are a no-op. Export target is chosen from
+    standard OTel env vars:
+
+      OTEL_EXPORTER_OTLP_ENDPOINT   — OTLP/HTTP URL. When set, spans
+                                      are batched and shipped there.
+      OTEL_SERVICE_NAME             — overrides the default "mnemos".
+
+    When no endpoint is set, the TracerProvider is still installed
+    so code using `_get_tracer()` records spans (useful for tests
+    and for any in-process consumers) — they just aren't exported.
+
+    When `opentelemetry` isn't installed at all, this is a log-and-
+    return no-op; the middleware short-circuits too.
+    """
+    global _TRACING_INSTALLED
+
+    if _TRACING_INSTALLED:
+        return
+
+    if not _OTEL_AVAILABLE:
+        logger.info(
+            "[observability] opentelemetry not installed; tracing is a no-op"
+        )
+        _TRACING_INSTALLED = True
+        return
+
+    effective_name = os.getenv("OTEL_SERVICE_NAME", service_name)
+    resource = Resource.create({"service.name": effective_name})
+    provider = TracerProvider(resource=resource)
+
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    if endpoint:
+        try:  # Exporter-proto-http is also soft-optional — a leaner
+              # operator may install only the SDK and export some
+              # other way (file, in-memory for tests).
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                OTLPSpanExporter,
+            )
+            provider.add_span_processor(
+                BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint))
+            )
+            logger.info(
+                "[observability] OTLP span exporter configured for %s",
+                endpoint,
+            )
+        except ImportError:
+            logger.warning(
+                "[observability] OTEL_EXPORTER_OTLP_ENDPOINT set to %s but "
+                "opentelemetry-exporter-otlp-proto-http isn't installed; "
+                "spans will be recorded but not exported",
+                endpoint,
+            )
+
+    _otel_trace.set_tracer_provider(provider)
+    _TRACING_INSTALLED = True
+
+
+_tracer = None
+
+
+def _get_tracer():
+    """Lazy tracer accessor. Uses the global TracerProvider — call
+    install_tracing() at startup to bind it."""
+    global _tracer
+    if _tracer is None and _OTEL_AVAILABLE:
+        _tracer = _otel_trace.get_tracer("mnemos.api")
+    return _tracer
+
+
+class TracingMiddleware(BaseHTTPMiddleware):
+    """Wraps each HTTP request in an OTel span.
+
+    Attributes set:
+      http.method         — request method
+      http.route          — Starlette-matched route template (same
+                            shape as the Prometheus `route` label;
+                            bounds cardinality)
+      http.status_code    — response status (integer)
+      mnemos.request_id   — the request-ID bound by RequestIDMiddleware
+                            (enables log<->trace correlation)
+
+    Placed INSIDE RequestIDMiddleware in the stack so
+    `current_request_id()` is already populated when the span starts.
+    """
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        if not _OTEL_AVAILABLE:
+            return await call_next(request)
+
+        tracer = _get_tracer()
+        if tracer is None:
+            return await call_next(request)
+
+        # Starlette matches the route INSIDE its router, which runs
+        # after middleware dispatch starts. We open the span with a
+        # placeholder name keyed on method and refine it in finally
+        # once the router has populated request.scope["route"]. This
+        # mirrors the finally-based pattern in PrometheusMiddleware.
+        method = request.method
+
+        with tracer.start_as_current_span(method) as span:
+            span.set_attribute("http.method", method)
+            rid = current_request_id()
+            if rid:
+                span.set_attribute("mnemos.request_id", rid)
+
+            status_code = 500
+            try:
+                response = await call_next(request)
+                status_code = response.status_code
+                return response
+            finally:
+                route = _route_template(request)
+                span.update_name(f"{method} {route}")
+                span.set_attribute("http.route", route)
+                span.set_attribute("http.status_code", status_code)
+
+
 __all__ = [
     "REQUEST_ID_HEADER",
     "RequestIDMiddleware",
     "PrometheusMiddleware",
+    "TracingMiddleware",
     "current_request_id",
     "install_log_correlation",
+    "install_tracing",
     "metrics_router",
     "HTTP_REQUESTS_TOTAL",
     "HTTP_REQUEST_DURATION_SECONDS",

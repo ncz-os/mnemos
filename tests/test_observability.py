@@ -265,3 +265,161 @@ def test_metrics_unknown_route_bucketed_as_no_route():
     body = client.get("/metrics").text
     assert 'route="__no_route__"' in body
     assert 'route="/does-not-exist"' not in body
+
+
+# ---- OpenTelemetry tracing (v3.2 observability slice 3) --------------------
+
+
+# Module-level: OTel's TracerProvider is a process global that can
+# only be set ONCE per run. We install a shared provider on first use
+# and reuse the same InMemorySpanExporter across all tracing tests,
+# clearing its captured spans at the start of each test.
+_SHARED_EXPORTER = None
+
+
+def _tracing_app():
+    """Build a minimal app with TracingMiddleware wired. Spans land in
+    the shared in-memory exporter; caller should clear it first.
+    Skips the whole test if opentelemetry isn't installed.
+    """
+    pytest.importorskip("opentelemetry")
+
+    global _SHARED_EXPORTER
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from opentelemetry.sdk.resources import Resource
+
+    from api.observability import RequestIDMiddleware, TracingMiddleware
+    import api.observability as obs
+
+    if _SHARED_EXPORTER is None:
+        _SHARED_EXPORTER = InMemorySpanExporter()
+
+        # If the process already has a real TracerProvider (e.g.
+        # because `import api_server` ran install_tracing() during
+        # an earlier test), add our exporter TO THAT provider.
+        # Otherwise install our own. Either way _SHARED_EXPORTER
+        # captures every span the engine emits.
+        existing = otel_trace.get_tracer_provider()
+        if isinstance(existing, TracerProvider):
+            existing.add_span_processor(SimpleSpanProcessor(_SHARED_EXPORTER))
+        else:
+            provider = TracerProvider(
+                resource=Resource.create({"service.name": "test"})
+            )
+            provider.add_span_processor(SimpleSpanProcessor(_SHARED_EXPORTER))
+            otel_trace.set_tracer_provider(provider)
+
+        # Reset the module-level tracer cache so the next _get_tracer()
+        # call pulls a tracer from the now-fully-configured provider.
+        obs._tracer = None
+
+    _SHARED_EXPORTER.clear()
+    obs._tracer = None
+
+    app = FastAPI()
+    # Stacking is LIFO — add RequestID LAST so it becomes the
+    # outermost middleware, guaranteeing the ContextVar is bound by
+    # the time Tracing reads `current_request_id()`.
+    app.add_middleware(TracingMiddleware)
+    app.add_middleware(RequestIDMiddleware)
+
+    @app.get("/widgets/{widget_id}")
+    def _get_widget(widget_id: str):
+        return {"id": widget_id}
+
+    @app.get("/boom")
+    def _boom():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail="boom")
+
+    return app, _SHARED_EXPORTER
+
+
+def test_tracing_creates_span_per_request():
+    app, exporter = _tracing_app()
+    client = TestClient(app)
+    client.get("/widgets/abc")
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.name == "GET /widgets/{widget_id}"
+
+
+def test_tracing_span_attributes_include_method_route_status():
+    app, exporter = _tracing_app()
+    client = TestClient(app)
+    client.get("/widgets/xyz")
+    span = exporter.get_finished_spans()[0]
+    attrs = dict(span.attributes or {})
+    assert attrs["http.method"] == "GET"
+    assert attrs["http.route"] == "/widgets/{widget_id}"
+    assert attrs["http.status_code"] == 200
+
+
+def test_tracing_span_carries_request_id():
+    """Log<->trace correlation: the span attribute `mnemos.request_id`
+    must match the X-Request-ID echoed back to the client so operators
+    can jump from a log line to the corresponding span.
+    """
+    app, exporter = _tracing_app()
+    client = TestClient(app)
+    resp = client.get(
+        "/widgets/alpha",
+        headers={REQUEST_ID_HEADER: "test-rid-000"},
+    )
+    span_attrs = dict(exporter.get_finished_spans()[0].attributes or {})
+    assert span_attrs["mnemos.request_id"] == "test-rid-000"
+    assert resp.headers[REQUEST_ID_HEADER] == "test-rid-000"
+
+
+def test_tracing_records_5xx_status():
+    """5xx responses still close the span cleanly with the correct
+    status attribute — don't lose the observation on the error path."""
+    app, exporter = _tracing_app()
+    client = TestClient(app)
+    client.get("/boom")
+    span_attrs = dict(exporter.get_finished_spans()[0].attributes or {})
+    assert span_attrs["http.status_code"] == 500
+
+
+def test_install_tracing_is_idempotent():
+    """Calling install_tracing twice must not re-install the provider
+    (prevents test-suite cross-contamination on dev-server reloads)."""
+    pytest.importorskip("opentelemetry")
+    from api.observability import install_tracing
+    import api.observability as obs
+
+    # Reset the install flag so we can exercise the idempotent path
+    obs._TRACING_INSTALLED = False
+    install_tracing()
+    assert obs._TRACING_INSTALLED is True
+    # Second call is a no-op
+    install_tracing()
+    assert obs._TRACING_INSTALLED is True
+
+
+def test_tracing_middleware_passthrough_when_otel_missing(monkeypatch):
+    """If opentelemetry isn't available, the middleware must pass
+    requests through unchanged — never raise, never 500 a caller."""
+    import api.observability as obs
+
+    # Simulate OTel missing
+    monkeypatch.setattr(obs, "_OTEL_AVAILABLE", False)
+
+    from api.observability import TracingMiddleware
+    app = FastAPI()
+    app.add_middleware(TracingMiddleware)
+
+    @app.get("/ok")
+    def _ok():
+        return {"ok": True}
+
+    client = TestClient(app)
+    resp = client.get("/ok")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}

@@ -50,10 +50,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(na
 from api.observability import (  # noqa: E402
     PrometheusMiddleware,
     RequestIDMiddleware,
+    TracingMiddleware,
     install_log_correlation,
+    install_tracing,
     metrics_router,
 )
 install_log_correlation()
+install_tracing()  # no-op unless opentelemetry is installed
 
 app = FastAPI(title="MNEMOS API", version="3.1.0", description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway", lifespan=lifespan)
 
@@ -141,10 +144,16 @@ app.add_middleware(_BodySizeLimitASGI, max_bytes=_MAX_BODY_BYTES)
 # handler is already tagged. In Starlette/FastAPI, add_middleware
 # wraps the app LIFO — so the last-added runs first. We add it near
 # the end of the middleware stack below via `app.add_middleware`.
-app.add_middleware(RequestIDMiddleware)
-# Prometheus timing middleware runs inside RequestIDMiddleware so
-# metric exemplars (follow-up) can attach the request_id.
+# Starlette's add_middleware is LIFO: last added = outermost (runs
+# FIRST on incoming requests). We want the request_id bound before
+# tracing creates its span, so:
+#   RequestID (outermost)  -> sets the ContextVar
+#     TracingMiddleware    -> reads current_request_id() into span attrs
+#       PrometheusMiddleware (innermost) -> times just the handler
+# Therefore add them in REVERSE of the desired evaluation order.
 app.add_middleware(PrometheusMiddleware)
+app.add_middleware(TracingMiddleware)
+app.add_middleware(RequestIDMiddleware)
 
 # Rate limiting (opt-in via RATE_LIMIT_ENABLED=true — see api/rate_limit.py)
 app.state.limiter = limiter
