@@ -137,6 +137,11 @@ def create_root_api_key(db_name: str) -> str | None:
 def main() -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_dir, "config.toml")
+    # Keep this list in sync with `installer/db.py::run_migrations`.
+    # Both are ordered; every new migration must be appended to the
+    # end of BOTH lists, not inserted in the middle. Order is
+    # load-bearing — v2 migrations expect v1 tables, v3.1 expects v3,
+    # v3.1.2 expects v3.1.
     migration_files = [
         os.path.join(script_dir, "db", "migrations.sql"),
         os.path.join(script_dir, "db", "migrations_v1_multiuser.sql"),
@@ -149,10 +154,14 @@ def main() -> None:
         os.path.join(script_dir, "db", "migrations_v3_oauth.sql"),
         os.path.join(script_dir, "db", "migrations_v3_federation.sql"),
         os.path.join(script_dir, "db", "migrations_v3_ownership.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_1_compression.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_1_versioning_fix.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_1_2_kg_tenancy.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_1_2_audit_log_columns.sql"),
     ]
 
     print("=" * 60)
-    print("  MNEMOS v3.0.0 Installer")
+    print("  MNEMOS Installer")
     print("=" * 60)
 
     # 1. Choose deployment profile

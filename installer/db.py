@@ -218,7 +218,14 @@ def setup_database(config: Config, info) -> bool:
 
 
 def run_migrations(config: Config) -> bool:
-    """Run SQL migration files in order. Idempotent."""
+    """Run SQL migration files in order. Idempotent.
+
+    Keep this list in sync with `install.py::main()`. Both are
+    ordered; every new migration must be appended to the end of BOTH
+    lists, not inserted in the middle. Order is load-bearing —
+    v2 migrations expect v1 tables, v3.1 expects v3, v3.1.2
+    expects v3.1.
+    """
     repo_path = Path(__file__).parent.parent
     migration_files = [
         repo_path / "db" / "migrations.sql",
