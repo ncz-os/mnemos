@@ -11,6 +11,8 @@ shapes only, no code shared). Additional schemas (decision, person,
 event) are scheduled for v3.3 S-II.
 """
 from .base import DetectionResult, Schema
+from .code import CodeSchema
+from .commit import CommitSchema
 from .decision import DecisionSchema
 from .event import EventSchema
 from .person import PersonSchema
@@ -23,4 +25,6 @@ __all__ = [
     "DecisionSchema",
     "PersonSchema",
     "EventSchema",
+    "CodeSchema",
+    "CommitSchema",
 ]
