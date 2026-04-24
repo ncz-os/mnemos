@@ -80,8 +80,8 @@ See `.env.example` for complete options including GPU setup, compression tiers, 
 ### When You Need GPU
 
 MNEMOS works great on CPU alone. GPU is only beneficial if:
-- You want faster compression (ALETHEIA Tier 2: 200-500ms vs CPU latency)
-- You want fact extraction (ANAMNESIS Tier 3: 500ms-2s)
+- You want fact extraction (ANAMNESIS: 500ms-2s per memory)
+- You want APOLLO's LLM fallback for content that misses a schema (v3.3+)
 - You're running large local LLMs (70B+ parameters)
 
 **For most users**: Use external LLM providers (Together AI, Groq) instead. They're cheaper and faster than self-hosting.
@@ -398,7 +398,7 @@ psql -U mnemos -d mnemos -c "SELECT COUNT(*) FROM memories;"
 curl http://$GPU_PROVIDER_HOST:$GPU_PROVIDER_PORT/health
 
 # Check MNEMOS logs
-grep "GPU\|compression\|ALETHEIA" /var/log/mnemos.log
+grep "GPU\|compression\|ANAMNESIS\|APOLLO" /var/log/mnemos.log
 ```
 
 ### Memory Search Slow
