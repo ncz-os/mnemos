@@ -47,7 +47,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(na
 # v3.2 observability foundation: request-ID correlation across logs +
 # response headers. Must run BEFORE any handler emits log records so
 # each line is tagged with [req:<id>] from the first one.
-from api.observability import RequestIDMiddleware, install_log_correlation  # noqa: E402
+from api.observability import (  # noqa: E402
+    PrometheusMiddleware,
+    RequestIDMiddleware,
+    install_log_correlation,
+    metrics_router,
+)
 install_log_correlation()
 
 app = FastAPI(title="MNEMOS API", version="3.1.0", description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway", lifespan=lifespan)
@@ -137,6 +142,9 @@ app.add_middleware(_BodySizeLimitASGI, max_bytes=_MAX_BODY_BYTES)
 # wraps the app LIFO — so the last-added runs first. We add it near
 # the end of the middleware stack below via `app.add_middleware`.
 app.add_middleware(RequestIDMiddleware)
+# Prometheus timing middleware runs inside RequestIDMiddleware so
+# metric exemplars (follow-up) can attach the request_id.
+app.add_middleware(PrometheusMiddleware)
 
 # Rate limiting (opt-in via RATE_LIMIT_ENABLED=true — see api/rate_limit.py)
 app.state.limiter = limiter
@@ -183,6 +191,7 @@ app.add_middleware(
 )
 
 app.include_router(health_router)
+app.include_router(metrics_router)  # v3.2 observability: Prometheus /metrics
 app.include_router(consultations_router)  # v3.0.0: Unified /v1/consultations (GRAEAE reasoning)
 app.include_router(providers_router)  # v3.0.0: Unified /v1/providers (model routing)
 app.include_router(openai_compat_router)  # Phase 0: OpenAI-compatible gateway
