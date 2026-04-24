@@ -1,0 +1,431 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/perlowja/mnemos/blob/master/docs/mpf_v0.1.json",
+  "title": "Memory Portability Format (MPF) v0.1",
+  "description": "Cross-system agent-memory interchange format. Envelope-level schema version with per-record payload versions; discriminated union of record kinds (document, memory, fact, event). Designed to be emitted by Mem0, Letta, Graphiti, Cognee, MNEMOS, and consumed by any of the same. See docs/MEMORY_EXPORT_FORMAT.md for the prose spec.",
+  "type": "object",
+  "required": ["mpf_version", "exported_at", "records"],
+  "additionalProperties": true,
+  "properties": {
+    "mpf_version": {
+      "type": "string",
+      "description": "Envelope schema version. Consumers implement per-version readers.",
+      "pattern": "^0\\.1(\\.[0-9]+)?$"
+    },
+    "source_system": {
+      "type": ["string", "null"],
+      "description": "Emitting system identifier. Convention: lowercase ASCII, e.g. 'mnemos', 'mem0', 'letta', 'graphiti', 'cognee', 'mempalace'. Diagnostic only; null ≈ absent."
+    },
+    "source_version": {
+      "type": ["string", "null"],
+      "description": "Version of the emitting system. Diagnostic only; null ≈ absent."
+    },
+    "source_instance": {
+      "type": ["string", "null"],
+      "description": "Emitting deployment identifier (hostname, cluster name, etc). Diagnostic only; null ≈ absent."
+    },
+    "source_commit": {
+      "type": ["string", "null"],
+      "description": "Emitting system's VCS commit hash. Diagnostic only; null ≈ absent."
+    },
+    "exported_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this envelope was emitted. RFC 3339 / ISO 8601."
+    },
+    "record_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total records in the envelope. If absent, consumers compute from records.length."
+    },
+    "records": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/record" },
+      "description": "Discriminated union of payload records. Consumers MUST accept and skip records whose 'kind' they don't understand (forward-compatibility ratchet)."
+    },
+    "kg_triples": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/kg_triple" },
+      "description": "Knowledge-graph triples. Covers Graphiti temporal edges via valid_from/valid_until."
+    },
+    "relations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/relation" },
+      "description": "Cross-record provenance links (derived_from, answers, derived_memory_of, ...). References record_id values."
+    },
+    "compression_manifest": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/compression_manifest_entry" },
+      "description": "Compressed forms of records. Record-ID-keyed; consumers may regenerate."
+    },
+    "compression_candidates": {
+      "type": "array",
+      "items": { "type": "object" },
+      "description": "Full compression-contest audit history. Opaque at the envelope level; consumers that don't run contests skip."
+    },
+    "memory_versions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/memory_version_entry" },
+      "description": "Memory DAG history (per-version snapshots + parent links). Optional. Consumers that lack DAG support skip."
+    },
+    "embeddings": {
+      "$ref": "#/$defs/embedding_sidecar",
+      "description": "Embedding sidecar descriptor. Vector data lives either inline per-record or in a parquet sidecar file."
+    },
+    "attestations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/attestation" },
+      "description": "Reserved for v0.2+. Detached signatures over canonical envelope form for signed exports."
+    }
+  },
+
+  "$defs": {
+
+    "record": {
+      "type": "object",
+      "required": ["id", "kind", "payload_version", "payload"],
+      "additionalProperties": true,
+      "description": "Base record envelope. 'kind' selects the payload schema.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable, unique within the envelope. Preserved on round-trip. Recommendation: ULID or UUID v4."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Registered kind (document/memory/fact/event) OR namespaced producer-defined kind (e.g. 'acme.observation'). Unknown kinds MUST be skipped by consumers."
+        },
+        "payload_version": {
+          "type": "string",
+          "description": "Version of the payload schema. For 'document': docling SemVer (e.g. '1.10.0'). For 'memory': producing system's native version (e.g. 'mnemos-3.1', 'letta-0.9', 'mem0-0.1'). For MPF-defined kinds ('fact', 'event'): 'mpf-0.1'."
+        },
+        "payload": {
+          "description": "Opaque to the envelope. The payload schema is owned by the payload_version; consumers validate it with their system's schema.",
+          "oneOf": [
+            { "type": "object" },
+            { "type": "array" },
+            { "type": "string" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "fact" },
+              "payload_version": { "const": "mpf-0.1" }
+            },
+            "required": ["kind", "payload_version"]
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/fact_payload_v0_1" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "event" },
+              "payload_version": { "const": "mpf-0.1" }
+            },
+            "required": ["kind", "payload_version"]
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/event_payload_v0_1" }
+            }
+          }
+        }
+      ]
+    },
+
+    "fact_payload_v0_1": {
+      "type": "object",
+      "required": ["statement"],
+      "additionalProperties": true,
+      "description": "MPF-defined 'fact' payload. Models an extracted atomic claim. Covers Mem0-style extracted facts, Graphiti edges as literals, Cognee KG entries, LLM-distilled assertions.",
+      "properties": {
+        "statement": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable claim in natural language. Required; the canonical representation of the fact."
+        },
+        "subject": {
+          "type": "string",
+          "description": "Subject of the triple, if the statement decomposes. Free-form."
+        },
+        "predicate": {
+          "type": "string",
+          "description": "Relation/verb of the triple, if the statement decomposes. Convention: camelCase or snake_case, e.g. 'capitalOf', 'works_at'."
+        },
+        "object": {
+          "type": "string",
+          "description": "Object of the triple, if the statement decomposes. Free-form string (literal) or a record id reference."
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Extraction/assertion confidence in [0, 1]."
+        },
+        "created": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When this fact was extracted/asserted. RFC 3339."
+        },
+        "updated": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When this fact was last updated."
+        },
+        "valid_from": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Optional temporal validity window start. Covers Graphiti's temporal-edge semantics."
+        },
+        "valid_until": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "Optional temporal validity window end. Null means 'still valid'."
+        },
+        "source_record_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Record IDs this fact was extracted from. Enables provenance round-trip back to source documents or memories."
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Free-form extension slot. Producer-namespaced keys (e.g. 'mem0_agent_id', 'graphiti_group_id') are encouraged to avoid collision."
+        }
+      }
+    },
+
+    "event_payload_v0_1": {
+      "type": "object",
+      "required": ["event_type", "occurred_at"],
+      "additionalProperties": true,
+      "description": "MPF-defined 'event' payload. Models a session turn, agent action, or temporal event. Covers Letta/Zep session turns, Graphiti episodes, agent-action logs.",
+      "properties": {
+        "event_type": {
+          "type": "string",
+          "description": "Event class. Convention: snake_case. Common values: 'session_turn', 'agent_action', 'tool_call', 'ingest_event'."
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Session/conversation identifier. Optional."
+        },
+        "actor": {
+          "type": "string",
+          "description": "Who produced the event. Convention: 'user', 'assistant', 'system', 'tool:<name>', or a free-form identifier."
+        },
+        "content": {
+          "type": "string",
+          "description": "Textual content associated with the event (message body, tool output, narration). Optional."
+        },
+        "occurred_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the event occurred. RFC 3339. Required."
+        },
+        "source_record_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Records this event relates to (e.g. the document the user asked about, the memory the assistant retrieved)."
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Free-form extension slot. Producer-namespaced keys encouraged."
+        }
+      }
+    },
+
+    "kg_triple": {
+      "type": "object",
+      "required": ["id", "predicate"],
+      "additionalProperties": true,
+      "description": "Knowledge-graph triple. Subject and object may be either record IDs (internal) or free-form literals (external). Supports Graphiti-style temporal validity windows.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable triple identifier, unique within the envelope."
+        },
+        "subject_id": {
+          "type": "string",
+          "description": "Record ID of the subject. Mutually exclusive with subject_literal."
+        },
+        "subject_literal": {
+          "type": "string",
+          "description": "Free-form subject when not a record. Mutually exclusive with subject_id."
+        },
+        "predicate": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Relation/verb. Convention: camelCase or snake_case. Required."
+        },
+        "object_id": {
+          "type": "string",
+          "description": "Record ID of the object. Mutually exclusive with object_literal."
+        },
+        "object_literal": {
+          "type": "string",
+          "description": "Free-form object when not a record. Mutually exclusive with object_id."
+        },
+        "valid_from": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Start of temporal validity window. Matches Graphiti edge semantics."
+        },
+        "valid_until": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "End of temporal validity window; null means open-ended."
+        },
+        "created": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the triple was first recorded."
+        },
+        "owner_id": {
+          "type": "string",
+          "description": "Tenancy owner for multi-tenant systems."
+        },
+        "namespace": {
+          "type": "string",
+          "description": "Tenancy namespace."
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Free-form extension slot."
+        }
+      },
+      "anyOf": [
+        { "required": ["subject_id"] },
+        { "required": ["subject_literal"] }
+      ]
+    },
+
+    "relation": {
+      "type": "object",
+      "required": ["from", "rel", "to"],
+      "additionalProperties": true,
+      "description": "Cross-record provenance link. Covers 'derived_from', 'answers', 'cites', 'block_contains_passage' (Letta), 'chunk_of_document' (Cognee), etc.",
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "Source record ID."
+        },
+        "rel": {
+          "type": "string",
+          "description": "Relation type. Convention: snake_case. Consumers MAY ignore unknown rel values."
+        },
+        "to": {
+          "type": "string",
+          "description": "Target record ID."
+        },
+        "created": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the relation was established."
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Free-form extension slot."
+        }
+      }
+    },
+
+    "compression_manifest_entry": {
+      "type": "object",
+      "required": ["record_id", "engine_id"],
+      "additionalProperties": true,
+      "description": "One compressed form of a record, selected via contest.",
+      "properties": {
+        "record_id": { "type": "string" },
+        "engine_id": { "type": "string" },
+        "engine_version": { "type": "string" },
+        "compressed_content": { "type": "string" },
+        "compression_ratio": { "type": "number", "minimum": 0 },
+        "composite_score": { "type": "number" },
+        "scoring_profile": { "type": "string" },
+        "selected_at": { "type": "string", "format": "date-time" },
+        "winner_contest_id": { "type": "string" }
+      }
+    },
+
+    "memory_version_entry": {
+      "type": "object",
+      "required": ["id", "record_id", "version_num", "content"],
+      "additionalProperties": true,
+      "description": "One snapshot in a record's DAG history. content-addressed via commit_hash when present.",
+      "properties": {
+        "id": { "type": "string" },
+        "record_id": { "type": "string" },
+        "version_num": { "type": "integer", "minimum": 1 },
+        "commit_hash": { "type": "string" },
+        "branch": { "type": "string" },
+        "parent_version_id": { "type": ["string", "null"] },
+        "content": { "type": "string" },
+        "snapshot_at": { "type": "string", "format": "date-time" },
+        "change_type": {
+          "type": "string",
+          "enum": ["create", "update", "delete", "revert", "merge", "branch"]
+        }
+      }
+    },
+
+    "embedding_sidecar": {
+      "type": "object",
+      "required": ["model", "dim", "encoding"],
+      "additionalProperties": true,
+      "description": "Describes how embeddings are delivered for this envelope.",
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "Embedding model identifier (e.g. 'nomic-embed-text', 'text-embedding-3-small'). Importers that change models regenerate embeddings."
+        },
+        "dim": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Embedding dimensionality."
+        },
+        "encoding": {
+          "type": "string",
+          "enum": ["inline_base64_f32", "sidecar"],
+          "description": "'inline_base64_f32' stores each vector in its record's payload.embedding as base64(float32 bytes). 'sidecar' references an external parquet file via sidecar_file."
+        },
+        "sidecar_file": {
+          "type": "string",
+          "description": "Path to parquet sidecar (when encoding='sidecar'). Relative to the envelope file."
+        }
+      }
+    },
+
+    "attestation": {
+      "type": "object",
+      "required": ["alg", "signature"],
+      "additionalProperties": true,
+      "description": "Reserved for v0.2+. Detached signature over canonical envelope JSON.",
+      "properties": {
+        "alg": {
+          "type": "string",
+          "description": "Signing algorithm, e.g. 'ed25519'."
+        },
+        "signature": {
+          "type": "string",
+          "description": "Base64-encoded signature bytes over canonical envelope form (records sorted by id, keys sorted)."
+        },
+        "kid": {
+          "type": "string",
+          "description": "Signer key identifier."
+        },
+        "signed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}
