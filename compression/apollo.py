@@ -387,3 +387,89 @@ def _normalize_fallback_output(raw: str) -> Optional[str]:
         if _FALLBACK_RE.match(candidate):
             return candidate
     return None
+
+
+# ── Narration (dense → prose readback, v3.3 S-II rule-based) ──────────────
+#
+# The narrate API endpoint (GET /v1/memories/{id}/narrate) calls these
+# helpers to convert APOLLO's dense-form output back into prose for
+# human display. S-III replaces the rule-based readback with a cached
+# small-LLM call behind the same dispatcher seam.
+#
+# Two encoded shapes ship in S-II:
+#   * Portfolio schema:  AAPL:100@150.25/175.50:tech;MSFT:50@300/310:tech
+#   * LLM fallback:      summary=...;facts=[...];entities=[...];concepts=[...]
+#
+# Each has a rule-based narrator. The dispatcher sniffs the shape and
+# routes to the right one; unknown shapes pass through verbatim.
+
+# Portfolio-shape sniff (single-position regex — schema has the full grammar).
+_PORTFOLIO_SHAPE_RE = re.compile(
+    r"^[A-Z]{1,5}:\d+(?:\.\d+)?@\d+(?:\.\d+)?/\d+(?:\.\d+)?:\S+"
+)
+
+
+def looks_like_portfolio(encoded: str) -> bool:
+    """Return True if the encoded form matches the portfolio dense
+    shape. Sniff for dispatch only; the schema owns full validation."""
+    if not encoded:
+        return False
+    first = encoded.split(";", 1)[0].strip()
+    return bool(_PORTFOLIO_SHAPE_RE.match(first))
+
+
+def looks_like_fallback(encoded: str) -> bool:
+    """Return True if the encoded form matches the LLM-fallback
+    shape."""
+    if not encoded:
+        return False
+    return bool(_FALLBACK_RE.match(encoded.strip()))
+
+
+def _narrate_fallback_form(encoded: str) -> str:
+    """Rule-based readback of the LLM-fallback dense shape.
+
+    Input:   summary=<s>;facts=[f1|f2];entities=[e1|e2];concepts=[c1|c2]
+    Output:  <s>. Facts: f1, f2. Entities: e1, e2. Concepts: c1, c2.
+
+    Empty sections are omitted from the prose output to avoid ending
+    sentences like "Entities: .".
+    """
+    m = _FALLBACK_RE.match(encoded.strip())
+    if m is None:
+        return encoded
+    summary = (m.group("summary") or "").strip()
+    parts: List[str] = []
+    if summary:
+        # Ensure a trailing period so the sentence reads cleanly even
+        # when the LLM omitted one.
+        parts.append(summary if summary.endswith((".", "!", "?")) else summary + ".")
+    for label, key in (("Facts", "facts"), ("Entities", "entities"), ("Concepts", "concepts")):
+        raw_group = (m.group(key) or "").strip()
+        if not raw_group:
+            continue
+        items = [item.strip() for item in raw_group.split("|") if item.strip()]
+        if not items:
+            continue
+        parts.append(f"{label}: {', '.join(items)}.")
+    return " ".join(parts) if parts else ""
+
+
+def narrate_encoded(encoded: Optional[str]) -> str:
+    """Dispatch an APOLLO dense form to the correct rule-based
+    narrator.
+
+    Recognizes the portfolio schema and the LLM-fallback shape.
+    Unknown shapes fall through verbatim — narration is best-effort
+    and MUST NOT raise: the /v1/memories/{id}/narrate endpoint calls
+    this and the caller is always safe to display the result.
+    """
+    if not encoded:
+        return ""
+    if looks_like_portfolio(encoded):
+        return PortfolioSchema().narrate(encoded)
+    if looks_like_fallback(encoded):
+        return _narrate_fallback_form(encoded)
+    # Unknown shape — return verbatim; operator can still see the
+    # dense form, and a future schema addition will widen coverage.
+    return encoded

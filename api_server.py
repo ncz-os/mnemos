@@ -34,6 +34,7 @@ from api.handlers.dag import router as dag_router
 from api.handlers.webhooks import router as webhooks_router
 from api.handlers.oauth import router as oauth_router
 from api.handlers.federation import router as federation_router
+from api.handlers.narrate import router as narrate_router
 
 try:
     from api.handlers.document_import import router as document_import_router
@@ -228,6 +229,7 @@ app.include_router(webhooks_router)  # v3.0.0: Outbound webhook subscriptions
 app.include_router(oauth_router)  # v3.0.0: OAuth/OIDC browser login
 app.include_router(federation_router)  # v3.0.0: Cross-instance memory federation
 app.include_router(memories_router)
+app.include_router(narrate_router)  # v3.3 S-II: APOLLO dense-form narration
 app.include_router(ingest_router)
 app.include_router(kg_router)
 app.include_router(portability_router)  # v3.2: /v1/export + /v1/import (MPF v0.1)
