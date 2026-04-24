@@ -45,7 +45,16 @@ from typing import Any, Dict, Optional
 # Individual engines may override these on a per-instance basis; the
 # CompressionManager passes the effective target_ratio via the request.
 BASE_CHUNK_RATIO: float = 0.4              # default: keep 40% of tokens
-MIN_CHUNK_RATIO: float = 0.15              # floor: never compress below 15%
+# MIN_CHUNK_RATIO floor: catch empty / degenerate output, NOT aggressive
+# dense encoding. APOLLO's schema path produces ~99% reduction by design
+# (500-char portfolio → 5-char "PORTFOLIO:name=..." slot), and a 0.15
+# floor miscategorised those as broken (live PYTHIA contest 2026-04-24
+# had APOLLO 0-wins / 60 judged because composite was always 0).
+# Use a tighter floor that still catches actual empties (ratio ≈ 0
+# when compressed_tokens ≤ 1) without punishing legitimate dense
+# encoding. Engines that produce empty output will still bottom out
+# via the compressed_tokens check and _pow_guard's base≤0 path.
+MIN_CHUNK_RATIO: float = 0.001             # floor: catch empties only
 SAFETY_MARGIN: float = 1.2                  # budget multiplier for over-production
 SUMMARIZATION_OVERHEAD_TOKENS: int = 4096   # reservation for summarization prompt
 
