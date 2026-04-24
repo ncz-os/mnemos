@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+from .apollo import narrate_encoded
 from .base import (
     MIN_CHUNK_RATIO,
     CompressionEngine,
@@ -57,6 +58,7 @@ from .base import (
     CompressionResult,
     IdentifierPolicy,
 )
+from .judge import Judge
 
 # Python 3.11+ floor per pyproject.toml; tomllib is stdlib.
 import tomllib
@@ -356,11 +358,74 @@ def _classify_failure(result: CompressionResult) -> str:
     return "no_output"
 
 
+async def _apply_judge_scores(
+    raw_results: list[CompressionResult],
+    request: CompressionRequest,
+    judge: Judge,
+) -> None:
+    """Run ``judge`` against every succeeded result and overwrite
+    ``quality_score`` with the judge's fidelity rating. Mutates
+    ``raw_results`` in place.
+
+    Preserves the engine's self-reported score under
+    ``result.manifest['engine_quality_score']`` so the audit log
+    records both readings. Stamps ``result.judge_model`` with the
+    judge's id. Judge failure (returns None) leaves the result's
+    score untouched — the contest never fails closed because the
+    judge is down.
+
+    For APOLLO candidates the dense form is narrated first (the
+    judge compares against prose, not dense form); non-APOLLO
+    engines ship prose output directly so no narration is needed.
+    """
+    for r in raw_results:
+        if not r.succeeded() or r.compressed_content is None:
+            continue
+
+        # APOLLO outputs are dense — narrate to prose before scoring.
+        # Other engines emit prose-shaped output already.
+        if r.engine_id == "apollo":
+            candidate_narrated = narrate_encoded(r.compressed_content)
+        else:
+            candidate_narrated = r.compressed_content
+
+        try:
+            score = await judge.score(
+                original=request.content,
+                candidate_encoded=r.compressed_content,
+                candidate_narrated=candidate_narrated,
+                candidate_engine_id=r.engine_id,
+            )
+        except Exception:  # noqa: BLE001 — judge MUST NOT raise upward
+            logger.exception(
+                "Judge %s raised scoring candidate engine=%s; falling "
+                "back to engine-reported quality_score",
+                type(judge).__name__, r.engine_id,
+            )
+            continue
+
+        if score is None:
+            # Judge returned None (unavailable, parse failure, circuit
+            # open). Keep the engine's self-reported score.
+            continue
+
+        # Preserve the engine's self-reported score on the manifest so
+        # the audit log carries both readings; then replace
+        # quality_score with the judge's fidelity rating.
+        r.manifest = dict(r.manifest or {})
+        if r.quality_score is not None:
+            r.manifest["engine_quality_score"] = r.quality_score
+        r.manifest["judge_reasoning"] = score.reasoning
+        r.quality_score = score.fidelity
+        r.judge_model = score.model_id
+
+
 async def run_contest(
     engines: Sequence[CompressionEngine],
     request: CompressionRequest,
     *,
     profile: Optional[ScoringProfile] = None,
+    judge: Optional[Judge] = None,
 ) -> ContestOutcome:
     """Run every eligible engine on one memory and select a winner.
 
@@ -371,9 +436,18 @@ async def run_contest(
       2. Runs eligible engines concurrently via asyncio.gather, with
          return_exceptions=True so one engine's crash doesn't kill the
          contest.
-      3. Normalizes speed_factor across completed results (fastest=1.0).
-      4. Applies the quality floor, then scores survivors.
-      5. Picks the max-composite survivor as winner; remaining
+      3. (v3.3 S-II, optional) If a ``judge`` is supplied, rates the
+         fidelity of every succeeded candidate against the original
+         memory. Replaces the engine's self-reported quality_score
+         with the judge's fidelity score; stamps the candidate's
+         ``judge_model`` with the judge's id; preserves the engine's
+         self-reported score in the candidate manifest under
+         ``engine_quality_score``. Judge failure falls back silently
+         to the engine-reported score — the contest never fails
+         closed because the judge is down.
+      4. Normalizes speed_factor across completed results (fastest=1.0).
+      5. Applies the quality floor, then scores survivors.
+      6. Picks the max-composite survivor as winner; remaining
          survivors get reject_reason='inferior'.
 
     The ContestOutcome is pure data — the caller writes it to the
@@ -458,6 +532,14 @@ async def run_contest(
         r.elapsed_ms for r in raw_results if r.succeeded() and r.elapsed_ms > 0
     ]
     fastest = min(completed_times) if completed_times else 0
+
+    # v3.3 S-II: judge-LLM fidelity scoring. When supplied, run the
+    # judge against every succeeded result BEFORE the quality floor is
+    # applied. Judge failures fall back silently to the engine's
+    # self-reported score; the engine score is preserved on the
+    # result's manifest so the audit log carries both readings.
+    if judge is not None:
+        await _apply_judge_scores(raw_results, request, judge)
 
     survivors: list[ContestCandidate] = []
     for r in raw_results:

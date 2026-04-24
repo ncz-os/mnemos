@@ -245,6 +245,7 @@ async def process_contest_queue(
     min_content_length: int = 0,
     stale_threshold_secs: int = _DEFAULT_STALE_THRESHOLD_SECS,
     judge_model: Optional[str] = None,
+    judge: Optional[Any] = None,
 ) -> Dict[str, int]:
     """Drain up to `batch_size` pending queue rows via the contest path.
 
@@ -340,6 +341,7 @@ async def process_contest_queue(
                 engines=engines,
                 counts=counts,
                 judge_model=judge_model,
+                judge=judge,
                 min_content_length=min_content_length,
                 expected_attempts=attempts,
             )
@@ -368,6 +370,7 @@ async def _process_one(
     engines: Sequence[CompressionEngine],
     counts: Counter[str],
     judge_model: Optional[str],
+    judge: Optional[Any] = None,
     min_content_length: int = 0,
     expected_attempts: int,
 ) -> None:
@@ -423,7 +426,7 @@ async def _process_one(
         scoring_profile=scoring_profile,
         identifier_policy=IdentifierPolicy.STRICT,
     )
-    outcome = await run_contest(engines, request)
+    outcome = await run_contest(engines, request, judge=judge)
 
     # persist + queue-finalization must commit together so a failure
     # between them cannot leave a contest durable with the queue row
