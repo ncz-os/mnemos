@@ -1,12 +1,23 @@
 """
-Compression Module: THE MOIRAI (Tier 1-3 compression)
+Compression Module
 
-Provides:
-- LETHE: Fast CPU compression (Tier 1, 0.5-5ms, 30-57% reduction; token + sentence modes)
-- ALETHEIA: GPU token-level compression via a configurable GPU provider (Tier 2, 200-500ms, 70% reduction)
-- ANAMNESIS: GPU fact extraction for archival (Tier 3, 500ms-2s, semantic compression)
-- CompressionManager: Orchestrates LETHE/ALETHEIA/ANAMNESIS with fallback
-- QualityAnalyzer: Quality manifest generation
+Provides the LETHE / ANAMNESIS / APOLLO stack plus a plugin
+CompressionEngine ABC for operator-registered engines.
+
+- LETHE: Fast CPU extractive compression (0.5-5ms, 30-57% reduction;
+  token + sentence modes).
+- ANAMNESIS: GPU-optional LLM fact extraction for prose that doesn't
+  fit a known schema (500ms-2s, semantic compression).
+- APOLLO (v3.3+, see ROADMAP.md Apollo Program): schema-aware dense
+  encoding for LLM-to-LLM consumption.
+- ALETHEIA: DEPRECATED. GPU token-level importance scoring from the
+  v3.1 stack; lost every contest in the 2026-04-23 benchmark
+  (docs/benchmarks/compression-2026-04-23.md). Kept importable for
+  operators who had it opted-in, but removed from the default
+  contest in distillation_worker.py. Scheduled for v4.0 removal.
+- CompressionManager: legacy v3.0 orchestrator, still used for
+  MNEMOS_COMPRESSION_MODE='off|lethe|anamnesis|auto'.
+- QualityAnalyzer: Quality manifest generation.
 """
 
 from .base import (
@@ -61,14 +72,17 @@ __all__ = [
     "ContestOutcome",
     "run_contest",
     "persist_contest",
-    # v3.0 compression surface (still in use until LETHE/ALETHEIA/ANAMNESIS
-    # migrate to the ABC)
+    # v3.0 compression surface (still in use until LETHE/ANAMNESIS
+    # migrate to the ABC; APOLLO lands on the ABC directly)
     "QualityAnalyzer",
     "QualityManifest",
     "CompressionManager",
     "CompressionResult",
     "LETHE",
     "LETHEEngine",
+    # ALETHEIA: deprecated — kept importable for operators who had
+    # MNEMOS_ALETHEIA_ENABLED=true before the retirement commit;
+    # v4.0 removes.
     "ALETHEIA",
     "ALETHEIAEngine",
     "ANAMNESIS",

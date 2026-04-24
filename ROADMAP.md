@@ -10,7 +10,7 @@ This document is kept intentionally narrow. It lists what the next release will 
 
 **Headline:** plugin-interfaced compression platform with competitive per-memory engine selection, a persisted audit log on every compression decision, and a first-class GPU batcher that works across integrated graphics, discrete GPUs, and remote OpenAI-compatible endpoints.
 
-Three engines ship under the platform: LETHE (extractive, CPU), ALETHEIA (LLM-assisted token importance, GPU-optional), and ANAMNESIS (LLM fact extraction, GPU-optional). The `CompressionEngine` ABC is open: operators can register additional engines, and a first-party fourth engine (APOLLO — schema-aware dense encoding for LLM-to-LLM consumption) is staged across v3.2–v3.4 (see "Apollo Program" below).
+Three engines shipped under the platform in v3.1: LETHE (extractive, CPU), ALETHEIA (LLM-assisted token importance, GPU-required), and ANAMNESIS (LLM fact extraction, GPU-optional). The going-forward stack is LETHE + ANAMNESIS + APOLLO — ALETHEIA was retired from the default contest in the v3.2 tail on the back of the 2026-04-23 benchmark (0 contest wins, index-list prompt incompatible with instruction-tuned generalist LLMs) and is scheduled for v4.0 removal. The `CompressionEngine` ABC is open: operators can register additional engines, and the first-party third engine of the going-forward stack (APOLLO — schema-aware dense encoding for LLM-to-LLM consumption) is staged across v3.3–v3.4 (see "Apollo Program" below).
 
 ### Tier 1 — small fixes that unblock real surfaces (shipped on master)
 
@@ -49,7 +49,7 @@ These were in earlier v3.1 plans and have been explicitly deferred to keep v3.1 
 
 ## Apollo Program — v3.2 to v3.4 staged rollout
 
-APOLLO is MNEMOS's fourth compression engine: schema-aware dense encoding targeted at **LLM-to-LLM wire use**, not human reading. The insight is that LETHE/ALETHEIA/ANAMNESIS all assume the final reader is human or a search-ranking pass. APOLLO assumes the final reader is a downstream LLM (a GRAEAE muse, a consultative agent, a tool-use caller) and encodes accordingly: typed key:value dense forms that LLMs parse natively in fewer tokens than the prose equivalent. Humans read through a narrator at read time; the raw dense form is never shown to them.
+APOLLO is the going-forward stack's schema-aware engine: dense encoding targeted at **LLM-to-LLM wire use**, not human reading. The insight is that LETHE and ANAMNESIS both assume the final reader is human or a search-ranking pass. APOLLO assumes the final reader is a downstream LLM (a GRAEAE muse, a consultative agent, a tool-use caller) and encodes accordingly: typed key:value dense forms that LLMs parse natively in fewer tokens than the prose equivalent. Humans read through a narrator at read time; the raw dense form is never shown to them.
 
 The canonical production pattern is InvestorClaw's consultative layer, which already demonstrates that `AAPL:100@150.25/175.50:tech` (12 tokens) is equivalent context for a downstream LLM to the 50-token prose sentence it was derived from.
 

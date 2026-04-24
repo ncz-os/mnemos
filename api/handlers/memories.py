@@ -466,7 +466,7 @@ async def search_memories(
         backend = _lc.get_inference_backend()
         backend_healthy = await backend.health_check()
         if backend_healthy:
-            # Phase 2 complete: compression stack available (LETHE/ALETHEIA/ANAMNESIS)
+            # Phase 2 complete: compression stack available (LETHE + ANAMNESIS; APOLLO in v3.3+)
             # On-the-fly search result compression deferred to Phase 8A (batch optimization)
             # Gateway uses LETHE compression for memory injection (critical path)
             logger.debug(

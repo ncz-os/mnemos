@@ -240,7 +240,22 @@ Only output the indices, no explanation.
 
 
 class ALETHEIAEngine(CompressionEngine):
-    """ALETHEIA under the v3.1 CompressionEngine ABC.
+    """ALETHEIA under the CompressionEngine ABC — DEPRECATED.
+
+    Retired from the default contest in distillation_worker.py as of
+    the v3.2 tail. Kept importable for operators who had
+    MNEMOS_ALETHEIA_ENABLED=true before the retirement, but no longer
+    part of the going-forward stack (LETHE + ANAMNESIS + APOLLO, per
+    docs/benchmarks/compression-2026-04-23.md).
+
+    Why retired: the 2026-04-23 CERBERUS benchmark across 49
+    PYTHIA memories showed ALETHEIA winning 0 contests against
+    gemma-4-E4B-it — the index-list scoring prompt doesn't survive
+    instruction-tuned generalist LLMs, and the fallback-to-first-N
+    path is strictly inferior to LETHE's sentence-extractive output.
+    Niche audit: every case where ALETHEIA might win is owned by
+    LETHE (cheaper), ANAMNESIS (better fact shape), or APOLLO
+    (schema-typed). Scheduled for v4.0 removal.
 
     Composes the async ALETHEIA HTTP client with disable_fallback=True
     so a GPU outage becomes an honest error result rather than a
@@ -255,15 +270,12 @@ class ALETHEIAEngine(CompressionEngine):
     STRICT.
 
     gpu_intent=GPU_REQUIRED: this engine has no self-contained CPU
-    path. Task #6's gpu_batcher pre-checks endpoint availability and
-    skips gpu_required engines with reject_reason='disabled' when the
-    GPU endpoint is unreachable. Until the batcher lands, ALETHEIA
-    returns an error result in the GPU-down case and the contest
-    records it with reject_reason='error'.
+    path. GPU-down case returns an error result; the contest records
+    it with reject_reason='error'.
     """
 
     id = "aletheia"
-    label = "ALETHEIA — LLM-assisted token compression (GPU)"
+    label = "ALETHEIA — LLM-assisted token compression (GPU) [deprecated]"
     version = "1.0"
     gpu_intent = GPUIntent.GPU_REQUIRED
 
@@ -274,6 +286,16 @@ class ALETHEIAEngine(CompressionEngine):
         core: Optional[ALETHEIA] = None,
     ) -> None:
         super().__init__()
+        import warnings
+        warnings.warn(
+            "ALETHEIAEngine is deprecated and removed from the default "
+            "MNEMOS compression stack (LETHE/ANAMNESIS/APOLLO going "
+            "forward). Kept importable for operator registration; "
+            "v4.0 will remove. See docs/benchmarks/"
+            "compression-2026-04-23.md for rationale.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._core = core or ALETHEIA(
             gpu_url=gpu_url,
             timeout=timeout,

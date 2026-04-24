@@ -6,6 +6,25 @@ All notable changes to MNEMOS are documented here.
 
 Post-3.2.0 work not yet tagged.
 
+### Changed
+
+- **ALETHEIA retired from the default compression stack.** The
+  going-forward stack is LETHE + ANAMNESIS + APOLLO (APOLLO in
+  v3.3+ per ROADMAP.md Apollo Program). ALETHEIA won 0 contests in
+  the 2026-04-23 CERBERUS benchmark — its index-list scoring prompt
+  doesn't survive instruction-tuned generalist LLMs, and the
+  fallback-to-first-N path is strictly inferior to LETHE at lower
+  cost. Niche audit found every case where ALETHEIA might
+  theoretically win is owned by LETHE (cheaper), ANAMNESIS (better
+  fact shape), or APOLLO (schema-typed). `ALETHEIAEngine` now emits
+  a DeprecationWarning on construction and is skipped in the
+  default contest (`distillation_worker.py` still honors
+  `MNEMOS_ALETHEIA_ENABLED=true` for operators who had it opted in,
+  but logs a deprecation warning when that gate flips on). The
+  engine class stays importable; v4.0 removes it entirely. See
+  `docs/benchmarks/compression-2026-04-23.md` for measured rationale
+  and the niche audit captured in-session.
+
 ## [3.2.0] — 2026-04-23
 
 Tenancy + observability + ideation-infrastructure release. Rolls in
