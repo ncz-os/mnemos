@@ -298,16 +298,36 @@ async def t_update_drawer(args: Dict[str, Any]) -> Any:
         body["content"] = args["content"]
     if "room" in args:
         body["category"] = args["room"]
+
     # MemPalace callers pass tags as a top-level field; MNEMOS has no
-    # tags column on MemoryUpdateRequest — tags live in
-    # metadata.tags. Merge caller-supplied metadata with caller-supplied
-    # tags so both end up on the same metadata object in the update.
-    # Codex caught the prior pass-through dropping tag-only updates.
-    metadata = dict(args.get("metadata") or {})
-    if "tags" in args:
-        metadata["tags"] = args["tags"]
-    if metadata:
-        body["metadata"] = metadata
+    # tags column on MemoryUpdateRequest — tags live in metadata.tags.
+    #
+    # The server's PATCH path REPLACES the full metadata object
+    # (not a JSON merge patch), so naively sending
+    # `metadata={"tags": [...]}` would erase every other key the
+    # memory already carries (distillation_success, source, ...).
+    # Round-trip read: GET the memory first, merge caller's metadata
+    # + tags into the existing object, PATCH the merged result.
+    # Skip the merge round-trip when the caller isn't touching
+    # metadata OR tags at all — avoids a wasted fetch on
+    # content/room-only updates.
+    caller_meta = args.get("metadata")
+    caller_tags = args.get("tags")
+    if caller_meta is not None or caller_tags is not None:
+        try:
+            existing = await _get(f"/v1/memories/{drawer_id}")
+            merged = dict((existing or {}).get("metadata") or {})
+        except Exception:
+            # If the read fails, fall back to sending just what the
+            # caller passed. Losing merge is better than blocking the
+            # update; the warning is visible in server logs.
+            merged = {}
+        if isinstance(caller_meta, dict):
+            merged.update(caller_meta)
+        if caller_tags is not None:
+            merged["tags"] = caller_tags
+        body["metadata"] = merged
+
     resp = await _patch(f"/v1/memories/{drawer_id}", body)
     return _mem_to_drawer(resp)
 

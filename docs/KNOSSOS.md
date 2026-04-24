@@ -61,7 +61,7 @@ the MemPalace tool-response shape.
 
 | MemPalace concept | MNEMOS concept | KNOSSOS default |
 |---|---|---|
-| **wing** (person/project space) | `owner_id` OR `namespace` | `owner_id` (configurable via `KNOSSOS_WING_AXIS=namespace`) |
+| **wing** (person/project space) | `owner_id` OR `namespace` | `namespace` (configurable via `KNOSSOS_WING_AXIS=owner_id`) |
 | **room** (topic within a wing) | `category` | 1:1 mapping |
 | **drawer** (verbatim content unit) | memory record | 1:1 — a memory is a drawer |
 | **tunnel** (cross-wing link) | `kg_triple` with `predicate="tunnel:<label>"` | Round-trips via `/v1/kg/triples` |
@@ -105,7 +105,8 @@ the MNEMOS repo root. Full deployment notes in [DEPLOYMENT_GUIDE.md](./DEPLOYMEN
 ```bash
 export MNEMOS_BASE=http://mnemos.internal:5002
 export MNEMOS_API_KEY=$TEAM_API_KEY           # bearer token, issued per user
-export KNOSSOS_WING_AXIS=owner_id             # or 'namespace' for tenant-wide wings
+export KNOSSOS_WING_AXIS=namespace             # default; 'owner_id' is also accepted
+                                               # (MNEMOS /v1/memories/search only scopes by namespace today)
 
 python -m tools.knossos_mcp                   # stdio MCP server
 ```
