@@ -41,8 +41,13 @@ _EVENT_TYPES = {
     "post": "publication",
     "handoff": "handoff",
     "announcement": "announcement",
-    "decision": "decision",
-    "review": "review",
+    # "decision" and "review" deliberately excluded as event types —
+    # Codex caught that "On 2026-04-23 we reviewed the release notes
+    # and decision quality" would fire EventSchema because those
+    # words appeared in the content. They're descriptions of what
+    # happened, not event kinds. DecisionSchema already covers
+    # formal decision captures; prose mentioning a review should
+    # fall through to Artemis rather than mislabel as an event.
 }
 
 # Date patterns we understand. Each capture group resolves to a
@@ -101,13 +106,30 @@ def _extract_date(content: str) -> Optional[str]:
     return None
 
 
+# Compound-noun suffixes that mean the event-type word is a MODIFIER,
+# not a standalone event claim. e.g. "release notes" = documentation,
+# not a release event.
+_EVENT_COMPOUND_SUFFIXES = (
+    "notes", "candidate", "candidates", "plan", "plans", "schedule",
+    "schedules", "timeline", "timelines", "calendar", "history",
+    "log", "logs", "archive", "archives", "doc", "docs",
+    "summary", "summaries", "quality",
+)
+
+
 def _extract_event_type(content: str) -> Optional[str]:
     """First type-marker hit wins; canonical label returned."""
     lowered = content.lower()
     # Word-boundary scan; longer markers (e.g. "outage") won before
     # shorter ones that could subsume them.
     for marker in sorted(_EVENT_TYPES.keys(), key=len, reverse=True):
-        if re.search(rf"\b{re.escape(marker)}\b", lowered):
+        # Codex regression: "release notes" / "incident history" /
+        # "deployment plan" are compound-noun descriptions, not event
+        # kinds. Require the marker NOT be immediately followed by a
+        # descriptor that recasts it as a modifier.
+        suffix_alt = "|".join(re.escape(s) for s in _EVENT_COMPOUND_SUFFIXES)
+        pattern = rf"\b{re.escape(marker)}\b(?!\s+(?:{suffix_alt})\b)"
+        if re.search(pattern, lowered):
             return _EVENT_TYPES[marker]
     return None
 

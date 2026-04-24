@@ -57,6 +57,25 @@ _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _HANDLE_RE = re.compile(r"(?:^|\s)@([A-Za-z0-9_\-]{2,40})\b")
 _PHONE_RE = re.compile(r"\b(?:\+?1[\s\-.])?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}\b")
 
+# A plausible person-name value: one or more capitalized tokens,
+# allowing hyphens/apostrophes/periods (initials). Rejects:
+#   - lowercased strings
+#   - runs with numerics or checklist filler ("item 1")
+#   - strings with trailing punctuation beyond a final period
+# Sentinel values ("TBD", "placeholder") are rejected separately.
+_PERSON_NAME_RE = re.compile(
+    r"^[A-Z][a-zA-Z\-'.]*"              # First capitalized token
+    r"(?:\s+[A-Z][a-zA-Z\-'.]*){0,3}"   # 0-3 additional capitalized tokens
+    r"$"
+)
+
+# Non-name values to reject even when they happen to be capitalized.
+_NAME_SENTINELS = frozenset({
+    "tbd", "n/a", "na", "none", "unknown", "placeholder",
+    "everyone", "someone", "anyone", "nobody", "staff", "team",
+    "anonymous", "redacted", "see above", "see below",
+})
+
 # Role/title keywords — used to validate loose-form role captures.
 _ROLE_WORDS = (
     "engineer", "developer", "architect", "manager", "director",
@@ -76,8 +95,14 @@ class PersonSchema(Schema):
             return None
 
         # Try labeled form first — strictest signal.
+        # Codex re-review: the old contact-fallback path let strings
+        # like "Name: Q4 Escalation Owner" fire because any
+        # non-sentinel Name + any contact anchor was accepted. That's
+        # a role/checklist record, not a person. The name-shape check
+        # is now authoritative — no contact-based escape hatch.
         labeled_fields = _extract_labeled(content)
-        if labeled_fields.get("name"):
+        name_val = labeled_fields.get("name")
+        if name_val and _looks_like_person_name(name_val):
             return self._build_result(labeled_fields, content, source="labeled")
 
         # Fall through to loose inline form.
@@ -168,6 +193,37 @@ class PersonSchema(Schema):
         if contact:
             sentence += f" Contact: {contact}."
         return sentence
+
+
+def _looks_like_person_name(s: str) -> bool:
+    """Tight test for plausible person-name values.
+
+    Codex re-review caught that ``Q4 Escalation Owner`` passes the raw
+    capitalization regex but is a role label, not a person. Reject
+    names that (a) contain any digit, or (b) contain a role/title
+    keyword — those are role descriptions that belong in ``role:``,
+    not ``name:``.
+    """
+    if not s:
+        return False
+    stripped = s.strip().strip(".,;:")
+    if not stripped:
+        return False
+    if stripped.lower() in _NAME_SENTINELS:
+        return False
+    if not _PERSON_NAME_RE.match(stripped):
+        return False
+    # Digits in a name are vanishingly rare (Q4, v2, 2FA) and far
+    # more often signal a role/ticket/id misfiled under name:.
+    if any(c.isdigit() for c in stripped):
+        return False
+    # Role keywords in the name value mean this is a role label, not
+    # a person. Check on a word-boundary, case-insensitive.
+    lowered = stripped.lower()
+    for word in _ROLE_WORDS:
+        if re.search(rf"\b{re.escape(word)}\b", lowered):
+            return False
+    return True
 
 
 def _extract_labeled(content: str) -> Dict[str, str]:

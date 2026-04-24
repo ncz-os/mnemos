@@ -455,3 +455,29 @@ def test_outcome_is_serializable_shape():
     assert isinstance(outcome.scoring_profile, str)
     assert isinstance(outcome.candidates, list)
     assert all(c.result is not None for c in outcome.candidates)
+
+
+def test_scoring_profile_weights_actually_flip_the_winner():
+    """Codex re-review regression: prove that quality_first vs balanced
+    pick DIFFERENT winners under the exponentiated-weights math. The
+    prior test suite only asserted same-winner across profiles which
+    didn't exercise whether weights were load-bearing.
+
+    Candidates chosen so:
+        balanced (q_w=1, r_w=1, s_w=1) → fast_good wins on speed
+        quality_first (q_w=2, s_w=0.5) → slow_great wins on quality
+    """
+    engines = [
+        MockEngine("fast_good", quality=0.82, ratio=0.4, elapsed_ms=10),
+        MockEngine("slow_great", quality=0.99, ratio=0.4, elapsed_ms=50),
+    ]
+    balanced_out = asyncio.run(run_contest(engines, _request("balanced")))
+    quality_out = asyncio.run(run_contest(engines, _request("quality_first")))
+    assert balanced_out.winner is not None
+    assert quality_out.winner is not None
+    assert balanced_out.winner.result.engine_id == "fast_good"
+    assert quality_out.winner.result.engine_id == "slow_great"
+    assert (
+        balanced_out.winner.result.engine_id
+        != quality_out.winner.result.engine_id
+    ), "profile weights must actually flip the contest winner"

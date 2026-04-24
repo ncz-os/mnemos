@@ -351,6 +351,23 @@ def _ratio_term(ratio: Optional[float]) -> float:
     return 1.0 - ratio
 
 
+def _pow_guard(base: float, exp: float) -> float:
+    """Return base ** exp with guards that keep composite_score sane:
+
+      * Negative base -> 0 (no axis should produce a negative value
+        in the [0, 1] normalized range we work in; negative is a bug
+        upstream).
+      * base == 0 and exp == 0 -> 0 (mathematical 0^0 is indeterminate;
+        we treat it as "no contribution" to match the zero-kills-
+        composite gate).
+      * base == 0 and exp > 0  -> 0 (mathematical identity).
+      * Otherwise pow(base, exp).
+    """
+    if base <= 0.0:
+        return 0.0
+    return base ** exp
+
+
 def _classify_failure(result: CompressionResult) -> str:
     """Map a non-succeeded result to a DB-allowlisted reject_reason."""
     if result.error is not None:
@@ -563,11 +580,23 @@ async def run_contest(
             continue
 
         speed_factor = _speed_factor(fastest, r.elapsed_ms)
+        ratio_term = _ratio_term(r.compression_ratio)
 
+        # Exponentiated weights so profiles actually reshape the
+        # decision boundary. The earlier multiplicative form
+        # `(q_w * q) * (r_w * r) * (s_w * s)` folded into a shared
+        # constant across candidates — within a contest every
+        # candidate's composite got multiplied by the same
+        # `q_w * r_w * s_w` factor, leaving winner ordering
+        # identical across profiles. Codex flagged this in the
+        # v3.3 review. The exponential form preserves the
+        # "zero-in-any-axis zeros composite" property (needed for
+        # the MIN_CHUNK_RATIO and speed_floor gates) while making
+        # profile weights genuinely steer outcomes.
         composite = (
-            (prof.quality_weight * q)
-            * (prof.ratio_weight * _ratio_term(r.compression_ratio))
-            * (prof.speed_weight * speed_factor)
+            _pow_guard(q, prof.quality_weight)
+            * _pow_guard(ratio_term, prof.ratio_weight)
+            * _pow_guard(speed_factor, prof.speed_weight)
         )
         survivors.append(
             ContestCandidate(
