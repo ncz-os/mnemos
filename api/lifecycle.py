@@ -366,7 +366,17 @@ async def _vector_search(conn, embedding: list, limit: int,
                      ("owner_id", owner_id)]:
         if val is not None:
             params.append(val)
-            conditions.append(f"{col}=${len(params)}")
+            if col == "owner_id":
+                # v3.2 H1 fix: federated memories carry owner_id='federation'
+                # and must be readable alongside the caller's own rows.
+                # Mutation paths still hard-filter by owner_id (caller
+                # can't update/delete federated rows) — this only affects
+                # the read helpers used by search/rehydrate/gateway.
+                conditions.append(
+                    f"(owner_id=${len(params)} OR federation_source IS NOT NULL)"
+                )
+            else:
+                conditions.append(f"{col}=${len(params)}")
     params.append(limit)
     limit_ph = f"${len(params)}"
 
@@ -409,7 +419,17 @@ async def _fts_fetch(conn, query: str, limit: int,
                      ("owner_id", owner_id)]:
         if val is not None:
             params.append(val)
-            conditions.append(f"{col}=${len(params)}")
+            if col == "owner_id":
+                # v3.2 H1 fix: federated memories carry owner_id='federation'
+                # and must be readable alongside the caller's own rows.
+                # Mutation paths still hard-filter by owner_id (caller
+                # can't update/delete federated rows) — this only affects
+                # the read helpers used by search/rehydrate/gateway.
+                conditions.append(
+                    f"(owner_id=${len(params)} OR federation_source IS NOT NULL)"
+                )
+            else:
+                conditions.append(f"{col}=${len(params)}")
 
     where = " AND ".join(conditions)
     sql = (f"SELECT {select_cols}, {rank_col} FROM memories "
@@ -428,7 +448,13 @@ async def _fts_fetch(conn, query: str, limit: int,
                          ("owner_id", owner_id)]:
             if val is not None:
                 ilike_params.append(val)
-                ilike_conditions.append(f"{col}=${len(ilike_params)}")
+                if col == "owner_id":
+                    # H1 fix — see _fts_fetch FTS branch above.
+                    ilike_conditions.append(
+                        f"(owner_id=${len(ilike_params)} OR federation_source IS NOT NULL)"
+                    )
+                else:
+                    ilike_conditions.append(f"{col}=${len(ilike_params)}")
         ilike_where = " AND ".join(ilike_conditions)
         ilike_sql = (f"SELECT {select_cols} FROM memories "
                      f"WHERE {ilike_where} ORDER BY created DESC LIMIT $2")
