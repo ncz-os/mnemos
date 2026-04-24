@@ -182,6 +182,16 @@ async def create_webhook(
     _validate_events(request.events)
 
     secret = secrets.token_urlsafe(32)
+
+    # v3.2 Tier 3: non-root cannot create a webhook in a namespace
+    # other than their own. Root may pass request.namespace for
+    # cross-tenant support.
+    if request.namespace and request.namespace != user.namespace:
+        if user.role != "root":
+            raise HTTPException(
+                status_code=403,
+                detail="cross-namespace webhook create requires root",
+            )
     namespace = request.namespace or user.namespace or "default"
 
     async with _lc._pool.acquire() as conn:
@@ -227,17 +237,32 @@ async def list_webhooks(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
+    # v3.2 Tier 3: scope by owner_id + namespace. Root sees all
+    # (no owner / namespace filter) so ops can audit cross-tenant.
+    is_root = user.role == "root"
+
     async with _lc._pool.acquire() as conn:
-        if include_revoked:
+        if is_root:
+            where = "" if include_revoked else "WHERE NOT revoked"
+            rows = await conn.fetch(
+                f"""
+                SELECT id, url, events, description, owner_id, namespace,
+                       created, revoked, revoked_at
+                FROM webhook_subscriptions
+                {where}
+                ORDER BY created DESC
+                """,
+            )
+        elif include_revoked:
             rows = await conn.fetch(
                 """
                 SELECT id, url, events, description, owner_id, namespace,
                        created, revoked, revoked_at
                 FROM webhook_subscriptions
-                WHERE owner_id = $1
+                WHERE owner_id = $1 AND namespace = $2
                 ORDER BY created DESC
                 """,
-                user.user_id,
+                user.user_id, user.namespace,
             )
         else:
             rows = await conn.fetch(
@@ -245,10 +270,10 @@ async def list_webhooks(
                 SELECT id, url, events, description, owner_id, namespace,
                        created, revoked, revoked_at
                 FROM webhook_subscriptions
-                WHERE owner_id = $1 AND NOT revoked
+                WHERE owner_id = $1 AND namespace = $2 AND NOT revoked
                 ORDER BY created DESC
                 """,
-                user.user_id,
+                user.user_id, user.namespace,
             )
 
     return WebhookListResponse(
@@ -265,16 +290,31 @@ async def get_webhook(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
+    # v3.2 Tier 3: non-root must match owner AND namespace.
+    # Root reads any webhook.
+    is_root = user.role == "root"
+
     async with _lc._pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, url, events, description, owner_id, namespace,
-                   created, revoked, revoked_at
-            FROM webhook_subscriptions
-            WHERE id = $1::uuid AND owner_id = $2
-            """,
-            webhook_id, user.user_id,
-        )
+        if is_root:
+            row = await conn.fetchrow(
+                """
+                SELECT id, url, events, description, owner_id, namespace,
+                       created, revoked, revoked_at
+                FROM webhook_subscriptions
+                WHERE id = $1::uuid
+                """,
+                webhook_id,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                SELECT id, url, events, description, owner_id, namespace,
+                       created, revoked, revoked_at
+                FROM webhook_subscriptions
+                WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3
+                """,
+                webhook_id, user.user_id, user.namespace,
+            )
     if not row:
         raise HTTPException(status_code=404, detail="webhook not found")
     return _to_item(row)
@@ -290,16 +330,31 @@ async def revoke_webhook(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
+    # v3.2 Tier 3: non-root must match owner AND namespace. Root
+    # can revoke any webhook.
+    is_root = user.role == "root"
+
     async with _lc._pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE webhook_subscriptions
-            SET revoked = TRUE, revoked_at = NOW()
-            WHERE id = $1::uuid AND owner_id = $2 AND NOT revoked
-            RETURNING id
-            """,
-            webhook_id, user.user_id,
-        )
+        if is_root:
+            row = await conn.fetchrow(
+                """
+                UPDATE webhook_subscriptions
+                SET revoked = TRUE, revoked_at = NOW()
+                WHERE id = $1::uuid AND NOT revoked
+                RETURNING id
+                """,
+                webhook_id,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                UPDATE webhook_subscriptions
+                SET revoked = TRUE, revoked_at = NOW()
+                WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3 AND NOT revoked
+                RETURNING id
+                """,
+                webhook_id, user.user_id, user.namespace,
+            )
     if not row:
         raise HTTPException(
             status_code=404, detail="webhook not found or already revoked"
@@ -318,11 +373,21 @@ async def list_deliveries(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
+    # v3.2 Tier 3: subscription must belong to caller's owner AND
+    # namespace. Root bypasses both.
+    is_root = user.role == "root"
     async with _lc._pool.acquire() as conn:
-        sub = await conn.fetchrow(
-            "SELECT id FROM webhook_subscriptions WHERE id=$1::uuid AND owner_id=$2",
-            webhook_id, user.user_id,
-        )
+        if is_root:
+            sub = await conn.fetchrow(
+                "SELECT id FROM webhook_subscriptions WHERE id=$1::uuid",
+                webhook_id,
+            )
+        else:
+            sub = await conn.fetchrow(
+                "SELECT id FROM webhook_subscriptions "
+                "WHERE id=$1::uuid AND owner_id=$2 AND namespace=$3",
+                webhook_id, user.user_id, user.namespace,
+            )
         if not sub:
             raise HTTPException(status_code=404, detail="webhook not found")
         rows = await conn.fetch(
