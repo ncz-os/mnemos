@@ -49,6 +49,7 @@ from .aletheia import ALETHEIA, ALETHEIAEngine
 from .anamnesis import ANAMNESIS, ANAMNESISEngine
 from .apollo import APOLLOEngine
 from .apollo_schemas import PortfolioSchema, Schema as APOLLOSchema
+from .artemis import ARTEMISEngine
 from .distillation_engine import (
     DistillationEngine,
     CompressionStrategy,
@@ -95,6 +96,8 @@ __all__ = [
     "APOLLOEngine",
     "APOLLOSchema",
     "PortfolioSchema",
+    # v3.3: Artemis — CPU-only extractive with identifier preservation
+    "ARTEMISEngine",
     "DistillationEngine",
     "CompressionStrategy",
     "get_distillation_engine",
