@@ -11,6 +11,14 @@ class ConsultationRequest(BaseModel):
     limit_chars: Optional[int] = None
     format: Optional[str] = "full"
 
+    # v3.2 Custom Query mode. Three optional selectors let the caller
+    # pick their own muse lineup per query instead of getting the
+    # default auto-resolved set. Precedence: models > providers > tier.
+    # If none is set, behavior is unchanged (auto lineup).
+    models: Optional[List[str]] = None
+    providers: Optional[List[str]] = None
+    tier: Optional[str] = None  # "frontier" | "premium" | "budget"
+
 
 class StatsResponse(BaseModel):
     total_memories: int

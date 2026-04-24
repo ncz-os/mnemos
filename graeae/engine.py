@@ -184,17 +184,48 @@ class GraeaeEngine:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
-    async def consult(self, prompt: str, task_type: str = "reasoning", timeout: int = 30) -> Dict:
-        """Query eligible providers in parallel and return all responses."""
+    async def consult(
+        self,
+        prompt: str,
+        task_type: str = "reasoning",
+        timeout: int = 30,
+        selection: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Dict:
+        """Query eligible providers in parallel and return all responses.
+
+        `selection` (v3.2 Custom Query mode) is an optional
+        `{provider_name: model_override_or_None}` dict. When set, only
+        those providers are considered for the fan-out; every other
+        registered provider is omitted (not marked unavailable). A
+        `model_override` value, if not None, overrides
+        `self.providers[name]["model"]` for that one call.
+
+        When `selection` is None, behavior is unchanged — every
+        registered provider is considered (current auto-lineup).
+        """
         task_type = task_type or "reasoning"
 
         # ── Cache check ──────────────────────────────────────────────────────
-        cached = self._cache.get(prompt, task_type)
+        # Include the selection (or lack thereof) in the cache key so a
+        # Custom Query for "frontier only" doesn't get served the cached
+        # all-providers response for the same prompt.
+        cache_tag = _selection_cache_tag(selection) if selection else ""
+        cache_key_task = f"{task_type}{cache_tag}"
+        cached = self._cache.get(prompt, cache_key_task)
         if cached is not None:
-            logger.info(f"[GRAEAE] cache hit (task_type={task_type})")
+            logger.info(f"[GRAEAE] cache hit (task_type={cache_key_task})")
             return {"all_responses": cached, "cache_hit": True}
 
         concurrency = self._get_concurrency()
+
+        # ── Selection-aware iteration list ───────────────────────────────────
+        # If Custom Query set a lineup, respect it verbatim; unknown
+        # provider names should have been rejected by the caller before
+        # reaching the engine, but we guard defensively.
+        if selection is not None:
+            candidate_providers = [p for p in selection if p in self.providers]
+        else:
+            candidate_providers = list(self.providers)
 
         # ── Eligibility gate ─────────────────────────────────────────────────
         # A provider is skipped (not queued) if it is:
@@ -203,7 +234,7 @@ class GraeaeEngine:
         #   • saturated (all concurrency slots occupied)
         active: list[str] = []
         skipped: list[str] = []
-        for name in self.providers:
+        for name in candidate_providers:
             if not self._circuit_breakers.is_allowed(name):
                 skipped.append(name)
             elif not self._rate_limiters.is_allowed(name):
@@ -221,14 +252,31 @@ class GraeaeEngine:
             return {
                 "all_responses": {
                     name: _unavailable(self.providers[name]["model"])
-                    for name in self.providers
+                    for name in candidate_providers
                 },
                 "error": "all providers unavailable",
             }
 
         # ── Fan-out ──────────────────────────────────────────────────────────
-        tasks = [self._query_provider(name, prompt, task_type, timeout) for name in active]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # When a selection supplied a per-provider model override, apply
+        # it temporarily for the duration of this query. We deep-copy the
+        # provider config and pass it through a throwaway self.providers
+        # snapshot via _query_provider — but simpler: route through the
+        # same _query_provider and let it pick the current config. For the
+        # override we swap `self.providers[name]["model"]` in place, fan
+        # out, then restore. This keeps _query_provider untouched.
+        restored: Dict[str, str] = {}
+        if selection is not None:
+            for name, override in selection.items():
+                if override and name in self.providers:
+                    restored[name] = self.providers[name]["model"]
+                    self.providers[name]["model"] = override
+        try:
+            tasks = [self._query_provider(name, prompt, task_type, timeout) for name in active]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            for name, original in restored.items():
+                self.providers[name]["model"] = original
 
         all_responses: Dict = {}
 
@@ -255,7 +303,7 @@ class GraeaeEngine:
 
         # ── Cache successful result ──────────────────────────────────────────
         if any(r["status"] == "success" for r in all_responses.values()):
-            self._cache.set(prompt, task_type, all_responses)
+            self._cache.set(prompt, cache_key_task, all_responses)
 
         return {"all_responses": all_responses}
 
@@ -438,6 +486,21 @@ class GraeaeEngine:
         if self._concurrency:
             status["concurrency"] = self._concurrency.status()
         return status
+
+
+def _selection_cache_tag(selection: Optional[Dict[str, Optional[str]]]) -> str:
+    """Deterministic string suffix for the response cache key when a
+    Custom Query selection is active. Different lineups must not share
+    a cache entry — two callers asking the same prompt under different
+    lineups expect different result sets.
+    """
+    if not selection:
+        return ""
+    parts = sorted(
+        f"{name}={override or ''}"
+        for name, override in selection.items()
+    )
+    return "|" + ",".join(parts)
 
 
 def _unavailable(model_id: str, error: str = "") -> Dict:

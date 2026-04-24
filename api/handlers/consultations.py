@@ -5,7 +5,7 @@
 """
 import hashlib
 import logging
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
@@ -24,6 +24,161 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["consultations"])
 
 _GENESIS_HASH = hashlib.sha256(b"MNEMOS_AUDIT_GENESIS_v3").hexdigest()
+
+
+# ── Custom Query selection (v3.2) ─────────────────────────────────────────────
+
+_VALID_TIERS = {"frontier", "premium", "budget"}
+
+
+async def _tier_lineup(tier: str) -> dict:
+    """Resolve a tier name to {provider_name: model_id} using model_registry.
+
+    Tier definitions (aligned with the v3.1.2 /v1/models registry work):
+
+      * frontier  — arena_rank <= 5 OR graeae_weight >= 0.95
+      * premium   — arena_rank BETWEEN 6 AND 15 OR graeae_weight in [0.85, 0.95)
+      * budget    — cheapest available models at graeae_weight >= 0.75
+
+    The caller reflects a tier into a concrete dict that consult()
+    consumes as a selection. Empty registry -> empty dict; handler
+    treats that as a hard error (otherwise we'd silently fall back
+    to auto, which violates the caller's intent).
+    """
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+
+    if tier == "frontier":
+        sql = """
+            SELECT DISTINCT ON (provider) provider, model_id
+            FROM model_registry
+            WHERE available = true AND deprecated = false
+              AND (arena_rank IS NOT NULL AND arena_rank <= 5
+                   OR graeae_weight >= 0.95)
+            ORDER BY provider, graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST
+        """
+        params: tuple = ()
+    elif tier == "premium":
+        sql = """
+            SELECT DISTINCT ON (provider) provider, model_id
+            FROM model_registry
+            WHERE available = true AND deprecated = false
+              AND ((arena_rank IS NOT NULL AND arena_rank BETWEEN 6 AND 15)
+                   OR (graeae_weight >= 0.85 AND graeae_weight < 0.95))
+            ORDER BY provider, graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST
+        """
+        params = ()
+    elif tier == "budget":
+        sql = """
+            SELECT DISTINCT ON (provider) provider, model_id
+            FROM model_registry
+            WHERE available = true AND deprecated = false
+              AND graeae_weight >= 0.75
+            ORDER BY provider,
+                     (COALESCE(input_cost_per_mtok, 0)
+                      + COALESCE(output_cost_per_mtok, 0)) ASC
+        """
+        params = ()
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unknown tier {tier!r}; "
+                f"expected one of {sorted(_VALID_TIERS)}"
+            ),
+        )
+
+    async with _lc._pool.acquire() as conn:
+        rows = await conn.fetch(sql, *params)
+    return {r["provider"]: r["model_id"] for r in rows}
+
+
+async def _resolve_models(model_ids: List[str]) -> dict:
+    """Resolve each explicit model_id to its provider via model_registry.
+
+    Returns {provider_name: model_id}. Raises 400 on the first
+    unrecognized model_id — fail-loudly beats silently narrowing a
+    deliberately-chosen lineup.
+    """
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    async with _lc._pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT provider, model_id
+            FROM model_registry
+            WHERE model_id = ANY($1::text[])
+              AND available = true
+              AND deprecated = false
+            """,
+            model_ids,
+        )
+    found = {r["model_id"]: r["provider"] for r in rows}
+    missing = [m for m in model_ids if m not in found]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown model_id(s): {missing}",
+        )
+    return {found[m]: m for m in model_ids}
+
+
+async def _resolve_selection(
+    engine,
+    models: Optional[List[str]] = None,
+    providers: Optional[List[str]] = None,
+    tier: Optional[str] = None,
+) -> Optional[dict]:
+    """Resolve a caller's Custom Query selectors to a
+    {provider_name: model_id_or_None} dict consult() understands.
+
+    Precedence: models > providers > tier > None (auto lineup).
+    Raises HTTPException(400) for unknown providers, unknown tiers,
+    unknown model_ids, or empty tier result sets.
+    """
+    # Mutual exclusion — at most one selector. Prevents a caller from
+    # passing both `tier=frontier` and `providers=[...]` and then
+    # wondering which won. If a caller wants combined semantics (e.g.
+    # "frontier models FROM these providers"), that's a follow-up
+    # design; reject the combination today for clarity.
+    set_fields = [n for n in (
+        "models" if models else None,
+        "providers" if providers else None,
+        "tier" if tier else None,
+    ) if n]
+    if len(set_fields) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Custom Query accepts at most one of "
+                f"{{'models', 'providers', 'tier'}}; got {set_fields}"
+            ),
+        )
+
+    if models:
+        return await _resolve_models(models)
+
+    if providers:
+        unknown = [p for p in providers if p not in engine.providers]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown provider(s): {unknown}",
+            )
+        # No model override — engine uses per-provider default
+        return {p: None for p in providers}
+
+    if tier:
+        lineup = await _tier_lineup(tier)
+        if not lineup:
+            raise HTTPException(
+                status_code=404,
+                detail=f"tier {tier!r} has no matching rows in model_registry",
+            )
+        return lineup
+
+    # None set -> auto lineup (existing behavior).
+    return None
 
 
 # ── Audit helpers ─────────────────────────────────────────────────────────────
@@ -139,7 +294,22 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
     try:
         from graeae.engine import get_graeae_engine
         engine = get_graeae_engine()
-        result = await engine.consult(body.prompt, body.task_type)
+
+        # v3.2 Custom Query mode: resolve the caller's lineup from the
+        # three optional selectors on the request body. Precedence:
+        # models > providers > tier > auto. `_resolve_selection` is
+        # HTTPException-raising on bad input (unknown provider, unknown
+        # model_id, unknown tier, empty tier result set).
+        selection = await _resolve_selection(
+            engine=engine,
+            models=body.models,
+            providers=body.providers,
+            tier=body.tier,
+        )
+
+        result = await engine.consult(
+            body.prompt, body.task_type, selection=selection,
+        )
 
         if body.limit_chars and result.get("all_responses"):
             for provider, resp in result["all_responses"].items():
