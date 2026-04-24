@@ -62,7 +62,7 @@ def test_health_response():
         status="healthy",
         timestamp="2026-04-12T00:00:00",
         database_connected=True,
-        version="3.1.0",
+        version="3.2.0",
     )
     assert h.status == "healthy"
     assert h.database_connected is True

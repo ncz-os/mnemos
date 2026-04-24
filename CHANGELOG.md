@@ -4,9 +4,27 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
-Post-3.1.0 work staging into v3.1.1 (ops hardening) and v3.1.2 (Tier 3
-tenancy), plus a round of provider-routing fixes that landed in
-response to a field-ops handoff. Not yet tagged.
+Post-3.2.0 work not yet tagged.
+
+## [3.2.0] — 2026-04-23
+
+Tenancy + observability + ideation-infrastructure release. Rolls in
+the v3.1.1 ops-hardening and v3.1.2 Tier-3 tenancy candidates, adds
+the full request-correlation/metrics/tracing/logs observability
+stack, wires compression artifacts into the hot retrieval paths,
+makes the OpenAI-compatible gateway registry-first, lands per-user
+namespace tenancy end-to-end (DB column, auth resolution, admin
+provisioning API, Tier 3 enforcement on DAG / entities / webhooks),
+ships MPF v0.1 export / import, brings the reasoning layer in line
+with the public contract (consensus_response / consensus_score /
+winning_muse / cost / latency_ms populated from the engine's own
+_compute_consensus output), and opens `/v1/consultations` to
+operator-driven Custom Query selection across the refreshed
+frontier model registry. Queue workers are now self-healing (stale-
+running sweep with forward-progress guarantee) and the GPUGuard
+circuit breaker handles auto-replacement safely via a probe-identity
+handshake. Closes every HIGH finding from the v3.2 memory-OS audit
+and the full follow-up Codex re-audit.
 
 ### Ops hardening — v3.1.1 candidate
 
@@ -198,16 +216,25 @@ response to a field-ops handoff. Not yet tagged.
 Suite: 282 → 295 → 303 → 309 → 317 → 318 → 318 across the series.
 All targeted tests green, full suite 0 regressions.
 
-### Deferred to later releases (v3.2+)
+### Deferred to later releases (v3.3+)
 
-- DAG handlers (`api/handlers/dag.py`) still check `owner_id` only
-  — Tier 3 namespace enforcement on the DAG surface is a follow-up.
-- GPUGuard probe-identity handshake — v3.2 candidate. See v3.1.1
-  single-probe commit for the rationale on why auto-replacement
-  was dropped rather than patched.
-- Custom Query mode on `/graeae/consult` — caller-specified
-  providers / models / tier (frontier / premium / budget) instead
-  of the default auto lineup. Design in MNEMOS `mem_ad879ef01095`.
+- Horizontal scaling past workers=1 — GRAEAE reliability state
+  (circuit breaker, rate limiter, semaphores) is process-local, so
+  the server is still pinned to single-worker uvicorn. External
+  state store (Redis) or session-affinity at the load balancer is
+  the path forward.
+- Webhook SSRF DNS-rebinding defense — the current allowlist is
+  checked once at subscribe time; a malicious DNS TTL could still
+  flip to an internal IP between check and delivery. Needs
+  per-delivery re-resolution against a pinned IP.
+- Federation peer tokens stored plaintext — `federation.py:113`
+  still writes tokens in the clear; needs symmetric-encrypt-at-rest
+  with operator-supplied key or KMS plugin.
+- APOLLO engine (v3.2–v3.4 per ROADMAP.md) — schema-aware dense
+  encoding for LLM-to-LLM wire use. S-IC scheduled for v3.3 kickoff.
+- Dream state (v3.3 preview / v3.4 real) — divergent-mode ideation
+  riding on APOLLO's dense-form substrate. Design scoped in
+  `docs/DREAM_STATE_DESIGN.md`.
 
 ## [3.1.0] — 2026-04-23
 

@@ -36,7 +36,7 @@ class TestAPIEndpoints:
                 status="healthy",
                 timestamp="2026-02-05T00:00:00Z",
                 database_connected=True,
-                version="3.1.0"
+                version="3.2.0"
             )
             assert health.status == "healthy"
 
