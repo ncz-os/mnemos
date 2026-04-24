@@ -1,0 +1,52 @@
+{"id": "bench-portfolio-001", "category": "portfolio", "content": "Portfolio update: AAPL 100 shares at 150.25, now 175.50. MSFT 50 shares at 300, now 310. GOOG 20 at 120, now 135."}
+{"id": "bench-portfolio-002", "category": "portfolio", "content": "Positions as of this morning — TSLA 30 at 185.00 now 210.45, NVDA 15 shares at 480 now 510, AMZN 10 at 145 now 155."}
+{"id": "bench-portfolio-003", "category": "portfolio", "content": "Holdings: META 25 shares at 220.00, currently 245.10. AMD 40 at 105 now 115. INTC 100 at 42 now 38."}
+{"id": "bench-portfolio-004", "category": "portfolio", "content": "Current portfolio: JPM 50 at 155 now 162, BAC 80 at 30 now 34, GS 15 at 380 now 395."}
+{"id": "bench-portfolio-005", "category": "portfolio", "content": "Tech positions: CRM 20 at 245 now 260, ORCL 40 at 115 now 122, ADBE 12 at 510 now 540."}
+{"id": "bench-portfolio-006", "category": "portfolio", "content": "Small-cap allocation: PATH 200 at 15 now 17, SOFI 300 at 8 now 9, RIVN 150 at 14 now 12."}
+{"id": "bench-portfolio-007", "category": "portfolio", "content": "Dividend holdings: T 100 shares at 18 now 20, VZ 80 at 38 now 40, KO 50 at 58 now 62."}
+{"id": "bench-portfolio-008", "category": "portfolio", "content": "Energy sector: XOM 60 at 105 now 112, CVX 40 at 155 now 160, COP 30 at 115 now 118."}
+{"id": "bench-decision-001", "category": "decision", "content": "We decided to use PostgreSQL because of the ACID guarantees and mature ecosystem, over SQLite and MongoDB."}
+{"id": "bench-decision-002", "category": "decision", "content": "Chose Rust for the high-throughput API layer because of its memory safety guarantees and predictable performance, over Go and C++."}
+{"id": "bench-decision-003", "category": "decision", "content": "Opted for Kafka as the message bus since we needed durable ordered streams with strong partitioning, over RabbitMQ and NATS."}
+{"id": "bench-decision-004", "category": "decision", "content": "Picked React for the frontend given team familiarity and component ecosystem, over Vue and Svelte."}
+{"id": "bench-decision-005", "category": "decision", "content": "Selected S3-compatible storage because of cost and durability, over local NFS and a managed EBS setup."}
+{"id": "bench-decision-006", "category": "decision", "content": "Went with Tailwind CSS for styling due to the utility-first mental model, over MUI and styled-components."}
+{"id": "bench-decision-007", "category": "decision", "content": "Settled on pytest for testing because of its fixture system and plugin ecosystem, over unittest and nose2."}
+{"id": "bench-decision-008", "category": "decision", "content": "Elected to run the worker in-process rather than as a sidecar because the cross-process IPC latency dominated real workloads. Alternatives considered were Celery and RQ."}
+{"id": "bench-person-001", "category": "person", "content": "Name: Alice Chen\nRole: Senior Software Engineer\nOrg: Acme Corporation\nEmail: alice.chen@acme.com"}
+{"id": "bench-person-002", "category": "person", "content": "Name: Dr. Maria Rodriguez\nTitle: Principal Research Scientist\nCompany: BioTech Labs\nContact: m.rodriguez@biotech.io"}
+{"id": "bench-person-003", "category": "person", "content": "Bob Kim, VP of Engineering at CloudScale Inc. Direct contact: bob.kim@cloudscale.com. Previously CTO at two successful exits."}
+{"id": "bench-person-004", "category": "person", "content": "Sarah Patel, Head of Product at NextGen AI. Reach her at spatel@nextgen.ai. Background in ML research at DeepMind."}
+{"id": "bench-person-005", "category": "person", "content": "Name: James O'Brien\nRole: Lead DevOps Engineer\nOrganization: FinTech Solutions\nPhone: 555-234-5678"}
+{"id": "bench-person-006", "category": "person", "content": "Priya Sharma, Director of Data Science at InsightCorp. Contact priya@insightcorp.com. PhD in statistics."}
+{"id": "bench-person-007", "category": "person", "content": "Name: Mark Johnson\nTitle: Chief Architect\nEmployer: DataPipe Systems\nEmail: mark.johnson@datapipe.com"}
+{"id": "bench-person-008", "category": "person", "content": "Linda Garcia, Senior PM at AppFactory. Her Slack handle is @lgarcia. 15 years in mobile dev."}
+{"id": "bench-event-001", "category": "event", "content": "Production incident on 2026-04-23. scope: compression-worker. description: stranded-running queue rows recovered via the v3.1.1 sweep mechanism."}
+{"id": "bench-event-002", "category": "event", "content": "Release on Apr 15 2026 — v3.1.0 tagged and pushed to the OSS repository, CI green on all platforms."}
+{"id": "bench-event-003", "category": "event", "content": "Deployment 2026/04/20 to production. scope: api-server. description: enabled request-ID middleware and Prometheus metrics."}
+{"id": "bench-event-004", "category": "event", "content": "Outage on 2026-04-10. scope: database. description: connection pool exhaustion during morning peak, resolved by pool size increase."}
+{"id": "bench-event-005", "category": "event", "content": "Team sync on 2026-04-22. description: quarterly planning review, agreed on Q3 priorities."}
+{"id": "bench-event-006", "category": "event", "content": "Milestone reached 2026-03-15. scope: product. description: 10,000 active users surpassed."}
+{"id": "bench-event-007", "category": "event", "content": "Handoff on April 18 2026 between the night shift and the morning team. scope: oncall. description: two open Sev-3 tickets passed over."}
+{"id": "bench-event-008", "category": "event", "content": "Announcement 2026-04-01 — new VP of Engineering joins, transitioning team structure over Q2."}
+{"id": "bench-technical-001", "category": "technical", "content": "To configure pgvector, first install the extension on your Postgres 15+ instance, then create a memories table with an embedding column typed vector(768). Index with HNSW for approximate nearest-neighbor search under 50ms."}
+{"id": "bench-technical-002", "category": "technical", "content": "For the OAuth integration: register a client in your IdP, set the redirect URI to /oauth/callback, configure the client ID and secret as environment variables, then restart the auth service. Test with a browser flow to /oauth/login."}
+{"id": "bench-technical-003", "category": "technical", "content": "Docker compose setup requires mounting the postgres data volume, exposing port 5002, and setting the MNEMOS_SECRET_KEY env var to at least 32 characters. Migrations run at startup via api/lifecycle.py."}
+{"id": "bench-technical-004", "category": "technical", "content": "GPU inference with llama-server: mount your GGUF model, set --n-gpu-layers 99 to offload everything, --ctx-size 32768 for long contexts, --flash-attn on for memory efficiency, and -ctk q8_0 -ctv q8_0 to quantize the KV cache."}
+{"id": "bench-technical-005", "category": "technical", "content": "Rate limiting is opt-in. Set RATE_LIMIT_ENABLED=true and optionally MNEMOS_REDIS_URL for a shared backend. SlowAPI middleware reads the per-user key from the Authorization header."}
+{"id": "bench-technical-006", "category": "technical", "content": "Backup strategy: pg_dump the database daily, rsync the memories table to a secondary host, keep 7 days of rolling snapshots. Test restore quarterly by spinning up a recovery instance."}
+{"id": "bench-technical-007", "category": "technical", "content": "Observability stack setup: Prometheus scrapes /metrics, OpenTelemetry exporter sends traces to the OTLP collector on port 4318, structlog JSON output goes to stdout and is aggregated by the log forwarder."}
+{"id": "bench-technical-008", "category": "technical", "content": "Federation peer onboarding: create a user with role='federation', generate a Bearer API key, share the instance URL and key with the peer admin, then run the first pull via POST /v1/federation/pull."}
+{"id": "bench-technical-009", "category": "technical", "content": "To debug a slow query: enable pg_stat_statements, check the top 10 by total_exec_time, inspect EXPLAIN ANALYZE for the worst offender, add indexes or rewrite joins as needed. Latencies should drop below 50ms for hot paths."}
+{"id": "bench-technical-010", "category": "technical", "content": "DAG merge resolution: when two branches have diverged, the merge uses advisory locks on memory_branches.head_version_id to prevent races. Three-way merge with operator resolution is v3.4 work."}
+{"id": "bench-fact-001", "category": "fact", "content": "Bob deployed the v3.2 release last Thursday after the CI suite passed on both Python 3.11 and 3.12. The deploy target was the primary MNEMOS host. No rollback was required."}
+{"id": "bench-fact-002", "category": "fact", "content": "The team decided to postpone the mobile app launch until Q3 to prioritize stability improvements on the web platform. Initial customer feedback cited performance as the main concern."}
+{"id": "bench-fact-003", "category": "fact", "content": "During the retro, engineers noted that code reviews have been taking 3 days on average, up from 1 day last quarter. Proposal to implement automated PR assignment for better distribution."}
+{"id": "bench-fact-004", "category": "fact", "content": "API response times have improved 40% after the caching layer was added. The p95 latency dropped from 450ms to 280ms across all endpoints."}
+{"id": "bench-fact-005", "category": "fact", "content": "The security audit identified three medium-severity findings: missing rate limits on /admin/users, plaintext storage of federation peer tokens, and SSRF DNS-rebinding defense gap on webhook delivery."}
+{"id": "bench-fact-006", "category": "fact", "content": "Customer adoption metrics this week: 250 new signups, 85% retention at day-7, median session length of 12 minutes. Growth is steady but below target for the quarter."}
+{"id": "bench-short-001", "category": "short", "content": "git commit: fix typo in README"}
+{"id": "bench-short-002", "category": "short", "content": "ticket closed #4521"}
+{"id": "bench-short-003", "category": "short", "content": "deployed v3.2.1"}
+{"id": "bench-short-004", "category": "short", "content": "merge conflict resolved"}
