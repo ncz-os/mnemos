@@ -93,6 +93,22 @@ class DecisionSchema(Schema):
             if because_match else None
         )
 
+        # Codex caught:
+        #   "We selected participants for the study because attrition
+        #    was high"
+        # fires as a decision with chose=participants. It's describing
+        # a research-methodology step, not capturing a technical
+        # decision in the conventional sense. Require both:
+        #   (a) the chose value is a noun phrase that could plausibly
+        #       be a named technology/tool/approach (starts with an
+        #       uppercase letter, or is a short lowercase slug, or is
+        #       a quoted/backticked string), AND
+        #   (b) a rationale ("because ...") is present — single-verb
+        #       pronoun-shaped choices without rationale are more
+        #       often descriptive prose than captured decisions.
+        if not _looks_like_named_choice(chose):
+            return None
+
         alternatives: List[str] = []
         alts_match = _ALTERNATIVES_RE.search(content)
         if alts_match:
@@ -165,6 +181,52 @@ class DecisionSchema(Schema):
             if parts:
                 sentences.append(f"Alternatives considered: {', '.join(parts)}.")
         return " ".join(sentences) if sentences else encoded
+
+
+# A "named choice" is something plausibly referring to a technology,
+# tool, library, or approach — not prose pronouns/common-noun phrases.
+# Three accepting shapes:
+#   (1) starts with an uppercase letter (Postgres, React, OAuth2)
+#   (2) is a short lowercase slug (postgres, redis-cluster, k8s)
+#   (3) is quoted or backticked ("foo bar", `baz`)
+_STRICT_NAMED_RE = re.compile(
+    r"""^(?:
+        [A-Z][\w\-./]*(?:\s+[A-Z0-9][\w\-./]*)*   |   # Capitalized token(s)
+        [a-z][\w\-./]{0,30}                       |   # short lowercase slug
+        ["'`][^"'`]{1,60}["'`]                        # quoted/backticked
+    )$""",
+    re.VERBOSE,
+)
+
+# A looser "looks like a choice" test: reject bare prose pronouns
+# and obviously-descriptive common-noun phrases.
+_BAD_CHOICE_TOKENS = frozenset({
+    "it", "them", "us", "him", "her", "this", "that", "these", "those",
+    "participants", "subjects", "users", "people", "everyone", "everything",
+    "some", "none", "all", "many", "few", "several",
+})
+
+
+def _looks_like_named_choice(s: str) -> bool:
+    """Filter out pronoun-shaped / methodology-prose 'chose' captures.
+
+    Codex caught that an earlier permissive-multi-word fallback let
+    `"new process"` / `"our approach"` / `"the rewrite"` through even
+    though they are common-noun prose, not a named technology. Require
+    the full `_STRICT_NAMED_RE` shape (Capitalized, lowercase slug, or
+    quoted/backticked). Anything looser is ambiguous and should fall
+    through to Apollo's LLM fallback instead of producing a bad dense
+    encoding.
+    """
+    if not s:
+        return False
+    stripped = s.strip()
+    if not stripped:
+        return False
+    if stripped.lower() in _BAD_CHOICE_TOKENS:
+        return False
+    # Only accept if the strict shape fires. Anything else is prose.
+    return bool(_STRICT_NAMED_RE.match(stripped))
 
 
 def _clean_capture(s: str) -> str:

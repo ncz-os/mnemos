@@ -112,9 +112,13 @@ def test_encode_with_because_and_alternatives():
 
 def test_encode_sanitizes_pipes_in_values():
     """Pipe characters in captured values would break the dense form;
-    they must be replaced."""
+    they must be replaced. Exercise sanitization via the `because`
+    field (the `chose` field can't carry pipes under the tightened
+    _looks_like_named_choice guard)."""
     s = DecisionSchema()
-    match = s.detect("We chose a | b because of reasons.")
+    match = s.detect(
+        "We chose Postgres because audit | compliance requirements."
+    )
     assert match is not None
     encoded = s.encode(match)
     # The encoded form should not contain a raw pipe in a value slot.

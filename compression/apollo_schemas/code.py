@@ -31,6 +31,12 @@ _FILE_LINE_RE = re.compile(
     r"(?::(?P<line>\d+))?\b"
 )
 
+# Code extensions always anchor on their own; doc/config extensions
+# alone are weak signal — Codex caught "See report.md:12 for customer
+# summary and `class action` risk" firing as code because .md:N + a
+# prose-backticked phrase is enough under the old rules.
+_DOC_EXTS = frozenset({"md", "json", "yaml", "yml", "toml"})
+
 _LANG_BY_EXT = {
     "py": "python", "js": "javascript", "ts": "typescript",
     "tsx": "typescript", "jsx": "javascript",
@@ -43,6 +49,29 @@ _LANG_BY_EXT = {
 
 # Backtick-delimited inline code (single or triple).
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+
+# Code-shape punctuation that separates real inline code from prose
+# that just happens to be backticked for emphasis. A backticked run
+# with no internal whitespace OR containing any of these characters
+# counts as a code signal; prose like ``class action`` does not.
+_CODE_PUNCT_RE = re.compile(r"[(){}\[\].=_/\\:<>@$#|*&^~%!+?-]")
+
+
+def _is_codelike_backtick(s: str) -> bool:
+    """Heuristic: does a backticked run look like code, not prose?"""
+    if not s:
+        return False
+    inner = s.strip()
+    if not inner:
+        return False
+    if len(inner) > 80:
+        # Long backtick runs are usually prose-emphasis, not code.
+        return False
+    # No whitespace at all → treat as an identifier-shape token.
+    if not any(c.isspace() for c in inner):
+        return True
+    # Has whitespace → require at least one code-shape char.
+    return bool(_CODE_PUNCT_RE.search(inner))
 
 # Function / class signature patterns across common languages.
 _SIGNATURE_PATTERNS: List[re.Pattern] = [
@@ -69,7 +98,12 @@ class CodeSchema(Schema):
             return None
 
         file_match = _FILE_LINE_RE.search(content)
-        inline_code = _INLINE_CODE_RE.findall(content)
+        # Only count backticked runs that look like code — not prose
+        # emphasis quotes like `class action`.
+        inline_code = [
+            c for c in _INLINE_CODE_RE.findall(content)
+            if _is_codelike_backtick(c)
+        ]
         signatures: List[str] = []
         for pat in _SIGNATURE_PATTERNS:
             for m in pat.finditer(content):
@@ -77,12 +111,16 @@ class CodeSchema(Schema):
                 if name and name not in signatures:
                     signatures.append(name)
 
-        # Strictness: require a file reference OR at least 2 distinct
-        # code signals (signatures + inline code). A single backticked
-        # identifier in prose doesn't fire.
+        # Strictness: require a CODE-extension file reference OR at
+        # least 2 distinct code signals (signatures + codelike inline).
+        # A doc/config extension (.md/.json/.yaml/.toml) on its own is
+        # not enough — those names appear in prose too often.
         has_file = file_match is not None
+        is_code_file = (
+            has_file and file_match.group("ext") not in _DOC_EXTS
+        )
         code_signals = len(signatures) + len(inline_code)
-        if not has_file and code_signals < 2:
+        if not is_code_file and code_signals < 2:
             return None
 
         fields: Dict[str, object] = {}

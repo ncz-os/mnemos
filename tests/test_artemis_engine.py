@@ -385,3 +385,90 @@ def test_engine_latency_under_50ms():
     assert result.elapsed_ms < 50, (
         f"Artemis should stay under 50ms on realistic inputs; got {result.elapsed_ms}ms"
     )
+
+
+# ── Codex regression: labeled-block preservation ────────────────────────────
+
+
+def test_labeled_blocks_survive_when_mixed_with_prose():
+    """Codex caught: _extract_labeled_blocks ran but was never prepended
+    to the output — the labeled content was only kept when the ≥80%
+    passthrough path fired. On mixed prose + labels, the labels vanished.
+
+    Fix: labeled blocks prepended verbatim; sentences overlapping a
+    labeled span anchored so they aren't re-selected, then de-duped.
+    """
+    engine = ARTEMISEngine()
+    content = (
+        "We had a productive session today with several attendees. "
+        "Everyone brought great energy and insightful questions.\n"
+        "\n"
+        "Name: Alice Chen\n"
+        "Role: Senior Engineer\n"
+        "Org: Acme Corp\n"
+        "Email: alice@acme.com\n"
+        "\n"
+        "The meeting wrapped up at 5pm and we ordered dinner. "
+        "Everyone agreed the roadmap was tracking well overall."
+    )
+    result = asyncio.run(engine.compress(_req(content)))
+    assert result.error is None
+    # All four labeled rows must survive verbatim.
+    for label in ("Name: Alice Chen", "Role: Senior Engineer",
+                  "Org: Acme Corp", "Email: alice@acme.com"):
+        assert label in result.compressed_content, (
+            f"labeled row {label!r} must survive the extractive pass"
+        )
+
+
+def test_duplicate_labeled_blocks_map_to_distinct_occurrences():
+    """Codex re-review: when two labeled blocks share identical text,
+    naive content.find(block) resolved both ranges to the first
+    occurrence. The second block's sentences were then treated as
+    unmatched prose, duplicated in the tail, and compression_ratio
+    blew up to ~1.0. Fix: walk a cursor forward so each block maps
+    to a distinct occurrence.
+    """
+    engines = ARTEMISEngine()
+    block = (
+        "Name: Alice Chen\n"
+        "Role: Senior Engineer\n"
+        "Org: Acme Corp\n"
+    )
+    content = (
+        "First engineer profile follows.\n\n"
+        + block + "\n"
+        + "Second duplicate copy follows (exercise collision).\n\n"
+        + block + "\n"
+        + "End of block log."
+    )
+    result = asyncio.run(engines.compress(_req(content)))
+    assert result.error is None
+    # Output must not end up LONGER than input (the prior bug).
+    assert len(result.compressed_content) <= len(content), (
+        "duplicate labeled blocks must not double in the compressed tail"
+    )
+    # Both labeled block copies should survive as verbatim rows.
+    assert result.compressed_content.count("Name: Alice Chen") >= 1
+    assert result.compressed_content.count("Role: Senior Engineer") >= 1
+
+
+def test_duplicate_sentences_do_not_break_span_mapping():
+    """Codex caught: the old content.find(sentence, cursor) approach
+    gets confused by duplicate or normalized sentences. The
+    _split_sentences_with_spans() replacement returns offsets directly
+    so this input compresses correctly rather than crashing or
+    mis-anchoring.
+    """
+    engine = ARTEMISEngine()
+    content = (
+        "The outage was caused by a database failure. "
+        "The outage was caused by a database failure. "
+        "We deployed the fix on 2026-04-23. "
+        "Rollout completed without issues. "
+        "We deployed the fix on 2026-04-23."
+    )
+    result = asyncio.run(engine.compress(_req(content)))
+    assert result.error is None
+    # Protected spans (the date) must still be preserved.
+    assert "2026-04-23" in result.compressed_content

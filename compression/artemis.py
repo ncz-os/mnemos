@@ -164,6 +164,35 @@ def _split_sentences(text: str) -> List[str]:
     return [re.sub(r"\s+", " ", s) for s in sentences if len(s) > 3]
 
 
+def _split_sentences_with_spans(text: str) -> List[Tuple[str, int, int]]:
+    """Sentence tokenizer that preserves source character offsets.
+
+    Returns a list of (normalized_sentence, start_offset, end_offset)
+    tuples. Callers that need to anchor spans in the ORIGINAL text
+    (e.g. protected-span host detection) use the offsets directly
+    rather than re-searching via content.find(), which fails on
+    duplicate normalized sentences.
+    """
+    results: List[Tuple[str, int, int]] = []
+    pos = 0
+    for match in _SENT_SPLIT_RE.finditer(text):
+        raw = text[pos:match.start()]
+        if raw.strip():
+            normalized = re.sub(r"\s+", " ", raw.strip())
+            if len(normalized) > 3:
+                # Use the raw chunk's bounds; the normalized string
+                # is only used for ranking, not for source lookup.
+                results.append((normalized, pos, match.start()))
+        pos = match.end()
+    # Final chunk after the last split boundary.
+    tail = text[pos:]
+    if tail.strip():
+        normalized = re.sub(r"\s+", " ", tail.strip())
+        if len(normalized) > 3:
+            results.append((normalized, pos, len(text)))
+    return results
+
+
 # ── TF-IDF (stdlib) ───────────────────────────────────────────────────────
 
 
@@ -427,7 +456,13 @@ class ARTEMISEngine(CompressionEngine):
             )
 
         # Phase 3: sentence-level extractive ranking.
-        sentences = _split_sentences(content)
+        # Tokenize sentences AND track their source character offsets
+        # so anchoring isn't brittle on duplicate-string sentences.
+        # Codex flagged that content.find(s, cursor) anchors the
+        # wrong occurrence when a normalized sentence appears twice
+        # or gets whitespace-collapsed away from its source.
+        sentence_spans = _split_sentences_with_spans(content)
+        sentences = [s for s, _, _ in sentence_spans]
         if not sentences:
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             return CompressionResult(
@@ -441,19 +476,49 @@ class ARTEMISEngine(CompressionEngine):
                 error="unable to tokenize sentences",
             )
 
-        # Which sentences contain protected spans? (Host-sentence indexes.)
+        # Which sentences contain protected spans? Use the real
+        # offsets from the tokenizer rather than a string search.
         anchored_indices: set = set()
-        for (span_start, span_end, _) in protected:
-            # Find the sentence containing this span.
-            cursor = 0
-            for i, s in enumerate(sentences):
-                idx = content.find(s, cursor)
-                if idx < 0:
-                    continue
-                if idx <= span_start < idx + len(s):
+        for (span_start, _span_end, _kind) in protected:
+            for i, (_sent, s_off, s_end) in enumerate(sentence_spans):
+                if s_off <= span_start < s_end:
                     anchored_indices.add(i)
                     break
-                cursor = idx + len(s)
+
+        # Also anchor sentences that overlap any labeled block so
+        # they survive MMR selection — labeled blocks then get
+        # prepended at assembly time (below).
+        # Codex regression: when the same labeled block text appears
+        # twice, the naive content.find(block) resolves both to the
+        # first occurrence, so the tail is assembled as if the second
+        # block were still prose to dedupe. Walk a cursor forward so
+        # each block maps to a distinct occurrence. Also extend each
+        # range through trailing whitespace — _extract_labeled_blocks
+        # strips trailing newlines, but the sentence tokenizer includes
+        # them in the sentence span, so strict containment misses by
+        # one char without the extension.
+        labeled_ranges: List[Tuple[int, int]] = []
+        if labeled_blocks:
+            cursor = 0
+            for block in labeled_blocks:
+                b_start = content.find(block, cursor)
+                if b_start < 0:
+                    # Block not found past cursor — fall back to the
+                    # first occurrence, but don't advance cursor.
+                    b_start = content.find(block)
+                    if b_start < 0:
+                        continue
+                b_end = b_start + len(block)
+                # Extend through trailing whitespace.
+                while b_end < len(content) and content[b_end] in " \t\n\r":
+                    b_end += 1
+                labeled_ranges.append((b_start, b_end))
+                cursor = b_end
+        for i, (_sent, s_off, s_end) in enumerate(sentence_spans):
+            for (b_start, b_end) in labeled_ranges:
+                if s_off < b_end and s_end > b_start:
+                    anchored_indices.add(i)
+                    break
 
         vectors, _ = _tfidf_vectors(sentences)
         scores = _anchored_textrank(sentences, vectors, anchored_indices)
@@ -465,8 +530,33 @@ class ARTEMISEngine(CompressionEngine):
         )
 
         # Phase 5: assembly.
-        selected_sentences = [sentences[i] for i in selected]
-        compressed = " ".join(selected_sentences)
+        # Codex caught that the earlier build computed labeled_blocks
+        # and then discarded them unless the >=80% passthrough fired.
+        # Mixed prose + labeled notes lost the structure Artemis
+        # claims to protect. Fix: prepend labeled blocks verbatim,
+        # then append selected sentences that aren't already inside
+        # a labeled block's character span.
+        selected_sentences: List[str] = []
+        for i in selected:
+            s_off = sentence_spans[i][1]
+            s_end = sentence_spans[i][2]
+            inside_labeled = any(
+                s_off >= b_start and s_end <= b_end
+                for (b_start, b_end) in labeled_ranges
+            )
+            if inside_labeled:
+                # Already captured verbatim via the labeled block
+                # — dropping it from the MMR-joined tail prevents
+                # duplication.
+                continue
+            selected_sentences.append(sentences[i])
+
+        parts: List[str] = []
+        if labeled_blocks:
+            parts.extend(labeled_blocks)
+        if selected_sentences:
+            parts.append(" ".join(selected_sentences))
+        compressed = "\n\n".join(parts) if parts else " ".join(sentences)
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         compressed_tokens = len(compressed.split())

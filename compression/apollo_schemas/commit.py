@@ -67,9 +67,46 @@ class CommitSchema(Schema):
         if commit_type not in _COMMIT_TYPES:
             return None
 
+        # False-positive guard: Codex caught that
+        #   "fix: we should probably revisit the onboarding doc tone"
+        # matches the header regex even though it's casual prose, not
+        # a commit. Real commit subjects have three properties that
+        # casual-prose-with-a-colon don't reliably share:
+        #   (a) imperative-mood subjects tend to be short (<= 80 chars)
+        #   (b) commits without a body are usually trivial; commits
+        #       with substantial prose typically have a body paragraph
+        #       separated by a blank line
+        #   (c) commit headers rarely end with modal-verb phrasings
+        #       like "should", "probably", "might" that prose uses
+        # Require EITHER a short subject OR a body paragraph to fire.
+        # Rejects casual prose that happens to lead with `fix:` / `docs:`
+        # / `chore:` while still catching terse commits AND long ones
+        # with proper bodies.
+        subject = m.group("subject").strip()
+        # Subject MUST NOT end with punctuation typical of prose.
+        if subject.endswith((".", "!", "?", ":")):
+            return None
+        # Detect a body: blank line followed by more content after the
+        # header line.
+        has_body = bool(
+            re.search(r"\n\s*\n\S", content, flags=re.DOTALL)
+        )
+        if len(subject) > 72 and not has_body:
+            # Long subject without a body is more likely prose. Real
+            # commit conventions target 50-72 chars for the header.
+            return None
+        # Reject casual-prose cues in the subject itself.
+        prose_tells = (
+            " should ", " probably ", " might ", " maybe ",
+            " we'll ", " i'll ", " we're ", " we are ",
+        )
+        subj_lower = " " + subject.lower() + " "
+        if any(tell in subj_lower for tell in prose_tells):
+            return None
+
         fields: Dict[str, object] = {
             "type": commit_type,
-            "subject": m.group("subject").strip(),
+            "subject": subject,
         }
         scope = m.group("scope")
         if scope:
