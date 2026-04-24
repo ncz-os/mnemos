@@ -86,9 +86,26 @@ _CONTEST_MIN_CONTENT_LENGTH = int(
 # AND the fresh-connection fallback mark-failed failed — pool exhausted,
 # SIGKILL, etc.). Default 600s is safe for typical runs that finish in
 # seconds. Set to 0 to disable the sweep entirely.
-_CONTEST_STALE_THRESHOLD_SECS = int(
-    os.getenv("MNEMOS_CONTEST_STALE_THRESHOLD_SECS", "600")
-)
+def _parse_stale_threshold_secs() -> int:
+    raw = os.getenv("MNEMOS_CONTEST_STALE_THRESHOLD_SECS", "600")
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "MNEMOS_CONTEST_STALE_THRESHOLD_SECS=%r is not an integer; "
+            "disabling stale-running sweep.", raw,
+        )
+        return 0
+    if value < 0:
+        logger.warning(
+            "MNEMOS_CONTEST_STALE_THRESHOLD_SECS=%d is negative; "
+            "disabling stale-running sweep.", value,
+        )
+        return 0
+    return value
+
+
+_CONTEST_STALE_THRESHOLD_SECS = _parse_stale_threshold_secs()
 
 # Tuning
 SIZE_LIMIT_KB = 5
