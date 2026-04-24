@@ -8,8 +8,10 @@ CompressionEngine ABC for operator-registered engines.
   token + sentence modes).
 - ANAMNESIS: GPU-optional LLM fact extraction for prose that doesn't
   fit a known schema (500ms-2s, semantic compression).
-- APOLLO (v3.3+, see ROADMAP.md Apollo Program): schema-aware dense
-  encoding for LLM-to-LLM consumption.
+- APOLLO: schema-aware dense encoding for LLM-to-LLM consumption
+  (v3.3 S-IC: PortfolioSchema as the first concrete schema with
+  rule-based detection; S-II adds LLM fallback, narration endpoint,
+  judge-LLM scoring, decision/person/event schemas).
 - ALETHEIA: DEPRECATED. GPU token-level importance scoring from the
   v3.1 stack; lost every contest in the 2026-04-23 benchmark
   (docs/benchmarks/compression-2026-04-23.md). Kept importable for
@@ -45,6 +47,8 @@ from .manager import CompressionManager, CompressionResult
 from .lethe import LETHE, LETHEEngine
 from .aletheia import ALETHEIA, ALETHEIAEngine
 from .anamnesis import ANAMNESIS, ANAMNESISEngine
+from .apollo import APOLLOEngine
+from .apollo_schemas import PortfolioSchema, Schema as APOLLOSchema
 from .distillation_engine import (
     DistillationEngine,
     CompressionStrategy,
@@ -87,6 +91,10 @@ __all__ = [
     "ALETHEIAEngine",
     "ANAMNESIS",
     "ANAMNESISEngine",
+    # v3.3 S-IC: APOLLO — schema-aware dense encoding
+    "APOLLOEngine",
+    "APOLLOSchema",
+    "PortfolioSchema",
     "DistillationEngine",
     "CompressionStrategy",
     "get_distillation_engine",
