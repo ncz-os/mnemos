@@ -289,6 +289,62 @@ def _flatten_messages_for_prompt(messages: List[Dict[str, str]]) -> str:
     return "\n\n".join(parts)
 
 
+# Substring-to-provider heuristics kept as a last-resort fallback when
+# model_registry is empty (fresh install without a seeded registry).
+# Ordering matters — first match wins, so more-specific tokens go
+# first (`gpt-` matches `gpt-5` before `gpt-4`). Updated for 2026
+# frontier names; entries stay broad so drift between models like
+# "gpt-5.2-chat-latest" and "gpt-5-mini" both land on `openai`.
+_FALLBACK_PROVIDER_MAP = {
+    "claude":   "claude",
+    "gpt-":     "openai",
+    "llama":    "groq",
+    "deepseek": "groq",
+    "sonar":    "perplexity",
+    "grok":     "xai",
+    "gemini":   "gemini",
+    "mistral":  "together",
+}
+
+
+def _fallback_provider_from_name(model: str) -> Optional[str]:
+    """Last-resort resolver used when model_registry has no row for
+    the requested model_id. Returns a provider name or None (unknown)."""
+    lower = model.lower()
+    for key, mapped in _FALLBACK_PROVIDER_MAP.items():
+        if key in lower:
+            return mapped
+    return None
+
+
+async def _resolve_provider_for_model(model: str) -> Optional[str]:
+    """Look up `model` in model_registry and return its provider.
+
+    Falls back to the substring-match heuristic (matched against
+    `_FALLBACK_PROVIDER_MAP`) when the registry has no row for this
+    exact model_id — this preserves behavior for operators who run
+    without a seeded registry. Returns None if both lookups fail;
+    the caller surfaces that as a 400.
+    """
+    if _lc._pool is not None:
+        try:
+            async with _lc._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT provider FROM model_registry "
+                    "WHERE model_id = $1 "
+                    "  AND available = true AND deprecated = false",
+                    model,
+                )
+            if row is not None:
+                return row["provider"]
+        except Exception as exc:
+            logger.warning(
+                "[MNEMOS] model_registry lookup failed for model=%s: %s",
+                model, exc,
+            )
+    return _fallback_provider_from_name(model)
+
+
 async def _route_to_provider(
     model: str,
     messages: List[Dict[str, str]],
@@ -296,7 +352,15 @@ async def _route_to_provider(
     max_tokens: Optional[int],
     user: UserContext,
 ) -> str:
-    """Route request to selected provider via GRAEAE single-provider mode."""
+    """Route request to selected provider via GRAEAE single-provider mode.
+
+    Provider resolution (v3.2): query model_registry for the exact
+    model_id, falling back to substring heuristics only when the
+    registry has no row. Unknown models are rejected with 400 instead
+    of silently routing to a default (pre-v3.2 behavior was
+    "default to groq" which caused surprising misroutes on any new
+    or typo'd model_id).
+    """
     graeae = get_graeae_engine()
     # Flatten the full messages array rather than keeping only
     # messages[-1]. The prior behaviour silently dropped the system prompt,
@@ -306,23 +370,21 @@ async def _route_to_provider(
         raise HTTPException(status_code=400, detail="messages required")
     prompt = _flatten_messages_for_prompt(messages)
 
-    # Determine provider from model name
-    provider_map = {
-        "claude": "claude",
-        "gpt-4": "openai",
-        "gpt-": "openai",
-        "llama": "groq",
-        "deepseek": "groq",
-        "sonar": "perplexity",
-        "grok": "xai",
-        "gemini": "gemini",
-    }
-
-    provider = "groq"  # Default fallback
-    for key, mapped in provider_map.items():
-        if key in model.lower():
-            provider = mapped
-            break
+    provider = await _resolve_provider_for_model(model)
+    if provider is None:
+        logger.warning(
+            "[MNEMOS] unknown model %r — not in model_registry and no "
+            "fallback substring match", model,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unknown model {model!r}; not in model_registry and "
+                f"no provider heuristic matched. Add the model to the "
+                f"registry (update_model_registry.py) or use a known "
+                f"model id."
+            ),
+        )
 
     logger.info(
         f"[MNEMOS] Route: model={model} → provider={provider} "
