@@ -22,6 +22,7 @@ from api.handlers.providers import router as providers_router
 from api.handlers.memories import router as memories_router
 from api.handlers.ingest import router as ingest_router
 from api.handlers.kg import router as kg_router
+from api.handlers.portability import router as portability_router
 from api.handlers.admin import router as admin_router
 from api.handlers.versions import router as versions_router
 from api.handlers.journal import router as journal_router
@@ -181,6 +182,7 @@ app.include_router(federation_router)  # v3.0.0: Cross-instance memory federatio
 app.include_router(memories_router)
 app.include_router(ingest_router)
 app.include_router(kg_router)
+app.include_router(portability_router)  # v3.2: /v1/export + /v1/import (MPF v0.1)
 app.include_router(admin_router)
 app.include_router(versions_router)
 app.include_router(journal_router)
