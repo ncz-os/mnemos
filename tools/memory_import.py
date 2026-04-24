@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-memory_import.py - Generic memory importers for common formats into MNEMOS.
+memory_import.py — CHARON import side (MNEMOS memory portability).
+
+Part of CHARON, MNEMOS's memory portability subsystem (ferrying
+memories between instances and across version boundaries). The
+companion is memory_export.py; together they anchor the round-trip
+that makes migrations repeatable.
+
+Generic memory importers for common formats into MNEMOS.
 
 Subcommands:
   json      Import from MNEMOS JSON export or simplified array
@@ -12,11 +19,22 @@ Subcommands:
 
 Usage:
   python tools/memory_import.py json     --file memories.json --endpoint http://localhost:5002
+  python tools/memory_import.py json     --file memories.jsonl --jsonl --endpoint http://localhost:5002
+  python tools/memory_import.py json     --file memories.jsonl --jsonl --preserve-metadata \
+                                         --api-key $MNEMOS_API_KEY --endpoint http://localhost:5002
   python tools/memory_import.py csv      --file data.csv --content-col text --endpoint http://localhost:5002
   python tools/memory_import.py chatgpt  --file conversations.json --endpoint http://localhost:5002
   python tools/memory_import.py obsidian --vault /path/to/vault --endpoint http://localhost:5002
   python tools/memory_import.py text     --source /path --category notes --endpoint http://localhost:5002
   python tools/memory_import.py stats    --endpoint http://localhost:5002
+
+Preserve-metadata mode (the cross-version-migration path):
+  When --preserve-metadata is set, the importer posts an MPF envelope
+  to /v1/import?preserve_owner=true instead of /memories POSTs. This
+  keeps the original id, owner_id, namespace, subcategory, created,
+  updated, quality_rating, and source_* provenance fields. Requires
+  root-tier bearer token (the endpoint refuses preserve_owner=true
+  for non-root callers). Batched to keep request bodies bounded.
 """
 
 import argparse
@@ -37,24 +55,44 @@ from pathlib import Path
 class BaseImporter:
     """Shared HTTP posting logic for all importers."""
 
+    # MPF envelope constants (must match api/handlers/portability.py).
+    MPF_VERSION = "0.1.0"
+    MEMORY_PAYLOAD_VERSION = "mnemos-3.1"
+    # Keep envelope bodies small enough to avoid request-size limits.
+    MPF_BATCH_SIZE = 200
+
     def __init__(
         self,
         endpoint: str = "http://localhost:5002",
         api_key: str = None,
         category: str = "imported",
         dry_run: bool = False,
+        preserve_metadata: bool = False,
     ):
         self.endpoint = endpoint.rstrip("/")
         self.api_key = api_key
         self.category = category
         self.dry_run = dry_run
+        # preserve_metadata routes through /v1/import (MPF envelope)
+        # with preserve_owner=true, which requires a root bearer token
+        # and keeps id/owner_id/namespace/timestamps verbatim.
+        self.preserve_metadata = preserve_metadata
 
     def _post(self, memories: list) -> tuple:
         """POST a list of memories to MNEMOS.
 
+        When ``preserve_metadata=True`` was set on the importer, routes
+        through ``/v1/import`` (MPF envelope, batched) instead of the
+        per-memory ``/memories`` path. The MPF path keeps the original
+        id, owner_id, namespace, subcategory, timestamps, and
+        provenance fields — needed for cross-version migrations.
+
         Returns:
             (ok_count, fail_count)
         """
+        if self.preserve_metadata:
+            return self._post_mpf(memories)
+
         ok = 0
         fail = 0
         for mem in memories:
@@ -92,6 +130,88 @@ class BaseImporter:
 
         return ok, fail
 
+    def _post_mpf(self, memories: list) -> tuple:
+        """POST memories as MPF envelope batches to /v1/import?preserve_owner=true.
+
+        Each entry in ``memories`` is the raw memory dict shape (with
+        id, owner_id, namespace, created, ...). We wrap it into an
+        MPFRecord with kind="memory" and payload_version matching the
+        server's. Batched by MPF_BATCH_SIZE to keep request bodies
+        bounded (FastAPI default body size is small).
+        """
+        url = f"{self.endpoint}/v1/import?preserve_owner=true"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        def _record(mem: dict) -> dict:
+            # Strip None payload fields to keep envelope tidy; server
+            # defaults missing fields.
+            payload = {k: v for k, v in {
+                "content": mem.get("content"),
+                "category": mem.get("category") or self.category,
+                "subcategory": mem.get("subcategory"),
+                "created": mem.get("created"),
+                "updated": mem.get("updated"),
+                "owner_id": mem.get("owner_id") or "default",
+                "namespace": mem.get("namespace") or "default",
+                "permission_mode": mem.get("permission_mode"),
+                "quality_rating": mem.get("quality_rating"),
+                "metadata": mem.get("metadata") or {},
+                "source_model": mem.get("source_model"),
+                "source_provider": mem.get("source_provider"),
+                "source_session": mem.get("source_session"),
+                "source_agent": mem.get("source_agent"),
+            }.items() if v is not None}
+            return {
+                "id": mem.get("id") or f"imported_{id(mem):x}",
+                "kind": "memory",
+                "payload_version": self.MEMORY_PAYLOAD_VERSION,
+                "payload": payload,
+            }
+
+        ok = 0
+        fail = 0
+        for start in range(0, len(memories), self.MPF_BATCH_SIZE):
+            batch = memories[start:start + self.MPF_BATCH_SIZE]
+            if self.dry_run:
+                for mem in batch:
+                    preview = str(mem.get("content", ""))[:80].replace("\n", " ")
+                    print(f"  DRY RUN  id={mem.get('id')!r}  content={preview!r}")
+                ok += len(batch)
+                continue
+
+            envelope = {
+                "mpf_version": self.MPF_VERSION,
+                "source_system": "memory_import",
+                "source_version": self.MEMORY_PAYLOAD_VERSION,
+                "records": [_record(m) for m in batch],
+            }
+            data = json.dumps(envelope).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    body = json.loads(resp.read())
+                    imported = int(body.get("imported", 0))
+                    skipped = int(body.get("skipped", 0))
+                    failed = int(body.get("failed", 0))
+                    ok += imported
+                    fail += failed
+                    print(f"  batch {start//self.MPF_BATCH_SIZE + 1}: "
+                          f"imported={imported} skipped={skipped} failed={failed}")
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:300]
+                print(f"  WARNING  /v1/import HTTP {exc.code}: {detail}")
+                fail += len(batch)
+            except urllib.error.URLError as exc:
+                print(f"  WARNING  /v1/import error: {exc.reason}")
+                fail += len(batch)
+            except Exception as exc:
+                print(f"  WARNING  /v1/import exception: {exc}")
+                fail += len(batch)
+
+        return ok, fail
+
     def run(self) -> dict:
         """Execute the import. Override in subclasses.
 
@@ -106,32 +226,83 @@ class BaseImporter:
 # ---------------------------------------------------------------------------
 
 class JsonImporter(BaseImporter):
-    """Import MNEMOS JSON export or simplified array of memory objects."""
+    """Import MNEMOS JSON / JSONL export or simplified array of memory objects.
 
-    def __init__(self, file_path: str, **kwargs):
+    Accepts three wire shapes:
+
+    1. A plain JSON array of memory dicts.
+    2. A wrapped object: ``{"memories": [...]}`` or ``{"data": [...]}``.
+    3. An MPF envelope: ``{"mpf_version": "0.1.0", "records": [...]}``.
+    4. JSONL — one memory dict per line. Enable with ``jsonl=True`` or
+       by passing a file with a ``.jsonl`` suffix.
+
+    When ``preserve_metadata=True`` the importer routes through
+    ``/v1/import`` (MPF envelope, batched) so the original id,
+    owner_id, namespace, subcategory, timestamps, and provenance
+    fields are kept verbatim. Required for cross-version MNEMOS
+    migrations.
+    """
+
+    def __init__(self, file_path: str, jsonl: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.file_path = Path(file_path)
+        # Explicit jsonl flag wins; otherwise infer from extension.
+        self.jsonl = jsonl or self.file_path.suffix.lower() == ".jsonl"
 
-    def run(self) -> dict:
-        stats = {"imported": 0, "failed": 0, "skipped": 0}
+    def _parse_source(self) -> list:
+        """Return a list of raw memory dicts regardless of input shape."""
+        if self.jsonl:
+            items = []
+            with self.file_path.open(encoding="utf-8") as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        items.append(json.loads(line))
+                    except json.JSONDecodeError as exc:
+                        print(f"WARNING: line {line_num}: bad JSON ({exc})",
+                              file=sys.stderr)
+            return items
 
         raw = self.file_path.read_text(encoding="utf-8")
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
             print(f"ERROR: Cannot parse JSON: {exc}", file=sys.stderr)
-            return stats
+            return []
 
-        # Handle wrapped export format: {"memories": [...]}
+        # MPF envelope → flatten records back to payload dicts
+        # (with the envelope id promoted into the payload).
+        if isinstance(data, dict) and "records" in data and "mpf_version" in data:
+            flat = []
+            for rec in data.get("records", []):
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("kind") != "memory":
+                    continue
+                payload = dict(rec.get("payload") or {})
+                if "id" in rec:
+                    payload.setdefault("id", rec["id"])
+                flat.append(payload)
+            return flat
+
+        # Wrapped export format: {"memories": [...]}
         if isinstance(data, dict):
             data = data.get("memories", data.get("data", list(data.values())))
 
         if not isinstance(data, list):
-            print("ERROR: JSON must be an array (or object with 'memories' key)", file=sys.stderr)
-            return stats
+            print("ERROR: JSON must be an array, wrapped object, or MPF envelope",
+                  file=sys.stderr)
+            return []
+        return data
+
+    def run(self) -> dict:
+        stats = {"imported": 0, "failed": 0, "skipped": 0}
+        raw_items = self._parse_source()
 
         memories = []
-        for i, item in enumerate(data):
+        for item in raw_items:
             if not isinstance(item, dict):
                 stats["skipped"] += 1
                 continue
@@ -140,12 +311,20 @@ class JsonImporter(BaseImporter):
                 stats["skipped"] += 1
                 continue
 
-            mem = {
-                "content": str(content).strip(),
-                "category": item.get("category", self.category),
-                "tags": item.get("tags", []),
-                "metadata": item.get("metadata", {}),
-            }
+            if self.preserve_metadata:
+                # Pass-through the whole record; BaseImporter._post_mpf
+                # pulls what it needs.
+                mem = dict(item)
+                mem["content"] = str(content).strip()
+                mem.setdefault("category", self.category)
+            else:
+                # Legacy per-memory POST path — just content/cat/tags/metadata.
+                mem = {
+                    "content": str(content).strip(),
+                    "category": item.get("category", self.category),
+                    "tags": item.get("tags", []),
+                    "metadata": item.get("metadata", {}),
+                }
             memories.append(mem)
 
         print(f"Loaded {len(memories)} memories from {self.file_path.name} "
@@ -677,6 +856,10 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
                         help="Optional Bearer token for MNEMOS auth")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be imported without POSTing")
+    parser.add_argument("--preserve-metadata", action="store_true",
+                        help="Route through /v1/import (MPF envelope, batched) "
+                             "keeping id/owner_id/namespace/timestamps verbatim. "
+                             "Requires root bearer token.")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -688,11 +871,14 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     # --- json ---
-    p_json = sub.add_parser("json", help="Import from MNEMOS JSON export or array")
+    p_json = sub.add_parser("json", help="Import from MNEMOS JSON / JSONL export, array, or MPF envelope")
     p_json.add_argument("--file", required=True, metavar="PATH",
-                        help="Path to JSON file")
+                        help="Path to JSON or JSONL file")
     p_json.add_argument("--category", default="imported",
                         help="Default category if not present in records")
+    p_json.add_argument("--jsonl", action="store_true",
+                        help="Parse as JSONL (one memory per line). "
+                             "Auto-enabled for *.jsonl files.")
     _add_common_args(p_json)
 
     # --- csv ---
@@ -757,12 +943,15 @@ def main(argv=None):
         endpoint=args.endpoint,
         api_key=args.api_key,
     )
+    if hasattr(args, "preserve_metadata"):
+        common["preserve_metadata"] = args.preserve_metadata
 
     if args.subcommand == "json":
         importer = JsonImporter(
             file_path=args.file,
             category=args.category,
             dry_run=args.dry_run,
+            jsonl=getattr(args, "jsonl", False),
             **common,
         )
         importer.run()
