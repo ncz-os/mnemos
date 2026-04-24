@@ -448,9 +448,11 @@ def test_duplicate_labeled_blocks_map_to_distinct_occurrences():
     assert len(result.compressed_content) <= len(content), (
         "duplicate labeled blocks must not double in the compressed tail"
     )
-    # Both labeled block copies should survive as verbatim rows.
-    assert result.compressed_content.count("Name: Alice Chen") >= 1
-    assert result.compressed_content.count("Role: Senior Engineer") >= 1
+    # Both labeled block copies must survive verbatim (not just one).
+    # Codex re-review noted that >= 1 under-specifies the fix; the
+    # implementation produces exactly 2 occurrences on this input.
+    assert result.compressed_content.count("Name: Alice Chen") == 2
+    assert result.compressed_content.count("Role: Senior Engineer") == 2
 
 
 def test_duplicate_sentences_do_not_break_span_mapping():
