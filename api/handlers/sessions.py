@@ -39,7 +39,7 @@ async def create_session(
 
     Args:
         model: LLM model (default: gpt-4o)
-        compression_tier: 1=LETHE (fast), 2=ALETHEIA (GPU), 3=ANAMNESIS (archival)
+        compression_tier: 1=LETHE (fast), 2=[deprecated ALETHEIA — prefer 3], 3=ANAMNESIS (archival)
         initial_context: Optional initial system context
 
     Returns:
@@ -202,7 +202,7 @@ async def add_session_message(
             # Store injection record for each memory.
             # compression_ratio is NULL because the session-injection path
             # currently ships raw-slice truncation (doc['content'][:500] below),
-            # not real LETHE/ALETHEIA/ANAMNESIS compression. Writing a
+            # not real LETHE/ANAMNESIS compression. Writing a
             # fabricated ratio (previously: 0.45 literal) turned
             # `session_memory_injections.compression_ratio` into a fiction
             # column. It stays NULL until v3.1 wires compression into this

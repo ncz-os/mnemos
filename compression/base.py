@@ -22,8 +22,13 @@ uses that to route work through compression/gpu_batcher.py with a
 circuit breaker and a mandatory CPU fallback path for every gpu_optional
 engine.
 
-Built-in engines: LETHE (cpu_only), ALETHEIA (gpu_optional),
-ANAMNESIS (gpu_optional), APOLLO (gpu_optional, schema-aware).
+Built-in engines (going-forward stack): LETHE (cpu_only),
+ANAMNESIS (gpu_optional), APOLLO (gpu_optional, schema-aware;
+v3.3+ per ROADMAP.md Apollo Program). ALETHEIA (gpu_required) is
+DEPRECATED — retired from the default contest in the v3.2 tail;
+remains importable for operator-registered use, scheduled for v4.0
+removal.
+
 Operators register additional engines at startup via
 compression.manager.register_engine().
 """

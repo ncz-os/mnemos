@@ -58,8 +58,9 @@ Circuit states:
 
 The guard is per-endpoint (keyed by URL) and lives in a process-local
 registry. Multiple engines sharing the same `GPU_PROVIDER_HOST` share
-one guard — one ALETHEIA timeout informs ANAMNESIS that the endpoint
-is unresponsive without ANAMNESIS having to time out too.
+one guard — one ANAMNESIS timeout informs APOLLO (and any other
+GPU-consuming engine) that the endpoint is unresponsive without
+each having to time out independently.
 
 For v3.2 horizontal-scaling work, the registry becomes a Redis-backed
 shared-state singleton. v3.1 is single-worker per the DEPLOYMENT.md

@@ -1,10 +1,18 @@
 """
-Compression Manager - Orchestrates THE MOIRAI compression tiers
+Compression Manager (legacy v3.0 orchestrator)
 
-Tier 1: LETHE (CPU, real-time)
-Tier 2: ALETHEIA (GPU, batch offline)
-Tier 3: ANAMNESIS (GPU, archival fact extraction)
-Tier 4: None (full archive)
+Current stack: LETHE + ANAMNESIS (+ APOLLO in v3.3+). ALETHEIA is
+deprecated and removed from the default contest; see
+compression/aletheia.py and the 2026-04-23 CERBERUS benchmark for
+rationale. The aletheia method path below stays in place so operators
+who had MNEMOS_ALETHEIA_ENABLED=true keep working until v4.0 removes
+the engine.
+
+v3.0 tiering (still referenced by /v1/sessions compression_tier):
+  Tier 1: LETHE (CPU, real-time)
+  Tier 2: [deprecated ALETHEIA] — prefer ANAMNESIS for GPU batch work
+  Tier 3: ANAMNESIS (GPU-optional, archival fact extraction)
+  Tier 4: None (full archive)
 """
 
 import logging
@@ -36,7 +44,9 @@ class CompressionResult(Dict):
 
 class CompressionManager:
     """
-    Manages THE MOIRAI compression stack (LETHE/ALETHEIA/ANAMNESIS).
+    Manages the compression stack (LETHE + ANAMNESIS; APOLLO in v3.3+).
+    ALETHEIA method remains wired for opt-in operators but is deprecated
+    and scheduled for v4.0 removal.
 
     Task-type specific compression ratios:
     - reasoning: 0.45 (keep 45%)
@@ -134,7 +144,7 @@ class CompressionManager:
         if "rehydration" in self.config and "tier_ratios" in self.config["rehydration"]:
             self.tier_ratios.update(self.config["rehydration"]["tier_ratios"])
 
-        logger.info("✓ CompressionManager initialized (LETHE/ALETHEIA/ANAMNESIS)")
+        logger.info("✓ CompressionManager initialized (LETHE + ANAMNESIS; ALETHEIA deprecated)")
         logger.info(f"  Default strategy: {self.config.get('default_strategy', 'lethe')}")
         logger.info(f"  Semantic analysis: {'enabled' if semantic_analysis else 'disabled'}")
 
@@ -306,7 +316,7 @@ class CompressionManager:
         """
         Decompress text (lossy compression — returns as-is).
 
-        LETHE and ALETHEIA are lossy; ANAMNESIS preserves full text.
+        LETHE (and deprecated ALETHEIA) are lossy; ANAMNESIS preserves full text.
         """
         return compressed
 

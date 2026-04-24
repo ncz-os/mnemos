@@ -52,18 +52,26 @@ _CONTEST_ENABLED = os.getenv("MNEMOS_CONTEST_ENABLED", "true").lower() == "true"
 # ALETHEIA is disabled by default in v3.1. The engine's v3.0 index-list
 # scoring prompt ("output comma-separated token indices to KEEP")
 # doesn't survive instruction-tuned chat models — verified against
-# Qwen2.5-Coder-7B on TYPHON and gemma-4-E4B-it on CERBERUS, both
-# returned whitespace/punctuation instead of an index list. The parser
-# fallback emits first-N tokens with honest quality_score=0.60, which
-# the balanced-profile 0.70 quality_floor correctly rejects — so the
-# engine never wins but still burns ~0.2-0.5s of GPU round-trip per
-# memory. Disabling by default skips the waste. Operators with a
-# model/prompt that actually handles importance scoring opt-in via:
+# ALETHEIA is DEPRECATED. v3.2 tail retirement:
 #
-#   MNEMOS_ALETHEIA_ENABLED=true
+# The 2026-04-23 CERBERUS benchmark across 49 PYTHIA memories recorded
+# ALETHEIA winning 0 contests. The index-list scoring prompt doesn't
+# survive instruction-tuned generalist LLMs (Qwen2.5-Coder-7B on
+# TYPHON and gemma-4-E4B-it on CERBERUS both returned whitespace or
+# punctuation instead of an index list), and the first-N fallback is
+# strictly inferior to LETHE at lower cost.
 #
-# The engine's prompt redesign ("direct compression mode") is v3.x
-# work, not v3.1. See docs/benchmarks/compression-2026-04-23.md.
+# The niche audit found every case where ALETHEIA might theoretically
+# win is already owned by LETHE (same prose-prune shape, free),
+# ANAMNESIS (better fact shape), or APOLLO (schema-typed). The going-
+# forward stack is LETHE + ANAMNESIS + APOLLO.
+#
+# Kept behind MNEMOS_ALETHEIA_ENABLED for any operator install that
+# had it opted in before retirement, but the engine class now emits a
+# DeprecationWarning on construction. v4.0 removes it entirely.
+#
+# See docs/benchmarks/compression-2026-04-23.md for the measured
+# rationale.
 _ALETHEIA_ENABLED = os.getenv("MNEMOS_ALETHEIA_ENABLED", "false").lower() == "true"
 
 # Optional minimum-content-length gate for the v3.1 contest path.
@@ -165,20 +173,26 @@ class MemoryDistillationWorker:
         # enabled set and let the gpu_guard handle endpoint
         # unavailability at runtime.
         if _CONTEST_AVAILABLE and _CONTEST_ENABLED:
+            # Going-forward stack: LETHE + ANAMNESIS (+ APOLLO in v3.3).
+            # ALETHEIA is retired — kept opt-in behind
+            # MNEMOS_ALETHEIA_ENABLED=true for operators who had it
+            # enabled before retirement; emits a DeprecationWarning on
+            # construction. v4.0 removes it entirely.
             self._contest_engines = [LETHEEngine()]
             if _ALETHEIA_ENABLED:
                 self._contest_engines.append(ALETHEIAEngine())
             self._contest_engines.append(ANAMNESISEngine())
             engine_ids = [e.id for e in self._contest_engines]
             logger.info(
-                "[OK] v3.1 contest path enabled (engines: %s)",
+                "[OK] contest path enabled (engines: %s)",
                 ", ".join(engine_ids),
             )
-            if not _ALETHEIA_ENABLED:
-                logger.info(
-                    "ALETHEIA is disabled by default in v3.1 (set "
-                    "MNEMOS_ALETHEIA_ENABLED=true to opt in). See "
-                    "docs/benchmarks/compression-2026-04-23.md for rationale."
+            if _ALETHEIA_ENABLED:
+                logger.warning(
+                    "ALETHEIA is deprecated and retired from the "
+                    "default stack. You have MNEMOS_ALETHEIA_ENABLED=true "
+                    "set; v4.0 will remove the engine entirely. See "
+                    "docs/benchmarks/compression-2026-04-23.md."
                 )
         else:
             logger.info(
