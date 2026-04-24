@@ -325,16 +325,27 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         consultation_id = None
         memory_ids = _extract_memory_ids(result)
         if _lc._pool and result.get("all_responses"):
-            best_resp = max(
-                result["all_responses"].items(),
-                key=lambda x: x[1].get("final_score", 0),
-            )
-            # Prefer the engine's reported cost (per-provider, token-aware)
-            # and fall back to 0.0 if the engine didn't surface one. This was
-            # previously hardcoded to 0.02 which made the cost column useless.
-            engine_cost = result.get("cost")
-            if engine_cost is None:
-                engine_cost = best_resp[1].get("cost", 0.0)
+            # Persistence reads consensus fields FROM THE ENGINE return
+            # dict instead of re-deriving them locally. The engine's
+            # _compute_consensus is the single source of truth for
+            # winning_muse / consensus_response / consensus_score /
+            # cost / latency_ms; previously this block ran its own
+            # max() over all_responses, which diverged from the engine
+            # whenever scoring rules changed and produced nonsense
+            # rows on all-failure (max() of a dict with only errored
+            # entries picks an arbitrary error).
+            #
+            # On all-failure _compute_consensus returns
+            # consensus_response="" / consensus_score=0.0 /
+            # winning_muse=None / cost=0.0 / latency_ms=0, all safe to
+            # persist. The response row still lands so the caller
+            # has a stable consultation_id and the audit chain is
+            # unbroken.
+            consensus_response = result.get("consensus_response", "") or ""
+            consensus_score = float(result.get("consensus_score", 0.0) or 0.0)
+            winning_muse = result.get("winning_muse")
+            engine_cost = float(result.get("cost", 0.0) or 0.0)
+            engine_latency_ms = int(result.get("latency_ms", 0) or 0)
 
             # All three writes — consultation row, audit entry, memory refs —
             # must commit as a single unit. If the audit write fails we MUST
@@ -351,11 +362,11 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                                RETURNING id""",
                             body.prompt,
                             body.task_type,
-                            best_resp[1].get("response_text", "")[:500],
-                            best_resp[1].get("final_score", 0),
-                            best_resp[0],
+                            consensus_response[:500],
+                            consensus_score,
+                            winning_muse,
                             engine_cost,
-                            best_resp[1].get("latency_ms", 0),
+                            engine_latency_ms,
                             body.mode or "auto",
                             user.user_id,
                         )
@@ -365,10 +376,10 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                             conn=conn,
                             consultation_id=consultation_id,
                             prompt=body.prompt,
-                            response=best_resp[1].get("response_text", ""),
+                            response=consensus_response,
                             task_type=body.task_type or "reasoning",
-                            provider=best_resp[0],
-                            quality_score=best_resp[1].get("final_score", 0),
+                            provider=winning_muse,
+                            quality_score=consensus_score,
                         )
                         await _write_memory_refs_on_conn(
                             conn=conn,
