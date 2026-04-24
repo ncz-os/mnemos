@@ -110,7 +110,11 @@ def test_h1_gateway_context_search_includes_federation(monkeypatch):
     asyncio.run(openai_compat._search_mnemos_context("hello", _alice(), limit=5))
 
     sql = conn.fetches[-1][0]
-    assert "owner_id = $1 OR federation_source IS NOT NULL" in sql
+    # v3.2 compression-in-hot-paths added table aliases (`m.`, `v.`)
+    # and a LEFT JOIN to memory_compressed_variants. The federation
+    # clause now reads `m.owner_id = $1 OR m.federation_source IS NOT NULL`.
+    assert "owner_id = $1 OR" in sql
+    assert "federation_source IS NOT NULL" in sql
 
 
 # ─── H2: consensus fields populated ──────────────────────────────────────────
