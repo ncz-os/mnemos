@@ -178,3 +178,90 @@ def test_handler_sees_id_via_current_request_id():
     assert resp.status_code == 200
     assert captured["ctx_rid"] == "ctx-test-42"
     assert resp.headers[REQUEST_ID_HEADER] == "ctx-test-42"
+
+
+# ---- Prometheus /metrics (v3.2 observability slice 2) ---------------------
+
+
+def _metrics_app():
+    """Build a minimal app with the Prometheus middleware + endpoint
+    wired, mirroring api_server.py's pattern."""
+    from api.observability import PrometheusMiddleware, metrics_router
+
+    app = FastAPI()
+    app.add_middleware(PrometheusMiddleware)
+    app.include_router(metrics_router)
+
+    @app.get("/widgets/{widget_id}")
+    def _get_widget(widget_id: str):
+        return {"id": widget_id}
+
+    @app.get("/fail")
+    def _fail():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail="boom")
+
+    return app
+
+
+def test_metrics_endpoint_serves_prometheus_text():
+    client = TestClient(_metrics_app())
+    resp = client.get("/metrics")
+    assert resp.status_code == 200
+    ct = resp.headers["content-type"]
+    # Accept either the canonical text/plain or versioned variant
+    assert "text/plain" in ct
+
+
+def test_metrics_counter_bumps_per_request():
+    """Each request increments mnemos_http_requests_total by 1 with
+    the matched route template, not the concrete URL."""
+    client = TestClient(_metrics_app())
+    client.get("/widgets/abc-1")
+    client.get("/widgets/abc-2")
+
+    body = client.get("/metrics").text
+    # Route template is /widgets/{widget_id}, not /widgets/abc-1
+    assert 'route="/widgets/{widget_id}"' in body
+    assert 'route="/widgets/abc-1"' not in body
+    # Two 2xx responses bumped the counter
+    import re
+    m = re.search(
+        r'mnemos_http_requests_total\{[^}]*route="/widgets/\{widget_id\}"[^}]*\}\s+([0-9.]+)',
+        body,
+    )
+    assert m, "expected counter line for /widgets/{widget_id}"
+    assert float(m.group(1)) >= 2.0
+
+
+def test_metrics_records_status_class_label():
+    """5xx responses land under status='5xx' label, not '500'. Keeps
+    cardinality bounded; alerting off status class is what operators
+    actually want."""
+    client = TestClient(_metrics_app())
+    client.get("/fail", headers={}, follow_redirects=False)
+    body = client.get("/metrics").text
+    assert 'status="5xx"' in body
+
+
+def test_metrics_histogram_present():
+    """The latency histogram must appear for every served route. We
+    don't assert specific bucket values (timing-dependent) — just
+    that the metric family and a _count observation exist."""
+    client = TestClient(_metrics_app())
+    client.get("/widgets/xyz")
+    body = client.get("/metrics").text
+    assert "mnemos_http_request_duration_seconds" in body
+    assert "mnemos_http_request_duration_seconds_count" in body
+
+
+def test_metrics_unknown_route_bucketed_as_no_route():
+    """404s for URLs that don't match any route go under
+    route='__no_route__' rather than creating one time series per
+    probed path. Protects against adversarial cardinality blow-up."""
+    client = TestClient(_metrics_app())
+    client.get("/does-not-exist")
+    client.get("/also-fake")
+    body = client.get("/metrics").text
+    assert 'route="__no_route__"' in body
+    assert 'route="/does-not-exist"' not in body
