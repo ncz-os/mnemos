@@ -11,6 +11,16 @@ shapes only, no code shared). Additional schemas (decision, person,
 event) are scheduled for v3.3 S-II.
 """
 from .base import DetectionResult, Schema
+from .decision import DecisionSchema
+from .event import EventSchema
+from .person import PersonSchema
 from .portfolio import PortfolioSchema
 
-__all__ = ["DetectionResult", "Schema", "PortfolioSchema"]
+__all__ = [
+    "DetectionResult",
+    "Schema",
+    "PortfolioSchema",
+    "DecisionSchema",
+    "PersonSchema",
+    "EventSchema",
+]

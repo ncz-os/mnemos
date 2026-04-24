@@ -44,7 +44,13 @@ from typing import List, Optional
 
 import httpx
 
-from .apollo_schemas import PortfolioSchema, Schema
+from .apollo_schemas import (
+    DecisionSchema,
+    EventSchema,
+    PersonSchema,
+    PortfolioSchema,
+    Schema,
+)
 from .base import (
     CompressionEngine,
     CompressionRequest,
@@ -64,10 +70,15 @@ _GPU_PROVIDER_TIMEOUT = float(os.getenv("GPU_PROVIDER_TIMEOUT", "30.0"))
 
 
 # Default schema registry. Order matters: first match wins.
-# Specific-before-general is the rule; additional schemas insert ahead
-# of any future generic fallback schema.
+# Specific-before-general is the rule — portfolio (strictest regex
+# shape, tightest false-positive guard) runs before schemas with
+# softer markers (decision, person, event). Any future generic
+# fallback schema inserts at the tail of this list.
 _DEFAULT_SCHEMAS: List[Schema] = [
     PortfolioSchema(),
+    DecisionSchema(),
+    PersonSchema(),
+    EventSchema(),
 ]
 
 
@@ -459,13 +470,25 @@ def narrate_encoded(encoded: Optional[str]) -> str:
     """Dispatch an APOLLO dense form to the correct rule-based
     narrator.
 
-    Recognizes the portfolio schema and the LLM-fallback shape.
-    Unknown shapes fall through verbatim — narration is best-effort
-    and MUST NOT raise: the /v1/memories/{id}/narrate endpoint calls
-    this and the caller is always safe to display the result.
+    Dispatch order:
+      1. Prefixed forms (DECISION:, PERSON:, EVENT:) — cheap,
+         unambiguous.
+      2. Portfolio (no prefix; TICKER:N@P/P:CAT sniff).
+      3. LLM fallback (summary=...;facts=[...];...).
+      4. Unknown — return verbatim.
+
+    Narration is best-effort and MUST NOT raise: the
+    /v1/memories/{id}/narrate endpoint calls this and the caller is
+    always safe to display the result.
     """
     if not encoded:
         return ""
+    if encoded.startswith("DECISION:"):
+        return DecisionSchema().narrate(encoded)
+    if encoded.startswith("PERSON:"):
+        return PersonSchema().narrate(encoded)
+    if encoded.startswith("EVENT:"):
+        return EventSchema().narrate(encoded)
     if looks_like_portfolio(encoded):
         return PortfolioSchema().narrate(encoded)
     if looks_like_fallback(encoded):

@@ -94,7 +94,15 @@ def test_compress_no_match_no_fallback_returns_clean_error_result():
     assert result.error == "no_schema_match"
     assert result.succeeded() is False
     assert result.compressed_content is None
-    assert result.manifest.get("schemas_tried") == ["portfolio"]
+    # v3.3 S-II grew the default schema set to four. Assert the
+    # core schemas are present rather than pin the exact list —
+    # additional schemas added in later slices should not re-break
+    # this test on every extension.
+    schemas_tried = result.manifest.get("schemas_tried") or []
+    assert "portfolio" in schemas_tried
+    assert "decision" in schemas_tried
+    assert "person" in schemas_tried
+    assert "event" in schemas_tried
     assert result.manifest.get("path") == "schema_only_no_match"
 
 
