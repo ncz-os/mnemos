@@ -45,6 +45,8 @@ from typing import List, Optional
 import httpx
 
 from .apollo_schemas import (
+    CodeSchema,
+    CommitSchema,
     DecisionSchema,
     EventSchema,
     PersonSchema,
@@ -75,10 +77,15 @@ _GPU_PROVIDER_TIMEOUT = float(os.getenv("GPU_PROVIDER_TIMEOUT", "30.0"))
 # softer markers (decision, person, event). Any future generic
 # fallback schema inserts at the tail of this list.
 _DEFAULT_SCHEMAS: List[Schema] = [
+    # Strictest / most-specific shapes first. CommitSchema comes
+    # before CodeSchema because a commit message might incidentally
+    # reference code; we want the commit shape captured first.
+    CommitSchema(),
     PortfolioSchema(),
     DecisionSchema(),
     PersonSchema(),
     EventSchema(),
+    CodeSchema(),
 ]
 
 
@@ -94,9 +101,16 @@ Emit ONE line with four sections separated by SEMICOLONS, in this exact shape:
 
 summary=<one-line summary>;facts=[fact1|fact2|fact3];entities=[name1|name2];concepts=[concept1|concept2]
 
-Concrete example (study the punctuation — SEMICOLONS between sections, PIPES only inside the bracketed lists):
+Three concrete examples (study the punctuation — SEMICOLONS between sections, PIPES only inside the bracketed lists):
 
+Example 1 — release narrative:
   summary=Bob shipped v1.2 last week;facts=[v1.2-shipped|CI-passed|rollback-unused];entities=[Bob|CI];concepts=[release|deploy]
+
+Example 2 — technical how-to:
+  summary=Install pgvector before creating the memories table;facts=[install-pgvector|create-memories-table|index-HNSW-for-ANN];entities=[pgvector|Postgres-15|HNSW];concepts=[setup|indexing]
+
+Example 3 — incident report:
+  summary=Queue rows stranded in running state on 2026-04-23;facts=[incident-on-2026-04-23|compression-worker-affected|sweep-recovery-shipped];entities=[queue|sweep|v3.1.1];concepts=[incident|recovery]
 
 Rules:
 - Four sections required. Empty list sections render as facts=[] (with empty brackets).
@@ -598,6 +612,10 @@ def narrate_encoded(encoded: Optional[str]) -> str:
     """
     if not encoded:
         return ""
+    if encoded.startswith("CODE:"):
+        return CodeSchema().narrate(encoded)
+    if encoded.startswith("COMMIT:"):
+        return CommitSchema().narrate(encoded)
     if encoded.startswith("DECISION:"):
         return DecisionSchema().narrate(encoded)
     if encoded.startswith("PERSON:"):
