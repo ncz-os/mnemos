@@ -84,18 +84,25 @@ _DEFAULT_SCHEMAS: List[Schema] = [
 
 # LLM-fallback prompt. Designed for the ANAMNESIS-style output
 # contract: one line, four required sections, pipe-separated lists.
-# Strict form lets the parser validate and reject malformed returns.
+# The parser below accepts both `;` and `|` as section separators —
+# gemma4-class 7B models empirically conflate "use pipe inside
+# lists" with "use pipe everywhere". A concrete example in the
+# prompt AND parser tolerance together are what keep this robust.
 _FALLBACK_PROMPT = """\
 You are extracting structured facts from a memory for dense LLM-to-LLM encoding.
-Read the content below and emit ONE line in this exact form:
+Emit ONE line with four sections separated by SEMICOLONS, in this exact shape:
 
-summary=<one-line summary, max 100 chars>;facts=[fact1|fact2|...];entities=[name1|name2|...];concepts=[concept1|concept2|...]
+summary=<one-line summary>;facts=[fact1|fact2|fact3];entities=[name1|name2];concepts=[concept1|concept2]
+
+Concrete example (study the punctuation — SEMICOLONS between sections, PIPES only inside the bracketed lists):
+
+  summary=Bob shipped v1.2 last week;facts=[v1.2-shipped|CI-passed|rollback-unused];entities=[Bob|CI];concepts=[release|deploy]
 
 Rules:
-- All four sections required. Empty sections render as summary=;facts=[];entities=[];concepts=[]
-- Use '|' as the in-list separator (never commas)
-- No quotes around values
-- No newlines, no markdown, no explanation — one line of output, exactly.
+- Four sections required. Empty list sections render as facts=[] (with empty brackets).
+- SEMICOLON ';' separates the four top-level sections.
+- PIPE '|' separates items within a bracketed list. Never commas.
+- No quotes around values, no newlines, no markdown, no explanation — exactly one line.
 - Preserve proper nouns, IDs, numbers, and other identifiers verbatim.
 
 Memory content:
@@ -104,12 +111,15 @@ Memory content:
 Output (one line only):"""
 
 
-# Strict parser. Accepts lines of the exact shape produced by
-# _FALLBACK_PROMPT. Tolerates LLM preamble/suffix by scanning newlines.
+# Parser accepts ';' or '|' as the top-level section separator —
+# smaller models conflate the in-list separator with the section
+# separator. Non-greedy summary is anchored by the literal
+# 'facts=[' boundary so a pipe inside a summary sentence (rare)
+# doesn't truncate the capture.
 _FALLBACK_RE = re.compile(
-    r"^summary=(?P<summary>[^;]*);"
-    r"facts=\[(?P<facts>[^\]]*)\];"
-    r"entities=\[(?P<entities>[^\]]*)\];"
+    r"^summary=(?P<summary>.*?)[;|]"
+    r"facts=\[(?P<facts>[^\]]*)\][;|]"
+    r"entities=\[(?P<entities>[^\]]*)\][;|]"
     r"concepts=\[(?P<concepts>[^\]]*)\]$"
 )
 

@@ -105,6 +105,27 @@ def test_normalize_accepts_shape_inside_preamble():
     assert _normalize_fallback_output(raw) == "summary=s;facts=[f];entities=[e];concepts=[c]"
 
 
+def test_normalize_accepts_pipe_as_section_separator():
+    """Regression for the live-GPU smoke: gemma4-class models
+    empirically conflate the in-list pipe with the section
+    separator and emit the whole line pipe-delimited. The parser
+    accepts either separator between top-level sections because
+    small instruction-tuned models aren't reliable at the
+    distinction — see the updated _FALLBACK_PROMPT for the
+    operator-side fix (concrete example + explicit section-vs-list
+    punctuation call-out)."""
+    pipe_shape = (
+        "summary=Bob shipped v1.2|facts=[v1.2-shipped|CI-passed]"
+        "|entities=[Bob|CI]|concepts=[release|deploy]"
+    )
+    out = _normalize_fallback_output(pipe_shape)
+    assert out is not None, (
+        "parser must accept pipe-separated top-level sections — "
+        "gemma4-consult empirically produces this form"
+    )
+    assert out == pipe_shape
+
+
 def test_normalize_rejects_missing_section():
     bad = "summary=s;facts=[f];entities=[e]"   # no concepts
     assert _normalize_fallback_output(bad) is None
