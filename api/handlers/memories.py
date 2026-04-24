@@ -795,14 +795,60 @@ async def rehydrate_memories(
     rehydrate_owner_id = None if _is_root(user) else user.user_id
     rehydrate_namespace = None if _is_root(user) else user.namespace
 
+    # v3.2 compression-in-hot-paths: rehydrate is the canonical
+    # "fit memories into a token budget" path, so it benefits most
+    # from preferring the v3.1 contest winner variant over the raw
+    # content. Fallback chain: contest winner -> v3.0
+    # memories.compressed_content -> raw content.
+    #
+    # Inlined here (rather than routed through _fts_fetch) because
+    # the JOIN shape is rehydrate-specific: one-to-one with
+    # memory_compressed_variants, COALESCE chosen in SELECT. The
+    # shared helper doesn't need the complexity.
+    #
+    # We also track `compression_applied` for the response: true
+    # iff at least one row returned a variant-compressed form.
+    clean_query = request.query.strip()
+    sql_conditions = [
+        "to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)"
+    ]
+    sql_params: list = [clean_query, request.limit]
+    idx = 3
+    if rehydrate_owner_id is not None:
+        # Apply the v3.1.2 Tier 3 federation-aware filter: the caller's
+        # own rows OR any row marked federation_source.
+        sql_conditions.append(
+            f"(m.owner_id=${idx} OR m.federation_source IS NOT NULL)"
+        )
+        sql_params.append(rehydrate_owner_id)
+        idx += 1
+    if rehydrate_namespace is not None:
+        sql_conditions.append(f"m.namespace=${idx}")
+        sql_params.append(rehydrate_namespace)
+        idx += 1
+    if request.category is not None:
+        sql_conditions.append(f"m.category=${idx}")
+        sql_params.append(request.category)
+        idx += 1
+
+    where_sql = " AND ".join(sql_conditions)
+    sql = (
+        "SELECT m.id, m.category, m.created, m.quality_rating, "
+        "       m.content AS raw_content, "
+        "       COALESCE(v.compressed_content, m.compressed_content) AS compressed_content, "
+        "       v.compressed_content IS NOT NULL AS variant_used, "
+        "       ts_rank(to_tsvector('english', m.content), "
+        "               plainto_tsquery('english', $1)) AS rank "
+        "FROM memories m "
+        "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
+        f"WHERE {where_sql} "
+        "ORDER BY rank DESC LIMIT $2"
+    )
+
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
-            rows = await _fts_fetch(
-                conn, request.query, request.limit, request.category,
-                select_cols="id, content, category, created, compressed_content, quality_rating",
-                owner_id=rehydrate_owner_id,
-                namespace=rehydrate_namespace,
-            )
+            rows = await conn.fetch(sql, *sql_params)
+
     if not rows:
         return RehydrationResponse(
             context="", tokens_used=0, original_tokens=0,
@@ -810,29 +856,40 @@ async def rehydrate_memories(
             memories_included=0, compression_applied=False,
         )
     context_parts = []
+    raw_size = 0
+    variant_hits = 0
     for row in rows:
-        effective_content = row['compressed_content'] if row['compressed_content'] else row['content']
+        # Prefer contest winner (variant_used=True) or v3.0 column, else raw.
+        effective = row["compressed_content"] or row["raw_content"]
+        raw_size += len(row["raw_content"] or "")
+        if row["variant_used"]:
+            variant_hits += 1
         created_str = row['created'].strftime('%Y-%m-%d') if row['created'] else 'unknown'
-        context_parts.append(f"[{row['category']} / {created_str}]\n{effective_content[:2000]}")
+        context_parts.append(f"[{row['category']} / {created_str}]\n{effective[:2000]}")
     combined_context = "\n\n---\n\n".join(context_parts)
     original_tokens = int(len(combined_context) / 4)
 
-    # Phase 2 complete: compression available (LETHE/ALETHEIA/ANAMNESIS)
-    # Rehydration compression deferred to Phase 8A (batch optimization)
-    # Gateway prioritizes memory injection compression (critical path)
     tokens_used = min(original_tokens, request.budget_tokens) if request.budget_tokens else original_tokens
-    compression_applied = False  # Phase 8A: integrate LETHE for large context budgets
+    compression_applied = variant_hits > 0
+    # Only report a non-1.0 ratio when variants were actually used;
+    # otherwise the context size is dominated by category/date
+    # prefixes added by the rehydrator and the "ratio" is misleading.
+    if compression_applied and raw_size > 0:
+        compression_ratio = len(combined_context) / raw_size
+    else:
+        compression_ratio = 1.0
 
     logger.info(
         f"[REHYDRATE] query='{request.query[:30]}' | memories={len(rows)} | "
-        f"original_tokens={original_tokens} | tokens_used={tokens_used} | "
-        f"compression_applied={compression_applied}"
+        f"variant_hits={variant_hits} | original_tokens={original_tokens} | "
+        f"tokens_used={tokens_used} | compression_applied={compression_applied} | "
+        f"compression_ratio={compression_ratio:.3f}"
     )
     return RehydrationResponse(
         context=combined_context[:request.budget_tokens * 4] if request.budget_tokens else combined_context,
         tokens_used=tokens_used,
         original_tokens=original_tokens,
-        compression_ratio=1.0,
+        compression_ratio=compression_ratio,
         quality_score=100,
         memories_included=len(rows),
         compression_applied=compression_applied,

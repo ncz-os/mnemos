@@ -109,15 +109,28 @@ async def _search_mnemos_context(query: str, user: UserContext, limit: int = 5) 
             # to_tsvector so we match the 'english' dictionary regardless of
             # the cluster's default_text_search_config and so the index (if
             # present) can actually be used.
+            # v3.2 compression-in-hot-paths: prefer the v3.1 contest
+            # winner's compressed_content when available, fall back
+            # to the v3.0 column, fall back to raw content. Saves
+            # prompt-window tokens on memories that have been
+            # through the compression pipeline — the whole point of
+            # running the contest. Non-winners' compressed forms
+            # (candidates) intentionally NOT used; we only surface
+            # the audit-approved winner.
             if is_root:
-                # Root sees every memory regardless of tenancy.
                 memories = await conn.fetch(
                     """
-                    SELECT id, content, category FROM memories
+                    SELECT m.id, m.category,
+                           COALESCE(v.compressed_content,
+                                    m.compressed_content,
+                                    m.content) AS content
+                    FROM memories m
+                    LEFT JOIN memory_compressed_variants v
+                        ON v.memory_id = m.id
                     WHERE
-                        to_tsvector('english', content) @@ plainto_tsquery('english', $1)
-                        OR category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
-                    ORDER BY updated DESC NULLS LAST
+                        to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)
+                        OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
+                    ORDER BY m.updated DESC NULLS LAST
                     LIMIT $2
                     """,
                     query,
@@ -131,14 +144,20 @@ async def _search_mnemos_context(query: str, user: UserContext, limit: int = 5) 
                 # federated rows aren't writable by non-root.
                 memories = await conn.fetch(
                     """
-                    SELECT id, content, category FROM memories
-                    WHERE (owner_id = $1 OR federation_source IS NOT NULL)
-                      AND namespace = $2
-                    AND (
-                        to_tsvector('english', content) @@ plainto_tsquery('english', $3)
-                        OR category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
-                    )
-                    ORDER BY updated DESC NULLS LAST
+                    SELECT m.id, m.category,
+                           COALESCE(v.compressed_content,
+                                    m.compressed_content,
+                                    m.content) AS content
+                    FROM memories m
+                    LEFT JOIN memory_compressed_variants v
+                        ON v.memory_id = m.id
+                    WHERE (m.owner_id = $1 OR m.federation_source IS NOT NULL)
+                      AND m.namespace = $2
+                      AND (
+                          to_tsvector('english', m.content) @@ plainto_tsquery('english', $3)
+                          OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
+                      )
+                    ORDER BY m.updated DESC NULLS LAST
                     LIMIT $4
                     """,
                     user.user_id,
