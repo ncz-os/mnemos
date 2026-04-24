@@ -47,7 +47,19 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 MPF_VERSION = "0.1.0"
-MEMPALACE_PAYLOAD_VERSION = "mempalace-3.3"
+# Adapter translates drawer → MNEMOS memory shape (wing → namespace,
+# room → category, drawer metadata → payload.metadata.mempalace.*).
+# Payload is therefore MNEMOS-native after the translation, so declare
+# mnemos-3.1 — that's what /v1/import accepts. MemPalace provenance
+# is preserved via envelope-level source_system="mempalace" + the
+# per-payload metadata.mempalace round-trip blob, not via
+# payload_version.
+#
+# Codex caught the prior mempalace-3.3 declaration silently drop every
+# record (importer's payload-version check filed them to the `skipped`
+# bucket per the forward-compat rule, because the handler only
+# understands mnemos-3.1).
+PAYLOAD_VERSION_MNEMOS = "mnemos-3.1"
 SOURCE_SYSTEM = "mempalace"
 
 # ChromaDB is required — same dependency MemPalace itself uses. The
@@ -181,7 +193,7 @@ def _drawer_to_record(
     return {
         "id": record_id,
         "kind": "memory",
-        "payload_version": MEMPALACE_PAYLOAD_VERSION,
+        "payload_version": PAYLOAD_VERSION_MNEMOS,
         "payload": payload,
     }
 

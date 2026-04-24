@@ -496,6 +496,13 @@ class ARTEMISEngine(CompressionEngine):
         if len(content) < 40:
             # Tiny content — nothing to compress. Return as-is, tag
             # the path so the contest understands.
+            #
+            # Codex caught that quality_score=None on passthrough paths
+            # gets coerced to 0.5 by the contest and auto-rejected by
+            # the profile quality_floor. Output here IS byte-identical
+            # to input, so fidelity is 1.0 by construction — self-score
+            # at the Artemis ceiling (0.98) so the contest treats this
+            # correctly without a judge.
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             return CompressionResult(
                 engine_id=self.id,
@@ -504,11 +511,11 @@ class ARTEMISEngine(CompressionEngine):
                 original_tokens=original_tokens,
                 compressed_tokens=original_tokens,
                 compression_ratio=1.0,
-                quality_score=None,   # judge will score
+                quality_score=0.98,
                 elapsed_ms=elapsed_ms,
                 gpu_used=False,
                 identifier_policy=IdentifierPolicy.STRICT,
-                manifest={"path": "passthrough_short"},
+                manifest={"path": "passthrough_short", "quality_source": "passthrough_verbatim"},
             )
 
         # Phase 1: protected-span detection.
@@ -519,6 +526,8 @@ class ARTEMISEngine(CompressionEngine):
 
         # If the entire content is a labeled block, return it verbatim
         # — no compression is better than expansion.
+        # quality_score=0.98 per the passthrough_short fix; output is
+        # byte-identical so fidelity is 1.0 by construction.
         if labeled_blocks and sum(len(b) for b in labeled_blocks) >= len(content) * 0.8:
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             return CompressionResult(
@@ -528,11 +537,11 @@ class ARTEMISEngine(CompressionEngine):
                 original_tokens=original_tokens,
                 compressed_tokens=original_tokens,
                 compression_ratio=1.0,
-                quality_score=None,
+                quality_score=0.98,
                 elapsed_ms=elapsed_ms,
                 gpu_used=False,
                 identifier_policy=IdentifierPolicy.STRICT,
-                manifest={"path": "passthrough_labeled"},
+                manifest={"path": "passthrough_labeled", "quality_source": "passthrough_verbatim"},
             )
 
         # Phase 3: sentence-level extractive ranking.

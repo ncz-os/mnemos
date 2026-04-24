@@ -259,10 +259,31 @@ class JsonImporter(BaseImporter):
                     if not line:
                         continue
                     try:
-                        items.append(json.loads(line))
+                        parsed = json.loads(line)
                     except json.JSONDecodeError as exc:
                         print(f"WARNING: line {line_num}: bad JSON ({exc})",
                               file=sys.stderr)
+                        continue
+                    # Per-line MPF record unwrap:
+                    # memory_export.py emits one full MPF record per
+                    # line ({id, kind, payload_version, payload}),
+                    # not a flat memory dict. Detect that shape and
+                    # unwrap the payload (promoting envelope id into
+                    # the payload) so the rest of the pipeline treats
+                    # it uniformly with the one-shot JSON path. Codex
+                    # caught the asymmetry: exporter said "round-trips
+                    # via memory_import --jsonl", but every line was
+                    # getting dropped as empty because content lived
+                    # at payload.content, not top-level content.
+                    if (isinstance(parsed, dict)
+                            and parsed.get("kind") == "memory"
+                            and isinstance(parsed.get("payload"), dict)):
+                        payload = dict(parsed["payload"])
+                        if "id" in parsed:
+                            payload.setdefault("id", parsed["id"])
+                        items.append(payload)
+                    else:
+                        items.append(parsed)
             return items
 
         raw = self.file_path.read_text(encoding="utf-8")
