@@ -44,6 +44,12 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
+# v3.2 observability foundation: request-ID correlation across logs +
+# response headers. Must run BEFORE any handler emits log records so
+# each line is tagged with [req:<id>] from the first one.
+from api.observability import RequestIDMiddleware, install_log_correlation  # noqa: E402
+install_log_correlation()
+
 app = FastAPI(title="MNEMOS API", version="3.1.0", description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway", lifespan=lifespan)
 
 # ── Request body size limit (SEC-04) ──────────────────────────────────────────
@@ -125,6 +131,12 @@ class _BodyTooLarge(Exception):
 
 
 app.add_middleware(_BodySizeLimitASGI, max_bytes=_MAX_BODY_BYTES)
+# Request-ID should be the outermost middleware so EVERY log line
+# produced by subsequent middleware (rate limit, CORS, auth) or any
+# handler is already tagged. In Starlette/FastAPI, add_middleware
+# wraps the app LIFO — so the last-added runs first. We add it near
+# the end of the middleware stack below via `app.add_middleware`.
+app.add_middleware(RequestIDMiddleware)
 
 # Rate limiting (opt-in via RATE_LIMIT_ENABLED=true — see api/rate_limit.py)
 app.state.limiter = limiter
