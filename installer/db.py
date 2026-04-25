@@ -247,6 +247,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v3_2_entities_namespace.sql",
         repo_path / "db" / "migrations_v3_2_2_version_snapshot_new_values.sql",
         repo_path / "db" / "migrations_v3_3_morpheus.sql",
+        repo_path / "db" / "migrations_v3_3_morpheus_namespace.sql",
     ]
 
     print("[db] Running migrations...")
