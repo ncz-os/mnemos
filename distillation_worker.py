@@ -298,6 +298,26 @@ class MemoryDistillationWorker:
                     "Flip MNEMOS_APOLLO_LLM_FALLBACK_ENABLED=true to "
                     "cover all memories."
                 )
+            if _APOLLO_ENABLED and _APOLLO_LLM_FALLBACK_ENABLED and not _JUDGE_ENABLED:
+                # APOLLO's LLM fallback emits a deliberately-low self-reported
+                # quality_score (compression/apollo.py: _FALLBACK_QUALITY_SCORE
+                # = 0.55) so it can never win the contest without external
+                # validation. Without judge mode that validation never fires
+                # — meaning APOLLO spends GPU on every fallback candidate
+                # for nothing. This is wasted hardware. Either disable
+                # the fallback (MNEMOS_APOLLO_LLM_FALLBACK_ENABLED=false)
+                # or enable the judge (MNEMOS_JUDGE_ENABLED=true). See
+                # docs/benchmarks/compression-2026-04-23.md for the
+                # judge's GPU cost profile.
+                logger.warning(
+                    "APOLLO LLM fallback ENABLED but judge mode is OFF — "
+                    "APOLLO fallback candidates self-score 0.55 and cannot "
+                    "win the quality floor without judge re-scoring. "
+                    "Set MNEMOS_JUDGE_ENABLED=true to enable the judge or "
+                    "MNEMOS_APOLLO_LLM_FALLBACK_ENABLED=false to skip the "
+                    "fallback path entirely. As-configured the fallback "
+                    "path burns GPU on candidates that cannot win."
+                )
         else:
             logger.info(
                 "v3.1 contest path disabled (available=%s, enabled=%s)",

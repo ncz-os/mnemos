@@ -159,14 +159,14 @@ def cmd_html(args: argparse.Namespace) -> None:
 
 def cmd_text(args: argparse.Namespace) -> None:
     try:
-        from tools.export_memories_for_docling import export_memories_text
+        from tools.export_memories_for_docling import export_memories_plaintext
     except ImportError:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from tools.export_memories_for_docling import export_memories_text  # noqa
+        from tools.export_memories_for_docling import export_memories_plaintext  # noqa
     memories = _fetch_memories_legacy(args.endpoint, args.api_key,
                                       args.category, args.limit)
     out = Path(args.out)
-    export_memories_text(memories, out)
+    export_memories_plaintext(memories, out)
     print(f"Wrote {len(memories)} memories as plain text → {out}")
 
 
