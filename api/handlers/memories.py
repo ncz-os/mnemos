@@ -1,4 +1,5 @@
 """Memory CRUD, search, and rehydration endpoints."""
+import asyncio
 import json
 import logging
 import uuid
@@ -72,6 +73,32 @@ def _is_root(user: UserContext) -> bool:
     namespace at the app layer, as defense-in-depth against RLS
     being disabled in personal-mode installs."""
     return user.role == "root"
+
+
+async def _bump_recall_counters(memory_ids: list) -> None:
+    """Increment recall_count + set last_recalled_at for a hit set.
+
+    Called fire-and-forget after a search returns its response, so
+    counter updates don't add latency to the user-visible search path.
+    Failures log and swallow — recall counters are observability, not
+    user-content correctness.
+
+    Single UPDATE for the whole hit set, so search hits with N memories
+    cost one DB round-trip not N.
+    """
+    if not memory_ids or not _lc._pool:
+        return
+    try:
+        async with _lc._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE memories "
+                "SET recall_count = recall_count + 1, "
+                "    last_recalled_at = now() "
+                "WHERE id = ANY($1::text[])",
+                list(memory_ids),
+            )
+    except Exception as e:
+        logger.warning(f"[RECALL] bump failed for {len(memory_ids)} ids: {e}")
 
 
 @router.get("/memories", response_model=MemoryListResponse)
@@ -458,6 +485,14 @@ async def search_memories(
                 )
 
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
+
+    # Fire-and-forget recall-frequency bump for the hit set.
+    # Doesn't block the response; failure here is logged and ignored
+    # (recall counters are observability, not user-content correctness).
+    if memories:
+        hit_ids = [m.id for m in memories]
+        asyncio.create_task(_bump_recall_counters(hit_ids))
+
     compression_applied = False
     compression_metadata = {}
     total_size = sum(len(m.content) for m in memories)
