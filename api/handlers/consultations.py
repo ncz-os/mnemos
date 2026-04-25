@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
 from api.rate_limit import limiter
+from graeae.engine import _REGISTRY_MAP
 from api.models import (
     ConsultationRequest,
     ConsultationResponse,
@@ -29,6 +30,20 @@ _GENESIS_HASH = hashlib.sha256(b"MNEMOS_AUDIT_GENESIS_v3").hexdigest()
 # ── Custom Query selection (v3.2) ─────────────────────────────────────────────
 
 _VALID_TIERS = {"frontier", "premium", "budget"}
+
+# Translate a model_registry.provider value (e.g. "anthropic") back into
+# the GRAEAE engine provider key (e.g. "claude") so consult()'s selection
+# filter doesn't silently drop entries. Only `anthropic→claude` flips
+# today but the map is built from _REGISTRY_MAP so future renames
+# propagate automatically.
+_REGISTRY_TO_GRAEAE = {
+    cfg["registry_provider"]: name
+    for name, cfg in _REGISTRY_MAP.items()
+}
+
+
+def _to_graeae_provider(registry_name: str) -> str:
+    return _REGISTRY_TO_GRAEAE.get(registry_name, registry_name)
 
 
 async def _tier_lineup(tier: str) -> dict:
@@ -90,7 +105,10 @@ async def _tier_lineup(tier: str) -> dict:
 
     async with _lc._pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
-    return {r["provider"]: r["model_id"] for r in rows}
+    # Translate registry provider → GRAEAE engine provider key
+    # (`anthropic` → `claude` etc.) so consult()'s selection filter
+    # at engine.py:_candidate_providers doesn't silently drop muses.
+    return {_to_graeae_provider(r["provider"]): r["model_id"] for r in rows}
 
 
 async def _resolve_models(model_ids: List[str]) -> dict:
@@ -120,7 +138,7 @@ async def _resolve_models(model_ids: List[str]) -> dict:
             status_code=400,
             detail=f"unknown model_id(s): {missing}",
         )
-    return {found[m]: m for m in model_ids}
+    return {_to_graeae_provider(found[m]): m for m in model_ids}
 
 
 async def _resolve_selection(
@@ -159,14 +177,27 @@ async def _resolve_selection(
         return await _resolve_models(models)
 
     if providers:
-        unknown = [p for p in providers if p not in engine.providers]
+        # Accept either GRAEAE name ("claude") or registry name
+        # ("anthropic") and normalise to the GRAEAE key that consult()
+        # filters against. Without this, providers=["anthropic"] would
+        # 400 because engine.providers is keyed by "claude".
+        normalised = [_to_graeae_provider(p) for p in providers]
+        unknown = [p for p in normalised if p not in engine.providers]
         if unknown:
             raise HTTPException(
                 status_code=400,
                 detail=f"unknown provider(s): {unknown}",
             )
-        # No model override — engine uses per-provider default
-        return {p: None for p in providers}
+        # De-duplicate while preserving caller order (two callers could
+        # legitimately pass both "anthropic" and "claude" — they map to
+        # the same engine slot).
+        seen: set[str] = set()
+        out: dict = {}
+        for p in normalised:
+            if p not in seen:
+                out[p] = None
+                seen.add(p)
+        return out
 
     if tier:
         lineup = await _tier_lineup(tier)
