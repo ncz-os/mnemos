@@ -85,7 +85,6 @@ def _structural_check(env: Any) -> List[str]:
 def _full_check(env: Any, schema: Any) -> List[str]:
     """Run the full JSON Schema validation via the jsonschema package."""
     try:
-        import jsonschema
         from jsonschema.validators import Draft202012Validator
     except ImportError:
         return ["jsonschema not installed — skipping full-schema check; "

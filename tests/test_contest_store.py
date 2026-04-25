@@ -14,14 +14,11 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 
 from compression.base import (
-    CompressionRequest,
     CompressionResult,
-    GPUIntent,
     IdentifierPolicy,
 )
 from compression.contest import ContestCandidate, ContestOutcome

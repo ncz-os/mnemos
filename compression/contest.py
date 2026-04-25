@@ -56,7 +56,6 @@ from .base import (
     CompressionEngine,
     CompressionRequest,
     CompressionResult,
-    IdentifierPolicy,
 )
 from .judge import Judge
 

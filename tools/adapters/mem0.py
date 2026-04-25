@@ -70,7 +70,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional
 
 MPF_VERSION = "0.1.0"
 # Adapter translates Mem0 points → MNEMOS-native memory/fact shape.

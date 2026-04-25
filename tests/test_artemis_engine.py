@@ -15,7 +15,6 @@ Predictions to verify empirically (before + after benchmark):
 from __future__ import annotations
 
 import asyncio
-import re
 
 import pytest
 
@@ -208,7 +207,6 @@ def test_anchored_textrank_boosts_anchored_sentences():
 
 def test_anchored_textrank_degrades_without_networkx(monkeypatch):
     """When networkx is absent, fall back to TF-IDF centroid scoring."""
-    import sys
 
     # Block networkx import in the anchored_textrank call.
     real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
