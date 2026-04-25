@@ -1,9 +1,9 @@
 """APOLLO — schema-aware dense encoding compression engine.
 
-Part of the going-forward compression stack (LETHE + ANAMNESIS +
-APOLLO). Designed for LLM-to-LLM wire use: encodes memories into
-typed key:value dense forms that downstream LLMs parse natively in
-fewer tokens than the prose equivalent.
+Part of the v3.3 going-forward compression stack (APOLLO + ARTEMIS).
+Designed for LLM-to-LLM wire use: encodes memories into typed
+key:value dense forms that downstream LLMs parse natively in fewer
+tokens than the prose equivalent.
 
 v3.3 S-IC (landed):
   * APOLLOEngine under CompressionEngine ABC.

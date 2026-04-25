@@ -94,10 +94,11 @@ def _load_config() -> dict:
 async def _run_distillation_worker():
     """Supervised distillation worker loop — restarts on unhandled errors.
 
-    Dispatches unoptimized memories through the compression stack:
-      1. LETHE (local CPU compression, fast)
-      2. ALETHEIA (GPU token-level compression, offline batch)
-      3. ANAMNESIS (LLM fact extraction, archival)
+    Dispatches unoptimized memories through the v3.3 going-forward
+    compression stack:
+      - ARTEMIS (CPU-only extractive with identifier preservation)
+      - APOLLO  (schema-aware dense encoding, GPU-optional fallback)
+    Selected by the contest framework per memory.
 
     Previously a single crash set status to 'idle' and left the worker
     permanently dead for the rest of the process lifetime. We now restart

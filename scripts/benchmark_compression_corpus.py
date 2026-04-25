@@ -81,7 +81,6 @@ from typing import Dict, List, Optional
 # Repo-root path so the script runs whether via `-m` or direct file.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from compression.anamnesis import ANAMNESISEngine
 from compression.apollo import APOLLOEngine
 from compression.artemis import ARTEMISEngine
 from compression.base import CompressionRequest, IdentifierPolicy
@@ -92,7 +91,6 @@ from compression.judge import (
     LLMJudge,
     NullJudge,
 )
-from compression.lethe import LETHEEngine
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
@@ -437,13 +435,11 @@ async def _run(args) -> int:
 
     # v3.3 default contest stack: Artemis + Apollo.
     # Prior engines (LETHE, ANAMNESIS) included here for benchmark
-    # comparability across stack revisions — they don't participate in
-    # the production default contest anymore but running them here
-    # gives a before/after distribution on the same corpus.
+    # comparability across stack revisions. LETHE / ANAMNESIS were
+    # removed in v3.3 (see EVOLUTION.md "v3.2 tail") so the harness
+    # now benchmarks the going-forward stack only.
     engines = [
         ARTEMISEngine(),
-        LETHEEngine(),
-        ANAMNESISEngine(gpu_url=args.gpu_url),
         APOLLOEngine(enable_llm_fallback=True, gpu_url=args.gpu_url),
     ]
 
