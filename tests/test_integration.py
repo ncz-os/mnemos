@@ -278,7 +278,7 @@ class TestDockerIntegration:
         pyproject_path = Path(__file__).parent.parent / 'pyproject.toml'
         assert pyproject_path.exists(), "pyproject.toml not found"
         content = pyproject_path.read_text()
-        assert 'version = "3.2.3"' in content, "Version not at 3.2.3"
+        assert 'version = "3.2.4"' in content, "Version not at 3.2.4"
 
     def test_pyproject_toml_has_uv_config(self):
         """pyproject.toml has uv configuration."""

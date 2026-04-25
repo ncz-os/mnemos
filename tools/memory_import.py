@@ -104,7 +104,7 @@ class BaseImporter:
                 ok += 1
                 continue
 
-            url = f"{self.endpoint}/memories"
+            url = f"{self.endpoint}/v1/memories"
             data = json.dumps(mem).encode("utf-8")
             headers = {"Content-Type": "application/json"}
             if self.api_key:
@@ -185,6 +185,11 @@ class BaseImporter:
                 "mpf_version": self.MPF_VERSION,
                 "source_system": "memory_import",
                 "source_version": self.MEMORY_PAYLOAD_VERSION,
+                # Required by both docs/mpf_v0.1.json and tools/mpf_validate.py.
+                # Earlier importers omitted this and produced envelopes that
+                # failed our own validator — added so the importer's output
+                # round-trips through the schema check.
+                "exported_at": datetime.now(timezone.utc).isoformat(),
                 "records": [_record(m) for m in batch],
             }
             data = json.dumps(envelope).encode("utf-8")
@@ -557,7 +562,13 @@ class ChatGPTImporter(BaseImporter):
                         combined = f"Q: {prev_user_text}\nA: {text}"
                         prev_user_text = None
 
-                    category = self._classify_category(combined)
+                    # Honor an explicit --category override; only auto-classify
+                    # when the operator left the flag unset (CLI default for
+                    # the chatgpt subcommand is None). Earlier behaviour
+                    # silently reclassified every assistant turn as
+                    # `decisions` / `patterns`, ignoring the operator's
+                    # explicit lineage choice.
+                    category = self.category if self.category else self._classify_category(combined)
                     meta = {
                         "conversation_title": title,
                         "source_file": self.file_path.name,
