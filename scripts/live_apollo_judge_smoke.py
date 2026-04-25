@@ -2,10 +2,10 @@
 """Live APOLLO + Judge smoke harness (v3.3 S-II).
 
 Exercises the compression contest against a real GPU inference
-endpoint. Runs LETHE + ANAMNESIS + APOLLO on a small hand-curated
-memory sample covering every schema + LLM-fallback + prose, with
-judge-LLM enabled. Captures per-engine latencies, judge scores,
-winners, and prints a comparison table.
+endpoint. Runs ARTEMIS + APOLLO (the v3.3 going-forward stack) on
+a small hand-curated memory sample covering every schema +
+LLM-fallback + prose, with judge-LLM enabled. Captures per-engine
+latencies, judge scores, winners, and prints a comparison table.
 
 Purpose: answer "does the going-forward stack actually work on
 real hardware, and how long does each stage take?" on a per-host
@@ -50,12 +50,11 @@ from typing import List, Optional
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from compression.anamnesis import ANAMNESISEngine
 from compression.apollo import APOLLOEngine
+from compression.artemis import ARTEMISEngine
 from compression.base import CompressionRequest, IdentifierPolicy
 from compression.contest import run_contest
 from compression.judge import LLMJudge, NullJudge
-from compression.lethe import LETHEEngine
 
 
 # ── test corpus (hand-curated, covers each schema + fallback + prose) ──
@@ -246,10 +245,7 @@ async def _main(args) -> int:
     # Construct engines. APOLLO's enable_llm_fallback drives whether
     # it hits the endpoint on schema-less content.
     engines = [
-        LETHEEngine(),
-        ANAMNESISEngine(
-            gpu_url=args.gpu_url,
-        ),
+        ARTEMISEngine(),
         APOLLOEngine(
             enable_llm_fallback=True,
             gpu_url=args.gpu_url,

@@ -142,43 +142,47 @@ class TestDAGImplementation:
         assert 'memory_branches' in content
 
 
-class TestCompressionStackRename:
-    """Verify THE MOIRAI compression triad is properly renamed."""
+class TestCompressionStackV33:
+    """Verify the v3.3 going-forward stack (APOLLO + ARTEMIS).
 
-    def test_lethe_module_exists(self):
-        """LETHE (CPU tier 1) module exists."""
-        try:
-            from compression import lethe
-            assert hasattr(lethe, 'LETHE')
-        except ImportError as e:
-            pytest.fail(f"LETHE module missing: {e}")
+    Replaces the prior TestCompressionStackRename class which checked
+    for LETHE / ANAMNESIS / ALETHEIA modules + CompressionManager —
+    all removed in the v3.3 legacy-compression cleanup. See
+    EVOLUTION.md "v3.2 tail" for the rationale."""
 
-    def test_aletheia_module_exists(self):
-        """ALETHEIA (GPU tier 2) module exists."""
+    def test_apollo_engine_importable(self):
+        """APOLLO is the schema-aware engine in the v3.3 stack."""
         try:
-            from compression import aletheia
-            assert hasattr(aletheia, 'ALETHEIA')
+            from compression.apollo import APOLLOEngine
+            assert APOLLOEngine.id == "apollo"
         except ImportError as e:
-            pytest.fail(f"ALETHEIA module missing: {e}")
+            pytest.fail(f"APOLLOEngine missing: {e}")
 
-    def test_anamnesis_module_exists(self):
-        """ANAMNESIS (archival tier 3) module exists."""
+    def test_artemis_engine_importable(self):
+        """ARTEMIS is the CPU-only extractive engine in the v3.3 stack."""
         try:
-            from compression import anamnesis
-            assert hasattr(anamnesis, 'ANAMNESIS')
+            from compression.artemis import ARTEMISEngine
+            assert ARTEMISEngine.id == "artemis"
         except ImportError as e:
-            pytest.fail(f"ANAMNESIS module missing: {e}")
+            pytest.fail(f"ARTEMISEngine missing: {e}")
 
-    def test_manager_dispatch_fixed(self):
-        """CompressionManager has separate methods for each tier."""
+    def test_legacy_engines_removed(self):
+        """LETHE / ANAMNESIS / ALETHEIA must NOT be importable anymore.
+        If a future commit re-introduces them, this test catches it."""
+        for legacy in ("compression.lethe", "compression.anamnesis", "compression.aletheia"):
+            try:
+                __import__(legacy)
+                pytest.fail(f"{legacy} should be gone in v3.3 — found it importable")
+            except ImportError:
+                pass  # expected
+
+    def test_compression_manager_removed(self):
+        """The legacy CompressionManager was deleted in v3.3."""
         try:
-            from compression.manager import CompressionManager
-            # Check for tier-specific methods
-            assert hasattr(CompressionManager, '_compress_lethe')
-            assert hasattr(CompressionManager, '_compress_aletheia')
-            assert hasattr(CompressionManager, '_compress_anamnesis')
-        except ImportError as e:
-            pytest.fail(f"CompressionManager dispatch methods missing: {e}")
+            __import__("compression.manager")
+            pytest.fail("compression.manager should be gone in v3.3")
+        except ImportError:
+            pass  # expected
 
 
 class TestDistillationWorkerIntegration:

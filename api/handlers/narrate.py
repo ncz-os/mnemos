@@ -4,7 +4,7 @@ GET /v1/memories/{memory_id}/narrate[?format=prose|dense]
 
 For memories whose winning compression variant is APOLLO's dense
 form, expand back to prose. Non-APOLLO winners pass through
-unchanged (LETHE/ANAMNESIS output is already prose-shaped). When no
+unchanged (ARTEMIS output is already prose-shaped). When no
 winning variant exists, return the raw memory content.
 
 v3.3 S-II ships the rule-based narrator dispatcher (see
@@ -36,7 +36,7 @@ class NarrateResponse(BaseModel):
     `source` distinguishes where the returned content came from:
       * ``narrated``            — APOLLO dense form expanded to prose
       * ``variant_passthrough`` — non-APOLLO winning variant
-                                  (e.g. LETHE/ANAMNESIS output, already prose)
+                                  (e.g. ARTEMIS output, already prose)
       * ``variant_dense``       — raw dense form when format=dense
       * ``raw``                 — no winning variant; raw memories.content
     """
@@ -141,7 +141,7 @@ async def narrate(
             )
 
         # Prose-form request: narrate APOLLO outputs; pass through
-        # LETHE/ANAMNESIS (already prose-shaped); fall back to raw on
+        # ARTEMIS (already prose-shaped); fall back to raw on
         # missing variant.
         if variant_row is None:
             return NarrateResponse(
