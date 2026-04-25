@@ -112,16 +112,21 @@ class TestMCPWireContract:
             f"any path without the prefix will 404."
         )
 
-    def test_kg_paths_are_not_v1_prefixed(self):
-        """KG routes register with /kg prefix, NOT /v1/kg. Adding /v1
-        to them would reintroduce the inverse bug."""
+    def test_kg_paths_are_v1_prefixed(self):
+        """KG routes were moved from /kg to /v1/kg as part of the v3.3
+        legacy-cleanup pass (drop the v2.3 unversioned prefix). Any
+        unversioned /kg/* path in mcp_server.py would 404 against the
+        current API."""
         mcp_paths = _extract_mcp_paths()
-        kg_paths = [p for p in mcp_paths if p.startswith("/kg/") or p == "/kg"]
+        kg_paths = [p for p in mcp_paths if "/kg/" in p or p.endswith("/kg")]
         assert kg_paths, "mcp_server.py has no KG paths — extraction regex is broken"
 
-        wrong = [p for p in kg_paths if p.startswith("/v1/")]
-        assert not wrong, (
-            f"These KG paths in mcp_server.py incorrectly carry the /v1 prefix: {wrong}. "
-            f"KG routes register at /kg directly (api/handlers/kg.py:14). "
-            f"Do not add /v1 to them."
+        unprefixed = [
+            p for p in kg_paths
+            if (p.startswith("/kg/") or p == "/kg") and not p.startswith("/v1/")
+        ]
+        assert not unprefixed, (
+            f"These KG paths in mcp_server.py are missing the /v1 prefix: "
+            f"{unprefixed}. The REST router registers KG under /v1/kg "
+            f"(api/handlers/kg.py); any path without the prefix will 404."
         )
