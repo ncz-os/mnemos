@@ -188,6 +188,7 @@ async def test_phase_cluster_groups_similar_vectors():
         "cluster_min_size": 2,
         "window_started_at": "2026-04-25T00:00:00",
         "window_ended_at": "2026-04-25T23:59:59",
+        "namespace": None,
     }
     rows = [
         _row("mem_a", [1.0, 0.0, 0.0]),
@@ -218,6 +219,7 @@ async def test_phase_cluster_threshold_separation(monkeypatch):
         "cluster_min_size": 1,
         "window_started_at": "2026-04-25T00:00:00",
         "window_ended_at": "2026-04-25T23:59:59",
+        "namespace": None,
     }
     rows = [
         _row("mem_a", [1.0, 0.0]),
@@ -238,6 +240,7 @@ async def test_phase_cluster_no_rows_zero_clusters():
         "cluster_min_size": 3,
         "window_started_at": "2026-04-25T00:00:00",
         "window_ended_at": "2026-04-25T23:59:59",
+        "namespace": None,
     }
     conn = _MockConn(fetchrow_result=run_row, fetch_result=[])
     pool = _MockPool(conn)
@@ -248,6 +251,49 @@ async def test_phase_cluster_no_rows_zero_clusters():
 
 
 @pytest.mark.asyncio
+async def test_phase_cluster_passes_namespace_to_query():
+    """When the run has namespace set, phase_cluster should forward it
+    as a query arg so the SQL filter scopes the scan to that tenant."""
+    run_row = {
+        "cluster_min_size": 1,
+        "window_started_at": "2026-04-25T00:00:00",
+        "window_ended_at": "2026-04-25T23:59:59",
+        "namespace": "tenant-a",
+    }
+
+    captured: list = []
+
+    class _Conn:
+        async def fetchrow(self, *_args, **_kwargs):
+            return run_row
+
+        async def fetch(self, _sql, *args, **_kwargs):
+            captured.append(args)
+            return []
+
+        async def execute(self, *_args, **_kwargs):
+            return "OK"
+
+    conn = _Conn()
+
+    class _Pool:
+        def acquire(self_inner):
+            class _Ctx:
+                async def __aenter__(self_ctx):
+                    return conn
+                async def __aexit__(self_ctx, *_exc):
+                    return False
+            return _Ctx()
+
+    n = await phase_cluster(_Pool(), "00000000-0000-0000-0000-000000000005")
+    assert n == 0
+    # The fetch call should have received the namespace as one of its
+    # bound parameters (the query arg list).
+    assert captured, "phase_cluster did not call fetch"
+    assert "tenant-a" in captured[0]
+
+
+@pytest.mark.asyncio
 async def test_phase_cluster_skips_garbage_embeddings():
     """A row with an unparseable embedding should be skipped, not crash
     the whole phase."""
@@ -255,6 +301,7 @@ async def test_phase_cluster_skips_garbage_embeddings():
         "cluster_min_size": 1,
         "window_started_at": "2026-04-25T00:00:00",
         "window_ended_at": "2026-04-25T23:59:59",
+        "namespace": None,
     }
     rows = [
         {"id": "mem_a", "embedding": "garbage-not-a-vector"},
