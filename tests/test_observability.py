@@ -204,6 +204,14 @@ def _metrics_app():
     return app
 
 
+# The /metrics tests below exercise the prometheus_client exporter wire
+# format. Skip the whole group when the package is absent — operators
+# who run MNEMOS without prometheus_client still get a stub /metrics
+# endpoint, but the integration-level assertions below need the real
+# package to validate the canonical format.
+pytest.importorskip("prometheus_client")
+
+
 def test_metrics_endpoint_serves_prometheus_text():
     client = TestClient(_metrics_app())
     resp = client.get("/metrics")
