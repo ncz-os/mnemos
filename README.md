@@ -42,7 +42,7 @@ MNEMOS is designed to be the memory layer for the agentic tooling you already us
 
 1. **MCP (Model Context Protocol).** MNEMOS ships a stdio MCP server (`mcp_server.py`) that exposes memory operations — search, create, update, delete, DAG versioning, model optimizer — as first-class tool calls. Register it in any MCP-aware client (Claude Code, OpenClaw, ZeroClaw, Hermes) and the agent gets persistent memory without your framework having to know MNEMOS exists at the code level.
 2. **OpenAI-compatible gateway.** `POST /v1/chat/completions` and `GET /v1/models` are drop-in for the OpenAI SDK. Point `OPENAI_BASE_URL` at your MNEMOS instance and any client that already speaks OpenAI gets memory injection, multi-provider routing, and consensus scoring with zero code change. This is the path for LangChain, LlamaIndex, CrewAI, AutoGen, and anything else that was written against the OpenAI wire protocol.
-3. **Native `/v1/*` REST surface.** For integrations that want to speak to MNEMOS directly: `/v1/memories`, `/v1/consultations`, `/v1/providers`, `/sessions`, `/v1/webhooks`, `/v1/federation`, `/kg/triples`. The full API is language-agnostic; pick your HTTP client and go.
+3. **Native `/v1/*` REST surface.** For integrations that want to speak to MNEMOS directly: `/v1/memories`, `/v1/consultations`, `/v1/providers`, `/v1/sessions`, `/v1/webhooks`, `/v1/federation`, `/v1/kg/triples`. The full API is language-agnostic; pick your HTTP client and go.
 
 ### Today's integration inventory
 
@@ -250,11 +250,11 @@ All admin endpoints require root role. On personal installs (no auth), they are 
 
 | Endpoint | What it does |
 |----------|-------------|
-| `POST /kg/triples` | Create a subject → predicate → object triple |
-| `GET /kg/triples` | List triples with filters |
-| `GET /kg/timeline/{subject}` | All triples for a subject in temporal order |
-| `PATCH /kg/triples/{id}` | Update a triple |
-| `DELETE /kg/triples/{id}` | Delete a triple |
+| `POST /v1/kg/triples` | Create a subject → predicate → object triple |
+| `GET /v1/kg/triples` | List triples with filters |
+| `GET /v1/kg/timeline/{subject}` | All triples for a subject in temporal order |
+| `PATCH /v1/kg/triples/{id}` | Update a triple |
+| `DELETE /v1/kg/triples/{id}` | Delete a triple |
 
 ### Consultations — reasoning domain (v3, shipped)
 
@@ -295,10 +295,10 @@ Multi-turn conversation state with memory injection at turn boundaries. Sessions
 | Endpoint | What it does |
 |----------|-------------|
 | `POST /sessions` | Start a new session |
-| `GET /sessions/{id}` | Retrieve session state |
-| `POST /sessions/{id}/messages` | Post a turn; memory injection at turn boundary |
-| `GET /sessions/{id}/history` | Full message history |
-| `DELETE /sessions/{id}` | End a session |
+| `GET /v1/sessions/{id}` | Retrieve session state |
+| `POST /v1/sessions/{id}/messages` | Post a turn; memory injection at turn boundary |
+| `GET /v1/sessions/{id}/history` | Full message history |
+| `DELETE /v1/sessions/{id}` | End a session |
 
 ### Webhooks (v3, shipped)
 

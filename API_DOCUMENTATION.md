@@ -192,9 +192,9 @@ Memory injection can be enabled per-request via header
 Stateful multi-turn chat with memory injection at turn boundaries.
 
 - `POST /sessions` — create
-- `POST /sessions/{id}/messages` — post a turn
-- `GET /sessions/{id}` — retrieve transcript
-- `DELETE /sessions/{id}` — close
+- `POST /v1/sessions/{id}/messages` — post a turn
+- `GET /v1/sessions/{id}` — retrieve transcript
+- `DELETE /v1/sessions/{id}` — close
 
 ---
 

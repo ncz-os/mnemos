@@ -176,7 +176,7 @@ class MemoryDistillationWorker:
     def __init__(self):
         self.db_pool = None   # asyncpg Pool — set in start()
         self.llm = get_backend()
-        # Local compression engine (LETHE: token + sentence modes, no external calls)
+        # Local compression engine (ARTEMIS-backed extractive, no external calls)
         self._compression_engine = DistillationEngine() if _COMPRESSION_AVAILABLE else None
         # v3.1 contest engines — populated in start() once config is loaded
         self._contest_engines = []
@@ -399,10 +399,16 @@ class MemoryDistillationWorker:
             compressed = None
             quality_score = None
 
-            # --- Primary path: local LETHE compression (no external calls) ---
+            # --- Primary path: local ARTEMIS compression (no external calls) ---
             if _COMPRESSION_AVAILABLE and self._compression_engine is not None:
                 try:
-                    result = self._compression_engine.distill(original_text, strategy=CompressionStrategy.AUTO)
+                    # MUST use distill_async — we're inside the worker's
+                    # running event loop. The sync .distill() raises
+                    # RuntimeError here as a safety guard against
+                    # silently falling through to the LLM fallback path.
+                    result = await self._compression_engine.distill_async(
+                        original_text, strategy=CompressionStrategy.AUTO,
+                    )
                     compressed_candidate = result.get("compressed_text") or result.get("compressed", "")
                     candidate_quality = float(result.get("quality_score", 0) or 0) * 100  # 0-1 -> 0-100
                     strategy_used = result.get("strategy_used", "auto")

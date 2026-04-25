@@ -60,25 +60,20 @@ class DistillationEngine:
         }
         self._engine = ARTEMISEngine()
 
-    def distill(
+    async def distill_async(
         self,
         text: str,
         strategy: CompressionStrategy = CompressionStrategy.AUTO,
         ratio: Optional[float] = None,
         task_type: Optional[str] = None,
     ) -> Dict:
-        """Distill/compress text using ARTEMIS.
+        """Distill/compress text using ARTEMIS — async path.
 
-        Args:
-            text: Text to compress.
-            strategy: Compression strategy (vestigial — recorded in
-                output for observability, ignored at the engine level).
-            ratio: Target compression ratio (overrides default).
-            task_type: Task type for ratio selection.
-
-        Returns:
-            Compression result dict — same shape as the historical
-            LETHE-backed return value.
+        Use this from any async caller (the distillation worker, FastAPI
+        handlers, anywhere already inside an event loop). The sync
+        distill() method spawns a fresh loop via asyncio.run() and
+        therefore raises RuntimeError when called from inside a running
+        loop. distill_async() is the correct seam for those callers.
         """
         start_time = time.time()
 
@@ -88,7 +83,7 @@ class DistillationEngine:
             except ValueError:
                 strategy = CompressionStrategy.AUTO
 
-        target_ratio = ratio or self._get_ratio_for_task(task_type)
+        target_ratio = ratio if ratio is not None else self._get_ratio_for_task(task_type)
 
         # Maintain stat counters at the strategy granularity callers
         # expect, even though ARTEMIS treats them as the same path.
@@ -104,18 +99,7 @@ class DistillationEngine:
             target_ratio=target_ratio,
         )
 
-        try:
-            artemis_result = asyncio.run(self._engine.compress(request))
-        except RuntimeError:
-            # We're inside a running loop already; create a task and
-            # block on it via a fresh loop. This path is hit by
-            # callers that are themselves async but used the sync
-            # distill() API. Async callers should prefer distill_async().
-            loop = asyncio.new_event_loop()
-            try:
-                artemis_result = loop.run_until_complete(self._engine.compress(request))
-            finally:
-                loop.close()
+        artemis_result = await self._engine.compress(request)
 
         elapsed_ms = (time.time() - start_time) * 1000
         original_tokens = artemis_result.original_tokens
@@ -152,6 +136,47 @@ class DistillationEngine:
         )
 
         return result
+
+    def distill(
+        self,
+        text: str,
+        strategy: CompressionStrategy = CompressionStrategy.AUTO,
+        ratio: Optional[float] = None,
+        task_type: Optional[str] = None,
+    ) -> Dict:
+        """Distill/compress text using ARTEMIS — sync path.
+
+        Spawns its own event loop. **Cannot be called from inside an
+        existing running loop** — raises RuntimeError. Async callers
+        must use distill_async().
+
+        Args:
+            text: Text to compress.
+            strategy: Compression strategy (vestigial — recorded in
+                output for observability, ignored at the engine level).
+            ratio: Target compression ratio (overrides default).
+            task_type: Task type for ratio selection.
+
+        Returns:
+            Compression result dict — same shape as the historical
+            LETHE-backed return value.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Expected: no running loop, sync path is safe.
+            pass
+        else:
+            raise RuntimeError(
+                "DistillationEngine.distill() cannot be called from "
+                "inside a running event loop. Use distill_async() "
+                "instead. (Pre-fix this was the silent regression that "
+                "made the worker always fall through to the LLM "
+                "fallback.)"
+            )
+        return asyncio.run(
+            self.distill_async(text, strategy, ratio, task_type)
+        )
 
     def batch_distill(
         self,
