@@ -62,7 +62,7 @@ def test_enum_string_values_are_stable():
 
 def test_budget_constants_pinned():
     assert BASE_CHUNK_RATIO == 0.4
-    assert MIN_CHUNK_RATIO == 0.15
+    assert MIN_CHUNK_RATIO == 0.001
     assert SAFETY_MARGIN == 1.2
     assert SUMMARIZATION_OVERHEAD_TOKENS == 4096
 

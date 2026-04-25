@@ -258,7 +258,7 @@ def test_h3_route_refused_when_concurrency_saturated(monkeypatch):
 def test_h3_route_releases_concurrency_on_success(monkeypatch):
     engine = _engine_with_fakes()
 
-    async def _fake_query(self, provider_name, prompt, task_type, timeout):
+    async def _fake_query(self, provider_name, prompt, task_type, timeout, model_override=None):
         return {"status": "success", "response_text": "ok", "latency_ms": 20, "model_id": "gpt-5", "final_score": 0.9}
 
     monkeypatch.setattr(engine.__class__, "_query_provider", _fake_query)
@@ -277,7 +277,7 @@ def test_h3_route_releases_concurrency_on_provider_error(monkeypatch):
     — otherwise the gateway leaks concurrency capacity on errors."""
     engine = _engine_with_fakes()
 
-    async def _fake_query(self, provider_name, prompt, task_type, timeout):
+    async def _fake_query(self, provider_name, prompt, task_type, timeout, model_override=None):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(engine.__class__, "_query_provider", _fake_query)
