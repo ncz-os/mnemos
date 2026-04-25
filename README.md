@@ -75,7 +75,7 @@ MNEMOS was built to solve those problems in a way that reflects real platform ex
 
 Its design is informed by years of enterprise platform work, large-vendor systems thinking, open-source infrastructure experience, and current work in the AI industry, without assuming that professional users want marketing language where they really need operational clarity.
 
-**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape shipped here; v3.1.0 is the current shipping version and adds a plugin `CompressionEngine` ABC, a competitive per-memory contest across three built-in engines, and a persisted audit log of every winner and loser. See [`CHANGELOG.md`](./CHANGELOG.md) for the full v3.0.x / v3.1 release history.
+**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape shipped here; **v3.2.3 is the current shipping version**, carrying the v3.1 compression platform (plugin `CompressionEngine` ABC, per-memory contest, persisted audit log) plus the v3.2 namespace tenancy + observability work and the v3.2.x stability bundle (registry-driven GRAEAE muse manifest with live-probe rotation, federation timezone + cursor fixes, per-version trigger correctness, gateway provider/model normalization). See [`CHANGELOG.md`](./CHANGELOG.md) for the full v3.0.x / v3.1 / v3.2 release history.
 
 For the longer story — the original catalyzing moment, the architectural decisions (and mistakes) that took MNEMOS from a single-file prototype to a unified runtime, and the scrubs, refactors, and release-gate audits that landed the public cut — see [`EVOLUTION.md`](./EVOLUTION.md). Written for future contributors as much as for future readers who want to know what they're inheriting.
 
@@ -184,7 +184,7 @@ The shared premise — that agent memory deserves first-class treatment — is t
 
 ## What works now
 
-This is the current state of v3.1.0 — the compression platform release. Features described here are implemented and running in production. Forward-looking scope for v3.1.1 (Tier 3 tenancy fixes) and v3.2–v3.4 (the Apollo Program) is in [`ROADMAP.md`](./ROADMAP.md).
+This is the current state of v3.2.3 — the v3.1 compression platform plus the v3.2 namespace-tenancy + observability rollups and the v3.2.x stability bundle. Features described here are implemented and running in production. Forward-looking scope (continued Apollo Program, MPF v0.2 sidecars, federation hardening) is in [`ROADMAP.md`](./ROADMAP.md).
 
 The API surface is namespaced under `/v1/*`.
 
@@ -483,7 +483,7 @@ Landed with the v3.0 release line:
 - ✅ **OAuth/OIDC authentication** — browser-based login via Google, GitHub, Azure AD, or custom OIDC providers. Coexists with existing API-key auth.
 - ✅ **Cross-instance memory federation** — pull-based peer sync with Bearer-authenticated peers. Federated memories stored locally with `federation_source` metadata, `fed:{peer}:{remote_id}` id prefix, and a background worker that respects per-peer sync intervals.
 
-### Shipped in v3.1 (current)
+### Shipped in v3.1 (compression platform — carried forward in v3.2.x)
 
 - ✅ **Plugin `CompressionEngine` ABC** — open extension point; operators register additional engines alongside the built-ins (LETHE, ANAMNESIS; APOLLO in v3.3+; ALETHEIA retired from the default contest in v3.2 tail).
 - ✅ **Competitive-selection compression contest** — every eligible engine runs per memory; highest composite_score wins; every loser recorded with its reject_reason. Scoring profile is operator-configurable (`balanced` | `quality_first` | `speed_first` | `custom`).

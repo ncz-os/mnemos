@@ -39,6 +39,11 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 # Copy application code
 COPY . .
 
+# Register the package itself so importlib.metadata.version("mnemos-os")
+# matches pyproject.toml. --no-deps because deps are already installed
+# from requirements.txt above.
+RUN python -m pip install --no-deps --no-build-isolation .
+
 # Environment variables
 ENV PG_USER=mnemos_user \
     PG_DATABASE=mnemos \

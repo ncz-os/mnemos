@@ -1,7 +1,7 @@
 # MNEMOS API Documentation
 
 **Base URL**: `http://localhost:5002`
-**Version**: 3.1.0
+**Version**: 3.2.3
 **Format**: JSON
 
 ---
@@ -60,7 +60,7 @@ Liveness + readiness check (no auth required).
   "status": "healthy",
   "timestamp": "2026-04-21T14:30:00.000Z",
   "database_connected": true,
-  "version": "3.1.0"
+  "version": "3.2.3"
 }
 ```
 

@@ -61,7 +61,7 @@ Apache-2.0. Single-worker at v3.2 (horizontal scaling is v3.3+ work).
   ingest (optional extra).
 - **Observability**: request-ID ContextVar, Prometheus `/metrics`,
   OpenTelemetry spans (opt-in), structured JSON logs (opt-in).
-- **Two-protocol surface**: REST over HTTP (91 endpoints) + MCP
+- **Two-protocol surface**: REST over HTTP (96 endpoints) + MCP
   stdio server (13 tools).
 
 ### 2.2 Explicitly out of scope at v3.2
@@ -187,7 +187,7 @@ GPU circuit breaker (per-endpoint, process-local): `compression/gpu_guard.py`.
 
 | Protocol | Entry point | Tools / endpoints |
 |----------|-------------|-------------------|
-| REST over HTTP | `api_server.py` (uvicorn on port 5002) | 91 endpoints across 21 routers |
+| REST over HTTP | `api_server.py` (uvicorn on port 5002) | 96 endpoints across 21 routers |
 | MCP stdio      | `mcp_server.py`                         | 13 tools (§5.2) |
 
 ## 4. Data Model
@@ -285,7 +285,7 @@ string joins. Advisory locks on DAG merge operations.
 
 ## 5. Interface Contracts
 
-### 5.1 REST (91 endpoints, 21 routers)
+### 5.1 REST (96 endpoints, 21 routers)
 
 Surface breakdown:
 
@@ -705,6 +705,28 @@ See `CHANGELOG.md` for the authoritative list. Selected milestones:
   handshake on GPUGuard.
 - **v3.2 tail** — ALETHEIA retired; APOLLO S-IC + S-II landed;
   going-forward stack is LETHE + ANAMNESIS + APOLLO.
+- **v3.2.1** — registry-driven GRAEAE muse manifest with ELO-override
+  + newer-version override + live-probe + n-1 fallback; non-blocking
+  startup reload; gateway provider/model namespacing; gateway prefix-
+  strip is provider-aware; new endpoints `/v1/consultations/muses`,
+  `/v1/consultations/modes`, `POST /admin/graeae/reload-providers`.
+- **v3.2.2** — three regression fixes from Codex deep-review:
+  `mnemos_version_snapshot()` UPDATE branch now records NEW state
+  (was duplicating OLD into every version row); federation
+  `next_cursor` emitted with explicit `Z` so non-UTC pullers stay
+  aligned across pages; Custom Query selection (`models` /
+  `providers` / `tier`) translates registry provider names
+  (`anthropic`) to GRAEAE engine keys (`claude`) so the dispatch
+  filter doesn't silently drop muses.
+- **v3.2.3** — packaging cleanup: single-source `_version.py`
+  consumed by `api_server.py`, `health.py`, `portability.py`;
+  `.dockerignore` to drop stale `*.egg-info`; Dockerfile installs
+  the package after `COPY . .` so `importlib.metadata.version()`
+  agrees with `pyproject.toml`. `/v1/documents/import` now uses
+  the canonical `mem_<hex12>` id, sets `verbatim_content` /
+  `quality_rating` / `permission_mode`, invalidates search cache,
+  and dispatches `memory.created` webhooks per chunk — matching
+  the single-create endpoint's contract.
 
 ---
 
