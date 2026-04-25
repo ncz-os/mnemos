@@ -163,6 +163,7 @@ def main() -> None:
         os.path.join(script_dir, "db", "migrations_v3_2_2_version_snapshot_new_values.sql"),
         os.path.join(script_dir, "db", "migrations_v3_3_morpheus.sql"),
         os.path.join(script_dir, "db", "migrations_v3_3_morpheus_namespace.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_3_recall_tracking.sql"),
     ]
 
     print("=" * 60)

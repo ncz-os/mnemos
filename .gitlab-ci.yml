@@ -130,7 +130,8 @@ test:integration:
         db/migrations_v3_2_entities_namespace.sql \
         db/migrations_v3_2_2_version_snapshot_new_values.sql \
         db/migrations_v3_3_morpheus.sql \
-        db/migrations_v3_3_morpheus_namespace.sql; do
+        db/migrations_v3_3_morpheus_namespace.sql \
+        db/migrations_v3_3_recall_tracking.sql; do
         if [ -f "$f" ]; then
           echo "applying $f"
           psql -h postgres -U postgres -d mnemos_test -v ON_ERROR_STOP=1 -f "$f"
