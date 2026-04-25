@@ -21,7 +21,7 @@ from api.handlers.openai_compat import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/sessions", tags=["sessions"])
+router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
 
 def _require_pool():

@@ -350,7 +350,7 @@ async def _dispatch(name: str, args: dict) -> Any:
         return await _get("/stats")
 
     elif name == "kg_create_triple":
-        return await _post("/kg/triples", {k: v for k, v in args.items() if v is not None})
+        return await _post("/v1/kg/triples", {k: v for k, v in args.items() if v is not None})
 
     elif name == "kg_search":
         params = {
@@ -358,20 +358,20 @@ async def _dispatch(name: str, args: dict) -> Any:
             if k in ("subject", "predicate", "object", "subject_type", "object_type", "limit")
             and v is not None
         }
-        return await _get("/kg/triples", params=params)
+        return await _get("/v1/kg/triples", params=params)
 
     elif name == "kg_timeline":
         return await _get(
-            f"/kg/timeline/{args['subject']}",
+            f"/v1/kg/timeline/{args['subject']}",
             params={"limit": args.get("limit", 100)},
         )
 
     elif name == "update_triple":
         triple_id = args.pop("triple_id")
-        return await _post(f"/kg/triples/{triple_id}", {k: v for k, v in args.items() if v is not None}, method="PATCH")
+        return await _post(f"/v1/kg/triples/{triple_id}", {k: v for k, v in args.items() if v is not None}, method="PATCH")
 
     elif name == "delete_triple":
-        status = await _delete(f"/kg/triples/{args['triple_id']}")
+        status = await _delete(f"/v1/kg/triples/{args['triple_id']}")
         return {"deleted": True, "status": status}
 
     elif name == "bulk_create_memories":
