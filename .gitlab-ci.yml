@@ -108,8 +108,7 @@ test:integration:
       END $$;
       SQL
     # Apply migrations in the canonical order (mirrors install.py / installer/db.py).
-    # Keep this list in sync with both Python loaders. Newer migrations added
-    # at the end (the v3_2_2 + v3_3 ones still need adding to install.py).
+    # Keep this list in sync with both Python loaders.
     - |
       for f in \
         db/migrations.sql \
