@@ -1,6 +1,7 @@
 """Health check and statistics endpoints."""
 import json
 import logging
+from _version import __version__ as _MNEMOS_VERSION
 from datetime import datetime, timezone
 
 import asyncpg
@@ -32,7 +33,7 @@ async def health_check() -> HealthResponse:
         status="healthy" if db_ok else "degraded",
         timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         database_connected=db_ok,
-        version="3.2.0",
+        version=_MNEMOS_VERSION,
         distillation_worker=worker_status,
     )
 

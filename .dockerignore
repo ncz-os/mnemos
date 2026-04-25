@@ -1,0 +1,27 @@
+# Build artifacts that should never enter the container — they leak
+# stale metadata into the running app (importlib.metadata reads from
+# egg-info/dist-info, so a 3.1.0-vintage egg-info kept reporting that
+# version even after pyproject was bumped to 3.2.2).
+*.egg-info
+*.egg-info/
+build/
+dist/
+*.pyc
+__pycache__/
+
+# Local-only state that should never be baked into images.
+.git/
+.github/
+.venv/
+.env
+.env.*
+!.env.example
+
+# Test caches + IDE noise
+.pytest_cache/
+.ruff_cache/
+.vscode/
+.idea/
+
+# Personal docker overrides — host-specific and contain absolute paths.
+docker-compose.override.yml

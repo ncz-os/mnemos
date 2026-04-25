@@ -49,7 +49,7 @@ router = APIRouter(prefix="/v1", tags=["portability"])
 MPF_VERSION = "0.1.0"
 MEMORY_PAYLOAD_VERSION = "mnemos-3.1"
 SOURCE_SYSTEM = "mnemos"
-SOURCE_VERSION = "3.2.0"
+from _version import __version__ as SOURCE_VERSION
 
 # Server-side export cap. Anything larger should use the streaming
 # JSONL variant — not in this v3.2.0 cut. Prevents a pathological
