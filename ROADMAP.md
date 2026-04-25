@@ -55,27 +55,47 @@ The canonical production pattern is InvestorClaw's consultative layer, which alr
 
 Rolled out in stages, Saturn V-style — each stage delivers a usable payload on separation, not a deferred promise.
 
-### v3.2 — S-IC (first stage: get off the pad)
+### v3.2 — S-IC (first stage: get off the pad) — **SHIPPED v3.2.0–v3.2.4**
 
-- `APOLLOEngine` under the `CompressionEngine` ABC; `gpu_intent=gpu_optional`.
-- First schema: portfolio (InvestorClaw data model lifted read-only; field shapes only, no code shared).
-- Rule-based detection (regex for tickers + shares/cost patterns); LLM fallback via ANAMNESIS-pattern httpx scaffolding for content that looks fact-shaped but doesn't match the portfolio schema.
-- Narration endpoint (`GET /v1/memories/{id}/narrate`) expands dense form back to prose via a small LLM; cached.
-- Judge-LLM scoring integrated into the contest: quality_score is no longer a self-report from the engine — it's the judge-rated fidelity of narrated-derivative versus root memory.
-- Hot-path reads wired: `/v1/memories/rehydrate`, the gateway inject path, and the session context path read from `memory_compressed_variants` when a winner exists, falling through to raw content otherwise.
+- ✅ `APOLLOEngine` under the `CompressionEngine` ABC; `gpu_intent=gpu_optional`.
+- ✅ First schema: portfolio. **v3.3 already added decision / person / event / commit / code schemas**, ahead of the original v3.3 plan.
+- ✅ Rule-based detection (regex) with LLM fallback via ANAMNESIS-pattern httpx scaffolding. Fallback gated behind `MNEMOS_APOLLO_LLM_FALLBACK_ENABLED`; turned off in PYTHIA prod after v3.2.4 audit found 4.4% win rate without judge.
+- ✅ Narration endpoint (`GET /v1/memories/{id}/narrate`).
+- ✅ Judge-LLM scoring integrated; `MNEMOS_JUDGE_ENABLED` toggle.
+- ✅ Hot-path reads wired: rehydrate / gateway / session-context paths read winner variant when present.
+- ✅ ARTEMIS — CPU-only extractive engine added alongside APOLLO; LETHE retired from default contest.
 
-### v3.3 — S-II (second stage: to upper atmosphere)
+### v3.3 — S-II (second stage: to upper atmosphere) — **SHIPPED in part (v3.3.0-alpha.1)**
 
-- Additional schemas: decision (decided X because Y, alternatives considered), person (name/role/org/contact), event (date/type/scope/description).
-- DAG wiring for derivations: each compression candidate lands as a `memory_versions` child row with `parent_version_id → root`, branch='distilled'; narrated prose as `parent_version_id → distilled`, branch='narrated'. Each derivation is content-addressed (SHA-256), tamper-evident.
-- Read-path routing: `Accept: text/plain` → narrated prose; `Accept: application/x-apollo-dense` → raw dense form; default prose narration for human users.
+- ✅ Additional schemas already shipped in v3.2 tail (decision, person, event, code, commit) with adversarial regression tests.
+- 🔵 DAG wiring for derivations: still planned. Each compression candidate as a `memory_versions` child row with `parent_version_id → root`, branch='distilled'; narrated as branch='narrated'. Content-addressed, tamper-evident.
+- 🔵 Read-path routing on `Accept` headers: `text/plain` → narrated; `application/x-apollo-dense` → raw dense.
+- ✅ **MORPHEUS dream-state subsystem (slice 1: foundation).** v3.3.0-alpha.1 ships `morpheus_runs` table + per-row `morpheus_run_id` tagging + admin/observability API + rollback contract. Synthesis logic stubbed; slice 2 fills it in. Architecture per GRAEAE consensus 2026-04-25: append-only synthesis first, mutation paths (CONSOLIDATE / EXTRACT / ARCHIVE) deferred to v3.6+.
+- 🔵 **MORPHEUS slice 2** in flight: real cluster + synthesise phases, cron timer at 03:17 UTC, recall-frequency tracking columns (absorbed from OpenClaw dreaming patterns), per-cluster introspection artifact, per-namespace dream scoping. Drops the `-alpha` when it lands.
 
-### v3.4 — S-IVB (third stage: trans-lunar injection)
+### v3.4 — S-IVB (third stage: trans-lunar injection) — **PLAN UPDATED 2026-04-25**
 
-- Distill-on-ingest becomes the default write path: new memories run the contest synchronously if they fit a schema, returning the winning variant alongside the stored original.
-- ANAMNESIS deprecation path: APOLLO's LLM-fallback "generic fact extraction" mode subsumes ANAMNESIS's role. ANAMNESIS stays exported for backward compat with a deprecation notice; v4.0 removes it.
-- Full round-trip fidelity benchmark as GA gate: stratified memory sample, narration judged against root, per-schema pass rates published.
-- Design paper draft: git-like DAG + LLM-synthesized distillation + LLM-synthesized narration + judge-verified round-trip fidelity, the specific combination that MNEMOS appears to be the first public system to ship.
+The original v3.4 plan was distill-on-ingest + ANAMNESIS deprecation. Both still in scope, but the headline shifts based on the v3.2.x audit pass and the post-MORPHEUS roadmap:
+
+- 🔵 **CHARON v0.2 — full MPF v0.2 sidecars.** Server-side import/export for `kind in {document, fact, event, kg_triples, relations, compression_manifest, memory_versions}`. Adapter `payload_version` normalization (Graphiti / Cognee currently mislabel `kind=event/fact/document` as `mnemos-3.1` instead of `mpf-0.1` — schema becomes authoritative). Per-adapter validate-before-post + skipped-record reporting. Round-trip CI tests: `memory_export json/jsonl → memory_import --preserve-metadata` per adapter.
+- 🔵 **KNOSSOS solidify (phase 2).** Tunnels (`mempalace_create_tunnel` / `_list_tunnels` / `_delete_tunnel`), diary read/write, `_get_aaak_spec` for round-trip with MemPalace-compressed drawers. End-to-end test against a real OpenClaw + MemPalace stack. Migration guide for MemPalace operators.
+- 🔵 **First wave of goodwill PRs to MemPalace.** 2–3 small, high-value upstream contributions: bug fixes from their tracker, an `export --mpf-v0.1` mode, doc improvements spotted while building KNOSSOS adapters. Establishes contributor presence ahead of the Track 4 RFC.
+- 🔵 Distill-on-ingest as default write path (carried forward from original v3.4 plan).
+- 🔵 ANAMNESIS deprecation path; APOLLO LLM-fallback subsumes its role. Stays importable until v4.0.
+- 🔵 Full round-trip fidelity benchmark as GA gate.
+
+### v3.5 — MemPalace RFC re-engagement + compression hot-paths
+
+- 🔵 **RFC-002**: re-open the MemPalace bridge conversation with v3.4 evidence in hand (compression contest, MORPHEUS dreams, GPU budget, KNOSSOS phase 2). Frame as positive-sum: their local-first ethos + our production-scale capacity, KNOSSOS as the interop point. Address the "scare" honestly — different problems, composable answers.
+- 🔵 Compression hot-path expansion: more read paths consume `memory_compressed_variants` instead of raw `memories.content` when a winner exists. Specific surfaces: federation feed (peers receive compressed, save bandwidth), session message replay, MCP `get_memory`.
+- 🔵 Search response `compression_applied` / `compression_metadata` fields decision (Codex audit deferred): either wire a real summary path for large-result-set compression, or formally document as reserved.
+- 🔵 Design paper draft: git-like DAG + LLM-synthesized distillation + LLM-synthesized narration + judge-verified fidelity (carried from v3.4 charter).
+
+### v3.6 — PERSEPHONE + MORPHEUS mutation paths
+
+- 🔵 **PERSEPHONE — archival subsystem.** Cold-set rotation: memories not recalled in M days move to compressed archival storage with a stub pointer in the live table. Recall-tracking columns from v3.3 feed the eligibility decision. Restore on demand. Federation-aware (peers see archive marker, can request restore).
+- 🔵 MORPHEUS slice 3 — CONSOLIDATE phase. Merge near-duplicate clusters into a canonical with `permission_mode=400` read-only pointers on originals (`consolidated_into:<canonical_id>`). Soft-delete only; never hard-delete user data. Federation-safe (peers can see merge happened).
+- 🔵 MORPHEUS slice 4 — EXTRACT phase. LLM mining of latent KG triples from `verbatim_content` of prose memories not already triplified. Two-model split: fast/quantized for extraction, strong reasoner for synthesis (already the v3.3 slice 2 pattern).
 
 ### Deferred beyond v3.4
 
@@ -84,6 +104,118 @@ Rolled out in stages, Saturn V-style — each stage delivers a usable payload on
 - DAG merge conflict resolution (three-way merge with operator-assisted resolution).
 - Embedding-axis quantization beyond pgvector's built-in `halfvec` and `bit` types — revisit when official TurboQuant / PolarQuant / QJL reference implementations land with compatible licenses.
 - Migration rollback tooling.
+
+---
+
+## v4.0 — Pluggable Monolith + Surface Integrations + Lite Profile
+
+The 4.0 charter is structural, not feature-driven. Three coupled work streams:
+
+### Track 5 — modularization + persistence abstraction
+
+Same repo, internal API boundaries enforced by tooling. Pattern: Django, SQLAlchemy, Airflow.
+
+- 🔵 `src/mnemos/` package layout. Subsystems become subpackages (`mnemos.graeae`, `mnemos.compression`, `mnemos.morpheus`, `mnemos.federation`, `mnemos.charon`, `mnemos.knossos`).
+- 🔵 `import-linter` config in `pyproject.toml`. CI fails on cross-subsystem internal imports.
+- 🔵 Public APIs via `__all__`; private surfaces under `_internal/`.
+- 🔵 `installer/` extracted to a separate package (operators don't need it at runtime).
+- 🔵 Plugin entry-points for `CompressionEngine`, judges, federation backends, MORPHEUS phases. Third-party engines install as packages and self-register on startup.
+- 🔵 Optional-extras: `pip install mnemos-os`, `mnemos-os[graeae,morpheus]`, `mnemos-os[full]`. Lets embedding apps pull only the slice they need.
+- 🔵 **Persistence abstraction** — `mnemos.persistence.{postgres,sqlite}` swappable. Foundation for the lite profile (next).
+
+### Track 5b — SQLite "lite" profile
+
+Same code, same API, same KNOSSOS interop. Single-binary, embeddable, MemPalace-compatible MCP from day one.
+
+- 🔵 `mnemos.persistence.sqlite` implementation: SQLite + `sqlite-vec` (replaces pgvector) + FTS5 (replaces pg's tsvector).
+- 🔵 SQL dialect translation: `<=>` cosine ops, jsonb, generated columns, partial indexes — the persistence layer hides this.
+- 🔵 Migration parity: `db/migrations/sqlite/` mirrors `db/migrations/postgres/`. Same conceptual schema, different SQL.
+- 🔵 Single-binary build: `pyinstaller`-style bundle that ships MNEMOS + SQLite-vec + the static assets in one executable.
+- 🔵 Pitch: **"Run it as a single SQLite binary on your laptop, scale it to a Postgres+pgvector+GPU stack on a fleet, anywhere in between."** The MemPalace-compatible variant of MNEMOS that doesn't sacrifice the schema-extensibility our database choice gives us.
+
+### Track 6 — surface integrations (multi-vendor MCP + REST connectors)
+
+MNEMOS exposes a mature MCP server (`mcp_server.py`, 13 tools, working in Claude Code today). Goal: make MNEMOS the easiest memory layer to wire into *any* agent surface. v4.0 ships a connectors gallery + bridge tooling for the surfaces that don't natively speak MCP.
+
+| Surface | MCP support | Plan |
+|---|---|---|
+| **Claude Code** | ✅ native | Already working; document the registration recipe |
+| **Claude Desktop** | ✅ native | Same MCP server file; document config-file path |
+| **Cursor** | ✅ native | Same MCP; document `~/.cursor/mcp.json` registration |
+| **Codex CLI** (OpenAI's dev tool) | ✅ native (0.125.0+) | Verify config path + ship a `codex mcp add mnemos` recipe |
+| **Cline / Continue / Aider** | ✅ native | One-line MCP config snippets in docs |
+| **ChatGPT Pro / Team / Enterprise / Edu (web)** | ✅ via Developer Mode | Custom-connector registration; MNEMOS MCP exposed over HTTP/SSE transport. Document the connector-config recipe |
+| **ChatGPT free / Plus (consumer)** | ❌ no MCP at this tier | OpenAPI manifest + Custom GPT calling MNEMOS REST API. Bridge until OpenAI broadens MCP access |
+| **ChatGPT Desktop app** | ⚠️ partial | Track app-side connector support as it stabilizes |
+| **Gemini / Code Assist / IDX** | ❌ no MCP | Build `mcp-to-gemini-functions` bridge: translate MCP tool definitions to Gemini's function-calling JSON schema. Document REST-direct path as fallback |
+| **OpenWebUI / LM Studio / Ollama** | ⚠️ partial | OpenAI-compat tool-call path; MNEMOS REST endpoints accessible via tool-use config |
+
+Deliverables:
+- 🔵 `docs/connectors/` directory with one Markdown per surface, including the exact config snippet to paste.
+- 🔵 `mnemos-openapi.json` published as a downloadable artifact in CI; consumed by Custom GPTs and any OpenAPI-aware client.
+- 🔵 `mnemos-bridges/gemini/` — small Python package that runs alongside MNEMOS, exposes the MCP tool surface as a Gemini-compatible REST endpoint.
+- 🔵 `mnemos-bridges/openai-actions/` — Custom GPT manifest + OAuth scaffold for the consumer ChatGPT path.
+- 🔵 Smoke tests per surface in CI (where automatable; some surfaces require real credentials and are manual).
+
+---
+
+## Audit Remediation Log
+
+Every Codex / GRAEAE / stop-hook audit finding from the v3.2.x and v3.3.x cycles, with status. Maintained release-by-release; new findings append. ✅ = remediated, 🔵 = planned, ⏳ = deferred.
+
+### Codex round 1 — 9-commit deep probe (early v3.2.x cycle)
+
+5 bugs found across the session's commit set 71b40e0..58011a9; all fixed in commit `1c56488` (compression scoring math, Artemis assembly, Apollo schema FP guards).
+
+- ✅ All 5 bugs remediated.
+
+### Stop-hook reviews during v3.2.1 development
+
+- ✅ `federation.py` non-UTC ISO 8601 cursor handling — UTC-normalize before strip-tzinfo (v3.2.1).
+- ✅ Startup-time GRAEAE manifest reload stalls boot + holds DB conn — moved to `_schedule_background()` with 120s `wait_for` cap; Phase 1 (DB) releases conn before Phase 2 (parallel probes) (v3.2.1).
+- ✅ Background reload undone by concurrent consult overrides — overrides via `model_override` param; `_query_provider` snapshots provider config (v3.2.1).
+- ✅ Override refactor broke gateway model-override path — `engine.route()` now passes `model_override`; gateway strips matching prefix (v3.2.1).
+- ✅ Gateway prefix-strip breaks legitimate slash-bearing model IDs — strip only matching `<provider>/`; resolver tries bare + namespaced lookups (v3.2.1).
+- ✅ Bare `claude-opus-4-7` resolves to `anthropic` not `claude` (engine key) — reverse-map `_REGISTRY_MAP`; strip accepts either name as prefix (v3.2.1).
+- ✅ Resolver semantics changed without test updates — 1 test updated, 3 new tests added; 10/10 pass (v3.2.1).
+
+### Codex deep-review of v3.2.1 (task `task-modqloxk-o6tgad`)
+
+3 HIGH blockers + several validations.
+
+- ✅ `mnemos_version_snapshot()` UPDATE branch wrote OLD into version rows (semantics inverted) — UPDATE now inserts NEW; migration `db/migrations_v3_2_2_version_snapshot_new_values.sql` (v3.2.2).
+- ✅ Federation cursor timezone drift — `next_cursor` now emitted with explicit `Z` suffix; puller's `astimezone(UTC)` is a no-op (v3.2.2).
+- ✅ Custom Query selection silently dropped Anthropic muse — `_REGISTRY_TO_GRAEAE` reverse-map applied to `_resolve_models` / `_tier_lineup` / providers-list path (v3.2.2).
+- ✅ Validated: auth-gating on new endpoints, gateway resolver matrix, race-fix shape, ARGONAS cherry-picks runtime-benign.
+
+### Codex source-vs-live audit (after v3.2.2 reconcile)
+
+- ✅ Version-source drift: `_version.py` single literal; api_server / health / portability all import; pyproject + pip metadata + /health + /openapi.json all agree at 3.2.3 (v3.2.3).
+- ✅ Docker pip metadata stale at 3.1.0: `.dockerignore` drops `*.egg-info`; Dockerfile installs the package after `COPY . .` (v3.2.3).
+- ✅ `/v1/documents/import` bypass: now uses `mem_<hex12>` ids, populates `verbatim_content` / `quality_rating` / `permission_mode`, dispatches `memory.created` webhooks per chunk, invalidates search cache (v3.2.3).
+- ✅ Stale docs: README current-version paragraph rewritten to v3.2.3; SPECIFICATION endpoint count 91→96; release-history extended (v3.2.3).
+- 🔵 MPF portability partial (`kind=memory` only) — deferred to v3.4 CHARON v0.2.
+- ⏳ `/v1/memories/search` `compression_applied` / `compression_metadata` reserved-but-always-false — decision pending: implement or formally document as reserved. Carried into v3.5.
+
+### Codex round-2 portability + APOLLO audit (after v3.2.3)
+
+- ⏳ MPF import is memory-only; rich envelopes (kg_triples, documents, facts, events, compression_manifest, memory_versions) silently dropped — deferred to v3.4 CHARON v0.2.
+- ✅ Legacy `/memories` POST path returned 404 against current API (`/v1/memories`) — fixed (v3.2.4).
+- ⏳ Adapter `payload_version` conflict (Graphiti / Cognee mislabel `kind=event/fact/document` as `mnemos-3.1` instead of `mpf-0.1`) — deferred to v3.4 CHARON v0.2.
+- ✅ `_post_mpf` envelope missing `exported_at` (failed own validator) — added (v3.2.4).
+- ✅ `tools/memory_export.py text` import error (`export_memories_text` → `export_memories_plaintext`) — fixed (v3.2.4).
+- ✅ ChatGPT `--category` override ignored — now honored when set; auto-classify only when unset (v3.2.4).
+- ✅ APOLLO LLM fallback wasted GPU without judge enabled (4.4% win rate on 2,146 dispatches/day) — startup warning when both enabled+judge-off; `MNEMOS_APOLLO_LLM_FALLBACK_ENABLED` flipped off in PYTHIA prod (v3.2.4 + ops).
+
+### OpenClaw dream-architecture comparison (informational)
+
+Pattern absorption opportunities surfaced by reading OpenClaw issues #70072, #65630, #67413, #70402, #64756.
+
+- 🔵 Recall-frequency tracking columns (`recall_count`, `last_recalled_at`, `unique_queries`) — planned v3.3 slice 2.
+- 🔵 Per-cluster introspection artifact (`morpheus_clusters` table + `/v1/morpheus/runs/{id}/clusters`) — planned v3.3 slice 2.
+- 🔵 Per-namespace dream scoping (`morpheus_runs.namespace` filter) — planned v3.3 slice 2.
+- ❌ Flat-file storage (`MEMORY.md` promotion target) — explicitly skipped; Postgres is canonical.
+- ❌ Promotion-gate-as-primary-mechanism — explicitly skipped; MORPHEUS is synthesizer, not triage. PERSEPHONE (v3.6) covers archival decisions.
 
 ---
 
