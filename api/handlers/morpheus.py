@@ -46,6 +46,7 @@ class MorpheusRun(BaseModel):
     summaries_created: int
     error: Optional[str] = None
     config: dict = Field(default_factory=dict)
+    namespace: Optional[str] = None
 
 
 class MorpheusRunList(BaseModel):
@@ -57,12 +58,32 @@ class MorpheusTriggerRequest(BaseModel):
     window_hours: int = Field(168, ge=1, le=8760)        # 1h … 1 year
     cluster_min_size: int = Field(3, ge=2, le=100)
     config: dict = Field(default_factory=dict)
+    namespace: Optional[str] = Field(
+        None,
+        description=(
+            "Optional tenant scope. When set, the run only considers "
+            "memories with this namespace. Default = all namespaces."
+        ),
+    )
 
 
 class MorpheusRollbackResponse(BaseModel):
     run_id: str
     memories_deleted: int
     run_status: str = "rolled_back"
+
+
+class MorpheusCluster(BaseModel):
+    cluster_id: int
+    member_memory_ids: List[str]
+    member_count: int
+    synthesised_memory_id: Optional[str] = None
+
+
+class MorpheusClusterList(BaseModel):
+    run_id: str
+    count: int
+    clusters: List[MorpheusCluster]
 
 
 def _row_to_run(r) -> MorpheusRun:
@@ -84,13 +105,14 @@ def _row_to_run(r) -> MorpheusRun:
         summaries_created=r["summaries_created"],
         error=r["error"],
         config=dict(r["config"]) if isinstance(r["config"], dict) else {},
+        namespace=r["namespace"] if "namespace" in r.keys() else None,
     )
 
 
 @router.get("/v1/morpheus/runs", response_model=MorpheusRunList)
 async def list_runs(
     limit: int = Query(50, ge=1, le=500),
-    status: Optional[str] = Query(None, regex=r"^(running|success|failed|rolled_back)$"),
+    status: Optional[str] = Query(None, pattern=r"^(running|success|failed|rolled_back)$"),
     _: UserContext = Depends(get_current_user),
 ):
     """List MORPHEUS runs newest-first.
@@ -110,7 +132,7 @@ async def list_runs(
         "SELECT id, started_at, finished_at, status, phase, triggered_by, "
         "       window_started_at, window_ended_at, window_hours, "
         "       cluster_min_size, memories_scanned, clusters_found, "
-        "       summaries_created, error, config "
+        "       summaries_created, error, config, namespace "
         f"FROM morpheus_runs{where} "
         f"ORDER BY started_at DESC LIMIT ${len(args)}"
     )
@@ -128,13 +150,81 @@ async def get_run(run_id: str, _: UserContext = Depends(get_current_user)):
             "SELECT id, started_at, finished_at, status, phase, triggered_by, "
             "       window_started_at, window_ended_at, window_hours, "
             "       cluster_min_size, memories_scanned, clusters_found, "
-            "       summaries_created, error, config "
+            "       summaries_created, error, config, namespace "
             "FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
         )
     if row is None:
         raise HTTPException(status_code=404, detail=f"morpheus run {run_id} not found")
     return _row_to_run(row)
+
+
+@router.get(
+    "/v1/morpheus/runs/{run_id}/clusters",
+    response_model=MorpheusClusterList,
+)
+async def list_clusters(run_id: str, _: UserContext = Depends(get_current_user)):
+    """Read out the cluster grouping a MORPHEUS run produced.
+
+    Slice 2's phase_cluster persists clusters to morpheus_runs.config
+    under the "clusters" key as a JSONB list of
+    {cluster_id, member_memory_ids: [...]}. This endpoint pulls that
+    payload and joins it against the synthesised memories so each
+    cluster can be inspected with its summary id.
+
+    Returns 404 if the run doesn't exist. Returns an empty list if
+    the run never reached the cluster phase or produced zero clusters
+    above cluster_min_size.
+    """
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    async with _lc._pool.acquire() as conn:
+        config_raw = await conn.fetchval(
+            "SELECT config FROM morpheus_runs WHERE id=$1::uuid", run_id,
+        )
+        if config_raw is None:
+            # Disambiguate "run not found" from "run found, no clusters yet".
+            exists = await conn.fetchval(
+                "SELECT 1 FROM morpheus_runs WHERE id=$1::uuid", run_id,
+            )
+            if not exists:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"morpheus run {run_id} not found",
+                )
+            return MorpheusClusterList(run_id=run_id, count=0, clusters=[])
+
+        # Read synthesised memories for this run so we can attach
+        # synthesised_memory_id to each cluster.
+        synth_rows = await conn.fetch(
+            "SELECT id, source_memories FROM memories "
+            "WHERE morpheus_run_id=$1::uuid "
+            "  AND provenance='morpheus_local'",
+            run_id,
+        )
+
+    config = config_raw if isinstance(config_raw, dict) else {}
+    raw_clusters = config.get("clusters") or []
+
+    # Build a quick lookup: any synthesised memory whose source set
+    # exactly matches a cluster's member set is that cluster's summary.
+    synth_by_sources: dict = {}
+    for sr in synth_rows:
+        sources = tuple(sorted(sr["source_memories"] or []))
+        if sources:
+            synth_by_sources[sources] = sr["id"]
+
+    out: List[MorpheusCluster] = []
+    for c in raw_clusters:
+        members = list(c.get("member_memory_ids") or [])
+        synth_id = synth_by_sources.get(tuple(sorted(members)))
+        out.append(MorpheusCluster(
+            cluster_id=int(c.get("cluster_id", len(out))),
+            member_memory_ids=members,
+            member_count=len(members),
+            synthesised_memory_id=synth_id,
+        ))
+    return MorpheusClusterList(run_id=run_id, count=len(out), clusters=out)
 
 
 @router.post("/admin/morpheus/runs", response_model=MorpheusRun, status_code=201)
@@ -158,13 +248,14 @@ async def trigger_run(
         window_hours=request.window_hours,
         cluster_min_size=request.cluster_min_size,
         config=request.config,
+        namespace=request.namespace,
     )
     async with _lc._pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, started_at, finished_at, status, phase, triggered_by, "
             "       window_started_at, window_ended_at, window_hours, "
             "       cluster_min_size, memories_scanned, clusters_found, "
-            "       summaries_created, error, config "
+            "       summaries_created, error, config, namespace "
             "FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
         )

@@ -59,6 +59,7 @@ async def begin_run(
     window_hours: int = 168,
     cluster_min_size: int = 3,
     config: Optional[dict] = None,
+    namespace: Optional[str] = None,
 ) -> str:
     """Open a new MORPHEUS run row and return its UUID as a string.
 
@@ -66,6 +67,10 @@ async def begin_run(
     set_phase() and finalising via finish_run() (or fail_run() on
     exception). The row is created with status='running' so an inspector
     polling /v1/morpheus/runs sees the dream in flight.
+
+    `namespace`, when set, scopes the run to memories with that
+    `namespace` value. NULL = "all namespaces" (the default — matches
+    the historical behavior before per-namespace scoping).
     """
     window_end = datetime.now(timezone.utc)
     window_start = window_end - timedelta(hours=window_hours)
@@ -74,18 +79,19 @@ async def begin_run(
             """
             INSERT INTO morpheus_runs
                 (triggered_by, window_started_at, window_ended_at,
-                 window_hours, cluster_min_size, config)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                 window_hours, cluster_min_size, config, namespace)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
             RETURNING id
             """,
             triggered_by, window_start, window_end,
             window_hours, cluster_min_size,
             json.dumps(config or {}),
+            namespace,
         )
     run_id = str(row["id"])
     logger.info(
-        "[MORPHEUS] run %s opened (window=%dh, triggered_by=%s)",
-        run_id, window_hours, triggered_by,
+        "[MORPHEUS] run %s opened (window=%dh, triggered_by=%s, namespace=%s)",
+        run_id, window_hours, triggered_by, namespace or "<all>",
     )
     return run_id
 
@@ -202,7 +208,11 @@ async def rollback_run(pool: asyncpg.Pool, run_id: str) -> Tuple[int, int]:
 # it, which is the foundation we want before touching synthesis logic.
 
 async def phase_replay(pool: asyncpg.Pool, run_id: str) -> int:
-    """Scan memories from the run's window. Returns count scanned."""
+    """Scan memories from the run's window. Returns count scanned.
+
+    When the run has `namespace` set, the scan is scoped to memories
+    with that namespace; NULL means "all namespaces".
+    """
     async with pool.acquire() as conn:
         n = await conn.fetchval(
             """
@@ -212,6 +222,7 @@ async def phase_replay(pool: asyncpg.Pool, run_id: str) -> int:
             WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
               AND m.provenance IS DISTINCT FROM 'morpheus_local'
               AND m.morpheus_run_id IS NULL
+              AND (r.namespace IS NULL OR m.namespace = r.namespace)
             """,
             run_id,
         )
@@ -238,7 +249,8 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
 
     async with pool.acquire() as conn:
         run_row = await conn.fetchrow(
-            "SELECT cluster_min_size, window_started_at, window_ended_at "
+            "SELECT cluster_min_size, window_started_at, window_ended_at, "
+            "       namespace "
             "FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
         )
@@ -255,9 +267,11 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
               AND provenance IS DISTINCT FROM 'morpheus_local'
               AND morpheus_run_id IS NULL
               AND embedding IS NOT NULL
+              AND ($3::text IS NULL OR namespace = $3)
             ORDER BY created
             """,
             run_row["window_started_at"], run_row["window_ended_at"],
+            run_row["namespace"],
         )
 
     if not rows:
@@ -503,6 +517,7 @@ async def run_dream(
     window_hours: int = 168,
     cluster_min_size: int = 3,
     config: Optional[dict] = None,
+    namespace: Optional[str] = None,
 ) -> str:
     """End-to-end MORPHEUS run.
 
@@ -511,6 +526,8 @@ async def run_dream(
     /v1/morpheus/runs/{id} for the final state. Exceptions inside
     phases are caught and recorded on the run row; they do not
     propagate to the trigger (cron / API caller / scheduler).
+
+    `namespace`, when set, scopes the run to that tenant's memories.
     """
     run_id = await begin_run(
         pool,
@@ -518,6 +535,7 @@ async def run_dream(
         window_hours=window_hours,
         cluster_min_size=cluster_min_size,
         config=config,
+        namespace=namespace,
     )
     try:
         await set_phase(pool, run_id, "replay")
