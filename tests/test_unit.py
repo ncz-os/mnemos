@@ -174,7 +174,7 @@ def test_app_routes_registered():
     assert "/v1/memories/bulk" in paths
     assert "/v1/consultations" in paths  # Unified GRAEAE
     assert "/v1/providers" in paths  # Provider routing
-    assert "/kg/triples" in paths
+    assert "/v1/kg/triples" in paths
     assert "/admin/users" in paths
 
 

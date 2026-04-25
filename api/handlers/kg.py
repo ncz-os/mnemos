@@ -25,7 +25,7 @@ from api.auth import UserContext, get_current_user
 from api.models import KGTriple, KGTripleCreate, KGTripleListResponse, KGTripleUpdate
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/kg", tags=["knowledge-graph"])
+router = APIRouter(prefix="/v1/kg", tags=["knowledge-graph"])
 
 
 def _row_to_triple(row) -> KGTriple:
