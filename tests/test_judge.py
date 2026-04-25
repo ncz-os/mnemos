@@ -8,12 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-import pytest
 
 from compression.judge import (
-    Judge,
     JudgeScore,
     LLMJudge,
     NullJudge,

@@ -99,7 +99,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 MPF_VERSION = "0.1.0"
 # After translation, payloads are MNEMOS-native; declare mnemos-3.1

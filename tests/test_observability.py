@@ -13,7 +13,6 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 import pytest
@@ -491,7 +490,6 @@ def test_structured_logging_renders_json_with_request_id(caplog):
     # output. We add a dedicated StreamHandler with the same formatter
     # and a StringIO buffer so we can assert on the rendered text.
     import io
-    import structlog as _structlog
 
     buf = io.StringIO()
     capture_handler = _logging.StreamHandler(buf)

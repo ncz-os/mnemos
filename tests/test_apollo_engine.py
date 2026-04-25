@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
-import pytest
 
 from compression.apollo import APOLLOEngine
 from compression.apollo_schemas.base import DetectionResult, Schema

@@ -16,11 +16,9 @@ import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 
 from compression.base import (
     CompressionEngine,
-    CompressionRequest,
     CompressionResult,
     GPUIntent,
 )

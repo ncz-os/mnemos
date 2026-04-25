@@ -9,7 +9,6 @@ extended here to match kg.py / memories.py.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
 
 import pytest
 

@@ -19,12 +19,10 @@ from compression.base import (
     CompressionRequest,
     CompressionResult,
     GPUIntent,
-    IdentifierPolicy,
 )
 from compression.contest import (
     BUILT_IN_PROFILES,
     ContestOutcome,
-    ScoringProfile,
     _ratio_term,
     load_scoring_profile,
     run_contest,

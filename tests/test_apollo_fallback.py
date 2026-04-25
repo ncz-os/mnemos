@@ -15,9 +15,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from typing import Any, Dict, Optional
-from unittest.mock import AsyncMock
 
-import pytest
 
 from compression.apollo import (
     APOLLOEngine,

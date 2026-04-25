@@ -17,7 +17,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from api.auth import UserContext
 from api.handlers import consultations
 
 
