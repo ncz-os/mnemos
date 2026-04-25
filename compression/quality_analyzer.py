@@ -17,7 +17,7 @@ class QualityManifest:
     timestamp: str
     source: str  # 'memory_storage', 'rehydration', 'graeae'
     task_type: str
-    method: str  # 'lethe', 'aletheia', 'anamnesis'
+    method: str  # 'apollo', 'artemis', or operator-registered engine id
 
     original_tokens: int
     compressed_tokens: int

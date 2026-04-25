@@ -11,7 +11,7 @@ Model selection:
 
 Memory injection:
   - Semantic search on last user message
-  - LETHE-compress relevant context (512-token budget)
+  - ARTEMIS-compress relevant context (512-token budget)
   - Add to system prompt with [MNEMOS context] header
 """
 

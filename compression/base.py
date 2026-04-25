@@ -22,15 +22,14 @@ uses that to route work through compression/gpu_batcher.py with a
 circuit breaker and a mandatory CPU fallback path for every gpu_optional
 engine.
 
-Built-in engines (going-forward stack): LETHE (cpu_only),
-ANAMNESIS (gpu_optional), APOLLO (gpu_optional, schema-aware;
-v3.3+ per ROADMAP.md Apollo Program). ALETHEIA (gpu_required) is
-DEPRECATED — retired from the default contest in the v3.2 tail;
-remains importable for operator-registered use, scheduled for v4.0
-removal.
+Built-in engines (v3.3 going-forward stack): APOLLO (gpu_optional,
+schema-aware) and ARTEMIS (cpu_only, extractive with identifier
+preservation). LETHE / ANAMNESIS / ALETHEIA were the v3.0–v3.2
+stack and were removed in the v3.3 cleanup pass — see
+EVOLUTION.md "v3.2 tail" and the 2026-04-23 CERBERUS benchmark.
 
-Operators register additional engines at startup via
-compression.manager.register_engine().
+Operators register additional engines at startup by adding them to
+the contest engine list in distillation_worker.py.
 """
 
 from __future__ import annotations

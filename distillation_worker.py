@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Background distillation worker: compresses memories using LETHE (token + sentence modes) or LLM fallback,
-updates embeddings, and maintains compression quality metrics.
+Background distillation worker: compresses memories using ARTEMIS (extractive,
+identifier-preserving) or LLM fallback, updates embeddings, and maintains
+compression quality metrics.
 
 Lifecycle supervision lives in `api/lifecycle.py::_run_distillation_worker` —
 this class knows how to do the work; that wrapper knows how to keep it alive
@@ -38,9 +39,6 @@ except Exception as _ce:
 # the v3.0 direct-memory-polling path; does not replace it. Operators
 # can disable the v3.1 path by setting MNEMOS_CONTEST_ENABLED=false.
 try:
-    from compression.lethe import LETHEEngine  # opt-in via MNEMOS_LETHE_ENABLED
-    from compression.aletheia import ALETHEIAEngine  # opt-in via MNEMOS_ALETHEIA_ENABLED
-    from compression.anamnesis import ANAMNESISEngine  # opt-in via MNEMOS_ANAMNESIS_ENABLED
     from compression.apollo import APOLLOEngine
     from compression.artemis import ARTEMISEngine
     from compression.judge import CrossEncoderJudge, EnsembleJudge, LLMJudge, NullJudge
@@ -52,35 +50,14 @@ except Exception as _ce:
 
 _CONTEST_ENABLED = os.getenv("MNEMOS_CONTEST_ENABLED", "true").lower() == "true"
 
-# ALETHEIA is DEPRECATED. v3.2 tail retirement:
-#
-# The 2026-04-23 CERBERUS benchmark across 49 PYTHIA memories recorded
-# ALETHEIA winning 0 contests. The index-list scoring prompt doesn't
-# survive instruction-tuned generalist LLMs (Qwen2.5-Coder-7B on
-# TYPHON and gemma-4-E4B-it on CERBERUS both returned whitespace or
-# punctuation instead of an index list), and the first-N fallback is
-# strictly inferior to LETHE at lower cost.
-#
-# The niche audit found every case where ALETHEIA might theoretically
-# win is already owned by LETHE (same prose-prune shape, free),
-# ANAMNESIS (better fact shape), or APOLLO (schema-typed). The going-
-# forward stack is LETHE + ANAMNESIS + APOLLO.
-#
-# Kept behind MNEMOS_ALETHEIA_ENABLED for any operator install that
-# had it opted in before retirement, but the engine class now emits a
-# DeprecationWarning on construction. v4.0 removes it entirely.
-#
-# See docs/benchmarks/compression-2026-04-23.md for the measured
-# rationale.
-_ALETHEIA_ENABLED = os.getenv("MNEMOS_ALETHEIA_ENABLED", "false").lower() == "true"
-# LETHE and ANAMNESIS are the v3.1 extractive and fact-extraction
-# engines. Artemis supersedes LETHE (identifier preservation +
-# structure-aware extraction + TextRank), and APOLLO's LLM fallback
-# subsumes ANAMNESIS's fact-extraction role in a denser output form.
-# Both classes stay importable; flip these env vars to re-enable them
-# in the default contest set.
-_LETHE_ENABLED = os.getenv("MNEMOS_LETHE_ENABLED", "false").lower() == "true"
-_ANAMNESIS_ENABLED = os.getenv("MNEMOS_ANAMNESIS_ENABLED", "false").lower() == "true"
+# v3.3 cleanup: LETHE / ANAMNESIS / ALETHEIA were removed entirely.
+# The 2026-04-23 CERBERUS benchmark recorded ALETHEIA winning 0/49
+# contests; ARTEMIS supersedes LETHE (identifier preservation +
+# structure-aware extraction + TextRank); APOLLO's LLM fallback
+# subsumes ANAMNESIS's fact-extraction role in a denser form. The
+# going-forward stack is APOLLO + ARTEMIS. See
+# docs/benchmarks/compression-2026-04-23.md and EVOLUTION.md
+# "v3.2 tail" for the full settlement.
 
 # Optional minimum-content-length gate for the v3.1 contest path.
 # Memories shorter than this value are marked 'failed' with
@@ -231,15 +208,10 @@ class MemoryDistillationWorker:
             #            structure-aware, TextRank + MMR selection.
             #   Apollo:  Schema-aware dense encoding (portfolio / decision
             #            / person / event) with LLM fallback on misses.
-            # Earlier engines (LETHE, ANAMNESIS, ALETHEIA) stay importable
-            # and opt-in via their respective *_ENABLED env vars.
+            # Going-forward stack only: ARTEMIS + (optional) APOLLO.
+            # LETHE / ANAMNESIS / ALETHEIA were removed in the v3.3
+            # cleanup pass.
             self._contest_engines = [ARTEMISEngine()]
-            if _LETHE_ENABLED:
-                self._contest_engines.append(LETHEEngine())
-            if _ALETHEIA_ENABLED:
-                self._contest_engines.append(ALETHEIAEngine())
-            if _ANAMNESIS_ENABLED:
-                self._contest_engines.append(ANAMNESISEngine())
             if _APOLLO_ENABLED:
                 self._contest_engines.append(
                     APOLLOEngine(
@@ -284,13 +256,6 @@ class MemoryDistillationWorker:
                 "[OK] contest path enabled (engines: %s) judge=%s",
                 ", ".join(engine_ids), type(self._judge).__name__,
             )
-            if _ALETHEIA_ENABLED:
-                logger.warning(
-                    "ALETHEIA is deprecated and retired from the "
-                    "default stack. You have MNEMOS_ALETHEIA_ENABLED=true "
-                    "set; v4.0 will remove the engine entirely. See "
-                    "docs/benchmarks/compression-2026-04-23.md."
-                )
             if _APOLLO_ENABLED and not _APOLLO_LLM_FALLBACK_ENABLED:
                 logger.info(
                     "APOLLO registered with LLM fallback DISABLED — "
@@ -440,15 +405,11 @@ class MemoryDistillationWorker:
                     result = self._compression_engine.distill(original_text, strategy=CompressionStrategy.AUTO)
                     compressed_candidate = result.get("compressed_text") or result.get("compressed", "")
                     candidate_quality = float(result.get("quality_score", 0) or 0) * 100  # 0-1 -> 0-100
-                    strategy_used = result.get("strategy_used", "token")
-                    # strategy_used is 'token', 'sentence', or the engine's internal label;
-                    # record as 'lethe-<mode>' for clarity in the compression log.
-                    if strategy_used == "sentence":
-                        compression_method = "lethe-sentence"
-                    elif strategy_used == "token":
-                        compression_method = "lethe-token"
-                    else:
-                        compression_method = f"lethe-{strategy_used}"
+                    strategy_used = result.get("strategy_used", "auto")
+                    # ARTEMIS-backed; strategy_used is the API-level
+                    # strategy name (vestigial after the v3.3 LETHE
+                    # removal — ARTEMIS has a single extractive path).
+                    compression_method = f"artemis-{strategy_used}"
                     if compressed_candidate and len(compressed_candidate) >= 10 and candidate_quality >= 60:
                         compressed = compressed_candidate
                         quality_score = candidate_quality

@@ -155,7 +155,7 @@ class SessionContext(BaseModel):
     message_count: int
     total_tokens: int
     model: str
-    compression_tier: int = 1  # 1=LETHE, 2=ALETHEIA, 3=ANAMNESIS
+    compression_tier: int = 1  # vestigial post-v3.3; ARTEMIS is the actual engine
     injected_memories: Optional[List[str]] = None
 
 

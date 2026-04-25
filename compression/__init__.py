@@ -1,25 +1,23 @@
 """
 Compression Module
 
-Provides the LETHE / ANAMNESIS / APOLLO stack plus a plugin
-CompressionEngine ABC for operator-registered engines.
+Provides the APOLLO + ARTEMIS stack plus a plugin CompressionEngine
+ABC for operator-registered engines, dispatched via the contest
+framework.
 
-- LETHE: Fast CPU extractive compression (0.5-5ms, 30-57% reduction;
-  token + sentence modes).
-- ANAMNESIS: GPU-optional LLM fact extraction for prose that doesn't
-  fit a known schema (500ms-2s, semantic compression).
 - APOLLO: schema-aware dense encoding for LLM-to-LLM consumption
   (v3.3 S-IC: PortfolioSchema as the first concrete schema with
   rule-based detection; S-II adds LLM fallback, narration endpoint,
   judge-LLM scoring, decision/person/event schemas).
-- ALETHEIA: DEPRECATED. GPU token-level importance scoring from the
-  v3.1 stack; lost every contest in the 2026-04-23 benchmark
-  (docs/benchmarks/compression-2026-04-23.md). Kept importable for
-  operators who had it opted-in, but removed from the default
-  contest in distillation_worker.py. Scheduled for v4.0 removal.
-- CompressionManager: legacy v3.0 orchestrator, still used for
-  MNEMOS_COMPRESSION_MODE='off|lethe|anamnesis|auto'.
+- ARTEMIS: CPU-only extractive with identifier preservation,
+  labeled-block handling, and evidence-based self-scoring. Drives
+  the legacy DistillationEngine API after LETHE removal.
 - QualityAnalyzer: Quality manifest generation.
+
+History note: LETHE / ALETHEIA / ANAMNESIS were the v3.0–v3.2 stack.
+All three were removed in v3.3 after the 2026-04-23 benchmark
+(docs/benchmarks/compression-2026-04-23.md). See EVOLUTION.md
+"v3.2 tail" for the full settlement.
 """
 
 from .base import (
@@ -43,10 +41,6 @@ from .contest import (
 )
 from .contest_store import persist_contest
 from .quality_analyzer import QualityAnalyzer, QualityManifest
-from .manager import CompressionManager, CompressionResult
-from .lethe import LETHE, LETHEEngine
-from .aletheia import ALETHEIA, ALETHEIAEngine
-from .anamnesis import ANAMNESIS, ANAMNESISEngine
 from .apollo import APOLLOEngine
 from .apollo_schemas import PortfolioSchema, Schema as APOLLOSchema
 from .artemis import ARTEMISEngine
@@ -77,26 +71,12 @@ __all__ = [
     "ContestOutcome",
     "run_contest",
     "persist_contest",
-    # v3.0 compression surface (still in use until LETHE/ANAMNESIS
-    # migrate to the ABC; APOLLO lands on the ABC directly)
     "QualityAnalyzer",
     "QualityManifest",
-    "CompressionManager",
-    "CompressionResult",
-    "LETHE",
-    "LETHEEngine",
-    # ALETHEIA: deprecated — kept importable for operators who had
-    # MNEMOS_ALETHEIA_ENABLED=true before the retirement commit;
-    # v4.0 removes.
-    "ALETHEIA",
-    "ALETHEIAEngine",
-    "ANAMNESIS",
-    "ANAMNESISEngine",
-    # v3.3 S-IC: APOLLO — schema-aware dense encoding
+    # v3.3 going-forward stack: APOLLO (schema-aware) + ARTEMIS (extractive)
     "APOLLOEngine",
     "APOLLOSchema",
     "PortfolioSchema",
-    # v3.3: Artemis — CPU-only extractive with identifier preservation
     "ARTEMISEngine",
     "DistillationEngine",
     "CompressionStrategy",

@@ -100,3 +100,4 @@ api_keys.json
 
 # uv lockfile — we install via uv pip install -e .[dev] (no uv sync), so the lockfile is a local artifact
 uv.lock
+.venv-ci/
