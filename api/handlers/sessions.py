@@ -39,9 +39,11 @@ async def create_session(
 
     Args:
         model: LLM model (default: gpt-4o)
-        compression_tier: vestigial post-v3.3 cleanup. Accepted on the wire
-            for backwards-compat but no longer maps to a concrete engine —
-            session compression goes through ARTEMIS via DistillationEngine.
+        compression_tier: vestigial — accepted on the wire for backwards-
+            compat with v3.0–v3.2 callers and persisted alongside session
+            metadata. The current session-injection path ships raw-slice
+            truncation (doc['content'][:500]), NOT compressed text; real
+            compression here is queued for a later slice.
         initial_context: Optional initial system context
 
     Returns:

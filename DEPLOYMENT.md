@@ -258,18 +258,18 @@ curl -X POST http://localhost:5002/sessions \
   -H "Content-Type: application/json" \
   -d '{"model": "auto", "compression_tier": 1}'
 
-# POST /sessions/{id}/messages - Add message to session
-curl -X POST http://localhost:5002/sessions/{id}/messages \
+# POST /v1/sessions/{id}/messages - Add message to session
+curl -X POST http://localhost:5002/v1/sessions/{id}/messages \
   -H "Authorization: Bearer $MNEMOS_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"role": "user", "content": "Hello"}'
 
-# GET /sessions/{id}/history - Get session history
-curl -X GET http://localhost:5002/sessions/{id}/history \
+# GET /v1/sessions/{id}/history - Get session history
+curl -X GET http://localhost:5002/v1/sessions/{id}/history \
   -H "Authorization: Bearer $MNEMOS_API_KEY"
 
-# DELETE /sessions/{id} - Close session
-curl -X DELETE http://localhost:5002/sessions/{id} \
+# DELETE /v1/sessions/{id} - Close session
+curl -X DELETE http://localhost:5002/v1/sessions/{id} \
   -H "Authorization: Bearer $MNEMOS_API_KEY"
 ```
 
