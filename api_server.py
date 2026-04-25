@@ -31,6 +31,7 @@ from api.handlers.entities import router as entities_router
 from api.handlers.openai_compat import router as openai_compat_router
 from api.handlers.sessions import router as sessions_router
 from api.handlers.dag import router as dag_router
+from api.handlers.morpheus import router as morpheus_router
 from api.handlers.webhooks import router as webhooks_router
 from api.handlers.oauth import router as oauth_router
 from api.handlers.federation import router as federation_router
@@ -240,6 +241,7 @@ app.include_router(versions_router)
 app.include_router(journal_router)
 app.include_router(state_router)
 app.include_router(entities_router)
+app.include_router(morpheus_router)  # v3.3 MORPHEUS dream-state subsystem
 
 # Document import (Docling) — optional, requires docling extra
 if _document_import_available:
