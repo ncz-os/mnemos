@@ -672,35 +672,15 @@ async def update_memory(
                     )
                 if not row:
                     raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
-                # Calculate next version BEFORE the UPDATE so trigger and app agree on the version number.
-                # On instances with the pg trigger, the trigger fires during UPDATE and writes next_ver;
-                # ON CONFLICT DO NOTHING ensures we skip cleanly. On instances without the trigger,
-                # our INSERT writes the version.
-                next_ver = await conn.fetchval(
-                    "SELECT COALESCE(MAX(version_num), 0) + 1 FROM memory_versions WHERE memory_id = $1",
-                    memory_id,
-                )
+                # The mnemos_version_snapshot AFTER UPDATE trigger writes the
+                # new memory_versions row (commit_hash + bumped version_num);
+                # the handler must not duplicate that INSERT.
                 await conn.execute(
                     f"UPDATE memories SET {', '.join(set_clauses)} WHERE id=$1",
                     memory_id, *values,
                 )
                 row = await conn.fetchrow(
                     f"SELECT {_lc._MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
-                )
-                # Snapshot the post-update state into version history
-                await conn.execute(
-                    "INSERT INTO memory_versions "
-                    "(memory_id, version_num, content, category, subcategory, metadata, verbatim_content, "
-                    "owner_id, namespace, permission_mode, "
-                    "source_model, source_provider, source_session, source_agent, "
-                    "snapshot_by, change_type) "
-                    "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'update') "
-                    "ON CONFLICT (memory_id, version_num) DO NOTHING",
-                    memory_id, next_ver, row["content"], row["category"], row["subcategory"],
-                    json.dumps(row["metadata"] or {}),
-                    row["verbatim_content"], row["owner_id"], row["namespace"], row["permission_mode"],
-                    row["source_model"], row["source_provider"], row["source_session"], row["source_agent"],
-                    user.user_id,
                 )
     if _lc._cache:
         try:

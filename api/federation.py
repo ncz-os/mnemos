@@ -240,7 +240,8 @@ async def _store_memories(
                    source_model, source_provider, source_session, source_agent,
                    federation_source, federation_remote_updated, created, updated)
                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, 'federation', $8, 644,
-                        $9, $10, $11, $12, $13, $14, NOW(), $14)
+                        $9, $10, $11, $12, $13, $14::timestamptz, NOW(),
+                        ($14::timestamptz AT TIME ZONE 'UTC'))
                 """,
                 local_id,
                 content,
@@ -270,7 +271,8 @@ async def _store_memories(
                       content = $2, category = $3, subcategory = $4,
                       metadata = $5::jsonb, verbatim_content = $6,
                       quality_rating = $7, namespace = $8,
-                      federation_remote_updated = $9, updated = $9
+                      federation_remote_updated = $9::timestamptz,
+                      updated = ($9::timestamptz AT TIME ZONE 'UTC')
                     WHERE id = $1
                     """,
                     local_id,

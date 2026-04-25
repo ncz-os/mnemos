@@ -31,9 +31,10 @@ Reliability stack (innermost to outermost):
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import httpx
 
@@ -177,18 +178,123 @@ class GraeaeEngine:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=60)
+            self._client = httpx.AsyncClient(timeout=200)
         return self._client
 
     async def close(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
+    async def reload_from_registry(self, pool) -> Dict[str, str]:
+        """Refresh self.providers[*]['model'] from model_registry.
+
+        Selection policy (per provider):
+          1. ELO override: Arena-ranked top within the family is the default.
+          2. Newer-version override: any same-family model with a strictly
+             higher version tuple than the Arena top wins (catches fresh
+             releases like claude-opus-4-7 over Arena-leading 4-6, or
+             gpt-5.5 the day it ships ahead of Arena-ranked 5.4).
+          3. Live probe + n-1 fallback: each candidate, in rank order, gets
+             a tiny generate call; the first that returns 200 wins. If the
+             top pick fails (model retired, regional rollout, key tier),
+             we fall through to the next-best — usually the previous
+             generation.
+
+        Two-phase to avoid stalling startup or holding a pool connection
+        for ~minutes on slow upstreams:
+          Phase 1: pull every provider's candidate list in one DB conn,
+                   then RELEASE the connection.
+          Phase 2: probe candidates in parallel ACROSS providers (sequential
+                   within a provider so n-1 fallback ordering is preserved),
+                   no DB held.
+
+        url/api/key_name/weight are preserved from the existing provider
+        config — only the model field changes. gemini's URL embeds the
+        model name and is rebuilt on rotation.
+        """
+        # Phase 1 — DB-bound, release the connection before any HTTP probe.
+        plans: Dict[str, list[str]] = {}
+        api_keys: Dict[str, str] = {}
+        async with pool.acquire() as conn:
+            for name, mapping in _REGISTRY_MAP.items():
+                if name not in self.providers:
+                    continue
+                cfg = self.providers[name]
+                api_key = get_key(cfg["key_name"])
+                if not api_key:
+                    logger.info("[GRAEAE] reload: %s → no api key, keeping %s",
+                                name, cfg.get("model"))
+                    continue
+                candidates = await _ranked_candidates(
+                    conn, mapping["registry_provider"], mapping["prefer"],
+                )
+                if not candidates:
+                    logger.info("[GRAEAE] reload: %s → registry empty, keeping %s",
+                                name, cfg.get("model"))
+                    continue
+                plans[name] = candidates[:_PROBE_MAX_CANDIDATES]
+                api_keys[name] = api_key
+
+        if not plans:
+            logger.info("[GRAEAE] manifest reload: no eligible providers")
+            return {}
+
+        # Phase 2 — probe in parallel across providers (no DB held).
+        client = await self._get_client()
+
+        async def _probe_one_provider(name: str, cands: list[str], api_key: str):
+            cfg = self.providers[name]
+            tried: list[str] = []
+            for cand in cands:
+                if await _probe_model(client, cfg, cand, api_key):
+                    return name, cand, tried
+                tried.append(cand)
+            return name, None, tried
+
+        results = await asyncio.gather(
+            *(_probe_one_provider(n, plans[n], api_keys[n]) for n in plans),
+            return_exceptions=True,
+        )
+
+        changes: Dict[str, str] = {}
+        for r in results:
+            if isinstance(r, BaseException):
+                logger.warning(f"[GRAEAE] probe task crashed: {type(r).__name__}: {r}")
+                continue
+            name, chosen, tried = r
+            cfg = self.providers[name]
+            if chosen is None:
+                logger.warning(
+                    "[GRAEAE] %s: all %d candidates failed probe (%s) — keeping %s",
+                    name, len(tried), tried, cfg.get("model"),
+                )
+                continue
+            if tried:
+                logger.info(
+                    "[GRAEAE] %s: probe failures %s → falling back to %s (n-%d)",
+                    name, tried, chosen, len(tried),
+                )
+            old = cfg.get("model")
+            if old == chosen:
+                continue
+            cfg["model"] = chosen
+            if name == "gemini":
+                cfg["url"] = (
+                    f"https://generativelanguage.googleapis.com/v1beta/"
+                    f"models/{chosen}:generateContent"
+                )
+            changes[name] = f"{old} → {chosen}"
+        if changes:
+            logger.info(f"[GRAEAE] manifest refreshed from registry: {changes}")
+        else:
+            logger.info("[GRAEAE] manifest reload: no changes (already current)")
+        return changes
+
     async def consult(
         self,
         prompt: str,
         task_type: str = "reasoning",
-        timeout: int = 30,
+        timeout: int = 180,
         selection: Optional[Dict[str, Optional[str]]] = None,
     ) -> Dict:
         """Query eligible providers in parallel and return all responses.
@@ -258,25 +364,25 @@ class GraeaeEngine:
             }
 
         # ── Fan-out ──────────────────────────────────────────────────────────
-        # When a selection supplied a per-provider model override, apply
-        # it temporarily for the duration of this query. We deep-copy the
-        # provider config and pass it through a throwaway self.providers
-        # snapshot via _query_provider — but simpler: route through the
-        # same _query_provider and let it pick the current config. For the
-        # override we swap `self.providers[name]["model"]` in place, fan
-        # out, then restore. This keeps _query_provider untouched.
-        restored: Dict[str, str] = {}
+        # When a selection supplied a per-provider model override, pass it
+        # through as a per-task argument instead of mutating self.providers.
+        # In-place mutation would race with the background reload_from_registry
+        # task: a concurrent reload that lands between save-and-restore would
+        # be silently undone by the finally:'s restore step. Snapshot-by-arg
+        # is also re-entrant for concurrent overlapping consult() calls.
+        overrides: Dict[str, Optional[str]] = {}
         if selection is not None:
             for name, override in selection.items():
                 if override and name in self.providers:
-                    restored[name] = self.providers[name]["model"]
-                    self.providers[name]["model"] = override
-        try:
-            tasks = [self._query_provider(name, prompt, task_type, timeout) for name in active]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        finally:
-            for name, original in restored.items():
-                self.providers[name]["model"] = original
+                    overrides[name] = override
+        tasks = [
+            self._query_provider(
+                name, prompt, task_type, timeout,
+                model_override=overrides.get(name),
+            )
+            for name in active
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_responses: Dict = {}
 
@@ -285,9 +391,12 @@ class GraeaeEngine:
             if isinstance(result, Exception):
                 self._circuit_breakers.record_failure(name)
                 self._quality.record_failure(name)
+                err_msg = f"{type(result).__name__}: {str(result)[:400]}"
+                logger.warning(f"[GRAEAE] muse {name} failed: {err_msg}")
                 all_responses[name] = {
                     "status": "error",
                     "response_text": "",
+                    "error": err_msg,
                     "latency_ms": 0,
                     "model_id": self.providers[name]["model"],
                     "final_score": 0.0,
@@ -316,7 +425,7 @@ class GraeaeEngine:
         return {"all_responses": all_responses, **consensus}
 
     async def route(
-        self, provider: str, model: str, prompt: str, task_type: str = "reasoning", timeout: int = 30
+        self, provider: str, model: str, prompt: str, task_type: str = "reasoning", timeout: int = 180
     ) -> Dict:
         """Single-provider pass-through — consensus skipped, eligibility
         gates applied.
@@ -400,7 +509,15 @@ class GraeaeEngine:
 
         try:
             try:
-                result = await self._query_provider(provider, prompt, task_type, timeout)
+                # Pass `model` through as model_override so the gateway's
+                # per-call selection (e.g. /v1/chat/completions with
+                # model="claude-opus-4-7") actually reaches dispatch
+                # instead of being silently overwritten by whatever
+                # self.providers[provider]["model"] currently holds.
+                result = await self._query_provider(
+                    provider, prompt, task_type, timeout,
+                    model_override=model,
+                )
             except Exception as e:
                 # Record the failure against the breaker so repeated
                 # gateway-path failures actually trip it, and quality
@@ -425,9 +542,22 @@ class GraeaeEngine:
             concurrency.release(provider)
 
     async def _query_provider(
-        self, provider_name: str, prompt: str, task_type: str, timeout: int
+        self, provider_name: str, prompt: str, task_type: str, timeout: int,
+        model_override: Optional[str] = None,
     ) -> Dict:
-        provider = self.providers[provider_name]
+        # Snapshot the provider config so a concurrent reload_from_registry
+        # mutation can't tear the dict mid-dispatch. shallow copy is enough
+        # because we only read scalar fields (model, url, weight, api,
+        # key_name) and never mutate them here.
+        provider = dict(self.providers[provider_name])
+        if model_override:
+            provider["model"] = model_override
+            # gemini's URL embeds the model name; rebuild for the override.
+            if provider.get("api") == "gemini":
+                provider["url"] = (
+                    f"https://generativelanguage.googleapis.com/v1beta/"
+                    f"models/{model_override}:generateContent"
+                )
         start = datetime.now(timezone.utc)
         api = provider["api"]
 
@@ -461,7 +591,7 @@ class GraeaeEngine:
         payload: Dict = {
             "model": provider["model"],
             "messages": [{"role": "user", "content": prompt}],
-            tokens_key: 2000,
+            tokens_key: 4096,
         }
         if not is_gpt5:
             payload["temperature"] = 0.7
@@ -487,7 +617,7 @@ class GraeaeEngine:
         }
         payload = {
             "model": provider["model"],
-            "max_tokens": 2000,
+            "max_tokens": 4096,
             "messages": [{"role": "user", "content": prompt}],
         }
         client = await self._get_client()
@@ -508,7 +638,7 @@ class GraeaeEngine:
         headers = {"x-goog-api-key": api_key}
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 2000, "temperature": 0.7},
+            "generationConfig": {"maxOutputTokens": 4096, "temperature": 0.7},
         }
         client = await self._get_client()
         resp = await client.post(provider["url"], headers=headers, json=payload, timeout=timeout)
@@ -629,6 +759,244 @@ def _unavailable(model_id: str, error: str = "") -> Dict:
         "final_score": 0.0,
         "error": error,
     }
+
+
+# ── Registry-backed manifest refresh ──────────────────────────────────────────
+# Maps each GRAEAE provider name to:
+#   registry_provider — name used by provider_sync.py when upserting into
+#                       model_registry (may differ from the GRAEAE name,
+#                       e.g. claude→anthropic).
+#   prefer            — ordered list of ILIKE patterns to pick a current
+#                       flagship when arena_score is absent (providers
+#                       without Arena coverage: groq, nvidia, perplexity).
+# Arena-ranked models always win over pattern matches when available.
+_REGISTRY_MAP: dict[str, dict] = {
+    "together":   {"registry_provider": "together",   "prefer": ["Qwen3-235B", "Llama-3.3-70B", "Llama-3.1-70B"]},
+    "groq":       {"registry_provider": "groq",       "prefer": ["llama-3.3-70b-versatile", "llama-3.3", "llama-3.1"]},
+    "openai":     {"registry_provider": "openai",     "prefer": ["gpt-5", "gpt-4o", "gpt-4"]},
+    "claude":     {"registry_provider": "anthropic",  "prefer": ["claude-opus", "claude-sonnet"]},
+    "perplexity": {"registry_provider": "perplexity", "prefer": ["sonar-pro", "sonar"]},
+    "xai":        {"registry_provider": "xai",        "prefer": ["grok-4", "grok-3", "grok"]},
+    "nvidia":     {"registry_provider": "nvidia",     "prefer": ["llama-3.3-70b-instruct", "llama-3.1-70b-instruct", "nemotron-70b"]},
+    "gemini":     {"registry_provider": "gemini",     "prefer": ["gemini-3", "gemini-2.5", "gemini-2"]},
+}
+
+
+_VERSION_RE = re.compile(r"(\d+)(?:[.\-_](\d+))?(?:[.\-_](\d+))?(?:[.\-_](\d+))?")
+_VERSION_PAD = 4
+
+
+def _extract_version(model_id: str) -> tuple:
+    """Best-effort version tuple extraction for cherry-pick ordering.
+
+    Captures the first dotted/hyphen-separated digit sequence, strips
+    date-snapshot components (anything ≥ 1900 — years and YYYYMMDD
+    stamps), and pads to a fixed length so prefix-shorter tuples don't
+    outrank longer ones in ascending sort. Examples:
+
+      gpt-5.4              → (5, 4, 0, 0)
+      gpt-5                → (5, 0, 0, 0)
+      gpt-5-2025-08-07     → (5, 0, 0, 0)   # 2025 = date, truncated
+      claude-opus-4-7      → (4, 7, 0, 0)
+      claude-haiku-4-5-20251001 → (4, 5, 0, 0)   # date stamp dropped
+      gemini-3.1-pro-preview    → (3, 1, 0, 0)
+      grok-4-0709          → (4, 709, 0, 0)
+
+    After negation, gpt-5.4 sorts before gpt-5 in ascending order, so
+    .sort() picks the highest version first.
+    """
+    m = _VERSION_RE.search(model_id)
+    raw = [int(x) for x in m.groups() if x is not None] if m else []
+    cleaned: list[int] = []
+    for p in raw:
+        # Anything ≥ 100 in a version slot is almost always a date code,
+        # release stamp, or parameter count, not a major/minor version
+        # — provider naming conventions don't ship versions like 5.235.
+        # Stripping at 100 prevents 'grok-4-0709' (4, 709) from outranking
+        # 'grok-4-1-fast' (4, 1) and 'gpt-5-2025-08-07' from outranking
+        # 'gpt-5.4'.
+        if p >= 100:
+            break
+        cleaned.append(p)
+    cleaned.extend([0] * max(0, _VERSION_PAD - len(cleaned)))
+    return tuple(cleaned[:_VERSION_PAD])
+
+
+# How many candidates to probe before giving up on a provider. Each probe is
+# one billable 1-token call, so we cap it. n-1 fallback covers "top pick is
+# retired"; n-2 covers a double-rotation window. The cap is deliberately
+# above _RISERS_MAX + arena_top + n-1 + n-2 so the Arena-ranked floor always
+# gets a probe even when several post-Arena variants exist (e.g. four
+# gpt-5.5 variants released the same day before Arena reviewed any).
+_PROBE_MAX_CANDIDATES = 6
+_RISERS_MAX = 3
+
+
+async def _ranked_candidates(conn, registry_provider: str, prefer: list[str]) -> list[str]:
+    """Return model_ids ordered by selection priority (best first).
+
+    Two-stage policy:
+      Stage A (post-Arena risers): same-family models with a STRICTLY higher
+        version tuple than the Arena-ranked top — covers fresh releases that
+        Arena hasn't ranked yet.
+      Stage B (Arena top + tier): the Arena-ranked top, then everything else
+        in the same family tier by Arena score / version / last_synced.
+      Stage C (other families): models matching later prefer-list entries
+        (n-1 family) by the same internal ordering. Used as fallback when
+        the primary family is unhealthy.
+
+    Within each stage, ties break by version tuple DESC, arena_score DESC,
+    last_synced DESC, len(model_id) ASC (prefer canonical short names).
+    """
+    rows = await conn.fetch(
+        """
+        SELECT model_id, arena_score, last_synced
+        FROM model_registry
+        WHERE provider = $1 AND available AND NOT deprecated
+        """,
+        registry_provider,
+    )
+    if not rows:
+        return []
+
+    annotated: list[dict] = []
+    for r in rows:
+        mid = r["model_id"]
+        family_rank: Optional[int] = None
+        for i, pat in enumerate(prefer):
+            if pat.lower() in mid.lower():
+                family_rank = i
+                break
+        # Drop entries that match no family pattern AND have no Arena rank
+        # (e.g. groq's whisper variants in the llama family slot).
+        if family_rank is None and not r["arena_score"]:
+            continue
+        annotated.append({
+            "mid": mid,
+            "family_rank": family_rank if family_rank is not None else len(prefer),
+            "version": _extract_version(mid),
+            "arena": float(r["arena_score"] or 0),
+            "synced": r["last_synced"].timestamp() if r["last_synced"] else 0,
+        })
+    if not annotated:
+        return []
+
+    def _internal_key(a: dict) -> tuple:
+        return (
+            a["family_rank"],
+            tuple(-x for x in a["version"]),
+            -a["arena"],
+            -a["synced"],
+            len(a["mid"]),
+        )
+
+    # Identify the Arena top within the strongest family tier (lowest
+    # family_rank that has any Arena entries).
+    arena_top: Optional[dict] = None
+    for tier in sorted({a["family_rank"] for a in annotated}):
+        in_tier = [a for a in annotated if a["family_rank"] == tier and a["arena"] > 0]
+        if in_tier:
+            arena_top = max(in_tier, key=lambda a: a["arena"])
+            break
+
+    risers: list[dict] = []
+    if arena_top is not None:
+        risers = [
+            a for a in annotated
+            if a["family_rank"] == arena_top["family_rank"]
+            and a["version"] > arena_top["version"]
+            and a["mid"] != arena_top["mid"]
+        ]
+        risers.sort(key=_internal_key)
+        # Cap risers so Arena-ranked floor isn't crowded out of the probe
+        # budget on providers that ship many same-day variants of a new
+        # version (e.g. four gpt-5.5 release variants).
+        risers = risers[:_RISERS_MAX]
+
+    riser_ids = {a["mid"] for a in risers}
+    others = sorted(
+        (a for a in annotated
+         if (arena_top is None or a["mid"] != arena_top["mid"])
+         and a["mid"] not in riser_ids),
+        key=_internal_key,
+    )
+
+    ranked: list[str] = []
+    seen: set[str] = set()
+    for entry in risers + ([arena_top] if arena_top else []) + others:
+        if entry is None:
+            continue
+        if entry["mid"] in seen:
+            continue
+        ranked.append(entry["mid"])
+        seen.add(entry["mid"])
+    return ranked
+
+
+async def _probe_model(client: httpx.AsyncClient, provider_cfg: dict,
+                       model_id: str, api_key: str, timeout: int = 15) -> bool:
+    """Probe model_id with a tiny generate call; True iff HTTP 200.
+
+    Probe bodies match the shape of _query_provider so a passing probe
+    means the model can actually be dispatched against — not just that
+    it appears in /v1/models. Token budgets are tuned per family:
+
+      gpt-5.x reasoning models silently consume internal reasoning tokens
+      from max_completion_tokens, so max_completion_tokens=1 always 400s
+      with "max_tokens too low". Bumped to 128 to cover the reasoning
+      phase + a 1-token output. Cost is pennies per startup × 8 providers.
+    """
+    api = provider_cfg["api"]
+    try:
+        if api == "openai":
+            url = provider_cfg["url"]
+            is_gpt5 = model_id.startswith("gpt-5")
+            if is_gpt5:
+                body = {
+                    "model": model_id,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_completion_tokens": 128,
+                }
+            else:
+                body = {
+                    "model": model_id,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 4,
+                    "temperature": 0,
+                }
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+        elif api == "anthropic":
+            url = provider_cfg["url"]
+            body = {
+                "model": model_id,
+                "max_tokens": 4,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
+        elif api == "gemini":
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/"
+                f"models/{model_id}:generateContent"
+            )
+            body = {
+                "contents": [{"parts": [{"text": "hi"}]}],
+                "generationConfig": {"maxOutputTokens": 4, "temperature": 0},
+            }
+            headers = {"x-goog-api-key": api_key}
+        else:
+            return False
+        resp = await client.post(url, json=body, headers=headers, timeout=timeout)
+        return resp.status_code == 200
+    except Exception as e:
+        logger.debug(f"[GRAEAE] probe error for {model_id}: {type(e).__name__}: {e}")
+        return False
 
 
 # ── Module-level singleton ─────────────────────────────────────────────────────

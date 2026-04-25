@@ -232,6 +232,21 @@ def _fetch_anthropic_static() -> list[dict]:
     return [
         {
             "provider": "anthropic",
+            "model_id": "claude-opus-4-7",
+            "display_name": "Claude Opus 4.7",
+            "family": "claude-opus-4",
+            "context_window": 200000,
+            "max_output_tokens": 32768,
+            "capabilities": ["chat", "code", "reasoning", "vision"],
+            "input_cost_per_mtok":  15.00,
+            "output_cost_per_mtok": 75.00,
+            "cache_read_per_mtok":   1.50,
+            "cache_write_per_mtok":  3.75,
+            "available": True,
+            "raw": {"source": "static", "docs": "https://docs.anthropic.com/en/docs/about-claude/models"},
+        },
+        {
+            "provider": "anthropic",
             "model_id": "claude-opus-4-6",
             "display_name": "Claude Opus 4.6",
             "family": "claude-opus-4",

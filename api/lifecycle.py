@@ -177,6 +177,32 @@ async def lifespan(app):
     from api.auth import configure_auth
     configure_auth(config.get("auth", {}))
 
+    # Refresh GRAEAE provider manifest from model_registry in the background
+    # so startup doesn't block on per-provider HTTP probes (each can take up
+    # to ~12s with httpx default timeouts; 8 providers × up to 6 candidates
+    # would otherwise stall lifespan completion for several minutes on a slow
+    # upstream and tie up a DB connection the whole time). The engine starts
+    # with the hardcoded _BUILTIN_PROVIDERS defaults and rotates as soon as
+    # the background task lands. POST /admin/graeae/reload-providers is also
+    # available for on-demand refresh (and is what the daily systemd timer
+    # uses after sync_provider_models.py finishes).
+    import asyncio as _asyncio_for_reload
+    async def _bg_graeae_reload():
+        try:
+            from graeae.engine import get_graeae_engine
+            await _asyncio_for_reload.wait_for(
+                get_graeae_engine().reload_from_registry(_pool),
+                timeout=120,
+            )
+        except _asyncio_for_reload.TimeoutError:
+            logger.warning(
+                "[GRAEAE] background manifest reload exceeded 120s — "
+                "keeping built-in defaults; daily timer will retry",
+            )
+        except Exception as e:
+            logger.warning(f"[GRAEAE] background manifest reload failed: {e}")
+    _schedule_background(_bg_graeae_reload())
+
     # RLS enforcement flag
     _rls_enabled = config.get("multiuser", {}).get("rls_enabled", False)
     if _rls_enabled:
