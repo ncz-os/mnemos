@@ -14,13 +14,14 @@ The ABC adapts design patterns from OpenClaw's CompactionProvider
 
 No code is shared with OpenClaw; only the patterns are credited. MNEMOS
 compression is per-memory rather than per-conversation, and the contest
-is orchestrated by CompressionManager (see compression/manager.py), not
-by the engine itself.
+is orchestrated by compression.contest.run_contest (called from
+compression.worker_contest.process_contest_queue), not by the engine
+itself.
 
-Engine instances declare their GPU intent at class level. The manager
-uses that to route work through compression/gpu_batcher.py with a
-circuit breaker and a mandatory CPU fallback path for every gpu_optional
-engine.
+Engine instances declare their GPU intent at class level. The contest
+runner uses that to route work through compression/gpu_batcher.py with
+a circuit breaker and a mandatory CPU fallback path for every
+gpu_optional engine.
 
 Built-in engines (v3.3 going-forward stack): APOLLO (gpu_optional,
 schema-aware) and ARTEMIS (cpu_only, extractive with identifier

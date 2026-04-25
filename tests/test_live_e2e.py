@@ -309,7 +309,7 @@ check("subcategory-filtered search finds memory",
 section("9c. Knowledge Graph")
 kg_id = None
 
-st, r, _ = req("POST", "/kg/triples", {
+st, r, _ = req("POST", "/v1/kg/triples", {
     "subject": "primary-host",
     "predicate": "runs",
     "object": "MNEMOS",
@@ -321,21 +321,21 @@ check("POST /kg/triples -> 201", st == 201, f"got {st}: {r}")
 check("triple id starts with kg_", r and r.get("id", "").startswith("kg_"))
 kg_id = r.get("id") if r else None
 
-st, r, _ = req("GET", "/kg/triples?subject=primary-host")
+st, r, _ = req("GET", "/v1/kg/triples?subject=primary-host")
 check("GET /kg/triples?subject -> 200", st == 200, f"got {st}")
 check("created triple in list",
       r and any(t["id"] == kg_id for t in r.get("triples", [])))
 
-st, r, _ = req("GET", "/kg/timeline/primary-host")
-check("GET /kg/timeline/primary-host -> 200", st == 200, f"got {st}")
+st, r, _ = req("GET", "/v1/kg/timeline/primary-host")
+check("GET /v1/kg/timeline/primary-host -> 200", st == 200, f"got {st}")
 check("timeline returns triples", r and r.get("count", 0) > 0)
 
 if kg_id:
-    st, _, _ = req("DELETE", f"/kg/triples/{kg_id}")
+    st, _, _ = req("DELETE", f"/v1/kg/triples/{kg_id}")
     check("DELETE /kg/triples/{id} -> 204", st == 204, f"got {st}")
 
 check("DELETE nonexistent triple -> 404",
-      req("DELETE", "/kg/triples/kg_never_exists")[0] == 404)
+      req("DELETE", "/v1/kg/triples/kg_never_exists")[0] == 404)
 
 # ─── 9. CLEANUP ──────────────────────────────────────────────
 section("9. Cleanup (delete all test memories)")

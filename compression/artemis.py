@@ -611,8 +611,16 @@ class ARTEMISEngine(CompressionEngine):
         vectors, _ = _tfidf_vectors(sentences)
         scores = _anchored_textrank(sentences, vectors, anchored_indices)
 
-        # Phase 4: MMR selection to a target length.
-        target_length = int(original_chars * self._target_ratio)
+        # Phase 4: MMR selection to a target length. Caller's
+        # request.target_ratio overrides the constructor default —
+        # without this, every distill() with a different ratio produced
+        # identical output (Codex audit P2, 2026-04-25).
+        effective_ratio = (
+            request.target_ratio
+            if request.target_ratio and request.target_ratio > 0
+            else self._target_ratio
+        )
+        target_length = int(original_chars * effective_ratio)
         selected = _mmr_select(
             sentences, scores, vectors, target_length, anchored_indices,
         )
@@ -703,7 +711,7 @@ class ARTEMISEngine(CompressionEngine):
                 "anchored_sentences": len(anchored_indices),
                 "selected": len(selected),
                 "total_sentences": len(sentences),
-                "target_ratio": self._target_ratio,
+                "target_ratio": effective_ratio,
                 "quality_source": "artemis_self_report",
             },
         )
