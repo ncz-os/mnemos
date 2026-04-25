@@ -92,6 +92,21 @@ test:integration:
         fi
         sleep 1
       done
+    # Pre-create roles that install.py / installer/db.py create before migrations.
+    # The migrations themselves GRANT to these roles but do not create them, so
+    # CI must seed them first or migrations_v1_multiuser.sql:193 fails.
+    - |
+      psql -h postgres -U postgres -d mnemos_test -v ON_ERROR_STOP=1 <<'SQL'
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'mnemos_user') THEN
+          CREATE ROLE mnemos_user LOGIN PASSWORD 'test';
+        END IF;
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'mnemos') THEN
+          CREATE ROLE mnemos LOGIN PASSWORD 'test';
+        END IF;
+      END $$;
+      SQL
     # Apply migrations in the canonical order (mirrors install.py / installer/db.py).
     # Keep this list in sync with both Python loaders. Newer migrations added
     # at the end (the v3_2_2 + v3_3 ones still need adding to install.py).
