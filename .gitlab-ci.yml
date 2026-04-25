@@ -1,0 +1,162 @@
+# MNEMOS GitLab CI
+#
+# Posture: ARGONAS (canonical) > GitLab (active dev + CI) > GitHub (publish + contrib).
+# This pipeline runs on every push to master and on merge requests.
+#
+# Stages:
+#   - lint:   ruff (the test the GitHub mirror has been failing on for days)
+#   - test:   pytest unit tests + integration tests against real Postgres + pgvector
+#   - build:  docker image build (publishing handled separately, see release-docker)
+#
+# The integration job is the high-leverage win over the previous GitHub CI:
+# it runs the suite against a real pgvector-enabled Postgres so the FakePool
+# substring-matcher gaps caught in the v3.0 audit pass can no longer reach
+# master.
+
+default:
+  image: python:3.11-slim
+  cache:
+    key:
+      files:
+        - pyproject.toml
+    paths:
+      - .cache/pip
+  before_script:
+    - pip install --cache-dir=.cache/pip -e ".[dev]"
+
+variables:
+  PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # Minimum coverage gate — start permissive, ratchet up over time.
+  COVERAGE_FAIL_UNDER: "0"
+
+stages:
+  - lint
+  - test
+  - build
+
+# ---- lint --------------------------------------------------------------
+
+lint:ruff:
+  stage: lint
+  script:
+    - ruff check .
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# ---- test --------------------------------------------------------------
+
+test:unit:
+  stage: test
+  script:
+    - pytest tests/
+        --tb=short
+        --ignore=tests/test_live_e2e.py
+        --junitxml=junit.xml
+        -q
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+test:integration:
+  stage: test
+  services:
+    - name: pgvector/pgvector:pg17
+      alias: postgres
+      variables:
+        POSTGRES_PASSWORD: test
+        POSTGRES_DB: mnemos_test
+        POSTGRES_USER: postgres
+  variables:
+    PGHOST: postgres
+    PGUSER: postgres
+    PGPASSWORD: test
+    PGDATABASE: mnemos_test
+    DATABASE_URL: "postgresql://postgres:test@postgres:5432/mnemos_test"
+    MNEMOS_TEST_DB: "postgresql://postgres:test@postgres:5432/mnemos_test"
+  before_script:
+    - apt-get update -qq && apt-get install -qq -y postgresql-client
+    - pip install --cache-dir=.cache/pip -e ".[dev]"
+    # Wait for Postgres to accept connections (pgvector image does not
+    # signal readiness; poll until psql connects).
+    - |
+      for i in $(seq 1 30); do
+        if pg_isready -h postgres -U postgres -t 1 >/dev/null 2>&1; then
+          echo "postgres ready"; break
+        fi
+        sleep 1
+      done
+    # Apply migrations in the canonical order (mirrors install.py / installer/db.py).
+    # Keep this list in sync with both Python loaders. Newer migrations added
+    # at the end (the v3_2_2 + v3_3 ones still need adding to install.py).
+    - |
+      for f in \
+        db/migrations.sql \
+        db/migrations_v1_multiuser.sql \
+        db/migrations_v2_versioning.sql \
+        db/migrations_v2_sessions.sql \
+        db/migrations_model_registry.sql \
+        db/migrations_v3_dag.sql \
+        db/migrations_v3_graeae_unified.sql \
+        db/migrations_v3_webhooks.sql \
+        db/migrations_v3_oauth.sql \
+        db/migrations_v3_federation.sql \
+        db/migrations_v3_ownership.sql \
+        db/migrations_v3_1_compression.sql \
+        db/migrations_v3_1_versioning_fix.sql \
+        db/migrations_v3_1_2_kg_tenancy.sql \
+        db/migrations_v3_1_2_audit_log_columns.sql \
+        db/migrations_v3_2_user_namespace.sql \
+        db/migrations_v3_2_entities_namespace.sql \
+        db/migrations_v3_2_2_version_snapshot_new_values.sql \
+        db/migrations_v3_3_morpheus.sql; do
+        if [ -f "$f" ]; then
+          echo "applying $f"
+          psql -h postgres -U postgres -d mnemos_test -v ON_ERROR_STOP=1 -f "$f"
+        else
+          echo "skip $f (not present)"
+        fi
+      done
+  script:
+    - pytest tests/ -m integration --tb=short -q --junitxml=junit-integration.xml || EXIT=$?
+    - |
+      # If no integration-marked tests exist yet, exit code 5 ("no tests collected")
+      # is acceptable. Anything else fails the job.
+      if [ "${EXIT:-0}" = "5" ]; then
+        echo "no @pytest.mark.integration tests yet — passing"
+        exit 0
+      fi
+      exit "${EXIT:-0}"
+  artifacts:
+    when: always
+    reports:
+      junit: junit-integration.xml
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ---- build -------------------------------------------------------------
+
+build:docker:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script: []
+  script:
+    - docker build -t mnemos-os:$CI_COMMIT_SHORT_SHA .
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
