@@ -67,7 +67,7 @@ install_tracing()  # no-op unless opentelemetry is installed
 if os.getenv("MNEMOS_STRUCTURED_LOGS", "").lower() in ("1", "true", "yes"):
     install_structured_logging()
 
-app = FastAPI(title="MNEMOS API", version="3.2.1", description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway", lifespan=lifespan)
+app = FastAPI(title="MNEMOS API", version="3.2.2", description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway", lifespan=lifespan)
 
 # ── Request body size limit (SEC-04) ──────────────────────────────────────────
 # Default 5 MB. Override via MAX_BODY_BYTES env var.

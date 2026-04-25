@@ -57,7 +57,7 @@ class _FakeEngine:
 def test_resolve_no_selectors_returns_none(monkeypatch):
     conn = _Conn()
     _install(monkeypatch, conn)
-    engine = _FakeEngine(["openai", "anthropic"])
+    engine = _FakeEngine(["openai", "claude"])
 
     result = asyncio.run(consultations._resolve_selection(
         engine=engine, models=None, providers=None, tier=None,
@@ -88,12 +88,14 @@ def test_resolve_providers_maps_to_null_overrides(monkeypatch):
     per-provider default."""
     conn = _Conn()
     _install(monkeypatch, conn)
-    engine = _FakeEngine(["openai", "anthropic", "groq"])
+    engine = _FakeEngine(["openai", "claude", "groq"])
 
+    # Caller passes registry-side name "anthropic"; handler normalises
+    # to the GRAEAE engine key "claude" so consult()'s filter matches.
     result = asyncio.run(consultations._resolve_selection(
         engine=engine, models=None, providers=["openai", "anthropic"], tier=None,
     ))
-    assert result == {"openai": None, "anthropic": None}
+    assert result == {"openai": None, "claude": None}
 
 
 def test_resolve_providers_unknown_raises_400(monkeypatch):
@@ -121,7 +123,7 @@ def test_resolve_models_looks_up_provider_per_model(monkeypatch):
         {"provider": "anthropic", "model_id": "claude-opus-4-6"},
     ])
     _install(monkeypatch, conn)
-    engine = _FakeEngine(["openai", "anthropic"])
+    engine = _FakeEngine(["openai", "claude"])
 
     result = asyncio.run(consultations._resolve_selection(
         engine=engine,
@@ -130,7 +132,7 @@ def test_resolve_models_looks_up_provider_per_model(monkeypatch):
     ))
     assert result == {
         "openai": "gpt-5.2-chat-latest",
-        "anthropic": "claude-opus-4-6",
+        "claude": "claude-opus-4-6",
     }
 
 
@@ -164,14 +166,14 @@ def test_resolve_tier_frontier_returns_registry_slice(monkeypatch):
         {"provider": "gemini",    "model_id": "gemini-3-pro-preview"},
     ])
     _install(monkeypatch, conn)
-    engine = _FakeEngine(["openai", "anthropic", "gemini"])
+    engine = _FakeEngine(["openai", "claude", "gemini"])
 
     result = asyncio.run(consultations._resolve_selection(
         engine=engine, models=None, providers=None, tier="frontier",
     ))
     assert result == {
         "openai": "gpt-5.2-chat-latest",
-        "anthropic": "claude-opus-4-6",
+        "claude": "claude-opus-4-6",
         "gemini": "gemini-3-pro-preview",
     }
     # Verify the SQL scoped to frontier criteria (arena_rank <= 5 OR graeae_weight >= 0.95)

@@ -374,7 +374,7 @@ async def federation_feed(
         )
         for r in rows
     ]
-    next_cursor = rows[-1]["updated"].isoformat() if rows and rows[-1]["updated"] else None
+    next_cursor = (rows[-1]["updated"].isoformat() + "Z") if rows and rows[-1]["updated"] else None
 
     return FederationFeedResponse(
         memories=memories,
