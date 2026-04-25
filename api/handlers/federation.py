@@ -6,9 +6,10 @@ Two halves:
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid as _uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -290,9 +291,17 @@ async def federation_feed(
     since_ts: Optional[datetime] = None
     if since:
         try:
-            since_ts = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            _parsed = datetime.fromisoformat(since.replace("Z", "+00:00"))
         except ValueError:
             raise HTTPException(status_code=422, detail="since must be ISO 8601")
+        # Memories are stored as `timestamp without time zone` in UTC by
+        # convention. If the input carried an offset, convert to UTC first
+        # so the wall-clock matches what's stored; if it was naive, assume
+        # the caller already meant UTC. Either way, strip tzinfo so asyncpg
+        # can bind it against the naive column.
+        if _parsed.tzinfo is not None:
+            _parsed = _parsed.astimezone(timezone.utc)
+        since_ts = _parsed.replace(tzinfo=None)
 
     namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
     categories = [s.strip() for s in category.split(",") if s.strip()] if category else []
@@ -352,7 +361,7 @@ async def federation_feed(
             subcategory=r["subcategory"],
             created=r["created"].isoformat(),
             updated=r["updated"].isoformat() if r["updated"] else None,
-            metadata=dict(r["metadata"]) if r["metadata"] else None,
+            metadata=(json.loads(r["metadata"]) if isinstance(r["metadata"], str) else (dict(r["metadata"]) if r["metadata"] else None)),
             quality_rating=r["quality_rating"],
             verbatim_content=r["verbatim_content"],
             owner_id=r["owner_id"],

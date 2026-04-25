@@ -519,6 +519,46 @@ async def verify_audit_chain(
     )
 
 
+# ── Static muse / mode listings ────────────────────────────────────────────────
+# MUST be declared BEFORE the parametric /{consultation_id} route below so
+# FastAPI doesn't try to parse "muses" or "modes" as a UUID and 500 in asyncpg.
+
+@router.get("/consultations/muses")
+async def list_muses(_: UserContext = Depends(get_current_user)):
+    """List the live GRAEAE muse manifest.
+
+    Pulls model + weight + api shape from the engine's in-memory provider
+    map, which is auto-refreshed from model_registry at startup and on
+    /admin/graeae/reload-providers. Operators can use this to confirm the
+    daily provider sync rotated to current model_ids.
+    """
+    from graeae.engine import get_graeae_engine
+    engine = get_graeae_engine()
+    muses = []
+    for name, cfg in engine.providers.items():
+        muses.append({
+            "name": name,
+            "model": cfg.get("model"),
+            "weight": cfg.get("weight"),
+            "api": cfg.get("api"),
+            "key_name": cfg.get("key_name"),
+        })
+    return {"count": len(muses), "muses": muses}
+
+
+@router.get("/consultations/modes")
+async def list_modes(_: UserContext = Depends(get_current_user)):
+    """List supported consultation routing modes."""
+    return {
+        "modes": [
+            {"name": "auto",     "description": "engine picks based on task_type"},
+            {"name": "local",    "description": "force local-only muses (no commercial APIs)"},
+            {"name": "external", "description": "force external commercial muses"},
+            {"name": "all",      "description": "fan out to every available muse"},
+        ]
+    }
+
+
 # ── Dynamic /{consultation_id} routes (declared after static /audit above) ────
 
 @router.get("/consultations/{consultation_id}")

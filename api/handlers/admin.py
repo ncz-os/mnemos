@@ -528,3 +528,22 @@ async def compression_enqueue_all(
             n = 0
 
     return CompressionEnqueueAllResponse(enqueued=n, reason=request.reason)
+
+
+# ── GRAEAE provider manifest ──────────────────────────────────────────────────
+
+@router.post("/graeae/reload-providers")
+async def reload_graeae_providers(_: UserContext = Depends(require_root)):
+    """Refresh the GRAEAE muse manifest from model_registry.
+
+    Lets the daily provider /v1/models cron rotate model_ids in-process
+    without restarting the container. Returns a dict of changes.
+    """
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    from graeae.engine import get_graeae_engine
+    changes = await get_graeae_engine().reload_from_registry(_lc._pool)
+    return {"changes": changes, "providers": {
+        n: {"model": cfg["model"], "weight": cfg["weight"]}
+        for n, cfg in get_graeae_engine().providers.items()
+    }}

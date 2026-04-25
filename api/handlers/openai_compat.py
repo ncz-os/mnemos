@@ -24,7 +24,18 @@ from pydantic import BaseModel
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
-from graeae.engine import get_graeae_engine
+from graeae.engine import get_graeae_engine, _REGISTRY_MAP
+
+# Reverse the engine's _REGISTRY_MAP so we can translate the
+# model_registry's `provider` column (e.g. "anthropic") back into the
+# GRAEAE-engine provider key (e.g. "claude") that engine.route() looks
+# up via self.providers. Only `anthropic → claude` actually flips today,
+# but build the full reverse so future mismatches are absorbed
+# automatically without touching this resolver.
+_REGISTRY_PROVIDER_TO_GRAEAE: Dict[str, str] = {
+    cfg["registry_provider"]: name
+    for name, cfg in _REGISTRY_MAP.items()
+}
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["openai"])
@@ -320,11 +331,24 @@ def _fallback_provider_from_name(model: str) -> Optional[str]:
 async def _resolve_provider_for_model(model: str) -> Optional[str]:
     """Look up `model` in model_registry and return its provider.
 
-    Falls back to the substring-match heuristic (matched against
-    `_FALLBACK_PROVIDER_MAP`) when the registry has no row for this
-    exact model_id — this preserves behavior for operators who run
-    without a seeded registry. Returns None if both lookups fail;
-    the caller surfaces that as a 400.
+    Two lookup attempts so callers can use either the bare upstream
+    model_id (which may itself contain slashes like `meta/llama-3.3-70b-
+    instruct` for NVIDIA or `Qwen/Qwen3-235B-A22B-Instruct-2507-tput`
+    for Together) OR the gateway-namespaced form
+    `<graeae_provider>/<bare_api_id>`:
+
+      1. Direct: WHERE model_id = $1 — matches a bare slash-bearing
+         id verbatim against the registry.
+      2. Namespaced: split on the first `/`; require the head to match
+         a registered provider AND the tail to match its model_id. Only
+         strips the prefix when the head is actually a GRAEAE provider,
+         so a bare `meta/llama-3.3-70b-instruct` doesn't get truncated
+         by accident (since `meta` isn't a provider in the registry).
+
+    Falls back to the substring-match heuristic when both lookups
+    miss — preserves behavior for fresh installs without a seeded
+    registry. Returns None if everything fails; the caller surfaces
+    that as a 400.
     """
     if _lc._pool is not None:
         try:
@@ -335,8 +359,34 @@ async def _resolve_provider_for_model(model: str) -> Optional[str]:
                     "  AND available = true AND deprecated = false",
                     model,
                 )
-            if row is not None:
-                return row["provider"]
+                if row is not None:
+                    # Translate registry provider name → GRAEAE provider name.
+                    # The registry stores Anthropic models under "anthropic"
+                    # but GRAEAE's engine knows that provider as "claude";
+                    # without this normalization, engine.route("anthropic", ...)
+                    # 503s with "provider 'anthropic' not registered".
+                    return _REGISTRY_PROVIDER_TO_GRAEAE.get(
+                        row["provider"], row["provider"],
+                    )
+                if "/" in model:
+                    head, tail = model.split("/", 1)
+                    # Accept either a registry provider name OR a GRAEAE
+                    # provider name as the head — both forms appear in
+                    # the wild. Map the head to its registry name for
+                    # the WHERE clause.
+                    head_registry = _REGISTRY_MAP.get(
+                        head, {"registry_provider": head}
+                    )["registry_provider"]
+                    row = await conn.fetchrow(
+                        "SELECT provider FROM model_registry "
+                        "WHERE provider = $1 AND model_id = $2 "
+                        "  AND available = true AND deprecated = false",
+                        head_registry, tail,
+                    )
+                    if row is not None:
+                        return _REGISTRY_PROVIDER_TO_GRAEAE.get(
+                            row["provider"], row["provider"],
+                        )
         except Exception as exc:
             logger.warning(
                 "[MNEMOS] model_registry lookup failed for model=%s: %s",
@@ -392,8 +442,29 @@ async def _route_to_provider(
     )
 
     try:
+        # Strip ONLY a leading `<provider>/` namespace that matches the
+        # resolved provider — many upstream APIs use slash-bearing model
+        # IDs natively (NVIDIA: `meta/llama-3.3-70b-instruct`, Together:
+        # `meta-llama/Llama-3.3-70B-Instruct-Turbo`, `Qwen/Qwen3-235B-…`),
+        # so a blanket "strip the first slash" rule would corrupt those.
+        # Two equivalent prefixes are recognised:
+        #   - GRAEAE name (e.g. `claude/`)
+        #   - registry name (e.g. `anthropic/`) — what /v1/models surfaces
+        # Only one is stripped; org-style prefixes the caller passes
+        # through untouched (e.g. plain `meta-llama/Llama-…` is already
+        # in the upstream API's expected shape).
+        candidate_prefixes = [f"{provider}/"]
+        if provider in _REGISTRY_MAP:
+            registry_name = _REGISTRY_MAP[provider]["registry_provider"]
+            if registry_name != provider:
+                candidate_prefixes.append(f"{registry_name}/")
+        bare_model = model
+        for pfx in candidate_prefixes:
+            if model.startswith(pfx):
+                bare_model = model[len(pfx):]
+                break
         # Use GRAEAE single-provider route (no consensus, just direct call)
-        response = await graeae.route(provider, model, prompt, task_type="reasoning", timeout=30)
+        response = await graeae.route(provider, bare_model, prompt, task_type="reasoning", timeout=30)
 
         if response.get("status") == "success":
             return response.get("response_text", "")
