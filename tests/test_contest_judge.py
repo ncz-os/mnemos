@@ -17,9 +17,7 @@ candidate.judge_model is stamped on winners.
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
 
-import pytest
 
 from compression.base import (
     CompressionEngine,

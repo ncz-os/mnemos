@@ -15,7 +15,6 @@ import re
 from pathlib import Path
 from typing import Iterable
 
-import pytest
 
 
 REPO_ROOT = Path(__file__).parent.parent

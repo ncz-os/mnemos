@@ -62,7 +62,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import sys
 import time
 import urllib.error
@@ -70,7 +69,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 MPF_VERSION = "0.1.0"
 # Adapter translates Cognee nodes → MNEMOS memory shape. Cognee-native
@@ -471,7 +470,6 @@ async def _collect(
         if not src or not tgt:
             continue
         src_type = node_type_index.get(src, "")
-        tgt_type = node_type_index.get(tgt, "")
 
         # Canonical structural chunk → document.
         if rel == "is_part_of" and src_type == "DocumentChunk":

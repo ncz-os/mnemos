@@ -36,7 +36,6 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -212,23 +211,28 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     p_json = sub.add_parser("json", help="Emit MPF envelope (big JSON)")
-    _add_common(p_json); _add_fetch_args(p_json)
+    _add_common(p_json)
+    _add_fetch_args(p_json)
     p_json.set_defaults(func=cmd_json)
 
     p_jsonl = sub.add_parser("jsonl", help="Emit JSONL (one MPF record per line)")
-    _add_common(p_jsonl); _add_fetch_args(p_jsonl)
+    _add_common(p_jsonl)
+    _add_fetch_args(p_jsonl)
     p_jsonl.set_defaults(func=cmd_jsonl)
 
     p_md = sub.add_parser("markdown", help="Emit Markdown (human-readable)")
-    _add_common(p_md); _add_fetch_args(p_md)
+    _add_common(p_md)
+    _add_fetch_args(p_md)
     p_md.set_defaults(func=cmd_markdown)
 
     p_html = sub.add_parser("html", help="Emit HTML (human-readable)")
-    _add_common(p_html); _add_fetch_args(p_html)
+    _add_common(p_html)
+    _add_fetch_args(p_html)
     p_html.set_defaults(func=cmd_html)
 
     p_txt = sub.add_parser("text", help="Emit plain text")
-    _add_common(p_txt); _add_fetch_args(p_txt)
+    _add_common(p_txt)
+    _add_fetch_args(p_txt)
     p_txt.set_defaults(func=cmd_text)
 
     p_stats = sub.add_parser("stats", help="Print /stats response")

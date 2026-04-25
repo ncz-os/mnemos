@@ -50,7 +50,6 @@ import time
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 
 from .base import (
     CompressionEngine,

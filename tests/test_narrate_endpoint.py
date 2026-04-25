@@ -9,7 +9,6 @@ this file validates the HTTP surface + handler logic.
 """
 from __future__ import annotations
 
-import datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
