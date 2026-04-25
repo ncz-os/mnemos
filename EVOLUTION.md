@@ -12,6 +12,39 @@ forward as architecture changes land.
 
 ---
 
+## Development timeline
+
+The version sections below tell the story in detail. This is the
+five-month at-a-glance — when each piece landed, and what shape the
+codebase took along the way.
+
+| Date | Milestone |
+|---|---|
+| 2025-11 | Pre-history. A shell script (`auto_hydrate.sh`) + ChromaDB on a Mac Studio Ultra serving ~1,808 conversation chunks exported from prior Claude sessions. The thing was called *Rehydrator*. No FastAPI, no Postgres, no graph. |
+| 2025-12-03 | Design review (`DESIGN_REVIEW_FOR_GPT_GEMINI.md`) names the failure mode in one line: *"vector search finds similar text, not connected meaning."* The graph-aware design starts here. |
+| 2025-12 | **v1.0.0** — single-file FastAPI server. PostgreSQL + pgvector chosen as the backing store on day one. GRAEAE runs as a separate service on port 5001. *Rehydrator* → **MNEMOS** rename (Mnemosyne, Titan of memory). Persistent, inspectable, attributable, operationally reliable — the non-negotiables. |
+| 2026-01 | Multi-provider GRAEAE consensus design + first eight provider integrations (Mistral, Qwen, DeepSeek, Gemini, OpenAI, Groq, Perplexity, Together). Per-provider circuit breaker prototype. The single-file server starts hitting its maintainability ceiling around 2,000 lines. |
+| 2026-02 | **v2.0.0** — single-file → `api/handlers/` package refactor. `asyncpg` replaces `psycopg2`; connection pooling lands (`min=5, max=20`, never revisited). Real pgvector semantic search replaces grep-in-Python. Per-provider circuit breakers (CLOSED / OPEN / HALF_OPEN, 5-minute cooldown) ship. |
+| 2026-03 | Knowledge graph schema design — subject / predicate / object with temporal validity windows. Memory versioning trigger drafted. Cryptographic audit chain (SHA-256) prototyped. Multi-user RLS foundation via PostgreSQL session variables. The first attempt at the column-naming convention that the v2.3 release would later force a five-bug cleanup of. |
+| 2026-04-12 | **v2.3.0** — knowledge graph (`/kg/triples`, `/kg/timeline/{subject}`), journal, key-value state, entity tracking, model registry, LETHE compression (Tier 1, CPU), full audit chain, multi-user RLS, memory versioning with diff/revert. The painful release — five `created_at` column bugs, missing `kg_triples` migration on fresh installs, FK type mismatch (`UUID` vs `TEXT`) caught at first insert, port 5000 → 5002 move. |
+| 2026-04-19 | **v2.4.0** (consolidation, not public) — OpenAI-compatible gateway (`/v1/chat/completions`, `/v1/models`) with optional memory injection. Stateful session management (`/sessions/*`). DAG versioning — git-like branch / merge / revert on memory history. MOIRAI compression triad (LETHE / ALETHEIA / ANAMNESIS) with quality manifests on every transformation. The shape of v3 is locked. |
+| 2026-04-22 | **v3.0.0-beta** — MNEMOS + GRAEAE unify on port 5002. Webhooks (HMAC-SHA256, SSRF defense, durable retry log). OAuth / OIDC (Google / GitHub / Azure AD / generic) with `email_verified` cross-provider linking guard. Cross-instance federation with `permission_mode` per-memory opt-in and `federation_source` loop prevention. Self-maintaining model registry (`provider_sync` daily, Arena.ai Elo quarterly). Per-owner multi-tenant scoping on memories / consultations / state / journal / entities. Atomic consultation persistence under `pg_advisory_xact_lock`. Twenty-two FK edges with explicit `ON DELETE`. Two-pass release-gate audit (self + Codex re-audit) catches five P0 issues including a hardcoded production bearer in the Docling export tool. |
+| 2026-04-22 | OpenClaw PR #70224 merged — first upstream contribution from the MNEMOS testing surface. The "we give as well as take" principle starts being load-bearing instead of aspirational. |
+| 2026-04-23 | **v3.1.0** — Plugin `CompressionEngine` ABC + competitive contest framework + persisted audit log across three built-in engines. GPU circuit breaker. Admin enqueue endpoints. First real benchmark on 49 PYTHIA memories with `gemma-4-E4B` as judge on CERBERUS reveals ALETHEIA scored 0/49 contest wins — its index-list prompt doesn't survive instruction-tuned generalist LLMs. ALETHEIA retired from default contest the same day. Benchmark write-up: `docs/benchmarks/compression-2026-04-23.md`. |
+| 2026-04-23 | Federation → fault-tolerance pivot. The cross-instance feed model from v3.0.0-beta turns out to be the wrong primitive for a single operator running multiple boxes; what was actually needed was HA. Move to `pg_auto_failover` (TYPHON monitor, PYTHIA primary, CERBERUS standby). ARGONAS reconciled against public master via 156-commit Codex triage (6 KEEP / 137 SKIP / 13 DROP). |
+| 2026-04-24 | **v3.2.x bug-fix tail** — APOLLO LLM-fallback emits a startup warning when GPU isn't reachable; flag flipped off in PYTHIA prod after the 49-mem run showed 4.4% win-rate didn't justify the GPU cost. Apollo schema false-positive guards across five schemas (commit / code / decision / event / person). Artemis labeled-block assembly + sentence-span tracking rewrite. Scoring math fix in the contest (multiplicative profile-weight constants → exponentiated weights, so winner ordering actually depends on profile). 654/654 tests pass on CERBERUS. |
+| 2026-04-24 | **v3.3.0-alpha** — MORPHEUS dream-state subsystem slice 1 lands (begin / finish / rollback runs, replay phase real, cluster + synthesise as stubs). MCP HTTP/SSE bridge (`mcp_http_server.py`) for ChatGPT Pro Developer Mode + any remote MCP client that needs an HTTPS URL. KNOSSOS / CHARON positioning as *gifts to other memory systems* (MemPalace, Mem0, Letta, Graphiti, Cognee) with concrete upstream-PR commitments. The compression stack settles to two engines (APOLLO + ARTEMIS); LETHE / ANAMNESIS / ALETHEIA become evolutionary history. `EVOLUTION.md`, `ROADMAP.md`, and `docs/connectors/` written for the first public release. |
+
+Roughly five months. One developer with three reviewers (Codex, GRAEAE
+multi-LLM consensus, occasional Sonnet / Opus passes for design). Several
+rounds of audit-driven rework — every major surface in v3.0.0-beta has had
+its seams moved at least once, on evidence rather than vibes. The point of
+the timeline is not the version count; it's that nothing here is a
+two-week-sprint prototype, and every architectural seam has paid for
+itself in a real failure mode at least once.
+
+---
+
 ## v1.0.0 — December 2025 — "a file that doesn't disappear"
 
 ### The story that started it all
@@ -343,6 +376,60 @@ original v3 PRs had claimed but not delivered. The ones worth remembering:
   The original was accurate on the narrow technical points but wrong
   in spirit for a first-public-release document. Competitors deserve
   respect; we would want the same.
+
+---
+
+## v3.2 tail — April 2026 — "the compression stack settles to two"
+
+The MOIRAI triad shipped in v3.1 (LETHE / ALETHEIA / ANAMNESIS) didn't
+survive its first real benchmark. That benchmark — 49 memories from
+PYTHIA's actual corpus, run through gemma-4-E4B as the judge on
+CERBERUS — surfaced concrete problems with each engine that the
+unit-test suite hadn't caught:
+
+- **ALETHEIA** scored 0 contest wins. Its index-list prompt
+  ("return the indices of the sentences to keep") doesn't survive
+  instruction-tuned generalist LLMs; modern Gemma / Llama / Qwen
+  flavors paraphrase the input rather than emitting an index list.
+  Retired from the default contest 2026-04-23. The benchmark write-up
+  is in `docs/benchmarks/compression-2026-04-23.md`.
+- **LETHE** worked, but its extractive path missed the structured-
+  span treatment (protected identifiers, labeled blocks like
+  `**Field**: value`, code fences) that real prose memories carry.
+- **ANAMNESIS** worked, but its role — LLM-driven fact extraction —
+  was already subsumable by APOLLO's LLM fallback path: when APOLLO
+  doesn't recognize a schema, it falls back to "generic fact
+  extraction with identifier preservation," which is what ANAMNESIS
+  was. Two engines were doing the same job.
+
+The settlement, landed in the v3.2 tail:
+
+- **APOLLO** (gpu_optional) — schema-aware dense encoding for
+  LLM-to-LLM wire use. Portfolio, decision, person, event, code, and
+  commit schemas as of v3.2.4. LLM-fallback path covers anything that
+  doesn't match a schema.
+- **ARTEMIS** (cpu_only) — extractive with identifier preservation,
+  labeled-block handling, evidence-based self-scoring. Replaces
+  LETHE in the going-forward stack.
+- **The contest framework itself** stays untouched. Adding APOLLO
+  and ARTEMIS, retiring the others, was a registration change in
+  `compression/manager.py` plus a benchmark-driven decision recorded
+  in the manifest. No platform churn.
+
+The takeaway for contributors: compression engines are not features
+operators register against; they are architectural choices we
+revisit when benchmark evidence demands. The contest's value is
+exactly that we can evaluate, retire, and replace engines without
+breaking the platform around them. LETHE / ANAMNESIS / ALETHEIA
+remain in the codebase as evolutionary history — see
+`compression/{lethe,anamnesis,aletheia}.py` for what each was —
+but the going-forward names are APOLLO and ARTEMIS. The pantheon
+moved on.
+
+When MORPHEUS (v3.3+) and PERSEPHONE (v3.6+) land, the same
+naming convention extends: each subsystem is a Greek name that
+maps to its function. Engines that turn out to be wrong don't get
+renamed; they get retired and the history gets recorded here.
 
 ---
 
