@@ -1,0 +1,35 @@
+name: PR check (lint + unit)
+
+# Slim PR-only check so external contributors get green/red signal on
+# their PRs. The full pipeline (lint + unit + integration with real
+# pgvector + build) lives on GitLab and runs on master merges.
+# See ~/.claude/rules/gitlab-ci-policy.md or MNEMOS memory
+# "gitlab ci policy" for the fleet pattern.
+
+on:
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  lint-and-unit:
+    name: ruff + pytest unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Install dependencies
+        run: |
+          uv venv .venv --python 3.11
+          uv pip install --python .venv/bin/python -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: .venv/bin/ruff check .
+
+      - name: Unit tests
+        run: .venv/bin/pytest tests/ --tb=short --ignore=tests/test_live_e2e.py -q
