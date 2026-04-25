@@ -95,6 +95,68 @@ Three reasons:
    about making MNEMOS easy to wire into the agent surfaces that
    people in our audience already use, not about market displacement.
 
+## The pantheon gives gifts
+
+The subsystem names are Greek on purpose. MNEMOS (memory itself, the
+mother of the Muses), GRAEAE (the three grey sisters who shared one
+eye — multi-LLM consensus), LETHE (the river of forgetting —
+compression), ANAMNESIS (recollection — fact extraction), APOLLO and
+ARTEMIS (twin deities, twin compression engines), CHARON (the
+ferryman between worlds — memory portability), KNOSSOS (the palace
+at Crete where Linear A/B tablets first institutionalised writing-
+as-memory — the MemPalace-compatible MCP shim), MORPHEUS (the god of
+dreams who shapes — the dream-state synthesiser). Each name maps to
+a function. The convention isn't decoration; it's how we keep the
+architecture's intent legible across releases.
+
+In the mythology, the gods give gifts. Prometheus brought fire.
+Demeter brought grain. Athena brought olive cultivation and weaving.
+Each was specific, each was useful, each strengthened the mortal
+world rather than diminishing the giver. KNOSSOS and CHARON sit in
+that lineage:
+
+- **KNOSSOS** is a portal into MNEMOS's storage substrate that
+  speaks MemPalace's tool vocabulary (wings, rooms, drawers,
+  tunnels, diaries) byte-for-byte. Existing MemPalace-targeting
+  agents — every Claude Code prompt, every harness — keep working
+  when their owner's workload outgrows what file-backed local-first
+  storage can handle. No migration, no code changes in the agent.
+- **CHARON** is the ferryman between memory systems with different
+  schemas. The adapters in `tools/adapters/` carry data across from
+  MemPalace, Mem0, Letta, Graphiti, and Cognee without losing
+  provenance. MPF (Memory Portability Format) is the envelope; each
+  adapter is a translator between a foreign schema and the envelope.
+
+Both are interop gifts, not weapons. The goal is composability —
+operators who run MemPalace alongside MNEMOS get to use both. CHARON
+adapters move data without forcing rewrites. The two-way bridges
+matter more than any single system winning.
+
+This isn't just framing. The pantheon brings tools, AND it picks up
+its hammer when the upstream needs work. We contribute back to
+projects we touch, file issues for bugs we encounter through
+KNOSSOS/CHARON testing, and propose fixes where maintainers are
+open to them. Public evidence:
+
+- **OpenClaw** (`openclaw/openclaw`):
+  [PR #70224](https://github.com/openclaw/openclaw/pull/70224) —
+  critical gateway fix, merged 2026-04-22. Contributor status as
+  @perlowja.
+- **Zeroclaw**: provider-config + backend work in
+  [perlowja/zeroclaw](https://github.com/perlowja/zeroclaw); ongoing.
+- **Hermes Agent**: design-inspiration credit on the zterm-family
+  side; PRs scoped where the runtime intersects MNEMOS's MCP surface.
+- **MemPalace, Mem0, Letta, Graphiti, Cognee**: bug reports and
+  goodwill PRs as we encounter issues testing the CHARON adapters
+  against real instances. v3.4 charter commits to a first wave of
+  2–3 upstream MemPalace contributions before re-engaging on the
+  KNOSSOS bridge RFC there. See `ROADMAP.md` Track 3.
+
+We'll grow this list as PRs land. The principle is simple: when
+KNOSSOS or CHARON adapters surface bugs in upstream memory systems,
+we file them, we propose fixes, and where the maintainers are open
+to it, we ship the fix as a PR. That's the contract.
+
 ## Stability commitments
 
 While `experimental`:
