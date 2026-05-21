@@ -12,6 +12,24 @@ from mnemos.core import config
 from mnemos.core import lifecycle
 from mnemos.persistence import PostgresBackend, SqliteBackend
 
+# Enterprise backends import lazily — protect under try/except so the test
+# module still loads on environments where the optional driver isn't
+# installed. The DSN-detection tests below skip when the class isn't
+# available.
+try:
+    from mnemos.persistence.oracle import OracleBackend  # noqa: F401
+
+    _HAS_ORACLE_BACKEND = True
+except Exception:  # pragma: no cover — driver not installed
+    _HAS_ORACLE_BACKEND = False
+
+try:
+    from mnemos.persistence.db2 import Db2Backend  # noqa: F401
+
+    _HAS_DB2_BACKEND = True
+except Exception:  # pragma: no cover — driver not installed
+    _HAS_DB2_BACKEND = False
+
 
 runner = CliRunner()
 
@@ -242,3 +260,64 @@ async def test_health_returns_active_profile(monkeypatch: pytest.MonkeyPatch, tm
     assert response.profile == "edge"
     assert response.database_connected is True
     assert response.nats_publishing_enabled is True
+
+
+# ─── Enterprise backend DSN detection ─────────────────────────────────────────
+#
+# These tests verify that the runtime config layer recognizes the Oracle and
+# Db2 DSN env vars / schemes. They do NOT open a live pool — that path is
+# covered by tests/test_oracle_live.py and tests/test_db2_live.py.
+#
+# Each test skips if the matching backend module isn't importable (driver not
+# installed) so they stay green on minimal CI.
+
+
+@pytest.mark.skipif(not _HAS_ORACLE_BACKEND, reason="oracledb driver not installed")
+def test_oracle_dsn_selects_oracle_backend(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """ORACLE_DSN or oracle:// scheme on MNEMOS_DATABASE_DSN → backend=oracle."""
+    with _isolated_settings(
+        monkeypatch,
+        tmp_path,
+        env={
+            "MNEMOS_PROFILE": "server",
+            "MNEMOS_DATABASE_DSN": "oracle://MNEMOS:secret@127.0.0.1:1521/ORCLPDB1",
+        },
+    ) as settings:
+        assert settings.profile == "server"
+        # Backend selection should resolve to "oracle" once the DSN scheme is
+        # recognized. The exact attribute name depends on the config plumbing;
+        # at minimum, _select_persistence_backend must return "oracle".
+        assert lifecycle._select_persistence_backend(settings) == "oracle"
+
+
+@pytest.mark.skipif(not _HAS_DB2_BACKEND, reason="ibm_db driver not installed")
+def test_db2_dsn_selects_db2_backend(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """DB2_DSN or db2:// scheme on MNEMOS_DATABASE_DSN → backend=db2."""
+    with _isolated_settings(
+        monkeypatch,
+        tmp_path,
+        env={
+            "MNEMOS_PROFILE": "server",
+            "MNEMOS_DATABASE_DSN": "db2://MNEMOS:secret@127.0.0.1:50000/MNEMOS",
+        },
+    ) as settings:
+        assert settings.profile == "server"
+        assert lifecycle._select_persistence_backend(settings) == "db2"
+
+
+@pytest.mark.skipif(not _HAS_ORACLE_BACKEND, reason="oracledb driver not installed")
+def test_oracle_dsn_envvar_takes_precedence_over_pg_host(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """ORACLE_DSN beats stale PG_HOST when MNEMOS_DATABASE_DSN is unset."""
+    with _isolated_settings(
+        monkeypatch,
+        tmp_path,
+        env={
+            "MNEMOS_PROFILE": "server",
+            "ORACLE_DSN": "oracle://MNEMOS:secret@127.0.0.1:1521/ORCLPDB1",
+            # PG_HOST left at default — ORACLE_DSN should still win.
+        },
+    ) as settings:
+        # Per the precedence table in SPECIFICATION §9.1, the per-backend
+        # ORACLE_DSN env var should select the oracle backend even without
+        # MNEMOS_DATABASE_DSN being set.
+        assert lifecycle._select_persistence_backend(settings) == "oracle"

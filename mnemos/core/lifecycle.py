@@ -1,4 +1,5 @@
 """Shared globals, lifespan, and DB/cache helpers for MNEMOS API."""
+
 import hashlib
 import importlib
 import ipaddress
@@ -17,7 +18,6 @@ from typing import Optional, Protocol
 from urllib.parse import urlparse
 
 import asyncpg
-import httpx
 import redis.asyncio as aioredis
 from fastapi import HTTPException
 
@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 
 class PersistenceBackend(Protocol):
-    async def close(self) -> None:
-        ...
+    async def close(self) -> None: ...
+
 
 # Background task registries — keep finite webhook sends out of the cancel-first
 # worker pool so graceful shutdown can let them finalize their leases.
@@ -53,6 +53,7 @@ _worker_status: dict = {
 
 def _schedule_tracked(coro, registry: set):
     import asyncio as _asyncio
+
     task = _asyncio.create_task(coro)
     registry.add(task)
     task.add_done_callback(registry.discard)
@@ -230,25 +231,13 @@ async def _drain_delivery_attempt_tasks() -> None:
                 _FINAL_CANCEL_WAIT_SECONDS,
             )
 
+
 # DB config sourced from config.PG_CONFIG (env > config.toml > defaults)
 
-# Embedding config (for vector search, MOD-02).
-#
-# The embedding endpoint is BACKEND-AGNOSTIC. The function _get_embedding
-# below auto-detects the wire shape (OpenAI-compat /v1/embeddings vs
-# Ollama-compat /api/embeddings), so the same env var works against:
-#   - llama.cpp llama-server in embeddings mode (CERBERUS/TYPHON/PYTHIA)
-#   - Ollama (dev workstations)
-#   - vLLM with --task embed
-#   - NVIDIA NIM embedding containers (e.g. llama-3.2-nv-embedqa-1b-v2)
-#   - any OpenAI-compatible /v1/embeddings endpoint
-#
-# Canonical env vars are INFERENCE_EMBED_* so embedding config is not
-# tied to any one inference server implementation.
-_PROVIDER_SETTINGS = get_settings().providers
-_EMBED_HOST = _PROVIDER_SETTINGS.inference_embed_host
-_EMBED_MODEL = _PROVIDER_SETTINGS.inference_embed_model
-_EMBED_TIMEOUT = _PROVIDER_SETTINGS.inference_embed_timeout
+# Embedding generation is ALWAYS in-process — see
+# mnemos/runtime/embedder.py. Architectural decision
+# mem_1779334716543_f8ebd4 (operator-locked 2026-05-21). No HTTP
+# dependency on Ollama or any external embedding server.
 
 # ── Singleton globals ────────────────────────────────────────────────────────
 _pool: Optional[asyncpg.Pool] = None
@@ -256,7 +245,7 @@ _pool_manager: Optional[PoolManager] = None
 _persistence_backend: PersistenceBackend | None = None
 _cache: Optional[aioredis.Redis] = None
 _redis_client: Optional[aioredis.Redis] = None
-_rls_enabled: bool = False   # set from config at startup; read by handlers
+_rls_enabled: bool = False  # set from config at startup; read by handlers
 
 
 def _build_postgres_backend(pool, settings):
@@ -309,11 +298,13 @@ def _normalize_backend_name(configured: str) -> str:
         return "postgres"
     if configured in {"sqlite", "sqlite3"}:
         return "sqlite"
+    if configured in {"oracle", "oracledb", "oracle+oracledb"}:
+        return "oracle"
+    if configured in {"db2", "ibm_db2", "ibmdb2", "db2+ibm_db"}:
+        return "db2"
     if configured == "auto":
         return "auto"
-    raise ValueError(
-        f"Unsupported persistence backend {configured!r}; expected postgres, sqlite, or auto"
-    )
+    raise ValueError(f"Unsupported persistence backend {configured!r}; expected postgres, sqlite, oracle, db2, or auto")
 
 
 def _backend_from_database_url(database_url: str) -> str | None:
@@ -321,6 +312,10 @@ def _backend_from_database_url(database_url: str) -> str | None:
         return "sqlite"
     if database_url.startswith(("postgres:", "postgresql:")):
         return "postgres"
+    if database_url.startswith(("oracle:", "oracle+oracledb:")):
+        return "oracle"
+    if database_url.startswith(("db2:", "ibm_db2:", "db2+ibm_db:")):
+        return "db2"
     return None
 
 
@@ -345,6 +340,69 @@ def _database_dsn_from_settings(settings) -> str:
         if database_url.startswith(("postgres:", "postgresql:")):
             return database_url
     return ""
+
+
+def _oracle_dsn_from_settings(settings) -> str:
+    database_settings = getattr(settings, "database", None)
+    if database_settings is None:
+        return ""
+    for field_name in ("dsn", "url"):
+        database_url = getattr(database_settings, field_name, "").strip()
+        if database_url.startswith(("oracle:", "oracle+oracledb:")):
+            return database_url
+    return ""
+
+
+async def _build_oracle_backend(dsn, settings):
+    """Build and open the Oracle persistence backend.
+
+    Per Oracle eng review (O9 / R3): the ``backend.open()`` call after
+    construction validates the production-posture knobs from
+    ``create_oracle_pool`` (statement_cache_size, session_callback,
+    NLS pinning, optional PDB switch) at startup rather than at first
+    request. Mirrors the SQLite and Db2 startup contracts so all
+    backends share the same factory shape.
+    """
+    oracle_module = importlib.import_module("mnemos.persistence.oracle")
+    min_size = PG_CONFIG.get("pool_min_size", 1)
+    max_size = PG_CONFIG.get("pool_max_size", 8)
+    pool = await oracle_module.create_oracle_pool(
+        dsn,
+        min_size=min_size,
+        max_size=max_size,
+        settings=settings,
+    )
+    backend = oracle_module.OracleBackend(pool, settings)
+    await backend.open()
+    return backend
+
+
+def _db2_dsn_from_settings(settings) -> str:
+    database_settings = getattr(settings, "database", None)
+    if database_settings is None:
+        return ""
+    for field_name in ("dsn", "url"):
+        database_url = getattr(database_settings, field_name, "").strip()
+        if database_url.startswith(("db2:", "ibm_db2:", "db2+ibm_db:")):
+            return database_url
+    return ""
+
+
+async def _build_db2_backend(dsn, settings):
+    """Build and open the IBM Db2 persistence backend (ORA-compat).
+
+    ``backend.open()`` runs the ``DB2_VECTOR_INDEXING`` registry probe
+    added in the prior Db2 hardening pass; without this call the probe
+    never fires and operators don't see the actionable startup warning
+    when native vector indexing is disabled.
+    """
+    db2_module = importlib.import_module("mnemos.persistence.db2")
+    min_size = PG_CONFIG.get("pool_min_size", 1)
+    max_size = PG_CONFIG.get("pool_max_size", 8)
+    pool = await db2_module.create_db2_pool(dsn, min_size=min_size, max_size=max_size)
+    backend = db2_module.Db2Backend(pool, settings)
+    await backend.open()
+    return backend
 
 
 def _sqlite_path_from_settings(settings):
@@ -466,6 +524,7 @@ async def _log_federation_startup_guidance(pool: asyncpg.Pool | None) -> None:
 
 # ── App lifespan ─────────────────────────────────────────────────────────────
 
+
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, and workers."""
@@ -487,6 +546,42 @@ async def lifespan(app):
             app.state.pool_manager = None
             app.state.persistence_backend = _persistence_backend
             logger.info("SQLite persistence backend initialized (%s)", sqlite_path)
+        elif backend_type == "oracle":
+            oracle_dsn = _oracle_dsn_from_settings(settings)
+            if not oracle_dsn:
+                raise RuntimeError(
+                    "Oracle backend selected but no oracle:// DSN configured. "
+                    "Set MNEMOS_DATABASE_DSN=oracle://user:pass@host:port/service"
+                )
+            _pool = None
+            _pool_manager = None
+            _persistence_backend = await _build_oracle_backend(oracle_dsn, settings)
+            app.state.pool = None
+            app.state.pool_manager = None
+            app.state.persistence_backend = _persistence_backend
+            logger.info(
+                "Oracle persistence backend initialized (pool min=%s max=%s)",
+                PG_CONFIG.get("pool_min_size"),
+                PG_CONFIG.get("pool_max_size"),
+            )
+        elif backend_type == "db2":
+            db2_dsn = _db2_dsn_from_settings(settings)
+            if not db2_dsn:
+                raise RuntimeError(
+                    "Db2 backend selected but no db2:// DSN configured. "
+                    "Set MNEMOS_DATABASE_DSN=db2://user:pass@host:port/database"
+                )
+            _pool = None
+            _pool_manager = None
+            _persistence_backend = await _build_db2_backend(db2_dsn, settings)
+            app.state.pool = None
+            app.state.pool_manager = None
+            app.state.persistence_backend = _persistence_backend
+            logger.info(
+                "Db2 persistence backend initialized (pool min=%s max=%s)",
+                PG_CONFIG.get("pool_min_size"),
+                PG_CONFIG.get("pool_max_size"),
+            )
         else:
             database_dsn = _database_dsn_from_settings(settings)
             pool_kwargs = {
@@ -515,7 +610,7 @@ async def lifespan(app):
             _pool = wrap_pool_with_timeout(_raw_pool)
             _pool_manager = PoolManager(_pool)
             _persistence_backend = _build_postgres_backend(_pool, settings)
-            app.state.pool = _pool   # auth.py reads this via request.app.state.pool
+            app.state.pool = _pool  # auth.py reads this via request.app.state.pool
             app.state.pool_manager = _pool_manager
             app.state.persistence_backend = _persistence_backend
             logger.info(
@@ -619,6 +714,7 @@ async def lifespan(app):
             scheduled_workers += 1
     if scheduled_workers:
         import asyncio as _asyncio
+
         await _asyncio.sleep(0.5)  # Give worker time to initialize
     elif not worker_enabled:
         logger.info("Background distillation worker disabled")
@@ -627,18 +723,21 @@ async def lifespan(app):
     # OAuth expired-session GC worker (v3.0.0)
     if _pool:
         import asyncio as _asyncio
+
         async def _oauth_gc_loop():
             from mnemos.core.oauth import gc_expired_sessions
+
             while True:
                 try:
                     await _asyncio.sleep(3600)  # hourly
                     deleted = await gc_expired_sessions(_pool)
                     if deleted:
-                        logger.info(f'oauth gc: deleted {deleted} expired sessions')
+                        logger.info(f"oauth gc: deleted {deleted} expired sessions")
                 except _asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.exception('oauth gc iteration failed')
+                    logger.exception("oauth gc iteration failed")
+
         _schedule_worker(_oauth_gc_loop())
 
     # NATS JetStream connection (v4.2 MQ substrate). Optional — if
@@ -646,6 +745,7 @@ async def lifespan(app):
     # and do NOT block startup; publishers fall back to silent skip.
     try:
         from mnemos.nats import connect_nats as _connect_nats
+
         await _connect_nats(settings.nats.url, settings.nats.token)
     except Exception:
         logger.exception("[NATS] startup hook failed; publishing disabled")
@@ -701,6 +801,7 @@ async def lifespan(app):
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
+
 def _get_cache_key(prefix: str, *args) -> str:
     """Generate a stable, prefixed cache key.
 
@@ -749,50 +850,37 @@ def get_redis_client() -> Optional[aioredis.Redis]:
 
 
 async def _get_embedding(text: str) -> list:
-    """Get embedding vector from nomic-embed-text. Returns [] on failure.
+    """Get embedding vector for `text`. Returns [] on failure.
 
-    Accepts either wire format from the configured INFERENCE_EMBED_HOST:
-      * Ollama-compat /api/embeddings: {"prompt": ...} → {"embedding": [...]}
-        (phi_server.py fastembed, Ollama itself)
-      * OpenAI-compat /v1/embeddings: {"input": ...} →
-        {"data": [{"embedding": [...]}]} (llama.cpp server embeddings mode,
-        OpenAI, vLLM)
+    Architectural decision (mem_1779334716543_f8ebd4, operator-locked 2026-05-21):
+    embedding generation is ALWAYS in-process. No HTTP dependency on Ollama or
+    any external embedding server. The model (nomic-embed-text-v1.5.Q8_0.gguf
+    by default, 768-dim) is loaded once per process via llama-cpp-python and
+    held in memory for the lifetime of the worker.
 
-    Tries OpenAI first (newer; faster llama.cpp SYCL path on PYTHIA),
-    falls through to Ollama on 404. The dim depends on the model: 768
-    for nomic-embed-text-v1.5 (PYTHIA default), 512 for bge-small-zh-v1.5
-    (Cix Sky1 NPU substrate). Match the SQLite vec column to your model
-    via MNEMOS_EMBEDDING_DIM (see _DatabaseSettings.embedding_dim).
+    To switch model file, set MNEMOS_EMBED_MODEL_PATH. To switch dim, also
+    update the `memories.embedding vector(N)` column + pgvector index. See
+    mnemos/runtime/embedder.py for env knobs.
     """
-    truncated = text[:2000]
-    try:
-        async with httpx.AsyncClient(timeout=_EMBED_TIMEOUT) as client:
-            r = await client.post(
-                f"{_EMBED_HOST}/v1/embeddings",
-                json={"model": _EMBED_MODEL, "input": truncated},
-            )
-            if r.status_code == 404:
-                r = await client.post(
-                    f"{_EMBED_HOST}/api/embeddings",
-                    json={"model": _EMBED_MODEL, "prompt": truncated},
-                )
-                r.raise_for_status()
-                return r.json().get("embedding", [])
-            r.raise_for_status()
-            data = r.json().get("data") or []
-            if data and isinstance(data[0], dict):
-                return data[0].get("embedding", [])
-            return []
-    except Exception as e:
-        logger.warning(f"[EMBED] Failed to get embedding: {e}")
-        return []
+    from mnemos.runtime.embedder import embed_text
+
+    return await embed_text(text)
 
 
-async def _vector_search(conn, embedding: list, limit: int,
-                         category=None, subcategory=None, select_cols=None,
-                         source_provider=None, source_model=None,
-                         source_agent=None, namespace=None,
-                         owner_id=None, group_ids=None) -> list:
+async def _vector_search(
+    conn,
+    embedding: list,
+    limit: int,
+    category=None,
+    subcategory=None,
+    select_cols=None,
+    source_provider=None,
+    source_model=None,
+    source_agent=None,
+    namespace=None,
+    owner_id=None,
+    group_ids=None,
+) -> list:
     """pgvector cosine similarity search. Returns rows ordered by similarity desc.
 
     The vector is always $1 — used in both the SELECT similarity expression and
@@ -821,16 +909,24 @@ async def _vector_search(conn, embedding: list, limit: int,
     # Dynamic WHERE builder: $1=vec_str, filter params at $2+, limit always last
     params: list = [vec_str]
     conditions: list = ["embedding IS NOT NULL", "deleted_at IS NULL", "archived_at IS NULL"]
-    for col, val in [("category", category), ("subcategory", subcategory),
-                     ("source_provider", source_provider), ("source_model", source_model),
-                     ("source_agent", source_agent), ("namespace", namespace)]:
+    for col, val in [
+        ("category", category),
+        ("subcategory", subcategory),
+        ("source_provider", source_provider),
+        ("source_model", source_model),
+        ("source_agent", source_agent),
+        ("namespace", namespace),
+    ]:
         if val is not None:
             params.append(val)
             conditions.append(f"{col}=${len(params)}")
     if owner_id is not None:
         from mnemos.core.visibility import read_visibility_predicate
+
         clause, vis_params = read_visibility_predicate(
-            owner_id, list(group_ids or []), len(params) + 1,
+            owner_id,
+            list(group_ids or []),
+            len(params) + 1,
         )
         conditions.append(clause)
         params.extend(vis_params)
@@ -838,8 +934,10 @@ async def _vector_search(conn, embedding: list, limit: int,
     limit_ph = f"${len(params)}"
 
     where = " AND ".join(conditions)
-    sql = (f"SELECT {select_cols}, {sim_col} FROM memories "
-           f"WHERE {where} ORDER BY embedding <=> $1::vector LIMIT {limit_ph}")
+    sql = (
+        f"SELECT {select_cols}, {sim_col} FROM memories "
+        f"WHERE {where} ORDER BY embedding <=> $1::vector LIMIT {limit_ph}"
+    )
     try:
         return await conn.fetch(sql, *params)
     except Exception as e:
@@ -847,11 +945,20 @@ async def _vector_search(conn, embedding: list, limit: int,
         return []
 
 
-async def _fts_fetch(conn, query: str, limit: int,
-                     category=None, subcategory=None, select_cols=None,
-                     source_provider=None, source_model=None,
-                     source_agent=None, namespace=None,
-                     owner_id=None, group_ids=None):
+async def _fts_fetch(
+    conn,
+    query: str,
+    limit: int,
+    category=None,
+    subcategory=None,
+    select_cols=None,
+    source_provider=None,
+    source_model=None,
+    source_agent=None,
+    namespace=None,
+    owner_id=None,
+    group_ids=None,
+):
     """FTS search with ILIKE fallback. Shared by /memories/search and /memories/rehydrate.
 
     Uses plainto_tsquery (not to_tsquery) so user input is treated as plain text —
@@ -878,16 +985,24 @@ async def _fts_fetch(conn, query: str, limit: int,
         """
         params = list(start_params)
         conditions: list = []
-        for col, val in [("category", category), ("subcategory", subcategory),
-                         ("source_provider", source_provider), ("source_model", source_model),
-                         ("source_agent", source_agent), ("namespace", namespace)]:
+        for col, val in [
+            ("category", category),
+            ("subcategory", subcategory),
+            ("source_provider", source_provider),
+            ("source_model", source_model),
+            ("source_agent", source_agent),
+            ("namespace", namespace),
+        ]:
             if val is not None:
                 params.append(val)
                 conditions.append(f"{col}=${len(params)}")
         if owner_id is not None:
             from mnemos.core.visibility import read_visibility_predicate
+
             clause, vis_params = read_visibility_predicate(
-                owner_id, list(group_ids or []), len(params) + 1,
+                owner_id,
+                list(group_ids or []),
+                len(params) + 1,
             )
             conditions.append(clause)
             params.extend(vis_params)
@@ -901,8 +1016,7 @@ async def _fts_fetch(conn, query: str, limit: int,
         "archived_at IS NULL",
     ] + fts_conditions
     where = " AND ".join(fts_conditions)
-    sql = (f"SELECT {select_cols}, {rank_col} FROM memories "
-           f"WHERE {where} ORDER BY rank DESC LIMIT $2")
+    sql = f"SELECT {select_cols}, {rank_col} FROM memories WHERE {where} ORDER BY rank DESC LIMIT $2"
     try:
         return await conn.fetch(sql, *fts_params)
     except Exception:
@@ -912,8 +1026,7 @@ async def _fts_fetch(conn, query: str, limit: int,
         ilike_conditions, ilike_params = _build_filters([like_q, limit])
         ilike_conditions = ["content ILIKE $1", "deleted_at IS NULL", "archived_at IS NULL"] + ilike_conditions
         ilike_where = " AND ".join(ilike_conditions)
-        ilike_sql = (f"SELECT {select_cols} FROM memories "
-                     f"WHERE {ilike_where} ORDER BY created DESC LIMIT $2")
+        ilike_sql = f"SELECT {select_cols} FROM memories WHERE {ilike_where} ORDER BY created DESC LIMIT $2"
         try:
             return await conn.fetch(ilike_sql, *ilike_params)
         except Exception as e2:

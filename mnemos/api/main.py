@@ -1,4 +1,5 @@
 """MNEMOS API Server v3.0.0 — unified service with consultations + providers + OpenAI-compat gateway."""
+
 import logging
 import os
 import sys
@@ -43,6 +44,7 @@ from mnemos.core.rate_limit import (
 
 try:
     from mnemos.api.routes.document_import import router as document_import_router
+
     _document_import_available = True
 except ImportError:
     _document_import_available = False
@@ -81,7 +83,12 @@ from mnemos._version import __version__ as _MNEMOS_VERSION  # noqa: E402
 
 register_lifespan_hooks()
 
-app = FastAPI(title="MNEMOS API", version=_MNEMOS_VERSION, description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway", lifespan=lifespan)
+app = FastAPI(
+    title="MNEMOS API",
+    version=_MNEMOS_VERSION,
+    description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway",
+    lifespan=lifespan,
+)
 
 # ── Request body size limit (SEC-04) ──────────────────────────────────────────
 # Default 5 MB. Override via MAX_BODY_BYTES env var.
@@ -100,6 +107,7 @@ class _BodySizeLimitASGI:
     `http.request` messages as they stream past and short-circuit with 413
     as soon as the running byte count exceeds the limit.
     """
+
     def __init__(self, app, max_bytes: int):
         self.app = app
         self.max_bytes = max_bytes
@@ -143,18 +151,22 @@ class _BodySizeLimitASGI:
 
     async def _send_413(self, send):
         msg = f'{{"detail":"Request body exceeds {self.max_bytes // 1024 // 1024} MB limit"}}'
-        await send({
-            "type": "http.response.start",
-            "status": 413,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(msg)).encode("ascii")),
-            ],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": msg.encode("utf-8"),
-        })
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(msg)).encode("ascii")),
+                ],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": msg.encode("utf-8"),
+            }
+        )
 
 
 class _BodyTooLarge(Exception):
@@ -261,10 +273,32 @@ def _warn_if_audit_token_unset(settings) -> bool:
 
 _oauth_state_secret = _settings.server.session_secret
 if not _oauth_state_secret:
+    # v6.1-roadmap #38 — operators running in production MUST set
+    # MNEMOS_SESSION_SECRET to a stable value. Setting
+    # MNEMOS_REQUIRE_SESSION_SECRET=YES (recommended for all
+    # multi-user / public-facing deployments) makes a missing secret
+    # fail-loud at startup instead of silently generating a per-process
+    # ephemeral key (which invalidates every logged-in session on every
+    # restart).
+    _require_secret = os.environ.get("MNEMOS_REQUIRE_SESSION_SECRET", "").strip().lower() in (
+        "yes",
+        "1",
+        "true",
+    )
+    if _require_secret:
+        raise RuntimeError(
+            "MNEMOS_SESSION_SECRET is required but not set "
+            "(MNEMOS_REQUIRE_SESSION_SECRET=YES). Generate one with "
+            "'python -c \"import secrets; print(secrets.token_urlsafe(48))\"' "
+            "and export it before starting the server. OAuth sessions "
+            "will not survive restart without a stable secret."
+        )
     logging.getLogger(__name__).warning(
         "MNEMOS_SESSION_SECRET is not set — generating a random key for this "
         "process. In-flight OAuth logins will break on restart. Set a stable "
-        "value in your environment for production."
+        "value in your environment for production, and set "
+        "MNEMOS_REQUIRE_SESSION_SECRET=YES to make this missing-value path "
+        "fail-loud at startup."
     )
     _oauth_state_secret = _secrets.token_urlsafe(48)
 
@@ -272,9 +306,9 @@ _warn_if_audit_token_unset(_settings)
 app.add_middleware(
     _SessionMiddleware,
     secret_key=_oauth_state_secret,
-    session_cookie='mnemos_oauth_state',
+    session_cookie="mnemos_oauth_state",
     max_age=600,  # 10 minutes — just for the redirect roundtrip
-    same_site='lax',
+    same_site="lax",
     https_only=False,  # set MNEMOS_SESSION_HTTPS_ONLY=1 to harden in prod
 )
 

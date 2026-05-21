@@ -1,8 +1,13 @@
 # MNEMOS Specification
 
-**Version**: v5.0.1 current (on top of v5.0.0 GA shipped 2026-05-02)
-**Status**: Authoritative for the checked-out v5.0.1 tree. Behavior not
-described here is either undefined (report as a bug) or scoped to a
+**Version**: `feat/oracle-port` branch (v6 candidate; PyPI baseline = v5.0.1
+on top of v5.0.0 GA shipped 2026-05-02). Adds Oracle Database 26ai + IBM Db2 12.1.5
+backends behind the existing `PersistenceBackend` ABC.
+**Status**: Authoritative for the checked-out tree on `feat/oracle-port`.
+Where text below references "v5.0.1" it describes the v5 baseline that
+the branch extends; the four-backend persistence surface (Postgres,
+Oracle Database 26ai, Db2 12.1.5, SQLite) is the current branch reality. Behavior
+not described here is either undefined (report as a bug) or scoped to a
 future release via `ROADMAP.md`.
 **Purpose**: supply enough structural detail that a scoping tool
 (human or LLM) can estimate effort to build MNEMOS from scratch, or
@@ -38,7 +43,10 @@ Postgres/SQLite backends, deployment profiles, single-binary distribution,
 unified CLI, and Redis-coordinated multi-worker support, then adds GDPR
 deletion-request workers, the closed MORPHEUS divergent dream-state pipeline,
 PERSEPHONE archival, PANTHEON, KRONOS, NATS routing-audit substrate, DAG wiring
-for compression derivations, and MCP cross-tenant security gates. Apache-2.0.
+for compression derivations, and MCP cross-tenant security gates. The
+`feat/oracle-port` branch (v6 candidate) adds **Oracle Database 26ai** and **IBM Db2
+12.1.5** as first-class persistence backends behind the same
+`PersistenceBackend` ABC, exercised by the shared parity test suite. Apache-2.0.
 
 ## 2. System Scope
 
@@ -46,9 +54,27 @@ for compression derivations, and MCP cross-tenant security gates. Apache-2.0.
 
 - **Memory**: CRUD, search, DAG versioning with branch/merge, knowledge-graph
   triples, categories + namespaces, background compression with persisted audit.
-- **Persistence**: `mnemos.persistence.base.PersistenceBackend` with
-  `PostgresBackend` (asyncpg + pgvector + RLS + LISTEN/NOTIFY) and
-  `SqliteBackend` (aiosqlite + sqlite-vec + FTS5 + JSON1 + WAL).
+- **Persistence**: `mnemos.persistence.base.PersistenceBackend` with four
+  concrete backends, swapped at startup based on `MNEMOS_DATABASE_DSN` /
+  `MNEMOS_PERSISTENCE_BACKEND` / `MNEMOS_PROFILE`:
+  - `PostgresBackend` (asyncpg + pgvector HNSW + RLS + LISTEN/NOTIFY)
+  - `OracleBackend` (oracledb + Oracle Database 26ai HNSW INMEMORY NEIGHBOR GRAPH +
+    JSON Duality + optional TDE) — `mnemos/persistence/oracle.py`
+  - `Db2Backend` (ibm_db + Db2 12.1.5 EAP `VECTOR(768, FLOAT32)` + DiskANN
+    vector index — bench-validated using `EUCLIDEAN`, the metric supported
+    by the 12.1.5 EAP vector index). **Runs through Db2 Oracle Compatibility
+    Mode** (`DB CFG ORA_COMPATIBILITY ON`) — subclasses `OracleBackend` and
+    inherits the Oracle SQL surface verbatim, with cursor-level token
+    translation (`SYSTIMESTAMP`→`CURRENT TIMESTAMP`, `:name` binds → `?`
+    positional, etc.) at query time. This carries parse-time overhead and
+    prevents the Db2 optimizer from seeing native dialect tokens directly;
+    a full **native Db2 dialect port** is tracked on the v6.x roadmap
+    (`docs/v6.1-roadmap.md`) and will A/B native vs Oracle-compat on the
+    same DiskANN index. `Db2MemoryRepository.semantic_search` is already
+    overridden with native Db2 SQL (`VECTOR_DISTANCE(..., EUCLIDEAN)` +
+    `FETCH APPROX FIRST`) so the DiskANN index actually engages on the
+    user-facing query path. Module: `mnemos/persistence/db2.py`
+  - `SqliteBackend` (aiosqlite + sqlite-vec + FTS5 + JSON1 + WAL)
 - **Reasoning (GRAEAE)**: multi-LLM consultation across registered providers
   with cryptographic hash-chain audit, Custom Query lineup selection,
   routing-strategy modes (`auto`, `local`, `external`, `all`), reasoning-shape
@@ -178,16 +204,17 @@ warning when used with multiple workers.
 
 ### 3.4 Persistence feature matrix
 
-| Capability | PostgresBackend | SqliteBackend |
-|---|---|---|
-| Driver | asyncpg | aiosqlite |
-| Vector search | pgvector | sqlite-vec when available, cosine fallback otherwise |
-| Full-text search | PostgreSQL FTS / tsvector | FTS5 |
-| JSON | jsonb | JSON text + JSON1 |
-| Transactions | ACID, row locks, advisory locks | WAL, serialized writer mutex |
-| Tenancy enforcement | application predicates + optional RLS | application predicates only |
-| Notifications | LISTEN/NOTIFY | polling |
-| Multi-worker profile | supported with Redis | not recommended; edge/dev are single-worker |
+| Capability | PostgresBackend | OracleBackend | Db2Backend | SqliteBackend |
+|---|---|---|---|---|
+| Driver | asyncpg | oracledb (thin by default) | ibm_db | aiosqlite |
+| Vector search | pgvector HNSW (`vector` type) | Oracle Database 26ai HNSW INMEMORY NEIGHBOR GRAPH (`VECTOR(768, FLOAT32)`) | Db2 12.1.5 EAP DiskANN (`VECTOR(768, FLOAT32)`; native Db2 `semantic_search` override implemented — emits `VECTOR_DISTANCE(..., EUCLIDEAN)` + `FETCH APPROX FIRST K ROWS ONLY` to engage the DiskANN index; `MNEMOS_DB2_VECTOR_INDEX=approx|exact` toggles index engagement; `Db2Backend.open` probes `DB2_VECTOR_INDEXING=YES` registry var and warns when missing) | sqlite-vec when available, cosine fallback otherwise |
+| Full-text search | PostgreSQL FTS / tsvector | Oracle Text (LIKE/INSTR fallback today) | LIKE/INSTR fallback (Db2 TEXT_SEARCH planned) | FTS5 |
+| JSON | jsonb | JSON Duality View (Oracle Database 26ai) | JSON BSON | JSON text + JSON1 |
+| Transactions | ACID, row locks, advisory locks | ACID, row locks | ACID, row locks | WAL, serialized writer mutex |
+| Tenancy enforcement | application predicates + optional RLS | application predicates (visibility renderer) | application predicates (visibility renderer) | application predicates only |
+| Notifications | LISTEN/NOTIFY | AQ (planned) | event queue (planned) | polling |
+| Multi-worker profile | supported with Redis | supported with Redis | supported with Redis | not recommended; edge/dev are single-worker |
+| TDE / column encryption | optional via pgcrypto | Oracle TDE (verified, `oracle-ee-tde-*.json`) | Db2 native encryption | n/a |
 
 ### 3.5 Workers, compression, and client protocols
 
@@ -606,7 +633,7 @@ The semantic/gpu/phi runtime extras are deliberately **torch-free**. ``fastembed
 ONNX runtime for the same MiniLM/Nomic embedding model family that
 ``sentence-transformers`` exposes via torch, but ships ~10–20 MB
 instead of ~700 MB–1 GB of torch + nvidia binary weight. This
-matches the production blueprint at PYTHIA :5002 (``phi_server.py``
+matches the production blueprint at pg-host :5002 (``phi_server.py``
 uses ``fastembed`` + ``openvino_genai`` with no ``import torch``).
 
 GPU acceleration is gated behind the ``[gpu]`` extra (NVIDIA CUDA EP)
@@ -639,10 +666,48 @@ Grouped by concern:
 
 **Bind + DB**
 - `MNEMOS_BIND` (127.0.0.1), `MNEMOS_PORT` (5002)
+- `MNEMOS_DATABASE_DSN` — **preferred** single-DSN backend selector.
+  Scheme determines backend (`postgres://`, `oracle://`, `db2://`,
+  `sqlite:///`). Overrides per-backend env vars below.
+- `MNEMOS_PERSISTENCE_BACKEND` / `PG_BACKEND` — explicit backend selector
+  (`postgres` | `oracle` | `db2` | `sqlite`); used when DSN is not set.
 - `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD`
   (the `_DatabaseSettings` class in `mnemos/core/config.py`
   uses `env_prefix="PG_"`)
+- `ORACLE_DSN` — Oracle Database 26ai connection string,
+  e.g. `oracle://user:pass@host:1521/service_name`
+  (consumed by `_parse_oracle_dsn` in `mnemos/persistence/oracle.py`).
+- `DB2_DSN` — IBM Db2 12.1.5 connection string,
+  e.g. `db2://user:pass@host:50000/dbname`
+  (consumed by `_parse_db2_dsn` in `mnemos/persistence/db2.py`).
 - `PG_POOL_MIN` (5), `PG_POOL_MAX` (20)
+
+**Oracle pool + vector knobs (2026-05-21 audit posture)**
+- `MNEMOS_ORACLE_POOL_MIN` (2), `MNEMOS_ORACLE_POOL_MAX` (10),
+  `MNEMOS_ORACLE_POOL_INCREMENT` (1) — `oracledb.create_pool_async`
+  sizing.
+- `MNEMOS_ORACLE_STMT_CACHE_SIZE` (20) — per-session cursor cache.
+- `MNEMOS_ORACLE_POOL_ACQUIRE_TIMEOUT` (60s) — seconds before
+  `pool.acquire()` gives up; explicit so a saturated pool fails fast
+  instead of blocking forever.
+- `MNEMOS_ORACLE_PDB` — optional; when set and the DSN targets
+  `CDB$ROOT`, the per-session callback issues
+  `ALTER SESSION SET CONTAINER = <pdb>`.
+- `MNEMOS_ORACLE_DRCP=YES` — opt-in to Database Resident Connection
+  Pooling (`cclass='MNEMOS'`, `purity=SELF`); requires
+  `EXECUTE DBMS_CONNECTION_POOL.START_POOL` on the server side.
+- `MNEMOS_ORACLE_THICK=YES` — call `oracledb.init_oracle_client()`
+  before pool creation. Fails loud when Instant Client is missing.
+- `MNEMOS_VECTOR_DIM_MAX` (4096) — cap on `embedding` length accepted
+  by the Oracle / Db2 `semantic_search` paths. NaN / Inf are always
+  rejected; the cap protects against accidental giant-array binds.
+
+Backend selection precedence (highest first):
+
+1. `MNEMOS_DATABASE_DSN` scheme
+2. Per-backend DSN env vars (`ORACLE_DSN`, `DB2_DSN`, `PG_*`)
+3. `MNEMOS_PERSISTENCE_BACKEND` / `PG_BACKEND`
+4. `MNEMOS_PROFILE` defaults (`server` → postgres, `edge`/`dev` → sqlite)
 
 **Auth**
 - `MNEMOS_API_KEY` (default root), `MNEMOS_KEYS_PATH`
@@ -896,7 +961,7 @@ See `CHANGELOG.md` for the authoritative list. Selected milestones:
   HTTP/SSE bridge, and the APOLLO/ARTEMIS compression-stack settlement.
 - **v3.4.0** — CHARON v0.2 MPF sidecar round-trip for KG triples,
   documents, facts, events, compression manifests, and memory-version
-  DAGs; staging compose for PROTEUS; sidecar ownership and conflict
+  DAGs; staging compose for oracle-host; sidecar ownership and conflict
   checks.
 - **v3.4.1** — federation schema-compat preflight and dev↔prod MPF
   restore drill.
@@ -1004,8 +1069,8 @@ after the three Fates.
 **ARTEMIS** — CPU extractive compression engine.
 **APOLLO** — schema-aware dense encoding engine; god of oracles.
 **MPF** — MNEMOS Portability Format (v0.1).
-**CERBERUS** — deployment hostname for the test instance (RTX 4500 ADA).
-**PYTHIA** — deployment hostname for the production instance.
+**gpu-host** — deployment hostname for the test instance (RTX 4500 ADA).
+**pg-host** — deployment hostname for the production instance.
 **DAG** — content-addressed directed acyclic graph of memory versions.
 **Custom Query mode** — operator-specified provider/model/tier
 selection on `/v1/consultations`.

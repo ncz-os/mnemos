@@ -258,8 +258,8 @@ The fleet shape made this decision easy: of the hosts that
 actually run MNEMOS,
 
 * zero have NVIDIA discrete GPUs as their MNEMOS-running role
-  (TYPHON has an RTX 5060 but doesn't run the engine);
-* most have Intel iGPU (PYTHIA, PROTEUS, ARGOS) — OpenVINO is the
+  (gpu-host-2 has an RTX 5060 but doesn't run the engine);
+* most have Intel iGPU (pg-host, oracle-host, docker-host) — OpenVINO is the
   match;
 * Apple Silicon dev hosts use MPS, not CUDA;
 * edge hosts (Pis, Jetson) have other ML stacks (CPU, TensorRT).
@@ -382,29 +382,57 @@ roll local state backward to an older version.
 
 ## 7. Persistence backends
 
-### 7.1 Two backends, one repository surface
+### 7.1 Four backends, one repository surface
 
-MNEMOS supports two persistence backends:
+MNEMOS supports four persistence backends:
 
-* **Postgres** (`postgres` profile) — the production target.
-  pgvector for embeddings, asyncpg for I/O, full transactional
-  semantics.
+* **PostgreSQL** (`postgres` profile) — the original production target.
+  pgvector HNSW for embeddings, asyncpg for I/O, full transactional
+  semantics with optional RLS.
+* **Oracle Database 26ai** (enterprise) — HNSW INMEMORY NEIGHBOR GRAPH on the
+  native `VECTOR(768, FLOAT32)` type; JSON Duality View; TDE column
+  encryption; oracledb thin-mode driver by default. Module:
+  `mnemos/persistence/oracle.py`.
+* **IBM Db2 12.1.5 (Early Access Program)** (enterprise) — DiskANN vector
+  index on `VECTOR(768, FLOAT32)` with the `VECTOR_DISTANCE` function.
+  Runtime app-path `semantic_search` is overridden in
+  `Db2MemoryRepository` to emit
+  `VECTOR_DISTANCE(..., EUCLIDEAN)` + `FETCH APPROX FIRST K ROWS ONLY`,
+  which engages the DiskANN index instead of an exact scan; for
+  L2-normalized embeddings (MNEMOS default) the EUCLIDEAN top-K
+  ordering is identical to COSINE. The toggle env var
+  `MNEMOS_DB2_VECTOR_INDEX=approx|exact` selects index engagement
+  vs. exact-scan parity; `Db2Backend.open` probes the
+  `DB2_VECTOR_INDEXING=YES` registry variable on startup and logs
+  a clear operator-action warning when missing. Native column
+  encryption; ibm_db driver. **The backend runs through Db2 Oracle
+  Compatibility Mode** (`DB CFG ORA_COMPATIBILITY ON`): `Db2Backend`
+  subclasses `OracleBackend` and inherits the Oracle SQL surface
+  verbatim, with cursor-level Oracle→Db2 token translation at query
+  time. This carries parse-time overhead and limits the Db2
+  optimizer's visibility into the SQL — a **native Db2 dialect port**
+  (dropping the Oracle subclassing in favor of hand-written native
+  SQL) is tracked on the v6.x roadmap and will A/B native vs compat
+  on the same DiskANN index (`mnemos/persistence/db2.py`).
 * **SQLite** (`edge` profile) — single-file deployment for
   laptops, edge appliances, single-binary builds. sqlite-vec
   for embeddings (or a Python UDF fallback when the native
   extension isn't loaded).
 
-Both backends implement the same `PersistenceBackend` ABC
+All four backends implement the same `PersistenceBackend` ABC
 (`mnemos/persistence/base.py`). API handlers and domain code
 target the abstract repository surface; the concrete backend is
-swapped at startup based on the `MNEMOS_PROFILE` env var.
+swapped at startup based on `MNEMOS_DATABASE_DSN`,
+`MNEMOS_PERSISTENCE_BACKEND`, or `MNEMOS_PROFILE` (in that order
+of precedence — see SPECIFICATION §9.1).
 
 ### 7.2 Persistence-parity discipline
 
-The two backends ship together with strict parity tests:
+The four backends ship together with strict parity tests:
 `tests/test_persistence_parity.py` runs the same CRUD + search +
-versioning operations against both backends and asserts identical
-output. This has caught:
+versioning operations against each available backend (SQLite always,
+plus PostgreSQL, Oracle, and Db2 when their respective DSN env vars
+are set) and asserts identical output. This has caught:
 
 * asyncpg returning `Decimal` for NUMERIC columns where SQLite
   returns `float`. Fixed via `mnemos/core/numeric.py:safe_float`.
@@ -435,8 +463,14 @@ deployments where:
 The trade-off: SQLite serialization-level concurrency is worse
 than Postgres MVCC, and pgvector's HNSW index outperforms
 sqlite-vec's LSH at scale. For 10k-memory edge deployments,
-SQLite is fine; for 10M-memory production, Postgres is the only
-viable choice.
+SQLite is fine; for 10M-memory production, choose PostgreSQL,
+Oracle Database 26ai, or IBM Db2 12.1.5 — the three large-scale backends
+serve the MNEMOS workload identically per the
+[2026-05-21 bake-off](proof/bakeoff-final-summary-2026-05-21.md),
+with vendor-specific value-adds (Oracle: HNSW INMEMORY NEIGHBOR
+GRAPH + JSON Duality + TDE; Db2: DiskANN + native column
+encryption; PostgreSQL: most permissive license, broadest
+tooling).
 
 ---
 
@@ -527,9 +561,13 @@ round-trip on the native subset.
 * **General-purpose key-value store.** Use Redis. MNEMOS's keying,
   versioning, and indexing assume textual content; storing config
   blobs as memories is wrong-shape.
-* **Vector index optimization at install time.** `pgvector` HNSW
+* **Vector index optimization at install time.** Vector-index
   parameter tuning is the operator's job; MNEMOS picks safe
-  defaults but doesn't auto-tune.
+  defaults but doesn't auto-tune. This applies across all
+  large-scale backends — pgvector HNSW (PostgreSQL), Oracle Database 26ai
+  HNSW INMEMORY NEIGHBOR GRAPH (Oracle), and DiskANN (Db2 12.1.5)
+  each expose vendor-specific tuning knobs that the operator
+  sizes against their corpus.
 * **GUI / web front-end.** `mnemos-web` is a separate repo,
   post-v4.0 track. The CLI + REST + MCP surface is the
   programmatic-only contract.
@@ -559,6 +597,17 @@ round-trip on the native subset.
 * `STREAMING_REPLICATION.md` — federation pull/push semantics.
 * `SQLITE_PROFILE.md` — edge-tier deployment guide.
 * `SCALING.md` — production sizing + horizontal scale.
+* `oracle-port-status.md` — Oracle Database 26ai backend status + parity coverage.
+* `db2-port-handoff.md` / `db2-translation-handoff-2026-05-20.md` —
+  Db2 12.1.5 backend + Oracle→Db2 SQL translation layer.
+* `db2-oracle-ee-test-plan.md` — enterprise-backend test topology.
+* `proof/bakeoff-final-summary-2026-05-21.md` — 4-backend functional
+  bake-off (Postgres / Oracle / Db2 / SQLite).
+
+---
+
+**Document version:** v6 / `feat/oracle-port`
+**Last updated:** 2026-05-21
 
 ---
 

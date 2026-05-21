@@ -3,7 +3,7 @@
 **v5.0 status:** shipped (v0.2) for the `/pantheon/v1` slice. Routing is direct
 HTTP forward from the gateway to the selected upstream; NATS is used for the
 best-effort routing audit substrate, not the main request path.
-**Position in stack:** Above Triton (CERBERUS) + GRAEAE (PYTHIA); below every OpenAI-compatible client.
+**Position in stack:** Above Triton (gpu-host) + GRAEAE (pg-host); below every OpenAI-compatible client.
 **Greek-name fit:** *Temple of all gods.* One facade, many providers behind it. Pairs with CHARON (the ferryman who carries memories across systems): same interop posture, different surface.
 
 ## v0.2 Implementation Note
@@ -117,7 +117,7 @@ can verify whether the gateway searched and injected memory for that request.
        ┌─────────────────────────────┼───────────────────────────┐
        ▼                             ▼                           ▼
    Triton/vLLM                 Cloud APIs                Cloud APIs
-   (CERBERUS)                  (Together, Groq,          (OpenAI,
+   (gpu-host)                  (Together, Groq,          (OpenAI,
    local GPU                    Perplexity)               Gemini)
 
 Routing decisions are also written to MNEMOS as `pantheon_routing` memories.
@@ -182,7 +182,7 @@ GRAEAE already maintains a provider database (the muses registry) — which prov
                   ┌─────────────────────────────┐
                   │ GRAEAE muses_api_keys.json  │
                   │ + provider/muse registry    │
-                  │ (existing on PYTHIA)        │
+                  │ (existing on pg-host)        │
                   └─────────────┬───────────────┘
                                 │ read on PANTHEON startup
                                 │ + on `catalog reload` event
@@ -496,8 +496,8 @@ Result: **the routing improves with use, automatically.** Backends that have bee
 
 For the user's current fleet:
 
-1. **Day 0:** PANTHEON deployed on PYTHIA next to GRAEAE. Empty catalog, no workers.
-2. **Day 1:** First worker = vLLM-CERBERUS. PANTHEON advertises Mistral-7B as `pantheon:vllm.cerberus`. One client (zterm? Cursor?) points at PANTHEON; rest of fleet still uses old configs.
+1. **Day 0:** PANTHEON deployed on pg-host next to GRAEAE. Empty catalog, no workers.
+2. **Day 1:** First worker = vLLM-gpu-host. PANTHEON advertises Mistral-7B as `pantheon:vllm.cerberus`. One client (zterm? Cursor?) points at PANTHEON; rest of fleet still uses old configs.
 3. **Day 2–5:** Together / Groq / Gemini workers come online. Catalog grows.
 4. **Day 6:** Anthropic worker added with `usage_tier: consultation_only`. GRAEAE consultation flow now goes through PANTHEON instead of GRAEAE's direct provider calls (or alongside).
 5. **Day 7+:** Other clients migrate (`~/.zeroclaw/config.toml`, `~/.openclaw/config.toml`, etc. — replace per-provider sections with single PANTHEON URL).
