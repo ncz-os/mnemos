@@ -49,6 +49,16 @@ COPY . .
 
 RUN python -m pip install --no-deps --no-build-isolation .
 
+# NB: this `full` image inherits the legacy INFERENCE_EMBED_HOST path that
+# expects an external Ollama embedding endpoint. The canonical Dockerfile
+# (Postgres-profile) ships the in-process embedder per architectural decision
+# mem_1779334716543_f8ebd4 (operator-locked 2026-05-21) and uses
+# MNEMOS_EMBED_MODEL_PATH + MNEMOS_EMBED_OV_DEVICE instead. To migrate this
+# `full` build to the in-process path, drop INFERENCE_EMBED_HOST and add:
+#   MNEMOS_EMBED_MODEL_PATH=/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf
+#   MNEMOS_EMBED_OV_DEVICE=AUTO   # OpenVINO device hint: AUTO | CPU | GPU | NPU
+#   OV_CACHE_DIR=/opt/mnemos/ov_cache
+# (plus the GGUF download step from the canonical Dockerfile).
 ENV PG_USER=mnemos_user \
     PG_DATABASE=mnemos \
     PG_HOST=postgres \

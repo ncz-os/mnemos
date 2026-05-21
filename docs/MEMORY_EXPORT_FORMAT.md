@@ -189,7 +189,7 @@ know about. This is deliberate forward/backward compatibility.
         "event_type": "session_turn",
         "session_id": "sess-xyz",
         "actor": "user",
-        "content": "How do I deploy MNEMOS on CERBERUS?",
+        "content": "How do I deploy MNEMOS on gpu-host?",
         "occurred_at": "2026-04-23T11:45:00Z"
       }
     }
@@ -377,7 +377,7 @@ schema migration.
 Canonical producer. `GET /v1/export` emits MPF v0.1 with MNEMOS
 memories as `kind: memory` records. `POST /v1/import` accepts MPF v0.1
 and transforms payloads at the declared `payload_version` into the
-target schema. For the PYTHIA v2.3 → CERBERUS v3.1 migration, the
+target schema. For the pg-host v2.3 → gpu-host v3.1 migration, the
 importer applies the v2.4 → v3.1 upgrade rules above.
 
 ### docling

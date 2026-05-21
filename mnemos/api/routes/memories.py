@@ -1,4 +1,5 @@
 """Memory CRUD, search, and rehydration endpoints."""
+
 import asyncio
 import json
 import logging
@@ -138,6 +139,7 @@ def _schedule_outbox_deliveries(delivery_ids: list[str]) -> None:
     if not delivery_ids:
         return
     from mnemos.webhooks.sender import _attempt_delivery
+
     for did in delivery_ids:
         _lc._schedule_delivery_attempt(_attempt_delivery(str(did)))
 
@@ -164,9 +166,7 @@ async def _publish_nats_with_timeout(
             subject,
         )
         try:
-            _lc._schedule_background(
-                _nats_publish_event(subject, payload, msg_id=msg_id)
-            )
+            _lc._schedule_background(_nats_publish_event(subject, payload, msg_id=msg_id))
         except RuntimeError as exc:
             logger.warning("NATS publish retry scheduling failed for %s: %s", subject, exc)
 
@@ -238,9 +238,19 @@ async def _insert_memory_with_created_webhook(
         "owner_id, namespace, permission_mode, "
         "source_model, source_provider, source_session, source_agent) "
         "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10, $11, $12, $13)",
-        mem_id, content, category, subcategory, json.dumps(metadata or {}), verbatim,
-        owner_id, namespace, permission_mode,
-        source_model, source_provider, source_session, source_agent,
+        mem_id,
+        content,
+        category,
+        subcategory,
+        json.dumps(metadata or {}),
+        verbatim,
+        owner_id,
+        namespace,
+        permission_mode,
+        source_model,
+        source_provider,
+        source_session,
+        source_agent,
     )
 
     event_payload = {
@@ -253,6 +263,7 @@ async def _insert_memory_with_created_webhook(
     }
 
     from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook
+
     await _dispatch_webhook(
         "memory.created",
         event_payload,
@@ -262,6 +273,7 @@ async def _insert_memory_with_created_webhook(
     )
 
     from mnemos.nats.client import get_node_name as _nats_get_node_name
+
     safe_ns = (namespace or "default").replace(".", "_")
     nats_intents: list[NatsPublishIntent] = [
         (
@@ -347,7 +359,8 @@ async def list_memories(
             include_archived=include_archived,
         )
     return MemoryListResponse(
-        count=total, memories=[_row_to_memory(r) for r in rows],
+        count=total,
+        memories=[_row_to_memory(r) for r in rows],
     )
 
 
@@ -387,14 +400,18 @@ async def get_memory(
     # (not 403) keeps other-tenant memory existence invisible — same
     # contract as the legacy handler.
     visibility = VisibilityFilter.for_read(
-        user, namespace=None if is_root(user) else user.namespace,
+        user,
+        namespace=None if is_root(user) else user.namespace,
     )
     body: Optional[str] = None
     row = None
     async with backend.transactional() as tx:
         await _maybe_set_pg_rls(tx, user)
         row = await backend.memories.get_memory(
-            tx, memory_id, visibility=visibility, include_archived=True,
+            tx,
+            memory_id,
+            visibility=visibility,
+            include_archived=True,
         )
         if not row:
             raise HTTPException(status_code=404, detail="Memory not found")
@@ -414,11 +431,7 @@ async def get_memory(
                     headers={"Vary": "Accept"},
                 )
             else:
-                archived_at_text = (
-                    archived_at.isoformat()
-                    if hasattr(archived_at, "isoformat")
-                    else str(archived_at)
-                )
+                archived_at_text = archived_at.isoformat() if hasattr(archived_at, "isoformat") else str(archived_at)
                 return JSONResponse(
                     status_code=410,
                     content={
@@ -437,7 +450,10 @@ async def get_memory(
             from mnemos.api.routes.narrate import build_narration_body
 
             body = await build_narration_body(
-                backend, tx, row, narrate_format,
+                backend,
+                tx,
+                row,
+                narrate_format,
             )
 
     if restore:
@@ -469,7 +485,10 @@ async def get_memory(
                 from mnemos.api.routes.narrate import build_narration_body
 
                 body = await build_narration_body(
-                    backend, tx, row, narrate_format,
+                    backend,
+                    tx,
+                    row,
+                    narrate_format,
                 )
 
     # Vary: Accept on every successful representation. Unifies cache
@@ -480,11 +499,7 @@ async def get_memory(
     # serialised response — relying on FastAPI's response_model would
     # bypass our header injection.
     if narrate_format is not None:
-        media_type = (
-            "text/plain"
-            if narrate_format == "prose"
-            else "application/x-apollo-dense"
-        )
+        media_type = "text/plain" if narrate_format == "prose" else "application/x-apollo-dense"
         return PlainTextResponse(
             body or "",
             media_type=media_type,
@@ -492,6 +507,7 @@ async def get_memory(
         )
 
     from fastapi.encoders import jsonable_encoder
+
     memory_item = _row_to_memory(row, include_compressed=True)
     return JSONResponse(
         content=jsonable_encoder(memory_item),
@@ -555,7 +571,9 @@ async def get_compression_manifests(
                     "SELECT 1 FROM memories "
                     "WHERE id = $1 AND owner_id = $2 AND namespace = $3 "
                     "AND deleted_at IS NULL",
-                    memory_id, user.user_id, user.namespace,
+                    memory_id,
+                    user.user_id,
+                    user.namespace,
                 )
             if not exists:
                 raise HTTPException(status_code=404, detail="Memory not found")
@@ -593,7 +611,8 @@ async def get_compression_manifests(
             "engine_id": variant_row["engine_id"],
             "engine_version": variant_row["engine_version"],
             "compressed_content": _render_content_preview(
-                variant_row["compressed_content"], include_content,
+                variant_row["compressed_content"],
+                include_content,
             ),
             "compressed_tokens": variant_row["compressed_tokens"],
             "compression_ratio": variant_row["compression_ratio"],
@@ -601,24 +620,23 @@ async def get_compression_manifests(
             "composite_score": variant_row["composite_score"],
             "scoring_profile": variant_row["scoring_profile"],
             "judge_model": variant_row["judge_model"],
-            "selected_at": (
-                variant_row["selected_at"].isoformat()
-                if variant_row["selected_at"] else None
-            ),
+            "selected_at": (variant_row["selected_at"].isoformat() if variant_row["selected_at"] else None),
             "winner_candidate_id": (
-                str(variant_row["winner_candidate_id"])
-                if variant_row["winner_candidate_id"] else None
+                str(variant_row["winner_candidate_id"]) if variant_row["winner_candidate_id"] else None
             ),
         }
 
     contests: dict[str, dict] = {}
     for row in candidate_rows:
         cid = str(row["contest_id"])
-        bucket = contests.setdefault(cid, {
-            "contest_id": cid,
-            "started_at": row["created"],
-            "candidates": [],
-        })
+        bucket = contests.setdefault(
+            cid,
+            {
+                "contest_id": cid,
+                "started_at": row["created"],
+                "candidates": [],
+            },
+        )
         # earliest created row's timestamp represents the contest start
         if row["created"] < bucket["started_at"]:
             bucket["started_at"] = row["created"]
@@ -630,33 +648,33 @@ async def get_compression_manifests(
             except Exception:
                 manifest_field = {"_raw": manifest_field}
 
-        bucket["candidates"].append({
-            "engine_id": row["engine_id"],
-            "engine_version": row["engine_version"],
-            "compressed_content": _render_content_preview(
-                row["compressed_content"], include_content,
-            ),
-            "original_tokens": row["original_tokens"],
-            "compressed_tokens": row["compressed_tokens"],
-            "compression_ratio": row["compression_ratio"],
-            "quality_score": row["quality_score"],
-            "speed_factor": row["speed_factor"],
-            "composite_score": row["composite_score"],
-            "scoring_profile": row["scoring_profile"],
-            "elapsed_ms": row["elapsed_ms"],
-            "judge_model": row["judge_model"],
-            "gpu_used": row["gpu_used"],
-            "is_winner": row["is_winner"],
-            "reject_reason": row["reject_reason"],
-            "manifest": manifest_field,
-            "created": row["created"].isoformat(),
-        })
+        bucket["candidates"].append(
+            {
+                "engine_id": row["engine_id"],
+                "engine_version": row["engine_version"],
+                "compressed_content": _render_content_preview(
+                    row["compressed_content"],
+                    include_content,
+                ),
+                "original_tokens": row["original_tokens"],
+                "compressed_tokens": row["compressed_tokens"],
+                "compression_ratio": row["compression_ratio"],
+                "quality_score": row["quality_score"],
+                "speed_factor": row["speed_factor"],
+                "composite_score": row["composite_score"],
+                "scoring_profile": row["scoring_profile"],
+                "elapsed_ms": row["elapsed_ms"],
+                "judge_model": row["judge_model"],
+                "gpu_used": row["gpu_used"],
+                "is_winner": row["is_winner"],
+                "reject_reason": row["reject_reason"],
+                "manifest": manifest_field,
+                "created": row["created"].isoformat(),
+            }
+        )
 
     contests_list = sorted(
-        (
-            {**bucket, "started_at": bucket["started_at"].isoformat()}
-            for bucket in contests.values()
-        ),
+        ({**bucket, "started_at": bucket["started_at"].isoformat()} for bucket in contests.values()),
         key=lambda c: c["started_at"],
         reverse=True,
     )
@@ -720,13 +738,18 @@ async def search_memories(
     # digest reflects the request's actual filter shape.
     cache_key = _get_cache_key(
         "search",
-        user.user_id, user.namespace,
-        request.query, request_limit,
-        request.category, request.subcategory,
+        user.user_id,
+        user.namespace,
+        request.query,
+        request_limit,
+        request.category,
+        request.subcategory,
         "semantic" if request.semantic else "fts",
-        request.source_provider, request.source_model,
+        request.source_provider,
+        request.source_model,
         request.source_agent,
-        search_namespace, search_owner_id,
+        search_namespace,
+        search_owner_id,
         sorted(user.group_ids),  # list, not pre-serialized string
         request.include_archived,
         request.boost_recency,
@@ -907,13 +930,28 @@ async def create_memory(
                 source_session=request.source_session,
                 source_agent=request.source_agent,
                 verbatim_content=(
-                    request.verbatim_content
-                    if request.verbatim_content is not None
-                    else request.content
+                    request.verbatim_content if request.verbatim_content is not None else request.content
                 ),
                 created=None,
                 updated=None,
             )
+            # Inline embed via mnemos.runtime.embedder.embed_text — the
+            # in-process embedder (architectural decision
+            # mem_1779334716543_f8ebd4, 2026-05-21) loads the GGUF model
+            # once per worker and returns a 768-dim vector in ~50-100ms
+            # on PYTHIA CPU. Failures (empty vec) are swallowed and the
+            # row keeps embedding=NULL; the backfill script picks it up
+            # on the next pass. Embed in the same tx so the vector
+            # commits atomically with the memory row.
+            try:
+                vec = await _get_embedding(request.content)
+                if vec and hasattr(backend.memories, "upsert_memory_embedding"):
+                    await backend.memories.upsert_memory_embedding(tx, mem_id, vec)
+            except Exception:
+                logger.exception(
+                    "[create_memory] inline embed failed for %s; row will be backfilled",
+                    mem_id,
+                )
             # Same-tx outbox enqueue — preserves the v4.0 contract
             # that webhook_deliveries rows commit atomically with
             # the data write.
@@ -953,6 +991,7 @@ async def create_memory(
     # v4.2 NATS additive emit. Best-effort — silent skip when broker
     # unreachable. Webhooks outbox above is the durable path.
     from mnemos.nats.client import get_node_name as _nats_get_node_name
+
     safe_ns = (namespace or "default").replace(".", "_")
     await _publish_nats_with_timeout(
         f"mnemos.memory.created.{safe_ns}",
@@ -996,11 +1035,7 @@ async def bulk_create_memories(
             errors.append(f"[{i}] {exc.detail}")
             continue
         mid = new_memory_id()
-        verbatim = (
-            mem.verbatim_content
-            if mem.verbatim_content is not None
-            else mem.content
-        )
+        verbatim = mem.verbatim_content if mem.verbatim_content is not None else mem.content
         owner_id = mem.owner_id or user.user_id
         namespace = mem.namespace or user.namespace
         try:
@@ -1075,6 +1110,7 @@ async def bulk_create_memories(
         delivery_ids.extend(item_delivery_ids)
     _schedule_outbox_deliveries(delivery_ids)
     from mnemos.nats.client import get_node_name as _nats_get_node_name
+
     source_node = _nats_get_node_name()
     for event in nats_created_events:
         safe_ns = (event["namespace"] or "default").replace(".", "_")
@@ -1128,13 +1164,17 @@ async def update_memory(
             await _maybe_set_pg_rls(tx, user)
             try:
                 row = await backend.memories.update_memory(
-                    tx, memory_id, visibility=visibility, fields=updates,
+                    tx,
+                    memory_id,
+                    visibility=visibility,
+                    fields=updates,
                 )
             except asyncpg.PostgresError as exc:
                 handle_trigger_pgerror(exc)
             if not row:
                 raise HTTPException(
-                    status_code=404, detail=f"Memory {memory_id} not found",
+                    status_code=404,
+                    detail=f"Memory {memory_id} not found",
                 )
             delivery_ids = await backend.webhooks.dispatch_event(
                 tx,
@@ -1164,6 +1204,7 @@ async def update_memory(
     namespace = row["namespace"]
     from mnemos.nats import publish_event as _nats_publish_event
     from mnemos.nats.client import get_node_name as _nats_get_node_name
+
     safe_ns = (namespace or "default").replace(".", "_")
     await _nats_publish_event(
         f"mnemos.memory.updated.{safe_ns}",
@@ -1213,7 +1254,8 @@ async def delete_memory(
                 handle_trigger_pgerror(exc)
             if not row:
                 raise HTTPException(
-                    status_code=404, detail=f"Memory {memory_id} not found",
+                    status_code=404,
+                    detail=f"Memory {memory_id} not found",
                 )
             delivery_ids = await backend.webhooks.dispatch_event(
                 tx,
@@ -1235,6 +1277,7 @@ async def delete_memory(
     namespace = row["namespace"]
     from mnemos.nats import publish_event as _nats_publish_event
     from mnemos.nats.client import get_node_name as _nats_get_node_name
+
     safe_ns = (namespace or "default").replace(".", "_")
     await _nats_publish_event(
         f"mnemos.memory.deleted.{safe_ns}",
@@ -1288,8 +1331,12 @@ async def rehydrate_memories(
         # as list/get/search so a memory visible there is visible
         # via /memories/rehydrate.
         from mnemos.core.visibility import read_visibility_predicate
+
         clause, vis_params = read_visibility_predicate(
-            rehydrate_owner_id, list(user.group_ids), idx, table_alias="m",
+            rehydrate_owner_id,
+            list(user.group_ids),
+            idx,
+            table_alias="m",
         )
         sql_conditions.append(clause)
         sql_params.extend(vis_params)
@@ -1323,9 +1370,13 @@ async def rehydrate_memories(
 
     if not rows:
         return RehydrationResponse(
-            context="", tokens_used=0, original_tokens=0,
-            compression_ratio=1.0, quality_score=100,
-            memories_included=0, compression_applied=False,
+            context="",
+            tokens_used=0,
+            original_tokens=0,
+            compression_ratio=1.0,
+            quality_score=100,
+            memories_included=0,
+            compression_applied=False,
         )
     context_parts = []
     raw_size = 0
@@ -1336,7 +1387,7 @@ async def rehydrate_memories(
         raw_size += len(row["raw_content"] or "")
         if row["variant_used"]:
             variant_hits += 1
-        created_str = row['created'].strftime('%Y-%m-%d') if row['created'] else 'unknown'
+        created_str = row["created"].strftime("%Y-%m-%d") if row["created"] else "unknown"
         context_parts.append(f"[{row['category']} / {created_str}]\n{effective[:2000]}")
     combined_context = "\n\n---\n\n".join(context_parts)
     original_tokens = int(len(combined_context) / 4)
@@ -1358,7 +1409,7 @@ async def rehydrate_memories(
         f"compression_ratio={compression_ratio:.3f}"
     )
     return RehydrationResponse(
-        context=combined_context[:request.budget_tokens * 4] if request.budget_tokens else combined_context,
+        context=combined_context[: request.budget_tokens * 4] if request.budget_tokens else combined_context,
         tokens_used=tokens_used,
         original_tokens=original_tokens,
         compression_ratio=compression_ratio,

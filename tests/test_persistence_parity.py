@@ -39,6 +39,8 @@ from mnemos.webhooks import types as webhook_types
 
 
 PG_URL = os.environ.get("MNEMOS_TEST_DB")
+ORACLE_DSN = os.environ.get("ORACLE_DSN")
+DB2_DSN = os.environ.get("DB2_DSN")
 
 
 @dataclass
@@ -49,9 +51,21 @@ class BackendCase:
 
 
 def _backend_params() -> list[str]:
+    """Enumerate parity backend arms based on which DSN env vars are set.
+
+    SQLite always runs. Postgres / Oracle / Db2 arms are skipped cleanly
+    when their respective env vars are absent — see
+    `docs/INSTALL.md#enterprise-backends-oracle-23ai--ibm-db2-1215` and
+    `CONTRIBUTING.md` "Backend-gated parity tests" for the canonical
+    matrix.
+    """
     params = ["sqlite"]
     if PG_URL:
         params.append("postgres")
+    if ORACLE_DSN:
+        params.append("oracle")
+    if DB2_DSN:
+        params.append("db2")
     return params
 
 
@@ -64,6 +78,19 @@ async def backend_case(request, tmp_path, monkeypatch):
         await backend.open()
         yield BackendCase("sqlite", backend, prefix)
         await backend.close()
+        return
+
+    if request.param in ("oracle", "db2"):
+        # Oracle / Db2 live parity arms — opt-in via ORACLE_DSN / DB2_DSN.
+        # The full cleanup orchestration for these backends differs from
+        # PostgreSQL (no SET LOCAL custom GUC; different cascade semantics).
+        # Until that cleanup helper lands, skip from this generic fixture and
+        # rely on tests/test_oracle_live.py and tests/test_db2_live.py for
+        # the minimal live probes. See docs/INSTALL.md "Backend-gated tests".
+        pytest.skip(
+            f"{request.param} parity arm: detected DSN but cleanup helper not yet wired; "
+            f"see tests/test_{request.param}_live.py for the live smoke probe."
+        )
         return
 
     pool = await asyncpg.create_pool(PG_URL, min_size=1, max_size=2)
@@ -149,7 +176,9 @@ async def _raw_fetchval(case: BackendCase, tx: Any, pg_sql: str, *pg_args: Any, 
     return await tx.conn.fetchval(pg_sql, *pg_args)
 
 
-async def _raw_fetch(case: BackendCase, tx: Any, pg_sql: str, *pg_args: Any, sqlite_sql: str | None = None) -> list[Any]:
+async def _raw_fetch(
+    case: BackendCase, tx: Any, pg_sql: str, *pg_args: Any, sqlite_sql: str | None = None
+) -> list[Any]:
     if case.name == "sqlite":
         return await sqlite_persistence._fetch_all(tx.conn, sqlite_sql or pg_sql, pg_args)
     return await tx.conn.fetch(pg_sql, *pg_args)
@@ -250,10 +279,7 @@ async def _ensure_user(case: BackendCase, tx: Any, user_id: str, namespace: str 
             user_id,
             user_id,
             namespace,
-            sqlite_sql=(
-                "INSERT OR IGNORE INTO users (id, username, role, namespace) "
-                "VALUES (?, ?, 'user', ?)"
-            ),
+            sqlite_sql=("INSERT OR IGNORE INTO users (id, username, role, namespace) " "VALUES (?, ?, 'user', ?)"),
         )
     else:
         await _raw_execute(
@@ -1522,6 +1548,7 @@ async def test_state_kv_is_namespace_scoped(backend_case: BackendCase):
 @pytest.mark.asyncio
 async def test_sqlite_vector_semantic_search(tmp_path):
     from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
     # The runtime dim guard (added in the embed-dim slice) requires
     # _expected_embedding_dim to match the fixture vector length. Pass
     # a settings shim with embedding_dim=3 so the 3-D fixture vectors
@@ -1530,7 +1557,10 @@ async def test_sqlite_vector_semantic_search(tmp_path):
     backend = SqliteBackend(tmp_path / "vector.sqlite3", settings)
     await backend.open()
     visibility = VisibilityFilter(
-        scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace=None,
+        scope=VisibilityScope.ROOT_BYPASS,
+        user_id=None,
+        group_ids=(),
+        namespace=None,
     )
     async with backend.transactional() as tx:
         near = await _insert_memory(BackendCase("sqlite", backend, "sqlite_vector"), tx, suffix="near", content="near")
@@ -1539,7 +1569,10 @@ async def test_sqlite_vector_semantic_search(tmp_path):
         await backend.memories.upsert_memory_embedding(tx, near, [1.0, 0.0, 0.0])
         await backend.memories.upsert_memory_embedding(tx, far, [0.0, 1.0, 0.0])
         rows = await backend.memories.semantic_search(
-            tx, embedding=[0.9, 0.1, 0.0], limit=2, visibility=visibility,
+            tx,
+            embedding=[0.9, 0.1, 0.0],
+            limit=2,
+            visibility=visibility,
         )
     await backend.close()
     assert [row["id"] for row in rows] == [near, far]
@@ -1549,17 +1582,24 @@ async def test_sqlite_vector_semantic_search(tmp_path):
 @pytest.mark.asyncio
 async def test_sqlite_fts5_relevance_ordering(tmp_path):
     from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
     backend = SqliteBackend(tmp_path / "fts.sqlite3", SimpleNamespace())
     await backend.open()
     visibility = VisibilityFilter(
-        scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace=None,
+        scope=VisibilityScope.ROOT_BYPASS,
+        user_id=None,
+        group_ids=(),
+        namespace=None,
     )
     case = BackendCase("sqlite", backend, "sqlite_fts")
     async with backend.transactional() as tx:
         best = await _insert_memory(case, tx, suffix="best", content="apollo apollo apollo sqlite")
         other = await _insert_memory(case, tx, suffix="other", content="apollo persistence")
         rows = await backend.memories.fts_search(
-            tx, query="apollo", limit=2, visibility=visibility,
+            tx,
+            query="apollo",
+            limit=2,
+            visibility=visibility,
         )
     await backend.close()
     assert [row["id"] for row in rows] == [best, other]

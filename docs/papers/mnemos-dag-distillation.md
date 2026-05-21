@@ -39,7 +39,7 @@ or say exactly what is dropped.
 
 This paper describes the MNEMOS v5.0.0 design as implemented in the local
 codebase. It is a design paper, not a completed evaluation report. The
-evaluation work described later should be run by the PROTEUS barrage against
+evaluation work described later should be run by the <oracle-host> barrage against
 fixed corpora and fixed deployment profiles.
 
 ## 2. Architecture Overview
@@ -266,7 +266,7 @@ when selecting compression judges, synthesis models, or extraction models.
 ## 9. Evaluation Design
 
 This paper does not present final benchmark data. The correct evaluation should
-come from the PROTEUS barrage using fixed corpora, fixed model settings, and
+come from the <oracle-host> barrage using fixed corpora, fixed model settings, and
 repeatable deployment profiles. Three evaluation tracks are most important.
 
 First, recall fidelity at different compression ratios. A corpus should be

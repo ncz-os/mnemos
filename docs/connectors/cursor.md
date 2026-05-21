@@ -2,17 +2,17 @@
 
 Cursor can load MNEMOS through `~/.cursor/mcp.json` so its chat and agent flows share memory with the rest of your MCP clients.
 
-## What you need — token, host (192.168.207.67), relevant port(s)
+## What you need — token, host (<mnemos-host>), relevant port(s)
 
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- MNEMOS REST reachable at `http://192.168.207.67:5002`.
+- MNEMOS REST reachable at `http://<mnemos-host>:5002`.
 - Cursor with MCP support enabled.
 - Config path: `~/.cursor/mcp.json`.
 - The `mnemos` CLI installed on the same machine as Cursor.
-- Optional HTTP/SSE MCP bridge reachable at `http://192.168.207.67:5003/sse`.
+- Optional HTTP/SSE MCP bridge reachable at `http://<mnemos-host>:5003/sse`.
 - A Cursor restart after changing MCP server config.
 - A model profile allowed to call tools.
-- Network access from Cursor's machine to `192.168.207.67`.
+- Network access from Cursor's machine to `<mnemos-host>`.
 - `jq` available for the verification command below.
 
 ## Configuration — copy-paste-runnable code block; use $MNEMOS_TOKEN placeholder (never the live token)
@@ -29,7 +29,7 @@ servers. Cursor reads this file only during startup.
       "command": "mnemos",
       "args": ["serve", "mcp-stdio"],
       "env": {
-        "MNEMOS_BASE": "http://192.168.207.67:5002",
+        "MNEMOS_BASE": "http://<mnemos-host>:5002",
         "MNEMOS_API_KEY": "$MNEMOS_TOKEN"
       }
     }
@@ -45,7 +45,7 @@ with `wsl.exe` is fragile because environment and quoting rules differ.
 {
   "mcpServers": {
     "mnemos-sse": {
-      "url": "http://192.168.207.67:5003/sse",
+      "url": "http://<mnemos-host>:5003/sse",
       "headers": {
         "Authorization": "Bearer $MNEMOS_TOKEN"
       }
@@ -65,7 +65,7 @@ insufficient for MCP registration changes.
 
 ```bash
 # Server up?
-curl -fsS http://192.168.207.67:5002/health | jq -r '.status'    # → "healthy"
+curl -fsS http://<mnemos-host>:5002/health | jq -r '.status'    # → "healthy"
 
 # Confirm the canonical MCP tool registry includes search_memories:
 python3 -c 'from mnemos.mcp.tools import TOOL_REGISTRY; print("search_memories" in TOOL_REGISTRY)'  # → True

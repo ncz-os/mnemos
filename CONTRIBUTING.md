@@ -96,6 +96,33 @@ pytest -q
 ruff check . --extend-exclude .venv-ci
 ```
 
+### Backend-gated parity tests
+
+The `tests/test_persistence_parity.py` suite enumerates backend arms
+based on which DSN env vars are set. SQLite always runs; the other
+arms are skipped cleanly when their env var is absent. To exercise
+the full matrix:
+
+```bash
+# PostgreSQL parity arm
+export MNEMOS_TEST_DB='postgres://mnemos:<password>@localhost:5432/mnemos'
+
+# Oracle 23ai parity arm
+export ORACLE_DSN='oracle://MNEMOS:<password>@localhost:1521/ORCLPDB1'
+
+# IBM Db2 12.1.5 parity arm
+export DB2_DSN='db2://MNEMOS:<password>@localhost:50000/MNEMOS'
+
+# Single-DSN selector (overrides per-backend vars)
+export MNEMOS_DATABASE_DSN='oracle://MNEMOS:<password>@localhost:1521/ORCLPDB1'
+
+pytest -q tests/test_persistence_parity.py tests/test_oracle_live.py tests/test_db2_live.py
+```
+
+Without these env vars, the default `pytest -q` run exercises the
+SQLite arm and the unit-level Oracle/Db2 surface (fake cursors, SQL
+translation safety), and skips the live arms.
+
 - For changes touching tenancy, DAG history, triggers, import/export, or
   auth, include focused regression tests and document the expected
   operator behavior for 404 vs 409 vs 403 outcomes.
@@ -128,6 +155,29 @@ mnemos serve --profile server
 If `MNEMOS_WORKERS > 1` with `RATE_LIMIT_STORAGE_URI=memory://`, startup logs a
 warning because circuit-breaker, rate-limit, and concurrency state are only
 process-local.
+
+### Multi-backend development
+
+To target one of the enterprise backends (Oracle 23ai or Db2 12.1.5) for local
+development, install the driver extra and set the matching DSN:
+
+```bash
+# Oracle 23ai
+python -m pip install -e '.[dev,server,oracle]'
+export MNEMOS_DATABASE_DSN='oracle://MNEMOS:<password>@localhost:1521/ORCLPDB1'
+mnemos install --profile server --backend oracle
+mnemos serve --profile server
+
+# IBM Db2 12.1.5
+python -m pip install -e '.[dev,server,db2]'
+export MNEMOS_DATABASE_DSN='db2://MNEMOS:<password>@localhost:50000/MNEMOS'
+mnemos install --profile server --backend db2
+mnemos serve --profile server
+```
+
+See `docs/INSTALL.md` for full driver and DSN guidance, and
+`docs/oracle-port-status.md` / `docs/db2-port-handoff.md` for the current
+repository-surface coverage on each backend.
 
 ## Guidelines
 

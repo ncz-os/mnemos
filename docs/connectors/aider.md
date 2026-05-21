@@ -2,11 +2,11 @@
 
 Aider does not currently expose a native MCP-client configuration, so use MNEMOS REST directly and paste the retrieved context into Aider when needed.
 
-## What you need — token, host (192.168.207.67), relevant port(s)
+## What you need — token, host (<mnemos-host>), relevant port(s)
 
 - Aider installed for your repo workflow.
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- MNEMOS REST reachable at `http://192.168.207.67:5002`.
+- MNEMOS REST reachable at `http://<mnemos-host>:5002`.
 - `curl` for quick memory search and write calls.
 - Python 3 with `urllib.request` for a no-dependency helper.
 - A shell where Aider and the helper commands share environment.
@@ -23,7 +23,7 @@ Use REST calls before or during an Aider session. The curl example searches
 MNEMOS; the Python example creates a small memory from the command line.
 
 ```bash
-export MNEMOS_BASE="http://192.168.207.67:5002"
+export MNEMOS_BASE="http://<mnemos-host>:5002"
 export MNEMOS_TOKEN="${MNEMOS_TOKEN:?set MNEMOS_TOKEN first}"
 
 curl -fsS -X POST "$MNEMOS_BASE/v1/memories/search" \
@@ -76,7 +76,7 @@ prints only the fields you want in Aider's prompt.
 ## Verification — one curl or one tool-list call that proves registration worked
 
 ```bash
-curl -fsS -H "Authorization: Bearer $MNEMOS_TOKEN" http://192.168.207.67:5002/health
+curl -fsS -H "Authorization: Bearer $MNEMOS_TOKEN" http://<mnemos-host>:5002/health
 ```
 
 REST direct has no MCP registration to list; a healthy authenticated REST

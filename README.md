@@ -4,8 +4,10 @@
 
 # MNEMOS + GRAEAE
 
-**MNEMOS v5.0.1 is the memory operating system for serious agentic work: a
-packaged FastAPI runtime, multi-backend persistence layer, GRAEAE reasoning bus,
+**MNEMOS (v6.0-rc — `release/v6.0-rc` branch, `v6.0-rc` tag) is the memory operating system for
+serious agentic work: a packaged FastAPI runtime, **four-backend** persistence
+layer (PostgreSQL + pgvector, Oracle Database 26ai HNSW INMEMORY NEIGHBOR GRAPH,
+IBM Db2 12.1.5 (EAP) DiskANN vector, SQLite + sqlite-vec), GRAEAE reasoning bus,
 operator-audited compression stack, divergent dream-state pipeline (REPLAY ->
 CLUSTER -> CONSOLIDATE -> SYNTHESISE -> EXTRACT), GDPR right-to-be-forgotten
 worker, PERSEPHONE archival subsystem, PANTHEON unified LLM facade, KRONOS
@@ -15,6 +17,17 @@ MNEMOS is not just a place to put bytes. It is a runtime of named subsystems tha
 manage the full lifecycle of agent memory across providers, agents, and time
 horizons: **write, embed, search, compress, version, reason-over, audit,
 federate, export, import, and operate**.
+
+> **Release candidate.** This README documents the **`v6.0-rc` tag** —
+> the canonical release candidate. It adds Oracle Database 26ai and
+> IBM Db2 12.1.5 (Early Access Program) as first-class persistence
+> backends alongside PostgreSQL and SQLite. The most recent published
+> PyPI release is `5.0.1` (Postgres + SQLite only). Enterprise backends
+> ship from source against the tag until pip extras are published:
+> `git clone -b v6.0-rc https://github.com/ncz-os/mnemos`. See
+> [docs/INSTALL.md](docs/INSTALL.md#enterprise-backends-oracle-ai-database-26ai--ibm-db2-1215-eap)
+> for driver, DSN, and migration steps. Development history continues
+> on the `feat/oracle-port` branch.
 
 
 ## Quick Start
@@ -40,6 +53,23 @@ Steps:
 
 Edge device (SQLite, no Postgres): pip install 'mnemos-os[edge]==5.0.1' instead.
 Full install with all subsystems: pip install 'mnemos-os[full]==5.0.1'
+```
+
+**Enterprise backends (Oracle Database 26ai, IBM Db2 12.1.5 EAP).**
+Until the next PyPI release is cut, install from source against the
+`v6.0-rc` tag (or the `feat/oracle-port` development branch) and add
+the matching extras. See
+[docs/INSTALL.md](docs/INSTALL.md#enterprise-backends-oracle-ai-database-26ai--ibm-db2-1215-eap)
+for full driver, DSN, and migration steps.
+
+```
+git clone -b feat/oracle-port https://github.com/ncz-os/mnemos
+cd mnemos
+python -m pip install -e '.[server,oracle]'   # or '.[server,db2]' or '.[server,enterprise]'
+export MNEMOS_DATABASE_DSN='oracle://user:pass@host:1521/service_name'
+# or:  MNEMOS_DATABASE_DSN='db2://user:pass@host:50000/dbname'
+mnemos install --profile server
+mnemos serve --profile server
 ```
 
 ---
@@ -94,7 +124,7 @@ Full documentation: [docs/](docs/)
 
 ## Architecture
 
-MNEMOS is a packaged FastAPI service with a single `mnemos` CLI for installation, serving, MCP transport, and operational checks. Agents connect through MCP stdio, MCP HTTP/SSE, REST, or OpenAI-compatible SDKs, while the runtime routes memory, reasoning, session, webhook, federation, portability, and observability work through the `mnemos/` package. Persistence is selected by profile: SQLite plus sqlite-vec for edge and development installs, or PostgreSQL plus pgvector for server deployments. GRAEAE handles multi-provider reasoning and model routing; MOIRAI handles operator-audited compression through APOLLO and ARTEMIS.
+MNEMOS is a packaged FastAPI service with a single `mnemos` CLI for installation, serving, MCP transport, and operational checks. Agents connect through MCP stdio, MCP HTTP/SSE, REST, or OpenAI-compatible SDKs, while the runtime routes memory, reasoning, session, webhook, federation, portability, and observability work through the `mnemos/` package. Persistence is selected by profile and DSN: **SQLite + sqlite-vec** for edge and development installs, **PostgreSQL + pgvector** for server deployments, **Oracle Database 26ai** (`23.26.1-ee`, HNSW INMEMORY NEIGHBOR GRAPH, JSON Duality, TDE) for enterprise installs, and **IBM Db2 12.1.5** (Early Access Program; native `VECTOR(768, FLOAT32)` + DiskANN vector index, bench-validated with `EUCLIDEAN`; runs through **Db2 Oracle Compatibility Mode** with cursor-level Oracle→Db2 token translation, so query parsing carries compat-layer overhead — a native Db2 dialect port is on the v6.x roadmap, see [docs/v6.1-roadmap.md](docs/v6.1-roadmap.md). `Db2MemoryRepository.semantic_search` is the one method already overridden with native Db2 SQL — `EUCLIDEAN` + `FETCH APPROX FIRST` — so the DiskANN index engages on the user-facing query path) for enterprise installs. All four backends implement the same `PersistenceBackend` ABC (`mnemos/persistence/base.py`) and share `tests/test_persistence_parity.py`. GRAEAE handles multi-provider reasoning and model routing; MOIRAI handles operator-audited compression through APOLLO and ARTEMIS.
 
 ## Documentation
 
@@ -112,6 +142,7 @@ MNEMOS is a packaged FastAPI service with a single `mnemos` CLI for installation
 | Scaling | [docs/SCALING.md](docs/SCALING.md) |
 | Single-binary builds | [docs/SINGLE_BINARY.md](docs/SINGLE_BINARY.md) |
 | Operations | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
+| Proof & benchmarks | [docs/proof/bench-v4/](docs/proof/bench-v4/) (canonical: [bench-v4-defensible-10000-20260521T182312Z.json](docs/proof/bench-v4/bench-v4-defensible-10000-20260521T182312Z.json)) · [bakeoff-final-summary-2026-05-21.md](docs/proof/bakeoff-final-summary-2026-05-21.md) |
 
 ## License
 

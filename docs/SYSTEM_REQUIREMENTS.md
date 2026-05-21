@@ -105,8 +105,8 @@ From real deployments as of 2026-04-23:
 
 | Host      | Tier        | CPU avg  | RAM resident | Disk (live) | GPU util                     |
 | --------- | ----------- | -------- | ------------ | ----------- | ---------------------------- |
-| PYTHIA    | Server      | ~15% of 12 cores | ~8 GB (pg + api + worker) | ~12 GB (corpus 5k+ memories, backups separate) | N/A (no GPU; offloads to CERBERUS) |
-| CERBERUS  | Server + GPU | ~20% of 24 cores | ~18 GB (pg + api + worker + vLLM) | ~30 GB | 60-80% during active contest, idle otherwise |
+| pg-host    | Server      | ~15% of 12 cores | ~8 GB (pg + api + worker) | ~12 GB (corpus 5k+ memories, backups separate) | N/A (no GPU; offloads to gpu-host) |
+| gpu-host  | Server + GPU | ~20% of 24 cores | ~18 GB (pg + api + worker + vLLM) | ~30 GB | 60-80% during active contest, idle otherwise |
 
 These are operational rather than prescriptive — real workloads will
 differ. Use these as a sanity check when sizing a new host.

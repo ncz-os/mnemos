@@ -2,14 +2,14 @@
 
 GitHub Copilot Chat can partially reach MNEMOS through VS Code's chat participant and MCP configuration path, using the MNEMOS HTTP/SSE endpoint as the backing tool server.
 
-## What you need — token, host (192.168.207.67), relevant port(s)
+## What you need — token, host (<mnemos-host>), relevant port(s)
 
 - VS Code with GitHub Copilot Chat installed and enabled.
 - A Copilot Chat build that exposes chat participant MCP configuration.
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- MNEMOS MCP HTTP/SSE reachable at `http://192.168.207.67:5003/sse`.
+- MNEMOS MCP HTTP/SSE reachable at `http://<mnemos-host>:5003/sse`.
 - Config path: user or workspace `settings.json`.
-- Network access from VS Code to `192.168.207.67`.
+- Network access from VS Code to `<mnemos-host>`.
 - A VS Code window reload after changing settings.
 - A model and policy profile that permits tool use.
 - `curl` for bridge verification.
@@ -29,7 +29,7 @@ resolved from a private environment and is never committed.
     "mnemos": {
       "type": "mcp",
       "transport": "sse",
-      "url": "http://192.168.207.67:5003/sse",
+      "url": "http://<mnemos-host>:5003/sse",
       "headers": {
         "Authorization": "Bearer ${env:MNEMOS_TOKEN}"
       }
@@ -56,7 +56,7 @@ the VS Code configuration reference.
 ## Verification — one curl or one tool-list call that proves registration worked
 
 ```bash
-curl -fsS -H "Authorization: Bearer $MNEMOS_TOKEN" http://192.168.207.67:5003/sse
+curl -fsS -H "Authorization: Bearer $MNEMOS_TOKEN" http://<mnemos-host>:5003/sse
 ```
 
 The authenticated request should open a `text/event-stream`. Then reload the

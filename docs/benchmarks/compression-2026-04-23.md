@@ -2,7 +2,7 @@
 
 First full-scale run of the v3.1 competitive-selection contest against
 real production memories. Executed against a test deployment on
-CERBERUS (192.168.207.96) with PYTHIA MNEMOS as the memory source.
+<gpu-host> (<host>) with <pg-host> MNEMOS as the memory source.
 
 This document discharges the ROADMAP shipping criterion:
 
@@ -21,7 +21,7 @@ bytea crash on backslash content), per-engine characterization across
 
 | Component              | Detail                                              |
 |------------------------|-----------------------------------------------------|
-| Test host              | CERBERUS, 192.168.207.96                            |
+| Test host              | <gpu-host>, <host>                            |
 | CPU                    | AMD Threadripper PRO 5945WX (12-core / 24-thread)   |
 | RAM                    | 128 GB DDR4                                         |
 | GPU                    | NVIDIA RTX 4500 Ada Generation, 24 GB               |
@@ -37,7 +37,7 @@ bytea crash on backslash content), per-engine characterization across
 
 ## Sample selection
 
-464 memories pulled from PYTHIA MNEMOS via `/memories/search` across
+464 memories pulled from <pg-host> MNEMOS via `/memories/search` across
 50 varied query terms, filtered to uncompressed only
 (`compressed_content IS NULL` at source — clean v3.1 input, no v3.0
 compression artifacts), then stratified by content length.
@@ -51,13 +51,13 @@ Harvest result:
 | large  (>5KB)   | 200    |   15     | 5,080 - 16,993 bytes |
 | **Total**       | **1000** | **464** |                    |
 
-Small and large buckets were shallow in PYTHIA's `/memories/search`
+Small and large buckets were shallow in <pg-host>'s `/memories/search`
 results — the endpoint prioritizes relevance-weighted matches, which
 favor medium-length content. The resulting sample skews toward 2-5KB
 memories, which turned out to be the sweet spot where the contest
 dynamics are most interesting (neither engine is trivially dominant).
 
-Category distribution (auto-derived from PYTHIA, not re-stratified):
+Category distribution (auto-derived from <pg-host>, not re-stratified):
 
 | Category              | N   | Share |
 |-----------------------|----:|------:|
@@ -202,7 +202,7 @@ bytea" on memories whose content contained backslash-escape-like
 sequences. The `mnemos_version_snapshot()` trigger computed
 `commit_hash` via `(text_expr)::bytea` which interprets `\x47`,
 `\d+`, `\0`, `\n` etc. as bytea escape syntax. Latent since v2
-shipped; surfaced when the benchmark fed real PYTHIA content (code,
+shipped; surfaced when the benchmark fed real <pg-host> content (code,
 paths, regex) through INSERT. Fix: `db/migrations_v3_1_versioning_
 fix.sql` replaces the cast with `convert_to(text, 'UTF8')` which
 returns raw UTF-8 bytes without parsing escapes.
@@ -352,9 +352,9 @@ next (not promises for v3.1):
 ## Reproducing this benchmark
 
 Driver scripts retained in `/tmp/` on the dev host and in
-`/home/jasonperlow/mnemos-test/` on CERBERUS:
+`/home/jasonperlow/mnemos-test/` on <gpu-host>:
 
-- `barrage_seed.py` — harvests 2660+ memories from PYTHIA, filters
+- `barrage_seed.py` — harvests 2660+ memories from <pg-host>, filters
   to uncompressed only, stratifies by size, selects ~1000 (subject
   to pool depth), bulk-inserts into memories + enqueues
 - `barrage_drain.py` — loops `process_contest_queue` until empty,
@@ -367,12 +367,12 @@ Driver scripts retained in `/tmp/` on the dev host and in
 Running the drain is one command once the test instance is up:
 
 ```bash
-ssh jasonperlow@192.168.207.96 \
+ssh jasonperlow@<host> \
     /home/jasonperlow/mnemos-test/.venv/bin/python \
     /home/jasonperlow/mnemos-test/barrage_drain.py
 ```
 
 Expected timing at current parameters: ~2 hours wall-clock for 464
-memories on CERBERUS's RTX 4500 Ada with gemma-4-E4B-it-Q6_K.
+memories on <gpu-host>'s RTX 4500 Ada with gemma-4-E4B-it-Q6_K.
 Scales linearly with memory count; dominant per-memory cost is
 ANAMNESIS's extraction call.

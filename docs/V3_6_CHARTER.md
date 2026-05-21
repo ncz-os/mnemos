@@ -33,7 +33,7 @@ MNEMOS v3.6 is the **APOLLO S-IVB maturity release**. It ships the final two pha
 - Never hard-delete; soft-delete pattern preserves audit trail across federation boundaries.
 
 **Cost benefit:**
-- Reduces `pgvector` index bloat (10–15% reduction on PYTHIA production sample).
+- Reduces `pgvector` index bloat (10–15% reduction on pg-host production sample).
 - Decreases embedding-search redundancy (fewer near-identical candidates to rank).
 - Improves retrieval latency (fewer results to rerank).
 
@@ -218,7 +218,7 @@ env = {PANTHEON_API_KEY = "..."}
 - ✅ Compression hot-paths serving dense variants to federation + session replay + MCP.
 - ✅ Design paper published in `docs/MEMORY_ARCHITECTURE.md`; covers all major subsystems.
 - ✅ PANTHEON donations (Hermes + Continue) merged or documented as PRs.
-- ✅ Live PYTHIA production: archival job runs nightly without incidents; archival volume > 100k memories.
+- ✅ Live pg-host production: archival job runs nightly without incidents; archival volume > 100k memories.
 
 ---
 
@@ -228,7 +228,7 @@ v3.6 GA gate:
 - [ ] CONSOLIDATE + archival integration tests against real MNEMOS instance.
 - [ ] Federation round-trip: archive on system A, peer system B sees stub, restore via federation pull.
 - [ ] Design paper peer review (external: 1–2 reviewers from OSS community).
-- [ ] PERSEPHONE S3 restore validated on operator's prod infrastructure (or PYTHIA test).
+- [ ] PERSEPHONE S3 restore validated on operator's prod infrastructure (or pg-host test).
 - [ ] All mutation paths (CONSOLIDATE, EXTRACT, ARCHIVE) audit-logged and queryable via `/v1/audit`.
 - [ ] Compression hot-paths benchmarked: bytes-on-wire reduction, latency impact, LLM token savings.
 - [ ] Client donations (Hermes + Continue) either merged upstream or documented for operator adoption.

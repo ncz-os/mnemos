@@ -2,14 +2,14 @@
 
 vLLM can use MNEMOS through its OpenAI-compatible tool-call API when served with automatic tool choice and the correct per-model parser.
 
-## What you need — token, host (192.168.207.67), relevant port(s)
+## What you need — token, host (<mnemos-host>), relevant port(s)
 
 - vLLM installed on the model-serving host.
 - A model with reliable tool-call training.
 - `--enable-auto-tool-choice` enabled on the vLLM server.
 - The right `--tool-call-parser` for the model family.
 - Python 3.11+ with the OpenAI SDK.
-- MNEMOS MCP HTTP/SSE reachable at `http://192.168.207.67:5003/sse`.
+- MNEMOS MCP HTTP/SSE reachable at `http://<mnemos-host>:5003/sse`.
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
 - The upcoming `mnemos-bridge-openai` adapter package from Phase 2 of bridge
   consolidation.
@@ -35,7 +35,7 @@ Parser choices are model-family specific:
 - `mistral` for the Mistral family.
 - `llama3_json` for the Meta-Llama-3 family.
 
-Fleet live example: CERBERUS at `192.168.207.96:8000` runs vLLM with
+Fleet live example: <gpu-host> at `<host>:8000` runs vLLM with
 Mistral-7B and `--tool-call-parser mistral`.
 
 Then use the OpenAI SDK pattern and list MNEMOS tools through the bridge
@@ -51,7 +51,7 @@ from openai import OpenAI
 from mnemos_bridge_openai import MnemosOpenAITools
 
 mnemos = MnemosOpenAITools.from_sse(
-    url="http://192.168.207.67:5003/sse",
+    url="http://<mnemos-host>:5003/sse",
     headers={"Authorization": f"Bearer {os.environ['MNEMOS_TOKEN']}"},
 )
 
@@ -65,14 +65,14 @@ response = client.chat.completions.create(
 print(mnemos.dispatch_tool_calls(response))
 ```
 
-For the CERBERUS fleet endpoint, replace the client base URL with
-`http://192.168.207.96:8000/v1`.
+For the <gpu-host> fleet endpoint, replace the client base URL with
+`http://<host>:8000/v1`.
 
 ## Verification — one curl or one tool-list call that proves registration worked
 
 ```bash
 curl -fsS http://localhost:8000/v1/models
-curl -fsS -H "Authorization: Bearer $MNEMOS_TOKEN" http://192.168.207.67:5003/sse
+curl -fsS -H "Authorization: Bearer $MNEMOS_TOKEN" http://<mnemos-host>:5003/sse
 ```
 
 The first command proves the vLLM OpenAI-compatible server is up. The second

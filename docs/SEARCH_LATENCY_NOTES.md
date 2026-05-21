@@ -1,6 +1,6 @@
 # Search Latency Notes
 
-Context: live PYTHIA production `POST /v1/memories/search` latency measured on
+Context: live pg-host production `POST /v1/memories/search` latency measured on
 2026-05-04 was p50=1527ms, p95=1913ms, p99=1931ms, mean=1579ms,
 stdev=144ms over a corpus of about 7,500 memories. Image v5.0.7 had
 `mnemos_hot` enabled; the isolated Rust rerank path measured about 66ms.

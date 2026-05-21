@@ -1,3 +1,18 @@
+"""Tests for `mnemos.core.pool.PoolManager` — the asyncpg pool wrapper.
+
+Scope clarifier: this file exercises the PoolManager that wraps the
+`asyncpg`-backed PostgreSQL connection pool used by `PostgresBackend`.
+It does NOT exercise the Redis-backed pool (no Redis dependency here),
+nor the per-driver pool shapes used by `OracleBackend` (`oracledb` pool)
+or `Db2Backend` (`ibm_db` pool). Those are covered by their own backend
+tests + the live probes in `tests/test_oracle_live.py` and
+`tests/test_db2_live.py`.
+
+If a future refactor consolidates pool management across backends, the
+shared coverage should land here under explicit per-backend
+parametrize() arms (mirroring the test_persistence_parity.py shape).
+"""
+
 from __future__ import annotations
 
 from collections import deque

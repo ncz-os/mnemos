@@ -2,15 +2,15 @@
 
 LlamaIndex can load MNEMOS tools through `llama-index-tools-mcp` and expose them to an agent or query workflow as regular LlamaIndex tools.
 
-## What you need — token, host (192.168.207.67), relevant port(s)
+## What you need — token, host (<mnemos-host>), relevant port(s)
 
 - Python 3.11+.
 - `llama-index-core >= 0.11`.
 - `llama-index-tools-mcp`.
 - A LlamaIndex LLM integration for the agent runtime.
-- MNEMOS MCP HTTP/SSE reachable at `http://192.168.207.67:5003/sse`.
+- MNEMOS MCP HTTP/SSE reachable at `http://<mnemos-host>:5003/sse`.
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- Network access from the LlamaIndex runtime to `192.168.207.67`.
+- Network access from the LlamaIndex runtime to `<mnemos-host>`.
 - A policy decision about which write tools the agent may call.
 
 ## Configuration snippet — MCPToolSpec to a LlamaIndex agent
@@ -27,7 +27,7 @@ from llama_index.tools.mcp import BasicMCPClient, McpToolSpec
 
 async def main() -> None:
     client = BasicMCPClient(
-        "http://192.168.207.67:5003/sse",
+        "http://<mnemos-host>:5003/sse",
         headers={"Authorization": f"Bearer {os.environ['MNEMOS_TOKEN']}"},
     )
     tool_spec = McpToolSpec(client=client)
@@ -51,7 +51,7 @@ import asyncio, os
 from llama_index.tools.mcp import BasicMCPClient, McpToolSpec
 
 async def main():
-    client = BasicMCPClient("http://192.168.207.67:5003/sse", headers={"Authorization": f"Bearer {os.environ['MNEMOS_TOKEN']}"})
+    client = BasicMCPClient("http://<mnemos-host>:5003/sse", headers={"Authorization": f"Bearer {os.environ['MNEMOS_TOKEN']}"})
     spec = McpToolSpec(client=client)
     print([tool.metadata.name for tool in await spec.to_tool_list_async()])
 

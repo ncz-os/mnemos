@@ -2,16 +2,16 @@
 
 Cline can use MNEMOS from VS Code by adding a `mnemos` MCP server to the extension's MCP settings JSON.
 
-## What you need — token, host (192.168.207.67), relevant port(s)
+## What you need — token, host (<mnemos-host>), relevant port(s)
 
 - Cline for VS Code with MCP support.
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- MNEMOS REST reachable at `http://192.168.207.67:5002`.
+- MNEMOS REST reachable at `http://<mnemos-host>:5002`.
 - The `mnemos` CLI installed where VS Code launches extensions.
 - macOS Cline path: `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`.
 - Linux Cline path: `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`.
 - Windows Cline path: `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`.
-- Optional HTTP/SSE bridge reachable at `http://192.168.207.67:5003/sse`.
+- Optional HTTP/SSE bridge reachable at `http://<mnemos-host>:5003/sse`.
 - VS Code window reload after editing the file.
 - A model selected in Cline that can call tools.
 
@@ -30,7 +30,7 @@ still prompt for approval.
       "command": "mnemos",
       "args": ["serve", "mcp-stdio"],
       "env": {
-        "MNEMOS_BASE": "http://192.168.207.67:5002",
+        "MNEMOS_BASE": "http://<mnemos-host>:5002",
         "MNEMOS_API_KEY": "$MNEMOS_TOKEN"
       },
       "disabled": false,
@@ -57,7 +57,7 @@ For HTTP/SSE, use this shape only if your Cline build supports remote MCP:
 {
   "mcpServers": {
     "mnemos-sse": {
-      "url": "http://192.168.207.67:5003/sse",
+      "url": "http://<mnemos-host>:5003/sse",
       "headers": {
         "Authorization": "Bearer $MNEMOS_TOKEN"
       },
@@ -75,7 +75,7 @@ task that was already running will not pick up the new server.
 
 ```bash
 # Server up?
-curl -fsS http://192.168.207.67:5002/health | jq -r '.status'    # → "healthy"
+curl -fsS http://<mnemos-host>:5002/health | jq -r '.status'    # → "healthy"
 
 # Confirm the canonical MCP tool registry includes kg_search:
 python3 -c 'from mnemos.mcp.tools import TOOL_REGISTRY; print("kg_search" in TOOL_REGISTRY)'  # → True

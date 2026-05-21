@@ -2,14 +2,14 @@
 
 Codex CLI 0.125.0 and newer can register MNEMOS as an MCP server with `codex mcp add` or a `~/.codex/config.toml` block.
 
-## What you need — token, host (192.168.207.67), relevant port(s)
+## What you need — token, host (<mnemos-host>), relevant port(s)
 
 - Codex CLI `0.125.0` or newer.
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- MNEMOS REST reachable at `http://192.168.207.67:5002`.
+- MNEMOS REST reachable at `http://<mnemos-host>:5002`.
 - The `mnemos` CLI installed on the same machine as Codex CLI.
 - Config path: `~/.codex/config.toml`.
-- Optional HTTP/SSE MCP bridge reachable at `http://192.168.207.67:5003/sse`.
+- Optional HTTP/SSE MCP bridge reachable at `http://<mnemos-host>:5003/sse`.
 - A new Codex process after config changes.
 - Shell access to run `codex mcp add`.
 - `jq` available for the verification command.
@@ -25,7 +25,7 @@ Codex CLI builds that support `codex mcp add`.
 ```bash
 export MNEMOS_TOKEN="${MNEMOS_TOKEN:?set MNEMOS_TOKEN first}"
 codex mcp add mnemos \
-  --env MNEMOS_BASE=http://192.168.207.67:5002 \
+  --env MNEMOS_BASE=http://<mnemos-host>:5002 \
   --env MNEMOS_API_KEY="$MNEMOS_TOKEN" \
   -- mnemos serve mcp-stdio
 ```
@@ -38,7 +38,7 @@ command = "mnemos"
 args = ["serve", "mcp-stdio"]
 
 [mcp_servers.mnemos.env]
-MNEMOS_BASE = "http://192.168.207.67:5002"
+MNEMOS_BASE = "http://<mnemos-host>:5002"
 MNEMOS_API_KEY = "$MNEMOS_TOKEN"
 ```
 
@@ -51,7 +51,7 @@ MCP transport:
 
 ```toml
 [mcp_servers.mnemos-sse]
-url = "http://192.168.207.67:5003/sse"
+url = "http://<mnemos-host>:5003/sse"
 
 [mcp_servers.mnemos-sse.headers]
 Authorization = "Bearer $MNEMOS_TOKEN"

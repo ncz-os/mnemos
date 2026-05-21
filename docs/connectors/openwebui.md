@@ -2,15 +2,15 @@
 
 OpenWebUI has no native MCP client path for MNEMOS, so wire MNEMOS REST on `:5002` as a tool endpoint or a small OpenWebUI Function.
 
-## What you need — token, host (192.168.207.67), relevant port(s)
+## What you need — token, host (<mnemos-host>), relevant port(s)
 
 - OpenWebUI running as an administrator-managed instance.
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- MNEMOS REST reachable at `http://192.168.207.67:5002`.
+- MNEMOS REST reachable at `http://<mnemos-host>:5002`.
 - No MCP server for OpenWebUI; do not use `:5003` for this surface.
 - A model in OpenWebUI that supports tool/function calling.
 - Access to OpenWebUI Admin Settings, Tools, or Functions.
-- Optional access to `http://192.168.207.67:5002/openapi.json`.
+- Optional access to `http://<mnemos-host>:5002/openapi.json`.
 - Python `requests` available inside the OpenWebUI container for Functions.
 - A non-root MNEMOS token for shared team OpenWebUI deployments.
 - Browser access to enable the tool per chat after registration.
@@ -52,7 +52,7 @@ maps model tool calls to MNEMOS REST. This minimal schema covers search:
 Point the implementation at:
 
 ```text
-POST http://192.168.207.67:5002/v1/memories/search
+POST http://<mnemos-host>:5002/v1/memories/search
 Authorization: Bearer $MNEMOS_TOKEN
 Content-Type: application/json
 ```
@@ -67,7 +67,7 @@ from pydantic import BaseModel, Field
 
 class Tools:
     class Valves(BaseModel):
-        MNEMOS_BASE: str = Field(default="http://192.168.207.67:5002")
+        MNEMOS_BASE: str = Field(default="http://<mnemos-host>:5002")
         MNEMOS_TOKEN: str = Field(default="$MNEMOS_TOKEN")
 
     def __init__(self):
@@ -86,13 +86,13 @@ class Tools:
 ```
 
 An OpenAPI-server style setup can also point OpenWebUI at
-`http://192.168.207.67:5002/openapi.json`, then restrict exposed operations
+`http://<mnemos-host>:5002/openapi.json`, then restrict exposed operations
 to read tools such as memory search before allowing writes.
 
 ## Verification — one curl or one tool-list call that proves registration worked
 
 ```bash
-curl -fsS -X POST http://192.168.207.67:5002/v1/memories/search -H "Authorization: Bearer $MNEMOS_TOKEN" -H "Content-Type: application/json" -d '{"query":"openwebui connector smoke","limit":3}'
+curl -fsS -X POST http://<mnemos-host>:5002/v1/memories/search -H "Authorization: Bearer $MNEMOS_TOKEN" -H "Content-Type: application/json" -d '{"query":"openwebui connector smoke","limit":3}'
 ```
 
 In OpenWebUI, enable the registered tool in the chat's tool picker and ask
