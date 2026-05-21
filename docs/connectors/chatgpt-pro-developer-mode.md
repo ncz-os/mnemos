@@ -54,7 +54,7 @@ Desktop is queryable from ChatGPT and vice versa.
 
 ### 1. Bring up the MCP HTTP/SSE bridge
 
-Add to your `docker-compose.override.yml` (PYTHIA prod example):
+Add to your `docker-compose.override.yml` (<pg-host> prod example):
 
 ```yaml
 services:
@@ -114,13 +114,13 @@ brew install ngrok        # or: snap install ngrok
 ngrok config add-authtoken <your-ngrok-authtoken-from-dashboard>
 
 # Each session:
-ngrok http http://192.168.207.67:5004
+ngrok http http://<mnemos-host>:5004
 ```
 
 ngrok prints something like:
 
 ```
-Forwarding   https://abc-123.ngrok-free.app → http://192.168.207.67:5004
+Forwarding   https://abc-123.ngrok-free.app → http://<mnemos-host>:5004
 ```
 
 The `https://abc-123.ngrok-free.app` is your public connector URL.
@@ -133,7 +133,7 @@ subdomain with `--domain=mnemos.ngrok.app`.
 cloudflared tunnel login                # one-time, requires domain in CF
 cloudflared tunnel create mnemos
 cloudflared tunnel route dns mnemos mnemos.yourdomain.com
-cloudflared tunnel run --url http://192.168.207.67:5004 mnemos
+cloudflared tunnel run --url http://<mnemos-host>:5004 mnemos
 ```
 
 Resulting URL: `https://mnemos.yourdomain.com`.

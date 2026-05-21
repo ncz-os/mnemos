@@ -8,6 +8,7 @@ Allowed exceptions to the ban are:
   * ``mnemos/installer/*``: the install wizard runs before package config exists.
   * ``tests/*``: test-specific process environment setup is intentional.
 """
+
 from __future__ import annotations
 
 import os
@@ -153,9 +154,7 @@ class _ServerSettings(BaseSettings):
     # bearer tokens) so any token holder can't append forged audit
     # rows. When unset, the endpoint operates in legacy mode (any
     # authenticated caller) and emits a warning at startup.
-    internal_audit_token: str = Field(
-        "", validation_alias="MNEMOS_INTERNAL_AUDIT_TOKEN"
-    )
+    internal_audit_token: str = Field("", validation_alias="MNEMOS_INTERNAL_AUDIT_TOKEN")
     profile: str = Field("personal", validation_alias="MNEMOS_PROFILE")
     max_body_bytes: int = Field(5 * 1024 * 1024, validation_alias="MAX_BODY_BYTES")
     cors_origins: str = Field(
@@ -218,9 +217,21 @@ class _ProviderSettings(BaseSettings):
     gpu_provider_host: str = Field("http://localhost", validation_alias="GPU_PROVIDER_HOST")
     gpu_provider_port: str = Field("8000", validation_alias="GPU_PROVIDER_PORT")
     gpu_provider_timeout: float = Field(30.0, validation_alias="GPU_PROVIDER_TIMEOUT")
-    inference_embed_host: str = Field("http://localhost:11434", validation_alias="INFERENCE_EMBED_HOST")
-    inference_embed_model: str = Field("nomic-embed-text", validation_alias="INFERENCE_EMBED_MODEL")
+    # Embedding generation is in-process — see mnemos/runtime/embedder.py.
+    # Architectural decision mem_1779334716543_f8ebd4, operator-locked 2026-05-21.
+    # Fields below are retained for installer compatibility only and are no
+    # longer read by the runtime. New deployments should set MNEMOS_EMBED_*
+    # (model path / threads / gpu_layers) instead.
+    inference_embed_host: str = Field("", validation_alias="INFERENCE_EMBED_HOST")
+    inference_embed_model: str = Field("", validation_alias="INFERENCE_EMBED_MODEL")
     inference_embed_timeout: float = Field(10.0, validation_alias="INFERENCE_EMBED_TIMEOUT")
+    embed_model_path: str = Field(
+        "/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf",
+        validation_alias="MNEMOS_EMBED_MODEL_PATH",
+    )
+    embed_n_ctx: int = Field(8192, validation_alias="MNEMOS_EMBED_N_CTX")
+    embed_threads: int = Field(0, validation_alias="MNEMOS_EMBED_THREADS")  # 0 = auto
+    embed_gpu_layers: int = Field(0, validation_alias="MNEMOS_EMBED_GPU_LAYERS")
 
     def api_key_for(self, provider: str) -> str:
         keys = {
@@ -304,7 +315,8 @@ class _ObservabilitySettings(BaseSettings):
     # /metrics endpoint is reachable from less-trusted networks (shared
     # cloud Prometheus, public-internet-routed clusters) flip this on.
     metrics_require_auth: bool = Field(
-        False, validation_alias="MNEMOS_METRICS_REQUIRE_AUTH",
+        False,
+        validation_alias="MNEMOS_METRICS_REQUIRE_AUTH",
     )
     otel_service_name: str = Field("mnemos", validation_alias="OTEL_SERVICE_NAME")
     otel_exporter_otlp_endpoint: str = Field("", validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -596,9 +608,7 @@ class _NatsSettings(BaseSettings):
     # both single- and multi-replica deployments, just wasteful in the
     # multi-replica case. Flip to a non-empty group name only after all
     # replicas understand it. (Audit Finding 5.)
-    webhook_queue_group: str = Field(
-        "", validation_alias="MNEMOS_WEBHOOK_NATS_QUEUE_GROUP"
-    )
+    webhook_queue_group: str = Field("", validation_alias="MNEMOS_WEBHOOK_NATS_QUEUE_GROUP")
 
     @field_validator("publish_timeout_seconds", mode="before")
     @classmethod

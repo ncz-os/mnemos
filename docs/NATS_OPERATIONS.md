@@ -251,10 +251,10 @@ Set `MNEMOS_FEDERATION_NATS_PEERS` to a JSON array per peer:
 [
   {
     "name": "pythia",
-    "nats_url": "nats://192.168.207.67:4222",
+    "nats_url": "nats://<host>:4222",
     "nats_token": "<NATS broker token>",
     "subjects": ["mnemos.memory.>"],
-    "base_url": "http://192.168.207.67:5002",
+    "base_url": "http://<host>:5002",
     "auth_token": "<HTTP Bearer for /v1/federation/* endpoints>"
   }
 ]

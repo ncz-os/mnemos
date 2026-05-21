@@ -1,0 +1,16 @@
+# IBM Db2 silent-install response file.
+#
+# `LIC_AGREEMENT = ACCEPT` below records acceptance of the IBM Db2
+# license terms governing the media used to build this container.
+# By setting `--build-arg ACCEPT_DB2_LICENSE=YES` on the docker build
+# command, you are explicitly accepting those terms for your build.
+#
+# If you are NOT entitled to accept IBM Db2 terms (no EAP enrollment,
+# no Passport Advantage seat, no commercial license), DO NOT USE THIS
+# FILE. The Dockerfile in this directory gates the install on the
+# ACCEPT_DB2_LICENSE build-arg.
+PROD = DB2_SERVER_EDITION
+FILE = /opt/ibm/db2/V12.1
+INSTALL_TYPE = TYPICAL
+LIC_AGREEMENT = ACCEPT
+INTERACTIVE = NONE

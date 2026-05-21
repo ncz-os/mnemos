@@ -36,7 +36,7 @@ MNEMOS v4.0 is the **infrastructure maturity + federation release**. It consolid
 The release spans three coupled work streams:
 
 1. **API consolidation** — unify security, pooling, ID-derivation patterns scattered across 9 handler files into reusable modules.
-2. **GPU stack integration** — deploy KRONOS (Tesseract time-series) on CERBERUS/TYPHON; measure anomaly detection + forecasting ROI; wire into the PANTHEON audit log.
+2. **GPU stack integration** — deploy KRONOS (Tesseract time-series) on gpu-host/gpu-host-2; measure anomaly detection + forecasting ROI; wire into the PANTHEON audit log.
 3. **MCP + surface integrations** — bring MNEMOS memory to Claude Code, Cursor, Continue, ChatGPT, Gemini via native MCP or bridged HTTP.
 
 Post-v4.0, MNEMOS is production-ready for enterprise deployment; v5.0 pivots to foundation-tier visibility work + Rust ports.
@@ -60,19 +60,19 @@ Post-v4.0, MNEMOS is production-ready for enterprise deployment; v5.0 pivots to 
 # api/security.py
 def is_root(bearer_token: str) -> bool:
     """Check if caller is root (master token)."""
-    
+
 def scope_owner(bearer_token: str) -> UUID:
     """Extract owner_id from bearer token."""
-    
+
 def assert_caller_owner_match(caller_owner_id: UUID, resource_owner_id: UUID, reason: str = None) -> None:
     """Raise 403 if mismatch."""
-    
+
 def assert_namespace_access(caller: Identity, requested_namespace: str) -> None:
     """Raise 403 if tenant not authorized."""
-    
+
 def assert_root_or_owner(bearer_token: str, resource_owner_id: UUID) -> bool:
     """Return True if caller is root OR owner; raise 403 else."""
-    
+
 class SecurityPolicy:
     """Encapsulate tenant-level policy (cost cap, model allowlist, etc.)."""
     @staticmethod
@@ -101,16 +101,16 @@ class SecurityPolicy:
 # api/pool.py
 class PoolManager:
     """Singleton wrapper around asyncpg pool with sensible defaults."""
-    
+
     async def transactional(self, isolation: str = "serializable") -> AsyncGenerator:
         """Context manager: acquire conn, start tx, commit or rollback."""
-        
+
     async def query(self, sql: str, *args) -> list[Record]:
         """Execute query; auto-retry on transient failures."""
-        
+
     async def execute(self, sql: str, *args) -> int:
         """Execute non-query; auto-retry."""
-        
+
     async def call(self, func: Callable, *args, isolation: str = "serializable") -> Any:
         """Run arbitrary async func inside tx."""
 ```
@@ -135,16 +135,16 @@ class PoolManager:
 # api/ids.py
 def parse_uuid_or_raise(s: str) -> UUID:
     """Parse string as UUID; raise 400 if invalid."""
-    
+
 def caller_scoped_id(owner_id: UUID, salt: str, extra: str = "") -> UUID:
     """Derive deterministic UUID from owner_id + salt + optional extra."""
-    
+
 def memory_id_from_content(owner_id: UUID, content: str, verbatim: str = "") -> UUID:
     """Deterministic memory_id from owner + content hash."""
-    
+
 def kg_triple_id_from_edges(owner_id: UUID, subject: str, predicate: str, obj: str) -> UUID:
     """Deterministic KG triple id."""
-    
+
 class IDNamespace:
     """Per-subsystem namespace for derived IDs (memories, kg_triples, dreams, etc.)."""
     MEMORY = "mem"
@@ -272,7 +272,7 @@ class MemoryStore(ABC):
     @abstractmethod
     async def create(self, memory: Memory) -> Memory:
         ...
-    
+
     @abstractmethod
     async def search(self, query: str, limit: int, owner_id: UUID) -> list[SearchResult]:
         """Vector search via `<=>` on Postgres, custom scoring on SQLite."""
@@ -453,12 +453,12 @@ pyinstaller --onefile mnemos-cli.spec
 **Tesseract choice:** NVIDIA Tesseract NIM (Normalized Inference Module) — production-grade time-series models.
 
 **Models:**
-- `nv-tesseract:ad-diffusion-1.1.0` (anomaly detection via diffusion) — CPU-capable, 46s per 45-row window on CERBERUS.
-- `nv-tesseract:forecasting-1.0.1` (univariate forecasting) — GPU-recommended, 16GB VRAM on TYPHON.
+- `nv-tesseract:ad-diffusion-1.1.0` (anomaly detection via diffusion) — CPU-capable, 46s per 45-row window on gpu-host.
+- `nv-tesseract:forecasting-1.0.1` (univariate forecasting) — GPU-recommended, 16GB VRAM on gpu-host-2.
 
 **Deployment:**
-- CERBERUS: AD-Diffusion NIM in Triton container (shares vLLM inference port or separate Triton instance).
-- TYPHON: Forecasting NIM, solo deploy (8GB + head room; requires Tensor RT 10 minimum).
+- gpu-host: AD-Diffusion NIM in Triton container (shares vLLM inference port or separate Triton instance).
+- gpu-host-2: Forecasting NIM, solo deploy (8GB + head room; requires Tensor RT 10 minimum).
 
 **Cost:** ~9 NIMs total across the fleet; ~$900–1200/year at current NVIDIA licensing.
 
@@ -500,16 +500,16 @@ pyinstaller --onefile mnemos-cli.spec
 
 ### 5.4 GPU resource placement
 
-**Before v4.0:** CERBERUS has 9.3 GB in use (Apollo Q6 5.1 GB, Apollo Q4 2.8 GB fallback, unused).
+**Before v4.0:** gpu-host has 9.3 GB in use (Apollo Q6 5.1 GB, Apollo Q4 2.8 GB fallback, unused).
 
 **v4.0 planning:**
 - Drop Apollo Q4 fallback (systemd auto-restart on Q6 failure; Q4 was redundancy overkill).
 - Add EmbedQA-1B NIM (2 GB, handles all embedding).
 - Add RerankQA-1B NIM (2 GB, ranks search results).
 - Add AD-Diffusion NIM (1 GB, anomaly detection).
-- **CERBERUS budget:** ~5.1 (Q6) + 2 (EmbedQA) + 2 (RerankQA) + 1 (AD-Diff) = **10.1 GB** (0.1 GB over current 10GB, acceptable margin).
+- **gpu-host budget:** ~5.1 (Q6) + 2 (EmbedQA) + 2 (RerankQA) + 1 (AD-Diff) = **10.1 GB** (0.1 GB over current 10GB, acceptable margin).
 
-**TYPHON GPU (RTX 5060, 24 GB):**
+**gpu-host-2 GPU (RTX 5060, 24 GB):**
 - Forecasting NIM: 8 GB.
 - Headroom for operator experiments: 16 GB free.
 - No dedicated allocation; Forecasting is lower priority than agentic batch work.

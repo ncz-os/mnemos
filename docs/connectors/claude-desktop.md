@@ -2,15 +2,15 @@
 
 Claude Desktop can spawn MNEMOS's stdio MCP server and expose the same memory tools used by Claude Code, Cursor, and Codex CLI.
 
-## What you need — token, host (192.168.207.67), relevant port(s)
+## What you need — token, host (<mnemos-host>), relevant port(s)
 
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- MNEMOS REST reachable at `http://192.168.207.67:5002`.
+- MNEMOS REST reachable at `http://<mnemos-host>:5002`.
 - The `mnemos` CLI installed on the same machine as Claude Desktop.
 - macOS config path: `~/Library/Application Support/Claude/claude_desktop_config.json`.
 - Windows config path: `%APPDATA%\Claude\claude_desktop_config.json`.
 - Linux config path: `~/.config/Claude/claude_desktop_config.json`.
-- Optional remote MCP bridge at `http://192.168.207.67:5003/sse`.
+- Optional remote MCP bridge at `http://<mnemos-host>:5003/sse`.
 - A Claude Desktop build with MCP server support enabled.
 - File permissions that prevent other users from reading the token.
 - A full Claude Desktop restart after config edits.
@@ -29,7 +29,7 @@ entry into the top-level `mcpServers` object.
       "command": "mnemos",
       "args": ["serve", "mcp-stdio"],
       "env": {
-        "MNEMOS_BASE": "http://192.168.207.67:5002",
+        "MNEMOS_BASE": "http://<mnemos-host>:5002",
         "MNEMOS_API_KEY": "$MNEMOS_TOKEN"
       }
     }
@@ -66,7 +66,7 @@ supports it:
 {
   "mcpServers": {
     "mnemos-sse": {
-      "url": "http://192.168.207.67:5003/sse",
+      "url": "http://<mnemos-host>:5003/sse",
       "headers": {
         "Authorization": "Bearer $MNEMOS_TOKEN"
       }
@@ -82,7 +82,7 @@ chat window is not enough on some builds.
 
 ```bash
 # Server up?
-curl -fsS http://192.168.207.67:5002/health | jq -r '.status'    # → "healthy"
+curl -fsS http://<mnemos-host>:5002/health | jq -r '.status'    # → "healthy"
 
 # Print the canonical MCP tool names from the live registry:
 python3 -c 'from mnemos.mcp.tools import TOOL_REGISTRY; print("\n".join(sorted(TOOL_REGISTRY)))' | head

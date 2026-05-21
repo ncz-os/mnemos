@@ -2,13 +2,13 @@
 
 Zed has native MCP support since late 2025 and can use MNEMOS by registering the MNEMOS HTTP/SSE endpoint in `~/.config/zed/settings.json`.
 
-## What you need — token, host (192.168.207.67), relevant port(s)
+## What you need — token, host (<mnemos-host>), relevant port(s)
 
 - Zed `0.169` or newer; older builds silently ignore `mcp_servers`.
-- MNEMOS MCP HTTP/SSE reachable at `http://192.168.207.67:5003/sse`.
+- MNEMOS MCP HTTP/SSE reachable at `http://<mnemos-host>:5003/sse`.
 - The connector bearer token for the Zed principal.
 - Config path: `~/.config/zed/settings.json`.
-- Network access from the Zed machine to `192.168.207.67`.
+- Network access from the Zed machine to `<mnemos-host>`.
 - A full Zed restart after changing MCP server config.
 - A model profile in Zed that is allowed to use tools.
 - A private config file; do not paste bearer-token settings into shared screenshots.
@@ -23,9 +23,9 @@ file already has settings, keep the outer object and add only the
 {
   "mcp_servers": {
     "mnemos": {
-      "url": "http://192.168.207.67:5003/sse",
+      "url": "http://<mnemos-host>:5003/sse",
       "headers": {
-        "Authorization": "Bearer <REDACTED-MNEMOS-TOKEN>"
+        "Authorization": "Bearer <MNEMOS_API_TOKEN>"
       }
     }
   }
@@ -45,7 +45,7 @@ tools.
 You can verify the bridge directly before debugging Zed:
 
 ```bash
-curl -fsS -H "Authorization: Bearer <REDACTED-MNEMOS-TOKEN>" http://192.168.207.67:5003/sse
+curl -fsS -H "Authorization: Bearer <MNEMOS_API_TOKEN>" http://<mnemos-host>:5003/sse
 ```
 
 The authenticated request should open a `text/event-stream`.

@@ -39,11 +39,11 @@ sections that apply to what's shipping.
 - [ ] `git push origin master --tags` (gitlab fires CI first; let it
       finish before the other pushes if a CI green is part of the gate).
 - [ ] `git push github master --tags`.
-- [ ] `GIT_SSH_COMMAND='sshpass -p "<REDACTED-ARGONAS-PASS>" ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=no' git push argonas master --tags`.
+- [ ] `GIT_SSH_COMMAND='sshpass -p "${ARGONAS_ROOT_PASS:?set ARGONAS_ROOT_PASS env var; never commit}" ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=no' git push argonas master --tags`.
 - [ ] Verify all three remotes converged:
   ```bash
   for r in origin github argonas; do
-    case $r in argonas) tip=$(GIT_SSH_COMMAND='sshpass -p "<REDACTED-ARGONAS-PASS>" ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=no' git ls-remote $r master | awk '{print $1}');;
+    case $r in argonas) tip=$(GIT_SSH_COMMAND='sshpass -p "${ARGONAS_ROOT_PASS:?set ARGONAS_ROOT_PASS env var; never commit}" ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=no' git ls-remote $r master | awk '{print $1}');;
       *) tip=$(git ls-remote $r master | awk '{print $1}');;
     esac
     printf "  %-8s %s\n" "$r" "${tip:0:12}"
@@ -55,25 +55,25 @@ sections that apply to what's shipping.
 
 Skip if the release is docs-only.
 
-- [ ] Build the `full-hot` image on PYTHIA from the working-tree checkout:
+- [ ] Build the `full-hot` image on pg-host from the working-tree checkout:
   ```bash
-  rsync -az --delete --exclude='.venv*' --exclude='__pycache__' /tmp/mnemos-work/ jasonperlow@192.168.207.67:/tmp/mnemos-build-x.y.z/
-  ssh jasonperlow@192.168.207.67 'cp /tmp/mnemos_hot-0.2.0-cp311-abi3-manylinux_2_34_x86_64.whl /tmp/mnemos-build-x.y.z/ && cd /tmp/mnemos-build-x.y.z && podman build -f Dockerfile.full -t localhost/mnemos-os:x.y.z-full-hot .'
+  rsync -az --delete --exclude='.venv*' --exclude='__pycache__' /tmp/mnemos-work/ jasonperlow@<host>:/tmp/mnemos-build-x.y.z/
+  ssh jasonperlow@<host> 'cp /tmp/mnemos_hot-0.2.0-cp311-abi3-manylinux_2_34_x86_64.whl /tmp/mnemos-build-x.y.z/ && cd /tmp/mnemos-build-x.y.z && podman build -f Dockerfile.full -t localhost/mnemos-os:x.y.z-full-hot .'
   ```
-- [ ] Save + transfer to CERBERUS + PROTEUS:
+- [ ] Save + transfer to gpu-host + oracle-host:
   ```bash
-  ssh jasonperlow@192.168.207.67 'podman save -o /tmp/mnemos-os-x.y.z-full-hot.tar localhost/mnemos-os:x.y.z-full-hot && scp /tmp/mnemos-os-x.y.z-full-hot.tar jasonperlow@192.168.207.96:/tmp/ && scp /tmp/mnemos-os-x.y.z-full-hot.tar jasonperlow@192.168.207.25:/tmp/'
+  ssh jasonperlow@<host> 'podman save -o /tmp/mnemos-os-x.y.z-full-hot.tar localhost/mnemos-os:x.y.z-full-hot && scp /tmp/mnemos-os-x.y.z-full-hot.tar jasonperlow@<host>:/tmp/ && scp /tmp/mnemos-os-x.y.z-full-hot.tar jasonperlow@<host>:/tmp/'
   ```
-- [ ] Roll the **canary** (PROTEUS) first:
+- [ ] Roll the **canary** (oracle-host) first:
   - Stop + rename the old container as `_pre<version>` for rollback
   - Start a new container against the same env-file with the new image
   - Verify `/health` returns `version: x.y.z` and `database_connected: true`
   - Check logs for migration apply success (any new SQL should run on first boot)
-- [ ] Roll **CERBERUS** (HA standby + federation peer).
-- [ ] Roll **PYTHIA primary + MCP sidecar** last.
+- [ ] Roll **gpu-host** (HA standby + federation peer).
+- [ ] Roll **pg-host primary + MCP sidecar** last.
 - [ ] Run smoke checks across the fleet:
   ```bash
-  for h in 192.168.207.67 192.168.207.96 192.168.207.25; do
+  for h in <host> <host> <host>; do
     ssh -n jasonperlow@$h 'curl -s http://localhost:5002/health' | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['version'], d['status'], d['database_connected'])"
   done
   ```
@@ -82,23 +82,23 @@ Skip if the release is docs-only.
 
 ### HA / replication
 
-- [ ] PYTHIA → CERBERUS streaming replication still healthy:
+- [ ] pg-host → gpu-host streaming replication still healthy:
   ```bash
-  ssh jasonperlow@192.168.207.67 "podman exec mnemos-v3x-podman_postgres_1 psql -U mnemos_user -d mnemos -c 'SELECT application_name, state, replay_lag FROM pg_stat_replication;'"
+  ssh jasonperlow@<host> "podman exec mnemos-v3x-podman_postgres_1 psql -U mnemos_user -d mnemos -c 'SELECT application_name, state, replay_lag FROM pg_stat_replication;'"
   ```
 - [ ] If the release added migrations, confirm they replicated to
-      CERBERUS automatically:
+      gpu-host automatically:
   ```bash
-  ssh jasonperlow@192.168.207.96 'podman exec mnemos-standby psql -U mnemos_user -d mnemos -p 5434 -h 127.0.0.1 -c "\dt" | grep <new_table_name>'
+  ssh jasonperlow@<host> 'podman exec mnemos-standby psql -U mnemos_user -d mnemos -p 5434 -h 127.0.0.1 -c "\dt" | grep <new_table_name>'
   ```
 
 ### Bridge tier-2 verification
 
-- [ ] PYTHIA cron `bridge-tier2-nightly.sh` succeeded last night:
+- [ ] pg-host cron `bridge-tier2-nightly.sh` succeeded last night:
   ```bash
-  ssh jasonperlow@192.168.207.67 'tail -20 /tmp/bridge-tier2-$(date -u +%Y-%m-%d).log'
+  ssh jasonperlow@<host> 'tail -20 /tmp/bridge-tier2-$(date -u +%Y-%m-%d).log'
   ```
-- [ ] Or run it on demand: `ssh jasonperlow@192.168.207.67 '/usr/local/bin/bridge-tier2-nightly.sh'`.
+- [ ] Or run it on demand: `ssh jasonperlow@<host> '/usr/local/bin/bridge-tier2-nightly.sh'`.
       All three target APIs should pass — if any fail, the bridge or the
       target SDK has drifted and needs a fix before announcing GA.
 
@@ -125,7 +125,7 @@ shared `mnemos-bridge-core`.
 Skip if the adapter has no live model API target (aider sidecar CLI,
 crewai offline-only, claude-connector OAuth — those are tier-3 only).
 
-- [ ] OpenAI: `OPENAI_API_KEY=... MNEMOS_TEST_BASE=http://192.168.207.67:5003/sse MNEMOS_MCP_TOKEN=... pytest tests/integration -v`
+- [ ] OpenAI: `OPENAI_API_KEY=... MNEMOS_TEST_BASE=http://<host>:5003/sse MNEMOS_MCP_TOKEN=... pytest tests/integration -v`
 - [ ] Gemini: same with `GOOGLE_API_KEY` set.
 - [ ] Anthropic: same with `ANTHROPIC_API_KEY` set.
 - [ ] Each tier-2 should complete in <15s. If a test is timing out >30s
@@ -139,16 +139,16 @@ namespace `mnemos-os/mnemos-bridge-<name>`. The `/tmp/publish-bridge.sh`
 helper script captures the canonical sequence (init + glab create + push +
 gh create + push + argonas init + push).
 
-### PYTHIA refresh (if the cron consumes the new version)
+### pg-host refresh (if the cron consumes the new version)
 
 The nightly tier-2 cron uses clones at `/opt/mnemos-bridges/`. If a bridge
 just released:
 
-- [ ] `ssh jasonperlow@192.168.207.67 'cd /opt/mnemos-bridges/mnemos-bridge-<name> && git pull --quiet && /opt/mnemos-bridges/.venv/bin/pip install --quiet -e .'`
+- [ ] `ssh jasonperlow@<host> 'cd /opt/mnemos-bridges/mnemos-bridge-<name> && git pull --quiet && /opt/mnemos-bridges/.venv/bin/pip install --quiet -e .'`
 - [ ] Run the cron once manually:
-      `ssh jasonperlow@192.168.207.67 '/usr/local/bin/bridge-tier2-nightly.sh'`
+      `ssh jasonperlow@<host> '/usr/local/bin/bridge-tier2-nightly.sh'`
 - [ ] Confirm the daily summary memory landed in MNEMOS:
-      `curl -s -H 'Authorization: Bearer <token>' "http://192.168.207.67:5002/v1/memories/search?subcategory=bridge-tier2&limit=1"`
+      `curl -s -H 'Authorization: Bearer <token>' "http://<host>:5002/v1/memories/search?subcategory=bridge-tier2&limit=1"`
 
 ---
 
@@ -194,7 +194,7 @@ The realistic path is the `mnemos-bridge-gemini` v0.2.0 adapter:
 - [ ] Run the included example script that builds a `genai.Client.aio`
       session with `await adapter.gemini_tools()`.
 - [ ] Send a tool-using prompt; verify the function_call lands and the
-      adapter dispatches it to PYTHIA.
+      adapter dispatches it to pg-host.
 
 ### Claude.ai Connectors
 
@@ -257,12 +257,12 @@ For each runner that's part of the operator's stack:
 - Per-bridge releases follow the same pattern, scoped to that bridge's
   surface — no separate copy needed.
 - The fleet helper script for tier-2 cron lives at
-  `/usr/local/bin/bridge-tier2-nightly.sh` on PYTHIA. Source of truth
+  `/usr/local/bin/bridge-tier2-nightly.sh` on pg-host. Source of truth
   is `ops/bridge-tier2-nightly.sh` in this repo. Refresh the deployed
   copy with:
   ```bash
-  scp ops/bridge-tier2-nightly.sh jasonperlow@192.168.207.67:/tmp/
-  ssh jasonperlow@192.168.207.67 'sudo install -m 755 /tmp/bridge-tier2-nightly.sh /usr/local/bin/bridge-tier2-nightly.sh'
+  scp ops/bridge-tier2-nightly.sh jasonperlow@<host>:/tmp/
+  ssh jasonperlow@<host> 'sudo install -m 755 /tmp/bridge-tier2-nightly.sh /usr/local/bin/bridge-tier2-nightly.sh'
   ```
 - The image build artifact for the `-full-hot` images (every release
   since v5.0.6) is `Dockerfile.full` at the repo root. It pulls all

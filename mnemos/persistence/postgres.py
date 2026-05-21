@@ -75,6 +75,7 @@ _HOT_RS_ENABLED = hot_rs_enabled()
 if _HOT_RS_ENABLED:
     try:
         import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
+
         logger.info(
             "mnemos_hot Rust accelerator enabled (Postgres semantic rerank will use mnemos_hot %s)",
             getattr(_HOT_RS, "__version__", "?"),
@@ -164,7 +165,12 @@ def _rerank_composite(
         except Exception:
             pass
     return _rerank_composite_python(
-        query, candidates, recency_boost, weight_cos, weight_recency, k,
+        query,
+        candidates,
+        recency_boost,
+        weight_cos,
+        weight_recency,
+        k,
     )
 
 
@@ -300,9 +306,7 @@ def _queue_federation_nats_upsert(tx: PostgresTransaction, row: Row | None) -> N
     event = persistence_nats_events.federation_memory_upsert_event(row)
     if event is None:
         return
-    tx.add_after_commit(
-        lambda event=event: persistence_nats_events.publish_federation_memory_upsert_event(event)
-    )
+    tx.add_after_commit(lambda event=event: persistence_nats_events.publish_federation_memory_upsert_event(event))
 
 
 class PostgresMemoryRepository(MemoryRepository):
@@ -452,6 +456,25 @@ class PostgresMemoryRepository(MemoryRepository):
             await _queue_federation_nats_upsert_from_db(pg_tx, memory_id)
         return result
 
+    async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
+        """Write a precomputed embedding vector to memories.embedding for the
+        given memory_id. Idempotent; no-op when embedding is empty.
+
+        Used by the create_memory path (mnemos/api/routes/memories.py) to
+        attach an embedding inline after insert, and by
+        scripts/backfill_embeddings.py to fill NULL rows. The embedding
+        dim must match the configured `embedding_dim` (768 by default).
+        """
+        if not embedding:
+            return
+        self._require_dim(embedding, "upsert_memory_embedding")
+        vec_str = "[" + ",".join(str(float(v)) for v in embedding) + "]"
+        await _postgres_tx(tx).conn.execute(
+            "UPDATE memories SET embedding = $1::vector WHERE id = $2",
+            vec_str,
+            memory_id,
+        )
+
     async def fetch_memory_by_id(self, tx: Transaction, memory_id: str) -> Row | None:
         return await portability_repo.fetch_memory_by_id(_postgres_tx(tx).conn, memory_id)
 
@@ -499,7 +522,8 @@ class PostgresMemoryRepository(MemoryRepository):
             params.append(subcategory)
             where_parts.append(f"subcategory=${len(params)}")
         vis_clause, vis_params, _ = _render_postgres_visibility(
-            visibility, start_idx=len(params) + 1,
+            visibility,
+            start_idx=len(params) + 1,
         )
         if vis_clause:
             where_parts.append(vis_clause)
@@ -530,7 +554,8 @@ class PostgresMemoryRepository(MemoryRepository):
                 memory_id,
             )
         vis_clause, vis_params, _ = _render_postgres_visibility(
-            visibility, start_idx=2,
+            visibility,
+            start_idx=2,
         )
         sql = (
             f"SELECT {_MEMORY_COLS} FROM memories "
@@ -558,7 +583,8 @@ class PostgresMemoryRepository(MemoryRepository):
         set_sql = ", ".join(set_clauses)
         values = [fields[k] for k in keys]
         vis_clause, vis_params, _ = _render_postgres_visibility(
-            visibility, start_idx=len(values) + 2,
+            visibility,
+            start_idx=len(values) + 2,
         )
         if vis_clause:
             sql = (
@@ -570,10 +596,7 @@ class PostgresMemoryRepository(MemoryRepository):
             if row is not None:
                 await _queue_federation_nats_upsert_from_db(_postgres_tx(tx), memory_id)
             return row
-        sql = (
-            f"UPDATE memories SET {set_sql} WHERE id=$1 AND deleted_at IS NULL "
-            f"RETURNING {_MEMORY_COLS}"
-        )
+        sql = f"UPDATE memories SET {set_sql} WHERE id=$1 AND deleted_at IS NULL " f"RETURNING {_MEMORY_COLS}"
         row = await conn.fetchrow(sql, memory_id, *values)
         if row is not None:
             await _queue_federation_nats_upsert_from_db(_postgres_tx(tx), memory_id)
@@ -644,8 +667,9 @@ class PostgresMemoryRepository(MemoryRepository):
         namespace: str | None = None,
     ) -> list[Row]:
         conn = _postgres_tx(tx).conn
-        return list(await conn.fetch(
-            """
+        return list(
+            await conn.fetch(
+                """
             SELECT
                 owner_id,
                 namespace,
@@ -663,8 +687,9 @@ class PostgresMemoryRepository(MemoryRepository):
             HAVING COUNT(*) > 1
             ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC
             """,
-            namespace,
-        ))
+                namespace,
+            )
+        )
 
     async def consolidate_duplicate_memories(
         self,
@@ -714,7 +739,8 @@ class PostgresMemoryRepository(MemoryRepository):
     ) -> Row | None:
         conn = _postgres_tx(tx).conn
         vis_clause, vis_params, _ = _render_postgres_visibility(
-            visibility, start_idx=2,
+            visibility,
+            start_idx=2,
         )
         if requested_by is not None:
             target_where = "id=$1 AND deleted_at IS NULL"
@@ -820,7 +846,8 @@ class PostgresMemoryRepository(MemoryRepository):
                 params.append(val)
                 conditions.append(f"{col}=${len(params)}")
         vis_clause, vis_params, _ = _render_postgres_visibility(
-            visibility, start_idx=len(params) + 1,
+            visibility,
+            start_idx=len(params) + 1,
         )
         if vis_clause:
             conditions.append(vis_clause)
@@ -910,7 +937,8 @@ class PostgresMemoryRepository(MemoryRepository):
                 params.append(val)
                 conditions.append(f"{col}=${len(params)}")
         vis_clause, vis_params, _ = _render_postgres_visibility(
-            visibility, start_idx=len(params) + 1,
+            visibility,
+            start_idx=len(params) + 1,
         )
         if vis_clause:
             conditions.append(vis_clause)
@@ -944,7 +972,8 @@ class PostgresMemoryRepository(MemoryRepository):
                     ilike_params.append(val)
                     ilike_conditions.append(f"{col}=${len(ilike_params)}")
             ilike_vis_clause, ilike_vis_params, _ = _render_postgres_visibility(
-                visibility, start_idx=len(ilike_params) + 1,
+                visibility,
+                start_idx=len(ilike_params) + 1,
             )
             if ilike_vis_clause:
                 ilike_conditions.append(ilike_vis_clause)
@@ -971,8 +1000,7 @@ class PostgresMemoryRepository(MemoryRepository):
             "GROUP BY federation_source ORDER BY cnt DESC",
         )
         cat_rows = await conn.fetch(
-            "SELECT category, COUNT(*) AS cnt FROM memories "
-            "WHERE deleted_at IS NULL GROUP BY category",
+            "SELECT category, COUNT(*) AS cnt FROM memories " "WHERE deleted_at IS NULL GROUP BY category",
         )
         sub_rows = await conn.fetch(
             "SELECT category, subcategory, COUNT(*) AS cnt FROM memories "
@@ -980,8 +1008,7 @@ class PostgresMemoryRepository(MemoryRepository):
             "GROUP BY category, subcategory ORDER BY cnt DESC",
         )
         avg_quality = await conn.fetchval(
-            "SELECT AVG(quality_rating) FROM memories "
-            "WHERE quality_rating IS NOT NULL AND deleted_at IS NULL",
+            "SELECT AVG(quality_rating) FROM memories " "WHERE quality_rating IS NOT NULL AND deleted_at IS NULL",
         )
         memories_by_subcategory: dict[str, dict[str, int]] = {}
         for r in sub_rows:
@@ -1248,16 +1275,21 @@ class PostgresCompressionRepository(CompressionRepository):
 
     async def gather_stats(self, tx: Transaction) -> CompressionStatsRow:
         conn = _postgres_tx(tx).conn
-        total = await conn.fetchval(
-            "SELECT COUNT(*) FROM memory_compressed_variants",
-        ) or 0
+        total = (
+            await conn.fetchval(
+                "SELECT COUNT(*) FROM memory_compressed_variants",
+            )
+            or 0
+        )
         avg_ratio = await conn.fetchval(
             "SELECT AVG(v.compression_ratio) FROM memory_compressed_variants v",
         )
-        unreviewed = await conn.fetchval(
-            "SELECT COUNT(*) FROM memory_compressed_variants "
-            "WHERE quality_score IS NULL",
-        ) or 0
+        unreviewed = (
+            await conn.fetchval(
+                "SELECT COUNT(*) FROM memory_compressed_variants " "WHERE quality_score IS NULL",
+            )
+            or 0
+        )
         return CompressionStatsRow(
             total_compressions=int(total),
             average_compression_ratio=float(avg_ratio) if avg_ratio is not None else None,
@@ -1338,6 +1370,7 @@ class PostgresWebhookRepository(WebhookRepository):
                 webhook_constants.NEW_CODE_WRITER_REVISION,
             )
             from mnemos.nats.webhook_events import publish_delivery_queued
+
             await publish_delivery_queued(
                 delivery_id=delivery_id,
                 subscription_id=sub["id"],
@@ -1496,8 +1529,7 @@ class PostgresFederationRepository(FederationRepository):
         set_clauses = [f"{col}=${i + 2}" for i, col in enumerate(updates.keys())]
         set_clauses.append("updated=NOW()")
         return await _postgres_tx(tx).conn.fetchrow(
-            f"UPDATE federation_peers SET {', '.join(set_clauses)} "
-            "WHERE id=$1::uuid RETURNING *",
+            f"UPDATE federation_peers SET {', '.join(set_clauses)} " "WHERE id=$1::uuid RETURNING *",
             peer_id,
             *updates.values(),
         )
@@ -1534,8 +1566,9 @@ class PostgresFederationRepository(FederationRepository):
         return _pg_result_count(result) > 0
 
     async def fetch_sync_log(self, tx: Transaction, peer_id: str, limit: int) -> list[Row]:
-        return list(await _postgres_tx(tx).conn.fetch(
-            """
+        return list(
+            await _postgres_tx(tx).conn.fetch(
+                """
             SELECT id::text, started_at, finished_at, memories_pulled,
                    memories_new, memories_updated, error,
                    cursor_before, cursor_after
@@ -1544,9 +1577,10 @@ class PostgresFederationRepository(FederationRepository):
             ORDER BY started_at DESC
             LIMIT $2
             """,
-            peer_id,
-            limit,
-        ))
+                peer_id,
+                limit,
+            )
+        )
 
     async def feed_query(
         self,
@@ -1598,18 +1632,11 @@ class PostgresFederationRepository(FederationRepository):
                 "  < (octet_length(to_json(m.content)::text) "
                 "     + COALESCE(octet_length(to_json(m.verbatim_content)::text), 0))"
             )
-            content_select = (
-                f"CASE WHEN {use_variant} THEN v.compressed_content "
-                "ELSE m.content END AS content,"
-            )
+            content_select = f"CASE WHEN {use_variant} THEN v.compressed_content " "ELSE m.content END AS content,"
             compressed_select = (
-                f"CASE WHEN {use_variant} THEN v.compressed_content "
-                "ELSE NULL::text END AS compressed_content,"
+                f"CASE WHEN {use_variant} THEN v.compressed_content " "ELSE NULL::text END AS compressed_content,"
             )
-            verbatim_select = (
-                f"CASE WHEN {use_variant} THEN NULL "
-                "ELSE m.verbatim_content END AS verbatim_content,"
-            )
+            verbatim_select = f"CASE WHEN {use_variant} THEN NULL " "ELSE m.verbatim_content END AS verbatim_content,"
             join_compressed = "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
         else:
             content_select = "m.content,"
@@ -1619,8 +1646,9 @@ class PostgresFederationRepository(FederationRepository):
 
         memory_where_clause = " AND ".join(memory_query_parts)
         tombstone_where_clause = " AND ".join(tombstone_query_parts)
-        return list(await _postgres_tx(tx).conn.fetch(
-            f"""
+        return list(
+            await _postgres_tx(tx).conn.fetch(
+                f"""
             SELECT *
             FROM (
                 SELECT NULL::text AS type,
@@ -1667,8 +1695,9 @@ class PostgresFederationRepository(FederationRepository):
             ORDER BY updated ASC, id ASC
             LIMIT ${len(args)}
             """,
-            *args,
-        ))
+                *args,
+            )
+        )
 
     async def get_feed_memory(
         self,
@@ -1851,8 +1880,9 @@ class PostgresFederationRepository(FederationRepository):
         )
 
     async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]:
-        return list(await _postgres_tx(tx).conn.fetch(
-            """
+        return list(
+            await _postgres_tx(tx).conn.fetch(
+                """
             SELECT id::text, name, sync_interval_secs, last_sync_at
             FROM federation_peers
             WHERE enabled
@@ -1864,13 +1894,13 @@ class PostgresFederationRepository(FederationRepository):
             )
             LIMIT $1
             """,
-            limit,
-        ))
+                limit,
+            )
+        )
 
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
         return await _postgres_tx(tx).conn.fetchrow(
-            "SELECT federation_remote_updated FROM memories "
-            "WHERE id = $1 AND deleted_at IS NULL",
+            "SELECT federation_remote_updated FROM memories " "WHERE id = $1 AND deleted_at IS NULL",
             local_id,
         )
 
@@ -2085,8 +2115,7 @@ class PostgresStateRepository(StateRepository):
         namespace: str = "default",
     ) -> bool:
         result = await _postgres_tx(tx).conn.execute(
-            "DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3 "
-            "AND deleted_at IS NULL",
+            "DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3 " "AND deleted_at IS NULL",
             owner_id,
             namespace,
             key,
@@ -2145,9 +2174,7 @@ class PostgresBackend(PersistenceBackend):
         # operator-friendly error rather than the generic asyncpg
         # cast error. Settings shape mirrors what SqliteBackend uses.
         try:
-            self._memories._expected_embedding_dim = int(
-                getattr(settings.database, "embedding_dim", 768)
-            )
+            self._memories._expected_embedding_dim = int(getattr(settings.database, "embedding_dim", 768))
         except (AttributeError, TypeError, ValueError):
             # Defensive: tests or stripped-down settings shapes may
             # not carry `database.embedding_dim`. Leave the slot as

@@ -1,3 +1,23 @@
+# MNEMOS docker-compose — PostgreSQL profile.
+#
+# This file provisions a PostgreSQL 16 + pgvector stack with the embedded
+# `mnemos serve` runtime. The two enterprise backends (Oracle 23ai and IBM Db2
+# 12.1.5) are NOT provisioned here because their container images are vendor-
+# distributed (Oracle EE via container-registry.oracle.com; Db2 12.1.5 EAP via
+# AESE tarball — see docs/db2-eap-recipe-2026-05-20.md for the build recipe).
+#
+# To run MNEMOS against Oracle or Db2, either:
+#   (a) Bring up the vendor image separately and point MNEMOS at it via
+#       MNEMOS_DATABASE_DSN (see `mnemos` service `environment:` block below
+#       for the commented-out DSN examples), OR
+#   (b) Uncomment and adapt the `oracle-ee` / `db2-eap` profile stubs near
+#       the bottom of this file (you must supply the image yourself).
+#
+# Cross-references:
+#   - docs/db2-oracle-ee-test-plan.md  — enterprise-backend test topology
+#   - docs/db2-eap-recipe-2026-05-20.md  — Db2 12.1.5 EAP container recipe
+#   - docs/oracle-port-status.md  — Oracle 23ai backend status
+
 services:
 
   postgres:
@@ -193,14 +213,60 @@ services:
       PG_PASSWORD: ${POSTGRES_PASSWORD:-mnemos_local}
       PG_DATABASE: mnemos
       PG_HOST: postgres
+      # MNEMOS_DATABASE_DSN — uncomment ONE to override per-backend env vars.
+      # Scheme determines backend (see SPECIFICATION §9.1 / docs/INSTALL.md).
+      # MNEMOS_DATABASE_DSN: postgres://mnemos_user:${POSTGRES_PASSWORD:-mnemos_local}@postgres:5432/mnemos
+      # MNEMOS_DATABASE_DSN: oracle://MNEMOS:${ORACLE_PASSWORD:-changeme}@oracle-ee:1521/ORCLPDB1
+      # MNEMOS_DATABASE_DSN: db2://MNEMOS:${DB2_PASSWORD:-changeme}@db2-eap:50000/MNEMOS
       INFERENCE_EMBED_HOST: http://ollama:11434
       # On Linux: use http://172.17.0.1:5001 or add --add-host=host.docker.internal:host-gateway
       GRAEAE_URL: ${GRAEAE_URL:-http://host.docker.internal:5001}
       MNEMOS_PROFILE: personal
     ports:
       - '5002:5002'
+      # MCP HTTP/SSE transport advertised in README is `mnemos serve mcp-http`
+      # on :5004. This compose runs the default REST/MCP-stdio surface on
+      # :5002 only; expose 5004 explicitly when running `mnemos serve mcp-http`.
+      # - '5004:5004'
     restart: unless-stopped
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Enterprise backend profile stubs (commented; opt-in).
+  #
+  # Uncomment and adapt to point MNEMOS at Oracle 23ai or IBM Db2 12.1.5.
+  # You must supply the image — Oracle EE ships from container-registry.oracle.com
+  # (requires SSO acceptance of license); Db2 12.1.5 EAP requires a build per
+  # docs/db2-eap-recipe-2026-05-20.md. Once the matching service is up, set
+  # MNEMOS_DATABASE_DSN on the `mnemos` service above to point at it.
+  #
+  # Both stubs are EXAMPLES — they will not start without the real image refs.
+  # ───────────────────────────────────────────────────────────────────────────
+  # oracle-ee:
+  #   image: container-registry.oracle.com/database/enterprise:23.26.1.0   # supply yourself
+  #   environment:
+  #     ORACLE_PWD: ${ORACLE_PASSWORD:-changeme}    # placeholder — use real secret
+  #     ORACLE_CHARACTERSET: AL32UTF8
+  #   ports:
+  #     - '1522:1521'
+  #   volumes:
+  #     - oracle_data:/opt/oracle/oradata
+  #   shm_size: '8gb'   # required for INMEMORY NEIGHBOR GRAPH workloads
+  #
+  # db2-eap:
+  #   image: mnemos/db2-eap:vnext   # build from docs/db2-eap-recipe-2026-05-20.md
+  #   privileged: true   # Db2 needs IPC_LOCK + kernel sysctls
+  #   environment:
+  #     DB2INST1_PASSWORD: ${DB2_PASSWORD:-changeme}   # placeholder — use real secret
+  #     LICENSE: accept
+  #     DBNAME: MNEMOS
+  #   ports:
+  #     - '50001:50000'
+  #   volumes:
+  #     - db2_data:/database
+  #   shm_size: '8gb'
 
 volumes:
   postgres_data:
   ollama_data:
+  # oracle_data:
+  # db2_data:

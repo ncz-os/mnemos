@@ -8,7 +8,7 @@
 
 ## 1. Overview
 
-This document specifies the operational practices for running MNEMOS across multiple physical nodes. MNEMOS ships as a single Python package; production deployment spans at least three tiers — production (PYTHIA + CERBERUS), staging (PROTEUS), and test (ephemeral docker-compose + test database). The topology is fronted by a load balancer (nginx on ARGONAS), backed by a replicated PostgreSQL cluster (pgha-primary + pgha-standby), and capable of federation (peer-to-peer memory sync with sister MNEMOS deployments).
+This document specifies the operational practices for running MNEMOS across multiple physical nodes. MNEMOS ships as a single Python package; production deployment spans at least three tiers — production (pg-host + gpu-host), staging (oracle-host), and test (ephemeral docker-compose + test database). The topology is fronted by a load balancer (nginx on nas-host), backed by a replicated PostgreSQL cluster (pgha-primary + pgha-standby), and capable of federation (peer-to-peer memory sync with sister MNEMOS deployments).
 
 This doc covers:
 - Topology and roles (what runs where)
@@ -34,13 +34,13 @@ What this doc does NOT cover:
 ### 2.1 Diagram and physical nodes
 
 ```
-                        ARGONAS (.101)
+                        nas-host (.101)
                          nginx LB
                          :80/:443
                       ____|____
                      /         \
                     /           \
-              PYTHIA (.67)    CERBERUS (.96)
+              pg-host (.67)    gpu-host (.96)
               v5.3 prod       dark prod / GPU host
               pg17 primary    standby + inference
               11,756 memories + Apollo Gemma 4 (ports 8080/8081)
@@ -50,33 +50,33 @@ What this doc does NOT cover:
                     | replication
                     |
                 pgha-standby
-                (CERBERUS pg17)
+                (gpu-host pg17)
 
 
-              PROTEUS (.25)
+              oracle-host (.25)
               staging / restore-drill target
               Intel i7-6700, 60GB RAM
               Runs latest cut during release drills
-              GPU calls proxy to CERBERUS
+              GPU calls proxy to gpu-host
 ```
 
 ### 2.2 Per-node roles
 
 | Host | IP | OS | CPU | RAM | GPU | Role | MNEMOS version | Status |
 |---|---|---|---|---|---|---|---|---|
-| **PYTHIA** | 192.168.207.67 | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v5.3 stable target | ✅ Operational |
-| **CERBERUS** | 192.168.207.96 | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary/dark prod + Apollo GPU inference | v5.3 stable target | ✅ Operational |
-| **PROTEUS** | 192.168.207.25 | Debian 12 | Intel i7-6700 | 60GB | — | Staging + restore-drill target | latest cut / release drills | ✅ Used for drills |
-| **ARGONAS** | 192.168.207.101 | TrueNAS | — | — | — | NFS + git origin (planned: LB) | nginx 1.26 (TrueNAS UI proxy only) | ✅ Running |
+| **pg-host** | <host> | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v5.3 stable target | ✅ Operational |
+| **gpu-host** | <host> | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary/dark prod + Apollo GPU inference | v5.3 stable target | ✅ Operational |
+| **oracle-host** | <host> | Debian 12 | Intel i7-6700 | 60GB | — | Staging + restore-drill target | latest cut / release drills | ✅ Used for drills |
+| **nas-host** | <host> | TrueNAS | — | — | — | NFS + git origin (planned: LB) | nginx 1.26 (TrueNAS UI proxy only) | ✅ Running |
 
 ### 2.3 Network & authentication
 
-> **Current-state caveat (verified 2026-04-26):** The nginx running on ARGONAS today is the TrueNAS web UI proxy, **NOT** a MNEMOS HTTP load balancer. All `proxy_pass` entries route to `127.0.0.1:6000` (TrueNAS middleware). There is **no HTTP LB in front of MNEMOS today** — clients hit PYTHIA at `192.168.207.67:5002` directly. CERBERUS `:5003` is currently *dark prod* (running but not externally routed). Standing up a real LB on ARGONAS (or elsewhere) is a **production rollout prerequisite** for the blue-green deploy pattern below to function. Until that's done, "drain a node" means "stop sending it traffic from clients you control" — there's no upstream pool to manipulate.
+> **Current-state caveat (verified 2026-04-26):** The nginx running on nas-host today is the TrueNAS web UI proxy, **NOT** a MNEMOS HTTP load balancer. All `proxy_pass` entries route to `127.0.0.1:6000` (TrueNAS middleware). There is **no HTTP LB in front of MNEMOS today** — clients hit pg-host at `<host>:5002` directly. gpu-host `:5003` is currently *dark prod* (running but not externally routed). Standing up a real LB on nas-host (or elsewhere) is a **production rollout prerequisite** for the blue-green deploy pattern below to function. Until that's done, "drain a node" means "stop sending it traffic from clients you control" — there's no upstream pool to manipulate.
 
-- **External (planned):** ARGONAS nginx LB listens on :80 (http) and :443 (https); backends are PYTHIA + CERBERUS on private :5002 + :5003. Status: NOT YET CONFIGURED.
-- **External (today):** Clients hit PYTHIA `192.168.207.67:5002` directly. No fronting LB.
+- **External (planned):** nas-host nginx LB listens on :80 (http) and :443 (https); backends are pg-host + gpu-host on private :5002 + :5003. Status: NOT YET CONFIGURED.
+- **External (today):** Clients hit pg-host `<host>:5002` directly. No fronting LB.
 - **Internal:** Backends communicate directly with each other via private IP; no SSH tunneling needed
-- **Database:** PostgreSQL unix-socket on same host; replication via TCP between PYTHIA and CERBERUS
+- **Database:** PostgreSQL unix-socket on same host; replication via TCP between pg-host and gpu-host
 - **Auth:** Bearer token in `Authorization: Bearer <token>` header; token validation done by FastAPI dependency `get_current_user` in `mnemos/api/dependencies.py`
 - **Federation:** Peer-to-peer sync uses HTTP + bearer tokens; same auth model as client API
 
@@ -88,19 +88,19 @@ Production MNEMOS runs on a **canary + ratchet** model: new features bake in sta
 
 | Tier | Host(s) | Version target | Stability | Deployment source |
 |---|---|---|---|---|
-| **Prod** | PYTHIA + CERBERUS | *latest stable* (v5.0.x) | GA, no alpha/beta | git tag, N+1 weeks after staging bake |
-| **Staging** | PROTEUS | *latest cut* / next release branch | alpha/rc, real federation | release branch, merged + tagged |
-| **Test** | docker-compose + mnemos-test-pg on CERBERUS | *feature branches* | ephemeral, parallel | PR builds via CI, cleaned up post-merge |
+| **Prod** | pg-host + gpu-host | *latest stable* (v5.0.x) | GA, no alpha/beta | git tag, N+1 weeks after staging bake |
+| **Staging** | oracle-host | *latest cut* / next release branch | alpha/rc, real federation | release branch, merged + tagged |
+| **Test** | docker-compose + mnemos-test-pg on gpu-host | *feature branches* | ephemeral, parallel | PR builds via CI, cleaned up post-merge |
 
 **Promotion path:**
 ```
 feature branch (local dev)
     ↓ (git push)
-master (alpha tag + CI) → deploy PROTEUS
+master (alpha tag + CI) → deploy oracle-host
     ↓ (1–2 weeks bake with real federation + load)
-stable tag → blue-green upgrade PYTHIA + CERBERUS → both prod
+stable tag → blue-green upgrade pg-host + gpu-host → both prod
     ↓ (ongoing)
-PROTEUS continues to lead (tests features for next release)
+oracle-host continues to lead (tests features for next release)
 ```
 
 **Version skew tolerance:** Prod nodes may be at different versions for up to 2 hours during a blue-green upgrade (one node rolling). Staging may lag prod by 1–2 weeks. Test is ephemeral (no SLA).
@@ -112,18 +112,18 @@ PROTEUS continues to lead (tests features for next release)
 ### 4.1 Merge to master (alpha stage)
 
 When a feature branch is merged to master:
-1. CI runs (lint + unit tests + integration tests on CERBERUS pg17 test instance)
+1. CI runs (lint + unit tests + integration tests on gpu-host pg17 test instance)
 2. On success, tag `v<major>.<minor>.<patch>-alpha.<N>` (e.g., `v3.4.0-alpha.1`)
 3. Push tag to github + gitlab + argonas
 4. Changelog updated in `CHANGELOG.md` with link to alpha tag
 5. CI publishes `mnemos:v3.4.0-alpha.1` to ghcr.io
 
-### 4.2 Deploy to PROTEUS (staging bake)
+### 4.2 Deploy to oracle-host (staging bake)
 
 After alpha tag, deploy to staging:
 ```bash
-# On PROTEUS via SSH
-sshpass -p $PROTEUS_SUDO_PASS ssh root@192.168.207.25 "
+# On oracle-host via SSH
+sshpass -p $oracle-host_SUDO_PASS ssh root@<host> "
   cd /opt/mnemos && \
   git fetch origin v3.4.0-alpha.1 && \
   git checkout v3.4.0-alpha.1 && \
@@ -132,12 +132,12 @@ sshpass -p $PROTEUS_SUDO_PASS ssh root@192.168.207.25 "
 "
 
 # Verify
-curl -H "Authorization: Bearer $TOKEN" http://192.168.207.25:5002/health
+curl -H "Authorization: Bearer $TOKEN" http://<host>:5002/health
 # Expected: {"version": "v3.4.0-alpha.1", "status": "healthy", ...}
 ```
 
 Staging runs for 1–2 weeks. During this period:
-- Federation sync is tested (PROTEUS pulls from PYTHIA and vice versa)
+- Federation sync is tested (oracle-host pulls from pg-host and vice versa)
 - Real-world query patterns exercised
 - Any regressions caught before production
 
@@ -151,21 +151,21 @@ git push origin v3.4.0 gitlab v3.4.0 argonas v3.4.0
 
 Then **blue-green upgrade** of production:
 
-**Phase 1: Drain PYTHIA from LB**
+**Phase 1: Drain pg-host from LB**
 ```bash
-# On ARGONAS nginx
-ssh root@192.168.207.101 "
+# On nas-host nginx
+ssh root@<host> "
   # Edit /etc/nginx/sites-enabled/mnemos-upstream (or equivalent)
-  # Change PYTHIA entry from 'up' to 'down' (comment it out)
+  # Change pg-host entry from 'up' to 'down' (comment it out)
   nginx -s reload
-  # Verify: curl http://localhost/ routes only to CERBERUS
+  # Verify: curl http://localhost/ routes only to gpu-host
 "
 ```
 
-**Phase 2: Upgrade PYTHIA**
+**Phase 2: Upgrade pg-host**
 ```bash
-# On PYTHIA
-sshpass -p $PYTHIA_SUDO_PASS ssh root@192.168.207.67 "
+# On pg-host
+sshpass -p $pg-host_SUDO_PASS ssh root@<host> "
   # Pre-upgrade backup
   pg_dump -U postgres mnemos | gzip > \
     /mnt/argonas/backups/mnemos/pre-v3.4.0-upgrade-$(date +%Y%m%d_%H%M%S).sql.gz
@@ -187,28 +187,28 @@ sshpass -p $PYTHIA_SUDO_PASS ssh root@192.168.207.67 "
 "
 ```
 
-**Phase 3: Smoke test PYTHIA**
+**Phase 3: Smoke test pg-host**
 ```bash
 # Run a quick integration test
-curl -X POST http://192.168.207.67:5002/v1/memories/search \
+curl -X POST http://<host>:5002/v1/memories/search \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"query": "test", "limit": 5}'
 # Expected: 200 OK, results list
 ```
 
-**Phase 4: Rejoin PYTHIA to LB**
+**Phase 4: Rejoin pg-host to LB**
 ```bash
-ssh root@192.168.207.101 "
-  nginx config: re-enable PYTHIA entry
+ssh root@<host> "
+  nginx config: re-enable pg-host entry
   nginx -s reload
 "
 ```
 
-**Phase 5: Repeat for CERBERUS**
+**Phase 5: Repeat for gpu-host**
 ```bash
-# Drain CERBERUS, upgrade docker containers + migrations, smoke test, rejoin
-# (Same pattern as PYTHIA; see detailed script in §12)
+# Drain gpu-host, upgrade docker containers + migrations, smoke test, rejoin
+# (Same pattern as pg-host; see detailed script in §12)
 ```
 
 **Rollback (if needed):**
@@ -267,13 +267,13 @@ gunzip -t /mnt/argonas/backups/mnemos/pre-v3.4.0-20260426_120000.sql.gz
 
 ### 5.4 Replication and migration propagation
 
-MNEMOS uses **streaming replication** from PYTHIA (primary) to CERBERUS (standby). Schema changes propagate **automatically via WAL** — the standby does not apply migrations independently.
+MNEMOS uses **streaming replication** from pg-host (primary) to gpu-host (standby). Schema changes propagate **automatically via WAL** — the standby does not apply migrations independently.
 
-Consequence: After upgrading PYTHIA to a new version with a new migration:
-1. PYTHIA runs the migration (superuser-privileged)
+Consequence: After upgrading pg-host to a new version with a new migration:
+1. pg-host runs the migration (superuser-privileged)
 2. Changes enter the WAL stream
-3. CERBERUS standby replicates the WAL (zero-downtime, automatic)
-4. When you promote CERBERUS, it already has the schema
+3. gpu-host standby replicates the WAL (zero-downtime, automatic)
+4. When you promote gpu-host, it already has the schema
 
 Do not attempt to run a migration directly on the standby.
 
@@ -367,10 +367,10 @@ write.
 
 ### 6.1 Automated daily backup
 
-Daily automated backup at **03:00 UTC** to ARGONAS NFS:
+Daily automated backup at **03:00 UTC** to nas-host NFS:
 
 ```bash
-# Cron on PYTHIA (or ARGONAS as a separate job)
+# Cron on pg-host (or nas-host as a separate job)
 0 3 * * * pg_dump -U postgres mnemos | gzip > \
   /mnt/argonas/backups/mnemos/daily-$(date +\%Y\%m\%d-\%H\%M\%S).sql.gz && \
   find /mnt/argonas/backups/mnemos/ -name 'daily-*.sql.gz' -mtime +30 -delete
@@ -393,7 +393,7 @@ pg_dump -U postgres mnemos | gzip > \
 **Status:** Dev↔prod MPF restore drill documented and last run for v3.4.1; repeat before high-risk schema work.
 Repeat quarterly and before high-risk schema work.
 
-To restore from backup to PROTEUS (test/staging host):
+To restore from backup to oracle-host (test/staging host):
 
 ```bash
 # 1. Get latest backup
@@ -402,18 +402,18 @@ BACKUP=/mnt/argonas/backups/mnemos/daily-20260426-030000.sql.gz
 # 2. Verify integrity
 gunzip -t $BACKUP
 
-# 3. Create test database on PROTEUS
-ssh root@192.168.207.25 "createdb -U postgres mnemos_restore_test"
+# 3. Create test database on oracle-host
+ssh root@<host> "createdb -U postgres mnemos_restore_test"
 
 # 4. Restore
-ssh root@192.168.207.25 \
+ssh root@<host> \
   "gunzip < $BACKUP | psql -U postgres -d mnemos_restore_test"
 
 # 5. Verify app can read
 PG_DATABASE=mnemos_restore_test python -m pytest tests/test_memories.py -k "test_list" -v
 
 # 6. Cleanup
-ssh root@192.168.207.25 "dropdb -U postgres mnemos_restore_test"
+ssh root@<host> "dropdb -U postgres mnemos_restore_test"
 ```
 
 ### 6.4 Important: HA is NOT backup
@@ -427,7 +427,7 @@ The pgha-primary/pgha-standby replication layer is **failover**, not **backup**.
 ### 7.1 Current state (verified 2026-04-26)
 
 **Existing monitoring:**
-- Grafana + Prometheus + cAdvisor on PYTHIA (4+ days uptime)
+- Grafana + Prometheus + cAdvisor on pg-host (4+ days uptime)
 - Per-node `/health` endpoint (returns JSON status + version)
 - Structured logging via `structlog` → stdout → journalctl (or docker logs)
 - Request-ID correlation via `mnemos/core/observability.py` (soft-optional deps)
@@ -476,9 +476,9 @@ Response (JSON):
 Simple dashboard (Grafana or custom HTML) that queries each node's `/health` and shows:
 
 ```
-PYTHIA:   5.0.1         (prod target)
-CERBERUS: 5.0.1         (dark prod / GPU host)
-PROTEUS:  next cut      (staging / restore-drill target)
+pg-host:   5.0.1         (prod target)
+gpu-host: 5.0.1         (dark prod / GPU host)
+oracle-host:  next cut      (staging / restore-drill target)
 ```
 
 Update frequency: 5 minutes (sufficient for drift detection).
@@ -487,7 +487,7 @@ Update frequency: 5 minutes (sufficient for drift detection).
 
 ## 8. LB drain and rejoin
 
-### 8.1 ARGONAS nginx configuration (TBD)
+### 8.1 nas-host nginx configuration (TBD)
 
 **Status:** Config location and exact structure not yet read (permission rate-limit on 2026-04-26). To be confirmed next ops cycle.
 
@@ -495,8 +495,8 @@ Update frequency: 5 minutes (sufficient for drift detection).
 
 ```nginx
 upstream mnemos_backends {
-    # server 192.168.207.67:5002 max_fails=2 fail_timeout=10s;  # down (draining)
-    server 192.168.207.96:5003;                                  # up
+    # server <host>:5002 max_fails=2 fail_timeout=10s;  # down (draining)
+    server <host>:5003;                                  # up
 }
 
 server {
@@ -515,15 +515,15 @@ To remove a node from load balancer (e.g., for maintenance):
 
 ```bash
 # 1. Comment out the node's upstream entry (or mark 'down')
-ssh root@192.168.207.101 "
-  sed -i 's/^server 192.168.207.67:5002/# server 192.168.207.67:5002/' \
+ssh root@<host> "
+  sed -i 's/^server <host>:5002/# server <host>:5002/' \
     /etc/nginx/sites-enabled/mnemos-upstream
   nginx -s reload
 "
 
-# 2. Verify: all traffic routes only to CERBERUS
-curl http://192.168.207.101/ -v
-# (should see X-Request-Server: CERBERUS or similar header)
+# 2. Verify: all traffic routes only to gpu-host
+curl http://<host>/ -v
+# (should see X-Request-Server: gpu-host or similar header)
 
 # 3. Wait for existing connections to drain (30–60 sec)
 sleep 60
@@ -538,22 +538,22 @@ After maintenance:
 ```bash
 # 1. Verify node is healthy
 curl -H "Authorization: Bearer $TOKEN" \
-  http://192.168.207.67:5002/health
+  http://<host>:5002/health
 # Expected: 200 OK, "status": "healthy"
 
 # 2. Re-enable in nginx upstream
-ssh root@192.168.207.101 "
-  sed -i 's/^# server 192.168.207.67:5002/server 192.168.207.67:5002/' \
+ssh root@<host> "
+  sed -i 's/^# server <host>:5002/server <host>:5002/' \
     /etc/nginx/sites-enabled/mnemos-upstream
   nginx -s reload
 "
 
 # 3. Verify: traffic routes to both nodes
 for i in {1..5}; do
-  curl http://192.168.207.101/ -H "Authorization: Bearer $TOKEN" | \
+  curl http://<host>/ -H "Authorization: Bearer $TOKEN" | \
     jq '.debug.node'
 done
-# Should see both PYTHIA and CERBERUS in results
+# Should see both pg-host and gpu-host in results
 ```
 
 ### 8.4 Alternative: health-check-driven drain
@@ -562,12 +562,12 @@ Instead of explicit manual drain, nginx can auto-detect failures via health chec
 
 ```nginx
 upstream mnemos_backends {
-    server 192.168.207.67:5002 max_fails=2 fail_timeout=10s check interval=5000 rise=2 fall=3;
-    server 192.168.207.96:5003 max_fails=2 fail_timeout=10s check interval=5000 rise=2 fall=3;
+    server <host>:5002 max_fails=2 fail_timeout=10s check interval=5000 rise=2 fall=3;
+    server <host>:5003 max_fails=2 fail_timeout=10s check interval=5000 rise=2 fall=3;
 }
 ```
 
-With this config, if a node's `/health` returns non-200 three times in a row, nginx stops routing to it automatically. **Status:** Not yet confirmed on ARGONAS; requires ngx_http_upstream_check_module (non-standard).
+With this config, if a node's `/health` returns non-200 three times in a row, nginx stops routing to it automatically. **Status:** Not yet confirmed on nas-host; requires ngx_http_upstream_check_module (non-standard).
 
 ---
 
@@ -576,8 +576,8 @@ With this config, if a node's `/health` returns non-200 three times in a row, ng
 ### 9.1 Problem
 
 During the 2026-04-26 audit:
-- CLAUDE.md claimed PYTHIA was v3.2.0; reality was v3.3-alpha.1
-- CERBERUS had both v3.1.0 (dev artifact on port 5002) and v3.2.0 (prod on port 5003) running simultaneously
+- CLAUDE.md claimed pg-host was v3.2.0; reality was v3.3-alpha.1
+- gpu-host had both v3.1.0 (dev artifact on port 5002) and v3.2.0 (prod on port 5003) running simultaneously
 - No automated detection caught the drift
 
 ### 9.2 Solution: weekly version check
@@ -588,23 +588,23 @@ Implement `scripts/ops/version_check.sh`:
 #!/bin/bash
 # Check each node's version vs. declared target
 
-PYTHIA_DECLARED="5.0.1"
-CERBERUS_DECLARED="5.0.1"
-PROTEUS_DECLARED="next-cut"
+pg-host_DECLARED="5.0.1"
+gpu-host_DECLARED="5.0.1"
+oracle-host_DECLARED="next-cut"
 
-PYTHIA_ACTUAL=$(curl -s -H "Authorization: Bearer $TOKEN" \
-  http://192.168.207.67:5002/health | jq -r .version)
-CERBERUS_ACTUAL=$(curl -s -H "Authorization: Bearer $TOKEN" \
-  http://192.168.207.96:5003/health | jq -r .version)
+pg-host_ACTUAL=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  http://<host>:5002/health | jq -r .version)
+gpu-host_ACTUAL=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  http://<host>:5003/health | jq -r .version)
 
-if [[ "$PYTHIA_ACTUAL" != "$PYTHIA_DECLARED" ]]; then
-  echo "DRIFT: PYTHIA actual=$PYTHIA_ACTUAL, declared=$PYTHIA_DECLARED"
-  logger -t mnemos-drift "PYTHIA version mismatch"
+if [[ "$pg-host_ACTUAL" != "$pg-host_DECLARED" ]]; then
+  echo "DRIFT: pg-host actual=$pg-host_ACTUAL, declared=$pg-host_DECLARED"
+  logger -t mnemos-drift "pg-host version mismatch"
 fi
 
-if [[ "$CERBERUS_ACTUAL" != "$CERBERUS_DECLARED" ]]; then
-  echo "DRIFT: CERBERUS actual=$CERBERUS_ACTUAL, declared=$CERBERUS_DECLARED"
-  logger -t mnemos-drift "CERBERUS version mismatch"
+if [[ "$gpu-host_ACTUAL" != "$gpu-host_DECLARED" ]]; then
+  echo "DRIFT: gpu-host actual=$gpu-host_ACTUAL, declared=$gpu-host_DECLARED"
+  logger -t mnemos-drift "gpu-host version mismatch"
 fi
 ```
 
@@ -615,7 +615,7 @@ fi
 Quarterly, audit running containers on each node and retire stale ones:
 
 ```bash
-# On CERBERUS (find stale MNEMOS containers)
+# On gpu-host (find stale MNEMOS containers)
 docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
 
 # Example stale artifact from 2026-04-26:
@@ -643,7 +643,7 @@ The combination `rate-limit-clean + auth-works + public-404` = T&S account-hide.
 
 **Resolution path (established 2026-04-26):**
 1. Outreach to GitHub Head of OSPO via LinkedIn-direct, LF-affiliation framing
-2. Continue dev on GitLab + ARGONAS bare repos during restriction (NEVER create new GitHub repos/branches/gists during the window — confirms abuse-heuristic suspicion)
+2. Continue dev on GitLab + nas-host bare repos during restriction (NEVER create new GitHub repos/branches/gists during the window — confirms abuse-heuristic suspicion)
 3. Resume GitHub pushes only after restriction is lifted
 
 Goodwill is finite — escalation channel is for real platform-enforcement only, not routine support. Routine billing/quota issues go through https://support.github.com/ first.
@@ -669,7 +669,7 @@ Federation (peer-to-peer memory sync) is specified in `mnemos/api/routes/federat
 
 Currently: node logs an error and retries on next sync interval (default 1h). **No active heartbeat.**
 
-Risk: Silent failure — if CERBERUS goes down mid-night, PYTHIA won't know for 1–2 hours.
+Risk: Silent failure — if gpu-host goes down mid-night, pg-host won't know for 1–2 hours.
 
 ### 11.3 Required: Peer heartbeat detection
 
@@ -702,12 +702,12 @@ if not await check_peer_health(peer.url, peer.token):
 
 ## 12. Pre-flight checklist for any production change
 
-Use this checklist before **any** deployment, upgrade, or migration on PYTHIA or CERBERUS:
+Use this checklist before **any** deployment, upgrade, or migration on pg-host or gpu-host:
 
 - [ ] **Version state:** Confirm current version on each prod node
   ```bash
   curl -H "Authorization: Bearer $TOKEN" \
-    http://192.168.207.67:5002/health | jq .version
+    http://<host>:5002/health | jq .version
   ```
 
 - [ ] **Replication lag:** Verify replication is current (<30s lag)
@@ -738,7 +738,7 @@ Use this checklist before **any** deployment, upgrade, or migration on PYTHIA or
 - [ ] **LB has healthy peer:** Verify the OTHER prod node is healthy and receiving traffic
   ```bash
   curl -H "Authorization: Bearer $TOKEN" \
-    http://192.168.207.96:5003/health
+    http://<host>:5003/health
   ```
 
 - [ ] **Notification sent:** Inform any on-call + relevant teams (Slack, Signal, etc. — currently manual)
@@ -756,7 +756,7 @@ The following three shell scripts codify operational patterns and reduce manual 
 
 **Purpose:** Detect version drift between actual and declared.
 
-**Inputs:** PYTHIA_DECLARED, CERBERUS_DECLARED (environment vars or config file).
+**Inputs:** pg-host_DECLARED, gpu-host_DECLARED (environment vars or config file).
 
 **Outputs:** Logs mismatches to syslog `mnemos-drift` tag.
 
@@ -790,14 +790,14 @@ The following three shell scripts codify operational patterns and reduce manual 
 
 ### 13.3 `scripts/ops/blue_green_deploy.sh`
 
-**Purpose:** Codifies blue-green upgrade of a single prod node (PYTHIA or CERBERUS).
+**Purpose:** Codifies blue-green upgrade of a single prod node (pg-host or gpu-host).
 
 **Inputs:** node IP, new version tag, LB IP, token.
 
 **Outputs:** Upgrade success/failure, rejoin to LB.
 
 **Sequence:**
-1. Drain node from LB (via ssh to ARGONAS nginx)
+1. Drain node from LB (via ssh to nas-host nginx)
 2. Take pre-upgrade backup
 3. Upgrade MNEMOS code + deps (git checkout, pip install)
 4. Run migrations (via `migration_apply.sh`)
@@ -810,8 +810,8 @@ The following three shell scripts codify operational patterns and reduce manual 
 - [ ] Zero manual intervention once started
 - [ ] Automatic rollback on smoke failure
 - [ ] Idempotent (safe to re-run if partial failure)
-- [ ] Works for both systemd (PYTHIA) and docker (CERBERUS) deployments
-- [ ] End-to-end test: upgrade PROTEUS successfully, then PYTHIA in lower env
+- [ ] Works for both systemd (pg-host) and docker (gpu-host) deployments
+- [ ] End-to-end test: upgrade oracle-host successfully, then pg-host in lower env
 
 ---
 
@@ -819,13 +819,13 @@ The following three shell scripts codify operational patterns and reduce manual 
 
 | Item | Status | Impact | Owner | Target |
 |---|---|---|---|---|
-| ARGONAS nginx config location | TBD (permission rate-limit) | Can't read LB config or verify drain setup | ops | Next cycle |
+| nas-host nginx config location | TBD (permission rate-limit) | Can't read LB config or verify drain setup | ops | Next cycle |
 | Health-check probe interval/timeout | TBD | Don't know if nginx can auto-detect backend failure | ops | Next cycle |
-| CERBERUS port 5002 v3.1.0 cleanup | ⏳ Planned | Stale container running, wastes VRAM | ops | v3.5 quarterly pass |
+| gpu-host port 5002 v3.1.0 cleanup | ⏳ Planned | Stale container running, wastes VRAM | ops | v3.5 quarterly pass |
 | Restore drill | ✅ Dev↔prod drill documented and run | Repeat quarterly, not a one-time substitute for backup monitoring | ops | quarterly |
 | Slack/Signal alerting | ⏳ Not wired | On-call relies on manual checking | ops | v3.5 |
 | Federation peer heartbeat | ⏳ No detection | Silent failure if peer unreachable >1h | dev | v3.5 |
-| PROTEUS deployment | ✅ Used for v3.4.1 restore/schema drills | Keep as staging proving ground | ops+dev | ongoing |
+| oracle-host deployment | ✅ Used for v3.4.1 restore/schema drills | Keep as staging proving ground | ops+dev | ongoing |
 | Version check script | ⏳ Not written | Drift detection manual-only | ops | v3.5 |
 | Migration wrapper script | ⏳ Not written | No safe migration automation | ops | v3.5 |
 | Blue-green deploy script | ⏳ Not written | Prod upgrades manual-only | ops | v3.5 |
@@ -848,28 +848,28 @@ The following three shell scripts codify operational patterns and reduce manual 
 ### Health and status
 
 ```bash
-# PYTHIA health
-curl -H "Authorization: Bearer $TOKEN" http://192.168.207.67:5002/health | jq .
+# pg-host health
+curl -H "Authorization: Bearer $TOKEN" http://<host>:5002/health | jq .
 
-# CERBERUS prod health
-curl -H "Authorization: Bearer $TOKEN" http://192.168.207.96:5003/health | jq .
+# gpu-host prod health
+curl -H "Authorization: Bearer $TOKEN" http://<host>:5003/health | jq .
 
 # Replication lag
 psql -U postgres -d mnemos -c \
   "SELECT slot_name, restart_lsn FROM pg_replication_slots;"
 ```
 
-### Containers (CERBERUS)
+### Containers (gpu-host)
 
 ```bash
 # List all containers
-ssh jasonperlow@192.168.207.96 "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'"
+ssh jasonperlow@<host> "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'"
 
 # Logs for a container
-ssh jasonperlow@192.168.207.96 "docker logs -f <container-name>"
+ssh jasonperlow@<host> "docker logs -f <container-name>"
 
 # Stop a container
-ssh jasonperlow@192.168.207.96 "docker stop <container-name>"
+ssh jasonperlow@<host> "docker stop <container-name>"
 ```
 
 ### Database operations
@@ -878,8 +878,8 @@ ssh jasonperlow@192.168.207.96 "docker stop <container-name>"
 # Manual backup
 pg_dump -U postgres mnemos | gzip > backup-$(date +%Y%m%d).sql.gz
 
-# List backups on ARGONAS
-ssh jasonperlow@192.168.207.101 "ls -lh /mnt/argonas/backups/mnemos/"
+# List backups on nas-host
+ssh jasonperlow@<host> "ls -lh /mnt/argonas/backups/mnemos/"
 
 # Restore from backup
 gunzip < backup.sql.gz | psql -U postgres -d mnemos
@@ -889,20 +889,20 @@ sudo -u postgres psql -d mnemos -v ON_ERROR_STOP=1 \
   -f db/migrations_v3_5_trigger_same_memory_parent.sql
 ```
 
-### Load balancer (ARGONAS)
+### Load balancer (nas-host)
 
 ```bash
 # Reload nginx config
-ssh root@192.168.207.101 "nginx -s reload"
+ssh root@<host> "nginx -s reload"
 
 # Check nginx status
-ssh root@192.168.207.101 "systemctl status nginx"
+ssh root@<host> "systemctl status nginx"
 
 # View nginx error log
-ssh root@192.168.207.101 "tail -f /var/log/nginx/error.log"
+ssh root@<host> "tail -f /var/log/nginx/error.log"
 ```
 
-### Systemd (PYTHIA)
+### Systemd (pg-host)
 
 ```bash
 # Restart MNEMOS

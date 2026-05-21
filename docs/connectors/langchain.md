@@ -2,16 +2,16 @@
 
 LangChain can load MNEMOS tools through `langchain-mcp-adapters` and pass them into an agent as standard LangChain tools.
 
-## What you need — token, host (192.168.207.67), relevant port(s)
+## What you need — token, host (<mnemos-host>), relevant port(s)
 
 - Python 3.11+.
 - `langchain >= 0.3` and `langchain-community >= 0.3`.
 - `langchain-mcp-adapters` from
   `https://github.com/langchain-ai/langchain-mcp-adapters`.
 - A chat model integration for the agent runtime.
-- MNEMOS MCP HTTP/SSE reachable at `http://192.168.207.67:5003/sse`.
+- MNEMOS MCP HTTP/SSE reachable at `http://<mnemos-host>:5003/sse`.
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- Network access from the LangChain runtime to `192.168.207.67`.
+- Network access from the LangChain runtime to `<mnemos-host>`.
 - A policy decision about which write tools the agent may call.
 
 ## Configuration snippet — MultiServerMCPClient to a LangChain agent
@@ -31,7 +31,7 @@ async def main() -> None:
     client = MultiServerMCPClient({
         "mnemos": {
             "transport": "sse",
-            "url": "http://192.168.207.67:5003/sse",
+            "url": "http://<mnemos-host>:5003/sse",
             "headers": {"Authorization": f"Bearer {os.environ['MNEMOS_TOKEN']}"},
         }
     })
@@ -54,7 +54,7 @@ import asyncio, os
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 async def main():
-    client = MultiServerMCPClient({"mnemos": {"transport": "sse", "url": "http://192.168.207.67:5003/sse", "headers": {"Authorization": f"Bearer {os.environ['MNEMOS_TOKEN']}"}}})
+    client = MultiServerMCPClient({"mnemos": {"transport": "sse", "url": "http://<mnemos-host>:5003/sse", "headers": {"Authorization": f"Bearer {os.environ['MNEMOS_TOKEN']}"}}})
     print([tool.name for tool in await client.get_tools()])
 
 asyncio.run(main())

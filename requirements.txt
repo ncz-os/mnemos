@@ -19,9 +19,31 @@ asyncpg>=0.29.0          # async API path (lifecycle.py + handlers)
 # is suitable. Operators who want the psycopg installer path can
 # `pip install psycopg[binary]` separately and the existing import
 # guards in mnemos/installer/db.py will pick it up.
+#
+# Enterprise backend drivers are NOT in default deps (the runtime imports
+# them lazily inside the matching backend modules). Install via the
+# pyproject extras (`pip install 'mnemos-os[oracle]'` etc.) or uncomment
+# the lines below for a flat requirements-driven build. See
+# docs/INSTALL.md "Enterprise Backends" for full setup.
+# oracledb>=2.0    # Oracle 23ai backend (mnemos/persistence/oracle.py)
+# ibm_db>=3.2      # IBM Db2 12.1.5 backend (mnemos/persistence/db2.py)
 
 # HTTP client (single library — replaces requests + aiohttp)
 httpx>=0.27.0
+
+# In-process embedding generation (architectural decision
+# mem_1779334716543_f8ebd4, operator-locked 2026-05-21). Loads an
+# embedding model in the mnemos worker; no Ollama / no llama-server HTTP.
+# Two backends — runtime auto-selects:
+#   openvino + optimum-intel: Intel CPU/iGPU/NPU; PYTHIA Xe iGPU does
+#     50 rec/s vs ~11 rec/s on llama-cpp CPU (Phase 1B 2026-05-21).
+#   llama-cpp-python: portable GGUF path. CUDA wheels at
+#     https://abetlen.github.io/llama-cpp-python/whl/cu124/
+llama-cpp-python>=0.3
+openvino>=2025.0
+optimum-intel[openvino]>=1.20
+transformers>=4.40
+torch>=2.3
 
 # Cache
 slowapi>=0.1.9

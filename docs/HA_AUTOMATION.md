@@ -1,7 +1,7 @@
 # MNEMOS HA Automation: Patroni + etcd3 + HAProxy
 
 Status: v5.3.0 design and configuration artifacts. The automation is designed
-for the PYTHIA/CERBERUS pg16 + pgvector deployment and is not yet exercised in
+for the pg-host/gpu-host pg16 + pgvector deployment and is not yet exercised in
 CI.
 
 ## Decision
@@ -16,9 +16,9 @@ The current manual topology remains the source input for this design:
 
 | Role | Host | Address | PostgreSQL |
 |---|---|---|---|
-| Primary | PYTHIA | `192.168.207.67` | pg16 + pgvector on host port `5433` |
-| Standby | CERBERUS | `192.168.207.96` | pg16 + pgvector on host port `5434` |
-| Witness | PROTEUS | `192.168.207.25` | etcd3 quorum witness only |
+| Primary | pg-host | `<host>` | pg16 + pgvector on host port `5433` |
+| Standby | gpu-host | `<host>` | pg16 + pgvector on host port `5434` |
+| Witness | oracle-host | `<host>` | etcd3 quorum witness only |
 
 The current physical replication slot is `cerberus_standby`. Patroni can keep
 physical slots enabled and will manage member slots after hand-off.
@@ -27,22 +27,22 @@ physical slots enabled and will manage member slots after hand-off.
 
 Use etcd3 as a three-node witness cluster:
 
-- PYTHIA runs PostgreSQL + Patroni + an etcd3 member.
-- CERBERUS runs PostgreSQL + Patroni + an etcd3 member.
-- PROTEUS runs only an etcd3 member as quorum witness.
+- pg-host runs PostgreSQL + Patroni + an etcd3 member.
+- gpu-host runs PostgreSQL + Patroni + an etcd3 member.
+- oracle-host runs only an etcd3 member as quorum witness.
 
 Do not use Patroni's built-in raft for this two-database-node deployment. A
 two-node raft group has no majority after either node is lost, so it cannot
-reliably distinguish "peer failed" from "I am partitioned." Adding PROTEUS as
+reliably distinguish "peer failed" from "I am partitioned." Adding oracle-host as
 an etcd3 witness gives the control plane a three-member majority while keeping
-the data plane limited to PYTHIA and CERBERUS.
+the data plane limited to pg-host and gpu-host.
 
 The DCS endpoints used by the shipped configs are:
 
 ```text
-192.168.207.67:2379   # PYTHIA etcd3 client
-192.168.207.96:2379   # CERBERUS etcd3 client
-192.168.207.25:2379   # PROTEUS etcd3 client
+<host>:2379   # pg-host etcd3 client
+<host>:2379   # gpu-host etcd3 client
+<host>:2379   # oracle-host etcd3 client
 ```
 
 ## Patroni Configuration
@@ -59,7 +59,7 @@ Both nodes share these cluster-level fields:
 | `scope` | `mnemos-pg16`, the Patroni cluster name stored in etcd3. |
 | `namespace` | `/mnemos/patroni/`, isolating MNEMOS keys from other etcd users. |
 | `restapi` | Patroni health API on `:8008`; HAProxy checks `/primary` and `/replica`. |
-| `etcd3` | Three endpoints: PYTHIA, CERBERUS, PROTEUS. |
+| `etcd3` | Three endpoints: pg-host, gpu-host, oracle-host. |
 | `bootstrap.dcs` | Cluster TTL, failover timing, pg16 replication parameters, physical slots, and async replication posture. |
 | `bootstrap.initdb` | UTF-8 initdb defaults for a fresh cluster; not used when adopting existing data. |
 | `bootstrap.users` | Initial local database roles for new clusters. Replace sample passwords before production use. |
@@ -71,16 +71,16 @@ Node-specific values:
 
 | Node | Patroni name | PostgreSQL listen/connect | REST connect |
 |---|---|---|---|
-| PYTHIA | `pythia` | `0.0.0.0:5433` / `192.168.207.67:5433` | `192.168.207.67:8008` |
-| CERBERUS | `cerberus` | `0.0.0.0:5434` / `192.168.207.96:5434` | `192.168.207.96:8008` |
+| pg-host | `pythia` | `0.0.0.0:5433` / `<host>:5433` | `<host>:8008` |
+| gpu-host | `cerberus` | `0.0.0.0:5434` / `<host>:5434` | `<host>:8008` |
 
 The local PostgreSQL ports intentionally preserve the current deployment:
-PYTHIA stays on `5433`, CERBERUS stays on `5434`, and pgvector remains part of
+pg-host stays on `5433`, gpu-host stays on `5434`, and pgvector remains part of
 the PostgreSQL image.
 
 ## Primary Discovery
 
-MNEMOS clients should not connect directly to PYTHIA or CERBERUS. Route
+MNEMOS clients should not connect directly to pg-host or gpu-host. Route
 database traffic through HAProxy on a stable VIP or stable host address:
 
 | Endpoint | Port | Meaning | HAProxy health check |
@@ -89,7 +89,7 @@ database traffic through HAProxy on a stable VIP or stable host address:
 | `mnemos-postgres-vip:5001` | `5001` | Read-only replica PostgreSQL endpoint | `GET /replica` on each Patroni REST API |
 
 The concrete HAProxy config is `ops/patroni/haproxy.cfg`. It forwards
-PostgreSQL TCP traffic to `192.168.207.67:5433` or `192.168.207.96:5434`, but
+PostgreSQL TCP traffic to `<host>:5433` or `<host>:5434`, but
 health-checks the Patroni REST API on `:8008`. A promoted standby begins
 receiving writes through port `5000` only after Patroni reports it as
 `/primary`.
@@ -109,33 +109,33 @@ acceptable.
 
 ## Migration Path
 
-Goal: move from the current manual PYTHIA-primary/CERBERUS-standby setup to a
+Goal: move from the current manual pg-host-primary/gpu-host-standby setup to a
 Patroni-managed cluster without data loss.
 
 1. Prepare etcd3 quorum.
-   Start the etcd3 member on PYTHIA, CERBERUS, and PROTEUS. Verify a majority
+   Start the etcd3 member on pg-host, gpu-host, and oracle-host. Verify a majority
    before touching PostgreSQL:
 
    ```bash
    ETCDCTL_API=3 etcdctl \
-     --endpoints=http://192.168.207.67:2379,http://192.168.207.96:2379,http://192.168.207.25:2379 \
+     --endpoints=http://<host>:2379,http://<host>:2379,http://<host>:2379 \
      endpoint status --write-out=table
    ```
 
 2. Freeze MNEMOS writes.
-   Stop or drain MNEMOS services that write to PYTHIA. This preserves a clean
+   Stop or drain MNEMOS services that write to pg-host. This preserves a clean
    final LSN before hand-off:
 
    ```bash
-   ssh jasonperlow@192.168.207.67 "podman stop mnemos-v3x-podman_mnemos_1 mnemos-v3x-podman_mnemos-mcp-http_1"
+   ssh jasonperlow@<host> "podman stop mnemos-v3x-podman_mnemos_1 mnemos-v3x-podman_mnemos-mcp-http_1"
    ```
 
-3. Confirm CERBERUS has replayed all WAL from PYTHIA.
+3. Confirm gpu-host has replayed all WAL from pg-host.
 
    ```bash
-   ssh jasonperlow@192.168.207.67 "podman exec mnemos-v3x-podman_postgres_1 \
+   ssh jasonperlow@<host> "podman exec mnemos-v3x-podman_postgres_1 \
        psql -U mnemos_user -d mnemos -tAc 'SELECT sent_lsn FROM pg_stat_replication;'"
-   ssh jasonperlow@192.168.207.96 "podman exec mnemos-standby \
+   ssh jasonperlow@<host> "podman exec mnemos-standby \
        psql -U mnemos_user -d mnemos -p 5434 -h 127.0.0.1 -tAc 'SELECT pg_last_wal_replay_lsn();'"
    ```
 
@@ -144,43 +144,43 @@ Patroni-managed cluster without data loss.
 4. Take a final physical backup of the primary before changing supervisors.
 
    ```bash
-   ssh jasonperlow@192.168.207.67 "podman exec mnemos-v3x-podman_postgres_1 \
+   ssh jasonperlow@<host> "podman exec mnemos-v3x-podman_postgres_1 \
        pg_basebackup -h 127.0.0.1 -p 5432 -U replicator \
        -D /tmp/mnemos-pythia-final-basebackup -Fp -Xs -P"
    ```
 
    Store that backup off the container host before proceeding.
 
-5. Hand PYTHIA's existing PGDATA to Patroni.
+5. Hand pg-host's existing PGDATA to Patroni.
    Stop only the old PostgreSQL container supervisor, mount the same pg16 data
    volume into the Patroni-wrapped pgvector container, and start
-   `patroni-pythia.yml`. Because the DCS is empty and PYTHIA has the existing
-   primary data directory, Patroni should initialize the DCS with PYTHIA as
+   `patroni-pythia.yml`. Because the DCS is empty and pg-host has the existing
+   primary data directory, Patroni should initialize the DCS with pg-host as
    leader rather than running `initdb`.
 
-6. Rebuild CERBERUS under Patroni with `pg_basebackup`.
-   Use a fresh CERBERUS pg16 data volume, clone from PYTHIA, and preserve the
+6. Rebuild gpu-host under Patroni with `pg_basebackup`.
+   Use a fresh gpu-host pg16 data volume, clone from pg-host, and preserve the
    existing slot name during the transition:
 
    ```bash
-   ssh jasonperlow@192.168.207.96 "podman run --rm \
+   ssh jasonperlow@<host> "podman run --rm \
        -v mnemos-patroni-cerberus-pgdata:/var/lib/postgresql/data \
        -e PGPASSWORD=replace-with-replicator-password \
        docker.io/pgvector/pgvector:pg16 \
        pg_basebackup \
-           -h 192.168.207.67 -p 5433 -U replicator \
+           -h <host> -p 5433 -U replicator \
            -D /var/lib/postgresql/data \
            -Fp -Xs -P -R --slot=cerberus_standby --create-slot"
    ```
 
-   Then start CERBERUS with `patroni-cerberus.yml`. Patroni will rewrite
+   Then start gpu-host with `patroni-cerberus.yml`. Patroni will rewrite
    recovery settings as needed and keep the node following the current leader.
 
 7. Verify Patroni state.
 
    ```bash
-   curl -fsS http://192.168.207.67:8008/primary
-   curl -fsS http://192.168.207.96:8008/replica
+   curl -fsS http://<host>:8008/primary
+   curl -fsS http://<host>:8008/replica
    ```
 
    Also verify PostgreSQL recovery status:
@@ -189,7 +189,7 @@ Patroni-managed cluster without data loss.
    SELECT pg_is_in_recovery();
    ```
 
-   PYTHIA should return `false`; CERBERUS should return `true`.
+   pg-host should return `false`; gpu-host should return `true`.
 
 8. Put HAProxy/VIP in front of the cluster.
    Start HAProxy with `ops/patroni/haproxy.cfg`, point MNEMOS at port `5000`,
@@ -203,12 +203,12 @@ Patroni-managed cluster without data loss.
 
 | Scenario | DCS quorum | Expected Patroni behavior | Client impact | Operator action |
 |---|---|---|---|---|
-| PYTHIA down | CERBERUS + PROTEUS retain majority | CERBERUS promotes if its replay lag is within `maximum_lag_on_failover`; HAProxy moves port `5000` to CERBERUS. | Short write outage during promotion; reads may continue after CERBERUS is healthy. | Repair PYTHIA and reinitialize it as a replica from CERBERUS before rejoining. |
-| CERBERUS down | PYTHIA + PROTEUS retain majority | PYTHIA remains leader; no failover. | Writes continue on port `5000`; read-only port `5001` may have no backend. | Repair/reinitialize CERBERUS. Watch WAL retention and replication slot growth. |
-| PYTHIA partitioned from CERBERUS but PYTHIA can still reach PROTEUS | PYTHIA + PROTEUS retain majority | PYTHIA keeps the leader lock; CERBERUS remains or becomes a non-leader without quorum. | Writes continue through PYTHIA if HAProxy can reach it. | Repair network; confirm CERBERUS follows after partition heals. |
-| PYTHIA isolated from both CERBERUS and PROTEUS | CERBERUS + PROTEUS retain majority | PYTHIA loses/ cannot renew leader lock and must stop accepting writes; CERBERUS promotes. | HAProxy should remove PYTHIA and route writes to CERBERUS after promotion. | Fence old PYTHIA until it can be rebuilt as a replica. |
+| pg-host down | gpu-host + oracle-host retain majority | gpu-host promotes if its replay lag is within `maximum_lag_on_failover`; HAProxy moves port `5000` to gpu-host. | Short write outage during promotion; reads may continue after gpu-host is healthy. | Repair pg-host and reinitialize it as a replica from gpu-host before rejoining. |
+| gpu-host down | pg-host + oracle-host retain majority | pg-host remains leader; no failover. | Writes continue on port `5000`; read-only port `5001` may have no backend. | Repair/reinitialize gpu-host. Watch WAL retention and replication slot growth. |
+| pg-host partitioned from gpu-host but pg-host can still reach oracle-host | pg-host + oracle-host retain majority | pg-host keeps the leader lock; gpu-host remains or becomes a non-leader without quorum. | Writes continue through pg-host if HAProxy can reach it. | Repair network; confirm gpu-host follows after partition heals. |
+| pg-host isolated from both gpu-host and oracle-host | gpu-host + oracle-host retain majority | pg-host loses/ cannot renew leader lock and must stop accepting writes; gpu-host promotes. | HAProxy should remove pg-host and route writes to gpu-host after promotion. | Fence old pg-host until it can be rebuilt as a replica. |
 | Network split, both database nodes up, no side has quorum | No majority | No node may safely acquire or renew leadership; Patroni prevents unsafe promotion. | Write endpoint unavailable; avoids split-brain. | Restore etcd connectivity or deliberately execute break-glass manual recovery. |
-| PROTEUS witness loss only | PYTHIA + CERBERUS retain majority | Current leader remains valid; failover can still occur while both DB nodes are connected. | No immediate impact. | Restore PROTEUS quickly; a later DB-node failure would remove quorum. |
+| oracle-host witness loss only | pg-host + gpu-host retain majority | Current leader remains valid; failover can still occur while both DB nodes are connected. | No immediate impact. | Restore oracle-host quickly; a later DB-node failure would remove quorum. |
 | Any two etcd3 members lost | No majority | Patroni cannot make safe leadership changes. Existing leader may step down when TTL cannot be renewed. | Write outage likely. | Restore etcd majority first, then recover PostgreSQL nodes. |
 | HAProxy node/VIP down | Patroni state unchanged | Database roles do not change. | MNEMOS cannot reach the stable endpoint even if PostgreSQL is healthy. | Move VIP/start backup HAProxy or point clients temporarily to the current primary as break-glass. |
 

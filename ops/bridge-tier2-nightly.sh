@@ -30,7 +30,17 @@ fi
 
 export OPENAI_API_KEY GOOGLE_API_KEY ANTHROPIC_API_KEY
 export MNEMOS_TEST_BASE="${MNEMOS_TEST_BASE:-http://192.168.207.67:5003/sse}"
-export MNEMOS_MCP_TOKEN="${MNEMOS_MCP_TOKEN:-<REDACTED-MNEMOS-TOKEN>}"
+
+# v6.1-roadmap #37 — in-script MNEMOS_MCP_TOKEN fallback constant was
+# removed 2026-05-21. The token must be supplied by the cron environment
+# / systemd unit / operator session. No secrets in source.
+if [ -z "${MNEMOS_MCP_TOKEN:-}" ]; then
+    echo "ERROR: MNEMOS_MCP_TOKEN env var is required (no in-script fallback)." >&2
+    echo "       Set it in your cron environment / systemd unit and re-run." >&2
+    echo "       See docs/v6.1-roadmap.md item #37 for the rotation procedure." >&2
+    exit 1
+fi
+export MNEMOS_MCP_TOKEN
 export MNEMOS_API_BASE="${MNEMOS_API_BASE:-http://192.168.207.67:5002}"
 export MNEMOS_API_TOKEN="${MNEMOS_API_TOKEN:-$MNEMOS_MCP_TOKEN}"
 

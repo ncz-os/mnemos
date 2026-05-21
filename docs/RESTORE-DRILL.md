@@ -14,19 +14,19 @@ a source MNEMOS, validating the envelope, and restoring into a target.
 - **For dev seeding** — clone a snapshot of prod into a staging instance
   to test against realistic data.
 - **For instance migration** — move a corpus from one MNEMOS to another
-  with different infrastructure (e.g. PYTHIA → PROTEUS).
+  with different infrastructure (e.g. pg-host → oracle-host).
 
 ## End-to-end procedure
 
 The drill that lives below was validated on 2026-04-26 against
-PYTHIA (v3.3.0, 11,769 memories) → PROTEUS staging (v3.4.0).
+pg-host (v3.3.0, 11,769 memories) → oracle-host staging (v3.4.0).
 Throughput was ~770 records/sec end-to-end.
 
 ### 1. Export from source
 
 ```bash
-TOKEN='<REDACTED-MNEMOS-TOKEN>'
-SOURCE='http://192.168.207.67:5002'
+TOKEN="${MNEMOS_API_TOKEN:?set MNEMOS_API_TOKEN env var}"
+SOURCE='http://<host>:5002'
 
 curl -s -H "Authorization: Bearer $TOKEN" \
     "$SOURCE/v1/export?include_sidecars=true&limit=10000" \
@@ -59,7 +59,7 @@ the file was corrupted in transit.
 For anything bigger, use the CLI tool.
 
 ```bash
-TARGET='http://192.168.207.25:5002'
+TARGET='http://<host>:5002'
 
 python3 -m mnemos.tools.memory_import json \
     --file /tmp/source-export.json \
