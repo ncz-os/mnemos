@@ -1652,13 +1652,55 @@ async def test_db2_live_memory_assert_readable() -> None:
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_memory_fetch_export() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_memory_export (PR #8c)")
+    """Exercise fetch_memory_export (OFFSET/FETCH paging)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    try:
+        await _seed_test_memory(backend, owner, ns, mem_id)
+        async with backend.transactional() as tx:
+            rows = await backend.memories.fetch_memory_export(
+                tx,
+                effective_owner=owner,
+                effective_ns=ns,
+                category=None,
+                limit=10,
+                offset=0,
+            )
+            assert any(r.get("id") == mem_id for r in rows)
+    finally:
+        await _hard_delete_memory(backend, mem_id)
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_memory_fts_search() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.fts_search (PR #8c)")
+    """Exercise fts_search (UPPER LIKE fallback)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    needle = f"NEEDLE_{uuid.uuid4().hex[:8]}"
+    try:
+        await _seed_test_memory(backend, owner, ns, mem_id, content=f"hay {needle} stack")
+        async with backend.transactional() as tx:
+            vis = VisibilityFilter(scope=VisibilityScope.OWN_ONLY, user_id=owner, group_ids=(), namespace=ns)
+            rows = await backend.memories.fts_search(tx, query=needle, limit=10, visibility=vis)
+            assert any(r.get("id") == mem_id for r in rows)
+    finally:
+        await _hard_delete_memory(backend, mem_id)
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
@@ -1739,13 +1781,49 @@ async def test_db2_live_memory_gather_stats() -> None:
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_memory_bump_recall() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.bump_recall_and_get_memory (PR #8d)")
+    """Exercise bump_recall_and_get_memory."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    try:
+        await _seed_test_memory(backend, owner, ns, mem_id)
+        async with backend.transactional() as tx:
+            vis = VisibilityFilter(scope=VisibilityScope.OWN_ONLY, user_id=owner, group_ids=(), namespace=ns)
+            row = await backend.memories.bump_recall_and_get_memory(tx, mem_id, visibility=vis)
+            assert row and row["id"] == mem_id
+    finally:
+        await _hard_delete_memory(backend, mem_id)
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_memory_fetch_log() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_memory_log (PR #8d)")
+    """Exercise fetch_memory_log (joins memory_versions on branch)."""
+    from mnemos.core.auth_context import UserContext
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    user = UserContext(user_id=owner, namespace=ns, role="user", authenticated=True, group_ids=())
+    try:
+        await _seed_test_memory(backend, owner, ns, mem_id)
+        async with backend.transactional() as tx:
+            rows = await backend.memories.fetch_memory_log(tx, mem_id, "main", 10, user)
+            assert isinstance(rows, list)
+    finally:
+        await _hard_delete_memory(backend, mem_id)
+        await backend.close()
 
 
 # ── PR #8e: Db2MemoryRepository live stubs (7, commit-head / diff / checkout / allowlist / dedup / context) ──
@@ -1754,43 +1832,149 @@ async def test_db2_live_memory_fetch_log() -> None:
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_memory_head_checks() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_memory_head_checks (PR #8e)")
+    """Exercise fetch_memory_head_checks (IN-list + LEFT JOIN)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    try:
+        async with backend.transactional() as tx:
+            rows = await backend.memories.fetch_memory_head_checks(tx, ["nope_a", "nope_b"])
+            assert isinstance(rows, list)
+    finally:
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_memory_diff_commit_pair() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_diff_commit_pair (PR #8e)")
+    """Exercise fetch_diff_commit_pair (miss path — both None)."""
+    from mnemos.core.auth_context import UserContext
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    user = UserContext(user_id=owner, namespace=ns, role="user", authenticated=True, group_ids=())
+    try:
+        async with backend.transactional() as tx:
+            a, b = await backend.memories.fetch_diff_commit_pair(tx, "nope_mem", "nope_a", "nope_b", user)
+            assert a is None and b is None
+    finally:
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_memory_checkout_commit() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_checkout_commit (PR #8e)")
+    """Exercise fetch_checkout_commit (miss path)."""
+    from mnemos.core.auth_context import UserContext
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    user = UserContext(user_id=owner, namespace=ns, role="user", authenticated=True, group_ids=())
+    try:
+        async with backend.transactional() as tx:
+            row = await backend.memories.fetch_checkout_commit(tx, "nope_mem", "nope_commit", user)
+            assert row is None
+    finally:
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_memory_referenced_allowlist() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_referenced_memory_allowlist (PR #8e)")
+    """Exercise fetch_referenced_memory_allowlist (IN-list)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    try:
+        async with backend.transactional() as tx:
+            rows = await backend.memories.fetch_referenced_memory_allowlist(
+                tx,
+                referenced_ids=["nope_a", "nope_b"],
+                scope_owner=None,
+                scope_namespace=None,
+            )
+            assert isinstance(rows, list)
+    finally:
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_memory_find_duplicate_groups() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.find_duplicate_content_groups (PR #8e)")
+    """Exercise find_duplicate_content_groups (CTE + FIRST_VALUE window)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    try:
+        async with backend.transactional() as tx:
+            rows = await backend.memories.find_duplicate_content_groups(tx)
+            assert isinstance(rows, list)
+    finally:
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_memory_consolidate_duplicates() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.consolidate_duplicate_memories (PR #8e)")
+    """Exercise consolidate_duplicate_memories (multi-statement UPDATE)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    canonical = f"m_can_{uuid.uuid4().hex[:8]}"
+    dup_a = f"m_dup_{uuid.uuid4().hex[:8]}"
+    try:
+        await _seed_test_memory(backend, owner, ns, canonical, content="orig")
+        await _seed_test_memory(backend, owner, ns, dup_a, content="dup")
+        async with backend.transactional() as tx:
+            n = await backend.memories.consolidate_duplicate_memories(
+                tx,
+                canonical_id=canonical,
+                duplicate_ids=[dup_a],
+            )
+            assert isinstance(n, int)
+    finally:
+        await _hard_delete_memory(backend, canonical)
+        await _hard_delete_memory(backend, dup_a)
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_memory_fetch_context() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_memory_context (PR #8e)")
+    """Exercise fetch_memory_context (delegates to semantic_search)."""
+    from mnemos.core.auth_context import UserContext
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    user = UserContext(user_id=owner, namespace=ns, role="user", authenticated=True, group_ids=())
+    try:
+        async with backend.transactional() as tx:
+            rows = await backend.memories.fetch_memory_context(tx, "query text", user, limit=3)
+            assert isinstance(rows, list)
+    finally:
+        await backend.close()
 
 
 # ────────────────────────────────────────────────────────────────────────────
