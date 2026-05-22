@@ -158,6 +158,71 @@ async def test_db2_vector_indexing_registry_probe() -> None:
         await backend.close()
 
 
+async def test_db2_webhook_dispatch_event_end_to_end() -> None:
+    """Live Db2 probe for the native webhook dispatch override.
+
+    Skipped with the rest of this module unless ``DB2_DSN`` is set.
+    """
+    from mnemos.persistence.db2 import Db2WebhookRepository, create_db2_pool
+
+    dsn = os.environ["DB2_DSN"]
+    pool = await create_db2_pool(dsn)
+    owner = f"db2webhook_{uuid.uuid4().hex[:10]}"
+    namespace = "native-dispatch"
+    subscription_id = f"sub_{uuid.uuid4().hex}"
+    repo = Db2WebhookRepository()
+    try:
+        async with pool.acquire() as conn:
+            cursor = await conn.cursor()
+            try:
+                await cursor.execute(
+                    """
+                    INSERT INTO webhook_subscriptions (
+                        id, url, events, secret, owner_id, namespace
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        subscription_id,
+                        "https://example.com/db2-native-webhook",
+                        '["memory.created"]',
+                        "secret",
+                        owner,
+                        namespace,
+                    ),
+                )
+                delivery_ids = await repo.dispatch_event(
+                    SimpleNamespace(conn=conn),
+                    "memory.created",
+                    {"memory_id": "live-db2-native"},
+                    owner_id=owner,
+                    namespace=namespace,
+                )
+                await conn.commit()
+                assert len(delivery_ids) == 1
+
+                await cursor.execute(
+                    """
+                    SELECT id FROM webhook_deliveries
+                    WHERE subscription_id = ? AND event_type = ?
+                    """,
+                    (subscription_id, "memory.created"),
+                )
+                assert await cursor.fetchone() is not None
+            finally:
+                await cursor.execute(
+                    "DELETE FROM webhook_deliveries WHERE subscription_id = ?",
+                    (subscription_id,),
+                )
+                await cursor.execute(
+                    "DELETE FROM webhook_subscriptions WHERE id = ?",
+                    (subscription_id,),
+                )
+                await conn.commit()
+                await cursor.close()
+    finally:
+        await pool.close()
+
+
 async def test_db2_semantic_search_parity_with_oracle_normalized_embeddings() -> None:
     """Cross-backend recall sanity probe — gated on both ORACLE_DSN
     and DB2_DSN. Ingests the same small normalized-embedding corpus
