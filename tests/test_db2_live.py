@@ -478,7 +478,45 @@ async def test_db2_live_state_delete_namespace() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_kg_insert() -> None:
-    pytest.skip("live EAP exercise for Db2KGRepository.insert_kg_triple (PR #4)")
+    """Exercise Db2KGRepository.insert_kg_triple against live Db2."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    namespace = f"ns_{uuid.uuid4().hex[:6]}"
+    triple_id = f"t_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            await backend.kg_triples.insert_kg_triple(
+                tx,
+                triple_id=triple_id,
+                subject="s",
+                predicate="p",
+                obj="o",
+                subject_type="entity",
+                object_type="entity",
+                valid_from=None,
+                valid_until=None,
+                memory_id=None,
+                confidence=0.9,
+                created=None,
+                owner_id=owner,
+                namespace=namespace,
+            )
+            row = await backend.kg_triples.fetch_kg_triple_by_id(tx, triple_id)
+            assert row is not None
+            assert row["subject"] == "s"
+    finally:
+        async with backend.transactional() as tx:
+            from mnemos.persistence.db2 import _conn_from_tx, _call
+
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM kg_triples WHERE id = ?", (triple_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -487,7 +525,45 @@ async def test_db2_live_kg_insert() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_kg_fetch_by_id() -> None:
-    pytest.skip("live EAP exercise for Db2KGRepository.fetch_kg_triple_by_id (PR #4)")
+    """Exercise Db2KGRepository.fetch_kg_triple_by_id against live Db2."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    namespace = f"ns_{uuid.uuid4().hex[:6]}"
+    triple_id = f"t_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            await backend.kg_triples.insert_kg_triple(
+                tx,
+                triple_id=triple_id,
+                subject="x",
+                predicate="y",
+                obj="z",
+                subject_type="e",
+                object_type="e",
+                valid_from=None,
+                valid_until=None,
+                memory_id=None,
+                confidence=1.0,
+                created=None,
+                owner_id=owner,
+                namespace=namespace,
+            )
+            row = await backend.kg_triples.fetch_kg_triple_by_id(tx, triple_id)
+            assert row is not None
+            assert row["predicate"] == "y"
+            miss = await backend.kg_triples.fetch_kg_triple_by_id(tx, "nope_does_not_exist")
+            assert miss is None
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM kg_triples WHERE id = ?", (triple_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -496,7 +572,50 @@ async def test_db2_live_kg_fetch_by_id() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_kg_fetch_for_export() -> None:
-    pytest.skip("live EAP exercise for Db2KGRepository.fetch_kg_triples_for_export (PR #4)")
+    """Exercise Db2KGRepository.fetch_kg_triples_for_export against live Db2."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    namespace = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    triple_id = f"t_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            await backend.kg_triples.insert_kg_triple(
+                tx,
+                triple_id=triple_id,
+                subject="a",
+                predicate="b",
+                obj="c",
+                subject_type=None,
+                object_type=None,
+                valid_from=None,
+                valid_until=None,
+                memory_id=mem_id,
+                confidence=0.5,
+                created=None,
+                owner_id=owner,
+                namespace=namespace,
+            )
+            rows = await backend.kg_triples.fetch_kg_triples_for_export(
+                tx,
+                memory_ids=[mem_id],
+                effective_owner=owner,
+                effective_ns=namespace,
+                include_unattached=False,
+                hard_limit=10,
+            )
+            assert any(r.get("id") == triple_id for r in rows)
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM kg_triples WHERE id = ?", (triple_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
