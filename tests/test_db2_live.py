@@ -1349,7 +1349,46 @@ async def test_db2_live_compression_fetch_variants_for_export() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_memory_insert() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.insert_memory (PR #8a)")
+    """Exercise Db2MemoryRepository.insert_memory + fetch_memory_by_id."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            await backend.memories.insert_memory(
+                tx,
+                memory_id=mem_id,
+                content="c",
+                category="test",
+                subcategory=None,
+                metadata_json="{}",
+                quality_rating=50,
+                owner_id=owner,
+                namespace=ns,
+                permission_mode=600,
+                source_model=None,
+                source_provider=None,
+                source_session=None,
+                source_agent=None,
+                verbatim_content=None,
+                created=None,
+                updated=None,
+            )
+            row = await backend.memories.fetch_memory_by_id(tx, mem_id)
+            assert row is not None
+            assert row["content"] == "c"
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -1358,7 +1397,47 @@ async def test_db2_live_memory_insert() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_memory_fetch_by_id() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_memory_by_id (PR #8a)")
+    """Exercise Db2MemoryRepository.fetch_memory_by_id (hit + miss)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            await backend.memories.insert_memory(
+                tx,
+                memory_id=mem_id,
+                content="hello",
+                category="test",
+                subcategory=None,
+                metadata_json="{}",
+                quality_rating=50,
+                owner_id=owner,
+                namespace=ns,
+                permission_mode=600,
+                source_model=None,
+                source_provider=None,
+                source_session=None,
+                source_agent=None,
+                verbatim_content=None,
+                created=None,
+                updated=None,
+            )
+            row = await backend.memories.fetch_memory_by_id(tx, mem_id)
+            assert row and row["id"] == mem_id
+            miss = await backend.memories.fetch_memory_by_id(tx, "nope_xxx")
+            assert miss is None
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -1367,7 +1446,47 @@ async def test_db2_live_memory_fetch_by_id() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_memory_update() -> None:
-    pytest.skip("live EAP exercise for Db2MemoryRepository.update_memory (PR #8a)")
+    """Exercise Db2MemoryRepository.update_memory."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            await backend.memories.insert_memory(
+                tx,
+                memory_id=mem_id,
+                content="orig",
+                category="test",
+                subcategory=None,
+                metadata_json="{}",
+                quality_rating=50,
+                owner_id=owner,
+                namespace=ns,
+                permission_mode=600,
+                source_model=None,
+                source_provider=None,
+                source_session=None,
+                source_agent=None,
+                verbatim_content=None,
+                created=None,
+                updated=None,
+            )
+            vis = VisibilityFilter(scope=VisibilityScope.OWN_ONLY, owner_id=owner, namespace=ns)
+            updated = await backend.memories.update_memory(tx, mem_id, visibility=vis, fields={"content": "new"})
+            assert updated and updated["content"] == "new"
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
