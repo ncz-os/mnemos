@@ -3,15 +3,16 @@
 Outbound notifications on memory and consultation events. Delivery is handled
 by `mnemos.webhooks.dispatcher`; this handler is CRUD only.
 """
+
 import logging
 import secrets
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+from mnemos.api.persistence_helpers import maybe_set_pg_rls as _maybe_set_pg_rls
+from mnemos.api.routes._postgres_only import _backend_or_503
 from mnemos.core.ids import parse_uuid_or_404
 from mnemos.domain.models import (
     VALID_WEBHOOK_EVENTS,
@@ -69,7 +70,7 @@ async def create_webhook(
     user: UserContext = Depends(get_current_user),
 ):
     """Create a webhook subscription. Returns the HMAC secret exactly once."""
-    require_postgres_pool_or_503(route_label="POST /v1/webhooks")
+    backend = _backend_or_503()
 
     await _validate_url(request.url)
     _validate_events(request.events)
@@ -87,30 +88,29 @@ async def create_webhook(
             )
     namespace = request.namespace or user.namespace or "default"
 
-    async with _lc.get_pool_manager().acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO webhook_subscriptions
-              (url, events, secret, description, owner_id, namespace)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, url, events, description, owner_id, namespace, created, revoked
-            """,
-            request.url,
-            request.events,
-            secret,
-            request.description,
-            user.user_id,
-            namespace,
+    async with backend.transactional() as tx:
+        await _maybe_set_pg_rls(tx, user)
+        row = await backend.webhooks.create_webhook_subscription(
+            tx,
+            url=request.url,
+            events=request.events,
+            secret=secret,
+            description=request.description,
+            owner_id=user.user_id,
+            namespace=namespace,
         )
 
     logger.info(
         "webhook created id=%s owner=%s events=%s",
-        row["id"], user.user_id, list(row["events"]),
+        row["id"],
+        user.user_id,
+        list(row["events"]),
     )
 
     webhook_id = str(row["id"])
     from mnemos.nats import publish_event as _nats_publish_event
     from mnemos.nats.client import get_node_name as _nats_get_node_name
+
     safe_ns = (row["namespace"] or "default").replace(".", "_")
     await _nats_publish_event(
         f"mnemos.webhook.subscription.created.{safe_ns}",
@@ -144,50 +144,23 @@ async def list_webhooks(
     include_revoked: bool = False,
 ):
     """List the caller's webhook subscriptions. Secrets are never returned."""
-    require_postgres_pool_or_503(route_label="GET /v1/webhooks")
+    backend = _backend_or_503()
 
     # v3.2 Tier 3: scope by owner_id + namespace. Root sees all
     # (no owner / namespace filter) so ops can audit cross-tenant.
     is_root = user.role == "root"
 
-    async with _lc.get_pool_manager().acquire() as conn:
-        if is_root:
-            where = "" if include_revoked else "WHERE NOT revoked"
-            rows = await conn.fetch(
-                f"""
-                SELECT id, url, events, description, owner_id, namespace,
-                       created, revoked, revoked_at
-                FROM webhook_subscriptions
-                {where}
-                ORDER BY created DESC
-                """,
-            )
-        elif include_revoked:
-            rows = await conn.fetch(
-                """
-                SELECT id, url, events, description, owner_id, namespace,
-                       created, revoked, revoked_at
-                FROM webhook_subscriptions
-                WHERE owner_id = $1 AND namespace = $2
-                ORDER BY created DESC
-                """,
-                user.user_id, user.namespace,
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT id, url, events, description, owner_id, namespace,
-                       created, revoked, revoked_at
-                FROM webhook_subscriptions
-                WHERE owner_id = $1 AND namespace = $2 AND NOT revoked
-                ORDER BY created DESC
-                """,
-                user.user_id, user.namespace,
-            )
+    async with backend.transactional() as tx:
+        await _maybe_set_pg_rls(tx, user)
+        rows = await backend.webhooks.list_webhooks(
+            tx,
+            owner_id=user.user_id,
+            namespace=user.namespace,
+            is_root=is_root,
+            include_revoked=include_revoked,
+        )
 
-    return WebhookListResponse(
-        count=len(rows), webhooks=[_to_item(r) for r in rows]
-    )
+    return WebhookListResponse(count=len(rows), webhooks=[_to_item(r) for r in rows])
 
 
 @router.get("/{webhook_id}", response_model=WebhookItem)
@@ -196,33 +169,21 @@ async def get_webhook(
     user: UserContext = Depends(get_current_user),
 ):
     webhook_id = parse_uuid_or_404(webhook_id, "webhook")
-    require_postgres_pool_or_503(route_label="GET /v1/webhooks/{webhook_id}")
+    backend = _backend_or_503()
 
     # v3.2 Tier 3: non-root must match owner AND namespace.
     # Root reads any webhook.
     is_root = user.role == "root"
 
-    async with _lc.get_pool_manager().acquire() as conn:
-        if is_root:
-            row = await conn.fetchrow(
-                """
-                SELECT id, url, events, description, owner_id, namespace,
-                       created, revoked, revoked_at
-                FROM webhook_subscriptions
-                WHERE id = $1::uuid
-                """,
-                webhook_id,
-            )
-        else:
-            row = await conn.fetchrow(
-                """
-                SELECT id, url, events, description, owner_id, namespace,
-                       created, revoked, revoked_at
-                FROM webhook_subscriptions
-                WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3
-                """,
-                webhook_id, user.user_id, user.namespace,
-            )
+    async with backend.transactional() as tx:
+        await _maybe_set_pg_rls(tx, user)
+        row = await backend.webhooks.get_webhook(
+            tx,
+            webhook_id=webhook_id,
+            owner_id=user.user_id,
+            namespace=user.namespace,
+            is_root=is_root,
+        )
     if not row:
         raise HTTPException(status_code=404, detail="webhook not found")
     return _to_item(row)
@@ -235,37 +196,23 @@ async def revoke_webhook(
 ):
     """Soft-delete: marks the subscription revoked. Delivery log preserved."""
     webhook_id = parse_uuid_or_404(webhook_id, "webhook")
-    require_postgres_pool_or_503(route_label="DELETE /v1/webhooks/{webhook_id}")
+    backend = _backend_or_503()
 
     # v3.2 Tier 3: non-root must match owner AND namespace. Root
     # can revoke any webhook.
     is_root = user.role == "root"
 
-    async with _lc.get_pool_manager().acquire() as conn:
-        if is_root:
-            row = await conn.fetchrow(
-                """
-                UPDATE webhook_subscriptions
-                SET revoked = TRUE, revoked_at = NOW()
-                WHERE id = $1::uuid AND NOT revoked
-                RETURNING id
-                """,
-                webhook_id,
-            )
-        else:
-            row = await conn.fetchrow(
-                """
-                UPDATE webhook_subscriptions
-                SET revoked = TRUE, revoked_at = NOW()
-                WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3 AND NOT revoked
-                RETURNING id
-                """,
-                webhook_id, user.user_id, user.namespace,
-            )
-    if not row:
-        raise HTTPException(
-            status_code=404, detail="webhook not found or already revoked"
+    async with backend.transactional() as tx:
+        await _maybe_set_pg_rls(tx, user)
+        result = await backend.webhooks.revoke_webhook(
+            tx,
+            webhook_id=webhook_id,
+            owner_id=user.user_id,
+            namespace=user.namespace,
+            is_root=is_root,
         )
+    if result is None:
+        raise HTTPException(status_code=404, detail="webhook not found or already revoked")
     logger.info("webhook revoked id=%s owner=%s", webhook_id, user.user_id)
 
 
@@ -281,38 +228,23 @@ async def list_deliveries(
 ):
     """List recent delivery attempts for a subscription."""
     webhook_id = parse_uuid_or_404(webhook_id, "webhook")
-    require_postgres_pool_or_503(route_label="GET /v1/webhooks/{webhook_id}/deliveries")
+    backend = _backend_or_503()
 
     # v3.2 Tier 3: subscription must belong to caller's owner AND
     # namespace. Root bypasses both.
     is_root = user.role == "root"
-    async with _lc.get_pool_manager().acquire() as conn:
-        if is_root:
-            sub = await conn.fetchrow(
-                "SELECT id FROM webhook_subscriptions WHERE id=$1::uuid",
-                webhook_id,
-            )
-        else:
-            sub = await conn.fetchrow(
-                "SELECT id FROM webhook_subscriptions "
-                "WHERE id=$1::uuid AND owner_id=$2 AND namespace=$3",
-                webhook_id, user.user_id, user.namespace,
-            )
-        if not sub:
-            raise HTTPException(status_code=404, detail="webhook not found")
-        rows = await conn.fetch(
-            """
-            SELECT id, subscription_id, event_type, attempt_num, status,
-                   superseded,
-                   response_status, response_body, error,
-                   scheduled_at, delivered_at, created
-            FROM webhook_deliveries
-            WHERE subscription_id = $1::uuid
-            ORDER BY created DESC
-            LIMIT $2
-            """,
-            webhook_id, limit,
+    async with backend.transactional() as tx:
+        await _maybe_set_pg_rls(tx, user)
+        sub_exists, rows = await backend.webhooks.list_deliveries(
+            tx,
+            webhook_id=webhook_id,
+            owner_id=user.user_id,
+            namespace=user.namespace,
+            is_root=is_root,
+            limit=limit,
         )
+    if not sub_exists:
+        raise HTTPException(status_code=404, detail="webhook not found")
 
     deliveries = [
         WebhookDelivery(
