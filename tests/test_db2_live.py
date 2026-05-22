@@ -371,3 +371,39 @@ async def test_db2_live_kg_fetch_by_id() -> None:
 @pytest.mark.asyncio
 async def test_db2_live_kg_fetch_for_export() -> None:
     pytest.skip("live EAP exercise for Db2KGRepository.fetch_kg_triples_for_export (PR #4)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_version_insert() -> None:
+    pytest.skip("live EAP exercise for Db2VersionRepository.insert_memory_version (PR #5)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_version_fetch_by_id() -> None:
+    pytest.skip("live EAP exercise for Db2VersionRepository.fetch_memory_version_by_id (PR #5)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_version_fetch_for_export() -> None:
+    pytest.skip("live EAP exercise for Db2VersionRepository.fetch_memory_versions_for_export (PR #5)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_version_fetch_by_ids() -> None:
+    pytest.skip("live EAP exercise for Db2VersionRepository.fetch_memory_versions_by_ids (PR #5)")

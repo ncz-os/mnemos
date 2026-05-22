@@ -841,7 +841,191 @@ class Db2KGRepository(_Db2OraCompatMixin, OracleKGRepository):
 
 
 class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
-    """Version history repository — Oracle SQL auto-translated by cursor layer."""
+    """Version history repository — Db2-native overrides for insert + fetches.
+
+    All four methods emit explicit native Db2 SQL:
+    - ``?`` positional binds (no ``:name``)
+    - ``CURRENT TIMESTAMP`` (no ``SYSTIMESTAMP``)
+    - ``COALESCE`` (no ``NVL``)
+    - ``INTEGER`` for permission_mode (no ``NUMBER``)
+    - ``SYSIBM.SYSDUMMY1`` (no ``dual``)
+    """
+
+    async def insert_memory_version(
+        self,
+        tx: Any,
+        *,
+        version_id: str,
+        memory_id: str,
+        version_num: int,
+        content: str,
+        category: str | None,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str | None,
+        owner_id: str,
+        namespace: str | None,
+        permission_mode: int | None,
+        source_model: str | None,
+        source_provider: str | None,
+        source_session: str | None,
+        source_agent: str | None,
+        snapshot_at: Any,
+        snapshot_by: str | None,
+        change_type: str | None,
+        commit_hash: str | None,
+        parent_version_id: str | None,
+        branch: str | None,
+        merge_parents: Any,
+    ) -> str:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        affected = 0
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memory_versions (
+                    id, memory_id, version_num, content, category, subcategory,
+                    metadata, verbatim_content, owner_id, namespace,
+                    permission_mode, source_model, source_provider, source_session,
+                    source_agent, snapshot_at, snapshot_by, change_type,
+                    commit_hash, parent_version_id, branch, merge_parents
+                )
+                SELECT
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, COALESCE(?, 'default'),
+                    COALESCE(CAST(? AS INTEGER), 600),
+                    ?, ?, ?, ?,
+                    COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP),
+                    ?, COALESCE(?, 'create'),
+                    ?, ?, COALESCE(?, 'main'),
+                    ?
+                FROM SYSIBM.SYSDUMMY1
+                WHERE NOT EXISTS (SELECT 1 FROM memory_versions WHERE id = ?)
+                """,
+                (
+                    version_id,
+                    memory_id,
+                    version_num,
+                    content,
+                    category,
+                    subcategory,
+                    metadata_json,
+                    verbatim_content,
+                    owner_id,
+                    namespace,
+                    permission_mode,
+                    source_model,
+                    source_provider,
+                    source_session,
+                    source_agent,
+                    snapshot_at,
+                    snapshot_by,
+                    change_type,
+                    commit_hash,
+                    parent_version_id,
+                    branch,
+                    merge_parents,
+                    version_id,  # for the NOT EXISTS subquery
+                ),
+            )
+            affected = int(getattr(cursor, "rowcount", 0) or 0)
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                return "INSERT 0 0"
+            raise
+        finally:
+            await _call(cursor.close)
+        return "INSERT 0 1" if affected else "INSERT 0 0"
+
+    async def fetch_memory_version_by_id(self, tx: Any, version_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, memory_id, version_num, content, category, subcategory,
+                       metadata, verbatim_content, owner_id, namespace,
+                       permission_mode, source_model, source_provider,
+                       source_session, source_agent, snapshot_at, snapshot_by,
+                       change_type, commit_hash, parent_version_id, branch,
+                       merge_parents, deleted_at
+                  FROM memory_versions
+                 WHERE id = ? AND deleted_at IS NULL
+                """,
+                (version_id,),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            if rows:
+                out = rows[0]
+                if isinstance(out.get("merge_parents"), str):
+                    try:
+                        import json
+
+                        out["merge_parents"] = json.loads(out["merge_parents"])
+                    except Exception:
+                        pass
+                return out
+            return None
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_memory_versions_for_export(
+        self,
+        tx: Any,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        effective_ns: str | None,
+        hard_limit: int,
+    ) -> list[Row]:
+        if not memory_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ", ".join("?" for _ in memory_ids)
+            params: list[Any] = list(memory_ids)
+            where = ["deleted_at IS NULL", f"memory_id IN ({placeholders})"]
+            if effective_owner:
+                where.append("owner_id = ?")
+                params.append(effective_owner)
+            if effective_ns:
+                where.append("namespace = ?")
+                params.append(effective_ns)
+            sql = (
+                "SELECT id, memory_id, version_num, content, category, subcategory, "
+                "metadata, verbatim_content, owner_id, namespace, permission_mode, "
+                "source_model, source_provider, source_session, source_agent, "
+                "snapshot_at, snapshot_by, change_type, commit_hash, parent_version_id, "
+                "branch, merge_parents "
+                "FROM memory_versions WHERE " + " AND ".join(where) + " "
+                "ORDER BY memory_id ASC, branch ASC, version_num ASC "
+                f"FETCH FIRST {int(hard_limit) + 1} ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_memory_versions_by_ids(self, tx: Any, version_ids: Sequence[str]) -> list[Row]:
+        if not version_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ", ".join("?" for _ in version_ids)
+            params = tuple(version_ids)
+            sql = (
+                f"SELECT id, memory_id, owner_id, namespace FROM memory_versions "
+                f"WHERE id IN ({placeholders}) AND deleted_at IS NULL"
+            )
+            await _call(cursor.execute, sql, params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
 
 class Db2BranchRepository(_Db2OraCompatMixin, OracleBranchRepository):
