@@ -961,7 +961,10 @@ async def test_db2_live_branch_fetch_heads() -> None:
     owner = f"db2live_{uuid.uuid4().hex[:8]}"
     ns = f"ns_{uuid.uuid4().hex[:6]}"
     mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    vid = f"v_{uuid.uuid4().hex[:8]}"
     try:
+        # fetch_memory_branch_heads queries memory_versions (not memory_branches)
+        # picking latest version per (memory_id, branch). Insert a version row.
         async with backend.transactional() as tx:
             conn = _conn_from_tx(tx)
             cur = conn.cursor()
@@ -971,8 +974,30 @@ async def test_db2_live_branch_fetch_heads() -> None:
                 (mem_id, owner, ns),
             )
             await _call(cur.close)
-            await backend.memory_branches.upsert_memory_branch_head(
-                tx, memory_id=mem_id, branch="main", head_version_id="v1"
+            await backend.memory_versions.insert_memory_version(
+                tx,
+                version_id=vid,
+                memory_id=mem_id,
+                version_num=1,
+                content="c",
+                category=None,
+                subcategory=None,
+                metadata_json="{}",
+                verbatim_content=None,
+                owner_id=owner,
+                namespace=ns,
+                permission_mode=None,
+                source_model=None,
+                source_provider=None,
+                source_session=None,
+                source_agent=None,
+                snapshot_at=None,
+                snapshot_by=None,
+                change_type=None,
+                commit_hash=None,
+                parent_version_id=None,
+                branch="main",
+                merge_parents=None,
             )
             rows = await backend.memory_branches.fetch_memory_branch_heads(tx, [mem_id])
             assert any(r.get("memory_id") == mem_id for r in rows)
@@ -980,7 +1005,7 @@ async def test_db2_live_branch_fetch_heads() -> None:
         async with backend.transactional() as tx:
             conn = _conn_from_tx(tx)
             cur = conn.cursor()
-            await _call(cur.execute, "DELETE FROM memory_branches WHERE memory_id = ?", (mem_id,))
+            await _call(cur.execute, "DELETE FROM memory_versions WHERE id = ?", (vid,))
             await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
             await _call(cur.close)
         await backend.close()
