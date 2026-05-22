@@ -1176,7 +1176,184 @@ class Db2BranchRepository(_Db2OraCompatMixin, OracleBranchRepository):
 
 
 class Db2CompressionRepository(_Db2OraCompatMixin, OracleCompressionRepository):
-    """Compression statistics repository — Oracle SQL auto-translated by cursor layer."""
+    """Compression statistics repository — Db2-native overrides for candidate checks + variants.
+
+    All five methods emit explicit native Db2 SQL:
+    - ``?`` positional binds (no ``:name``)
+    - ``CURRENT TIMESTAMP`` (no ``SYSTIMESTAMP``)
+    - ``COALESCE`` (no ``NVL``)
+    - ``FROM SYSIBM.SYSDUMMY1`` (no ``FROM DUAL``)
+    """
+
+    async def compression_candidate_exists(
+        self,
+        tx: Any,
+        *,
+        candidate_id: str,
+        memory_id: str,
+        owner_id: str,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT 1 FROM memory_compression_candidates
+                 WHERE id = ?
+                   AND memory_id = ?
+                   AND owner_id = ?
+                """,
+                (candidate_id, memory_id, owner_id),
+            )
+            row = await _call(cursor.fetchone)
+            return row is not None
+        finally:
+            await _call(cursor.close)
+
+    async def insert_compressed_variant(
+        self,
+        tx: Any,
+        *,
+        memory_id: str,
+        owner_id: str,
+        winner_candidate_id: str | None,
+        engine_id: str,
+        engine_version: str | None,
+        compressed_content: str | None,
+        compressed_tokens: int | None,
+        compression_ratio: float | None,
+        quality_score: float | None,
+        composite_score: float | None,
+        scoring_profile: str | None,
+        judge_model: str | None,
+        selected_at: Any,
+    ) -> str:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        affected = 0
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memory_compressed_variants (
+                    memory_id, owner_id, winner_candidate_id, engine_id, engine_version,
+                    compressed_content, compressed_tokens, compression_ratio,
+                    quality_score, composite_score, scoring_profile, judge_model,
+                    selected_at
+                )
+                SELECT
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, COALESCE(?, 'balanced'), ?,
+                    COALESCE(?, CURRENT TIMESTAMP)
+                FROM SYSIBM.SYSDUMMY1
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM memory_compressed_variants WHERE memory_id = ?
+                )
+                """,
+                (
+                    memory_id,
+                    owner_id,
+                    winner_candidate_id,
+                    engine_id,
+                    engine_version,
+                    compressed_content,
+                    compressed_tokens,
+                    compression_ratio,
+                    quality_score,
+                    composite_score,
+                    scoring_profile,
+                    judge_model,
+                    selected_at,
+                    memory_id,
+                ),
+            )
+            affected = int(getattr(cursor, "rowcount", 0) or 0)
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                return "INSERT 0 0"
+            raise
+        finally:
+            await _call(cursor.close)
+        return "INSERT 0 1" if affected else "INSERT 0 0"
+
+    async def fetch_compressed_variant_by_memory_id(self, tx: Any, memory_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT memory_id, owner_id, winner_candidate_id, engine_id, engine_version,
+                       compressed_content, compressed_tokens, compression_ratio,
+                       quality_score, composite_score, scoring_profile, judge_model,
+                       selected_at
+                  FROM memory_compressed_variants
+                 WHERE memory_id = ?
+                """,
+                (memory_id,),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
+        finally:
+            await _call(cursor.close)
+
+    async def gather_stats(self, tx: Any):
+        from mnemos.persistence.base import CompressionStatsRow
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT COUNT(*), AVG(compression_ratio),
+                       SUM(CASE WHEN quality_score IS NULL THEN 1 ELSE 0 END)
+                  FROM memory_compressed_variants
+                """,
+            )
+            row = await _call(cursor.fetchone) or (0, None, 0)
+            total, avg_ratio, unreviewed = row
+            return CompressionStatsRow(
+                total_compressions=int(total or 0),
+                average_compression_ratio=float(avg_ratio) if avg_ratio is not None else None,
+                unreviewed_compressions=int(unreviewed or 0),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_compressed_variants_for_export(
+        self,
+        tx: Any,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        hard_limit: int,
+    ) -> list[Row]:
+        if not memory_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ",".join("?" for _ in memory_ids)
+            where = [f"memory_id IN ({placeholders})"]
+            params: list[Any] = list(memory_ids)
+            if effective_owner:
+                where.append("owner_id = ?")
+                params.append(effective_owner)
+            sql = (
+                "SELECT memory_id, owner_id, winner_candidate_id, engine_id, "
+                "engine_version, compressed_content, compressed_tokens, "
+                "compression_ratio, quality_score, composite_score, "
+                "scoring_profile, judge_model, selected_at "
+                "FROM memory_compressed_variants WHERE " + " AND ".join(where) + " "
+                f"OFFSET 0 ROWS FETCH NEXT {int(hard_limit) + 1} ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
 
 class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):

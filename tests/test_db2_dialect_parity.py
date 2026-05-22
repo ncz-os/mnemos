@@ -780,3 +780,180 @@ async def test_db2_branch_create_memory_branch_native() -> None:
     assert "INSERT INTO MEMORY_BRANCHES" in sql
     assert "?" in sql
     assert "FETCH FIRST 1 ROWS ONLY" in sql or True  # optional path
+
+
+# --- PR #7: Db2CompressionRepository (5 methods, 27 total) ---
+
+
+@pytest.mark.asyncio
+async def test_db2_compression_candidate_exists_native() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+            self._rows = []
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql, "params": params})
+            self._rows = [(1,)] if "SELECT 1" in sql else []
+
+        async def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2CompressionRepository
+
+    repo = Db2CompressionRepository()
+    await repo.compression_candidate_exists(tx, candidate_id="c1", memory_id="m1", owner_id="o1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "SELECT 1 FROM MEMORY_COMPRESSION_CANDIDATES" in sql
+    assert "?" in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_compression_insert_compressed_variant_native() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2CompressionRepository
+
+    repo = Db2CompressionRepository()
+    await repo.insert_compressed_variant(
+        tx,
+        memory_id="m1",
+        owner_id="o1",
+        winner_candidate_id=None,
+        engine_id="e1",
+        engine_version=None,
+        compressed_content="c",
+        compressed_tokens=10,
+        compression_ratio=0.5,
+        quality_score=None,
+        composite_score=None,
+        scoring_profile=None,
+        judge_model=None,
+        selected_at=None,
+    )
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "INSERT INTO MEMORY_COMPRESSED_VARIANTS" in sql
+    assert "COALESCE" in sql
+    assert "CURRENT TIMESTAMP" in sql
+    assert "SYSIBM.SYSDUMMY1" in sql
+    assert "?" in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_compression_fetch_compressed_variant_by_memory_id_native() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def fetchall(self):
+            return []
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2CompressionRepository
+
+    repo = Db2CompressionRepository()
+    await repo.fetch_compressed_variant_by_memory_id(tx, "m1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "FROM MEMORY_COMPRESSED_VARIANTS" in sql
+    assert "WHERE MEMORY_ID = ?" in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_compression_gather_stats_native() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def fetchone(self):
+            return (0, None, 0)
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2CompressionRepository
+
+    repo = Db2CompressionRepository()
+    await repo.gather_stats(tx)
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "COUNT(*)" in sql
+    assert "AVG(COMPRESSION_RATIO)" in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_compression_fetch_compressed_variants_for_export_native() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def fetchall(self):
+            return []
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2CompressionRepository
+
+    repo = Db2CompressionRepository()
+    await repo.fetch_compressed_variants_for_export(tx, memory_ids=["m1"], effective_owner=None, hard_limit=10)
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "OFFSET 0 ROWS FETCH NEXT" in sql or "FETCH NEXT" in sql
+    assert "?" in sql
