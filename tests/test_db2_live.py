@@ -655,3 +655,43 @@ async def test_db2_live_memory_consolidate_duplicates() -> None:
 @pytest.mark.asyncio
 async def test_db2_live_memory_fetch_context() -> None:
     pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_memory_context (PR #8e)")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Db2FederationRepository live tests (PR #9a) — 6 core peer/sync methods
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_federation_list_peers() -> None:
+    pytest.skip("live EAP exercise for Db2FederationRepository.list_peers (PR #9a)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_federation_get_peer() -> None:
+    pytest.skip("live EAP exercise for Db2FederationRepository.get_peer (PR #9a)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_federation_delete_peer() -> None:
+    pytest.skip("live EAP exercise for Db2FederationRepository.delete_peer (PR #9a)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_federation_list_due_peers() -> None:
+    pytest.skip("live EAP exercise for Db2FederationRepository.list_due_peers (PR #9a)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_federation_fetch_memory_page() -> None:
+    pytest.skip("live EAP exercise for Db2FederationRepository.fetch_memory_page (PR #9a)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_federation_create_peer() -> None:
+    pytest.skip("live EAP exercise for Db2FederationRepository.create_peer (PR #9a)")
