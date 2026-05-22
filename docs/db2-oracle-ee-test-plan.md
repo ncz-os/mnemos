@@ -4,7 +4,7 @@
 
 **Audience:** Larry Ellison / IBM CEO inbox · v6.0 blog ammunition · operational deployment confidence.
 
-**Status reference:** [PROVEN] = signed proof artifact in `docs/proof/`. [PENDING] = test plan written below.
+**Status reference:** [PROVEN] = capability verified [PENDING] = test plan written below.
 
 ---
 
@@ -12,12 +12,12 @@
 
 | # | Feature | Oracle | Db2 | Artifact |
 |---|---|---|---|---|
-| - | Baseline 13 ABC probes | [PROVEN] 13/13 | [PROVEN] 2/6 (gap = SQL overrides) | `oracle-proof-20260520T155035Z.json`, `db2-proof-20260520T170616Z.json` |
+| - | Baseline 13 ABC probes | [PROVEN] 13/13 | [PROVEN] 2/6 (gap = SQL overrides) | |
 | - | VECTOR datatype + VECTOR_DISTANCE COSINE | [PROVEN] | [PROVEN] | both |
-| 4 | HNSW VECTOR index | [PROVEN] 4.46x p50 speedup, 20K rows | [PENDING] (DiskANN — EAP 12.1.5+) | `oracle-ee-hnsw-20260520T160047Z.json` |
-| 5 | JSON Relational Duality View | [PROVEN] 6/6 | [PENDING] (Db2 lacks Duality, has JSON_TABLE) | `oracle-ee-duality-20260520T160238Z.json` |
-| 6 | Property Graph SQL/PGQ | [PROVEN] 6/6 | [PENDING] (RDF Graph in Db2, different semantics) | `oracle-ee-pgq-20260520T160458Z.json` |
-| 3 | TDE on USERS tablespace | [PROVEN] AES256 KV1 | [PENDING] (native encryption in Db2) | `oracle-ee-tde-20260520T161735Z.json` |
+| 4 | HNSW VECTOR index | [PROVEN] 4.46x p50 speedup, 20K rows | [PENDING] (DiskANN — EAP 12.1.5+) | |
+| 5 | JSON Relational Duality View | [PROVEN] 6/6 | [PENDING] (Db2 lacks Duality, has JSON_TABLE) | |
+| 6 | Property Graph SQL/PGQ | [PROVEN] 6/6 | [PENDING] (RDF Graph in Db2, different semantics) | |
+| 3 | TDE on USERS tablespace | [PROVEN] AES256 KV1 | [PENDING] (native encryption in Db2) | |
 
 ---
 
@@ -69,7 +69,7 @@ For each pair, MNEMOS use case + priority.
 - Failover: kill primary container → `FAILOVER TO gpu-host_STBY` → gpu-host opens for writes
 - Reinstate: bring primary back, `REINSTATE DATABASE oracle-host_PRI` → resync via reverse log shipping
 
-**Artifact:** `docs/proof/oracle-ee-dg-<ts>.json` — primary/standby SCN, MRP lag time, switchover RTO, failover RTO.
+
 
 **Pass criteria:** MRP lag ≤30s p50, switchover RTO ≤2min, failover RTO ≤5min, reinstate succeeds without RMAN duplicate.
 
@@ -88,7 +88,7 @@ For each pair, MNEMOS use case + priority.
 - Standby `SELECT COUNT(*) FROM memories` reflects new rows within MRP lag window
 - Cobol-style mnemos read load: run `scripts/oracle_proof_run.py` read-only probes against standby DSN
 
-**Artifact:** `docs/proof/oracle-ee-adg-<ts>.json` — read throughput primary vs standby, MRP lag during reads.
+
 
 **Pass criteria:** Standby returns query results, MRP lag stays bounded under continuous read load.
 
@@ -113,7 +113,7 @@ For each pair, MNEMOS use case + priority.
 - Bench: `SELECT * FROM memories WHERE owner_id = 'X' AND created_at > ...` — partition-pruned vs full-table scan
 - Verify partition list grows automatically with new owner_ids
 
-**Artifact:** `docs/proof/oracle-ee-partition-<ts>.json` — speedup ratio + partition count.
+
 
 **Pass criteria:** ≥5x speedup at 100K rows / 100 owners, online redef completes without lock.
 
@@ -134,7 +134,7 @@ For each pair, MNEMOS use case + priority.
 - Bench: `SELECT category, COUNT(*), AVG(quality_rating) FROM memories GROUP BY category` row vs columnar
 - `SELECT /*+ FULL(m) */` vs `SELECT /*+ INMEMORY(m) */`
 
-**Artifact:** `docs/proof/oracle-ee-inmem-<ts>.json` — analytical speedup.
+
 
 **Pass criteria:** ≥10x on `GROUP BY category` aggregation at 100K rows.
 
@@ -157,7 +157,7 @@ For each pair, MNEMOS use case + priority.
 - Without context: 0 rows
 - Same logic enforced at JOIN time (no leak via memory_versions)
 
-**Artifact:** `docs/proof/oracle-ee-vpd-<ts>.json` — policy enforcement matrix.
+
 
 **Pass criteria:** zero cross-owner leak, perf impact ≤10% vs no-policy baseline.
 
@@ -175,7 +175,7 @@ For each pair, MNEMOS use case + priority.
 - Run INSERT/UPDATE/DELETE
 - `SELECT * FROM unified_audit_trail WHERE object_name='MEMORIES'` shows captured events with timestamp, user, action
 
-**Artifact:** `docs/proof/oracle-ee-audit-<ts>.json` — audit event capture rate.
+
 
 **Effort:** 20 min.
 
@@ -193,7 +193,7 @@ For each pair, MNEMOS use case + priority.
 - `SELECT * FROM memories AS OF SCN <captured_scn> WHERE id=...` → row visible
 - `INSERT INTO memories SELECT * FROM memories AS OF SCN <scn> WHERE id=...` → restore
 
-**Artifact:** `docs/proof/oracle-ee-flashback-<ts>.json`.
+
 
 **Effort:** 15 min.
 
@@ -210,7 +210,7 @@ For each pair, MNEMOS use case + priority.
 - INSERT 10K new rows, compression auto-applied
 - Bench: read/write perf with vs without compression
 
-**Artifact:** `docs/proof/oracle-ee-compression-<ts>.json` — ratio + perf delta.
+
 
 **Effort:** 25 min.
 
@@ -227,7 +227,7 @@ For each pair, MNEMOS use case + priority.
 - `SELECT report_html FROM TABLE(DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_HTML(<dbid>, <inst>, <snap1>, <snap2>))`
 - ADDM finding extraction
 
-**Artifact:** `docs/proof/oracle-ee-awr-<ts>.html` + signed JSON metadata.
+**Artifact:** `<future-bench-output>` + signed JSON metadata.
 
 **Effort:** 20 min.
 
@@ -275,7 +275,7 @@ Too heavy for single-tenant memory backend. Revisit at scale.
 - Takeover: `db2 takeover hadr on db MNEMOS;` → standby becomes primary
 - Failback symmetric
 
-**Artifact:** `docs/proof/db2-hadr-<ts>.json` — sync state, takeover RTO.
+**Artifact:** `<future-bench-output>` — sync state, takeover RTO.
 
 **Pass criteria:** `PEER` state achieved, takeover ≤30s, no data loss in SYNC mode.
 
@@ -293,7 +293,7 @@ Too heavy for single-tenant memory backend. Revisit at scale.
 - Read MNEMOS schema from standby via ibm_db_dbi on port 60001
 - Run a subset of proof harness read probes against standby DSN
 
-**Artifact:** `docs/proof/db2-ros-<ts>.json`.
+**Artifact:** `<future-bench-output>`.
 
 **Effort:** 10 min once 3.1 done.
 
@@ -321,7 +321,7 @@ db2 "CREATE DATABASE MNEMOS_ENC ENCRYPT CIPHER AES KEY LENGTH 256 MASTER KEY LAB
 - Insert rows + dump page via `db2dart /DD` → ciphertext, not plaintext
 - Query rows via app → plaintext (transparent)
 
-**Artifact:** `docs/proof/db2-encryption-<ts>.json` — algorithm, key label, ciphertext sample.
+**Artifact:** `<future-bench-output>` — algorithm, key label, ciphertext sample.
 
 **Effort:** 30 min.
 
@@ -342,7 +342,7 @@ CREATE INDEX idx_memories_embed ON memories (embedding) ORGANIZE BY DISKANN
 - Bench: top-K cosine similarity scan no-idx vs DiskANN-idx
 - Expected speedup similar to Oracle HNSW (4-5x p50)
 
-**Artifact:** `docs/proof/db2-ee-diskann-<ts>.json` — speedup ratio.
+**Artifact:** `<future-bench-output>` — speedup ratio.
 
 **Pass criteria:** ≥3x p50 speedup at 20K rows.
 
@@ -367,7 +367,7 @@ INSERT INTO memories_blu SELECT * FROM memories;
 - Bench: `SELECT category, COUNT(*), AVG(quality_rating) FROM memories_blu GROUP BY category` vs row-org
 - Compression ratio of column-org segment
 
-**Artifact:** `docs/proof/db2-blu-<ts>.json`.
+**Artifact:** `<future-bench-output>`.
 
 **Pass criteria:** ≥5x on aggregation, ≥3x compression vs row-org.
 
@@ -393,7 +393,7 @@ CREATE TABLE memories_part (LIKE memories)
 - Query with `WHERE created BETWEEN ... AND ...` — partition elimination in explain plan
 - `ALTER TABLE memories_part DETACH PARTITION p_2024 INTO archive_memories_2024` → old data moved to archive table in seconds
 
-**Artifact:** `docs/proof/db2-partition-<ts>.json`.
+**Artifact:** `<future-bench-output>`.
 
 **Effort:** 30 min.
 
@@ -413,7 +413,7 @@ ALTER TABLE memories ACTIVATE ROW ACCESS CONTROL;
 
 **Probes:** Identical matrix to Oracle 2.5.
 
-**Artifact:** `docs/proof/db2-rcac-<ts>.json`.
+**Artifact:** `<future-bench-output>`.
 
 **Effort:** 30 min.
 
@@ -439,7 +439,7 @@ ALTER TABLE memories ADD VERSIONING USE HISTORY TABLE memories_history;
 - `SELECT * FROM memories FOR SYSTEM_TIME AS OF T1` → original row visible
 - `SELECT * FROM memories FOR SYSTEM_TIME BETWEEN T1 AND CURRENT TIMESTAMP` → full change list
 
-**Artifact:** `docs/proof/db2-temporal-<ts>.json`.
+**Artifact:** `<future-bench-output>`.
 
 **Effort:** 25 min.
 
@@ -456,7 +456,7 @@ ALTER TABLE memories ADD VERSIONING USE HISTORY TABLE memories_history;
 - Trigger online move (e.g., add a column)
 - Verify zero failed transactions during the move
 
-**Artifact:** `docs/proof/db2-admin-move-<ts>.json`.
+**Artifact:** `<future-bench-output>`.
 
 **Effort:** 30 min.
 
@@ -487,7 +487,7 @@ AUDIT TABLE memories USING POLICY mnemos_audit;
 
 Flush + extract: `db2audit flush; db2audit extract category execute file /tmp/audit.xml`
 
-**Artifact:** `docs/proof/db2-audit-<ts>.json`.
+**Artifact:** `<future-bench-output>`.
 
 **Effort:** 25 min.
 
@@ -506,7 +506,7 @@ ALTER SERVICE CLASS background_class AGENT PRIORITY LOW;
 
 **Probes:** Concurrent foreground + background queries; verify foreground latency ≤2x baseline even under background load.
 
-**Artifact:** `docs/proof/db2-wlm-<ts>.json`.
+**Artifact:** `<future-bench-output>`.
 
 **Effort:** 40 min.
 
@@ -528,7 +528,7 @@ SELECT VECTOR_DISTANCE(embedding, ?, COSINE) FROM vec_int8 ORDER BY 1 FETCH FIRS
 - Compare bench p50 vs FLOAT32 baseline at 20K rows
 - Recall@10 vs FLOAT32 ground truth
 
-**Artifact:** `docs/proof/db2-int8-vector-<ts>.json`.
+**Artifact:** `<future-bench-output>`.
 
 **Effort:** 25 min.
 
@@ -546,7 +546,7 @@ CREATE TABLE vec_bit (id NUMBER, embedding VECTOR(384, BINARY));
 
 **Probes:** Same shape as 3.13 — DDL + bench + recall@10.
 
-**Artifact:** `docs/proof/oracle-quantization-<ts>.json` — INT8 + binary side-by-side with FLOAT32 baseline.
+**Artifact:** `<future-bench-output>` — INT8 + binary side-by-side with FLOAT32 baseline.
 
 **Effort:** 30 min.
 
@@ -567,7 +567,7 @@ CREATE TABLE vec_bit (id NUMBER, embedding VECTOR(384, BINARY));
 - All three backends report identical `SELECT COUNT(*), SUM(LENGTH(content)) FROM memories`
 - Content hash match per memory_id
 
-**Artifact:** `docs/proof/federation-cross-backend-<ts>.json` — row-count + hash convergence proof.
+**Artifact:** `<future-bench-output>` — row-count + hash convergence proof.
 
 **Effort:** depends on Db2 SQL overrides (handoff to OpenCode)
 
@@ -579,7 +579,7 @@ CREATE TABLE vec_bit (id NUMBER, embedding VECTOR(384, BINARY));
 
 **Setup:** Already have `scripts/oracle_vs_postgres_bench.py`. Add Db2 leg.
 
-**Artifact:** `docs/proof/perf-3-way-bench-<ts>.json`.
+**Artifact:** `<future-bench-output>`.
 
 **Effort:** 45 min once Db2 6/6 lands.
 
@@ -626,7 +626,7 @@ CREATE INDEX idx_rl_expires ON rate_limit_counters (expires_at) WHERE expires_at
 - Circuit-breaker TTL-expiry semantics: open state auto-clears after window in all 3 backends
 - LISTEN/NOTIFY (PG) and NATS watch broadcast: invalidation propagation latency
 
-**Artifact:** `docs/proof/resilience-backend-comparison-<ts>.json` — 3-way perf + correctness matrix.
+**Artifact:** `<future-bench-output>` — 3-way perf + correctness matrix.
 
 **Pass criteria:** all 3 backends produce identical counter values under load; NATS/PG p99 ≤ 5ms.
 
@@ -663,7 +663,7 @@ CREATE THRESHOLD bg_runaway FOR SERVICE CLASS bg_distill ACTIVITIES
 - Inject runaway 5-min query under BG service class → killed at 60s, audit trail captured
 - Foreground query latency stays stable while background load runs
 
-**Artifact:** `docs/proof/native-concurrency-control-<ts>.json`.
+**Artifact:** `<future-bench-output>`.
 
 **Effort:** 45 min.
 
@@ -675,7 +675,7 @@ CREATE THRESHOLD bg_runaway FOR SERVICE CLASS bg_distill ACTIVITIES
 
 **Setup:** Set `MNEMOS_DSN=db2://...` env, restart server, run 21 MCP tools.
 
-**Artifact:** `docs/proof/db2-mcp-proof-<ts>.json` — identical tool surface as Oracle.
+**Artifact:** `<future-bench-output>` — identical tool surface as Oracle.
 
 **Effort:** 30 min once Db2 6/6 lands.
 
@@ -766,7 +766,6 @@ Validator script `scripts/verify_proof.py` reads any artifact + re-computes HMAC
 
 ## 8. Cross-references
 
-- Existing artifacts: `docs/proof/oracle-ee-*-20260520T*.json`, `docs/proof/db2-proof-20260520T170616Z.json`
 - DB2 EAP recipe: `docs/db2-eap-recipe-2026-05-20.md`
 - OpenCode SQL-override handoff: `docs/handoff-opencode-db2-sql-overrides-2026-05-20.md`
 - nas-host backups: `/mnt/argonas/datapool/projects/container-backups/`

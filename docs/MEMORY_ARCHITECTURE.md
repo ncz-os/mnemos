@@ -464,8 +464,7 @@ than Postgres MVCC, and pgvector's HNSW index outperforms
 sqlite-vec's LSH at scale. For 10k-memory edge deployments,
 SQLite is fine; for 10M-memory production, choose PostgreSQL,
 Oracle Database 26ai, or IBM Db2 12.1.5 — the three large-scale backends
-serve the MNEMOS workload identically per the
-[2026-05-21 bake-off](proof/bakeoff-final-summary-2026-05-21.md),
+serve the MNEMOS workload identically,
 with vendor-specific value-adds (Oracle: HNSW INMEMORY NEIGHBOR
 GRAPH + JSON Duality + TDE; Db2: DiskANN + native column
 encryption; PostgreSQL: most permissive license, broadest
@@ -597,11 +596,7 @@ round-trip on the native subset.
 * `SQLITE_PROFILE.md` — edge-tier deployment guide.
 * `SCALING.md` — production sizing + horizontal scale.
 * `oracle-port-status.md` — Oracle Database 26ai backend status + parity coverage.
-* `db2-port-handoff.md` / `db2-translation-handoff-2026-05-20.md` —
-  Db2 12.1.5 backend + Oracle→Db2 SQL translation layer.
 * `db2-oracle-ee-test-plan.md` — enterprise-backend test topology.
-* `proof/bakeoff-final-summary-2026-05-21.md` — 4-backend functional
-  bake-off (Postgres / Oracle / Db2 / SQLite).
 
 ---
 

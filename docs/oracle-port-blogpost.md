@@ -447,7 +447,7 @@ And on `memories`:
 
 `scripts/oracle_proof_run.py` is the runnable proof. It connects to
 the live Oracle instance, exercises every repository surface, and
-emits an HMAC-signed JSON artifact under `docs/proof/`.
+emits an neutral artifact (archived).
 
 **Running it (reproducible):**
 
@@ -456,23 +456,14 @@ emits an HMAC-signed JSON artifact under `docs/proof/`.
     --dsn oracle://mnemos:<password>@<host>:1521/FREEPDB1
 ```
 
-**Initial parity artifact:** `docs/proof/oracle-proof-20260519T230133Z.json`
+**Initial parity artifact:** Companion artifacts (archived):
 (committed in this branch).
 
-**Companion artifacts in `docs/proof/`:**
+**Companion artifacts (archived):**
 
 | Artifact | What it proves |
 |---|---|
 | `oracle-proof-*.json` | 13/13 ABC repository probes pass against live Oracle Database 26ai |
-| `oracle-perf-20260519T230753Z.json` | First perf run (no Oracle index, no embeddings) |
-| `oracle-perf-20260519T230926Z.json` | Embeddings synced, no vector index |
-| `oracle-perf-20260519T231004Z.json` | IVF vector index added (oracle-host) |
-| `oracle-perf-20260519T232024Z.json` | Hardware metadata captured (oracle-host Skylake + SATA3) |
-| `oracle-perf-pythia-side-by-side-*.json` | Equal-hw bench, untuned Oracle on pg-host |
-| `oracle-perf-pythia-equal-tuned-*.json` | Equal-hw bench, ANALYZE + IVF + indexes |
-| `oracle-federation-*.json` | pg-host-PG → oracle-host-Oracle pull: 5,845 federated rows |
-| `oracle-wipe-reimport-*.json` | DROP USER + recreate + migration replay clean |
-| `oracle-embed-bench-*.json` | gpu-host RTX 4500 ADA vs gpu-host-2 RTX 5060 embed throughput |
 
 All artifacts share the same `mnemos-oracle-proof-v1` HMAC key id
 (`5a3d2…`) so signatures cross-verify with the same Python snippet.
@@ -495,7 +486,7 @@ signature is one Python snippet:
 
 ```python
 import json, hmac, hashlib
-art = json.load(open("docs/proof/oracle-proof-20260519T230133Z.json"))
+art = json.load(open("<archived bench artifact>"))
 body = json.dumps(art["evidence"], separators=(",", ":"),
                   sort_keys=True, default=str)
 sig = hmac.new(b"mnemos-oracle-proof-v1", body.encode(), hashlib.sha256).hexdigest()
@@ -545,7 +536,7 @@ Oracle Database 26ai database.**
 
 **Bench harness:** `scripts/oracle_vs_postgres_bench.py` runs the same
 6-operation workload against both backends and emits an HMAC-signed
-artifact under `docs/proof/`. The artifact records dataset sizes,
+artifact under Companion artifacts (archived):. The artifact records dataset sizes,
 backend version banners, **hardware specs of both hosts**, and
 p50/p95/p99/min/mean/max in milliseconds.
 
@@ -571,7 +562,7 @@ Conclusion: this is **not Oracle vs Postgres** in isolation. This is
 
 ### Latest run (n=50, with index parity attempts)
 
-Source: `docs/proof/oracle-perf-20260519T232024Z.json`
+Source: Companion artifacts (archived):
 
 | Op | PG p50 (pg-host) | Oracle p50 (oracle-host) | PG/Oracle | Interpretation |
 |---|---|---|---|---|
@@ -673,7 +664,7 @@ advance to `2026-05-01T04:31:25`, so the next pull is incremental.
 
 ### Artifact
 
-`docs/proof/oracle-federation-20260519T233918Z.json`:
+Companion artifacts (archived):
 
 ```
 schema:           mnemos-oracle-federation-proof/v1
@@ -758,7 +749,7 @@ ORA-04081 are treated as idempotent-replay signals.
 
 ### Artifact
 
-`docs/proof/oracle-wipe-reimport-20260519T234719Z.json`:
+Companion artifacts (archived):
 
 ```
 total:     5845    (federation re-populated the rows)
@@ -801,7 +792,7 @@ two B-tree indexes to mirror the pgvector + standard PG plan.
 
 ### Headline numbers (n=100, equal hardware, tuned)
 
-Source: `docs/proof/oracle-perf-pythia-equal-tuned-20260519T235034Z.json`
+Source: Companion artifacts (archived):
 
 | Op | PG p50 | Oracle p50 | Ratio |
 |---|---|---|---|
@@ -850,7 +841,7 @@ $ MNEMOS_BASE=http://127.0.0.1:5003 \
 
 ### Probe result (signed artifact)
 
-`docs/proof/oracle-mcp-20260520T002424Z.json`:
+Companion artifacts (archived):
 
 ```
 protocol:        2025-11-25 (MCP)
@@ -890,7 +881,7 @@ Per-host context for the MNEMOS embedding path. `scripts/embed_throughput_bench.
 hits `/api/embeddings` on both endpoints with `nomic-embed-text:latest`
 under Ollama and measures latency at four text sizes.
 
-Source: `docs/proof/oracle-embed-bench-20260519T235304Z.json`
+Source: Companion artifacts (archived):
 
 | Chars | gpu-host RTX 4500 ADA (24 GB) | gpu-host-2 RTX 5060 (8 GB) | Winner |
 |---|---|---|---|
@@ -925,7 +916,7 @@ The test sequence at the time of writing:
 | **C** Wipe + reimport | ✅ | `oracle-wipe-reimport-*.json` — replay clean |
 | **E** Federation HA | ✅ | `oracle-federation-*.json` — 5,845 PG→Oracle rows |
 | **F** Keys + MNEMOS service | ✅ | Live API `/v1/memories?limit=1` count=8166 |
-| **G** Equal-hw + GPU embed | ✅ | `oracle-perf-pythia-equal-tuned-*.json` + `oracle-embed-bench-*.json` |
+| **G** Equal-hw + GPU embed | ✅ | (archived) |
 | **D** Data Guard | pending | Awaiting Oracle Technology Network Developer License login |
 
 For Data Guard specifically: the Free tier prohibits it, and we are
@@ -965,7 +956,7 @@ sqlplus -L user/pass@host:1521/FREEPDB1 @db/migrations_oracle/0001_core_schema.s
 
 # Emit a fresh signed proof artifact
 .venv/bin/python scripts/oracle_proof_run.py
-ls docs/proof/  # newest file is yours
+# (archived bench artifacts not in public repo)
 ```
 
 Boot the MNEMOS API server against Oracle:

@@ -2,7 +2,7 @@
 
 Seeds N synthetic 384-dim float32 embeddings on the EE PDB then runs
 top-K cosine-similarity scans both with and without an HNSW index.
-Emits a JSON artifact under docs/proof/.
+Emits a JSON artifact under <archived bench artifact>
 """
 
 from __future__ import annotations

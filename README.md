@@ -142,7 +142,7 @@ MNEMOS is a packaged FastAPI service with a single `mnemos` CLI for installation
 | Scaling | [docs/SCALING.md](docs/SCALING.md) |
 | Single-binary builds | [docs/SINGLE_BINARY.md](docs/SINGLE_BINARY.md) |
 | Operations | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
-| Proof & benchmarks | [docs/proof/bench-v4/](docs/proof/bench-v4/) (canonical: [bench-v4-defensible-10000-20260521T182312Z.json](docs/proof/bench-v4/bench-v4-defensible-10000-20260521T182312Z.json)) · [bakeoff-final-summary-2026-05-21.md](docs/proof/bakeoff-final-summary-2026-05-21.md) |
+| Benchmark harness | [scripts/bench_v4.py](scripts/bench_v4.py) — cross-backend vector-search harness (PG / Oracle / Db2 / SQLite). Results published post-GA. |
 
 ## License
 

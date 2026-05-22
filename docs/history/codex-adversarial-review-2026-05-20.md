@@ -15,7 +15,7 @@
 | **C2** | `db2.py:75` | Bare `CAST(:p AS TIMESTAMP)` (no NVL wrapper) folded to `CURRENT TIMESTAMP` whenever value was None → `valid_until=None` (open-ended window) became "expires now" | Same fold removal. Db2 binds NULL through `CAST(? AS TIMESTAMP)` correctly without help. |
 | **C3** | `db2.py:96` | `compiled.sub(..., count=1)` replaced **first** match regardless of which bind was identified as null → wrong site clobbered under multi-match | Same fold removal. |
 
-**Verification:** Db2 12/12 still passes (proof `db2-proof-20260520T224924Z.json`); Oracle 13/13 unchanged (`oracle-proof-20260520T224933Z.json`).
+**Verification:** Db2 12/12 still passes (proof <archived>); Oracle 13/13 unchanged (archived).
 
 ---
 
@@ -97,8 +97,8 @@
 - Original handoff before review: `docs/db2-translation-handoff-2026-05-20.md`
 - v6.1 roadmap: `docs/v6.1-roadmap.md` (will integrate M1-M15 + L1-L4)
 - Latest signed proofs:
-  - `docs/proof/oracle-proof-20260520T224933Z.json` (13/13)
-  - `docs/proof/db2-proof-20260520T224924Z.json` (12/12, post-fold-removal)
+  - <archived bench artifact> (13/13)
+  - <archived bench artifact> (12/12, post-fold-removal)
 
 ---
 

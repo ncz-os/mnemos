@@ -752,7 +752,7 @@ class Db2Backend(OracleBackend):
     has a real performance cost: every query carries parse-time
     translation overhead, and the Db2 optimizer cannot see native
     Db2-dialect tokens directly (it sees the rewritten output). The
-    bench-v4 measurements in ``docs/proof/bench-v4/`` include this
+    Db2 backend carries this
     overhead.
 
     The :meth:`Db2MemoryRepository.semantic_search` override is the
