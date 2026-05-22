@@ -39,6 +39,7 @@ from mnemos.persistence.base import (
     PersistenceBackend,
     StateRepository,
     Transaction,
+    UserRepository,
     VersionRepository,
     WebhookRepository,
 )
@@ -2052,6 +2053,45 @@ class PostgresFederationRepository(FederationRepository):
         return _pg_result_count(result)
 
 
+class PostgresUserRepository(UserRepository):
+    """Admin user CRUD (users table)."""
+
+    async def create_user(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        display_name: str | None,
+        email: str | None,
+        role: str,
+        namespace: str,
+    ) -> dict[str, Any]:
+        row = await _postgres_tx(tx).conn.fetchrow(
+            "INSERT INTO users (id, display_name, email, role, namespace) "
+            "VALUES ($1, $2, $3, $4, $5) "
+            "RETURNING id, display_name, email, role, namespace, created_at",
+            user_id,
+            display_name,
+            email,
+            role,
+            namespace,
+        )
+        return dict(row) if row else {}
+
+    async def list_users(self, tx: Transaction) -> list[dict[str, Any]]:
+        rows = await _postgres_tx(tx).conn.fetch(
+            "SELECT id, display_name, email, role, namespace, created_at " "FROM users ORDER BY created_at"
+        )
+        return [dict(r) for r in rows]
+
+    async def get_user(self, tx: Transaction, *, user_id: str) -> dict[str, Any] | None:
+        row = await _postgres_tx(tx).conn.fetchrow(
+            "SELECT id, display_name, email, role, namespace, created_at " "FROM users WHERE id = $1",
+            user_id,
+        )
+        return dict(row) if row else None
+
+
 class PostgresStateRepository(StateRepository):
     """state.value is now TEXT on PG (migrations_v4_2_state_value_text.sql).
 
@@ -2189,6 +2229,7 @@ class PostgresBackend(PersistenceBackend):
         self._consultations_audit = PostgresConsultationAuditRepository()
         self._federation = PostgresFederationRepository()
         self._state_kv = PostgresStateRepository()
+        self._users = PostgresUserRepository()
         self._closed = False
 
     @property
@@ -2246,6 +2287,10 @@ class PostgresBackend(PersistenceBackend):
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv
+
+    @property
+    def users(self) -> UserRepository:
+        return self._users
 
     async def close(self) -> None:
         if self._closed:
