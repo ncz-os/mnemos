@@ -2042,10 +2042,10 @@ class Db2BranchRepository(_Db2OraCompatMixin, OracleBranchRepository):
                 where.append(f"id IN ({vid_ph})")
                 params.extend(authorized_version_uuids)
             sql = (
-                "SELECT memory_id, name AS branch, id AS head_version_id FROM ("
-                "  SELECT memory_id, name, id, "
+                "SELECT memory_id, branch, id AS head_version_id FROM ("
+                "  SELECT memory_id, branch, id, "
                 "         ROW_NUMBER() OVER ("
-                "             PARTITION BY memory_id, name "
+                "             PARTITION BY memory_id, branch "
                 "             ORDER BY version_num DESC"
                 "         ) AS rn "
                 "  FROM memory_versions"
