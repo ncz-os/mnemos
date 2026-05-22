@@ -1029,7 +1029,150 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
 
 
 class Db2BranchRepository(_Db2OraCompatMixin, OracleBranchRepository):
-    """Branch management repository — Oracle SQL auto-translated by cursor layer."""
+    """Branch management repository — Db2-native overrides (4 methods).
+
+    Second MERGE INTO native (after State PR #3). All emit explicit native Db2 SQL:
+    - ``?`` positional binds (no ``:name``)
+    - ``CURRENT TIMESTAMP`` (no ``SYSTIMESTAMP``)
+    - ``SYSIBM.SYSDUMMY1`` (no ``dual``)
+    - ``COALESCE`` where needed; IN-list with ``?``; FETCH FIRST + ROW_NUMBER native.
+    """
+
+    async def upsert_memory_branch_head(
+        self,
+        tx: Any,
+        *,
+        memory_id: str,
+        branch: str,
+        head_version_id: Any,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO memory_branches m
+                USING (SELECT ? AS memory_id, ? AS name, ? AS head_version_id
+                       FROM SYSIBM.SYSDUMMY1) src
+                   ON (m.memory_id = src.memory_id AND m.name = src.name)
+                WHEN MATCHED THEN UPDATE SET
+                    head_version_id = src.head_version_id,
+                    updated = CURRENT TIMESTAMP
+                WHEN NOT MATCHED THEN INSERT (
+                    id, memory_id, name, head_version_id, created, updated
+                ) VALUES (
+                    src.memory_id || ':' || src.name,
+                    src.memory_id,
+                    src.name,
+                    src.head_version_id,
+                    CURRENT TIMESTAMP,
+                    CURRENT TIMESTAMP
+                )
+                """,
+                (memory_id, branch, head_version_id),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_memory_branch_heads(
+        self,
+        tx: Any,
+        memory_ids: Sequence[str],
+        *,
+        authorized_version_uuids: Sequence[str] | None = None,
+    ) -> list[Row]:
+        if not memory_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ", ".join("?" for _ in memory_ids)
+            params: list[Any] = list(memory_ids)
+            where = [f"memory_id IN ({placeholders})", "deleted_at IS NULL"]
+            if authorized_version_uuids is not None:
+                if not authorized_version_uuids:
+                    return []
+                vid_ph = ", ".join("?" for _ in authorized_version_uuids)
+                where.append(f"id IN ({vid_ph})")
+                params.extend(authorized_version_uuids)
+            sql = (
+                "SELECT memory_id, name AS branch, id AS head_version_id FROM ("
+                "  SELECT memory_id, name, id, "
+                "         ROW_NUMBER() OVER ("
+                "             PARTITION BY memory_id, name "
+                "             ORDER BY version_num DESC"
+                "         ) AS rn "
+                "  FROM memory_versions"
+                "  WHERE " + " AND ".join(where) + ""
+                ") WHERE rn = 1"
+            )
+            await _call(cursor.execute, sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def delete_memory_branches_for_memories(self, tx: Any, memory_ids: Sequence[str]) -> None:
+        if not memory_ids:
+            return None
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ", ".join("?" for _ in memory_ids)
+            await _call(
+                cursor.execute,
+                f"DELETE FROM memory_branches WHERE memory_id IN ({placeholders})",
+                tuple(memory_ids),
+            )
+        finally:
+            await _call(cursor.close)
+        return None
+
+    async def create_memory_branch(
+        self,
+        tx: Any,
+        memory_id: str,
+        name: str,
+        from_commit: str | None,
+        user: Any,
+    ) -> dict[str, Any]:
+        _ = user
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            head_version_id: str | None = None
+            if from_commit is not None:
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT id FROM memory_versions
+                     WHERE memory_id = ?
+                       AND commit_hash = ?
+                       AND deleted_at IS NULL
+                       FETCH FIRST 1 ROWS ONLY
+                    """,
+                    (memory_id, from_commit),
+                )
+                rows = await _fetch_all_dicts(cursor)
+                if rows:
+                    head_version_id = rows[0].get("id") or rows[0].get("ID")
+            branch_id = f"{memory_id}:{name}"
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memory_branches (id, memory_id, name, head_version_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (branch_id, memory_id, name, head_version_id),
+            )
+            return {
+                "id": branch_id,
+                "memory_id": memory_id,
+                "name": name,
+                "head_version_id": head_version_id,
+            }
+        finally:
+            await _call(cursor.close)
 
 
 class Db2CompressionRepository(_Db2OraCompatMixin, OracleCompressionRepository):

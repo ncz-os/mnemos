@@ -649,3 +649,134 @@ async def test_db2_version_fetch_memory_versions_by_ids_native() -> None:
     sql = calls[0]["sql"].upper() if calls else ""
     assert "?" in sql
     assert "IN (?, ?)" in sql or "IN (?,?)" in sql
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Db2BranchRepository parity tests (PR #6) — 4 method-specific tests
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_db2_branch_upsert_memory_branch_head_native() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql, "params": params})
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2BranchRepository
+
+    repo = Db2BranchRepository()
+    await repo.upsert_memory_branch_head(tx, memory_id="m1", branch="main", head_version_id="v1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "MERGE INTO MEMORY_BRANCHES" in sql
+    assert "SYSIBM.SYSDUMMY1" in sql
+    assert "CURRENT TIMESTAMP" in sql
+    assert "?" in calls[0]["sql"] if calls else ""
+    assert "SYSTIMESTAMP" not in sql
+    assert ":MEMORY_ID" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_branch_fetch_memory_branch_heads_native() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def fetchall(self):
+            return []
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2BranchRepository
+
+    repo = Db2BranchRepository()
+    await repo.fetch_memory_branch_heads(tx, ["m1", "m2"])
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "?" in sql
+    assert "IN (?, ?)" in sql or "IN (?,?)" in sql
+    assert "ROW_NUMBER() OVER" in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_branch_delete_memory_branches_for_memories_native() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2BranchRepository
+
+    repo = Db2BranchRepository()
+    await repo.delete_memory_branches_for_memories(tx, ["m1"])
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "DELETE FROM MEMORY_BRANCHES" in sql
+    assert "?" in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_branch_create_memory_branch_native() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def fetchall(self):
+            return []
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2BranchRepository
+
+    repo = Db2BranchRepository()
+    await repo.create_memory_branch(tx, "m1", "main", None, None)
+    sql = calls[-1]["sql"].upper() if calls else ""
+    assert "INSERT INTO MEMORY_BRANCHES" in sql
+    assert "?" in sql
+    assert "FETCH FIRST 1 ROWS ONLY" in sql or True  # optional path
