@@ -401,7 +401,7 @@ the build steps are identical.
 
 - `docs/handoff-opencode-db2-sql-overrides-2026-05-20.md` — SQL override work needed to push proof from 2/6 → 6/6
 - `docs/db2-port-handoff.md` — older handoff (R1-R6 attempts)
-- `docs/proof/db2-proof-20260520T170616Z.json` — signed 2/6 proof artifact on EAP
+- <archived bench artifact> — signed 2/6 proof artifact on EAP
 - IBM Db2 12.1 docs (response file keywords): https://www.ibm.com/docs/en/db2/12.1
 - jbonhag/db2-docker #9 (Global Profile Registry trap): https://github.com/jbonhag/db2-docker/issues/9
 - aeronje/ibm_db2_community_edition_linux_ubuntu (Ubuntu prereq research): https://github.com/aeronje/ibm_db2_community_edition_linux_ubuntu

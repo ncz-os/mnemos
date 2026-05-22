@@ -307,7 +307,7 @@ The risk is that a native port silently changes one query's semantics — wrong 
 - Rewrite `db/migrations_db2/0001_core_schema.sql` to native types (VARCHAR/BIGINT/CLOB sized)
 - Add `Db2BackendNative` + `MNEMOS_DB2_DIALECT` selector in `lifecycle.py`
 - Write `tests/test_db2_dialect_parity.py` (one parametrized case per method; run against compat + native)
-- Write `scripts/bench_v5.py` + capture A/B numbers (against Db2 12.1.5 GA, not EAP) into `docs/proof/bench-v5/`
+- Write `scripts/bench_v5.py` + capture A/B numbers (against Db2 12.1.5 GA, not EAP) into <archived bench artifact>
 
 **Phase 3 — Compat deprecation + cleanup (≈ 3 working days)**
 - Flip lifecycle default to `native`

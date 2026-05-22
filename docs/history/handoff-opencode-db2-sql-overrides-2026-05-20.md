@@ -156,7 +156,7 @@ After each Db2 SQL change:
   --dsn 'db2://db2inst1:mnemos_dev@192.168.207.67:50001/MNEMOS'
 ```
 
-Look at `docs/proof/db2-proof-<timestamp>.json` — `evidence.probes` array tells you which probes pass / fail and the exact SQL error.
+Look at <archived bench artifact> — `evidence.probes` array tells you which probes pass / fail and the exact SQL error.
 
 **Don't merge changes that regress Oracle probes.** After Db2 work, also run the Oracle proof to confirm you haven't broken the Oracle path:
 
@@ -182,7 +182,7 @@ Modified (unstaged):
   M docker/db2-eap/Dockerfile           # working R12 recipe
   M docker/db2-eap/entrypoint.sh        # with -nosharedgroup + correct license filenames
   M docker/db2-eap/response.rsp         # 5-line binary-only
-  ?? docs/proof/db2-proof-20260520T170616Z.json  # signed 2/6 baseline
+  ?? <archived bench artifact>  # signed 2/6 baseline
   ?? docs/handoff-opencode-db2-sql-overrides-2026-05-20.md  # this file
 ```
 
@@ -199,7 +199,7 @@ git commit -m "feat(db2): EAP 12.1.5 container split-install recipe working
 * Image 3.04GB, MNEMOS database created with ORA-compat + VECTOR + VECTOR_DISTANCE COSINE working"
 
 # Then a second commit for the SQL-override work once 6/6 lands:
-git add mnemos/persistence/db2.py docs/proof/db2-proof-*.json
+git add mnemos/persistence/db2.py <archived bench artifact>
 git commit -m "feat(db2): SQL overrides for ORA-compat gaps — 6/6 proof
 
 * Override TIMESTAMP WITH TIME ZONE casts in MemoryRepository
@@ -223,7 +223,7 @@ git commit -m "feat(db2): SQL overrides for ORA-compat gaps — 6/6 proof
 ## Cross-references
 
 - Codex's R9 split-install reasoning (build-time vs runtime instance creation): `docs/db2-port-handoff.md` (R9 section)
-- Oracle EE 23.26 proof artifacts for shape reference: `docs/proof/oracle-ee-*-20260520T*.json`
+- Oracle EE 23.26 proof artifacts for shape reference: <archived bench artifact>
 - Handoff to ncz-claude on OpenClaw container missing auth profile: `~/.claude/rules/handoff-to-ncz-claude-openclaw-auth-profile-2026-05-08.md`
 
 ---
