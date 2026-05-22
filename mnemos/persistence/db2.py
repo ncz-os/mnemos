@@ -46,6 +46,7 @@ from mnemos.persistence.oracle import (
     _fetch_all_dicts,
     _is_unique_violation,
     _render_visibility,
+    _row_to_dict,
     _validate_and_format_vector,
 )
 from mnemos.persistence.types import Row
@@ -1308,6 +1309,230 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             return await _fetch_all_dicts(cursor)
         finally:
             await _call(cursor.close)
+
+    # ── PR #8e: commit-head / diff / checkout / allowlist / dedup / context
+    #         (7 methods — closes out Memory repository) ──
+
+    async def fetch_memory_head_checks(self, tx: Any, memory_ids: Sequence[str]) -> list[Row]:
+        if not memory_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ",".join("?" for _ in memory_ids)
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT m.id, m.content AS memory_content, mv.content AS head_content
+                  FROM memories m
+                  LEFT JOIN memory_branches b
+                    ON b.memory_id = m.id
+                   AND b.name = 'main'
+                  LEFT JOIN memory_versions mv
+                    ON mv.id = b.head_version_id
+                   AND mv.deleted_at IS NULL
+                 WHERE m.id IN ({placeholders})
+                   AND m.deleted_at IS NULL
+                """,
+                tuple(memory_ids),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_diff_commit_pair(
+        self,
+        tx: Any,
+        memory_id: str,
+        commit_a: str,
+        commit_b: str,
+        user: Any,
+    ) -> tuple[Row | None, Row | None]:
+        _ = user
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            sql = (
+                "SELECT content, version_num FROM memory_versions "
+                "WHERE memory_id = ? AND commit_hash = ? "
+                "AND deleted_at IS NULL"
+            )
+            await _call(cursor.execute, sql, (memory_id, commit_a))
+            row_a = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            await _call(cursor.execute, sql, (memory_id, commit_b))
+            row_b = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            return row_a, row_b
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_checkout_commit(
+        self,
+        tx: Any,
+        memory_id: str,
+        commit_hash: str,
+        user: Any,
+    ) -> Row | None:
+        _ = user
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT commit_hash, version_num, branch, category, subcategory,
+                       content, change_type, snapshot_at, snapshot_by
+                  FROM memory_versions
+                 WHERE memory_id = ?
+                   AND commit_hash = ?
+                   AND deleted_at IS NULL
+                """,
+                (memory_id, commit_hash),
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_referenced_memory_allowlist(
+        self,
+        tx: Any,
+        *,
+        referenced_ids: Sequence[str],
+        scope_owner: str | None = None,
+        scope_namespace: str | None = None,
+    ) -> list[Row]:
+        if not referenced_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ",".join("?" for _ in referenced_ids)
+            where = [f"id IN ({placeholders})", "deleted_at IS NULL"]
+            params_list: list[Any] = list(referenced_ids)
+            if scope_owner is not None:
+                where.append("owner_id = ?")
+                params_list.append(scope_owner)
+            if scope_namespace is not None:
+                where.append("namespace = ?")
+                params_list.append(scope_namespace)
+            sql = "SELECT id, owner_id, namespace FROM memories WHERE " + " AND ".join(where)
+            await _call(cursor.execute, sql, tuple(params_list))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def find_duplicate_content_groups(
+        self,
+        tx: Any,
+        *,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = ["deleted_at IS NULL", "content_hash IS NOT NULL"]
+            params_list: list[Any] = []
+            if namespace is not None:
+                where.append("namespace = ?")
+                params_list.append(namespace)
+            ns_clause = "AND namespace = ?" if namespace is not None else ""
+            sql = (
+                "WITH dup_groups AS ("
+                "SELECT content_hash, COUNT(*) AS cnt "
+                "FROM memories "
+                "WHERE " + " AND ".join(where) + " "
+                "GROUP BY content_hash "
+                "HAVING COUNT(*) > 1"
+                "), "
+                "earliest AS ("
+                "SELECT m.content_hash, "
+                "FIRST_VALUE(m.id) OVER ("
+                "PARTITION BY m.content_hash ORDER BY m.created ASC, m.id ASC"
+                ") AS canonical_id, "
+                "ROW_NUMBER() OVER ("
+                "PARTITION BY m.content_hash ORDER BY m.content_hash"
+                ") AS rn "
+                "FROM memories m "
+                "WHERE m.deleted_at IS NULL AND m.content_hash IS NOT NULL " + ns_clause + ") "
+                "SELECT d.content_hash, d.cnt, e.canonical_id "
+                "FROM dup_groups d "
+                "JOIN (SELECT content_hash, canonical_id FROM earliest WHERE rn = 1) e "
+                "ON d.content_hash = e.content_hash "
+                "ORDER BY d.cnt DESC, d.content_hash ASC"
+            )
+            # Use the same params as where clause, but duplicate for CTE scan if namespace present
+            all_params = tuple(params_list + params_list) if namespace is not None else tuple(params_list)
+            await _call(cursor.execute, sql, all_params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def consolidate_duplicate_memories(
+        self,
+        tx: Any,
+        *,
+        canonical_id: str,
+        duplicate_ids: Sequence[str],
+    ) -> int:
+        if not duplicate_ids:
+            return 0
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ",".join("?" for _ in duplicate_ids)
+            params_list = list(duplicate_ids) + [canonical_id]
+            await _call(
+                cursor.execute,
+                f"""
+                UPDATE memories
+                   SET deleted_at = CURRENT TIMESTAMP
+                 WHERE id IN ({placeholders})
+                   AND id != ?
+                   AND deleted_at IS NULL
+                """,
+                tuple(params_list),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_memory_context(
+        self,
+        tx: Any,
+        query: str,
+        user: Any,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        # Resolve an embedding via the lifecycle-owned embedder. Import
+        # is local to avoid a hard top-level cycle on lifecycle.
+        from mnemos.core.lifecycle import _get_embedding
+        from mnemos.core.security import is_root
+        from mnemos.persistence.visibility import VisibilityScope
+
+        embedding = await _get_embedding(query)
+        if not embedding:
+            return []
+
+        if hasattr(user, "user_id"):
+            if is_root(user):
+                visibility = VisibilityFilter(
+                    scope=VisibilityScope.ROOT_BYPASS,
+                    user_id=None,
+                    group_ids=(),
+                    namespace=None,
+                )
+            else:
+                ns = getattr(user, "namespace", None) or "default"
+                visibility = VisibilityFilter.for_read(user, namespace=ns)
+        else:
+            visibility = VisibilityFilter(
+                scope=VisibilityScope.ROOT_BYPASS,
+                user_id=None,
+                group_ids=(),
+                namespace=None,
+            )
+
+        rows = await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=visibility)
+        return [dict(row) for row in rows]
 
 
 class Db2KGRepository(_Db2OraCompatMixin, OracleKGRepository):

@@ -1875,3 +1875,409 @@ async def test_db2_memory_fetch_memory_log_native_tokens() -> None:
     assert ":BRANCH" not in sql
     assert ":LIMIT" not in sql
     assert len(params) == 3
+
+
+# ── PR #8e: 7 native tests (commit-head / diff / checkout / allowlist / dedup / context) ──
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_fetch_memory_head_checks_native() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+    ids = ["mem-a", "mem-b", "mem-c"]
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    await repo.fetch_memory_head_checks(tx, ids)
+    sql = calls[0]["sql"].upper() if calls else ""
+    params = calls[0]["params"] if calls else ()
+    assert "LEFT JOIN MEMORY_BRANCHES" in sql
+    assert "LEFT JOIN MEMORY_VERSIONS" in sql
+    assert "B.NAME = 'MAIN'" in sql or "B.NAME = 'main'" in calls[0]["sql"]
+    assert "MV.HEAD_VERSION_ID" in sql or "b.head_version_id" in calls[0]["sql"].lower()
+    assert ":ID0" not in sql
+    assert ":ID1" not in sql
+    assert ":ID" not in sql
+    assert "?" in sql
+    assert len(params) == 3
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_fetch_diff_commit_pair_native() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = (("content",), ("version_num",))
+            self._fetch_calls = 0
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchone(self) -> Any:
+            self._fetch_calls += 1
+            return ("text", self._fetch_calls)
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    result = await repo.fetch_diff_commit_pair(tx, "mem-1", "aaa", "bbb", None)
+    assert result is not None
+    assert len(result) == 2
+    assert len(calls) == 2
+    for i, c in enumerate(calls):
+        sql = c["sql"].upper()
+        params = c["params"]
+        assert "FROM MEMORY_VERSIONS" in sql
+        assert "WHERE MEMORY_ID = ?" in sql
+        assert "AND COMMIT_HASH = ?" in sql
+        assert "DELETED_AT IS NULL" in sql
+        assert ":MEMORY_ID" not in sql
+        assert ":COMMIT" not in sql
+        assert len(params) == 2
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_fetch_checkout_commit_native() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = (
+                ("commit_hash",),
+                ("version_num",),
+                ("branch",),
+                ("category",),
+                ("subcategory",),
+                ("content",),
+                ("change_type",),
+                ("snapshot_at",),
+                ("snapshot_by",),
+            )
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchone(self) -> Any:
+            return ("abc123", 1, "main", "facts", None, "text", "update", None, None)
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    await repo.fetch_checkout_commit(tx, "mem-1", "abc123", None)
+    sql = calls[0]["sql"].upper() if calls else ""
+    params = calls[0]["params"] if calls else ()
+    assert "FROM MEMORY_VERSIONS" in sql
+    assert "WHERE MEMORY_ID = ?" in sql
+    assert "AND COMMIT_HASH = ?" in sql
+    assert "DELETED_AT IS NULL" in sql
+    assert ":MEMORY_ID" not in sql
+    assert ":COMMIT" not in sql
+    assert len(params) == 2
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_fetch_referenced_memory_allowlist_native() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+    refs = ["r1", "r2"]
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = (("id",), ("owner_id",), ("namespace",))
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return [("r1", "own", "ns1"), ("r2", "own", "ns1")]
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    await repo.fetch_referenced_memory_allowlist(tx, referenced_ids=refs, scope_owner="o", scope_namespace="ns")
+    sql = calls[0]["sql"].upper() if calls else ""
+    params = calls[0]["params"] if calls else ()
+    assert "IN (" in sql
+    assert "?," in sql  # multiple positional binds
+    assert "OWNER_ID = ?" in sql
+    assert "NAMESPACE = ?" in sql
+    assert ":REF" not in sql
+    assert ":SCOPE_OWNER" not in sql
+    assert ":SCOPE_NS" not in sql
+    assert len(params) == 4  # 2 refs + owner + ns
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_fetch_referenced_memory_allowlist_empty_native() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = (("id",), ("owner_id",), ("namespace",))
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    result = await repo.fetch_referenced_memory_allowlist(tx, referenced_ids=[])
+    assert result == []
+    assert len(calls) == 0  # early-return, no SQL emitted
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_find_duplicate_content_groups_native() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = (("content_hash",), ("cnt",), ("canonical_id",))
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return [("h1", 3, "mem-old"), ("h2", 2, "mem-early")]
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    result = await repo.find_duplicate_content_groups(tx, namespace="ns1")
+    assert len(result) == 2
+    sql = calls[0]["sql"].upper() if calls else ""
+    params = calls[0]["params"] if calls else ()
+    assert "GROUP BY CONTENT_HASH" in sql
+    assert "HAVING COUNT(*) > 1" in sql
+    assert "WITH DUP_GROUPS" in sql.upper()  # CTE
+    assert "FIRST_VALUE" in sql.upper()  # KEEP→FIRST_VALUE
+    assert "ORDER BY D.CNT DESC" in sql or "ORDER BY D.CNT DESC" in calls[0]["sql"]
+    assert "KEEP" not in sql.upper()  # no Oracle-ism
+    assert ":NS" not in sql
+    assert len(params) == 2  # namespace param duplicated for CTEs
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_find_duplicate_content_groups_no_namespace_native() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = (("content_hash",), ("cnt",), ("canonical_id",))
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    await repo.find_duplicate_content_groups(tx)
+    sql = calls[0]["sql"].upper() if calls else ""
+    params = calls[0]["params"] if calls else ()
+    assert "GROUP BY CONTENT_HASH" in sql
+    assert "HAVING COUNT(*) > 1" in sql
+    assert "FIRST_VALUE" in sql.upper()
+    assert "KEEP" not in sql.upper()
+    assert len(params) == 0
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_consolidate_duplicate_memories_native() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 3
+
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    result = await repo.consolidate_duplicate_memories(tx, canonical_id="canon", duplicate_ids=["d1", "d2", "d3"])
+    assert result == 3
+    sql = calls[0]["sql"].upper() if calls else ""
+    params = calls[0]["params"] if calls else ()
+    assert "UPDATE MEMORIES" in sql
+    assert "SET DELETED_AT = CURRENT TIMESTAMP" in sql
+    assert "IN (" in sql
+    assert "AND ID != ?" in sql
+    assert "DELETED_AT IS NULL" in sql
+    assert "SYSTIMESTAMP" not in sql
+    assert ":CANONICAL_ID" not in sql
+    assert ":DUP" not in sql
+    assert len(params) == 4  # 3 dups + canonical_id
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_consolidate_duplicate_memories_empty_native() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 0
+
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    result = await repo.consolidate_duplicate_memories(tx, canonical_id="c", duplicate_ids=[])
+    assert result == 0
+    assert len(calls) == 0  # early-return, no SQL emitted
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_fetch_memory_context_native() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    try:
+        from mnemos.core.lifecycle import _set_embedder_for_testing
+
+        _embed_calls: list[list[float]] = []
+
+        async def _fake_embed(text: str) -> list[float]:
+            _embed_calls.append([1.0] * 384)
+            return _embed_calls[-1]
+
+        _set_embedder_for_testing(_fake_embed)
+        HAVE_EMBEDDER = True
+    except ImportError:
+        HAVE_EMBEDDER = False
+
+    if not HAVE_EMBEDDER:
+        pytest.skip("lifecycle embedder test hook not available; fine on main")
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = (
+                ("id",),
+                ("content",),
+                ("category",),
+                ("subcategory",),
+                ("metadata",),
+                ("quality_rating",),
+                ("owner_id",),
+                ("namespace",),
+                ("created",),
+                ("updated",),
+            )
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return [("ctx1", "surrounding context", "facts", None, "{}", 5, "u1", "ns1", "2026-01-01", "2026-01-01")]
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    user = SimpleNamespace(user_id="u1", namespace="ns1")
+    result = await repo.fetch_memory_context(tx, "test query", user, limit=3)
+    assert isinstance(result, list)
+    assert all(isinstance(r, dict) for r in result)
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "VECTOR_DISTANCE" in sql or "COSINE" in sql
+    assert "FETCH FIRST" in sql
