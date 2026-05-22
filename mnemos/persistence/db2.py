@@ -42,6 +42,7 @@ from mnemos.persistence.oracle import (
     OracleWebhookRepository,
     _call,
     _conn_from_tx,
+    _content_hash,
     _fetch_all_dicts,
     _is_unique_violation,
     _render_visibility,
@@ -562,11 +563,12 @@ def _resolve_db2_vector_index_mode(settings: Any) -> str:
 
 
 class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
-    """Memory repository — Db2-native ``semantic_search`` override.
+    """Memory repository — Db2-native overrides for core write/read paths.
 
-    All other methods inherit verbatim from
-    :class:`OracleMemoryRepository` and rely on the cursor-layer
-    Oracle→Db2 translation in :class:`_Db2AsyncCursor.execute`.
+    Provides Db2-native SQL for insert, fetch-by-id, update, and
+    semantic-search. These methods emit explicit ``?`` positional binds
+    + ``CURRENT TIMESTAMP`` / ``COALESCE`` instead of relying on the
+    cursor-layer Oracle→Db2 translation.
 
     ``semantic_search`` is overridden because the inherited Oracle SQL
     uses ``VECTOR_DISTANCE(..., COSINE)`` + ``FETCH FIRST K ROWS ONLY``
@@ -696,6 +698,146 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             rows = rows[:limit]
 
         return rows
+
+    async def insert_memory(
+        self,
+        tx: Any,
+        *,
+        memory_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        quality_rating: int,
+        owner_id: str,
+        namespace: str,
+        permission_mode: int,
+        source_model: str | None,
+        source_provider: str | None,
+        source_session: str | None,
+        source_agent: str | None,
+        verbatim_content: str | None,
+        created: Any,
+        updated: Any,
+    ) -> str:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        affected = 0
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memories (
+                    id, content, category, subcategory, metadata, content_hash,
+                    quality_rating, verbatim_content, owner_id, namespace,
+                    permission_mode, source_model, source_provider,
+                    source_session, source_agent, created, updated
+                )
+                SELECT
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?,
+                    COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP),
+                    COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP)
+                FROM SYSIBM.SYSDUMMY1
+                WHERE NOT EXISTS (SELECT 1 FROM memories WHERE id = ?)
+                """,
+                (
+                    memory_id,
+                    content,
+                    category,
+                    subcategory,
+                    metadata_json,
+                    _content_hash(content),
+                    quality_rating,
+                    verbatim_content,
+                    owner_id,
+                    namespace,
+                    permission_mode,
+                    source_model,
+                    source_provider,
+                    source_session,
+                    source_agent,
+                    created,
+                    updated,
+                    memory_id,
+                ),
+            )
+            affected = int(getattr(cursor, "rowcount", 0) or 0)
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                return "INSERT 0 0"
+            raise
+        finally:
+            await _call(cursor.close)
+        return "INSERT 0 1" if affected else "INSERT 0 0"
+
+    async def fetch_memory_by_id(self, tx: Any, memory_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, content, category, subcategory, metadata,
+                       quality_rating, compressed_content, verbatim_content,
+                       owner_id, namespace, permission_mode, source_model,
+                       source_provider, source_session, source_agent,
+                       group_id, created, updated, archived_at, deleted_at
+                  FROM memories
+                 WHERE id = ? AND deleted_at IS NULL
+                """,
+                (memory_id,),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
+        finally:
+            await _call(cursor.close)
+
+    async def update_memory(
+        self,
+        tx: Any,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        fields: dict[str, Any],
+    ) -> Row | None:
+        if not fields:
+            return await self.get_memory(tx, memory_id, visibility=visibility)
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            sets_parts: list[str] = []
+            params_list: list[Any] = []
+            for key, value in fields.items():
+                if key not in self._UPDATABLE_FIELDS:
+                    continue
+                sets_parts.append(f"{key} = ?")
+                params_list.append(value)
+            if "content" in fields and "content" in self._UPDATABLE_FIELDS:
+                sets_parts.append("content_hash = ?")
+                params_list.append(_content_hash(fields["content"]))
+            if not sets_parts:
+                return await self.get_memory(tx, memory_id, visibility=visibility)
+            sets_parts.append("updated = CURRENT TIMESTAMP")
+
+            clause, vis_params = _render_visibility(visibility)
+            where = ["id = ?", "deleted_at IS NULL"]
+            if clause:
+                # Convert named binds to positional (?).
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            params_list.append(memory_id)
+
+            sql = f"UPDATE memories SET {', '.join(sets_parts)} WHERE " + " AND ".join(where)
+            await _call(cursor.execute, sql, tuple(params_list))
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return None
+        finally:
+            await _call(cursor.close)
+        return await self.get_memory(tx, memory_id, visibility=visibility)
 
 
 class Db2KGRepository(_Db2OraCompatMixin, OracleKGRepository):
