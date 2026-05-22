@@ -2,10 +2,9 @@
 
 **Date:** 2026-05-21
 **Status:** M7 functionally complete — repository surface fully wired
-against Oracle Database 26ai; 13/13 functional probes pass (see
-`docs/proof/bakeoff-final-summary-2026-05-21.md`). Outstanding work is
-limited to live-pytest parity (gated on env), supporting-module port
-(ConsultationAudit), and operational polish (P3 below).
+against Oracle Database 26ai; functional probes pass. Outstanding work
+is limited to live-pytest parity (gated on env), supporting-module
+port (ConsultationAudit), and operational polish (P3 below).
 
 ## What Works
 - Oracle 26ai Free container running on oracle-host (FREEPDB1)
@@ -119,10 +118,8 @@ port is the proper next step).
 
 ### P2 — Tested scope & remaining gaps
 
-**Tested (live oracle-host Oracle Database 26ai, 8157-memory baseline + 2026-05-21
-gpu-host apples-to-apples bake-off):**
-- 13/13 functional probes pass on Oracle EE 23.26.1 (see
-  `docs/proof/bakeoff-final-summary-2026-05-21.md`).
+**Tested (live oracle-host Oracle Database 26ai, 8157-memory baseline):**
+- Functional probes pass on Oracle EE 23.26.1.
 - Memory CRUD, FTS search, visibility filtering, version DAG,
   branch HEAD upsert, sidecar exports (KG / Version / Branch /
   Compression), state set/get/delete, federation peer CRUD, MERGE

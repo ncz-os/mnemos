@@ -54,7 +54,7 @@ $ .venv/bin/python -c "import sys; sys.path.insert(0,'scripts'); import oracle_e
 NameError: name 'os' is not defined
 ```
 
-**Both scripts crash at module load.** EE features #5 (JSON Relational Duality) and #6 (Property Graph SQL/PGQ) **cannot be re-proven** under the rotated HMAC key. Their existing signed artifacts (`oracle-ee-duality-20260520T160238Z.json`, `oracle-ee-pgq-20260520T160458Z.json`) still verify under the old leaked key `b"mnemos-oracle-proof-v1"` but cannot be regenerated.
+**Both scripts crash at module load.** EE features #5 (JSON Relational Duality) and #6 (Property Graph SQL/PGQ) **cannot be re-proven** under the rotated HMAC key. Their existing signed artifacts (<archived>, <archived>) still verify under the old leaked key `b"mnemos-oracle-proof-v1"` but cannot be regenerated.
 
 This is a regression introduced by OpenCode's workstream C1 rollout. `hnsw_bench.py` + `tde_proof.py` got the `import os` correctly; `pgq` + `duality` did not.
 
@@ -350,9 +350,7 @@ For balance, what survived this pass:
 - `mnemos/persistence/db2.py` — current state post-OpenCode mask-arch + Opus NVL-order fix
 - `mnemos/persistence/oracle.py` — unchanged, awaiting A6 dialect-aware unique-violation fix
 - `db/migrations_db2/0001_core_schema.sql` — **CORRUPT** per O1, immediate fix required
-- Latest proofs (under rotated key `e1c5e3f73e30f066`):
-  - `docs/proof/oracle-proof-20260520T233450Z.json` (13/13)
-  - `docs/proof/db2-proof-20260520T233449Z.json` (12/12)
+- Latest proofs: removed (see history scrub 2026-05-21).
 
 ---
 

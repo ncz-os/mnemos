@@ -214,7 +214,7 @@ warning when used with multiple workers.
 | Tenancy enforcement | application predicates + optional RLS | application predicates (visibility renderer) | application predicates (visibility renderer) | application predicates only |
 | Notifications | LISTEN/NOTIFY | AQ (planned) | event queue (planned) | polling |
 | Multi-worker profile | supported with Redis | supported with Redis | supported with Redis | not recommended; edge/dev are single-worker |
-| TDE / column encryption | optional via pgcrypto | Oracle TDE (verified, `oracle-ee-tde-*.json`) | Db2 native encryption | n/a |
+| TDE / column encryption | optional via pgcrypto | Oracle TDE (verified) | Db2 native encryption | n/a |
 
 ### 3.5 Workers, compression, and client protocols
 
