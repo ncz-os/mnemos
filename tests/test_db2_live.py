@@ -407,3 +407,44 @@ async def test_db2_live_version_fetch_for_export() -> None:
 @pytest.mark.asyncio
 async def test_db2_live_version_fetch_by_ids() -> None:
     pytest.skip("live EAP exercise for Db2VersionRepository.fetch_memory_versions_by_ids (PR #5)")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Db2BranchRepository live stubs (PR #6)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_branch_upsert_head() -> None:
+    pytest.skip("live EAP exercise for Db2BranchRepository.upsert_memory_branch_head (PR #6)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_branch_fetch_heads() -> None:
+    pytest.skip("live EAP exercise for Db2BranchRepository.fetch_memory_branch_heads (PR #6)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_branch_delete_for_memories() -> None:
+    pytest.skip("live EAP exercise for Db2BranchRepository.delete_memory_branches_for_memories (PR #6)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_branch_create() -> None:
+    pytest.skip("live EAP exercise for Db2BranchRepository.create_memory_branch (PR #6)")
