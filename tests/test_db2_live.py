@@ -254,7 +254,7 @@ async def test_db2_semantic_search_parity_with_oracle_normalized_embeddings() ->
 )
 @pytest.mark.asyncio
 async def test_db2_live_fetch_recommended_model() -> None:
-    pytest.skip("live EAP exercise for fetch_recommended_model (PR #2)")
+    pytest.skip("model_registry table not in Db2 EAP migration; schema provisioning is out of scope for v6.0-rc")
 
 
 @pytest.mark.skipif(
@@ -263,7 +263,7 @@ async def test_db2_live_fetch_recommended_model() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_fetch_model_recommendation() -> None:
-    pytest.skip("live EAP exercise for fetch_model_recommendation (PR #2)")
+    pytest.skip("model_registry table not in Db2 EAP migration; schema provisioning is out of scope for v6.0-rc")
 
 
 @pytest.mark.skipif(
@@ -272,7 +272,7 @@ async def test_db2_live_fetch_model_recommendation() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_lookup_provider_for_model() -> None:
-    pytest.skip("live EAP exercise for lookup_provider_for_model (PR #2)")
+    pytest.skip("model_registry table not in Db2 EAP migration; schema provisioning is out of scope for v6.0-rc")
 
 
 @pytest.mark.skipif(
@@ -281,7 +281,7 @@ async def test_db2_live_lookup_provider_for_model() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_fetch_available_models() -> None:
-    pytest.skip("live EAP exercise for fetch_available_models (PR #2)")
+    pytest.skip("model_registry table not in Db2 EAP migration; schema provisioning is out of scope for v6.0-rc")
 
 
 @pytest.mark.skipif(
@@ -290,7 +290,7 @@ async def test_db2_live_fetch_available_models() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_fetch_model_provider() -> None:
-    pytest.skip("live EAP exercise for fetch_model_provider (PR #2)")
+    pytest.skip("model_registry table not in Db2 EAP migration; schema provisioning is out of scope for v6.0-rc")
 
 
 # ────────────────────────────────────────────────────────────────────────────
