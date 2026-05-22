@@ -844,7 +844,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 SELECT
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
                     COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP),
                     COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP)
                 FROM SYSIBM.SYSDUMMY1
