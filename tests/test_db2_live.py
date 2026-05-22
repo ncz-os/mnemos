@@ -773,6 +773,17 @@ async def test_db2_live_version_fetch_for_export() -> None:
     vids = [f"v_{uuid.uuid4().hex[:8]}" for _ in range(2)]
     try:
         async with backend.transactional() as tx:
+            from mnemos.persistence.db2 import _conn_from_tx as _cft, _call as _cl
+
+            conn = _cft(tx)
+            cur = conn.cursor()
+            await _cl(
+                cur.execute,
+                "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, 'c', ?, ?)",
+                (mem_id, owner, namespace),
+            )
+            await _cl(cur.close)
+        async with backend.transactional() as tx:
             for i, vid in enumerate(vids):
                 await backend.memory_versions.insert_memory_version(
                     tx,
@@ -836,6 +847,17 @@ async def test_db2_live_version_fetch_by_ids() -> None:
     mem_id = f"m_{uuid.uuid4().hex[:8]}"
     vids = [f"v_{uuid.uuid4().hex[:8]}" for _ in range(3)]
     try:
+        async with backend.transactional() as tx:
+            from mnemos.persistence.db2 import _conn_from_tx as _cft, _call as _cl
+
+            conn = _cft(tx)
+            cur = conn.cursor()
+            await _cl(
+                cur.execute,
+                "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, 'c', ?, ?)",
+                (mem_id, owner, namespace),
+            )
+            await _cl(cur.close)
         async with backend.transactional() as tx:
             for i, vid in enumerate(vids):
                 await backend.memory_versions.insert_memory_version(
