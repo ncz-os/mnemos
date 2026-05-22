@@ -304,7 +304,30 @@ async def test_db2_live_fetch_model_provider() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_state_get() -> None:
-    pytest.skip("live EAP exercise for Db2StateRepository.get (PR #3)")
+    """Exercise Db2StateRepository.get against live Db2 — round-trip."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, settings=None)
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    namespace = "test_state"
+    key = f"k_{uuid.uuid4().hex[:6]}"
+    try:
+        async with backend.transactional() as tx:
+            # Set a value first
+            row = await backend.state_kv.set(tx, key, "hello", owner_id=owner, namespace=namespace)
+            assert row is not None
+            assert row["value"] == "hello"
+            # Get it back
+            got = await backend.state_kv.get(tx, key, owner_id=owner, namespace=namespace)
+            assert got is not None
+            assert got["value"] == "hello"
+    finally:
+        # Cleanup
+        async with backend.transactional() as tx:
+            await backend.state_kv.delete_namespace(tx, owner_id=owner, namespace=namespace)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -313,7 +336,28 @@ async def test_db2_live_state_get() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_state_set() -> None:
-    pytest.skip("live EAP exercise for Db2StateRepository.set (PR #3)")
+    """Exercise Db2StateRepository.set against live Db2 — round-trip."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, settings=None)
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    namespace = "test_state"
+    key = f"k_{uuid.uuid4().hex[:6]}"
+    try:
+        async with backend.transactional() as tx:
+            row = await backend.state_kv.set(tx, key, "hello", owner_id=owner, namespace=namespace)
+            assert row is not None
+            assert row["value"] == "hello"
+            # Round-trip
+            got = await backend.state_kv.get(tx, key, owner_id=owner, namespace=namespace)
+            assert got and got["value"] == "hello"
+    finally:
+        # Cleanup
+        async with backend.transactional() as tx:
+            await backend.state_kv.delete_namespace(tx, owner_id=owner, namespace=namespace)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -322,7 +366,31 @@ async def test_db2_live_state_set() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_state_delete() -> None:
-    pytest.skip("live EAP exercise for Db2StateRepository.delete (PR #3)")
+    """Exercise Db2StateRepository.delete against live Db2."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, settings=None)
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    namespace = "test_state"
+    key = f"k_{uuid.uuid4().hex[:6]}"
+    try:
+        async with backend.transactional() as tx:
+            # Set a value first
+            row = await backend.state_kv.set(tx, key, "hello", owner_id=owner, namespace=namespace)
+            assert row is not None
+            # Delete it
+            deleted = await backend.state_kv.delete(tx, key, owner_id=owner, namespace=namespace)
+            assert deleted is True
+            # Verify it's gone
+            got = await backend.state_kv.get(tx, key, owner_id=owner, namespace=namespace)
+            assert got is None
+    finally:
+        # Cleanup
+        async with backend.transactional() as tx:
+            await backend.state_kv.delete_namespace(tx, owner_id=owner, namespace=namespace)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -331,7 +399,37 @@ async def test_db2_live_state_delete() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_state_list_namespace() -> None:
-    pytest.skip("live EAP exercise for Db2StateRepository.list_namespace (PR #3)")
+    """Exercise Db2StateRepository.list_namespace against live Db2."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, settings=None)
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    namespace = "test_state"
+    key1 = f"k1_{uuid.uuid4().hex[:6]}"
+    key2 = f"k2_{uuid.uuid4().hex[:6]}"
+    try:
+        async with backend.transactional() as tx:
+            # Set multiple values
+            await backend.state_kv.set(tx, key1, "value1", owner_id=owner, namespace=namespace)
+            await backend.state_kv.set(tx, key2, "value2", owner_id=owner, namespace=namespace)
+            # List them
+            rows = await backend.state_kv.list_namespace(tx, owner_id=owner, namespace=namespace)
+            assert len(rows) == 2
+            # Verify both keys are present
+            keys = {row["key"] for row in rows}
+            assert key1 in keys
+            assert key2 in keys
+            # Verify values
+            values = {row["value"] for row in rows}
+            assert "value1" in values
+            assert "value2" in values
+    finally:
+        # Cleanup
+        async with backend.transactional() as tx:
+            await backend.state_kv.delete_namespace(tx, owner_id=owner, namespace=namespace)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -340,7 +438,35 @@ async def test_db2_live_state_list_namespace() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_state_delete_namespace() -> None:
-    pytest.skip("live EAP exercise for Db2StateRepository.delete_namespace (PR #3)")
+    """Exercise Db2StateRepository.delete_namespace against live Db2."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, settings=None)
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    namespace = "test_state"
+    key1 = f"k1_{uuid.uuid4().hex[:6]}"
+    key2 = f"k2_{uuid.uuid4().hex[:6]}"
+    try:
+        async with backend.transactional() as tx:
+            # Set multiple values
+            await backend.state_kv.set(tx, key1, "value1", owner_id=owner, namespace=namespace)
+            await backend.state_kv.set(tx, key2, "value2", owner_id=owner, namespace=namespace)
+            # Verify they exist
+            rows = await backend.state_kv.list_namespace(tx, owner_id=owner, namespace=namespace)
+            assert len(rows) == 2
+            # Delete the entire namespace
+            deleted_count = await backend.state_kv.delete_namespace(tx, owner_id=owner, namespace=namespace)
+            assert deleted_count == 2
+            # Verify they're gone
+            rows = await backend.state_kv.list_namespace(tx, owner_id=owner, namespace=namespace)
+            assert len(rows) == 0
+    finally:
+        # Cleanup
+        async with backend.transactional() as tx:
+            await backend.state_kv.delete_namespace(tx, owner_id=owner, namespace=namespace)
+        await backend.close()
 
 
 # ── PR #4 live stubs (skipped unless DB2_DSN) ────────────────────────────────
