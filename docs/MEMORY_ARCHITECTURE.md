@@ -398,9 +398,8 @@ MNEMOS supports four persistence backends:
   Runtime app-path `semantic_search` is overridden in
   `Db2MemoryRepository` to emit
   `VECTOR_DISTANCE(..., EUCLIDEAN)` + `FETCH APPROX FIRST K ROWS ONLY`,
-  which engages the DiskANN index instead of an exact scan; for
-  L2-normalized embeddings (MNEMOS default) the EUCLIDEAN top-K
-  ordering is identical to COSINE. The toggle env var
+  engaging the DiskANN index; for L2-normalized embeddings (MNEMOS
+  default) the EUCLIDEAN top-K ordering is identical to COSINE. The toggle env var
   `MNEMOS_DB2_VECTOR_INDEX=approx|exact` selects index engagement
   vs. exact-scan parity; `Db2Backend.open` probes the
   `DB2_VECTOR_INDEXING=YES` registry variable on startup and logs

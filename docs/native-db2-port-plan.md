@@ -265,9 +265,9 @@ The risk is that a native port silently changes one query's semantics — wrong 
 
 **Step 3 — bench-v5.** New `scripts/bench_v5.py` measures latency delta native-vs-compat on the same DiskANN index, same dataset, same query mix. Targets:
 - `semantic_search` (already native; expect zero delta)
-- `list_memories` (compat does dict→positional rewrite — expect 5-15% native gain on small queries)
-- `insert_memory` (compat does full mask/unmask — expect 10-20% native gain)
-- MERGE operations (`state.set`, `upsert_peer`) — expect 5-10% native gain
+- `list_memories` (compat does dict→positional rewrite — exact delta TBD (measured against Db2 12.1.5 GA, not EAP))
+- `insert_memory` (compat does full mask/unmask — exact delta TBD (measured against Db2 12.1.5 GA, not EAP))
+- MERGE operations (`state.set`, `upsert_peer`) — exact delta TBD (measured against Db2 12.1.5 GA, not EAP)
 
 **Step 4 — Promotion + deprecation.** Once parity + bench prove native is correct and at least as fast, flip lifecycle default to `native`. Emit `DeprecationWarning` on the compat path with a one-release window. Phase 3 removes the compat backend.
 
@@ -307,7 +307,7 @@ The risk is that a native port silently changes one query's semantics — wrong 
 - Rewrite `db/migrations_db2/0001_core_schema.sql` to native types (VARCHAR/BIGINT/CLOB sized)
 - Add `Db2BackendNative` + `MNEMOS_DB2_DIALECT` selector in `lifecycle.py`
 - Write `tests/test_db2_dialect_parity.py` (one parametrized case per method; run against compat + native)
-- Write `scripts/bench_v5.py` + capture A/B numbers into `docs/proof/bench-v5/`
+- Write `scripts/bench_v5.py` + capture A/B numbers (against Db2 12.1.5 GA, not EAP) into `docs/proof/bench-v5/`
 
 **Phase 3 — Compat deprecation + cleanup (≈ 3 working days)**
 - Flip lifecycle default to `native`
@@ -348,7 +348,7 @@ Every test file below must pass before the port is declared done:
 - `tests/test_persistence_helpers.py` — `_validate_and_format_vector`, `_render_visibility` semantics unchanged
 - `tests/test_oracle_vector_validation.py` — vector path tests still hold
 - `scripts/db2_proof_run.py` — green against `MNEMOS_DB2_DIALECT=native`
-- `scripts/bench_v5.py` — published numbers in `docs/proof/bench-v5/native-vs-compat.json`
+- `scripts/bench_v5.py` — results published against Db2 12.1.5 GA
 - `scripts/db2_apply_migration.py` — applies the native-type 0001 schema cleanly to a fresh container
 - Db2 EAP container starts cleanly with `ENABLE_ORACLE_COMPATIBILITY=false`
 
@@ -366,7 +366,7 @@ The port is **implementation-only**. User-visible surface is unchanged. Specific
 - **Environment variables**: `MNEMOS_DB2_VECTOR_INDEX={approx|exact}` — unchanged. **NEW** `MNEMOS_DB2_DIALECT={compat|native}` is added for Phase 2 transition only; removed (or hardcoded `native`) in Phase 3
 - **Migration files**: `db/migrations_db2/0001_core_schema.sql` content changes (Phase 2) but apply target + script unchanged
 - **Vector index name**: `idx_memories_emb_diskann` — unchanged
-- **Performance characteristics**: `semantic_search` already native (no change); other methods improve 5-20% per Phase 2 bench numbers; no regression expected, validated by parity tests
+- **Performance characteristics**: `semantic_search` already native (no change); other methods expected to improve per Phase 2 bench (run against Db2 12.1.5 GA, not EAP); no regression expected, validated by parity tests
 - **Operator workflow**: identical — `db2set DB2_VECTOR_INDEXING=YES`, `db2start`, point MNEMOS at the DSN. The ORA_COMPATIBILITY toggle defaults flip from on to off in Phase 3, but the toggle remains for fallback.
 
 ---

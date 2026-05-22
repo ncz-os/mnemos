@@ -209,9 +209,7 @@ path on June 6, 2026 GA.
 > overridden with native Db2 SQL so the DiskANN index actually engages.
 > A full native Db2 dialect port (drop Oracle subclassing + compat
 > mode dependency) is tracked on the v6.x roadmap
-> ([docs/v6.1-roadmap.md](v6.1-roadmap.md) items #44-46). Until that
-> lands, Db2 latency numbers in `docs/proof/bench-v4/` should be read
-> as a floor, not a ceiling.
+> ([docs/v6.1-roadmap.md](v6.1-roadmap.md) items #44-46).
 
 ```bash
 # 1. Install the driver
