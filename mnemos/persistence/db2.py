@@ -1689,7 +1689,7 @@ class Db2KGRepository(_Db2OraCompatMixin, OracleKGRepository):
                     ?,
                     COALESCE(CAST(? AS DECFLOAT), CAST(1.0 AS DECFLOAT)),
                     COALESCE(CAST(? AS DATE), CURRENT DATE),
-                    ?, COALESCE(?, 'default')
+                    ?, COALESCE(CAST(? AS VARCHAR(100)), 'default')
                 FROM SYSIBM.SYSDUMMY1
                 WHERE NOT EXISTS (SELECT 1 FROM kg_triples WHERE id = ?)
                 """,
@@ -1838,12 +1838,12 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
                 )
                 SELECT
                     ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, COALESCE(?, 'default'),
+                    ?, ?, ?, COALESCE(CAST(? AS VARCHAR(100)), 'default'),
                     COALESCE(CAST(? AS INTEGER), 600),
                     ?, ?, ?, ?,
                     COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP),
-                    ?, COALESCE(?, 'create'),
-                    ?, ?, COALESCE(?, 'main'),
+                    ?, COALESCE(CAST(? AS VARCHAR(40)), 'create'),
+                    ?, ?, COALESCE(CAST(? AS VARCHAR(100)), 'main'),
                     ?
                 FROM SYSIBM.SYSDUMMY1
                 WHERE NOT EXISTS (SELECT 1 FROM memory_versions WHERE id = ?)
@@ -2189,8 +2189,8 @@ class Db2CompressionRepository(_Db2OraCompatMixin, OracleCompressionRepository):
                 SELECT
                     ?, ?, ?, ?, ?,
                     ?, ?, ?,
-                    ?, ?, COALESCE(?, 'balanced'), ?,
-                    COALESCE(?, CURRENT TIMESTAMP)
+                    ?, ?, COALESCE(CAST(? AS VARCHAR(40)), 'balanced'), ?,
+                    COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP)
                 FROM SYSIBM.SYSDUMMY1
                 WHERE NOT EXISTS (
                     SELECT 1 FROM memory_compressed_variants WHERE memory_id = ?
@@ -2358,8 +2358,9 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
                         id, subscription_id, event_type, payload, owner_id,
                         namespace, state, attempt_count, next_attempt_at
                     ) VALUES (
-                        ?, ?, ?, ?, COALESCE(?, 'default'),
-                        COALESCE(?, 'default'), 'pending', 0, CURRENT TIMESTAMP
+                        ?, ?, ?, ?, COALESCE(CAST(? AS VARCHAR(100)), 'default'),
+                        COALESCE(CAST(? AS VARCHAR(100)), 'default'),
+                        'pending', 0, CURRENT TIMESTAMP
                     )
                     """,
                     (
@@ -2941,13 +2942,13 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                    ON (p.id = s.id)
                 WHEN MATCHED THEN UPDATE SET
                     base_url = ?,
-                    name = COALESCE(?, p.name),
+                    name = COALESCE(CAST(? AS VARCHAR(200)), p.name),
                     enabled = ?,
                     updated = CURRENT TIMESTAMP
                 WHEN NOT MATCHED THEN INSERT (
                     id, name, base_url, auth_token, enabled
                 ) VALUES (
-                    ?, COALESCE(?, ?), ?, '', ?
+                    ?, COALESCE(CAST(? AS VARCHAR(200)), CAST(? AS VARCHAR(200))), ?, '', ?
                 )
                 """,
                 (
