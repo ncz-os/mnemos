@@ -34,6 +34,7 @@ from mnemos.persistence.base import (
     CompressionRepository,
     ConsultationAuditRepository,
     FederationRepository,
+    JournalRepository,
     KGRepository,
     MemoryRepository,
     PersistenceBackend,
@@ -2813,6 +2814,130 @@ class OracleFederationRepository(FederationRepository):
             await _call(cursor.close)
 
 
+class OracleJournalRepository(JournalRepository):
+    """Oracle journal repo — Oracle dialect journal CRUD over the ``journal`` table."""
+
+    async def create_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any,
+        topic: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        import json as _json
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if entry_date is not None:
+                await _call(
+                    cursor.execute,
+                    """INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                       VALUES (:id, :owner_id, :namespace, :entry_date, :topic, :content, :metadata)""",
+                    {
+                        "id": entry_id,
+                        "owner_id": owner_id,
+                        "namespace": namespace,
+                        "entry_date": entry_date,
+                        "topic": topic,
+                        "content": content,
+                        "metadata": _json.dumps(metadata or {}),
+                    },
+                )
+            else:
+                await _call(
+                    cursor.execute,
+                    """INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                       VALUES (:id, :owner_id, :namespace, SYSDATE, :topic, :content, :metadata)""",
+                    {
+                        "id": entry_id,
+                        "owner_id": owner_id,
+                        "namespace": namespace,
+                        "topic": topic,
+                        "content": content,
+                        "metadata": _json.dumps(metadata or {}),
+                    },
+                )
+            # Oracle RETURNING is awkward with oracledb thin driver; SELECT the row back.
+            await _call(
+                cursor.execute,
+                """SELECT id, TO_CHAR(entry_date, 'YYYY-MM-DD') AS entry_date, topic, content, metadata,
+                          TO_CHAR(created, 'YYYY-MM-DD HH24:MI:SS') AS created
+                   FROM journal WHERE id = :id""",
+                {"id": entry_id},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone)) or {}
+        finally:
+            await _call(cursor.close)
+
+    async def list_journal_entries(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        topic: str | None = None,
+        entry_date: Any = None,
+        search: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = ["owner_id = :owner_id", "namespace = :namespace", "deleted_at IS NULL"]
+            params: dict[str, Any] = {"owner_id": owner_id, "namespace": namespace, "limit": limit}
+            if entry_date is not None:
+                where.append("entry_date = :entry_date")
+                params["entry_date"] = entry_date
+            elif topic is not None:
+                where.append("topic = :topic")
+                params["topic"] = topic
+            elif search is not None:
+                pattern = f"%{search}%"
+                where.append("(UPPER(content) LIKE UPPER(:search) OR UPPER(topic) LIKE UPPER(:search))")
+                params["search"] = pattern
+            sql = (
+                "SELECT id, TO_CHAR(entry_date, 'YYYY-MM-DD') AS entry_date, topic, content, "
+                "metadata, TO_CHAR(created, 'YYYY-MM-DD HH24:MI:SS') AS created "
+                "FROM journal WHERE " + " AND ".join(where) + " "
+                "ORDER BY created DESC FETCH FIRST :limit ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def delete_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+    ) -> bool:
+        # Soft delete: the route currently uses HARD delete. The trait contract
+        # specifies soft-delete for consistency with other repos; route migration
+        # follow-up will adopt this behaviour.
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """UPDATE journal SET deleted_at = SYSDATE
+                   WHERE id = :id AND owner_id = :owner_id AND namespace = :namespace
+                     AND deleted_at IS NULL""",
+                {"id": entry_id, "owner_id": owner_id, "namespace": namespace},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+
 class OracleStateRepository(StateRepository):
     """Oracle key/value state repo — full CRUD over the ``state`` table."""
 
@@ -3011,6 +3136,7 @@ class OracleBackend(PersistenceBackend):
         self._consultations_audit_repo = OracleConsultationAuditRepository()
         self._federation_repo = OracleFederationRepository()
         self._state_kv_repo = OracleStateRepository()
+        self._journal_repo = OracleJournalRepository()
 
     @property
     def settings(self) -> Any:
@@ -3070,6 +3196,10 @@ class OracleBackend(PersistenceBackend):
     def state_kv(self) -> StateRepository:
         return self._state_kv_repo
 
+    @property
+    def journal(self) -> JournalRepository:
+        return self._journal_repo
+
     async def open(self) -> None:
         """Lifecycle hook — validates pool checkout + session callback.
 
@@ -3122,6 +3252,7 @@ __all__ = [
     "OracleCompressionRepository",
     "OracleConsultationAuditRepository",
     "OracleFederationRepository",
+    "OracleJournalRepository",
     "OracleKGRepository",
     "OracleMemoryRepository",
     "OracleStateRepository",

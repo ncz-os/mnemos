@@ -35,6 +35,7 @@ from mnemos.persistence.oracle import (
     OracleCompressionRepository,
     OracleConsultationAuditRepository,
     OracleFederationRepository,
+    OracleJournalRepository,
     OracleKGRepository,
     OracleMemoryRepository,
     OracleStateRepository,
@@ -725,6 +726,10 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
     """Federation peer management repository — Oracle SQL auto-translated by cursor layer."""
 
 
+class Db2JournalRepository(_Db2OraCompatMixin, OracleJournalRepository):
+    """Journal repository — Oracle SQL auto-translated by cursor layer."""
+
+
 class Db2StateRepository(_Db2OraCompatMixin, OracleStateRepository):
     """Key/value state repository — Oracle SQL auto-translated by cursor layer.
 
@@ -806,6 +811,7 @@ class Db2Backend(OracleBackend):
         self._consultations_audit_repo = Db2ConsultationAuditRepository()
         self._federation_repo = Db2FederationRepository()
         self._state_kv_repo = Db2StateRepository()
+        self._journal_repo = Db2JournalRepository()
         # Startup registry-probe state, populated lazily by ``open()``.
         # ``None`` means "not yet probed"; otherwise stores the raw
         # registry value (``"YES"``, ``"NO"``, ``""``...) for the
@@ -890,6 +896,7 @@ __all__ = [
     "Db2CompressionRepository",
     "Db2ConsultationAuditRepository",
     "Db2FederationRepository",
+    "Db2JournalRepository",
     "Db2KGRepository",
     "Db2MemoryRepository",
     "Db2StateRepository",
