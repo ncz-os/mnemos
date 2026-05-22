@@ -566,12 +566,7 @@ Source: Companion artifacts (archived):
 
 | Op | PG p50 (pg-host) | Oracle p50 (oracle-host) | PG/Oracle | Interpretation |
 |---|---|---|---|---|
-| count_star | 0.96 ms | 5.62 ms | 0.17x | Single-PK aggregate; Skylake + SATA tax |
-| **fetch_by_id** | 0.74 ms | **0.57 ms** | **1.31x — Oracle wins** | PK index probe; both engines fast, Oracle pulls ahead despite hardware |
-| list_page | 0.46 ms | 8.40 ms | 0.05x | Oracle has the index but planner not picking it; needs DBMS_STATS.GATHER_TABLE_STATS |
-| fts_substring | 1.86 ms | 4.69 ms | 0.40x | DBMS_LOB.INSTR is linear; Oracle Text would close the gap |
-| semantic_search | 0.80 ms | 3.19 ms | 0.25x | PG HNSW vs Oracle IVF — HNSW blocked on Free tier |
-| **insert_delete** | 1.06 ms | **1.22 ms** | **0.87x (Oracle within 14%)** | Round-trip durability on SATA3 vs NVMe — Oracle nearly matches |
+| _(measured op-by-op latency rows omitted — see internal archive)_  | | | | |
 
 ### What the asymmetry reveals
 
@@ -796,12 +791,7 @@ Source: Companion artifacts (archived):
 
 | Op | PG p50 | Oracle p50 | Ratio |
 |---|---|---|---|
-| count_star | 0.97 ms | 2.98 ms | PG 3.1x |
-| **fetch_by_id** | 0.74 ms | **0.29 ms** | **Oracle 2.54x** |
-| fts_substring | 1.59 ms | 2.74 ms | PG 1.7x |
-| **insert_delete** | 1.02 ms | **0.90 ms** | **Oracle 1.12x** |
-| list_page | 0.45 ms | 4.34 ms | PG 9.6x (Oracle planner not using index) |
-| semantic_search | 0.60 ms | 2.11 ms | PG 3.5x (HNSW vs IVF) |
+| _(measured op-by-op latency rows omitted — see internal archive)_  | | | | |
 
 ### Read
 
@@ -885,10 +875,7 @@ Source: Companion artifacts (archived):
 
 | Chars | gpu-host RTX 4500 ADA (24 GB) | gpu-host-2 RTX 5060 (8 GB) | Winner |
 |---|---|---|---|
-| 293 | 12.3 ms (80/s) | **9.6 ms (99/s)** | **gpu-host-2 +28%** |
-| 592 | 13.7 ms (73/s) | **12.9 ms (77/s)** | gpu-host-2 +5% |
-| 1174 | **18.1 ms (54/s)** | 22.1 ms (45/s) | gpu-host +22% |
-| 2360 | **33.2 ms (30/s)** | 43.7 ms (23/s) | gpu-host +30% |
+| _(embed-throughput rows omitted — see internal archive)_  | | | |
 
 gpu-host-2's newer Blackwell silicon (RTX 5060) wins short-text
 embedding by a wide margin. gpu-host's older but VRAM-rich Ada
