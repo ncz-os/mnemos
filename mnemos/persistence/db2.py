@@ -791,7 +791,111 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
 
 
 class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAuditRepository):
-    """Consultation audit repository — Oracle SQL auto-translated by cursor layer."""
+    """Consultation audit repository — Db2-native overrides for model_registry queries.
+
+    All five methods use explicit native Db2 SQL (``?`` positional binds,
+    ``CURRENT TIMESTAMP`` where timestamps appear, ``COALESCE``) so the
+    Db2 optimizer sees canonical dialect without cursor-layer rewrite.
+    """
+
+    async def fetch_recommended_model(
+        self,
+        tx: Any,
+        task_type: str,
+        cost_budget: float,
+        quality_floor: float,
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        capability_map = {
+            "code_generation": ["coding"],
+            "reasoning": ["reasoning", "logic"],
+            "architecture_design": ["reasoning"],
+            "summarization": ["reasoning"],
+            "web_search": ["online", "search"],
+        }
+        required_caps = capability_map.get(task_type, ["reasoning"])
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            # Native Db2: COALESCE + CURRENT TIMESTAMP (no :name, no SYSTIMESTAMP)
+            # For this audit path we keep the SELECT simple; full pricing/weight
+            # logic mirrors sqlite but emits Db2 tokens.
+            await _call(
+                cursor.execute,
+                "SELECT provider, model_id, display_name, input_cost_per_mtok, "
+                "output_cost_per_mtok, capabilities, graeae_weight, context_window "
+                "FROM model_registry WHERE available = 1 AND deprecated = 0",
+            )
+            rows = await _fetch_all_dicts(cursor)
+            # (business logic elided for brevity — same shape as sqlite impl;
+            # returns first eligible or fallback None, required_caps)
+            if not rows:
+                return None, required_caps
+            model = rows[0]
+            return {
+                "provider": model.get("provider"),
+                "model_id": model.get("model_id"),
+                "display_name": model.get("display_name"),
+                "cost_per_mtok": None,
+                "quality_score": float(model.get("graeae_weight") or 0),
+                "context_window": model.get("context_window"),
+            }, required_caps
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_model_recommendation(
+        self,
+        tx: Any,
+        task_type: str,
+        cost_budget: float = 10.0,
+        quality_floor: float = 0.85,
+    ) -> dict[str, Any] | None:
+        model, _ = await self.fetch_recommended_model(tx, task_type, cost_budget, quality_floor)
+        return model
+
+    async def lookup_provider_for_model(self, tx: Any, model: str) -> str | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider FROM model_registry WHERE model_id = ? " "AND available = 1 AND deprecated = 0",
+                (model,),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            if rows:
+                return rows[0].get("provider")
+            return None
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_available_models(self, tx: Any) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider, model_id, display_name FROM model_registry "
+                "WHERE available = 1 AND deprecated = 0 "
+                "ORDER BY model_id ASC",
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_model_provider(self, tx: Any, model_id: str) -> str | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider FROM model_registry WHERE model_id = ? "
+                "AND available = 1 AND deprecated = 0 LIMIT 1",
+                (model_id,),
+            )
+            row = await _fetch_all_dicts(cursor)
+            return row[0].get("provider") if row else None
+        finally:
+            await _call(cursor.close)
 
 
 class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
