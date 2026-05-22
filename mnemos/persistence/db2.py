@@ -931,13 +931,13 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
 
             clause, vis_params = _render_visibility(visibility)
             where = ["id = ?", "deleted_at IS NULL"]
+            params_list.append(memory_id)
             if clause:
                 # Convert named binds to positional (?).
                 pos_clause = _BIND_RE.sub("?", clause)
                 for m in _BIND_RE.finditer(clause):
                     params_list.append(vis_params[m.group(1)])
                 where.append(pos_clause)
-            params_list.append(memory_id)
 
             sql = f"UPDATE memories SET {', '.join(sets_parts)} WHERE " + " AND ".join(where)
             await _call(cursor.execute, sql, tuple(params_list))
@@ -968,13 +968,12 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         try:
             clause, vis_params = _render_visibility(visibility)
             where = ["id = ?", "deleted_at IS NULL"]
-            params_list: list[Any] = []
+            params_list: list[Any] = [memory_id]
             if clause:
                 pos_clause = _BIND_RE.sub("?", clause)
                 for m in _BIND_RE.finditer(clause):
                     params_list.append(vis_params[m.group(1)])
                 where.append(pos_clause)
-            params_list.append(memory_id)
             await _call(
                 cursor.execute,
                 "UPDATE memories SET deleted_at = CURRENT TIMESTAMP WHERE " + " AND ".join(where),
