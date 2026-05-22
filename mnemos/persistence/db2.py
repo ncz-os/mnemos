@@ -839,6 +839,144 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             await _call(cursor.close)
         return await self.get_memory(tx, memory_id, visibility=visibility)
 
+    async def delete_memory(
+        self,
+        tx: Any,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        requested_by: str | None = None,
+        requested_at: Any = None,
+        request_kind: str = "admin_purge",
+        reason: str | None = None,
+        source: Sequence[str] | None = None,
+    ) -> Row | None:
+        _ = (requested_by, requested_at, request_kind, reason, source)
+        row = await self.get_memory(tx, memory_id, visibility=visibility, include_archived=True)
+        if row is None:
+            return None
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility)
+            where = ["id = ?", "deleted_at IS NULL"]
+            params_list: list[Any] = []
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            params_list.append(memory_id)
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET deleted_at = CURRENT TIMESTAMP WHERE " + " AND ".join(where),
+                tuple(params_list),
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return None
+        finally:
+            await _call(cursor.close)
+        return row
+
+    async def list_memories(
+        self,
+        tx: Any,
+        *,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        include_archived: bool = False,
+    ) -> tuple[list[Row], int]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility, table_alias="m")
+            where = ["m.deleted_at IS NULL"]
+            if not include_archived:
+                where.append("m.archived_at IS NULL")
+            params_list: list[Any] = []
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            if category is not None:
+                where.append("m.category = ?")
+                params_list.append(category)
+            if subcategory is not None:
+                where.append("m.subcategory = ?")
+                params_list.append(subcategory)
+            where_sql = " AND ".join(where)
+
+            await _call(
+                cursor.execute,
+                f"SELECT COUNT(*) FROM memories m WHERE {where_sql}",
+                tuple(params_list),
+            )
+            (total,) = await _call(cursor.fetchone) or (0,)
+
+            page_params = tuple(params_list + [offset, limit])
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT m.id, m.content, m.category, m.subcategory, m.metadata,
+                       m.quality_rating, m.compressed_content, m.verbatim_content,
+                       m.owner_id, m.namespace, m.permission_mode, m.source_model,
+                       m.source_provider, m.source_session, m.source_agent,
+                       m.group_id, m.created, m.updated, m.archived_at, m.deleted_at
+                  FROM memories m
+                 WHERE {where_sql}
+                 ORDER BY m.created DESC, m.id ASC
+                 OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+                """,
+                page_params,
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return rows, int(total or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def count_memories(
+        self,
+        tx: Any,
+        *,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        include_archived: bool = False,
+    ) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility, table_alias="m")
+            where = ["m.deleted_at IS NULL"]
+            if not include_archived:
+                where.append("m.archived_at IS NULL")
+            params_list: list[Any] = []
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            if category is not None:
+                where.append("m.category = ?")
+                params_list.append(category)
+            if subcategory is not None:
+                where.append("m.subcategory = ?")
+                params_list.append(subcategory)
+            where_sql = " AND ".join(where)
+            await _call(
+                cursor.execute,
+                f"SELECT COUNT(*) FROM memories m WHERE {where_sql}",
+                tuple(params_list),
+            )
+            (total,) = await _call(cursor.fetchone) or (0,)
+            return int(total or 0)
+        finally:
+            await _call(cursor.close)
+
 
 class Db2KGRepository(_Db2OraCompatMixin, OracleKGRepository):
     """KG triples repository — Db2-native overrides for insert + fetch.
