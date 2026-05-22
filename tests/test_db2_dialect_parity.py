@@ -1160,3 +1160,200 @@ async def test_db2_memory_update_native_tokens() -> None:
     assert "SYSTIMESTAMP" not in update_sql
     assert ":ID" not in update_sql
     assert ":F_" not in update_sql
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_delete_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+            if "SELECT" in sql.upper() and "FROM MEMORIES M" in sql.upper():
+                self.description = (
+                    ("id",),
+                    ("content",),
+                    ("category",),
+                    ("subcategory",),
+                    ("metadata",),
+                    ("quality_rating",),
+                    ("compressed_content",),
+                    ("verbatim_content",),
+                    ("owner_id",),
+                    ("namespace",),
+                    ("permission_mode",),
+                    ("source_model",),
+                    ("source_provider",),
+                    ("source_session",),
+                    ("source_agent",),
+                    ("group_id",),
+                    ("created",),
+                    ("updated",),
+                    ("archived_at",),
+                    ("deleted_at",),
+                    ("recall_count",),
+                    ("last_recalled_at",),
+                    ("content_hash",),
+                    ("federation_source",),
+                    ("federation_remote_updated",),
+                )
+
+        async def fetchone(self) -> Any:
+            return (
+                "m1",
+                "hello",
+                "facts",
+                "test",
+                "{}",
+                5,
+                None,
+                None,
+                "owner-a",
+                "ns-test",
+                600,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "2026-01-01",
+                "2026-01-01",
+                None,
+                None,
+                0,
+                None,
+                "hash",
+                None,
+                None,
+            )
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    vis = VisibilityFilter(
+        scope=VisibilityScope.OWN_ONLY,
+        user_id="owner-a",
+        group_ids=[],
+        namespace="ns-test",
+    )
+    await repo.delete_memory(tx, "m1", visibility=vis)
+    update_calls = [c for c in calls if c["sql"].upper().lstrip().startswith("UPDATE")]
+    assert len(update_calls) == 1
+    update_sql = update_calls[0]["sql"].upper()
+    assert "CURRENT TIMESTAMP" in update_sql
+    assert "ID = ?" in update_sql
+    assert "SYSTIMESTAMP" not in update_sql
+    assert ":ID" not in update_sql
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_list_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+            self.description = None
+
+        async def fetchone(self) -> Any:
+            return (3,)
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    vis = VisibilityFilter(
+        scope=VisibilityScope.OWN_ONLY,
+        user_id="owner-a",
+        group_ids=[],
+        namespace="ns-test",
+    )
+    await repo.list_memories(
+        tx,
+        visibility=vis,
+        category="facts",
+        subcategory="test",
+        limit=10,
+        offset=20,
+    )
+    assert len(calls) == 2
+    count_sql = calls[0]["sql"].upper()
+    list_sql = calls[1]["sql"].upper()
+    assert "SELECT COUNT(*)" in count_sql
+    assert "WHERE M.DELETED_AT IS NULL" in count_sql
+    assert "FROM MEMORIES M" in list_sql
+    assert "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY" in list_sql
+    assert ":OFFSET" not in list_sql
+    assert ":LIMIT" not in list_sql
+    assert ":CAT" not in list_sql
+    assert ":SUB" not in list_sql
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_count_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchone(self) -> Any:
+            return (5,)
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    vis = VisibilityFilter(
+        scope=VisibilityScope.OWN_ONLY,
+        user_id="owner-a",
+        group_ids=[],
+        namespace="ns-test",
+    )
+    total = await repo.count_memories(tx, visibility=vis, category="facts", subcategory="test")
+    assert total == 5
+    assert len(calls) == 1
+    count_sql = calls[0]["sql"].upper()
+    assert "SELECT COUNT(*)" in count_sql
+    assert "WHERE M.DELETED_AT IS NULL" in count_sql
+    assert ":CAT" not in count_sql
+    assert ":SUB" not in count_sql

@@ -526,3 +526,21 @@ async def test_db2_live_memory_fetch_by_id() -> None:
 @pytest.mark.asyncio
 async def test_db2_live_memory_update() -> None:
     pytest.skip("live EAP exercise for Db2MemoryRepository.update_memory (PR #8a)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_delete() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.delete_memory (PR #8b)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_list() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.list_memories (PR #8b)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_count() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.count_memories (PR #8b)")
