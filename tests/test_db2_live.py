@@ -910,7 +910,40 @@ async def test_db2_live_version_fetch_by_ids() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_branch_upsert_head() -> None:
-    pytest.skip("live EAP exercise for Db2BranchRepository.upsert_memory_branch_head (PR #6)")
+    """Exercise Db2BranchRepository.upsert_memory_branch_head (MERGE INTO)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(
+                cur.execute,
+                "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, 'c', ?, ?)",
+                (mem_id, owner, ns),
+            )
+            await _call(cur.close)
+            await backend.memory_branches.upsert_memory_branch_head(
+                tx, memory_id=mem_id, branch="main", head_version_id="v1"
+            )
+            # Idempotent upsert (MERGE WHEN MATCHED)
+            await backend.memory_branches.upsert_memory_branch_head(
+                tx, memory_id=mem_id, branch="main", head_version_id="v2"
+            )
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM memory_branches WHERE memory_id = ?", (mem_id,))
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -919,7 +952,38 @@ async def test_db2_live_branch_upsert_head() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_branch_fetch_heads() -> None:
-    pytest.skip("live EAP exercise for Db2BranchRepository.fetch_memory_branch_heads (PR #6)")
+    """Exercise Db2BranchRepository.fetch_memory_branch_heads."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(
+                cur.execute,
+                "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, 'c', ?, ?)",
+                (mem_id, owner, ns),
+            )
+            await _call(cur.close)
+            await backend.memory_branches.upsert_memory_branch_head(
+                tx, memory_id=mem_id, branch="main", head_version_id="v1"
+            )
+            rows = await backend.memory_branches.fetch_memory_branch_heads(tx, [mem_id])
+            assert any(r.get("memory_id") == mem_id for r in rows)
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM memory_branches WHERE memory_id = ?", (mem_id,))
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -928,7 +992,44 @@ async def test_db2_live_branch_fetch_heads() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_branch_delete_for_memories() -> None:
-    pytest.skip("live EAP exercise for Db2BranchRepository.delete_memory_branches_for_memories (PR #6)")
+    """Exercise Db2BranchRepository.delete_memory_branches_for_memories (IN-list)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_ids = [f"m_{uuid.uuid4().hex[:8]}" for _ in range(2)]
+    try:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            for mid in mem_ids:
+                await _call(
+                    cur.execute,
+                    "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, 'c', ?, ?)",
+                    (mid, owner, ns),
+                )
+            await _call(cur.close)
+            for mid in mem_ids:
+                await backend.memory_branches.upsert_memory_branch_head(
+                    tx, memory_id=mid, branch="main", head_version_id="v1"
+                )
+            await backend.memory_branches.delete_memory_branches_for_memories(tx, mem_ids)
+            rows = await backend.memory_branches.fetch_memory_branch_heads(tx, mem_ids)
+            # After delete, no heads remain for these memories
+            for r in rows:
+                assert r.get("memory_id") not in mem_ids or r.get("deleted_at") is not None
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            for mid in mem_ids:
+                await _call(cur.execute, "DELETE FROM memory_branches WHERE memory_id = ?", (mid,))
+                await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mid,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -937,7 +1038,36 @@ async def test_db2_live_branch_delete_for_memories() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_branch_create() -> None:
-    pytest.skip("live EAP exercise for Db2BranchRepository.create_memory_branch (PR #6)")
+    """Exercise Db2BranchRepository.create_memory_branch."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    branch_name = f"b_{uuid.uuid4().hex[:6]}"
+    try:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(
+                cur.execute,
+                "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, 'c', ?, ?)",
+                (mem_id, owner, ns),
+            )
+            await _call(cur.close)
+            result = await backend.memory_branches.create_memory_branch(tx, mem_id, branch_name, None, None)
+            assert result is not None
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM memory_branches WHERE memory_id = ?", (mem_id,))
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 # --- PR #7: Db2CompressionRepository live stubs (5) ---
