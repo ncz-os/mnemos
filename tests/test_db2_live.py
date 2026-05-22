@@ -610,3 +610,48 @@ async def test_db2_live_memory_bump_recall() -> None:
 @pytest.mark.asyncio
 async def test_db2_live_memory_fetch_log() -> None:
     pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_memory_log (PR #8d)")
+
+
+# ── PR #8e: Db2MemoryRepository live stubs (7, commit-head / diff / checkout / allowlist / dedup / context) ──
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_head_checks() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_memory_head_checks (PR #8e)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_diff_commit_pair() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_diff_commit_pair (PR #8e)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_checkout_commit() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_checkout_commit (PR #8e)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_referenced_allowlist() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_referenced_memory_allowlist (PR #8e)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_find_duplicate_groups() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.find_duplicate_content_groups (PR #8e)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_consolidate_duplicates() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.consolidate_duplicate_memories (PR #8e)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_fetch_context() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_memory_context (PR #8e)")
