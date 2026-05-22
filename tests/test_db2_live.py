@@ -173,7 +173,7 @@ async def test_db2_webhook_dispatch_event_end_to_end() -> None:
     repo = Db2WebhookRepository()
     try:
         async with pool.acquire() as conn:
-            cursor = await conn.cursor()
+            cursor = conn.cursor()
             try:
                 await cursor.execute(
                     """
