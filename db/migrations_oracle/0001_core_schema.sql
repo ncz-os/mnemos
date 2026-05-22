@@ -248,6 +248,24 @@ CREATE TABLE IF NOT EXISTS webhook_subscriptions (
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_subs_owner ON webhook_subscriptions(owner_id, namespace);
 
+-- Idempotent column additions for webhook_subscriptions (RA-0b).
+DECLARE
+    v_count NUMBER;
+    PROCEDURE add_col(p_col VARCHAR2, p_ddl VARCHAR2) IS
+    BEGIN
+        SELECT COUNT(*) INTO v_count
+          FROM user_tab_columns
+         WHERE table_name = 'WEBHOOK_SUBSCRIPTIONS'
+           AND column_name = UPPER(p_col);
+        IF v_count = 0 THEN
+            EXECUTE IMMEDIATE 'ALTER TABLE webhook_subscriptions ADD (' || p_ddl || ')';
+        END IF;
+    END;
+BEGIN
+    add_col('description', 'description VARCHAR2(1000)');
+END;
+/
+
 -- memory_compression_candidates: per-engine compression-contest entries.
 CREATE TABLE IF NOT EXISTS memory_compression_candidates (
     id VARCHAR2(100) PRIMARY KEY,

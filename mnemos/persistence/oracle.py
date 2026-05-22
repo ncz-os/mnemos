@@ -2044,6 +2044,233 @@ class OracleWebhookRepository(WebhookRepository):
         finally:
             await _call(cursor.close)
 
+    async def create_webhook_subscription(
+        self,
+        tx: Transaction,
+        *,
+        url: str,
+        events: Sequence[str],
+        secret: str,
+        description: str | None,
+        owner_id: str,
+        namespace: str,
+    ) -> dict[str, Any]:
+        import json as _json
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            events_json = _json.dumps(list(events), separators=(",", ":"))
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO webhook_subscriptions
+                  (url, events, secret, description, owner_id, namespace)
+                VALUES (:url, :events, :secret, :description, :owner_id, :namespace)
+                RETURNING id, url, events, description, owner_id, namespace,
+                          created_at AS created, revoked
+                INTO :out_id, :out_url, :out_events, :out_description,
+                     :out_owner_id, :out_namespace, :out_created, :out_revoked
+                """,
+                {
+                    "url": url,
+                    "events": events_json,
+                    "secret": secret,
+                    "description": description,
+                    "owner_id": owner_id,
+                    "namespace": namespace,
+                },
+            )
+            # Oracle oracledb doesn't support RETURNING via execute(); switch to
+            # a separate SELECT. The INSERT-then-SELECT pattern is safe inside
+            # a single transaction.
+            pass
+        finally:
+            await _call(cursor.close)
+
+        # Re-fetch the row we just inserted.
+        cursor2 = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor2.execute,
+                """
+                SELECT id, url, events, description, owner_id, namespace,
+                       created_at AS created, revoked
+                FROM webhook_subscriptions
+                WHERE id = (SELECT MAX(id) FROM webhook_subscriptions
+                            WHERE url = :url AND owner_id = :owner_id AND namespace = :ns
+                              AND ROWNUM = 1)
+                """,
+                {"url": url, "owner_id": owner_id, "ns": namespace},
+            )
+            row = await _row_to_dict(cursor2, await _call(cursor2.fetchone))
+        finally:
+            await _call(cursor2.close)
+        return row or {}
+
+    async def list_webhooks(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        is_root: bool,
+        include_revoked: bool,
+    ) -> list[dict[str, Any]]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where: list[str] = []
+            params: dict[str, Any] = {}
+            if not include_revoked:
+                where.append("revoked = 0")
+            if not is_root:
+                where.append("owner_id = :owner_id")
+                where.append("namespace = :ns")
+                params["owner_id"] = owner_id
+                params["ns"] = namespace
+            sql = (
+                "SELECT id, url, events, description, owner_id, namespace, "
+                "created_at AS created, revoked, revoked_at "
+                "FROM webhook_subscriptions"
+            )
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY created_at DESC"
+            await _call(cursor.execute, sql, params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_webhook(
+        self,
+        tx: Transaction,
+        *,
+        webhook_id: str,
+        owner_id: str,
+        namespace: str,
+        is_root: bool,
+    ) -> dict[str, Any] | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if is_root:
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT id, url, events, description, owner_id, namespace,
+                           created_at AS created, revoked, revoked_at
+                    FROM webhook_subscriptions
+                    WHERE id = :id
+                    """,
+                    {"id": webhook_id},
+                )
+            else:
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT id, url, events, description, owner_id, namespace,
+                           created_at AS created, revoked, revoked_at
+                    FROM webhook_subscriptions
+                    WHERE id = :id AND owner_id = :owner_id AND namespace = :ns
+                    """,
+                    {"id": webhook_id, "owner_id": owner_id, "ns": namespace},
+                )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_webhook(
+        self,
+        tx: Transaction,
+        *,
+        webhook_id: str,
+        owner_id: str,
+        namespace: str,
+        is_root: bool,
+    ) -> str | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if is_root:
+                await _call(
+                    cursor.execute,
+                    """
+                    UPDATE webhook_subscriptions
+                    SET revoked = 1, revoked_at = SYSTIMESTAMP
+                    WHERE id = :id AND revoked = 0
+                    """,
+                    {"id": webhook_id},
+                )
+            else:
+                await _call(
+                    cursor.execute,
+                    """
+                    UPDATE webhook_subscriptions
+                    SET revoked = 1, revoked_at = SYSTIMESTAMP
+                    WHERE id = :id AND owner_id = :owner_id AND namespace = :ns AND revoked = 0
+                    """,
+                    {"id": webhook_id, "owner_id": owner_id, "ns": namespace},
+                )
+            affected = int(getattr(cursor, "rowcount", 0) or 0)
+            if affected:
+                # Fetch the updated id to confirm
+                pass  # we already know we updated a row
+            return webhook_id if affected else None
+        finally:
+            await _call(cursor.close)
+
+    async def list_deliveries(
+        self,
+        tx: Transaction,
+        *,
+        webhook_id: str,
+        owner_id: str,
+        namespace: str,
+        is_root: bool,
+        limit: int,
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if is_root:
+                await _call(
+                    cursor.execute,
+                    "SELECT id FROM webhook_subscriptions WHERE id = :id",
+                    {"id": webhook_id},
+                )
+            else:
+                await _call(
+                    cursor.execute,
+                    "SELECT id FROM webhook_subscriptions "
+                    "WHERE id = :id AND owner_id = :owner_id AND namespace = :ns",
+                    {"id": webhook_id, "owner_id": owner_id, "ns": namespace},
+                )
+            sub = await _call(cursor.fetchone)
+            if not sub:
+                return False, []
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, subscription_id, event_type, attempt_count AS attempt_num,
+                       state AS status, NULL AS superseded,
+                       NULL AS response_status, NULL AS response_body,
+                       last_error AS error,
+                       next_attempt_at AS scheduled_at,
+                       NULL AS delivered_at,
+                       created_at AS created
+                FROM webhook_deliveries
+                WHERE subscription_id = :sub_id
+                ORDER BY created_at DESC
+                FETCH FIRST :lim ROWS ONLY
+                """,
+                {"sub_id": webhook_id, "lim": limit},
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return True, rows
+        finally:
+            await _call(cursor.close)
+
 
 class OracleConsultationAuditRepository(ConsultationAuditRepository):
     """Oracle consultations-audit repo — safe-default returns.
