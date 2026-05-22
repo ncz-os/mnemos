@@ -1392,6 +1392,189 @@ class PostgresWebhookRepository(WebhookRepository):
             delivery_ids.append(delivery_id)
         return delivery_ids
 
+    async def create_webhook_subscription(
+        self,
+        tx: Transaction,
+        *,
+        url: str,
+        events: Sequence[str],
+        secret: str,
+        description: str | None,
+        owner_id: str,
+        namespace: str,
+    ) -> dict[str, Any]:
+        row = await _postgres_tx(tx).conn.fetchrow(
+            """
+            INSERT INTO webhook_subscriptions
+              (url, events, secret, description, owner_id, namespace)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, url, events, description, owner_id, namespace, created, revoked
+            """,
+            url,
+            list(events),
+            secret,
+            description,
+            owner_id,
+            namespace,
+        )
+        return dict(row)
+
+    async def list_webhooks(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        is_root: bool,
+        include_revoked: bool,
+    ) -> list[dict[str, Any]]:
+        conn = _postgres_tx(tx).conn
+        if is_root:
+            where = "" if include_revoked else "WHERE NOT revoked"
+            rows = await conn.fetch(
+                f"""
+                SELECT id, url, events, description, owner_id, namespace,
+                       created, revoked, revoked_at
+                FROM webhook_subscriptions
+                {where}
+                ORDER BY created DESC
+                """,
+            )
+        elif include_revoked:
+            rows = await conn.fetch(
+                """
+                SELECT id, url, events, description, owner_id, namespace,
+                       created, revoked, revoked_at
+                FROM webhook_subscriptions
+                WHERE owner_id = $1 AND namespace = $2
+                ORDER BY created DESC
+                """,
+                owner_id,
+                namespace,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT id, url, events, description, owner_id, namespace,
+                       created, revoked, revoked_at
+                FROM webhook_subscriptions
+                WHERE owner_id = $1 AND namespace = $2 AND NOT revoked
+                ORDER BY created DESC
+                """,
+                owner_id,
+                namespace,
+            )
+        return [dict(r) for r in rows]
+
+    async def get_webhook(
+        self,
+        tx: Transaction,
+        *,
+        webhook_id: str,
+        owner_id: str,
+        namespace: str,
+        is_root: bool,
+    ) -> dict[str, Any] | None:
+        conn = _postgres_tx(tx).conn
+        if is_root:
+            row = await conn.fetchrow(
+                """
+                SELECT id, url, events, description, owner_id, namespace,
+                       created, revoked, revoked_at
+                FROM webhook_subscriptions
+                WHERE id = $1::uuid
+                """,
+                webhook_id,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                SELECT id, url, events, description, owner_id, namespace,
+                       created, revoked, revoked_at
+                FROM webhook_subscriptions
+                WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3
+                """,
+                webhook_id,
+                owner_id,
+                namespace,
+            )
+        return dict(row) if row else None
+
+    async def revoke_webhook(
+        self,
+        tx: Transaction,
+        *,
+        webhook_id: str,
+        owner_id: str,
+        namespace: str,
+        is_root: bool,
+    ) -> str | None:
+        conn = _postgres_tx(tx).conn
+        if is_root:
+            row = await conn.fetchrow(
+                """
+                UPDATE webhook_subscriptions
+                SET revoked = TRUE, revoked_at = NOW()
+                WHERE id = $1::uuid AND NOT revoked
+                RETURNING id
+                """,
+                webhook_id,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                UPDATE webhook_subscriptions
+                SET revoked = TRUE, revoked_at = NOW()
+                WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3 AND NOT revoked
+                RETURNING id
+                """,
+                webhook_id,
+                owner_id,
+                namespace,
+            )
+        return str(row["id"]) if row else None
+
+    async def list_deliveries(
+        self,
+        tx: Transaction,
+        *,
+        webhook_id: str,
+        owner_id: str,
+        namespace: str,
+        is_root: bool,
+        limit: int,
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        conn = _postgres_tx(tx).conn
+        if is_root:
+            sub = await conn.fetchrow(
+                "SELECT id FROM webhook_subscriptions WHERE id = $1::uuid",
+                webhook_id,
+            )
+        else:
+            sub = await conn.fetchrow(
+                "SELECT id FROM webhook_subscriptions " "WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3",
+                webhook_id,
+                owner_id,
+                namespace,
+            )
+        if not sub:
+            return False, []
+        rows = await conn.fetch(
+            """
+            SELECT id, subscription_id, event_type, attempt_num, status,
+                   superseded,
+                   response_status, response_body, error,
+                   scheduled_at, delivered_at, created
+            FROM webhook_deliveries
+            WHERE subscription_id = $1::uuid
+            ORDER BY created DESC
+            LIMIT $2
+            """,
+            webhook_id,
+            limit,
+        )
+        return True, [dict(r) for r in rows]
+
     async def fetch_deliveries(self, tx: Transaction, subscription_id: str | None = None) -> list[Row]:
         if subscription_id is None:
             return await _postgres_tx(tx).conn.fetch("SELECT * FROM webhook_deliveries ORDER BY created ASC")
