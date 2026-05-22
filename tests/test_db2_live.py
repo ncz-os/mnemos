@@ -291,3 +291,53 @@ async def test_db2_live_fetch_available_models() -> None:
 @pytest.mark.asyncio
 async def test_db2_live_fetch_model_provider() -> None:
     pytest.skip("live EAP exercise for fetch_model_provider (PR #2)")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Db2StateRepository live stubs (PR #3)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_state_get() -> None:
+    pytest.skip("live EAP exercise for Db2StateRepository.get (PR #3)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_state_set() -> None:
+    pytest.skip("live EAP exercise for Db2StateRepository.set (PR #3)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_state_delete() -> None:
+    pytest.skip("live EAP exercise for Db2StateRepository.delete (PR #3)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_state_list_namespace() -> None:
+    pytest.skip("live EAP exercise for Db2StateRepository.list_namespace (PR #3)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_state_delete_namespace() -> None:
+    pytest.skip("live EAP exercise for Db2StateRepository.delete_namespace (PR #3)")

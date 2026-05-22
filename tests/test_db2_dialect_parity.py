@@ -185,3 +185,191 @@ async def test_db2_consultation_fetch_available_models_native() -> None:
 @pytest.mark.asyncio
 async def test_db2_consultation_fetch_model_provider_native() -> None:
     assert True
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Db2StateRepository parity tests (PR #3) — 5 method-specific tests
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_db2_state_get_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2StateRepository
+
+    calls: list[dict] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+            self._rows = []
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql, "params": params})
+            self.description = (("key",), ("value",), ("updated",))
+            self._rows = []
+
+        async def fetchall(self):
+            return self._rows
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2StateRepository()
+    await repo.get(tx, "k1", owner_id="o1", namespace="n1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "FROM STATE" in sql
+    assert "?" in sql
+    assert "CURRENT TIMESTAMP" not in sql  # not in get
+    assert "SYSTIMESTAMP" not in sql
+    assert ":OWNER_ID" not in sql
+    assert "DUAL" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_state_set_merge_native() -> None:
+    from mnemos.persistence.db2 import Db2StateRepository
+
+    calls: list[dict] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def __init__(self):
+            self.description = None
+            self._rows = []
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql, "params": params})
+            if "MERGE" in sql.upper():
+                self.description = None
+            else:
+                # for the get() after merge
+                self.description = (("key",),)
+                self._rows = [{"key": "k1", "value": "v1", "updated": "2026-..."}]
+
+        async def fetchall(self):
+            return self._rows
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2StateRepository()
+    await repo.set(tx, "k1", "v1", owner_id="o1", namespace="n1")
+    merge_call = [c for c in calls if "MERGE" in c["sql"].upper()][0]
+    sql_u = merge_call["sql"].upper()
+    assert "MERGE INTO STATE S" in sql_u
+    assert "WHEN MATCHED THEN UPDATE" in sql_u
+    assert "WHEN NOT MATCHED THEN INSERT" in sql_u
+    assert "SYSIBM.SYSDUMMY1" in sql_u
+    assert "CURRENT TIMESTAMP" in sql_u
+    assert "?" in merge_call["sql"]
+    assert "SYSTIMESTAMP" not in sql_u
+    assert "DUAL" not in sql_u
+    assert ":VALUE" not in sql_u
+
+
+@pytest.mark.asyncio
+async def test_db2_state_delete_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2StateRepository
+
+    calls: list[dict] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql, "params": params})
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2StateRepository()
+    await repo.delete(tx, "k1", owner_id="o1", namespace="n1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "SET DELETED_AT = CURRENT TIMESTAMP" in sql
+    assert "?" in sql
+    assert "SYSTIMESTAMP" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_state_list_namespace_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2StateRepository
+
+    calls: list[dict] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+            self._rows = []
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql, "params": params})
+            self._rows = []
+
+        async def fetchall(self):
+            return self._rows
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2StateRepository()
+    await repo.list_namespace(tx, owner_id="o1", namespace="n1", limit=10, offset=5)
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY" in sql
+    assert "TO_CHAR(UPDATED)" in sql
+    assert "SYSTIMESTAMP" not in sql
+    assert ":OFFSET" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_state_delete_namespace_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2StateRepository
+
+    calls: list[dict] = []
+
+    class _FakeCursor:
+        rowcount = 3
+
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql, "params": params})
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2StateRepository()
+    await repo.delete_namespace(tx, owner_id="o1", namespace="n1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "SET DELETED_AT = CURRENT TIMESTAMP" in sql
+    assert "SYSTIMESTAMP" not in sql
+    assert "?" in sql
