@@ -635,6 +635,18 @@ async def test_db2_live_version_insert() -> None:
     version_id = f"v_{uuid.uuid4().hex[:8]}"
     mem_id = f"m_{uuid.uuid4().hex[:8]}"
     try:
+        # Pre-insert parent memory row (FK from memory_versions.memory_id)
+        async with backend.transactional() as tx:
+            from mnemos.persistence.db2 import _conn_from_tx as _cft, _call as _cl
+
+            conn = _cft(tx)
+            cur = conn.cursor()
+            await _cl(
+                cur.execute,
+                "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, 'c', ?, ?)",
+                (mem_id, owner, namespace),
+            )
+            await _cl(cur.close)
         async with backend.transactional() as tx:
             await backend.memory_versions.insert_memory_version(
                 tx,
@@ -669,6 +681,7 @@ async def test_db2_live_version_insert() -> None:
             conn = _conn_from_tx(tx)
             cur = conn.cursor()
             await _call(cur.execute, "DELETE FROM memory_versions WHERE id = ?", (version_id,))
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
             await _call(cur.close)
         await backend.close()
 
@@ -690,6 +703,18 @@ async def test_db2_live_version_fetch_by_id() -> None:
     version_id = f"v_{uuid.uuid4().hex[:8]}"
     mem_id = f"m_{uuid.uuid4().hex[:8]}"
     try:
+        # Pre-insert parent memory row (FK from memory_versions.memory_id)
+        async with backend.transactional() as tx:
+            from mnemos.persistence.db2 import _conn_from_tx as _cft, _call as _cl
+
+            conn = _cft(tx)
+            cur = conn.cursor()
+            await _cl(
+                cur.execute,
+                "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, 'c', ?, ?)",
+                (mem_id, owner, namespace),
+            )
+            await _cl(cur.close)
         async with backend.transactional() as tx:
             await backend.memory_versions.insert_memory_version(
                 tx,
@@ -725,6 +750,7 @@ async def test_db2_live_version_fetch_by_id() -> None:
             conn = _conn_from_tx(tx)
             cur = conn.cursor()
             await _call(cur.execute, "DELETE FROM memory_versions WHERE id = ?", (version_id,))
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
             await _call(cur.close)
         await backend.close()
 
@@ -788,6 +814,7 @@ async def test_db2_live_version_fetch_for_export() -> None:
             cur = conn.cursor()
             for vid in vids:
                 await _call(cur.execute, "DELETE FROM memory_versions WHERE id = ?", (vid,))
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
             await _call(cur.close)
         await backend.close()
 
@@ -845,6 +872,7 @@ async def test_db2_live_version_fetch_by_ids() -> None:
             cur = conn.cursor()
             for vid in vids:
                 await _call(cur.execute, "DELETE FROM memory_versions WHERE id = ?", (vid,))
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
             await _call(cur.close)
         await backend.close()
 
