@@ -495,3 +495,157 @@ async def test_db2_kg_fetch_for_export_native_tokens() -> None:
     assert "?" in sql
     assert "SYSTIMESTAMP" not in sql
     assert ":MEMORY_ID" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_version_insert_memory_version_native(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql, "params": params})
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2VersionRepository
+
+    repo = Db2VersionRepository()
+    await repo.insert_memory_version(
+        tx,
+        version_id="v1",
+        memory_id="m1",
+        version_num=1,
+        content="c",
+        category=None,
+        subcategory=None,
+        metadata_json="{}",
+        verbatim_content=None,
+        owner_id="o1",
+        namespace=None,
+        permission_mode=None,
+        source_model=None,
+        source_provider=None,
+        source_session=None,
+        source_agent=None,
+        snapshot_at=None,
+        snapshot_by=None,
+        change_type=None,
+        commit_hash=None,
+        parent_version_id=None,
+        branch=None,
+        merge_parents=None,
+    )
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "?" in sql
+    assert "COALESCE" in sql
+    assert "CURRENT TIMESTAMP" in sql
+    assert "NVL" not in sql
+    assert "SYSTIMESTAMP" not in sql
+    assert "FROM DUAL" not in sql
+    assert "SYSIBM.SYSDUMMY1" in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_version_fetch_memory_version_by_id_native() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def fetchall(self):
+            return []
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2VersionRepository
+
+    repo = Db2VersionRepository()
+    await repo.fetch_memory_version_by_id(tx, "v1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "?" in sql
+    assert ":ID" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_version_fetch_memory_versions_for_export_native() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def fetchall(self):
+            return []
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2VersionRepository
+
+    repo = Db2VersionRepository()
+    await repo.fetch_memory_versions_for_export(
+        tx, memory_ids=["m1"], effective_owner=None, effective_ns=None, hard_limit=10
+    )
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "?" in sql
+    assert "FETCH FIRST" in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_version_fetch_memory_versions_by_ids_native() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def fetchall(self):
+            return []
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    from mnemos.persistence.db2 import Db2VersionRepository
+
+    repo = Db2VersionRepository()
+    await repo.fetch_memory_versions_by_ids(tx, ["v1", "v2"])
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "?" in sql
+    assert "IN (?, ?)" in sql or "IN (?,?)" in sql
