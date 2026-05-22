@@ -6,7 +6,7 @@ This document is kept intentionally narrow. It lists what the next release will 
 
 ---
 
-## Current status — v5.0.1 shipped on 2026-05-08
+## Current status — v6.0.0rc1 release candidate (legacy GA v5.0.1 shipped on 2026-05-08
 
 v5.0 closes the v3.6 + v4.x charters and rolls up the v4.2.0a14
 alpha line. Major new surfaces in this release:
