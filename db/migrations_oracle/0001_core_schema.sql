@@ -367,3 +367,21 @@ CREATE INDEX IF NOT EXISTS idx_memories_feed_cursor
     ON memories(federation_source, deleted_at, archived_at, updated, id);
 CREATE INDEX IF NOT EXISTS idx_memories_updated_cursor
     ON memories(deleted_at, updated, id);
+
+-- journal: per-owner, per-namespace journal entries (v1/journal route family).
+-- Mirrors the Postgres/SQLite schema with Oracle types.
+CREATE TABLE IF NOT EXISTS journal (
+    id VARCHAR2(100) PRIMARY KEY,
+    owner_id VARCHAR2(100) NOT NULL,
+    namespace VARCHAR2(100) NOT NULL,
+    entry_date DATE NOT NULL,
+    topic VARCHAR2(200) NOT NULL,
+    content CLOB,
+    metadata CLOB,
+    created TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+    deleted_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_journal_owner_ns ON journal(owner_id, namespace);
+CREATE INDEX IF NOT EXISTS idx_journal_entry_date ON journal(entry_date DESC);
+CREATE INDEX IF NOT EXISTS idx_journal_topic ON journal(topic);
+CREATE INDEX IF NOT EXISTS idx_journal_created ON journal(created DESC);

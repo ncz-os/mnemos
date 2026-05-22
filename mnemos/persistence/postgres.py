@@ -33,6 +33,7 @@ from mnemos.persistence.base import (
     CompressionStatsRow,
     ConsultationAuditRepository,
     FederationRepository,
+    JournalRepository,
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
@@ -2157,6 +2158,131 @@ class PostgresStateRepository(StateRepository):
         return _pg_result_count(result)
 
 
+class PostgresJournalRepository(JournalRepository):
+    """Postgres journal repo — ported from the v1/journal route SQL."""
+
+    async def create_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any,
+        topic: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        conn = _postgres_tx(tx).conn
+        if entry_date is not None:
+            row = await conn.fetchrow(
+                """INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                   RETURNING id, entry_date::text, topic, content, metadata, created::text""",
+                entry_id,
+                owner_id,
+                namespace,
+                entry_date,
+                topic,
+                content,
+                json.dumps(metadata or {}),
+            )
+        else:
+            row = await conn.fetchrow(
+                """INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                   VALUES ($1, $2, $3, CURRENT_DATE, $4, $5, $6::jsonb)
+                   RETURNING id, entry_date::text, topic, content, metadata, created::text""",
+                entry_id,
+                owner_id,
+                namespace,
+                topic,
+                content,
+                json.dumps(metadata or {}),
+            )
+        return dict(row)
+
+    async def list_journal_entries(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        topic: str | None = None,
+        entry_date: Any = None,
+        search: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        conn = _postgres_tx(tx).conn
+        select_cols = "id, entry_date::text, topic, content, metadata, created::text"
+        if entry_date is not None:
+            rows = await conn.fetch(
+                f"""SELECT {select_cols}
+                   FROM journal WHERE owner_id = $1 AND namespace = $2 AND entry_date = $3
+                     AND deleted_at IS NULL
+                   ORDER BY created DESC LIMIT $4""",
+                owner_id,
+                namespace,
+                entry_date,
+                limit,
+            )
+        elif topic is not None:
+            rows = await conn.fetch(
+                f"""SELECT {select_cols}
+                   FROM journal WHERE owner_id = $1 AND namespace = $2 AND topic = $3
+                     AND deleted_at IS NULL
+                   ORDER BY created DESC LIMIT $4""",
+                owner_id,
+                namespace,
+                topic,
+                limit,
+            )
+        elif search is not None:
+            pattern = f"%{search}%"
+            rows = await conn.fetch(
+                f"""SELECT {select_cols}
+                   FROM journal WHERE owner_id = $1 AND namespace = $2
+                     AND (content ILIKE $3 OR topic ILIKE $3)
+                     AND deleted_at IS NULL
+                   ORDER BY created DESC LIMIT $4""",
+                owner_id,
+                namespace,
+                pattern,
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                f"""SELECT {select_cols}
+                   FROM journal WHERE owner_id = $1 AND namespace = $2
+                     AND deleted_at IS NULL
+                   ORDER BY created DESC LIMIT $3""",
+                owner_id,
+                namespace,
+                limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def delete_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+    ) -> bool:
+        # Soft delete: the route currently uses HARD delete. The trait contract
+        # specifies soft-delete for consistency with other repos; route migration
+        # follow-up will adopt this behaviour.
+        result = await _postgres_tx(tx).conn.execute(
+            "UPDATE journal SET deleted_at = CURRENT_TIMESTAMP "
+            "WHERE id = $1 AND owner_id = $2 AND namespace = $3 "
+            "AND deleted_at IS NULL",
+            entry_id,
+            owner_id,
+            namespace,
+        )
+        return _pg_result_count(result) > 0
+
+
 class PostgresBackend(PersistenceBackend):
     """Postgres persistence facade backed by an asyncpg pool."""
 
@@ -2189,6 +2315,7 @@ class PostgresBackend(PersistenceBackend):
         self._consultations_audit = PostgresConsultationAuditRepository()
         self._federation = PostgresFederationRepository()
         self._state_kv = PostgresStateRepository()
+        self._journal = PostgresJournalRepository()
         self._closed = False
 
     @property
@@ -2246,6 +2373,10 @@ class PostgresBackend(PersistenceBackend):
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv
+
+    @property
+    def journal(self) -> JournalRepository:
+        return self._journal
 
     async def close(self) -> None:
         if self._closed:
