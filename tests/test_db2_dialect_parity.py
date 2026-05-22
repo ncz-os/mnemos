@@ -373,3 +373,125 @@ async def test_db2_state_delete_namespace_native_tokens() -> None:
     assert "SET DELETED_AT = CURRENT TIMESTAMP" in sql
     assert "SYSTIMESTAMP" not in sql
     assert "?" in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_kg_insert_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2KGRepository
+
+    calls: list[dict] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2KGRepository()
+    await repo.insert_kg_triple(
+        tx,
+        triple_id="t1",
+        subject="s",
+        predicate="p",
+        obj="o",
+        subject_type=None,
+        object_type=None,
+        valid_from=None,
+        valid_until=None,
+        memory_id=None,
+        confidence=None,
+        created=None,
+        owner_id="o1",
+        namespace=None,
+    )
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "COALESCE" in sql
+    assert "CURRENT TIMESTAMP" in sql
+    assert "CURRENT DATE" in sql
+    assert "DECFLOAT" in sql
+    assert "?" in sql
+    assert "SYSTIMESTAMP" not in sql
+    assert "NVL" not in sql
+    assert ":ID" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_kg_fetch_by_id_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2KGRepository
+
+    calls: list[dict] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def fetchall(self):
+            return []
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2KGRepository()
+    await repo.fetch_kg_triple_by_id(tx, "t1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "?" in sql
+    assert "SYSTIMESTAMP" not in sql
+    assert ":ID" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_kg_fetch_for_export_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2KGRepository
+
+    calls: list[dict] = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.description = None
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql})
+
+        async def fetchall(self):
+            return []
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2KGRepository()
+    await repo.fetch_kg_triples_for_export(
+        tx,
+        memory_ids=["m1"],
+        effective_owner="o1",
+        effective_ns=None,
+        include_unattached=False,
+        hard_limit=10,
+    )
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "?" in sql
+    assert "SYSTIMESTAMP" not in sql
+    assert ":MEMORY_ID" not in sql

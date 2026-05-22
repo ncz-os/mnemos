@@ -43,6 +43,7 @@ from mnemos.persistence.oracle import (
     _call,
     _conn_from_tx,
     _fetch_all_dicts,
+    _is_unique_violation,
     _render_visibility,
     _validate_and_format_vector,
 )
@@ -698,7 +699,145 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
 
 
 class Db2KGRepository(_Db2OraCompatMixin, OracleKGRepository):
-    """KG triples repository — Oracle SQL auto-translated by cursor layer."""
+    """KG triples repository — Db2-native overrides for insert + fetch.
+
+    All three methods emit explicit native Db2 SQL:
+    - ``?`` positional binds (no ``:name``)
+    - ``CURRENT TIMESTAMP`` / ``CURRENT DATE`` (no ``SYSTIMESTAMP`` / ``SYSDATE``)
+    - ``COALESCE`` (no ``NVL``)
+    - ``DECFLOAT`` for confidence floats (no ``NUMBER``)
+    """
+
+    async def insert_kg_triple(
+        self,
+        tx: Any,
+        *,
+        triple_id: str,
+        subject: str,
+        predicate: str,
+        obj: str,
+        subject_type: str | None,
+        object_type: str | None,
+        valid_from: Any,
+        valid_until: Any,
+        memory_id: str | None,
+        confidence: float | None,
+        created: Any,
+        owner_id: str,
+        namespace: str | None,
+    ) -> str:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        affected = 0
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO kg_triples (
+                    id, subject, predicate, object, subject_type, object_type,
+                    valid_from, valid_until, memory_id, confidence, created,
+                    owner_id, namespace
+                )
+                SELECT
+                    ?, ?, ?, ?, ?, ?,
+                    COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP),
+                    CAST(? AS TIMESTAMP),
+                    ?,
+                    COALESCE(CAST(? AS DECFLOAT), CAST(1.0 AS DECFLOAT)),
+                    COALESCE(CAST(? AS DATE), CURRENT DATE),
+                    ?, COALESCE(?, 'default')
+                FROM SYSIBM.SYSDUMMY1
+                WHERE NOT EXISTS (SELECT 1 FROM kg_triples WHERE id = ?)
+                """,
+                (
+                    triple_id,
+                    subject,
+                    predicate,
+                    obj,
+                    subject_type,
+                    object_type,
+                    valid_from,
+                    valid_until,
+                    memory_id,
+                    confidence,
+                    created,
+                    owner_id,
+                    namespace,
+                    triple_id,
+                ),
+            )
+            affected = int(getattr(cursor, "rowcount", 0) or 0)
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                return "INSERT 0 0"
+            raise
+        finally:
+            await _call(cursor.close)
+        return "INSERT 0 1" if affected else "INSERT 0 0"
+
+    async def fetch_kg_triple_by_id(self, tx: Any, triple_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, subject, predicate, object, subject_type, object_type,
+                       valid_from, valid_until, memory_id, confidence,
+                       owner_id, namespace, metadata,
+                       created, deleted_at
+                  FROM kg_triples
+                 WHERE id = ? AND deleted_at IS NULL
+                """,
+                (triple_id,),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_kg_triples_for_export(
+        self,
+        tx: Any,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        effective_ns: str | None,
+        include_unattached: bool,
+        hard_limit: int,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where: list[str] = ["deleted_at IS NULL"]
+            params: list[Any] = []
+            if memory_ids:
+                placeholders = ",".join("?" for _ in memory_ids)
+                if include_unattached:
+                    where.append(f"(memory_id IS NULL OR memory_id IN ({placeholders}))")
+                else:
+                    where.append(f"memory_id IN ({placeholders})")
+                params.extend(memory_ids)
+            elif include_unattached:
+                where.append("memory_id IS NULL")
+            else:
+                return []
+            if effective_owner:
+                where.append("owner_id = ?")
+                params.append(effective_owner)
+            if effective_ns:
+                where.append("namespace = ?")
+                params.append(effective_ns)
+            sql = (
+                "SELECT id, subject, predicate, object, subject_type, object_type, "
+                "valid_from, valid_until, memory_id, confidence, created, owner_id, "
+                "namespace FROM kg_triples WHERE " + " AND ".join(where) + " "
+                f"FETCH FIRST {int(hard_limit) + 1} ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
 
 class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
