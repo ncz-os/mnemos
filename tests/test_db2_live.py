@@ -448,3 +448,51 @@ async def test_db2_live_branch_delete_for_memories() -> None:
 @pytest.mark.asyncio
 async def test_db2_live_branch_create() -> None:
     pytest.skip("live EAP exercise for Db2BranchRepository.create_memory_branch (PR #6)")
+
+
+# --- PR #7: Db2CompressionRepository live stubs (5) ---
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_compression_candidate_exists() -> None:
+    pytest.skip("live EAP exercise for Db2CompressionRepository.compression_candidate_exists (PR #7)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_compression_insert_variant() -> None:
+    pytest.skip("live EAP exercise for Db2CompressionRepository.insert_compressed_variant (PR #7)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_compression_fetch_by_memory_id() -> None:
+    pytest.skip("live EAP exercise for Db2CompressionRepository.fetch_compressed_variant_by_memory_id (PR #7)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_compression_gather_stats() -> None:
+    pytest.skip("live EAP exercise for Db2CompressionRepository.gather_stats (PR #7)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_compression_fetch_variants_for_export() -> None:
+    pytest.skip("live EAP exercise for Db2CompressionRepository.fetch_compressed_variants_for_export (PR #7)")
