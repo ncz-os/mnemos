@@ -341,3 +341,33 @@ async def test_db2_live_state_list_namespace() -> None:
 @pytest.mark.asyncio
 async def test_db2_live_state_delete_namespace() -> None:
     pytest.skip("live EAP exercise for Db2StateRepository.delete_namespace (PR #3)")
+
+
+# ── PR #4 live stubs (skipped unless DB2_DSN) ────────────────────────────────
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_kg_insert() -> None:
+    pytest.skip("live EAP exercise for Db2KGRepository.insert_kg_triple (PR #4)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_kg_fetch_by_id() -> None:
+    pytest.skip("live EAP exercise for Db2KGRepository.fetch_kg_triple_by_id (PR #4)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_kg_fetch_for_export() -> None:
+    pytest.skip("live EAP exercise for Db2KGRepository.fetch_kg_triples_for_export (PR #4)")
