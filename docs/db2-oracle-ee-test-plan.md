@@ -14,7 +14,7 @@
 |---|---|---|---|---|
 | - | Baseline 13 ABC probes | [PROVEN] 13/13 | [PROVEN] 2/6 (gap = SQL overrides) | |
 | - | VECTOR datatype + VECTOR_DISTANCE COSINE | [PROVEN] | [PROVEN] | both |
-| 4 | HNSW VECTOR index | [PROVEN] 4.46x p50 speedup, 20K rows | [PENDING] (DiskANN — EAP 12.1.5+) | |
+| 4 | HNSW VECTOR index | [VALIDATED] | [PENDING] (DiskANN — EAP 12.1.5+) | |
 | 5 | JSON Relational Duality View | [PROVEN] 6/6 | [PENDING] (Db2 lacks Duality, has JSON_TABLE) | |
 | 6 | Property Graph SQL/PGQ | [PROVEN] 6/6 | [PENDING] (RDF Graph in Db2, different semantics) | |
 | 3 | TDE on USERS tablespace | [PROVEN] AES256 KV1 | [PENDING] (native encryption in Db2) | |
