@@ -1104,7 +1104,47 @@ async def test_db2_live_branch_create() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_compression_candidate_exists() -> None:
-    pytest.skip("live EAP exercise for Db2CompressionRepository.compression_candidate_exists (PR #7)")
+    """Exercise Db2CompressionRepository.compression_candidate_exists."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    cand_id = f"c_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(
+                cur.execute,
+                "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, 'c', ?, ?)",
+                (mem_id, owner, ns),
+            )
+            await _call(
+                cur.execute,
+                "INSERT INTO memory_compression_candidates (id, memory_id, owner_id, engine_id, is_winner) VALUES (?, ?, ?, ?, 0)",
+                (cand_id, mem_id, owner, "e1"),
+            )
+            await _call(cur.close)
+            exists = await backend.compression.compression_candidate_exists(
+                tx, candidate_id=cand_id, memory_id=mem_id, owner_id=owner
+            )
+            assert exists is True
+            miss = await backend.compression.compression_candidate_exists(
+                tx, candidate_id="nope_xxx", memory_id=mem_id, owner_id=owner
+            )
+            assert miss is False
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM memory_compression_candidates WHERE id = ?", (cand_id,))
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -1113,7 +1153,54 @@ async def test_db2_live_compression_candidate_exists() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_compression_insert_variant() -> None:
-    pytest.skip("live EAP exercise for Db2CompressionRepository.insert_compressed_variant (PR #7)")
+    """Exercise Db2CompressionRepository.insert_compressed_variant."""
+    from datetime import datetime, timezone
+
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(
+                cur.execute,
+                "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, 'c', ?, ?)",
+                (mem_id, owner, ns),
+            )
+            await _call(cur.close)
+            await backend.compression.insert_compressed_variant(
+                tx,
+                memory_id=mem_id,
+                owner_id=owner,
+                winner_candidate_id=None,
+                engine_id="e1",
+                engine_version="1.0",
+                compressed_content="x",
+                compressed_tokens=1,
+                compression_ratio=0.5,
+                quality_score=0.9,
+                composite_score=0.7,
+                scoring_profile="balanced",
+                judge_model=None,
+                selected_at=datetime.now(timezone.utc),
+            )
+            row = await backend.compression.fetch_compressed_variant_by_memory_id(tx, mem_id)
+            assert row is not None
+            assert row["engine_id"] == "e1"
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM memory_compressed_variants WHERE memory_id = ?", (mem_id,))
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -1122,7 +1209,55 @@ async def test_db2_live_compression_insert_variant() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_compression_fetch_by_memory_id() -> None:
-    pytest.skip("live EAP exercise for Db2CompressionRepository.fetch_compressed_variant_by_memory_id (PR #7)")
+    """Exercise Db2CompressionRepository.fetch_compressed_variant_by_memory_id."""
+    from datetime import datetime, timezone
+
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(
+                cur.execute,
+                "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, 'c', ?, ?)",
+                (mem_id, owner, ns),
+            )
+            await _call(cur.close)
+            await backend.compression.insert_compressed_variant(
+                tx,
+                memory_id=mem_id,
+                owner_id=owner,
+                winner_candidate_id=None,
+                engine_id="e2",
+                engine_version=None,
+                compressed_content="y",
+                compressed_tokens=None,
+                compression_ratio=None,
+                quality_score=None,
+                composite_score=None,
+                scoring_profile="balanced",
+                judge_model=None,
+                selected_at=datetime.now(timezone.utc),
+            )
+            row = await backend.compression.fetch_compressed_variant_by_memory_id(tx, mem_id)
+            assert row and row["memory_id"] == mem_id
+            miss = await backend.compression.fetch_compressed_variant_by_memory_id(tx, "nope_xxx")
+            assert miss is None
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM memory_compressed_variants WHERE memory_id = ?", (mem_id,))
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -1131,7 +1266,18 @@ async def test_db2_live_compression_fetch_by_memory_id() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_compression_gather_stats() -> None:
-    pytest.skip("live EAP exercise for Db2CompressionRepository.gather_stats (PR #7)")
+    """Exercise Db2CompressionRepository.gather_stats (aggregate COUNT/SUM)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    try:
+        async with backend.transactional() as tx:
+            stats = await backend.compression.gather_stats(tx)
+            assert stats is not None
+    finally:
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -1140,7 +1286,58 @@ async def test_db2_live_compression_gather_stats() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_compression_fetch_variants_for_export() -> None:
-    pytest.skip("live EAP exercise for Db2CompressionRepository.fetch_compressed_variants_for_export (PR #7)")
+    """Exercise Db2CompressionRepository.fetch_compressed_variants_for_export."""
+    from datetime import datetime, timezone
+
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(
+                cur.execute,
+                "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, 'c', ?, ?)",
+                (mem_id, owner, ns),
+            )
+            await _call(cur.close)
+            await backend.compression.insert_compressed_variant(
+                tx,
+                memory_id=mem_id,
+                owner_id=owner,
+                winner_candidate_id=None,
+                engine_id="e3",
+                engine_version=None,
+                compressed_content="z",
+                compressed_tokens=None,
+                compression_ratio=None,
+                quality_score=None,
+                composite_score=None,
+                scoring_profile="balanced",
+                judge_model=None,
+                selected_at=datetime.now(timezone.utc),
+            )
+            rows = await backend.compression.fetch_compressed_variants_for_export(
+                tx,
+                memory_ids=[mem_id],
+                effective_owner=owner,
+                hard_limit=10,
+            )
+            assert any(r.get("memory_id") == mem_id for r in rows)
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM memory_compressed_variants WHERE memory_id = ?", (mem_id,))
+            await _call(cur.execute, "DELETE FROM memories WHERE id = ?", (mem_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 # --- PR #8a: Db2MemoryRepository live stubs (3) ---
