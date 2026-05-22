@@ -793,6 +793,121 @@ class OracleVersionRepository(VersionRepository):
         finally:
             await _call(cursor.close)
 
+    async def list_versions(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        branch: str | None,
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> list[dict[str, Any]]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = ["memory_id = :mid", "deleted_at IS NULL"]
+            params: dict[str, Any] = {"mid": memory_id}
+            if branch is not None:
+                where.append("branch = :branch")
+                params["branch"] = branch
+            if not is_root:
+                where.append("owner_id = :owner_id")
+                params["owner_id"] = owner_id or ""
+                where.append("namespace = :ns")
+                params["ns"] = namespace or ""
+            sql = (
+                "SELECT id, memory_id, version_num, content, category, subcategory, "
+                "metadata, verbatim_content, owner_id, namespace, permission_mode, "
+                "source_model, source_provider, source_session, source_agent, "
+                "snapshot_at, snapshot_by, change_type, commit_hash, parent_version_id, "
+                "branch, merge_parents "
+                "FROM memory_versions WHERE " + " AND ".join(where) + " "
+                "ORDER BY version_num ASC"
+            )
+            await _call(cursor.execute, sql, params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_version(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        version_num: int,
+        branch: str | None,
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> dict[str, Any] | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = ["memory_id = :mid", "version_num = :vnum", "deleted_at IS NULL"]
+            params: dict[str, Any] = {"mid": memory_id, "vnum": version_num}
+            if branch is not None:
+                where.append("branch = :branch")
+                params["branch"] = branch
+            if not is_root:
+                where.append("owner_id = :owner_id")
+                params["owner_id"] = owner_id or ""
+                where.append("namespace = :ns")
+                params["ns"] = namespace or ""
+            sql = (
+                "SELECT id, memory_id, version_num, content, category, subcategory, "
+                "metadata, verbatim_content, owner_id, namespace, permission_mode, "
+                "source_model, source_provider, source_session, source_agent, "
+                "snapshot_at, snapshot_by, change_type, commit_hash, parent_version_id, "
+                "branch, merge_parents "
+                "FROM memory_versions WHERE " + " AND ".join(where)
+            )
+            await _call(cursor.execute, sql, params)
+            row = await _call(cursor.fetchone)
+            return await _row_to_dict(cursor, row)
+        finally:
+            await _call(cursor.close)
+
+    async def diff_versions(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        from_version: int,
+        to_version: int,
+        branch: str | None,
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            vnums = sorted({from_version, to_version})
+            where = [
+                "memory_id = :mid",
+                f"version_num IN ({','.join(f':v{i}' for i in range(len(vnums)))})",
+                "deleted_at IS NULL",
+            ]
+            params: dict[str, Any] = {"mid": memory_id}
+            for i, v in enumerate(vnums):
+                params[f"v{i}"] = v
+            if branch is not None:
+                where.append("branch = :branch")
+                params["branch"] = branch
+            if not is_root:
+                where.append("owner_id = :owner_id")
+                params["owner_id"] = owner_id or ""
+                where.append("namespace = :ns")
+                params["ns"] = namespace or ""
+            sql = "SELECT version_num, content FROM memory_versions WHERE " + " AND ".join(where)
+            await _call(cursor.execute, sql, params)
+            rows = await _fetch_all_dicts(cursor)
+            versions: dict[int, dict[str, Any]] = {r["version_num"]: r for r in rows}
+            return (versions.get(from_version), versions.get(to_version))
+        finally:
+            await _call(cursor.close)
+
 
 class OracleBranchRepository(BranchRepository):
     """Oracle memory_branches repo — supports upsert head, stubs others."""

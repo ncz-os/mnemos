@@ -1160,6 +1160,117 @@ class PostgresVersionRepository(VersionRepository):
     async def fetch_memory_version_by_id(self, tx: Transaction, version_id: str) -> Row | None:
         return await portability_repo.fetch_memory_version_by_id(_postgres_tx(tx).conn, version_id)
 
+    async def list_versions(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        branch: str | None,
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> list[dict[str, Any]]:
+        conn = _postgres_tx(tx).conn
+        cols = (
+            "id, memory_id, version_num, content, category, subcategory, metadata, "
+            "verbatim_content, owner_id, namespace, permission_mode, "
+            "source_model, source_provider, source_session, source_agent, "
+            "snapshot_at, snapshot_by, change_type, commit_hash, parent_version_id, "
+            "branch, merge_parents"
+        )
+        clauses = ["memory_id = $1", "deleted_at IS NULL"]
+        params: list[Any] = [memory_id]
+        idx = 2
+        if branch is not None:
+            clauses.append(f"branch = ${idx}")
+            params.append(branch)
+            idx += 1
+        if not is_root:
+            clauses.append(f"owner_id = ${idx}")
+            params.append(owner_id or "")
+            idx += 1
+            clauses.append(f"namespace = ${idx}")
+            params.append(namespace or "")
+            idx += 1
+        rows = await conn.fetch(
+            f"SELECT {cols} FROM memory_versions WHERE {' AND '.join(clauses)} ORDER BY version_num ASC",
+            *params,
+        )
+        return [dict(r) for r in rows]
+
+    async def get_version(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        version_num: int,
+        branch: str | None,
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> dict[str, Any] | None:
+        conn = _postgres_tx(tx).conn
+        cols = (
+            "id, memory_id, version_num, content, category, subcategory, metadata, "
+            "verbatim_content, owner_id, namespace, permission_mode, "
+            "source_model, source_provider, source_session, source_agent, "
+            "snapshot_at, snapshot_by, change_type, commit_hash, parent_version_id, "
+            "branch, merge_parents"
+        )
+        clauses = ["memory_id = $1", "version_num = $2", "deleted_at IS NULL"]
+        params: list[Any] = [memory_id, version_num]
+        idx = 3
+        if branch is not None:
+            clauses.append(f"branch = ${idx}")
+            params.append(branch)
+            idx += 1
+        if not is_root:
+            clauses.append(f"owner_id = ${idx}")
+            params.append(owner_id or "")
+            idx += 1
+            clauses.append(f"namespace = ${idx}")
+            params.append(namespace or "")
+            idx += 1
+        row = await conn.fetchrow(
+            f"SELECT {cols} FROM memory_versions WHERE {' AND '.join(clauses)}",
+            *params,
+        )
+        return dict(row) if row is not None else None
+
+    async def diff_versions(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        from_version: int,
+        to_version: int,
+        branch: str | None,
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        conn = _postgres_tx(tx).conn
+        clauses = ["memory_id = $1", "version_num = ANY($2::int[])", "deleted_at IS NULL"]
+        params: list[Any] = [memory_id, [from_version, to_version]]
+        idx = 3
+        if branch is not None:
+            clauses.append(f"branch = ${idx}")
+            params.append(branch)
+            idx += 1
+        if not is_root:
+            clauses.append(f"owner_id = ${idx}")
+            params.append(owner_id or "")
+            idx += 1
+            clauses.append(f"namespace = ${idx}")
+            params.append(namespace or "")
+            idx += 1
+        rows = await conn.fetch(
+            "SELECT version_num, content FROM memory_versions WHERE " + " AND ".join(clauses),
+            *params,
+        )
+        versions: dict[int, dict[str, Any]] = {r["version_num"]: dict(r) for r in rows}
+        return (versions.get(from_version), versions.get(to_version))
+
 
 class PostgresBranchRepository(BranchRepository):
     async def create_memory_branch(
