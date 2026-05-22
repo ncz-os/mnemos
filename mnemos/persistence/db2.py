@@ -714,7 +714,80 @@ class Db2CompressionRepository(_Db2OraCompatMixin, OracleCompressionRepository):
 
 
 class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
-    """Webhook dispatch repository — Oracle SQL auto-translated by cursor layer."""
+    """Webhook dispatch repository — Db2-native ``dispatch_event`` override.
+
+    All other methods inherit verbatim from
+    :class:`OracleWebhookRepository` and rely on the cursor-layer
+    Oracle→Db2 translation in :class:`_Db2AsyncCursor.execute`.
+    """
+
+    async def dispatch_event(
+        self,
+        tx: Any,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        owner_id: str | None = None,
+        namespace: str | None = None,
+    ) -> list[str]:
+        import json
+        import uuid as _uuid
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            sub_where = ["revoked = 0"]
+            sub_params: list[Any] = []
+            if owner_id is not None:
+                sub_where.append("owner_id = ?")
+                sub_params.append(owner_id)
+            if namespace is not None:
+                sub_where.append("namespace = ?")
+                sub_params.append(namespace)
+            # Subscription opts in to an event by listing it in the JSON
+            # array stored in ``events``. Db2-native LOCATE keeps this
+            # driver-side positional and matches Oracle's quoted-token
+            # behavior for compact or pretty-printed arrays.
+            sub_where.append("LOCATE(?, CAST(events AS VARCHAR(32672))) > 0")
+            sub_params.append(f'"{event_type}"')
+            sql_sub = (
+                "SELECT id, COALESCE(owner_id, 'default') AS owner_id, "
+                "COALESCE(namespace, 'default') AS namespace "
+                "FROM webhook_subscriptions WHERE " + " AND ".join(sub_where)
+            )
+            await _call(cursor.execute, sql_sub, tuple(sub_params))
+            subs = await _fetch_all_dicts(cursor)
+            if not subs:
+                return []
+
+            payload_json = json.dumps(payload, default=str, separators=(",", ":"))
+            delivery_ids: list[str] = []
+            for sub in subs:
+                d_id = _uuid.uuid4().hex
+                await _call(
+                    cursor.execute,
+                    """
+                    INSERT INTO webhook_deliveries (
+                        id, subscription_id, event_type, payload, owner_id,
+                        namespace, state, attempt_count, next_attempt_at
+                    ) VALUES (
+                        ?, ?, ?, ?, COALESCE(?, 'default'),
+                        COALESCE(?, 'default'), 'pending', 0, CURRENT TIMESTAMP
+                    )
+                    """,
+                    (
+                        d_id,
+                        sub["id"],
+                        event_type,
+                        payload_json,
+                        sub.get("owner_id"),
+                        sub.get("namespace"),
+                    ),
+                )
+                delivery_ids.append(d_id)
+            return delivery_ids
+        finally:
+            await _call(cursor.close)
 
 
 class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAuditRepository):
