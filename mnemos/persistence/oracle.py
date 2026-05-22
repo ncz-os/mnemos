@@ -616,6 +616,183 @@ class OracleKGRepository(KGRepository):
         finally:
             await _call(cursor.close)
 
+    async def list_kg_triples(
+        self,
+        tx: Transaction,
+        *,
+        filters: dict[str, Any],
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where: list[str] = ["k.deleted_at IS NULL"]
+            params: dict[str, Any] = {}
+            if not is_root:
+                where.append("k.owner_id = :owner_id")
+                params["owner_id"] = owner_id
+                where.append("k.namespace = :ns")
+                params["ns"] = namespace
+            if (subject := filters.get("subject")) is not None:
+                where.append("k.subject = :subject")
+                params["subject"] = subject
+            if (predicate := filters.get("predicate")) is not None:
+                where.append("k.predicate = :predicate")
+                params["predicate"] = predicate
+            if (obj := filters.get("object")) is not None:
+                where.append("k.object = :obj")
+                params["obj"] = obj
+            if (since := filters.get("since")) is not None:
+                where.append("k.created >= :since")
+                params["since"] = since
+            cols = (
+                "k.id, k.subject, k.predicate, k.object, k.subject_type, "
+                "k.object_type, k.valid_from, k.valid_until, k.memory_id, "
+                "k.confidence, k.owner_id, k.namespace, k.metadata, k.created, k.deleted_at"
+            )
+            count_sql = f"SELECT COUNT(*) FROM kg_triples k WHERE {' AND '.join(where)}"
+            select_sql = (
+                f"SELECT {cols} FROM kg_triples k WHERE {' AND '.join(where)} "
+                f"ORDER BY k.created DESC OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY"
+            )
+            params["limit"] = limit
+            params["offset"] = offset
+            await _call(cursor.execute, count_sql, {k: v for k, v in params.items() if k not in ("limit", "offset")})
+            count_row = await _call(cursor.fetchone)
+            total = count_row[0] if count_row else 0
+            await _call(cursor.execute, select_sql, params)
+            return total, await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_kg_timeline(
+        self,
+        tx: Transaction,
+        *,
+        subject: str,
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where: list[str] = ["subject = :subject", "deleted_at IS NULL"]
+            params: dict[str, Any] = {"subject": subject}
+            if not is_root:
+                where.append("owner_id = :owner_id")
+                params["owner_id"] = owner_id
+                where.append("namespace = :ns")
+                params["ns"] = namespace
+            sql = (
+                "SELECT id, subject, predicate, object, subject_type, object_type, "
+                "valid_from, valid_until, memory_id, confidence, owner_id, namespace, "
+                f"metadata, created, deleted_at FROM kg_triples WHERE {' AND '.join(where)} "
+                "ORDER BY valid_from ASC FETCH FIRST :limit ROWS ONLY"
+            )
+            params["limit"] = limit
+            await _call(cursor.execute, sql, params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def update_kg_triple(
+        self,
+        tx: Transaction,
+        *,
+        triple_id: str,
+        updates: dict[str, Any],
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> dict[str, Any] | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            _allowed = {"confidence", "metadata"}
+            valid_updates = {k: v for k, v in updates.items() if k in _allowed}
+            if not valid_updates:
+                return None
+            set_clauses = [f"{col} = :{col}" for col in valid_updates.keys()]
+            params: dict[str, Any] = {"id": triple_id, **valid_updates}
+            where_extra = ""
+            if not is_root:
+                where_extra = " AND owner_id = :owner_id AND namespace = :ns"
+                params["owner_id"] = owner_id
+                params["ns"] = namespace
+            await _call(
+                cursor.execute,
+                f"UPDATE kg_triples SET {', '.join(set_clauses)} WHERE id = :id AND deleted_at IS NULL{where_extra}",
+                params,
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return None
+            # Re-select to return the updated row (Oracle RETURNING INTO pattern)
+            await _call(
+                cursor.execute,
+                "SELECT id, subject, predicate, object, subject_type, object_type, "
+                "valid_from, valid_until, memory_id, confidence, owner_id, namespace, "
+                "metadata, created, deleted_at FROM kg_triples WHERE id = :id AND deleted_at IS NULL",
+                {"id": triple_id},
+            )
+            row = await _call(cursor.fetchone)
+            return await _row_to_dict(cursor, row)
+        finally:
+            await _call(cursor.close)
+
+    async def delete_kg_triple(
+        self,
+        tx: Transaction,
+        *,
+        triple_id: str,
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            params: dict[str, Any] = {"id": triple_id}
+            where_extra = ""
+            if not is_root:
+                where_extra = " AND owner_id = :owner_id AND namespace = :ns"
+                params["owner_id"] = owner_id
+                params["ns"] = namespace
+            await _call(
+                cursor.execute,
+                f"UPDATE kg_triples SET deleted_at = SYSTIMESTAMP WHERE id = :id AND deleted_at IS NULL{where_extra}",
+                params,
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def check_memory_ownership(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        owner_id: str,
+        namespace: str | None,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT 1 FROM memories WHERE id = :id AND owner_id = :owner_id AND namespace = :ns AND deleted_at IS NULL",
+                {"id": memory_id, "owner_id": owner_id, "ns": namespace},
+            )
+            row = await _call(cursor.fetchone)
+            return row is not None
+        finally:
+            await _call(cursor.close)
+
 
 class OracleVersionRepository(VersionRepository):
     """Oracle memory_versions repo — minimal coverage for insert + fetch-by-id."""

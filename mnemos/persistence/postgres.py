@@ -1082,6 +1082,150 @@ class PostgresKGRepository(KGRepository):
     async def fetch_kg_triple_by_id(self, tx: Transaction, triple_id: str) -> Row | None:
         return await portability_repo.fetch_kg_triple_by_id(_postgres_tx(tx).conn, triple_id)
 
+    async def list_kg_triples(
+        self,
+        tx: Transaction,
+        *,
+        filters: dict[str, Any],
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        conn = _postgres_tx(tx).conn
+        conditions: list[str] = ["k.deleted_at IS NULL"]
+        filter_params: list[Any] = []
+        idx = 1
+        if not is_root:
+            conditions.append(f"k.owner_id=${idx}")
+            filter_params.append(owner_id)
+            idx += 1
+            conditions.append(f"k.namespace=${idx}")
+            filter_params.append(namespace)
+            idx += 1
+        if (subject := filters.get("subject")) is not None:
+            conditions.append(f"k.subject=${idx}")
+            filter_params.append(subject)
+            idx += 1
+        if (predicate := filters.get("predicate")) is not None:
+            conditions.append(f"k.predicate=${idx}")
+            filter_params.append(predicate)
+            idx += 1
+        if (obj := filters.get("object")) is not None:
+            conditions.append(f"k.object=${idx}")
+            filter_params.append(obj)
+            idx += 1
+        if (since := filters.get("since")) is not None:
+            conditions.append(f"k.created >= ${idx}")
+            filter_params.append(since)
+            idx += 1
+        where = "WHERE " + " AND ".join(conditions)
+        cols = "k.id, k.subject, k.predicate, k.object, k.subject_type, k.object_type, k.valid_from, k.valid_until, k.memory_id, k.confidence, k.owner_id, k.namespace, k.metadata, k.created, k.deleted_at"
+        count_sql = f"SELECT COUNT(*) FROM kg_triples k {where}"
+        select_sql = f"SELECT {cols} FROM kg_triples k {where} ORDER BY k.created DESC LIMIT ${idx} OFFSET ${idx + 1}"
+        params = [*filter_params, limit, offset]
+        total = await conn.fetchval(count_sql, *filter_params)
+        rows = [dict(r) for r in await conn.fetch(select_sql, *params)]
+        return total, rows
+
+    async def get_kg_timeline(
+        self,
+        tx: Transaction,
+        *,
+        subject: str,
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        conn = _postgres_tx(tx).conn
+        conditions: list[str] = ["subject=$1", "deleted_at IS NULL"]
+        params: list[Any] = [subject]
+        idx = 2
+        if not is_root:
+            conditions.append(f"owner_id=${idx}")
+            params.append(owner_id)
+            idx += 1
+            conditions.append(f"namespace=${idx}")
+            params.append(namespace)
+            idx += 1
+        cols = "id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, owner_id, namespace, metadata, created, deleted_at"
+        rows = await conn.fetch(
+            f"SELECT {cols} FROM kg_triples WHERE {' AND '.join(conditions)} ORDER BY valid_from ASC LIMIT ${idx}",
+            *params,
+            limit,
+        )
+        return [dict(r) for r in rows]
+
+    async def update_kg_triple(
+        self,
+        tx: Transaction,
+        *,
+        triple_id: str,
+        updates: dict[str, Any],
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> dict[str, Any] | None:
+        conn = _postgres_tx(tx).conn
+        _allowed = {"confidence", "metadata"}
+        valid_updates = {k: v for k, v in updates.items() if k in _allowed}
+        if not valid_updates:
+            return None
+        set_clauses = [f"{col}=${i + 2}" for i, col in enumerate(valid_updates.keys())]
+        params: list[Any] = [triple_id, *valid_updates.values()]
+        idx = len(params) + 1
+        where_extra = ""
+        if not is_root:
+            where_extra = f" AND owner_id=${idx} AND namespace=${idx + 1}"
+            params.extend([owner_id, namespace])
+            idx += 2
+        cols = "id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, owner_id, namespace, metadata, created, deleted_at"
+        row = await conn.fetchrow(
+            f"UPDATE kg_triples SET {', '.join(set_clauses)} WHERE id=$1 AND deleted_at IS NULL{where_extra} RETURNING {cols}",
+            *params,
+        )
+        return dict(row) if row else None
+
+    async def delete_kg_triple(
+        self,
+        tx: Transaction,
+        *,
+        triple_id: str,
+        is_root: bool,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> bool:
+        conn = _postgres_tx(tx).conn
+        params: list[Any] = [triple_id]
+        where_extra = ""
+        if not is_root:
+            where_extra = " AND owner_id=$2 AND namespace=$3"
+            params.extend([owner_id, namespace])
+        result = await conn.execute(
+            f"UPDATE kg_triples SET deleted_at = NOW() WHERE id=$1 AND deleted_at IS NULL{where_extra}",
+            *params,
+        )
+        return _pg_result_count(result) > 0
+
+    async def check_memory_ownership(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        owner_id: str,
+        namespace: str | None,
+    ) -> bool:
+        conn = _postgres_tx(tx).conn
+        row = await conn.fetchrow(
+            "SELECT 1 FROM memories WHERE id=$1 AND owner_id=$2 AND namespace=$3 AND deleted_at IS NULL",
+            memory_id,
+            owner_id,
+            namespace,
+        )
+        return row is not None
+
 
 class PostgresVersionRepository(VersionRepository):
     async def fetch_memory_versions_for_export(
