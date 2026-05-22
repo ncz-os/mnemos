@@ -1505,35 +1505,151 @@ async def test_db2_live_memory_fetch_context() -> None:
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
+async def _create_test_peer(backend, name):
+    """Helper — create a peer via create_peer and return the row."""
+    async with backend.transactional() as tx:
+        row = await backend.federation.create_peer(
+            tx,
+            name=name,
+            base_url="http://test.example",
+            auth_token="t",
+            namespace_filter=None,
+            category_filter=None,
+            enabled=True,
+            sync_interval_secs=60,
+            compat_mode="oracle",
+        )
+    return row
+
+
+async def _delete_test_peer(backend, peer_id):
+    """Helper — hard delete peer row by id."""
+    from mnemos.persistence.db2 import _conn_from_tx, _call
+
+    async with backend.transactional() as tx:
+        conn = _conn_from_tx(tx)
+        cur = conn.cursor()
+        await _call(cur.execute, "DELETE FROM federation_peers WHERE id = ?", (peer_id,))
+        await _call(cur.close)
+
+
 async def test_db2_live_federation_list_peers() -> None:
-    pytest.skip("live EAP exercise for Db2FederationRepository.list_peers (PR #9a)")
+    """Exercise list_peers."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    name = f"peer_{uuid.uuid4().hex[:8]}"
+    row = await _create_test_peer(backend, name)
+    peer_id = row["id"]
+    try:
+        async with backend.transactional() as tx:
+            peers = await backend.federation.list_peers(tx)
+            assert any(p.get("id") == peer_id for p in peers)
+    finally:
+        await _delete_test_peer(backend, peer_id)
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_federation_get_peer() -> None:
-    pytest.skip("live EAP exercise for Db2FederationRepository.get_peer (PR #9a)")
+    """Exercise get_peer."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    name = f"peer_{uuid.uuid4().hex[:8]}"
+    row = await _create_test_peer(backend, name)
+    peer_id = row["id"]
+    try:
+        async with backend.transactional() as tx:
+            p = await backend.federation.get_peer(tx, peer_id)
+            assert p and p["id"] == peer_id
+            miss = await backend.federation.get_peer(tx, "nope_xxx")
+            assert miss is None
+    finally:
+        await _delete_test_peer(backend, peer_id)
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_federation_delete_peer() -> None:
-    pytest.skip("live EAP exercise for Db2FederationRepository.delete_peer (PR #9a)")
+    """Exercise delete_peer."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    name = f"peer_{uuid.uuid4().hex[:8]}"
+    row = await _create_test_peer(backend, name)
+    peer_id = row["id"]
+    try:
+        async with backend.transactional() as tx:
+            deleted = await backend.federation.delete_peer(tx, peer_id)
+            assert deleted is True
+            after = await backend.federation.get_peer(tx, peer_id)
+            assert after is None
+    finally:
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_federation_list_due_peers() -> None:
-    pytest.skip("live EAP exercise for Db2FederationRepository.list_due_peers (PR #9a)")
+    """Exercise list_due_peers (INTERVAL arithmetic)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    name = f"peer_{uuid.uuid4().hex[:8]}"
+    row = await _create_test_peer(backend, name)
+    peer_id = row["id"]
+    try:
+        async with backend.transactional() as tx:
+            due = await backend.federation.list_due_peers(tx, limit=10)
+            assert isinstance(due, list)
+    finally:
+        await _delete_test_peer(backend, peer_id)
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_federation_fetch_memory_page() -> None:
-    pytest.skip("live EAP exercise for Db2FederationRepository.fetch_memory_page (PR #9a)")
+    """Exercise fetch_memory_page."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    try:
+        async with backend.transactional() as tx:
+            rows = await backend.federation.fetch_memory_page(tx, limit=5)
+            assert isinstance(rows, list)
+    finally:
+        await backend.close()
 
 
 @pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
 @pytest.mark.asyncio
 async def test_db2_live_federation_create_peer() -> None:
-    pytest.skip("live EAP exercise for Db2FederationRepository.create_peer (PR #9a)")
+    """Exercise create_peer (canonical write path)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    name = f"peer_{uuid.uuid4().hex[:8]}"
+    row = await _create_test_peer(backend, name)
+    peer_id = row["id"]
+    try:
+        assert row["name"] == name
+        assert row["enabled"] in (True, 1)
+    finally:
+        await _delete_test_peer(backend, peer_id)
+        await backend.close()
