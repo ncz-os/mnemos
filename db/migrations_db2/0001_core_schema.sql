@@ -1,48 +1,59 @@
--- IBM Db2 12.1.x core MNEMOS schema bootstrap (ORA-compat mode).
+-- IBM Db2 12.1.x core MNEMOS schema bootstrap (NATIVE Db2 — no ORA-compat).
 -- migration_id: db2/0001_core_schema
 -- depends_on: (none)
 --
--- Requires: ENABLE_ORACLE_COMPATIBILITY=true on container OR
--- db2set DB2_COMPATIBILITY_VECTOR=ORA BEFORE db creation.
+-- This migration uses Db2-native types (VARCHAR, DECIMAL, BIGINT, TIMESTAMP).
+-- It does NOT require ENABLE_ORACLE_COMPATIBILITY=true. The Db2-native
+-- repository layer in mnemos/persistence/db2.py emits only Db2-native SQL
+-- (? positional binds, CURRENT TIMESTAMP, FROM SYSIBM.SYSDUMMY1, etc.) — see
+-- docs/native-db2-port-plan.md §1.
 --
--- Most statements port verbatim from db/migrations_oracle/0001_core_schema.sql
--- under Db2 Oracle Compatibility Mode. Notable differences:
---   * Db2 12.1.2+ ships VECTOR data type; dimension is required.
---     {{embedding_dim}} placeholder substituted by db2_apply_migration.py
---     (default 768 for nomic-embed-text, supports 384/1536/3072).
---   * TIMESTAMP WITH TIME ZONE → TIMESTAMP (Db2 ORA-compat gap)
---   * SYSTIMESTAMP → CURRENT TIMESTAMP, SYSDATE → CURRENT DATE
---   * Oracle ALTER TABLE ADD COLUMN chains inlined into one CREATE TABLE.
+-- Statement terminator: @ (Db2 CLP convention — scripts/db2_apply_migration.py
+-- splits on @ regardless of --#SET TERMINATOR directives).
+--
+-- Most statements ported from db/migrations_oracle/0001_core_schema.sql with
+-- Oracle-compat aliases replaced by Db2-native types:
+--   * Oracle CHAR-varying types → VARCHAR(N)
+--   * Oracle generic-numeric (counters) → BIGINT / INTEGER
+--   * Oracle fixed-precision numeric → SMALLINT / INTEGER
+--   * Oracle numeric (fractional / metrics) → DOUBLE
+--   * CLOB stays CLOB (Db2 native)
+--   * DATE DEFAULT CURRENT DATE stays (Db2 calendar-date, already native)
+--   * TIMESTAMP DEFAULT CURRENT TIMESTAMP stays (already native)
+--   * Db2 12.1.2+ ships VECTOR; dimension {{embedding_dim}} is template-substituted
+--     by scripts/db2_apply_migration.py (default 768 for nomic-embed-text).
+--   * CREATE VECTOR INDEX … WITH DISTANCE EUCLIDEAN (Db2 12.1.5 EAP DiskANN;
+--     tolerated as benign-skip on 12.1.4 / non-EAP builds).
 
 CREATE TABLE memories (
-    id VARCHAR2(100) NOT NULL PRIMARY KEY,
+    id VARCHAR(100) NOT NULL PRIMARY KEY,
     content CLOB,
-    category VARCHAR2(100),
-    subcategory VARCHAR2(100),
+    category VARCHAR(100),
+    subcategory VARCHAR(100),
     metadata CLOB,
     quality_rating DECIMAL(5,2) DEFAULT 50,
     compressed_content CLOB,
     verbatim_content CLOB,
-    owner_id VARCHAR2(100) DEFAULT 'default',
-    namespace VARCHAR2(100) DEFAULT 'default',
+    owner_id VARCHAR(100) DEFAULT 'default',
+    namespace VARCHAR(100) DEFAULT 'default',
     created_at DATE DEFAULT CURRENT DATE,
     updated_at DATE DEFAULT CURRENT DATE,
-    external_id VARCHAR2(200),
+    external_id VARCHAR(200),
     created TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL,
     updated TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL,
     permission_mode SMALLINT DEFAULT 600 NOT NULL,
-    source_model VARCHAR2(200),
-    source_provider VARCHAR2(100),
-    source_session VARCHAR2(200),
-    source_agent VARCHAR2(200),
-    group_id VARCHAR2(100),
+    source_model VARCHAR(200),
+    source_provider VARCHAR(100),
+    source_session VARCHAR(200),
+    source_agent VARCHAR(200),
+    group_id VARCHAR(100),
     archived_at TIMESTAMP,
     deleted_at TIMESTAMP,
-    federation_source VARCHAR2(200),
+    federation_source VARCHAR(200),
     federation_remote_updated TIMESTAMP,
-    recall_count NUMBER DEFAULT 0 NOT NULL,
+    recall_count BIGINT DEFAULT 0 NOT NULL,
     last_recalled_at TIMESTAMP,
-    content_hash VARCHAR2(64),
+    content_hash VARCHAR(64),
     embedding VECTOR({{embedding_dim}}, FLOAT32)
 )@
 
@@ -80,27 +91,27 @@ CREATE VECTOR INDEX idx_memories_emb_diskann
     ON memories(embedding) WITH DISTANCE EUCLIDEAN @
 
 CREATE TABLE memory_versions (
-    id VARCHAR2(100) NOT NULL PRIMARY KEY,
-    memory_id VARCHAR2(100) NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    version_num NUMBER,
+    id VARCHAR(100) NOT NULL PRIMARY KEY,
+    memory_id VARCHAR(100) NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    version_num INTEGER,
     content CLOB NOT NULL,
-    category VARCHAR2(100),
-    subcategory VARCHAR2(100),
+    category VARCHAR(100),
+    subcategory VARCHAR(100),
     metadata CLOB,
     verbatim_content CLOB,
-    owner_id VARCHAR2(100) DEFAULT 'default' NOT NULL,
-    namespace VARCHAR2(100) DEFAULT 'default' NOT NULL,
-    permission_mode NUMBER(4) DEFAULT 600,
-    source_model VARCHAR2(200),
-    source_provider VARCHAR2(100),
-    source_session VARCHAR2(200),
-    source_agent VARCHAR2(200),
+    owner_id VARCHAR(100) DEFAULT 'default' NOT NULL,
+    namespace VARCHAR(100) DEFAULT 'default' NOT NULL,
+    permission_mode SMALLINT DEFAULT 600,
+    source_model VARCHAR(200),
+    source_provider VARCHAR(100),
+    source_session VARCHAR(200),
+    source_agent VARCHAR(200),
     snapshot_at TIMESTAMP DEFAULT CURRENT TIMESTAMP,
-    snapshot_by VARCHAR2(100),
-    change_type VARCHAR2(40) DEFAULT 'create',
-    commit_hash VARCHAR2(128),
-    parent_version_id VARCHAR2(100),
-    branch VARCHAR2(100) DEFAULT 'main',
+    snapshot_by VARCHAR(100),
+    change_type VARCHAR(40) DEFAULT 'create',
+    commit_hash VARCHAR(128),
+    parent_version_id VARCHAR(100),
+    branch VARCHAR(100) DEFAULT 'main',
     merge_parents CLOB,
     deleted_at TIMESTAMP
 )@
@@ -109,61 +120,61 @@ CREATE INDEX idx_mv_memory_id ON memory_versions(memory_id)@
 CREATE INDEX idx_mv_branch_head ON memory_versions(memory_id, branch, version_num DESC)@
 
 CREATE TABLE kg_triples (
-    id VARCHAR2(100) NOT NULL PRIMARY KEY,
-    subject VARCHAR2(1000) NOT NULL,
-    predicate VARCHAR2(500) NOT NULL,
+    id VARCHAR(100) NOT NULL PRIMARY KEY,
+    subject VARCHAR(1000) NOT NULL,
+    predicate VARCHAR(500) NOT NULL,
     object CLOB NOT NULL,
-    subject_type VARCHAR2(100),
-    object_type VARCHAR2(100),
+    subject_type VARCHAR(100),
+    object_type VARCHAR(100),
     valid_from TIMESTAMP DEFAULT CURRENT TIMESTAMP,
     valid_until TIMESTAMP,
-    memory_id VARCHAR2(100),
-    confidence NUMBER DEFAULT 1.0 NOT NULL,
+    memory_id VARCHAR(100),
+    confidence DOUBLE DEFAULT 1.0 NOT NULL,
     metadata CLOB,
     created DATE DEFAULT CURRENT DATE NOT NULL,
-    owner_id VARCHAR2(100) DEFAULT 'default' NOT NULL,
-    namespace VARCHAR2(100) DEFAULT 'default' NOT NULL,
+    owner_id VARCHAR(100) DEFAULT 'default' NOT NULL,
+    namespace VARCHAR(100) DEFAULT 'default' NOT NULL,
     deleted_at TIMESTAMP
 )@
 
 CREATE TABLE memory_branches (
-    id VARCHAR2(100) NOT NULL PRIMARY KEY,
-    memory_id VARCHAR2(100) NOT NULL,
-    name VARCHAR2(100) NOT NULL,
-    head_version_id VARCHAR2(100),
+    id VARCHAR(100) NOT NULL PRIMARY KEY,
+    memory_id VARCHAR(100) NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    head_version_id VARCHAR(100),
     created_at TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL,
-    created_by VARCHAR2(100),
+    created_by VARCHAR(100),
     CONSTRAINT uq_memory_branches UNIQUE (memory_id, name)
 )@
 CREATE INDEX idx_memory_branches_memory ON memory_branches(memory_id)@
 
 CREATE TABLE state (
-    owner_id VARCHAR2(100) DEFAULT 'default' NOT NULL,
-    namespace VARCHAR2(100) DEFAULT 'default' NOT NULL,
-    key VARCHAR2(500) NOT NULL,
+    owner_id VARCHAR(100) DEFAULT 'default' NOT NULL,
+    namespace VARCHAR(100) DEFAULT 'default' NOT NULL,
+    key VARCHAR(500) NOT NULL,
     value CLOB,
     updated TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL,
-    version NUMBER DEFAULT 1 NOT NULL,
+    version INTEGER DEFAULT 1 NOT NULL,
     deleted_at TIMESTAMP,
     CONSTRAINT pk_state PRIMARY KEY (owner_id, namespace, key)
 )@
 
 CREATE TABLE federation_peers (
-    id VARCHAR2(100) NOT NULL PRIMARY KEY,
-    name VARCHAR2(100) UNIQUE NOT NULL,
-    base_url VARCHAR2(500) NOT NULL,
-    auth_token VARCHAR2(500) NOT NULL,
+    id VARCHAR(100) NOT NULL PRIMARY KEY,
+    name VARCHAR(100) UNIQUE NOT NULL,
+    base_url VARCHAR(500) NOT NULL,
+    auth_token VARCHAR(500) NOT NULL,
     namespace_filter CLOB,
     category_filter CLOB,
-    enabled NUMBER(1) DEFAULT 1 NOT NULL,
-    sync_interval_secs NUMBER DEFAULT 300 NOT NULL,
+    enabled SMALLINT DEFAULT 1 NOT NULL,
+    sync_interval_secs INTEGER DEFAULT 300 NOT NULL,
     last_sync_at TIMESTAMP,
     last_sync_cursor TIMESTAMP,
     last_error CLOB,
     last_error_at TIMESTAMP,
-    total_pulled NUMBER DEFAULT 0 NOT NULL,
-    compat_mode VARCHAR2(20) DEFAULT 'strict' NOT NULL,
-    peer_mnemos_version VARCHAR2(50),
+    total_pulled BIGINT DEFAULT 0 NOT NULL,
+    compat_mode VARCHAR(20) DEFAULT 'strict' NOT NULL,
+    peer_mnemos_version VARCHAR(50),
     last_schema_check_at TIMESTAMP,
     created TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL,
     updated TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL,
@@ -171,49 +182,49 @@ CREATE TABLE federation_peers (
 )@
 
 CREATE TABLE federation_sync_log (
-    id VARCHAR2(100) NOT NULL PRIMARY KEY,
-    peer_id VARCHAR2(100) NOT NULL,
+    id VARCHAR(100) NOT NULL PRIMARY KEY,
+    peer_id VARCHAR(100) NOT NULL,
     started_at TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL,
     finished_at TIMESTAMP,
-    memories_pulled NUMBER DEFAULT 0 NOT NULL,
-    memories_new NUMBER DEFAULT 0 NOT NULL,
-    memories_updated NUMBER DEFAULT 0 NOT NULL,
+    memories_pulled BIGINT DEFAULT 0 NOT NULL,
+    memories_new BIGINT DEFAULT 0 NOT NULL,
+    memories_updated BIGINT DEFAULT 0 NOT NULL,
     error CLOB,
     cursor_before TIMESTAMP,
     cursor_after TIMESTAMP
 )@
 
 CREATE TABLE federation_consolidation_tombstones (
-    peer_name VARCHAR2(100) NOT NULL,
-    remote_id VARCHAR2(100) NOT NULL,
-    local_id VARCHAR2(100) NOT NULL,
-    local_canonical_id VARCHAR2(100) NOT NULL,
-    canonical_remote_id VARCHAR2(100) NOT NULL,
+    peer_name VARCHAR(100) NOT NULL,
+    remote_id VARCHAR(100) NOT NULL,
+    local_id VARCHAR(100) NOT NULL,
+    local_canonical_id VARCHAR(100) NOT NULL,
+    canonical_remote_id VARCHAR(100) NOT NULL,
     consolidated_at TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL,
     CONSTRAINT pk_fed_tomb PRIMARY KEY (peer_name, remote_id)
 )@
 
 CREATE TABLE webhook_subscriptions (
-    id VARCHAR2(100) NOT NULL PRIMARY KEY,
-    url VARCHAR2(1000) NOT NULL,
+    id VARCHAR(100) NOT NULL PRIMARY KEY,
+    url VARCHAR(1000) NOT NULL,
     events CLOB DEFAULT '[]',
-    secret VARCHAR2(500),
-    owner_id VARCHAR2(100) DEFAULT 'default' NOT NULL,
-    namespace VARCHAR2(100) DEFAULT 'default' NOT NULL,
-    revoked NUMBER(1) DEFAULT 0 NOT NULL,
+    secret VARCHAR(500),
+    owner_id VARCHAR(100) DEFAULT 'default' NOT NULL,
+    namespace VARCHAR(100) DEFAULT 'default' NOT NULL,
+    revoked SMALLINT DEFAULT 0 NOT NULL,
     revoked_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL
 )@
 
 CREATE TABLE webhook_deliveries (
-    id VARCHAR2(100) NOT NULL PRIMARY KEY,
-    subscription_id VARCHAR2(100) NOT NULL,
-    event_type VARCHAR2(100) NOT NULL,
+    id VARCHAR(100) NOT NULL PRIMARY KEY,
+    subscription_id VARCHAR(100) NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
     payload CLOB,
-    owner_id VARCHAR2(100) DEFAULT 'default' NOT NULL,
-    namespace VARCHAR2(100) DEFAULT 'default' NOT NULL,
-    state VARCHAR2(40) DEFAULT 'pending' NOT NULL,
-    attempt_count NUMBER DEFAULT 0 NOT NULL,
+    owner_id VARCHAR(100) DEFAULT 'default' NOT NULL,
+    namespace VARCHAR(100) DEFAULT 'default' NOT NULL,
+    state VARCHAR(40) DEFAULT 'pending' NOT NULL,
+    attempt_count BIGINT DEFAULT 0 NOT NULL,
     next_attempt_at TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL,
     last_error CLOB,
     created_at TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL,
@@ -221,35 +232,35 @@ CREATE TABLE webhook_deliveries (
 )@
 
 CREATE TABLE memory_compression_candidates (
-    id VARCHAR2(100) NOT NULL PRIMARY KEY,
-    memory_id VARCHAR2(100) NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    owner_id VARCHAR2(100) DEFAULT 'default' NOT NULL,
-    contest_id VARCHAR2(100),
-    engine_id VARCHAR2(100) NOT NULL,
-    engine_version VARCHAR2(50),
+    id VARCHAR(100) NOT NULL PRIMARY KEY,
+    memory_id VARCHAR(100) NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    owner_id VARCHAR(100) DEFAULT 'default' NOT NULL,
+    contest_id VARCHAR(100),
+    engine_id VARCHAR(100) NOT NULL,
+    engine_version VARCHAR(50),
     candidate_content CLOB,
-    candidate_tokens NUMBER,
-    compression_ratio NUMBER,
-    quality_score NUMBER,
-    composite_score NUMBER,
-    is_winner NUMBER(1) DEFAULT 0 NOT NULL,
+    candidate_tokens INTEGER,
+    compression_ratio DOUBLE,
+    quality_score DOUBLE,
+    composite_score DOUBLE,
+    is_winner SMALLINT DEFAULT 0 NOT NULL,
     reject_reason CLOB,
     created_at TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL
 )@
 
 CREATE TABLE memory_compressed_variants (
-    memory_id VARCHAR2(100) NOT NULL PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
-    owner_id VARCHAR2(100) DEFAULT 'default' NOT NULL,
-    winner_candidate_id VARCHAR2(100) REFERENCES memory_compression_candidates(id) ON DELETE SET NULL,
-    engine_id VARCHAR2(100) NOT NULL,
-    engine_version VARCHAR2(50),
+    memory_id VARCHAR(100) NOT NULL PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+    owner_id VARCHAR(100) DEFAULT 'default' NOT NULL,
+    winner_candidate_id VARCHAR(100) REFERENCES memory_compression_candidates(id) ON DELETE SET NULL,
+    engine_id VARCHAR(100) NOT NULL,
+    engine_version VARCHAR(50),
     compressed_content CLOB,
-    compressed_tokens NUMBER,
-    compression_ratio NUMBER,
-    quality_score NUMBER,
-    composite_score NUMBER,
-    scoring_profile VARCHAR2(50) DEFAULT 'balanced' NOT NULL,
-    judge_model VARCHAR2(200),
+    compressed_tokens INTEGER,
+    compression_ratio DOUBLE,
+    quality_score DOUBLE,
+    composite_score DOUBLE,
+    scoring_profile VARCHAR(50) DEFAULT 'balanced' NOT NULL,
+    judge_model VARCHAR(200),
     selected_at TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL
 )@
 
@@ -262,41 +273,41 @@ CREATE TABLE memory_compressed_variants (
 -- ────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE users (
-    id VARCHAR2(100) NOT NULL PRIMARY KEY,
-    display_name VARCHAR2(200),
-    email VARCHAR2(200),
-    role VARCHAR2(50) DEFAULT 'user',
-    namespace VARCHAR2(100) DEFAULT 'default',
+    id VARCHAR(100) NOT NULL PRIMARY KEY,
+    display_name VARCHAR(200),
+    email VARCHAR(200),
+    role VARCHAR(50) DEFAULT 'user',
+    namespace VARCHAR(100) DEFAULT 'default',
     created_at DATE DEFAULT CURRENT DATE
 )@
 
 CREATE TABLE sessions (
-    id VARCHAR2(100) NOT NULL PRIMARY KEY,
-    user_id VARCHAR2(100),
+    id VARCHAR(100) NOT NULL PRIMARY KEY,
+    user_id VARCHAR(100),
     created_at DATE DEFAULT CURRENT DATE
 )@
 
 CREATE TABLE session_messages (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    session_id VARCHAR2(100),
-    role VARCHAR2(20),
+    session_id VARCHAR(100),
+    role VARCHAR(20),
     content CLOB,
     created_at DATE DEFAULT CURRENT DATE
 )@
 
 CREATE TABLE deletion_log (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    memory_id VARCHAR2(100),
+    memory_id VARCHAR(100),
     requested_at DATE DEFAULT CURRENT DATE,
     executed_at DATE,
-    status VARCHAR2(20)
+    status VARCHAR(20)
 )@
 
 CREATE TABLE compression_manifest (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    memory_id VARCHAR2(100),
-    tier NUMBER,
-    ratio NUMBER,
-    model VARCHAR2(100),
+    memory_id VARCHAR(100),
+    tier INTEGER,
+    ratio DOUBLE,
+    model VARCHAR(100),
     created_at DATE DEFAULT CURRENT DATE
 )@
