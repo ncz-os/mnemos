@@ -12,7 +12,10 @@ v3.1.2 tenancy contract (Tier 3):
   * update and delete verify the caller owns the target row before
     mutating; non-owners get 404 (not 403 — the row is invisible
     to them per the read contract).
+
+Migrated to backend-neutral persistence (v6.0-rc Oracle route migration RA-3).
 """
+
 import logging
 import uuid
 from datetime import datetime
@@ -20,9 +23,9 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+from mnemos.api.persistence_helpers import maybe_set_pg_rls as _maybe_set_pg_rls
+from mnemos.api.routes._postgres_only import _backend_or_503
 from mnemos.core.security import is_root
 from mnemos.domain.models import KGTriple, KGTripleCreate, KGTripleListResponse, KGTripleUpdate
 
@@ -32,23 +35,23 @@ router = APIRouter(prefix="/v1/kg", tags=["knowledge-graph"])
 
 def _row_to_triple(row) -> KGTriple:
     return KGTriple(
-        id=row['id'],
-        subject=row['subject'],
-        predicate=row['predicate'],
-        object=row['object'],
-        subject_type=row.get('subject_type'),
-        object_type=row.get('object_type'),
-        valid_from=row['valid_from'].isoformat() if row['valid_from'] else '',
-        valid_until=row['valid_until'].isoformat() if row.get('valid_until') else None,
-        memory_id=row.get('memory_id'),
-        confidence=row['confidence'],
-        created=row['created'].isoformat() if row['created'] else '',
+        id=row["id"],
+        subject=row["subject"],
+        predicate=row["predicate"],
+        object=row["object"],
+        subject_type=row.get("subject_type"),
+        object_type=row.get("object_type"),
+        valid_from=row["valid_from"].isoformat() if row["valid_from"] else "",
+        valid_until=row["valid_until"].isoformat() if row.get("valid_until") else None,
+        memory_id=row.get("memory_id"),
+        confidence=row["confidence"],
+        created=row["created"].isoformat() if row["created"] else "",
     )
 
 
 @router.post("/triples", response_model=KGTriple, status_code=201)
 async def create_triple(req: KGTripleCreate, user: UserContext = Depends(get_current_user)):
-    require_postgres_pool_or_503(route_label="POST /v1/kg/triples")
+    backend = _backend_or_503()
     triple_id = f"kg_{uuid.uuid4().hex[:12]}"
 
     valid_from = None
@@ -65,43 +68,43 @@ async def create_triple(req: KGTripleCreate, user: UserContext = Depends(get_cur
         except ValueError:
             raise HTTPException(status_code=422, detail="valid_until must be ISO8601")
 
-    async with _lc.get_pool_manager().transactional() as conn:
-        if req.memory_id:
-            # Cross-tenant memory_id references are rejected: a triple's
-            # memory_id must point at a memory the caller can see. We
-            # check BOTH owner_id and namespace so a caller can't attach
-            # triples across either tenancy boundary.
-            mem_row = await conn.fetchrow(
-                "SELECT owner_id, namespace FROM memories "
-                "WHERE id=$1 AND deleted_at IS NULL",
-                req.memory_id,
+    try:
+        async with backend.transactional() as tx:
+            await _maybe_set_pg_rls(tx, user)
+            if req.memory_id and not is_root(user):
+                # Cross-tenant memory_id references are rejected: a triple's
+                # memory_id must point at a memory the caller can see.
+                ok = await backend.kg_triples.check_memory_ownership(
+                    tx,
+                    memory_id=req.memory_id,
+                    owner_id=user.user_id,
+                    namespace=user.namespace,
+                )
+                if not ok:
+                    raise HTTPException(status_code=404, detail=f"memory_id {req.memory_id} not found")
+            await backend.kg_triples.insert_kg_triple(
+                tx,
+                triple_id=triple_id,
+                subject=req.subject,
+                predicate=req.predicate,
+                obj=req.object,
+                subject_type=req.subject_type,
+                object_type=req.object_type,
+                valid_from=valid_from,
+                valid_until=valid_until,
+                memory_id=req.memory_id,
+                confidence=req.confidence,
+                created=None,
+                owner_id=user.user_id,
+                namespace=user.namespace,
             )
-            if mem_row is None:
-                raise HTTPException(status_code=404, detail=f"memory_id {req.memory_id} not found")
-            if not is_root(user) and (
-                mem_row["owner_id"] != user.user_id
-                or mem_row["namespace"] != user.namespace
-            ):
-                raise HTTPException(status_code=404, detail=f"memory_id {req.memory_id} not found")
-
-        await conn.execute(
-            "INSERT INTO kg_triples "
-            "(id, subject, predicate, object, subject_type, object_type, "
-            " valid_from, valid_until, memory_id, confidence, owner_id, namespace) "
-            "VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()), $8, $9, $10, $11, $12)",
-            triple_id, req.subject, req.predicate, req.object,
-            req.subject_type, req.object_type,
-            valid_from, valid_until, req.memory_id, req.confidence,
-            user.user_id, user.namespace,
-        )
-        row = await conn.fetchrow(
-            "SELECT id, subject, predicate, object, subject_type, object_type, "
-            "valid_from, valid_until, memory_id, confidence, created "
-            "FROM kg_triples WHERE id=$1 AND deleted_at IS NULL",
-            triple_id,
-        )
-
-    return _row_to_triple(row)
+            row = await backend.kg_triples.fetch_kg_triple_by_id(tx, triple_id)
+        return _row_to_triple(row)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to create KG triple")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/triples", response_model=KGTripleListResponse)
@@ -115,71 +118,68 @@ async def list_triples(
     offset: int = Query(0, ge=0),
     user: UserContext = Depends(get_current_user),
 ):
-    require_postgres_pool_or_503(route_label="GET /v1/kg/triples")
-
-    conditions = ["deleted_at IS NULL"]
-    filter_params = []
-    idx = 1
-
-    # Tenancy filter: non-root callers are scoped to both their
-    # owner_id AND their namespace — the same two-dimensional gate as
-    # the memories handlers now apply.
-    if not is_root(user):
-        conditions.append(f"owner_id=${idx}")
-        filter_params.append(user.user_id)
-        idx += 1
-        conditions.append(f"namespace=${idx}")
-        filter_params.append(user.namespace)
-        idx += 1
-
-    for col, val in [
-        ("subject", subject), ("predicate", predicate), ("object", object),
-        ("subject_type", subject_type), ("object_type", object_type),
-    ]:
-        if val is not None:
-            conditions.append(f"{col}=${idx}")
-            filter_params.append(val)
-            idx += 1
-
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-
-    async with _lc.get_pool_manager().acquire() as conn:
-        rows = await conn.fetch(
-            f"SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples {where} ORDER BY created DESC "
-            f"LIMIT ${idx} OFFSET ${idx + 1}",
-            *filter_params, limit, offset,
-        )
-        total = await conn.fetchval(
-            f"SELECT COUNT(*) FROM kg_triples {where}",
-            *filter_params,
-        )
-
-    return KGTripleListResponse(count=total, triples=[_row_to_triple(r) for r in rows])
+    backend = _backend_or_503()
+    filters: dict = {}
+    if subject is not None:
+        filters["subject"] = subject
+    if predicate is not None:
+        filters["predicate"] = predicate
+    if object is not None:
+        filters["object"] = object
+    if subject_type is not None:
+        filters["subject_type"] = subject_type
+    if object_type is not None:
+        filters["object_type"] = object_type
+    try:
+        async with backend.transactional() as tx:
+            await _maybe_set_pg_rls(tx, user)
+            total, rows = await backend.kg_triples.list_kg_triples(
+                tx,
+                filters=filters,
+                is_root=is_root(user),
+                owner_id=user.user_id,
+                namespace=user.namespace,
+                limit=limit,
+                offset=offset,
+            )
+        return KGTripleListResponse(count=total, triples=[_row_to_triple(r) for r in rows])
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to list KG triples")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/timeline/{subject}", response_model=KGTripleListResponse)
-async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000), user: UserContext = Depends(get_current_user)):
+async def get_timeline(
+    subject: str, limit: int = Query(100, ge=1, le=1000), user: UserContext = Depends(get_current_user)
+):
     """Get all triples for a subject ordered by valid_from (chronological history)."""
-    require_postgres_pool_or_503(route_label="GET /v1/kg/timeline/{subject}")
-    async with _lc.get_pool_manager().acquire() as conn:
-        if is_root(user):
-            rows = await conn.fetch(
-                "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 AND deleted_at IS NULL ORDER BY valid_from ASC LIMIT $2",
-                subject, limit,
+    backend = _backend_or_503()
+    try:
+        async with backend.transactional() as tx:
+            await _maybe_set_pg_rls(tx, user)
+            rows = await backend.kg_triples.get_kg_timeline(
+                tx,
+                subject=subject,
+                is_root=is_root(user),
+                owner_id=user.user_id,
+                namespace=user.namespace,
+                limit=limit,
             )
-        else:
-            rows = await conn.fetch(
-                "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 AND deleted_at IS NULL AND owner_id=$2 AND namespace=$3 ORDER BY valid_from ASC LIMIT $4",
-                subject, user.user_id, user.namespace, limit,
-            )
-    return KGTripleListResponse(count=len(rows), triples=[_row_to_triple(r) for r in rows])
+        return KGTripleListResponse(count=len(rows), triples=[_row_to_triple(r) for r in rows])
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to get KG timeline")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.patch("/triples/{triple_id}", response_model=KGTriple)
 async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext = Depends(get_current_user)):
     """Partially update a KG triple. Non-owners see 404 to avoid
     leaking existence of triples they don't own."""
-    require_postgres_pool_or_503(route_label="PATCH /v1/kg/triples/{triple_id}")
+    backend = _backend_or_503()
     updates: dict = {}
     for field in ("subject", "predicate", "object", "subject_type", "object_type", "confidence"):
         val = getattr(req, field)
@@ -192,52 +192,44 @@ async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext =
             raise HTTPException(status_code=422, detail="valid_until must be ISO8601")
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update")
-    set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
-    async with _lc.get_pool_manager().transactional() as conn:
-        row = await conn.fetchrow(
-            "SELECT owner_id, namespace FROM kg_triples "
-            "WHERE id=$1 AND deleted_at IS NULL",
-            triple_id,
-        )
+    try:
+        async with backend.transactional() as tx:
+            await _maybe_set_pg_rls(tx, user)
+            row = await backend.kg_triples.update_kg_triple(
+                tx,
+                triple_id=triple_id,
+                updates=updates,
+                is_root=is_root(user),
+                owner_id=user.user_id,
+                namespace=user.namespace,
+            )
         if row is None:
             raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
-        if not is_root(user) and (
-            row["owner_id"] != user.user_id
-            or row["namespace"] != user.namespace
-        ):
-            # Non-owner: 404 (same response as missing — don't leak existence).
-            raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
-        await conn.execute(
-            f"UPDATE kg_triples SET {', '.join(set_clauses)} "
-            "WHERE id=$1 AND deleted_at IS NULL",
-            triple_id, *list(updates.values()),
-        )
-        row = await conn.fetchrow(
-            "SELECT id, subject, predicate, object, subject_type, object_type, "
-            "valid_from, valid_until, memory_id, confidence, created "
-            "FROM kg_triples WHERE id=$1 AND deleted_at IS NULL",
-            triple_id,
-        )
-    return _row_to_triple(row)
+        return _row_to_triple(row)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to update KG triple")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete("/triples/{triple_id}", status_code=204)
 async def delete_triple(triple_id: str, user: UserContext = Depends(get_current_user)):
-    require_postgres_pool_or_503(route_label="DELETE /v1/kg/triples/{triple_id}")
-    async with _lc.get_pool_manager().transactional() as conn:
-        row = await conn.fetchrow(
-            "SELECT owner_id, namespace FROM kg_triples "
-            "WHERE id=$1 AND deleted_at IS NULL",
-            triple_id,
-        )
-        if row is None:
+    backend = _backend_or_503()
+    try:
+        async with backend.transactional() as tx:
+            await _maybe_set_pg_rls(tx, user)
+            deleted = await backend.kg_triples.delete_kg_triple(
+                tx,
+                triple_id=triple_id,
+                is_root=is_root(user),
+                owner_id=user.user_id,
+                namespace=user.namespace,
+            )
+        if not deleted:
             raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
-        if not is_root(user) and (
-            row["owner_id"] != user.user_id
-            or row["namespace"] != user.namespace
-        ):
-            raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
-        await conn.execute(
-            "DELETE FROM kg_triples WHERE id=$1 AND deleted_at IS NULL",
-            triple_id,
-        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to delete KG triple")
+        raise HTTPException(status_code=500, detail="Internal server error")
