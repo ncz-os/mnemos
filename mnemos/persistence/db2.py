@@ -423,6 +423,113 @@ class _Db2AsyncConnectionPool:
                 await self._idle.pop().close()
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Native-cursor pass-through (no Oracle → Db2 translation)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class _Db2NativeAsyncCursor:
+    """Async wrapper over ``ibm_db_dbi`` cursor — NO Oracle token translation.
+
+    This cursor passes SQL and params through to the sync cursor verbatim.
+    Use when every repository method emits Db2-native SQL (``?`` positional
+    binds, ``CURRENT TIMESTAMP``, ``FROM SYSIBM.SYSDUMMY1``, etc.).
+
+    Defensive guard: if the incoming SQL contains Oracle-style ``:name``
+    named binds, a ``RuntimeError`` is raised to fail fast rather than
+    silently mangling the query.
+    """
+
+    def __init__(self, sync_cursor: Any):
+        self._cur = sync_cursor
+        self.description = None
+        self.rowcount = -1
+
+    async def execute(self, sql: str, params: tuple | None = None) -> None:
+        if _BIND_RE.search(sql):
+            raise RuntimeError(
+                "native cursor received Oracle :name bind — "
+                "the native path expects ? positional binds only. "
+                "Switch back to Db2Backend (compat) or rewrite the "
+                "caller to emit Db2-native ? binds."
+            )
+
+        def _go():
+            if params:
+                self._cur.execute(sql, params)
+            else:
+                self._cur.execute(sql)
+            self.description = self._cur.description
+            self.rowcount = self._cur.rowcount
+
+        await asyncio.to_thread(_go)
+
+    async def fetchone(self) -> tuple | None:
+        return await asyncio.to_thread(self._cur.fetchone)
+
+    async def fetchall(self) -> list[tuple]:
+        return await asyncio.to_thread(self._cur.fetchall)
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._cur.close)
+
+
+class _Db2NativeAsyncConnection(_Db2AsyncConnection):
+    """Async connection wrapper that produces ``_Db2NativeAsyncCursor``
+    cursors instead of the translation-layer ``_Db2AsyncCursor``.
+    """
+
+    def cursor(self) -> _Db2NativeAsyncCursor:
+        return _Db2NativeAsyncCursor(self._conn.cursor())
+
+
+class _Db2NativeAsyncConnectionPool(_Db2AsyncConnectionPool):
+    """Pool that opens ``_Db2NativeAsyncConnection`` wrappers.
+
+    Shares all acquisition/warmup/timeout logic with
+    :class:`_Db2AsyncConnectionPool`; only the connection wrapper
+    class differs so the pool always yields native cursors.
+    """
+
+    async def _open(self) -> _Db2NativeAsyncConnection:
+        import ibm_db_dbi  # type: ignore
+
+        for k, v in self._dsn_kwargs.items():
+            if not isinstance(v, str):
+                continue
+            if ";" in v or "=" in v and k != "PORT":
+                raise ValueError(
+                    f"DSN attribute {k} contains forbidden char (; or =); " "would allow CLI attribute injection."
+                )
+        dsn_string = ";".join(f"{k}={v}" for k, v in self._dsn_kwargs.items()) + ";"
+        raw = await asyncio.to_thread(ibm_db_dbi.connect, dsn_string, "", "")
+        return _Db2NativeAsyncConnection(raw)
+
+
+async def create_db2_native_pool(
+    dsn: str,
+    *,
+    min_size: int = 1,
+    max_size: int = 8,
+    acquire_timeout: float = 30.0,
+) -> _Db2NativeAsyncConnectionPool:
+    """Create a DB2 native-cursor async pool from a DSN.
+
+    Mirrors :func:`create_db2_pool` but produces
+    :class:`_Db2NativeAsyncConnectionPool` so every acquired connection
+    yields :class:`_Db2NativeAsyncCursor` (no Oracle→Db2 translation).
+    """
+    kwargs = _parse_db2_dsn(dsn)
+    pool = _Db2NativeAsyncConnectionPool(
+        kwargs,
+        min_size=min_size,
+        max_size=max_size,
+        acquire_timeout=acquire_timeout,
+    )
+    await pool.warmup()
+    return pool
+
+
 # Forbidden chars per O10 — used by _parse_db2_dsn validation.
 _DSN_FORBIDDEN_CHARS = (";", "=")
 
@@ -3431,8 +3538,37 @@ class Db2Backend(OracleBackend):
         return (self._db2_vector_indexing_value or "").upper() == "YES"
 
 
+class Db2BackendNative(Db2Backend):
+    """Db2 backend with native-cursor pass-through (no Oracle→Db2 token translation).
+
+    Suitable for deployments where every repository method emits Db2-native
+    SQL natively (i.e. uses ``?`` positional binds, ``CURRENT TIMESTAMP``,
+    ``FROM SYSIBM.SYSDUMMY1``, etc.). MNEMOS as of PR #9c has every
+    persistence repository natively overridden, so this is the production
+    posture going forward.
+
+    Operators on older versions OR ones who have customized repositories
+    with Oracle-shape SQL should stay on :class:`Db2Backend` (the compat
+    default). Toggle via env var ``MNEMOS_DB2_DIALECT={native|compat}``.
+    """
+
+    supports_listen_notify = False
+    supports_advisory_locks = False
+    supports_row_level_security = False
+    supports_pgvector = False
+    supports_db2_vector = True
+
+    def __init__(self, pool: Any, settings: Any):
+        # Accept a pre-built _Db2NativeAsyncConnectionPool (built by
+        # create_db2_native_pool). Everything else — repo wiring,
+        # settings, _closed, vector-indexing probe — inherits from
+        # Db2Backend unchanged.
+        super().__init__(pool, settings)
+
+
 __all__ = [
     "Db2Backend",
+    "Db2BackendNative",
     "Db2BranchRepository",
     "Db2CompressionRepository",
     "Db2ConsultationAuditRepository",
@@ -3443,4 +3579,5 @@ __all__ = [
     "Db2VersionRepository",
     "Db2WebhookRepository",
     "create_db2_pool",
+    "create_db2_native_pool",
 ]
