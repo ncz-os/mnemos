@@ -903,13 +903,179 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
 
 
 class Db2StateRepository(_Db2OraCompatMixin, OracleStateRepository):
-    """Key/value state repository — Oracle SQL auto-translated by cursor layer.
+    """Key/value state repository — Db2-native overrides (first MERGE INTO on branch).
 
-    Db2 12.1.x MERGE syntax is fully compatible with the Oracle form
-    used in ``OracleStateRepository.set`` — SYSTIMESTAMP → CURRENT
-    TIMESTAMP is handled by the cursor layer, so no manual override
-    is needed for the 12.1.4/12.1.5 column set.
+    All five methods emit explicit native Db2 SQL:
+    - ``?`` positional binds (no ``:name``)
+    - ``CURRENT TIMESTAMP`` (no ``SYSTIMESTAMP``)
+    - ``SYSIBM.SYSDUMMY1`` for MERGE source (no ``DUAL``)
+    - ``TO_CHAR`` kept for timestamp formatting (native in Db2 12.1.x)
+    Pattern reused by PR #6 (Branch) and PR #9 (Federation).
     """
+
+    async def get(
+        self,
+        tx: Any,
+        key: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT key, value, TO_CHAR(updated) AS updated, version, owner_id, namespace
+                  FROM state
+                 WHERE owner_id = ?
+                   AND namespace = ?
+                   AND key = ?
+                   AND deleted_at IS NULL
+                """,
+                (owner_id, namespace, key),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
+        finally:
+            await _call(cursor.close)
+
+    async def set(
+        self,
+        tx: Any,
+        key: str,
+        value: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+        expires_at: Any | None = None,
+    ) -> Row | None:
+        _ = expires_at  # TTL not yet modelled in the Oracle schema
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO state s
+                USING (SELECT ? AS owner_id, ? AS namespace,
+                              ? AS key, ? AS value FROM SYSIBM.SYSDUMMY1) src
+                   ON (s.owner_id = src.owner_id
+                       AND s.namespace = src.namespace
+                       AND s.key = src.key)
+                WHEN MATCHED THEN UPDATE SET
+                    value = src.value,
+                    updated = CURRENT TIMESTAMP,
+                    version = s.version + 1,
+                    deleted_at = NULL
+                WHEN NOT MATCHED THEN INSERT (
+                    owner_id, namespace, key, value, updated, version
+                ) VALUES (
+                    src.owner_id, src.namespace, src.key, src.value, CURRENT TIMESTAMP, 1
+                )
+                """,
+                (owner_id, namespace, key, value),
+            )
+        finally:
+            await _call(cursor.close)
+        return await self.get(tx, key, owner_id=owner_id, namespace=namespace)
+
+    async def delete(
+        self,
+        tx: Any,
+        key: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE state
+                   SET deleted_at = CURRENT TIMESTAMP
+                 WHERE owner_id = ?
+                   AND namespace = ?
+                   AND key = ?
+                   AND deleted_at IS NULL
+                """,
+                (owner_id, namespace, key),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def list_namespace(
+        self,
+        tx: Any,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if limit is None:
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT key, value, TO_CHAR(updated) AS updated, version, owner_id, namespace
+                      FROM state
+                     WHERE owner_id = ?
+                       AND namespace = ?
+                       AND deleted_at IS NULL
+                     ORDER BY key
+                     OFFSET ? ROWS
+                    """,
+                    (owner_id, namespace, offset),
+                )
+            else:
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT key, value, TO_CHAR(updated) AS updated, version, owner_id, namespace
+                      FROM state
+                     WHERE owner_id = ?
+                       AND namespace = ?
+                       AND deleted_at IS NULL
+                     ORDER BY key
+                     OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+                    """,
+                    (owner_id, namespace, offset, limit),
+                )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def delete_namespace(
+        self,
+        tx: Any,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE state
+                   SET deleted_at = CURRENT TIMESTAMP
+                 WHERE owner_id = ?
+                   AND namespace = ?
+                   AND deleted_at IS NULL
+                """,
+                (owner_id, namespace),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
 
 
 class Db2Backend(OracleBackend):
