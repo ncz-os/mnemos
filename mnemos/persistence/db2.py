@@ -2775,6 +2775,336 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         finally:
             await _call(cursor.close)
 
+    # ── peer management (cont) ────────────────────────────────────────────
+
+    async def update_peer(self, tx: Any, peer_id: str, updates: dict[str, Any]) -> Row | None:
+        bad = set(updates) - self._ALLOWED_PEER_COLS
+        if bad:
+            raise ValueError(f"unknown federation peer fields: {sorted(bad)}")
+        if not updates:
+            return await self.get_peer(tx, peer_id)
+        import json
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            sets: list[str] = []
+            params_list: list[Any] = []
+            for col, value in updates.items():
+                if col == "enabled":
+                    sets.append("enabled = ?")
+                    params_list.append(1 if value else 0)
+                elif col in ("namespace_filter", "category_filter"):
+                    sets.append(f"{col} = ?")
+                    params_list.append(json.dumps(list(value)) if value is not None else None)
+                else:
+                    sets.append(f"{col} = ?")
+                    params_list.append(value)
+            if not sets:
+                return await self.get_peer(tx, peer_id)
+            sets.append("updated = CURRENT TIMESTAMP")
+            sql = f"UPDATE federation_peers SET {', '.join(sets)} WHERE id = ?"
+            params_list.append(peer_id)
+            await _call(cursor.execute, sql, tuple(params_list))
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return None
+        finally:
+            await _call(cursor.close)
+        return await self.get_peer(tx, peer_id)
+
+    async def upsert_peer(
+        self,
+        tx: Any,
+        *,
+        peer_id: str,
+        base_url: str,
+        name: str | None = None,
+        enabled: bool = True,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO federation_peers p
+                USING (
+                    SELECT ? AS id FROM SYSIBM.SYSDUMMY1
+                ) s
+                   ON (p.id = s.id)
+                WHEN MATCHED THEN UPDATE SET
+                    base_url = ?,
+                    name = COALESCE(?, p.name),
+                    enabled = ?,
+                    updated = CURRENT TIMESTAMP
+                WHEN NOT MATCHED THEN INSERT (
+                    id, name, base_url, auth_token, enabled
+                ) VALUES (
+                    ?, COALESCE(?, ?), ?, '', ?
+                )
+                """,
+                (
+                    peer_id,
+                    base_url,
+                    name,
+                    1 if enabled else 0,
+                    peer_id,
+                    name,
+                    peer_id,
+                    base_url,
+                    1 if enabled else 0,
+                ),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def get_sync_peer(self, tx: Any, peer_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT * FROM federation_peers WHERE id = ?",
+                (peer_id,),
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    # ── sync log CRUD ────────────────────────────────────────────────────
+
+    async def fetch_sync_log(self, tx: Any, peer_id: str, limit: int) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, started_at, finished_at, memories_pulled,
+                       memories_new, memories_updated, error,
+                       cursor_before, cursor_after
+                  FROM federation_sync_log
+                 WHERE peer_id = ?
+                 ORDER BY started_at DESC
+                 FETCH FIRST ? ROWS ONLY
+                """,
+                (peer_id, limit),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def create_sync_log(self, tx: Any, peer_id: str, cursor_before: Any) -> Any:
+        import uuid as _uuid
+
+        log_id = str(_uuid.uuid4())
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO federation_sync_log (id, peer_id, cursor_before)
+                VALUES (?, ?, ?)
+                """,
+                (log_id, peer_id, cursor_before),
+            )
+        finally:
+            await _call(cursor.close)
+        return log_id
+
+    async def finish_sync_log(
+        self,
+        tx: Any,
+        *,
+        log_id: Any,
+        memories_pulled: int,
+        memories_new: int,
+        memories_updated: int,
+        error: str | None,
+        cursor_after: Any,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE federation_sync_log SET
+                    finished_at = CURRENT TIMESTAMP,
+                    memories_pulled = ?,
+                    memories_new = ?,
+                    memories_updated = ?,
+                    error = ?,
+                    cursor_after = ?
+                 WHERE id = ?
+                """,
+                (
+                    memories_pulled,
+                    memories_new,
+                    memories_updated,
+                    error,
+                    cursor_after,
+                    log_id,
+                ),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def record_sync_error(self, tx: Any, peer_id: str, error: str) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE federation_peers SET
+                    last_sync_at = CURRENT TIMESTAMP,
+                    last_error = ?,
+                    last_error_at = CURRENT TIMESTAMP
+                 WHERE id = ?
+                """,
+                (error, peer_id),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def record_sync_success(
+        self,
+        tx: Any,
+        peer_id: str,
+        cursor: Any,
+        total_pulled: int,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cur = await _call(conn.cursor)
+        try:
+            await _call(
+                cur.execute,
+                """
+                UPDATE federation_peers SET
+                    last_sync_at = CURRENT TIMESTAMP,
+                    last_sync_cursor = ?,
+                    last_error = NULL,
+                    last_error_at = NULL,
+                    total_pulled = total_pulled + ?
+                 WHERE id = ?
+                """,
+                (cursor, total_pulled, peer_id),
+            )
+        finally:
+            await _call(cur.close)
+
+    async def update_peer_schema_check(
+        self,
+        tx: Any,
+        peer_id: str,
+        peer_version: str | None,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE federation_peers SET
+                    peer_mnemos_version = ?,
+                    last_schema_check_at = CURRENT TIMESTAMP
+                 WHERE id = ?
+                """,
+                (peer_version, peer_id),
+            )
+        finally:
+            await _call(cursor.close)
+
+    # ── feed queries ─────────────────────────────────────────────────────
+
+    async def feed_query(
+        self,
+        tx: Any,
+        *,
+        since_updated: Any | None,
+        since_id: str | None,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+        limit: int,
+        prefer_compressed: bool,
+    ) -> list[Row]:
+        _ = prefer_compressed
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = [
+                "m.deleted_at IS NULL",
+                "m.federation_source IS NULL",
+                "m.archived_at IS NULL",
+            ]
+            params_list: list[Any] = []
+            if since_updated is not None and since_id is not None:
+                where.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
+                params_list.extend([since_updated, since_updated, since_id])
+            if namespaces:
+                ns_ph = ",".join("?" for _ in namespaces)
+                where.append(f"m.namespace IN ({ns_ph})")
+                params_list.extend(namespaces)
+            if categories:
+                cat_ph = ",".join("?" for _ in categories)
+                where.append(f"m.category IN ({cat_ph})")
+                params_list.extend(categories)
+            params_list.append(limit)
+            sql = (
+                "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
+                "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
+                "m.permission_mode, m.source_model, m.source_provider, "
+                "m.source_session, m.source_agent, m.created, m.updated, "
+                "m.archived_at "
+                "FROM memories m WHERE " + " AND ".join(where) + " "
+                "ORDER BY m.updated ASC, m.id ASC "
+                "FETCH FIRST ? ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_feed_memory(
+        self,
+        tx: Any,
+        memory_id: str,
+        *,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = [
+                "m.id = ?",
+                "m.deleted_at IS NULL",
+                "m.federation_source IS NULL",
+            ]
+            params_list: list[Any] = [memory_id]
+            if namespaces:
+                ns_ph = ",".join("?" for _ in namespaces)
+                where.append(f"m.namespace IN ({ns_ph})")
+                params_list.extend(namespaces)
+            if categories:
+                cat_ph = ",".join("?" for _ in categories)
+                where.append(f"m.category IN ({cat_ph})")
+                params_list.extend(categories)
+            sql = (
+                "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
+                "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
+                "m.permission_mode, m.source_model, m.source_provider, "
+                "m.source_session, m.source_agent, m.created, m.updated, "
+                "m.archived_at "
+                "FROM memories m WHERE " + " AND ".join(where)
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
 
 class Db2StateRepository(_Db2OraCompatMixin, OracleStateRepository):
     """Key/value state repository — Db2-native overrides (first MERGE INTO on branch).
