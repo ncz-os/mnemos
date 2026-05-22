@@ -101,6 +101,14 @@ class _DatabaseSettings(BaseSettings):
     password: str = ""
     pool_min_size: int = Field(5, validation_alias="PG_POOL_MIN")
     pool_max_size: int = Field(20, validation_alias="PG_POOL_MAX")
+    # Native-db2-port PR #11: runtime dialect selector.
+    # "compat" = use Db2Backend (cursor-layer Oracle→Db2 translation, default)
+    # "native" = use Db2BackendNative (pass-through, requires all repos emit
+    #            Db2-native SQL with ? positional binds)
+    db2_dialect: str = Field(
+        "compat",
+        validation_alias=AliasChoices("MNEMOS_DB2_DIALECT", "PG_DB2_DIALECT"),
+    )
     embedding_dim: int = Field(
         768,
         validation_alias=AliasChoices("MNEMOS_EMBEDDING_DIM", "PG_EMBEDDING_DIM"),

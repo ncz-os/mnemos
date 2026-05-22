@@ -389,18 +389,43 @@ def _db2_dsn_from_settings(settings) -> str:
 
 
 async def _build_db2_backend(dsn, settings):
-    """Build and open the IBM Db2 persistence backend (ORA-compat).
+    """Build and open the IBM Db2 persistence backend.
+
+    Obeys ``MNEMOS_DB2_DIALECT``: ``compat`` (default) uses
+    :class:`~mnemos.persistence.db2.Db2Backend` with cursor-layer
+    Oracle→Db2 translation; ``native`` uses
+    :class:`~mnemos.persistence.db2.Db2BackendNative` with pass-through
+    cursors. Unknown values warn and fall back to ``compat``.
 
     ``backend.open()`` runs the ``DB2_VECTOR_INDEXING`` registry probe
-    added in the prior Db2 hardening pass; without this call the probe
-    never fires and operators don't see the actionable startup warning
-    when native vector indexing is disabled.
+    added in the prior Db2 hardening pass — this applies to both
+    compat and native paths.
     """
+    import logging as _build_logging
+
+    _db2_log = _build_logging.getLogger(__name__)
+
     db2_module = importlib.import_module("mnemos.persistence.db2")
     min_size = PG_CONFIG.get("pool_min_size", 1)
     max_size = PG_CONFIG.get("pool_max_size", 8)
-    pool = await db2_module.create_db2_pool(dsn, min_size=min_size, max_size=max_size)
-    backend = db2_module.Db2Backend(pool, settings)
+
+    dialect = getattr(settings.database, "db2_dialect", "compat")
+    valid = {"compat", "native"}
+    if dialect not in valid:
+        _db2_log.warning(
+            "MNEMOS_DB2_DIALECT=%r is not one of %s; falling back to 'compat'.",
+            dialect,
+            sorted(valid),
+        )
+        dialect = "compat"
+
+    if dialect == "native":
+        pool = await db2_module.create_db2_native_pool(dsn, min_size=min_size, max_size=max_size)
+        backend = db2_module.Db2BackendNative(pool, settings)
+    else:
+        pool = await db2_module.create_db2_pool(dsn, min_size=min_size, max_size=max_size)
+        backend = db2_module.Db2Backend(pool, settings)
+
     await backend.open()
     return backend
 
