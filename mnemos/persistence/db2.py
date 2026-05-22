@@ -2379,7 +2379,158 @@ class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAudit
 
 
 class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
-    """Federation peer management repository — Oracle SQL auto-translated by cursor layer."""
+    """Federation peer management repository — Db2-native overrides (PR #9a).
+
+    Six core peer-mgmt methods emit explicit native Db2 SQL:
+    - ``?`` positional binds (no ``:name``)
+    - ``CURRENT TIMESTAMP`` (no ``SYSTIMESTAMP``)
+    - ``SYSIBM.SYSDUMMY1`` for MERGE source (no ``DUAL`` — not needed in #9a subset)
+    Pattern reused from PR #3 (State) and PR #6 (Branch).
+    """
+
+    # ── peer CRUD ──────────────────────────────────────────────────────────
+
+    async def list_peers(self, tx: Any) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT * FROM federation_peers ORDER BY created",
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_peer(self, tx: Any, peer_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT * FROM federation_peers WHERE id = ?",
+                (peer_id,),
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def delete_peer(self, tx: Any, peer_id: str) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM federation_peers WHERE id = ?",
+                (peer_id,),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def list_due_peers(self, tx: Any, *, limit: int = 10) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT * FROM federation_peers
+                 WHERE enabled = 1
+                   AND (last_sync_at IS NULL
+                        OR last_sync_at < CURRENT TIMESTAMP - sync_interval_secs SECONDS)
+                 ORDER BY COALESCE(last_sync_at, TIMESTAMP('1970-01-01 00:00:00'))
+                 FETCH FIRST ? ROWS ONLY
+                """,
+                (limit,),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    # ── sync helpers ───────────────────────────────────────────────────────
+
+    async def fetch_memory_page(
+        self,
+        tx: Any,
+        *,
+        updated_after: Any | None = None,
+        id_after: str | None = None,
+        limit: int = 100,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if updated_after is not None and id_after is not None:
+                sql = (
+                    "SELECT id, content, category, subcategory, metadata, "
+                    "owner_id, namespace, updated FROM memories "
+                    "WHERE deleted_at IS NULL "
+                    "AND (updated > ? OR (updated = ? AND id > ?)) "
+                    "ORDER BY updated ASC, id ASC "
+                    "FETCH FIRST ? ROWS ONLY"
+                )
+                params = (updated_after, updated_after, id_after, limit)
+            else:
+                sql = (
+                    "SELECT id, content, category, subcategory, metadata, "
+                    "owner_id, namespace, updated FROM memories "
+                    "WHERE deleted_at IS NULL "
+                    "ORDER BY updated ASC, id ASC "
+                    "FETCH FIRST ? ROWS ONLY"
+                )
+                params = (limit,)
+            await _call(cursor.execute, sql, params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def create_peer(
+        self,
+        tx: Any,
+        *,
+        name: str,
+        base_url: str,
+        auth_token: str,
+        namespace_filter: Sequence[str] | None,
+        category_filter: Sequence[str] | None,
+        enabled: bool,
+        sync_interval_secs: int,
+        compat_mode: str,
+    ) -> Row:
+        import json
+        import uuid as _uuid
+
+        peer_id = str(_uuid.uuid4())
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO federation_peers (
+                    id, name, base_url, auth_token, namespace_filter,
+                    category_filter, enabled, sync_interval_secs, compat_mode
+                ) VALUES (
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?
+                )
+                """,
+                (
+                    peer_id,
+                    name,
+                    base_url,
+                    auth_token,
+                    json.dumps(list(namespace_filter)) if namespace_filter is not None else None,
+                    json.dumps(list(category_filter)) if category_filter is not None else None,
+                    1 if enabled else 0,
+                    sync_interval_secs,
+                    compat_mode or "strict",
+                ),
+            )
+        finally:
+            await _call(cursor.close)
+        return await self.get_peer(tx, peer_id)
 
 
 class Db2StateRepository(_Db2OraCompatMixin, OracleStateRepository):

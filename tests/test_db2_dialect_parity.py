@@ -2281,3 +2281,253 @@ async def test_db2_memory_fetch_memory_context_native() -> None:
     sql = calls[0]["sql"].upper() if calls else ""
     assert "VECTOR_DISTANCE" in sql or "COSINE" in sql
     assert "FETCH FIRST" in sql
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Db2FederationRepository parity tests (PR #9a) — 6 core peer/sync methods
+
+
+@pytest.mark.asyncio
+async def test_db2_federation_list_peers_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2FederationRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2FederationRepository()
+    await repo.list_peers(tx)
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "FROM FEDERATION_PEERS" in sql
+    assert "ORDER BY CREATED" in sql
+    assert ":ID" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_federation_get_peer_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2FederationRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchone(self) -> Any:
+            return None
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2FederationRepository()
+    await repo.get_peer(tx, "peer-1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "FROM FEDERATION_PEERS" in sql
+    assert "WHERE ID = ?" in sql
+    assert ":ID" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_federation_delete_peer_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2FederationRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 0
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2FederationRepository()
+    await repo.delete_peer(tx, "peer-1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "DELETE FROM FEDERATION_PEERS" in sql
+    assert "WHERE ID = ?" in sql
+    assert ":ID" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_federation_list_due_peers_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2FederationRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2FederationRepository()
+    await repo.list_due_peers(tx, limit=10)
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "FROM FEDERATION_PEERS" in sql
+    assert "CURRENT TIMESTAMP" in sql
+    assert "SYSTIMESTAMP" not in sql
+    assert "NUMTODSINTERVAL" not in sql
+    assert "SECONDS" in sql
+    assert "FETCH FIRST ? ROWS ONLY" in sql
+    assert ":LIMIT" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_federation_fetch_memory_page_basic_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2FederationRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2FederationRepository()
+    await repo.fetch_memory_page(tx, limit=10)
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "FROM MEMORIES" in sql
+    assert "WHERE DELETED_AT IS NULL" in sql
+    assert "FETCH FIRST ? ROWS ONLY" in sql
+    assert ":LIMIT" not in sql
+    assert ":UPD" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_federation_create_peer_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2FederationRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+            if "SELECT" in sql.upper():
+                self.description = (
+                    ("id",),
+                    ("name",),
+                    ("base_url",),
+                    ("auth_token",),
+                    ("namespace_filter",),
+                    ("category_filter",),
+                    ("enabled",),
+                    ("sync_interval_secs",),
+                    ("compat_mode",),
+                    ("last_sync_at",),
+                    ("last_sync_cursor",),
+                    ("last_error",),
+                    ("last_error_at",),
+                    ("total_pulled",),
+                    ("peer_mnemos_version",),
+                    ("last_schema_check_at",),
+                    ("created",),
+                    ("updated",),
+                )
+
+        async def fetchone(self) -> Any:
+            return (
+                "p1",
+                "test",
+                "http://peer",
+                "tok",
+                None,
+                None,
+                1,
+                3600,
+                "strict",
+                None,
+                None,
+                None,
+                None,
+                0,
+                None,
+                None,
+                "2026-01-01",
+                "2026-01-01",
+            )
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2FederationRepository()
+    await repo.create_peer(
+        tx,
+        name="test",
+        base_url="http://peer",
+        auth_token="tok",
+        namespace_filter=None,
+        category_filter=None,
+        enabled=True,
+        sync_interval_secs=3600,
+        compat_mode="strict",
+    )
+    assert len(calls) >= 2  # insert + get_peer follow-up
+    insert_sql = calls[0]["sql"].upper() if calls else ""
+    assert "INSERT INTO FEDERATION_PEERS" in insert_sql
+    assert insert_sql.count("?") == 9
+    assert ":ID" not in insert_sql
+    assert ":NAME" not in insert_sql
