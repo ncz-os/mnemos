@@ -2379,13 +2379,21 @@ class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAudit
 
 
 class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
-    """Federation peer management repository — Db2-native overrides (PR #9a).
+    """Federation peer management repository — Db2-native overrides (PR #9a + #9b).
 
-    Six core peer-mgmt methods emit explicit native Db2 SQL:
+    Eleven methods emit explicit native Db2 SQL:
     - ``?`` positional binds (no ``:name``)
     - ``CURRENT TIMESTAMP`` (no ``SYSTIMESTAMP``)
-    - ``SYSIBM.SYSDUMMY1`` for MERGE source (no ``DUAL`` — not needed in #9a subset)
+    - ``SYSIBM.SYSDUMMY1`` for MERGE source (no ``DUAL``)
+    - ``COALESCE`` (no ``NVL``)
+    - ``CAST(? AS TIMESTAMP)`` (no ``CAST(:x AS TIMESTAMP WITH TIME ZONE)``)
     Pattern reused from PR #3 (State) and PR #6 (Branch).
+
+    PR #9a (6 methods): list_peers, get_peer, delete_peer, list_due_peers,
+    fetch_memory_page, create_peer.
+    PR #9b (5 methods): fetch_federated_memory_marker, insert_federated_memory,
+    update_federated_memory_if_newer, apply_consolidation_tombstone,
+    delete_federated_memory.
     """
 
     # ── peer CRUD ──────────────────────────────────────────────────────────
@@ -2531,6 +2539,241 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         finally:
             await _call(cursor.close)
         return await self.get_peer(tx, peer_id)
+
+    # ── consolidation + tombstone ────────────────────────────────────────
+
+    async def fetch_federated_memory_marker(self, tx: Any, local_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT federation_remote_updated
+                  FROM memories
+                 WHERE id = ? AND deleted_at IS NULL
+                """,
+                (local_id,),
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def insert_federated_memory(
+        self,
+        tx: Any,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        source_model: str | None,
+        source_provider: str | None,
+        source_session: str | None,
+        source_agent: str | None,
+        peer_name: str,
+        remote_updated: Any,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            try:
+                await _call(
+                    cursor.execute,
+                    """
+                    INSERT INTO memories (
+                        id, content, category, subcategory, metadata,
+                        verbatim_content, quality_rating, owner_id, namespace,
+                        permission_mode, source_model, source_provider,
+                        source_session, source_agent, federation_source,
+                        federation_remote_updated, created, updated
+                    ) VALUES (
+                        ?, ?, ?, ?, ?,
+                        ?, ?, 'federation', ?,
+                        644, ?, ?,
+                        ?, ?, ?,
+                        CAST(? AS TIMESTAMP),
+                        CURRENT TIMESTAMP,
+                        CAST(? AS TIMESTAMP)
+                    )
+                    """,
+                    (
+                        local_id,
+                        content,
+                        category,
+                        subcategory,
+                        metadata_json,
+                        verbatim_content,
+                        quality_rating,
+                        namespace,
+                        source_model,
+                        source_provider,
+                        source_session,
+                        source_agent,
+                        peer_name,
+                        remote_updated,
+                        remote_updated,
+                    ),
+                )
+                return True
+            except Exception as e:
+                if _is_unique_violation(e):
+                    return False
+                raise
+        finally:
+            await _call(cursor.close)
+
+    async def update_federated_memory_if_newer(
+        self,
+        tx: Any,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        remote_updated: Any,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE memories SET
+                    content = ?,
+                    category = ?,
+                    subcategory = ?,
+                    metadata = ?,
+                    verbatim_content = ?,
+                    quality_rating = ?,
+                    namespace = ?,
+                    federation_remote_updated = CAST(? AS TIMESTAMP),
+                    updated = CAST(? AS TIMESTAMP)
+                 WHERE id = ?
+                   AND deleted_at IS NULL
+                   AND (
+                        federation_remote_updated IS NULL
+                        OR federation_remote_updated < CAST(? AS TIMESTAMP)
+                   )
+                """,
+                (
+                    content,
+                    category,
+                    subcategory,
+                    metadata_json,
+                    verbatim_content,
+                    quality_rating,
+                    namespace,
+                    remote_updated,
+                    remote_updated,
+                    local_id,
+                    remote_updated,
+                ),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def apply_consolidation_tombstone(
+        self,
+        tx: Any,
+        *,
+        local_id: str,
+        local_canonical_id: str,
+        consolidated_at: Any,
+        remote_id: str,
+        canonical_remote_id: str,
+        peer_name: str,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO federation_consolidation_tombstones t
+                USING (
+                    SELECT ? AS peer_name, ? AS remote_id
+                      FROM SYSIBM.SYSDUMMY1
+                ) s
+                   ON (t.peer_name = s.peer_name AND t.remote_id = s.remote_id)
+                WHEN MATCHED THEN UPDATE SET
+                    local_id = ?,
+                    local_canonical_id = ?,
+                    canonical_remote_id = ?,
+                    consolidated_at = COALESCE(
+                        CAST(? AS TIMESTAMP),
+                        CURRENT TIMESTAMP
+                    )
+                WHEN NOT MATCHED THEN INSERT (
+                    peer_name, remote_id, local_id, local_canonical_id,
+                    canonical_remote_id, consolidated_at
+                ) VALUES (
+                    ?, ?, ?, ?,
+                    ?,
+                    COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP)
+                )
+                """,
+                (
+                    peer_name,
+                    remote_id,
+                    local_id,
+                    local_canonical_id,
+                    canonical_remote_id,
+                    consolidated_at,
+                    consolidated_at,
+                    peer_name,
+                    remote_id,
+                    local_id,
+                    local_canonical_id,
+                    canonical_remote_id,
+                    consolidated_at,
+                ),
+            )
+            await _call(
+                cursor.execute,
+                """
+                UPDATE memories
+                   SET deleted_at = CURRENT TIMESTAMP
+                 WHERE id = ?
+                   AND deleted_at IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM memories c
+                        WHERE c.id = ? AND c.deleted_at IS NULL
+                   )
+                """,
+                (local_id, local_canonical_id),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def delete_federated_memory(self, tx: Any, peer_name: str, memory_id: str) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE memories
+                   SET deleted_at = CURRENT TIMESTAMP
+                 WHERE id = ?
+                   AND federation_source = ?
+                   AND deleted_at IS NULL
+                """,
+                (memory_id, peer_name),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
 
 
 class Db2StateRepository(_Db2OraCompatMixin, OracleStateRepository):

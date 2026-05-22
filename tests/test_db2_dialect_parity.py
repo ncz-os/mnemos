@@ -2531,3 +2531,210 @@ async def test_db2_federation_create_peer_native_tokens() -> None:
     assert insert_sql.count("?") == 9
     assert ":ID" not in insert_sql
     assert ":NAME" not in insert_sql
+
+
+@pytest.mark.asyncio
+async def test_db2_federation_fetch_federated_memory_marker_native_tokens() -> None:
+    """Db2 fetch_federated_memory_marker emits ? bind + no Oracle tokens."""
+    from mnemos.persistence.db2 import Db2FederationRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchone(self) -> Any:
+            return None
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2FederationRepository()
+    await repo.fetch_federated_memory_marker(tx, "mem-1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "FROM MEMORIES" in sql
+    assert "WHERE ID = ? AND DELETED_AT IS NULL" in sql
+    assert ":ID" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_federation_insert_federated_memory_native_tokens() -> None:
+    """Db2 insert_federated_memory emits ? binds + CURRENT TIMESTAMP."""
+    from mnemos.persistence.db2 import Db2FederationRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.rowcount = 1
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2FederationRepository()
+    await repo.insert_federated_memory(
+        tx,
+        local_id="mem-1",
+        content="hello",
+        category="facts",
+        subcategory=None,
+        metadata_json="{}",
+        verbatim_content="hello",
+        quality_rating=0,
+        namespace="test",
+        source_model=None,
+        source_provider=None,
+        source_session=None,
+        source_agent=None,
+        peer_name="peer-x",
+        remote_updated="2026-01-01T00:00:00",
+    )
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "INSERT INTO MEMORIES" in sql
+    assert "CURRENT TIMESTAMP" in sql
+    assert "SYSTIMESTAMP" not in sql
+    assert "CAST(? AS TIMESTAMP)" in sql
+    assert ":ID" not in sql
+    assert ":CONTENT" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_federation_update_federated_memory_if_newer_native_tokens() -> None:
+    """Db2 update_federated_memory_if_newer emits ? binds + CAST(? AS TIMESTAMP)."""
+    from mnemos.persistence.db2 import Db2FederationRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2FederationRepository()
+    await repo.update_federated_memory_if_newer(
+        tx,
+        local_id="mem-1",
+        content="updated",
+        category="facts",
+        subcategory=None,
+        metadata_json="{}",
+        verbatim_content="updated",
+        quality_rating=1,
+        namespace="test",
+        remote_updated="2026-06-01T00:00:00",
+    )
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "UPDATE MEMORIES SET" in sql
+    assert "CAST(? AS TIMESTAMP)" in sql
+    assert sql.count("CAST(? AS TIMESTAMP)") >= 3
+    assert "TIMESTAMP WITH TIME ZONE" not in sql
+    assert ":ID" not in sql
+    assert ":CONTENT" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_federation_apply_consolidation_tombstone_native_tokens() -> None:
+    """Db2 apply_consolidation_tombstone emits MERGE with SYSDUMMY1 + COALESCE."""
+    from mnemos.persistence.db2 import Db2FederationRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2FederationRepository()
+    await repo.apply_consolidation_tombstone(
+        tx,
+        local_id="mem-1",
+        local_canonical_id="mem-2",
+        consolidated_at="2026-05-01T00:00:00",
+        remote_id="remote-1",
+        canonical_remote_id="remote-2",
+        peer_name="peer-x",
+    )
+    assert len(calls) >= 2  # MERGE + UPDATE
+    merge_sql = calls[0]["sql"].upper() if calls else ""
+    assert "MERGE INTO FEDERATION_CONSOLIDATION_TOMBSTONES" in merge_sql
+    assert "FROM SYSIBM.SYSDUMMY1" in merge_sql
+    assert "FROM DUAL" not in merge_sql
+    assert "COALESCE" in merge_sql
+    assert "NVL" not in merge_sql
+    assert "CURRENT TIMESTAMP" in merge_sql
+    assert "SYSTIMESTAMP" not in merge_sql
+    assert "CAST(? AS TIMESTAMP)" in merge_sql
+    assert ":PEER_NAME" not in merge_sql
+
+    update_sql = calls[1]["sql"].upper() if len(calls) > 1 else ""
+    assert "UPDATE MEMORIES" in update_sql
+    assert "CURRENT TIMESTAMP" in update_sql
+    assert "SYSTIMESTAMP" not in update_sql
+
+
+@pytest.mark.asyncio
+async def test_db2_federation_delete_federated_memory_native_tokens() -> None:
+    """Db2 delete_federated_memory emits ? binds + CURRENT TIMESTAMP."""
+    from mnemos.persistence.db2 import Db2FederationRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2FederationRepository()
+    await repo.delete_federated_memory(tx, "peer-x", "mem-1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "UPDATE MEMORIES" in sql
+    assert "SET DELETED_AT = CURRENT TIMESTAMP" in sql
+    assert "SYSTIMESTAMP" not in sql
+    assert "WHERE ID = ?" in sql
+    assert "AND FEDERATION_SOURCE = ?" in sql
+    assert ":ID" not in sql
+    assert ":PEER" not in sql
