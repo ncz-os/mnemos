@@ -3,12 +3,14 @@
 ## Supported versions
 
 The most recently maintained release branch is supported. The current
-release line is `v5.0.x`. v5.0.1 shipped on 2026-05-06 (on top of the
-v5.0.0 GA from 2026-05-02 and v4.0.0 from 2026-04-29).
+release candidate is **`v6.0.0rc1`** (source-install from the `v6.0-rc`
+tag — adds Oracle Database 26ai + IBM Db2 12.1.5 EAP backends). The
+most recently published PyPI release is `v5.0.1` (2026-05-06, on top
+of the v5.0.0 GA from 2026-05-02 and v4.0.0 from 2026-04-29).
 
 ## Current security invariants
 
-As of v5.0.1 (carried forward from v4.0.0):
+As of v6.0.0rc1 (also covers v5.0.1 GA + carried forward from v4.0.0):
 
 - Memory read visibility is symmetric across list/get/search/rehydrate,
   OpenAI-compatible gateway context, version history, DAG history, and MCP

@@ -22,7 +22,7 @@ federate, export, import, and operate**.
 > the canonical release candidate. It adds Oracle Database 26ai and
 > IBM Db2 12.1.5 (Early Access Program) as first-class persistence
 > backends alongside PostgreSQL and SQLite. The most recent published
-> PyPI release is `5.0.1` (Postgres + SQLite only). Enterprise backends
+> latest published PyPI release is `5.0.1` (legacy); `6.0.0rc1` is the source-install candidate from the `v6.0-rc` tag (Postgres + SQLite only). Enterprise backends
 > ship from source against the tag until pip extras are published:
 > `git clone -b v6.0-rc https://github.com/ncz-os/mnemos`. See
 > [docs/INSTALL.md](docs/INSTALL.md#enterprise-backends-oracle-ai-database-26ai--ibm-db2-1215-eap)
@@ -44,15 +44,15 @@ Paste into Claude Code, Cursor, or Codex. The agent runs the install; you confir
 Install MNEMOS on this machine.
 
 Steps:
-1. pip install 'mnemos-os[server]==5.0.1'
+1. pip install 'mnemos-os[server]==6.0.0rc1'  # source-install from v6.0-rc tag until PyPI publish
 2. mnemos init                         # scaffold config + token
 3. mnemos serve                        # start API on :5002
 4. mnemos doctor                       # verify subsystems
 5. Set MNEMOS_BASE=http://localhost:5002 and MNEMOS_API_KEY=<token from step 2>
    in shell env and any agent config that needs to reach it.
 
-Edge device (SQLite, no Postgres): pip install 'mnemos-os[edge]==5.0.1' instead.
-Full install with all subsystems: pip install 'mnemos-os[full]==5.0.1'
+Edge device (SQLite, no Postgres): pip install 'mnemos-os[edge]==6.0.0rc1' instead.
+Full install with all subsystems: pip install 'mnemos-os[full]==6.0.0rc1'
 ```
 
 **Enterprise backends (Oracle Database 26ai, IBM Db2 12.1.5 EAP).**
