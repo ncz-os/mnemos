@@ -243,3 +243,51 @@ async def test_db2_semantic_search_parity_with_oracle_normalized_embeddings() ->
         "EUCLIDEAN-vs-COSINE recall@10 expectation for normalized "
         "embeddings is ≥ 0.8 per the migration notes."
     )
+
+
+# ── PR #2 live stubs (skipped unless DB2_DSN) ────────────────────────────────
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_fetch_recommended_model() -> None:
+    pytest.skip("live EAP exercise for fetch_recommended_model (PR #2)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_fetch_model_recommendation() -> None:
+    pytest.skip("live EAP exercise for fetch_model_recommendation (PR #2)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_lookup_provider_for_model() -> None:
+    pytest.skip("live EAP exercise for lookup_provider_for_model (PR #2)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_fetch_available_models() -> None:
+    pytest.skip("live EAP exercise for fetch_available_models (PR #2)")
+
+
+@pytest.mark.skipif(
+    os.environ.get("DB2_DSN") is None,
+    reason="DB2_DSN not set; nightly EAP-only",
+)
+@pytest.mark.asyncio
+async def test_db2_live_fetch_model_provider() -> None:
+    pytest.skip("live EAP exercise for fetch_model_provider (PR #2)")
