@@ -61,8 +61,8 @@ for compression derivations, and MCP cross-tenant security gates. The
   - `OracleBackend` (oracledb + Oracle Database 26ai HNSW INMEMORY NEIGHBOR GRAPH +
     JSON Duality + optional TDE) — `mnemos/persistence/oracle.py`
   - `Db2Backend` (ibm_db + Db2 12.1.5 EAP `VECTOR(768, FLOAT32)` + DiskANN
-    vector index — bench-validated using `EUCLIDEAN`, the metric supported
-    by the 12.1.5 EAP vector index). **Runs through Db2 Oracle Compatibility
+    vector index — functionality validated using `EUCLIDEAN`, the metric
+    supported by the 12.1.5 EAP vector index). **Runs through Db2 Oracle Compatibility
     Mode** (`DB CFG ORA_COMPATIBILITY ON`) — subclasses `OracleBackend` and
     inherits the Oracle SQL surface verbatim, with cursor-level token
     translation (`SYSTIMESTAMP`→`CURRENT TIMESTAMP`, `:name` binds → `?`
