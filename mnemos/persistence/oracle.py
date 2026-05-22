@@ -39,6 +39,7 @@ from mnemos.persistence.base import (
     PersistenceBackend,
     StateRepository,
     Transaction,
+    UserRepository,
     VersionRepository,
     WebhookRepository,
 )
@@ -2813,6 +2814,92 @@ class OracleFederationRepository(FederationRepository):
             await _call(cursor.close)
 
 
+class OracleUserRepository(UserRepository):
+    """Admin user CRUD (users table) — Oracle dialect."""
+
+    async def create_user(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        display_name: str | None,
+        email: str | None,
+        role: str,
+        namespace: str,
+    ) -> dict[str, Any]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO users (id, display_name, email, role, namespace)
+                VALUES (:id, :display_name, :email, :role, :namespace)
+                """,
+                {
+                    "id": user_id,
+                    "display_name": display_name,
+                    "email": email,
+                    "role": role,
+                    "namespace": namespace,
+                },
+            )
+            # Oracle RETURNING with multi-column is awkward via oracledb async;
+            # SELECT-after-INSERT in same tx (uncommitted INSERT visible to caller).
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, display_name, email, role, namespace,
+                       TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
+                  FROM users
+                 WHERE id = :id
+                """,
+                {"id": user_id},
+            )
+            row = await _call(cursor.fetchone)
+            return await _row_to_dict(cursor, row) or {}
+        finally:
+            await _call(cursor.close)
+
+    async def list_users(self, tx: Transaction) -> list[dict[str, Any]]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, display_name, email, role, namespace,
+                       TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
+                  FROM users
+                 ORDER BY created_at
+                """,
+            )
+            rows = await _call(cursor.fetchall)
+            cols = [d[0].lower() for d in cursor.description]
+            return [dict(zip(cols, r)) for r in rows]
+        finally:
+            await _call(cursor.close)
+
+    async def get_user(self, tx: Transaction, *, user_id: str) -> dict[str, Any] | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, display_name, email, role, namespace,
+                       TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
+                  FROM users
+                 WHERE id = :id
+                """,
+                {"id": user_id},
+            )
+            row = await _call(cursor.fetchone)
+            return await _row_to_dict(cursor, row)
+        finally:
+            await _call(cursor.close)
+
+
 class OracleStateRepository(StateRepository):
     """Oracle key/value state repo — full CRUD over the ``state`` table."""
 
@@ -3011,6 +3098,7 @@ class OracleBackend(PersistenceBackend):
         self._consultations_audit_repo = OracleConsultationAuditRepository()
         self._federation_repo = OracleFederationRepository()
         self._state_kv_repo = OracleStateRepository()
+        self._users_repo = OracleUserRepository()
 
     @property
     def settings(self) -> Any:
@@ -3069,6 +3157,10 @@ class OracleBackend(PersistenceBackend):
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv_repo
+
+    @property
+    def users(self) -> UserRepository:
+        return self._users_repo
 
     async def open(self) -> None:
         """Lifecycle hook — validates pool checkout + session callback.

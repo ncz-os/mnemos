@@ -40,6 +40,7 @@ from mnemos.persistence.base import (
     PersistenceBackend,
     StateRepository,
     Transaction,
+    UserRepository,
     VersionRepository,
     WebhookRepository,
 )
@@ -313,6 +314,7 @@ _HOT_RS_ENABLED = hot_rs_enabled()
 if _HOT_RS_ENABLED:
     try:
         import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
+
         logger.info(
             "mnemos_hot Rust accelerator enabled (cosine UDF will use mnemos_hot %s)",
             getattr(_HOT_RS, "__version__", "?"),
@@ -570,7 +572,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         if _is_root(user):
             return rows
         return [
-            row for row in rows
+            row
+            for row in rows
             if row["namespace"] == user.namespace
             and (row["owner_id"] == user.user_id or (row["permission_mode"] % 10) >= 4)
         ]
@@ -770,7 +773,9 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
 
     async def set_suppress_version_snapshot(self, tx: Transaction) -> None:
         await _execute(self._conn(tx), "CREATE TEMP TABLE IF NOT EXISTS mnemos_tx_flags (key TEXT PRIMARY KEY)")
-        await _execute(self._conn(tx), "INSERT OR IGNORE INTO mnemos_tx_flags(key) VALUES ('suppress_version_snapshot')")
+        await _execute(
+            self._conn(tx), "INSERT OR IGNORE INTO mnemos_tx_flags(key) VALUES ('suppress_version_snapshot')"
+        )
 
     async def fetch_versioned_memory_ids(self, tx: Transaction, memory_ids: Sequence[str]) -> list[Row]:
         if not memory_ids:
@@ -967,7 +972,9 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                     like_conditions.append(f"m.{col} = ?")
                     like_params.append(val)
             like_vis_clause = _render_sqlite_visibility(
-                visibility, like_params, table_alias="m",
+                visibility,
+                like_params,
+                table_alias="m",
             )
             if like_vis_clause:
                 like_conditions.append(like_vis_clause)
@@ -1009,8 +1016,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             where_parts.append(vis_clause)
         where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
         select_sql = (
-            f"SELECT {_sqlite_memory_cols()} FROM memories{where_sql} "
-            "ORDER BY created DESC LIMIT ? OFFSET ?"
+            f"SELECT {_sqlite_memory_cols()} FROM memories{where_sql} " "ORDER BY created DESC LIMIT ? OFFSET ?"
         )
         # COUNT(*) first (without limit/offset params), then paged
         # SELECT with the same predicate params plus limit/offset.
@@ -1066,15 +1072,10 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         vis_clause = _render_sqlite_visibility(visibility, params)
         if vis_clause:
             sql = (
-                f"UPDATE memories SET {set_sql} "
-                f"WHERE id = ? AND {vis_clause} "
-                f"RETURNING {_sqlite_memory_cols()}"
+                f"UPDATE memories SET {set_sql} " f"WHERE id = ? AND {vis_clause} " f"RETURNING {_sqlite_memory_cols()}"
             )
         else:
-            sql = (
-                f"UPDATE memories SET {set_sql} WHERE id = ? "
-                f"RETURNING {_sqlite_memory_cols()}"
-            )
+            sql = f"UPDATE memories SET {set_sql} WHERE id = ? " f"RETURNING {_sqlite_memory_cols()}"
         return await _fetch_one(conn, sql, params)
 
     async def find_active_duplicate_by_content_hash(
@@ -1236,8 +1237,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             )
         else:
             sql = (
-                "DELETE FROM memories WHERE id = ? "
-                "RETURNING owner_id, namespace, id, content, category, subcategory"
+                "DELETE FROM memories WHERE id = ? " "RETURNING owner_id, namespace, id, content, category, subcategory"
             )
         return await _fetch_one(conn, sql, params)
 
@@ -1245,7 +1245,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         conn = self._conn(tx)
         total = await _fetch_val(conn, "SELECT COUNT(*) FROM memories")
         native = await _fetch_val(
-            conn, "SELECT COUNT(*) FROM memories WHERE federation_source IS NULL",
+            conn,
+            "SELECT COUNT(*) FROM memories WHERE federation_source IS NULL",
         )
         federated = await _fetch_val(
             conn,
@@ -1397,9 +1398,7 @@ class SqliteKGRepository(_SqliteRepository, KGRepository):
         limit: int = 20,
     ) -> list[Row]:
         params: list[Any] = [f"%{query}%", f"%{query}%", f"%{query}%"]
-        conditions = [
-            "(lower(subject) LIKE lower(?) OR lower(predicate) LIKE lower(?) OR lower(object) LIKE lower(?))"
-        ]
+        conditions = ["(lower(subject) LIKE lower(?) OR lower(predicate) LIKE lower(?) OR lower(object) LIKE lower(?))"]
         if owner_id is not None:
             conditions.append("owner_id = ?")
             params.append(owner_id)
@@ -1856,15 +1855,16 @@ class SqliteCompressionRepository(_SqliteRepository, CompressionRepository):
     async def gather_stats(self, tx: Transaction) -> CompressionStatsRow:
         conn = self._conn(tx)
         total = await _fetch_val(
-            conn, "SELECT COUNT(*) FROM memory_compressed_variants",
+            conn,
+            "SELECT COUNT(*) FROM memory_compressed_variants",
         )
         avg_ratio = await _fetch_val(
-            conn, "SELECT AVG(compression_ratio) FROM memory_compressed_variants",
+            conn,
+            "SELECT AVG(compression_ratio) FROM memory_compressed_variants",
         )
         unreviewed = await _fetch_val(
             conn,
-            "SELECT COUNT(*) FROM memory_compressed_variants "
-            "WHERE quality_score IS NULL",
+            "SELECT COUNT(*) FROM memory_compressed_variants " "WHERE quality_score IS NULL",
         )
         return CompressionStatsRow(
             total_compressions=int(total or 0),
@@ -1943,6 +1943,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
                 ),
             )
             from mnemos.nats.webhook_events import publish_delivery_queued
+
             await publish_delivery_queued(
                 delivery_id=delivery_id,
                 subscription_id=sub["id"],
@@ -1989,17 +1990,12 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
         )
 
         def _has_priced(row: Row) -> bool:
-            return (
-                row["input_cost_per_mtok"] is not None
-                and row["output_cost_per_mtok"] is not None
-            )
+            return row["input_cost_per_mtok"] is not None and row["output_cost_per_mtok"] is not None
 
         def _avg_cost_or_none(row: Row) -> float | None:
             if not _has_priced(row):
                 return None
-            return (
-                float(row["input_cost_per_mtok"]) + float(row["output_cost_per_mtok"])
-            ) / 2.0
+            return (float(row["input_cost_per_mtok"]) + float(row["output_cost_per_mtok"])) / 2.0
 
         # Budget tier EXCLUDES rows with NULL costs — an unknown
         # cost cannot legally satisfy a "<= budget" constraint;
@@ -2007,7 +2003,8 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
         # ahead of priced ones. Mirrors the Postgres invariant in
         # mnemos/db/mcp_repo.py and friends.
         eligible = [
-            row for row in rows
+            row
+            for row in rows
             if float(row["graeae_weight"] or 0) >= quality_floor
             and _has_priced(row)
             and (_avg_cost_or_none(row) or 0.0) <= cost_budget
@@ -2020,9 +2017,7 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
             # via "(unknown=infinity)" key — matches PG's NULLS LAST.
             chosen_rows = sorted(
                 rows,
-                key=lambda r: (
-                    _avg_cost_or_none(r) if _avg_cost_or_none(r) is not None else float("inf")
-                ),
+                key=lambda r: (_avg_cost_or_none(r) if _avg_cost_or_none(r) is not None else float("inf")),
             )
         if not chosen_rows:
             return None, required_caps
@@ -2179,11 +2174,13 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         return [self._peer_row(row) for row in rows]  # type: ignore[list-item]
 
     async def get_peer(self, tx: Transaction, peer_id: str) -> Row | None:
-        return self._peer_row(await _fetch_one(
-            self._conn(tx),
-            "SELECT * FROM federation_peers WHERE id = ?",
-            (peer_id,),
-        ))
+        return self._peer_row(
+            await _fetch_one(
+                self._conn(tx),
+                "SELECT * FROM federation_peers WHERE id = ?",
+                (peer_id,),
+            )
+        )
 
     async def update_peer(self, tx: Transaction, peer_id: str, updates: dict[str, Any]) -> Row | None:
         bad = set(updates) - self._ALLOWED_PEER_COLS
@@ -2228,11 +2225,14 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         )
 
     async def delete_peer(self, tx: Transaction, peer_id: str) -> bool:
-        return await _execute_count(
-            self._conn(tx),
-            "DELETE FROM federation_peers WHERE id = ?",
-            (peer_id,),
-        ) > 0
+        return (
+            await _execute_count(
+                self._conn(tx),
+                "DELETE FROM federation_peers WHERE id = ?",
+                (peer_id,),
+            )
+            > 0
+        )
 
     async def fetch_sync_log(self, tx: Transaction, peer_id: str, limit: int) -> list[Row]:
         return await _fetch_all(
@@ -2395,16 +2395,18 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         )
 
     async def get_sync_peer(self, tx: Transaction, peer_id: str) -> Row | None:
-        return self._peer_row(await _fetch_one(
-            self._conn(tx),
-            """
+        return self._peer_row(
+            await _fetch_one(
+                self._conn(tx),
+                """
             SELECT id, name, base_url, auth_token, namespace_filter,
                    category_filter, enabled, last_sync_cursor,
                    compat_mode
             FROM federation_peers WHERE id = ?
             """,
-            (peer_id,),
-        ))
+                (peer_id,),
+            )
+        )
 
     async def update_peer_schema_check(self, tx: Transaction, peer_id: str, peer_version: str | None) -> None:
         await _execute(
@@ -2638,9 +2640,10 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         namespace: str,
         remote_updated: Any,
     ) -> bool:
-        return await _execute_count(
-            self._conn(tx),
-            """
+        return (
+            await _execute_count(
+                self._conn(tx),
+                """
             UPDATE memories SET
               content = ?,
               category = ?,
@@ -2657,20 +2660,22 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                   OR federation_remote_updated < ?
               )
             """,
-            (
-                content,
-                category,
-                subcategory,
-                metadata_json,
-                verbatim_content,
-                quality_rating,
-                namespace,
-                remote_updated,
-                remote_updated,
-                local_id,
-                remote_updated,
-            ),
-        ) > 0
+                (
+                    content,
+                    category,
+                    subcategory,
+                    metadata_json,
+                    verbatim_content,
+                    quality_rating,
+                    namespace,
+                    remote_updated,
+                    remote_updated,
+                    local_id,
+                    remote_updated,
+                ),
+            )
+            > 0
+        )
 
     async def apply_consolidation_tombstone(
         self,
@@ -2683,9 +2688,10 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         canonical_remote_id: str,
         peer_name: str,
     ) -> bool:
-        return await _execute_count(
-            self._conn(tx),
-            """
+        return (
+            await _execute_count(
+                self._conn(tx),
+                """
             UPDATE memories
             SET consolidated_into = ?,
                 consolidated_at = COALESCE(?, CURRENT_TIMESTAMP),
@@ -2706,17 +2712,19 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                   WHERE id = ?
               )
             """,
-            (
-                local_canonical_id,
-                consolidated_at,
-                remote_id,
-                canonical_remote_id,
-                peer_name,
-                local_id,
-                local_canonical_id,
-                local_canonical_id,
-            ),
-        ) > 0
+                (
+                    local_canonical_id,
+                    consolidated_at,
+                    remote_id,
+                    canonical_remote_id,
+                    peer_name,
+                    local_id,
+                    local_canonical_id,
+                    local_canonical_id,
+                ),
+            )
+            > 0
+        )
 
     async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int:
         local_id = f"fed:{peer_name}:{memory_id}"
@@ -2731,8 +2739,48 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         )
 
 
+class SqliteUserRepository(_SqliteRepository, UserRepository):
+    """Admin user CRUD — SQLite dialect."""
+
+    async def create_user(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        display_name: str | None,
+        email: str | None,
+        role: str,
+        namespace: str,
+    ) -> dict[str, Any]:
+        row = await _fetch_one(
+            self._conn(tx),
+            "INSERT INTO users (id, display_name, email, role, namespace) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "RETURNING id, display_name, email, role, namespace, created_at",
+            (user_id, display_name, email, role, namespace),
+        )
+        return dict(row) if row else {}
+
+    async def list_users(self, tx: Transaction) -> list[dict[str, Any]]:
+        rows = await _fetch_all(
+            self._conn(tx),
+            "SELECT id, display_name, email, role, namespace, created_at " "FROM users ORDER BY created_at",
+        )
+        return [dict(r) for r in rows]
+
+    async def get_user(self, tx: Transaction, *, user_id: str) -> dict[str, Any] | None:
+        row = await _fetch_one(
+            self._conn(tx),
+            "SELECT id, display_name, email, role, namespace, created_at " "FROM users WHERE id = ?",
+            (user_id,),
+        )
+        return dict(row) if row else None
+
+
 class SqliteStateRepository(_SqliteRepository, StateRepository):
-    async def get(self, tx: Transaction, key: str, *, owner_id: str = "default", namespace: str = "default") -> Row | None:
+    async def get(
+        self, tx: Transaction, key: str, *, owner_id: str = "default", namespace: str = "default"
+    ) -> Row | None:
         return await _fetch_one(
             self._conn(tx),
             "SELECT key, value, updated, version, owner_id, namespace FROM state "
@@ -2762,11 +2810,14 @@ class SqliteStateRepository(_SqliteRepository, StateRepository):
         )
 
     async def delete(self, tx: Transaction, key: str, *, owner_id: str = "default", namespace: str = "default") -> bool:
-        return await _execute_count(
-            self._conn(tx),
-            "DELETE FROM state WHERE owner_id = ? AND namespace = ? AND key = ? AND deleted_at IS NULL",
-            (owner_id, namespace, key),
-        ) > 0
+        return (
+            await _execute_count(
+                self._conn(tx),
+                "DELETE FROM state WHERE owner_id = ? AND namespace = ? AND key = ? AND deleted_at IS NULL",
+                (owner_id, namespace, key),
+            )
+            > 0
+        )
 
     async def list_namespace(
         self,
@@ -2827,6 +2878,7 @@ class SqliteBackend(PersistenceBackend):
         self._consultations_audit = SqliteConsultationAuditRepository()
         self._federation = SqliteFederationRepository()
         self._state_kv = SqliteStateRepository()
+        self._users = SqliteUserRepository()
 
     @property
     def settings(self) -> Any:
@@ -2870,8 +2922,7 @@ class SqliteBackend(PersistenceBackend):
             await _call(conn.close)
             required = ".".join(str(part) for part in MIN_SQLITE_VERSION)
             raise RuntimeError(
-                f"SQLite {required}+ is required for UPDATE ... RETURNING support; "
-                f"found {raw_version}"
+                f"SQLite {required}+ is required for UPDATE ... RETURNING support; " f"found {raw_version}"
             )
 
     async def _register_functions(self, conn: Any) -> None:
@@ -3048,8 +3099,7 @@ class SqliteBackend(PersistenceBackend):
         """
         row = await _fetch_one(
             conn,
-            "SELECT sql FROM sqlite_master WHERE type='table' "
-            "AND name='memory_embedding_vec'",
+            "SELECT sql FROM sqlite_master WHERE type='table' " "AND name='memory_embedding_vec'",
         )
         if not row:
             return None
@@ -3081,8 +3131,7 @@ class SqliteBackend(PersistenceBackend):
         """
         row_meta = await _fetch_one(
             conn,
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name='memory_embeddings'",
+            "SELECT name FROM sqlite_master WHERE type='table' " "AND name='memory_embeddings'",
         )
         if not row_meta:
             return {}
@@ -3178,6 +3227,10 @@ class SqliteBackend(PersistenceBackend):
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv
+
+    @property
+    def users(self) -> UserRepository:
+        return self._users
 
     async def close(self) -> None:
         if self._closed:

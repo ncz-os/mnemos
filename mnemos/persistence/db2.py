@@ -38,6 +38,7 @@ from mnemos.persistence.oracle import (
     OracleKGRepository,
     OracleMemoryRepository,
     OracleStateRepository,
+    OracleUserRepository,
     OracleVersionRepository,
     OracleWebhookRepository,
     _call,
@@ -725,6 +726,10 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
     """Federation peer management repository — Oracle SQL auto-translated by cursor layer."""
 
 
+class Db2UserRepository(_Db2OraCompatMixin, OracleUserRepository):
+    """Admin user CRUD — Oracle SQL auto-translated by cursor layer."""
+
+
 class Db2StateRepository(_Db2OraCompatMixin, OracleStateRepository):
     """Key/value state repository — Oracle SQL auto-translated by cursor layer.
 
@@ -806,6 +811,7 @@ class Db2Backend(OracleBackend):
         self._consultations_audit_repo = Db2ConsultationAuditRepository()
         self._federation_repo = Db2FederationRepository()
         self._state_kv_repo = Db2StateRepository()
+        self._users_repo = Db2UserRepository()
         # Startup registry-probe state, populated lazily by ``open()``.
         # ``None`` means "not yet probed"; otherwise stores the raw
         # registry value (``"YES"``, ``"NO"``, ``""``...) for the
