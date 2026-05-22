@@ -624,7 +624,53 @@ async def test_db2_live_kg_fetch_for_export() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_version_insert() -> None:
-    pytest.skip("live EAP exercise for Db2VersionRepository.insert_memory_version (PR #5)")
+    """Exercise Db2VersionRepository.insert_memory_version against live Db2."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    namespace = f"ns_{uuid.uuid4().hex[:6]}"
+    version_id = f"v_{uuid.uuid4().hex[:8]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            await backend.memory_versions.insert_memory_version(
+                tx,
+                version_id=version_id,
+                memory_id=mem_id,
+                version_num=1,
+                content="c",
+                category="t",
+                subcategory=None,
+                metadata_json="{}",
+                verbatim_content=None,
+                owner_id=owner,
+                namespace=namespace,
+                permission_mode=600,
+                source_model=None,
+                source_provider=None,
+                source_session=None,
+                source_agent=None,
+                snapshot_at=None,
+                snapshot_by=None,
+                change_type=None,
+                commit_hash=None,
+                parent_version_id=None,
+                branch=None,
+                merge_parents=None,
+            )
+            row = await backend.memory_versions.fetch_memory_version_by_id(tx, version_id)
+            assert row is not None
+            assert row["content"] == "c"
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM memory_versions WHERE id = ?", (version_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -633,7 +679,54 @@ async def test_db2_live_version_insert() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_version_fetch_by_id() -> None:
-    pytest.skip("live EAP exercise for Db2VersionRepository.fetch_memory_version_by_id (PR #5)")
+    """Exercise Db2VersionRepository.fetch_memory_version_by_id."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    namespace = f"ns_{uuid.uuid4().hex[:6]}"
+    version_id = f"v_{uuid.uuid4().hex[:8]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    try:
+        async with backend.transactional() as tx:
+            await backend.memory_versions.insert_memory_version(
+                tx,
+                version_id=version_id,
+                memory_id=mem_id,
+                version_num=2,
+                content="hello",
+                category=None,
+                subcategory=None,
+                metadata_json="{}",
+                verbatim_content=None,
+                owner_id=owner,
+                namespace=namespace,
+                permission_mode=None,
+                source_model=None,
+                source_provider=None,
+                source_session=None,
+                source_agent=None,
+                snapshot_at=None,
+                snapshot_by=None,
+                change_type=None,
+                commit_hash=None,
+                parent_version_id=None,
+                branch=None,
+                merge_parents=None,
+            )
+            row = await backend.memory_versions.fetch_memory_version_by_id(tx, version_id)
+            assert row and row["memory_id"] == mem_id
+            miss = await backend.memory_versions.fetch_memory_version_by_id(tx, "nope_xxx")
+            assert miss is None
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            await _call(cur.execute, "DELETE FROM memory_versions WHERE id = ?", (version_id,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -642,7 +735,61 @@ async def test_db2_live_version_fetch_by_id() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_version_fetch_for_export() -> None:
-    pytest.skip("live EAP exercise for Db2VersionRepository.fetch_memory_versions_for_export (PR #5)")
+    """Exercise Db2VersionRepository.fetch_memory_versions_for_export (OFFSET/FETCH paging)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    namespace = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    vids = [f"v_{uuid.uuid4().hex[:8]}" for _ in range(2)]
+    try:
+        async with backend.transactional() as tx:
+            for i, vid in enumerate(vids):
+                await backend.memory_versions.insert_memory_version(
+                    tx,
+                    version_id=vid,
+                    memory_id=mem_id,
+                    version_num=i + 1,
+                    content=f"c{i}",
+                    category=None,
+                    subcategory=None,
+                    metadata_json="{}",
+                    verbatim_content=None,
+                    owner_id=owner,
+                    namespace=namespace,
+                    permission_mode=None,
+                    source_model=None,
+                    source_provider=None,
+                    source_session=None,
+                    source_agent=None,
+                    snapshot_at=None,
+                    snapshot_by=None,
+                    change_type=None,
+                    commit_hash=None,
+                    parent_version_id=None,
+                    branch=None,
+                    merge_parents=None,
+                )
+            rows = await backend.memory_versions.fetch_memory_versions_for_export(
+                tx,
+                memory_ids=[mem_id],
+                effective_owner=owner,
+                effective_ns=namespace,
+                hard_limit=10,
+            )
+            ids = [r.get("id") for r in rows]
+            assert all(v in ids for v in vids)
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            for vid in vids:
+                await _call(cur.execute, "DELETE FROM memory_versions WHERE id = ?", (vid,))
+            await _call(cur.close)
+        await backend.close()
 
 
 @pytest.mark.skipif(
@@ -651,7 +798,55 @@ async def test_db2_live_version_fetch_for_export() -> None:
 )
 @pytest.mark.asyncio
 async def test_db2_live_version_fetch_by_ids() -> None:
-    pytest.skip("live EAP exercise for Db2VersionRepository.fetch_memory_versions_by_ids (PR #5)")
+    """Exercise Db2VersionRepository.fetch_memory_versions_by_ids (IN-list)."""
+    from mnemos.persistence.db2 import Db2Backend, create_db2_pool, _conn_from_tx, _call
+
+    pool = await create_db2_pool(DB2_DSN)
+    backend = Db2Backend(pool, SimpleNamespace())
+    await backend.open()
+    owner = f"db2live_{uuid.uuid4().hex[:8]}"
+    namespace = f"ns_{uuid.uuid4().hex[:6]}"
+    mem_id = f"m_{uuid.uuid4().hex[:8]}"
+    vids = [f"v_{uuid.uuid4().hex[:8]}" for _ in range(3)]
+    try:
+        async with backend.transactional() as tx:
+            for i, vid in enumerate(vids):
+                await backend.memory_versions.insert_memory_version(
+                    tx,
+                    version_id=vid,
+                    memory_id=mem_id,
+                    version_num=i + 1,
+                    content=f"c{i}",
+                    category=None,
+                    subcategory=None,
+                    metadata_json="{}",
+                    verbatim_content=None,
+                    owner_id=owner,
+                    namespace=namespace,
+                    permission_mode=None,
+                    source_model=None,
+                    source_provider=None,
+                    source_session=None,
+                    source_agent=None,
+                    snapshot_at=None,
+                    snapshot_by=None,
+                    change_type=None,
+                    commit_hash=None,
+                    parent_version_id=None,
+                    branch=None,
+                    merge_parents=None,
+                )
+            rows = await backend.memory_versions.fetch_memory_versions_by_ids(tx, vids)
+            got_ids = {r.get("id") for r in rows}
+            assert set(vids) <= got_ids
+    finally:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            cur = conn.cursor()
+            for vid in vids:
+                await _call(cur.execute, "DELETE FROM memory_versions WHERE id = ?", (vid,))
+            await _call(cur.close)
+        await backend.close()
 
 
 # ────────────────────────────────────────────────────────────────────────────
