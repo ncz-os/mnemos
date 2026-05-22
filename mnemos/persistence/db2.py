@@ -977,6 +977,201 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         finally:
             await _call(cursor.close)
 
+    async def get_memory(
+        self,
+        tx: Any,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        include_archived: bool = False,
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility, table_alias="m")
+            where = ["m.id = ?", "m.deleted_at IS NULL"]
+            params_list: list[Any] = [memory_id]
+            if not include_archived:
+                where.append("m.archived_at IS NULL")
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            sql = (
+                "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
+                "m.quality_rating, m.compressed_content, m.verbatim_content, "
+                "m.owner_id, m.namespace, m.permission_mode, m.source_model, "
+                "m.source_provider, m.source_session, m.source_agent, m.group_id, "
+                "m.created, m.updated, m.archived_at, m.deleted_at, "
+                "m.recall_count, m.last_recalled_at, m.content_hash, "
+                "m.federation_source, m.federation_remote_updated "
+                "FROM memories m WHERE " + " AND ".join(where)
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
+        finally:
+            await _call(cursor.close)
+
+    async def assert_memory_readable(self, tx: Any, memory_id: str, user: Any) -> None:
+        from mnemos.core.auth_context import UserContext
+        from mnemos.persistence.visibility import VisibilityScope
+
+        if isinstance(user, UserContext):
+            ns = getattr(user, "namespace", None) or "default"
+            visibility = VisibilityFilter.for_read(user, namespace=ns)
+        else:
+            visibility = VisibilityFilter(
+                scope=VisibilityScope.ROOT_BYPASS,
+                user_id=None,
+                group_ids=(),
+                namespace=None,
+            )
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility, table_alias="m")
+            where = ["m.id = ?"]
+            params_list: list[Any] = [memory_id]
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            sql = "SELECT 1 FROM memories m WHERE " + " AND ".join(where)
+            await _call(cursor.execute, sql, tuple(params_list))
+            rows = await _fetch_all_dicts(cursor)
+            if not rows:
+                raise PermissionError("Memory not found")
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_memory_export(
+        self,
+        tx: Any,
+        *,
+        effective_owner: str | None,
+        effective_ns: str | None,
+        category: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = ["deleted_at IS NULL"]
+            params_list: list[Any] = []
+            for col, val in [
+                ("owner_id", effective_owner),
+                ("namespace", effective_ns),
+                ("category", category),
+            ]:
+                if val is not None:
+                    where.append(f"{col} = ?")
+                    params_list.append(val)
+            params_list.extend([offset, limit])
+            sql = (
+                "SELECT id, content, category, subcategory, created, updated, "
+                "owner_id, namespace, permission_mode, quality_rating, "
+                "source_model, source_provider, source_session, source_agent, "
+                "metadata "
+                "FROM memories WHERE " + " AND ".join(where) + " "
+                "ORDER BY created ASC "
+                "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def fts_search(
+        self,
+        tx: Any,
+        *,
+        query: str,
+        limit: int,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        source_provider: str | None = None,
+        source_model: str | None = None,
+        source_agent: str | None = None,
+        include_archived: bool = False,
+    ) -> list[Row]:
+        # LIKE-based substring search — works in stock Db2 without the
+        # Db2 Text Search Server installed. Operators with Db2 Text Search
+        # can subclass and replace this with CONTAINS(c, 'pattern').
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility, table_alias="m")
+            where = ["m.deleted_at IS NULL"]
+            params_list: list[Any] = []
+            if not include_archived:
+                where.append("m.archived_at IS NULL")
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            search_term = query.strip().strip("%")
+            where.append("UPPER(m.content) LIKE '%' || UPPER(?) || '%'")
+            params_list.append(search_term)
+            for col, val in [
+                ("category", category),
+                ("subcategory", subcategory),
+                ("source_provider", source_provider),
+                ("source_model", source_model),
+                ("source_agent", source_agent),
+            ]:
+                if val is not None:
+                    where.append(f"m.{col} = ?")
+                    params_list.append(val)
+            params_list.append(limit)
+            sql = (
+                "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
+                "m.quality_rating, m.owner_id, m.namespace, m.created, m.updated "
+                "FROM memories m WHERE " + " AND ".join(where) + " "
+                "ORDER BY m.updated DESC FETCH FIRST ? ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def find_active_duplicate_by_content_hash(
+        self,
+        tx: Any,
+        *,
+        owner_id: str,
+        namespace: str,
+        content_hash: str,
+        cross_namespace: bool = False,
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = [
+                "deleted_at IS NULL",
+                "archived_at IS NULL",
+                "content_hash = ?",
+                "owner_id = ?",
+            ]
+            params_list: list[Any] = [content_hash, owner_id]
+            if not cross_namespace:
+                where.append("namespace = ?")
+                params_list.append(namespace)
+            sql = (
+                "SELECT id, content, category, subcategory, owner_id, namespace, "
+                "created, updated FROM memories WHERE " + " AND ".join(where) + " FETCH FIRST 1 ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
+        finally:
+            await _call(cursor.close)
+
 
 class Db2KGRepository(_Db2OraCompatMixin, OracleKGRepository):
     """KG triples repository — Db2-native overrides for insert + fetch.
