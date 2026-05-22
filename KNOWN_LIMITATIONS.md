@@ -1,4 +1,4 @@
-# Known limitations — v5.0.1 (covers master through the unreleased v5.3.4 line)
+# Known limitations — v6.0.0rc1 (covers v5.0.1 GA + v6.0-rc multi-DB additions)
 
 This file lists known operational caveats that aren't bugs in
 the strict sense but are worth surfacing for self-hosting
