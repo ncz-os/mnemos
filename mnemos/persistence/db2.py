@@ -2001,16 +2001,14 @@ class Db2BranchRepository(_Db2OraCompatMixin, OracleBranchRepository):
                        FROM SYSIBM.SYSDUMMY1) src
                    ON (m.memory_id = src.memory_id AND m.name = src.name)
                 WHEN MATCHED THEN UPDATE SET
-                    head_version_id = src.head_version_id,
-                    updated = CURRENT TIMESTAMP
+                    head_version_id = src.head_version_id
                 WHEN NOT MATCHED THEN INSERT (
-                    id, memory_id, name, head_version_id, created, updated
+                    id, memory_id, name, head_version_id, created_at
                 ) VALUES (
                     src.memory_id || ':' || src.name,
                     src.memory_id,
                     src.name,
                     src.head_version_id,
-                    CURRENT TIMESTAMP,
                     CURRENT TIMESTAMP
                 )
                 """,
