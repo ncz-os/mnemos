@@ -1997,7 +1997,10 @@ class Db2BranchRepository(_Db2OraCompatMixin, OracleBranchRepository):
                 cursor.execute,
                 """
                 MERGE INTO memory_branches m
-                USING (SELECT ? AS memory_id, ? AS name, ? AS head_version_id
+                USING (SELECT
+                    CAST(? AS VARCHAR(100)) AS memory_id,
+                    CAST(? AS VARCHAR(100)) AS name,
+                    CAST(? AS VARCHAR(100)) AS head_version_id
                        FROM SYSIBM.SYSDUMMY1) src
                    ON (m.memory_id = src.memory_id AND m.name = src.name)
                 WHEN MATCHED THEN UPDATE SET
