@@ -957,3 +957,206 @@ async def test_db2_compression_fetch_compressed_variants_for_export_native() -> 
     sql = calls[0]["sql"].upper() if calls else ""
     assert "OFFSET 0 ROWS FETCH NEXT" in sql or "FETCH NEXT" in sql
     assert "?" in sql
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Db2MemoryRepository parity tests (PR #8a) — 3 method-specific tests
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_insert_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    await repo.insert_memory(
+        tx,
+        memory_id="m1",
+        content="hello",
+        category="facts",
+        subcategory="test",
+        metadata_json="{}",
+        quality_rating=5,
+        owner_id="o1",
+        namespace="n1",
+        permission_mode=600,
+        source_model=None,
+        source_provider=None,
+        source_session=None,
+        source_agent=None,
+        verbatim_content=None,
+        created=None,
+        updated=None,
+    )
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "COALESCE" in sql
+    assert "CURRENT TIMESTAMP" in sql
+    assert "SYSIBM.SYSDUMMY1" in sql
+    assert "?" in sql
+    assert "NVL" not in sql
+    assert "SYSTIMESTAMP" not in sql
+    assert ":ID" not in sql
+    assert "FROM DUAL" not in sql
+    assert "TIMESTAMP WITH TIME ZONE" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_fetch_by_id_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    await repo.fetch_memory_by_id(tx, "m1")
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "FROM MEMORIES" in sql
+    assert "WHERE ID = ?" in sql
+    assert ":ID" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_update_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def __init__(self) -> None:
+            self.description = None
+            self._rows: list[Any] = []
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+            if "SELECT" in sql.upper() and "FROM MEMORIES M" in sql.upper():
+                self.description = (
+                    ("id",),
+                    ("content",),
+                    ("category",),
+                    ("subcategory",),
+                    ("metadata",),
+                    ("quality_rating",),
+                    ("compressed_content",),
+                    ("verbatim_content",),
+                    ("owner_id",),
+                    ("namespace",),
+                    ("permission_mode",),
+                    ("source_model",),
+                    ("source_provider",),
+                    ("source_session",),
+                    ("source_agent",),
+                    ("group_id",),
+                    ("created",),
+                    ("updated",),
+                    ("archived_at",),
+                    ("deleted_at",),
+                    ("recall_count",),
+                    ("last_recalled_at",),
+                    ("content_hash",),
+                    ("federation_source",),
+                    ("federation_remote_updated",),
+                )
+                self._rows = [
+                    (
+                        "m1",
+                        "updated",
+                        "facts",
+                        "sub",
+                        "{}",
+                        5,
+                        None,
+                        None,
+                        "owner-a",
+                        "ns-test",
+                        600,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "2026-01-01",
+                        "2026-01-01",
+                        None,
+                        None,
+                        0,
+                        None,
+                        "hash",
+                        None,
+                        None,
+                    )
+                ]
+
+        async def fetchone(self) -> Any:
+            return self._rows[0] if self._rows else None
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    vis = VisibilityFilter(
+        scope=VisibilityScope.OWN_ONLY,
+        user_id="owner-a",
+        group_ids=[],
+        namespace="ns-test",
+    )
+    await repo.update_memory(
+        tx,
+        "m1",
+        visibility=vis,
+        fields={"content": "updated", "category": "facts"},
+    )
+    assert len(calls) >= 2  # update + get_memory follow-up
+    update_sql = calls[0]["sql"].upper()
+    assert "UPDATE MEMORIES SET" in update_sql
+    assert "CURRENT TIMESTAMP" in update_sql
+    assert "CONTENT = ?" in update_sql
+    assert "CONTENT_HASH = ?" in update_sql
+    assert "CATEGORY = ?" in update_sql
+    assert "ID = ?" in update_sql
+    assert "SYSTIMESTAMP" not in update_sql
+    assert ":ID" not in update_sql
+    assert ":F_" not in update_sql
