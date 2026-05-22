@@ -1477,7 +1477,7 @@ async def test_db2_live_memory_update() -> None:
                 created=None,
                 updated=None,
             )
-            vis = VisibilityFilter(scope=VisibilityScope.OWN_ONLY, owner_id=owner, namespace=ns)
+            vis = VisibilityFilter(scope=VisibilityScope.OWN_ONLY, user_id=owner, group_ids=(), namespace=ns)
             updated = await backend.memories.update_memory(tx, mem_id, visibility=vis, fields={"content": "new"})
             assert updated and updated["content"] == "new"
     finally:
