@@ -6,7 +6,12 @@ DB2INSTANCE="${DB2INSTANCE:-db2inst1}"
 DB2FENCED_USER="${DB2FENCED_USER:-db2fenc1}"
 DB2INST1_PASSWORD="${DB2INST1_PASSWORD:-mnemos_dev}"
 DBNAME="${DBNAME:-MNEMOS}"
-ENABLE_ORACLE_COMPATIBILITY="${ENABLE_ORACLE_COMPATIBILITY:-true}"
+# Db2 native is the default as of PR #12 (2026-05-22). MNEMOS ships a
+# fully native Db2 backend (Memory + Federation repos closed out per
+# PRs #1-9; migration DDL native per PR #10). Set ENABLE_ORACLE_COMPATIBILITY=true
+# to fall back to ORA-compat mode (e.g. for older clients running pre-PR-1
+# repository overrides). The toggle stays for emergency fallback.
+ENABLE_ORACLE_COMPATIBILITY="${ENABLE_ORACLE_COMPATIBILITY:-false}"
 
 DB2INST_HOME="/database/config/${DB2INSTANCE}"
 DB2FENCED_HOME="/database/config/${DB2FENCED_USER}"
