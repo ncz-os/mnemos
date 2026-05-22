@@ -1128,6 +1128,9 @@ async def test_db2_memory_update_native_tokens() -> None:
         async def fetchone(self) -> Any:
             return self._rows[0] if self._rows else None
 
+        async def fetchall(self) -> list[Any]:
+            return self._rows
+
         async def close(self) -> None:
             pass
 
@@ -1234,6 +1237,37 @@ async def test_db2_memory_delete_native_tokens() -> None:
                 None,
                 None,
             )
+
+        async def fetchall(self) -> list[Any]:
+            return [
+                (
+                    "m1",
+                    "hello",
+                    "facts",
+                    "test",
+                    "{}",
+                    5,
+                    None,
+                    None,
+                    "owner-a",
+                    "ns-test",
+                    600,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "2026-01-01",
+                    "2026-01-01",
+                    None,
+                    None,
+                    0,
+                    None,
+                    "hash",
+                    None,
+                    None,
+                )
+            ]
 
         async def close(self) -> None:
             pass
@@ -1357,3 +1391,238 @@ async def test_db2_memory_count_native_tokens() -> None:
     assert "WHERE M.DELETED_AT IS NULL" in count_sql
     assert ":CAT" not in count_sql
     assert ":SUB" not in count_sql
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Db2MemoryRepository parity tests (PR #8c) — 5 read-side method tests
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_get_memory_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    vis = VisibilityFilter(
+        scope=VisibilityScope.OWN_ONLY,
+        user_id="owner-a",
+        group_ids=[],
+        namespace="ns-test",
+    )
+    await repo.get_memory(tx, "mem-1", visibility=vis)
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "FROM MEMORIES M" in sql
+    assert "WHERE M.ID = ?" in sql
+    assert "AND M.DELETED_AT IS NULL" in sql
+    assert ":ID" not in sql
+    assert "NVL" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_assert_memory_readable_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = (("1",),)
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return [(1,)]
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    class _FakeUser:
+        namespace = "ns-test"
+        user_id = "owner-a"
+        groups: list[str] = []
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    # Use a ROOT_BYPASS visibility so the test exercises the native
+    # override without needing a full UserContext construction.
+    await repo.assert_memory_readable(tx, "mem-1", _FakeUser())
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "SELECT 1 FROM MEMORIES M" in sql
+    assert "WHERE M.ID = ?" in sql
+    assert ":ID" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_fetch_memory_export_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    await repo.fetch_memory_export(
+        tx,
+        effective_owner="owner-a",
+        effective_ns="ns-test",
+        category="facts",
+        limit=50,
+        offset=0,
+    )
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY" in sql
+    assert "WHERE DELETED_AT IS NULL" in sql
+    assert "OWNER_ID = ?" in sql
+    assert "NAMESPACE = ?" in sql
+    assert "CATEGORY = ?" in sql
+    assert ":OWNER_ID" not in sql
+    assert ":NS" not in sql
+    assert ":CAT" not in sql
+    assert ":OFFSET" not in sql
+    assert ":LIMIT" not in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_fts_search_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    vis = VisibilityFilter(
+        scope=VisibilityScope.OWN_ONLY,
+        user_id="owner-a",
+        group_ids=[],
+        namespace="ns-test",
+    )
+    await repo.fts_search(
+        tx,
+        query="hello",
+        limit=10,
+        visibility=vis,
+        category="facts",
+        subcategory="test",
+        source_provider="openai",
+        source_model="gpt-4",
+        source_agent="claude",
+    )
+    sql = calls[0]["sql"].upper() if calls else ""
+    params = calls[0]["params"] if calls else ()
+    assert "UPPER(M.CONTENT) LIKE '%' || UPPER(?) || '%'" in sql
+    assert "DBMS_LOB.INSTR" not in sql
+    assert "FETCH FIRST ? ROWS ONLY" in sql
+    assert ":Q" not in sql
+    assert ":FLT_CATEGORY" not in sql
+    assert ":FLT_SUBCATEGORY" not in sql
+    assert ":FLT_SOURCE_PROVIDER" not in sql
+    assert ":FLT_SOURCE_MODEL" not in sql
+    assert ":FLT_SOURCE_AGENT" not in sql
+    assert ":LIMIT" not in sql
+    assert len(params) >= 2
+    # search_term is stripped of surrounding % signs
+    assert "hello" in params
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_find_active_duplicate_by_content_hash_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    await repo.find_active_duplicate_by_content_hash(
+        tx,
+        owner_id="owner-a",
+        namespace="ns-test",
+        content_hash="abc123",
+        cross_namespace=False,
+    )
+    sql = calls[0]["sql"].upper() if calls else ""
+    assert "FETCH FIRST 1 ROWS ONLY" in sql
+    assert "DELETED_AT IS NULL" in sql
+    assert "ARCHIVED_AT IS NULL" in sql
+    assert "CONTENT_HASH = ?" in sql
+    assert "OWNER_ID = ?" in sql
+    assert "NAMESPACE = ?" in sql
+    assert ":H" not in sql
+    assert ":OWNER_ID" not in sql
+    assert ":NS" not in sql
