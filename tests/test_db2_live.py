@@ -577,3 +577,36 @@ async def test_db2_live_memory_fts_search() -> None:
 @pytest.mark.asyncio
 async def test_db2_live_memory_find_duplicate() -> None:
     pytest.skip("live EAP exercise for Db2MemoryRepository.find_active_duplicate_by_content_hash (PR #8c)")
+
+
+# --- PR #8d: Db2MemoryRepository live stubs (5, version-snapshot + recall + stats + memory-log) ---
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_set_suppress_version_snapshot() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.set_suppress_version_snapshot (PR #8d)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_fetch_versioned_ids() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_versioned_memory_ids (PR #8d)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_gather_stats() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.gather_stats (MemoryStatsRow) (PR #8d)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_bump_recall() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.bump_recall_and_get_memory (PR #8d)")
+
+
+@pytest.mark.skipif(not DB2_DSN, reason="DB2_DSN not set; live probe skipped")
+@pytest.mark.asyncio
+async def test_db2_live_memory_fetch_log() -> None:
+    pytest.skip("live EAP exercise for Db2MemoryRepository.fetch_memory_log (PR #8d)")

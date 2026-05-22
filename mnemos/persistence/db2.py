@@ -1172,6 +1172,143 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         finally:
             await _call(cursor.close)
 
+    # ── PR #8d: version-snapshot + recall + stats + memory-log (5 methods) ──
+
+    async def set_suppress_version_snapshot(self, tx: Any) -> None:
+        # No-op — Db2 has no version-snapshot trigger to bypass.
+        # Oracle parent is also a no-op; this override prevents the
+        # compat-mixin from round-tripping through the cursor translator.
+        return None
+
+    async def fetch_versioned_memory_ids(self, tx: Any, memory_ids: Sequence[str]) -> list[Row]:
+        if not memory_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ",".join("?" for _ in memory_ids)
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT DISTINCT memory_id
+                  FROM memory_versions
+                 WHERE memory_id IN ({placeholders})
+                   AND deleted_at IS NULL
+                """,
+                tuple(memory_ids),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def gather_stats(self, tx: Any):
+        from mnemos.persistence.base import MemoryStatsRow
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN metadata IS NULL
+                                 OR LENGTH(COALESCE(metadata, '')) = 0
+                                 OR LOCATE('\"federation_origin\"', COALESCE(metadata, '')) = 0
+                                THEN 1 ELSE 0 END) AS native_count,
+                       SUM(CASE WHEN LOCATE('\"federation_origin\"', COALESCE(metadata, '')) > 0
+                                THEN 1 ELSE 0 END) AS federated_count,
+                       AVG(quality_rating) AS avg_quality
+                  FROM memories
+                 WHERE deleted_at IS NULL
+                """,
+            )
+            row = await _call(cursor.fetchone) or (0, 0, 0, None)
+            total, native, federated, avg_q = row
+            await _call(
+                cursor.execute,
+                """
+                SELECT category, COUNT(*)
+                  FROM memories
+                 WHERE deleted_at IS NULL AND category IS NOT NULL
+                 GROUP BY category
+                """,
+            )
+            by_cat: dict[str, int] = {}
+            for cat, n in await _call(cursor.fetchall) or []:
+                by_cat[str(cat)] = int(n)
+            return MemoryStatsRow(
+                total_memories=int(total or 0),
+                native_memories=int(native or 0),
+                federated_memories=int(federated or 0),
+                memories_by_category=by_cat,
+                avg_quality_rating=float(avg_q) if avg_q is not None else None,
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def bump_recall_and_get_memory(
+        self,
+        tx: Any,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility)
+            where = ["id = ?", "deleted_at IS NULL"]
+            params_list: list[Any] = [memory_id]
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET "
+                "recall_count = COALESCE(recall_count, 0) + 1, "
+                "last_recalled_at = CURRENT TIMESTAMP "
+                "WHERE " + " AND ".join(where),
+                tuple(params_list),
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return None
+        finally:
+            await _call(cursor.close)
+        return await self.get_memory(tx, memory_id, visibility=visibility)
+
+    async def fetch_memory_log(
+        self,
+        tx: Any,
+        memory_id: str,
+        branch: str,
+        limit: int,
+        user: Any,
+    ) -> list[Row]:
+        _ = user
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, memory_id, version_num, content, commit_hash,
+                       parent_version_id, branch, snapshot_at, snapshot_by,
+                       change_type, category, subcategory, owner_id, namespace
+                  FROM memory_versions
+                 WHERE memory_id = ?
+                   AND branch = ?
+                   AND deleted_at IS NULL
+                 ORDER BY version_num DESC
+                 FETCH FIRST ? ROWS ONLY
+                """,
+                (memory_id, branch, limit),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
 
 class Db2KGRepository(_Db2OraCompatMixin, OracleKGRepository):
     """KG triples repository — Db2-native overrides for insert + fetch.

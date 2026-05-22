@@ -1626,3 +1626,252 @@ async def test_db2_memory_find_active_duplicate_by_content_hash_native_tokens() 
     assert ":H" not in sql
     assert ":OWNER_ID" not in sql
     assert ":NS" not in sql
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Db2MemoryRepository parity tests (PR #8d) — 5 method-specific tests
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_set_suppress_version_snapshot_native() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    repo = Db2MemoryRepository()
+    import types
+
+    tx = types.SimpleNamespace()
+    result = await repo.set_suppress_version_snapshot(tx)
+    # No-op on both Oracle and Db2; this override prevents an
+    # Oracle-via-translator round-trip.
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_fetch_versioned_memory_ids_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    await repo.fetch_versioned_memory_ids(tx, ["m1", "m2"])
+    sql = calls[0]["sql"].upper() if calls else ""
+    params = calls[0]["params"] if calls else ()
+    assert "SELECT DISTINCT MEMORY_ID" in sql
+    assert "FROM MEMORY_VERSIONS" in sql
+    assert "WHERE MEMORY_ID IN (?, ?)" in sql or "IN (?,?)" in sql
+    assert "DELETED_AT IS NULL" in sql
+    assert ":ID0" not in sql
+    assert ":ID1" not in sql
+    assert len(params) == 2
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_gather_stats_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql})
+
+        async def fetchone(self) -> Any:
+            return (0, 0, 0, None)
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    await repo.gather_stats(tx)
+    assert len(calls) == 2
+    agg_sql = calls[0]["sql"].upper()
+    cat_sql = calls[1]["sql"].upper()
+    assert "COUNT(*)" in agg_sql
+    assert "AVG(QUALITY_RATING)" in agg_sql
+    assert "LOCATE('\"FEDERATION_ORIGIN\"'" in agg_sql
+    assert "COALESCE(METADATA, ''" in agg_sql
+    assert "DBMS_LOB" not in agg_sql
+    assert "INSTR" not in agg_sql
+    assert "SYSTIMESTAMP" not in agg_sql
+    assert "NVL" not in agg_sql
+    assert "FROM MEMORIES" in agg_sql
+    assert "SELECT CATEGORY, COUNT(*)" in cat_sql
+    assert "GROUP BY CATEGORY" in cat_sql
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_bump_recall_and_get_memory_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def __init__(self) -> None:
+            self.description = None
+            self._rows: list[Any] = []
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+            if "SELECT" in sql.upper() and "FROM MEMORIES M" in sql.upper():
+                self.description = (
+                    ("id",),
+                    ("content",),
+                    ("category",),
+                    ("subcategory",),
+                    ("metadata",),
+                    ("quality_rating",),
+                    ("compressed_content",),
+                    ("verbatim_content",),
+                    ("owner_id",),
+                    ("namespace",),
+                    ("permission_mode",),
+                    ("source_model",),
+                    ("source_provider",),
+                    ("source_session",),
+                    ("source_agent",),
+                    ("group_id",),
+                    ("created",),
+                    ("updated",),
+                    ("archived_at",),
+                    ("deleted_at",),
+                    ("recall_count",),
+                    ("last_recalled_at",),
+                    ("content_hash",),
+                    ("federation_source",),
+                    ("federation_remote_updated",),
+                )
+                self._rows = [
+                    (
+                        "m1",
+                        "hello",
+                        "facts",
+                        "test",
+                        "{}",
+                        5,
+                        None,
+                        None,
+                        "owner-a",
+                        "ns-test",
+                        600,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "2026-01-01",
+                        "2026-01-01",
+                        None,
+                        None,
+                        1,
+                        "2026-01-01",
+                        "hash",
+                        None,
+                        None,
+                    )
+                ]
+
+        async def fetchall(self) -> list[Any]:
+            return self._rows
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    vis = VisibilityFilter(
+        scope=VisibilityScope.OWN_ONLY,
+        user_id="owner-a",
+        group_ids=[],
+        namespace="ns-test",
+    )
+    result = await repo.bump_recall_and_get_memory(tx, "m1", visibility=vis)
+    assert result is not None
+    assert len(calls) == 2  # UPDATE + get_memory SELECT
+    update_sql = calls[0]["sql"].upper()
+    update_params = calls[0]["params"]
+    assert "UPDATE MEMORIES SET" in update_sql
+    assert "COALESCE(RECALL_COUNT, 0) + 1" in update_sql
+    assert "LAST_RECALLED_AT = CURRENT TIMESTAMP" in update_sql
+    assert "ID = ?" in update_sql
+    assert "DELETED_AT IS NULL" in update_sql
+    assert "NVL" not in update_sql
+    assert "SYSTIMESTAMP" not in update_sql
+    assert ":ID" not in update_sql
+    assert len(update_params) >= 1
+
+
+@pytest.mark.asyncio
+async def test_db2_memory_fetch_memory_log_native_tokens() -> None:
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.description = None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    class _FakeConn:
+        def cursor(self) -> _FakeCursor:
+            return _FakeCursor()
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    await repo.fetch_memory_log(tx, "mem-1", "main", 10, None)
+    sql = calls[0]["sql"].upper() if calls else ""
+    params = calls[0]["params"] if calls else ()
+    assert "FROM MEMORY_VERSIONS" in sql
+    assert "WHERE MEMORY_ID = ?" in sql
+    assert "AND BRANCH = ?" in sql
+    assert "FETCH FIRST ? ROWS ONLY" in sql
+    assert "ORDER BY VERSION_NUM DESC" in sql
+    assert "DELETED_AT IS NULL" in sql
+    assert ":MEMORY_ID" not in sql
+    assert ":BRANCH" not in sql
+    assert ":LIMIT" not in sql
+    assert len(params) == 3
