@@ -319,19 +319,19 @@ def _build_oracle_session_callback(settings: Any) -> Any:
     """
     pdb_target = os.environ.get("MNEMOS_ORACLE_PDB", "").strip()
 
-    def _session_callback(conn: Any, requested_tag: Any) -> None:
+    async def _session_callback(conn: Any, requested_tag: Any) -> None:
         cur = None
         try:
             cur = conn.cursor()
             # Defensive NLS pinning: prevents locale-dependent decimal
             # parsing of vector literals + numeric binds.
             try:
-                cur.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '. '")
+                await cur.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '. '")
             except Exception as exc:  # pragma: no cover - driver-dependent
                 _LOG.debug("ALTER SESSION SET NLS_NUMERIC_CHARACTERS failed: %s", exc)
             if pdb_target:
                 try:
-                    cur.execute(f"ALTER SESSION SET CONTAINER = {pdb_target}")
+                    await cur.execute(f"ALTER SESSION SET CONTAINER = {pdb_target}")
                 except Exception as exc:  # pragma: no cover - driver-dependent
                     # ORA-65049 = already in the requested PDB; benign.
                     _LOG.debug(
@@ -420,7 +420,7 @@ async def create_oracle_pool(
     kwargs.setdefault("min", pool_min)
     kwargs.setdefault("max", pool_max)
     kwargs.setdefault("increment", pool_increment)
-    kwargs.setdefault("statement_cache_size", stmt_cache)
+    kwargs.setdefault("stmtcachesize", stmt_cache)
     # Explicit WAIT mode + timeout: default behaviour would otherwise
     # block forever when the pool is saturated.
     kwargs.setdefault("getmode", oracledb.POOL_GETMODE_WAIT)
