@@ -317,6 +317,124 @@ class SqliteHiveMindRepository:
             )
             await db.commit()
 
+    # ---------- atomic claim (Phase 2 migration cut 4) ----------
+
+    async def find_and_claim_job(
+        self, *, agent_urn: str, agent_kind: str,
+        agent_caps: set[str], agent_runtime: str, agent_model: str,
+        agent_provider: str, agent_tier: str,
+        cost_tier_order: list[str],
+        sub_throttled: bool,
+        now: float,
+    ) -> Optional[dict[str, Any]]:
+        """Atomic dequeue. Owns the transaction because claim correctness
+        IS storage semantics: dependency gates, retry backoff, and the
+        UPDATE-WHERE-status='queued' race guard all live or die with
+        the surrounding BEGIN IMMEDIATE.
+
+        Returns the claimed job dict (same shape service expects to
+        forward to the worker) or None when nothing is claimable.
+
+        Filter chain executed in-order, cheapest first:
+          1. DAG gate (depends_on all done)
+          2. eligible_kinds membership
+          3. required_capabilities subset (with "*" wildcard escape)
+          4. cost-tier ceiling
+          5. subscription throttle
+          6. preferred_providers / preferred_models
+        """
+        import json as _json
+        import aiosqlite
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT id, kind, description, priority, deadline, "
+                    "required_capabilities, eligible_kinds, submitter_urn, "
+                    "parent_job_id, started_at, max_cost_tier, "
+                    "preferred_providers, preferred_models, mnemos_refs, depends_on "
+                    "FROM jobs WHERE status='queued' "
+                    "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
+                    "ORDER BY priority DESC, started_at ASC",
+                    (now,),
+                ) as cur:
+                    async for r in cur:
+                        (job_id, j_kind, j_desc, j_prio, j_dead, j_caps_json,
+                         j_kinds_json, j_sub, j_par, j_started, j_max_tier,
+                         j_pref_providers, j_pref_models, j_mnemos_refs,
+                         j_deps_json) = r
+                        # DAG gate
+                        if j_deps_json:
+                            deps = _json.loads(j_deps_json) or []
+                            if deps:
+                                ph = ",".join("?" * len(deps))
+                                async with db.execute(
+                                    f"SELECT COUNT(*) FROM jobs "
+                                    f"WHERE id IN ({ph}) AND status='done'",
+                                    tuple(deps),
+                                ) as dc:
+                                    done_count = (await dc.fetchone())[0]
+                                if done_count < len(deps):
+                                    continue
+                        # eligible_kinds
+                        if j_kinds_json:
+                            kinds = _json.loads(j_kinds_json)
+                            if kinds and agent_kind not in kinds:
+                                continue
+                        # required_capabilities (with "*" claim-any escape)
+                        if j_caps_json and "*" not in agent_caps:
+                            need = set(_json.loads(j_caps_json))
+                            if not need.issubset(agent_caps):
+                                continue
+                        # cost-tier ceiling
+                        job_max_tier = (j_max_tier or "A").upper()
+                        if cost_tier_order.index(agent_tier) > cost_tier_order.index(job_max_tier):
+                            continue
+                        # subscription throttle (Anthropic Max past 85% MTD)
+                        if sub_throttled and job_max_tier != "A":
+                            continue
+                        # preferred_providers
+                        if j_pref_providers:
+                            provs = _json.loads(j_pref_providers)
+                            if provs and agent_provider not in provs:
+                                continue
+                        if j_pref_models:
+                            models = _json.loads(j_pref_models)
+                            if models and agent_model not in models:
+                                continue
+                        # match — claim with race guard
+                        await db.execute(
+                            "UPDATE jobs SET status='claimed', claimed_by=?, "
+                            "claimed_at=?, claimed_runtime=?, claimed_model=?, "
+                            "claimed_provider=?, claimed_cost_tier=? "
+                            "WHERE id=? AND status='queued'",
+                            (agent_urn, now, agent_runtime, agent_model,
+                             agent_provider, agent_tier, job_id),
+                        )
+                        await db.execute("COMMIT")
+                        return {
+                            "id": job_id, "kind": j_kind,
+                            "description": j_desc, "priority": j_prio,
+                            "deadline": j_dead,
+                            "submitter_urn": j_sub,
+                            "parent_job_id": j_par,
+                            "claimed_at": now, "queued_at": j_started,
+                            "mnemos_refs": (
+                                _json.loads(j_mnemos_refs) if j_mnemos_refs else []
+                            ),
+                            "claimed_resources": {
+                                "runtime": agent_runtime, "model": agent_model,
+                                "provider": agent_provider,
+                                "cost_tier": agent_tier,
+                            },
+                        }
+                await db.execute("COMMIT")
+                return None
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+
     # Every other Protocol method raises NotImplementedError until
     # migrated. We don't list them here to keep the file scannable;
     # service.py will type-check against the Protocol so missing
