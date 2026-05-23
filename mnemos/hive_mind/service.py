@@ -832,29 +832,25 @@ async def create_job(req: JobCreate):
     async with aiosqlite.connect(DB_PATH) as db:
         cached = await cache_lookup(db, ck)
         if cached:
-            # short-circuit: store job as done with cached result + cost=0
-            await db.execute(
-                "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
-                "required_capabilities, eligible_kinds, project, max_cost_tier, preferred_providers, preferred_models, "
-                "mnemos_refs, status, started_at, ended_at, result, claimed_provider, claimed_model, "
-                "claimed_cost_tier, estimated_cost_usd, result_mnemos_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?, ?, ?, 'A', 0, ?)",
-                (
-                    job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
-                    req.priority, req.deadline,
-                    json.dumps(req.required_capabilities) if req.required_capabilities else None,
-                    json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
-                    req.project,
-                    (req.max_cost_tier or "A").upper(),
-                    json.dumps(req.preferred_providers) if req.preferred_providers else None,
-                    json.dumps(req.preferred_models) if req.preferred_models else None,
-                    json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
-                    now, now,
-                    json.dumps({**(cached["result"] or {}), "cache_hit": True,
-                                "source_job_id": cached["source_job_id"]}),
-                    cached["provider"], cached["model"],
-                    cached.get("result_mnemos_id"),
-                ),
+            # Phase 2 cut 3: cache-hit insert delegated to repo. Cache-hit
+            # accounting (cache_record_hit) stays inline because it needs
+            # the existing db handle for emit_event.
+            cached_result = {**(cached["result"] or {}), "cache_hit": True,
+                             "source_job_id": cached["source_job_id"]}
+            await _REPO.insert_job_cache_hit(
+                job_id=job_id, submitter_urn=req.submitter_urn,
+                parent_job_id=req.parent_job_id, kind=req.kind,
+                description=req.description, priority=req.priority,
+                deadline=req.deadline,
+                required_capabilities=req.required_capabilities,
+                eligible_kinds=req.eligible_kinds, project=req.project,
+                max_cost_tier=(req.max_cost_tier or "A").upper(),
+                preferred_providers=req.preferred_providers,
+                preferred_models=req.preferred_models,
+                mnemos_refs=req.mnemos_refs,
+                started_at=now, ended_at=now, result=cached_result,
+                provider=cached["provider"], model=cached["model"],
+                result_mnemos_id=cached.get("result_mnemos_id"),
             )
             # record cache hit with estimated cost-saving (use prior job's cost or fallback)
             saved = 0.01  # conservative fallback if no token data

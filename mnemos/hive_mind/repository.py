@@ -270,6 +270,53 @@ class SqliteHiveMindRepository:
             )
             await db.commit()
 
+    async def insert_job_cache_hit(self, *, job_id: str, submitter_urn: str,
+                                   parent_job_id: Optional[str], kind: str,
+                                   description: Optional[str], priority: int,
+                                   deadline: Optional[float],
+                                   required_capabilities: Optional[list[str]],
+                                   eligible_kinds: Optional[list[str]],
+                                   project: Optional[str], max_cost_tier: str,
+                                   preferred_providers: Optional[list[str]],
+                                   preferred_models: Optional[list[str]],
+                                   mnemos_refs: Optional[list[str]],
+                                   started_at: float, ended_at: float,
+                                   result: dict[str, Any], provider: Optional[str],
+                                   model: Optional[str],
+                                   result_mnemos_id: Optional[str]) -> None:
+        """Cache-hit short-circuit insert: job is born status='done' with the
+        prior result, no claim cycle. claimed_cost_tier hard-coded to 'A'
+        and estimated_cost_usd to 0 because the work was never actually
+        executed (cache served it).
+        """
+        import json as _json
+        import aiosqlite
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, "
+                "priority, deadline, required_capabilities, eligible_kinds, project, "
+                "max_cost_tier, preferred_providers, preferred_models, mnemos_refs, "
+                "status, started_at, ended_at, result, claimed_provider, claimed_model, "
+                "claimed_cost_tier, estimated_cost_usd, result_mnemos_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?, ?, ?, 'A', 0, ?)",
+                (
+                    job_id, submitter_urn, parent_job_id, kind, description,
+                    priority, deadline,
+                    _json.dumps(required_capabilities) if required_capabilities else None,
+                    _json.dumps(eligible_kinds) if eligible_kinds else None,
+                    project, max_cost_tier,
+                    _json.dumps(preferred_providers) if preferred_providers else None,
+                    _json.dumps(preferred_models) if preferred_models else None,
+                    _json.dumps(mnemos_refs) if mnemos_refs else None,
+                    started_at, ended_at,
+                    _json.dumps(result),
+                    provider, model,
+                    result_mnemos_id,
+                ),
+            )
+            await db.commit()
+
     # Every other Protocol method raises NotImplementedError until
     # migrated. We don't list them here to keep the file scannable;
     # service.py will type-check against the Protocol so missing
