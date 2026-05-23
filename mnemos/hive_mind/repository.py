@@ -224,6 +224,52 @@ class SqliteHiveMindRepository:
             )
             await db.commit()
 
+    # ---------- jobs (Phase 2 migration cut 2) ----------
+
+    async def insert_job_queued(self, *, job_id: str, submitter_urn: str,
+                                parent_job_id: Optional[str], kind: str,
+                                description: Optional[str], priority: int,
+                                deadline: Optional[float],
+                                required_capabilities: Optional[list[str]],
+                                eligible_kinds: Optional[list[str]],
+                                project: Optional[str], max_cost_tier: str,
+                                preferred_providers: Optional[list[str]],
+                                preferred_models: Optional[list[str]],
+                                mnemos_refs: Optional[list[str]],
+                                depends_on: Optional[list[str]],
+                                max_retries: int, started_at: float) -> None:
+        """Atomic insert of a new queued job. Cache-hit short-circuit path
+        is NOT migrated here — that path writes status='done' with cached
+        result + claimed_provider/model, very different shape. Cut 3 will
+        give it a separate insert_job_cache_hit() method.
+        """
+        import json as _json
+        import aiosqlite
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, "
+                "priority, deadline, required_capabilities, eligible_kinds, project, "
+                "max_cost_tier, preferred_providers, preferred_models, "
+                "mnemos_refs, depends_on, max_retries, status, started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                (
+                    job_id, submitter_urn, parent_job_id, kind, description,
+                    priority, deadline,
+                    _json.dumps(required_capabilities) if required_capabilities else None,
+                    _json.dumps(eligible_kinds) if eligible_kinds else None,
+                    project,
+                    max_cost_tier,
+                    _json.dumps(preferred_providers) if preferred_providers else None,
+                    _json.dumps(preferred_models) if preferred_models else None,
+                    _json.dumps(mnemos_refs) if mnemos_refs else None,
+                    _json.dumps(depends_on) if depends_on else None,
+                    int(max_retries),
+                    started_at,
+                ),
+            )
+            await db.commit()
+
     # Every other Protocol method raises NotImplementedError until
     # migrated. We don't list them here to keep the file scannable;
     # service.py will type-check against the Protocol so missing

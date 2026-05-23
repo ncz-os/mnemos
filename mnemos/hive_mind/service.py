@@ -889,27 +889,22 @@ async def create_job(req: JobCreate):
                     ),
                 )
         # else: submitter not registered → allowed (human/external curl)
-        await db.execute(
-            "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
-            "required_capabilities, eligible_kinds, project, max_cost_tier, preferred_providers, preferred_models, "
-            "mnemos_refs, depends_on, max_retries, status, started_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
-            (
-                job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
-                req.priority, req.deadline,
-                json.dumps(req.required_capabilities) if req.required_capabilities else None,
-                json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
-                req.project,
-                (req.max_cost_tier or "A").upper(),
-                json.dumps(req.preferred_providers) if req.preferred_providers else None,
-                json.dumps(req.preferred_models) if req.preferred_models else None,
-                json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
-                json.dumps(req.depends_on) if req.depends_on else None,
-                int(req.max_retries),
-                now,
-            ),
+        # Phase 2 cut 2: INSERT delegated to repo.insert_job_queued.
+        # The cache-hit short-circuit path above still runs inline (different
+        # row shape — status='done' + claimed_provider — cut 3 target).
+        await _REPO.insert_job_queued(
+            job_id=job_id, submitter_urn=req.submitter_urn,
+            parent_job_id=req.parent_job_id, kind=req.kind,
+            description=req.description, priority=req.priority,
+            deadline=req.deadline,
+            required_capabilities=req.required_capabilities,
+            eligible_kinds=req.eligible_kinds, project=req.project,
+            max_cost_tier=(req.max_cost_tier or "A").upper(),
+            preferred_providers=req.preferred_providers,
+            preferred_models=req.preferred_models,
+            mnemos_refs=req.mnemos_refs, depends_on=req.depends_on,
+            max_retries=req.max_retries, started_at=now,
         )
-        await db.commit()
         await emit_event(db, "job.queued", {
             "id": job_id, "submitter": req.submitter_urn, "kind": req.kind,
             "description": req.description, "priority": req.priority,
@@ -985,7 +980,12 @@ async def dequeue_next_job(agent_urn: str):
                         if kinds and agent_kind not in kinds:
                             continue
                     # filter: required_capabilities
-                    if j_caps_json:
+                    # Wildcard "*" in agent_caps = claim-any (workers willing to
+                    # attempt any tag; failure-mode handled by exit_code+retry).
+                    # Without this, the hive becomes unusable for free-form
+                    # project tags (e.g. ["db2","yocto","npu"]) that no general
+                    # worker declares but everything ends up tagged with.
+                    if j_caps_json and "*" not in agent_caps:
                         need = set(json.loads(j_caps_json))
                         if not need.issubset(agent_caps):
                             continue
