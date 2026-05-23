@@ -1,6 +1,6 @@
 # MNEMOS Quick Start Requirements
 
-**Applies to**: current v6.0.0rc1 release-candidate line (legacy GA v5.0.1)
+**Applies to**: current v6.0.0rc1 release line (legacy GA v5.0.1)
 **TL;DR**: Python 3.11+ for package installs; no host Python for single-binary.
 Use SQLite for `edge`/`dev`, or PostgreSQL 16 + Redis for `server`.
 **Full Details**: See `SYSTEM_REQUIREMENTS.md`
