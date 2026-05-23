@@ -131,19 +131,48 @@ def update_job(job_id: str, status: str, result: dict):
     _http("PATCH", f"/v1/jobs/{job_id}", body)
 
 
+ERR_PATTERNS = [
+    ("rate_limit",      "Rate limit exceeded"),
+    ("rate_limit_429",  '"status":429'),
+    ("auth_error",      "Authentication error"),
+    ("auth_failed",     "Authentication failed"),
+    ("context_overflow","context length"),
+    ("model_not_found", "model not found"),
+    ("upstream_500",    "InternalServerError"),
+]
+
+
+def detect_goose_error(stdout: str) -> Optional[str]:
+    """Inspect goose stdout. Return error tag if recoverable failure pattern found, else None."""
+    if not stdout:
+        return None
+    s = stdout.lower()
+    for tag, needle in ERR_PATTERNS:
+        if needle.lower() in s:
+            return tag
+    return None
+
+
 def run_goose(description: str) -> dict:
     cmd = [GOOSE_BIN, "run", "--text", description, "--no-session"] + GOOSE_EXTRA_ARGS
     print(f"[worker] $ {' '.join(cmd[:6])} … [desc len={len(description)}]", flush=True)
     start = time.time()
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=GOOSE_TIMEOUT)
-        return {
+        err_tag = detect_goose_error(proc.stdout)
+        result = {
             "exit_code": proc.returncode,
             "stdout": proc.stdout[-12000:],
             "stderr": proc.stderr[-4000:],
             "duration_sec": round(time.time() - start, 1),
             "goose_cmd": " ".join(cmd[:6]),
         }
+        if err_tag:
+            # Goose's exit code lies when the API errors; override so hive
+            # can auto-retry instead of caching the error message as success.
+            result["exit_code"] = 1
+            result["worker_error"] = err_tag
+        return result
     except subprocess.TimeoutExpired:
         return {
             "exit_code": -1,
