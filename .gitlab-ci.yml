@@ -56,6 +56,20 @@ lint:import-linter:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
 
+lint:migration-parity:
+  stage: lint
+  tags: [argos, ncz-os]
+  script:
+    # MR pipelines: --mode diff against CI_MERGE_REQUEST_DIFF_BASE_SHA
+    #               (only blocks NEW additions vs target branch).
+    # Branch pipelines (post-merge): full mode would flag the 20
+    #               grandfathered violations + always red, so skip.
+    # Prevents the audit-persistence gap pattern that surfaced 2026-05-23
+    # (GRAEAE consultations in PG, missing from Oracle, 503).
+    - python3 scripts/check_migration_parity.py --mode diff
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
 lint:env-discipline:
   stage: lint
   tags: [argos, ncz-os]
