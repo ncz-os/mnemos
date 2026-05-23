@@ -296,6 +296,36 @@ def estimate_cost(provider: str, model: str, tokens_in: int, tokens_out: int) ->
     return round((tokens_in / 1_000_000) * in_rate + (tokens_out / 1_000_000) * out_rate, 6)
 
 
+def hallucination_check(result: dict) -> Optional[str]:
+    """Return reason string if result looks like an LLM token-loop / hallucination,
+    else None. Saves marking-done garbage that wastes a cache entry + claims completion.
+
+    Heuristics:
+    - >40% of stdout is a single repeated word/phrase
+    - stdout >1500 chars with <50 unique words (Kimi-K2.6 'extension extension extension' loop)
+    - stdout contains 'Rate limit exceeded' / 'Authentication error' / 'context-length exceeded'
+    """
+    if not isinstance(result, dict):
+        return None
+    stdout = result.get("stdout") or result.get("output") or ""
+    if not isinstance(stdout, str) or len(stdout) < 200:
+        return None
+    if "rate limit exceeded" in stdout.lower():
+        return "rate_limit_in_output"
+    if "authentication error" in stdout.lower() or "authentication failed" in stdout.lower():
+        return "auth_error_in_output"
+    if "context length" in stdout.lower() and "exceed" in stdout.lower():
+        return "context_overflow_in_output"
+    # token-loop detection
+    words = stdout.split()
+    if len(words) > 200:
+        from collections import Counter
+        top_word, top_count = Counter(words).most_common(1)[0]
+        if top_count / len(words) > 0.4:
+            return f"token_loop:{top_word!r}_repeated_{top_count}_of_{len(words)}"
+    return None
+
+
 # RESULT CACHE — Nemotron killer feature 2026-05-23.
 # Memoize (kind, description, max_cost_tier, sorted-required-capabilities) → result.
 # When identical job submitted, return cached result instantly. Cuts LLM spend
@@ -507,7 +537,22 @@ async def reaper_task(app: FastAPI):
                         print(f"scheduler error {sched_id}: {se}", flush=True)
                 if due:
                     await db.commit()
-                # 4. Purge old events
+                # 4. Auto-cancel stale jobs (queued > 7 days untouched)
+                stale_job_cutoff = time.time() - 7 * 24 * 3600
+                async with db.execute(
+                    "SELECT id FROM jobs WHERE status='queued' AND started_at < ?",
+                    (stale_job_cutoff,)
+                ) as cur:
+                    stale_ids = [r[0] async for r in cur]
+                if stale_ids:
+                    await db.executemany(
+                        "UPDATE jobs SET status='cancelled', ended_at=? WHERE id=?",
+                        [(time.time(), j) for j in stale_ids],
+                    )
+                    for j in stale_ids:
+                        await emit_event(db, "job.cancelled", {"id": j, "reason": "stale_>7d"})
+                    await db.commit()
+                # 5. Purge old events
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
                 await db.execute("DELETE FROM events WHERE ts < ?", (retain_cutoff,))
                 await db.commit()
@@ -967,6 +1012,19 @@ async def dequeue_next_job(agent_urn: str):
 @app.patch("/v1/jobs/{job_id}")
 async def update_job(job_id: str, req: JobUpdate):
     now = time.time()
+    # Hallucination guard: convert status=done with garbage output to status=failed
+    eff_status = req.status
+    halluc_reason = None
+    if req.status == "done" and req.result:
+        halluc_reason = hallucination_check(req.result)
+        if halluc_reason:
+            eff_status = "failed"
+            req = JobUpdate(
+                status="failed",
+                result={**(req.result or {}), "_hallucination_guard": halluc_reason},
+                claimed_by=req.claimed_by, tokens_in=req.tokens_in,
+                tokens_out=req.tokens_out, result_mnemos_id=req.result_mnemos_id,
+            )
     fields = ["status=?"]
     args: list = [req.status]
     if req.status in ("done", "failed", "cancelled"):
