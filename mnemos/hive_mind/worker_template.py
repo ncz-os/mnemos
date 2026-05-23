@@ -188,13 +188,19 @@ def update_job(job_id: str, status: str, result: dict):
 
 
 ERR_PATTERNS = [
-    ("rate_limit",      "Rate limit exceeded"),
-    ("rate_limit_429",  '"status":429'),
-    ("auth_error",      "Authentication error"),
-    ("auth_failed",     "Authentication failed"),
-    ("context_overflow","context length"),
-    ("model_not_found", "model not found"),
-    ("upstream_500",    "InternalServerError"),
+    ("rate_limit",          "Rate limit exceeded"),
+    ("rate_limit_429",      '"status":429'),
+    ("auth_error",          "Authentication error"),
+    ("auth_failed",         "Authentication failed"),
+    ("context_overflow",    "context length"),
+    ("model_not_found",     "model not found"),
+    ("upstream_500",        "InternalServerError"),
+    # Added 2026-05-23 iter-4: goose-side config not set up on a fleet host.
+    # Worker-local condition — the hive should not retry on this same worker
+    # but routing to a different host may succeed.
+    ("goose_not_configured", "Please run 'goose configure'"),
+    ("keyring_missing",      "system is unable to use the keyring"),
+    ("missing_api_key",      "No API key found"),
 ]
 
 
