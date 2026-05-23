@@ -34,9 +34,12 @@ from mnemos.persistence.oracle import (
     OracleBranchRepository,
     OracleCompressionRepository,
     OracleConsultationAuditRepository,
+    OracleConsultationsRepository,
     OracleFederationRepository,
     OracleKGRepository,
     OracleMemoryRepository,
+    OracleOAuthRepository,
+    OracleSessionsRepository,
     OracleStateRepository,
     OracleVersionRepository,
     OracleWebhookRepository,
@@ -3390,6 +3393,28 @@ class Db2StateRepository(_Db2OraCompatMixin, OracleStateRepository):
             await _call(cursor.close)
 
 
+class Db2OAuthRepository(_Db2OraCompatMixin, OracleOAuthRepository):
+    """OAuth repository for Db2 via Oracle compatibility.
+
+    Inherits all SQL from :class:`OracleOAuthRepository`; the mixin
+    applies Db2 cursor translation (``SYSTIMESTAMP``→``CURRENT TIMESTAMP``,
+    ``:name`` binds → ``?`` positional binds) at execution time.
+    """
+
+
+class Db2SessionsRepository(_Db2OraCompatMixin, OracleSessionsRepository):
+    """Sessions repository for Db2 via Oracle compatibility."""
+
+
+class Db2ConsultationsRepository(_Db2OraCompatMixin, OracleConsultationsRepository):
+    """Consultations repository for Db2 via Oracle compatibility.
+
+    Distinct from :class:`Db2ConsultationAuditRepository` — this is the
+    user-facing consultations table that consultations.py routes operate
+    on. Audit is the lower-level event log.
+    """
+
+
 class Db2Backend(OracleBackend):
     """IBM Db2 12.1.x backend via Oracle Compatibility Mode.
 
@@ -3461,6 +3486,12 @@ class Db2Backend(OracleBackend):
         self._consultations_audit_repo = Db2ConsultationAuditRepository()
         self._federation_repo = Db2FederationRepository()
         self._state_kv_repo = Db2StateRepository()
+        # RA-0/5/6: OAuth/Sessions/Consultations repos (PYTHIA Oracle-only
+        # uses these in production; Db2 needs them for cross-backend parity
+        # so the same code paths exercise both backends in tests).
+        self._oauth_repo = Db2OAuthRepository()
+        self._sessions_repo = Db2SessionsRepository()
+        self._consultations_repo = Db2ConsultationsRepository()
         # Startup registry-probe state, populated lazily by ``open()``.
         # ``None`` means "not yet probed"; otherwise stores the raw
         # registry value (``"YES"``, ``"NO"``, ``""``...) for the
