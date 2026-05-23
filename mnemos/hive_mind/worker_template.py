@@ -137,7 +137,18 @@ def claim_next_job() -> dict | None:
 
 
 def update_job(job_id: str, status: str, result: dict):
+    # REVIEW #9 fix: tokens_in/tokens_out MUST be top-level on JobUpdate
+    # body or agent_bus.py never moves them into jobs.tokens_in/tokens_out
+    # columns. Keep them in result too for caller introspection, but lift
+    # to top-level for the PATCH so /v1/stats/workers counts populate.
     body = {"status": status, "result": result}
+    if isinstance(result, dict):
+        t_in = result.get("tokens_in")
+        t_out = result.get("tokens_out")
+        if t_in is not None:
+            body["tokens_in"] = int(t_in)
+        if t_out is not None:
+            body["tokens_out"] = int(t_out)
     _http("PATCH", f"/v1/jobs/{job_id}", body)
 
 
@@ -192,12 +203,13 @@ def parse_tokens(stdout: str, stderr: str = "") -> tuple[int, int]:
     return (0, 0)
 
 
-def run_goose(description: str) -> dict:
+def run_goose(description: str, kind: str = "") -> dict:
     cmd = [GOOSE_BIN, "run", "--text", description, "--no-session"] + GOOSE_EXTRA_ARGS
-    print(f"[worker] $ {' '.join(cmd[:6])} … [desc len={len(description)}]", flush=True)
+    eff_timeout = timeout_for_kind(kind)
+    print(f"[worker] $ {' '.join(cmd[:6])} … [desc len={len(description)} kind={kind!r} timeout={eff_timeout}s]", flush=True)
     start = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=GOOSE_TIMEOUT)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=eff_timeout)
         err_tag = detect_goose_error(proc.stdout)
         t_in, t_out = parse_tokens(proc.stdout, proc.stderr)
         # Fallback estimate when goose doesn't surface counts: char/4 (rough GPT-tokenizer heuristic)
@@ -220,7 +232,7 @@ def run_goose(description: str) -> dict:
     except subprocess.TimeoutExpired:
         return {
             "exit_code": -1,
-            "error": f"timeout {GOOSE_TIMEOUT}s exceeded",
+            "error": f"timeout {eff_timeout}s exceeded",
             "duration_sec": round(time.time() - start, 1),
         }
     except Exception as e:
@@ -244,7 +256,7 @@ def main():
         backoff = 1.0  # reset on success
         print(f"[worker] claimed job {job['id'][:8]} kind={job['kind']} priority={job.get('priority')}", flush=True)
         update_job(job["id"], "running", {"started_by": _urn, "started_at": time.time()})
-        result = run_goose(job.get("description") or job.get("kind", ""))
+        result = run_goose(job.get("description") or job.get("kind", ""), kind=job.get("kind", ""))
         status = "done" if result.get("exit_code") == 0 else "failed"
         result["finished_at"] = time.time()
         update_job(job["id"], status, result)
