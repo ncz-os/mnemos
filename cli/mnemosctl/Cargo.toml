@@ -1,0 +1,27 @@
+[package]
+name = "mnemosctl"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.78"
+authors = ["MNEMOS Contributors"]
+description = "User-facing CLI for MNEMOS memory operations. Companion to mnemos-rs desktop."
+license = "Apache-2.0"
+repository = "https://gitlab.com/ncz-os/mnemos"
+documentation = "https://gitlab.com/ncz-os/mnemos/-/blob/main/docs/MNEMOSCTL_DESIGN.md"
+keywords = ["mnemos", "cli", "memory", "knowledge"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "mnemosctl"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
