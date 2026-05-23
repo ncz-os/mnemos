@@ -92,7 +92,7 @@ def test_no_stale_install_pins_to_old_version():
     # `for md in [...]` list below, which is the actual filter.
     # Match any pip install pin to a 4.x or 5.0.x version.
     pattern = re.compile(
-        r"pip install\s+'?mnemos-os(?:\[[^\]]+\])?==(?P<v>[0-9.]+)'?"
+        r"pip install\s+'?mnemos-os(?:\[[^\]]+\])?==(?P<v>[0-9][0-9.a-zA-Z]*)'?"
     )
     bad: list[str] = []
     for md in [REPO / "README.md", REPO / "DEPLOYMENT.md",
@@ -201,7 +201,7 @@ def test_no_stale_tracks_mnemos_server_marker():
     version. Codex round-4 of #193 caught two of these."""
     version = _current_version()
     pattern = re.compile(
-        r"Tracks MNEMOS server v(?P<v>\d+(?:\.\d+)*(?:[a-z]\d+)?)"
+        r"Tracks MNEMOS server v(?P<v>\d+(?:\.\d+)*(?:[a-zA-Z]+\d+)?)"
     )
     bad: list[str] = []
     docs_dir = REPO / "docs"
@@ -237,7 +237,7 @@ def test_no_stale_as_of_version_anywhere():
     """
     version = _current_version()
     pattern = re.compile(
-        r"\b[Aa]s of v(?P<v>\d+(?:\.\d+)*(?:[a-z]\d+)?)"
+        r"\b[Aa]s of v(?P<v>\d+(?:\.\d+)*(?:[a-zA-Z]+\d+)?)"
     )
     bad: list[str] = []
     docs_dir = REPO / "docs"

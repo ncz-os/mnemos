@@ -314,7 +314,7 @@ and `docker-compose.staging.yml` initdb mounts:
 25. `migrations_v3_5_rls_group_select_unix_bits.sql` (RLS group-read parity)
 26. `migrations_v3_5_webhook_retry_terminal_state.sql` (retry terminal-state repair)
 27. `migrations_v3_5_webhook_attempt_lease.sql` (persisted webhook leases)
-28. `migrations_v3_5_webhook_writer_revision.sql` (current-writer marker)
+28. `migrations_v6.0.0rc1 current-writer marker)
 29. `migrations_v3_5_webhook_status_updated_at.sql` (status transition timestamp)
 30. `migrations_v3_5_webhook_superseded_marker.sql` (superseded audit marker)
 31. `migrations_v3_5_webhook_attempt_unique.sql` (live successor uniqueness)
@@ -793,7 +793,7 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
   application visibility after
   `db/migrations_v3_5_rls_group_select_unix_bits.sql`.
 
-### 10.4 Known gaps (as of v5.0.1)
+### 10.4 Known gaps (as of v6.0.0rc1)
 
 - GDPR deletion requests can still hit the documented final-verify race or
   sweep-verifying exhaustion under sustained target writes; see

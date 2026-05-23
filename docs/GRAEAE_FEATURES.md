@@ -1,6 +1,6 @@
 # GRAEAE Feature Surface
 
-**Status:** current v5.0.1 documentation (on top of v5.0.0 GA shipped 2026-05-02).
+**Status:** current v6.0.0rc1 documentation (on top of v5.0.0 GA shipped 2026-05-02).
 
 GRAEAE is MNEMOS's multi-provider reasoning bus. It fans a prompt out to live
 LLM providers, scores the responses, persists consultations, and writes a
