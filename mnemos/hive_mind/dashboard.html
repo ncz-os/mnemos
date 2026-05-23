@@ -75,11 +75,28 @@ function tag(t,c){const s=document.createElement('span');s.className='tag '+c;s.
 function td(html){const t=document.createElement('td');if(html instanceof Node)t.appendChild(html);else t.innerHTML=html;return t;}
 async function refreshAgents(){
   const d = await load('/v1/agents?status=online');
-  document.getElementById('agent-count').textContent = d.count;
-  const tb = document.querySelector('#agent-tbl tbody'); tb.innerHTML='';
+  // Dedup display by (kind,host,runtime,model) and show instance count.
+  // Two `goose-worker@1/@2` units on the same host produce two URNs that
+  // are operationally one worker pool; rendering both rows visually
+  // double-counts the fleet and clutters the panel.
+  const groups = new Map();
   for (const a of d.agents) {
+    const key = `${a.kind}|${a.host}|${a.runtime||''}|${a.model||''}`;
+    const g = groups.get(key);
+    if (g) {
+      g.count++;
+      if ((a.last_heartbeat||0) > (g.last_heartbeat||0)) g.last_heartbeat = a.last_heartbeat;
+    } else {
+      groups.set(key, {...a, count: 1});
+    }
+  }
+  const rows = [...groups.values()].sort((a,b)=>(a.kind+a.host).localeCompare(b.kind+b.host));
+  document.getElementById('agent-count').textContent = `${rows.length} pools · ${d.count} instances`;
+  const tb = document.querySelector('#agent-tbl tbody'); tb.innerHTML='';
+  for (const a of rows) {
     const r = tb.insertRow();
-    r.appendChild(td(a.kind));
+    const kindCell = a.kind + (a.count > 1 ? ` <small class="dim">×${a.count}</small>` : '');
+    r.appendChild(td(kindCell));
     r.appendChild(td(a.host));
     r.appendChild(td(a.runtime||''));
     r.appendChild(td(a.model||''));
