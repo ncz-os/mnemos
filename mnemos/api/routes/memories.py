@@ -302,19 +302,28 @@ async def _bump_recall_counters(memory_ids: list) -> None:
     Single UPDATE for the whole hit set, so search hits with N memories
     cost one DB round-trip not N.
     """
-    if not memory_ids or not _lc._pool:
+    if not memory_ids:
         return
     try:
-        async with _lc.get_pool_manager().acquire() as conn:
-            await conn.execute(
-                "UPDATE memories "
-                "SET recall_count = recall_count + 1, "
-                "    last_recalled_at = now() "
-                "WHERE id = ANY($1::text[]) "
-                "AND deleted_at IS NULL "
-                "AND archived_at IS NULL",
-                list(memory_ids),
-            )
+        backend = _backend_or_503()
+        from mnemos.core.auth_context import UserContext as _UserContext
+        from mnemos.persistence.visibility import VisibilityFilter as _VisibilityFilter
+
+        root = _UserContext(
+            user_id="root",
+            group_ids=[],
+            role="root",
+            namespace="default",
+            authenticated=True,
+        )
+        visibility = _VisibilityFilter.for_read(root, namespace=None)
+        async with backend.transactional() as tx:
+            for memory_id in memory_ids:
+                await backend.memories.bump_recall_and_get_memory(
+                    tx,
+                    str(memory_id),
+                    visibility=visibility,
+                )
     except Exception as e:
         logger.warning(f"[RECALL] bump failed for {len(memory_ids)} ids: {e}")
 
@@ -464,9 +473,9 @@ async def get_memory(
             )
         from mnemos.domain.persephone.runner import restore_memory as _restore_archived_memory
 
-        require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}?restore=true")
+        pool = require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}?restore=true")
         try:
-            async with _lc.get_pool_manager().acquire() as conn:
+            async with pool.acquire() as conn:
                 await _restore_archived_memory(conn, memory_id, user.user_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -552,9 +561,9 @@ async def get_compression_manifests(
     operators can reason about what was tried, what scored how, and why
     each engine was or wasn't picked.
     """
-    require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}/compression-manifests")
+    pool = require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}/compression-manifests")
 
-    async with _lc.get_pool_manager().acquire() as conn:
+    async with pool.acquire() as conn:
         async with _rls_context(conn, user):
             # Enforce memory visibility — check owner + namespace for
             # non-root so manifests for cross-tenant memories don't
@@ -1364,7 +1373,8 @@ async def rehydrate_memories(
         "ORDER BY rank DESC LIMIT $2"
     )
 
-    async with _lc.get_pool_manager().acquire() as conn:
+    pool = require_postgres_pool_or_503(route_label="POST /v1/memories/rehydrate")
+    async with pool.acquire() as conn:
         async with _rls_context(conn, user):
             rows = await conn.fetch(sql, *sql_params)
 

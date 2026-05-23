@@ -3,6 +3,7 @@
 /v1/consultations — GRAEAE reasoning domain with hash-chained audit log and memory refs.
 
 """
+
 import hashlib
 import logging
 from typing import List, Optional
@@ -11,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.core.rate_limit import limiter
 from mnemos.core.security import is_root, scope_namespace
 from mnemos.domain.graeae.engine import _REGISTRY_MAP
@@ -37,6 +38,7 @@ def _schedule_outbox_deliveries(delivery_ids: list[str]) -> None:
 
     _schedule(delivery_ids)
 
+
 # ── Custom Query selection (v3.2) ─────────────────────────────────────────────
 
 _VALID_TIERS = {"frontier", "premium", "budget"}
@@ -46,10 +48,7 @@ _VALID_TIERS = {"frontier", "premium", "budget"}
 # filter doesn't silently drop entries. Only `anthropic→claude` flips
 # today but the map is built from _REGISTRY_MAP so future renames
 # propagate automatically.
-_REGISTRY_TO_GRAEAE = {
-    cfg["registry_provider"]: name
-    for name, cfg in _REGISTRY_MAP.items()
-}
+_REGISTRY_TO_GRAEAE = {cfg["registry_provider"]: name for name, cfg in _REGISTRY_MAP.items()}
 
 
 def _to_graeae_provider(registry_name: str) -> str:
@@ -70,56 +69,14 @@ async def _tier_lineup(tier: str) -> dict:
     treats that as a hard error (otherwise we'd silently fall back
     to auto, which violates the caller's intent).
     """
-    require_postgres_pool_or_503(route_label="POST /v1/consultations")
-
-    if tier == "frontier":
-        sql = """
-            SELECT DISTINCT ON (provider) provider, model_id
-            FROM model_registry
-            WHERE available = true AND deprecated = false
-              AND (arena_rank IS NOT NULL AND arena_rank <= 5
-                   OR graeae_weight >= 0.95)
-            ORDER BY provider, graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST
-        """
-        params: tuple = ()
-    elif tier == "premium":
-        sql = """
-            SELECT DISTINCT ON (provider) provider, model_id
-            FROM model_registry
-            WHERE available = true AND deprecated = false
-              AND ((arena_rank IS NOT NULL AND arena_rank BETWEEN 6 AND 15)
-                   OR (graeae_weight >= 0.85 AND graeae_weight < 0.95))
-            ORDER BY provider, graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST
-        """
-        params = ()
-    elif tier == "budget":
-        # NULL costs are EXCLUDED from the budget tier — an unknown
-        # cost cannot legally satisfy a "cheapest" semantics, and
-        # COALESCEing to 0 would let partially-synced rows rank
-        # ahead of priced models. Same invariant as the budget
-        # selection in mcp_repo / providers route / openai_compat.
-        sql = """
-            SELECT DISTINCT ON (provider) provider, model_id
-            FROM model_registry
-            WHERE available = true AND deprecated = false
-              AND graeae_weight >= 0.75
-              AND input_cost_per_mtok IS NOT NULL
-              AND output_cost_per_mtok IS NOT NULL
-            ORDER BY provider,
-                     (input_cost_per_mtok + output_cost_per_mtok) ASC
-        """
-        params = ()
-    else:
+    if tier not in _VALID_TIERS:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"unknown tier {tier!r}; "
-                f"expected one of {sorted(_VALID_TIERS)}"
-            ),
+            detail=(f"unknown tier {tier!r}; " f"expected one of {sorted(_VALID_TIERS)}"),
         )
-
-    async with _lc.get_pool_manager().acquire() as conn:
-        rows = await conn.fetch(sql, *params)
+    backend = backend_or_503()
+    async with backend.transactional() as tx:
+        rows = await backend.consultations.resolve_tier_lineup(tx, tier)
     # Translate registry provider → GRAEAE engine provider key
     # (`anthropic` → `claude` etc.) so consult()'s selection filter
     # at engine.py:_candidate_providers doesn't silently drop muses.
@@ -133,18 +90,9 @@ async def _resolve_models(model_ids: List[str]) -> dict:
     unrecognized model_id — fail-loudly beats silently narrowing a
     deliberately-chosen lineup.
     """
-    require_postgres_pool_or_503(route_label="POST /v1/consultations")
-    async with _lc.get_pool_manager().acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT provider, model_id
-            FROM model_registry
-            WHERE model_id = ANY($1::text[])
-              AND available = true
-              AND deprecated = false
-            """,
-            model_ids,
-        )
+    backend = backend_or_503()
+    async with backend.transactional() as tx:
+        rows = await backend.consultations.resolve_models(tx, model_ids)
     found = {r["model_id"]: r["provider"] for r in rows}
     missing = [m for m in model_ids if m not in found]
     if missing:
@@ -173,18 +121,19 @@ async def _resolve_selection(
     # wondering which won. If a caller wants combined semantics (e.g.
     # "frontier models FROM these providers"), that's a follow-up
     # design; reject the combination today for clarity.
-    set_fields = [n for n in (
-        "models" if models else None,
-        "providers" if providers else None,
-        "tier" if tier else None,
-    ) if n]
+    set_fields = [
+        n
+        for n in (
+            "models" if models else None,
+            "providers" if providers else None,
+            "tier" if tier else None,
+        )
+        if n
+    ]
     if len(set_fields) > 1:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Custom Query accepts at most one of "
-                f"{{'models', 'providers', 'tier'}}; got {set_fields}"
-            ),
+            detail=(f"Custom Query accepts at most one of " f"{{'models', 'providers', 'tier'}}; got {set_fields}"),
         )
 
     if models:
@@ -228,6 +177,7 @@ async def _resolve_selection(
 
 # ── Audit helpers ─────────────────────────────────────────────────────────────
 
+
 async def _write_audit_entry_on_conn(
     conn,
     consultation_id,
@@ -257,10 +207,7 @@ async def _write_audit_entry_on_conn(
     # Audit-chain continuity is internal tamper-evidence, not a
     # user-content read path: the chain tip must include soft-deleted
     # rows so later writes keep validating across GDPR restore windows.
-    prev_row = await conn.fetchrow(
-        "SELECT id, chain_hash FROM graeae_audit_log "
-        "ORDER BY sequence_num DESC LIMIT 1"
-    )
+    prev_row = await conn.fetchrow("SELECT id, chain_hash FROM graeae_audit_log " "ORDER BY sequence_num DESC LIMIT 1")
     if prev_row:
         prev_chain = prev_row["chain_hash"]
         prev_id = prev_row["id"]
@@ -271,9 +218,7 @@ async def _write_audit_entry_on_conn(
     # Chain covers prev_chain + prompt_hash + response_hash so that
     # neither the prompt nor the response can be swapped without
     # breaking chain integrity.
-    chain_hash = hashlib.sha256(
-        (prev_chain + prompt_hash + response_hash).encode()
-    ).hexdigest()
+    chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
 
     await conn.execute(
         "INSERT INTO graeae_audit_log "
@@ -281,9 +226,17 @@ async def _write_audit_entry_on_conn(
         "response_hash, chain_hash, prev_id, prev_chain_hash, "
         "task_type, quality_score) "
         "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-        consultation_id, prompt, prompt_hash, provider, response,
-        response_hash, chain_hash, prev_id, prev_chain,
-        task_type, quality_score,
+        consultation_id,
+        prompt,
+        prompt_hash,
+        provider,
+        response,
+        response_hash,
+        chain_hash,
+        prev_id,
+        prev_chain,
+        task_type,
+        quality_score,
     )
 
 
@@ -305,18 +258,14 @@ async def _write_memory_refs_on_conn(
             "(consultation_id, memory_id, injected_at) "
             "VALUES ($1, $2, NOW()) "
             "ON CONFLICT DO NOTHING",
-            consultation_id, memory_id,
+            consultation_id,
+            memory_id,
         )
 
 
 def _extract_memory_ids(result: dict) -> List[str]:
     """Collect injected/reference memory IDs from known result shapes."""
-    raw_ids = (
-        result.get("memory_ids")
-        or result.get("injected_memory_ids")
-        or result.get("citations")
-        or []
-    )
+    raw_ids = result.get("memory_ids") or result.get("injected_memory_ids") or result.get("citations") or []
     memory_ids: list[str] = []
     for raw_id in raw_ids:
         memory_id = str(raw_id).strip()
@@ -340,6 +289,7 @@ def _require_non_empty_consultation_result(result: object, mode: str) -> dict:
 
 # ── Consultation endpoint ─────────────────────────────────────────────────────
 
+
 @router.post("/consultations", response_model=ConsultationResponse)
 @limiter.limit("60/minute")
 async def consult_graeae(request: Request, body: ConsultationRequest, user: UserContext = Depends(get_current_user)):
@@ -349,11 +299,11 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
     Returns raw provider responses (full, best, or truncated per format param).
     """
     logger.info(
-        f"[CONSULTATION] {user.user_id}: {body.task_type} "
-        f"(limit_chars={body.limit_chars}, format={body.format})"
+        f"[CONSULTATION] {user.user_id}: {body.task_type} " f"(limit_chars={body.limit_chars}, format={body.format})"
     )
     try:
         from mnemos.domain.graeae.engine import get_graeae_engine
+
         engine = get_graeae_engine()
 
         # v3.2 Custom Query mode: resolve the caller's lineup from the
@@ -369,7 +319,10 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         )
 
         result = await engine.consult(
-            body.prompt, body.task_type, selection=selection, mode=body.mode,
+            body.prompt,
+            body.task_type,
+            selection=selection,
+            mode=body.mode,
         )
         result = _require_non_empty_consultation_result(result, body.mode)
 
@@ -377,7 +330,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
             for provider, resp in result["all_responses"].items():
                 if isinstance(resp.get("response_text"), str):
                     original_len = len(resp["response_text"])
-                    resp["response_text"] = resp["response_text"][:body.limit_chars]
+                    resp["response_text"] = resp["response_text"][: body.limit_chars]
                     resp["truncated"] = original_len > body.limit_chars
 
         if body.format == "best" and result.get("all_responses"):
@@ -387,7 +340,8 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         consultation_id = None
         memory_ids = _extract_memory_ids(result)
         delivery_ids: list[str] = []
-        if _lc._pool and result.get("all_responses"):
+        backend = _lc._persistence_backend
+        if backend is not None and result.get("all_responses"):
             # Persistence reads consensus fields FROM THE ENGINE return
             # dict instead of re-deriving them locally. The engine's
             # _compute_consensus is the single source of truth for
@@ -415,43 +369,21 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
             # abort the consultation row: tamper-evidence requires that a
             # committed consultation implies a committed audit chain link.
             try:
-                backend = _lc._persistence_backend
-                if backend is None:
-                    raise RuntimeError("Persistence backend not available")
                 async with backend.transactional() as tx:
-                    conn = tx.conn
-                    row = await conn.fetchrow(
-                        """INSERT INTO graeae_consultations
-                            (prompt, task_type, consensus_response, consensus_score,
-                             winning_muse, cost, latency_ms, mode, owner_id, namespace)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                           RETURNING id""",
-                        body.prompt,
-                        body.task_type,
-                        consensus_response[:500],
-                        consensus_score,
-                        winning_muse,
-                        engine_cost,
-                        engine_latency_ms,
-                        body.mode,
-                        user.user_id,
-                        user.namespace,
-                    )
-                    consultation_id = row["id"] if row else None
-
-                    await _write_audit_entry_on_conn(
-                        conn=conn,
-                        consultation_id=consultation_id,
+                    consultation_id = await backend.consultations.create_consultation_with_audit(
+                        tx,
                         prompt=body.prompt,
-                        response=consensus_response,
-                        task_type=body.task_type or "reasoning",
-                        provider=winning_muse,
-                        quality_score=consensus_score,
-                    )
-                    await _write_memory_refs_on_conn(
-                        conn=conn,
-                        consultation_id=consultation_id,
+                        task_type=body.task_type,
+                        consensus_response=consensus_response,
+                        consensus_score=consensus_score,
+                        winning_muse=winning_muse,
+                        cost=engine_cost,
+                        latency_ms=engine_latency_ms,
+                        mode=body.mode,
+                        owner_id=user.user_id,
+                        namespace=user.namespace,
                         memory_ids=memory_ids,
+                        genesis_hash=_GENESIS_HASH,
                     )
                     delivery_ids = await backend.webhooks.dispatch_event(
                         tx,
@@ -480,6 +412,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         if consultation_id is not None:
             from mnemos.nats import publish_event as _nats_publish_event
             from mnemos.nats.client import get_node_name as _nats_get_node_name
+
             safe_ns = (user.namespace or "default").replace(".", "_")
             await _nats_publish_event(
                 f"mnemos.consultation.completed.{safe_ns}",
@@ -525,6 +458,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
 # ── Audit log endpoints (declared before dynamic /{consultation_id} to prevent
 #    'audit' string being matched as a UUID path param) ───────────────────────
 
+
 @router.get("/consultations/audit", response_model=List[AuditLogEntry])
 @limiter.limit("30/minute")
 async def list_audit_log(
@@ -539,53 +473,18 @@ async def list_audit_log(
     Non-root callers only see audit rows for their own consultations. Root
     callers keep the operational global view.
     """
-    require_postgres_pool_or_503(route_label="GET /v1/consultations/audit")
     target_ns = scope_namespace(user, namespace)
-    async with _lc.get_pool_manager().acquire() as conn:
-        root = is_root(user)
-        if root and namespace is None:
-            rows = await conn.fetch(
-                "SELECT id, sequence_num, consultation_id, prompt_hash, response_hash, "
-                "chain_hash, prev_id, task_type, provider, quality_score, created_at "
-                "FROM graeae_audit_log WHERE deleted_at IS NULL "
-                "ORDER BY sequence_num DESC LIMIT $1 OFFSET $2",
-                limit, offset,
-            )
-        elif root:
-            rows = await conn.fetch(
-                "SELECT al.id, al.sequence_num, al.consultation_id, al.prompt_hash, al.response_hash, "
-                "al.chain_hash, al.prev_id, al.task_type, al.provider, al.quality_score, al.created_at "
-                "FROM graeae_audit_log al "
-                "JOIN graeae_consultations c ON c.id = al.consultation_id "
-                "WHERE c.namespace = $1 "
-                "AND c.deleted_at IS NULL "
-                "AND al.deleted_at IS NULL "
-                "ORDER BY al.sequence_num DESC LIMIT $2 OFFSET $3",
-                target_ns, limit, offset,
-            )
-        else:
-            rows = await conn.fetch(
-                "WITH visible AS ("
-                "SELECT al.id, al.sequence_num AS global_sequence_num, "
-                "al.consultation_id, al.prompt_hash, al.response_hash, "
-                "al.task_type, al.provider, al.quality_score, "
-                "al.created_at, "
-                "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
-                "LAG(al.id) OVER (ORDER BY al.sequence_num ASC) AS scoped_prev_id "
-                "FROM graeae_audit_log al "
-                "JOIN graeae_consultations c ON c.id = al.consultation_id "
-                "WHERE c.owner_id = $1 AND c.namespace = $2 "
-                "AND c.deleted_at IS NULL "
-                "AND al.deleted_at IS NULL "
-                ") "
-                "SELECT id, scoped_sequence_num AS sequence_num, consultation_id, "
-                "prompt_hash, response_hash, NULL::text AS chain_hash, "
-                "scoped_prev_id AS prev_id, "
-                "task_type, provider, quality_score, created_at "
-                "FROM visible "
-                "ORDER BY global_sequence_num DESC LIMIT $3 OFFSET $4",
-                user.user_id, target_ns, limit, offset,
-            )
+    root = is_root(user)
+    backend = backend_or_503()
+    async with backend.transactional() as tx:
+        rows = await backend.consultations.list_audit_log(
+            tx,
+            root=root,
+            user_id=user.user_id,
+            namespace=target_ns if (namespace is not None or not root) else None,
+            limit=limit,
+            offset=offset,
+        )
     return [
         AuditLogEntry(
             id=str(r["id"]),
@@ -619,81 +518,29 @@ async def verify_audit_chain(
     the row's tamperable prev_id. Rate-limited because the cost grows linearly
     with audit-log size. Returns details of any broken sequences.
     """
-    require_postgres_pool_or_503(route_label="GET /v1/consultations/audit/verify")
     target_ns = scope_namespace(user, namespace)
     verify_global_chain = is_root(user) and namespace is None
-    async with _lc.get_pool_manager().acquire() as conn:
-        if verify_global_chain:
-            # Root global verification is admin tooling and must include
-            # soft-deleted audit rows, otherwise the immutable hash chain
-            # would appear broken immediately after a GDPR soft-delete.
-            rows = await conn.fetch(
-                "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
-                "FROM graeae_audit_log ORDER BY sequence_num ASC"
-            )
-        elif is_root(user):
-            rows = await conn.fetch(
-                "SELECT al.sequence_num, "
-                "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
-                "al.prompt_hash, al.response_hash, "
-                "al.chain_hash, al.prev_id, al.prev_chain_hash, "
-                "prev.chain_hash AS expected_prev_hash "
-                "FROM graeae_audit_log al "
-                "JOIN graeae_consultations c ON c.id = al.consultation_id "
-                "LEFT JOIN LATERAL ("
-                "SELECT chain_hash "
-                "FROM graeae_audit_log "
-                "WHERE sequence_num < al.sequence_num "
-                "ORDER BY sequence_num DESC "
-                "LIMIT 1"
-                ") prev ON TRUE "
-                "WHERE c.namespace = $1 "
-                "AND c.deleted_at IS NULL "
-                "AND al.deleted_at IS NULL "
-                "ORDER BY al.sequence_num ASC",
-                target_ns,
-            )
-        else:
-            rows = await conn.fetch(
-                "SELECT al.sequence_num, "
-                "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
-                "al.prompt_hash, al.response_hash, "
-                "al.chain_hash, al.prev_id, al.prev_chain_hash, "
-                "prev.chain_hash AS expected_prev_hash "
-                "FROM graeae_audit_log al "
-                "JOIN graeae_consultations c ON c.id = al.consultation_id "
-                "LEFT JOIN LATERAL ("
-                "SELECT chain_hash "
-                "FROM graeae_audit_log "
-                "WHERE sequence_num < al.sequence_num "
-                "ORDER BY sequence_num DESC "
-                "LIMIT 1"
-                ") prev ON TRUE "
-                "WHERE c.owner_id = $1 AND c.namespace = $2 "
-                "AND c.deleted_at IS NULL "
-                "AND al.deleted_at IS NULL "
-                "ORDER BY al.sequence_num ASC",
-                user.user_id, target_ns,
-            )
+    backend = backend_or_503()
+    async with backend.transactional() as tx:
+        rows = await backend.consultations.fetch_audit_chain(
+            tx,
+            root=is_root(user),
+            user_id=user.user_id,
+            namespace=None if verify_global_chain else target_ns,
+        )
 
     if not rows:
         return AuditVerifyResponse(
             valid=True,
             entries_checked=0,
-            message=(
-                "Audit log is empty"
-                if verify_global_chain
-                else "No audit entries visible for caller"
-            ),
+            message=("Audit log is empty" if verify_global_chain else "No audit entries visible for caller"),
         )
 
     if verify_global_chain:
         prev_chain = _GENESIS_HASH
         failures: dict[int, str] = {}
         for row in rows:
-            expected = hashlib.sha256(
-                (prev_chain + row["prompt_hash"] + row["response_hash"]).encode()
-            ).hexdigest()
+            expected = hashlib.sha256((prev_chain + row["prompt_hash"] + row["response_hash"]).encode()).hexdigest()
             if expected != row["chain_hash"]:
                 failures.setdefault(
                     row["sequence_num"],
@@ -742,9 +589,7 @@ async def verify_audit_chain(
                 f"Scoped chain broken at row {scoped_sequence_num}: "
                 "stored previous hash does not match actual previous row",
             )
-        expected = hashlib.sha256(
-            (prev_chain + row["prompt_hash"] + row["response_hash"]).encode()
-        ).hexdigest()
+        expected = hashlib.sha256((prev_chain + row["prompt_hash"] + row["response_hash"]).encode()).hexdigest()
         if expected != row["chain_hash"]:
             logger.warning(
                 "Scoped audit hash mismatch for user=%s scoped_row=%s "
@@ -785,6 +630,7 @@ async def verify_audit_chain(
 # MUST be declared BEFORE the parametric /{consultation_id} route below so
 # FastAPI doesn't try to parse "muses" or "modes" as a UUID and 500 in asyncpg.
 
+
 @router.get("/consultations/muses")
 async def list_muses(_: UserContext = Depends(get_current_user)):
     """List the live GRAEAE muse manifest.
@@ -795,16 +641,19 @@ async def list_muses(_: UserContext = Depends(get_current_user)):
     daily provider sync rotated to current model_ids.
     """
     from mnemos.domain.graeae.engine import get_graeae_engine
+
     engine = get_graeae_engine()
     muses = []
     for name, cfg in engine.providers.items():
-        muses.append({
-            "name": name,
-            "model": cfg.get("model"),
-            "weight": cfg.get("weight"),
-            "api": cfg.get("api"),
-            "key_name": cfg.get("key_name"),
-        })
+        muses.append(
+            {
+                "name": name,
+                "model": cfg.get("model"),
+                "weight": cfg.get("weight"),
+                "api": cfg.get("api"),
+                "key_name": cfg.get("key_name"),
+            }
+        )
     return {"count": len(muses), "muses": muses}
 
 
@@ -855,6 +704,7 @@ async def list_modes(_: UserContext = Depends(get_current_user)):
 
 # ── Dynamic /{consultation_id} routes (declared after static /audit above) ────
 
+
 @router.get("/consultations/{consultation_id}")
 async def get_consultation(
     consultation_id: str,
@@ -867,33 +717,17 @@ async def get_consultation(
     consultations. Not-yours and not-exists both return 404 so we don't
     leak which consultation IDs are in use across users.
     """
-    require_postgres_pool_or_503(route_label="GET /v1/consultations/{consultation_id}")
     target_ns = scope_namespace(user, namespace)
-
-    async with _lc.get_pool_manager().acquire() as conn:
-        if is_root(user) and namespace is None:
-            row = await conn.fetchrow(
-                "SELECT id, prompt, task_type, consensus_response, consensus_score, "
-                "winning_muse, cost, latency_ms, mode, created "
-                "FROM graeae_consultations WHERE id = $1 AND deleted_at IS NULL",
-                consultation_id,
-            )
-        elif is_root(user):
-            row = await conn.fetchrow(
-                "SELECT id, prompt, task_type, consensus_response, consensus_score, "
-                "winning_muse, cost, latency_ms, mode, created "
-                "FROM graeae_consultations WHERE id = $1 AND namespace = $2 "
-                "AND deleted_at IS NULL",
-                consultation_id, target_ns,
-            )
-        else:
-            row = await conn.fetchrow(
-                "SELECT id, prompt, task_type, consensus_response, consensus_score, "
-                "winning_muse, cost, latency_ms, mode, created "
-                "FROM graeae_consultations WHERE id = $1 AND owner_id = $2 "
-                "AND namespace = $3 AND deleted_at IS NULL",
-                consultation_id, user.user_id, target_ns,
-            )
+    root = is_root(user)
+    backend = backend_or_503()
+    async with backend.transactional() as tx:
+        row = await backend.consultations.get_consultation(
+            tx,
+            consultation_id=consultation_id,
+            root=root,
+            user_id=user.user_id,
+            namespace=target_ns if (namespace is not None or not root) else None,
+        )
 
     if not row:
         raise HTTPException(status_code=404, detail="Consultation not found")
@@ -908,7 +742,7 @@ async def get_consultation(
         "cost": row["cost"],
         "latency_ms": row["latency_ms"],
         "mode": row["mode"],
-        "created_at": row["created"].isoformat(),
+        "created_at": row["created"].isoformat() if hasattr(row["created"], "isoformat") else str(row["created"]),
     }
 
 
@@ -919,39 +753,19 @@ async def get_consultation_artifacts(
     user: UserContext = Depends(get_current_user),
 ):
     """Retrieve structured outputs and citations from a consultation."""
-    require_postgres_pool_or_503(route_label="GET /v1/consultations/{consultation_id}/artifacts")
     target_ns = scope_namespace(user, namespace)
-
-    async with _lc.get_pool_manager().acquire() as conn:
-        # Get consultation — scoped to caller unless root.
-        if is_root(user) and namespace is None:
-            consultation = await conn.fetchrow(
-                "SELECT id, created FROM graeae_consultations "
-                "WHERE id = $1 AND deleted_at IS NULL",
-                consultation_id,
-            )
-        elif is_root(user):
-            consultation = await conn.fetchrow(
-                "SELECT id, created FROM graeae_consultations "
-                "WHERE id = $1 AND namespace = $2 AND deleted_at IS NULL",
-                consultation_id, target_ns,
-            )
-        else:
-            consultation = await conn.fetchrow(
-                "SELECT id, created FROM graeae_consultations "
-                "WHERE id = $1 AND owner_id = $2 AND namespace = $3 "
-                "AND deleted_at IS NULL",
-                consultation_id, user.user_id, target_ns,
-            )
-        if not consultation:
-            raise HTTPException(status_code=404, detail="Consultation not found")
-
-        # Get referenced memories
-        memory_refs = await conn.fetch(
-            "SELECT memory_id, injected_at FROM consultation_memory_refs "
-            "WHERE consultation_id = $1 ORDER BY injected_at",
-            consultation_id,
+    root = is_root(user)
+    backend = backend_or_503()
+    async with backend.transactional() as tx:
+        consultation, memory_refs = await backend.consultations.get_consultation_artifacts(
+            tx,
+            consultation_id=consultation_id,
+            root=root,
+            user_id=user.user_id,
+            namespace=target_ns if (namespace is not None or not root) else None,
         )
+    if not consultation:
+        raise HTTPException(status_code=404, detail="Consultation not found")
 
     return ConsultationArtifact(
         consultation_id=str(consultation["id"]),
@@ -959,9 +773,13 @@ async def get_consultation_artifacts(
         memory_refs=[
             {
                 "memory_id": str(ref["memory_id"]),
-                "injected_at": ref["injected_at"].isoformat(),
+                "injected_at": ref["injected_at"].isoformat()
+                if hasattr(ref["injected_at"], "isoformat")
+                else str(ref["injected_at"]),
             }
             for ref in memory_refs
         ],
-        created_at=consultation["created"].isoformat(),
+        created_at=consultation["created"].isoformat()
+        if hasattr(consultation["created"], "isoformat")
+        else str(consultation["created"]),
     )

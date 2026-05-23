@@ -11,6 +11,8 @@ import hashlib
 import inspect
 import json
 import logging
+import re
+import secrets
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -32,11 +34,14 @@ from mnemos.persistence.base import (
     CompressionRepository,
     CompressionStatsRow,
     ConsultationAuditRepository,
+    ConsultationsRepository,
     FederationRepository,
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
+    OAuthRepository,
     PersistenceBackend,
+    SessionsRepository,
     StateRepository,
     Transaction,
     VersionRepository,
@@ -55,6 +60,12 @@ _FEDERATION_NATS_MEMORY_ROW_COLS = (
     "source_model, source_provider, source_session, source_agent, archived_at, "
     "federation_source, deleted_at, consolidated_into"
 )
+_USER_ID_SAFE = re.compile(r"[^a-zA-Z0-9._:-]+")
+
+
+def _mint_user_id(provider: str, external_id: str) -> str:
+    slug = _USER_ID_SAFE.sub("", f"{provider}:{external_id}")
+    return slug[:64] or f"{provider}:{secrets.token_hex(6)}"
 
 
 def _log_search_phase(
@@ -1434,6 +1445,473 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
         return await openai_compat_repo.fetch_model_provider(model_id)
 
 
+class PostgresOAuthRepository(OAuthRepository):
+    async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
+        return await _postgres_tx(tx).conn.fetch(
+            "SELECT name, display_name, kind, enabled " "FROM oauth_providers WHERE enabled=TRUE ORDER BY display_name"
+        )
+
+    async def get_provider(self, tx: Transaction, name: str) -> Row | None:
+        return await _postgres_tx(tx).conn.fetchrow(
+            "SELECT name, kind, issuer_url, client_id, client_secret, scope, "
+            "authorize_url, token_url, userinfo_url, enabled "
+            "FROM oauth_providers WHERE name=$1",
+            name,
+        )
+
+    async def provision_or_link_user(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        external_id: str,
+        claims: dict[str, Any],
+    ) -> tuple[str, str]:
+        conn = _postgres_tx(tx).conn
+        raw_claims = json.dumps(claims)
+        existing = await conn.fetchrow(
+            "SELECT id, user_id FROM oauth_identities WHERE provider=$1 AND external_id=$2",
+            provider,
+            external_id,
+        )
+        if existing:
+            await conn.execute(
+                "UPDATE oauth_identities SET last_login_at=NOW(), raw_claims=$2::jsonb WHERE id=$1",
+                existing["id"],
+                raw_claims,
+            )
+            return existing["user_id"], str(existing["id"])
+
+        email = claims.get("email")
+        display_name = claims.get("name") or claims.get("preferred_username")
+        email_verified_claim = claims.get("email_verified")
+        if isinstance(email_verified_claim, bool):
+            email_verified = email_verified_claim
+        elif isinstance(email_verified_claim, str):
+            email_verified = email_verified_claim.strip().lower() == "true"
+        else:
+            email_verified = False
+
+        user_id = None
+        if email and email_verified:
+            link_target = await conn.fetchrow("SELECT id FROM users WHERE email=$1", email)
+            if link_target:
+                user_id = link_target["id"]
+        if user_id is None:
+            user_id = _mint_user_id(provider, external_id)
+            await conn.execute(
+                "INSERT INTO users (id, display_name, email, role) "
+                "VALUES ($1, $2, $3, 'user') ON CONFLICT (id) DO NOTHING",
+                user_id,
+                display_name,
+                email,
+            )
+        identity_id = await conn.fetchval(
+            "INSERT INTO oauth_identities "
+            "(user_id, provider, external_id, email, display_name, raw_claims, last_login_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW()) RETURNING id",
+            user_id,
+            provider,
+            external_id,
+            email,
+            display_name,
+            raw_claims,
+        )
+        return user_id, str(identity_id)
+
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        user_id: str,
+        identity_id: str | None,
+        expires_at: Any,
+        user_agent: str,
+        ip_address: str | None,
+    ) -> str:
+        await _postgres_tx(tx).conn.execute(
+            "INSERT INTO oauth_sessions "
+            "(session_id, user_id, identity_id, expires_at, user_agent, ip_address) "
+            "VALUES ($1, $2, $3::uuid, $4, $5, $6::inet)",
+            session_id,
+            user_id,
+            identity_id,
+            expires_at,
+            user_agent,
+            ip_address,
+        )
+        return session_id
+
+    async def revoke_session(self, tx: Transaction, session_id: str) -> bool:
+        result = await _postgres_tx(tx).conn.execute(
+            "UPDATE oauth_sessions SET revoked=TRUE, revoked_at=NOW() WHERE session_id=$1 AND NOT revoked",
+            session_id,
+        )
+        return _pg_result_count(result) > 0
+
+    async def revoke_all_sessions(self, tx: Transaction, user_id: str) -> int:
+        result = await _postgres_tx(tx).conn.execute(
+            "UPDATE oauth_sessions SET revoked=TRUE, revoked_at=NOW() WHERE user_id=$1 AND NOT revoked",
+            user_id,
+        )
+        return _pg_result_count(result)
+
+    async def get_identity_for_session(self, tx: Transaction, session_id: str) -> Row | None:
+        return await _postgres_tx(tx).conn.fetchrow(
+            "SELECT i.id::text AS id, i.user_id, i.provider, i.external_id, i.email, "
+            "i.display_name, i.last_login_at, i.created "
+            "FROM oauth_sessions s JOIN oauth_identities i ON i.id = s.identity_id "
+            "WHERE s.session_id=$1 AND NOT s.revoked",
+            session_id,
+        )
+
+
+class PostgresSessionsRepository(SessionsRepository):
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        namespace: str,
+        model: str,
+        initial_context: str | None,
+    ) -> Row:
+        conn = _postgres_tx(tx).conn
+        session_id = await conn.fetchval(
+            "INSERT INTO sessions (user_id, namespace, model) VALUES ($1, $2, $3) RETURNING id",
+            user_id,
+            namespace,
+            model,
+        )
+        if initial_context:
+            await conn.execute(
+                "INSERT INTO session_messages (session_id, role, content) VALUES ($1, 'system', $2)",
+                session_id,
+                initial_context,
+            )
+        return await conn.fetchrow(
+            "SELECT id, created_at, model FROM sessions "
+            "WHERE id=$1 AND user_id=$2 AND namespace=$3 AND deleted_at IS NULL",
+            session_id,
+            user_id,
+            namespace,
+        )
+
+    async def get_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> Row | None:
+        return await _postgres_tx(tx).conn.fetchrow(
+            "SELECT * FROM sessions WHERE id=$1 AND user_id=$2 AND namespace=$3 AND deleted_at IS NULL",
+            session_id,
+            user_id,
+            namespace,
+        )
+
+    async def list_injected_memory_ids(self, tx: Transaction, session_id: str, limit: int = 10) -> list[str]:
+        rows = await _postgres_tx(tx).conn.fetch(
+            "SELECT memory_id FROM session_memory_injections WHERE session_id=$1 AND deleted_at IS NULL "
+            "GROUP BY memory_id ORDER BY MAX(injection_timestamp) DESC LIMIT $2",
+            session_id,
+            limit,
+        )
+        return [r["memory_id"] for r in rows]
+
+    async def add_message(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        model: str | None = None,
+        tokens_used: int | None = None,
+        memories_injected: int | None = None,
+    ) -> Any:
+        return await _postgres_tx(tx).conn.fetchval(
+            "INSERT INTO session_messages "
+            "(session_id, role, content, model, tokens_used, memories_injected) "
+            "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            session_id,
+            role,
+            content,
+            model,
+            tokens_used,
+            memories_injected,
+        )
+
+    async def fetch_provider_history(self, tx: Transaction, session_id: str) -> list[Row]:
+        return await _postgres_tx(tx).conn.fetch(
+            """
+            WITH first_system AS (
+                SELECT id, role, content, timestamp FROM session_messages
+                WHERE session_id=$1 AND role='system' AND deleted_at IS NULL
+                ORDER BY timestamp ASC, id ASC LIMIT 1
+            ), later_system AS (
+                SELECT s.id, s.role, s.content, s.timestamp FROM session_messages s
+                WHERE s.session_id=$1 AND s.role='system' AND s.deleted_at IS NULL
+                AND s.id <> (SELECT id FROM first_system)
+                ORDER BY s.timestamp DESC, s.id DESC LIMIT 4
+            ), pinned AS (
+                SELECT id, role, content, timestamp, 0 AS k FROM first_system
+                UNION ALL SELECT id, role, content, timestamp, 0 AS k FROM later_system
+            ), recent AS (
+                SELECT id, role, content, timestamp, 1 AS k FROM session_messages
+                WHERE session_id=$1 AND role <> 'system' AND deleted_at IS NULL
+                ORDER BY timestamp DESC, id DESC LIMIT 10
+            )
+            SELECT role, content FROM (
+                SELECT * FROM pinned UNION ALL SELECT * FROM recent
+            ) all_msgs ORDER BY k, timestamp ASC, id ASC
+            """,
+            session_id,
+        )
+
+    async def add_memory_injections(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        message_id: Any,
+        memory_ids: Sequence[str],
+    ) -> None:
+        conn = _postgres_tx(tx).conn
+        for i, memory_id in enumerate(memory_ids):
+            await conn.execute(
+                "INSERT INTO session_memory_injections "
+                "(session_id, message_id, memory_id, relevance_score) VALUES ($1, $2, $3, $4)",
+                session_id,
+                message_id,
+                memory_id,
+                0.9 - (i * 0.1),
+            )
+
+    async def update_metrics(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        user_id: str,
+        namespace: str,
+        tokens_used: int,
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            "UPDATE sessions SET message_count=message_count+2, total_tokens=total_tokens+$2, "
+            "last_activity=NOW() WHERE id=$1 AND user_id=$3 AND namespace=$4 AND deleted_at IS NULL",
+            session_id,
+            tokens_used,
+            user_id,
+            namespace,
+        )
+
+    async def fetch_history(self, tx: Transaction, session_id: str, limit: int, offset: int) -> tuple[list[Row], int]:
+        conn = _postgres_tx(tx).conn
+        rows = await conn.fetch(
+            "SELECT role, content, timestamp, model FROM session_messages "
+            "WHERE session_id=$1 AND deleted_at IS NULL ORDER BY timestamp ASC LIMIT $2 OFFSET $3",
+            session_id,
+            limit,
+            offset,
+        )
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM session_messages WHERE session_id=$1 AND deleted_at IS NULL",
+            session_id,
+        )
+        return list(rows), int(total or 0)
+
+    async def delete_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> bool:
+        result = await _postgres_tx(tx).conn.execute(
+            "DELETE FROM sessions WHERE id=$1 AND user_id=$2 AND namespace=$3 AND deleted_at IS NULL",
+            session_id,
+            user_id,
+            namespace,
+        )
+        return _pg_result_count(result) > 0
+
+
+class PostgresConsultationsRepository(ConsultationsRepository):
+    async def resolve_tier_lineup(self, tx: Transaction, tier: str) -> list[Row]:
+        if tier == "frontier":
+            sql = (
+                "SELECT DISTINCT ON (provider) provider, model_id FROM model_registry "
+                "WHERE available=true AND deprecated=false "
+                "AND ((arena_rank IS NOT NULL AND arena_rank <= 5) OR graeae_weight >= 0.95) "
+                "ORDER BY provider, graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST"
+            )
+        elif tier == "premium":
+            sql = (
+                "SELECT DISTINCT ON (provider) provider, model_id FROM model_registry "
+                "WHERE available=true AND deprecated=false "
+                "AND ((arena_rank IS NOT NULL AND arena_rank BETWEEN 6 AND 15) "
+                "OR (graeae_weight >= 0.85 AND graeae_weight < 0.95)) "
+                "ORDER BY provider, graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST"
+            )
+        else:
+            sql = (
+                "SELECT DISTINCT ON (provider) provider, model_id FROM model_registry "
+                "WHERE available=true AND deprecated=false AND graeae_weight >= 0.75 "
+                "AND input_cost_per_mtok IS NOT NULL AND output_cost_per_mtok IS NOT NULL "
+                "ORDER BY provider, (input_cost_per_mtok + output_cost_per_mtok) ASC"
+            )
+        return await _postgres_tx(tx).conn.fetch(sql)
+
+    async def resolve_models(self, tx: Transaction, model_ids: Sequence[str]) -> list[Row]:
+        return await _postgres_tx(tx).conn.fetch(
+            "SELECT provider, model_id FROM model_registry "
+            "WHERE model_id = ANY($1::text[]) AND available=true AND deprecated=false",
+            list(model_ids),
+        )
+
+    async def create_consultation_with_audit(self, tx: Transaction, **kwargs: Any) -> Any:
+        conn = _postgres_tx(tx).conn
+        row = await conn.fetchrow(
+            "INSERT INTO graeae_consultations "
+            "(prompt, task_type, consensus_response, consensus_score, winning_muse, cost, latency_ms, mode, owner_id, namespace) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id",
+            kwargs["prompt"],
+            kwargs["task_type"],
+            kwargs["consensus_response"][:500],
+            kwargs["consensus_score"],
+            kwargs["winning_muse"],
+            kwargs["cost"],
+            kwargs["latency_ms"],
+            kwargs["mode"],
+            kwargs["owner_id"],
+            kwargs["namespace"],
+        )
+        consultation_id = row["id"]
+        prompt_hash = hashlib.sha256(kwargs["prompt"].encode()).hexdigest()
+        response_hash = hashlib.sha256(kwargs["consensus_response"].encode()).hexdigest()
+        await conn.execute("SELECT pg_advisory_xact_lock(285734657)")
+        prev = await conn.fetchrow("SELECT id, chain_hash FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT 1")
+        prev_chain = prev["chain_hash"] if prev else kwargs["genesis_hash"]
+        prev_id = prev["id"] if prev else None
+        chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
+        await conn.execute(
+            "INSERT INTO graeae_audit_log "
+            "(consultation_id, prompt, prompt_hash, provider, response_text, response_hash, "
+            "chain_hash, prev_id, prev_chain_hash, task_type, quality_score) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            consultation_id,
+            kwargs["prompt"],
+            prompt_hash,
+            kwargs["winning_muse"],
+            kwargs["consensus_response"],
+            response_hash,
+            chain_hash,
+            prev_id,
+            prev_chain,
+            kwargs["task_type"] or "reasoning",
+            kwargs["consensus_score"],
+        )
+        for memory_id in kwargs["memory_ids"]:
+            await conn.execute(
+                "INSERT INTO consultation_memory_refs (consultation_id, memory_id, injected_at) "
+                "VALUES ($1, $2, NOW()) ON CONFLICT DO NOTHING",
+                consultation_id,
+                memory_id,
+            )
+        return consultation_id
+
+    async def list_audit_log(
+        self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None, limit: int, offset: int
+    ) -> list[Row]:
+        conn = _postgres_tx(tx).conn
+        if root and namespace is None:
+            return await conn.fetch(
+                "SELECT id, sequence_num, consultation_id, prompt_hash, response_hash, chain_hash, prev_id, "
+                "task_type, provider, quality_score, created_at FROM graeae_audit_log WHERE deleted_at IS NULL "
+                "ORDER BY sequence_num DESC LIMIT $1 OFFSET $2",
+                limit,
+                offset,
+            )
+        if root:
+            return await conn.fetch(
+                "SELECT al.id, al.sequence_num, al.consultation_id, al.prompt_hash, al.response_hash, al.chain_hash, "
+                "al.prev_id, al.task_type, al.provider, al.quality_score, al.created_at "
+                "FROM graeae_audit_log al JOIN graeae_consultations c ON c.id=al.consultation_id "
+                "WHERE c.namespace=$1 AND c.deleted_at IS NULL AND al.deleted_at IS NULL "
+                "ORDER BY al.sequence_num DESC LIMIT $2 OFFSET $3",
+                namespace,
+                limit,
+                offset,
+            )
+        return await conn.fetch(
+            "WITH visible AS (SELECT al.id, al.sequence_num AS global_sequence_num, al.consultation_id, "
+            "al.prompt_hash, al.response_hash, al.task_type, al.provider, al.quality_score, al.created_at, "
+            "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+            "LAG(al.id) OVER (ORDER BY al.sequence_num ASC) AS scoped_prev_id "
+            "FROM graeae_audit_log al JOIN graeae_consultations c ON c.id=al.consultation_id "
+            "WHERE c.owner_id=$1 AND c.namespace=$2 AND c.deleted_at IS NULL AND al.deleted_at IS NULL) "
+            "SELECT id, scoped_sequence_num AS sequence_num, consultation_id, prompt_hash, response_hash, "
+            "NULL::text AS chain_hash, scoped_prev_id AS prev_id, task_type, provider, quality_score, created_at "
+            "FROM visible ORDER BY global_sequence_num DESC LIMIT $3 OFFSET $4",
+            user_id,
+            namespace,
+            limit,
+            offset,
+        )
+
+    async def fetch_audit_chain(self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None) -> list[Row]:
+        conn = _postgres_tx(tx).conn
+        if root and namespace is None:
+            return await conn.fetch(
+                "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
+                "FROM graeae_audit_log ORDER BY sequence_num ASC"
+            )
+        owner_clause = "" if root else "c.owner_id = $2 AND "
+        params = (namespace,) if root else (namespace, user_id)
+        return await conn.fetch(
+            "SELECT al.sequence_num, ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+            "al.prompt_hash, al.response_hash, al.chain_hash, al.prev_id, al.prev_chain_hash, "
+            "prev.chain_hash AS expected_prev_hash FROM graeae_audit_log al "
+            "JOIN graeae_consultations c ON c.id=al.consultation_id "
+            "LEFT JOIN LATERAL (SELECT chain_hash FROM graeae_audit_log WHERE sequence_num < al.sequence_num "
+            "ORDER BY sequence_num DESC LIMIT 1) prev ON TRUE "
+            f"WHERE {owner_clause}c.namespace=$1 AND c.deleted_at IS NULL AND al.deleted_at IS NULL "
+            "ORDER BY al.sequence_num ASC",
+            *params,
+        )
+
+    async def get_consultation(
+        self, tx: Transaction, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> Row | None:
+        conn = _postgres_tx(tx).conn
+        if root and namespace is None:
+            return await conn.fetchrow(
+                "SELECT id, prompt, task_type, consensus_response, consensus_score, winning_muse, cost, latency_ms, mode, created "
+                "FROM graeae_consultations WHERE id=$1 AND deleted_at IS NULL",
+                consultation_id,
+            )
+        if root:
+            return await conn.fetchrow(
+                "SELECT id, prompt, task_type, consensus_response, consensus_score, winning_muse, cost, latency_ms, mode, created "
+                "FROM graeae_consultations WHERE id=$1 AND namespace=$2 AND deleted_at IS NULL",
+                consultation_id,
+                namespace,
+            )
+        return await conn.fetchrow(
+            "SELECT id, prompt, task_type, consensus_response, consensus_score, winning_muse, cost, latency_ms, mode, created "
+            "FROM graeae_consultations WHERE id=$1 AND owner_id=$2 AND namespace=$3 AND deleted_at IS NULL",
+            consultation_id,
+            user_id,
+            namespace,
+        )
+
+    async def get_consultation_artifacts(
+        self, tx: Transaction, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> tuple[Row | None, list[Row]]:
+        conn = _postgres_tx(tx).conn
+        consultation = await self.get_consultation(
+            tx, consultation_id=consultation_id, root=root, user_id=user_id, namespace=namespace
+        )
+        if not consultation:
+            return None, []
+        refs = await conn.fetch(
+            "SELECT memory_id, injected_at FROM consultation_memory_refs WHERE consultation_id=$1 ORDER BY injected_at",
+            consultation_id,
+        )
+        return consultation, list(refs)
+
+
 class PostgresFederationRepository(FederationRepository):
     _ALLOWED_PEER_COLS = {
         "name",
@@ -2187,6 +2665,9 @@ class PostgresBackend(PersistenceBackend):
         self._compression = PostgresCompressionRepository()
         self._webhooks = PostgresWebhookRepository()
         self._consultations_audit = PostgresConsultationAuditRepository()
+        self._oauth = PostgresOAuthRepository()
+        self._sessions = PostgresSessionsRepository()
+        self._consultations = PostgresConsultationsRepository()
         self._federation = PostgresFederationRepository()
         self._state_kv = PostgresStateRepository()
         self._closed = False
@@ -2240,12 +2721,32 @@ class PostgresBackend(PersistenceBackend):
         return self._consultations_audit
 
     @property
+    def oauth(self) -> OAuthRepository:
+        return self._oauth
+
+    @property
+    def sessions(self) -> SessionsRepository:
+        return self._sessions
+
+    @property
+    def consultations(self) -> ConsultationsRepository:
+        return self._consultations
+
+    @property
     def federation(self) -> FederationRepository:
         return self._federation
 
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv
+
+    async def ping(self) -> bool:
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute("SELECT 1")
+            return True
+        except Exception:
+            return False
 
     async def close(self) -> None:
         if self._closed:

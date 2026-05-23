@@ -3,9 +3,12 @@
 Mounts under /auth/oauth/*. These endpoints do NOT require authentication:
 they establish it. Admin-side provider management is in api/handlers/oauth_admin.py.
 """
+
 from __future__ import annotations
 
 import logging
+import secrets
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -13,7 +16,7 @@ from starlette.responses import JSONResponse, RedirectResponse
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.core import oauth as _oauth
 from mnemos.domain.models import (
     OAuthIdentity,
@@ -33,17 +36,15 @@ router = APIRouter(prefix="/auth/oauth", tags=["oauth"])
 @router.get("/providers", response_model=OAuthProviderListResponse)
 async def list_providers_public():
     """List enabled providers for a login UI. No secrets returned."""
-    require_postgres_pool_or_503(route_label="GET /auth/oauth/providers")
-    async with _lc.get_pool_manager().acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT name, display_name, kind, enabled "
-            "FROM oauth_providers WHERE enabled=TRUE "
-            "ORDER BY display_name"
-        )
+    backend = backend_or_503()
+    async with backend.transactional() as tx:
+        rows = await backend.oauth.list_enabled_providers(tx)
     providers = [
         OAuthProviderPublic(
-            name=r["name"], display_name=r["display_name"],
-            kind=r["kind"], enabled=r["enabled"],
+            name=r["name"],
+            display_name=r["display_name"],
+            kind=r["kind"],
+            enabled=r["enabled"],
         )
         for r in rows
     ]
@@ -55,14 +56,9 @@ async def list_providers_public():
 
 async def _load_provider(name: str):
     """Fetch an enabled provider row, else 404."""
-    require_postgres_pool_or_503(route_label="GET /auth/oauth/{provider}/login")
-    async with _lc.get_pool_manager().acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT name, kind, issuer_url, client_id, client_secret, scope, "
-            "       authorize_url, token_url, userinfo_url, enabled "
-            "FROM oauth_providers WHERE name=$1",
-            name,
-        )
+    backend = backend_or_503()
+    async with backend.transactional() as tx:
+        row = await backend.oauth.get_provider(tx, name)
     if not row or not row["enabled"]:
         raise HTTPException(status_code=404, detail=f"OAuth provider '{name}' not found or disabled")
     return row
@@ -85,18 +81,50 @@ async def oauth_callback(provider: str, request: Request):
     """Provider redirect target. Exchanges code, provisions user, sets cookie."""
     provider_row = await _load_provider(provider)
 
-    require_postgres_pool_or_503(route_label="GET /auth/oauth/{provider}/callback")
-
-    async with _lc.get_pool_manager().acquire() as conn:
-        try:
-            user_id, identity_id, claims = await _oauth.finish_login(
-                request, provider_row, conn,
+    try:
+        client = await _oauth.build_client(provider_row)
+        token = await client.authorize_access_token(request)
+        claims = {}
+        if "id_token" in token:
+            try:
+                claims = dict(token.get("userinfo") or await client.parse_id_token(request, token))
+            except Exception:
+                pass
+        if not claims:
+            try:
+                claims = dict(await client.userinfo(token=token))
+            except Exception as e:
+                logger.warning("userinfo fetch failed for %s: %s", provider_row["name"], e)
+                claims = {}
+        external_id = _oauth._extract_external_id(provider_row["name"], claims)
+        if not external_id:
+            raise ValueError(
+                f"provider {provider_row['name']} returned no usable external id in claims: " f"{list(claims.keys())}"
             )
-        except Exception as e:
-            logger.exception("oauth callback failed for provider=%s", provider)
-            raise HTTPException(status_code=502, detail=f"OAuth callback error: {e}")
-
-        session_id = await _oauth.create_session(conn, user_id, identity_id, request)
+        session_id = secrets.token_urlsafe(48)
+        expires = datetime.now(timezone.utc) + _oauth.SESSION_TTL
+        user_agent = request.headers.get("user-agent", "")[:500]
+        ip = request.client.host if request.client else None
+        backend = backend_or_503()
+        async with backend.transactional() as tx:
+            user_id, identity_id = await backend.oauth.provision_or_link_user(
+                tx,
+                provider=provider_row["name"],
+                external_id=external_id,
+                claims=claims,
+            )
+            await backend.oauth.create_session(
+                tx,
+                session_id=session_id,
+                user_id=user_id,
+                identity_id=identity_id,
+                expires_at=expires,
+                user_agent=user_agent,
+                ip_address=ip,
+            )
+    except Exception as e:
+        logger.exception("oauth callback failed for provider=%s", provider)
+        raise HTTPException(status_code=502, detail=f"OAuth callback error: {e}")
 
     # Where to send the browser now.
     post_login_redirect = request.query_params.get("next") or "/"
@@ -116,14 +144,11 @@ async def oauth_callback(provider: str, request: Request):
     # X-Forwarded-Proto when OAUTH_TRUST_PROXY is set (and the proxy is
     # configured to rewrite the header).
     from mnemos.core.config import get_settings
+
     settings = get_settings()
     _trust_proxy = settings.oauth.trust_proxy
     _xfp = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
-    is_https = (
-        request.url.scheme == "https"
-        or (_trust_proxy and _xfp == "https")
-        or settings.server.session_https_only
-    )
+    is_https = request.url.scheme == "https" or (_trust_proxy and _xfp == "https") or settings.server.session_https_only
     response: RedirectResponse = RedirectResponse(url=post_login_redirect, status_code=303)
     response.set_cookie(
         key=_oauth.SESSION_COOKIE_NAME,
@@ -136,7 +161,9 @@ async def oauth_callback(provider: str, request: Request):
     )
     logger.info(
         "oauth: session created user_id=%s provider=%s identity=%s",
-        user_id, provider, identity_id,
+        user_id,
+        provider,
+        identity_id,
     )
     return response
 
@@ -151,21 +178,18 @@ async def oauth_logout(
     user: UserContext = Depends(get_current_user),
 ):
     """Invalidate the current session cookie (or all sessions for the user)."""
-    require_postgres_pool_or_503(route_label="POST /auth/oauth/logout")
-
+    backend = backend_or_503()
     sessions_revoked = 0
-    async with _lc.get_pool_manager().acquire() as conn:
+    async with backend.transactional() as tx:
         if all_devices:
-            sessions_revoked = await _oauth.revoke_all_sessions(conn, user.user_id)
+            sessions_revoked = await backend.oauth.revoke_all_sessions(tx, user.user_id)
         else:
             cookie_session = request.cookies.get(_oauth.SESSION_COOKIE_NAME)
             if cookie_session:
-                ok = await _oauth.revoke_session(conn, cookie_session)
+                ok = await backend.oauth.revoke_session(tx, cookie_session)
                 sessions_revoked = 1 if ok else 0
 
-    response = JSONResponse(
-        content={"logged_out": True, "sessions_revoked": sessions_revoked}
-    )
+    response = JSONResponse(content={"logged_out": True, "sessions_revoked": sessions_revoked})
     response.delete_cookie(_oauth.SESSION_COOKIE_NAME, path="/")
     return response
 
@@ -185,32 +209,25 @@ async def oauth_me(
     cookie_session = request.cookies.get(_oauth.SESSION_COOKIE_NAME)
     auth_method = "personal" if not user.authenticated else "api_key"
 
-    if cookie_session and _lc._pool:
-        async with _lc.get_pool_manager().acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT identity_id::text AS identity_id FROM oauth_sessions "
-                "WHERE session_id=$1 AND NOT revoked",
-                cookie_session,
-            )
-            if row and row["identity_id"]:
+    if cookie_session:
+        backend = _lc._persistence_backend
+        if backend is not None:
+            async with backend.transactional() as tx:
+                ident = await backend.oauth.get_identity_for_session(tx, cookie_session)
+            if ident:
                 auth_method = "session"
-                ident = await conn.fetchrow(
-                    "SELECT id::text AS id, user_id, provider, external_id, "
-                    "       email, display_name, last_login_at, created "
-                    "FROM oauth_identities WHERE id=$1::uuid",
-                    row["identity_id"],
+                identity = OAuthIdentity(
+                    id=str(ident["id"]),
+                    user_id=ident["user_id"],
+                    provider=ident["provider"],
+                    external_id=ident["external_id"],
+                    email=ident["email"],
+                    display_name=ident["display_name"],
+                    last_login_at=ident["last_login_at"].isoformat() if ident["last_login_at"] else None,
+                    created=ident["created"].isoformat()
+                    if hasattr(ident["created"], "isoformat")
+                    else str(ident["created"]),
                 )
-                if ident:
-                    identity = OAuthIdentity(
-                        id=ident["id"],
-                        user_id=ident["user_id"],
-                        provider=ident["provider"],
-                        external_id=ident["external_id"],
-                        email=ident["email"],
-                        display_name=ident["display_name"],
-                        last_login_at=ident["last_login_at"].isoformat() if ident["last_login_at"] else None,
-                        created=ident["created"].isoformat(),
-                    )
 
     return OAuthMeResponse(
         user_id=user.user_id,
