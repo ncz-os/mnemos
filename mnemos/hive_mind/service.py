@@ -474,6 +474,18 @@ async def health():
     return {"status": "healthy", "ts": time.time(), "service": "graeae-hive-mind", "version": "0.1.0"}
 
 
+@app.get("/")
+async def dashboard():
+    """Minimal HTML+JS dashboard. Auto-refreshes /v1/agents + /v1/jobs + /v1/stats/* + SSE."""
+    from fastapi.responses import HTMLResponse
+    p = "/srv/agent-bus/dashboard.html"
+    try:
+        with open(p) as f:
+            return HTMLResponse(f.read())
+    except FileNotFoundError:
+        return HTMLResponse(f"<h1>dashboard.html missing</h1><p>Expected at {p}</p>", status_code=404)
+
+
 @app.post("/v1/agents/register")
 async def register(req: AgentRegister):
     # IDENTITY ENFORCEMENT (Kimi K2.6 advisory 2026-05-23):
