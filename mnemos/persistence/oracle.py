@@ -2899,7 +2899,13 @@ class OracleFederationRepository(FederationRepository):
             params: dict[str, Any] = {"limit": limit}
             if since_updated is not None and since_id is not None:
                 where.append("(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))")
-                params["upd"] = since_updated
+                # Explicit TIMESTAMP_TZ bind to avoid thin-mode coercion to VARCHAR
+                # which was causing infinite-loop pulls on ACHILLES (id < since_id).
+                import oracledb
+
+                upd_var = cursor.var(oracledb.DB_TYPE_TIMESTAMP_TZ)
+                upd_var.setvalue(0, since_updated)
+                params["upd"] = upd_var
                 params["since_id"] = since_id
             if namespaces:
                 ns_ph, ns_params = _in_placeholders(namespaces, "ns")
