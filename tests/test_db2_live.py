@@ -8,9 +8,13 @@ Pattern matches `tests/test_oracle_live.py` — minimal live coverage,
 heavy parity matrix lives in `test_persistence_parity.py` once the
 Db2 cleanup helper is wired.
 
+Canonical Db2 EAP test backend: **CERBERUS** (192.168.207.96:50001).
+PYTHIA is reserved for the Oracle production MNEMOS instance — it no longer
+hosts a Db2 EAP container as of 2026-05-23.
+
 To run:
 
-    export DB2_DSN='db2://MNEMOS:<password>@host:50000/MNEMOS'
+    export DB2_DSN='db2://db2inst1:mnemos_dev@192.168.207.96:50001/MNEMOS'
     pytest -q tests/test_db2_live.py
 
 To skip (default CI shape):
