@@ -418,6 +418,14 @@ class JobUpdate(BaseModel):
     result_mnemos_id: Optional[str] = None   # mem_XXX id where worker stored the outcome — closes provenance loop
 
 
+class ScheduleCreate(BaseModel):
+    name: str
+    interval_seconds: int = Field(..., ge=60, le=86400 * 30,
+                                  description="60s minimum (avoid hot-loop); 30d maximum")
+    job_template: dict   # full JobCreate body that will be submitted each tick
+    enabled: bool = True
+
+
 class MessagePublish(BaseModel):
     from_urn: str
     to_urn: Optional[str] = None
@@ -471,7 +479,35 @@ async def reaper_task(app: FastAPI):
                             "reason": "worker_offline_or_stale_claim",
                         })
                     await db.commit()
-                # 3. Purge old events
+                # 3. Scheduler — fire due interval-based jobs
+                now_ts = time.time()
+                async with db.execute(
+                    "SELECT id, name, created_by_urn, interval_seconds, job_template, fire_count "
+                    "FROM scheduled_jobs WHERE enabled=1 AND next_fire_at <= ?",
+                    (now_ts,)
+                ) as cur:
+                    due = [tuple(r) async for r in cur]
+                for sched_id, sname, sub_urn, interval, tpl_json, fcount in due:
+                    try:
+                        tpl = json.loads(tpl_json)
+                        tpl["submitter_urn"] = sub_urn
+                        # synth a JobCreate + go through the cache+role machinery
+                        from fastapi import HTTPException as _HE
+                        await create_job(JobCreate(**tpl))  # type: ignore
+                        await db.execute(
+                            "UPDATE scheduled_jobs SET last_fired_at=?, next_fire_at=?, "
+                            "fire_count=fire_count+1 WHERE id=?",
+                            (now_ts, now_ts + interval, sched_id),
+                        )
+                        await emit_event(db, "schedule.fired", {
+                            "schedule_id": sched_id, "name": sname,
+                            "fire_count": fcount + 1, "next_at": now_ts + interval,
+                        })
+                    except Exception as se:
+                        print(f"scheduler error {sched_id}: {se}", flush=True)
+                if due:
+                    await db.commit()
+                # 4. Purge old events
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
                 await db.execute("DELETE FROM events WHERE ts < ?", (retain_cutoff,))
                 await db.commit()
@@ -1040,6 +1076,88 @@ async def update_job(job_id: str, req: JobUpdate):
             "estimated_cost_usd": cost_estimate,
         })
     return {"ok": True, "ts": now, "estimated_cost_usd": cost_estimate}
+
+
+@app.post("/v1/schedules")
+async def create_schedule(req: ScheduleCreate):
+    """Create a recurring scheduled job. Re-fires every `interval_seconds`.
+    job_template is the JobCreate body that will be submitted each tick.
+    Submitter_urn auto-injected from caller — they take responsibility for the cron loop.
+    """
+    sid = uuidv7()
+    now = time.time()
+    # Validate the template parses as a JobCreate
+    try:
+        tpl_copy = dict(req.job_template)
+        tpl_copy.setdefault("submitter_urn", "urn:agent:human:scheduler-placeholder")
+        JobCreate(**tpl_copy)
+    except Exception as e:
+        raise HTTPException(422, f"job_template invalid: {e}")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO scheduled_jobs (id, name, created_by_urn, interval_seconds, "
+            "job_template, enabled, last_fired_at, next_fire_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            (sid, req.name, tpl_copy.get("submitter_urn"), int(req.interval_seconds),
+             json.dumps(req.job_template), 1 if req.enabled else 0,
+             now + req.interval_seconds, now),
+        )
+        await db.commit()
+    return {"id": sid, "name": req.name, "next_fire_at": now + req.interval_seconds}
+
+
+@app.get("/v1/schedules")
+async def list_schedules():
+    rows = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, name, created_by_urn, interval_seconds, enabled, "
+            "last_fired_at, next_fire_at, fire_count, created_at FROM scheduled_jobs"
+        ) as cur:
+            async for r in cur:
+                rows.append({
+                    "id": r[0], "name": r[1], "created_by": r[2],
+                    "interval_seconds": r[3], "enabled": bool(r[4]),
+                    "last_fired_at": r[5], "next_fire_at": r[6],
+                    "fire_count": r[7], "created_at": r[8],
+                })
+    return {"count": len(rows), "schedules": rows}
+
+
+@app.patch("/v1/schedules/{sid}")
+async def patch_schedule(sid: str, enabled: Optional[bool] = None,
+                         interval_seconds: Optional[int] = None):
+    sets, args = [], []
+    if enabled is not None:
+        sets.append("enabled=?")
+        args.append(1 if enabled else 0)
+    if interval_seconds is not None:
+        if interval_seconds < 60 or interval_seconds > 86400 * 30:
+            raise HTTPException(422, "interval_seconds must be 60..2592000")
+        sets.append("interval_seconds=?")
+        args.append(int(interval_seconds))
+        sets.append("next_fire_at=?")
+        args.append(time.time() + int(interval_seconds))
+    if not sets:
+        raise HTTPException(422, "no fields to update")
+    args.append(sid)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            f"UPDATE scheduled_jobs SET {', '.join(sets)} WHERE id=?", args)
+        await db.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(404, "schedule not found")
+    return {"ok": True}
+
+
+@app.delete("/v1/schedules/{sid}")
+async def delete_schedule(sid: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("DELETE FROM scheduled_jobs WHERE id=?", (sid,))
+        await db.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(404, "schedule not found")
+    return {"ok": True}
 
 
 @app.get("/v1/stats/workers")
