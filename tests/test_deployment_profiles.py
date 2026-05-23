@@ -250,9 +250,13 @@ def test_cli_install_profile_flag_forwards_to_installer(monkeypatch: pytest.Monk
 async def test_health_returns_active_profile(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     from mnemos.api.routes import health
 
+    class _PingableBackend:
+        async def ping(self) -> bool:
+            return True
+
     with _isolated_settings(monkeypatch, tmp_path, env={"MNEMOS_PROFILE": "edge"}):
         monkeypatch.setattr(health._lc, "_pool", None)
-        monkeypatch.setattr(health._lc, "_persistence_backend", object())
+        monkeypatch.setattr(health._lc, "_persistence_backend", _PingableBackend())
         monkeypatch.setattr(health._lc, "_worker_status", {"distillation_worker": "idle"})
         monkeypatch.setattr(health, "publishing_enabled", lambda: True)
         response = await health.health_check()

@@ -169,7 +169,8 @@ async def list_runs(
         f"FROM morpheus_runs{where} "
         f"ORDER BY started_at DESC LIMIT ${len(args)}"
     )
-    async with pg_backend._pool.acquire() as conn:
+    pool_handle = pg_backend._pool
+    async with pool_handle.acquire() as conn:
         rows = await conn.fetch(sql, *args)
     return MorpheusRunList(count=len(rows), runs=[_row_to_run(r) for r in rows])
 
@@ -179,7 +180,8 @@ async def get_run(run_id: str, _: UserContext = Depends(require_root)):
     """Return one MORPHEUS run. Operator-only telemetry."""
     _require_morpheus_installed()
     pg_backend = _require_postgres_backend()
-    async with pg_backend._pool.acquire() as conn:
+    pool_handle = pg_backend._pool
+    async with pool_handle.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, started_at, finished_at, status, phase, triggered_by, "
             "       window_started_at, window_ended_at, window_hours, "
@@ -216,7 +218,8 @@ async def list_clusters(run_id: str, _: UserContext = Depends(require_root)):
     """
     _require_morpheus_installed()
     pg_backend = _require_postgres_backend()
-    async with pg_backend._pool.acquire() as conn:
+    pool_handle = pg_backend._pool
+    async with pool_handle.acquire() as conn:
         config_raw = await conn.fetchval(
             "SELECT config FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
@@ -308,7 +311,8 @@ async def trigger_run(
         config=run_config,
         namespace=request.namespace,
     )
-    async with pg_backend._pool.acquire() as conn:
+    pool_handle = pg_backend._pool
+    async with pool_handle.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, started_at, finished_at, status, phase, triggered_by, "
             "       window_started_at, window_ended_at, window_hours, "
@@ -337,7 +341,8 @@ async def rollback(
     """
     _require_morpheus_installed()
     pg_backend = _require_postgres_backend()
-    async with pg_backend._pool.acquire() as conn:
+    pool_handle = pg_backend._pool
+    async with pool_handle.acquire() as conn:
         existing = await conn.fetchval(
             "SELECT id FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
