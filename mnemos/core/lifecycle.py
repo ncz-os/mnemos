@@ -276,6 +276,13 @@ def _select_persistence_backend(settings) -> str:
 
     if "backend" in explicit_database_fields and configured != "auto":
         return _normalize_backend_name(configured)
+    # Per-backend env var shortcuts: ORACLE_DSN / DB2_DSN override
+    # explicit postgres connection defaults (host/port/user).
+    if os.environ.get("ORACLE_DSN", "").strip():
+        return "oracle"
+    if os.environ.get("DB2_DSN", "").strip():
+        return "db2"
+
     if _has_explicit_postgres_connection_config(settings):
         return "postgres"
     if configured != "auto":
