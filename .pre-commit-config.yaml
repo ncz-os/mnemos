@@ -17,3 +17,17 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
       - id: check-merge-conflict
+
+  # Migration parity gate (mnemos-migration-parity-ci-gate)
+  # Any new .sql under db/migrations/ OR db/migrations_oracle/ OR
+  # db/migrations_db2/ must have parallel files in all three dirs
+  # or the commit is rejected. Pre-commit uses --mode staged (only
+  # blocks new additions); CI runs --mode diff against MR base.
+  - repo: local
+    hooks:
+      - id: migration-parity-check
+        name: migration-parity-check
+        entry: python3 scripts/check_migration_parity.py --mode staged
+        language: system
+        pass_filenames: false
+        files: ^db/migrations(_oracle|_db2)?/.*\.sql$
