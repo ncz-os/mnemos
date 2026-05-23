@@ -943,92 +943,24 @@ async def dequeue_next_job(agent_urn: str):
         # they can still claim tier-A (free) work. Forces API/free fallback as plan cap nears.
         sub_throttled = (a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap)
 
-        await db.execute("BEGIN IMMEDIATE")
-        try:
-            async with db.execute(
-                "SELECT id, kind, description, priority, deadline, required_capabilities, eligible_kinds, "
-                "submitter_urn, parent_job_id, started_at, max_cost_tier, preferred_providers, preferred_models, "
-                "mnemos_refs, depends_on "
-                "FROM jobs WHERE status='queued' "
-                "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
-                "ORDER BY priority DESC, started_at ASC",
-                (time.time(),)
-            ) as cur:
-                async for r in cur:
-                    (job_id, j_kind, j_desc, j_prio, j_dead, j_caps_json, j_kinds_json,
-                     j_sub, j_par, j_started, j_max_tier, j_pref_providers, j_pref_models,
-                     j_mnemos_refs, j_deps_json) = r
-                    # DAG gate: all depends_on must be status='done'
-                    if j_deps_json:
-                        deps = json.loads(j_deps_json) or []
-                        if deps:
-                            ph = ",".join("?" * len(deps))
-                            async with db.execute(
-                                f"SELECT COUNT(*) FROM jobs WHERE id IN ({ph}) AND status='done'",
-                                tuple(deps),
-                            ) as dc:
-                                done_count = (await dc.fetchone())[0]
-                            if done_count < len(deps):
-                                continue  # parent not yet done; skip
-                    # filter: eligible_kinds
-                    if j_kinds_json:
-                        kinds = json.loads(j_kinds_json)
-                        if kinds and agent_kind not in kinds:
-                            continue
-                    # filter: required_capabilities
-                    # Wildcard "*" in agent_caps = claim-any (workers willing to
-                    # attempt any tag; failure-mode handled by exit_code+retry).
-                    # Without this, the hive becomes unusable for free-form
-                    # project tags (e.g. ["db2","yocto","npu"]) that no general
-                    # worker declares but everything ends up tagged with.
-                    if j_caps_json and "*" not in agent_caps:
-                        need = set(json.loads(j_caps_json))
-                        if not need.issubset(agent_caps):
-                            continue
-                    # filter: cost-tier cap (token-miser default: A=free only)
-                    job_max_tier = (j_max_tier or "A").upper()
-                    if COST_TIERS.index(a_tier) > COST_TIERS.index(job_max_tier):
-                        continue
-                    # throttle: subscription claude past 85% MTD limited to tier-A only
-                    if sub_throttled and job_max_tier != "A":
-                        continue
-                    # filter: preferred_providers (if set, agent must match one)
-                    if j_pref_providers:
-                        provs = json.loads(j_pref_providers)
-                        if provs and a_provider not in provs:
-                            continue
-                    if j_pref_models:
-                        models = json.loads(j_pref_models)
-                        if models and a_model not in models:
-                            continue
-                    # match — claim + record dispatch resources
-                    await db.execute(
-                        "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
-                        "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=? "
-                        "WHERE id=? AND status='queued'",
-                        (agent_urn, now, a_runtime, a_model, a_provider, a_tier, job_id),
-                    )
-                    await db.execute("COMMIT")
-                    await emit_event(db, "job.claimed", {
-                        "id": job_id, "claimed_by": agent_urn, "kind": j_kind,
-                        "runtime": a_runtime, "model": a_model,
-                        "provider": a_provider, "cost_tier": a_tier,
-                    })
-                    return {
-                        "id": job_id, "kind": j_kind, "description": j_desc,
-                        "priority": j_prio, "deadline": j_dead,
-                        "submitter_urn": j_sub, "parent_job_id": j_par,
-                        "claimed_at": now, "queued_at": j_started,
-                        "mnemos_refs": json.loads(j_mnemos_refs) if j_mnemos_refs else [],
-                        "claimed_resources": {
-                            "runtime": a_runtime, "model": a_model,
-                            "provider": a_provider, "cost_tier": a_tier,
-                        },
-                    }
-            await db.execute("COMMIT")
-        except Exception:
-            await db.execute("ROLLBACK")
-            raise
+    # Phase 2 cut 4: atomic claim delegated to repo (transaction +
+    # filter chain are storage semantics; only event emission stays here).
+    claimed = await _REPO.find_and_claim_job(
+        agent_urn=agent_urn, agent_kind=agent_kind, agent_caps=agent_caps,
+        agent_runtime=a_runtime or "unknown", agent_model=a_model or "unknown",
+        agent_provider=a_provider or "unknown", agent_tier=a_tier,
+        cost_tier_order=list(COST_TIERS),
+        sub_throttled=bool(sub_throttled), now=now,
+    )
+    if claimed:
+        async with aiosqlite.connect(DB_PATH) as db2:
+            await emit_event(db2, "job.claimed", {
+                "id": claimed["id"], "claimed_by": agent_urn,
+                "kind": claimed["kind"],
+                "runtime": a_runtime, "model": a_model,
+                "provider": a_provider, "cost_tier": a_tier,
+            })
+        return claimed
     return JSONResponse(status_code=204, content=None)
 
 
