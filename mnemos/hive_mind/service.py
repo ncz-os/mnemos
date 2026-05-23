@@ -155,9 +155,19 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
     "mnemos":        {"mnemos"},
     "human":         {"human"},
     "claude":        {"claude"},
+    "system":        {"system"},                    # fleet hosts (ARGOS/TYPHON/HYDRA/MEDUSA/CERBERUS/PROTEUS/cixmini)
     "unknown":       {"unknown"},
 }
 AUTONOMY_LEVELS = {"autonomous", "confirm-risky", "interactive", "unknown"}
+AUTH_METHODS = {"subscription", "api", "free", "unknown"}
+# Plan caps (USD/month) per CLAUDE.md:
+DEFAULT_PLAN_CAPS = {
+    "subscription": 200.0,   # Anthropic Max plan ($200 until 2026-05-31, $100 from 2026-06-01 — operator updates)
+    "api":          1000.0,  # pay-per-token has no hard cap; treat as high ceiling for safety
+    "free":         0.0,     # no cap (no cost)
+    "unknown":      50.0,    # conservative
+}
+THROTTLE_HEADROOM = 0.85  # at >=85% of plan cap, prefer non-subscription workers for tier-B/C jobs
 
 # ROLE SPLIT (user directive 2026-05-23): opencode + goose + codex + hermes +
 # claw-family + ic-engine + unknown = WORKERS (claim-only). Cannot submit jobs.
@@ -169,6 +179,7 @@ WORKER_ONLY_RUNTIMES: set[str] = {
     "hermes",
     "zeroclaw", "openclaw",
     "ic-engine",
+    "system",   # fleet hosts (system-watcher daemons) — sensors + optional build/ci workers, never submitters
 }
 ORCHESTRATOR_RUNTIMES: set[str] = {
     "claude-code", "claude-cli", "claude",
@@ -304,6 +315,9 @@ class AgentRegister(BaseModel):
                                 description="URN routing segment — defaults to runtime")
     autonomy_level: str = Field("unknown",
                                 description="autonomous / confirm-risky / interactive / unknown")
+    auth_method: str = Field("unknown",
+                             description="subscription (Max plan), api (pay-per-token), free, unknown")
+    plan_cap_usd: Optional[float] = None  # monthly cap; defaults from DEFAULT_PLAN_CAPS by auth_method
     pid: Optional[int] = None
     capabilities: Optional[list[str]] = None
     version: Optional[str] = None
@@ -420,6 +434,10 @@ async def register(req: AgentRegister):
     autonomy = (req.autonomy_level or "unknown").lower()
     if autonomy not in AUTONOMY_LEVELS:
         raise HTTPException(422, f"autonomy_level must be one of {sorted(AUTONOMY_LEVELS)}, got {autonomy!r}")
+    auth_method = (req.auth_method or "unknown").lower()
+    if auth_method not in AUTH_METHODS:
+        raise HTTPException(422, f"auth_method must be one of {sorted(AUTH_METHODS)}, got {auth_method!r}")
+    plan_cap_usd = req.plan_cap_usd if req.plan_cap_usd is not None else DEFAULT_PLAN_CAPS.get(auth_method, 50.0)
     provider = (req.provider or "unknown").lower()
     model = (req.model or "unknown").lower()
     tier = cost_tier_for(provider)
@@ -429,10 +447,12 @@ async def register(req: AgentRegister):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO agents (urn, kind, runtime, model, provider, cost_tier, autonomy_level, "
+            "auth_method, plan_cap_usd, plan_period_used_usd, "
             "host, session_id, pid, capabilities, version, started_at, last_heartbeat, status, metadata) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'online', ?)",
             (
                 urn, kind, runtime, model, provider, tier, autonomy,
+                auth_method, plan_cap_usd,
                 req.host, session_id, req.pid,
                 json.dumps(req.capabilities) if req.capabilities else None,
                 req.version, now, now,
@@ -449,6 +469,7 @@ async def register(req: AgentRegister):
         "urn": urn, "session_id": session_id, "registered_at": now,
         "kind": kind, "runtime": runtime, "model": model,
         "provider": provider, "cost_tier": tier, "autonomy_level": autonomy,
+        "auth_method": auth_method, "plan_cap_usd": plan_cap_usd,
     }
 
 
@@ -514,6 +535,41 @@ async def list_agents(
                     "display": display,
                 })
     return {"count": len(rows), "agents": rows}
+
+
+@app.get("/v1/agents/{urn_path:path}/throttle")
+async def agent_throttle(urn_path: str):
+    """Inspect an agent's plan-cap throttle state."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT urn, kind, runtime, auth_method, plan_cap_usd, plan_period_used_usd "
+            "FROM agents WHERE urn=?", (urn_path,)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"agent not found: {urn_path}")
+    used = row[5] or 0
+    cap = row[4] or 0
+    pct = (100 * used / cap) if cap else 0
+    return {
+        "urn": row[0], "kind": row[1], "runtime": row[2],
+        "auth_method": row[3], "plan_cap_usd": cap,
+        "plan_period_used_usd": round(used, 4),
+        "plan_period_pct": round(pct, 1),
+        "throttled": row[3] == "subscription" and pct >= 85.0,
+        "headroom_pct": THROTTLE_HEADROOM * 100,
+    }
+
+
+@app.post("/v1/agents/{urn_path:path}/plan-reset")
+async def reset_plan_period(urn_path: str):
+    """Operator zeros the MTD usage — call monthly on billing rollover."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE agents SET plan_period_used_usd = 0 WHERE urn=?", (urn_path,))
+        await db.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(404, f"agent not found: {urn_path}")
+    return {"ok": True, "urn": urn_path, "reset_at": time.time()}
 
 
 @app.get("/v1/agents/whoami")
@@ -616,16 +672,21 @@ async def dequeue_next_job(agent_urn: str):
     now = time.time()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT kind, capabilities, runtime, model, provider, cost_tier "
+            "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
+            "auth_method, plan_cap_usd, plan_period_used_usd "
             "FROM agents WHERE urn=? AND status IN ('online','idle')",
             (agent_urn,),
         ) as cur:
             row = await cur.fetchone()
         if not row:
             raise HTTPException(404, f"agent not registered or offline: {agent_urn}")
-        agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier = row
+        agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier, a_auth, a_cap, a_used = row
         agent_caps = set(json.loads(caps_json)) if caps_json else set()
         a_tier = a_tier or "C"
+        a_auth = (a_auth or "unknown").lower()
+        # Throttle: subscription agents over 85% MTD usage get refused tier-B/C jobs;
+        # they can still claim tier-A (free) work. Forces API/free fallback as plan cap nears.
+        sub_throttled = (a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap)
 
         await db.execute("BEGIN IMMEDIATE")
         try:
@@ -653,6 +714,9 @@ async def dequeue_next_job(agent_urn: str):
                     # filter: cost-tier cap (token-miser default: A=free only)
                     job_max_tier = (j_max_tier or "A").upper()
                     if COST_TIERS.index(a_tier) > COST_TIERS.index(job_max_tier):
+                        continue
+                    # throttle: subscription claude past 85% MTD limited to tier-A only
+                    if sub_throttled and job_max_tier != "A":
                         continue
                     # filter: preferred_providers (if set, agent must match one)
                     if j_pref_providers:
@@ -710,14 +774,15 @@ async def update_job(job_id: str, req: JobUpdate):
         args.extend([req.claimed_by, now])
     # token usage + cost estimation
     cost_estimate = None
+    claimed_by_urn = None
     if req.tokens_in is not None or req.tokens_out is not None:
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
-                "SELECT claimed_provider, claimed_model FROM jobs WHERE id=?", (job_id,)
+                "SELECT claimed_provider, claimed_model, claimed_by FROM jobs WHERE id=?", (job_id,)
             ) as cur:
                 row = await cur.fetchone()
         if row:
-            prov, mod = row
+            prov, mod, claimed_by_urn = row
             t_in = int(req.tokens_in or 0)
             t_out = int(req.tokens_out or 0)
             cost_estimate = estimate_cost(prov or "unknown", mod or "unknown", t_in, t_out)
@@ -727,6 +792,12 @@ async def update_job(job_id: str, req: JobUpdate):
     sql = f"UPDATE jobs SET {', '.join(fields)} WHERE id=?"
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(sql, args)
+        # Roll MTD spend onto claimer (subscription throttle requires this)
+        if cost_estimate and cost_estimate > 0 and claimed_by_urn:
+            await db.execute(
+                "UPDATE agents SET plan_period_used_usd = COALESCE(plan_period_used_usd,0) + ? WHERE urn=?",
+                (cost_estimate, claimed_by_urn),
+            )
         await db.commit()
         if cur.rowcount == 0:
             raise HTTPException(404, f"job not found: {job_id}")
