@@ -87,12 +87,42 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 10.
         return 0, None
 
 
+def _detect_provider_and_model() -> tuple[str, str]:
+    """Best-effort: derive provider/model from env so hive can apply
+    correct cost-tier filter. Without this, workers register as
+    provider=unknown → tier=C and can never claim default tier-A jobs.
+
+    Order matches LLM_RATES in service.py + CLAUDE.md dispatch policy.
+    """
+    if os.environ.get("AGENT_PROVIDER"):
+        return (os.environ["AGENT_PROVIDER"].lower(),
+                os.environ.get("AGENT_MODEL", "unknown").lower())
+    if os.environ.get("NVIDIA_API_KEY") or os.environ.get("NGC_API_KEY"):
+        return ("nvidia", os.environ.get("NGC_MODEL", "kimi-k2.6"))
+    if os.environ.get("GROQ_API_KEY"):
+        return ("groq", os.environ.get("GROQ_MODEL", "kimi-k2-32k"))
+    if os.environ.get("XAI_API_KEY"):
+        return ("xai", os.environ.get("XAI_MODEL", "grok-4"))
+    if os.environ.get("TOGETHER_API_KEY"):
+        return ("together", os.environ.get("TOGETHER_MODEL", "minimax-m2"))
+    if os.environ.get("OPENAI_API_KEY", "").startswith("nvapi-"):
+        # NGC-issued key in OPENAI_API_KEY slot — still NVIDIA
+        return ("nvidia", os.environ.get("NGC_MODEL", "kimi-k2.6"))
+    return ("unknown", "unknown")
+
+
 def register() -> str:
     global _urn, _last_heartbeat
+    provider, model = _detect_provider_and_model()
     body = {
         "kind": "goose",
         "host": AGENT_HOST,
         "pid": os.getpid(),
+        "runtime": "goose",
+        "provider": provider,
+        "model": model,
+        "auth_method": "free" if provider in ("nvidia", "local") else "api",
+        "autonomy_level": "autonomous",
         "capabilities": AGENT_CAPABILITIES,
         "version": _goose_version(),
         "metadata": {

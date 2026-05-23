@@ -24,6 +24,12 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
+
+# Phase 2 migration cut 1 (2026-05-23): storage abstraction. SQL methods
+# migrate into the repo one at a time; service-level helpers forward.
+# See mnemos/hive_mind/repository.py for the Protocol + cut plan.
+from mnemos.hive_mind.repository import SqliteHiveMindRepository  # noqa: E402
+_REPO = SqliteHiveMindRepository(DB_PATH)
 HEARTBEAT_REAP_INTERVAL = 30.0
 HEARTBEAT_DEAD_AFTER = 60.0
 EVENTS_RETAIN_HOURS = 168  # 7 days
@@ -647,27 +653,23 @@ async def register(req: AgentRegister):
     session_id = str(uuid.uuid4())
     urn = make_urn(kind, req.host, session_id)
     now = time.time()
+    # Phase 2 cut 1: INSERT delegated to SqliteHiveMindRepository.insert_agent.
+    # emit_event stays inline (separate transaction is acceptable — event log
+    # is observability, not the agent row's source of truth).
+    await _REPO.insert_agent(
+        urn=urn, kind=kind, runtime=runtime, model=model, provider=provider,
+        cost_tier=tier, autonomy_level=autonomy, auth_method=auth_method,
+        plan_cap_usd=plan_cap_usd, host=req.host, session_id=session_id,
+        pid=req.pid, capabilities=req.capabilities, version=req.version,
+        started_at=now, last_heartbeat=now, metadata=req.metadata,
+    )
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO agents (urn, kind, runtime, model, provider, cost_tier, autonomy_level, "
-            "auth_method, plan_cap_usd, plan_period_used_usd, "
-            "host, session_id, pid, capabilities, version, started_at, last_heartbeat, status, metadata) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'online', ?)",
-            (
-                urn, kind, runtime, model, provider, tier, autonomy,
-                auth_method, plan_cap_usd,
-                req.host, session_id, req.pid,
-                json.dumps(req.capabilities) if req.capabilities else None,
-                req.version, now, now,
-                json.dumps(req.metadata) if req.metadata else None,
-            ),
-        )
-        await db.commit()
         await emit_event(db, "agent.online", {
             "urn": urn, "kind": kind, "runtime": runtime,
             "model": model, "provider": provider, "cost_tier": tier,
             "host": req.host, "autonomy_level": autonomy,
         })
+        await db.commit()
     return {
         "urn": urn, "session_id": session_id, "registered_at": now,
         "kind": kind, "runtime": runtime, "model": model,
