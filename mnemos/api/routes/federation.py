@@ -4,6 +4,7 @@ Two halves:
   * Admin side (root only): register peers, inspect sync status, trigger manual sync.
   * Protocol side (federation role): the `/feed` endpoint that remote peers pull from.
 """
+
 from __future__ import annotations
 
 import json
@@ -36,6 +37,54 @@ router = APIRouter(prefix="/v1/federation", tags=["federation"])
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+# Class names + error strings that indicate the DB backend lost its
+# connection (vs a legitimate query failure / programming error).
+# Matched by name + chained-cause walk so we don't hard-import every
+# DB driver. Triggered by the 2026-05-23 CERBERUS investigation
+# (hive job 019e563f): mnemos-api-cerb's Oracle standby was MOUNTED
+# (not OPEN READ ONLY), oracledb raised DPY-6005 inside feed_query,
+# raw 500 propagated to PYTHIA federation pull worker.
+_DB_DISCONNECT_EXC_NAMES = frozenset(
+    {
+        "OperationalError",  # oracledb + sqlalchemy + psycopg
+        "InterfaceError",  # oracledb + psycopg
+        "ConnectionDoesNotExistError",  # asyncpg
+        "ConnectionRefusedError",  # builtin
+        "DisconnectionError",  # sqlalchemy
+        "CannotConnectNowError",  # asyncpg
+    }
+)
+_DB_DISCONNECT_TEXT_MARKERS = (
+    "dpy-6005",
+    "cannot connect",
+    "connection refused",
+    "connection reset",
+    "connection lost",
+    "no listener",
+    "ora-12541",  # TNS no listener
+    "ora-12514",  # listener doesn't currently know
+    "could not translate host name",
+)
+
+
+def _is_db_disconnect(exc: BaseException) -> bool:
+    """Walk the exception + its __cause__/__context__ chain matching
+    known DB-disconnect class names + text markers. Returns True when
+    the failure looks like the backend lost its connection rather than
+    a programming error."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if type(cur).__name__ in _DB_DISCONNECT_EXC_NAMES:
+            return True
+        text = str(cur).lower()
+        if any(marker in text for marker in _DB_DISCONNECT_TEXT_MARKERS):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 async def _require_federation_role(
@@ -148,9 +197,7 @@ def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
         source_provider=row["source_provider"],
         source_session=row["source_session"],
         source_agent=row["source_agent"],
-        archived_at=(
-            _iso_value(archived_at)
-        ),
+        archived_at=(_iso_value(archived_at)),
         archived=archived_at is not None,
     )
 
@@ -210,6 +257,7 @@ async def federation_schema(
     """
     from mnemos._version import __version__ as _v
     from mnemos.domain.federation import _local_migrations_fingerprint
+
     parts = _v.split(".")
     major_minor = f"{parts[0]}.{parts[1]}" if len(parts) >= 2 else _v
     return {
@@ -220,9 +268,16 @@ async def federation_schema(
         # whether their schema matches enough to pull. Not used as a
         # hard gate yet.
         "core_fields": [
-            "id", "content", "category", "subcategory",
-            "owner_id", "namespace", "permission_mode",
-            "quality_rating", "created", "updated",
+            "id",
+            "content",
+            "category",
+            "subcategory",
+            "owner_id",
+            "namespace",
+            "permission_mode",
+            "quality_rating",
+            "created",
+            "updated",
         ],
     }
 
@@ -246,14 +301,13 @@ async def _validate_peer_base_url(base_url: str) -> None:
         return
     if parsed.scheme == "http" and allow_insecure:
         logger.warning(
-            "federation: registering insecure peer base_url=%s — "
-            "auth token will be sent in cleartext", base_url,
+            "federation: registering insecure peer base_url=%s — " "auth token will be sent in cleartext",
+            base_url,
         )
         return
     raise HTTPException(
         status_code=422,
-        detail="peer base_url must use https:// "
-               "(set FEDERATION_ALLOW_INSECURE=true to permit http, not for prod)",
+        detail="peer base_url must use https:// " "(set FEDERATION_ALLOW_INSECURE=true to permit http, not for prod)",
     )
 
 
@@ -284,7 +338,8 @@ async def register_peer(
         raise HTTPException(status_code=503, detail=str(e))
     logger.info(
         "federation: peer registered name=%s compat_mode=%s",
-        request.name, request.compat_mode,
+        request.name,
+        request.compat_mode,
     )
     return _to_peer(row)
 
@@ -328,8 +383,14 @@ async def update_peer(
     # clause. Keys come from a Pydantic model today but this prevents future
     # additions from accidentally enabling injection.
     _ALLOWED_PEER_COLS = {
-        "name", "base_url", "auth_token", "namespace_filter", "category_filter",
-        "enabled", "sync_interval_secs", "compat_mode",
+        "name",
+        "base_url",
+        "auth_token",
+        "namespace_filter",
+        "category_filter",
+        "enabled",
+        "sync_interval_secs",
+        "compat_mode",
     }
     bad = set(updates.keys()) - _ALLOWED_PEER_COLS
     if bad:
@@ -381,7 +442,9 @@ async def trigger_sync(
         # Genuinely missing peer (UUID not in federation_peers).
         raise HTTPException(status_code=404, detail=str(e))
     return FederationSyncTriggerResponse(
-        pulled=pulled, new=new, updated=updated,
+        pulled=pulled,
+        new=new,
+        updated=updated,
     )
 
 
@@ -480,6 +543,23 @@ async def federation_feed(
             )
     except NotImplementedError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        if _is_db_disconnect(e):
+            logger.warning(
+                "[federation/feed] backend DB disconnected: %s: %s",
+                type(e).__name__,
+                e,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "database_disconnected",
+                    "exception_type": type(e).__name__,
+                    "message": str(e),
+                },
+            )
+        logger.exception("[federation/feed] unexpected error in feed_query")
+        raise
 
     has_more = len(rows) > limit
     rows = rows[:limit]
@@ -520,6 +600,23 @@ async def federation_memory(
             )
     except NotImplementedError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        if _is_db_disconnect(e):
+            logger.warning(
+                "[federation/memory] backend DB disconnected: %s: %s",
+                type(e).__name__,
+                e,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "database_disconnected",
+                    "exception_type": type(e).__name__,
+                    "message": str(e),
+                },
+            )
+        logger.exception("[federation/memory] unexpected error in get_feed_memory")
+        raise
 
     if row is None:
         raise HTTPException(status_code=404, detail="memory not found")
