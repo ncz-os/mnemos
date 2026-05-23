@@ -427,11 +427,13 @@ class MessagePublish(BaseModel):
 
 # ---------- lifecycle ----------
 
+CLAIM_STALE_AFTER = 1800.0   # claim → still 'claimed'/'running' without update >30min ⇒ orphan
 async def reaper_task(app: FastAPI):
     while True:
         await asyncio.sleep(HEARTBEAT_REAP_INTERVAL)
         try:
             async with aiosqlite.connect(DB_PATH) as db:
+                # 1. Heartbeat reaper — mark dead agents offline
                 cutoff = time.time() - HEARTBEAT_DEAD_AFTER
                 async with db.execute(
                     "SELECT urn FROM agents WHERE status != 'offline' AND last_heartbeat < ?",
@@ -446,7 +448,29 @@ async def reaper_task(app: FastAPI):
                     await db.commit()
                     for urn in dead:
                         await emit_event(db, "agent.offline", {"urn": urn, "reason": "heartbeat_timeout"})
-                # purge old events
+                # 2. ORPHAN CLAIM RECOVERY — jobs claimed by dead/stale workers go back to queue
+                stale_cutoff = time.time() - CLAIM_STALE_AFTER
+                async with db.execute(
+                    "SELECT j.id, j.claimed_by FROM jobs j "
+                    "LEFT JOIN agents a ON a.urn = j.claimed_by "
+                    "WHERE j.status IN ('claimed','running') "
+                    "AND ( a.status = 'offline' OR a.urn IS NULL OR j.claimed_at < ? )",
+                    (stale_cutoff,)
+                ) as cur:
+                    orphans = [(r[0], r[1]) async for r in cur]
+                if orphans:
+                    for job_id, claimer in orphans:
+                        await db.execute(
+                            "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
+                            "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
+                            "claimed_cost_tier=NULL WHERE id=? AND status IN ('claimed','running')",
+                            (job_id,))
+                        await emit_event(db, "job.unclaimed", {
+                            "id": job_id, "prior_claimer": claimer,
+                            "reason": "worker_offline_or_stale_claim",
+                        })
+                    await db.commit()
+                # 3. Purge old events
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
                 await db.execute("DELETE FROM events WHERE ts < ?", (retain_cutoff,))
                 await db.commit()
@@ -940,23 +964,48 @@ async def update_job(job_id: str, req: JobUpdate):
                 "UPDATE agents SET plan_period_used_usd = COALESCE(plan_period_used_usd,0) + ? WHERE urn=?",
                 (cost_estimate, claimed_by_urn),
             )
-        # On success: populate result cache for future identical submissions
-        if req.status == "done":
+        # On done/failed/cancelled: roll per-worker per-kind stats (capability scoring)
+        if req.status in ("done", "failed", "cancelled"):
             async with db.execute(
                 "SELECT kind, description, max_cost_tier, required_capabilities, "
-                "claimed_model, claimed_provider, result FROM jobs WHERE id=?", (job_id,)
+                "claimed_model, claimed_provider, claimed_by, result, started_at "
+                "FROM jobs WHERE id=?", (job_id,)
             ) as cur2:
                 jrow = await cur2.fetchone()
             if jrow:
-                kind_j, desc_j, mtier, reqcaps_json, mdl_j, prov_j, result_j = jrow
-                ck = cache_key_for(kind_j, desc_j, (mtier or "A").upper(),
-                                   json.loads(reqcaps_json) if reqcaps_json else None)
-                rdict = json.loads(result_j) if result_j else (req.result or {})
-                # only cache reasonable results — avoid caching error/timeout outputs
-                ec = (rdict or {}).get("exit_code")
-                if ec == 0 or ec is None:
-                    await cache_store(db, ck, job_id, rdict, req.result_mnemos_id,
-                                      mdl_j or "unknown", prov_j or "unknown", cost_estimate or 0)
+                kind_j, desc_j, mtier, reqcaps_json, mdl_j, prov_j, claimed_by_j, result_j, started_j = jrow
+                # capability scoring stats
+                if claimed_by_j and kind_j:
+                    duration = (time.time() - (started_j or time.time())) if started_j else 0
+                    col = {"done": "success_count", "failed": "fail_count", "cancelled": "cancelled_count"}[req.status]
+                    await db.execute(
+                        f"INSERT INTO worker_kind_stats (urn, kind, {col}, total_tokens_in, total_tokens_out, "
+                        f"total_cost_usd, total_duration_sec, last_run) "
+                        f"VALUES (?, ?, 1, ?, ?, ?, ?, ?) "
+                        f"ON CONFLICT(urn, kind) DO UPDATE SET "
+                        f"{col} = {col} + 1, "
+                        f"total_tokens_in = total_tokens_in + ?, "
+                        f"total_tokens_out = total_tokens_out + ?, "
+                        f"total_cost_usd = total_cost_usd + ?, "
+                        f"total_duration_sec = total_duration_sec + ?, "
+                        f"last_run = ?",
+                        (
+                            claimed_by_j, kind_j,
+                            int(req.tokens_in or 0), int(req.tokens_out or 0),
+                            cost_estimate or 0, duration, time.time(),
+                            int(req.tokens_in or 0), int(req.tokens_out or 0),
+                            cost_estimate or 0, duration, time.time(),
+                        ),
+                    )
+                # cache only successful results
+                if req.status == "done":
+                    ck = cache_key_for(kind_j, desc_j, (mtier or "A").upper(),
+                                       json.loads(reqcaps_json) if reqcaps_json else None)
+                    rdict = json.loads(result_j) if result_j else (req.result or {})
+                    ec = (rdict or {}).get("exit_code")
+                    if ec == 0 or ec is None:
+                        await cache_store(db, ck, job_id, rdict, req.result_mnemos_id,
+                                          mdl_j or "unknown", prov_j or "unknown", cost_estimate or 0)
         await db.commit()
         if cur.rowcount == 0:
             raise HTTPException(404, f"job not found: {job_id}")
@@ -966,6 +1015,35 @@ async def update_job(job_id: str, req: JobUpdate):
             "estimated_cost_usd": cost_estimate,
         })
     return {"ok": True, "ts": now, "estimated_cost_usd": cost_estimate}
+
+
+@app.get("/v1/stats/workers")
+async def worker_stats(kind: Optional[str] = None, top_n: int = 30):
+    """Per-worker per-kind capability scores. Submitters use this to pick best worker for a kind."""
+    sql = ("SELECT urn, kind, success_count, fail_count, cancelled_count, "
+           "total_tokens_in, total_tokens_out, ROUND(total_cost_usd,4), "
+           "ROUND(total_duration_sec/NULLIF(success_count+fail_count,0),1) AS avg_dur, "
+           "datetime(last_run,'unixepoch') AS last_run, "
+           "ROUND(100.0 * success_count / NULLIF(success_count+fail_count+cancelled_count,0), 1) AS success_pct "
+           "FROM worker_kind_stats")
+    args: list = []
+    if kind:
+        sql += " WHERE kind=?"
+        args.append(kind)
+    sql += " ORDER BY success_count DESC, success_pct DESC LIMIT ?"
+    args.append(int(top_n))
+    rows = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(sql, args) as cur:
+            async for r in cur:
+                rows.append({
+                    "urn": r[0], "kind": r[1],
+                    "success_count": r[2], "fail_count": r[3], "cancelled_count": r[4],
+                    "total_tokens_in": r[5], "total_tokens_out": r[6],
+                    "total_cost_usd": r[7], "avg_duration_sec": r[8],
+                    "last_run": r[9], "success_pct": r[10],
+                })
+    return {"count": len(rows), "workers": rows}
 
 
 @app.get("/v1/stats/cache")
