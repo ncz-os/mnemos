@@ -169,14 +169,10 @@ class HiveMindRepository(Protocol):
 class SqliteHiveMindRepository:
     """SQLite/aiosqlite backend.
 
-    Initial scaffold: every method raises NotImplementedError. Methods
-    are migrated out of service.py one at a time so each change can be
-    smoke-tested against the live hive on PYTHIA without flipping the
-    whole queue at once.
-
-    To preserve cut-over safety, the constructor accepts the same
-    DB_PATH the service uses; once a method is implemented here, the
-    service-level helper deletes its body and forwards to the repo.
+    Methods migrate out of service.py one at a time so each change can
+    be smoke-tested against the live hive on PYTHIA without flipping
+    the whole queue at once. Unmigrated methods raise NotImplementedError
+    via __getattr__ pointing back to this migration plan.
     """
 
     def __init__(self, db_path: str) -> None:
@@ -188,6 +184,45 @@ class SqliteHiveMindRepository:
             "+ ALTER TABLE block into this method, then have lifespan() call "
             "repo.init() instead of running SQL directly."
         )
+
+    # ---------- agents (Phase 2 migration cut 1) ----------
+
+    async def insert_agent(self, *, urn: str, kind: str, runtime: str,
+                           model: str, provider: str, cost_tier: str,
+                           autonomy_level: str, auth_method: str,
+                           plan_cap_usd: float, host: str, session_id: str,
+                           pid: Optional[int], capabilities: Optional[list[str]],
+                           version: Optional[str], started_at: float,
+                           last_heartbeat: float,
+                           metadata: Optional[dict[str, Any]]) -> None:
+        """Atomic insert of a newly-registered agent.
+
+        Caller (service.register endpoint) handles all validation +
+        urn/session minting + post-insert event emission. This method
+        is the SQL-only seam — so the same shape can be re-implemented
+        for Oracle (Phase 2 target backend) without dragging FastAPI
+        validators into the data layer.
+        """
+        import json as _json
+        import aiosqlite
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO agents (urn, kind, runtime, model, provider, cost_tier, "
+                "autonomy_level, auth_method, plan_cap_usd, plan_period_used_usd, "
+                "host, session_id, pid, capabilities, version, started_at, "
+                "last_heartbeat, status, metadata) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'online', ?)",
+                (
+                    urn, kind, runtime, model, provider, cost_tier, autonomy_level,
+                    auth_method, plan_cap_usd,
+                    host, session_id, pid,
+                    _json.dumps(capabilities) if capabilities else None,
+                    version, started_at, last_heartbeat,
+                    _json.dumps(metadata) if metadata else None,
+                ),
+            )
+            await db.commit()
 
     # Every other Protocol method raises NotImplementedError until
     # migrated. We don't list them here to keep the file scannable;
