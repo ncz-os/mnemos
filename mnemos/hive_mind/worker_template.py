@@ -31,9 +31,14 @@ import signal
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.8:5005")
 GOOSE_BIN = os.environ.get("GOOSE_BIN", "/usr/local/bin/goose")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname())
+# Default capability list: include "*" wildcard so the worker is willing
+# to attempt any required_capabilities set. The dequeue filter treats
+# "*" as match-all; without it, jobs tagged with project-specific tags
+# (db2, yocto, npu, mnemos, etc) sit unclaimable in the queue forever.
+# Operators with strict workloads override AGENT_CAPABILITIES to drop "*".
 AGENT_CAPABILITIES = [c.strip() for c in os.environ.get(
     "AGENT_CAPABILITIES",
-    "code-edit,build,test,debug,refactor,python,bash,docker,linux"
+    "*,code-edit,build,test,debug,refactor,python,bash,docker,linux"
 ).split(",") if c.strip()]
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
