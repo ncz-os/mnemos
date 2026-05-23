@@ -38,7 +38,17 @@ AGENT_CAPABILITIES = [c.strip() for c in os.environ.get(
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
 GOOSE_TIMEOUT = int(os.environ.get("GOOSE_TIMEOUT", "600"))
+# #2 FIX (review 2026-05-23): orchestration meta-jobs fan out child jobs and routinely
+# need >600s; give them their own ceiling. Override via env.
+ORCHESTRATION_TIMEOUT = int(os.environ.get("ORCHESTRATION_TIMEOUT", "3600"))
 GOOSE_EXTRA_ARGS = os.environ.get("GOOSE_EXTRA_ARGS", "").split()
+
+
+def timeout_for_kind(kind: str) -> int:
+    """Per-kind timeout override. Orchestration jobs need longer runway than typical worker jobs."""
+    if (kind or "").lower() in ("orchestration", "orchestrate", "fan-out", "meta"):
+        return ORCHESTRATION_TIMEOUT
+    return GOOSE_TIMEOUT
 
 _urn: str = ""
 _last_heartbeat = 0.0
@@ -153,6 +163,35 @@ def detect_goose_error(stdout: str) -> Optional[str]:
     return None
 
 
+import re as _re
+_TOKEN_PAT = _re.compile(r"\[tokens?:\s*(\d+)(?:\s*[/+]\s*(\d+))?", _re.I)
+_USAGE_PAT = _re.compile(r"(?:prompt[_ ]?tokens|input[_ ]?tokens)[:\s=]+(\d+).*?(?:completion[_ ]?tokens|output[_ ]?tokens)[:\s=]+(\d+)", _re.I | _re.S)
+
+
+def parse_tokens(stdout: str, stderr: str = "") -> tuple[int, int]:
+    """#9 FIX (review 2026-05-23): extract input/output token counts from goose output
+    so hive cost discipline can audit actual usage. Falls back to (0, 0) if no markers.
+
+    Goose emits a `[tokens: N]` line in some modes; some providers (OpenAI/Anthropic) leak
+    `prompt_tokens=N completion_tokens=N` shaped lines on debug; rough char/4 estimate
+    used only when nothing parseable found.
+    """
+    text = (stdout or "") + "\n" + (stderr or "")
+    # Pattern 1: goose's own [tokens: N] (often only output count)
+    m = _TOKEN_PAT.search(text)
+    if m:
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) else 0
+        if b:
+            return (a, b)
+        return (0, a)
+    # Pattern 2: structured prompt_tokens / completion_tokens
+    m = _USAGE_PAT.search(text)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return (0, 0)
+
+
 def run_goose(description: str) -> dict:
     cmd = [GOOSE_BIN, "run", "--text", description, "--no-session"] + GOOSE_EXTRA_ARGS
     print(f"[worker] $ {' '.join(cmd[:6])} … [desc len={len(description)}]", flush=True)
@@ -160,16 +199,21 @@ def run_goose(description: str) -> dict:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=GOOSE_TIMEOUT)
         err_tag = detect_goose_error(proc.stdout)
+        t_in, t_out = parse_tokens(proc.stdout, proc.stderr)
+        # Fallback estimate when goose doesn't surface counts: char/4 (rough GPT-tokenizer heuristic)
+        if t_in == 0 and t_out == 0:
+            t_in = max(1, len(description) // 4)
+            t_out = max(1, len(proc.stdout) // 4)
         result = {
             "exit_code": proc.returncode,
             "stdout": proc.stdout[-12000:],
             "stderr": proc.stderr[-4000:],
             "duration_sec": round(time.time() - start, 1),
             "goose_cmd": " ".join(cmd[:6]),
+            "tokens_in": t_in,
+            "tokens_out": t_out,
         }
         if err_tag:
-            # Goose's exit code lies when the API errors; override so hive
-            # can auto-retry instead of caching the error message as success.
             result["exit_code"] = 1
             result["worker_error"] = err_tag
         return result
