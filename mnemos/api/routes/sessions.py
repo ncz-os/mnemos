@@ -11,9 +11,8 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.core.security import scope_namespace
 from mnemos.domain.openai_compat.router import search_memory_context as _search_mnemos_context
 from mnemos.domain.openai_compat.providers import _route_to_provider
@@ -31,63 +30,31 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
 
-def _require_pool(*, route_label: str = "/v1/sessions"):
-    """Return the asyncpg pool or emit a profile-aware 503.
-
-    Wraps ``require_postgres_pool_or_503`` so each session endpoint
-    can keep a one-line guard while sharing the canonical detail
-    message with the rest of the Postgres-only routes.
-    """
-    require_postgres_pool_or_503(route_label=route_label)
-    return _lc._pool
-
 @router.post("", response_model=SessionResponse)
 async def create_session(
     request: SessionRequest,
     user: UserContext = Depends(get_current_user),
 ):
     """Create a new session for multi-turn conversation."""
-    pool = _require_pool(route_label="POST /v1/sessions")
+    backend = backend_or_503()
 
-    session_id = None
     try:
-        async with pool.acquire() as conn:
-            session_id = await conn.fetchval(
-                """
-                INSERT INTO sessions (user_id, namespace, model)
-                VALUES ($1, $2, $3)
-                RETURNING id
-                """,
-                user.user_id,
-                user.namespace,
-                request.model or "gpt-4o",
+        async with backend.transactional() as tx:
+            row = await backend.sessions.create_session(
+                tx,
+                user_id=user.user_id,
+                namespace=user.namespace,
+                model=request.model or "gpt-4o",
+                initial_context=request.initial_context,
             )
 
-            # Optionally add initial system context
-            if request.initial_context:
-                await conn.execute(
-                    """
-                    INSERT INTO session_messages (session_id, role, content)
-                    VALUES ($1, 'system', $2)
-                    """,
-                    session_id,
-                    request.initial_context,
-                )
-
-        logger.info(f"[SESSIONS] Created session {session_id} for user {user.user_id}")
-
-        # Return session metadata
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT id, created_at, model FROM sessions "
-                "WHERE id = $1 AND user_id = $2 AND namespace = $3 "
-                "AND deleted_at IS NULL",
-                session_id, user.user_id, user.namespace,
-            )
+        logger.info(f"[SESSIONS] Created session {row['id']} for user {user.user_id}")
 
         return SessionResponse(
             session_id=row["id"],
-            created_at=row["created_at"].isoformat(),
+            created_at=row["created_at"].isoformat()
+            if hasattr(row["created_at"], "isoformat")
+            else str(row["created_at"]),
             model=row["model"],
         )
 
@@ -103,44 +70,29 @@ async def get_session(
     user: UserContext = Depends(get_current_user),
 ):
     """Get session context and metadata."""
-    pool = _require_pool(route_label="GET /v1/sessions/{session_id}")
+    backend = backend_or_503()
     target_ns = scope_namespace(user, namespace)
 
-    async with pool.acquire() as conn:
-        session = await conn.fetchrow(
-            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2 "
-            "AND namespace = $3 AND deleted_at IS NULL",
-            session_id,
-            user.user_id,
-            target_ns,
-        )
+    async with backend.transactional() as tx:
+        session = await backend.sessions.get_session(tx, session_id, user.user_id, target_ns)
+        injections = await backend.sessions.list_injected_memory_ids(tx, session_id)
 
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Get list of injected memory IDs for this session
-    async with pool.acquire() as conn:
-        injections = await conn.fetch(
-            """
-            SELECT memory_id FROM session_memory_injections
-            WHERE session_id = $1
-              AND deleted_at IS NULL
-            GROUP BY memory_id
-            ORDER BY MAX(injection_timestamp) DESC
-            LIMIT 10
-            """,
-            session_id,
-        )
-
     return SessionContext(
         session_id=session["id"],
         user_id=session["user_id"],
-        created_at=session["created_at"].isoformat(),
-        last_activity=session["last_activity"].isoformat(),
+        created_at=session["created_at"].isoformat()
+        if hasattr(session["created_at"], "isoformat")
+        else str(session["created_at"]),
+        last_activity=session["last_activity"].isoformat()
+        if hasattr(session["last_activity"], "isoformat")
+        else str(session["last_activity"]),
         message_count=session["message_count"],
         total_tokens=session["total_tokens"],
         model=session["model"],
-        injected_memories=[m["memory_id"] for m in injections],
+        injected_memories=injections,
     )
 
 
@@ -161,35 +113,24 @@ async def add_session_message(
     5. Stores assistant response in history
     6. Updates session metrics
     """
-    pool = _require_pool(route_label="POST /v1/sessions/{session_id}/messages")
+    backend = backend_or_503()
     target_ns = scope_namespace(user, namespace)
 
     # Verify session ownership
-    async with pool.acquire() as conn:
-        session = await conn.fetchrow(
-            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2 "
-            "AND namespace = $3 AND deleted_at IS NULL",
-            session_id,
-            user.user_id,
-            target_ns,
-        )
+    async with backend.transactional() as tx:
+        session = await backend.sessions.get_session(tx, session_id, user.user_id, target_ns)
 
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
     # Store user message
-    message_id = None
-    async with pool.acquire() as conn:
-        message_id = await conn.fetchval(
-            """
-            INSERT INTO session_messages (session_id, role, content, model)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id
-            """,
-            session_id,
-            request.role or "user",
-            request.content,
-            request.model or session["model"],
+    async with backend.transactional() as tx:
+        message_id = await backend.sessions.add_message(
+            tx,
+            session_id=session_id,
+            role=request.role or "user",
+            content=request.content,
+            model=request.model or session["model"],
         )
 
     # Get conversation history for the provider:
@@ -219,49 +160,8 @@ async def add_session_message(
     # in session_messages, so an exclusion that uses `timestamp >`
     # alone could either double-count the initial row or skip it on
     # a tie. Using the row id as a tie-breaker is deterministic.
-    async with pool.acquire() as conn:
-        history = await conn.fetch(
-            """
-            WITH first_system AS (
-                SELECT id, role, content, timestamp
-                  FROM session_messages
-                 WHERE session_id = $1 AND role = 'system'
-                   AND deleted_at IS NULL
-                 ORDER BY timestamp ASC, id ASC
-                 LIMIT 1
-            ),
-            later_system AS (
-                SELECT s.id, s.role, s.content, s.timestamp
-                  FROM session_messages s
-                 WHERE s.session_id = $1
-                   AND s.role = 'system'
-                   AND s.deleted_at IS NULL
-                   AND s.id <> (SELECT id FROM first_system)
-                 ORDER BY s.timestamp DESC, s.id DESC
-                 LIMIT 4
-            ),
-            pinned AS (
-                SELECT id, role, content, timestamp, 0 AS k FROM first_system
-                UNION ALL
-                SELECT id, role, content, timestamp, 0 AS k FROM later_system
-            ),
-            recent AS (
-                SELECT id, role, content, timestamp, 1 AS k
-                  FROM session_messages
-                 WHERE session_id = $1 AND role <> 'system'
-                   AND deleted_at IS NULL
-                 ORDER BY timestamp DESC, id DESC
-                 LIMIT 10
-            )
-            SELECT role, content FROM (
-                SELECT * FROM pinned
-                UNION ALL
-                SELECT * FROM recent
-            ) all_msgs
-            ORDER BY k, timestamp ASC, id ASC
-            """,
-            session_id,
-        )
+    async with backend.transactional() as tx:
+        history = await backend.sessions.fetch_provider_history(tx, session_id)
 
     # Search MNEMOS for context
     memories_injected = 0
@@ -272,20 +172,14 @@ async def add_session_message(
 
         if mnemos_docs:
             # Store injection record for each memory.
-            async with pool.acquire() as conn:
-                for i, doc in enumerate(mnemos_docs):
-                    memory_id = doc.get("id", f"doc_{i}")
-                    await conn.execute(
-                        """
-                        INSERT INTO session_memory_injections
-                        (session_id, message_id, memory_id, relevance_score)
-                        VALUES ($1, $2, $3, $4)
-                        """,
-                        session_id,
-                        message_id,
-                        memory_id,
-                        0.9 - (i * 0.1),  # decreasing relevance
-                    )
+            memory_ids = [doc.get("id", f"doc_{i}") for i, doc in enumerate(mnemos_docs)]
+            async with backend.transactional() as tx:
+                await backend.sessions.add_memory_injections(
+                    tx,
+                    session_id=session_id,
+                    message_id=message_id,
+                    memory_ids=memory_ids,
+                )
 
             mnemos_context = "\n\n".join([f"[Memory]\n{doc['content'][:500]}" for doc in mnemos_docs])
             memories_injected = len(mnemos_docs)
@@ -297,10 +191,7 @@ async def add_session_message(
         logger.warning(f"[SESSIONS] Memory search failed: {e}, continuing without context")
 
     # Build messages for provider (include session history + injected context)
-    messages = [
-        {"role": msg["role"], "content": msg["content"]}
-        for msg in history
-    ]
+    messages = [{"role": msg["role"], "content": msg["content"]} for msg in history]
 
     # Add system prompt with MNEMOS context if available
     system_prompt = ""
@@ -336,36 +227,22 @@ async def add_session_message(
         raise HTTPException(status_code=503, detail=f"Provider unavailable: {str(e)}")
 
     # Store assistant response
-    assistant_message_id = None
-    async with pool.acquire() as conn:
-        assistant_message_id = await conn.fetchval(
-            """
-            INSERT INTO session_messages
-            (session_id, role, content, model, tokens_used, memories_injected)
-            VALUES ($1, 'assistant', $2, $3, $4, $5)
-            RETURNING id
-            """,
-            session_id,
-            response_text,
-            model,
-            tokens_used,
-            memories_injected,
+    async with backend.transactional() as tx:
+        assistant_message_id = await backend.sessions.add_message(
+            tx,
+            session_id=session_id,
+            role="assistant",
+            content=response_text,
+            model=model,
+            tokens_used=tokens_used,
+            memories_injected=memories_injected,
         )
-
-        # Update session metrics
-        await conn.execute(
-            """
-            UPDATE sessions
-            SET message_count = message_count + 2,
-                total_tokens = total_tokens + $2,
-                last_activity = NOW()
-            WHERE id = $1 AND user_id = $3 AND namespace = $4
-              AND deleted_at IS NULL
-            """,
-            session_id,
-            tokens_used,
-            user.user_id,
-            target_ns,
+        await backend.sessions.update_metrics(
+            tx,
+            session_id=session_id,
+            user_id=user.user_id,
+            namespace=target_ns,
+            tokens_used=tokens_used,
         )
 
     logger.info(
@@ -394,42 +271,18 @@ async def get_session_history(
     user: UserContext = Depends(get_current_user),
 ):
     """Get conversation history for session."""
-    pool = _require_pool(route_label="GET /v1/sessions/{session_id}/history")
+    backend = backend_or_503()
     target_ns = scope_namespace(user, namespace)
 
-    # Verify session ownership
-    async with pool.acquire() as conn:
-        session = await conn.fetchrow(
-            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2 "
-            "AND namespace = $3 AND deleted_at IS NULL",
-            session_id,
-            user.user_id,
-            target_ns,
-        )
+    async with backend.transactional() as tx:
+        session = await backend.sessions.get_session(tx, session_id, user.user_id, target_ns)
+        if session:
+            messages, total = await backend.sessions.fetch_history(tx, session_id, limit, offset)
+        else:
+            messages, total = [], 0
 
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-
-    # Get paginated message history
-    async with pool.acquire() as conn:
-        messages = await conn.fetch(
-            """
-            SELECT role, content, timestamp, model FROM session_messages
-            WHERE session_id = $1
-              AND deleted_at IS NULL
-            ORDER BY timestamp ASC
-            LIMIT $2 OFFSET $3
-            """,
-            session_id,
-            limit,
-            offset,
-        )
-
-        total = await conn.fetchval(
-            "SELECT COUNT(*) FROM session_messages "
-            "WHERE session_id = $1 AND deleted_at IS NULL",
-            session_id,
-        )
 
     return SessionHistoryResponse(
         session_id=session_id,
@@ -437,14 +290,18 @@ async def get_session_history(
             ChatMessage(
                 role=m["role"],
                 content=m["content"],
-                timestamp=m["timestamp"].isoformat() if m["timestamp"] else None,
+                timestamp=m["timestamp"].isoformat()
+                if hasattr(m["timestamp"], "isoformat")
+                else (str(m["timestamp"]) if m["timestamp"] else None),
                 model=m["model"],
             )
             for m in messages
         ],
         total_messages=total,
         total_tokens=session["total_tokens"],
-        created_at=session["created_at"].isoformat(),
+        created_at=session["created_at"].isoformat()
+        if hasattr(session["created_at"], "isoformat")
+        else str(session["created_at"]),
     )
 
 
@@ -455,29 +312,16 @@ async def delete_session(
     user: UserContext = Depends(get_current_user),
 ):
     """Close and delete session."""
-    pool = _require_pool(route_label="DELETE /v1/sessions/{session_id}")
+    backend = backend_or_503()
     target_ns = scope_namespace(user, namespace)
 
-    # Verify session ownership
-    async with pool.acquire() as conn:
-        session = await conn.fetchrow(
-            "SELECT id FROM sessions WHERE id = $1 AND user_id = $2 "
-            "AND namespace = $3 AND deleted_at IS NULL",
-            session_id,
-            user.user_id,
-            target_ns,
-        )
+    async with backend.transactional() as tx:
+        session = await backend.sessions.get_session(tx, session_id, user.user_id, target_ns)
+        if session:
+            await backend.sessions.delete_session(tx, session_id, user.user_id, target_ns)
 
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-
-    # Delete session (cascade deletes messages and injections)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM sessions WHERE id = $1 AND user_id = $2 "
-            "AND namespace = $3 AND deleted_at IS NULL",
-            session_id, user.user_id, target_ns,
-        )
 
     logger.info(f"[SESSIONS] Deleted session {session_id}")
 

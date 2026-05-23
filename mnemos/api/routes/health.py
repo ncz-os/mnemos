@@ -1,4 +1,5 @@
 """Health check and statistics endpoints."""
+
 import json
 import logging
 from datetime import datetime, timezone
@@ -19,15 +20,9 @@ router = APIRouter()
 async def health_check() -> HealthResponse:
     """Return health status including DB pool and background workers."""
     db_ok = False
-    if _lc._pool:
-        try:
-            async with _lc.get_pool_manager().acquire() as conn:
-                await conn.execute("SELECT 1")
-            db_ok = True
-        except Exception as e:
-            logger.warning(f"[HEALTH] DB probe failed: {e}")
-    elif _lc._persistence_backend is not None:
-        db_ok = True
+    backend = _lc._persistence_backend
+    if backend is not None:
+        db_ok = await backend.ping()
 
     # Get worker status
     worker_status = _lc._worker_status.get("distillation_worker", "unknown")
@@ -81,9 +76,7 @@ async def get_stats() -> StatsResponse:
                 else 0.57
             ),
             average_quality_rating=(
-                int(memory_stats.avg_quality_rating)
-                if memory_stats.avg_quality_rating is not None
-                else 75
+                int(memory_stats.avg_quality_rating) if memory_stats.avg_quality_rating is not None else 75
             ),
             memories_by_category=memory_stats.memories_by_category,
             memories_by_subcategory=memory_stats.memories_by_subcategory,
