@@ -1,0 +1,19 @@
+[Unit]
+Description=GRAEAE Hive Mind goose worker (instance %i)
+After=network-online.target graeae-hive.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/goose-worker
+Environment=HIVE_URL=http://192.168.207.8:5005
+Environment=GOOSE_BIN=/usr/local/bin/goose
+ExecStart=/usr/bin/python3 /srv/agent-bus/goose_worker.py
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=30
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
