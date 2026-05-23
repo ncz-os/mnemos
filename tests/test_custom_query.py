@@ -37,10 +37,44 @@ class _PoolCtx:
 
 
 def _install(monkeypatch, conn):
+    from contextlib import asynccontextmanager
+
     import mnemos.core.lifecycle as lc
+    from mnemos.persistence.postgres import (
+        PostgresConsultationsRepository,
+        PostgresTransaction,
+    )
+
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
+
+    class _FakeTx(PostgresTransaction):
+        def __init__(self) -> None:
+            self._conn = conn
+            self._tx = None
+            self._closed = False
+            self._after_commit = []
+
+        async def commit(self) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+    class _FakeBackend:
+        def __init__(self) -> None:
+            self._consultations = PostgresConsultationsRepository()
+
+        @property
+        def consultations(self):
+            return self._consultations
+
+        @asynccontextmanager
+        async def transactional(self):
+            yield _FakeTx()
+
+    monkeypatch.setattr(lc, "_persistence_backend", _FakeBackend())
 
 
 class _FakeEngine:

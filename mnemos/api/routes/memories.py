@@ -306,24 +306,13 @@ async def _bump_recall_counters(memory_ids: list) -> None:
         return
     try:
         backend = _backend_or_503()
-        from mnemos.core.auth_context import UserContext as _UserContext
-        from mnemos.persistence.visibility import VisibilityFilter as _VisibilityFilter
-
-        root = _UserContext(
-            user_id="root",
-            group_ids=[],
-            role="root",
-            namespace="default",
-            authenticated=True,
-        )
-        visibility = _VisibilityFilter.for_read(root, namespace=None)
         async with backend.transactional() as tx:
-            for memory_id in memory_ids:
-                await backend.memories.bump_recall_and_get_memory(
-                    tx,
-                    str(memory_id),
-                    visibility=visibility,
-                )
+            await tx.conn.execute(
+                "UPDATE memories "
+                "SET recall_count = recall_count + 1, last_recalled_at = now() "
+                "WHERE id = ANY($1::text[]) AND deleted_at IS NULL AND archived_at IS NULL",
+                list(memory_ids),
+            )
     except Exception as e:
         logger.warning(f"[RECALL] bump failed for {len(memory_ids)} ids: {e}")
 
