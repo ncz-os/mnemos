@@ -35,9 +35,7 @@ def _branch_advisory_lock_key(memory_id: str, branch: str, _hashlib_mod=None) ->
     """
     if _hashlib_mod is None:
         import hashlib as _hashlib_mod
-    digest = _hashlib_mod.sha256(
-        f"dag-branch:{memory_id}:{branch}".encode("utf-8")
-    ).digest()[:8]
+    digest = _hashlib_mod.sha256(f"dag-branch:{memory_id}:{branch}".encode("utf-8")).digest()[:8]
     key = int.from_bytes(digest, "big", signed=False)
     if key >= 2**63:
         key -= 2**64
@@ -51,16 +49,12 @@ async def _assert_memory_writable(conn, memory_id: str, user: UserContext) -> No
     owner_id AND namespace. We return 404 to avoid leaking existence.
     """
     row = await conn.fetchrow(
-        "SELECT owner_id, namespace FROM memories "
-        "WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT owner_id, namespace FROM memories " "WHERE id = $1 AND deleted_at IS NULL",
         memory_id,
     )
     if not row:
         raise HTTPException(status_code=404, detail="Memory not found")
-    if user.role != "root" and (
-        row["owner_id"] != user.user_id
-        or row["namespace"] != user.namespace
-    ):
+    if user.role != "root" and (row["owner_id"] != user.user_id or row["namespace"] != user.namespace):
         raise HTTPException(status_code=404, detail="Memory not found")
 
 
@@ -102,6 +96,7 @@ async def _assert_memory_readable(conn, memory_id: str, user: UserContext) -> No
     if not row:
         raise HTTPException(status_code=404, detail="Memory not found")
 
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/memories", tags=["dag"])
 
@@ -109,6 +104,7 @@ router = APIRouter(prefix="/v1/memories", tags=["dag"])
 # ────────────────────────────────────────────────────────────────────────────
 # Request/Response Models
 # ────────────────────────────────────────────────────────────────────────────
+
 
 class CommitInfo(BaseModel):
     commit_hash: str
@@ -155,13 +151,13 @@ def _require_pool(*, route_label: str = "/v1/dag"):
     the canonical SQLite/edge-profile detail with the rest of the
     Postgres-only routes.
     """
-    require_postgres_pool_or_503(route_label=route_label)
-    return _lc._pool
+    return require_postgres_pool_or_503(route_label=route_label)
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # Endpoints
 # ────────────────────────────────────────────────────────────────────────────
+
 
 @router.get("/{memory_id}/log", response_model=List[CommitInfo])
 async def get_memory_log(
@@ -259,13 +255,12 @@ async def get_memory_log(
             # only became authorized after the permission flip.
             # Mirrors api/handlers/versions.py + mnemos/db/mcp_repo.py.
             if user.role != "root":
+
                 def _snap_visible(r) -> bool:
                     if r["namespace"] != user.namespace:
                         return False
-                    return (
-                        r["owner_id"] == user.user_id
-                        or (r["permission_mode"] % 10) >= 4
-                    )
+                    return r["owner_id"] == user.user_id or (r["permission_mode"] % 10) >= 4
+
                 rows = [r for r in rows if _snap_visible(r)]
 
             # Assemble with parent hashes. The parent edge is reported only if
@@ -275,11 +270,7 @@ async def get_memory_log(
             visible_ids = {r["id"] for r in rows}
             commits = []
             for row in rows:
-                parent_hash = (
-                    row["parent_commit_hash"]
-                    if row["parent_version_id"] in visible_ids
-                    else None
-                )
+                parent_hash = row["parent_commit_hash"] if row["parent_version_id"] in visible_ids else None
                 commits.append(
                     CommitInfo(
                         commit_hash=row["commit_hash"],
@@ -343,7 +334,9 @@ async def get_memory_branches(
                 from mnemos.core.visibility import version_visibility_predicate
 
                 vis_clause, vis_params = version_visibility_predicate(
-                    user.user_id, start_param_idx=2, table_alias="mv",
+                    user.user_id,
+                    start_param_idx=2,
+                    table_alias="mv",
                 )
                 ns_ph = f"${len(vis_params) + 2}"
                 branches = await conn.fetch(
@@ -361,7 +354,9 @@ async def get_memory_branches(
                       AND mb.deleted_at IS NULL
                     ORDER BY mb.created_at DESC
                     """,
-                    memory_id, *vis_params, user.namespace,
+                    memory_id,
+                    *vis_params,
+                    user.namespace,
                 )
 
             # Filter out rows where the scoped JOIN returned NULL
@@ -381,12 +376,14 @@ async def get_memory_branches(
                         f"may be required."
                     )
                     continue
-                result.append(BranchInfo(
-                    name=b["name"],
-                    head_commit_hash=b["commit_hash"],
-                    created_at=b["created_at"].isoformat(),
-                    created_by=b["created_by"],
-                ))
+                result.append(
+                    BranchInfo(
+                        name=b["name"],
+                        head_commit_hash=b["commit_hash"],
+                        created_at=b["created_at"].isoformat(),
+                        created_by=b["created_by"],
+                    )
+                )
             return result
 
     except HTTPException:
@@ -416,8 +413,7 @@ async def create_branch(
                 # memory owner or namespace can change between auth and write.
                 if user.role == "root":
                     live = await conn.fetchrow(
-                        "SELECT 1 FROM memories "
-                        "WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
+                        "SELECT 1 FROM memories " "WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
                         memory_id,
                     )
                 else:
@@ -447,14 +443,18 @@ async def create_branch(
                         from mnemos.core.visibility import version_visibility_predicate
 
                         vis_clause, vis_params = version_visibility_predicate(
-                            user.user_id, start_param_idx=3,
+                            user.user_id,
+                            start_param_idx=3,
                         )
                         ns_ph = f"${len(vis_params) + 3}"
                         start_version = await conn.fetchrow(
                             "SELECT id, commit_hash, created_at FROM memory_versions "
                             "WHERE memory_id = $1 AND commit_hash = $2 "
                             f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
-                            memory_id, request.from_commit, *vis_params, user.namespace,
+                            memory_id,
+                            request.from_commit,
+                            *vis_params,
+                            user.namespace,
                         )
                     if not start_version:
                         raise HTTPException(status_code=404, detail="Commit hash not found")
@@ -476,7 +476,9 @@ async def create_branch(
                         from mnemos.core.visibility import version_visibility_predicate
 
                         vis_clause, vis_params = version_visibility_predicate(
-                            user.user_id, start_param_idx=2, table_alias="mv",
+                            user.user_id,
+                            start_param_idx=2,
+                            table_alias="mv",
                         )
                         ns_ph = f"${len(vis_params) + 2}"
                         start_version = await conn.fetchrow(
@@ -489,7 +491,9 @@ async def create_branch(
                               AND mb.deleted_at IS NULL
                               AND {vis_clause} AND mv.namespace = {ns_ph}
                             """,
-                            memory_id, *vis_params, user.namespace,
+                            memory_id,
+                            *vis_params,
+                            user.namespace,
                         )
                     if not start_version:
                         raise HTTPException(status_code=404, detail="main branch HEAD not found")
@@ -561,10 +565,12 @@ async def get_commit(
                     WHERE mv.memory_id = $1 AND mv.commit_hash = $2
                       AND mv.deleted_at IS NULL
                     """,
-                    memory_id, commit_hash,
+                    memory_id,
+                    commit_hash,
                 )
             else:
                 from mnemos.core.visibility import version_visibility_predicate
+
                 # Two visibility predicates: one for the requested
                 # row (alias mv), one for the parent subquery
                 # (alias mv2). Codex round 16 flagged the parent
@@ -574,7 +580,9 @@ async def get_commit(
                 # topology. Gate the parent equally; emit NULL for
                 # parent_hash when the parent is invisible.
                 vis_mv, vis_mv_params = version_visibility_predicate(
-                    user.user_id, start_param_idx=3, table_alias="mv",
+                    user.user_id,
+                    start_param_idx=3,
+                    table_alias="mv",
                 )
                 ns_mv_ph = f"${len(vis_mv_params) + 3}"
                 # Parent predicate takes the same user_id; placeholder
@@ -600,9 +608,12 @@ async def get_commit(
                       AND mv.deleted_at IS NULL
                       AND {vis_mv} AND mv.namespace = {ns_mv_ph}
                     """,
-                    memory_id, commit_hash,
-                    *vis_mv_params, user.namespace,
-                    *vis_mv2_params, user.namespace,
+                    memory_id,
+                    commit_hash,
+                    *vis_mv_params,
+                    user.namespace,
+                    *vis_mv2_params,
+                    user.namespace,
                 )
 
             if not row:

@@ -33,10 +33,13 @@ from mnemos.persistence.base import (
     BranchRepository,
     CompressionRepository,
     ConsultationAuditRepository,
+    ConsultationsRepository,
     FederationRepository,
     KGRepository,
     MemoryRepository,
+    OAuthRepository,
     PersistenceBackend,
+    SessionsRepository,
     StateRepository,
     Transaction,
     VersionRepository,
@@ -2091,6 +2094,153 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         return None
 
 
+class OracleOAuthRepository(OAuthRepository):
+    async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT name, display_name, kind, enabled FROM oauth_providers "
+                "WHERE enabled = 1 ORDER BY display_name",
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_provider(self, tx: Transaction, name: str) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT name, kind, issuer_url, client_id, client_secret, scope, "
+                "authorize_url, token_url, userinfo_url, enabled "
+                "FROM oauth_providers WHERE name = :name",
+                {"name": name},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def provision_or_link_user(self, tx: Transaction, **kwargs: Any) -> tuple[str, str]:
+        raise NotImplementedError("Oracle OAuth identity provisioning repository is not implemented")
+
+    async def create_session(self, tx: Transaction, **kwargs: Any) -> str:
+        raise NotImplementedError("Oracle OAuth session creation repository is not implemented")
+
+    async def revoke_session(self, tx: Transaction, session_id: str) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE oauth_sessions SET revoked = 1, revoked_at = SYSTIMESTAMP "
+                "WHERE session_id = :session_id AND revoked = 0",
+                {"session_id": session_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_all_sessions(self, tx: Transaction, user_id: str) -> int:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE oauth_sessions SET revoked = 1, revoked_at = SYSTIMESTAMP "
+                "WHERE user_id = :user_id AND revoked = 0",
+                {"user_id": user_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def get_identity_for_session(self, tx: Transaction, session_id: str) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT i.id, i.user_id, i.provider, i.external_id, i.email, i.display_name, "
+                "i.last_login_at, i.created FROM oauth_sessions s "
+                "JOIN oauth_identities i ON i.id = s.identity_id "
+                "WHERE s.session_id = :session_id AND s.revoked = 0",
+                {"session_id": session_id},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+
+class OracleSessionsRepository(SessionsRepository):
+    async def create_session(self, tx: Transaction, **kwargs: Any) -> Row:
+        raise NotImplementedError("Oracle chat sessions repository is not implemented")
+
+    async def get_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT * FROM sessions WHERE id = :id AND user_id = :user_id "
+                "AND namespace = :namespace AND deleted_at IS NULL",
+                {"id": session_id, "user_id": user_id, "namespace": namespace},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def list_injected_memory_ids(self, tx: Transaction, session_id: str, limit: int = 10) -> list[str]:
+        _ = (tx, session_id, limit)
+        return []
+
+    async def add_message(self, tx: Transaction, **kwargs: Any) -> Any:
+        raise NotImplementedError("Oracle chat session messages repository is not implemented")
+
+    async def fetch_provider_history(self, tx: Transaction, session_id: str) -> list[Row]:
+        _ = (tx, session_id)
+        return []
+
+    async def add_memory_injections(self, tx: Transaction, **kwargs: Any) -> None:
+        _ = (tx, kwargs)
+
+    async def update_metrics(self, tx: Transaction, **kwargs: Any) -> None:
+        _ = (tx, kwargs)
+
+    async def fetch_history(self, tx: Transaction, session_id: str, limit: int, offset: int) -> tuple[list[Row], int]:
+        _ = (tx, session_id, limit, offset)
+        return [], 0
+
+    async def delete_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> bool:
+        _ = (tx, session_id, user_id, namespace)
+        return False
+
+
+class OracleConsultationsRepository(ConsultationsRepository):
+    async def resolve_tier_lineup(self, tx: Transaction, tier: str) -> list[Row]:
+        _ = (tx, tier)
+        return []
+
+    async def resolve_models(self, tx: Transaction, model_ids: Sequence[str]) -> list[Row]:
+        _ = (tx, model_ids)
+        return []
+
+    async def create_consultation_with_audit(self, tx: Transaction, **kwargs: Any) -> Any:
+        raise NotImplementedError("Oracle consultation persistence repository is not implemented")
+
+    async def list_audit_log(self, tx: Transaction, **kwargs: Any) -> list[Row]:
+        _ = (tx, kwargs)
+        return []
+
+    async def fetch_audit_chain(self, tx: Transaction, **kwargs: Any) -> list[Row]:
+        _ = (tx, kwargs)
+        return []
+
+    async def get_consultation(self, tx: Transaction, **kwargs: Any) -> Row | None:
+        _ = (tx, kwargs)
+        return None
+
+    async def get_consultation_artifacts(self, tx: Transaction, **kwargs: Any) -> tuple[Row | None, list[Row]]:
+        _ = (tx, kwargs)
+        return None, []
+
+
 class OracleFederationRepository(FederationRepository):
     """Oracle federation repo — peer CRUD wired, sync paths stubbed."""
 
@@ -3009,6 +3159,9 @@ class OracleBackend(PersistenceBackend):
         self._compression_repo = OracleCompressionRepository()
         self._webhooks_repo = OracleWebhookRepository()
         self._consultations_audit_repo = OracleConsultationAuditRepository()
+        self._oauth_repo = OracleOAuthRepository()
+        self._sessions_repo = OracleSessionsRepository()
+        self._consultations_repo = OracleConsultationsRepository()
         self._federation_repo = OracleFederationRepository()
         self._state_kv_repo = OracleStateRepository()
 
@@ -3063,12 +3216,37 @@ class OracleBackend(PersistenceBackend):
         return self._consultations_audit_repo
 
     @property
+    def oauth(self) -> OAuthRepository:
+        return self._oauth_repo
+
+    @property
+    def sessions(self) -> SessionsRepository:
+        return self._sessions_repo
+
+    @property
+    def consultations(self) -> ConsultationsRepository:
+        return self._consultations_repo
+
+    @property
     def federation(self) -> FederationRepository:
         return self._federation_repo
 
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv_repo
+
+    async def ping(self) -> bool:
+        try:
+            async with self._pool.acquire() as conn:
+                cursor = await _call(conn.cursor)
+                try:
+                    await _call(cursor.execute, "SELECT 1 FROM DUAL")
+                    await _call(cursor.fetchone)
+                finally:
+                    await _call(cursor.close)
+            return True
+        except Exception:
+            return False
 
     async def open(self) -> None:
         """Lifecycle hook — validates pool checkout + session callback.

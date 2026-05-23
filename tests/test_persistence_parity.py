@@ -22,10 +22,13 @@ from mnemos.persistence import (
     BranchRepository,
     CompressionRepository,
     ConsultationAuditRepository,
+    ConsultationsRepository,
     FederationRepository,
     KGRepository,
     MemoryRepository,
+    OAuthRepository,
     PersistenceBackend,
+    SessionsRepository,
     PostgresBackend,
     SqliteBackend,
     SqliteTransaction,
@@ -419,6 +422,9 @@ async def test_backend_exposes_all_repository_properties(backend_case: BackendCa
     assert isinstance(backend.compression, CompressionRepository)
     assert isinstance(backend.webhooks, WebhookRepository)
     assert isinstance(backend.consultations_audit, ConsultationAuditRepository)
+    assert isinstance(backend.oauth, OAuthRepository)
+    assert isinstance(backend.sessions, SessionsRepository)
+    assert isinstance(backend.consultations, ConsultationsRepository)
     assert isinstance(backend.federation, FederationRepository)
     assert isinstance(backend.state_kv, StateRepository)
 
