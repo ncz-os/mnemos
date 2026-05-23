@@ -203,7 +203,7 @@ async def test_oracle_crud_roundtrip(_oracle_prefix: str) -> None:
             try:
                 await cur.execute("DELETE FROM memories WHERE id = :id", {"id": memory_id})
             finally:
-                await cur.close()
+                cur.close()
     finally:
         await _close_backend(backend, pool)
 
@@ -264,7 +264,7 @@ async def test_oracle_semantic_search_returns_inserted_memory(
                     {"q": literal, "id": memory_id},
                 )
             finally:
-                await cur.close()
+                cur.close()
 
         visibility = VisibilityFilter(
             scope=VisibilityScope.ROOT_BYPASS,
@@ -289,7 +289,7 @@ async def test_oracle_semantic_search_returns_inserted_memory(
             try:
                 await cur.execute("DELETE FROM memories WHERE id = :id", {"id": memory_id})
             finally:
-                await cur.close()
+                cur.close()
     finally:
         await _close_backend(backend, pool)
 
