@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   deadline REAL,
   required_capabilities TEXT,                   -- json array; worker must have ALL
   eligible_kinds TEXT,                          -- json array; agent kinds eligible (null = any)
+  project TEXT,                                 -- #10 FIX: separate project tag from capabilities (riskyeats/investorclaw/etc)
   status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','cancelled')),
   claimed_by TEXT,                              -- worker urn (set on claim/dequeue)
   claimed_at REAL,
@@ -109,6 +110,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_submitter ON jobs(submitter_urn);
 CREATE INDEX IF NOT EXISTS idx_jobs_claimed_by ON jobs(claimed_by);
 CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(status, priority DESC, started_at ASC);
+CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project);  -- #10 FIX
 
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -428,6 +430,10 @@ class JobCreate(BaseModel):
     deadline: Optional[float] = None                   # unix ts, optional SLA
     required_capabilities: Optional[list[str]] = None  # worker must have ALL of these
     eligible_kinds: Optional[list[str]] = None         # restrict to agent kinds; null = any
+    # #10 FIX (review 2026-05-23): project tag — separate from worker capabilities.
+    # 'riskyeats'/'investorclaw' are PROJECTS, not capabilities. Workers don't gain/lose
+    # the ability to do work because of a project label; the label is for filter+routing.
+    project: Optional[str] = None
     max_retries: int = 2                               # auto-resubmit after worker reports failed (up to N times)
     # COST DISCIPLINE (per CLAUDE.md llm-usage-policy):
     max_cost_tier: str = "A"                           # cap which tier may execute: A=free, B=cheap, C=reserve. Default A=free first.
@@ -566,6 +572,17 @@ async def lifespan(app: FastAPI):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
         await db.executescript(SCHEMA)
+        # #10 FIX (review 2026-05-23): additive migrations for live DBs (jobs.project).
+        # Add-only via ALTER TABLE; ignore "duplicate column" errors so reruns are no-ops.
+        for stmt in (
+            "ALTER TABLE jobs ADD COLUMN project TEXT",
+        ):
+            try:
+                await db.execute(stmt)
+            except Exception as e:
+                if "duplicate column" not in str(e).lower():
+                    print(f"migration warn ({stmt!r}): {e}", flush=True)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project)")
         await db.commit()
     task = asyncio.create_task(reaper_task(app))
     yield
@@ -596,11 +613,17 @@ async def dashboard():
 
 @app.post("/v1/agents/register")
 async def register(req: AgentRegister):
-    # IDENTITY ENFORCEMENT (Kimi K2.6 advisory 2026-05-23):
-    #   kind must be in RUNTIME_KIND_MAP[runtime] OR kind==runtime OR runtime=="unknown".
-    #   Prevents "opencode runtime declaring kind=claude" misregistration.
+    # #5 FIX (review 2026-05-23): reject minimally-incomplete registrations with 422 so
+    # callers see the error instead of getting a null URN that bricks their session.
+    if not req.host or not req.host.strip():
+        raise HTTPException(422, "host is required (e.g., 'studio' or hostname -s)")
     runtime = (req.runtime or "unknown").lower()
     kind = (req.kind or runtime).lower()
+    if runtime == "unknown" and not req.kind:
+        raise HTTPException(
+            422, "must provide runtime (claude-code/opencode/goose/codex/...) OR explicit kind. "
+                 "Defaulting to 'unknown' was masking session-bricking misregistrations."
+        )
     allowed = RUNTIME_KIND_MAP.get(runtime, {runtime, "unknown"})
     if runtime != "unknown" and kind not in allowed and kind != runtime:
         raise HTTPException(
@@ -810,15 +833,16 @@ async def create_job(req: JobCreate):
             # short-circuit: store job as done with cached result + cost=0
             await db.execute(
                 "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
-                "required_capabilities, eligible_kinds, max_cost_tier, preferred_providers, preferred_models, "
+                "required_capabilities, eligible_kinds, project, max_cost_tier, preferred_providers, preferred_models, "
                 "mnemos_refs, status, started_at, ended_at, result, claimed_provider, claimed_model, "
                 "claimed_cost_tier, estimated_cost_usd, result_mnemos_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?, ?, ?, 'A', 0, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?, ?, ?, 'A', 0, ?)",
                 (
                     job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
                     req.priority, req.deadline,
                     json.dumps(req.required_capabilities) if req.required_capabilities else None,
                     json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
+                    req.project,
                     (req.max_cost_tier or "A").upper(),
                     json.dumps(req.preferred_providers) if req.preferred_providers else None,
                     json.dumps(req.preferred_models) if req.preferred_models else None,
@@ -865,14 +889,15 @@ async def create_job(req: JobCreate):
         # else: submitter not registered → allowed (human/external curl)
         await db.execute(
             "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
-            "required_capabilities, eligible_kinds, max_cost_tier, preferred_providers, preferred_models, "
+            "required_capabilities, eligible_kinds, project, max_cost_tier, preferred_providers, preferred_models, "
             "mnemos_refs, depends_on, max_retries, status, started_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
             (
                 job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
                 req.priority, req.deadline,
                 json.dumps(req.required_capabilities) if req.required_capabilities else None,
                 json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
+                req.project,
                 (req.max_cost_tier or "A").upper(),
                 json.dumps(req.preferred_providers) if req.preferred_providers else None,
                 json.dumps(req.preferred_models) if req.preferred_models else None,
@@ -1012,16 +1037,19 @@ async def dequeue_next_job(agent_urn: str):
 @app.patch("/v1/jobs/{job_id}")
 async def update_job(job_id: str, req: JobUpdate):
     now = time.time()
-    # Hallucination guard: convert status=done with garbage output to status=failed
-    eff_status = req.status
+    # #3 FIX: Hallucination guard now surfaces failure_reason + exit_code=-2 (per review 2026-05-23)
     halluc_reason = None
     if req.status == "done" and req.result:
         halluc_reason = hallucination_check(req.result)
         if halluc_reason:
-            eff_status = "failed"
+            # patch result: exit_code=-2 + top-level failure_reason for easy filtering
+            patched = dict(req.result or {})
+            patched["exit_code"] = -2
+            patched["failure_reason"] = f"hallucination_guard:{halluc_reason}"
+            patched["_hallucination_guard"] = halluc_reason
             req = JobUpdate(
                 status="failed",
-                result={**(req.result or {}), "_hallucination_guard": halluc_reason},
+                result=patched,
                 claimed_by=req.claimed_by, tokens_in=req.tokens_in,
                 tokens_out=req.tokens_out, result_mnemos_id=req.result_mnemos_id,
             )
@@ -1069,12 +1097,15 @@ async def update_job(job_id: str, req: JobUpdate):
             ) as rcur:
                 rrow = await rcur.fetchone()
             if rrow and rrow[0] < rrow[1]:
-                backoff = 30.0 * (2 ** rrow[0])  # 30s, 60s, 120s, ...
+                backoff = 30.0 * (2 ** rrow[0])
                 next_at = time.time() + backoff
+                # #4 FIX: clear ended_at + result + tokens + cost when re-queueing — prevents
+                # impossible state (status=queued AND ended_at IS NOT NULL) per review 2026-05-23.
                 await db.execute(
                     "UPDATE jobs SET status='queued', retry_count=retry_count+1, "
                     "retry_backoff_until=?, claimed_by=NULL, claimed_at=NULL, "
-                    "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, claimed_cost_tier=NULL "
+                    "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, claimed_cost_tier=NULL, "
+                    "ended_at=NULL, result=NULL, tokens_in=NULL, tokens_out=NULL, estimated_cost_usd=NULL "
                     "WHERE id=?",
                     (next_at, job_id),
                 )
@@ -1219,18 +1250,25 @@ async def delete_schedule(sid: str):
 
 
 @app.get("/v1/stats/workers")
-async def worker_stats(kind: Optional[str] = None, top_n: int = 30):
-    """Per-worker per-kind capability scores. Submitters use this to pick best worker for a kind."""
+async def worker_stats(kind: Optional[str] = None, top_n: int = 30,
+                       include_system: bool = False):
+    """Per-worker per-kind capability scores. Submitters use this to pick best worker for a kind.
+
+    #8 FIX (review 2026-05-23): exclude `system` kind agents by default (they're host monitors,
+    not compute workers — including them was misleading). Pass include_system=true to override.
+    """
     sql = ("SELECT urn, kind, success_count, fail_count, cancelled_count, "
            "total_tokens_in, total_tokens_out, ROUND(total_cost_usd,4), "
            "ROUND(total_duration_sec/NULLIF(success_count+fail_count,0),1) AS avg_dur, "
            "datetime(last_run,'unixepoch') AS last_run, "
            "ROUND(100.0 * success_count / NULLIF(success_count+fail_count+cancelled_count,0), 1) AS success_pct "
-           "FROM worker_kind_stats")
+           "FROM worker_kind_stats WHERE 1=1")
     args: list = []
     if kind:
-        sql += " WHERE kind=?"
+        sql += " AND kind=?"
         args.append(kind)
+    if not include_system:
+        sql += " AND urn NOT LIKE 'urn:agent:system:%'"
     sql += " ORDER BY success_count DESC, success_pct DESC LIMIT ?"
     args.append(int(top_n))
     rows = []
