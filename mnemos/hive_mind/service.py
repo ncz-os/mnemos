@@ -404,6 +404,8 @@ class JobCreate(BaseModel):
     preferred_models: Optional[list[str]] = None       # ranked model preference
     # MNEMOS provenance:
     mnemos_refs: Optional[list[str]] = None            # mem_XXX ids — context/handoffs/related work the worker should consult
+    # DAG support:
+    depends_on: Optional[list[str]] = None             # job ids that must be status='done' before this job is dequeueable
 
 
 class JobUpdate(BaseModel):
@@ -680,6 +682,20 @@ async def create_job(req: JobCreate):
         bad = [r for r in req.mnemos_refs if not (isinstance(r, str) and r.startswith("mem_"))]
         if bad:
             raise HTTPException(422, f"mnemos_refs must be mem_XXX ids — bad entries: {bad}")
+    # DAG: validate depends_on targets exist + no self-cycle
+    if req.depends_on:
+        if job_id in req.depends_on:
+            raise HTTPException(422, "depends_on cannot include self")
+        async with aiosqlite.connect(DB_PATH) as _vd:
+            placeholders = ",".join("?" * len(req.depends_on))
+            async with _vd.execute(
+                f"SELECT id FROM jobs WHERE id IN ({placeholders})",
+                tuple(req.depends_on),
+            ) as cur:
+                found = {row[0] async for row in cur}
+            missing = [d for d in req.depends_on if d not in found]
+            if missing:
+                raise HTTPException(422, f"depends_on references unknown job ids: {missing}")
     # RESULT-CACHE CHECK: identical (kind, description, max_cost_tier, required_caps) within TTL → return cached result, mark new job done immediately
     ck = cache_key_for(req.kind, req.description, (req.max_cost_tier or "A").upper(), req.required_capabilities)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -744,8 +760,8 @@ async def create_job(req: JobCreate):
         await db.execute(
             "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
             "required_capabilities, eligible_kinds, max_cost_tier, preferred_providers, preferred_models, "
-            "mnemos_refs, status, started_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+            "mnemos_refs, depends_on, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
             (
                 job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
                 req.priority, req.deadline,
@@ -755,6 +771,7 @@ async def create_job(req: JobCreate):
                 json.dumps(req.preferred_providers) if req.preferred_providers else None,
                 json.dumps(req.preferred_models) if req.preferred_models else None,
                 json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
+                json.dumps(req.depends_on) if req.depends_on else None,
                 now,
             ),
         )
@@ -806,14 +823,26 @@ async def dequeue_next_job(agent_urn: str):
             async with db.execute(
                 "SELECT id, kind, description, priority, deadline, required_capabilities, eligible_kinds, "
                 "submitter_urn, parent_job_id, started_at, max_cost_tier, preferred_providers, preferred_models, "
-                "mnemos_refs "
+                "mnemos_refs, depends_on "
                 "FROM jobs WHERE status='queued' "
                 "ORDER BY priority DESC, started_at ASC"
             ) as cur:
                 async for r in cur:
                     (job_id, j_kind, j_desc, j_prio, j_dead, j_caps_json, j_kinds_json,
                      j_sub, j_par, j_started, j_max_tier, j_pref_providers, j_pref_models,
-                     j_mnemos_refs) = r
+                     j_mnemos_refs, j_deps_json) = r
+                    # DAG gate: all depends_on must be status='done'
+                    if j_deps_json:
+                        deps = json.loads(j_deps_json) or []
+                        if deps:
+                            ph = ",".join("?" * len(deps))
+                            async with db.execute(
+                                f"SELECT COUNT(*) FROM jobs WHERE id IN ({ph}) AND status='done'",
+                                tuple(deps),
+                            ) as dc:
+                                done_count = (await dc.fetchone())[0]
+                            if done_count < len(deps):
+                                continue  # parent not yet done; skip
                     # filter: eligible_kinds
                     if j_kinds_json:
                         kinds = json.loads(j_kinds_json)
