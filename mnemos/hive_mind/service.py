@@ -398,6 +398,7 @@ class JobCreate(BaseModel):
     deadline: Optional[float] = None                   # unix ts, optional SLA
     required_capabilities: Optional[list[str]] = None  # worker must have ALL of these
     eligible_kinds: Optional[list[str]] = None         # restrict to agent kinds; null = any
+    max_retries: int = 2                               # auto-resubmit after worker reports failed (up to N times)
     # COST DISCIPLINE (per CLAUDE.md llm-usage-policy):
     max_cost_tier: str = "A"                           # cap which tier may execute: A=free, B=cheap, C=reserve. Default A=free first.
     preferred_providers: Optional[list[str]] = None    # ranked preference (first match wins among tier-eligible)
@@ -784,8 +785,8 @@ async def create_job(req: JobCreate):
         await db.execute(
             "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
             "required_capabilities, eligible_kinds, max_cost_tier, preferred_providers, preferred_models, "
-            "mnemos_refs, depends_on, status, started_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+            "mnemos_refs, depends_on, max_retries, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
             (
                 job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
                 req.priority, req.deadline,
@@ -796,6 +797,7 @@ async def create_job(req: JobCreate):
                 json.dumps(req.preferred_models) if req.preferred_models else None,
                 json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
                 json.dumps(req.depends_on) if req.depends_on else None,
+                int(req.max_retries),
                 now,
             ),
         )
@@ -849,7 +851,9 @@ async def dequeue_next_job(agent_urn: str):
                 "submitter_urn, parent_job_id, started_at, max_cost_tier, preferred_providers, preferred_models, "
                 "mnemos_refs, depends_on "
                 "FROM jobs WHERE status='queued' "
-                "ORDER BY priority DESC, started_at ASC"
+                "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
+                "ORDER BY priority DESC, started_at ASC",
+                (time.time(),)
             ) as cur:
                 async for r in cur:
                     (job_id, j_kind, j_desc, j_prio, j_dead, j_caps_json, j_kinds_json,
@@ -964,6 +968,27 @@ async def update_job(job_id: str, req: JobUpdate):
                 "UPDATE agents SET plan_period_used_usd = COALESCE(plan_period_used_usd,0) + ? WHERE urn=?",
                 (cost_estimate, claimed_by_urn),
             )
+        # On failed: auto-retry if under max_retries. Exponential backoff: 30s × 2^retry_count
+        if req.status == "failed":
+            async with db.execute(
+                "SELECT retry_count, max_retries FROM jobs WHERE id=?", (job_id,)
+            ) as rcur:
+                rrow = await rcur.fetchone()
+            if rrow and rrow[0] < rrow[1]:
+                backoff = 30.0 * (2 ** rrow[0])  # 30s, 60s, 120s, ...
+                next_at = time.time() + backoff
+                await db.execute(
+                    "UPDATE jobs SET status='queued', retry_count=retry_count+1, "
+                    "retry_backoff_until=?, claimed_by=NULL, claimed_at=NULL, "
+                    "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, claimed_cost_tier=NULL "
+                    "WHERE id=?",
+                    (next_at, job_id),
+                )
+                await emit_event(db, "job.retry", {
+                    "id": job_id, "retry_count": rrow[0] + 1,
+                    "max_retries": rrow[1], "backoff_sec": backoff,
+                })
+                # fall through to stats roll-up below (count as fail for this attempt)
         # On done/failed/cancelled: roll per-worker per-kind stats (capability scoring)
         if req.status in ("done", "failed", "cancelled"):
             async with db.execute(
