@@ -57,7 +57,8 @@ DEFAULT_MODEL_PATH = "/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf"
 # http://192.168.207.64:8090/v1/embeddings. Same memo forbids ollama or
 # any other HTTP embed provider; MEDUSA is the sole exception. Must
 # circuit-break + fall through to llamacpp on >30s outage.
-DEFAULT_HTTP_URL = "http://192.168.207.64:8090/v1/embeddings"
+DEFAULT_HTTP_URL = "http://192.168.207.61:8090/v1/embeddings"  # TYPHON RTX 5060 CUDA
+DEFAULT_HTTP_URL_FALLBACK = "http://192.168.207.64:8090/v1/embeddings"  # MEDUSA AMD NAVI14 Vulkan
 DEFAULT_HTTP_MODEL = "bge-m3"
 DEFAULT_HTTP_TIMEOUT = 30.0
 DEFAULT_HTTP_CB_THRESHOLD = 5  # consecutive failures before opening breaker
@@ -622,6 +623,7 @@ class InProcessEmbedder:
         cix_max_seq_len: int | None = None,
         # http knobs (mem_1779334716543_f8ebd4 EXCEPTION clause 2026-05-23)
         http_url: str | None = None,
+        http_url_fallback: str | None = None,
         http_model: str | None = None,
         http_timeout: float | None = None,
         # hybrid knobs
@@ -663,6 +665,13 @@ class InProcessEmbedder:
             else os.environ.get("MNEMOS_EMBED_GPU_LAYERS", DEFAULT_N_GPU_LAYERS)
         )
         self.http_url = http_url or os.environ.get("MNEMOS_EMBED_HTTP_URL", DEFAULT_HTTP_URL)
+        # Fallback URL: empty string disables; default = MEDUSA so the primary
+        # TYPHON outage path falls to MEDUSA before in-process llamacpp.
+        self.http_url_fallback = (
+            http_url_fallback
+            if http_url_fallback is not None
+            else os.environ.get("MNEMOS_EMBED_HTTP_URL_FALLBACK", DEFAULT_HTTP_URL_FALLBACK)
+        )
         self.http_model = http_model or os.environ.get("MNEMOS_EMBED_HTTP_MODEL", DEFAULT_HTTP_MODEL)
         self.http_timeout = float(
             http_timeout
@@ -731,13 +740,25 @@ class InProcessEmbedder:
                 max_seq_len=self.cix_max_seq_len,
                 max_chars=self.max_text_chars,
             )
-        # HTTP fallback: per mem_1779334716543_f8ebd4 EXCEPTION clause,
-        # the http backend MUST fall through to in-process llamacpp when
-        # the remote endpoint is unreachable. The fallback is constructed
-        # lazily so missing GGUF on hosts that intentionally have only
-        # http available doesn't fail startup.
+        # HTTP fallback chain (mem_1779334716543_f8ebd4 EXCEPTION clause):
+        # the http backend falls through PRIMARY -> REMOTE-SECONDARY -> in-
+        # process llamacpp when the remote endpoint is unreachable. Each
+        # fallback is constructed lazily so missing GGUF on hosts that
+        # intentionally have only http available doesn't fail startup.
+        self._http_fallback_remote: _HttpBackend | None = None
         self._http_fallback: _LlamaCppBackend | None = None
         if resolved == "http":
+            if self.http_url_fallback and self.http_url_fallback != self.http_url:
+                self._http_fallback_remote = _HttpBackend(
+                    url=self.http_url_fallback,
+                    model=self.http_model,
+                    timeout=self.http_timeout,
+                    max_chars=self.max_text_chars,
+                )
+                logger.info(
+                    "[EMBED] http remote-fallback prepared: %s",
+                    self.http_url_fallback,
+                )
             try:
                 if Path(self.model_path).exists():
                     self._http_fallback = _LlamaCppBackend(
@@ -747,15 +768,16 @@ class InProcessEmbedder:
                         n_gpu_layers=self.n_gpu_layers,
                         max_chars=self.max_text_chars,
                     )
-                    logger.info("[EMBED] http backend fallback prepared: %s", self.model_path)
+                    logger.info("[EMBED] http local-fallback prepared: %s", self.model_path)
                 else:
                     logger.warning(
                         "[EMBED] http backend has NO local fallback (%s missing); "
-                        "MEDUSA outages will return [] embeddings",
+                        "remote-fallback %s will be tried, then [] embeddings",
                         self.model_path,
+                        self.http_url_fallback or "(none configured)",
                     )
             except Exception:
-                logger.exception("[EMBED] http backend fallback prep failed")
+                logger.exception("[EMBED] http backend local-fallback prep failed")
 
     def _load_sync(self) -> None:
         self._build_backend()
@@ -806,11 +828,20 @@ class InProcessEmbedder:
                     vec = await self._backend.embed_async(truncated)
                     if vec:
                         return vec
-                    # Empty -> breaker open or remote failed; fall through.
+                    # Empty -> breaker open or remote failed; try remote-fallback first.
+                    if self._http_fallback_remote is not None:
+                        logger.warning(
+                            "[EMBED][http] primary failed -> remote-fallback %s",
+                            self._http_fallback_remote.url,
+                        )
+                        vec = await self._http_fallback_remote.embed_async(truncated)
+                        if vec:
+                            return vec
+                    # Then in-process local llamacpp.
                     if self._http_fallback is not None:
                         if not self._http_fallback.loaded:
                             await asyncio.get_running_loop().run_in_executor(None, self._http_fallback._load_sync)
-                        logger.warning("[EMBED][http] fallback -> llamacpp local")
+                        logger.warning("[EMBED][http] remote+fallback failed -> llamacpp local")
                         return await asyncio.get_running_loop().run_in_executor(
                             None, self._http_fallback._embed_sync, truncated
                         )
@@ -847,14 +878,29 @@ class InProcessEmbedder:
                     await self._ensure_loaded()
                     if isinstance(self._backend, _HttpBackend):
                         vecs = await self._backend.embed_batch_async(texts_list)
-                        # Per-row fallback for items that came back empty when
-                        # http path returned partial / total failure.
+                        # Remote-fallback first for failed rows (MEDUSA :8090
+                        # when TYPHON primary failed). Batch only the failed
+                        # subset to keep wire payload tight.
+                        if any(not v for v in vecs) and self._http_fallback_remote is not None:
+                            miss_idx = [i for i, v in enumerate(vecs) if not v]
+                            miss_texts = [texts_list[i] for i in miss_idx]
+                            logger.warning(
+                                "[EMBED][http] batch primary missed %d/%d; remote-fallback %s",
+                                len(miss_idx),
+                                len(vecs),
+                                self._http_fallback_remote.url,
+                            )
+                            remote_vecs = await self._http_fallback_remote.embed_batch_async(miss_texts)
+                            for j, i in enumerate(miss_idx):
+                                if remote_vecs[j]:
+                                    vecs[i] = remote_vecs[j]
+                        # Local fallback for any rows still empty.
                         if any(not v for v in vecs) and self._http_fallback is not None:
                             if not self._http_fallback.loaded:
                                 await asyncio.get_running_loop().run_in_executor(None, self._http_fallback._load_sync)
                             for i, (v, t) in enumerate(zip(vecs, texts_list)):
                                 if not v and t and t.strip():
-                                    logger.warning("[EMBED][http] batch fallback idx=%d", i)
+                                    logger.warning("[EMBED][http] batch local-fallback idx=%d", i)
                                     vecs[i] = await asyncio.get_running_loop().run_in_executor(
                                         None, self._http_fallback._embed_sync, t[: self.max_text_chars]
                                     )
