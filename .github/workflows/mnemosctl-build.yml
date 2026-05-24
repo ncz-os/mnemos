@@ -5,7 +5,7 @@ on:
     branches: [main, "feat/**"]
     paths:
       - "cli/mnemosctl/**"
-      - ".github/workflows/build.yml"
+      - ".github/workflows/mnemosctl-build.yml"
   pull_request:
     paths:
       - "cli/mnemosctl/**"
