@@ -183,6 +183,13 @@ class MemorySearchRequest(BaseModel):
     # deep = semantic + cross-encoder rerank via MEDUSA :8091.
     # Unknown values → 400 in route handler.
     profile: Optional[str] = None
+    # v6.2 M-2.2.4: per-category temporal-decay override map.
+    # Keys = category names (or "*" to flatten all categories).
+    # Values = half-life-days OR multiplier when "*" is used.
+    # Most callers leave this None and rely on memory_category_decay
+    # table defaults; `synthesize`/`narrate` may set {"*": 1.0} to
+    # disable decay entirely for deep recall.
+    decay_overrides: Optional[Dict[str, float]] = None
 
 
 class MemoryCreateRequest(BaseModel):
