@@ -2702,6 +2702,7 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         categories: Sequence[str],
         limit: int,
         prefer_compressed: bool,
+        include_embedding: bool = False,
     ) -> list[Row]:
         if prefer_compressed:
             raise NotImplementedError(
@@ -2741,6 +2742,26 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
 
         memory_where_clause = " AND ".join(memory_query_parts)
         tombstone_where_clause = " AND ".join(tombstone_query_parts)
+        # v6.1 F-1.2: optional embedding + embedding_model literal columns.
+        # See docs/v6.1-federation-embeddings-copy.md. SQLite reads
+        # embeddings from memory_embeddings join table (not memories.embedding
+        # which is a synced backup) — LEFT JOIN so rows with no embedding
+        # still appear.
+        if include_embedding:
+            from mnemos.core.config import get_settings as _gs
+
+            try:
+                _model = (_gs().providers.inference_embed_model or "").strip() or "unknown"
+            except Exception:
+                _model = "unknown"
+            _model_escaped = _model.replace("'", "''")
+            mem_embed = f", me.embedding AS embedding, '{_model_escaped}' AS embedding_model"
+            mem_embed_join = "LEFT JOIN memory_embeddings me ON me.memory_id = m.id"
+            tomb_embed = ", NULL AS embedding, NULL AS embedding_model"
+        else:
+            mem_embed = ""
+            mem_embed_join = ""
+            tomb_embed = ""
         return await _fetch_all(
             self._conn(tx),
             f"""
@@ -2767,7 +2788,9 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                        NULL AS consolidated_into,
                        NULL AS consolidated_at,
                        NULL AS compressed_content
+                       {mem_embed}
                 FROM memories m
+                {mem_embed_join}
                 WHERE {memory_where_clause}
 
                 UNION ALL
@@ -2793,6 +2816,7 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                        m.consolidated_into,
                        m.consolidated_at,
                        NULL AS compressed_content
+                       {tomb_embed}
                 FROM memories m
                 WHERE {tombstone_where_clause}
             ) feed

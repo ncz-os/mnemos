@@ -3140,6 +3140,7 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         categories: Sequence[str],
         limit: int,
         prefer_compressed: bool,
+        include_embedding: bool = False,
     ) -> list[Row]:
         _ = prefer_compressed
         conn = _conn_from_tx(tx)
@@ -3162,14 +3163,25 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 cat_ph = ",".join("?" for _ in categories)
                 where.append(f"m.category IN ({cat_ph})")
                 params_list.extend(categories)
+            # v6.1 F-1.2: optional embedding + embedding_model literal columns.
+            # See docs/v6.1-federation-embeddings-copy.md.
+            embed_cols = ""
+            if include_embedding:
+                from mnemos.core.config import get_settings as _gs
+
+                try:
+                    _model = (_gs().providers.inference_embed_model or "").strip() or "unknown"
+                except Exception:
+                    _model = "unknown"
+                _model_escaped = _model.replace("'", "''")
+                embed_cols = f", m.embedding AS embedding, '{_model_escaped}' AS embedding_model"
             params_list.append(limit)
             sql = (
                 "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
                 "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
                 "m.permission_mode, m.source_model, m.source_provider, "
                 "m.source_session, m.source_agent, m.created, m.updated, "
-                "m.archived_at "
-                "FROM memories m WHERE " + " AND ".join(where) + " "
+                "m.archived_at" + embed_cols + " FROM memories m WHERE " + " AND ".join(where) + " "
                 "ORDER BY m.updated ASC, m.id ASC "
                 "FETCH FIRST ? ROWS ONLY"
             )
