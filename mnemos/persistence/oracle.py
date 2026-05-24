@@ -3558,6 +3558,50 @@ class OracleAuditChainRepository(AuditChainRepository):
         finally:
             await _call(cursor.close)
 
+    async def get_chain_stats(self, tx: Transaction) -> dict:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT
+                    COUNT(*),
+                    COUNT(CASE WHEN global_root IS NULL THEN 1 END),
+                    MIN(CASE WHEN global_root IS NULL THEN signed_at END)
+                FROM memory_audit_chain
+                """,
+            )
+            crow = await _call(cursor.fetchone)
+            total = int(crow[0] or 0)
+            unsealed = int(crow[1] or 0)
+            oldest = crow[2]
+            await _call(
+                cursor.execute,
+                """
+                SELECT COUNT(*), MAX(sealed_at)
+                FROM memory_audit_roots
+                """,
+            )
+            rrow = await _call(cursor.fetchone)
+            root_count = int(rrow[0] or 0)
+            last_sealed = rrow[1]
+        finally:
+            await _call(cursor.close)
+        return {
+            "total_entries": total,
+            "unsealed_count": unsealed,
+            "oldest_unsealed_signed_at": (
+                oldest.isoformat() if hasattr(oldest, "isoformat") else (str(oldest) if oldest else None)
+            ),
+            "sealed_root_count": root_count,
+            "last_sealed_at": (
+                last_sealed.isoformat()
+                if hasattr(last_sealed, "isoformat")
+                else (str(last_sealed) if last_sealed else None)
+            ),
+        }
+
     async def get_latest_audit_entries_batch(
         self,
         tx: Transaction,

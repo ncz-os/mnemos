@@ -1169,6 +1169,22 @@ class AuditChainRepository(ABC):
         """
         ...
 
+    @abstractmethod
+    async def get_chain_stats(self, tx: Transaction) -> dict:
+        """Return per-backend audit-chain health snapshot.
+
+        Used by the `/v1/audit/health` endpoint + operator dashboards.
+        Returns:
+            {
+                "total_entries": int,
+                "unsealed_count": int,
+                "oldest_unsealed_signed_at": str | None,  # ISO 8601
+                "sealed_root_count": int,
+                "last_sealed_at": str | None,             # ISO 8601
+            }
+        """
+        ...
+
     async def get_latest_audit_entries_batch(
         self,
         tx: Transaction,
