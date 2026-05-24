@@ -62,8 +62,13 @@ BEGIN
   create_index('IX_MEMORY_AUDIT_BY_ROOT',
                'CREATE INDEX ix_memory_audit_by_root ON memory_audit_chain(global_root)');
   -- Sealer worker queue: find entries not yet sealed, ordered by signed_at.
+  -- Oracle doesn't support PARTIAL INDEX (WHERE clause on CREATE INDEX); use
+  -- a function-based index that emits NULL for sealed rows so they don't take
+  -- index space. Sealer queries use the same CASE predicate so the optimizer
+  -- picks up the FBI. Same effective storage shape as PG/Db2 partial index.
   create_index('IX_MEMORY_AUDIT_UNSIGNED',
-               'CREATE INDEX ix_memory_audit_unsigned ON memory_audit_chain(signed_at) WHERE global_root IS NULL');
+               'CREATE INDEX ix_memory_audit_unsigned ON memory_audit_chain('
+               || 'CASE WHEN global_root IS NULL THEN signed_at END)');
   -- Writer accountability + per-writer chain audit.
   create_index('IX_MEMORY_AUDIT_BY_WRITER',
                'CREATE INDEX ix_memory_audit_by_writer ON memory_audit_chain(writer_id, signed_at DESC)');
