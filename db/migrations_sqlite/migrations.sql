@@ -585,7 +585,12 @@ CREATE TABLE IF NOT EXISTS federation_peers (
   created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  -- v6.1 F-1.1 (migration 0028 equivalent): per-peer flag controlling
+  -- whether /v1/federation/feed payload includes embedding bytes.
+  -- Default 0 preserves v6.0 wire format. See
+  -- docs/v6.1-federation-embeddings-copy.md.
+  copy_embeddings INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_federation_peers_enabled
