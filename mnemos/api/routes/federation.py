@@ -156,7 +156,11 @@ def _cursor_datetime(value):
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
-def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
+def _memory_item_from_row(
+    row,
+    include_compressed: bool = False,
+    include_embedding: bool = False,
+) -> MemoryItem:
     """Build a MemoryItem from a feed row.
 
     ``include_compressed`` populates ``compressed_content`` from the
@@ -164,6 +168,12 @@ def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
     (and the caller of the row-fetch actually selected the column).
     Receivers that don't recognize compressed_content fall through
     to the raw ``content`` with no behavior change.
+
+    ``include_embedding`` populates ``embedding`` (base64 float32),
+    ``embedding_model``, and ``embedding_dim`` when the feed_query
+    selected those columns (per v6.1 F-1 copy_embeddings flow). Default
+    off preserves v6.0 wire format. Empty/missing fields when the row
+    has no embedding (NULL column or no join match).
     """
     compressed = None
     if include_compressed:
@@ -175,6 +185,51 @@ def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
         archived_at = row["archived_at"]
     except (KeyError, IndexError):
         archived_at = None
+    embedding_b64: Optional[str] = None
+    embedding_model: Optional[str] = None
+    embedding_dim: Optional[int] = None
+    if include_embedding:
+        try:
+            raw = row["embedding"]
+        except (KeyError, IndexError):
+            raw = None
+        if raw is not None:
+            import base64
+
+            # Backend-specific embedding shapes:
+            #   - postgres pgvector: list[float] / str representation
+            #   - oracle 23ai VECTOR: array.array / list of floats
+            #   - sqlite mnemos: JSON text "[0.1, 0.2, ...]"
+            #   - any bytes-like blob already in float32 LE
+            if isinstance(raw, (bytes, bytearray, memoryview)):
+                # Assume raw is float32 LE bytes (sqlite BLOB / db2 VARBINARY)
+                embedding_b64 = base64.b64encode(bytes(raw)).decode("ascii")
+                embedding_dim = len(raw) // 4
+            elif isinstance(raw, str):
+                # JSON text — parse + repack as float32 LE bytes
+                try:
+                    import array as _array
+
+                    arr = _array.array("f", [float(v) for v in json.loads(raw)])
+                    embedding_b64 = base64.b64encode(arr.tobytes()).decode("ascii")
+                    embedding_dim = len(arr)
+                except Exception:
+                    embedding_b64 = None
+            else:
+                # List/tuple/array of floats (pg pgvector + oracle native)
+                try:
+                    import array as _array
+
+                    floats = [float(v) for v in raw]
+                    arr = _array.array("f", floats)
+                    embedding_b64 = base64.b64encode(arr.tobytes()).decode("ascii")
+                    embedding_dim = len(floats)
+                except Exception:
+                    embedding_b64 = None
+        try:
+            embedding_model = row["embedding_model"]
+        except (KeyError, IndexError):
+            embedding_model = None
     return MemoryItem(
         id=row["id"],
         content=row["content"],
@@ -199,6 +254,9 @@ def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
         source_agent=row["source_agent"],
         archived_at=(_iso_value(archived_at)),
         archived=archived_at is not None,
+        embedding=embedding_b64,
+        embedding_model=embedding_model,
+        embedding_dim=embedding_dim,
     )
 
 
@@ -206,6 +264,7 @@ def _feed_item_from_row(
     row,
     *,
     include_compressed: bool = False,
+    include_embedding: bool = False,
 ) -> MemoryItem | FederationConsolidationEvent:
     try:
         item_type = row["type"]
@@ -218,7 +277,11 @@ def _feed_item_from_row(
             consolidated_into=row["consolidated_into"],
             consolidated_at=_iso_value(consolidated_at) or "",
         )
-    return _memory_item_from_row(row, include_compressed=include_compressed)
+    return _memory_item_from_row(
+        row,
+        include_compressed=include_compressed,
+        include_embedding=include_embedding,
+    )
 
 
 def _federation_visibility_filters() -> list[str]:
@@ -513,6 +576,20 @@ async def federation_feed(
             "flag."
         ),
     ),
+    copy_embeddings: bool = Query(
+        False,
+        description=(
+            "v6.1 F-1 — when true, response MemoryItems include the "
+            "``embedding`` (base64 float32), ``embedding_model``, and "
+            "``embedding_dim`` fields so the receiver can ingest "
+            "pre-computed vectors instead of re-embedding locally. "
+            "Default off preserves v6.0 wire format. Per-call control: "
+            "receiver sets this when its local federation_peers row "
+            "has copy_embeddings=1 OR an out-of-band agreement with "
+            "the source peer exists. See docs/v6.1-federation-embeddings"
+            "-copy.md."
+        ),
+    ),
 ):
     """Serve memories for a remote peer to pull. Requires role='federation' or 'root'."""
     backend = backend_or_503()
@@ -540,6 +617,7 @@ async def federation_feed(
                 categories=categories,
                 limit=limit + 1,
                 prefer_compressed=prefer_compressed,
+                include_embedding=copy_embeddings,
             )
     except NotImplementedError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -564,7 +642,9 @@ async def federation_feed(
     has_more = len(rows) > limit
     rows = rows[:limit]
 
-    memories = [_feed_item_from_row(r, include_compressed=prefer_compressed) for r in rows]
+    memories = [
+        _feed_item_from_row(r, include_compressed=prefer_compressed, include_embedding=copy_embeddings) for r in rows
+    ]
     if rows and rows[-1]["updated"]:
         next_cursor = _fed._encode_feed_cursor(_cursor_datetime(rows[-1]["updated"]), rows[-1]["id"])
     else:
