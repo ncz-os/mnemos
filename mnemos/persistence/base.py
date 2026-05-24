@@ -840,7 +840,18 @@ class FederationRepository(ABC):
         categories: Sequence[str],
         limit: int,
         prefer_compressed: bool,
-    ) -> list[Row]: ...
+        include_embedding: bool = False,
+    ) -> list[Row]:
+        """Return federation feed rows.
+
+        When ``include_embedding=True``, rows additionally include the
+        ``embedding`` column (raw vector bytes/list) and ``embedding_model``
+        literal column.  Used by the v6.1 F-1 ``copy_embeddings`` flow so
+        replicas can ingest pre-computed vectors instead of re-embedding.
+        Default ``False`` preserves v6.0 wire format / bandwidth profile.
+        See ``docs/v6.1-federation-embeddings-copy.md``.
+        """
+        ...
 
     @abstractmethod
     async def get_feed_memory(

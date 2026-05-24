@@ -2070,6 +2070,7 @@ class PostgresFederationRepository(FederationRepository):
         categories: Sequence[str],
         limit: int,
         prefer_compressed: bool,
+        include_embedding: bool = False,
     ) -> list[Row]:
         memory_query_parts = [_eligibility.eligible_for_federation("m")]
         tombstone_query_parts = [
@@ -2122,6 +2123,27 @@ class PostgresFederationRepository(FederationRepository):
             verbatim_select = "m.verbatim_content,"
             join_compressed = ""
 
+        # v6.1 F-1.2: optional embedding column for the copy_embeddings flow.
+        # See docs/v6.1-federation-embeddings-copy.md. Default off preserves
+        # v6.0 wire format. embedding_model is a literal so the caller doesn't
+        # need a separate roundtrip; the receiver enforces match against its
+        # local embedder before accepting the bytes.
+        if include_embedding:
+            from mnemos.core.config import get_settings as _gs
+
+            try:
+                _embed_model = (_gs().providers.inference_embed_model or "").strip() or "unknown"
+            except Exception:
+                _embed_model = "unknown"
+            # Trailing-comma terminators: rely on the always-present _trailer
+            # column at the end of the SELECT lists so we can drop in
+            # additional columns without re-counting commas every change.
+            embedding_select_memory = f"m.embedding AS embedding, '{_embed_model}' AS embedding_model,"
+            embedding_select_tombstone = "NULL::vector AS embedding, NULL::text AS embedding_model,"
+        else:
+            embedding_select_memory = ""
+            embedding_select_tombstone = ""
+
         memory_where_clause = " AND ".join(memory_query_parts)
         tombstone_where_clause = " AND ".join(tombstone_query_parts)
         return list(
@@ -2139,7 +2161,9 @@ class PostgresFederationRepository(FederationRepository):
                        m.archived_at,
                        NULL::text AS consolidated_into,
                        NULL::timestamptz AS consolidated_at,
-                       {compressed_select.rstrip(',')}
+                       {compressed_select}
+                       {embedding_select_memory}
+                       NULL::text AS _trailer
                 FROM memories m
                 {join_compressed}
                 WHERE {memory_where_clause}
@@ -2166,7 +2190,9 @@ class PostgresFederationRepository(FederationRepository):
                        NULL::timestamptz AS archived_at,
                        m.consolidated_into,
                        m.consolidated_at,
-                       NULL::text AS compressed_content
+                       NULL::text AS compressed_content,
+                       {embedding_select_tombstone}
+                       NULL::text AS _trailer
                 FROM memories m
                 WHERE {tombstone_where_clause}
             ) feed
