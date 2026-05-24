@@ -3504,6 +3504,33 @@ class OracleAuditChainRepository(AuditChainRepository):
         finally:
             await _call(cursor.close)
 
+    async def list_window_entries(
+        self,
+        tx: Transaction,
+        global_root: bytes,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT entry_id, memory_id, signature, signed_at,
+                       global_seq, payload_hash, op
+                FROM memory_audit_chain
+                WHERE global_root = :root
+                ORDER BY signed_at ASC, entry_id ASC
+                """,
+                {"root": global_root},
+            )
+            rows = await _call(cursor.fetchall)
+            if not rows:
+                return []
+            cols = [d[0].lower() for d in cursor.description]
+            return [dict(zip(cols, r)) for r in rows]
+        finally:
+            await _call(cursor.close)
+
 
 class OracleBackend(PersistenceBackend):
     """Oracle persistence facade backed by a python-oracledb async pool."""
