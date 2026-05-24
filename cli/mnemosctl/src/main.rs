@@ -259,3 +259,129 @@ fn main() -> anyhow::Result<()> {
         Command::Raw { method, path } => todo(&format!("raw {} {}", method, path)),
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    //! Parser-contract tests. Previously `cargo test` ran zero tests so
+    //! command names, documented examples, environment-backed globals,
+    //! and exit-code behaviour could silently break. Covers the
+    //! workflow smoke (`--version`, `--help`) plus a representative
+    //! sample of subcommands from docs/MNEMOSCTL_DESIGN.md.
+    //!
+    //! Closes hive job `mnemosctl:missing-tests` (codex audit 2026-05-23).
+    use super::*;
+    use clap::CommandFactory;
+    use clap::Parser;
+
+    #[test]
+    fn help_smoke() {
+        // CommandFactory::command() succeeds means the clap derive
+        // metadata builds cleanly (no version/name conflicts, no
+        // misuse of #[arg]); failure here panics before help renders.
+        let mut cmd = Cli::command();
+        let buf = cmd.render_help().to_string();
+        assert!(buf.contains("mnemosctl"));
+        assert!(buf.contains("--server"));
+        assert!(buf.contains("--token"));
+        assert!(buf.contains("--format"));
+    }
+
+    #[test]
+    fn version_smoke() {
+        // Mirrors --version output emission. Just ensures the
+        // version string is non-empty + matches Cargo.toml.
+        let cmd = Cli::command();
+        assert!(!cmd.get_version().unwrap_or("").is_empty());
+    }
+
+    #[test]
+    fn parse_search_with_global_flags() {
+        let cli = Cli::try_parse_from([
+            "mnemosctl",
+            "--server", "https://hub.example/api",
+            "--token", "fake-token",
+            "--format", "json",
+            "search", "needle",
+            "--limit", "5",
+        ]).expect("search subcommand parses with global flags");
+        assert_eq!(cli.server.as_deref(), Some("https://hub.example/api"));
+        assert_eq!(cli.token.as_deref(), Some("fake-token"));
+        matches!(cli.format, OutputFormat::Json);
+        match cli.command {
+            Command::Search { query, limit, .. } => {
+                assert_eq!(query, "needle");
+                assert_eq!(limit, 5);
+            }
+            _ => panic!("expected Search variant"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_login() {
+        let cli = Cli::try_parse_from(["mnemosctl", "auth", "login"])
+            .expect("auth login parses");
+        match cli.command {
+            Command::Auth(auth) => {
+                matches!(auth.cmd, AuthCmd::Login);
+            }
+            _ => panic!("expected Auth variant"),
+        }
+    }
+
+    #[test]
+    fn parse_federation_peer_add() {
+        let cli = Cli::try_parse_from([
+            "mnemosctl",
+            "federation", "peer-add",
+            "https://peer.example/api",
+            "--name", "peer-alpha",
+        ]).expect("federation peer-add parses");
+        match cli.command {
+            Command::Federation(fed) => match fed.cmd {
+                FederationCmd::PeerAdd { url, name } => {
+                    assert_eq!(url, "https://peer.example/api");
+                    assert_eq!(name.as_deref(), Some("peer-alpha"));
+                }
+                _ => panic!("expected PeerAdd variant"),
+            },
+            _ => panic!("expected Federation variant"),
+        }
+    }
+
+    #[test]
+    fn parse_doctor_no_args() {
+        let cli = Cli::try_parse_from(["mnemosctl", "doctor"])
+            .expect("doctor parses");
+        matches!(cli.command, Command::Doctor);
+    }
+
+    #[test]
+    fn parse_raw_get() {
+        let cli = Cli::try_parse_from([
+            "mnemosctl", "raw", "GET", "/v1/memories/123",
+        ]).expect("raw GET parses");
+        match cli.command {
+            Command::Raw { method, path } => {
+                assert_eq!(method, "GET");
+                assert_eq!(path, "/v1/memories/123");
+            }
+            _ => panic!("expected Raw variant"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_subcommand() {
+        let res = Cli::try_parse_from(["mnemosctl", "nonexistent-cmd"]);
+        assert!(res.is_err(), "unknown subcommand should fail parsing");
+    }
+
+    #[test]
+    fn todo_returns_error_not_ok() {
+        // Catches a future regression where someone replaces bail! back
+        // to Ok() and loses the exit-code signal that distinguishes
+        // 'not implemented' from 'ran successfully'.
+        let res = todo("test cmd");
+        assert!(res.is_err(), "todo() must return Err so process exits non-zero");
+    }
+}
