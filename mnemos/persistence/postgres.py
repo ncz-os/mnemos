@@ -2233,11 +2233,14 @@ class PostgresFederationRepository(FederationRepository):
         )
 
     async def get_sync_peer(self, tx: Transaction, peer_id: str) -> Row | None:
+        # v6.1 F-1: copy_embeddings (migration 0028) — COALESCE so rows
+        # from pre-migration DB return 0 instead of NULL.
         return await _postgres_tx(tx).conn.fetchrow(
             """
             SELECT id::text, name, base_url, auth_token, namespace_filter,
                    category_filter, enabled, last_sync_cursor,
-                   compat_mode
+                   compat_mode,
+                   COALESCE(copy_embeddings, 0) AS copy_embeddings
             FROM federation_peers WHERE id = $1::uuid
             """,
             peer_id,
