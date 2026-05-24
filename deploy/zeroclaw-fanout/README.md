@@ -10,6 +10,28 @@ blocked on sudo-tmp perm; resume in follow-up session).
    ram_gb//2, 8)`. Per-host cap overrides via
    `ZC_FANOUT_FORCE_N=N` in `/etc/default/zeroclaw-fanout`.
 
+5. **Code-executing mode** (NEW 2026-05-24) — shim parses `[repo:URL
+   branch:B base:M]` directive at start of job description. If present,
+   clones repo + checks out branch, runs `zeroclaw agent` with cwd =
+   workspace, then captures git diff + commits + pushes to branch.
+   Reports `commits` + `files_changed` + `pushed_branch` + `repo_url`
+   in job result. Without directive: chat-only mode (current behavior,
+   backward compat). Git identity: `Jason Perlow <jperlow@gmail.com>`
+   per CLAUDE.md directive 2.
+
+## Submitting code jobs
+
+Prepend the description with the repo directive:
+
+```
+[repo:https://gitlab.com/ncz-os/mnemos branch:feat/some-fix base:main]
+Fix the foo bug in bar.py: replace `x == None` with `x is None`.
+```
+
+Branch + base optional (defaults: branch=`hive/<job-id-short>`,
+base=`main`). Workspace cloned shallow (depth=10) into
+`~/hive-work/job-<short>/` and wiped post-job.
+
 2. **All 8 GRAEAE muses available** — canonical `config.toml` with
    providers for groq, together, openai, claude, perplexity, xai, nvidia
    (NGC), gemini. 4 hive agents pre-configured: `hive` (Tier B default),
