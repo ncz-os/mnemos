@@ -2837,6 +2837,23 @@ class PostgresAuditChainRepository(AuditChainRepository):
         )
         return [dict(r) for r in rows]
 
+    async def get_audit_entry_by_id(
+        self,
+        tx: Transaction,
+        entry_id: bytes,
+    ) -> Row | None:
+        row = await _postgres_tx(tx).conn.fetchrow(
+            """
+            SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                   op, payload_hash, writer_id, writer_pubkey,
+                   signature, signed_at, global_root, global_seq
+            FROM memory_audit_chain
+            WHERE entry_id = $1
+            """,
+            entry_id,
+        )
+        return dict(row) if row is not None else None
+
 
 class PostgresBackend(PersistenceBackend):
     """Postgres persistence facade backed by an asyncpg pool."""
