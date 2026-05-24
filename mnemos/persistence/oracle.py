@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -2222,7 +2223,116 @@ class OracleConsultationsRepository(ConsultationsRepository):
         return []
 
     async def create_consultation_with_audit(self, tx: Transaction, **kwargs: Any) -> Any:
-        raise NotImplementedError("Oracle consultation persistence repository is not implemented")
+        """Insert a consultation + audit-chain link + memory refs in one tx.
+
+        Mirrors SqliteConsultationsRepository.create_consultation_with_audit
+        (mnemos/persistence/sqlite.py); Oracle 23ai schema at
+        db/migrations_oracle/0002_graeae.sql defines graeae_consultations,
+        graeae_audit_log, consultation_memory_refs with VARCHAR2(36) PKs and
+        app-side UUIDs.
+        """
+        conn = _conn_from_tx(tx)
+        consultation_id = uuid.uuid4().hex
+        cursor = await _call(conn.cursor)
+        try:
+            # graeae_consultations insert. Note: "mode" is a reserved word
+            # in Oracle; the DDL quotes the column, so the SQL must too.
+            # NOTE: bind var names cannot be Oracle reserved words (ORA-01745).
+            # The "mode" column is reserved → rename the bind to mode_val while
+            # keeping the column name "mode" (quoted) on the INSERT.
+            await _call(
+                cursor.execute,
+                "INSERT INTO graeae_consultations "
+                "(id, prompt, task_type, consensus_response, consensus_score, "
+                'winning_muse, cost, latency_ms, "mode", owner_id, namespace) '
+                "VALUES (:id, :prompt, :task_type, :consensus_response, :consensus_score, "
+                ":winning_muse, :cost, :latency_ms, :mode_val, :owner_id, :namespace)",
+                {
+                    "id": consultation_id,
+                    "prompt": kwargs["prompt"],
+                    "task_type": kwargs["task_type"],
+                    "consensus_response": kwargs["consensus_response"][:500],
+                    "consensus_score": kwargs["consensus_score"],
+                    "winning_muse": kwargs["winning_muse"],
+                    "cost": kwargs["cost"],
+                    "latency_ms": kwargs["latency_ms"],
+                    "mode_val": kwargs["mode"],
+                    "owner_id": kwargs["owner_id"],
+                    "namespace": kwargs["namespace"],
+                },
+            )
+
+            # Audit chain — fetch latest link, hash forward, insert next.
+            prompt_hash = hashlib.sha256(kwargs["prompt"].encode()).hexdigest()
+            response_hash = hashlib.sha256(kwargs["consensus_response"].encode()).hexdigest()
+            await _call(
+                cursor.execute,
+                "SELECT id, chain_hash FROM graeae_audit_log " "ORDER BY sequence_num DESC FETCH FIRST 1 ROWS ONLY",
+            )
+            prev_row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            prev_chain = prev_row["chain_hash"] if prev_row else kwargs["genesis_hash"]
+            chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
+            audit_id = uuid.uuid4().hex
+            # provider is NOT NULL on Oracle but winning_muse can be None on
+            # all-muses-failed consensus path (route at consultations.py L361
+            # documents this safe-degradation). Coerce to sentinel "[none]"
+            # so the audit chain still records the event.
+            provider_val = kwargs["winning_muse"] or "[none]"
+            # response_text + consensus_response can be "" → Oracle treats as
+            # NULL; that's now allowed (we ALTERed CONSENSUS_RESPONSE NULL),
+            # but RESPONSE_TEXT on audit_log might still be NOT NULL. The
+            # MODIFY ... NULL migration applied to consensus_response only;
+            # if audit_log.response_text fails NOT NULL, coerce "" to None
+            # so the SQL drops the bind and Oracle stores NULL (which is
+            # itself a violation if NOT NULL set, but the table allows it).
+            await _call(
+                cursor.execute,
+                "INSERT INTO graeae_audit_log "
+                "(id, consultation_id, prompt, prompt_hash, provider, response_text, "
+                "response_hash, chain_hash, prev_id, prev_chain_hash, task_type, quality_score) "
+                "VALUES (:id, :consultation_id, :prompt, :prompt_hash, :provider, :response_text, "
+                ":response_hash, :chain_hash, :prev_id, :prev_chain_hash, :task_type, :quality_score)",
+                {
+                    "id": audit_id,
+                    "consultation_id": consultation_id,
+                    "prompt": kwargs["prompt"],
+                    "prompt_hash": prompt_hash,
+                    "provider": provider_val,
+                    "response_text": kwargs["consensus_response"] or "[empty]",
+                    "response_hash": response_hash,
+                    "chain_hash": chain_hash,
+                    "prev_id": prev_row["id"] if prev_row else None,
+                    "prev_chain_hash": prev_chain,
+                    "task_type": kwargs["task_type"] or "reasoning",
+                    "quality_score": kwargs["consensus_score"],
+                },
+            )
+
+            # Memory refs — Oracle has no INSERT OR IGNORE; the UNIQUE
+            # constraint unique_consultation_memory raises ORA-00001 on
+            # duplicate, so we swallow that one error code only.
+            for memory_id in kwargs["memory_ids"]:
+                ref_id = uuid.uuid4().hex
+                try:
+                    await _call(
+                        cursor.execute,
+                        "INSERT INTO consultation_memory_refs "
+                        "(id, consultation_id, memory_id) "
+                        "VALUES (:id, :consultation_id, :memory_id)",
+                        {
+                            "id": ref_id,
+                            "consultation_id": consultation_id,
+                            "memory_id": memory_id,
+                        },
+                    )
+                except Exception as exc:
+                    # ORA-00001 unique violation — duplicate ref, safe to skip.
+                    msg = str(exc)
+                    if "ORA-00001" not in msg:
+                        raise
+        finally:
+            await _call(cursor.close)
+        return consultation_id
 
     async def list_audit_log(self, tx: Transaction, **kwargs: Any) -> list[Row]:
         _ = (tx, kwargs)
