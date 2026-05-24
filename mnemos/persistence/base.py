@@ -1030,6 +1030,115 @@ class StateRepository(ABC):
     ) -> int: ...
 
 
+class AuditChainRepository(ABC):
+    """v6.2 M-2.2.1 per-memory append-only audit chain.
+
+    Backends provide two operations: fetch the latest entry for a
+    memory (so the next builder call has prev_entry_id +
+    prev_entry_hash) and atomically insert a new entry alongside the
+    memory upsert. Sealer worker (mnemos/workers/audit_sealer.py)
+    additionally claims unsealed-window entries via SELECT ... FOR
+    UPDATE SKIP LOCKED and stamps global_root + global_seq columns.
+
+    Schema reference: db/migrations*/0029_memory_audit_chain.sql +
+    0030_memory_audit_roots.sql (shipped at 614d483).
+
+    Implementations are intentionally minimal — the canonical
+    bytes/signing/hash logic lives in mnemos/audit/ and is backend-
+    agnostic. The backend only persists the bytes.
+    """
+
+    @abstractmethod
+    async def get_latest_audit_entry(
+        self,
+        tx: Transaction,
+        memory_id: bytes,
+    ) -> Row | None:
+        """Return the most-recent audit chain row for ``memory_id``.
+
+        Used by the route handler to populate the next entry's
+        ``prev_entry_id`` and ``prev_entry_hash``. Returns ``None`` for
+        first-write memories. Implementations should ``ORDER BY
+        signed_at DESC LIMIT 1`` over the memory_audit_chain table.
+        """
+        ...
+
+    @abstractmethod
+    async def insert_audit_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: bytes,
+        memory_id: bytes,
+        prev_entry_id: bytes | None,
+        prev_entry_hash: bytes | None,
+        op: str,
+        payload_hash: bytes,
+        writer_id: str,
+        writer_pubkey: bytes,
+        signature: bytes,
+        signed_at: Any,
+    ) -> None:
+        """Insert a signed audit entry; commits in the caller's tx so
+        the memory UPSERT and the audit entry are atomic.
+
+        ``op`` MUST be one of: ``create``, ``update``, ``delete``,
+        ``archive``, ``replicate`` (enforced by CHECK constraint;
+        callers usually pass a build_entry() AuditOp Literal).
+        """
+        ...
+
+    @abstractmethod
+    async def claim_unsealed_window(
+        self,
+        tx: Transaction,
+        *,
+        max_window_seconds: int,
+        limit: int,
+    ) -> list[Row]:
+        """Sealer-side: claim the next unsealed window.
+
+        Backends pick rows where ``global_root IS NULL`` AND
+        ``signed_at <= now - max_window_seconds``, oldest-first, up
+        to ``limit`` entries, using a SKIP-LOCKED row lock so multiple
+        sealer instances coexist safely. Caller computes the Merkle
+        root + signs it + writes ``memory_audit_roots`` + UPDATEs
+        these rows' ``global_root`` + ``global_seq`` in the same tx.
+        """
+        ...
+
+    @abstractmethod
+    async def stamp_window_with_root(
+        self,
+        tx: Transaction,
+        *,
+        entry_ids: list[bytes],
+        global_root: bytes,
+        starting_seq: int,
+    ) -> None:
+        """Sealer-side: UPDATE memory_audit_chain SET global_root,
+        global_seq for the given entry_ids. Order preserved — entry
+        at position ``i`` gets ``starting_seq + i``.
+        """
+        ...
+
+    @abstractmethod
+    async def insert_audit_root(
+        self,
+        tx: Transaction,
+        *,
+        global_root: bytes,
+        window_start: Any,
+        window_end: Any,
+        entry_count: int,
+        root_signature: bytes,
+        signer_pubkey: bytes,
+        sealed_at: Any,
+    ) -> None:
+        """Sealer-side: INSERT into memory_audit_roots."""
+        ...
+
+
 class PersistenceBackend(ABC):
     """Top-level facade exposing backend-specific repository families."""
 
@@ -1081,6 +1190,18 @@ class PersistenceBackend(ABC):
     @property
     @abstractmethod
     def federation(self) -> FederationRepository: ...
+
+    @property
+    def audit_chain(self) -> AuditChainRepository | None:
+        """v6.2 M-2.2.1 audit chain repository.
+
+        Returns ``None`` on backends that haven't shipped the audit
+        chain rows yet — callers should treat None as
+        ``MNEMOS_AUDIT_CHAIN=off`` (no audit writes attempted).
+        Concrete backends override this property when the implementation
+        lands.
+        """
+        return None
 
     @abstractmethod
     async def ping(self) -> bool: ...
