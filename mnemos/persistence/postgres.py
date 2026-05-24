@@ -30,6 +30,7 @@ from mnemos.core.visibility import (
 from mnemos.db import eligibility as _eligibility
 from mnemos.db import mcp_repo, openai_compat_repo, portability_repo
 from mnemos.persistence.base import (
+    AuditChainRepository,
     BranchRepository,
     CompressionRepository,
     CompressionStatsRow,
@@ -2667,6 +2668,159 @@ class PostgresStateRepository(StateRepository):
         return _pg_result_count(result)
 
 
+class PostgresAuditChainRepository(AuditChainRepository):
+    """Postgres impl of the v6.2 M-2.2.1 audit chain repository.
+
+    Tables: ``memory_audit_chain`` + ``memory_audit_roots``
+    (migrations 0029 + 0030; shipped at 614d483).
+
+    Atomicity: all operations run inside the caller's tx so audit
+    inserts and the memory UPSERT commit together. The sealer's
+    claim/stamp pair uses ``FOR UPDATE SKIP LOCKED`` so concurrent
+    sealer instances coexist (single-row lock per entry).
+    """
+
+    async def get_latest_audit_entry(
+        self,
+        tx: Transaction,
+        memory_id: bytes,
+    ) -> Row | None:
+        row = await _postgres_tx(tx).conn.fetchrow(
+            """
+            SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                   op, payload_hash, writer_id, writer_pubkey,
+                   signature, signed_at, global_root, global_seq
+            FROM memory_audit_chain
+            WHERE memory_id = $1
+            ORDER BY signed_at DESC
+            LIMIT 1
+            """,
+            memory_id,
+        )
+        return dict(row) if row is not None else None
+
+    async def insert_audit_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: bytes,
+        memory_id: bytes,
+        prev_entry_id: bytes | None,
+        prev_entry_hash: bytes | None,
+        op: str,
+        payload_hash: bytes,
+        writer_id: str,
+        writer_pubkey: bytes,
+        signature: bytes,
+        signed_at: Any,
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            INSERT INTO memory_audit_chain (
+                entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                op, payload_hash, writer_id, writer_pubkey,
+                signature, signed_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            """,
+            entry_id,
+            memory_id,
+            prev_entry_id,
+            prev_entry_hash,
+            op,
+            payload_hash,
+            writer_id,
+            writer_pubkey,
+            signature,
+            signed_at,
+        )
+
+    async def claim_unsealed_window(
+        self,
+        tx: Transaction,
+        *,
+        max_window_seconds: int,
+        limit: int,
+    ) -> list[Row]:
+        """Claim oldest unsealed entries whose signed_at is older than
+        ``now - max_window_seconds``. SKIP LOCKED lets concurrent
+        sealer instances coexist (Postgres 9.5+; available since
+        forever in our supported range).
+        """
+        rows = await _postgres_tx(tx).conn.fetch(
+            """
+            SELECT entry_id, signature, signed_at
+            FROM memory_audit_chain
+            WHERE global_root IS NULL
+              AND signed_at <= NOW() - ($1 || ' seconds')::interval
+            ORDER BY signed_at ASC, entry_id ASC
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+            """,
+            str(max_window_seconds),
+            limit,
+        )
+        return [dict(r) for r in rows]
+
+    async def stamp_window_with_root(
+        self,
+        tx: Transaction,
+        *,
+        entry_ids: list[bytes],
+        global_root: bytes,
+        starting_seq: int,
+    ) -> None:
+        if not entry_ids:
+            return
+        # Use unnest + WITH ORDINALITY to preserve per-id seq order.
+        await _postgres_tx(tx).conn.execute(
+            """
+            WITH ordered AS (
+                SELECT unnest($1::bytea[]) AS entry_id,
+                       generate_series($3::bigint,
+                                       $3::bigint + array_length($1, 1) - 1) AS seq
+            )
+            UPDATE memory_audit_chain m
+            SET global_root = $2,
+                global_seq = o.seq
+            FROM ordered o
+            WHERE m.entry_id = o.entry_id
+            """,
+            entry_ids,
+            global_root,
+            starting_seq,
+        )
+
+    async def insert_audit_root(
+        self,
+        tx: Transaction,
+        *,
+        global_root: bytes,
+        window_start: Any,
+        window_end: Any,
+        entry_count: int,
+        root_signature: bytes,
+        signer_pubkey: bytes,
+        sealed_at: Any,
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            INSERT INTO memory_audit_roots (
+                global_root, window_start, window_end, entry_count,
+                root_signature, signer_pubkey, sealed_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            global_root,
+            window_start,
+            window_end,
+            entry_count,
+            root_signature,
+            signer_pubkey,
+            sealed_at,
+        )
+
+
 class PostgresBackend(PersistenceBackend):
     """Postgres persistence facade backed by an asyncpg pool."""
 
@@ -2702,6 +2856,7 @@ class PostgresBackend(PersistenceBackend):
         self._consultations = PostgresConsultationsRepository()
         self._federation = PostgresFederationRepository()
         self._state_kv = PostgresStateRepository()
+        self._audit_chain = PostgresAuditChainRepository()
         self._closed = False
 
     @property
@@ -2771,6 +2926,10 @@ class PostgresBackend(PersistenceBackend):
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv
+
+    @property
+    def audit_chain(self) -> AuditChainRepository:
+        return self._audit_chain
 
     async def ping(self) -> bool:
         try:
