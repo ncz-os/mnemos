@@ -31,6 +31,7 @@ from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 from mnemos.persistence.base import (
+    AuditChainRepository,
     BranchRepository,
     CompressionRepository,
     ConsultationAuditRepository,
@@ -3298,6 +3299,212 @@ class OracleStateRepository(StateRepository):
             await _call(cursor.close)
 
 
+class OracleAuditChainRepository(AuditChainRepository):
+    """Oracle impl of v6.2 M-2.2.1 audit chain.
+
+    Tables: ``memory_audit_chain`` + ``memory_audit_roots``
+    (migrations 0029 + 0030; shipped at 614d483 for Oracle).
+
+    Bytes columns are RAW(16/32/64) — bind via plain ``bytes``
+    through python-oracledb (driver coerces). Timestamps are
+    TIMESTAMP WITH TIME ZONE — bind ISO 8601 strings via
+    ``CAST(:ts AS TIMESTAMP WITH TIME ZONE)``.
+
+    Concurrent sealer instances coexist via Oracle's
+    ``FOR UPDATE SKIP LOCKED`` (11g+).
+    """
+
+    async def get_latest_audit_entry(
+        self,
+        tx: Transaction,
+        memory_id: bytes,
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT * FROM (
+                    SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                           op, payload_hash, writer_id, writer_pubkey,
+                           signature, signed_at, global_root, global_seq
+                    FROM memory_audit_chain
+                    WHERE memory_id = :memory_id
+                    ORDER BY signed_at DESC
+                ) WHERE ROWNUM = 1
+                """,
+                {"memory_id": memory_id},
+            )
+            row = await _call(cursor.fetchone)
+            if row is None:
+                return None
+            cols = [d[0].lower() for d in cursor.description]
+            return dict(zip(cols, row))
+        finally:
+            await _call(cursor.close)
+
+    async def insert_audit_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: bytes,
+        memory_id: bytes,
+        prev_entry_id: bytes | None,
+        prev_entry_hash: bytes | None,
+        op: str,
+        payload_hash: bytes,
+        writer_id: str,
+        writer_pubkey: bytes,
+        signature: bytes,
+        signed_at: Any,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memory_audit_chain (
+                    entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                    op, payload_hash, writer_id, writer_pubkey,
+                    signature, signed_at
+                )
+                VALUES (
+                    :entry_id, :memory_id, :prev_entry_id, :prev_entry_hash,
+                    :op, :payload_hash, :writer_id, :writer_pubkey,
+                    :signature, TO_TIMESTAMP_TZ(:signed_at, 'YYYY-MM-DD"T"HH24:MI:SS.FFTZH:TZM')
+                )
+                """,
+                {
+                    "entry_id": entry_id,
+                    "memory_id": memory_id,
+                    "prev_entry_id": prev_entry_id,
+                    "prev_entry_hash": prev_entry_hash,
+                    "op": op,
+                    "payload_hash": payload_hash,
+                    "writer_id": writer_id,
+                    "writer_pubkey": writer_pubkey,
+                    "signature": signature,
+                    "signed_at": signed_at,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def claim_unsealed_window(
+        self,
+        tx: Transaction,
+        *,
+        max_window_seconds: int,
+        limit: int,
+    ) -> list[Row]:
+        """Claim oldest unsealed entries older than the cutoff using
+        ``FOR UPDATE SKIP LOCKED``. Oracle's NUMTODSINTERVAL is the
+        equivalent of PG's ``interval '<n> seconds'``.
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT entry_id, signature, signed_at
+                FROM memory_audit_chain
+                WHERE global_root IS NULL
+                  AND signed_at <= SYSTIMESTAMP - NUMTODSINTERVAL(:secs, 'SECOND')
+                  AND ROWNUM <= :max_rows
+                ORDER BY signed_at ASC, entry_id ASC
+                FOR UPDATE SKIP LOCKED
+                """,
+                {"secs": int(max_window_seconds), "max_rows": int(limit)},
+            )
+            rows = await _call(cursor.fetchall)
+            if not rows:
+                return []
+            cols = [d[0].lower() for d in cursor.description]
+            return [dict(zip(cols, r)) for r in rows]
+        finally:
+            await _call(cursor.close)
+
+    async def stamp_window_with_root(
+        self,
+        tx: Transaction,
+        *,
+        entry_ids: list[bytes],
+        global_root: bytes,
+        starting_seq: int,
+    ) -> None:
+        if not entry_ids:
+            return
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            # Oracle has no array-unnest; loop UPDATE preserving
+            # caller-supplied seq order. Hot-path correctness > batch
+            # microseconds here — sealer runs at 60s cadence.
+            for offset, eid in enumerate(entry_ids):
+                await _call(
+                    cursor.execute,
+                    """
+                    UPDATE memory_audit_chain
+                    SET global_root = :root, global_seq = :seq
+                    WHERE entry_id = :eid
+                    """,
+                    {
+                        "root": global_root,
+                        "seq": starting_seq + offset,
+                        "eid": eid,
+                    },
+                )
+        finally:
+            await _call(cursor.close)
+
+    async def insert_audit_root(
+        self,
+        tx: Transaction,
+        *,
+        global_root: bytes,
+        window_start: Any,
+        window_end: Any,
+        entry_count: int,
+        root_signature: bytes,
+        signer_pubkey: bytes,
+        sealed_at: Any,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memory_audit_roots (
+                    global_root, window_start, window_end, entry_count,
+                    root_signature, signer_pubkey, sealed_at
+                )
+                VALUES (
+                    :global_root,
+                    TO_TIMESTAMP_TZ(:window_start, 'YYYY-MM-DD"T"HH24:MI:SS.FFTZH:TZM'),
+                    TO_TIMESTAMP_TZ(:window_end, 'YYYY-MM-DD"T"HH24:MI:SS.FFTZH:TZM'),
+                    :entry_count,
+                    :root_signature, :signer_pubkey,
+                    TO_TIMESTAMP_TZ(:sealed_at, 'YYYY-MM-DD"T"HH24:MI:SS.FFTZH:TZM')
+                )
+                """,
+                {
+                    "global_root": global_root,
+                    "window_start": window_start,
+                    "window_end": window_end,
+                    "entry_count": int(entry_count),
+                    "root_signature": root_signature,
+                    "signer_pubkey": signer_pubkey,
+                    "sealed_at": sealed_at,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
+
 class OracleBackend(PersistenceBackend):
     """Oracle persistence facade backed by a python-oracledb async pool."""
 
@@ -3322,6 +3529,7 @@ class OracleBackend(PersistenceBackend):
         self._consultations_repo = OracleConsultationsRepository()
         self._federation_repo = OracleFederationRepository()
         self._state_kv_repo = OracleStateRepository()
+        self._audit_chain_repo = OracleAuditChainRepository()
 
     @property
     def settings(self) -> Any:
@@ -3392,6 +3600,10 @@ class OracleBackend(PersistenceBackend):
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv_repo
+
+    @property
+    def audit_chain(self) -> AuditChainRepository:
+        return self._audit_chain_repo
 
     async def ping(self) -> bool:
         try:
