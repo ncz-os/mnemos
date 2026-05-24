@@ -26,6 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import backend_or_503 as _backend_or_503
 from mnemos.audit import derive_writer_keypair, load_root_keypair
+from mnemos.audit.crypto import merkle_leaf, merkle_proof, merkle_root
 from mnemos.audit.route_helper import memory_id_to_audit_bytes
 from mnemos.workers.audit_sealer import audit_chain_enabled
 
@@ -145,6 +146,188 @@ async def audit_proof_head(
     if row.get("prev_entry_hash") is not None:
         out["prev_entry_hash"] = row["prev_entry_hash"].hex()
     return out
+
+
+@router.get("/inclusion_proof")
+async def audit_inclusion_proof(
+    entry_id: str = Query(
+        ...,
+        description="Hex-encoded entry_id whose inclusion proof to return",
+    ),
+    user: UserContext = Depends(get_current_user),
+) -> dict:
+    """Return Merkle inclusion proof for one audit entry.
+
+    Caller passes ``entry_id`` (hex, 32 chars = 16 bytes). Endpoint:
+    1. Looks up the entry in ``memory_audit_chain``.
+    2. Errors 422 if entry is not yet sealed (global_root IS NULL).
+    3. Fetches ALL entries in the same sealed window
+       (WHERE global_root = X, ORDER BY signed_at, entry_id) -- the
+       SAME order the sealer used to build the leaves.
+    4. Computes the sibling-hash path from leaf to root via
+       `mnemos.audit.crypto.merkle_proof`.
+
+    Verifier uses `mnemos.audit.crypto.verify_inclusion(leaf, proof, root)`
+    -- walks the sibling list pairwise SHA-256-hashing, returns True
+    iff the reconstructed root matches the published ``global_root``.
+    """
+    if not audit_chain_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="audit chain disabled (MNEMOS_AUDIT_CHAIN not 'on')",
+        )
+    backend = _backend_or_503()
+    if backend.audit_chain is None:
+        raise HTTPException(
+            status_code=503,
+            detail="backend has no audit_chain repository",
+        )
+
+    try:
+        entry_id_bytes = bytes.fromhex(entry_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"entry_id must be hex: {exc}",
+        )
+    if len(entry_id_bytes) != 16:
+        raise HTTPException(
+            status_code=400,
+            detail=f"entry_id must be 32 hex chars (got {len(entry_id_bytes)} bytes)",
+        )
+
+    async with backend.transactional() as tx:
+        # Find the entry by entry_id. We need its memory_id +
+        # global_root to scope the window.
+        # No direct "fetch by entry_id" -- piggyback on list_window_entries
+        # only after the get_latest_audit_entry would have run. Cheaper:
+        # use the chain repo's existing get path indirectly. Direct SQL
+        # via backend.transactional is the cleanest path; expose via a
+        # short helper in this route.
+        target_row = await _fetch_entry_by_id(backend, tx, entry_id_bytes)
+        if target_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"audit entry {entry_id} not found",
+            )
+        if target_row.get("global_root") is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"audit entry {entry_id} is not yet sealed "
+                    "(sealer hasn't claimed its window). Retry after "
+                    "the next seal cadence."
+                ),
+            )
+
+        global_root_bytes = target_row["global_root"]
+        window_rows = await backend.audit_chain.list_window_entries(tx, global_root_bytes)
+
+    if not window_rows:
+        # Should never happen — target said it was sealed under this
+        # root, but the window is empty. Defensive guard for caller
+        # debugging.
+        raise HTTPException(
+            status_code=500,
+            detail="audit window is empty despite sealed target; chain inconsistency",
+        )
+
+    # Build leaves in the same order the sealer used.
+    leaves = [merkle_leaf(r["entry_id"], r["signature"]) for r in window_rows]
+    target_idx: int | None = None
+    for i, r in enumerate(window_rows):
+        if r["entry_id"] == entry_id_bytes:
+            target_idx = i
+            break
+    if target_idx is None:
+        raise HTTPException(
+            status_code=500,
+            detail=("target entry not found in its own window; chain " "inconsistency between get + list"),
+        )
+
+    proof = merkle_proof(leaves, target_idx)
+
+    # Self-check: reconstructed root must match the published one.
+    # Fail loud if not — server-side bug, not a client error.
+    computed = merkle_root(leaves)
+    if computed != global_root_bytes:
+        raise HTTPException(
+            status_code=500,
+            detail=("computed Merkle root does not match stored global_root; " "sealer/proof routine drift"),
+        )
+
+    return {
+        "entry_id": entry_id,
+        "leaf_hash": leaves[target_idx].hex(),
+        "leaf_index": target_idx,
+        "window_size": len(window_rows),
+        "global_root": global_root_bytes.hex(),
+        "global_seq": target_row.get("global_seq"),
+        "proof": [{"sibling": sib.hex(), "position": pos} for sib, pos in proof],
+    }
+
+
+async def _fetch_entry_by_id(backend, tx, entry_id_bytes: bytes) -> dict | None:
+    """Best-effort fetch by entry_id via backend-specific SQL path.
+
+    Repository protocol doesn't expose a get-by-entry-id today;
+    inline a backend-aware query here. PG / SQLite / Oracle differ
+    only on bind syntax; we use the underlying connection accessors
+    each backend exposes.
+    """
+    # Postgres
+    pg_tx = getattr(tx, "conn", None)
+    if hasattr(pg_tx, "fetchrow") and hasattr(pg_tx, "fetch"):
+        row = await pg_tx.fetchrow(
+            """
+            SELECT entry_id, memory_id, signature, signed_at,
+                   global_root, global_seq, payload_hash, op
+            FROM memory_audit_chain
+            WHERE entry_id = $1
+            """,
+            entry_id_bytes,
+        )
+        return dict(row) if row is not None else None
+
+    # SQLite (via cursor on the conn attribute)
+    if hasattr(pg_tx, "execute") and "sqlite" in type(pg_tx).__module__:
+        from mnemos.persistence.sqlite import _fetch_one
+
+        return await _fetch_one(
+            pg_tx,
+            """
+            SELECT entry_id, memory_id, signature, signed_at,
+                   global_root, global_seq, payload_hash, op
+            FROM memory_audit_chain
+            WHERE entry_id = ?
+            """,
+            (entry_id_bytes,),
+        )
+
+    # Oracle / Db2 (python-oracledb async conn)
+    if pg_tx is not None and hasattr(pg_tx, "cursor"):
+        cursor = pg_tx.cursor()
+        if hasattr(cursor, "__await__"):
+            cursor = await cursor
+        try:
+            await cursor.execute(
+                """
+                SELECT entry_id, memory_id, signature, signed_at,
+                       global_root, global_seq, payload_hash, op
+                FROM memory_audit_chain
+                WHERE entry_id = :eid
+                """,
+                {"eid": entry_id_bytes},
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            cols = [d[0].lower() for d in cursor.description]
+            return dict(zip(cols, row))
+        finally:
+            await cursor.close()
+
+    raise RuntimeError(f"_fetch_entry_by_id: unsupported tx shape {type(tx)!r}")
 
 
 def _to_iso(value) -> str:

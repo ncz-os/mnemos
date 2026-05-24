@@ -1138,6 +1138,22 @@ class AuditChainRepository(ABC):
         """Sealer-side: INSERT into memory_audit_roots."""
         ...
 
+    @abstractmethod
+    async def list_window_entries(
+        self,
+        tx: Transaction,
+        global_root: bytes,
+    ) -> list[Row]:
+        """Return all entries sealed under ``global_root`` ordered by
+        (signed_at, entry_id) -- the SAME order the sealer used to
+        compute the Merkle leaves. Critical for the inclusion-proof
+        endpoint to reconstruct the tree deterministically.
+
+        Returns ``[]`` when no entries match (root unknown OR
+        empty-window seal). Caller treats empty as 404.
+        """
+        ...
+
 
 class PersistenceBackend(ABC):
     """Top-level facade exposing backend-specific repository families."""

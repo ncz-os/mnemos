@@ -3455,6 +3455,23 @@ class SqliteAuditChainRepository(_SqliteRepository, AuditChainRepository):
             ),
         )
 
+    async def list_window_entries(
+        self,
+        tx: Transaction,
+        global_root: bytes,
+    ) -> list[Row]:
+        return await _fetch_all(
+            self._conn(tx),
+            """
+            SELECT entry_id, memory_id, signature, signed_at,
+                   global_seq, payload_hash, op
+            FROM memory_audit_chain
+            WHERE global_root = ?
+            ORDER BY datetime(signed_at) ASC, entry_id ASC
+            """,
+            (global_root,),
+        )
+
 
 class SqliteBackend(PersistenceBackend):
     """SQLite persistence facade backed by one serialized connection."""
