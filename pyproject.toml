@@ -133,10 +133,13 @@ full = ["mnemos-os[morpheus,persephone,pantheon,kronos,knossos,apollo,artemis,na
 # wheel, install the IBM DSN client first.
 oracle = ["oracledb>=4.0.1"]  # async pool + VECTOR support; thin mode default; tested with 4.0.1
 db2 = ["ibm_db>=3.2.4"]  # ibm_db_dbi + Db2 CLI driver build
-# Enterprise bundle = both enterprise drivers, suitable for hosts that
-# need to talk to either Oracle 23ai or IBM Db2 12.1.5 (or pick at runtime
-# via MNEMOS_DATABASE_DSN).
-enterprise = ["mnemos-os[oracle,db2]"]
+# MySQL 9.0+ backend (aiomysql async driver). MySQL 9.0 is required for
+# native VECTOR columns and VEC_DISTANCE_COSINE / VEC_FromText functions.
+# MariaDB does NOT support native VECTOR in mainline 11.x — use MySQL 9.0+.
+mysql = ["aiomysql>=0.2.0"]
+# Enterprise bundle — all three enterprise drivers suitable for hosts that
+# need to pick a backend at runtime via MNEMOS_DATABASE_DSN.
+enterprise = ["mnemos-os[oracle,db2,mysql]"]
 # [semantic] — optional semantic-similarity quality scoring.
 # fastembed uses ONNX runtime (~10-20 MB), supports the same
 # MiniLM/Nomic embedding family as sentence-transformers, and pulls

@@ -41,6 +41,18 @@ from mnemos.persistence.sqlite import (
     SqliteVersionRepository,
     SqliteWebhookRepository,
 )
+from mnemos.persistence.mysql import (
+    MysqlBackend,
+    MysqlBranchRepository,
+    MysqlCompressionRepository,
+    MysqlConsultationAuditRepository,
+    MysqlFederationRepository,
+    MysqlKGRepository,
+    MysqlMemoryRepository,
+    MysqlStateRepository,
+    MysqlVersionRepository,
+    MysqlWebhookRepository,
+)
 from mnemos.persistence.types import ModelRecommendation
 
 __all__ = [
@@ -52,6 +64,16 @@ __all__ = [
     "KGRepository",
     "MemoryRepository",
     "ModelRecommendation",
+    "MysqlBackend",
+    "MysqlBranchRepository",
+    "MysqlCompressionRepository",
+    "MysqlConsultationAuditRepository",
+    "MysqlFederationRepository",
+    "MysqlKGRepository",
+    "MysqlMemoryRepository",
+    "MysqlStateRepository",
+    "MysqlVersionRepository",
+    "MysqlWebhookRepository",
     "PersistenceBackend",
     "PostgresBackend",
     "PostgresBranchRepository",
