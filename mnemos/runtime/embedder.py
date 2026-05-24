@@ -52,6 +52,16 @@ DEFAULT_CIX_MAX_SEQ_LEN = 256
 DEFAULT_HYBRID = False
 DEFAULT_NPU_THRESHOLD_CHARS = 1000  # ~256 tokens at 4 chars/token
 DEFAULT_MODEL_PATH = "/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf"
+# HTTP backend (mem_1779334716543_f8ebd4 EXCEPTION clause 2026-05-23):
+# operator-authorized MEDUSA llama.cpp Vulkan endpoint at
+# http://192.168.207.64:8090/v1/embeddings. Same memo forbids ollama or
+# any other HTTP embed provider; MEDUSA is the sole exception. Must
+# circuit-break + fall through to llamacpp on >30s outage.
+DEFAULT_HTTP_URL = "http://192.168.207.64:8090/v1/embeddings"
+DEFAULT_HTTP_MODEL = "bge-m3"
+DEFAULT_HTTP_TIMEOUT = 30.0
+DEFAULT_HTTP_CB_THRESHOLD = 5  # consecutive failures before opening breaker
+DEFAULT_HTTP_CB_COOLDOWN = 30.0  # seconds breaker stays open before half-open probe
 # bge-base-en-v1.5: 768-dim, standard BERT-base, fully OpenVINO-supported.
 # Matches the existing `memories.embedding vector(768)` column. Nomic
 # uses a custom nomic_bert arch that optimum-intel's OV exporter does
@@ -336,6 +346,206 @@ class _CixNpuBackend:
         return self._embed_dim
 
 
+class _HttpBackend:
+    """OpenAI-compatible /v1/embeddings HTTP backend.
+
+    Operator-locked decision (mem_1779334716543_f8ebd4 EXCEPTION clause
+    2026-05-23) restricts this backend to the MEDUSA llama.cpp Vulkan
+    endpoint at http://192.168.207.64:8090/v1/embeddings (or another
+    operator-vetted local-LAN llama-server). ollama at any host remains
+    forbidden — the 2026-05-21 90-day silent-stall incident was caused
+    by a stale podman-compose service alias and this backend MUST guard
+    against the same failure mode.
+
+    Defenses:
+      * Per-call timeout (DEFAULT_HTTP_TIMEOUT, 30s).
+      * Consecutive-failure circuit breaker (DEFAULT_HTTP_CB_THRESHOLD,
+        5 failures → open for DEFAULT_HTTP_CB_COOLDOWN, 30s).
+      * Caller-side fall-through: HybridHttpEmbedder wraps this with an
+        in-process llama-cpp fallback so embedder.embed_text never
+        returns silently-stale.
+      * Per-call latency + status logging so /v1/admin/embed_stats can
+        surface degradation within minutes (vs the original 90 days).
+    """
+
+    def __init__(
+        self,
+        url: str,
+        model: str,
+        timeout: float,
+        max_chars: int,
+        cb_threshold: int = DEFAULT_HTTP_CB_THRESHOLD,
+        cb_cooldown: float = DEFAULT_HTTP_CB_COOLDOWN,
+    ) -> None:
+        self.url = url
+        self.model = model
+        self.timeout = timeout
+        self.max_chars = max_chars
+        self._cb_threshold = cb_threshold
+        self._cb_cooldown = cb_cooldown
+        self._consecutive_failures = 0
+        self._breaker_opened_at: float | None = None
+        self._embed_dim: int | None = None
+        self._client = None  # lazy httpx.AsyncClient
+
+    def _build_client_sync(self) -> None:
+        if self._client is not None:
+            return
+        import httpx
+
+        self._client = httpx.AsyncClient(timeout=self.timeout)
+        logger.info(
+            "[EMBED][http] backend ready: url=%s model=%s timeout=%.1fs",
+            self.url,
+            self.model,
+            self.timeout,
+        )
+
+    def _load_sync(self) -> None:
+        # No model file to load; just instantiate the client. Dim is
+        # discovered on the first successful embed call.
+        self._build_client_sync()
+
+    @property
+    def loaded(self) -> bool:
+        return self._client is not None
+
+    @property
+    def embed_dim(self) -> int | None:
+        return self._embed_dim
+
+    def _breaker_open(self) -> bool:
+        """Return True iff breaker is currently open (block calls)."""
+        if self._breaker_opened_at is None:
+            return False
+        import time as _t
+
+        if _t.monotonic() - self._breaker_opened_at >= self._cb_cooldown:
+            # Cooldown elapsed; half-open: allow next call to probe.
+            self._breaker_opened_at = None
+            self._consecutive_failures = 0
+            logger.info("[EMBED][http] circuit breaker half-open; probing %s", self.url)
+            return False
+        return True
+
+    def _record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._breaker_opened_at = None
+
+    def _record_failure(self) -> None:
+        import time as _t
+
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._cb_threshold and self._breaker_opened_at is None:
+            self._breaker_opened_at = _t.monotonic()
+            logger.warning(
+                "[EMBED][http] circuit breaker OPEN after %d consecutive failures; " "cooling down %.1fs (url=%s)",
+                self._consecutive_failures,
+                self._cb_cooldown,
+                self.url,
+            )
+
+    async def embed_async(self, text: str) -> list[float]:
+        """Async embed; respects breaker. Returns [] on failure (caller falls
+        through to the wrapping HybridHttpEmbedder's local backend)."""
+        if not text or not text.strip():
+            return []
+        if self._client is None:
+            self._build_client_sync()
+        if self._breaker_open():
+            return []
+        truncated = text[: self.max_chars]
+        import time as _t
+
+        t0 = _t.monotonic()
+        try:
+            r = await self._client.post(
+                self.url,
+                json={"model": self.model, "input": truncated},
+            )
+            dt_ms = (_t.monotonic() - t0) * 1000.0
+            if r.status_code != 200:
+                logger.warning(
+                    "[EMBED][http] status=%d latency_ms=%.1f url=%s",
+                    r.status_code,
+                    dt_ms,
+                    self.url,
+                )
+                self._record_failure()
+                return []
+            data = r.json()
+            vec = data["data"][0]["embedding"]
+            if self._embed_dim is None:
+                self._embed_dim = len(vec)
+                logger.info("[EMBED][http] embed_dim=%d (discovered)", self._embed_dim)
+            self._record_success()
+            logger.debug("[EMBED][http] ok latency_ms=%.1f dim=%d", dt_ms, len(vec))
+            return list(vec)
+        except Exception as exc:
+            dt_ms = (_t.monotonic() - t0) * 1000.0
+            logger.warning(
+                "[EMBED][http] exception=%s latency_ms=%.1f url=%s",
+                type(exc).__name__,
+                dt_ms,
+                self.url,
+            )
+            self._record_failure()
+            return []
+
+    async def embed_batch_async(self, texts: list[str]) -> list[list[float]]:
+        """Batch embed; one POST per call with `input` as a list. Returns
+        per-text [] on partial failure modes (length mismatch)."""
+        cleaned = [(t or "")[: self.max_chars] for t in texts]
+        nonempty = [c for c in cleaned if c.strip()]
+        if not nonempty:
+            return [[] for _ in texts]
+        if self._client is None:
+            self._build_client_sync()
+        if self._breaker_open():
+            return [[] for _ in texts]
+        import time as _t
+
+        t0 = _t.monotonic()
+        try:
+            r = await self._client.post(
+                self.url,
+                json={"model": self.model, "input": cleaned},
+            )
+            dt_ms = (_t.monotonic() - t0) * 1000.0
+            if r.status_code != 200:
+                logger.warning(
+                    "[EMBED][http] batch status=%d count=%d latency_ms=%.1f",
+                    r.status_code,
+                    len(cleaned),
+                    dt_ms,
+                )
+                self._record_failure()
+                return [[] for _ in texts]
+            data = r.json()
+            vecs = [list(d["embedding"]) for d in data["data"]]
+            if self._embed_dim is None and vecs:
+                self._embed_dim = len(vecs[0])
+                logger.info("[EMBED][http] embed_dim=%d (discovered, batch)", self._embed_dim)
+            self._record_success()
+            logger.info(
+                "[EMBED][http] batch ok count=%d latency_ms=%.1f rate=%.1f emb/s",
+                len(vecs),
+                dt_ms,
+                len(vecs) / max(0.001, dt_ms / 1000.0),
+            )
+            return vecs
+        except Exception as exc:
+            dt_ms = (_t.monotonic() - t0) * 1000.0
+            logger.warning(
+                "[EMBED][http] batch exception=%s count=%d latency_ms=%.1f",
+                type(exc).__name__,
+                len(cleaned),
+                dt_ms,
+            )
+            self._record_failure()
+            return [[] for _ in texts]
+
+
 def _cix_npu_available() -> bool:
     """Return True if Cix NPU is usable on this host (device + library + model)."""
     if not Path("/dev/aipu").exists():
@@ -410,6 +620,10 @@ class InProcessEmbedder:
         cix_model_path: str | None = None,
         cix_tokenizer_id: str | None = None,
         cix_max_seq_len: int | None = None,
+        # http knobs (mem_1779334716543_f8ebd4 EXCEPTION clause 2026-05-23)
+        http_url: str | None = None,
+        http_model: str | None = None,
+        http_timeout: float | None = None,
         # hybrid knobs
         hybrid: bool | None = None,
         npu_threshold_chars: int | None = None,
@@ -448,6 +662,13 @@ class InProcessEmbedder:
             if n_gpu_layers is not None
             else os.environ.get("MNEMOS_EMBED_GPU_LAYERS", DEFAULT_N_GPU_LAYERS)
         )
+        self.http_url = http_url or os.environ.get("MNEMOS_EMBED_HTTP_URL", DEFAULT_HTTP_URL)
+        self.http_model = http_model or os.environ.get("MNEMOS_EMBED_HTTP_MODEL", DEFAULT_HTTP_MODEL)
+        self.http_timeout = float(
+            http_timeout
+            if http_timeout is not None
+            else os.environ.get("MNEMOS_EMBED_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT)
+        )
         self.max_text_chars = int(
             max_text_chars
             if max_text_chars is not None
@@ -472,6 +693,13 @@ class InProcessEmbedder:
                 model_path=self.cix_model_path,
                 tokenizer_id=self.cix_tokenizer_id,
                 max_seq_len=self.cix_max_seq_len,
+                max_chars=self.max_text_chars,
+            )
+        if name == "http":
+            return _HttpBackend(
+                url=self.http_url,
+                model=self.http_model,
+                timeout=self.http_timeout,
                 max_chars=self.max_text_chars,
             )
         return _LlamaCppBackend(
@@ -503,6 +731,31 @@ class InProcessEmbedder:
                 max_seq_len=self.cix_max_seq_len,
                 max_chars=self.max_text_chars,
             )
+        # HTTP fallback: per mem_1779334716543_f8ebd4 EXCEPTION clause,
+        # the http backend MUST fall through to in-process llamacpp when
+        # the remote endpoint is unreachable. The fallback is constructed
+        # lazily so missing GGUF on hosts that intentionally have only
+        # http available doesn't fail startup.
+        self._http_fallback: _LlamaCppBackend | None = None
+        if resolved == "http":
+            try:
+                if Path(self.model_path).exists():
+                    self._http_fallback = _LlamaCppBackend(
+                        model_path=self.model_path,
+                        n_ctx=self.n_ctx,
+                        n_threads=self.n_threads,
+                        n_gpu_layers=self.n_gpu_layers,
+                        max_chars=self.max_text_chars,
+                    )
+                    logger.info("[EMBED] http backend fallback prepared: %s", self.model_path)
+                else:
+                    logger.warning(
+                        "[EMBED] http backend has NO local fallback (%s missing); "
+                        "MEDUSA outages will return [] embeddings",
+                        self.model_path,
+                    )
+            except Exception:
+                logger.exception("[EMBED] http backend fallback prep failed")
 
     def _load_sync(self) -> None:
         self._build_backend()
@@ -538,6 +791,10 @@ class InProcessEmbedder:
         graph at max_seq_len=256 tokens, low-latency). Longer inputs go
         to the primary backend (OV / llama-cpp) which has flexible
         max_length. This avoids silent truncation on the NPU's fixed shape.
+
+        For the http backend, the call is async (httpx) — no executor
+        thread. On empty result the optional local fallback is invoked
+        per mem_1779334716543_f8ebd4 EXCEPTION clause.
         """
         truncated = (text or "")[: self.max_text_chars]
         if not truncated.strip():
@@ -545,6 +802,19 @@ class InProcessEmbedder:
         async with self._lock:
             try:
                 await self._ensure_loaded()
+                if isinstance(self._backend, _HttpBackend):
+                    vec = await self._backend.embed_async(truncated)
+                    if vec:
+                        return vec
+                    # Empty -> breaker open or remote failed; fall through.
+                    if self._http_fallback is not None:
+                        if not self._http_fallback.loaded:
+                            await asyncio.get_running_loop().run_in_executor(None, self._http_fallback._load_sync)
+                        logger.warning("[EMBED][http] fallback -> llamacpp local")
+                        return await asyncio.get_running_loop().run_in_executor(
+                            None, self._http_fallback._embed_sync, truncated
+                        )
+                    return []
                 use_npu = (
                     self._npu_sidecar is not None
                     and self._npu_sidecar.loaded
@@ -565,13 +835,33 @@ class InProcessEmbedder:
                 return []
 
     async def embed_batch(self, texts: Iterable[str]) -> list[list[float]]:
-        """Embed multiple strings sequentially.
-
-        Neither backend supports safe parallel embed() calls — both serialize
-        through the lock. Embed concurrency comes from running multiple
-        worker processes, not multiple coroutines per process.
+        """Embed multiple strings. For the http backend, sends one POST
+        with input=list[str] (MEDUSA llama.cpp handles batch). For
+        local backends, falls back to per-text sequential calls since
+        neither in-process backend is reentrant.
         """
-        return [await self.embed(t) for t in texts]
+        texts_list = list(texts)
+        if isinstance(self._backend, _HttpBackend) or self.backend_choice == "http":
+            async with self._lock:
+                try:
+                    await self._ensure_loaded()
+                    if isinstance(self._backend, _HttpBackend):
+                        vecs = await self._backend.embed_batch_async(texts_list)
+                        # Per-row fallback for items that came back empty when
+                        # http path returned partial / total failure.
+                        if any(not v for v in vecs) and self._http_fallback is not None:
+                            if not self._http_fallback.loaded:
+                                await asyncio.get_running_loop().run_in_executor(None, self._http_fallback._load_sync)
+                            for i, (v, t) in enumerate(zip(vecs, texts_list)):
+                                if not v and t and t.strip():
+                                    logger.warning("[EMBED][http] batch fallback idx=%d", i)
+                                    vecs[i] = await asyncio.get_running_loop().run_in_executor(
+                                        None, self._http_fallback._embed_sync, t[: self.max_text_chars]
+                                    )
+                        return vecs
+                except Exception:
+                    logger.exception("[EMBED] http batch failed; per-text fallback")
+        return [await self.embed(t) for t in texts_list]
 
 
 _embedder: InProcessEmbedder | None = None
