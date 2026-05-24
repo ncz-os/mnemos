@@ -2854,6 +2854,31 @@ class PostgresAuditChainRepository(AuditChainRepository):
         )
         return dict(row) if row is not None else None
 
+    async def get_latest_audit_entries_batch(
+        self,
+        tx: Transaction,
+        memory_ids: list[bytes],
+    ) -> dict[bytes, Row]:
+        """Batch via DISTINCT ON (memory_id) ... ORDER BY memory_id,
+        signed_at DESC. Postgres-specific (DISTINCT ON not portable);
+        backends without it fall back to the base impl.
+        """
+        if not memory_ids:
+            return {}
+        rows = await _postgres_tx(tx).conn.fetch(
+            """
+            SELECT DISTINCT ON (memory_id)
+                   entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                   op, payload_hash, writer_id, writer_pubkey,
+                   signature, signed_at, global_root, global_seq
+            FROM memory_audit_chain
+            WHERE memory_id = ANY($1::bytea[])
+            ORDER BY memory_id, signed_at DESC
+            """,
+            memory_ids,
+        )
+        return {r["memory_id"]: dict(r) for r in rows}
+
 
 class PostgresBackend(PersistenceBackend):
     """Postgres persistence facade backed by an asyncpg pool."""

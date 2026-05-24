@@ -1169,6 +1169,31 @@ class AuditChainRepository(ABC):
         """
         ...
 
+    async def get_latest_audit_entries_batch(
+        self,
+        tx: Transaction,
+        memory_ids: list[bytes],
+    ) -> dict[bytes, Row]:
+        """Batch version of ``get_latest_audit_entry`` for N memories.
+
+        Default fallback impl serially calls
+        ``get_latest_audit_entry`` per id; backends override with a
+        single SQL query (typically `WHERE memory_id = ANY(...)` +
+        window function or a CTE picking the max signed_at per
+        memory_id). The federation-feed audit-head piggyback hot-path
+        is the canonical caller -- N+1 audit reads otherwise.
+
+        Returns a dict keyed by ``memory_id`` for entries that have
+        any audit history; absent keys mean no audit entries for
+        that memory_id.
+        """
+        result: dict[bytes, Row] = {}
+        for mid in memory_ids:
+            row = await self.get_latest_audit_entry(tx, mid)
+            if row is not None:
+                result[mid] = row
+        return result
+
 
 class PersistenceBackend(ABC):
     """Top-level facade exposing backend-specific repository families."""
