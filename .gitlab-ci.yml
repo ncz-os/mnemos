@@ -21,8 +21,15 @@ default:
         - pyproject.toml
     paths:
       - .cache/pip
+      - .venv
   before_script:
-    - uv pip install --system --cache-dir=.cache/pip -e ".[dev]"
+    # ARGOS runner is user-mode + Debian 13 (PEP 668). Cannot install into
+    # /usr/local/lib/python3.13/dist-packages without root and cannot use
+    # --system. Use a project-local venv that we cache between runs.
+    - export PATH="/usr/local/bin:/home/jasonperlow/.local/bin:$PATH"
+    - test -d .venv || uv venv .venv
+    - . .venv/bin/activate
+    - uv pip install --cache-dir=.cache/pip -e ".[dev]"
 
 variables:
   PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
@@ -128,7 +135,7 @@ test:integration:
     MNEMOS_TEST_DB: "postgresql://postgres:test@postgres:5432/mnemos_test"
     RATE_LIMIT_STORAGE_URI: "redis://redis:6379/0"
   before_script:
-    - uv pip install --system --cache-dir=.cache/pip -e ".[dev]"
+    - . .venv/bin/activate && uv pip install --cache-dir=.cache/pip -e ".[dev]"
     # Wait for Postgres to accept connections (pgvector image does not
     # signal readiness; poll until psql connects).
     - |
@@ -240,7 +247,7 @@ test:persistence-parity:
     DATABASE_URL: "postgresql://postgres:test@postgres:5432/mnemos_test"
     MNEMOS_TEST_DB: "postgresql://postgres:test@postgres:5432/mnemos_test"
   before_script:
-    - uv pip install --system --cache-dir=.cache/pip -e ".[dev,sqlite]"
+    - . .venv/bin/activate && uv pip install --cache-dir=.cache/pip -e ".[dev,sqlite]"
     - |
       for i in $(seq 1 30); do
         if pg_isready -h postgres -U postgres -t 1 >/dev/null 2>&1; then
@@ -369,7 +376,7 @@ build:docker:
   stage: release
   tags: [argos, ncz-os]
   before_script:
-    - uv pip install --system --cache-dir=.cache/pip -e ".[build]"
+    - . .venv/bin/activate && uv pip install --cache-dir=.cache/pip -e ".[build]"
   script:
     - bash scripts/build-binary.sh
   artifacts:
@@ -410,7 +417,7 @@ test:oracle-smoke:
   stage: test
   tags: [argos, ncz-os]
   script:
-    - uv pip install --system oracledb
+    - . .venv/bin/activate && uv pip install oracledb
     - |
       python -c '
       import oracledb
