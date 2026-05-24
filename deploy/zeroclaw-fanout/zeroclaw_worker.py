@@ -225,14 +225,171 @@ def parse_tokens(stdout: str, stderr: str = "") -> tuple[int, int]:
     return (0, 0)
 
 
-def run_zeroclaw(description: str, kind: str = "", job_heartbeat_fn=None) -> dict:
-    # zeroclaw agent -a <alias> -m "<description>" --no-session
+# ────────────────────────────────────────────────────────────
+# Workspace + git lifecycle (code-executing mode)
+# ────────────────────────────────────────────────────────────
+
+GIT_USER_NAME = os.environ.get("GIT_USER_NAME", "Jason Perlow")
+GIT_USER_EMAIL = os.environ.get("GIT_USER_EMAIL", "jperlow@gmail.com")
+HIVE_WORK_ROOT = os.path.expanduser(os.environ.get("HIVE_WORK_ROOT", "~/hive-work"))
+
+# Directive format embedded at start of job description:
+#   [repo:<URL> branch:<branch> base:<base-ref>]
+# Branch + base optional. base defaults to "main"; branch defaults to
+# `hive/<job-id-short>` (auto-derived per job).
+_REPO_DIRECTIVE_RE = _re.compile(
+    r"^\s*\[repo:(?P<url>\S+?)(?:\s+branch:(?P<branch>\S+?))?(?:\s+base:(?P<base>\S+?))?\s*\]\s*",
+    _re.IGNORECASE,
+)
+
+
+def _parse_repo_directive(description: str) -> Optional[dict]:
+    """Return {url, branch, base} dict if description starts with a
+    `[repo:...]` directive; else None."""
+    if not description:
+        return None
+    m = _REPO_DIRECTIVE_RE.match(description)
+    if not m:
+        return None
+    return {
+        "url": m.group("url"),
+        "branch": m.group("branch"),
+        "base": m.group("base") or "main",
+        "stripped_description": _REPO_DIRECTIVE_RE.sub("", description, count=1).strip(),
+    }
+
+
+def _git(workspace: str, *args, check: bool = True) -> subprocess.CompletedProcess:
+    """Run git in workspace; capture stdout/stderr; raise on check=True
+    and non-zero exit."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=check,
+    )
+
+
+def _prepare_workspace(job_id: str, repo: dict) -> Optional[str]:
+    """Clone repo + checkout branch into ephemeral workspace.
+
+    Returns workspace path on success; None on clone failure
+    (caller falls back to chat mode).
+    """
+    short = job_id[:8]
+    workspace = os.path.join(HIVE_WORK_ROOT, f"job-{short}")
+    try:
+        os.makedirs(HIVE_WORK_ROOT, exist_ok=True)
+        # Wipe any prior leftover for same id
+        if os.path.exists(workspace):
+            subprocess.run(["rm", "-rf", workspace], check=False)
+        # Shallow clone (depth=10 for diff context)
+        r = subprocess.run(
+            ["git", "clone", "--depth=10", "--branch", repo["base"], repo["url"], workspace],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if r.returncode != 0:
+            print(f"[zc-worker] clone failed: {r.stderr[:400]}", flush=True)
+            return None
+        # Set per-workspace git identity
+        _git(workspace, "config", "user.name", GIT_USER_NAME)
+        _git(workspace, "config", "user.email", GIT_USER_EMAIL)
+        # Determine working branch
+        branch = repo.get("branch") or f"hive/{short}"
+        # Try checkout existing OR create from base
+        check = subprocess.run(
+            ["git", "ls-remote", "--heads", repo["url"], branch],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if check.stdout.strip():
+            # Branch exists upstream — fetch + checkout
+            _git(workspace, "fetch", "origin", branch, check=False)
+            _git(workspace, "checkout", "-B", branch, f"origin/{branch}", check=False)
+        else:
+            _git(workspace, "checkout", "-B", branch, f"origin/{repo['base']}", check=False)
+        print(f"[zc-worker] workspace ready: {workspace} branch={branch}", flush=True)
+        return workspace
+    except Exception as exc:
+        print(f"[zc-worker] workspace prep failed: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+def _capture_changes(workspace: str) -> dict:
+    """Inspect workspace for uncommitted changes + return summary."""
+    try:
+        st = _git(workspace, "status", "--porcelain", check=False)
+        lines = [ln for ln in st.stdout.split("\n") if ln.strip()]
+        files = sorted({ln[3:].strip() for ln in lines if len(ln) > 3})
+        diffstat = _git(workspace, "diff", "HEAD", "--stat", check=False)
+        return {"files_changed": files, "diffstat": diffstat.stdout[-4000:]}
+    except Exception as exc:
+        return {"files_changed": [], "diffstat": f"err: {exc}"}
+
+
+def _commit_and_push(workspace: str, job_id: str, kind: str, branch: str) -> list[str]:
+    """Stage + commit + push workspace changes. Returns list of new
+    commit SHAs (empty if nothing to commit or push failed)."""
+    short = job_id[:8]
+    commits: list[str] = []
+    try:
+        _git(workspace, "add", "-A")
+        st = _git(workspace, "status", "--porcelain", check=False)
+        if not st.stdout.strip():
+            return []
+        msg = f"hive[{kind}]: job-{short} auto-commit\n\nGenerated by zeroclaw worker {os.environ.get('AGENT_HOST', socket.gethostname())}\nJob-Id: {job_id}\n"
+        _git(workspace, "commit", "-m", msg)
+        sha = _git(workspace, "rev-parse", "HEAD").stdout.strip()
+        commits.append(sha)
+        # Push
+        push = subprocess.run(
+            ["git", "push", "-u", "origin", branch],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if push.returncode != 0:
+            print(f"[zc-worker] push failed: {push.stderr[:400]}", flush=True)
+        else:
+            print(f"[zc-worker] pushed {sha[:10]} to origin/{branch}", flush=True)
+    except subprocess.CalledProcessError as exc:
+        print(f"[zc-worker] commit/push exc: {exc.stderr[:200]}", flush=True)
+    return commits
+
+
+def _cleanup_workspace(workspace: str) -> None:
+    try:
+        subprocess.run(["rm", "-rf", workspace], check=False)
+    except Exception:
+        pass
+
+
+def run_zeroclaw(description: str, kind: str = "", job_id: str = "", job_heartbeat_fn=None) -> dict:
+    """Execute one job. If description starts with [repo:...] directive,
+    clone + checkout + run agent in workspace + commit/push changes.
+    Otherwise chat-only mode (current behavior)."""
+    repo = _parse_repo_directive(description)
+    workspace = None
+    branch = None
+    if repo:
+        workspace = _prepare_workspace(job_id or "anon", repo)
+        if workspace:
+            branch = repo.get("branch") or f"hive/{(job_id or 'anon')[:8]}"
+            description = repo["stripped_description"] or description
+    exec_cwd = workspace or WORKDIR
+
     cmd = [ZEROCLAW_BIN, "agent", "-a", ZEROCLAW_AGENT, "-m", description]
-    print(f"[zc-worker] $ {' '.join(cmd[:5])} … [desc len={len(description)}]", flush=True)
+    print(f"[zc-worker] $ {' '.join(cmd[:5])} … [desc len={len(description)}] cwd={exec_cwd}", flush=True)
     start = time.time()
     timeout = timeout_for_kind(kind)
     try:
-        proc = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(cmd, cwd=exec_cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         last_job_hb = time.time()
         while True:
             try:
@@ -243,11 +400,13 @@ def run_zeroclaw(description: str, kind: str = "", job_heartbeat_fn=None) -> dic
                 if elapsed >= timeout:
                     proc.kill()
                     proc.wait()
+                    if workspace:
+                        _cleanup_workspace(workspace)
                     return {
                         "exit_code": -1,
                         "error": f"timeout {timeout}s exceeded",
                         "duration_sec": round(elapsed, 1),
-                        "workdir": WORKDIR,
+                        "workdir": exec_cwd,
                     }
                 if job_heartbeat_fn and (time.time() - last_job_hb) >= JOB_HEARTBEAT_INTERVAL:
                     try:
@@ -271,17 +430,35 @@ def run_zeroclaw(description: str, kind: str = "", job_heartbeat_fn=None) -> dic
             "agent_alias": ZEROCLAW_AGENT,
             "tokens_in": t_in,
             "tokens_out": t_out,
-            "workdir": WORKDIR,
+            "workdir": exec_cwd,
         }
         if err_tag:
             result["exit_code"] = 1
             result["worker_error"] = err_tag
+
+        # Post-agent: capture + commit/push changes if workspace exists
+        if workspace and proc.returncode == 0:
+            changes = _capture_changes(workspace)
+            result["files_changed"] = changes["files_changed"]
+            result["diffstat"] = changes["diffstat"]
+            if changes["files_changed"]:
+                commits = _commit_and_push(workspace, job_id or "anon", kind, branch)
+                result["commits"] = commits
+                result["pushed_branch"] = branch
+                result["repo_url"] = repo["url"]
+            else:
+                result["commits"] = []
+
+        if workspace:
+            _cleanup_workspace(workspace)
         return result
     except Exception as e:
+        if workspace:
+            _cleanup_workspace(workspace)
         return {
             "exit_code": -1,
             "error": f"{type(e).__name__}: {e}",
-            "workdir": WORKDIR,
+            "workdir": exec_cwd,
         }
 
 
@@ -304,7 +481,10 @@ def main():
             update_job(job_id, "running", {"heartbeat_at": time.time(), "elapsed_sec": elapsed})
 
         result = run_zeroclaw(
-            job.get("description") or job.get("kind", ""), job.get("kind", ""), job_heartbeat_fn=_job_hb
+            job.get("description") or job.get("kind", ""),
+            job.get("kind", ""),
+            job_id=job["id"],
+            job_heartbeat_fn=_job_hb,
         )
         status = "done" if result.get("exit_code") == 0 else "failed"
         result["finished_at"] = time.time()
