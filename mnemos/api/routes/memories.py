@@ -693,13 +693,20 @@ async def search_memories(
     """Search memories with optional 5-minute response caching."""
     search_trace_id = uuid4().hex[:8]
     search_started_at = time.monotonic()
-    request_limit = min(request.limit, 500)  # server-side cap regardless of model field
     # v6.2 M-2.2.3: validate retrieval profile (unknown → 400). Default
     # = balanced (current behavior); deep enables cross-encoder rerank.
     try:
         search_profile = resolve_profile(request.profile)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # Per-profile limit cap (spec § Design table): fast=25, balanced=100,
+    # deep=200. Server-side hard cap of 500 still applies on top.
+    _profile_caps = {
+        SearchProfile.FAST: 25,
+        SearchProfile.BALANCED: 100,
+        SearchProfile.DEEP: 200,
+    }
+    request_limit = min(request.limit, _profile_caps[search_profile], 500)
     _log_search_phase(search_trace_id, search_started_at, "parse")
 
     # v3.1.2 Tier 3: pin owner_id + namespace to the caller's identity
@@ -883,7 +890,19 @@ async def search_memories(
 
     if _lc._cache and not request.include_compressed and not compression_applied:
         try:
-            await _lc._cache.setex(cache_key, 300, response.model_dump_json())
+            # v6.2 M-2.2.3: per-profile cache TTL. fast/balanced 5min;
+            # deep 30s (less cacheable per spec — reranker scoring drifts
+            # faster as memories churn).
+            _profile_ttl = {
+                SearchProfile.FAST: 300,
+                SearchProfile.BALANCED: 300,
+                SearchProfile.DEEP: 30,
+            }
+            await _lc._cache.setex(
+                cache_key,
+                _profile_ttl[search_profile],
+                response.model_dump_json(),
+            )
         except Exception as e:
             logger.warning(f"[CACHE] search write error: {e}")
 
