@@ -2668,6 +2668,15 @@ class PostgresStateRepository(StateRepository):
         return _pg_result_count(result)
 
 
+def _iso_or_none(value: Any) -> str | None:
+    """Coerce a datetime / None to ISO 8601 string or None."""
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
 class PostgresAuditChainRepository(AuditChainRepository):
     """Postgres impl of the v6.2 M-2.2.1 audit chain repository.
 
@@ -2853,6 +2862,33 @@ class PostgresAuditChainRepository(AuditChainRepository):
             entry_id,
         )
         return dict(row) if row is not None else None
+
+    async def get_chain_stats(self, tx: Transaction) -> dict:
+        conn = _postgres_tx(tx).conn
+        chain_stats = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*)::bigint AS total_entries,
+                COUNT(*) FILTER (WHERE global_root IS NULL)::bigint AS unsealed_count,
+                MIN(signed_at) FILTER (WHERE global_root IS NULL) AS oldest_unsealed_signed_at
+            FROM memory_audit_chain
+            """
+        )
+        root_stats = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*)::bigint AS sealed_root_count,
+                MAX(sealed_at) AS last_sealed_at
+            FROM memory_audit_roots
+            """
+        )
+        return {
+            "total_entries": int(chain_stats["total_entries"] or 0),
+            "unsealed_count": int(chain_stats["unsealed_count"] or 0),
+            "oldest_unsealed_signed_at": _iso_or_none(chain_stats["oldest_unsealed_signed_at"]),
+            "sealed_root_count": int(root_stats["sealed_root_count"] or 0),
+            "last_sealed_at": _iso_or_none(root_stats["last_sealed_at"]),
+        }
 
     async def get_latest_audit_entries_batch(
         self,
