@@ -3531,6 +3531,7 @@ class SqliteBackend(PersistenceBackend):
                 "last_schema_check_at": "last_schema_check_at TEXT",
                 "created": "created TEXT",
                 "updated": "updated TEXT",
+                "copy_embeddings": "copy_embeddings INTEGER NOT NULL DEFAULT 0",
             },
         )
         await self._ensure_columns(
