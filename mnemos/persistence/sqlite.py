@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - local CI can run without optional extr
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import hot_rs_enabled
 from mnemos.persistence.base import (
+    AuditChainRepository,
     BranchRepository,
     CompressionRepository,
     CompressionStatsRow,
@@ -3296,6 +3297,165 @@ class SqliteStateRepository(_SqliteRepository, StateRepository):
         )
 
 
+class SqliteAuditChainRepository(_SqliteRepository, AuditChainRepository):
+    """SQLite impl of v6.2 M-2.2.1 audit chain.
+
+    Tables: ``memory_audit_chain`` + ``memory_audit_roots``
+    (migration ``migrations_v6_2_audit_chain_sqlite.sql`` shipped
+    alongside the protocol scaffold).
+
+    No SKIP LOCKED in SQLite — the single-writer pattern (one
+    serialized connection per backend) makes concurrent-sealer
+    isolation unnecessary. Multiple sealer instances against the
+    same DB would deadlock anyway; deploy at most one sealer per
+    SQLite node.
+    """
+
+    async def get_latest_audit_entry(
+        self,
+        tx: Transaction,
+        memory_id: bytes,
+    ) -> Row | None:
+        return await _fetch_one(
+            self._conn(tx),
+            """
+            SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                   op, payload_hash, writer_id, writer_pubkey,
+                   signature, signed_at, global_root, global_seq
+            FROM memory_audit_chain
+            WHERE memory_id = ?
+            ORDER BY signed_at DESC
+            LIMIT 1
+            """,
+            (memory_id,),
+        )
+
+    async def insert_audit_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: bytes,
+        memory_id: bytes,
+        prev_entry_id: bytes | None,
+        prev_entry_hash: bytes | None,
+        op: str,
+        payload_hash: bytes,
+        writer_id: str,
+        writer_pubkey: bytes,
+        signature: bytes,
+        signed_at: Any,
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            """
+            INSERT INTO memory_audit_chain (
+                entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                op, payload_hash, writer_id, writer_pubkey,
+                signature, signed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entry_id,
+                memory_id,
+                prev_entry_id,
+                prev_entry_hash,
+                op,
+                payload_hash,
+                writer_id,
+                writer_pubkey,
+                signature,
+                signed_at,
+            ),
+        )
+
+    async def claim_unsealed_window(
+        self,
+        tx: Transaction,
+        *,
+        max_window_seconds: int,
+        limit: int,
+    ) -> list[Row]:
+        """Claim oldest unsealed entries. No row lock — single-writer
+        SQLite makes the SKIP-LOCKED dance moot.
+
+        ``signed_at`` is stored as TEXT (ISO 8601); compare against
+        ``datetime('now', '-N seconds')`` to pick rows older than the
+        window cutoff.
+        """
+        # signed_at is stored as ISO 8601 TEXT. Route handler may emit
+        # "2026-05-24T16:00:00+00:00" (Python datetime.isoformat()) or
+        # the SQL-style "2026-05-24 16:00:00". Wrap both sides in
+        # datetime() so SQLite normalizes the format before comparing.
+        cutoff_expr = f"datetime('now', '-{int(max_window_seconds)} seconds')"
+        return await _fetch_all(
+            self._conn(tx),
+            f"""
+            SELECT entry_id, signature, signed_at
+            FROM memory_audit_chain
+            WHERE global_root IS NULL
+              AND datetime(signed_at) <= {cutoff_expr}
+            ORDER BY datetime(signed_at) ASC, entry_id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+    async def stamp_window_with_root(
+        self,
+        tx: Transaction,
+        *,
+        entry_ids: list[bytes],
+        global_root: bytes,
+        starting_seq: int,
+    ) -> None:
+        if not entry_ids:
+            return
+        conn = self._conn(tx)
+        for offset, eid in enumerate(entry_ids):
+            await _execute(
+                conn,
+                """
+                UPDATE memory_audit_chain
+                SET global_root = ?, global_seq = ?
+                WHERE entry_id = ?
+                """,
+                (global_root, starting_seq + offset, eid),
+            )
+
+    async def insert_audit_root(
+        self,
+        tx: Transaction,
+        *,
+        global_root: bytes,
+        window_start: Any,
+        window_end: Any,
+        entry_count: int,
+        root_signature: bytes,
+        signer_pubkey: bytes,
+        sealed_at: Any,
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            """
+            INSERT INTO memory_audit_roots (
+                global_root, window_start, window_end, entry_count,
+                root_signature, signer_pubkey, sealed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                global_root,
+                window_start,
+                window_end,
+                entry_count,
+                root_signature,
+                signer_pubkey,
+                sealed_at,
+            ),
+        )
+
+
 class SqliteBackend(PersistenceBackend):
     """SQLite persistence facade backed by one serialized connection."""
 
@@ -3325,6 +3485,7 @@ class SqliteBackend(PersistenceBackend):
         self._consultations = SqliteConsultationsRepository()
         self._federation = SqliteFederationRepository()
         self._state_kv = SqliteStateRepository()
+        self._audit_chain = SqliteAuditChainRepository()
 
     @property
     def settings(self) -> Any:
@@ -3755,6 +3916,10 @@ class SqliteBackend(PersistenceBackend):
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv
+
+    @property
+    def audit_chain(self) -> AuditChainRepository:
+        return self._audit_chain
 
     async def ping(self) -> bool:
         try:
