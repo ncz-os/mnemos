@@ -196,12 +196,20 @@ enum FederationCmd {
 }
 
 fn todo(cmd: &str) -> anyhow::Result<()> {
-    eprintln!(
-        "[mnemosctl] TODO: {} not implemented yet. Tracked in docs/MNEMOSCTL_DESIGN.md \
-         implementation breakdown.",
+    // Previously printed the TODO and returned Ok(()). Scripts treating
+    // exit-code as the success signal saw zero-exit on every unimplemented
+    // command, so auth, search, store, federation, raw, etc. silently
+    // 'succeeded' with no actual work — hiding real-state-change failures
+    // behind a TODO log line and breaking any CI / shell wrapper that
+    // relied on $? for control flow. Return an error so the process exits
+    // non-zero until the command lands. --help / --version still succeed
+    // (clap handles those before this dispatcher).
+    anyhow::bail!(
+        "[mnemosctl] {} not implemented yet. Tracked in docs/MNEMOSCTL_DESIGN.md \
+         implementation breakdown. Process exits non-zero so scripts can \
+         distinguish missing-impl from successful run.",
         cmd
-    );
-    Ok(())
+    )
 }
 
 fn main() -> anyhow::Result<()> {
