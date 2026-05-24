@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from mnemos.api.routes.admin import router as admin_router
+from mnemos.api.routes.admin_decay import router as admin_decay_router
 from mnemos.api.routes.audit import router as audit_router
 from mnemos.api.routes.mcp_audit import router as mcp_audit_router
 from mnemos.api.routes.consultations import router as consultations_router
@@ -342,6 +343,7 @@ app.include_router(oauth_router)  # v3.0.0: OAuth/OIDC browser login
 app.include_router(federation_router)  # v3.0.0: Cross-instance memory federation
 app.include_router(memories_router)
 app.include_router(audit_router)  # v6.2 M-2.2.1: audit chain pubkey + proof
+app.include_router(admin_decay_router)  # v6.2 M-2.2.4: category-decay admin
 app.include_router(narrate_router)  # v3.3 S-II: APOLLO dense-form narration
 app.include_router(ingest_router)
 app.include_router(kg_router)
