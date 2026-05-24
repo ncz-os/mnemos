@@ -847,6 +847,24 @@ async def _store_memories(
                     _s = _gs2()
                     _ss = (getattr(_s.server, "session_secret", "") or "").encode("utf-8")
                     if _ss:
+                        # v6.2 chain-head continuity check (best-effort).
+                        # If the primary sent its audit_latest_entry_hash
+                        # for this memory, we record a metadata-side
+                        # hint so post-hoc divergence audits can flag
+                        # any future mismatch. Active rejection of
+                        # mismatched feeds is a future hardening once
+                        # we've fielded the chain at scale.
+                        primary_eid = mem.get("audit_latest_entry_id")
+                        primary_hash = mem.get("audit_latest_entry_hash")
+                        if primary_eid and primary_hash:
+                            logger.info(
+                                "[federation/audit] peer=%s memory=%s primary_chain_head eid=%s hash=%s",
+                                peer_name,
+                                local_id,
+                                primary_eid[:16],
+                                primary_hash[:16],
+                            )
+
                         from mnemos.audit import write_audit_entry
 
                         await write_audit_entry(
