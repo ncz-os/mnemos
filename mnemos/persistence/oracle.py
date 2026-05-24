@@ -3558,6 +3558,54 @@ class OracleAuditChainRepository(AuditChainRepository):
         finally:
             await _call(cursor.close)
 
+    async def get_latest_audit_entries_batch(
+        self,
+        tx: Transaction,
+        memory_ids: list[bytes],
+    ) -> dict[bytes, Row]:
+        """Oracle 12c+ ROW_NUMBER() OVER PARTITION BY. Each memory_id
+        binds individually since python-oracledb doesn't natively
+        accept a list-binding for RAW types in an IN clause without
+        an array-type registration step.
+        """
+        if not memory_ids:
+            return {}
+        placeholders = ",".join(f":m{i}" for i in range(len(memory_ids)))
+        params = {f"m{i}": mid for i, mid in enumerate(memory_ids)}
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                       op, payload_hash, writer_id, writer_pubkey,
+                       signature, signed_at, global_root, global_seq
+                FROM (
+                  SELECT m.*,
+                         ROW_NUMBER() OVER (
+                           PARTITION BY memory_id
+                           ORDER BY signed_at DESC, entry_id DESC
+                         ) AS rn
+                  FROM memory_audit_chain m
+                  WHERE memory_id IN ({placeholders})
+                )
+                WHERE rn = 1
+                """,
+                params,
+            )
+            rows = await _call(cursor.fetchall)
+            if not rows:
+                return {}
+            cols = [d[0].lower() for d in cursor.description]
+            out: dict[bytes, Row] = {}
+            for r in rows:
+                d = dict(zip(cols, r))
+                out[d["memory_id"]] = d
+            return out
+        finally:
+            await _call(cursor.close)
+
 
 class OracleBackend(PersistenceBackend):
     """Oracle persistence facade backed by a python-oracledb async pool."""

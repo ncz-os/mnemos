@@ -3489,6 +3489,42 @@ class SqliteAuditChainRepository(_SqliteRepository, AuditChainRepository):
             (entry_id,),
         )
 
+    async def get_latest_audit_entries_batch(
+        self,
+        tx: Transaction,
+        memory_ids: list[bytes],
+    ) -> dict[bytes, Row]:
+        """Batch via CTE with ROW_NUMBER() OVER (PARTITION BY memory_id
+        ORDER BY signed_at DESC). SQLite 3.25+ supports window
+        functions. Single round-trip beats N+1 serial reads.
+        """
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        rows = await _fetch_all(
+            self._conn(tx),
+            f"""
+            WITH ranked AS (
+              SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                     op, payload_hash, writer_id, writer_pubkey,
+                     signature, signed_at, global_root, global_seq,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY memory_id
+                       ORDER BY datetime(signed_at) DESC, entry_id DESC
+                     ) AS rn
+              FROM memory_audit_chain
+              WHERE memory_id IN ({placeholders})
+            )
+            SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                   op, payload_hash, writer_id, writer_pubkey,
+                   signature, signed_at, global_root, global_seq
+            FROM ranked
+            WHERE rn = 1
+            """,
+            tuple(memory_ids),
+        )
+        return {r["memory_id"]: r for r in rows}
+
 
 class SqliteBackend(PersistenceBackend):
     """SQLite persistence facade backed by one serialized connection."""
