@@ -2132,7 +2132,10 @@ class PostgresFederationRepository(FederationRepository):
             from mnemos.core.config import get_settings as _gs
 
             try:
-                _embed_model = (_gs().providers.inference_embed_model or "").strip() or "unknown"
+                import os as _os
+
+                _http_model = _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                _embed_model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
             except Exception:
                 _embed_model = "unknown"
             # Trailing-comma terminators: rely on the always-present _trailer
