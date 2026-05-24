@@ -98,6 +98,14 @@ class MemoryItem(BaseModel):
     embedding: Optional[str] = None  # base64(float32 little-endian)
     embedding_model: Optional[str] = None
     embedding_dim: Optional[int] = None
+    # v6.2 M-2.2.1 chain head piggyback — primary publishes its chain
+    # head so replicas can validate continuity on inbound writes.
+    # Replicas compare audit_latest_entry_hash against their own
+    # prev_entry_hash for the federated memory; mismatch -> reject
+    # payload + log + halt peer. None/empty on peers that haven't
+    # enabled MNEMOS_AUDIT_CHAIN.
+    audit_latest_entry_id: Optional[str] = None  # hex(16-byte entry_id)
+    audit_latest_entry_hash: Optional[str] = None  # hex(32-byte sha256)
 
 
 class FederationConsolidationEvent(BaseModel):

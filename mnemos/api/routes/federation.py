@@ -607,6 +607,7 @@ async def federation_feed(
     namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
     categories = [s.strip() for s in category.split(",") if s.strip()] if category else []
 
+    audit_heads: dict[str, tuple[str, str]] = {}
     try:
         async with backend.transactional() as tx:
             rows = await backend.federation.feed_query(
@@ -619,6 +620,54 @@ async def federation_feed(
                 prefer_compressed=prefer_compressed,
                 include_embedding=copy_embeddings,
             )
+            # v6.2 M-2.2.1 chain-head piggyback. Gated by
+            # MNEMOS_AUDIT_CHAIN=on + backend.audit_chain present.
+            # Per-row lookup is O(N) audit reads; tolerable for the
+            # default feed limit (50-500 rows) but batch fetch is a
+            # follow-up optimization for larger feeds.
+            try:
+                from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
+                from mnemos.audit import entry_hash as _eh, memory_id_to_audit_bytes
+                from mnemos.audit.crypto import AuditEntry as _AE
+
+                if _ace() and getattr(backend, "audit_chain", None) is not None:
+                    for r in rows:
+                        try:
+                            item_type = r.get("type") if hasattr(r, "get") else None
+                        except (AttributeError, TypeError, KeyError):
+                            item_type = None
+                        if item_type == "consolidation":
+                            continue
+                        mid_str = r["id"] if r else None
+                        if not mid_str:
+                            continue
+                        mid_bytes = memory_id_to_audit_bytes(mid_str)
+                        prev_row = await backend.audit_chain.get_latest_audit_entry(tx, mid_bytes)
+                        if prev_row is None:
+                            continue
+                        # Reconstruct latest_hash from prior row
+                        ent = _AE(
+                            entry_id=prev_row["entry_id"],
+                            memory_id=prev_row["memory_id"],
+                            prev_entry_id=prev_row.get("prev_entry_id"),
+                            prev_entry_hash=prev_row.get("prev_entry_hash"),
+                            op=prev_row["op"],
+                            payload_hash=prev_row["payload_hash"],
+                            writer_id=prev_row["writer_id"],
+                            writer_pubkey=prev_row["writer_pubkey"],
+                            signed_at=(
+                                prev_row["signed_at"].isoformat()
+                                if hasattr(prev_row["signed_at"], "isoformat")
+                                else str(prev_row["signed_at"])
+                            ),
+                        )
+                        audit_heads[mid_str] = (
+                            prev_row["entry_id"].hex(),
+                            _eh(ent, prev_row["signature"]).hex(),
+                        )
+            except Exception:
+                # Audit lookup is best-effort; never fail the feed.
+                logger.exception("[federation/feed] audit chain-head lookup failed; continuing without piggyback")
     except NotImplementedError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -645,6 +694,18 @@ async def federation_feed(
     memories = [
         _feed_item_from_row(r, include_compressed=prefer_compressed, include_embedding=copy_embeddings) for r in rows
     ]
+    # v6.2 M-2.2.1: attach chain heads to the outbound items. Only
+    # MemoryItem variants (skip FederationConsolidationEvent rows).
+    if audit_heads:
+        for item in memories:
+            try:
+                mid = getattr(item, "id", None)
+                if mid and mid in audit_heads:
+                    eid, ehash = audit_heads[mid]
+                    item.audit_latest_entry_id = eid
+                    item.audit_latest_entry_hash = ehash
+            except Exception:
+                pass  # best-effort; never fail the feed on attach
     if rows and rows[-1]["updated"]:
         next_cursor = _fed._encode_feed_cursor(_cursor_datetime(rows[-1]["updated"]), rows[-1]["id"])
     else:
