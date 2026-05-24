@@ -2862,13 +2862,17 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         )
 
     async def get_sync_peer(self, tx: Transaction, peer_id: str) -> Row | None:
+        # v6.1 F-1: copy_embeddings flag (migration 0028) — COALESCE so
+        # DB rows that pre-date the migration still return 0 instead of
+        # KeyError on the consumer-side .get('copy_embeddings').
         return self._peer_row(
             await _fetch_one(
                 self._conn(tx),
                 """
             SELECT id, name, base_url, auth_token, namespace_filter,
                    category_filter, enabled, last_sync_cursor,
-                   compat_mode
+                   compat_mode,
+                   COALESCE(copy_embeddings, 0) AS copy_embeddings
             FROM federation_peers WHERE id = ?
             """,
                 (peer_id,),
