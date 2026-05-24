@@ -261,6 +261,65 @@ async def audit_inclusion_proof(
     }
 
 
+@router.get("/health")
+async def audit_health(
+    user: UserContext = Depends(get_current_user),
+) -> dict:
+    """Per-backend audit-chain health snapshot.
+
+    Returns:
+    * `chain_enabled`: ``MNEMOS_AUDIT_CHAIN`` flag state.
+    * `backend_has_audit_chain`: backend.audit_chain attribute non-None.
+    * `total_entries`, `unsealed_count`, `oldest_unsealed_signed_at`,
+      `sealed_root_count`, `last_sealed_at`: live counts from the
+      chain tables. Useful for operator dashboards + alerts on
+      unsealed-growth ("sealer is wedged").
+
+    Returns 503 if backend has no audit_chain repo. Returns the
+    snapshot with `chain_enabled=False` if env is off but tables
+    still exist (lets operators inspect a disabled chain without
+    re-enabling).
+    """
+    backend = _backend_or_503()
+    if backend.audit_chain is None:
+        raise HTTPException(
+            status_code=503,
+            detail="backend has no audit_chain repository",
+        )
+    out: dict = {
+        "chain_enabled": audit_chain_enabled(),
+        "backend_has_audit_chain": True,
+    }
+    try:
+        async with backend.transactional() as tx:
+            stats = await backend.audit_chain.get_chain_stats(tx)
+        out.update(stats)
+    except Exception as exc:
+        logger.exception("[audit/health] get_chain_stats failed")
+        raise HTTPException(
+            status_code=503,
+            detail=f"audit_chain stats fetch failed: {exc}",
+        )
+
+    # Lag computation: time since oldest_unsealed_signed_at.
+    # Useful for alerting "sealer stuck for >5 min".
+    oldest = out.get("oldest_unsealed_signed_at")
+    if oldest:
+        try:
+            from datetime import datetime, timezone
+
+            o = datetime.fromisoformat(str(oldest).replace("Z", "+00:00"))
+            if o.tzinfo is None:
+                o = o.replace(tzinfo=timezone.utc)
+            now = datetime.now(tz=timezone.utc)
+            out["oldest_unsealed_age_seconds"] = max(0.0, (now - o).total_seconds())
+        except Exception:
+            out["oldest_unsealed_age_seconds"] = None
+    else:
+        out["oldest_unsealed_age_seconds"] = None
+    return out
+
+
 def _to_iso(value) -> str:
     if hasattr(value, "isoformat"):
         return value.isoformat()

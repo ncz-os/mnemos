@@ -3490,6 +3490,39 @@ class SqliteAuditChainRepository(_SqliteRepository, AuditChainRepository):
             (entry_id,),
         )
 
+    async def get_chain_stats(self, tx: Transaction) -> dict:
+        conn = self._conn(tx)
+        chain = await _fetch_one(
+            conn,
+            """
+            SELECT
+                COUNT(*) AS total_entries,
+                SUM(CASE WHEN global_root IS NULL THEN 1 ELSE 0 END) AS unsealed_count,
+                MIN(CASE WHEN global_root IS NULL THEN signed_at END) AS oldest_unsealed_signed_at
+            FROM memory_audit_chain
+            """,
+            (),
+        )
+        root = await _fetch_one(
+            conn,
+            """
+            SELECT
+                COUNT(*) AS sealed_root_count,
+                MAX(sealed_at) AS last_sealed_at
+            FROM memory_audit_roots
+            """,
+            (),
+        )
+        chain = chain or {}
+        root = root or {}
+        return {
+            "total_entries": int(chain.get("total_entries") or 0),
+            "unsealed_count": int(chain.get("unsealed_count") or 0),
+            "oldest_unsealed_signed_at": chain.get("oldest_unsealed_signed_at") or None,
+            "sealed_root_count": int(root.get("sealed_root_count") or 0),
+            "last_sealed_at": root.get("last_sealed_at") or None,
+        }
+
     async def get_latest_audit_entries_batch(
         self,
         tx: Transaction,
