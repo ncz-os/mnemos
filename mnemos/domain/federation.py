@@ -830,6 +830,45 @@ async def _store_memories(
                             exc_info=True,
                         )
 
+        # v6.2 M-2.2.1 federation audit write. Replica records the
+        # inbound write under op="replicate" with writer_id="fed:<peer>"
+        # so its local audit chain reflects what was federated in.
+        # Spec § Federation interaction: audit chain becomes a federated
+        # Merkle DAG. Replica chains to its own prior entry for this
+        # local_id (NOT the primary's prev_entry_id) — the primary's
+        # chain is its own concern; we attest our local write.
+        if backend is not None and backend.audit_chain is not None:
+            try:
+                from mnemos.workers.audit_sealer import audit_chain_enabled
+
+                if audit_chain_enabled():
+                    from mnemos.core.config import get_settings as _gs2
+
+                    _s = _gs2()
+                    _ss = (getattr(_s.server, "session_secret", "") or "").encode("utf-8")
+                    if _ss:
+                        from mnemos.audit import write_audit_entry
+
+                        await write_audit_entry(
+                            backend,
+                            tx,
+                            op="replicate",
+                            memory_id_str=local_id,
+                            content=content,
+                            category=category,
+                            subcategory=subcategory,
+                            metadata=meta_raw if isinstance(meta_raw, dict) else None,
+                            embedding=None,
+                            writer_id=f"fed:{peer_name}",
+                            session_secret=_ss,
+                        )
+            except Exception:
+                logger.warning(
+                    "[federation/audit] replicate-op audit write failed for %s",
+                    local_id,
+                    exc_info=True,
+                )
+
     return new_n, upd_n
 
 
