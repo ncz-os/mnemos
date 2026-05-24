@@ -2820,6 +2820,23 @@ class PostgresAuditChainRepository(AuditChainRepository):
             sealed_at,
         )
 
+    async def list_window_entries(
+        self,
+        tx: Transaction,
+        global_root: bytes,
+    ) -> list[Row]:
+        rows = await _postgres_tx(tx).conn.fetch(
+            """
+            SELECT entry_id, memory_id, signature, signed_at,
+                   global_seq, payload_hash, op
+            FROM memory_audit_chain
+            WHERE global_root = $1
+            ORDER BY signed_at ASC, entry_id ASC
+            """,
+            global_root,
+        )
+        return [dict(r) for r in rows]
+
 
 class PostgresBackend(PersistenceBackend):
     """Postgres persistence facade backed by an asyncpg pool."""

@@ -238,6 +238,72 @@ def merkle_leaf(entry_id: bytes, signature: bytes) -> bytes:
     return h.digest()
 
 
+def merkle_proof(leaves: list[bytes], target_index: int) -> list[tuple[bytes, str]]:
+    """Compute the Merkle inclusion proof path for ``leaves[target_index]``.
+
+    Returns a list of ``(sibling_hash, position)`` tuples from leaf up
+    to the root, where ``position`` is ``"L"`` if the sibling sits on
+    the *left* of the running hash at that level, ``"R"`` otherwise.
+
+    Pads to power of two with zero leaves -- same shape as
+    ``merkle_root``. Empty / single-leaf inputs return ``[]`` since
+    there are no siblings to hash with.
+    """
+    if not leaves:
+        return []
+    if not (0 <= target_index < len(leaves)):
+        raise IndexError(f"target_index {target_index} out of range for {len(leaves)} leaves")
+    level = [bytes(leaf) for leaf in leaves]
+    n = 1
+    while n < len(level):
+        n <<= 1
+    if len(level) < n:
+        zero = b"\x00" * 32
+        level.extend([zero] * (n - len(level)))
+    proof: list[tuple[bytes, str]] = []
+    idx = target_index
+    while len(level) > 1:
+        sibling_idx = idx ^ 1  # XOR 1 flips the last bit -> left<->right partner
+        sibling = level[sibling_idx]
+        position = "L" if sibling_idx < idx else "R"
+        proof.append((sibling, position))
+        # Compute next level
+        next_level = []
+        for i in range(0, len(level), 2):
+            h = hashlib.sha256()
+            h.update(level[i])
+            h.update(level[i + 1])
+            next_level.append(h.digest())
+        level = next_level
+        idx >>= 1
+    return proof
+
+
+def verify_inclusion(
+    leaf: bytes,
+    proof: list[tuple[bytes, str]],
+    expected_root: bytes,
+) -> bool:
+    """Verify a Merkle inclusion proof.
+
+    Walks ``leaf`` up through the ``proof`` siblings; returns
+    ``True`` iff the computed root matches ``expected_root``.
+    """
+    current = bytes(leaf)
+    for sibling, position in proof:
+        h = hashlib.sha256()
+        if position == "L":
+            h.update(sibling)
+            h.update(current)
+        elif position == "R":
+            h.update(current)
+            h.update(sibling)
+        else:
+            return False
+        current = h.digest()
+    return constant_time_eq(current, expected_root)
+
+
 def merkle_root(leaves: Iterable[bytes]) -> bytes:
     """SHA-256 Merkle tree root with zero-padding to power-of-two width.
 
