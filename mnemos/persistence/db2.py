@@ -30,6 +30,7 @@ from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 from mnemos.persistence.oracle import (
+    OracleAuditChainRepository,
     OracleBackend,
     OracleBranchRepository,
     OracleCompressionRepository,
@@ -3454,6 +3455,21 @@ class Db2ConsultationsRepository(_Db2OraCompatMixin, OracleConsultationsReposito
     """
 
 
+class Db2AuditChainRepository(OracleAuditChainRepository):
+    """Db2 12.1.x impl of v6.2 M-2.2.1 audit chain.
+
+    Inherits the Oracle implementation verbatim — Db2's Oracle
+    Compatibility Mode supports `TO_TIMESTAMP_TZ`, `NUMTODSINTERVAL`,
+    `ROWNUM`, `SYSTIMESTAMP`, and `FOR UPDATE SKIP LOCKED` (Db2 11.5+).
+    Cursor-level Ora→Db2 translation (`_ORA_TO_DB2_PAIRS` +
+    `_BIND_RE`) handles `SYSTIMESTAMP`→`CURRENT TIMESTAMP` and
+    `:name` → `?` bind conversion.
+
+    No override needed unless Db2 diverges on a specific call;
+    file a follow-up commit if/when that happens.
+    """
+
+
 class Db2Backend(OracleBackend):
     """IBM Db2 12.1.x backend via Oracle Compatibility Mode.
 
@@ -3531,6 +3547,7 @@ class Db2Backend(OracleBackend):
         self._oauth_repo = Db2OAuthRepository()
         self._sessions_repo = Db2SessionsRepository()
         self._consultations_repo = Db2ConsultationsRepository()
+        self._audit_chain_repo = Db2AuditChainRepository()
         # Startup registry-probe state, populated lazily by ``open()``.
         # ``None`` means "not yet probed"; otherwise stores the raw
         # registry value (``"YES"``, ``"NO"``, ``""``...) for the
