@@ -774,6 +774,15 @@ async def _store_memories(
             emb_b64 = mem.get("embedding")
             emb_model = mem.get("embedding_model")
             emb_dim = mem.get("embedding_dim")
+            logger.info(
+                "[federation/embed] check %s emb_b64_len=%d emb_model=%s emb_dim=%s local_model=%s local_dim=%s",
+                local_id,
+                len(emb_b64 or ""),
+                emb_model,
+                emb_dim,
+                local_embed_model,
+                embed_dim_expected,
+            )
             if emb_b64 and emb_model:
                 if local_embed_model and emb_model != local_embed_model:
                     logger.debug(
@@ -798,8 +807,22 @@ async def _store_memories(
                         arr = _array.array("f")
                         arr.frombytes(raw_bytes)
                         vec = list(arr)
+                        logger.info(
+                            "[federation/embed] decoded %s vec_len=%d expected=%s",
+                            local_id,
+                            len(vec),
+                            embed_dim_expected,
+                        )
                         if not embed_dim_expected or len(vec) == embed_dim_expected:
                             await backend.memories.upsert_memory_embedding(tx, local_id, vec)
+                            logger.info("[federation/embed] upsert OK %s", local_id)
+                        else:
+                            logger.warning(
+                                "[federation/embed] dim mismatch %s vec=%d expected=%d",
+                                local_id,
+                                len(vec),
+                                embed_dim_expected,
+                            )
                     except Exception:
                         logger.warning(
                             "[federation/embed] failed to decode/store %s",
