@@ -3531,6 +3531,33 @@ class OracleAuditChainRepository(AuditChainRepository):
         finally:
             await _call(cursor.close)
 
+    async def get_audit_entry_by_id(
+        self,
+        tx: Transaction,
+        entry_id: bytes,
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                       op, payload_hash, writer_id, writer_pubkey,
+                       signature, signed_at, global_root, global_seq
+                FROM memory_audit_chain
+                WHERE entry_id = :eid
+                """,
+                {"eid": entry_id},
+            )
+            row = await _call(cursor.fetchone)
+            if row is None:
+                return None
+            cols = [d[0].lower() for d in cursor.description]
+            return dict(zip(cols, row))
+        finally:
+            await _call(cursor.close)
+
 
 class OracleBackend(PersistenceBackend):
     """Oracle persistence facade backed by a python-oracledb async pool."""

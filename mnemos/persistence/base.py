@@ -1154,6 +1154,21 @@ class AuditChainRepository(ABC):
         """
         ...
 
+    @abstractmethod
+    async def get_audit_entry_by_id(
+        self,
+        tx: Transaction,
+        entry_id: bytes,
+    ) -> Row | None:
+        """Fetch a single audit entry by its primary-key ``entry_id``.
+
+        Used by the inclusion-proof endpoint to look up the target
+        entry without going through ``get_latest_audit_entry`` (which
+        scans by memory_id). Returns ``None`` when entry_id is
+        unknown. Caller treats None as 404.
+        """
+        ...
+
 
 class PersistenceBackend(ABC):
     """Top-level facade exposing backend-specific repository families."""
