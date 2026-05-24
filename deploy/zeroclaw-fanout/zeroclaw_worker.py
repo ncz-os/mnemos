@@ -517,7 +517,7 @@ def main():
             job.get("kind", ""),
             job_id=job["id"],
             job_heartbeat_fn=_job_hb,
-            max_cost_tier=job.get("max_cost_tier", "C"),
+            max_cost_tier=job.get("max_cost_tier") or job.get("cost_tier") or "B",
         )
         status = "done" if result.get("exit_code") == 0 else "failed"
         result["finished_at"] = time.time()
