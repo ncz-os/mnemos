@@ -622,15 +622,17 @@ async def federation_feed(
             )
             # v6.2 M-2.2.1 chain-head piggyback. Gated by
             # MNEMOS_AUDIT_CHAIN=on + backend.audit_chain present.
-            # Per-row lookup is O(N) audit reads; tolerable for the
-            # default feed limit (50-500 rows) but batch fetch is a
-            # follow-up optimization for larger feeds.
+            # Batch fetch via `get_latest_audit_entries_batch` -- one
+            # SQL round-trip for all rows in the feed (PG: DISTINCT ON;
+            # SQLite/Oracle: ROW_NUMBER() OVER PARTITION).
             try:
                 from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
                 from mnemos.audit import entry_hash as _eh, memory_id_to_audit_bytes
                 from mnemos.audit.crypto import AuditEntry as _AE
 
                 if _ace() and getattr(backend, "audit_chain", None) is not None:
+                    # Build memory_id list (skip consolidation rows + missing ids).
+                    pairs: list[tuple[str, bytes]] = []
                     for r in rows:
                         try:
                             item_type = r.get("type") if hasattr(r, "get") else None
@@ -641,30 +643,34 @@ async def federation_feed(
                         mid_str = r["id"] if r else None
                         if not mid_str:
                             continue
-                        mid_bytes = memory_id_to_audit_bytes(mid_str)
-                        prev_row = await backend.audit_chain.get_latest_audit_entry(tx, mid_bytes)
-                        if prev_row is None:
-                            continue
-                        # Reconstruct latest_hash from prior row
-                        ent = _AE(
-                            entry_id=prev_row["entry_id"],
-                            memory_id=prev_row["memory_id"],
-                            prev_entry_id=prev_row.get("prev_entry_id"),
-                            prev_entry_hash=prev_row.get("prev_entry_hash"),
-                            op=prev_row["op"],
-                            payload_hash=prev_row["payload_hash"],
-                            writer_id=prev_row["writer_id"],
-                            writer_pubkey=prev_row["writer_pubkey"],
-                            signed_at=(
-                                prev_row["signed_at"].isoformat()
-                                if hasattr(prev_row["signed_at"], "isoformat")
-                                else str(prev_row["signed_at"])
-                            ),
-                        )
-                        audit_heads[mid_str] = (
-                            prev_row["entry_id"].hex(),
-                            _eh(ent, prev_row["signature"]).hex(),
-                        )
+                        pairs.append((mid_str, memory_id_to_audit_bytes(mid_str)))
+
+                    if pairs:
+                        mid_bytes_list = [p[1] for p in pairs]
+                        latest_by_mid = await backend.audit_chain.get_latest_audit_entries_batch(tx, mid_bytes_list)
+                        for mid_str, mid_bytes in pairs:
+                            prev_row = latest_by_mid.get(mid_bytes)
+                            if prev_row is None:
+                                continue
+                            ent = _AE(
+                                entry_id=prev_row["entry_id"],
+                                memory_id=prev_row["memory_id"],
+                                prev_entry_id=prev_row.get("prev_entry_id"),
+                                prev_entry_hash=prev_row.get("prev_entry_hash"),
+                                op=prev_row["op"],
+                                payload_hash=prev_row["payload_hash"],
+                                writer_id=prev_row["writer_id"],
+                                writer_pubkey=prev_row["writer_pubkey"],
+                                signed_at=(
+                                    prev_row["signed_at"].isoformat()
+                                    if hasattr(prev_row["signed_at"], "isoformat")
+                                    else str(prev_row["signed_at"])
+                                ),
+                            )
+                            audit_heads[mid_str] = (
+                                prev_row["entry_id"].hex(),
+                                _eh(ent, prev_row["signature"]).hex(),
+                            )
             except Exception:
                 # Audit lookup is best-effort; never fail the feed.
                 logger.exception("[federation/feed] audit chain-head lookup failed; continuing without piggyback")
