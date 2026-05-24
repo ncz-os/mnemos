@@ -905,6 +905,30 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         finally:
             await _call(cursor.close)
 
+    async def upsert_memory_embedding(self, tx: Any, memory_id: str, embedding: Sequence[float]) -> None:
+        """Db2 override: positional bind (?) vs Oracle :name.
+
+        Same shape as Oracle's variant — VECTOR column accepts
+        array.array('f', vec). No-op when embedding is empty.
+        2026-05-24: added so Db2 backend create_memory inline-embed
+        actually writes the vector.
+        """
+        if not embedding:
+            return
+        import array as _array
+
+        arr = _array.array("f", [float(v) for v in embedding])
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET embedding = ? WHERE id = ?",
+                (arr, memory_id),
+            )
+        finally:
+            await _call(cursor.close)
+
     async def update_memory(
         self,
         tx: Any,
