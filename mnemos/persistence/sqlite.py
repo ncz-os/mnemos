@@ -108,6 +108,7 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v5_2_0_nats_outbox_idempotency_sqlite.sql",
     "migrations_v5_3_4_mcp_audit_log_sqlite.sql",
     "migrations_v6_2_audit_chain_sqlite.sql",
+    "migrations_v6_2_category_decay_sqlite.sql",
 ]
 
 

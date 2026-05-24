@@ -17,7 +17,22 @@ keyed on env config.
 
 from __future__ import annotations
 
+from .decay import (
+    DecayParams,
+    apply_decay,
+    invalidate_decay_cache,
+    load_decay_table,
+)
 from .profile import SearchProfile, resolve_profile
 from .reranker import Reranker, get_reranker
 
-__all__ = ["SearchProfile", "resolve_profile", "Reranker", "get_reranker"]
+__all__ = [
+    "DecayParams",
+    "Reranker",
+    "SearchProfile",
+    "apply_decay",
+    "get_reranker",
+    "invalidate_decay_cache",
+    "load_decay_table",
+    "resolve_profile",
+]
