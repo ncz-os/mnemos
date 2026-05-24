@@ -28,6 +28,7 @@ from mnemos.core.lifecycle import (
 )
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
+from mnemos.domain.search import SearchProfile, get_reranker, resolve_profile
 from mnemos.domain.artemis_dedup import (
     duplicate_content_error_body,
     evaluate_memory_create_dedup,
@@ -693,6 +694,12 @@ async def search_memories(
     search_trace_id = uuid4().hex[:8]
     search_started_at = time.monotonic()
     request_limit = min(request.limit, 500)  # server-side cap regardless of model field
+    # v6.2 M-2.2.3: validate retrieval profile (unknown → 400). Default
+    # = balanced (current behavior); deep enables cross-encoder rerank.
+    try:
+        search_profile = resolve_profile(request.profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     _log_search_phase(search_trace_id, search_started_at, "parse")
 
     # v3.1.2 Tier 3: pin owner_id + namespace to the caller's identity
@@ -752,6 +759,7 @@ async def search_memories(
         request.include_archived,
         request.boost_recency,
         request.recency_weight,
+        search_profile.value,  # v6.2 M-2.2.3: distinct cache per profile
     )
 
     if _lc._cache and not request.include_compressed:
@@ -827,6 +835,33 @@ async def search_memories(
 
     _log_search_phase(search_trace_id, search_started_at, "metadata_fetch")
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
+
+    # v6.2 M-2.2.3: cross-encoder rerank for deep profile.
+    # Reranker returns [] on breaker-open / error — we keep original
+    # order in that case (no hard failure on search path).
+    if search_profile is SearchProfile.DEEP and memories:
+        try:
+            reranker = get_reranker()
+            docs = [m.content or "" for m in memories]
+            scores = await reranker.rerank(request.query, docs)
+            if scores and len(scores) == len(memories):
+                indexed = sorted(
+                    range(len(memories)),
+                    key=lambda i: scores[i],
+                    reverse=True,
+                )
+                memories = [memories[i] for i in indexed]
+                logger.info(
+                    "[SEARCH] profile=deep reranked n=%d trace=%s",
+                    len(memories),
+                    search_trace_id,
+                )
+        except Exception as exc:  # safety net; reranker.rerank should not raise
+            logger.warning(
+                "[SEARCH] reranker dispatch failed trace=%s err=%s",
+                search_trace_id,
+                exc,
+            )
 
     # Fire-and-forget recall-frequency bump for the hit set.
     # Doesn't block the response; failure here is logged and ignored
