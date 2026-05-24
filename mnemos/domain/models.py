@@ -170,6 +170,11 @@ class MemorySearchRequest(BaseModel):
     include_archived: Optional[bool] = False
     boost_recency: Optional[bool] = False
     recency_weight: float = Field(0.15, ge=0.0, le=1.0)
+    # v6.2 M-2.2.3: retrieval profile dispatcher.
+    # fast = semantic-only no rerank; balanced = current behavior (default);
+    # deep = semantic + cross-encoder rerank via MEDUSA :8091.
+    # Unknown values → 400 in route handler.
+    profile: Optional[str] = None
 
 
 class MemoryCreateRequest(BaseModel):
