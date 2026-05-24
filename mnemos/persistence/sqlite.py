@@ -848,10 +848,17 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         embedding_json = json.dumps([float(value) for value in embedding])
         conn = self._conn(tx)
         await _execute(conn, "UPDATE memories SET embedding = ? WHERE id = ?", (embedding_json, memory_id))
+        # On conflict, bump updated_at too — without it, an embedding
+        # refresh (federation re-pull, re-embed worker, manual backfill)
+        # leaves updated_at stale + the only signal that the row was
+        # touched is the embedding column itself, which is hard to
+        # diff. Surfaced 2026-05-24 during F-1 e2e verification.
         await _execute(
             conn,
             "INSERT INTO memory_embeddings(memory_id, embedding) VALUES (?, ?) "
-            "ON CONFLICT(memory_id) DO UPDATE SET embedding = excluded.embedding",
+            "ON CONFLICT(memory_id) DO UPDATE SET "
+            "  embedding = excluded.embedding, "
+            "  updated_at = strftime('%s', 'now')",
             (memory_id, embedding_json),
         )
 
