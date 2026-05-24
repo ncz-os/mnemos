@@ -41,7 +41,8 @@ DRY = "--dry-run" in sys.argv
 
 SMOKE_KIND_RE = re.compile(
     r"^(smoke|halluc|retry-smoke|zeroclaw-validation|hive-stats|"
-    r"hive-mind-feature|ping|halluc-smoke|fleet-goose-validate)",
+    r"hive-mind-feature|ping|halluc-smoke|fleet-goose-validate|hive-test|"
+    r"ic-runtime|mnemos-ic-runtime|investorclaw|investorclade)",
     re.I,
 )
 
