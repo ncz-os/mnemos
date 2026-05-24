@@ -714,15 +714,19 @@ async def _store_memories(
             )
             if inserted:
                 new_n += 1
-                continue
-            # Concurrent create from another federation consumer (the
-            # partial-fleet rollout window with queue-mode + legacy
-            # durables is the canonical trigger; both consumers see
-            # the same event, both pass the existence check, both attempt
-            # to insert, only one wins). Re-fetch and fall through to the
-            # update-when-newer branch so the losing path still applies
-            # a delta if its remote_updated is the freshest.
-            existing = await repo.fetch_federated_memory_marker(tx, local_id)
+                # NOTE: deliberately NOT 'continue' here — fall through to
+                # the F-1.4 embedding-copy block at the bottom of the loop
+                # so newly inserted rows get their embedding written same
+                # as updated rows. Pre-F-1.4 this 'continue' lived here.
+            else:
+                # Concurrent create from another federation consumer (the
+                # partial-fleet rollout window with queue-mode + legacy
+                # durables is the canonical trigger; both consumers see
+                # the same event, both pass the existence check, both attempt
+                # to insert, only one wins). Re-fetch and fall through to the
+                # update-when-newer branch so the losing path still applies
+                # a delta if its remote_updated is the freshest.
+                existing = await repo.fetch_federated_memory_marker(tx, local_id)
 
         if existing is not None:
             # Update only if the inbound remote_updated beats the
