@@ -3033,7 +3033,10 @@ class OracleFederationRepository(FederationRepository):
                 from mnemos.core.config import get_settings as _gs
 
                 try:
-                    _model = (_gs().providers.inference_embed_model or "").strip() or "unknown"
+                    import os as _os
+
+                    _http_model = _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                    _model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
                 except Exception:
                     _model = "unknown"
                 # Single-quote escape for embedded literal.
