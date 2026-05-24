@@ -1065,6 +1065,32 @@ class OracleMemoryRepository(MemoryRepository):
         finally:
             await _call(cursor.close)
 
+    async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
+        """Write a precomputed embedding to memories.embedding.
+
+        Idempotent UPDATE; no-op when embedding is empty. Used by
+        create_memory inline embed-on-write path (mnemos/api/routes/
+        memories.py:946) + federation F-1.4 copy_embeddings consumer.
+        2026-05-24: added so Oracle backend new-write rows actually
+        land with vectors instead of NULL.
+        """
+        if not embedding:
+            return
+        import array as _array
+
+        # Oracle 23ai VECTOR binds via array.array('f', ...).
+        arr = _array.array("f", [float(v) for v in embedding])
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET embedding = :emb WHERE id = :id",
+                {"emb": arr, "id": memory_id},
+            )
+        finally:
+            await _call(cursor.close)
+
     async def set_suppress_version_snapshot(self, tx: Transaction) -> None:
         # No-op for Oracle — Postgres uses a session GUC to bypass the
         # version-snapshot trigger; the Oracle schema has no equivalent
