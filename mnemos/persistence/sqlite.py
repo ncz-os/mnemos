@@ -3472,6 +3472,23 @@ class SqliteAuditChainRepository(_SqliteRepository, AuditChainRepository):
             (global_root,),
         )
 
+    async def get_audit_entry_by_id(
+        self,
+        tx: Transaction,
+        entry_id: bytes,
+    ) -> Row | None:
+        return await _fetch_one(
+            self._conn(tx),
+            """
+            SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                   op, payload_hash, writer_id, writer_pubkey,
+                   signature, signed_at, global_root, global_seq
+            FROM memory_audit_chain
+            WHERE entry_id = ?
+            """,
+            (entry_id,),
+        )
+
 
 class SqliteBackend(PersistenceBackend):
     """SQLite persistence facade backed by one serialized connection."""

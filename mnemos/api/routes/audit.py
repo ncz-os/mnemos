@@ -197,14 +197,8 @@ async def audit_inclusion_proof(
         )
 
     async with backend.transactional() as tx:
-        # Find the entry by entry_id. We need its memory_id +
-        # global_root to scope the window.
-        # No direct "fetch by entry_id" -- piggyback on list_window_entries
-        # only after the get_latest_audit_entry would have run. Cheaper:
-        # use the chain repo's existing get path indirectly. Direct SQL
-        # via backend.transactional is the cleanest path; expose via a
-        # short helper in this route.
-        target_row = await _fetch_entry_by_id(backend, tx, entry_id_bytes)
+        # v6.2 protocol method (cleanup from inline SQL bridge).
+        target_row = await backend.audit_chain.get_audit_entry_by_id(tx, entry_id_bytes)
         if target_row is None:
             raise HTTPException(
                 status_code=404,
@@ -265,69 +259,6 @@ async def audit_inclusion_proof(
         "global_seq": target_row.get("global_seq"),
         "proof": [{"sibling": sib.hex(), "position": pos} for sib, pos in proof],
     }
-
-
-async def _fetch_entry_by_id(backend, tx, entry_id_bytes: bytes) -> dict | None:
-    """Best-effort fetch by entry_id via backend-specific SQL path.
-
-    Repository protocol doesn't expose a get-by-entry-id today;
-    inline a backend-aware query here. PG / SQLite / Oracle differ
-    only on bind syntax; we use the underlying connection accessors
-    each backend exposes.
-    """
-    # Postgres
-    pg_tx = getattr(tx, "conn", None)
-    if hasattr(pg_tx, "fetchrow") and hasattr(pg_tx, "fetch"):
-        row = await pg_tx.fetchrow(
-            """
-            SELECT entry_id, memory_id, signature, signed_at,
-                   global_root, global_seq, payload_hash, op
-            FROM memory_audit_chain
-            WHERE entry_id = $1
-            """,
-            entry_id_bytes,
-        )
-        return dict(row) if row is not None else None
-
-    # SQLite (via cursor on the conn attribute)
-    if hasattr(pg_tx, "execute") and "sqlite" in type(pg_tx).__module__:
-        from mnemos.persistence.sqlite import _fetch_one
-
-        return await _fetch_one(
-            pg_tx,
-            """
-            SELECT entry_id, memory_id, signature, signed_at,
-                   global_root, global_seq, payload_hash, op
-            FROM memory_audit_chain
-            WHERE entry_id = ?
-            """,
-            (entry_id_bytes,),
-        )
-
-    # Oracle / Db2 (python-oracledb async conn)
-    if pg_tx is not None and hasattr(pg_tx, "cursor"):
-        cursor = pg_tx.cursor()
-        if hasattr(cursor, "__await__"):
-            cursor = await cursor
-        try:
-            await cursor.execute(
-                """
-                SELECT entry_id, memory_id, signature, signed_at,
-                       global_root, global_seq, payload_hash, op
-                FROM memory_audit_chain
-                WHERE entry_id = :eid
-                """,
-                {"eid": entry_id_bytes},
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-            cols = [d[0].lower() for d in cursor.description]
-            return dict(zip(cols, row))
-        finally:
-            await cursor.close()
-
-    raise RuntimeError(f"_fetch_entry_by_id: unsupported tx shape {type(tx)!r}")
 
 
 def _to_iso(value) -> str:
