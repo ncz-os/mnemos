@@ -1259,6 +1259,28 @@ async def update_memory(
                     status_code=404,
                     detail=f"Memory {memory_id} not found",
                 )
+            # v6.2 M-2.2.1 audit-chain entry. Same gate + same-tx
+            # commit as create_memory above (see commit e6d0677).
+            from mnemos.core.config import get_settings as _get_settings
+            from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
+
+            if _ace():
+                _settings = _get_settings()
+                _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
+                if _session_secret:
+                    await write_audit_entry(
+                        backend,
+                        tx,
+                        op="update",
+                        memory_id_str=memory_id,
+                        content=row["content"],
+                        category=row["category"],
+                        subcategory=row["subcategory"],
+                        metadata=request.metadata,
+                        embedding=None,
+                        writer_id=user.user_id,
+                        session_secret=_session_secret,
+                    )
             delivery_ids = await backend.webhooks.dispatch_event(
                 tx,
                 "memory.updated",
@@ -1340,6 +1362,29 @@ async def delete_memory(
                     status_code=404,
                     detail=f"Memory {memory_id} not found",
                 )
+            # v6.2 M-2.2.1 audit-chain delete entry. Same gate as
+            # create/update; captures the final state of the row at
+            # the delete point so the chain still verifies post-purge.
+            from mnemos.core.config import get_settings as _get_settings
+            from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
+
+            if _ace():
+                _settings = _get_settings()
+                _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
+                if _session_secret:
+                    await write_audit_entry(
+                        backend,
+                        tx,
+                        op="delete",
+                        memory_id_str=memory_id,
+                        content=row["content"],
+                        category=row["category"],
+                        subcategory=row["subcategory"],
+                        metadata=None,
+                        embedding=None,
+                        writer_id=user.user_id,
+                        session_secret=_session_secret,
+                    )
             delivery_ids = await backend.webhooks.dispatch_event(
                 tx,
                 "memory.deleted",
