@@ -28,6 +28,7 @@ from mnemos.core.lifecycle import (
 )
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
+from mnemos.audit import write_audit_entry
 from mnemos.domain.search import SearchProfile, get_reranker, resolve_profile
 from mnemos.domain.artemis_dedup import (
     duplicate_content_error_body,
@@ -1004,6 +1005,36 @@ async def create_memory(
                     "[create_memory] inline embed failed for %s; row will be backfilled",
                     mem_id,
                 )
+            # v6.2 M-2.2.1 audit chain entry. Gated by MNEMOS_AUDIT_CHAIN=on
+            # via the audit_sealer helper; backend.audit_chain is None on
+            # backends pre-implementation (Db2 live-test blocked on 12.1.5
+            # GA), so write_audit_entry no-ops there. Errors are logged
+            # but never re-raised — audit is a consistency layer, not a
+            # write prerequisite.
+            from mnemos.core.config import get_settings as _get_settings
+            from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
+
+            if _ace():
+                _settings = _get_settings()
+                _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
+                if _session_secret:
+                    await write_audit_entry(
+                        backend,
+                        tx,
+                        op="create",
+                        memory_id_str=mem_id,
+                        content=request.content,
+                        category=request.category,
+                        subcategory=request.subcategory,
+                        metadata=request.metadata,
+                        embedding=None,  # raw bytes for embedding hash; omitted for now
+                        writer_id=user.user_id,
+                        session_secret=_session_secret,
+                    )
+                else:
+                    logger.warning(
+                        "[create_memory] MNEMOS_AUDIT_CHAIN=on but " "session_secret is empty; skipping audit write"
+                    )
             # Same-tx outbox enqueue — preserves the v4.0 contract
             # that webhook_deliveries rows commit atomically with
             # the data write.
