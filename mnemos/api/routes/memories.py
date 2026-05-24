@@ -29,7 +29,7 @@ from mnemos.core.lifecycle import (
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
 from mnemos.audit import write_audit_entry
-from mnemos.domain.search import SearchProfile, get_reranker, resolve_profile
+from mnemos.domain.search import SearchProfile, apply_decay, get_reranker, load_decay_table, resolve_profile
 from mnemos.domain.artemis_dedup import (
     duplicate_content_error_body,
     evaluate_memory_create_dedup,
@@ -869,6 +869,27 @@ async def search_memories(
                 "[SEARCH] reranker dispatch failed trace=%s err=%s",
                 search_trace_id,
                 exc,
+            )
+
+    # v6.2 M-2.2.4: per-category temporal decay applied AFTER any
+    # reranker (deep profile) but BEFORE the response. Decay is
+    # cheap (process-local TTL cache + per-row math), so it runs
+    # unconditionally when the table exists. Override map from the
+    # request overrides per-category half-life or "*" flattens all.
+    if memories:
+        try:
+            decay_table = await load_decay_table(backend)
+            if decay_table or request.decay_overrides:
+                memories = apply_decay(
+                    memories,
+                    decay_table,
+                    overrides=request.decay_overrides,
+                    recency_weight=request.recency_weight,
+                )
+        except Exception:
+            logger.exception(
+                "[SEARCH] decay application failed trace=%s; returning unsorted",
+                search_trace_id,
             )
 
     # Fire-and-forget recall-frequency bump for the hit set.
