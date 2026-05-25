@@ -319,19 +319,19 @@ def _build_oracle_session_callback(settings: Any) -> Any:
     """
     pdb_target = os.environ.get("MNEMOS_ORACLE_PDB", "").strip()
 
-    def _session_callback(conn: Any, requested_tag: Any) -> None:
+    async def _session_callback(conn: Any, requested_tag: Any) -> None:
         cur = None
         try:
             cur = conn.cursor()
             # Defensive NLS pinning: prevents locale-dependent decimal
             # parsing of vector literals + numeric binds.
             try:
-                cur.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '. '")
+                await cur.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '. '")
             except Exception as exc:  # pragma: no cover - driver-dependent
                 _LOG.debug("ALTER SESSION SET NLS_NUMERIC_CHARACTERS failed: %s", exc)
             if pdb_target:
                 try:
-                    cur.execute(f"ALTER SESSION SET CONTAINER = {pdb_target}")
+                    await cur.execute(f"ALTER SESSION SET CONTAINER = {pdb_target}")
                 except Exception as exc:  # pragma: no cover - driver-dependent
                     # ORA-65049 = already in the requested PDB; benign.
                     _LOG.debug(
@@ -342,7 +342,7 @@ def _build_oracle_session_callback(settings: Any) -> Any:
         finally:
             if cur is not None:
                 try:
-                    cur.close()
+                    await cur.close()
                 except Exception:  # pragma: no cover
                     pass
 
@@ -420,7 +420,12 @@ async def create_oracle_pool(
     kwargs.setdefault("min", pool_min)
     kwargs.setdefault("max", pool_max)
     kwargs.setdefault("increment", pool_increment)
-    kwargs.setdefault("statement_cache_size", stmt_cache)
+    # oracledb 2.x accepted statement_cache_size on create_pool_async; 4.x
+    # moved it to PoolParams / connection-level params. Guard defensively so
+    # the call works on both major lines.
+    import inspect as _inspect
+    if "statement_cache_size" in _inspect.signature(oracledb.create_pool_async).parameters:
+        kwargs.setdefault("statement_cache_size", stmt_cache)
     # Explicit WAIT mode + timeout: default behaviour would otherwise
     # block forever when the pool is saturated.
     kwargs.setdefault("getmode", oracledb.POOL_GETMODE_WAIT)
@@ -1058,6 +1063,29 @@ class OracleMemoryRepository(MemoryRepository):
             )
             row = await _call(cursor.fetchone)
             return await _row_to_dict(cursor, row)
+        finally:
+            await _call(cursor.close)
+
+    async def upsert_memory_embedding(
+        self, tx: Transaction, memory_id: str, embedding: Sequence[float]
+    ) -> None:
+        """Write a precomputed embedding to memories.embedding.
+
+        No-op when embedding is empty. Uses Oracle 23ai ``TO_VECTOR``
+        which Db2MemoryRepository's SQL adapter transforms to
+        ``VECTOR(?, dim, FLOAT32)`` automatically.
+        """
+        if not embedding:
+            return
+        vec_literal = _validate_and_format_vector(embedding)
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET embedding = TO_VECTOR(:vec) WHERE id = :id",
+                {"vec": vec_literal, "id": memory_id},
+            )
         finally:
             await _call(cursor.close)
 
