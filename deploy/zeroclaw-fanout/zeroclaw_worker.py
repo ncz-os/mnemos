@@ -113,6 +113,10 @@ AGENT_CAPABILITIES = [
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
 ZEROCLAW_TIMEOUT = int(os.environ.get("ZEROCLAW_TIMEOUT", "600"))
+# Per-provider attempt timeout (separate from total job timeout). Stops hung
+# providers (e.g. Groq 8b under TPM cap returning empty for 10 min) from
+# burning the full ZEROCLAW_TIMEOUT before advancing chain.
+PER_ATTEMPT_TIMEOUT = int(os.environ.get("PER_ATTEMPT_TIMEOUT", "180"))
 ORCHESTRATION_TIMEOUT = int(os.environ.get("ORCHESTRATION_TIMEOUT", "3600"))
 WORKDIR = os.environ.get("HIVE_WORKDIR", os.getcwd())
 AGENT_MODEL = os.environ.get("AGENT_MODEL", "groq/qwen3-32b")
@@ -194,6 +198,8 @@ def _instance_id() -> str:
 
 
 def register() -> str:
+    """Register with hive. Retry with exponential backoff until success.
+    Never returns failure — workers cannot operate without a URN."""
     global _urn, _last_heartbeat
     body = {
         "kind": "zeroclaw",
@@ -212,22 +218,42 @@ def register() -> str:
             "instance_id": _instance_id(),
         },
     }
-    code, resp = _http("POST", "/v1/agents/register", body)
-    if code == 200 and resp:
-        _urn = resp["urn"]
-        _last_heartbeat = time.time()
-        print(f"[zc-worker] registered urn={_urn}", flush=True)
-        return _urn
-    print(f"[zc-worker] register failed code={code} resp={resp}", flush=True)
-    sys.exit(1)
+    attempt = 0
+    backoff = 5.0
+    while _running:
+        attempt += 1
+        code, resp = _http("POST", "/v1/agents/register", body)
+        if code == 200 and resp and resp.get("urn"):
+            _urn = resp["urn"]
+            _last_heartbeat = time.time()
+            print(f"[zc-worker] registered urn={_urn} (attempt {attempt})", flush=True)
+            return _urn
+        print(
+            f"[zc-worker] register attempt={attempt} failed code={code} resp={str(resp)[:200]} — retry in {backoff:.0f}s",
+            flush=True,
+        )
+        # Sleep in 1s chunks so SIGTERM is responsive
+        slept = 0.0
+        while slept < backoff and _running:
+            time.sleep(1.0)
+            slept += 1.0
+        backoff = min(backoff * 1.5, 60.0)  # cap 60s
+    # _running flipped (SIGTERM) — exit cleanly
+    print("[zc-worker] shutting down before register success", flush=True)
+    sys.exit(0)
 
 
 def heartbeat():
+    """Send heartbeat. If URN unknown (404), re-register."""
     global _last_heartbeat
     if time.time() - _last_heartbeat < HEARTBEAT_INTERVAL:
         return
-    _http("POST", "/v1/agents/heartbeat", {"urn": _urn})
+    code, resp = _http("POST", "/v1/agents/heartbeat", {"urn": _urn})
     _last_heartbeat = time.time()
+    # If hive lost our URN (404 or "not found"), re-register
+    if code == 404 or (code in (400, 410) and resp and "not found" in str(resp).lower()):
+        print(f"[zc-worker] heartbeat 404 — URN expired, re-registering", flush=True)
+        register()
 
 
 def claim_next_job() -> dict | None:
@@ -545,22 +571,35 @@ def _build_tier_chain(tier: str) -> list:
     return _HARDCODED_FALLBACK[tier.upper()]
 
 
+_FALLBACK_DEEPSEEK = os.environ.get("ZC_FALLBACK_DEEPSEEK", f"hive_deepseek_{_INST}")
+_FALLBACK_SILICONFLOW = os.environ.get("ZC_FALLBACK_SILICONFLOW", f"hive_siliconflow_{_INST}")
+
+# Fallback chain optimized 2026-05-25:
+# 1. FREE first (NGC NIM kimi-k2.6) — rate-limit-prone but free
+# 2. Cheap paid Groq 8b-instant — fast, but TPM-capped
+# 3. **DeepSeek V4-Flash direct** ($0.14/$0.28, 2500 concur) — funded $50, reliable
+# 4. Together MiniMax-M2.7 ($0.40/$1.20) — last paid resort
+# 5. xAI Grok 4.1 Fast / OpenAI — emergency
 _HARDCODED_FALLBACK = {
     "A": [
         os.environ.get("ZC_TIER_A_AGENT", "hive_anthropic"),
         "hive_openai",
         "hive_gemini",
+        _FALLBACK_DEEPSEEK,
         _FALLBACK_TOGETHER,
     ],
     "B": [
         _PRIMARY_BC,
+        _FALLBACK_DEEPSEEK,
         "hive_groq_8b",
         _FALLBACK_TOGETHER,
+        _FALLBACK_SILICONFLOW,
         "hive_xai",
         "hive_openai",
     ],
     "C": [
         _PRIMARY_BC,
+        _FALLBACK_DEEPSEEK,
         "hive_groq_8b",
         _FALLBACK_TOGETHER,
     ],
@@ -595,6 +634,25 @@ RATE_LIMIT_PATTERNS = [
     "quota_exceeded",
     "insufficient_quota",
     "overloaded",
+    # Together-specific (2026-05-25 — Together MiniMax M2.7 was failing "non-retryable"):
+    "model_not_available",
+    "context_length",
+    "max_tokens",
+    "model_invalid",
+    "Bad Request",
+    "400 Bad Request",
+    "internal_server_error",
+    "500 Internal Server Error",
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "Timed out",
+    "Connection reset",
+    "stream interrupted",
+    "no_completion",
+    # NGC-specific
+    "gateway timeout",
+    "504",
+    "model is currently being loaded",
     "service_unavailable",
     "503 Service Unavailable",
     "Resource has been exhausted",
@@ -660,7 +718,16 @@ def run_zeroclaw(
         )
         attempt_start = time.time()
         try:
-            proc = subprocess.Popen(cmd, cwd=exec_cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # Pass full env so subprocess sees HOME, PATH, API keys, XDG_*, etc.
+            # Without env=, Popen uses parent process env which under systemd may
+            # be sparse if EnvironmentFile didn't set everything.
+            child_env = os.environ.copy()
+            # Ensure essential paths
+            child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            child_env.setdefault("HOME", os.path.expanduser("~"))
+            proc = subprocess.Popen(
+                cmd, cwd=exec_cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=child_env
+            )
             last_job_hb = time.time()
             while True:
                 try:
