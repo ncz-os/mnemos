@@ -1,0 +1,224 @@
+{
+  "evidence": {
+    "schema": "mnemos-bench-four/v1",
+    "ts": "20260525T231430Z",
+    "git": "unknown",
+    "n_records": 5000,
+    "repeat": 5,
+    "results": [
+      {
+        "backend": "pg+pgvector",
+        "n_records": 5000,
+        "phases": [
+          {
+            "label": "bulk-insert-4968",
+            "n": 5,
+            "p50_ms": 4977.217,
+            "p95_ms": null,
+            "p99_ms": null,
+            "min_ms": 4738.273,
+            "max_ms": 5097.089,
+            "median_ms": 4977.217
+          },
+          {
+            "label": "semantic-top10",
+            "n": 20,
+            "p50_ms": 0.869,
+            "p95_ms": 1.227,
+            "p99_ms": null,
+            "min_ms": 0.79,
+            "max_ms": 1.414,
+            "median_ms": 0.869
+          },
+          {
+            "label": "point-lookup",
+            "n": 100,
+            "p50_ms": 0.316,
+            "p95_ms": 0.346,
+            "p99_ms": 0.378,
+            "min_ms": 0.294,
+            "max_ms": 0.384,
+            "median_ms": 0.316
+          },
+          {
+            "label": "list-scan-50",
+            "n": 25,
+            "p50_ms": 1.641,
+            "p95_ms": 2.139,
+            "p99_ms": null,
+            "min_ms": 0.487,
+            "max_ms": 2.404,
+            "median_ms": 1.641
+          }
+        ],
+        "recall": {
+          "label": "recall@10",
+          "n": 100,
+          "mean": 0.989,
+          "min": 0.9,
+          "p5": 0.9
+        }
+      },
+      {
+        "backend": "oracle-23ai",
+        "n_records": 5000,
+        "phases": [
+          {
+            "label": "bulk-insert-4968",
+            "n": 5,
+            "p50_ms": 2877.245,
+            "p95_ms": null,
+            "p99_ms": null,
+            "min_ms": 2831.962,
+            "max_ms": 2938.637,
+            "median_ms": 2877.245
+          },
+          {
+            "label": "semantic-top10",
+            "n": 50,
+            "p50_ms": 88.448,
+            "p95_ms": 96.782,
+            "p99_ms": 97.421,
+            "min_ms": 83.652,
+            "max_ms": 156.183,
+            "median_ms": 88.332
+          },
+          {
+            "label": "point-lookup",
+            "n": 100,
+            "p50_ms": 0.385,
+            "p95_ms": 0.441,
+            "p99_ms": 0.467,
+            "min_ms": 0.289,
+            "max_ms": 0.742,
+            "median_ms": 0.385
+          },
+          {
+            "label": "list-scan-50",
+            "n": 25,
+            "p50_ms": 104.266,
+            "p95_ms": 110.224,
+            "p99_ms": null,
+            "min_ms": 99.02,
+            "max_ms": 136.272,
+            "median_ms": 104.266
+          }
+        ],
+        "recall": {
+          "label": "recall@10",
+          "n": 100,
+          "mean": 0.988,
+          "min": 0.9,
+          "p5": 0.9
+        }
+      },
+      {
+        "backend": "db2-12.1.5",
+        "n_records": 5000,
+        "phases": [
+          {
+            "label": "bulk-insert-4968",
+            "n": 5,
+            "p50_ms": 6781.745,
+            "p95_ms": null,
+            "p99_ms": null,
+            "min_ms": 6627.426,
+            "max_ms": 6960.816,
+            "median_ms": 6781.745
+          },
+          {
+            "label": "semantic-top10",
+            "n": 50,
+            "p50_ms": 2.963,
+            "p95_ms": 3.081,
+            "p99_ms": 3.263,
+            "min_ms": 2.321,
+            "max_ms": 5.389,
+            "median_ms": 2.961
+          },
+          {
+            "label": "point-lookup",
+            "n": 100,
+            "p50_ms": 1.005,
+            "p95_ms": 1.195,
+            "p99_ms": 1.272,
+            "min_ms": 0.877,
+            "max_ms": 2.966,
+            "median_ms": 1.004
+          },
+          {
+            "label": "list-scan-50",
+            "n": 25,
+            "p50_ms": 2.351,
+            "p95_ms": 2.645,
+            "p99_ms": null,
+            "min_ms": 1.984,
+            "max_ms": 4.751,
+            "median_ms": 2.351
+          }
+        ],
+        "recall": {
+          "label": "recall@10",
+          "n": 100,
+          "mean": 1.0,
+          "min": 1.0,
+          "p5": 1.0
+        }
+      },
+      {
+        "backend": "mysql-9.0",
+        "n_records": 5000,
+        "phases": [
+          {
+            "label": "bulk-insert-4968",
+            "n": 5,
+            "p50_ms": 2574.181,
+            "p95_ms": null,
+            "p99_ms": null,
+            "min_ms": 2480.564,
+            "max_ms": 2765.673,
+            "median_ms": 2574.181
+          },
+          {
+            "label": "semantic-top10",
+            "n": 50,
+            "p50_ms": 680.118,
+            "p95_ms": 684.779,
+            "p99_ms": 686.62,
+            "min_ms": 529.316,
+            "max_ms": 687.294,
+            "median_ms": 680.022
+          },
+          {
+            "label": "point-lookup",
+            "n": 100,
+            "p50_ms": 0.297,
+            "p95_ms": 0.369,
+            "p99_ms": 0.458,
+            "min_ms": 0.275,
+            "max_ms": 0.821,
+            "median_ms": 0.297
+          },
+          {
+            "label": "list-scan-50",
+            "n": 25,
+            "p50_ms": 331.269,
+            "p95_ms": 333.796,
+            "p99_ms": null,
+            "min_ms": 4.977,
+            "max_ms": 335.41,
+            "median_ms": 331.269
+          }
+        ],
+        "recall": {
+          "label": "recall@10",
+          "n": 100,
+          "mean": 0.997,
+          "min": 0.9,
+          "p5": 1.0
+        }
+      }
+    ]
+  },
+  "hmac_sha256": "044471223bac9028159344f5abe0d89a4b50ba7766f6161e8865b69abc581ec6"
+}
