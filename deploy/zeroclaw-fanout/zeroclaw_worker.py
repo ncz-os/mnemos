@@ -400,6 +400,11 @@ TIER_PROVIDER_MAP = {
 # zeroclaw 0.8 binds api_key + model + endpoint to agent's model_provider field,
 # so we switch -a <alias> per attempt instead of --provider override (which
 # only changes endpoint URL, retains agent's key — wrong key for new endpoint).
+# Together MiniMax M2.7 = fleet primary. High concurrency, no Groq-style
+# 300k TPM ceiling for 39-worker fan-out. Per-instance aliases preserve
+# workspace isolation across concurrent workers.
+_INST = os.environ.get("ZEROCLAW_INSTANCE_ID", os.environ.get("INSTANCE", "1"))
+_PRIMARY_B = os.environ.get("ZC_TIER_B_AGENT", f"hive_together_{_INST}")
 TIER_FALLBACK_CHAIN = {
     "A": [
         os.environ.get("ZC_TIER_A_AGENT", "hive_anthropic"),
@@ -408,15 +413,15 @@ TIER_FALLBACK_CHAIN = {
         "hive_together",
     ],
     "B": [
-        os.environ.get("ZC_TIER_B_AGENT", "hive_groq"),
-        "hive_together",
+        _PRIMARY_B,
+        "hive_groq",
         "hive_xai",
         "hive_openai",
         "hive_gemini",
     ],
     "C": [
         os.environ.get("ZC_TIER_C_AGENT", "hive_nvidia"),
-        "hive_groq",
+        _PRIMARY_B,
         "hive_xai",
     ],
 }
