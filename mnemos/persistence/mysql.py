@@ -41,6 +41,7 @@ References:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 from collections.abc import Sequence
@@ -125,6 +126,24 @@ def _validate_and_format_vector(embedding: Sequence[float]) -> str:
             raise ValueError(f"embedding[{idx}] is non-finite ({num!r}); NaN and Inf are rejected.")
         formatted.append(f"{num:.7f}")
     return "[" + ",".join(formatted) + "]"
+
+
+def _cosine_distance_python(a: list[float], b: list[float]) -> float:
+    """Pure-Python cosine distance (1 - cosine_similarity) for two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a < 1e-9 or norm_b < 1e-9:
+        return 1.0
+    return 1.0 - dot / (norm_a * norm_b)
+
+
+def _is_vec_distance_unsupported(exc: BaseException) -> bool:
+    """True when exc indicates MySQL lacks built-in vector distance functions."""
+    msg = str(exc)
+    return "1305" in msg and (
+        "VEC_DISTANCE" in msg or "VEC_COSINE" in msg or "VEC_L2" in msg
+    )
 
 
 def _is_unique_violation(exc: BaseException) -> bool:
@@ -794,6 +813,57 @@ class MysqlMemoryRepository(MemoryRepository):
         vec_params = [vec_literal] + params + [limit]
 
         conn = tx.conn
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"""
+                    SELECT m.id, m.content, m.category, m.subcategory, m.metadata,
+                           m.quality_rating, m.compressed_content, m.verbatim_content,
+                           m.owner_id, m.namespace, m.permission_mode, m.source_model,
+                           m.source_provider, m.source_session, m.source_agent,
+                           m.group_id, m.created, m.updated, m.archived_at,
+                           m.recall_count, m.last_recalled_at,
+                           {rank_expr} AS rank_score
+                      FROM memories m
+                     WHERE {" AND ".join(where)}
+                     ORDER BY rank_score ASC
+                     LIMIT %s
+                    """,
+                    vec_params,
+                )
+                return await _fetch_all_dicts(cursor)
+        except Exception as exc:
+            if _is_vec_distance_unsupported(exc):
+                # MySQL Community Edition lacks VEC_DISTANCE_COSINE; fall back to
+                # Python-side cosine computation.
+                return await self._python_cosine_search(
+                    tx,
+                    vec_literal=vec_literal,
+                    where=where,
+                    params=params,
+                    limit=limit,
+                    boost_recency=boost_recency,
+                    recency_weight=recency_weight,
+                )
+            raise
+
+    async def _python_cosine_search(
+        self,
+        tx: Transaction,
+        *,
+        vec_literal: str,
+        where: list[str],
+        params: list[Any],
+        limit: int,
+        boost_recency: bool,
+        recency_weight: float,
+    ) -> list[Row]:
+        """Fallback semantic search using Python-side cosine when MySQL lacks
+        built-in VEC_DISTANCE functions (Community Edition)."""
+        import time as _time
+
+        query_vec = json.loads(vec_literal)
+        conn = tx.conn
         async with conn.cursor() as cursor:
             await cursor.execute(
                 f"""
@@ -803,15 +873,33 @@ class MysqlMemoryRepository(MemoryRepository):
                        m.source_provider, m.source_session, m.source_agent,
                        m.group_id, m.created, m.updated, m.archived_at,
                        m.recall_count, m.last_recalled_at,
-                       {rank_expr} AS rank_score
+                       FROM_VECTOR(m.embedding) AS embedding_json
                   FROM memories m
                  WHERE {" AND ".join(where)}
-                 ORDER BY rank_score ASC
-                 LIMIT %s
                 """,
-                vec_params,
+                params,
             )
-            return await _fetch_all_dicts(cursor)
+            raw_rows = await _fetch_all_dicts(cursor)
+
+        now_ts = _time.time()
+        for row in raw_rows:
+            emb_json = row.pop("embedding_json", None)
+            try:
+                emb = json.loads(emb_json) if emb_json else None
+                dist = _cosine_distance_python(query_vec, emb) if emb else 1.0
+            except (json.JSONDecodeError, ValueError, TypeError):
+                dist = 1.0
+            if boost_recency and row.get("updated") is not None:
+                try:
+                    updated = row["updated"]
+                    age_days = (now_ts - updated.timestamp()) / 86400.0
+                    dist -= recency_weight * (1.0 / (1.0 + age_days))
+                except (AttributeError, OSError):
+                    pass
+            row["rank_score"] = dist
+
+        raw_rows.sort(key=lambda r: r.get("rank_score", 1.0))
+        return raw_rows[:limit]
 
     async def fts_search(
         self,
