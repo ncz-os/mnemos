@@ -901,6 +901,8 @@ class StateRepository(ABC):
 class PersistenceBackend(ABC):
     """Top-level facade exposing backend-specific repository families."""
 
+    supports_webhooks = True
+
     @abstractmethod
     def transactional(self) -> AsyncContextManager[Transaction]:
         """Open a backend-neutral transaction context."""
