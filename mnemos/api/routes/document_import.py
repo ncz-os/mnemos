@@ -6,7 +6,6 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import asyncpg
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
@@ -18,12 +17,17 @@ except ImportError:
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.api.routes.memories import _validate_permission_mode
 from mnemos.core.ids import new_memory_id
+from mnemos.db.document_repo import (
+    DocumentChunkSoftDeletedConflictError,
+    DocumentRepository,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/documents", tags=["document-import"])
+_document_repo = DocumentRepository()
 
 _PROJECT_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _ARCHIVE_SNAPSHOT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -269,29 +273,17 @@ async def import_memories_from_document(
     JSONResponse return leaked Response internals into the batch
     response shape.
 
-    ``route_label`` is keyword-only so each caller surfaces the
-    correct edge-profile 503 detail. The previous hard-coded
-    ``"POST /v1/import/document"`` named a non-existent path
-    (the actual routes are ``POST /v1/documents/import`` and
-    ``POST /v1/documents/batch-import``) — codex caught this
-    in the round-61 review of the round-54..60 503-helper sweep.
-    The pool check is intentionally redundant with the batch
-    endpoint's own pre-loop ``require_postgres_pool_or_503`` call:
-    the batch's pre-loop check escapes the per-file try/except so
-    operators on edge profiles see a top-level 503 with the batch
-    route label, not a 207 body burying SQLite-incompatibility 503s
-    in per-file results.
+    ``route_label`` is kept for stable operator-facing wording in
+    retry/infrastructure payloads, but persistence now goes through
+    ``PersistenceBackend`` instead of a Postgres-only pool.
     """
     perm_mode = _validate_permission_mode(permission_mode, default=600)
     project_tag_value = _validate_project_tag(project_tag)
 
-    # Pool check FIRST — an edge-profile / SQLite deployment can't
-    # serve this route regardless of whether Docling is installed,
-    # so 503 with a route-named profile-aware detail is the more
-    # informative top-level signal than a Docling 501 (which would
-    # send operators chasing the wrong dependency). Codex round-61
-    # review of the round-54..60 sweep called this out.
-    require_postgres_pool_or_503(route_label=route_label)
+    # Backend check FIRST so missing lifecycle state still surfaces before
+    # parsing. The chunk writes below go through ``PersistenceBackend`` rather
+    # than a Postgres-only asyncpg pool.
+    backend = backend_or_503()
 
     if not DOCLING_AVAILABLE:
         raise HTTPException(
@@ -354,8 +346,6 @@ async def import_memories_from_document(
     pending_delivery_ids: list[str] = []
 
     from mnemos.core.pool import is_infrastructure_error
-    from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook
-
     # Infrastructure errors (asyncio.TimeoutError + asyncpg
     # connection family) at acquire time OR mid-loop AFTER one or
     # more chunks have committed must surface as 503 WITHOUT
@@ -489,233 +479,93 @@ async def import_memories_from_document(
             ).encode("utf-8")
         ).hexdigest()
     try:
-        async with _lc.get_pool_manager().acquire() as conn:
-            for chunk in chunks:
-                chunk_delivery_ids: list[str] = []
-                memory_id = new_memory_id()
-                # Pre-allocate the ID outside the per-chunk try so
-                # the outer infra-catch below can see it and decide
-                # whether to surface as committed / unconfirmed.
-                in_flight_id = memory_id
-                try:
-                    chunk_metadata = {
-                        **doc_metadata,
-                        **chunk["metadata"],
-                        "chunk_title": chunk["title"],
-                        "project_tag": project_tag_value,
-                        "import_source": "doc-import",
-                    }
+        for chunk in chunks:
+            chunk_delivery_ids: list[str] = []
+            memory_id = new_memory_id()
+            in_flight_id: str | None = None
+            try:
+                chunk_metadata = {
+                    **doc_metadata,
+                    **chunk["metadata"],
+                    "chunk_title": chunk["title"],
+                    "project_tag": project_tag_value,
+                    "import_source": "doc-import",
+                }
 
-                    chunk_key = _chunk_key(chunk["chunk_num"], chunk["content"])
-                    chunk_key_legacy_v70 = _chunk_key_v70(
-                        chunk["chunk_num"], chunk["content"]
+                chunk_key = _chunk_key(chunk["chunk_num"], chunk["content"])
+                chunk_key_legacy_v70 = _chunk_key_v70(
+                    chunk["chunk_num"], chunk["content"]
+                )
+                async with backend.transactional() as tx:
+                    imported = await _document_repo.import_chunk(
+                        backend,
+                        tx,
+                        memory_id=memory_id,
+                        content=chunk["content"],
+                        category=category,
+                        subcategory=subcategory,
+                        metadata_json=json.dumps(chunk_metadata),
+                        owner_id=user.user_id,
+                        namespace=user.namespace,
+                        permission_mode=perm_mode,
+                        chunk_key=chunk_key,
+                        legacy_chunk_key=chunk_key_legacy_v70,
                     )
-                    canonical_id: Optional[str] = None
-                    async with conn.transaction():
-                        # Round-72 legacy-key resolution: if a row
-                        # exists in this caller's (owner, namespace)
-                        # under the round-70 key shape AND its
-                        # stored permission_mode + category +
-                        # subcategory match the current request's
-                        # ACL/categorization, atomically migrate it
-                        # to the v71 key shape and use that row.
-                        # Codex review-10 of round-71 caught that
-                        # without this step, an alpha upgrade would
-                        # lose idempotency for already-committed
-                        # imports.
-                        #
-                        # The UPDATE can fail with a unique-violation
-                        # if the new chunk_key row ALREADY exists
-                        # (concurrent retry, rolling deploy, prior
-                        # duplicate). Codex review-12 of round-73
-                        # caught that catching UniqueViolationError
-                        # inside the OUTER transaction leaves the
-                        # transaction in Postgres' aborted state —
-                        # Python's ``except`` doesn't undo the
-                        # server-side abort. The very next
-                        # ``fetchval`` (the INSERT-with-ON-CONFLICT
-                        # path) would raise
-                        # ``InFailedSQLTransactionError``. Round-74:
-                        # wrap the UPDATE in a NESTED
-                        # ``conn.transaction()`` (asyncpg implements
-                        # this as a SAVEPOINT). On
-                        # UniqueViolationError the savepoint rolls
-                        # back, leaving the outer transaction
-                        # usable, and we fall through to the
-                        # ON CONFLICT path. The catch is narrowed
-                        # to the ``memories_import_chunk_key_uniq``
-                        # constraint so it doesn't swallow
-                        # unrelated unique violations (e.g., a
-                        # ``memory_id`` PK collision should still
-                        # bubble as a content error).
-                        legacy_id = None
-                        try:
-                            async with conn.transaction():
-                                legacy_id = await conn.fetchval(
-                                    "UPDATE memories "
-                                    "SET import_chunk_key = $1 "
-                                    "WHERE import_chunk_key = $2 "
-                                    "  AND owner_id = $3 "
-                                    "  AND namespace = $4 "
-                                    "  AND permission_mode = $5 "
-                                    "  AND category IS NOT DISTINCT FROM $6 "
-                                    "  AND subcategory IS NOT DISTINCT FROM $7 "
-                                    "  AND deleted_at IS NULL "
-                                    "RETURNING id",
-                                    chunk_key,
-                                    chunk_key_legacy_v70,
-                                    user.user_id,
-                                    user.namespace,
-                                    perm_mode,
-                                    category,
-                                    subcategory,
-                                )
-                        except asyncpg.UniqueViolationError as uv:
-                            # Filter to the import_chunk_key
-                            # constraint specifically. asyncpg
-                            # surfaces the constraint name on the
-                            # exception in modern versions; older
-                            # paths only carry it in the message
-                            # text. Check both so we don't swallow
-                            # an unrelated unique violation
-                            # (e.g., a ``memory_id`` PK collision
-                            # — that should bubble as a content
-                            # error so the operator sees the
-                            # actual data problem). Re-raising
-                            # propagates out of the savepoint
-                            # context which has already rolled
-                            # back, then the outer except handles
-                            # it as a content failure.
-                            constraint_name = getattr(
-                                uv, "constraint_name", None
-                            ) or ""
-                            message = str(uv)
-                            is_chunk_key_uniq = (
-                                constraint_name
-                                == "memories_import_chunk_key_uniq"
-                                or "memories_import_chunk_key_uniq"
-                                in message
-                            )
-                            if not is_chunk_key_uniq:
-                                raise
-                            # Savepoint rolled back; outer
-                            # transaction is still good. Fall
-                            # through to ON CONFLICT below.
-                            legacy_id = None
-                        if legacy_id is not None:
-                            # Legacy row migrated. No INSERT, no
-                            # webhook dispatch — the row already
-                            # exists with its original
-                            # ``memory.created`` event having
-                            # fired on the original write.
-                            canonical_id = legacy_id
-                            in_flight_id = canonical_id
-                            chunk_delivery_ids = []
-                            logger.debug(
-                                f"[DOCLING] Resolved legacy v70 chunk_key "
-                                f"to canonical {canonical_id} "
-                                f"(chunk={chunk['chunk_num']})"
-                            )
-                        else:
-                            # ON CONFLICT (import_chunk_key) DO
-                            # UPDATE SET import_chunk_key =
-                            # EXCLUDED.import_chunk_key is the
-                            # round-68 idempotency primitive: a
-                            # no-op SET because Postgres
-                            # ``DO UPDATE`` requires updating at
-                            # least one column. The
-                            # ``mnemos_version_snapshot()`` AFTER
-                            # UPDATE trigger only writes to
-                            # ``memory_versions`` when audited
-                            # fields are IS DISTINCT FROM their
-                            # previous values; ``import_chunk_key``
-                            # is not in that audited set, so a
-                            # true no-op SET produces no version-
-                            # row churn. ``RETURNING id`` returns
-                            # the canonical row id — the existing
-                            # row's id on conflict, the newly-
-                            # inserted row's id otherwise.
-                            canonical_id = await conn.fetchval(
-                                "INSERT INTO memories "
-                                "(id, content, category, subcategory, metadata, quality_rating, "
-                                " verbatim_content, owner_id, namespace, permission_mode, "
-                                " import_chunk_key) "
-                                "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10) "
-                                "ON CONFLICT (import_chunk_key) DO UPDATE "
-                                "  SET import_chunk_key = EXCLUDED.import_chunk_key "
-                                "  WHERE memories.deleted_at IS NULL "
-                                "RETURNING id",
-                                memory_id,
-                                chunk["content"],
-                                category,
-                                subcategory,
-                                json.dumps(chunk_metadata),
-                                chunk["content"],            # verbatim_content == content for chunks
-                                user.user_id,
-                                user.namespace,
-                                perm_mode,
-                                chunk_key,
-                            )
-                            if canonical_id is None:
-                                raise HTTPException(
-                                    status_code=409,
-                                    detail=(
-                                        "Document chunk matches a soft-deleted memory; "
-                                        "restore it before retrying this import"
-                                    ),
-                                )
-                            # Promote in_flight_id to canonical so
-                            # __aexit__ infra failure surfaces the
-                            # right id in unconfirmed_memory_ids
-                            # (codex review-8 of round-68).
-                            in_flight_id = canonical_id
-                            # Webhook delivery rows go into the
-                            # SAME transaction as the memory
-                            # INSERT.
-                            chunk_delivery_ids = await _dispatch_webhook(
-                                "memory.created",
-                                {
-                                    "memory_id": canonical_id,
-                                    "category": category,
-                                    "subcategory": subcategory,
-                                    "content": chunk["content"],
-                                    "owner_id": user.user_id,
-                                    "namespace": user.namespace,
-                                    "source": "document_import",
-                                },
-                                conn=conn,
-                                owner_id=user.user_id,
-                                namespace=user.namespace,
-                            )
-                    # __aexit__ returned cleanly → commit confirmed.
-                    memory_ids.append(canonical_id)
-                    pending_delivery_ids.extend(str(did) for did in chunk_delivery_ids)
-                    logger.debug(
-                        f"[DOCLING] Created memory {canonical_id} "
-                        f"(chunk_key={chunk_key[:12]}... idem-conflict={canonical_id != memory_id}) "
-                        f"from chunk {chunk['chunk_num']}"
-                    )
+                    canonical_id = imported.memory_id
+                    in_flight_id = canonical_id
+                    if imported.emit_created_event:
+                        chunk_delivery_ids = await backend.webhooks.dispatch_event(
+                            tx,
+                            "memory.created",
+                            {
+                                "memory_id": canonical_id,
+                                "category": category,
+                                "subcategory": subcategory,
+                                "content": chunk["content"],
+                                "owner_id": user.user_id,
+                                "namespace": user.namespace,
+                                "source": "document_import",
+                            },
+                            owner_id=user.user_id,
+                            namespace=user.namespace,
+                        )
+                    else:
+                        logger.debug(
+                            f"[DOCLING] Resolved legacy v70 chunk_key "
+                            f"to canonical {canonical_id} "
+                            f"(chunk={chunk['chunk_num']})"
+                        )
 
-                except Exception as chunk_err:
-                    # Infra-class errors mid-chunk (e.g., asyncpg
-                    # connection drop after acquire, OR a transaction
-                    # __aexit__ commit-ack timeout) escape the
-                    # per-chunk catch so they reach the outer
-                    # try/except below. The in-flight ID is captured
-                    # as unconfirmed before re-raising; the outer
-                    # handler returns ``(payload, 503)`` with both
-                    # ``memory_ids`` (definitely committed) AND
-                    # ``unconfirmed_memory_ids`` (commit ambiguous —
-                    # client must query ``GET /v1/memories/{id}`` to
-                    # reconcile).
-                    if is_infrastructure_error(chunk_err):
+                # transaction context exited cleanly → commit confirmed.
+                memory_ids.append(canonical_id)
+                pending_delivery_ids.extend(str(did) for did in chunk_delivery_ids)
+                logger.debug(
+                    f"[DOCLING] Created memory {canonical_id} "
+                    f"(chunk_key={chunk_key[:12]}... idem-conflict={canonical_id != memory_id}) "
+                    f"from chunk {chunk['chunk_num']}"
+                )
+
+            except Exception as chunk_err:
+                # Infra-class errors mid-chunk (e.g., connection drop or a
+                # transaction commit-ack timeout) escape the per-chunk catch so
+                # the outer handler returns ``(payload, 503)`` with committed
+                # chunks preserved.
+                if is_infrastructure_error(chunk_err):
+                    if in_flight_id is not None:
                         unconfirmed_memory_ids.append(in_flight_id)
-                        raise
+                    raise
+                if isinstance(chunk_err, DocumentChunkSoftDeletedConflictError):
+                    logger.info(
+                        "[DOCLING] Soft-deleted chunk conflict for chunk %s: %s",
+                        chunk["chunk_num"],
+                        chunk_err,
+                    )
+                else:
                     logger.error(
                         f"[DOCLING] Failed to create memory for chunk {chunk['chunk_num']}: {chunk_err}",
                         exc_info=True,
                     )
-                    errors.append({"chunk": chunk["chunk_num"], "error": str(chunk_err)})
+                errors.append({"chunk": chunk["chunk_num"], "error": str(chunk_err)})
     except HTTPException:
         # Already shaped — don't re-wrap.
         raise
@@ -878,17 +728,9 @@ async def batch_import_documents(
     # below would swallow the 422 into a per-file error result.
     _validate_permission_mode(permission_mode, default=600)
     _validate_project_tag(project_tag)
-    # Pre-loop pool check so an edge-profile 503 (SQLite-only deployment
-    # being asked to serve a Postgres-only route) escapes uncaught with
-    # the BATCH route label, not the per-file one. The per-file
-    # ``import_memories_from_document`` call below repeats the check,
-    # which is harmless when the pool is up and the right thing to do
-    # if it goes down mid-batch (the next iteration would then bubble).
-    # Codex caught the original round-56 form folded SQLite-incompat
-    # 503s into a 207 body and named a non-existent path
-    # ("POST /v1/import/document"); this loop boundary is the operator-
-    # honest top-level signal.
-    require_postgres_pool_or_503(route_label="POST /v1/documents/batch-import")
+    # Pre-loop backend check so a missing lifecycle backend escapes uncaught
+    # instead of being folded into a per-file result.
+    backend_or_503()
     results = []
     has_partial_or_full_failure = False
     for file in files:
