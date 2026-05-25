@@ -51,6 +51,8 @@ EMBED_DIM = 768
 TOP_K = 10
 WARMUP = 32
 BATCH_CHUNK = 128
+ACC_CORPUS = 300   # records in recall-accuracy corpus
+ACC_QUERIES = 100  # query vectors for recall@TOP_K measurement
 
 PG_DSN = os.environ.get("PG_DSN", "postgresql://mnemos_user:mnemos_local@localhost:5433/mnemos")
 ORACLE_DSN = os.environ.get("ORACLE_DSN", "")
@@ -91,6 +93,40 @@ def _rand_vec() -> list[float]:
     v = [random.gauss(0, 1) for _ in range(EMBED_DIM)]
     mag = sum(x * x for x in v) ** 0.5
     return [x / mag for x in v]
+
+
+def _brute_force_topk(
+    query: list[float],
+    corpus: list[tuple[str, list[float]]],
+    k: int,
+) -> list[str]:
+    """Return the top-k memory IDs by cosine similarity (brute force).
+
+    All embeddings are L2-normalized so cosine similarity = dot product.
+    For unit-norm vectors, minimising Euclidean distance is equivalent to
+    maximising cosine similarity, so this ground truth is correct for both
+    PG (cosine) and Db2 (EUCLIDEAN) backends.
+    """
+    scores = [
+        (mid, sum(q * c for q, c in zip(query, emb)))
+        for mid, emb in corpus
+    ]
+    scores.sort(key=lambda x: -x[1])
+    return [mid for mid, _ in scores[:k]]
+
+
+def _recall_stats(recalls: list[float], k: int) -> dict[str, Any]:
+    if not recalls:
+        return {"label": f"recall@{k}", "n": 0, "mean": None, "min": None, "p5": None}
+    s = sorted(recalls)
+    n = len(s)
+    return {
+        "label": f"recall@{k}",
+        "n": n,
+        "mean": round(statistics.mean(s), 4),
+        "min": round(s[0], 4),
+        "p5": round(s[max(0, int(n * 0.05))], 4) if n >= 10 else None,
+    }
 
 
 def _bench_user() -> Any:
@@ -285,6 +321,60 @@ async def _bench_backend(name: str, backend, repeat: int, n_records: int) -> dic
             list_samples.append(time.perf_counter() - t0)
     list_stat = _stats(list_samples, "list-scan-50")
 
+    # ── phase 5: recall accuracy ──
+    # Insert a dedicated corpus with fully known embeddings; compute
+    # brute-force cosine top-K as ground truth; compare with ANN results.
+    # Ground truth includes the warmup records already in the table.
+    print(f"  [{name}] recall accuracy: corpus={ACC_CORPUS} queries={ACC_QUERIES} K={TOP_K} ...", flush=True)
+    acc_prefix = f"acc_{uuid.uuid4().hex[:10]}_"
+    acc_records_meta = []
+    acc_embeddings_list: list[list[float]] = []
+    for i in range(ACC_CORPUS):
+        acc_records_meta.append({
+            "id": f"{acc_prefix}{i:06d}",
+            "content": f"accuracy corpus record {i}",
+            "category": "bench",
+            "subcategory": "accuracy",
+        })
+        acc_embeddings_list.append(_rand_vec())
+
+    async with backend.transactional() as tx:
+        for i, arec in enumerate(acc_records_meta):
+            await _insert_one(
+                backend, tx,
+                memory_id=arec["id"],
+                content=arec["content"],
+                category=arec["category"],
+                subcategory=arec["subcategory"],
+                embedding=acc_embeddings_list[i],
+            )
+
+    # Ground truth corpus = warmup records + acc corpus (all in namespace="bench").
+    # Warmup embeddings are the first WARMUP entries of `embeddings`.
+    gt_corpus = (
+        [(records[i]["id"], embeddings[i]) for i in range(WARMUP)]
+        + [(acc_records_meta[i]["id"], acc_embeddings_list[i]) for i in range(ACC_CORPUS)]
+    )
+    recalls: list[float] = []
+    for _ in range(ACC_QUERIES):
+        qvec = _rand_vec()
+        gt_ids = set(_brute_force_topk(qvec, gt_corpus, TOP_K))
+        async with backend.transactional() as tx:
+            ann_rows = await backend.memories.semantic_search(
+                tx, embedding=qvec, limit=TOP_K, visibility=vis,
+            )
+        ann_ids = {r["id"] for r in ann_rows}
+        recalls.append(len(ann_ids & gt_ids) / len(gt_ids) if gt_ids else 0.0)
+
+    recall_stat = _recall_stats(recalls, TOP_K)
+
+    async with backend.transactional() as tx:
+        for arec in acc_records_meta:
+            try:
+                await backend.memories.delete_memory(tx, arec["id"], visibility=vis)
+            except Exception:
+                pass
+
     # cleanup all bench records
     print(f"  [{name}] cleanup ...", flush=True)
     async with backend.transactional() as tx:
@@ -298,6 +388,7 @@ async def _bench_backend(name: str, backend, repeat: int, n_records: int) -> dic
         "backend": name,
         "n_records": n_records,
         "phases": [bulk_stat, sem_stat, lookup_stat, list_stat],
+        "recall": recall_stat,
     }
 
 
@@ -326,6 +417,20 @@ def _print_table(results: list[dict]) -> None:
             val = f"{p['p95_ms']}ms" if p.get("p95_ms") is not None else ""
             p95row += f"{val:>{col}}"
         print(p95row)
+    # recall@K section
+    print("-" * len(header))
+    recall_row = f"{'recall@'+str(TOP_K):<28}"
+    for res in results:
+        rc = res.get("recall", {})
+        val = f"{rc['mean']:.4f}" if rc.get("mean") is not None else "n/a"
+        recall_row += f"{val:>{col}}"
+    print(recall_row)
+    min_row = f"  {'min':>26}"
+    for res in results:
+        rc = res.get("recall", {})
+        val = f"{rc['min']:.4f}" if rc.get("min") is not None else ""
+        min_row += f"{val:>{col}}"
+    print(min_row)
     print("=" * len(header))
 
 
@@ -370,6 +475,8 @@ async def _main() -> None:
             results.append(res)
             for p in res["phases"]:
                 print(f"  {p['label']:30} p50={p['p50_ms']}ms  p95={p.get('p95_ms')}ms")
+            rc = res.get("recall", {})
+            print(f"  {rc.get('label','recall'):30} mean={rc.get('mean')}  min={rc.get('min')}")
         except Exception as exc:
             print(f"  ERROR {bname}: {exc}")
             import traceback
