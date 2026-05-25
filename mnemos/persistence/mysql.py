@@ -20,9 +20,10 @@ Key SQL-level differences from Postgres/Oracle:
 - No pgvector — ``supports_pgvector = False``.
 
 This backend implements the core memory / FTS / vector-search surfaces.
-KG triples, compression, versioning, webhooks, and federation surfaces
-raise ``NotImplementedError`` (same posture as the initial Oracle port)
-and will be filled in across subsequent slices following M4 review.
+KG triples, compression, versioning, and federation surfaces raise
+``NotImplementedError`` (same posture as the initial Oracle port) and will be
+filled in across subsequent slices following M4 review. Webhooks are explicitly
+declared unsupported and gated before callers can reach the outbox methods.
 
 Configuration example::
 
@@ -39,7 +40,6 @@ References:
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 import math
@@ -223,6 +223,12 @@ def _stub_method(method_name: str):
 
     _stub.__name__ = method_name
     return _stub
+
+
+_MYSQL_WEBHOOKS_UNSUPPORTED = (
+    "mysql: webhooks are not supported by MysqlBackend yet; "
+    "use a backend with webhook outbox support before accessing backend.webhooks"
+)
 
 
 # ── DDL ───────────────────────────────────────────────────────────────────────
@@ -496,10 +502,10 @@ class MysqlMemoryRepository(MemoryRepository):
             await cursor.execute(
                 """
                 INSERT INTO memory_embeddings (memory_id, embedding, dimension)
-                VALUES (%s, VEC_FromText(%s), %s)
+                VALUES (%s, VEC_FromText(%s), %s) AS new_row (memory_id, embedding, dimension)
                 ON DUPLICATE KEY UPDATE
-                    embedding = VEC_FromText(VALUES(embedding)),
-                    dimension = VALUES(dimension)
+                    embedding = new_row.embedding,
+                    dimension = new_row.dimension
                 """,
                 (memory_id, vec_literal, dimension),
             )
@@ -866,12 +872,11 @@ class MysqlMemoryRepository(MemoryRepository):
         user: Any,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
-        from mnemos.core.lifecycle import get_embedder
+        from mnemos.core.lifecycle import _get_embedding
 
-        embedder = get_embedder()
-        if embedder is None:
+        embedding = await _get_embedding(query)
+        if not embedding:
             return []
-        embedding = await asyncio.get_event_loop().run_in_executor(None, embedder.embed, query)
 
         from mnemos.core.security import is_root
 
@@ -950,15 +955,19 @@ class MysqlCompressionRepository(CompressionRepository):
 
 
 class MysqlWebhookRepository(WebhookRepository):
-    dispatch_event = _stub_method("dispatch_event")
-    insert_webhook = _stub_method("insert_webhook")
-    fetch_webhook = _stub_method("fetch_webhook")
-    list_webhooks = _stub_method("list_webhooks")
-    update_webhook = _stub_method("update_webhook")
-    delete_webhook = _stub_method("delete_webhook")
-    fetch_active_webhooks_for_event = _stub_method("fetch_active_webhooks_for_event")
-    record_delivery_attempt = _stub_method("record_delivery_attempt")
-    fetch_delivery_attempts = _stub_method("fetch_delivery_attempts")
+    def __init__(self) -> None:
+        raise NotImplementedError(_MYSQL_WEBHOOKS_UNSUPPORTED)
+
+    async def dispatch_event(
+        self,
+        tx: Transaction,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        owner_id: str | None = None,
+        namespace: str | None = None,
+    ) -> list[str]:
+        raise NotImplementedError(_MYSQL_WEBHOOKS_UNSUPPORTED)
 
 
 class MysqlConsultationAuditRepository(ConsultationAuditRepository):
@@ -1031,8 +1040,10 @@ class MysqlBackend(PersistenceBackend):
 
     Core memory, FTS, and VECTOR search surfaces are implemented.
     All other repository surfaces (KG triples, versioning, compression,
-    webhooks, federation, state) are stubbed — ``NotImplementedError`` is
-    raised at call time so attribute lookups are always safe.
+    federation, state) are stubbed - ``NotImplementedError`` is raised at call
+    time. Webhooks are currently unsupported and fail at ``backend.webhooks``
+    access so callers can detect the missing outbox capability before invoking
+    a method.
 
     The pool is managed externally (via ``create_mysql_pool``); callers
     must call ``await backend.close()`` at shutdown to drain the pool.
@@ -1043,6 +1054,7 @@ class MysqlBackend(PersistenceBackend):
     supports_row_level_security = False
     supports_pgvector = False
     supports_mysql_vector = True  # MySQL 9.0 native VECTOR
+    supports_webhooks = False
 
     def __init__(self, pool: Any, settings: Any) -> None:
         self._pool = pool
@@ -1059,7 +1071,6 @@ class MysqlBackend(PersistenceBackend):
         self._memory_versions_repo = MysqlVersionRepository()
         self._memory_branches_repo = MysqlBranchRepository()
         self._compression_repo = MysqlCompressionRepository()
-        self._webhooks_repo = MysqlWebhookRepository()
         self._consultations_audit_repo = MysqlConsultationAuditRepository()
         self._federation_repo = MysqlFederationRepository()
         self._state_kv_repo = MysqlStateRepository()
@@ -1109,7 +1120,7 @@ class MysqlBackend(PersistenceBackend):
 
     @property
     def webhooks(self) -> WebhookRepository:
-        return self._webhooks_repo
+        return MysqlWebhookRepository()
 
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:
