@@ -10,19 +10,19 @@ schema_version = 3
 
 [providers.models.anthropic.opus_4_6]
 api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
-model = "claude-opus-4-6"
+model = "claude-opus-4-1"
 
 [providers.models.anthropic.sonnet_4_6]
 api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
-model = "claude-sonnet-4-6"
+model = "claude-sonnet-4-5-20250929"
 
 [providers.models.openai.gpt5_2_pro]
 api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
-model = "gpt-5.2-pro"
+model = "gpt-5-pro"
 
 [providers.models.openai.gpt5_2]
 api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
-model = "gpt-5.2-chat-latest"
+model = "gpt-5"
 
 [providers.models.gemini.pro_preview]
 api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
@@ -38,11 +38,11 @@ model = "MiniMaxAI/MiniMax-M2.7"
 
 [providers.models.openai.gpt5_mini]
 api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
-model = "gpt-5.4-nano"
+model = "gpt-5-mini"
 
 [providers.models.gemini.flash]
 api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
-model = "gemini-3-flash"
+model = "gemini-2.5-flash"
 
 [providers.models.xai.grok_4_1_fast]
 api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
