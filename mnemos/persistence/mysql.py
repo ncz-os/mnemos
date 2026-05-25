@@ -11,8 +11,8 @@ Key SQL-level differences from Postgres/Oracle:
 - ``VEC_FromText(%s)`` to bind an embedding string; ``VEC_DISTANCE_COSINE``
   for ANN distance (MySQL 9.0 nomenclature).
 - ``DATETIME(6)`` with ``SET time_zone = '+00:00'`` for UTC timestamps.
-- ``INSERT … ON DUPLICATE KEY UPDATE id = id`` as an idempotent no-op
-  upsert guard.
+- ``INSERT … ON DUPLICATE KEY UPDATE`` with COALESCE-protected column
+  updates for duplicate-key writes.
 - ``COALESCE`` (no NVL / NVL2), ``LIMIT n`` (no FETCH FIRST).
 - ``MATCH (col) AGAINST (%s IN BOOLEAN MODE)`` for full-text search.
 - No advisory locks — ``supports_advisory_locks = False``.
@@ -180,7 +180,7 @@ def _render_visibility(
         )
 
     group_ids = list(visibility.group_ids)
-    params: list[Any] = [visibility.user_id, visibility.namespace]
+    params: list[Any] = [visibility.user_id]
     if group_ids:
         placeholders = ", ".join(["%s"] * len(group_ids))
         group_clause = f"{p}group_id IN ({placeholders})"
@@ -221,10 +221,7 @@ def _stub_method(method_name: str):
     """Build a coroutine stub that raises NotImplementedError on call."""
 
     async def _stub(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError(
-            f"{type(self).__name__}.{method_name} is not implemented in the MySQL "
-            "backend yet — see docs/mysql-port-status.md for the porting roadmap."
-        )
+        raise NotImplementedError(f"mysql: {method_name} not yet implemented")
 
     _stub.__name__ = method_name
     return _stub
@@ -399,7 +396,7 @@ class MysqlMemoryRepository(MemoryRepository):
             async with conn.cursor() as cursor:
                 await cursor.execute(
                     """
-                    INSERT IGNORE INTO memories (
+                    INSERT INTO memories (
                         id, content, content_hash, category, subcategory, metadata,
                         quality_rating, verbatim_content, owner_id, namespace,
                         permission_mode, source_model, source_provider,
@@ -411,6 +408,23 @@ class MysqlMemoryRepository(MemoryRepository):
                         %s, %s,
                         COALESCE(%s, NOW(6)), COALESCE(%s, NOW(6))
                     )
+                    ON DUPLICATE KEY UPDATE
+                        content = COALESCE(VALUES(content), content),
+                        content_hash = COALESCE(VALUES(content_hash), content_hash),
+                        category = COALESCE(VALUES(category), category),
+                        subcategory = COALESCE(VALUES(subcategory), subcategory),
+                        metadata = COALESCE(VALUES(metadata), metadata),
+                        quality_rating = COALESCE(VALUES(quality_rating), quality_rating),
+                        verbatim_content = COALESCE(VALUES(verbatim_content), verbatim_content),
+                        owner_id = COALESCE(VALUES(owner_id), owner_id),
+                        namespace = COALESCE(VALUES(namespace), namespace),
+                        permission_mode = COALESCE(VALUES(permission_mode), permission_mode),
+                        source_model = COALESCE(VALUES(source_model), source_model),
+                        source_provider = COALESCE(VALUES(source_provider), source_provider),
+                        source_session = COALESCE(VALUES(source_session), source_session),
+                        source_agent = COALESCE(VALUES(source_agent), source_agent),
+                        created = COALESCE(VALUES(created), created),
+                        updated = COALESCE(VALUES(updated), updated)
                     """,
                     (
                         memory_id, content, _content_hash(content), category, subcategory,
@@ -621,16 +635,24 @@ class MysqlMemoryRepository(MemoryRepository):
         visibility: VisibilityFilter,
     ) -> Row | None:
         conn = tx.conn
+        vis_clause, vis_params = _render_visibility(visibility, table_alias="m")
+        where = ["m.id = %s", "m.deleted_at IS NULL", "m.archived_at IS NULL"]
+        params: list[Any] = [memory_id]
+        if vis_clause:
+            where.append(vis_clause)
+            params += vis_params
         async with conn.cursor() as cursor:
             await cursor.execute(
-                """
-                UPDATE memories
+                f"""
+                UPDATE memories m
                    SET recall_count = recall_count + 1,
                        last_recalled_at = NOW(6)
-                 WHERE id = %s AND deleted_at IS NULL
+                 WHERE {" AND ".join(where)}
                 """,
-                (memory_id,),
+                params,
             )
+            if not cursor.rowcount:
+                return None
         return await self.get_memory(tx, memory_id, visibility=visibility)
 
     async def delete_memory(
@@ -649,10 +671,16 @@ class MysqlMemoryRepository(MemoryRepository):
         if row is None:
             return None
         conn = tx.conn
+        vis_clause, vis_params = _render_visibility(visibility, table_alias="m")
+        where = ["m.id = %s", "m.deleted_at IS NULL"]
+        params: list[Any] = [memory_id]
+        if vis_clause:
+            where.append(vis_clause)
+            params += vis_params
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "UPDATE memories SET deleted_at = NOW(6) WHERE id = %s AND deleted_at IS NULL",
-                (memory_id,),
+                f"UPDATE memories m SET deleted_at = NOW(6) WHERE {' AND '.join(where)}",
+                params,
             )
         return row if cursor.rowcount else None
 
@@ -851,6 +879,7 @@ class MysqlMemoryRepository(MemoryRepository):
 class MysqlKGRepository(KGRepository):
     insert_kg_triple = _stub_method("insert_kg_triple")
     fetch_kg_triples_for_export = _stub_method("fetch_kg_triples_for_export")
+    fetch_kg_triple_by_id = _stub_method("fetch_kg_triple_by_id")
     fetch_kg_triple = _stub_method("fetch_kg_triple")
     fetch_kg_triples_for_memory = _stub_method("fetch_kg_triples_for_memory")
     delete_kg_triple = _stub_method("delete_kg_triple")
@@ -861,35 +890,47 @@ class MysqlKGRepository(KGRepository):
 
 
 class MysqlVersionRepository(VersionRepository):
+    fetch_memory_versions_for_export = _stub_method("fetch_memory_versions_for_export")
+    fetch_memory_versions_by_ids = _stub_method("fetch_memory_versions_by_ids")
     insert_memory_version = _stub_method("insert_memory_version")
+    fetch_memory_version_by_id = _stub_method("fetch_memory_version_by_id")
     fetch_memory_versions = _stub_method("fetch_memory_versions")
     fetch_memory_version_snapshot = _stub_method("fetch_memory_version_snapshot")
     revert_to_version = _stub_method("revert_to_version")
 
 
 class MysqlBranchRepository(BranchRepository):
-    list_memory_branches = _stub_method("list_memory_branches")
     create_memory_branch = _stub_method("create_memory_branch")
+    delete_memory_branches_for_memories = _stub_method("delete_memory_branches_for_memories")
+    fetch_memory_branch_heads = _stub_method("fetch_memory_branch_heads")
+    upsert_memory_branch_head = _stub_method("upsert_memory_branch_head")
+    list_memory_branches = _stub_method("list_memory_branches")
     delete_memory_branch = _stub_method("delete_memory_branch")
     fetch_dag_for_memory = _stub_method("fetch_dag_for_memory")
     merge_memory_branch = _stub_method("merge_memory_branch")
-    delete_memory_branches_for_memories = _stub_method("delete_memory_branches_for_memories")
+    get_branch_head = _stub_method("get_branch_head")
+    set_branch_head = _stub_method("set_branch_head")
 
 
 class MysqlCompressionRepository(CompressionRepository):
+    fetch_compressed_variants_for_export = _stub_method("fetch_compressed_variants_for_export")
+    compression_candidate_exists = _stub_method("compression_candidate_exists")
+    insert_compressed_variant = _stub_method("insert_compressed_variant")
+    fetch_compressed_variant_by_memory_id = _stub_method("fetch_compressed_variant_by_memory_id")
+    gather_stats = _stub_method("gather_stats")
     insert_compression = _stub_method("insert_compression")
     fetch_compressions = _stub_method("fetch_compressions")
     fetch_compression_by_id = _stub_method("fetch_compression_by_id")
     delete_compression = _stub_method("delete_compression")
     update_compression_review = _stub_method("update_compression_review")
     fetch_memories_for_compression = _stub_method("fetch_memories_for_compression")
-    gather_stats = _stub_method("gather_stats")
     fetch_manifests = _stub_method("fetch_manifests")
     fetch_manifest_by_id = _stub_method("fetch_manifest_by_id")
     insert_manifest = _stub_method("insert_manifest")
 
 
 class MysqlWebhookRepository(WebhookRepository):
+    dispatch_event = _stub_method("dispatch_event")
     insert_webhook = _stub_method("insert_webhook")
     fetch_webhook = _stub_method("fetch_webhook")
     list_webhooks = _stub_method("list_webhooks")
@@ -901,12 +942,42 @@ class MysqlWebhookRepository(WebhookRepository):
 
 
 class MysqlConsultationAuditRepository(ConsultationAuditRepository):
+    fetch_recommended_model = _stub_method("fetch_recommended_model")
+    fetch_model_recommendation = _stub_method("fetch_model_recommendation")
+    lookup_provider_for_model = _stub_method("lookup_provider_for_model")
+    fetch_available_models = _stub_method("fetch_available_models")
+    fetch_model_provider = _stub_method("fetch_model_provider")
     insert_consultation_audit = _stub_method("insert_consultation_audit")
     fetch_consultation_audits = _stub_method("fetch_consultation_audits")
     fetch_consultation_audit = _stub_method("fetch_consultation_audit")
+    fetch_consultation_by_id = _stub_method("fetch_consultation_by_id")
+    fetch_consultations = _stub_method("fetch_consultations")
 
 
 class MysqlFederationRepository(FederationRepository):
+    fetch_memory_page = _stub_method("fetch_memory_page")
+    create_peer = _stub_method("create_peer")
+    list_peers = _stub_method("list_peers")
+    get_peer = _stub_method("get_peer")
+    update_peer = _stub_method("update_peer")
+    upsert_peer = _stub_method("upsert_peer")
+    delete_peer = _stub_method("delete_peer")
+    fetch_sync_log = _stub_method("fetch_sync_log")
+    feed_query = _stub_method("feed_query")
+    get_feed_memory = _stub_method("get_feed_memory")
+    get_sync_peer = _stub_method("get_sync_peer")
+    update_peer_schema_check = _stub_method("update_peer_schema_check")
+    record_schema_abort = _stub_method("record_schema_abort")
+    create_sync_log = _stub_method("create_sync_log")
+    finish_sync_log = _stub_method("finish_sync_log")
+    record_sync_error = _stub_method("record_sync_error")
+    record_sync_success = _stub_method("record_sync_success")
+    list_due_peers = _stub_method("list_due_peers")
+    fetch_federated_memory_marker = _stub_method("fetch_federated_memory_marker")
+    insert_federated_memory = _stub_method("insert_federated_memory")
+    update_federated_memory_if_newer = _stub_method("update_federated_memory_if_newer")
+    apply_consolidation_tombstone = _stub_method("apply_consolidation_tombstone")
+    delete_federated_memory = _stub_method("delete_federated_memory")
     upsert_federated_memory = _stub_method("upsert_federated_memory")
     fetch_federation_peers = _stub_method("fetch_federation_peers")
     upsert_federation_peer = _stub_method("upsert_federation_peer")
@@ -916,10 +987,20 @@ class MysqlFederationRepository(FederationRepository):
 
 
 class MysqlStateRepository(StateRepository):
+    get = _stub_method("get")
+    set = _stub_method("set")
+    delete = _stub_method("delete")
+    list_namespace = _stub_method("list_namespace")
+    delete_namespace = _stub_method("delete_namespace")
     get_state = _stub_method("get_state")
     set_state = _stub_method("set_state")
     delete_state = _stub_method("delete_state")
     list_state_keys = _stub_method("list_state_keys")
+    get_state_value = _stub_method("get_state_value")
+    set_state_value = _stub_method("set_state_value")
+    delete_state_value = _stub_method("delete_state_value")
+    list_state_namespace = _stub_method("list_state_namespace")
+    delete_state_namespace = _stub_method("delete_state_namespace")
 
 
 # ── Backend facade ────────────────────────────────────────────────────────────

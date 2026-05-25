@@ -14,7 +14,7 @@ except ModuleNotFoundError:
     import tomli as tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 from urllib.parse import urlparse
 
 import asyncpg
