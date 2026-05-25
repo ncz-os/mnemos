@@ -37,12 +37,78 @@ HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "zeroclaw")
 ZEROCLAW_AGENT = os.environ.get("ZEROCLAW_AGENT", "hive")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname())
+_DEFAULT_CAPABILITIES = ",".join(
+    [
+        # Core skills
+        "code-edit",
+        "code-review",
+        "code-fix",
+        "multi-agent",
+        "delegate",
+        "orchestration",
+        "investigation",
+        "refactor",
+        "verify",
+        "benchmark",
+        "docs",
+        "architecture",
+        "migration",
+        "deploy",
+        # Languages
+        "python",
+        "bash",
+        "rust",
+        "typescript",
+        "javascript",
+        "sql",
+        "yaml",
+        "toml",
+        "markdown",
+        "shell",
+        # OS / runtime
+        "linux",
+        "docker",
+        "podman",
+        "quadlet",
+        "systemd",
+        "ssh",
+        "nfs",
+        "cron",
+        "git",
+        "gitlab",
+        "github",
+        # Databases
+        "sqlite",
+        "postgresql",
+        "postgres",
+        "oracle",
+        "db2",
+        "redis",
+        # Project domains
+        "investorclaw",
+        "investorclade",
+        "ic-engine",
+        "mnemos",
+        "graeae",
+        "riskyeats",
+        "calliope",
+        "cixmini-os",
+        "ncz-os",
+        "fleet-infra",
+        "llm-tooling",
+        "etlantis",
+        "mayaferries",
+        "zeroclaw",
+        "openclaw",
+        "hermes",
+        "claude-code-cli",
+        "testing",
+        "npu",
+        "yocto",
+    ]
+)
 AGENT_CAPABILITIES = [
-    c.strip()
-    for c in os.environ.get(
-        "AGENT_CAPABILITIES", "code-edit,multi-agent,delegate,python,bash,linux,orchestration"
-    ).split(",")
-    if c.strip()
+    c.strip() for c in os.environ.get("AGENT_CAPABILITIES", _DEFAULT_CAPABILITIES).split(",") if c.strip()
 ]
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
@@ -285,7 +351,6 @@ def _prepare_workspace(job_id: str, repo: dict, agent_alias: str = "") -> Option
     """
     short = job_id[:8]
     alias = agent_alias or os.environ.get("ZEROCLAW_AGENT", "hive")
-    instance = os.environ.get("ZEROCLAW_INSTANCE_ID", os.environ.get("INSTANCE", "1"))
     # Agent's workspace root — same path zeroclaw's file_write tool writes to
     workspace = os.path.expanduser(f"~/.zeroclaw/agents/{alias}/workspace")
     try:
@@ -400,31 +465,124 @@ TIER_PROVIDER_MAP = {
 # zeroclaw 0.8 binds api_key + model + endpoint to agent's model_provider field,
 # so we switch -a <alias> per attempt instead of --provider override (which
 # only changes endpoint URL, retains agent's key — wrong key for new endpoint).
-# Together MiniMax M2.7 = fleet primary. High concurrency, no Groq-style
-# 300k TPM ceiling for 39-worker fan-out. Per-instance aliases preserve
-# workspace isolation across concurrent workers.
+# Per-instance aliases preserve workspace isolation across concurrent workers.
 _INST = os.environ.get("ZEROCLAW_INSTANCE_ID", os.environ.get("INSTANCE", "1"))
-_PRIMARY_B = os.environ.get("ZC_TIER_B_AGENT", f"hive_together_{_INST}")
-TIER_FALLBACK_CHAIN = {
+_PRIMARY_BC = os.environ.get("ZC_TIER_BC_AGENT", f"hive_nvidia_{_INST}")
+_FALLBACK_TOGETHER = os.environ.get("ZC_FALLBACK_TOGETHER", f"hive_together_{_INST}")
+
+
+# Fleet LLM registry — single source of truth at NFS path, mutates as we
+# discover new providers / pricing. Workers consult on startup + on each
+# rate-limit pivot. Falls back to hard-coded chain if registry unreachable.
+_REGISTRY_PATH = os.environ.get(
+    "LLM_REGISTRY_PATH",
+    "/mnt/argonas/datapool/projects/fleet-registry/llm_provider_registry.json",
+)
+_REGISTRY_CACHE = {"loaded_at": 0, "data": None}
+
+
+def _load_registry(max_age_s: int = 300):
+    """Return registry dict or None if unavailable. Cached 5 min."""
+    now = time.time()
+    if _REGISTRY_CACHE["data"] and (now - _REGISTRY_CACHE["loaded_at"]) < max_age_s:
+        return _REGISTRY_CACHE["data"]
+    try:
+        with open(_REGISTRY_PATH) as f:
+            data = json.load(f)
+        _REGISTRY_CACHE["data"] = data
+        _REGISTRY_CACHE["loaded_at"] = now
+        return data
+    except Exception:
+        return _REGISTRY_CACHE["data"]  # stale OK, or None
+
+
+def _registry_chain_for_tier(tier: str) -> list:
+    """Map registry tier_picks → zeroclaw agent aliases. Returns empty list if no registry."""
+    reg = _load_registry()
+    if not reg:
+        return []
+    # Map our internal A/B/C tiers to registry tier-pick keys
+    tier_map = {
+        "A": ["C_g1_critical", "B_quality_surgical"],  # premium first
+        "B": ["B_fanout_high_volume", "S_free_default"],
+        "C": ["S_free_default", "B_fanout_high_volume"],
+    }
+    pick_keys = tier_map.get(tier.upper(), tier_map["C"])
+    alias_chain = []
+    for pk in pick_keys:
+        for entry in reg.get("tier_picks", {}).get(pk, []):
+            # entry format "provider.model" — map back to zeroclaw agent alias
+            prov, _ = entry.split(".", 1) if "." in entry else (entry, "")
+            alias = _provider_to_alias(prov)
+            if alias and alias not in alias_chain:
+                alias_chain.append(alias)
+    return alias_chain
+
+
+def _provider_to_alias(prov: str) -> str:
+    """Map registry provider name → zeroclaw agent alias in v3.toml config."""
+    mapping = {
+        "ngc_integrate": _PRIMARY_BC,  # per-instance hive_nvidia_<N>
+        "ngc_inference": _PRIMARY_BC,
+        "groq": "hive_groq_8b",
+        "deepseek_direct": f"hive_deepseek_{_INST}",
+        "siliconflow": f"hive_siliconflow_{_INST}",
+        "together": _FALLBACK_TOGETHER,
+        "xai": "hive_xai",
+        "openai": "hive_openai",
+        "anthropic": "hive_anthropic",
+        "gemini": "hive_gemini",
+    }
+    return mapping.get(prov, "")
+
+
+def _build_tier_chain(tier: str) -> list:
+    """Build chain for a tier. Prefer registry; fall back to hard-coded."""
+    reg_chain = _registry_chain_for_tier(tier)
+    if reg_chain:
+        return reg_chain
+    # Hard-coded fallback
+    return _HARDCODED_FALLBACK[tier.upper()]
+
+
+_HARDCODED_FALLBACK = {
     "A": [
         os.environ.get("ZC_TIER_A_AGENT", "hive_anthropic"),
         "hive_openai",
         "hive_gemini",
-        "hive_together",
+        _FALLBACK_TOGETHER,
     ],
     "B": [
-        _PRIMARY_B,
-        "hive_groq",
+        _PRIMARY_BC,
+        "hive_groq_8b",
+        _FALLBACK_TOGETHER,
         "hive_xai",
         "hive_openai",
-        "hive_gemini",
     ],
     "C": [
-        os.environ.get("ZC_TIER_C_AGENT", "hive_nvidia"),
-        _PRIMARY_B,
-        "hive_xai",
+        _PRIMARY_BC,
+        "hive_groq_8b",
+        _FALLBACK_TOGETHER,
     ],
 }
+
+
+class _ChainProxy(dict):
+    """Lazy dict that calls _build_tier_chain on .get/__getitem__ so registry
+    updates between job runs reflect immediately without restart."""
+
+    def get(self, key, default=None):
+        chain = _build_tier_chain(key)
+        return chain if chain else default
+
+    def __getitem__(self, key):
+        chain = _build_tier_chain(key)
+        if not chain:
+            raise KeyError(key)
+        return chain
+
+
+TIER_FALLBACK_CHAIN = _ChainProxy()
 
 # Patterns indicating need to advance to next provider in chain.
 # These are all retryable / transient at provider level.
@@ -456,7 +614,9 @@ def _is_rate_limited(stderr: str, stdout: str = "") -> bool:
     return False
 
 
-def run_zeroclaw(description: str, kind: str = "", job_id: str = "", job_heartbeat_fn=None, max_cost_tier: str = "C") -> dict:
+def run_zeroclaw(
+    description: str, kind: str = "", job_id: str = "", job_heartbeat_fn=None, max_cost_tier: str = "C"
+) -> dict:
     """Execute one job. If description starts with [repo:...] directive,
     clone + checkout + run agent in workspace + commit/push changes.
     Otherwise chat-only mode (current behavior).
@@ -494,7 +654,10 @@ def run_zeroclaw(description: str, kind: str = "", job_id: str = "", job_heartbe
         # provider type via its model_provider field. Avoids 0.8 bug where
         # --provider override keeps old agent's api_key.
         cmd = [ZEROCLAW_BIN, "agent", "-a", agent_alias, "-m", description]
-        print(f"[zc-worker] $ {' '.join(cmd[:4])} … [desc len={len(description)}] cwd={exec_cwd} (attempt {attempt_idx+1}/{len(chain)})", flush=True)
+        print(
+            f"[zc-worker] $ {' '.join(cmd[:4])} … [desc len={len(description)}] cwd={exec_cwd} (attempt {attempt_idx+1}/{len(chain)})",
+            flush=True,
+        )
         attempt_start = time.time()
         try:
             proc = subprocess.Popen(cmd, cwd=exec_cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -529,12 +692,18 @@ def run_zeroclaw(description: str, kind: str = "", job_id: str = "", job_heartbe
 
             # Success → break out of fallback loop
             if proc.returncode == 0:
-                print(f"[zc-worker] success on provider={agent_alias} attempt={attempt_idx+1} dur={time.time()-attempt_start:.1f}s", flush=True)
+                print(
+                    f"[zc-worker] success on provider={agent_alias} attempt={attempt_idx+1} dur={time.time()-attempt_start:.1f}s",
+                    flush=True,
+                )
                 break
 
             # Non-zero exit — decide retry or give up
             if _is_rate_limited(last_stderr, last_stdout):
-                print(f"[zc-worker] rate-limited on {agent_alias} ({time.time()-attempt_start:.1f}s), advancing chain", flush=True)
+                print(
+                    f"[zc-worker] rate-limited on {agent_alias} ({time.time()-attempt_start:.1f}s), advancing chain",
+                    flush=True,
+                )
                 # Continue to next provider in chain
                 continue
             else:
