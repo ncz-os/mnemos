@@ -504,7 +504,7 @@ def run_zeroclaw(description: str, kind: str = "", job_id: str = "", job_heartbe
                             _cleanup_workspace(workspace)
                         return {
                             "exit_code": -1,
-                            "error": f"timeout {timeout}s exceeded (provider={provider})",
+                            "error": f"timeout {timeout}s exceeded (provider={agent_alias})",
                             "duration_sec": round(elapsed, 1),
                             "workdir": exec_cwd,
                             "providers_attempted": providers_attempted,
@@ -521,21 +521,21 @@ def run_zeroclaw(description: str, kind: str = "", job_id: str = "", job_heartbe
 
             # Success → break out of fallback loop
             if proc.returncode == 0:
-                print(f"[zc-worker] success on provider={provider} attempt={attempt_idx+1} dur={time.time()-attempt_start:.1f}s", flush=True)
+                print(f"[zc-worker] success on provider={agent_alias} attempt={attempt_idx+1} dur={time.time()-attempt_start:.1f}s", flush=True)
                 break
 
             # Non-zero exit — decide retry or give up
             if _is_rate_limited(last_stderr, last_stdout):
-                print(f"[zc-worker] rate-limited on {provider} ({time.time()-attempt_start:.1f}s), advancing chain", flush=True)
+                print(f"[zc-worker] rate-limited on {agent_alias} ({time.time()-attempt_start:.1f}s), advancing chain", flush=True)
                 # Continue to next provider in chain
                 continue
             else:
                 # Non-retryable failure — break + report
-                print(f"[zc-worker] non-retryable failure on {provider} exit={proc.returncode}", flush=True)
+                print(f"[zc-worker] non-retryable failure on {agent_alias} exit={proc.returncode}", flush=True)
                 break
         except Exception as exc:
             last_stderr = f"{type(exc).__name__}: {exc}"
-            print(f"[zc-worker] exc on {provider}: {last_stderr[:200]}", flush=True)
+            print(f"[zc-worker] exc on {agent_alias}: {last_stderr[:200]}", flush=True)
             # Spawn exception is treated as retryable
             continue
 
