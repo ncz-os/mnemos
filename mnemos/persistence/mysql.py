@@ -11,8 +11,8 @@ Key SQL-level differences from Postgres/Oracle:
 - ``VEC_FromText(%s)`` to bind an embedding string; ``VEC_DISTANCE_COSINE``
   for ANN distance (MySQL 9.0 nomenclature).
 - ``DATETIME(6)`` with ``SET time_zone = '+00:00'`` for UTC timestamps.
-- ``INSERT … ON DUPLICATE KEY UPDATE`` with COALESCE-protected column
-  updates for duplicate-key writes.
+- ``INSERT … ON DUPLICATE KEY UPDATE id = id`` to preserve
+  ``ON CONFLICT DO NOTHING`` semantics for duplicate-key writes.
 - ``COALESCE`` (no NVL / NVL2), ``LIMIT n`` (no FETCH FIRST).
 - ``MATCH (col) AGAINST (%s IN BOOLEAN MODE)`` for full-text search.
 - No advisory locks — ``supports_advisory_locks = False``.
@@ -409,22 +409,7 @@ class MysqlMemoryRepository(MemoryRepository):
                         COALESCE(%s, NOW(6)), COALESCE(%s, NOW(6))
                     )
                     ON DUPLICATE KEY UPDATE
-                        content = COALESCE(VALUES(content), content),
-                        content_hash = COALESCE(VALUES(content_hash), content_hash),
-                        category = COALESCE(VALUES(category), category),
-                        subcategory = COALESCE(VALUES(subcategory), subcategory),
-                        metadata = COALESCE(VALUES(metadata), metadata),
-                        quality_rating = COALESCE(VALUES(quality_rating), quality_rating),
-                        verbatim_content = COALESCE(VALUES(verbatim_content), verbatim_content),
-                        owner_id = COALESCE(VALUES(owner_id), owner_id),
-                        namespace = COALESCE(VALUES(namespace), namespace),
-                        permission_mode = COALESCE(VALUES(permission_mode), permission_mode),
-                        source_model = COALESCE(VALUES(source_model), source_model),
-                        source_provider = COALESCE(VALUES(source_provider), source_provider),
-                        source_session = COALESCE(VALUES(source_session), source_session),
-                        source_agent = COALESCE(VALUES(source_agent), source_agent),
-                        created = COALESCE(VALUES(created), created),
-                        updated = COALESCE(VALUES(updated), updated)
+                        id = id
                     """,
                     (
                         memory_id, content, _content_hash(content), category, subcategory,
@@ -734,11 +719,9 @@ class MysqlMemoryRepository(MemoryRepository):
         else:
             rank_expr = "VEC_DISTANCE_COSINE(m.embedding, VEC_FromText(%s))"
 
-        # Bind %s for VEC_FromText before the rest of the params
+        # Bind the VEC_FromText placeholder before the rest of the params.
+        # ORDER BY uses the selected alias so the vector is bound once.
         vec_params = [vec_literal] + params + [limit]
-        if boost_recency:
-            # VEC_FromText appears once in the SELECT and once in ORDER BY
-            vec_params = [vec_literal] + params + [vec_literal, limit]
 
         conn = tx.conn
         async with conn.cursor() as cursor:
@@ -753,7 +736,7 @@ class MysqlMemoryRepository(MemoryRepository):
                        {rank_expr} AS rank_score
                   FROM memories m
                  WHERE {" AND ".join(where)}
-                 ORDER BY {rank_expr} ASC
+                 ORDER BY rank_score ASC
                  LIMIT %s
                 """,
                 vec_params,
