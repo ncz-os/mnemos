@@ -5,7 +5,7 @@
 # Idempotent — safe to re-run on every boot.
 # Cap: max 8 instances per host to avoid stampeding hive.
 
-set -euo pipefail
+set -uo pipefail
 
 LOG_TAG="zc-fanout"
 
@@ -48,7 +48,7 @@ for i in $(seq 1 "$N"); do
     systemctl enable "zeroclaw-worker@$i" 2>/dev/null || log "WARN: enable @$i failed"
     log "enabled @$i"
   fi
-  systemctl restart "zeroclaw-worker@$i" || log "WARN: restart @$i failed"
+  systemctl restart --no-block "zeroclaw-worker@$i" || log "WARN: restart @$i failed"
 done
 
 # Disable instances above N (down-scaling)

@@ -42,7 +42,7 @@ DRY = "--dry-run" in sys.argv
 SMOKE_KIND_RE = re.compile(
     r"^(smoke|halluc|retry-smoke|zeroclaw-validation|hive-stats|"
     r"hive-mind-feature|ping|halluc-smoke|fleet-goose-validate|hive-test|"
-    r"ic-runtime|mnemos-ic-runtime|investorclaw|investorclade)",
+    r"ic-runtime|mnemos-ic-runtime|investorclaw|investorclade|hive-validate)",
     re.I,
 )
 
@@ -93,6 +93,8 @@ def is_code_bearing_chat_done(j: dict) -> bool:
     kind = j.get("kind") or ""
     if SMOKE_KIND_RE.search(kind):
         return False
+    if "[resubmit]" in kind:
+        return False  # already resubmitted
     r = j.get("result") or {}
     if r.get("commits"):
         return False
@@ -142,8 +144,11 @@ def main() -> int:
     print(f"dry-run={DRY}")
     print()
 
-    failed = http_get_jobs("failed", limit=500)
-    cancelled = http_get_jobs("cancelled", limit=500)
+    def skip_resubmit_or_smoke(j):
+        k=j.get("kind","")
+        return "[resubmit]" in k or SMOKE_KIND_RE.search(k)
+    failed = [j for j in http_get_jobs("failed", limit=500) if not skip_resubmit_or_smoke(j)]
+    cancelled = [j for j in http_get_jobs("cancelled", limit=500) if not skip_resubmit_or_smoke(j)]
     done = http_get_jobs("done", limit=1000)
 
     chat_done = [j for j in done if is_code_bearing_chat_done(j)]

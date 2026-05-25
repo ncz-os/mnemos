@@ -1,7 +1,6 @@
 [Unit]
 Description=Zeroclaw Hive Worker instance %i
-After=network.target zeroclaw-fanout.service
-Wants=zeroclaw-fanout.service
+After=network.target
 
 [Service]
 Type=simple
