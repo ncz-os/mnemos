@@ -20,9 +20,12 @@ default:
       files:
         - pyproject.toml
     paths:
+      - .venv
       - .cache/pip
   before_script:
-    - pip install --cache-dir=.cache/pip -e ".[dev]"
+    - python3 -m venv .venv
+    - .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev]"
+    - export PATH="$CI_PROJECT_DIR/.venv/bin:$PATH"
 
 variables:
   PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
@@ -114,7 +117,9 @@ test:integration:
     MNEMOS_TEST_DB: "postgresql://postgres:test@postgres:5432/mnemos_test"
     RATE_LIMIT_STORAGE_URI: "redis://redis:6379/0"
   before_script:
-    - pip install --cache-dir=.cache/pip -e ".[dev]"
+    - python3 -m venv .venv
+    - .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev]"
+    - export PATH="$CI_PROJECT_DIR/.venv/bin:$PATH"
     # Wait for Postgres to accept connections (pgvector image does not
     # signal readiness; poll until psql connects).
     - |
@@ -226,7 +231,9 @@ test:persistence-parity:
     DATABASE_URL: "postgresql://postgres:test@postgres:5432/mnemos_test"
     MNEMOS_TEST_DB: "postgresql://postgres:test@postgres:5432/mnemos_test"
   before_script:
-    - pip install --cache-dir=.cache/pip -e ".[dev,sqlite]"
+    - python3 -m venv .venv
+    - .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev,sqlite]"
+    - export PATH="$CI_PROJECT_DIR/.venv/bin:$PATH"
     - |
       for i in $(seq 1 30); do
         if pg_isready -h postgres -U postgres -t 1 >/dev/null 2>&1; then
@@ -355,7 +362,9 @@ build:docker:
   stage: release
   tags: [argos, ncz-os]
   before_script:
-    - pip install --cache-dir=.cache/pip -e ".[build]"
+    - python3 -m venv .venv
+    - .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[build]"
+    - export PATH="$CI_PROJECT_DIR/.venv/bin:$PATH"
   script:
     - bash scripts/build-binary.sh
   artifacts:
@@ -396,7 +405,7 @@ test:oracle-smoke:
   stage: test
   tags: [argos, ncz-os]
   script:
-    - pip install oracledb
+    - python3 -m venv .venv && .venv/bin/pip install -q oracledb && export PATH="$CI_PROJECT_DIR/.venv/bin:$PATH"
     - |
       python -c '
       import oracledb

@@ -453,20 +453,23 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                         consultation_id=consultation_id,
                         memory_ids=memory_ids,
                     )
-                    delivery_ids = await backend.webhooks.dispatch_event(
-                        tx,
-                        "consultation.completed",
-                        {
-                            "consultation_id": str(consultation_id),
-                            "task_type": body.task_type,
-                            "winning_muse": result.get("winning_muse"),
-                            "consensus_score": result.get("consensus_score"),
-                            "owner_id": user.user_id,
-                            "namespace": user.namespace,
-                        },
-                        owner_id=user.user_id,
-                        namespace=user.namespace,
-                    )
+                    if backend.supports_webhooks:
+                        delivery_ids = await backend.webhooks.dispatch_event(
+                            tx,
+                            "consultation.completed",
+                            {
+                                "consultation_id": str(consultation_id),
+                                "task_type": body.task_type,
+                                "winning_muse": result.get("winning_muse"),
+                                "consensus_score": result.get("consensus_score"),
+                                "owner_id": user.user_id,
+                                "namespace": user.namespace,
+                            },
+                            owner_id=user.user_id,
+                            namespace=user.namespace,
+                        )
+                    else:
+                        delivery_ids = []
             except HTTPException:
                 raise
             except Exception as e:

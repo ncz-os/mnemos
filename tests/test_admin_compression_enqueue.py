@@ -35,11 +35,14 @@ class _AsyncContext:
 
 @pytest.fixture
 def fake_pool(monkeypatch):
-    """Mock _lc._pool so handlers get past the 503 gate and into validation."""
+    """Mock the active backend so handlers get into validation."""
     from mnemos.core import lifecycle
+    from tests._fake_backend import FakePoolBackedBackend
+
     mock_pool = MagicMock()
     mock_pool.acquire = MagicMock(return_value=_AsyncContext(MagicMock()))
     monkeypatch.setattr(lifecycle, "_pool", mock_pool)
+    monkeypatch.setattr(lifecycle, "_persistence_backend", FakePoolBackedBackend(mock_pool))
     return mock_pool
 
 
