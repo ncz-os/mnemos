@@ -496,18 +496,11 @@ class MysqlMemoryRepository(MemoryRepository):
             return
         self._require_dim(embedding, "upsert_memory_embedding")
         vec_literal = _validate_and_format_vector(embedding)
-        dimension = len(embedding)
         conn = tx.conn
         async with conn.cursor() as cursor:
             await cursor.execute(
-                """
-                INSERT INTO memory_embeddings (memory_id, embedding, dimension)
-                VALUES (%s, VEC_FromText(%s), %s) AS new_row (memory_id, embedding, dimension)
-                ON DUPLICATE KEY UPDATE
-                    embedding = new_row.embedding,
-                    dimension = new_row.dimension
-                """,
-                (memory_id, vec_literal, dimension),
+                "UPDATE memories SET embedding = VEC_FromText(%s) WHERE id = %s",
+                (vec_literal, memory_id),
             )
 
     async def list_memories(
@@ -955,9 +948,6 @@ class MysqlCompressionRepository(CompressionRepository):
 
 
 class MysqlWebhookRepository(WebhookRepository):
-    def __init__(self) -> None:
-        raise NotImplementedError(_MYSQL_WEBHOOKS_UNSUPPORTED)
-
     async def dispatch_event(
         self,
         tx: Transaction,
@@ -1041,9 +1031,8 @@ class MysqlBackend(PersistenceBackend):
     Core memory, FTS, and VECTOR search surfaces are implemented.
     All other repository surfaces (KG triples, versioning, compression,
     federation, state) are stubbed - ``NotImplementedError`` is raised at call
-    time. Webhooks are currently unsupported and fail at ``backend.webhooks``
-    access so callers can detect the missing outbox capability before invoking
-    a method.
+    time. Webhooks are currently unsupported; callers should use
+    ``supports_webhooks`` before dispatching.
 
     The pool is managed externally (via ``create_mysql_pool``); callers
     must call ``await backend.close()`` at shutdown to drain the pool.
