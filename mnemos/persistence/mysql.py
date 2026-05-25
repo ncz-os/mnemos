@@ -2,13 +2,13 @@
 
 Uses ``aiomysql`` (asyncio wrapper around PyMySQL) with a native async
 connection pool.  MySQL 9.0+ is required for the native ``VECTOR``
-column type and ``VEC_DISTANCE_COSINE`` / ``VEC_FromText`` functions
+column type and ``VEC_DISTANCE_COSINE`` / ``TO_VECTOR`` functions
 used by semantic search.
 
 Key SQL-level differences from Postgres/Oracle:
 
 - Positional ``%s`` placeholders (aiomysql / PyMySQL convention).
-- ``VEC_FromText(%s)`` to bind an embedding string; ``VEC_DISTANCE_COSINE``
+- ``TO_VECTOR(%s)`` to bind an embedding string; ``VEC_DISTANCE_COSINE``
   for ANN distance (MySQL 9.0 nomenclature).
 - ``DATETIME(6)`` with ``SET time_zone = '+00:00'`` for UTC timestamps.
 - ``INSERT … ON DUPLICATE KEY UPDATE id = id`` to preserve
@@ -107,9 +107,9 @@ def _content_hash(content: Any) -> str:
 
 
 def _validate_and_format_vector(embedding: Sequence[float]) -> str:
-    """Validate and format an embedding into a MySQL VEC_FromText-compatible string.
+    """Validate and format an embedding into a MySQL TO_VECTOR-compatible string.
 
-    MySQL 9.0 ``VEC_FromText`` accepts JSON arrays: ``'[0.1,0.2,...]'``.
+    MySQL 9.0 ``TO_VECTOR`` accepts JSON arrays: ``'[0.1,0.2,...]'``.
     """
     if not embedding:
         raise ValueError("embedding must not be empty")
@@ -499,7 +499,7 @@ class MysqlMemoryRepository(MemoryRepository):
         conn = tx.conn
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "UPDATE memories SET embedding = VEC_FromText(%s) WHERE id = %s",
+                "UPDATE memories SET embedding = TO_VECTOR(%s) WHERE id = %s",
                 (vec_literal, memory_id),
             )
 
@@ -769,14 +769,14 @@ class MysqlMemoryRepository(MemoryRepository):
         # VECTOR_DISTANCE … COSINE.
         if boost_recency:
             rank_expr = (
-                "VEC_DISTANCE_COSINE(m.embedding, VEC_FromText(%s))"
+                "VEC_DISTANCE_COSINE(m.embedding, TO_VECTOR(%s))"
                 f" - {float(recency_weight)}"
                 " * (1.0 / (1.0 + TIMESTAMPDIFF(SECOND, m.updated, NOW(6)) / 86400.0))"
             )
         else:
-            rank_expr = "VEC_DISTANCE_COSINE(m.embedding, VEC_FromText(%s))"
+            rank_expr = "VEC_DISTANCE_COSINE(m.embedding, TO_VECTOR(%s))"
 
-        # Bind the VEC_FromText placeholder before the rest of the params.
+        # Bind the TO_VECTOR placeholder before the rest of the params.
         # ORDER BY uses the selected alias so the vector is bound once.
         vec_params = [vec_literal] + params + [limit]
 
