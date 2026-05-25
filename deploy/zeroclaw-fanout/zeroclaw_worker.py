@@ -463,7 +463,10 @@ def run_zeroclaw(description: str, kind: str = "", job_id: str = "", job_heartbe
     workspace = None
     branch = None
     if repo:
-        workspace = _prepare_workspace(job_id or "anon", repo, agent_alias=ZEROCLAW_AGENT)
+        # Workspace path is per-agent-alias; use first chain entry (final_provider may
+        # change on rate-limit but workspace is shared across all chain attempts)
+        first_alias = TIER_FALLBACK_CHAIN.get((max_cost_tier or "C").upper(), TIER_FALLBACK_CHAIN["C"])[0]
+        workspace = _prepare_workspace(job_id or "anon", repo, agent_alias=first_alias)
         if workspace:
             branch = repo.get("branch") or f"hive/{(job_id or 'anon')[:8]}"
             description = repo["stripped_description"] or description
