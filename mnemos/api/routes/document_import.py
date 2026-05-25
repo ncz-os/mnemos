@@ -513,7 +513,7 @@ async def import_memories_from_document(
                     )
                     canonical_id = imported.memory_id
                     in_flight_id = canonical_id
-                    if imported.emit_created_event:
+                    if imported.emit_created_event and backend.supports_webhooks:
                         chunk_delivery_ids = await backend.webhooks.dispatch_event(
                             tx,
                             "memory.created",
@@ -529,6 +529,8 @@ async def import_memories_from_document(
                             owner_id=user.user_id,
                             namespace=user.namespace,
                         )
+                    elif imported.emit_created_event:
+                        chunk_delivery_ids = []
                     else:
                         logger.debug(
                             f"[DOCLING] Resolved legacy v70 chunk_key "

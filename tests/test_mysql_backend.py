@@ -31,6 +31,7 @@ def _tx_for_cursor(cursor):
 
 async def test_mysql_semantic_search_without_recency_uses_visibility_params_once():
     repo = MysqlMemoryRepository()
+    repo._expected_embedding_dim = 3
     cursor = MagicMock()
     cursor.fetchall = AsyncMock(return_value=[])
     captured: dict[str, object] = {}

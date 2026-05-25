@@ -721,6 +721,7 @@ class MysqlMemoryRepository(MemoryRepository):
     ) -> list[Row]:
         if not embedding:
             return []
+        self._require_dim(embedding, "semantic_search")
         vec_literal = _validate_and_format_vector(embedding)
         vis_clause, vis_params = _render_visibility(visibility, table_alias="m")
         where = ["m.deleted_at IS NULL", "m.embedding IS NOT NULL"]
