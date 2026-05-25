@@ -372,7 +372,8 @@ async def _main() -> None:
                 print(f"  {p['label']:30} p50={p['p50_ms']}ms  p95={p.get('p95_ms')}ms")
         except Exception as exc:
             print(f"  ERROR {bname}: {exc}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
         finally:
             try:
                 await backend.close()

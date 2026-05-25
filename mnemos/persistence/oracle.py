@@ -423,8 +423,7 @@ async def create_oracle_pool(
     # oracledb 2.x accepted statement_cache_size on create_pool_async; 4.x
     # moved it to PoolParams / connection-level params. Guard defensively so
     # the call works on both major lines.
-    import inspect as _inspect
-    if "statement_cache_size" in _inspect.signature(oracledb.create_pool_async).parameters:
+    if "statement_cache_size" in inspect.signature(oracledb.create_pool_async).parameters:
         kwargs.setdefault("statement_cache_size", stmt_cache)
     # Explicit WAIT mode + timeout: default behaviour would otherwise
     # block forever when the pool is saturated.
