@@ -591,6 +591,25 @@ class MysqlMemoryRepository(MemoryRepository):
             )
             return await _fetchone_dict(cursor)
 
+    _UPDATABLE_FIELDS = frozenset(
+        {
+            "content",
+            "category",
+            "subcategory",
+            "metadata",
+            "quality_rating",
+            "compressed_content",
+            "verbatim_content",
+            "permission_mode",
+            "source_model",
+            "source_provider",
+            "source_session",
+            "source_agent",
+            "group_id",
+            "archived_at",
+        }
+    )
+
     async def update_memory(
         self,
         tx: Transaction,
@@ -609,8 +628,11 @@ class MysqlMemoryRepository(MemoryRepository):
             where.append(vis_clause)
             params += vis_params
 
-        set_cols = ", ".join(f"{col} = %s" for col in fields)
-        set_vals = list(fields.values())
+        safe_fields = {k: v for k, v in fields.items() if k in self._UPDATABLE_FIELDS}
+        if not safe_fields:
+            return await self.get_memory(tx, memory_id, visibility=visibility)
+        set_cols = ", ".join(f"{col} = %s" for col in safe_fields)
+        set_vals = list(safe_fields.values())
 
         async with conn.cursor() as cursor:
             await cursor.execute(
