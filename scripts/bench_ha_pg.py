@@ -104,8 +104,16 @@ async def _cleanup(conn: asyncpg.Connection) -> None:
 # Benchmark phases
 # ---------------------------------------------------------------------------
 
+def _vec_str(vec: list[float]) -> str:
+    """Format a float list as a pgvector literal: '[0.1,0.2,...]'."""
+    return "[" + ",".join(f"{x:.7f}" for x in vec) + "]"
+
+
 async def _bulk_insert(conn: asyncpg.Connection, n: int) -> float:
-    rows = [(str(uuid.uuid4()), f"HA bench record {i}", _pool_vec(i)) for i in range(n)]
+    rows = [
+        (str(uuid.uuid4()), f"HA bench record {i}", _vec_str(_pool_vec(i)))
+        for i in range(n)
+    ]
     t0 = time.perf_counter()
     await conn.executemany(
         "INSERT INTO ha_bench_memories(id, content, embedding) VALUES($1, $2, $3::vector)",
@@ -130,12 +138,12 @@ async def _wait_for_replica(primary: asyncpg.Connection, standby: asyncpg.Connec
 async def _semantic_search(conn: asyncpg.Connection, repeat: int) -> list[float]:
     latencies = []
     for _ in range(repeat):
-        vec = _pool_vec()
+        vec = _vec_str(_pool_vec())
         t0 = time.perf_counter()
         await conn.fetch(
             """SELECT id FROM ha_bench_memories
                ORDER BY embedding <=> $1::vector LIMIT 10""",
-            str(vec),
+            vec,
         )
         latencies.append((time.perf_counter() - t0) * 1000)
     return latencies
