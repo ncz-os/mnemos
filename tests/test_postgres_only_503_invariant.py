@@ -561,7 +561,7 @@ def test_deletion_requests_blank_namespace_uses_unicode_aware_predicate():
 
 def test_legacy_chunk_key_update_is_wrapped_in_savepoint():
     """The round-72 legacy v70 chunk_key UPDATE in
-    ``document_import.py`` MUST be wrapped in a nested
+    ``DocumentRepository`` MUST be wrapped in
     ``conn.transaction()`` (asyncpg SAVEPOINT) so a
     UniqueViolationError on the new chunk_key constraint rolls
     back ONLY the savepoint, leaving the outer transaction
@@ -577,74 +577,59 @@ def test_legacy_chunk_key_update_is_wrapped_in_savepoint():
     refactor that flattens the nested transaction trips a
     unit test before it can ship.
 
-    Detection shape: AST-walks the helper, finds the
+    Detection shape: AST-walks the repository, finds the
     ``import_chunk_key`` UPDATE statement, and verifies that
-    its lexical position is INSIDE a second
-    ``async with conn.transaction()`` block nested within the
-    outer transaction.
+    its lexical position is inside ``async with conn.transaction()``.
+    The route-level outer transaction now comes from
+    ``PersistenceBackend.transactional()``; the raw asyncpg
+    savepoint belongs in ``mnemos/db/document_repo.py``.
     """
     import ast
 
-    helper_path = (
+    repo_path = (
         REPO_ROOT
         / "mnemos"
-        / "api"
-        / "routes"
-        / "document_import.py"
+        / "db"
+        / "document_repo.py"
     )
-    tree = ast.parse(helper_path.read_text(encoding="utf-8"))
+    tree = ast.parse(repo_path.read_text(encoding="utf-8"))
 
-    # Count ``async with conn.transaction():`` occurrences in
-    # the helper. Round-74's structure has TWO: the outer
-    # per-chunk transaction + the nested savepoint around the
-    # legacy UPDATE. A flatten-refactor would drop the second.
-    transaction_async_withs: list[ast.AsyncWith] = []
+    def _is_conn_transaction_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "transaction"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "conn"
+        )
+
+    def _contains_legacy_update(node: ast.AST) -> bool:
+        for descendant in ast.walk(node):
+            if not isinstance(descendant, ast.Constant):
+                continue
+            if not isinstance(descendant.value, str):
+                continue
+            sql = " ".join(descendant.value.split()).upper()
+            if "UPDATE MEMORIES" in sql and "SET IMPORT_CHUNK_KEY" in sql:
+                return True
+        return False
+
+    update_savepoints: list[ast.AsyncWith] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.AsyncWith):
             continue
-        for item in node.items:
-            ctx = item.context_expr
-            if isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Attribute):
-                if (
-                    ctx.func.attr == "transaction"
-                    and isinstance(ctx.func.value, ast.Name)
-                    and ctx.func.value.id == "conn"
-                ):
-                    transaction_async_withs.append(node)
-                    break
+        if any(_is_conn_transaction_call(item.context_expr) for item in node.items):
+            if _contains_legacy_update(node):
+                update_savepoints.append(node)
 
-    assert len(transaction_async_withs) >= 2, (
-        f"document_import.py has {len(transaction_async_withs)} "
-        f"``async with conn.transaction()`` blocks; expected ≥ 2 "
-        f"(outer per-chunk transaction + nested savepoint around "
-        f"the legacy v70 chunk_key UPDATE). A flatten-refactor "
-        f"that drops the savepoint would re-introduce the "
-        f"InFailedSQLTransactionError hazard codex review-12 of "
-        f"round-73 caught."
-    )
-
-    # Verify at least one of these is NESTED inside another —
-    # i.e., the savepoint pattern, not two sibling transactions.
-    nested = False
-    for outer in transaction_async_withs:
-        for inner in transaction_async_withs:
-            if inner is outer:
-                continue
-            for descendant in ast.walk(outer):
-                if descendant is inner:
-                    nested = True
-                    break
-            if nested:
-                break
-        if nested:
-            break
-    assert nested, (
-        "no nested ``async with conn.transaction()`` found in "
-        "document_import.py. The legacy v70 chunk_key UPDATE "
-        "must be wrapped in a nested transaction (savepoint) "
-        "INSIDE the outer per-chunk transaction; sibling "
-        "transactions don't provide the savepoint-rollback "
-        "semantics that round-74 relies on."
+    assert update_savepoints, (
+        "DocumentRepository._import_postgres_chunk must wrap the "
+        "legacy v70 import_chunk_key UPDATE in ``async with "
+        "conn.transaction():``. Catching UniqueViolationError "
+        "outside a savepoint leaves the surrounding Postgres "
+        "transaction aborted and re-introduces the "
+        "InFailedSQLTransactionError hazard codex review-12 of "
+        "round-73 caught."
     )
 
 

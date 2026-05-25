@@ -849,7 +849,10 @@ async def merge_branch(
                 ):
                     raise HTTPException(
                         status_code=409,
-                        detail="Live memory row has drifted from main HEAD; manual reconciliation required before merge into main",
+                        detail=(
+                            "Live memory row has drifted from main HEAD; "
+                            "manual reconciliation required before merge into main"
+                        ),
                     )
                 await conn.execute("SELECT set_config('mnemos.suppress_version_snapshot', '1', true)")
                 await conn.execute(
@@ -872,22 +875,25 @@ async def merge_branch(
                     source_head["source_agent"],
                     memory_id,
                 )
-                delivery_ids = await backend.webhooks.dispatch_event(
-                    tx,
-                    "memory.updated",
-                    {
-                        "memory_id": memory_id,
-                        "category": source_head["category"],
-                        "subcategory": source_head["subcategory"],
-                        "content": source_head["content"],
-                        "owner_id": merge_owner_id,
-                        "namespace": merge_namespace,
-                        "merge_source": request.source_branch,
-                        "merge_target": target_branch,
-                    },
-                    owner_id=merge_owner_id,
-                    namespace=merge_namespace,
-                )
+                if backend.supports_webhooks:
+                    delivery_ids = await backend.webhooks.dispatch_event(
+                        tx,
+                        "memory.updated",
+                        {
+                            "memory_id": memory_id,
+                            "category": source_head["category"],
+                            "subcategory": source_head["subcategory"],
+                            "content": source_head["content"],
+                            "owner_id": merge_owner_id,
+                            "namespace": merge_namespace,
+                            "merge_source": request.source_branch,
+                            "merge_target": target_branch,
+                        },
+                        owner_id=merge_owner_id,
+                        namespace=merge_namespace,
+                    )
+                else:
+                    delivery_ids = []
 
         if live_tracks_target:
             if _lc._cache:
