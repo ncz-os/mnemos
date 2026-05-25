@@ -396,6 +396,60 @@ TIER_PROVIDER_MAP = {
     "C": os.environ.get("ZC_TIER_C_PROVIDER", "nvidia.kimi"),
 }
 
+# Fallback chains per tier. Each entry = agent ALIAS (NOT provider type).
+# zeroclaw 0.8 binds api_key + model + endpoint to agent's model_provider field,
+# so we switch -a <alias> per attempt instead of --provider override (which
+# only changes endpoint URL, retains agent's key — wrong key for new endpoint).
+TIER_FALLBACK_CHAIN = {
+    "A": [
+        os.environ.get("ZC_TIER_A_AGENT", "hive_anthropic"),
+        "hive_openai",
+        "hive_gemini",
+        "hive_together",
+    ],
+    "B": [
+        os.environ.get("ZC_TIER_B_AGENT", "hive_groq"),
+        "hive_together",
+        "hive_xai",
+        "hive_openai",
+        "hive_gemini",
+    ],
+    "C": [
+        os.environ.get("ZC_TIER_C_AGENT", "hive_nvidia"),
+        "hive_groq",
+        "hive_xai",
+    ],
+}
+
+# Patterns indicating need to advance to next provider in chain.
+# These are all retryable / transient at provider level.
+RATE_LIMIT_PATTERNS = [
+    "rate_limited",
+    "rate_limit_exceeded",
+    "429 Too Many Requests",
+    "tokens per minute",
+    "TPM",
+    "quota_exceeded",
+    "insufficient_quota",
+    "overloaded",
+    "service_unavailable",
+    "503 Service Unavailable",
+    "Resource has been exhausted",
+    "All model_providers/models failed",
+    "rate limit",
+    "RATE_LIMIT",
+]
+
+
+def _is_rate_limited(stderr: str, stdout: str = "") -> bool:
+    """Return True if zeroclaw failure indicates provider exhaustion."""
+    blob = (stderr or "") + (stdout or "")
+    blob_lower = blob.lower()
+    for p in RATE_LIMIT_PATTERNS:
+        if p.lower() in blob_lower:
+            return True
+    return False
+
 
 def run_zeroclaw(description: str, kind: str = "", job_id: str = "", job_heartbeat_fn=None, max_cost_tier: str = "C") -> dict:
     """Execute one job. If description starts with [repo:...] directive,
@@ -416,82 +470,114 @@ def run_zeroclaw(description: str, kind: str = "", job_id: str = "", job_heartbe
     exec_cwd = workspace or WORKDIR
 
     tier = (max_cost_tier or "C").upper()
-    provider = TIER_PROVIDER_MAP.get(tier, TIER_PROVIDER_MAP["C"])
-    cmd = [ZEROCLAW_BIN, "agent", "-a", ZEROCLAW_AGENT, "--provider", provider, "-m", description]
-    print(f"[zc-worker] $ {' '.join(cmd[:5])} … [desc len={len(description)}] cwd={exec_cwd}", flush=True)
+    chain = TIER_FALLBACK_CHAIN.get(tier, TIER_FALLBACK_CHAIN["C"])
     start = time.time()
     timeout = timeout_for_kind(kind)
-    try:
-        proc = subprocess.Popen(cmd, cwd=exec_cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        last_job_hb = time.time()
-        while True:
-            try:
-                proc.wait(timeout=30)
+    last_stderr = ""
+    last_stdout = ""
+    providers_attempted = []
+    final_provider = chain[0]
+    proc = None
+
+    for attempt_idx, agent_alias in enumerate(chain):
+        final_provider = agent_alias
+        providers_attempted.append(agent_alias)
+        # Switch -a <agent_alias> per attempt; each agent binds to single
+        # provider type via its model_provider field. Avoids 0.8 bug where
+        # --provider override keeps old agent's api_key.
+        cmd = [ZEROCLAW_BIN, "agent", "-a", agent_alias, "-m", description]
+        print(f"[zc-worker] $ {' '.join(cmd[:4])} … [desc len={len(description)}] cwd={exec_cwd} (attempt {attempt_idx+1}/{len(chain)})", flush=True)
+        attempt_start = time.time()
+        try:
+            proc = subprocess.Popen(cmd, cwd=exec_cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            last_job_hb = time.time()
+            while True:
+                try:
+                    proc.wait(timeout=30)
+                    break
+                except subprocess.TimeoutExpired:
+                    elapsed = time.time() - start
+                    if elapsed >= timeout:
+                        proc.kill()
+                        proc.wait()
+                        if workspace:
+                            _cleanup_workspace(workspace)
+                        return {
+                            "exit_code": -1,
+                            "error": f"timeout {timeout}s exceeded (provider={provider})",
+                            "duration_sec": round(elapsed, 1),
+                            "workdir": exec_cwd,
+                            "providers_attempted": providers_attempted,
+                        }
+                    if job_heartbeat_fn and (time.time() - last_job_hb) >= JOB_HEARTBEAT_INTERVAL:
+                        try:
+                            job_heartbeat_fn(round(elapsed, 1))
+                        except Exception:
+                            pass
+                        last_job_hb = time.time()
+
+            last_stdout = proc.stdout.read()
+            last_stderr = proc.stderr.read()
+
+            # Success → break out of fallback loop
+            if proc.returncode == 0:
+                print(f"[zc-worker] success on provider={provider} attempt={attempt_idx+1} dur={time.time()-attempt_start:.1f}s", flush=True)
                 break
-            except subprocess.TimeoutExpired:
-                elapsed = time.time() - start
-                if elapsed >= timeout:
-                    proc.kill()
-                    proc.wait()
-                    if workspace:
-                        _cleanup_workspace(workspace)
-                    return {
-                        "exit_code": -1,
-                        "error": f"timeout {timeout}s exceeded",
-                        "duration_sec": round(elapsed, 1),
-                        "workdir": exec_cwd,
-                    }
-                if job_heartbeat_fn and (time.time() - last_job_hb) >= JOB_HEARTBEAT_INTERVAL:
-                    try:
-                        job_heartbeat_fn(round(elapsed, 1))
-                    except Exception:
-                        pass
-                    last_job_hb = time.time()
 
-        stdout, stderr = proc.stdout.read(), proc.stderr.read()
-        err_tag = detect_error(stdout)
-        t_in, t_out = parse_tokens(stdout, stderr)
-        if t_in == 0 and t_out == 0:
-            t_in = max(1, len(description) // 4)
-            t_out = max(1, len(stdout) // 4)
-        result = {
-            "exit_code": proc.returncode,
-            "stdout": stdout[-12000:],
-            "stderr": stderr[-4000:],
-            "duration_sec": round(time.time() - start, 1),
-            "zeroclaw_cmd": " ".join(cmd[:5]),
-            "agent_alias": ZEROCLAW_AGENT,
-            "tokens_in": t_in,
-            "tokens_out": t_out,
-            "workdir": exec_cwd,
-        }
-        if err_tag:
-            result["exit_code"] = 1
-            result["worker_error"] = err_tag
+            # Non-zero exit — decide retry or give up
+            if _is_rate_limited(last_stderr, last_stdout):
+                print(f"[zc-worker] rate-limited on {provider} ({time.time()-attempt_start:.1f}s), advancing chain", flush=True)
+                # Continue to next provider in chain
+                continue
+            else:
+                # Non-retryable failure — break + report
+                print(f"[zc-worker] non-retryable failure on {provider} exit={proc.returncode}", flush=True)
+                break
+        except Exception as exc:
+            last_stderr = f"{type(exc).__name__}: {exc}"
+            print(f"[zc-worker] exc on {provider}: {last_stderr[:200]}", flush=True)
+            # Spawn exception is treated as retryable
+            continue
 
-        # Post-agent: capture + commit/push changes if workspace exists
-        if workspace and proc.returncode == 0:
+    # Build result from last attempt
+    err_tag = detect_error(last_stdout)
+    t_in, t_out = parse_tokens(last_stdout, last_stderr)
+    if t_in == 0 and t_out == 0:
+        t_in = max(1, len(description) // 4)
+        t_out = max(1, len(last_stdout) // 4)
+    result = {
+        "exit_code": proc.returncode if proc else -1,
+        "stdout": last_stdout[-12000:],
+        "stderr": last_stderr[-4000:],
+        "duration_sec": round(time.time() - start, 1),
+        "zeroclaw_cmd": f"{ZEROCLAW_BIN} agent -a {final_provider}",
+        "agent_alias": final_provider,
+        "providers_attempted": providers_attempted,
+        "tokens_in": t_in,
+        "tokens_out": t_out,
+        "workdir": exec_cwd,
+    }
+    if err_tag:
+        result["exit_code"] = 1
+        result["worker_error"] = err_tag
+
+    # Post-agent: capture + commit/push changes if workspace exists
+    try:
+        if workspace and proc and proc.returncode == 0:
             changes = _capture_changes(workspace)
             result["files_changed"] = changes["files_changed"]
             result["diffstat"] = changes["diffstat"]
-            # Always attempt commit+push — agent may have committed via shell tool
             commits = _commit_and_push(workspace, job_id or "anon", kind, branch, base_ref=repo.get("base") or "main")
             result["commits"] = commits
             if commits:
                 result["pushed_branch"] = branch
                 result["repo_url"] = repo["url"]
-
-        if workspace:
-            _cleanup_workspace(workspace)
-        return result
     except Exception as e:
+        result["post_agent_error"] = f"{type(e).__name__}: {e}"
+    finally:
         if workspace:
             _cleanup_workspace(workspace)
-        return {
-            "exit_code": -1,
-            "error": f"{type(e).__name__}: {e}",
-            "workdir": exec_cwd,
-        }
+    return result
 
 
 def main():
