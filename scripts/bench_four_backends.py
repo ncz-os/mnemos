@@ -415,6 +415,15 @@ async def _bench_backend(name: str, backend, repeat: int, n_records: int) -> dic
             list_samples.append(time.perf_counter() - t0)
     list_stat = _stats(list_samples, "list-scan-50")
 
+    # ── pre-recall: rebuild PG HNSW index ────────────────────────────────────
+    # Bulk-insert phase deletes 4968 records × repeat reps without VACUUM.
+    # HNSW retains dead graph links to deleted entries, causing recall < 0.5.
+    # Rebuild before the recall test to get an honest ANN accuracy number.
+    if name == "pg+pgvector" and hasattr(backend, "_pool"):
+        async with backend._pool.acquire() as _conn:
+            await _conn.execute("VACUUM ANALYZE memories")
+            await _conn.execute("REINDEX INDEX idx_memories_hnsw")
+
     # ── phase 5: recall accuracy ──
     # Insert a dedicated corpus with fully known embeddings; compute
     # brute-force cosine top-K as ground truth; compare with ANN results.
