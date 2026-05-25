@@ -51,8 +51,13 @@ EMBED_DIM = 768
 TOP_K = 10
 WARMUP = 32
 BATCH_CHUNK = 128
-ACC_CORPUS = 300   # records in recall-accuracy corpus
+ACC_CORPUS = 300  # records in recall-accuracy corpus
 ACC_QUERIES = 100  # query vectors for recall@TOP_K measurement
+
+# Pre-generated embedding pool (populated at startup when --embed-url is set)
+_EMBED_POOL: list[list[float]] = []
+_EMBED_URL: str = ""
+_EMBED_MODEL: str = "nomic-embed-text"
 
 PG_DSN = os.environ.get("PG_DSN", "postgresql://mnemos_user:mnemos_local@localhost:5433/mnemos")
 ORACLE_DSN = os.environ.get("ORACLE_DSN", "")
@@ -66,6 +71,7 @@ HMAC_KEY = os.environ.get("BENCH_HMAC_KEY", "mnemos-bench-v2")
 
 def _sha() -> str:
     import subprocess
+
     try:
         return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=REPO, text=True).strip()
     except Exception:
@@ -95,6 +101,86 @@ def _rand_vec() -> list[float]:
     return [x / mag for x in v]
 
 
+def _pool_vec() -> list[float]:
+    """Return a vector from the pre-generated pool, or a random one if no pool."""
+    if _EMBED_POOL:
+        return random.choice(_EMBED_POOL)
+    return _rand_vec()
+
+
+async def _fetch_embedding(text: str) -> list[float]:
+    """Call Ollama /api/embeddings endpoint and return L2-normalised vector."""
+    import urllib.request
+
+    payload = json.dumps({"model": _EMBED_MODEL, "prompt": text}).encode()
+    req = urllib.request.Request(
+        f"{_EMBED_URL}/api/embeddings",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    loop = asyncio.get_event_loop()
+    raw = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=30).read())
+    vec = json.loads(raw)["embedding"]
+    mag = sum(x * x for x in vec) ** 0.5
+    return [x / mag for x in vec] if mag > 0 else vec
+
+
+async def _build_embed_pool(n: int) -> None:
+    """Pre-generate n real embeddings from diverse synthetic phrases."""
+    global _EMBED_POOL
+    categories = [
+        "infrastructure",
+        "facts",
+        "user",
+        "project",
+        "reasoning",
+        "research",
+        "memory",
+        "context",
+        "knowledge",
+        "retrieval",
+    ]
+    verbs = [
+        "stores",
+        "retrieves",
+        "indexes",
+        "compresses",
+        "searches",
+        "records",
+        "recalls",
+        "encodes",
+        "fetches",
+        "persists",
+    ]
+    nouns = [
+        "vector",
+        "embedding",
+        "memory",
+        "document",
+        "record",
+        "context",
+        "session",
+        "knowledge",
+        "concept",
+        "information",
+    ]
+    print(f"  [embed-pool] generating {n} embeddings from {_EMBED_URL} ...", flush=True)
+    texts = [
+        f"System {categories[i % len(categories)]} {verbs[i % len(verbs)]} {nouns[i % len(nouns)]} item {i}"
+        for i in range(n)
+    ]
+    pool = []
+    batch = 32
+    for start in range(0, len(texts), batch):
+        chunk = texts[start : start + batch]
+        vecs = await asyncio.gather(*[_fetch_embedding(t) for t in chunk])
+        pool.extend(vecs)
+        print(f"  [embed-pool] {len(pool)}/{n}", end="\r", flush=True)
+    _EMBED_POOL = pool
+    print(f"  [embed-pool] done — {len(pool)} vectors cached          ")
+
+
 def _brute_force_topk(
     query: list[float],
     corpus: list[tuple[str, list[float]]],
@@ -107,10 +193,7 @@ def _brute_force_topk(
     maximising cosine similarity, so this ground truth is correct for both
     PG (cosine) and Db2 (EUCLIDEAN) backends.
     """
-    scores = [
-        (mid, sum(q * c for q, c in zip(query, emb)))
-        for mid, emb in corpus
-    ]
+    scores = [(mid, sum(q * c for q, c in zip(query, emb))) for mid, emb in corpus]
     scores.sort(key=lambda x: -x[1])
     return [mid for mid, _ in scores[:k]]
 
@@ -131,6 +214,7 @@ def _recall_stats(recalls: list[float], k: int) -> dict[str, Any]:
 
 def _bench_user() -> Any:
     from mnemos.core.auth_context import UserContext
+
     return UserContext(
         user_id="bench",
         group_ids=[],
@@ -143,6 +227,7 @@ def _bench_user() -> Any:
 
 def _root_vis(namespace: str | None = "bench") -> Any:
     from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
     return VisibilityFilter(
         scope=VisibilityScope.ROOT_BYPASS,
         user_id=None,
@@ -157,6 +242,7 @@ def _root_vis(namespace: str | None = "bench") -> Any:
 async def _make_pg_backend(dsn: str):
     import asyncpg
     from mnemos.persistence.postgres import PostgresBackend
+
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4, statement_cache_size=0)
     b = PostgresBackend(pool, SimpleNamespace())
     # Postgres backend has no open(); pool is already ready
@@ -171,6 +257,7 @@ async def _open_noop(b):
 
 async def _make_oracle_backend(dsn: str):
     from mnemos.persistence.oracle import create_oracle_pool, OracleBackend
+
     pool = await create_oracle_pool(dsn, min_size=1, max_size=4)
     b = OracleBackend(pool, SimpleNamespace())
     return b, pool
@@ -178,6 +265,7 @@ async def _make_oracle_backend(dsn: str):
 
 async def _make_db2_backend(dsn: str):
     from mnemos.persistence.db2 import create_db2_pool, Db2Backend
+
     pool = await create_db2_pool(dsn, min_size=1, max_size=4, acquire_timeout=60.0)
     b = Db2Backend(pool, SimpleNamespace())
     return b, pool
@@ -185,6 +273,7 @@ async def _make_db2_backend(dsn: str):
 
 async def _make_mysql_backend(dsn: str):
     from mnemos.persistence.mysql import create_mysql_pool, MysqlBackend
+
     pool = await create_mysql_pool(dsn, min_size=1, max_size=4)
     b = MysqlBackend(pool, SimpleNamespace())
     return b, pool
@@ -193,8 +282,9 @@ async def _make_mysql_backend(dsn: str):
 # ── per-backend bench primitives ──────────────────────────────────────────────
 
 
-async def _insert_one(backend, tx, *, memory_id: str, content: str, category: str,
-                      subcategory: str, embedding: list[float]) -> None:
+async def _insert_one(
+    backend, tx, *, memory_id: str, content: str, category: str, subcategory: str, embedding: list[float]
+) -> None:
     now = datetime.datetime.now(datetime.timezone.utc)
     await backend.memories.insert_memory(
         tx,
@@ -227,20 +317,23 @@ async def _bench_backend(name: str, backend, repeat: int, n_records: int) -> dic
     records = []
     embeddings = []
     for i in range(n_records):
-        records.append({
-            "id": f"{prefix}{i:06d}",
-            "content": f"benchmark memory record {i} for {name} bakeoff run",
-            "category": ["infrastructure", "facts", "user", "project"][i % 4],
-            "subcategory": ["performance", "vector", "search", "index"][i % 4],
-        })
-        embeddings.append(_rand_vec())
+        records.append(
+            {
+                "id": f"{prefix}{i:06d}",
+                "content": f"benchmark memory record {i} for {name} bakeoff run",
+                "category": ["infrastructure", "facts", "user", "project"][i % 4],
+                "subcategory": ["performance", "vector", "search", "index"][i % 4],
+            }
+        )
+        embeddings.append(_pool_vec())
 
     # warmup: insert WARMUP records, don't time these
     print(f"  [{name}] warmup {WARMUP} records ...", flush=True)
     async with backend.transactional() as tx:
         for i in range(WARMUP):
             await _insert_one(
-                backend, tx,
+                backend,
+                tx,
                 memory_id=records[i]["id"],
                 content=records[i]["content"],
                 category=records[i]["category"],
@@ -256,11 +349,12 @@ async def _bench_backend(name: str, backend, repeat: int, n_records: int) -> dic
         t0 = time.perf_counter()
         async with backend.transactional() as tx:
             for j in range(0, len(rep_ids), BATCH_CHUNK):
-                chunk_ids = rep_ids[j: j + BATCH_CHUNK]
+                chunk_ids = rep_ids[j : j + BATCH_CHUNK]
                 for k, rid in enumerate(chunk_ids):
                     idx = j + k
                     await _insert_one(
-                        backend, tx,
+                        backend,
+                        tx,
                         memory_id=rid,
                         content=f"rep{rep} bulk record {idx}",
                         category=records[idx % len(records)]["category"],
@@ -275,11 +369,11 @@ async def _bench_backend(name: str, backend, repeat: int, n_records: int) -> dic
     bulk_stat = _stats(insert_samples, f"bulk-insert-{n_records - WARMUP}")
 
     # ── phase 2: semantic search (vector similarity) ──
-    print(f"  [{name}] semantic search x{repeat*10} ...", flush=True)
+    print(f"  [{name}] semantic search x{repeat * 10} ...", flush=True)
     sem_samples: list[float] = []
     for _ in range(repeat):
         for _ in range(10):
-            qvec = _rand_vec()
+            qvec = _pool_vec()
             t0 = time.perf_counter()
             async with backend.transactional() as tx:
                 results = await backend.memories.semantic_search(
@@ -294,9 +388,9 @@ async def _bench_backend(name: str, backend, repeat: int, n_records: int) -> dic
     sem_stat = _stats(sem_samples, f"semantic-top{TOP_K}")
 
     # ── phase 3: point lookup ──
-    print(f"  [{name}] point lookup x{repeat*20} ...", flush=True)
+    print(f"  [{name}] point lookup x{repeat * 20} ...", flush=True)
     lookup_samples: list[float] = []
-    sample_ids = [r["id"] for r in records[:min(20, len(records))]]
+    sample_ids = [r["id"] for r in records[: min(20, len(records))]]
     for _ in range(repeat):
         for mid in sample_ids:
             t0 = time.perf_counter()
@@ -306,7 +400,7 @@ async def _bench_backend(name: str, backend, repeat: int, n_records: int) -> dic
     lookup_stat = _stats(lookup_samples, "point-lookup")
 
     # ── phase 4: list/scan ──
-    print(f"  [{name}] list scan x{repeat*5} ...", flush=True)
+    print(f"  [{name}] list scan x{repeat * 5} ...", flush=True)
     list_samples: list[float] = []
     for _ in range(repeat):
         for cat in ["infrastructure", "facts", "user", "project", "bench"]:
@@ -330,18 +424,21 @@ async def _bench_backend(name: str, backend, repeat: int, n_records: int) -> dic
     acc_records_meta = []
     acc_embeddings_list: list[list[float]] = []
     for i in range(ACC_CORPUS):
-        acc_records_meta.append({
-            "id": f"{acc_prefix}{i:06d}",
-            "content": f"accuracy corpus record {i}",
-            "category": "bench",
-            "subcategory": "accuracy",
-        })
-        acc_embeddings_list.append(_rand_vec())
+        acc_records_meta.append(
+            {
+                "id": f"{acc_prefix}{i:06d}",
+                "content": f"accuracy corpus record {i}",
+                "category": "bench",
+                "subcategory": "accuracy",
+            }
+        )
+        acc_embeddings_list.append(_pool_vec())
 
     async with backend.transactional() as tx:
         for i, arec in enumerate(acc_records_meta):
             await _insert_one(
-                backend, tx,
+                backend,
+                tx,
                 memory_id=arec["id"],
                 content=arec["content"],
                 category=arec["category"],
@@ -351,17 +448,19 @@ async def _bench_backend(name: str, backend, repeat: int, n_records: int) -> dic
 
     # Ground truth corpus = warmup records + acc corpus (all in namespace="bench").
     # Warmup embeddings are the first WARMUP entries of `embeddings`.
-    gt_corpus = (
-        [(records[i]["id"], embeddings[i]) for i in range(WARMUP)]
-        + [(acc_records_meta[i]["id"], acc_embeddings_list[i]) for i in range(ACC_CORPUS)]
-    )
+    gt_corpus = [(records[i]["id"], embeddings[i]) for i in range(WARMUP)] + [
+        (acc_records_meta[i]["id"], acc_embeddings_list[i]) for i in range(ACC_CORPUS)
+    ]
     recalls: list[float] = []
     for _ in range(ACC_QUERIES):
-        qvec = _rand_vec()
+        qvec = _pool_vec()
         gt_ids = set(_brute_force_topk(qvec, gt_corpus, TOP_K))
         async with backend.transactional() as tx:
             ann_rows = await backend.memories.semantic_search(
-                tx, embedding=qvec, limit=TOP_K, visibility=vis,
+                tx,
+                embedding=qvec,
+                limit=TOP_K,
+                visibility=vis,
             )
         ann_ids = {r["id"] for r in ann_rows}
         recalls.append(len(ann_ids & gt_ids) / len(gt_ids) if gt_ids else 0.0)
@@ -419,7 +518,7 @@ def _print_table(results: list[dict]) -> None:
         print(p95row)
     # recall@K section
     print("-" * len(header))
-    recall_row = f"{'recall@'+str(TOP_K):<28}"
+    recall_row = f"{'recall@' + str(TOP_K):<28}"
     for res in results:
         rc = res.get("recall", {})
         val = f"{rc['mean']:.4f}" if rc.get("mean") is not None else "n/a"
@@ -442,11 +541,37 @@ async def _main() -> None:
     ap.add_argument("--n-records", type=int, default=1000)
     ap.add_argument("--repeat", type=int, default=3)
     ap.add_argument("--skip-pg", action="store_true")
+    ap.add_argument(
+        "--embed-url",
+        default="",
+        help="Ollama base URL for real embeddings, e.g. http://192.168.207.67:11434. "
+        "If omitted, random unit vectors are used.",
+    )
+    ap.add_argument(
+        "--embed-model",
+        default="nomic-embed-text",
+        help="Model name to pass to Ollama /api/embeddings (default: nomic-embed-text)",
+    )
+    ap.add_argument(
+        "--embed-pool-size",
+        type=int,
+        default=512,
+        help="Number of embeddings to pre-generate into the pool (default: 512)",
+    )
     args = ap.parse_args()
 
+    global _EMBED_URL, _EMBED_MODEL
+    _EMBED_URL = args.embed_url.rstrip("/")
+    _EMBED_MODEL = args.embed_model
+
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    embed_src = f"nomic-embed-text @ {_EMBED_URL}" if _EMBED_URL else "random unit vectors"
     print(f"[BAKEOFF] 4-backend bench n={args.n_records} repeat={args.repeat} @ {ts}")
     print(f"  git={_sha()}")
+    print(f"  embeddings={embed_src}")
+
+    if _EMBED_URL:
+        await _build_embed_pool(args.embed_pool_size)
 
     factories = []
     if not args.skip_pg:
@@ -476,10 +601,11 @@ async def _main() -> None:
             for p in res["phases"]:
                 print(f"  {p['label']:30} p50={p['p50_ms']}ms  p95={p.get('p95_ms')}ms")
             rc = res.get("recall", {})
-            print(f"  {rc.get('label','recall'):30} mean={rc.get('mean')}  min={rc.get('min')}")
+            print(f"  {rc.get('label', 'recall'):30} mean={rc.get('mean')}  min={rc.get('min')}")
         except Exception as exc:
             print(f"  ERROR {bname}: {exc}")
             import traceback
+
             traceback.print_exc()
         finally:
             try:
