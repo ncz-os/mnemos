@@ -41,8 +41,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
-import json
 import logging
 import math
 import os
@@ -370,6 +368,24 @@ class MysqlMemoryRepository(MemoryRepository):
     built-in ``FULLTEXT INDEX`` with ``MATCH … AGAINST … IN BOOLEAN MODE``.
     """
 
+    _expected_embedding_dim: int | None = _DEFAULT_EMBEDDING_DIM
+
+    def _require_dim(self, embedding: Sequence[float], op: str) -> None:
+        expected = self._expected_embedding_dim
+        if expected is None:
+            return
+        actual = len(embedding)
+        if actual != expected:
+            raise ValueError(
+                f"MySQL embedding dim mismatch on {op}: got {actual}-D vector "
+                f"but the configured MNEMOS_EMBEDDING_DIM is {expected}. The "
+                f"embedding endpoint may have been switched to a different "
+                f"model. Verify INFERENCE_EMBED_HOST / model selection and "
+                f"either restart with the matching MNEMOS_EMBEDDING_DIM or "
+                f"swap the embedding endpoint back to the model the DB was "
+                f"sized for."
+            )
+
     async def insert_memory(
         self,
         tx: Transaction,
@@ -468,6 +484,25 @@ class MysqlMemoryRepository(MemoryRepository):
                 list(memory_ids),
             )
             return await _fetch_all_dicts(cursor)
+
+    async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
+        if not embedding:
+            return
+        self._require_dim(embedding, "upsert_memory_embedding")
+        vec_literal = _validate_and_format_vector(embedding)
+        dimension = len(embedding)
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO memory_embeddings (memory_id, embedding, dimension)
+                VALUES (%s, VEC_FromText(%s), %s)
+                ON DUPLICATE KEY UPDATE
+                    embedding = VEC_FromText(VALUES(embedding)),
+                    dimension = VALUES(dimension)
+                """,
+                (memory_id, vec_literal, dimension),
+            )
 
     async def list_memories(
         self,
@@ -837,9 +872,11 @@ class MysqlMemoryRepository(MemoryRepository):
         if embedder is None:
             return []
         embedding = await asyncio.get_event_loop().run_in_executor(None, embedder.embed, query)
-        from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
-        vis = VisibilityFilter(scope=VisibilityScope.READABLE, user_id=getattr(user, "id", ""), namespace=getattr(user, "namespace", "default"), group_ids=frozenset())
+        from mnemos.core.security import is_root
+
+        namespace = None if is_root(user) else user.namespace
+        vis = VisibilityFilter.for_read(user, namespace=namespace)
         return await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=vis)
 
     # --- unimplemented stubs (port forthcoming) ---
@@ -1012,6 +1049,12 @@ class MysqlBackend(PersistenceBackend):
         self._settings = settings
         self._closed = False
         self._memories_repo = MysqlMemoryRepository()
+        try:
+            self._memories_repo._expected_embedding_dim = int(
+                getattr(settings.database, "embedding_dim", _DEFAULT_EMBEDDING_DIM)
+            )
+        except (AttributeError, TypeError, ValueError):
+            self._memories_repo._expected_embedding_dim = _DEFAULT_EMBEDDING_DIM
         self._kg_triples_repo = MysqlKGRepository()
         self._memory_versions_repo = MysqlVersionRepository()
         self._memory_branches_repo = MysqlBranchRepository()
