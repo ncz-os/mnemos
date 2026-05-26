@@ -116,7 +116,7 @@ ZEROCLAW_TIMEOUT = int(os.environ.get("ZEROCLAW_TIMEOUT", "600"))
 # Per-provider attempt timeout (separate from total job timeout). Stops hung
 # providers (e.g. Groq 8b under TPM cap returning empty for 10 min) from
 # burning the full ZEROCLAW_TIMEOUT before advancing chain.
-PER_ATTEMPT_TIMEOUT = int(os.environ.get("PER_ATTEMPT_TIMEOUT", "180"))
+PER_ATTEMPT_TIMEOUT = int(os.environ.get("PER_ATTEMPT_TIMEOUT", "600"))
 ORCHESTRATION_TIMEOUT = int(os.environ.get("ORCHESTRATION_TIMEOUT", "3600"))
 WORKDIR = os.environ.get("HIVE_WORKDIR", os.getcwd())
 AGENT_MODEL = os.environ.get("AGENT_MODEL", "groq/qwen3-32b")
@@ -585,7 +585,6 @@ _HARDCODED_FALLBACK = {
         os.environ.get("ZC_TIER_A_AGENT", "hive_anthropic"),
         "hive_openai",
         "hive_gemini",
-        _FALLBACK_DEEPSEEK,
         _FALLBACK_TOGETHER,
     ],
     "B": [
