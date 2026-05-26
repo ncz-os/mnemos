@@ -590,16 +590,13 @@ _HARDCODED_FALLBACK = {
     ],
     "B": [
         _PRIMARY_BC,
-        _FALLBACK_DEEPSEEK,
         "hive_groq_8b",
         _FALLBACK_TOGETHER,
-        _FALLBACK_SILICONFLOW,
         "hive_xai",
         "hive_openai",
     ],
     "C": [
         _PRIMARY_BC,
-        _FALLBACK_DEEPSEEK,
         "hive_groq_8b",
         _FALLBACK_TOGETHER,
     ],
