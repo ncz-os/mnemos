@@ -26,6 +26,7 @@ Usage (standalone, for testing):
 import asyncio
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -415,12 +416,20 @@ async def upsert_models(pool, models: list[dict], dry_run: bool = False) -> tupl
                     added += 1
                     logger.info(f"[SYNC] ADD {m['provider']}/{m['model_id']}")
                 else:
+                    # KNEMON: also merge prices on UPDATE. COALESCE so we only
+                    # OVERWRITE when the new value is non-null/non-zero — keeps
+                    # historical price entries intact when a fresh sync has
+                    # no static seed for that model.
                     await conn.execute(
                         """UPDATE model_registry SET
                             display_name=$3, family=$4,
                             context_window=COALESCE($5, context_window),
                             max_output_tokens=COALESCE($6, max_output_tokens),
                             capabilities=$7,
+                            input_cost_per_mtok=CASE WHEN $10::numeric IS NOT NULL AND $10 > 0 THEN $10 ELSE input_cost_per_mtok END,
+                            output_cost_per_mtok=CASE WHEN $11::numeric IS NOT NULL AND $11 > 0 THEN $11 ELSE output_cost_per_mtok END,
+                            cache_read_per_mtok=CASE WHEN $12::numeric IS NOT NULL AND $12 > 0 THEN $12 ELSE cache_read_per_mtok END,
+                            cache_write_per_mtok=CASE WHEN $13::numeric IS NOT NULL AND $13 > 0 THEN $13 ELSE cache_write_per_mtok END,
                             available=TRUE, last_seen=$8, last_synced=$8, raw=$9
                            WHERE provider=$1 AND model_id=$2""",
                         m["provider"], m["model_id"],
@@ -428,6 +437,10 @@ async def upsert_models(pool, models: list[dict], dry_run: bool = False) -> tupl
                         m.get("family") or _model_family(m["model_id"]),
                         m.get("context_window"), m.get("max_output_tokens"),
                         caps, now, raw_json,
+                        m.get("input_cost_per_mtok"),
+                        m.get("output_cost_per_mtok"),
+                        m.get("cache_read_per_mtok"),
+                        m.get("cache_write_per_mtok"),
                     )
                     updated += 1
 
@@ -486,6 +499,83 @@ _STATIC_PROVIDERS = {
     "perplexity": _fetch_perplexity_static,
 }
 
+# ── KNEMON price merge from llm_provider_registry.json (2026-05-27) ────────────
+# Provider /v1/models endpoints (openai, xai, groq, together, nvidia, gemini)
+# return model lists without pricing. KNEMON needs prices for cost-per-quality
+# triage. Static seed lives at /mnt/argonas/datapool/projects/fleet-registry/
+# llm_provider_registry.json. We merge it in before upsert so model_registry
+# rows get input_cost_per_mtok / output_cost_per_mtok populated.
+
+_PRICE_REGISTRY_PATH = os.environ.get(
+    "MNEMOS_LLM_PROVIDER_REGISTRY",
+    "/mnt/argonas/datapool/projects/fleet-registry/llm_provider_registry.json",
+)
+_STATIC_PRICES: Optional[dict] = None
+
+
+def _load_static_prices() -> dict:
+    """Lazy-load static pricing keyed by (provider, model_id) -> dict with cost_in/out."""
+    global _STATIC_PRICES
+    if _STATIC_PRICES is not None:
+        return _STATIC_PRICES
+    out: dict = {}
+    try:
+        with open(_PRICE_REGISTRY_PATH) as f:
+            data = json.load(f)
+        for prov_name, prov_entry in (data.get("providers") or {}).items():
+            for model_id, m in (prov_entry.get("models") or {}).items():
+                if not isinstance(m, dict):
+                    continue
+                cin = m.get("cost_in_per_m")
+                cout = m.get("cost_out_per_m")
+                if cin is None and cout is None:
+                    continue
+                out[(prov_name, model_id)] = {
+                    "input_cost_per_mtok": float(cin) if cin is not None else None,
+                    "output_cost_per_mtok": float(cout) if cout is not None else None,
+                    "cache_read_per_mtok": float(m["cost_cache_read_per_m"]) if m.get("cost_cache_read_per_m") is not None else None,
+                    "cache_write_per_mtok": float(m["cost_cache_write_per_m"]) if m.get("cost_cache_write_per_m") is not None else None,
+                }
+        _STATIC_PRICES = out
+        logger.info(f"[SYNC] loaded static prices for {len(out)} provider+model pairs from {_PRICE_REGISTRY_PATH}")
+    except FileNotFoundError:
+        logger.warning(f"[SYNC] static price registry not found at {_PRICE_REGISTRY_PATH}; skipping merge")
+        _STATIC_PRICES = {}
+    except Exception as e:
+        logger.error(f"[SYNC] failed to load static prices: {e}")
+        _STATIC_PRICES = {}
+    return _STATIC_PRICES
+
+
+def _merge_static_prices(models: list[dict]) -> int:
+    """Merge static seed prices into model dicts in place.
+
+    Only fills price fields when the fetched value is missing or zero. Returns
+    count of rows where at least one price field was filled in.
+    """
+    prices = _load_static_prices()
+    if not prices:
+        return 0
+    merged = 0
+    for m in models:
+        key = (m.get("provider"), m.get("model_id"))
+        seed = prices.get(key)
+        if not seed:
+            continue
+        touched = False
+        for field in ("input_cost_per_mtok", "output_cost_per_mtok",
+                      "cache_read_per_mtok", "cache_write_per_mtok"):
+            seed_val = seed.get(field)
+            if seed_val is None:
+                continue
+            current = m.get(field)
+            if current is None or current == 0:
+                m[field] = seed_val
+                touched = True
+        if touched:
+            merged += 1
+    return merged
+
 
 async def sync_provider(
     pool,
@@ -506,6 +596,13 @@ async def sync_provider(
             raise ValueError(f"Unknown provider: {provider!r}")
 
         logger.info(f"[SYNC:{provider}] fetched {len(models)} models")
+
+        # KNEMON: merge static seed prices for providers whose /v1/models
+        # endpoint omits pricing (openai/xai/groq/together/nvidia/gemini).
+        # No-op for anthropic + perplexity which already inline prices.
+        merged = _merge_static_prices(models)
+        if merged:
+            logger.info(f"[SYNC:{provider}] merged static prices into {merged}/{len(models)} models")
 
         added = updated = deprecated = 0
         if pool is not None:
