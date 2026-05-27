@@ -45,6 +45,8 @@ from mnemos.persistence.base import (
     SessionsRepository,
     StateRepository,
     Transaction,
+    UsageLedgerRecord,
+    UsageLedgerResult,
     VersionRepository,
     WebhookRepository,
 )
@@ -2973,6 +2975,61 @@ class PostgresBackend(PersistenceBackend):
             else:
                 if not tx.closed:
                     await tx.commit()
+
+    async def record_usage_ledger(
+        self,
+        tx: Transaction,
+        record: UsageLedgerRecord,
+    ) -> UsageLedgerResult:
+        row = await _postgres_tx(tx).conn.fetchrow(
+            """
+            WITH prices AS (
+                SELECT
+                    COALESCE(input_cost_per_mtok, 0)::NUMERIC AS price_in,
+                    COALESCE(output_cost_per_mtok, 0)::NUMERIC AS price_out,
+                    COALESCE(
+                        NULLIF(raw->>'reasoning_cost_per_mtok', '')::NUMERIC,
+                        output_cost_per_mtok,
+                        0
+                    )::NUMERIC AS price_reasoning
+                FROM model_registry
+                WHERE provider=$1 AND model_id=$2
+                LIMIT 1
+            ),
+            resolved_prices AS (
+                SELECT
+                    COALESCE((SELECT price_in FROM prices), 0)::NUMERIC AS price_in,
+                    COALESCE((SELECT price_out FROM prices), 0)::NUMERIC AS price_out,
+                    COALESCE((SELECT price_reasoning FROM prices), 0)::NUMERIC AS price_reasoning
+            )
+            INSERT INTO usage_ledger (
+                provider, model, task_kind, tokens_in, tokens_out,
+                tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                caller_subsystem, tier
+            )
+            SELECT
+                $1, $2, $3, $4, $5, $6,
+                (($4::NUMERIC * price_in)
+                 + ($5::NUMERIC * price_out)
+                 + ($6::NUMERIC * price_reasoning)) / 1000000,
+                $7, $8, $9, $10
+            FROM resolved_prices
+            RETURNING id, est_cost_usd
+            """,
+            record.provider,
+            record.model,
+            record.task_kind,
+            record.tokens_in,
+            record.tokens_out,
+            record.tokens_reasoning,
+            record.latency_ms,
+            record.outcome,
+            record.caller_subsystem,
+            record.tier,
+        )
+        if row is None:
+            raise RuntimeError("usage_ledger insert returned no row")
+        return UsageLedgerResult(id=int(row["id"]), est_cost_usd=row["est_cost_usd"])
 
     @property
     def memories(self) -> MemoryRepository:
