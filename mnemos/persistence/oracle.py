@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -33,10 +34,13 @@ from mnemos.persistence.base import (
     BranchRepository,
     CompressionRepository,
     ConsultationAuditRepository,
+    ConsultationsRepository,
     FederationRepository,
     KGRepository,
     MemoryRepository,
+    OAuthRepository,
     PersistenceBackend,
+    SessionsRepository,
     StateRepository,
     Transaction,
     VersionRepository,
@@ -319,19 +323,19 @@ def _build_oracle_session_callback(settings: Any) -> Any:
     """
     pdb_target = os.environ.get("MNEMOS_ORACLE_PDB", "").strip()
 
-    def _session_callback(conn: Any, requested_tag: Any) -> None:
+    async def _session_callback(conn: Any, requested_tag: Any) -> None:
         cur = None
         try:
             cur = conn.cursor()
             # Defensive NLS pinning: prevents locale-dependent decimal
             # parsing of vector literals + numeric binds.
             try:
-                cur.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '. '")
+                await cur.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '. '")
             except Exception as exc:  # pragma: no cover - driver-dependent
                 _LOG.debug("ALTER SESSION SET NLS_NUMERIC_CHARACTERS failed: %s", exc)
             if pdb_target:
                 try:
-                    cur.execute(f"ALTER SESSION SET CONTAINER = {pdb_target}")
+                    await cur.execute(f"ALTER SESSION SET CONTAINER = {pdb_target}")
                 except Exception as exc:  # pragma: no cover - driver-dependent
                     # ORA-65049 = already in the requested PDB; benign.
                     _LOG.debug(
@@ -420,7 +424,7 @@ async def create_oracle_pool(
     kwargs.setdefault("min", pool_min)
     kwargs.setdefault("max", pool_max)
     kwargs.setdefault("increment", pool_increment)
-    kwargs.setdefault("statement_cache_size", stmt_cache)
+    kwargs.setdefault("stmtcachesize", stmt_cache)
     # Explicit WAIT mode + timeout: default behaviour would otherwise
     # block forever when the pool is saturated.
     kwargs.setdefault("getmode", oracledb.POOL_GETMODE_WAIT)
@@ -1058,6 +1062,32 @@ class OracleMemoryRepository(MemoryRepository):
             )
             row = await _call(cursor.fetchone)
             return await _row_to_dict(cursor, row)
+        finally:
+            await _call(cursor.close)
+
+    async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
+        """Write a precomputed embedding to memories.embedding.
+
+        Idempotent UPDATE; no-op when embedding is empty. Used by
+        create_memory inline embed-on-write path (mnemos/api/routes/
+        memories.py:946) + federation F-1.4 copy_embeddings consumer.
+        2026-05-24: added so Oracle backend new-write rows actually
+        land with vectors instead of NULL.
+        """
+        if not embedding:
+            return
+        import array as _array
+
+        # Oracle 23ai VECTOR binds via array.array('f', ...).
+        arr = _array.array("f", [float(v) for v in embedding])
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET embedding = :emb WHERE id = :id",
+                {"emb": arr, "id": memory_id},
+            )
         finally:
             await _call(cursor.close)
 
@@ -2046,16 +2076,13 @@ class OracleWebhookRepository(WebhookRepository):
 
 
 class OracleConsultationAuditRepository(ConsultationAuditRepository):
-    """Oracle consultations-audit repo — safe-default returns.
+    """Oracle consultations-audit repo — backed by MODEL_REGISTRY (KNEMON).
 
-    The Postgres implementation delegates to the ``mcp_repo`` /
-    ``openai_compat_repo`` modules which read from the model registry
-    (model_registry / model_recommendations / provider_routing tables).
-    Those tables have not yet been ported to Oracle, so every call here
-    returns the empty / None value that signals "no Oracle-side audit
-    data" to the GRAEAE engine. The engine falls back to its built-in
-    provider defaults (see lifecycle docstring), which is the same
-    posture as a fresh Postgres install before model_registry seeding.
+    The MODEL_REGISTRY table is seeded by the graeae-model-sync timer
+    (postgres) and replicated into Oracle via the KNEMON seed script.
+    Selection mirrors the sqlite implementation: fetch candidate rows,
+    filter+rank in Python. Capabilities are stored as JSON CLOB and
+    decoded post-fetch.
     """
 
     async def fetch_recommended_model(
@@ -2065,8 +2092,101 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         cost_budget: float,
         quality_floor: float,
     ) -> tuple[dict[str, Any] | None, list[str]]:
-        _ = (tx, task_type, cost_budget, quality_floor)
-        return None, []
+        capability_map = {
+            "code_generation": ["coding"],
+            "reasoning": ["reasoning", "logic"],
+            "architecture_design": ["reasoning"],
+            "summarization": ["reasoning"],
+            "web_search": ["online", "search"],
+        }
+        required_caps = capability_map.get(task_type, ["reasoning"])
+
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider, model_id, display_name, "
+                "input_cost_per_mtok, output_cost_per_mtok, "
+                "capabilities, graeae_weight, context_window "
+                "FROM model_registry WHERE available = 1 AND deprecated = 0",
+            )
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+        def _caps_list(raw_caps: Any) -> list[str]:
+            if raw_caps is None:
+                return []
+            text = raw_caps
+            read = getattr(raw_caps, "read", None)
+            if callable(read):
+                try:
+                    text = read()
+                except Exception:
+                    text = ""
+            if isinstance(text, bytes):
+                try:
+                    text = text.decode("utf-8", "replace")
+                except Exception:
+                    text = ""
+            if not isinstance(text, str):
+                return []
+            text = text.strip()
+            if not text:
+                return []
+            try:
+                val = json.loads(text)
+            except Exception:
+                return []
+            if isinstance(val, list):
+                return [str(v) for v in val]
+            return []
+
+        def _has_priced(row: dict[str, Any]) -> bool:
+            return (
+                row.get("input_cost_per_mtok") is not None
+                and row.get("output_cost_per_mtok") is not None
+            )
+
+        def _avg_cost_or_none(row: dict[str, Any]) -> float | None:
+            if not _has_priced(row):
+                return None
+            return (
+                float(row["input_cost_per_mtok"]) + float(row["output_cost_per_mtok"])
+            ) / 2.0
+
+        # Decode capabilities once per row.
+        for r in rows:
+            r["_caps_decoded"] = _caps_list(r.get("capabilities"))
+
+        eligible = [
+            row
+            for row in rows
+            if float(row.get("graeae_weight") or 0) >= quality_floor
+            and _has_priced(row)
+            and (_avg_cost_or_none(row) or 0.0) <= cost_budget
+            and all(cap in row["_caps_decoded"] for cap in required_caps)
+        ]
+        chosen = sorted(eligible, key=lambda r: _avg_cost_or_none(r) or 0.0)
+        if not chosen:
+            # Degraded fallback: drop budget+quality, sort priced-first via NULLS-LAST.
+            chosen = sorted(
+                rows,
+                key=lambda r: (
+                    _avg_cost_or_none(r) if _avg_cost_or_none(r) is not None else float("inf")
+                ),
+            )
+        if not chosen:
+            return None, required_caps
+        model = chosen[0]
+        return {
+            "provider": model["provider"],
+            "model_id": model["model_id"],
+            "display_name": model.get("display_name"),
+            "cost_per_mtok": _avg_cost_or_none(model),
+            "quality_score": float(model.get("graeae_weight") or 0),
+            "context_window": model.get("context_window"),
+        }, required_caps
 
     async def fetch_model_recommendation(
         self,
@@ -2089,6 +2209,262 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
         _ = (tx, model_id)
         return None
+
+
+class OracleOAuthRepository(OAuthRepository):
+    async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT name, display_name, kind, enabled FROM oauth_providers "
+                "WHERE enabled = 1 ORDER BY display_name",
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_provider(self, tx: Transaction, name: str) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT name, kind, issuer_url, client_id, client_secret, scope, "
+                "authorize_url, token_url, userinfo_url, enabled "
+                "FROM oauth_providers WHERE name = :name",
+                {"name": name},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def provision_or_link_user(self, tx: Transaction, **kwargs: Any) -> tuple[str, str]:
+        raise NotImplementedError("Oracle OAuth identity provisioning repository is not implemented")
+
+    async def create_session(self, tx: Transaction, **kwargs: Any) -> str:
+        raise NotImplementedError("Oracle OAuth session creation repository is not implemented")
+
+    async def revoke_session(self, tx: Transaction, session_id: str) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE oauth_sessions SET revoked = 1, revoked_at = SYSTIMESTAMP "
+                "WHERE session_id = :session_id AND revoked = 0",
+                {"session_id": session_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_all_sessions(self, tx: Transaction, user_id: str) -> int:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE oauth_sessions SET revoked = 1, revoked_at = SYSTIMESTAMP "
+                "WHERE user_id = :user_id AND revoked = 0",
+                {"user_id": user_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def get_identity_for_session(self, tx: Transaction, session_id: str) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT i.id, i.user_id, i.provider, i.external_id, i.email, i.display_name, "
+                "i.last_login_at, i.created FROM oauth_sessions s "
+                "JOIN oauth_identities i ON i.id = s.identity_id "
+                "WHERE s.session_id = :session_id AND s.revoked = 0",
+                {"session_id": session_id},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+
+class OracleSessionsRepository(SessionsRepository):
+    async def create_session(self, tx: Transaction, **kwargs: Any) -> Row:
+        raise NotImplementedError("Oracle chat sessions repository is not implemented")
+
+    async def get_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT * FROM sessions WHERE id = :id AND user_id = :user_id "
+                "AND namespace = :namespace AND deleted_at IS NULL",
+                {"id": session_id, "user_id": user_id, "namespace": namespace},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def list_injected_memory_ids(self, tx: Transaction, session_id: str, limit: int = 10) -> list[str]:
+        _ = (tx, session_id, limit)
+        return []
+
+    async def add_message(self, tx: Transaction, **kwargs: Any) -> Any:
+        raise NotImplementedError("Oracle chat session messages repository is not implemented")
+
+    async def fetch_provider_history(self, tx: Transaction, session_id: str) -> list[Row]:
+        _ = (tx, session_id)
+        return []
+
+    async def add_memory_injections(self, tx: Transaction, **kwargs: Any) -> None:
+        _ = (tx, kwargs)
+
+    async def update_metrics(self, tx: Transaction, **kwargs: Any) -> None:
+        _ = (tx, kwargs)
+
+    async def fetch_history(self, tx: Transaction, session_id: str, limit: int, offset: int) -> tuple[list[Row], int]:
+        _ = (tx, session_id, limit, offset)
+        return [], 0
+
+    async def delete_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> bool:
+        _ = (tx, session_id, user_id, namespace)
+        return False
+
+
+class OracleConsultationsRepository(ConsultationsRepository):
+    async def resolve_tier_lineup(self, tx: Transaction, tier: str) -> list[Row]:
+        _ = (tx, tier)
+        return []
+
+    async def resolve_models(self, tx: Transaction, model_ids: Sequence[str]) -> list[Row]:
+        _ = (tx, model_ids)
+        return []
+
+    async def create_consultation_with_audit(self, tx: Transaction, **kwargs: Any) -> Any:
+        """Insert a consultation + audit-chain link + memory refs in one tx.
+
+        Mirrors SqliteConsultationsRepository.create_consultation_with_audit
+        (mnemos/persistence/sqlite.py); Oracle 23ai schema at
+        db/migrations_oracle/0002_graeae.sql defines graeae_consultations,
+        graeae_audit_log, consultation_memory_refs with VARCHAR2(36) PKs and
+        app-side UUIDs.
+        """
+        conn = _conn_from_tx(tx)
+        consultation_id = uuid.uuid4().hex
+        cursor = await _call(conn.cursor)
+        try:
+            # graeae_consultations insert. Note: "mode" is a reserved word
+            # in Oracle; the DDL quotes the column, so the SQL must too.
+            # NOTE: bind var names cannot be Oracle reserved words (ORA-01745).
+            # The "mode" column is reserved → rename the bind to mode_val while
+            # keeping the column name "mode" (quoted) on the INSERT.
+            await _call(
+                cursor.execute,
+                "INSERT INTO graeae_consultations "
+                "(id, prompt, task_type, consensus_response, consensus_score, "
+                'winning_muse, cost, latency_ms, "mode", owner_id, namespace) '
+                "VALUES (:id, :prompt, :task_type, :consensus_response, :consensus_score, "
+                ":winning_muse, :cost, :latency_ms, :mode_val, :owner_id, :namespace)",
+                {
+                    "id": consultation_id,
+                    "prompt": kwargs["prompt"],
+                    "task_type": kwargs["task_type"],
+                    "consensus_response": kwargs["consensus_response"][:500],
+                    "consensus_score": kwargs["consensus_score"],
+                    "winning_muse": kwargs["winning_muse"],
+                    "cost": kwargs["cost"],
+                    "latency_ms": kwargs["latency_ms"],
+                    "mode_val": kwargs["mode"],
+                    "owner_id": kwargs["owner_id"],
+                    "namespace": kwargs["namespace"],
+                },
+            )
+
+            # Audit chain — fetch latest link, hash forward, insert next.
+            prompt_hash = hashlib.sha256(kwargs["prompt"].encode()).hexdigest()
+            response_hash = hashlib.sha256(kwargs["consensus_response"].encode()).hexdigest()
+            await _call(
+                cursor.execute,
+                "SELECT id, chain_hash FROM graeae_audit_log " "ORDER BY sequence_num DESC FETCH FIRST 1 ROWS ONLY",
+            )
+            prev_row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            prev_chain = prev_row["chain_hash"] if prev_row else kwargs["genesis_hash"]
+            chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
+            audit_id = uuid.uuid4().hex
+            # provider is NOT NULL on Oracle but winning_muse can be None on
+            # all-muses-failed consensus path (route at consultations.py L361
+            # documents this safe-degradation). Coerce to sentinel "[none]"
+            # so the audit chain still records the event.
+            provider_val = kwargs["winning_muse"] or "[none]"
+            # response_text + consensus_response can be "" → Oracle treats as
+            # NULL; that's now allowed (we ALTERed CONSENSUS_RESPONSE NULL),
+            # but RESPONSE_TEXT on audit_log might still be NOT NULL. The
+            # MODIFY ... NULL migration applied to consensus_response only;
+            # if audit_log.response_text fails NOT NULL, coerce "" to None
+            # so the SQL drops the bind and Oracle stores NULL (which is
+            # itself a violation if NOT NULL set, but the table allows it).
+            await _call(
+                cursor.execute,
+                "INSERT INTO graeae_audit_log "
+                "(id, consultation_id, prompt, prompt_hash, provider, response_text, "
+                "response_hash, chain_hash, prev_id, prev_chain_hash, task_type, quality_score) "
+                "VALUES (:id, :consultation_id, :prompt, :prompt_hash, :provider, :response_text, "
+                ":response_hash, :chain_hash, :prev_id, :prev_chain_hash, :task_type, :quality_score)",
+                {
+                    "id": audit_id,
+                    "consultation_id": consultation_id,
+                    "prompt": kwargs["prompt"],
+                    "prompt_hash": prompt_hash,
+                    "provider": provider_val,
+                    "response_text": kwargs["consensus_response"] or "[empty]",
+                    "response_hash": response_hash,
+                    "chain_hash": chain_hash,
+                    "prev_id": prev_row["id"] if prev_row else None,
+                    "prev_chain_hash": prev_chain,
+                    "task_type": kwargs["task_type"] or "reasoning",
+                    "quality_score": kwargs["consensus_score"],
+                },
+            )
+
+            # Memory refs — Oracle has no INSERT OR IGNORE; the UNIQUE
+            # constraint unique_consultation_memory raises ORA-00001 on
+            # duplicate, so we swallow that one error code only.
+            for memory_id in kwargs["memory_ids"]:
+                ref_id = uuid.uuid4().hex
+                try:
+                    await _call(
+                        cursor.execute,
+                        "INSERT INTO consultation_memory_refs "
+                        "(id, consultation_id, memory_id) "
+                        "VALUES (:id, :consultation_id, :memory_id)",
+                        {
+                            "id": ref_id,
+                            "consultation_id": consultation_id,
+                            "memory_id": memory_id,
+                        },
+                    )
+                except Exception as exc:
+                    # ORA-00001 unique violation — duplicate ref, safe to skip.
+                    msg = str(exc)
+                    if "ORA-00001" not in msg:
+                        raise
+        finally:
+            await _call(cursor.close)
+        return consultation_id
+
+    async def list_audit_log(self, tx: Transaction, **kwargs: Any) -> list[Row]:
+        _ = (tx, kwargs)
+        return []
+
+    async def fetch_audit_chain(self, tx: Transaction, **kwargs: Any) -> list[Row]:
+        _ = (tx, kwargs)
+        return []
+
+    async def get_consultation(self, tx: Transaction, **kwargs: Any) -> Row | None:
+        _ = (tx, kwargs)
+        return None
+
+    async def get_consultation_artifacts(self, tx: Transaction, **kwargs: Any) -> tuple[Row | None, list[Row]]:
+        _ = (tx, kwargs)
+        return None, []
 
 
 class OracleFederationRepository(FederationRepository):
@@ -2736,6 +3112,7 @@ class OracleFederationRepository(FederationRepository):
         categories: Sequence[str],
         limit: int,
         prefer_compressed: bool,
+        include_embedding: bool = False,
     ) -> list[Row]:
         _ = prefer_compressed
         conn = _conn_from_tx(tx)
@@ -2749,7 +3126,13 @@ class OracleFederationRepository(FederationRepository):
             params: dict[str, Any] = {"limit": limit}
             if since_updated is not None and since_id is not None:
                 where.append("(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))")
-                params["upd"] = since_updated
+                # Explicit TIMESTAMP_TZ bind to avoid thin-mode coercion to VARCHAR
+                # which was causing infinite-loop pulls on ACHILLES (id < since_id).
+                import oracledb
+
+                upd_var = cursor.var(oracledb.DB_TYPE_TIMESTAMP_TZ)
+                upd_var.setvalue(0, since_updated)
+                params["upd"] = upd_var
                 params["since_id"] = since_id
             if namespaces:
                 ns_ph, ns_params = _in_placeholders(namespaces, "ns")
@@ -2759,13 +3142,28 @@ class OracleFederationRepository(FederationRepository):
                 cat_ph, cat_params = _in_placeholders(categories, "cat")
                 where.append(f"m.category IN ({cat_ph})")
                 params.update(cat_params)
+            # v6.1 F-1.2: optional embedding + embedding_model literal columns.
+            # See docs/v6.1-federation-embeddings-copy.md.
+            embed_cols = ""
+            if include_embedding:
+                from mnemos.core.config import get_settings as _gs
+
+                try:
+                    import os as _os
+
+                    _http_model = _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                    _model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
+                except Exception:
+                    _model = "unknown"
+                # Single-quote escape for embedded literal.
+                _model_escaped = _model.replace("'", "''")
+                embed_cols = f", m.embedding AS embedding, '{_model_escaped}' AS embedding_model"
             sql = (
                 "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
                 "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
                 "m.permission_mode, m.source_model, m.source_provider, "
                 "m.source_session, m.source_agent, m.created, m.updated, "
-                "m.archived_at "
-                "FROM memories m WHERE " + " AND ".join(where) + " "
+                "m.archived_at" + embed_cols + " FROM memories m WHERE " + " AND ".join(where) + " "
                 "ORDER BY m.updated ASC, m.id ASC "
                 "FETCH FIRST :limit ROWS ONLY"
             )
@@ -3009,6 +3407,9 @@ class OracleBackend(PersistenceBackend):
         self._compression_repo = OracleCompressionRepository()
         self._webhooks_repo = OracleWebhookRepository()
         self._consultations_audit_repo = OracleConsultationAuditRepository()
+        self._oauth_repo = OracleOAuthRepository()
+        self._sessions_repo = OracleSessionsRepository()
+        self._consultations_repo = OracleConsultationsRepository()
         self._federation_repo = OracleFederationRepository()
         self._state_kv_repo = OracleStateRepository()
 
@@ -3063,12 +3464,37 @@ class OracleBackend(PersistenceBackend):
         return self._consultations_audit_repo
 
     @property
+    def oauth(self) -> OAuthRepository:
+        return self._oauth_repo
+
+    @property
+    def sessions(self) -> SessionsRepository:
+        return self._sessions_repo
+
+    @property
+    def consultations(self) -> ConsultationsRepository:
+        return self._consultations_repo
+
+    @property
     def federation(self) -> FederationRepository:
         return self._federation_repo
 
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv_repo
+
+    async def ping(self) -> bool:
+        try:
+            async with self._pool.acquire() as conn:
+                cursor = await _call(conn.cursor)
+                try:
+                    await _call(cursor.execute, "SELECT 1 FROM DUAL")
+                    await _call(cursor.fetchone)
+                finally:
+                    await _call(cursor.close)
+            return True
+        except Exception:
+            return False
 
     async def open(self) -> None:
         """Lifecycle hook — validates pool checkout + session callback.
