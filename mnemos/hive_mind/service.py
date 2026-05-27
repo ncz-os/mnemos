@@ -582,6 +582,13 @@ async def lifespan(app: FastAPI):
         # Add-only via ALTER TABLE; ignore "duplicate column" errors so reruns are no-ops.
         for stmt in (
             "ALTER TABLE jobs ADD COLUMN project TEXT",
+            "ALTER TABLE jobs ADD COLUMN tokens_in INTEGER",
+            "ALTER TABLE jobs ADD COLUMN tokens_out INTEGER",
+            "ALTER TABLE jobs ADD COLUMN tokens_reasoning INTEGER",
+            "ALTER TABLE jobs ADD COLUMN provider TEXT",
+            "ALTER TABLE jobs ADD COLUMN model TEXT",
+            "ALTER TABLE jobs ADD COLUMN cost_usd_est REAL",
+            "ALTER TABLE jobs ADD COLUMN estimated_cost_usd REAL",
         ):
             try:
                 await db.execute(stmt)
@@ -991,6 +998,19 @@ async def update_job(job_id: str, req: JobUpdate):
     if req.result is not None:
         fields.append("result=?")
         args.append(json.dumps(req.result))
+        result_column_map = {
+            "tokens_in": ("tokens_in", int),
+            "tokens_out": ("tokens_out", int),
+            "tokens_reasoning": ("tokens_reasoning", int),
+            "provider": ("provider", str),
+            "model": ("model", str),
+            "cost_usd_est": ("cost_usd_est", float),
+        }
+        for result_key, (column, caster) in result_column_map.items():
+            value = req.result.get(result_key)
+            if value is not None:
+                fields.append(f"{column}=?")
+                args.append(caster(value))
     if req.claimed_by:
         fields.extend(["claimed_by=?", "claimed_at=?"])
         args.extend([req.claimed_by, now])
@@ -1315,6 +1335,26 @@ async def claim_job(job_id: str, by: str):
             raise HTTPException(409, "job already claimed or not available")
         await emit_event(db, "job.claimed", {"id": job_id, "claimed_by": by})
     return {"claimed": True, "ts": now}
+
+
+@app.get("/v1/jobs/{job_id}")
+async def get_job(job_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, submitter_urn, parent_job_id, kind, description, priority, "
+            "status, claimed_by, started_at, ended_at, result FROM jobs WHERE id=?",
+            (job_id,),
+        ) as cur:
+            r = await cur.fetchone()
+    if not r:
+        raise HTTPException(404, f"job not found: {job_id}")
+    return {
+        "id": r[0], "submitter_urn": r[1], "parent_job_id": r[2],
+        "kind": r[3], "description": r[4], "priority": r[5],
+        "status": r[6], "claimed_by": r[7],
+        "started_at": r[8], "ended_at": r[9],
+        "result": json.loads(r[10]) if r[10] else None,
+    }
 
 
 @app.get("/v1/jobs")

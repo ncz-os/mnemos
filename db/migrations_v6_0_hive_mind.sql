@@ -55,6 +55,10 @@ CREATE TABLE IF NOT EXISTS hive_jobs (
   result_mnemos_id     TEXT,
   tokens_in            BIGINT,
   tokens_out           BIGINT,
+  tokens_reasoning     BIGINT,
+  provider             TEXT,
+  model                TEXT,
+  cost_usd_est         NUMERIC(12,6),
   estimated_cost_usd   NUMERIC(12,6)
 );
 CREATE INDEX IF NOT EXISTS idx_hive_jobs_status    ON hive_jobs(status);
@@ -63,6 +67,13 @@ CREATE INDEX IF NOT EXISTS idx_hive_jobs_submitter ON hive_jobs(submitter_urn);
 CREATE INDEX IF NOT EXISTS idx_hive_jobs_claimed   ON hive_jobs(claimed_by);
 CREATE INDEX IF NOT EXISTS idx_hive_jobs_parent    ON hive_jobs(parent_job_id);
 CREATE INDEX IF NOT EXISTS idx_hive_jobs_tier      ON hive_jobs(claimed_cost_tier);
+
+ALTER TABLE hive_jobs ADD COLUMN IF NOT EXISTS tokens_in BIGINT;
+ALTER TABLE hive_jobs ADD COLUMN IF NOT EXISTS tokens_out BIGINT;
+ALTER TABLE hive_jobs ADD COLUMN IF NOT EXISTS tokens_reasoning BIGINT;
+ALTER TABLE hive_jobs ADD COLUMN IF NOT EXISTS provider TEXT;
+ALTER TABLE hive_jobs ADD COLUMN IF NOT EXISTS model TEXT;
+ALTER TABLE hive_jobs ADD COLUMN IF NOT EXISTS cost_usd_est NUMERIC(12,6);
 
 CREATE TABLE IF NOT EXISTS hive_messages (
   id           TEXT PRIMARY KEY,
