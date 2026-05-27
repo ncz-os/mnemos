@@ -10,19 +10,21 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
   task_kind          TEXT        NOT NULL,
   tokens_in          INT         NOT NULL,
   tokens_out         INT         NOT NULL,
-  tokens_reasoning   INT         DEFAULT 0,
+  tokens_reasoning   INT         NOT NULL DEFAULT 0,
   est_cost_usd       NUMERIC(12,6) NOT NULL,
   latency_ms         INT         NOT NULL,
   outcome            TEXT        NOT NULL,
   caller_subsystem   TEXT        NOT NULL,
   tier               TEXT        NOT NULL,
-  ts                 TIMESTAMPTZ DEFAULT now(),
+  ts                 TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT ck_usage_ledger_tokens_in_nonnegative
     CHECK (tokens_in >= 0),
   CONSTRAINT ck_usage_ledger_tokens_out_nonnegative
     CHECK (tokens_out >= 0),
   CONSTRAINT ck_usage_ledger_tokens_reasoning_nonnegative
     CHECK (tokens_reasoning >= 0),
+  CONSTRAINT ck_usage_ledger_est_cost_usd_nonnegative
+    CHECK (est_cost_usd >= 0),
   CONSTRAINT ck_usage_ledger_latency_ms_nonnegative
     CHECK (latency_ms >= 0),
   CONSTRAINT ck_usage_ledger_outcome
