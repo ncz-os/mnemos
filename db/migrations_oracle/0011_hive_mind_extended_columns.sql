@@ -62,6 +62,10 @@ BEGIN
     add_col('max_retries',         'max_retries NUMBER(5) DEFAULT 2 NOT NULL');
     add_col('retry_backoff_until', 'retry_backoff_until TIMESTAMP WITH TIME ZONE');
     add_col('last_update_at',      'last_update_at TIMESTAMP WITH TIME ZONE');
+    add_col('tokens_reasoning',    'tokens_reasoning NUMBER(15)');
+    add_col('provider',            'provider VARCHAR2(64)');
+    add_col('model',               'model VARCHAR2(128)');
+    add_col('cost_usd_est',        'cost_usd_est NUMBER(12,6)');
 END;
 /
 

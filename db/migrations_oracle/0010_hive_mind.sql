@@ -52,6 +52,10 @@ CREATE TABLE hive_jobs (
   result_mnemos_id      VARCHAR2(64),
   tokens_in             NUMBER(15),
   tokens_out            NUMBER(15),
+  tokens_reasoning      NUMBER(15),
+  provider              VARCHAR2(64),
+  model                 VARCHAR2(128),
+  cost_usd_est          NUMBER(12,6),
   estimated_cost_usd    NUMBER(12,6)
 );
 CREATE INDEX idx_hive_jobs_status    ON hive_jobs(status);
