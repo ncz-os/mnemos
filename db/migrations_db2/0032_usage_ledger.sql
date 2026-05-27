@@ -25,6 +25,8 @@ CREATE TABLE usage_ledger (
     CHECK (tokens_out >= 0),
   CONSTRAINT ck_usage_ledger_tokens_reasoning_nonneg
     CHECK (tokens_reasoning >= 0),
+  CONSTRAINT ck_usage_ledger_est_cost_usd_nonneg
+    CHECK (est_cost_usd >= 0),
   CONSTRAINT ck_usage_ledger_latency_ms_nonneg
     CHECK (latency_ms >= 0),
   CONSTRAINT ck_usage_ledger_outcome
