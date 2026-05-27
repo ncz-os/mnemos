@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -27,11 +28,12 @@ class _RecorderConn:
     def __init__(self) -> None:
         self.sql: str | None = None
         self.args: tuple | None = None
+        self.row = {"id": 42, "est_cost_usd": Decimal("0.000324")}
 
     async def fetchrow(self, sql: str, *args):
         self.sql = sql
         self.args = args
-        return {"id": 42, "est_cost_usd": Decimal("0.000324")}
+        return self.row
 
 
 def _settings():
@@ -78,6 +80,32 @@ async def test_postgres_record_usage_ledger_inserts_with_registry_prices():
     assert "INSERT INTO usage_ledger" in conn.sql
     assert "est_cost_usd" in conn.sql
     assert "$1" in conn.sql and "$10" in conn.sql
+    assert "resolved_prices" not in conn.sql
+
+
+@pytest.mark.asyncio
+async def test_postgres_record_usage_ledger_fails_closed_for_unknown_model():
+    conn = _RecorderConn()
+    conn.row = None
+    tx = PostgresTransaction(conn, _RawTx())  # type: ignore[arg-type]
+    backend = PostgresBackend(pool=SimpleNamespace(), settings=_settings())  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="usage_ledger insert returned no row"):
+        await backend.record_usage_ledger(
+            tx,
+            UsageLedgerRecord(
+                provider="unknown",
+                model="missing",
+                task_kind="code",
+                tokens_in=1,
+                tokens_out=1,
+                tokens_reasoning=0,
+                latency_ms=1,
+                outcome="ok",
+                caller_subsystem="pantheon",
+                tier="standard",
+            ),
+        )
 
 
 class _EndpointBackend:
@@ -162,3 +190,17 @@ async def test_ledger_endpoint_records_and_validates(monkeypatch):
         )
     ]
     assert invalid_response.status_code == 422
+
+
+def test_usage_ledger_migrations_preserve_constraint_parity():
+    root = Path(__file__).resolve().parent.parent
+    pg = (root / "db/migrations/0032_usage_ledger.sql").read_text()
+    oracle = (root / "db/migrations_oracle/0032_usage_ledger.sql").read_text()
+    db2 = (root / "db/migrations_db2/0032_usage_ledger.sql").read_text()
+
+    for sql in (pg, oracle, db2):
+        normalized = " ".join(sql.lower().split())
+        assert "tokens_reasoning" in normalized and "not null" in normalized
+        assert "est_cost_usd" in normalized and "check (est_cost_usd >= 0)" in normalized
+        assert "check (outcome in ('ok','err','timeout'))" in normalized
+        assert "check (latency_ms >= 0)" in normalized
