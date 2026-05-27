@@ -376,7 +376,7 @@ async def upsert_models(pool, models: list[dict], dry_run: bool = False) -> tupl
         return 0, 0, 0
 
     added = updated = deprecated = 0
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)  # KNEMON fix 2026-05-27: model_registry timestamps are TIMESTAMP WITHOUT TIME ZONE; bind naive to avoid asyncpg offset-aware/naive mismatch
 
     async with pool.acquire() as conn:
         async with conn.transaction():
