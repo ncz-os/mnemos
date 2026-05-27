@@ -18,13 +18,13 @@ BEGIN
         task_kind          VARCHAR2(64)   NOT NULL,
         tokens_in          NUMBER(12)     NOT NULL,
         tokens_out         NUMBER(12)     NOT NULL,
-        tokens_reasoning   NUMBER(12)     DEFAULT 0,
+        tokens_reasoning   NUMBER(12)     DEFAULT 0 NOT NULL,
         est_cost_usd       NUMBER(12,6)   NOT NULL,
         latency_ms         NUMBER(12)     NOT NULL,
         outcome            VARCHAR2(16)   NOT NULL,
         caller_subsystem   VARCHAR2(128)  NOT NULL,
         tier               VARCHAR2(32)   NOT NULL,
-        ts                 TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP,
+        ts                 TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
         CONSTRAINT pk_usage_ledger PRIMARY KEY (id),
         CONSTRAINT ck_usage_ledger_tokens_in_nonneg
           CHECK (tokens_in >= 0),
@@ -32,6 +32,8 @@ BEGIN
           CHECK (tokens_out >= 0),
         CONSTRAINT ck_usage_ledger_tokens_reasoning_nonneg
           CHECK (tokens_reasoning >= 0),
+        CONSTRAINT ck_usage_ledger_est_cost_usd_nonneg
+          CHECK (est_cost_usd >= 0),
         CONSTRAINT ck_usage_ledger_latency_ms_nonneg
           CHECK (latency_ms >= 0),
         CONSTRAINT ck_usage_ledger_outcome
