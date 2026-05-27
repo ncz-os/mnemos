@@ -14,6 +14,8 @@ from mnemos.persistence.base import (
     SessionsRepository,
     StateRepository,
     Transaction,
+    UsageLedgerRecord,
+    UsageLedgerResult,
     VersionRepository,
     WebhookRepository,
 )
@@ -96,6 +98,8 @@ __all__ = [
     "SessionsRepository",
     "OAuthRepository",
     "Transaction",
+    "UsageLedgerRecord",
+    "UsageLedgerResult",
     "VersionRepository",
     "WebhookRepository",
 ]

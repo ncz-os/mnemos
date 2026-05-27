@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, AsyncContextManager, Protocol, runtime_checkable
 
 from mnemos.core.auth_context import UserContext
@@ -47,6 +48,30 @@ class CompressionStatsRow:
     total_compressions: int
     average_compression_ratio: float | None
     unreviewed_compressions: int
+
+
+@dataclass(frozen=True)
+class UsageLedgerRecord:
+    """Input payload for a usage_ledger insert."""
+
+    provider: str
+    model: str
+    task_kind: str
+    tokens_in: int
+    tokens_out: int
+    tokens_reasoning: int
+    latency_ms: int
+    outcome: str
+    caller_subsystem: str
+    tier: str
+
+
+@dataclass(frozen=True)
+class UsageLedgerResult:
+    """Backend-neutral result returned after recording usage."""
+
+    id: int
+    est_cost_usd: Decimal
 
 
 @runtime_checkable
@@ -1218,6 +1243,17 @@ class PersistenceBackend(ABC):
     def transactional(self) -> AsyncContextManager[Transaction]:
         """Open a backend-neutral transaction context."""
         ...
+
+    async def record_usage_ledger(
+        self,
+        tx: Transaction,
+        record: UsageLedgerRecord,
+    ) -> UsageLedgerResult:
+        """Record model-token usage.
+
+        Only the Postgres backend implements KNEMON MVP Step 1.
+        """
+        raise NotImplementedError("usage_ledger is Postgres-only")
 
     @property
     @abstractmethod
