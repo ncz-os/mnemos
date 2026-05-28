@@ -31,6 +31,7 @@ import urllib.error
 import random
 import signal
 import re as _re
+from pathlib import Path
 from typing import Optional
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
@@ -197,6 +198,74 @@ def _instance_id() -> str:
     return os.environ.get("INSTANCE", os.environ.get("ZEROCLAW_INSTANCE_ID", "solo"))
 
 
+def _pool_slug(value: str) -> str:
+    return _re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def _add_plan_aliases(pools: set[str], provider: str, value: str) -> None:
+    raw = _pool_slug(value)
+    if not raw:
+        return
+    pools.add(raw)
+    if provider == "anthropic":
+        pools.add("anthropic_subscription")
+        pools.add("claude_subscription")
+        if "200" in raw:
+            pools.add("claude_max_200")
+        elif "100" in raw:
+            pools.add("claude_max_100")
+        elif "max" in raw:
+            pools.add("claude_max_100")
+    elif provider == "openai":
+        pools.add("openai_subscription")
+        pools.add("chatgpt_subscription")
+        pools.add("codex_subscription")
+        if "pro" in raw:
+            pools.add("chatgpt_pro")
+        elif "plus" in raw:
+            pools.add("chatgpt_plus")
+
+
+def _scan_subscription_config(path: Path, pools: set[str]) -> None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return
+    for pool in (
+        "claude_max_200",
+        "claude_max_100",
+        "chatgpt_plus",
+        "chatgpt_pro",
+        "openai_subscription",
+        "anthropic_subscription",
+        "codex_subscription",
+    ):
+        if pool in text.replace("-", "_"):
+            pools.add(pool)
+
+
+def _detect_subscription_pools() -> list[str]:
+    pools: set[str] = set()
+    home = Path.home()
+
+    for env_name in ("CLAUDE_SUBSCRIPTION_TIER",):
+        if os.environ.get(env_name):
+            _add_plan_aliases(pools, "anthropic", os.environ[env_name])
+    for env_name in ("CHATGPT_PLAN", "CODEX_PLAN"):
+        if os.environ.get(env_name):
+            _add_plan_aliases(pools, "openai", os.environ[env_name])
+
+    for config_path in (home / ".claude" / "config.toml", home / ".codex" / "config.toml"):
+        _scan_subscription_config(config_path, pools)
+
+    if (home / ".anthropic" / "auth.json").exists():
+        pools.update({"anthropic_subscription", "claude_subscription"})
+    if (home / ".openai" / "auth.json").exists():
+        pools.update({"openai_subscription", "chatgpt_subscription", "codex_subscription"})
+
+    return sorted(pools)
+
+
 def register() -> str:
     """Register with hive. Retry with exponential backoff until success.
     Never returns failure — workers cannot operate without a URN."""
@@ -209,6 +278,7 @@ def register() -> str:
         "provider": "groq",
         "model": AGENT_MODEL,
         "version": _zeroclaw_version(),
+        "subscription_pools": _detect_subscription_pools(),
         "metadata": {
             "daemon": "zeroclaw_worker.py",
             "agent_alias": ZEROCLAW_AGENT,

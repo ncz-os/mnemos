@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -12,12 +13,24 @@ from mnemos.domain.knemon.router import KnemonRouteRequest, route
 
 
 class _SqliteKnemonBackend:
-    def __init__(self, utilization_pct: int, *, burned_session: str | None = None) -> None:
+    def __init__(
+        self,
+        utilization_pct: int,
+        *,
+        burned_session: str | None = None,
+        agent_session_id: str | None = None,
+        subscription_pools: list[str] | None = None,
+    ) -> None:
         self.conn = sqlite3.connect(":memory:")
         self.active = 0
         self.max_active = 0
         self._create_schema()
-        self._seed(utilization_pct, burned_session=burned_session)
+        self._seed(
+            utilization_pct,
+            burned_session=burned_session,
+            agent_session_id=agent_session_id,
+            subscription_pools=subscription_pools,
+        )
 
     def _create_schema(self) -> None:
         self.conn.executescript(
@@ -67,10 +80,26 @@ class _SqliteKnemonBackend:
               plan_window_id TEXT,
               subscription_amortized INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE hive_agents (
+              urn TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              host TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              last_heartbeat REAL NOT NULL,
+              status TEXT NOT NULL,
+              subscription_pools TEXT
+            );
             """
         )
 
-    def _seed(self, utilization_pct: int, *, burned_session: str | None) -> None:
+    def _seed(
+        self,
+        utilization_pct: int,
+        *,
+        burned_session: str | None,
+        agent_session_id: str | None,
+        subscription_pools: list[str] | None,
+    ) -> None:
         now = datetime.now(timezone.utc)
         window_id = compute_plan_window_id(
             "openai",
@@ -114,6 +143,15 @@ class _SqliteKnemonBackend:
                           'test', 'chatgpt_plus', ?, 11, ?, 1)
                 """,
                 (now, burned_session, window_id),
+            )
+        if agent_session_id:
+            self.conn.execute(
+                """
+                INSERT INTO hive_agents (
+                  urn, kind, host, session_id, last_heartbeat, status, subscription_pools
+                ) VALUES ('urn:agent:test:1', 'codex', 'pytest', ?, ?, 'online', ?)
+                """,
+                (agent_session_id, now.timestamp(), json.dumps(subscription_pools or [])),
             )
         self.conn.commit()
 
@@ -168,6 +206,25 @@ async def test_g1_at_100_pct_subscription_routes_to_api_fallback():
     decision = await route(_req(14), _SqliteKnemonBackend(100))
     assert decision.provider == "xai"
     assert decision.auth_method == "api"
+
+
+@pytest.mark.asyncio
+async def test_subscription_requires_caller_workspace_pool():
+    session_id = "workspace-without-openai"
+    backend = _SqliteKnemonBackend(40, agent_session_id=session_id, subscription_pools=["anthropic_subscription"])
+    decision = await route(_req(14, session_id), backend)
+    assert decision.provider == "xai"
+    assert decision.auth_method == "api"
+    assert "lacks pool" in decision.reasoning
+
+
+@pytest.mark.asyncio
+async def test_subscription_allows_matching_caller_workspace_pool():
+    session_id = "workspace-with-openai"
+    backend = _SqliteKnemonBackend(40, agent_session_id=session_id, subscription_pools=["chatgpt_plus"])
+    decision = await route(_req(14, session_id), backend)
+    assert decision.provider == "openai"
+    assert decision.auth_method == "subscription"
 
 
 @pytest.mark.asyncio
