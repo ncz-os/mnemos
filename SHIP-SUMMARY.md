@@ -1,42 +1,25 @@
-# Persistence Protocol Split
+Oracle hive adapter completion
 
-## Delivered
+Implemented:
+- `OracleHiveMindRepository.insert_message` writes to `hive_messages` with UUIDv7 RAW(16) ids and JSON payloads.
+- `OracleHiveMindRepository.emit_event` writes to `hive_events`; it binds TIMESTAMP WITH TIME ZONE first and retries with epoch seconds only for live PYTHIA `ORA-00932` NUMBER compatibility.
+- `OracleHiveMindRepository.cache_get` and `cache_store` read/write `hive_cache` using Oracle `MERGE`.
+- `OracleHiveMindRepository.record_worker_kind_stats` upserts cumulative counters into `hive_worker_kind_stats`.
+- Added a minimal `SqliteHiveMindRepository` parity helper for the completed hive methods.
+- Added `tests/hive_mind/test_oracle_repository_complete.py`.
 
-- Split the monolithic persistence facade into runtime-checkable capability protocols:
-  `CorePersistence`, `OAuthPersistence`, `SessionsPersistence`,
-  `ConsultationsPersistence`, `FederationPersistence`, `AuditPersistence`,
-  and `StatePersistence`.
-- Kept `PersistenceBackend` as a backwards-compatible type alias over the
-  capability protocols.
-- Added `backend.capabilities` to concrete backends:
-  - SQLite: all capabilities.
-  - Postgres: all capabilities.
-  - Oracle: core, federation, audit, state.
-  - Db2: core only.
-- Added API capability guards that return `BackendCapabilityMissing` HTTP 503
-  before unsupported OAuth, sessions, consultations, federation, audit, or state
-  paths can hit repository stubs.
-- Added startup capability logging and `MNEMOS_REQUIRE_CAPABILITIES` fail-fast
-  validation in lifecycle startup.
-- Added focused protocol/capability tests under
-  `tests/persistence/test_capability_protocols.py`.
+Verification:
+- `bash -n scripts/*.sh` passed.
+- `python3 -m py_compile mnemos/hive_mind/oracle_repository.py mnemos/hive_mind/repository.py tests/hive_mind/test_oracle_repository_complete.py` passed.
+- `./.venv/bin/python -m py_compile mnemos/hive_mind/oracle_repository.py mnemos/hive_mind/repository.py tests/hive_mind/test_oracle_repository_complete.py` passed.
+- `./.venv/bin/python -m pytest tests/hive_mind/ -q` passed: 1 test.
 
-## Verification
+Smoke:
+- `/opt/agent-bus-venv/bin/python` was not present on this host.
+- Used repo `.venv` Python with `oracledb 4.0.1`.
+- PYTHIA Oracle smoke succeeded against `192.168.207.67:1521/ORCLPDB1` as `mnemos`.
+- Inserted synthetic message and emitted event: `message=019e6dba-d087-79cd-a230-b5210eaa6be6`, `topic=codex-smoke-29e3c32bd90c`.
 
-- `bash -n deploy.sh install.sh docker-gpu-setup.sh git_sync_daily.sh`
-  - Result: passed
-- `.venv/bin/python -m py_compile ...`
-  - Result: passed for changed persistence, API, lifecycle, domain, worker, audit,
-    and test files.
-- `.venv/bin/pytest -q tests/persistence/`
-  - Result: `4 passed`
-
-## Commits
-
-- `b8fe078` `refactor persistence capability protocols`
-
-## Logs
-
-- `/tmp/persistence-split/codex-out.log`
-
-No migrations were added. No redeploy was performed.
+Operational notes:
+- No migration files changed.
+- No `mnemos-api` or `graeae-hive` redeploy performed.
