@@ -47,6 +47,8 @@ Anthropic's separate Agent SDK / `claude -p` monthly credit starts on
 KNEMON currently has message/token utilization caps, not a credit-denominated
 cap with route intent, so keeping the old SDK credit pool row would let a
 non-interactive credit path compete in the interactive waterfall.
+The usage-ledger plan-window hints likewise keep only the active Claude Max
+5x/20x interactive rows.
 
 The router filters `effective_from` and `effective_until` in Python after
 fetching rows. This keeps Oracle, PostgreSQL, SQLite, and Db2 behavior aligned
