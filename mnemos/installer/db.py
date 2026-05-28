@@ -502,6 +502,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations" / "0033_subscription_plans.sql",
         repo_path / "db" / "migrations" / "0034_usage_ledger_session_tracking.sql",
         repo_path / "db" / "migrations" / "0035_subscription_plans_date_aware.sql",
+        repo_path / "db" / "migrations" / "0036_hive_agents_subscription_pools.sql",
         repo_path / "db" / "migrations" / "0037_deepseek_direct_provider_seed.sql",
     ]
 
