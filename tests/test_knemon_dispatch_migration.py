@@ -43,6 +43,13 @@ EXPECTED_ROW_MARKERS = {
     "codex_pro_200_20x": ("200", "300", "18000", "2026-06-01", "codex_pro_200"),
 }
 
+EXPECTED_CODEX_PRO_PARENTS = {
+    "codex_pro_100_10x": "codex_pro_100",
+    "codex_pro_100_5x": "codex_pro_100",
+    "codex_pro_200_25x": "codex_pro_200",
+    "codex_pro_200_20x": "codex_pro_200",
+}
+
 
 def _row_window(sql: str, plan_name: str) -> str:
     idx = sql.index(f"'{plan_name}'")
@@ -67,3 +74,16 @@ def test_knemon_0039_plan_row_markers_match_current_audit(
 
     for marker in markers:
         assert marker in row
+
+
+@pytest.mark.parametrize("migration", MIGRATIONS, ids=lambda path: path.parent.name)
+@pytest.mark.parametrize("plan_name, parent_plan", EXPECTED_CODEX_PRO_PARENTS.items())
+def test_knemon_0039_codex_pro_rows_use_stable_parent_aliases(
+    migration: Path,
+    plan_name: str,
+    parent_plan: str,
+) -> None:
+    row = _row_window(migration.read_text(encoding="utf-8"), plan_name)
+
+    assert f"'interactive', '{parent_plan}'" in row
+    assert "'interactive', 'codex_plus'" not in row

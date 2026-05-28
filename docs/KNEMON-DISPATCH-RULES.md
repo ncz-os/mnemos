@@ -40,7 +40,7 @@ These are the rows seeded or refreshed by `0039_knemon_dispatch_rule_refresh`. R
 | OpenAI | `codex_pro_200_25x` | Local planning cap: 375 GPT-5.5 messages per 5h through 2026-05-31 |
 | OpenAI | `codex_pro_200_20x` | Local planning cap: 300 GPT-5.5 messages per 5h from 2026-06-01 |
 
-OpenAI's public ChatGPT Pro documentation supports both $100 and $200 Pro tiers. The generic `chatgpt_pro` row remains as a backward-compatible $200 operator alias so existing workspace pools keep resolving; new pools should prefer the explicit `chatgpt_pro_100` or `chatgpt_pro_200` rows.
+OpenAI's public ChatGPT Pro documentation supports both $100 and $200 Pro tiers. The generic `chatgpt_pro` row remains as a backward-compatible $200 operator alias so existing workspace pools keep resolving; new pools should prefer the explicit `chatgpt_pro_100` or `chatgpt_pro_200` rows. Rows with no `msg_cap` or `token_cap` report `0%` utilization in KNEMON and are treated as unmetered subscription capacity, still subject to provider abuse guardrails and the local session-burn downgrade.
 
 Anthropic's public Max documentation supports the $100 Max 5x and $200 Max 20x tier relationship and publishes the `225` / `900` message counts as at-least usage estimates. KNEMON treats them as conservative planning caps for utilization accounting, not hard provider caps. The 2026-06-01 switch from `claude_max_200` to `claude_max_100` is a local operator policy encoded in KNEMON, not a provider-published tier migration.
 
@@ -50,7 +50,7 @@ For the `codex_pro_200_25x` expiry, this audit follows the Codex-specific pricin
 
 The deprecated `claude_max_interactive_post_jun15` and `agent_sdk_credit_pool_post_jun15` rows are expired at 2026-05-31 because no current official source supports that split as an active operator assumption.
 
-The router filters `effective_from` and `effective_until` in Python after fetching rows. That avoids Oracle-only date syntax in shared router code and prevents expired promo/tier-flip rows from winning on PostgreSQL, SQLite, or Db2 fallback paths.
+The router filters `effective_from` and `effective_until` in Python after fetching rows. The comparison uses the current UTC date. That avoids Oracle-only date syntax in shared router code and prevents expired promo/tier-flip rows from winning on PostgreSQL, SQLite, or Db2 fallback paths.
 
 ## Router Policy
 
@@ -65,7 +65,7 @@ else:
     keep tier A/B candidates, ordered by tier then weight
 ```
 
-`_fallback_bucket` is the fallback-chain order, not the initial winner rule:
+`_fallback_bucket` is the fallback-chain order, not the initial winner rule. A subscription at `>= 70%` utilization falls to `other` for fallback ranking unless the main waterfall has already selected it under the high-priority near-cap rules:
 
 ```text
 free -> subscription under 70% utilization -> API/token below $0.50 -> API/token at or above $0.50 -> other
@@ -83,6 +83,8 @@ Both still carry `openai_subscription` for operators that intentionally pool all
 Codex Pro promo rows use stable parent aliases `codex_pro_100` and `codex_pro_200`. A workspace with only `codex_plus` must not match a Pro row; use `codex_subscription` only when intentionally pooling all Codex tiers.
 
 When no workspace pool is known, the router uses model metadata as a fallback family discriminator. Generic OpenAI `gpt-*` candidates map to ChatGPT subscription rows; OpenAI model metadata containing `codex` maps to Codex rows. Workspace pools remain authoritative when present.
+
+Session burn is scoped to `usage_ledger.session_id` across providers and plans. It sums `request_count`, so retries and fanout attempts count when they are recorded against the same session. The burn window is sliding, not bucketed.
 
 ## Config Defaults
 
