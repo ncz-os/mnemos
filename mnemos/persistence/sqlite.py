@@ -17,6 +17,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
@@ -44,6 +45,8 @@ from mnemos.persistence.base import (
     SessionsRepository,
     StateRepository,
     Transaction,
+    UsageLedgerRecord,
+    UsageLedgerResult,
     VersionRepository,
     WebhookRepository,
 )
@@ -3598,6 +3601,114 @@ class SqliteBackend(PersistenceBackend):
     @property
     def vec_loaded(self) -> bool:
         return self._vec_loaded
+
+    async def record_usage_ledger(
+        self,
+        tx: Transaction,
+        record: UsageLedgerRecord,
+    ) -> UsageLedgerResult:
+        conn = _sqlite_tx(tx).conn
+        auth_method = "api"
+        try:
+            row = await _fetch_one(
+                conn,
+                "SELECT auth_method FROM subscription_plans WHERE provider = ? AND plan_name = ?",
+                (record.provider, record.tier),
+            )
+            if row:
+                auth_method = str(row["auth_method"] if isinstance(row, dict) else row[0]).lower()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+
+        registry_row: Row | None = None
+        if auth_method != "subscription":
+            try:
+                registry_row = await _fetch_one(
+                    conn,
+                    """
+                    SELECT input_cost_per_mtok, output_cost_per_mtok, raw
+                    FROM model_registry
+                    WHERE provider = ? AND model_id = ?
+                    """,
+                    (record.provider, record.model),
+                )
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
+                logger.warning(
+                    "usage_ledger model_registry table missing for provider=%s model=%s; recording est_cost_usd=0",
+                    record.provider,
+                    record.model,
+                )
+        if auth_method == "subscription":
+            est_cost = Decimal("0")
+        elif registry_row is None:
+            logger.warning(
+                "usage_ledger model_registry price missing for provider=%s model=%s; recording est_cost_usd=0",
+                record.provider,
+                record.model,
+            )
+            est_cost = Decimal("0")
+        else:
+            input_cost = Decimal(str(registry_row["input_cost_per_mtok"] or 0))
+            output_cost = Decimal(str(registry_row["output_cost_per_mtok"] or 0))
+            reasoning_cost = output_cost
+            raw = registry_row["raw"] if isinstance(registry_row, dict) else None
+            if raw:
+                try:
+                    parsed = json.loads(str(raw))
+                    reasoning_cost = Decimal(str(parsed.get("reasoning_cost_per_mtok") or output_cost))
+                except (TypeError, ValueError):
+                    reasoning_cost = output_cost
+            est_cost = (
+                Decimal(record.tokens_in) * input_cost
+                + Decimal(record.tokens_out) * output_cost
+                + Decimal(record.tokens_reasoning) * reasoning_cost
+            ) / Decimal(1000000)
+
+        cursor = await _execute(
+            conn,
+            """
+            INSERT INTO usage_ledger (
+                provider, model, task_kind, tokens_in, tokens_out,
+                tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                caller_subsystem, tier, session_id, request_count,
+                plan_window_id, subscription_amortized
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id, est_cost_usd
+            """,
+            (
+                record.provider,
+                record.model,
+                record.task_kind,
+                record.tokens_in,
+                record.tokens_out,
+                record.tokens_reasoning,
+                str(est_cost),
+                record.latency_ms,
+                record.outcome,
+                record.caller_subsystem,
+                record.tier,
+                record.session_id,
+                record.request_count,
+                record.plan_window_id,
+                1 if auth_method == "subscription" else 0,
+            ),
+        )
+        try:
+            row = await _maybe_await(cursor.fetchone())
+        finally:
+            close = getattr(cursor, "close", None)
+            if close is not None:
+                await _maybe_await(close())
+        if row is None:
+            raise RuntimeError("usage_ledger insert returned no row")
+        return UsageLedgerResult(
+            id=int(row["id"] if isinstance(row, dict) else row[0]),
+            est_cost_usd=Decimal(str(row["est_cost_usd"] if isinstance(row, dict) else row[1])),
+        )
 
     async def open(self) -> None:
         if self._conn is not None:
