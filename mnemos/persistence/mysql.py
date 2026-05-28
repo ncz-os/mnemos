@@ -1048,7 +1048,7 @@ class MysqlStateRepository(StateRepository):
 # ── Backend facade ────────────────────────────────────────────────────────────
 
 
-class MysqlBackend(PersistenceBackend):
+class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align with SqliteBackend/OracleBackend/Db2Backend/PostgresBackend bare-class pattern
     """MySQL 9.0+ persistence facade backed by an aiomysql connection pool.
 
     Core memory, FTS, and VECTOR search surfaces are implemented.
