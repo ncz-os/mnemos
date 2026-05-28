@@ -126,6 +126,8 @@ def _normalize_capabilities(value: Any) -> set[str]:
         parsed = json.loads(raw)
         if isinstance(parsed, list):
             return {str(item).strip() for item in parsed if str(item).strip()}
+        if isinstance(parsed, dict):
+            return {str(key).strip() for key, enabled in parsed.items() if enabled and str(key).strip()}
     except json.JSONDecodeError:
         pass
     return {item.strip().strip('"').strip("'") for item in raw.strip("{}[]").split(",") if item.strip()}
