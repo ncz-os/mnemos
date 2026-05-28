@@ -18,12 +18,14 @@ import binascii
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import httpx
 
 from mnemos.db import eligibility as _eligibility
-from mnemos.persistence.base import FederationRepository, PersistenceBackend, Transaction
+from mnemos.persistence.base import AuditPersistence, FederationPersistence, FederationRepository, Transaction
+
+FederationBackend = Union[FederationPersistence, AuditPersistence]
 
 logger = logging.getLogger(__name__)
 
@@ -330,7 +332,7 @@ def _local_migrations_fingerprint() -> str:
 
 
 async def sync_peer(
-    backend: PersistenceBackend,
+    backend: FederationBackend,
     peer_id: str,
 ) -> Tuple[int, int, int]:
     """Run a full sync against one peer. Returns (pulled, new, updated).
@@ -625,7 +627,7 @@ async def _store_memories(
     tx: Transaction,
     peer_name: str,
     memories: List[Dict[str, Any]],
-    backend: Optional[PersistenceBackend] = None,
+    backend: Optional[FederationBackend] = None,
 ) -> Tuple[int, int]:
     """Upsert a batch. Returns (newly_inserted, updated_existing).
 
@@ -925,7 +927,7 @@ async def _apply_consolidation_tombstone(
 # ── Background worker ────────────────────────────────────────────────────────
 
 
-async def federation_worker_loop(backend: PersistenceBackend) -> None:
+async def federation_worker_loop(backend: FederationPersistence) -> None:
     """Background loop: iterate enabled peers, sync those whose interval has elapsed.
 
     Started from the FastAPI lifespan. Cancels cleanly on shutdown.

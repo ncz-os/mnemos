@@ -8,12 +8,28 @@ persistence backend, and an RLS-context applier that no-ops on
 SQLite and on unauthenticated calls. Anything richer than that
 should grow in a domain or persistence module instead.
 """
+
 from __future__ import annotations
 
 from fastapi import HTTPException
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext
+from mnemos.persistence.base import (
+    AUDIT_CAPABILITY,
+    CONSULTATIONS_CAPABILITY,
+    FEDERATION_CAPABILITY,
+    OAUTH_CAPABILITY,
+    SESSIONS_CAPABILITY,
+    STATE_CAPABILITY,
+    AuditPersistence,
+    BackendCapabilityMissing,
+    ConsultationsPersistence,
+    FederationPersistence,
+    OAuthPersistence,
+    SessionsPersistence,
+    StatePersistence,
+)
 
 
 def backend_or_503():
@@ -25,6 +41,64 @@ def backend_or_503():
             detail="Persistence backend not available",
         )
     return backend
+
+
+def _capability_503(capability: str, backend: object) -> HTTPException:
+    backend_name = type(backend).__name__
+    return BackendCapabilityMissing(capability, backend_name)
+
+
+def require_backend_capability(backend: object, capability: str):
+    """Return backend if it advertises ``capability``; otherwise raise 503."""
+    if capability not in set(getattr(backend, "capabilities", set())):
+        raise _capability_503(capability, backend)
+    return backend
+
+
+def require_oauth_backend():
+    backend = require_backend_capability(backend_or_503(), OAUTH_CAPABILITY)
+    if not isinstance(backend, OAuthPersistence):
+        raise _capability_503(OAUTH_CAPABILITY, backend)
+    return backend
+
+
+def require_sessions_backend():
+    backend = require_backend_capability(backend_or_503(), SESSIONS_CAPABILITY)
+    if not isinstance(backend, SessionsPersistence):
+        raise _capability_503(SESSIONS_CAPABILITY, backend)
+    return backend
+
+
+def require_consultations_backend():
+    backend = require_backend_capability(backend_or_503(), CONSULTATIONS_CAPABILITY)
+    if not isinstance(backend, ConsultationsPersistence):
+        raise _capability_503(CONSULTATIONS_CAPABILITY, backend)
+    return backend
+
+
+def require_federation_backend():
+    backend = require_backend_capability(backend_or_503(), FEDERATION_CAPABILITY)
+    if not isinstance(backend, FederationPersistence):
+        raise _capability_503(FEDERATION_CAPABILITY, backend)
+    return backend
+
+
+def require_audit_backend():
+    backend = require_backend_capability(backend_or_503(), AUDIT_CAPABILITY)
+    if not isinstance(backend, AuditPersistence):
+        raise _capability_503(AUDIT_CAPABILITY, backend)
+    return backend
+
+
+def require_state_backend():
+    backend = require_backend_capability(backend_or_503(), STATE_CAPABILITY)
+    if not isinstance(backend, StatePersistence):
+        raise _capability_503(STATE_CAPABILITY, backend)
+    return backend
+
+
+def capability_exception_to_503(exc: BackendCapabilityMissing) -> HTTPException:
+    return exc
 
 
 def require_postgres_pool_or_503(*, route_label: str = "this endpoint"):
@@ -111,4 +185,16 @@ async def maybe_set_pg_rls(tx, user: UserContext) -> None:
     )
 
 
-__all__ = ["backend_or_503", "maybe_set_pg_rls", "require_postgres_pool_or_503"]
+__all__ = [
+    "backend_or_503",
+    "capability_exception_to_503",
+    "maybe_set_pg_rls",
+    "require_audit_backend",
+    "require_backend_capability",
+    "require_consultations_backend",
+    "require_federation_backend",
+    "require_oauth_backend",
+    "require_postgres_pool_or_503",
+    "require_sessions_backend",
+    "require_state_backend",
+]

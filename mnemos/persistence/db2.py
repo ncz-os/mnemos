@@ -3503,6 +3503,17 @@ class Db2Backend(OracleBackend):
     # lands in 12.1.5 (GA Jun 9 2026).
     supports_db2_vector = True
 
+    _UNSUPPORTED_CAPABILITY_MARKERS = frozenset(
+        {
+            "_supports_oauth_persistence",
+            "_supports_sessions_persistence",
+            "_supports_consultations_persistence",
+            "_supports_federation_persistence",
+            "_supports_audit_persistence",
+            "_supports_state_persistence",
+        }
+    )
+
     def __init__(self, pool: Any, settings: Any):
         # Call OracleBackend.__init__ so any new ``_X_repo`` attribute
         # added upstream is initialized (Opus review O15). Then rebind
@@ -3533,6 +3544,15 @@ class Db2Backend(OracleBackend):
         # registry value (``"YES"``, ``"NO"``, ``""``...) for the
         # ``is_vector_indexing_enabled`` property + ``mnemos doctor``.
         self._db2_vector_indexing_value: str | None = None
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in object.__getattribute__(self, "_UNSUPPORTED_CAPABILITY_MARKERS"):
+            raise AttributeError(name)
+        return super().__getattribute__(name)
+
+    @property
+    def capabilities(self) -> set[str]:
+        return {"core"}
 
     async def record_usage_ledger(
         self,

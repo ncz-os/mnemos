@@ -24,6 +24,7 @@ from typing import Any, Literal
 
 from .crypto import canonical_payload_hash
 from .writer import build_entry, latest_hash
+from mnemos.persistence.base import AuditPersistence
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ def memory_id_to_audit_bytes(memory_id_str: str) -> bytes:
 
 
 async def write_audit_entry(
-    backend: Any,
+    backend: AuditPersistence,
     tx: Any,
     *,
     op: AuditOp,

@@ -41,7 +41,6 @@ from mnemos.persistence.base import (
     MemoryRepository,
     MemoryStatsRow,
     OAuthRepository,
-    PersistenceBackend,
     SessionsRepository,
     StateRepository,
     Transaction,
@@ -2918,8 +2917,16 @@ class PostgresAuditChainRepository(AuditChainRepository):
         return {r["memory_id"]: dict(r) for r in rows}
 
 
-class PostgresBackend(PersistenceBackend):
+class PostgresBackend:
     """Postgres persistence facade backed by an asyncpg pool."""
+
+    _supports_core_persistence = True
+    _supports_oauth_persistence = True
+    _supports_sessions_persistence = True
+    _supports_consultations_persistence = True
+    _supports_federation_persistence = True
+    _supports_audit_persistence = True
+    _supports_state_persistence = True
 
     supports_listen_notify = True
     supports_advisory_locks = True
@@ -2959,6 +2966,10 @@ class PostgresBackend(PersistenceBackend):
     @property
     def settings(self) -> Any:
         return self._settings
+
+    @property
+    def capabilities(self) -> set[str]:
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
 
     @asynccontextmanager
     async def transactional(self) -> AsyncIterator[Transaction]:

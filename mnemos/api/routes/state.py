@@ -5,6 +5,7 @@ Per-owner, per-namespace KV store. All operations are scoped to the caller's
 another. Root can target another owner/namespace via `?owner_id=` and
 `?namespace=`.
 """
+
 import json
 import logging
 from typing import Any, Optional
@@ -13,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import backend_or_503
+from mnemos.api.persistence_helpers import require_state_backend
 from mnemos.core.security import scope_namespace, scope_owner
 
 logger = logging.getLogger(__name__)
@@ -23,13 +24,14 @@ router = APIRouter(tags=["state"])
 class StateSetRequest(BaseModel):
     value: Any
 
+
 @router.get("/state")
 async def list_state_keys(
     user: UserContext = Depends(get_current_user),
     owner_id: Optional[str] = Query(None, description="Admin-only: target another owner"),
     namespace: Optional[str] = Query(None, description="Admin-only: target another namespace"),
 ):
-    backend = backend_or_503()
+    backend = require_state_backend()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
@@ -54,7 +56,7 @@ async def get_state(
     owner_id: Optional[str] = Query(None),
     namespace: Optional[str] = Query(None),
 ):
-    backend = backend_or_503()
+    backend = require_state_backend()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
@@ -76,9 +78,10 @@ async def get_state(
         # JSON payload they posted, not the storage envelope.
         # Strip the prefix on read; pre-envelope rows pass through.
         from mnemos.domain.memory_categorization.state import _SM_ENVELOPE_PREFIX
+
         raw_value = result.get("value")
         if isinstance(raw_value, str) and raw_value.startswith(_SM_ENVELOPE_PREFIX):
-            result["value"] = raw_value[len(_SM_ENVELOPE_PREFIX):]
+            result["value"] = raw_value[len(_SM_ENVELOPE_PREFIX) :]
         return result
     except HTTPException:
         raise
@@ -97,7 +100,7 @@ async def set_state(
     owner_id: Optional[str] = Query(None, description="Admin-only: write on behalf of another owner"),
     namespace: Optional[str] = Query(None, description="Admin-only: write into another namespace"),
 ):
-    backend = backend_or_503()
+    backend = require_state_backend()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
@@ -131,7 +134,7 @@ async def delete_state(
     owner_id: Optional[str] = Query(None),
     namespace: Optional[str] = Query(None),
 ):
-    backend = backend_or_503()
+    backend = require_state_backend()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
