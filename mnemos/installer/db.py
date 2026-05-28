@@ -14,10 +14,9 @@ from .wizard import Config
 def _validate_identifier(value: str, name: str = "identifier") -> str:
     """Reject anything that is not a safe SQL identifier (letters/digits/underscore/hyphen)."""
     import re
-    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_\-]{0,62}', value):
-        raise ValueError(
-            f"Unsafe SQL {name} '{value}': must match [A-Za-z_][A-Za-z0-9_-]{{0,62}}"
-        )
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_\-]{0,62}", value):
+        raise ValueError(f"Unsafe SQL {name} '{value}': must match [A-Za-z_][A-Za-z0-9_-]{{0,62}}")
     return value
 
 
@@ -30,6 +29,7 @@ def _run(
 ) -> tuple[int, str, str]:
     """Run a command, return (returncode, stdout, stderr). Never raises."""
     import os as _os
+
     merged_env = _os.environ.copy()
     if env:
         merged_env.update(env)
@@ -63,8 +63,21 @@ def _psql_superuser(sql: str, dbname: str = "postgres", timeout: int = 30) -> tu
     'OK' on partial schema drift. Codex round-20 HIGH.
     """
     return _run(
-        ["sudo", "-u", "postgres", "psql", "-d", dbname, "-c", sql,
-         "--no-password", "-A", "-t", "-v", "ON_ERROR_STOP=1"],
+        [
+            "sudo",
+            "-u",
+            "postgres",
+            "psql",
+            "-d",
+            dbname,
+            "-c",
+            sql,
+            "--no-password",
+            "-A",
+            "-t",
+            "-v",
+            "ON_ERROR_STOP=1",
+        ],
         timeout=timeout,
     )
 
@@ -80,8 +93,7 @@ def _psql_superuser_file(filepath: str, dbname: str, timeout: int = 120) -> tupl
     with open(filepath, encoding="utf-8") as f:
         sql = f.read()
     return _run(
-        ["sudo", "-u", "postgres", "psql", "-d", dbname, "-f", "-",
-         "--no-password", "-v", "ON_ERROR_STOP=1"],
+        ["sudo", "-u", "postgres", "psql", "-d", dbname, "-f", "-", "--no-password", "-v", "ON_ERROR_STOP=1"],
         timeout=timeout,
         input=sql,
     )
@@ -99,12 +111,18 @@ def verify_connection(config: Config) -> bool:
     rc, out, err = _run(
         [
             "psql",
-            "-h", config.db_host,
-            "-p", str(config.db_port),
-            "-U", config.db_user,
-            "-d", config.db_name,
-            "-c", "SELECT 1",
-            "-A", "-t",
+            "-h",
+            config.db_host,
+            "-p",
+            str(config.db_port),
+            "-U",
+            config.db_user,
+            "-d",
+            config.db_name,
+            "-c",
+            "SELECT 1",
+            "-A",
+            "-t",
         ],
         timeout=10,
         env=pg_env,
@@ -154,10 +172,7 @@ def setup_sqlite_database(config: Config) -> bool:
 
     db_path = Path(config.sqlite_path).expanduser()
     embedding_dim = getattr(config, "embedding_dim", 768)
-    print(
-        f"[db] Initializing SQLite database at {db_path} "
-        f"(embedding dim: {embedding_dim})..."
-    )
+    print(f"[db] Initializing SQLite database at {db_path} " f"(embedding dim: {embedding_dim})...")
 
     settings_shim = SimpleNamespace(database=SimpleNamespace(embedding_dim=embedding_dim))
 
@@ -204,9 +219,7 @@ def setup_database(config: Config, info) -> bool:
     # with a remote host, and the legacy "personal" canonicalizes to
     # edge while the underlying config is postgres. Profile-gating
     # let those configs through; always check.
-    if not _is_local_postgres_host(
-        getattr(config, "db_host", "localhost")
-    ):
+    if not _is_local_postgres_host(getattr(config, "db_host", "localhost")):
         print(
             f"[db] ERROR cfg.db_host = {config.db_host!r} is not a local "
             f"postgres. setup_database() uses sudo -u postgres psql with "
@@ -267,13 +280,9 @@ def setup_database(config: Config, info) -> bool:
     print(f"[db] User '{config.db_user}' ready.")
 
     # 2. Create database (idempotent)
-    rc, out, _ = _psql_superuser(
-        f"SELECT 1 FROM pg_database WHERE datname='{config.db_name}'"
-    )
+    rc, out, _ = _psql_superuser(f"SELECT 1 FROM pg_database WHERE datname='{config.db_name}'")
     if out.strip() != "1":
-        rc, out, err = _psql_superuser(
-            f"CREATE DATABASE {config.db_name} OWNER {config.db_user}"
-        )
+        rc, out, err = _psql_superuser(f"CREATE DATABASE {config.db_name} OWNER {config.db_user}")
         if rc != 0:
             print(f"[db] ERROR creating database: {err}", file=sys.stderr)
             return False
@@ -393,9 +402,7 @@ def run_migrations(config: Config) -> bool:
     # a remote host. Profile-gating let those configs reach
     # _psql_superuser_file and silently mutate the local cluster.
     # Always check.
-    if not _is_local_postgres_host(
-        getattr(config, "db_host", "localhost")
-    ):
+    if not _is_local_postgres_host(getattr(config, "db_host", "localhost")):
         print(
             f"[db] ERROR cfg.db_host = {config.db_host!r} is not a local "
             f"postgres. The installer's migration runner only authenticates "
@@ -491,6 +498,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v5_3_3_deletion_log_export_index.sql",
         repo_path / "db" / "migrations_v5_3_4_mcp_audit_log.sql",
         repo_path / "db" / "migrations_v5_3_5_model_registry_capabilities_gin.sql",
+        repo_path / "db" / "migrations" / "0032_usage_ledger.sql",
     ]
 
     print("[db] Running migrations...")
@@ -631,6 +639,7 @@ def _alter_postgres_embedding_dim(config: Config, embedding_dim: int) -> bool:
             if "MNEMOS_EMBED_DIM_REFUSE" in err_text:
                 # Try to extract the row count from the error.
                 import re as _re
+
                 m = _re.search(r"has (\d+) non-null rows", err_text)
                 rows_str = m.group(1) if m else "non-zero"
                 print(
@@ -786,7 +795,7 @@ def create_api_key(config: Config) -> str | None:
     # to None at the bottom of the function.
     import re as _re
 
-    if not _re.fullmatch(r'[0-9a-f]{64}', key_hash):
+    if not _re.fullmatch(r"[0-9a-f]{64}", key_hash):
         print("[db] ERROR: unexpected key_hash format", file=sys.stderr)
         return None
     # raw_key[:8] is the display prefix. We reject anything in it that
@@ -794,7 +803,7 @@ def create_api_key(config: Config) -> str | None:
     # string (the psycopg paths parameterize; this psql-CLI fallback
     # does not).
     key_prefix = raw_key[:8]
-    if not _re.fullmatch(r'[A-Za-z0-9_-]{1,8}', key_prefix):
+    if not _re.fullmatch(r"[A-Za-z0-9_-]{1,8}", key_prefix):
         print("[db] ERROR: unexpected key_prefix format", file=sys.stderr)
         return None
     sql = (
@@ -808,9 +817,7 @@ def create_api_key(config: Config) -> str | None:
         return raw_key
 
     # Check if api_keys table even exists — may not be needed for personal profile
-    rc2, out2, _ = _psql_superuser(
-        "SELECT to_regclass('public.api_keys')", dbname=config.db_name
-    )
+    rc2, out2, _ = _psql_superuser("SELECT to_regclass('public.api_keys')", dbname=config.db_name)
     if "api_keys" not in out2:
         print("[db] No api_keys table found — skipping key creation (personal profile).")
         return None

@@ -3720,25 +3720,38 @@ class OracleBackend(PersistenceBackend):
 
         from mnemos.persistence.base import UsageLedgerResult
 
+        def _is_missing_table(exc: BaseException) -> bool:
+            return "ORA-00942" in str(exc)
+
+        def _scalar(var: Any) -> Any:
+            value = var.getvalue()
+            if isinstance(value, (list, tuple)):
+                return value[0] if value else None
+            return value
+
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
-            await _call(
-                cursor.execute,
-                "SELECT 1 FROM model_registry WHERE provider = :provider AND model_id = :model",
-                {"provider": record.provider, "model": record.model},
-            )
-            if await _call(cursor.fetchone) is None:
-                _LOG.warning(
-                    "usage_ledger model_registry price missing for provider=%s model=%s; " "recording est_cost_usd=0",
-                    record.provider,
-                    record.model,
-                )
             rid = cursor.var(oracledb.DB_TYPE_NUMBER)
             rcost = cursor.var(oracledb.DB_TYPE_NUMBER)
-            await _call(
-                cursor.execute,
-                """
+            params = {
+                "provider": record.provider,
+                "model": record.model,
+                "task_kind": record.task_kind,
+                "tokens_in": record.tokens_in,
+                "tokens_out": record.tokens_out,
+                "tokens_reasoning": record.tokens_reasoning,
+                "latency_ms": record.latency_ms,
+                "outcome": record.outcome,
+                "caller_subsystem": record.caller_subsystem,
+                "tier": record.tier,
+                "rid": rid,
+                "rcost": rcost,
+            }
+            try:
+                await _call(
+                    cursor.execute,
+                    """
                 INSERT INTO usage_ledger (
                     provider, model, task_kind, tokens_in, tokens_out,
                     tokens_reasoning, est_cost_usd, latency_ms, outcome,
@@ -3759,29 +3772,41 @@ class OracleBackend(PersistenceBackend):
                 )
                 RETURNING id, est_cost_usd INTO :rid, :rcost
                 """,
-                {
-                    "provider": record.provider,
-                    "model": record.model,
-                    "task_kind": record.task_kind,
-                    "tokens_in": record.tokens_in,
-                    "tokens_out": record.tokens_out,
-                    "tokens_reasoning": record.tokens_reasoning,
-                    "latency_ms": record.latency_ms,
-                    "outcome": record.outcome,
-                    "caller_subsystem": record.caller_subsystem,
-                    "tier": record.tier,
-                    "rid": rid,
-                    "rcost": rcost,
-                },
-            )
+                    params,
+                )
+            except Exception as exc:
+                if not _is_missing_table(exc):
+                    raise
+                _LOG.warning(
+                    "usage_ledger model_registry table missing for provider=%s model=%s; " "recording est_cost_usd=0",
+                    record.provider,
+                    record.model,
+                )
+                await _call(
+                    cursor.execute,
+                    """
+                INSERT INTO usage_ledger (
+                    provider, model, task_kind, tokens_in, tokens_out,
+                    tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                    caller_subsystem, tier
+                )
+                VALUES (
+                    :provider, :model, :task_kind, :tokens_in, :tokens_out,
+                    :tokens_reasoning, 0, :latency_ms, :outcome,
+                    :caller_subsystem, :tier
+                )
+                RETURNING id, est_cost_usd INTO :rid, :rcost
+                """,
+                    params,
+                )
+            if _scalar(rcost) == 0:
+                _LOG.warning(
+                    "usage_ledger model_registry price missing for provider=%s model=%s; " "recording est_cost_usd=0",
+                    record.provider,
+                    record.model,
+                )
         finally:
             await _call(cursor.close)
-
-        def _scalar(var: Any) -> Any:
-            value = var.getvalue()
-            if isinstance(value, (list, tuple)):
-                return value[0] if value else None
-            return value
 
         new_id = _scalar(rid)
         cost = _scalar(rcost)
