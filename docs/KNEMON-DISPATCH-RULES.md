@@ -38,7 +38,7 @@ These are the current rows after `0039_knemon_dispatch_rule_refresh`.
 | OpenAI | `codex_pro_200_25x` | 375 GPT-5.5 local messages per 5h through 2026-05-31, temporary 25x Plus lower bound |
 | OpenAI | `codex_pro_200_20x` | 300 GPT-5.5 local messages per 5h from 2026-06-01, lower bound of 300-1600 |
 
-Anthropic's public Max documentation supports both Max 100 and Max 200 caps. The 2026-06-01 switch from `claude_max_200` to `claude_max_100` is a local operator policy encoded in KNEMON, not a provider-published tier migration.
+Anthropic's public Max documentation supports the Max 100 and Max 200 tier relationship. The 900/225 message caps and 2026-06-01 switch from `claude_max_200` to `claude_max_100` are local operator-normalized policy values encoded in KNEMON, not provider-published universal message counts.
 
 The deprecated `claude_max_interactive_post_jun15` and `agent_sdk_credit_pool_post_jun15` rows are expired at 2026-05-31 because no current official source supports that split as an active operator assumption.
 
@@ -74,7 +74,7 @@ Both still carry `openai_subscription` for operators that intentionally pool all
 
 ## Cross-Check
 
-The audit was cross-checked with a Codex muse review. Codex confirmed the fallback, G1, and burn rules and flagged the portable effective-date filtering fix that is included here. The requested Claude/GRAEAE consultation path was unavailable in this environment: one external consultation returned without Claude and a shorter retry timed out. Provider-limit conclusions are therefore grounded in the official source links below rather than model assertion. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
+The audit was cross-checked with a Codex muse review. Codex confirmed the fallback, G1, and burn rules and flagged the portable effective-date filtering fix that is included here. The requested Claude/GRAEAE consultation path did not produce a Claude result in this environment: Hive job submission was rejected because this session registered without a submitter URN, and two external GRAEAE consultation attempts timed out. Provider-limit conclusions are therefore grounded in the official source links below rather than model assertion. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
 
 ## Sources
 
