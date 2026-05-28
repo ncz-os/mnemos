@@ -1,3 +1,35 @@
+# KNEMON Recommender Task-Type Split
+
+Implemented hive `019e6db2` follow-up for `/v1/providers/recommend` task-type differentiation on branch `feat/knemon-mvp`.
+
+## Shipped
+
+- Tightened `mnemos/domain/pantheon/recommendation.py` with explicit task policy for coding, narrative, reasoning, embedding, routing, and web search.
+- Added capability requirements, model-family preferences, Opus exclusion for narrative, chat exclusion for embeddings, and cost-tier ceilings with fallback tiers.
+- Removed Opus as a coding preference; coding now prefers coder/deepseek/sonnet families and only falls to tier C when no tier A/B model is available.
+- Added regression coverage proving task types no longer collapse to one model and narrative does not choose Opus when Sonnet is available.
+
+## Verification
+
+- `.venv/bin/pytest -q tests/domain/test_knemon_recommender.py tests/test_knemon_triage_llm.py` passed: 17 passed.
+- `python3 -m py_compile mnemos/domain/pantheon/recommendation.py tests/domain/test_knemon_recommender.py`
+- `git diff --check -- mnemos/domain/pantheon/recommendation.py tests/domain/test_knemon_recommender.py`
+- Smoke curl against local FastAPI on a temporary seeded SQLite registry:
+  - `code-fix` -> `nvidia/qwen/qwen3-coder-480b-a35b-instruct`
+  - `narrative` -> `anthropic/claude-sonnet-4-6`
+  - `reasoning` -> `anthropic/claude-opus-4-6`
+  - `embedding` -> `mnemos-local/bge-m3`
+  - `routing` -> `groq/llama-3.1-8b-instant`
+  - `web_search` -> `perplexity/sonar`
+
+## Artifacts
+
+- Work log: `/tmp/knemon-recommender-v2/codex-out.log`
+
+No redeploy performed.
+
+---
+
 # Rust Federation JSON Serializer
 
 Implemented hive `019e6d13-0597` federation feed JSON serialization port on branch `feat/knemon-mvp`.
