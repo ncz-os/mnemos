@@ -2166,17 +2166,50 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         try:
             await _call(
                 cursor.execute,
-                "SELECT provider, model_id, display_name, input_cost_per_mtok, "
+                "SELECT model_id, display_name, family, input_cost_per_mtok, "
                 "output_cost_per_mtok, capabilities, arena_score, arena_rank, "
-                "graeae_weight, context_window, cost_tier "
+                "graeae_weight, context_window "
                 "FROM model_registry "
                 "WHERE available = 1 AND NVL(deprecated, 0) = 0",
             )
-            return await _fetch_all_dicts(cursor)
+            raw_rows = await _fetch_all_dicts(cursor)
         except Exception:
             return []
         finally:
             await _call(cursor.close)
+
+        # Schema lacks explicit `provider` column — derive from model_id prefix
+        # (e.g. "nvidia/qwen3-coder-480b" -> provider="nvidia", model_id="qwen3-coder-480b")
+        # or from family for bare model_ids like "gemini-2.5-flash-lite".
+        normalized: list[dict[str, Any]] = []
+        for row in raw_rows:
+            mid = str(row.get("model_id") or "")
+            family = str(row.get("family") or "")
+            if "/" in mid:
+                provider, model_local = mid.split("/", 1)
+            elif "/" in family:
+                provider = family.split("/", 1)[0]
+                model_local = mid
+            else:
+                # Heuristic: try gemini/openai/anthropic family prefixes
+                low = mid.lower()
+                if low.startswith("gemini-"):
+                    provider = "gemini"
+                elif low.startswith("gpt-") or low.startswith("o3") or low.startswith("o4"):
+                    provider = "openai"
+                elif low.startswith("claude-"):
+                    provider = "anthropic"
+                elif low.startswith("grok-"):
+                    provider = "xai"
+                elif low.startswith("llama-") or low.startswith("kimi-"):
+                    provider = "groq"
+                else:
+                    provider = family or "unknown"
+                model_local = mid
+            row["provider"] = provider
+            row["model_id"] = model_local if model_local else mid
+            normalized.append(row)
+        return normalized
 
     async def fetch_recommended_model(
         self,
