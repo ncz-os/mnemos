@@ -26,6 +26,7 @@ from mnemos.db.deletion_log import log_morpheus_run_memory_deletions
 import numpy as np
 
 from mnemos.core.config import get_settings, hot_rs_enabled
+from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.ids import new_memory_id
 from mnemos.db.eligibility import eligible_for_morpheus
 
@@ -61,19 +62,7 @@ RETURNING r.id, o.started_at
 _HOT_RS = None
 _HOT_RS_ENABLED = hot_rs_enabled()
 if _HOT_RS_ENABLED:
-    try:
-        import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
-        logger.info(
-            "mnemos_hot Rust accelerator enabled (MORPHEUS clustering will use mnemos_hot %s)",
-            getattr(_HOT_RS, "__version__", "?"),
-        )
-    except ImportError as _exc:
-        logger.warning(
-            "MNEMOS_HOT_RS_ENABLED=1 but mnemos_hot wheel is not importable: %s. "
-            "Falling back to pure-Python MORPHEUS cosine clustering.",
-            _exc,
-        )
-        _HOT_RS = None
+    _HOT_RS = load_hot_rs(logger, "MORPHEUS clustering")
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:

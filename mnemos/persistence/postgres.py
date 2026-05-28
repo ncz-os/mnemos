@@ -24,6 +24,7 @@ import asyncpg
 
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import hot_rs_enabled
+from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.visibility import (
     read_visibility_predicate as _core_read_visibility_predicate,
 )
@@ -86,20 +87,7 @@ def _log_search_phase(
 _HOT_RS = None
 _HOT_RS_ENABLED = hot_rs_enabled()
 if _HOT_RS_ENABLED:
-    try:
-        import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
-
-        logger.info(
-            "mnemos_hot Rust accelerator enabled (Postgres semantic rerank will use mnemos_hot %s)",
-            getattr(_HOT_RS, "__version__", "?"),
-        )
-    except ImportError as _exc:
-        logger.warning(
-            "MNEMOS_HOT_RS_ENABLED=1 but mnemos_hot wheel is not importable: %s. "
-            "Falling back to Python Postgres semantic rerank.",
-            _exc,
-        )
-        _HOT_RS = None
+    _HOT_RS = load_hot_rs(logger, "Postgres semantic rerank")
 
 
 def _vector_to_float_list(vector: Sequence[float]) -> list[float]:

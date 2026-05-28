@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from mnemos.core.config import hot_rs_enabled
+from mnemos.core.native_accel import load_hot_rs
 
 logger = logging.getLogger(__name__)
 
@@ -18,19 +19,7 @@ logger = logging.getLogger(__name__)
 _HOT_RS = None
 _HOT_RS_ENABLED = hot_rs_enabled()
 if _HOT_RS_ENABLED:
-    try:
-        import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
-        logger.info(
-            "mnemos_hot Rust accelerator enabled (compression quality will use mnemos_hot %s)",
-            getattr(_HOT_RS, "__version__", "?"),
-        )
-    except ImportError as _exc:
-        logger.warning(
-            "MNEMOS_HOT_RS_ENABLED=1 but mnemos_hot wheel is not importable: %s. "
-            "Falling back to NumPy compression-quality cosine.",
-            _exc,
-        )
-        _HOT_RS = None
+    _HOT_RS = load_hot_rs(logger, "compression quality")
 
 
 def _embedding_to_float_list(values: Any) -> list[float]:

@@ -152,8 +152,7 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
     "claude-cli":    {"claude", "claude-code"},
     "opencode":      {"opencode"},                 # opencode CAN run any model — kind=opencode
     "opencode-cli":  {"opencode"},
-    "goose":         {"goose"},
-    "goose-cli":     {"goose"},
+    # goose RETIRED 2026-05-25 — see ~/.claude/rules/agentic-cli-usage-patterns-2026-05-23.md
     "codex":         {"codex"},
     "codex-cli":     {"codex"},
     "hermes":        {"hermes"},
@@ -177,12 +176,12 @@ DEFAULT_PLAN_CAPS = {
 }
 THROTTLE_HEADROOM = 0.85  # at >=85% of plan cap, prefer non-subscription workers for tier-B/C jobs
 
-# ROLE SPLIT (user directive 2026-05-23): opencode + goose + codex + hermes +
-# claw-family + ic-engine + unknown = WORKERS (claim-only). Cannot submit jobs.
-# Orchestrators: claude-code, human, mnemos. They submit work; workers execute it.
+# ROLE SPLIT (user directive 2026-05-23, goose retired 2026-05-25):
+# opencode + codex + hermes + claw-family + ic-engine + unknown = WORKERS (claim-only).
+# Cannot submit jobs. Orchestrators: claude-code, human, mnemos. They submit work; workers execute it.
 WORKER_ONLY_RUNTIMES: set[str] = {
     "opencode", "opencode-cli",
-    "goose", "goose-cli",
+    # goose RETIRED 2026-05-25
     "codex", "codex-cli",
     "hermes",
     "zeroclaw", "openclaw",

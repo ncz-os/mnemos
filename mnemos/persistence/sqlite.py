@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - local CI can run without optional extr
 
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import hot_rs_enabled
+from mnemos.core.native_accel import load_hot_rs
 from mnemos.persistence.base import (
     AuditChainRepository,
     BranchRepository,
@@ -368,23 +369,7 @@ def _parse_embedding(raw: Any) -> list[float]:
 _HOT_RS = None
 _HOT_RS_ENABLED = hot_rs_enabled()
 if _HOT_RS_ENABLED:
-    try:
-        import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
-
-        logger.info(
-            "mnemos_hot Rust accelerator enabled (cosine UDF will use mnemos_hot %s)",
-            getattr(_HOT_RS, "__version__", "?"),
-        )
-    except ImportError as _exc:
-        # Wheel not built for this platform / venv — fall back to the
-        # Python implementation. Operator can install via
-        # `maturin develop` from /private/tmp/mnemos-hot-rs.
-        logger.warning(
-            "MNEMOS_HOT_RS_ENABLED=1 but mnemos_hot wheel is not importable: %s. "
-            "Falling back to pure-Python cosine UDF.",
-            _exc,
-        )
-        _HOT_RS = None
+    _HOT_RS = load_hot_rs(logger, "SQLite cosine UDF")
 
 
 def _cosine_similarity(left: Any, right: Any) -> float:
