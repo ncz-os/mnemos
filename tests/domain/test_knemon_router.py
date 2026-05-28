@@ -387,10 +387,12 @@ def test_best_plan_honors_chatgpt_and_codex_workspace_pools():
     plans = {
         "openai": [
             {"provider": "openai", "plan_name": "chatgpt_pro", "auth_method": "subscription"},
+            {"provider": "openai", "plan_name": "chatgpt_pro_100", "auth_method": "subscription"},
             {"provider": "openai", "plan_name": "codex_pro_200_20x", "auth_method": "subscription"},
         ]
     }
 
+    assert _best_plan(plans, "openai", {"chatgpt_pro_100"})["plan_name"] == "chatgpt_pro_100"
     assert _best_plan(plans, "openai", {"chatgpt_subscription"})["plan_name"] == "chatgpt_pro"
     assert _best_plan(plans, "openai", {"codex_subscription"})["plan_name"] == "codex_pro_200_20x"
 
