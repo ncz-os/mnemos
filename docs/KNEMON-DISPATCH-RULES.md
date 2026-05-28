@@ -74,7 +74,7 @@ Both still carry `openai_subscription` for operators that intentionally pool all
 
 ## Cross-Check
 
-The audit was cross-checked with a Codex muse review and a Claude-only GRAEAE consultation (`66800d7688ad4e86ad31ce6abfdfa89e`). Codex confirmed the fallback, G1, and burn rules and flagged the portable effective-date filtering fix that is included here. Claude declined to certify provider-limit facts without live source access, which is the right residual risk: provider-limit conclusions are grounded in the official source links below rather than model assertion. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
+The audit was cross-checked with a Codex muse review. Codex confirmed the fallback, G1, and burn rules and flagged the portable effective-date filtering fix that is included here. The requested Claude/GRAEAE consultation path did not produce a Claude result in this environment: Hive job submission was rejected because this session registered without a submitter URN, and the external GRAEAE consultation retried here timed out. Provider-limit conclusions are therefore grounded in the official source links below rather than model assertion. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
 
 ## Sources
 
