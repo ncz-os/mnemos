@@ -1,0 +1,18 @@
+[Unit]
+Description=GRAEAE Hive Mind MCP SSE bridge (Hive + MNEMOS + GRAEAE)
+After=network-online.target graeae-hive.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/agent-bus
+Environment=HIVE_URL=http://127.0.0.1:5005
+Environment=MNEMOS_URL=http://192.168.207.67:5002
+Environment=PORT=5006
+LimitNOFILE=65535
+ExecStart=/opt/mcp-venv/bin/python /srv/agent-bus/mcp_bridge.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -2077,16 +2077,13 @@ class OracleWebhookRepository(WebhookRepository):
 
 
 class OracleConsultationAuditRepository(ConsultationAuditRepository):
-    """Oracle consultations-audit repo — safe-default returns.
+    """Oracle consultations-audit repo — backed by MODEL_REGISTRY (KNEMON).
 
-    The Postgres implementation delegates to the ``mcp_repo`` /
-    ``openai_compat_repo`` modules which read from the model registry
-    (model_registry / model_recommendations / provider_routing tables).
-    Those tables have not yet been ported to Oracle, so every call here
-    returns the empty / None value that signals "no Oracle-side audit
-    data" to the GRAEAE engine. The engine falls back to its built-in
-    provider defaults (see lifecycle docstring), which is the same
-    posture as a fresh Postgres install before model_registry seeding.
+    The MODEL_REGISTRY table is seeded by the graeae-model-sync timer
+    (postgres) and replicated into Oracle via the KNEMON seed script.
+    Selection mirrors the sqlite implementation: fetch candidate rows,
+    filter+rank in Python. Capabilities are stored as JSON CLOB and
+    decoded post-fetch.
     """
 
     async def fetch_recommended_model(
@@ -2096,8 +2093,101 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         cost_budget: float,
         quality_floor: float,
     ) -> tuple[dict[str, Any] | None, list[str]]:
-        _ = (tx, task_type, cost_budget, quality_floor)
-        return None, []
+        capability_map = {
+            "code_generation": ["coding"],
+            "reasoning": ["reasoning", "logic"],
+            "architecture_design": ["reasoning"],
+            "summarization": ["reasoning"],
+            "web_search": ["online", "search"],
+        }
+        required_caps = capability_map.get(task_type, ["reasoning"])
+
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider, model_id, display_name, "
+                "input_cost_per_mtok, output_cost_per_mtok, "
+                "capabilities, graeae_weight, context_window "
+                "FROM model_registry WHERE available = 1 AND deprecated = 0",
+            )
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+        def _caps_list(raw_caps: Any) -> list[str]:
+            if raw_caps is None:
+                return []
+            text = raw_caps
+            read = getattr(raw_caps, "read", None)
+            if callable(read):
+                try:
+                    text = read()
+                except Exception:
+                    text = ""
+            if isinstance(text, bytes):
+                try:
+                    text = text.decode("utf-8", "replace")
+                except Exception:
+                    text = ""
+            if not isinstance(text, str):
+                return []
+            text = text.strip()
+            if not text:
+                return []
+            try:
+                val = json.loads(text)
+            except Exception:
+                return []
+            if isinstance(val, list):
+                return [str(v) for v in val]
+            return []
+
+        def _has_priced(row: dict[str, Any]) -> bool:
+            return (
+                row.get("input_cost_per_mtok") is not None
+                and row.get("output_cost_per_mtok") is not None
+            )
+
+        def _avg_cost_or_none(row: dict[str, Any]) -> float | None:
+            if not _has_priced(row):
+                return None
+            return (
+                float(row["input_cost_per_mtok"]) + float(row["output_cost_per_mtok"])
+            ) / 2.0
+
+        # Decode capabilities once per row.
+        for r in rows:
+            r["_caps_decoded"] = _caps_list(r.get("capabilities"))
+
+        eligible = [
+            row
+            for row in rows
+            if float(row.get("graeae_weight") or 0) >= quality_floor
+            and _has_priced(row)
+            and (_avg_cost_or_none(row) or 0.0) <= cost_budget
+            and all(cap in row["_caps_decoded"] for cap in required_caps)
+        ]
+        chosen = sorted(eligible, key=lambda r: _avg_cost_or_none(r) or 0.0)
+        if not chosen:
+            # Degraded fallback: drop budget+quality, sort priced-first via NULLS-LAST.
+            chosen = sorted(
+                rows,
+                key=lambda r: (
+                    _avg_cost_or_none(r) if _avg_cost_or_none(r) is not None else float("inf")
+                ),
+            )
+        if not chosen:
+            return None, required_caps
+        model = chosen[0]
+        return {
+            "provider": model["provider"],
+            "model_id": model["model_id"],
+            "display_name": model.get("display_name"),
+            "cost_per_mtok": _avg_cost_or_none(model),
+            "quality_score": float(model.get("graeae_weight") or 0),
+            "context_window": model.get("context_window"),
+        }, required_caps
 
     async def fetch_model_recommendation(
         self,
