@@ -29,7 +29,12 @@ class _RecorderConn:
     def __init__(self) -> None:
         self.sql: str | None = None
         self.args: tuple | None = None
-        self.row = {"id": 42, "est_cost_usd": Decimal("0.000324"), "registry_match": True}
+        self.row = {
+            "id": 42,
+            "est_cost_usd": Decimal("0.000324"),
+            "registry_match": True,
+            "auth_method": "api",
+        }
 
     async def fetchrow(self, sql: str, *args):
         self.sql = sql
@@ -57,6 +62,8 @@ class _OracleLedgerCursor:
 
     async def execute(self, sql: str, params: dict):
         self.sql_calls.append(sql)
+        if "FROM subscription_plans" in sql:
+            raise Exception("ORA-00942: table or view does not exist")
         if "FROM model_registry" in sql:
             raise Exception("ORA-00942: table or view does not exist")
         params["rid"].setvalue(77)
@@ -88,7 +95,7 @@ class _Db2LedgerCursor:
     async def execute(self, sql: str, params: tuple):
         self.sql_calls.append(sql)
         self.params_calls.append(params)
-        if len(self.sql_calls) == 1:
+        if "subscription_plans" in sql or "model_registry" in sql:
             raise _Db2MissingTableError("SQL0204N model_registry is an undefined name. SQLSTATE=42704")
 
     async def fetchone(self):
@@ -144,19 +151,23 @@ async def test_postgres_record_usage_ledger_inserts_with_registry_prices():
         "ok",
         "pantheon",
         "standard",
+        None,
+        1,
+        None,
     )
     assert conn.sql is not None
     assert "FROM model_registry" in conn.sql
     assert "INSERT INTO usage_ledger" in conn.sql
     assert "est_cost_usd" in conn.sql
-    assert "$1" in conn.sql and "$10" in conn.sql
+    assert "$1" in conn.sql and "$13" in conn.sql
     assert "resolved_prices" in conn.sql
+    assert "resolved_plan" in conn.sql
 
 
 @pytest.mark.asyncio
 async def test_postgres_record_usage_ledger_records_and_warns_for_unknown_model(caplog):
     conn = _RecorderConn()
-    conn.row = {"id": 43, "est_cost_usd": Decimal("0"), "registry_match": False}
+    conn.row = {"id": 43, "est_cost_usd": Decimal("0"), "registry_match": False, "auth_method": "api"}
     tx = PostgresTransaction(conn, _RawTx())  # type: ignore[arg-type]
     backend = PostgresBackend(pool=SimpleNamespace(), settings=_settings())  # type: ignore[arg-type]
 
@@ -208,9 +219,10 @@ async def test_oracle_record_usage_ledger_records_when_model_registry_missing(mo
         )
 
     assert result == UsageLedgerResult(id=77, est_cost_usd=Decimal("0"))
-    assert len(conn.cursor_obj.sql_calls) == 2
-    assert "FROM model_registry" in conn.cursor_obj.sql_calls[0]
-    assert "FROM model_registry" not in conn.cursor_obj.sql_calls[1]
+    assert len(conn.cursor_obj.sql_calls) == 3
+    assert "FROM subscription_plans" in conn.cursor_obj.sql_calls[0]
+    assert "FROM model_registry" in conn.cursor_obj.sql_calls[1]
+    assert "FROM model_registry" not in conn.cursor_obj.sql_calls[2]
     assert "model_registry table missing" in caplog.text
 
 
@@ -239,10 +251,11 @@ async def test_db2_record_usage_ledger_records_when_model_registry_missing(caplo
         )
 
     assert result == UsageLedgerResult(id=88, est_cost_usd=Decimal("0"))
-    assert len(conn.cursor_obj.sql_calls) == 2
-    assert "FROM model_registry" in conn.cursor_obj.sql_calls[0]
-    assert "FROM model_registry" not in conn.cursor_obj.sql_calls[1]
-    assert conn.cursor_obj.params_calls[1] == (
+    assert len(conn.cursor_obj.sql_calls) == 3
+    assert "subscription_plans" in conn.cursor_obj.sql_calls[0]
+    assert "FROM model_registry" in conn.cursor_obj.sql_calls[1]
+    assert "FROM model_registry" not in conn.cursor_obj.sql_calls[2]
+    assert conn.cursor_obj.params_calls[2] == (
         "unknown",
         "missing",
         "code",
@@ -253,6 +266,10 @@ async def test_db2_record_usage_ledger_records_when_model_registry_missing(caplo
         "ok",
         "pantheon",
         "standard",
+        None,
+        1,
+        None,
+        0,
     )
     assert "model_registry table missing" in caplog.text
 
@@ -355,20 +372,14 @@ async def test_ledger_endpoint_requires_root_and_records(monkeypatch):
     assert response.status_code == 200
     assert response.json()["id"] == 7
     assert Decimal(str(response.json()["est_cost_usd"])) == Decimal("0.000324")
-    assert backend.records == [
-        UsageLedgerRecord(
-            provider="openai",
-            model="gpt-4o",
-            task_kind="code",
-            tokens_in=1200,
-            tokens_out=340,
-            tokens_reasoning=0,
-            latency_ms=1240,
-            outcome="ok",
-            caller_subsystem="pantheon",
-            tier="standard",
-        )
-    ]
+    assert len(backend.records) == 1
+    recorded = backend.records[0]
+    assert recorded.provider == "openai"
+    assert recorded.model == "gpt-4o"
+    assert recorded.session_id is None
+    assert recorded.request_count == 1
+    assert recorded.plan_window_id is not None
+    assert recorded.plan_window_id.startswith("openai-standard-")
     assert invalid_response.status_code == 422
 
 
