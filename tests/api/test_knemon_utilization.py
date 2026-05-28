@@ -74,7 +74,7 @@ class _SqliteBackend:
             """
             INSERT INTO subscription_plans
             VALUES ('openai', 'codex_pro_200_25x', 'subscription', 'interactive', 200, 375, 18000,
-                    NULL, NULL, 'rolling', NULL, NULL, 'expired promo', '2026-05-01', '2026-05-27', 'codex_plus')
+                    NULL, NULL, 'rolling', NULL, NULL, 'expired promo', '2026-05-01', '2026-05-27', 'codex_pro_200')
             """
         )
         self.conn.execute(
