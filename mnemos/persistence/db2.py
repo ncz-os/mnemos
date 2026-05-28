@@ -3570,21 +3570,20 @@ class Db2Backend(OracleBackend):
 
         from mnemos.persistence.base import UsageLedgerResult
 
-        conn = _conn_from_tx(tx)
-        cursor = conn.cursor()
-        try:
-            await _call(
-                cursor.execute,
-                "SELECT 1 FROM model_registry WHERE provider = ? AND model_id = ?",
-                (record.provider, record.model),
+        def _is_missing_model_registry(exc: BaseException) -> bool:
+            sqlstate = str(getattr(exc, "sqlstate", "")).upper()
+            sqlcode = str(getattr(exc, "sqlcode", ""))
+            msg = str(exc).upper()
+            return (
+                sqlstate == "42704"
+                or sqlcode == "-204"
+                or "SQLSTATE=42704" in msg
+                or "SQLSTATE 42704" in msg
+                or "SQLCODE=-204" in msg
+                or "SQL0204N" in msg
             )
-            if await _call(cursor.fetchone) is None:
-                _LOG.warning(
-                    "usage_ledger model_registry price missing for provider=%s model=%s; " "recording est_cost_usd=0",
-                    record.provider,
-                    record.model,
-                )
 
+        async def _insert_zero_cost() -> Any:
             await _call(
                 cursor.execute,
                 """
@@ -3597,18 +3596,7 @@ class Db2Backend(OracleBackend):
                     )
                     VALUES (
                         ?, ?, ?, ?, ?, ?,
-                        COALESCE((
-                            SELECT DECIMAL(
-                                (? * COALESCE(input_cost_per_mtok, 0)
-                               + ? * COALESCE(output_cost_per_mtok, 0)
-                               + ? * COALESCE(output_cost_per_mtok, 0))
-                               / 1000000,
-                               12,
-                               6
-                            )
-                            FROM model_registry
-                            WHERE provider = ? AND model_id = ?
-                        ), DECIMAL(0, 12, 6)),
+                        DECIMAL(0, 12, 6),
                         ?, ?, ?, ?
                     )
                 )
@@ -3620,18 +3608,99 @@ class Db2Backend(OracleBackend):
                     record.tokens_in,
                     record.tokens_out,
                     record.tokens_reasoning,
-                    record.tokens_in,
-                    record.tokens_out,
-                    record.tokens_reasoning,
-                    record.provider,
-                    record.model,
                     record.latency_ms,
                     record.outcome,
                     record.caller_subsystem,
                     record.tier,
                 ),
             )
-            row = await _call(cursor.fetchone)
+            return await _call(cursor.fetchone)
+
+        conn = _conn_from_tx(tx)
+        cursor = conn.cursor()
+        try:
+            try:
+                await _call(
+                    cursor.execute,
+                    "SELECT 1 FROM model_registry WHERE provider = ? AND model_id = ?",
+                    (record.provider, record.model),
+                )
+                if await _call(cursor.fetchone) is None:
+                    _LOG.warning(
+                        "usage_ledger model_registry price missing for provider=%s model=%s; "
+                        "recording est_cost_usd=0",
+                        record.provider,
+                        record.model,
+                    )
+            except Exception as exc:
+                if not _is_missing_model_registry(exc):
+                    raise
+                _LOG.warning(
+                    "usage_ledger model_registry table missing for provider=%s model=%s; " "recording est_cost_usd=0",
+                    record.provider,
+                    record.model,
+                )
+                row = await _insert_zero_cost()
+            else:
+                try:
+                    await _call(
+                        cursor.execute,
+                        """
+                        SELECT id, est_cost_usd
+                        FROM FINAL TABLE (
+                            INSERT INTO usage_ledger (
+                                provider, model, task_kind, tokens_in, tokens_out,
+                                tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                                caller_subsystem, tier
+                            )
+                            VALUES (
+                                ?, ?, ?, ?, ?, ?,
+                                COALESCE((
+                                    SELECT DECIMAL(
+                                        (? * COALESCE(input_cost_per_mtok, 0)
+                                       + ? * COALESCE(output_cost_per_mtok, 0)
+                                       + ? * COALESCE(output_cost_per_mtok, 0))
+                                       / 1000000,
+                                       12,
+                                       6
+                                    )
+                                    FROM model_registry
+                                    WHERE provider = ? AND model_id = ?
+                                ), DECIMAL(0, 12, 6)),
+                                ?, ?, ?, ?
+                            )
+                        )
+                        """,
+                        (
+                            record.provider,
+                            record.model,
+                            record.task_kind,
+                            record.tokens_in,
+                            record.tokens_out,
+                            record.tokens_reasoning,
+                            record.tokens_in,
+                            record.tokens_out,
+                            record.tokens_reasoning,
+                            record.provider,
+                            record.model,
+                            record.latency_ms,
+                            record.outcome,
+                            record.caller_subsystem,
+                            record.tier,
+                        ),
+                    )
+                    row = await _call(cursor.fetchone)
+                except Exception as exc:
+                    if not _is_missing_model_registry(exc):
+                        raise
+                    _LOG.warning(
+                        "usage_ledger model_registry table missing for provider=%s model=%s; "
+                        "recording est_cost_usd=0",
+                        record.provider,
+                        record.model,
+                    )
+                    row = await _insert_zero_cost()
+
         finally:
             await _call(cursor.close)
 

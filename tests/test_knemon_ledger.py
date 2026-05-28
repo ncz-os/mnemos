@@ -74,6 +74,38 @@ class _OracleLedgerConn:
         return self.cursor_obj
 
 
+class _Db2MissingTableError(Exception):
+    sqlstate = "42704"
+    sqlcode = "-204"
+
+
+class _Db2LedgerCursor:
+    def __init__(self) -> None:
+        self.sql_calls: list[str] = []
+        self.params_calls: list[tuple] = []
+        self.row = (88, Decimal("0"))
+
+    async def execute(self, sql: str, params: tuple):
+        self.sql_calls.append(sql)
+        self.params_calls.append(params)
+        if len(self.sql_calls) == 1:
+            raise _Db2MissingTableError("SQL0204N model_registry is an undefined name. SQLSTATE=42704")
+
+    async def fetchone(self):
+        return self.row
+
+    async def close(self) -> None:
+        return None
+
+
+class _Db2LedgerConn:
+    def __init__(self) -> None:
+        self.cursor_obj = _Db2LedgerCursor()
+
+    def cursor(self):
+        return self.cursor_obj
+
+
 def _settings():
     return SimpleNamespace(database=SimpleNamespace(embedding_dim=768))
 
@@ -179,6 +211,49 @@ async def test_oracle_record_usage_ledger_records_when_model_registry_missing(mo
     assert len(conn.cursor_obj.sql_calls) == 2
     assert "FROM model_registry" in conn.cursor_obj.sql_calls[0]
     assert "FROM model_registry" not in conn.cursor_obj.sql_calls[1]
+    assert "model_registry table missing" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_db2_record_usage_ledger_records_when_model_registry_missing(caplog):
+    from mnemos.persistence.db2 import Db2Backend
+
+    conn = _Db2LedgerConn()
+    backend = Db2Backend(pool=SimpleNamespace(), settings=SimpleNamespace())  # type: ignore[arg-type]
+
+    with caplog.at_level("WARNING"):
+        result = await backend.record_usage_ledger(
+            SimpleNamespace(conn=conn),
+            UsageLedgerRecord(
+                provider="unknown",
+                model="missing",
+                task_kind="code",
+                tokens_in=1,
+                tokens_out=1,
+                tokens_reasoning=0,
+                latency_ms=1,
+                outcome="ok",
+                caller_subsystem="pantheon",
+                tier="standard",
+            ),
+        )
+
+    assert result == UsageLedgerResult(id=88, est_cost_usd=Decimal("0"))
+    assert len(conn.cursor_obj.sql_calls) == 2
+    assert "FROM model_registry" in conn.cursor_obj.sql_calls[0]
+    assert "FROM model_registry" not in conn.cursor_obj.sql_calls[1]
+    assert conn.cursor_obj.params_calls[1] == (
+        "unknown",
+        "missing",
+        "code",
+        1,
+        1,
+        0,
+        1,
+        "ok",
+        "pantheon",
+        "standard",
+    )
     assert "model_registry table missing" in caplog.text
 
 
