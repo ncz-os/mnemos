@@ -20,7 +20,7 @@ Priority `>= 14` is the G1 escalation path and maps to `quality >= knemon.g1_qua
 
 If a session is burned, the router lowers the economic routing priority but still evaluates the quality floor from the originally requested priority. A burned priority-14 request therefore remains constrained by `g1_quality_floor`.
 
-The session burn threshold aligns with operator practice when it trips at `>= 10` requests in the rolling one-hour window. The policy is configurable through `MNEMOS_KNEMON_SESSION_BURN_REQUESTS_PER_HOUR` and `MNEMOS_KNEMON_SESSION_BURN_WINDOW_SECONDS`.
+The session burn threshold aligns with operator practice when it trips at `>= 10` requests in the rolling one-hour window. That is a local guardrail for interactive sessions: normal hand-driven use stays below it, while repeated retries, fanout loops, or automation bursts get downgraded before they drain subscription headroom. The policy is configurable through `MNEMOS_KNEMON_SESSION_BURN_REQUESTS_PER_HOUR` and `MNEMOS_KNEMON_SESSION_BURN_WINDOW_SECONDS`; bulk workers should use separate sessions or raise the threshold explicitly.
 
 ## Current Plan Rows
 
@@ -28,8 +28,8 @@ These are the current rows after `0039_knemon_dispatch_rule_refresh`.
 
 | Provider | Plan | Cap |
 | --- | --- | --- |
-| Anthropic | `claude_max_200` | At least 900 messages per 5h through 2026-05-31 |
-| Anthropic | `claude_max_100` | At least 225 messages per 5h from 2026-06-01 |
+| Anthropic | `claude_max_200` | Local planning cap: 900 messages per 5h through 2026-05-31 |
+| Anthropic | `claude_max_100` | Local planning cap: 225 messages per 5h from 2026-06-01 |
 | OpenAI | `chatgpt_plus` | 160 ChatGPT GPT-5.5 messages per 3h |
 | OpenAI | `chatgpt_pro` | Unmetered ChatGPT GPT-5.5 access subject to abuse guardrails |
 | OpenAI | `codex_plus` | Local planning cap: 15 GPT-5.5 messages per 5h |
@@ -76,7 +76,7 @@ Both still carry `openai_subscription` for operators that intentionally pool all
 
 ## Cross-Check
 
-The audit was cross-checked with a Codex muse review and a Claude-only GRAEAE consultation (`66800d7688ad4e86ad31ce6abfdfa89e`). Codex confirmed the fallback, G1, and burn rules and flagged the portable effective-date filtering fix that is included here. Claude declined to certify provider-limit facts without live source access, which is the right residual risk: provider-limit conclusions are grounded in the official source links below rather than model assertion. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
+The audit was cross-checked with a Codex muse review. Codex confirmed the fallback, G1, and burn rules, and recommended documenting `10 req/hr` as local operator policy rather than a vendor-derived threshold. The requested Claude cross-check could not complete in this environment: the external GRAEAE consultation timed out, and hive job submission to the online Claude worker was rejected because this session registered without a submitter URN. Provider-limit conclusions are therefore grounded in the official source links below rather than model assertion. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
 
 ## Sources
 
