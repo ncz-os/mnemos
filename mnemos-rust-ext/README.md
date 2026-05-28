@@ -1,6 +1,7 @@
 # mnemos-native-search
 
-PyO3 Rust extension for MNEMOS vector similarity search hot paths.
+PyO3 Rust extension for MNEMOS vector similarity and federation feed
+serialization hot paths.
 
 ## Development build
 
@@ -49,3 +50,9 @@ Compatibility aliases are also exported:
 
 - `cosine(...)`
 - `cosine_batch(...)`
+
+Federation feed rows can be serialized directly to compact JSON bytes:
+
+```python
+payload = mnemos_native_search.serialize_memory_rows(rows)
+```

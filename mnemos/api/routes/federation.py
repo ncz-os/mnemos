@@ -12,12 +12,13 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from mnemos.api.dependencies import UserContext, get_current_user, require_root
 from mnemos.api.persistence_helpers import require_federation_backend
 from mnemos.core.ids import parse_uuid_or_404
 from mnemos.domain import federation as _fed
+from mnemos.domain.federation import native_bridge as _native_federation
 from mnemos.domain.models import (
     FederationConsolidationEvent,
     FederationFeedResponse,
@@ -697,6 +698,24 @@ async def federation_feed(
     has_more = len(rows) > limit
     rows = rows[:limit]
 
+    if rows and rows[-1]["updated"]:
+        next_cursor = _fed._encode_feed_cursor(_cursor_datetime(rows[-1]["updated"]), rows[-1]["id"])
+    else:
+        next_cursor = since
+
+    if request is not None and not copy_embeddings and not audit_heads:
+        try:
+            return Response(
+                content=_native_federation.serialize_feed_response(
+                    rows,
+                    next_cursor=next_cursor,
+                    has_more=has_more,
+                ),
+                media_type="application/json",
+            )
+        except Exception:
+            logger.exception("[federation/feed] native serialization failed; falling back to pydantic")
+
     memories = [
         _feed_item_from_row(r, include_compressed=prefer_compressed, include_embedding=copy_embeddings) for r in rows
     ]
@@ -712,11 +731,6 @@ async def federation_feed(
                     item.audit_latest_entry_hash = ehash
             except Exception:
                 pass  # best-effort; never fail the feed on attach
-    if rows and rows[-1]["updated"]:
-        next_cursor = _fed._encode_feed_cursor(_cursor_datetime(rows[-1]["updated"]), rows[-1]["id"])
-    else:
-        next_cursor = since
-
     return FederationFeedResponse(
         memories=memories,
         next_cursor=next_cursor,

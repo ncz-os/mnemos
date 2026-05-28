@@ -2,7 +2,7 @@
 name = "mnemos-native-search"
 version = "0.1.0"
 edition = "2021"
-description = "PyO3 vector similarity accelerator for MNEMOS search hot paths"
+description = "PyO3 accelerators for MNEMOS search and federation hot paths"
 license = "Apache-2.0"
 
 [lib]
