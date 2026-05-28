@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compare native vs pure-Python cosine similarity helpers."""
+"""Compare native vs pure-Python cosine similarity helpers.
+
+Default shape mirrors the /v1/memories/search hot-path target:
+1000 bge-m3-sized candidate vectors by 1024 dimensions.
+"""
 
 from __future__ import annotations
 
@@ -23,23 +27,24 @@ def _vectors(rows: int, dims: int) -> tuple[list[float], list[list[float]]]:
     return query, corpus
 
 
-def _time_call(label: str, func, query: list[float], corpus: list[list[float]], rounds: int) -> tuple[str, float]:
+def _time_call(label: str, func, query, corpus, rounds: int) -> tuple[str, float, object]:
     start = time.perf_counter()
+    result = None
     for _ in range(rounds):
-        func(query, corpus)
+        result = func(query, corpus)
     elapsed = time.perf_counter() - start
-    return label, elapsed
+    return label, elapsed, result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=10_000)
-    parser.add_argument("--dims", type=int, default=384)
-    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--rows", type=int, default=1_000)
+    parser.add_argument("--dims", type=int, default=1_024)
+    parser.add_argument("--rounds", type=int, default=10)
     args = parser.parse_args()
 
     query, corpus = _vectors(args.rows, args.dims)
-    python_label, python_elapsed = _time_call(
+    python_label, python_elapsed, python_scores = _time_call(
         "python",
         native_bridge.pure_python_batch_cosine_similarity,
         query,
@@ -52,7 +57,7 @@ def main() -> None:
         print("native: unavailable; run `cd mnemos-rust-ext && maturin develop`")
         return
 
-    native_label, native_elapsed = _time_call(
+    native_label, native_elapsed, native_scores = _time_call(
         "native-list",
         native_bridge.batch_cosine_similarity,
         query,
@@ -66,11 +71,11 @@ def main() -> None:
     if np is None:
         return
 
-    query_np = np.asarray(query, dtype=np.float32)
-    corpus_np = np.asarray(corpus, dtype=np.float32)
-    native_np_label, native_np_elapsed = _time_call(
-        "native-numpy",
-        native_bridge.batch_cosine_similarity,
+    query_np = np.asarray(query, dtype=np.float64)
+    corpus_np = np.asarray(corpus, dtype=np.float64)
+    native_np_label, native_np_elapsed, native_np_scores = _time_call(
+        "native-similarity-dot-normalized",
+        native_bridge.similarity_dot_normalized,
         query_np,
         corpus_np,
         args.rounds,
@@ -78,6 +83,18 @@ def main() -> None:
     print(f"{native_np_label}: {native_np_elapsed:.4f}s")
     if native_np_elapsed > 0.0:
         print(f"numpy speedup: {python_elapsed / native_np_elapsed:.2f}x")
+
+    max_delta = max(
+        abs(float(left) - float(right))
+        for left, right in zip(python_scores, native_np_scores)
+    )
+    print(f"max score delta vs python: {max_delta:.3e}")
+    if native_scores is not None:
+        max_list_delta = max(
+            abs(float(left) - float(right))
+            for left, right in zip(python_scores, native_scores)
+        )
+        print(f"max native-list delta vs python: {max_list_delta:.3e}")
 
 
 if __name__ == "__main__":
