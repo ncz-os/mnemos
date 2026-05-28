@@ -127,6 +127,8 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "migrations_v5_1_0_deletion_log_sqlite.sql",
     "migrations_v5_2_0_nats_outbox_idempotency_sqlite.sql",
     "migrations_v5_3_4_mcp_audit_log_sqlite.sql",
+    "migrations_v6_2_audit_chain_sqlite.sql",
+    "migrations_v6_2_category_decay_sqlite.sql",
 ]
 
 
@@ -181,6 +183,19 @@ def test_installer_db_migration_list_includes_usage_ledger():
     assert installer_db_list.index("0032_usage_ledger.sql") > installer_db_list.index(
         "migrations_v5_3_5_model_registry_capabilities_gin.sql"
     )
+
+
+def test_usage_ledger_migration_grants_runtime_roles():
+    repo_root = Path(__file__).resolve().parents[1]
+    usage_ledger_sql = (repo_root / "db/migrations/0032_usage_ledger.sql").read_text()
+    model_registry_sql = (repo_root / "db/migrations_model_registry.sql").read_text()
+
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON model_registry TO mnemos_user;" in model_registry_sql
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON model_registry TO mnemos;" in model_registry_sql
+    assert "GRANT SELECT, INSERT ON usage_ledger TO mnemos_user;" in usage_ledger_sql
+    assert "GRANT USAGE, SELECT ON SEQUENCE usage_ledger_id_seq TO mnemos_user;" in usage_ledger_sql
+    assert "GRANT SELECT, INSERT ON usage_ledger TO mnemos;" in usage_ledger_sql
+    assert "GRANT USAGE, SELECT ON SEQUENCE usage_ledger_id_seq TO mnemos;" in usage_ledger_sql
 
 
 def test_sqlite_migration_list_matches_expected_order():
