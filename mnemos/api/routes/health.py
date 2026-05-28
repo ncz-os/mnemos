@@ -21,7 +21,11 @@ async def health_check() -> HealthResponse:
     """Return health status including DB pool and background workers."""
     db_ok = False
     backend = _lc._persistence_backend
+    backend_name = None
+    backend_capabilities: list[str] = []
     if backend is not None:
+        backend_name = type(backend).__name__
+        backend_capabilities = sorted(str(cap) for cap in getattr(backend, "capabilities", set()))
         db_ok = await backend.ping()
 
     # Get worker status
@@ -35,6 +39,8 @@ async def health_check() -> HealthResponse:
         distillation_worker=worker_status,
         profile=get_settings().profile,
         nats_publishing_enabled=publishing_enabled(),
+        persistence_backend=backend_name,
+        persistence_capabilities=backend_capabilities,
     )
 
 
