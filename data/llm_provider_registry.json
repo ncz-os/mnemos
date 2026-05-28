@@ -1,0 +1,237 @@
+{
+  "schema_version": "1.0",
+  "updated_at": "2026-05-25T08:30:00Z",
+  "authoritative_source": "mnemos-prod-working/data/llm_provider_registry.json",
+  "served_at": "http://192.168.207.67:5002/state/llm_registry",
+  "promo_deadlines": {
+    "deepseek_v4_pro": "2026-05-31T15:59:00Z"
+  },
+  "plan_caps": {
+    "anthropic_max": {"current_until": "2026-05-31", "current_usd_month": 200, "next_usd_month": 100, "next_effective": "2026-06-01"}
+  },
+  "providers": {
+    "ngc_integrate": {
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "auth_env": "NVIDIA_API_KEY",
+      "cli": "nllm",
+      "notes": "FREE NIM gateway. Shared pool, occasional rate-limit. Hard ~300s timeout for non-streaming - use ngc-stream for long outputs.",
+      "account_status": "active",
+      "models": {
+        "moonshotai/kimi-k2.6": {"cost_in_per_m": 0, "cost_out_per_m": 0, "cache_hit_in_per_m": 0, "ctx": 200000, "max_out": 8192, "swe_bench": 0.802, "quality": 0.85, "p50_latency_s": 1, "capabilities": ["chat","tools"], "tier": "S_free", "tags": ["fanout","review","default"]},
+        "nvidia/nemotron-3-super-120b-a12b": {"cost_in_per_m": 0, "cost_out_per_m": 0, "ctx": 256000, "max_out": 8192, "quality": 0.88, "p50_latency_s": 2, "capabilities": ["chat","reasoning"], "tier": "S_free", "tags": ["arch","reasoning","g1"], "notes": "Use /no_think for fast mode"},
+        "qwen/qwen3-coder-480b-a35b-instruct": {"cost_in_per_m": 0, "cost_out_per_m": 0, "ctx": 256000, "max_out": 8192, "quality": 0.86, "p50_latency_s": 14, "capabilities": ["chat","code"], "tier": "S_free", "tags": ["heavy-code"]},
+        "minimaxai/minimax-m2.7": {"cost_in_per_m": 0, "cost_out_per_m": 0, "ctx": 4000000, "max_out": 8192, "quality": 0.78, "p50_latency_s": 5, "capabilities": ["chat","long-context"], "tier": "S_free", "tags": ["long-ctx","narrate"]},
+        "deepseek-ai/deepseek-v4-pro": {"cost_in_per_m": 0, "cost_out_per_m": 0, "ctx": 200000, "quality": 0.87, "capabilities": ["chat","reasoning"], "tier": "S_free", "tags": ["g1"]}
+      }
+    },
+    "ngc_inference": {
+      "base_url": "https://inference-api.nvidia.com/v1",
+      "auth_env": "NVIDIA_INFERENCE_API_KEY",
+      "cli": "nllm",
+      "notes": "FREE NIM enterprise hub. Alt rate-limit pool to integrate.",
+      "account_status": "active",
+      "models": {}
+    },
+    "local_cerberus": {
+      "base_url": "http://192.168.207.96:8080/v1",
+      "auth_env": null,
+      "models": {
+        "gemma4-consult": {"cost_in_per_m": 0, "cost_out_per_m": 0, "quality": 0.78, "p50_latency_s": 3, "tier": "S_free", "tags": ["always-on","surgical"], "notes": "llama.cpp gemma-4-31B-it-UD-Q4_K_XL; ctx 16384 fixed for VRAM fit"},
+        "qwen2.5-coder:14b-instruct-q6_K": {"cost_in_per_m": 0, "cost_out_per_m": 0, "quality": 0.74, "p50_latency_s": 26, "tier": "S_free", "tags": ["surgical-coder","load-on-demand"], "notes": "Ollama keep_alive=0"}
+      }
+    },
+    "local_medusa": {
+      "base_url": "http://192.168.207.64:8090/v1",
+      "auth_env": null,
+      "models": {
+        "bge-m3-embedding": {"cost_in_per_m": 0, "cost_out_per_m": 0, "ctx": 8192, "tier": "S_free", "tags": ["embedding","fleet"], "notes": "1024d, Vulkan"},
+        "bge-rerank": {"cost_in_per_m": 0, "cost_out_per_m": 0, "tier": "S_free", "tags": ["rerank","v6.2-m223"]}
+      }
+    },
+    "groq": {
+      "base_url": "https://api.groq.com/openai/v1",
+      "auth_env": "GROQ_API_KEY",
+      "notes": "Dev tier PAID. Org-level rate limits: 250-300K TPM, 500K RPM, 7.5M tokens/day per model. Batch=50% off.",
+      "account_status": "active",
+      "models": {
+        "llama-3.1-8b-instant": {"cost_in_per_m": 0.05, "cost_out_per_m": 0.08, "tok_per_s": 840, "tpm_org": 300000, "max_per_day": 7500000, "quality": 0.65, "tier": "B_fanout", "tags": ["fanout","speed-king","cheapest"]},
+        "llama-3.3-70b-versatile": {"cost_in_per_m": 0.59, "cost_out_per_m": 0.79, "tok_per_s": 394, "tpm_org": 250000, "max_per_day": 7500000, "quality": 0.82, "tier": "B_quality", "tags": ["fast-70b","review"]},
+        "openai/gpt-oss-20b": {"cost_in_per_m": 0.075, "cost_out_per_m": 0.30, "tok_per_s": 1000, "tpm_org": 250000, "quality": 0.70, "tier": "B_fanout", "tags": ["fanout-quality"]},
+        "openai/gpt-oss-120b": {"cost_in_per_m": 0.15, "cost_out_per_m": 0.60, "tok_per_s": 500, "tpm_org": 250000, "quality": 0.80, "tier": "B_quality", "tags": ["fanout-quality"]},
+        "meta-llama/llama-4-scout-17b-16e-instruct": {"cost_in_per_m": 0.11, "cost_out_per_m": 0.34, "tok_per_s": 594, "quality": 0.74, "tier": "B_fanout"},
+        "qwen/qwen3-32b": {"cost_in_per_m": 0.29, "cost_out_per_m": 0.59, "tok_per_s": 662, "quality": 0.77, "tier": "B_quality"},
+        "whisper-large-v3-turbo": {"cost_per_hr": 0.04, "quality": 0.85, "tier": "B_audio", "tags": ["transcription","228x-realtime"]}
+      }
+    },
+    "deepseek_direct": {
+      "base_url": "https://api.deepseek.com/v1",
+      "anthropic_base_url": "https://api.deepseek.com/anthropic",
+      "auth_env": "DEEPSEEK_API_KEY",
+      "notes": "Direct DeepSeek. 4-5x cheaper than Together for V4-Pro. Anthropic-format URL = drop-in for Claude SDK clients. Cache hit always 1/10 of cache miss input.",
+      "account_status": "funded_50usd_2026_05_25",
+      "balance_usd": 50.00,
+      "models": {
+        "deepseek-v4-flash": {"cost_in_per_m": 0.14, "cost_out_per_m": 0.28, "cache_hit_in_per_m": 0.0028, "ctx": 1000000, "max_out": 384000, "concurrency": 2500, "capabilities": ["chat","tools","json","fim","prefix"], "quality": 0.78, "tier": "B_fanout", "tags": ["fanout-concur-king","1M-ctx"]},
+        "deepseek-v4-pro": {"cost_in_per_m": 0.435, "cost_out_per_m": 0.87, "cache_hit_in_per_m": 0.003625, "promo_until": "2026-05-31T15:59:00Z", "post_promo_in_per_m": 1.74, "post_promo_out_per_m": 3.48, "ctx": 1000000, "max_out": 384000, "concurrency": 500, "capabilities": ["chat","tools","json","fim","prefix","reasoning"], "quality": 0.87, "swe_bench": 0.806, "tier": "B_quality", "tags": ["g1","best-value-promo","cache-king"]}
+      }
+    },
+    "deepseek-direct": {
+      "base_url": "https://api.deepseek.com/v1",
+      "anthropic_base_url": "https://api.deepseek.com/anthropic",
+      "auth_env": "DEEPSEEK_API_KEY",
+      "notes": "Direct DeepSeek model_registry provider key. V4 Pro promo pricing effective until 2026-05-31, then reverts to 1.74/3.48 USD per mtok.",
+      "account_status": "funded_50usd_2026_05_25",
+      "balance_usd": 50.00,
+      "models": {
+        "deepseek-v4-flash": {"cost_in_per_m": 0.14, "cost_out_per_m": 0.28, "cache_hit_in_per_m": 0.0028, "ctx": 128000, "max_out": 8192, "capabilities": {"chat": true, "coding": true, "reasoning": false}, "quality": 0.78, "graeae_weight": 0.7, "tier": "B_fanout", "tags": ["fanout","low-cost"]},
+        "deepseek-v4-pro": {"cost_in_per_m": 0.435, "cost_out_per_m": 0.87, "cache_hit_in_per_m": 0.003625, "promo_until": "2026-05-31T15:59:00Z", "post_promo_in_per_m": 1.74, "post_promo_out_per_m": 3.48, "ctx": 128000, "max_out": 8192, "capabilities": {"chat": true, "coding": true, "reasoning": true}, "quality": 0.87, "graeae_weight": 0.85, "swe_bench": 0.806, "tier": "B_quality", "tags": ["reasoning","best-value-promo"]}
+      }
+    },
+    "siliconflow": {
+      "base_url": "https://api.siliconflow.com/v1",
+      "auth_env": "SILICONFLOW_API_KEY",
+      "notes": "China cloud, .com NOT .cn. 67 models. RPM=500 TPM=2M for V4-Pro at L0; per-model rate ladders.",
+      "account_status": "active_low_balance",
+      "balance_usd": 0.9971,
+      "models": {
+        "deepseek-ai/DeepSeek-V4-Pro": {"cost_in_per_m": 1.62, "cost_out_per_m": 3.48, "cache_hit_in_per_m": 0.145, "ctx": 1049000, "rpm_l0": 500, "tpm_l0": 2000000, "rpm_l5": 500, "tpm_l5": 2000000, "tier": "B_quality_postpromo", "tags": ["high-tpm","post-promo-fallback"], "notes": "Beats Together always; ties direct post-promo on input; loses cache by 40x"},
+        "deepseek-ai/DeepSeek-V4-Flash": {"cost_in_per_m": null, "cost_out_per_m": null, "ctx": 1049000, "tier": "B_fanout", "notes": "Pricing not yet fetched"},
+        "moonshotai/Kimi-K2.6": {"cost_in_per_m": 0.77, "cost_out_per_m": 4.00, "cache_hit_in_per_m": 0.20, "ctx": 256000, "tier": "C_avoid", "notes": "NGC has this FREE - SF only if NGC throttled"},
+        "Qwen/Qwen3.6-27B": {"cost_in_per_m": 0.30, "cost_out_per_m": 3.20, "ctx": 262000, "rpm_l0": 1000, "tpm_l0": 40000, "rpm_l5": 10000, "tpm_l5": 2000000, "capabilities": ["chat","vision","tools","reasoning"], "tier": "B_vision_special", "tags": ["vision+reasoning-unique"], "notes": "L0 TPM only 40K - low fanout cap until tier climb. Output expensive."},
+        "Qwen/Qwen3-Coder-30B-A3B-Instruct": {"cost_in_per_m": null, "cost_out_per_m": null, "p50_latency_s": 13.5, "ctx": 256000, "tier": "B_quality", "tags": ["surgical-coder"], "notes": "Pricing pending; verified working 13.5s on parse_iso bench"},
+        "Qwen/Qwen3-Embedding-8B": {"cost_in_per_m": null, "tier": "B_embed", "notes": "Pricing pending"},
+        "Qwen/Qwen3-Reranker-8B": {"cost_in_per_m": null, "tier": "B_rerank", "notes": "Pricing pending"}
+      }
+    },
+    "xai": {
+      "base_url": "https://api.x.ai/v1",
+      "auth_env": "XAI_API_KEY",
+      "notes": "$25 free signup + up to $150/mo data-sharing = $175/mo free spend. Enable data-sharing in dashboard.",
+      "account_status": "active_buy_more_authorized",
+      "models": {
+        "grok-4-1-fast": {"cost_in_per_m": 0.20, "cost_out_per_m": 0.50, "cache_hit_in_per_m": 0.20, "ctx": 256000, "quality": 0.80, "tier": "B_quality", "tags": ["cheap-frontier","real-time-web"]},
+        "grok-4-3": {"cost_in_per_m": 1.25, "cost_out_per_m": 2.50, "cache_hit_in_per_m": 0.20, "ctx": 1000000, "quality": 0.84, "tier": "B_quality", "tags": ["1M-ctx"]}
+      }
+    },
+    "together": {
+      "base_url": "https://api.together.xyz/v1",
+      "auth_env": "TOGETHER_API_KEY",
+      "notes": "RETIRING - DeepSeek direct + SF + NGC cover all cases cheaper. Halt V4-Pro use. Keep MiniMax FP4 as last-resort long-context paid.",
+      "account_status": "wind_down",
+      "models": {
+        "MiniMaxAI/MiniMax-M2.7": {"cost_in_per_m": 0.40, "cost_out_per_m": 1.20, "cache_hit_in_per_m": 0.04, "ctx": 4000000, "quality": 0.78, "tier": "C_fallback", "tags": ["long-ctx-paid-fallback"]},
+        "deepseek-ai/DeepSeek-V4-Pro": {"cost_in_per_m": 2.10, "cost_out_per_m": 4.40, "tier": "C_AVOID", "notes": "5x direct markup - DO NOT USE"},
+        "Qwen/Qwen2.5-Coder-32B-Instruct": {"cost_in_per_m": 0.05, "cost_out_per_m": 0.12, "tier": "B_fanout"}
+      }
+    },
+    "anthropic": {
+      "base_url": "https://api.anthropic.com/v1",
+      "auth_env": "ANTHROPIC_API_KEY",
+      "notes": "FORBIDDEN for nclawzero/zeroclaw stack per CLAUDE.md directive 5. Reserved for STUDIO Claude orchestrator only. Plan cap $200/mo→$100/mo 2026-06-01.",
+      "account_status": "plan_max",
+      "models": {
+        "claude-opus-4-7": {"cost_in_per_m": 5, "cost_out_per_m": 25, "ctx": 200000, "arena_elo": 1502, "swe_bench": 0.876, "quality": 0.95, "tier": "C_reserve", "tags": ["g1-only","triage-critical","forbidden-in-zc-stack"]},
+        "claude-sonnet-4-6": {"cost_in_per_m": 3, "cost_out_per_m": 15, "ctx": 1000000, "quality": 0.90, "tier": "C_reserve"},
+        "claude-haiku-4-5": {"cost_in_per_m": 1, "cost_out_per_m": 5, "ctx": 200000, "quality": 0.75, "tier": "C_reserve"}
+      }
+    },
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "auth_env": "OPENAI_API_KEY",
+      "notes": "Emergency only. 90% cache + 50% batch discounts stack.",
+      "account_status": "min_balance",
+      "models": {
+        "gpt-5.5": {"cost_in_per_m": 5, "cost_out_per_m": 30, "swe_bench": 0.887, "quality": 0.94, "tier": "C_reserve"}
+      }
+    },
+    "gemini": {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "auth_env": "GEMINI_API_KEY",
+      "notes": "Cheap multimodal options at Flash-Lite. Pro Preview expensive for >200k.",
+      "account_status": "active",
+      "models": {
+        "gemini-2.5-flash-lite": {"cost_in_per_m": 0.10, "cost_out_per_m": 0.40, "tier": "B_fanout", "tags": ["multimodal-cheap"]},
+        "gemini-2.5-flash": {"cost_in_per_m": 0.30, "cost_out_per_m": 2.50, "tier": "B_quality"},
+        "gemini-3-pro-preview": {"cost_in_per_m": 2.00, "cost_out_per_m": 12.00, "tier": "C_reserve"}
+      }
+    }
+  },
+  "tier_picks": {
+    "S_free_default": [
+      "ngc_integrate.moonshotai/kimi-k2.6",
+      "local_cerberus.gemma4-consult",
+      "ngc_integrate.nvidia/nemotron-3-super-120b-a12b",
+      "ngc_integrate.qwen/qwen3-coder-480b-a35b-instruct"
+    ],
+    "B_fanout_high_volume": [
+      "groq.llama-3.1-8b-instant",
+      "deepseek_direct.deepseek-v4-flash",
+      "together.Qwen/Qwen2.5-Coder-32B-Instruct",
+      "groq.openai/gpt-oss-20b",
+      "gemini.gemini-2.5-flash-lite",
+      "xai.grok-4-1-fast"
+    ],
+    "B_quality_surgical": [
+      "deepseek_direct.deepseek-v4-pro",
+      "groq.llama-3.3-70b-versatile",
+      "siliconflow.Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "groq.openai/gpt-oss-120b",
+      "xai.grok-4-1-fast"
+    ],
+    "B_long_context": [
+      "ngc_integrate.minimaxai/minimax-m2.7",
+      "deepseek_direct.deepseek-v4-pro",
+      "xai.grok-4-3",
+      "together.MiniMaxAI/MiniMax-M2.7"
+    ],
+    "B_vision": [
+      "siliconflow.Qwen/Qwen3.6-27B",
+      "gemini.gemini-2.5-flash"
+    ],
+    "B_embedding": [
+      "local_medusa.bge-m3-embedding",
+      "siliconflow.Qwen/Qwen3-Embedding-8B"
+    ],
+    "B_rerank": [
+      "local_medusa.bge-rerank",
+      "siliconflow.Qwen/Qwen3-Reranker-8B"
+    ],
+    "C_g1_critical": [
+      "anthropic.claude-opus-4-7",
+      "openai.gpt-5.5",
+      "deepseek_direct.deepseek-v4-pro"
+    ],
+    "C_avoid": [
+      "together.deepseek-ai/DeepSeek-V4-Pro"
+    ]
+  },
+  "use_case_routing": {
+    "zeroclaw_fanout_routine": {"primary": "groq.llama-3.1-8b-instant", "secondary": "deepseek_direct.deepseek-v4-flash", "fallback": "ngc_integrate.moonshotai/kimi-k2.6"},
+    "zeroclaw_surgical_review": {"primary": "deepseek_direct.deepseek-v4-pro", "secondary": "ngc_integrate.moonshotai/kimi-k2.6", "consensus": ["deepseek_direct.deepseek-v4-pro","ngc_integrate.moonshotai/kimi-k2.6"]},
+    "code_review_g1": {"primary": "anthropic.claude-opus-4-7", "consensus": ["anthropic.claude-opus-4-7","openai.gpt-5.5","deepseek_direct.deepseek-v4-pro"]},
+    "architecture_audit": {"primary": "ngc_integrate.nvidia/nemotron-3-super-120b-a12b", "params": {"thinking": false}},
+    "long_context_500k_plus": {"primary": "ngc_integrate.minimaxai/minimax-m2.7", "secondary": "deepseek_direct.deepseek-v4-pro"},
+    "agent_loop_speed": {"primary": "groq.llama-3.3-70b-versatile", "secondary": "groq.llama-3.1-8b-instant"},
+    "embeddings": {"primary": "local_medusa.bge-m3-embedding"},
+    "rerank": {"primary": "local_medusa.bge-rerank"},
+    "transcription": {"primary": "groq.whisper-large-v3-turbo"},
+    "vision_reasoning": {"primary": "siliconflow.Qwen/Qwen3.6-27B"}
+  },
+  "spend_caps_per_week_usd": {
+    "anthropic": 30,
+    "openai": 20,
+    "together": 25,
+    "xai": 30,
+    "gemini": 20,
+    "perplexity": 15,
+    "deepseek_direct": 30,
+    "deepseek-direct": 30,
+    "groq": 50,
+    "siliconflow": 20,
+    "ngc_integrate": 999999,
+    "ngc_inference": 999999,
+    "local_cerberus": 999999,
+    "local_medusa": 999999,
+    "TOTAL_TARGET": 200
+  }
+}

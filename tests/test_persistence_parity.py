@@ -22,10 +22,13 @@ from mnemos.persistence import (
     BranchRepository,
     CompressionRepository,
     ConsultationAuditRepository,
+    ConsultationsRepository,
     FederationRepository,
     KGRepository,
     MemoryRepository,
+    OAuthRepository,
     PersistenceBackend,
+    SessionsRepository,
     PostgresBackend,
     SqliteBackend,
     SqliteTransaction,
@@ -419,6 +422,9 @@ async def test_backend_exposes_all_repository_properties(backend_case: BackendCa
     assert isinstance(backend.compression, CompressionRepository)
     assert isinstance(backend.webhooks, WebhookRepository)
     assert isinstance(backend.consultations_audit, ConsultationAuditRepository)
+    assert isinstance(backend.oauth, OAuthRepository)
+    assert isinstance(backend.sessions, SessionsRepository)
+    assert isinstance(backend.consultations, ConsultationsRepository)
     assert isinstance(backend.federation, FederationRepository)
     assert isinstance(backend.state_kv, StateRepository)
 
@@ -1202,9 +1208,9 @@ async def test_model_recommendation_lookup_and_available_models(backend_case: Ba
         provider_lookup = await backend_case.backend.consultations_audit.lookup_provider_for_model(tx, "reasoner")
         available = await backend_case.backend.consultations_audit.fetch_available_models(tx)
         model_provider = await backend_case.backend.consultations_audit.fetch_model_provider(tx, "reasoner")
-    assert required == ["reasoning", "logic"]
+    assert required == ["reasoning"]
     assert recommended["model_id"] == "reasoner"
-    assert fallback["model_id"] == "reasoner"
+    assert fallback is None
     assert provider_lookup == provider
     assert any(row["model_id"] == "reasoner" for row in available)
     assert model_provider == provider

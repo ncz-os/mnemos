@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 # ── Key store ──────────────────────────────────────────────────────────────────
 
+
 def _load_key(provider: str) -> Optional[str]:
     """Load API key from the Provider Registry File."""
     try:
@@ -55,13 +56,14 @@ import re as _re
 def _model_family(model_id: str) -> str:
     """Extract major-version family for dedup / replace-vs-add logic."""
     name = model_id.lower().strip()
-    m = _re.match(r'^((?:[a-z][a-z0-9]*-)*[a-z][a-z0-9]*-\d+)[\.\-]', name)
+    m = _re.match(r"^((?:[a-z][a-z0-9]*-)*[a-z][a-z0-9]*-\d+)[\.\-]", name)
     if m:
         return m.group(1)
-    return name.split('.')[0]
+    return name.split(".")[0]
 
 
 # ── Per-provider fetch functions ───────────────────────────────────────────────
+
 
 async def _fetch_openai_compatible(
     base_url: str,
@@ -89,17 +91,19 @@ async def _fetch_openai_compatible(
             continue
         if model_filter and not model_filter(mid, item):
             continue
-        models.append({
-            "provider":           provider,
-            "model_id":           mid,
-            "display_name":       item.get("name") or item.get("display_name") or mid,
-            "family":             _model_family(mid),
-            "context_window":     item.get("context_window") or item.get("context_length"),
-            "max_output_tokens":  item.get("max_output_tokens") or item.get("max_tokens"),
-            "capabilities":       _infer_capabilities(mid, item),
-            "available":          True,
-            "raw":                item,
-        })
+        models.append(
+            {
+                "provider": provider,
+                "model_id": mid,
+                "display_name": item.get("name") or item.get("display_name") or mid,
+                "family": _model_family(mid),
+                "context_window": item.get("context_window") or item.get("context_length"),
+                "max_output_tokens": item.get("max_output_tokens") or item.get("max_tokens"),
+                "capabilities": _infer_capabilities(mid, item),
+                "available": True,
+                "raw": item,
+            }
+        )
     return models
 
 
@@ -166,9 +170,7 @@ async def _fetch_nvidia(timeout: int = 20) -> list[dict]:
         # NVIDIA NIM hosts many providers; we want nvidia/* models only
         return mid.startswith("nvidia/") or mid.startswith("meta/") or "/" not in mid
 
-    return await _fetch_openai_compatible(
-        "https://integrate.api.nvidia.com", key, "nvidia", _filter, timeout
-    )
+    return await _fetch_openai_compatible("https://integrate.api.nvidia.com", key, "nvidia", _filter, timeout)
 
 
 async def _fetch_gemini(timeout: int = 20) -> list[dict]:
@@ -203,17 +205,19 @@ async def _fetch_gemini(timeout: int = 20) -> list[dict]:
                     methods = item.get("supportedGenerationMethods", [])
                     if "generateContent" not in methods:
                         continue
-                    models.append({
-                        "provider":           "gemini",
-                        "model_id":           mid,
-                        "display_name":       item.get("displayName") or mid,
-                        "family":             _model_family(mid),
-                        "context_window":     item.get("inputTokenLimit"),
-                        "max_output_tokens":  item.get("outputTokenLimit"),
-                        "capabilities":       _infer_capabilities(mid, item),
-                        "available":          True,
-                        "raw":                item,
-                    })
+                    models.append(
+                        {
+                            "provider": "gemini",
+                            "model_id": mid,
+                            "display_name": item.get("displayName") or mid,
+                            "family": _model_family(mid),
+                            "context_window": item.get("inputTokenLimit"),
+                            "max_output_tokens": item.get("outputTokenLimit"),
+                            "capabilities": _infer_capabilities(mid, item),
+                            "available": True,
+                            "raw": item,
+                        }
+                    )
 
                 page_token = data.get("nextPageToken")
                 if not page_token:
@@ -240,10 +244,10 @@ def _fetch_anthropic_static() -> list[dict]:
             "context_window": 200000,
             "max_output_tokens": 32768,
             "capabilities": ["chat", "code", "reasoning", "vision"],
-            "input_cost_per_mtok":  15.00,
+            "input_cost_per_mtok": 15.00,
             "output_cost_per_mtok": 75.00,
-            "cache_read_per_mtok":   1.50,
-            "cache_write_per_mtok":  3.75,
+            "cache_read_per_mtok": 1.50,
+            "cache_write_per_mtok": 3.75,
             "available": True,
             "raw": {"source": "static", "docs": "https://docs.anthropic.com/en/docs/about-claude/models"},
         },
@@ -255,10 +259,10 @@ def _fetch_anthropic_static() -> list[dict]:
             "context_window": 200000,
             "max_output_tokens": 32768,
             "capabilities": ["chat", "code", "reasoning", "vision"],
-            "input_cost_per_mtok":  15.00,
+            "input_cost_per_mtok": 15.00,
             "output_cost_per_mtok": 75.00,
-            "cache_read_per_mtok":   1.50,
-            "cache_write_per_mtok":  3.75,
+            "cache_read_per_mtok": 1.50,
+            "cache_write_per_mtok": 3.75,
             "available": True,
             "raw": {"source": "static", "docs": "https://docs.anthropic.com/en/docs/about-claude/models"},
         },
@@ -270,10 +274,10 @@ def _fetch_anthropic_static() -> list[dict]:
             "context_window": 200000,
             "max_output_tokens": 16384,
             "capabilities": ["chat", "code", "reasoning", "vision"],
-            "input_cost_per_mtok":  3.00,
+            "input_cost_per_mtok": 3.00,
             "output_cost_per_mtok": 15.00,
-            "cache_read_per_mtok":   0.30,
-            "cache_write_per_mtok":  3.75,
+            "cache_read_per_mtok": 0.30,
+            "cache_write_per_mtok": 3.75,
             "available": True,
             "raw": {"source": "static", "docs": "https://docs.anthropic.com/en/docs/about-claude/models"},
         },
@@ -285,9 +289,9 @@ def _fetch_anthropic_static() -> list[dict]:
             "context_window": 200000,
             "max_output_tokens": 8192,
             "capabilities": ["chat", "code", "vision"],
-            "input_cost_per_mtok":  0.80,
+            "input_cost_per_mtok": 0.80,
             "output_cost_per_mtok": 4.00,
-            "cache_read_per_mtok":  0.08,
+            "cache_read_per_mtok": 0.08,
             "cache_write_per_mtok": 1.00,
             "available": True,
             "raw": {"source": "static", "docs": "https://docs.anthropic.com/en/docs/about-claude/models"},
@@ -306,7 +310,7 @@ def _fetch_perplexity_static() -> list[dict]:
             "context_window": 200000,
             "max_output_tokens": 8000,
             "capabilities": ["chat", "web_search"],
-            "input_cost_per_mtok":  3.00,
+            "input_cost_per_mtok": 3.00,
             "output_cost_per_mtok": 15.00,
             "available": True,
             "raw": {"source": "static"},
@@ -319,7 +323,7 @@ def _fetch_perplexity_static() -> list[dict]:
             "context_window": 128000,
             "max_output_tokens": 8000,
             "capabilities": ["chat", "web_search"],
-            "input_cost_per_mtok":  1.00,
+            "input_cost_per_mtok": 1.00,
             "output_cost_per_mtok": 1.00,
             "available": True,
             "raw": {"source": "static"},
@@ -332,7 +336,7 @@ def _fetch_perplexity_static() -> list[dict]:
             "context_window": 128000,
             "max_output_tokens": 8000,
             "capabilities": ["chat", "web_search", "reasoning"],
-            "input_cost_per_mtok":  2.00,
+            "input_cost_per_mtok": 2.00,
             "output_cost_per_mtok": 8.00,
             "available": True,
             "raw": {"source": "static"},
@@ -340,7 +344,56 @@ def _fetch_perplexity_static() -> list[dict]:
     ]
 
 
+def _fetch_deepseek_direct_static() -> list[dict]:
+    """DeepSeek direct model seed used until the model API exposes full metadata."""
+    return [
+        {
+            "provider": "deepseek-direct",
+            "model_id": "deepseek-v4-flash",
+            "display_name": "DeepSeek V4 Flash",
+            "family": "deepseek-v4",
+            "context_window": 128000,
+            "max_output_tokens": 8192,
+            "capabilities": ["chat", "coding"],
+            "input_cost_per_mtok": 0.14,
+            "output_cost_per_mtok": 0.28,
+            "cache_read_per_mtok": 0.0028,
+            "available": True,
+            "raw": {"source": "static", "capabilities": {"chat": True, "coding": True, "reasoning": False}},
+        },
+        {
+            "provider": "deepseek-direct",
+            "model_id": "deepseek-v4-pro",
+            "display_name": "DeepSeek V4 Pro",
+            "family": "deepseek-v4",
+            "context_window": 128000,
+            "max_output_tokens": 8192,
+            "capabilities": ["chat", "coding", "reasoning"],
+            "input_cost_per_mtok": 0.435,
+            "output_cost_per_mtok": 0.87,
+            "cache_read_per_mtok": 0.003625,
+            "available": True,
+            "raw": {
+                "source": "static",
+                "capabilities": {
+                    "chat": True,
+                    "coding": True,
+                    "reasoning": True,
+                    "promo_until": "2026-05-31",
+                    "post_promo_input_cost_per_mtok": 1.74,
+                    "post_promo_output_cost_per_mtok": 3.48,
+                },
+                "pricing_note": (
+                    "DeepSeek V4 Pro promo pricing effective until 2026-05-31; "
+                    "then input/output costs revert to 1.74/3.48 USD per mtok."
+                ),
+            },
+        },
+    ]
+
+
 # ── Capabilities inference ─────────────────────────────────────────────────────
+
 
 def _infer_capabilities(model_id: str, item: dict) -> list[str]:
     """Infer model capabilities from ID and API response metadata."""
@@ -367,6 +420,7 @@ def _infer_capabilities(model_id: str, item: dict) -> list[str]:
 
 # ── DB upsert ──────────────────────────────────────────────────────────────────
 
+
 async def upsert_models(pool, models: list[dict], dry_run: bool = False) -> tuple[int, int, int]:
     """Upsert model list into model_registry.
 
@@ -387,7 +441,8 @@ async def upsert_models(pool, models: list[dict], dry_run: bool = False) -> tupl
 
                 existing = await conn.fetchrow(
                     "SELECT id, available FROM model_registry WHERE provider=$1 AND model_id=$2",
-                    m["provider"], m["model_id"],
+                    m["provider"],
+                    m["model_id"],
                 )
 
                 raw_json = json.dumps(m.get("raw", {}))
@@ -403,14 +458,19 @@ async def upsert_models(pool, models: list[dict], dry_run: bool = False) -> tupl
                              available, last_seen, last_synced, raw)
                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,TRUE,$12,$12,$13)
                            ON CONFLICT (provider, model_id) DO NOTHING""",
-                        m["provider"], m["model_id"],
+                        m["provider"],
+                        m["model_id"],
                         m.get("display_name") or m["model_id"],
                         m.get("family") or _model_family(m["model_id"]),
-                        m.get("context_window"), m.get("max_output_tokens"),
+                        m.get("context_window"),
+                        m.get("max_output_tokens"),
                         caps,
-                        m.get("input_cost_per_mtok", 0), m.get("output_cost_per_mtok", 0),
-                        m.get("cache_read_per_mtok", 0), m.get("cache_write_per_mtok", 0),
-                        now, raw_json,
+                        m.get("input_cost_per_mtok", 0),
+                        m.get("output_cost_per_mtok", 0),
+                        m.get("cache_read_per_mtok", 0),
+                        m.get("cache_write_per_mtok", 0),
+                        now,
+                        raw_json,
                     )
                     added += 1
                     logger.info(f"[SYNC] ADD {m['provider']}/{m['model_id']}")
@@ -423,11 +483,15 @@ async def upsert_models(pool, models: list[dict], dry_run: bool = False) -> tupl
                             capabilities=$7,
                             available=TRUE, last_seen=$8, last_synced=$8, raw=$9
                            WHERE provider=$1 AND model_id=$2""",
-                        m["provider"], m["model_id"],
+                        m["provider"],
+                        m["model_id"],
                         m.get("display_name") or m["model_id"],
                         m.get("family") or _model_family(m["model_id"]),
-                        m.get("context_window"), m.get("max_output_tokens"),
-                        caps, now, raw_json,
+                        m.get("context_window"),
+                        m.get("max_output_tokens"),
+                        caps,
+                        now,
+                        raw_json,
                     )
                     updated += 1
 
@@ -440,7 +504,8 @@ async def upsert_models(pool, models: list[dict], dry_run: bool = False) -> tupl
                         """UPDATE model_registry SET available=FALSE
                            WHERE provider=$1 AND model_id != ALL($2::text[])
                              AND available=TRUE""",
-                        provider, seen_ids,
+                        provider,
+                        seen_ids,
                     )
                     # asyncpg returns "UPDATE N" string
                     try:
@@ -453,9 +518,16 @@ async def upsert_models(pool, models: list[dict], dry_run: bool = False) -> tupl
     return added, updated, deprecated
 
 
-async def log_sync(pool, provider: str, models_found: int, added: int,
-                   updated: int, deprecated: int, error: Optional[str],
-                   duration_ms: int) -> None:
+async def log_sync(
+    pool,
+    provider: str,
+    models_found: int,
+    added: int,
+    updated: int,
+    deprecated: int,
+    error: Optional[str],
+    duration_ms: int,
+) -> None:
     """Write a row to model_registry_sync_log."""
     try:
         async with pool.acquire() as conn:
@@ -464,7 +536,13 @@ async def log_sync(pool, provider: str, models_found: int, added: int,
                     (provider, models_found, models_added, models_updated,
                      models_deprecated, error, duration_ms)
                    VALUES ($1,$2,$3,$4,$5,$6,$7)""",
-                provider, models_found, added, updated, deprecated, error, duration_ms,
+                provider,
+                models_found,
+                added,
+                updated,
+                deprecated,
+                error,
+                duration_ms,
             )
     except Exception as exc:
         logger.warning(f"[SYNC] failed to write sync log for {provider}: {exc}")
@@ -473,16 +551,17 @@ async def log_sync(pool, provider: str, models_found: int, added: int,
 # ── Orchestrator ───────────────────────────────────────────────────────────────
 
 _LIVE_PROVIDERS = {
-    "openai":    _fetch_openai,
-    "xai":       _fetch_xai,
-    "groq":      _fetch_groq,
-    "together":  _fetch_together,
-    "nvidia":    _fetch_nvidia,
-    "gemini":    _fetch_gemini,
+    "openai": _fetch_openai,
+    "xai": _fetch_xai,
+    "groq": _fetch_groq,
+    "together": _fetch_together,
+    "nvidia": _fetch_nvidia,
+    "gemini": _fetch_gemini,
 }
 
 _STATIC_PROVIDERS = {
-    "anthropic":  _fetch_anthropic_static,
+    "anthropic": _fetch_anthropic_static,
+    "deepseek-direct": _fetch_deepseek_direct_static,
     "perplexity": _fetch_perplexity_static,
 }
 
@@ -523,14 +602,14 @@ async def sync_provider(
         await log_sync(pool, provider, len(models), added, updated, deprecated, error, duration_ms)
 
     return {
-        "provider":         provider,
-        "models_found":     len(models),
-        "models_added":     added if not dry_run else 0,
-        "models_updated":   updated if not dry_run else 0,
-        "models_deprecated":deprecated if not dry_run else 0,
-        "error":            error,
-        "duration_ms":      duration_ms,
-        "dry_run":          dry_run,
+        "provider": provider,
+        "models_found": len(models),
+        "models_added": added if not dry_run else 0,
+        "models_updated": updated if not dry_run else 0,
+        "models_deprecated": deprecated if not dry_run else 0,
+        "error": error,
+        "duration_ms": duration_ms,
+        "dry_run": dry_run,
     }
 
 
@@ -560,6 +639,7 @@ async def sync_all_providers(
 
 
 # ── Arena score update (called by update_model_registry.py) ───────────────────
+
 
 async def update_arena_scores(
     pool,
@@ -596,7 +676,11 @@ async def update_arena_scores(
                 """UPDATE model_registry
                    SET arena_score=$3, arena_rank=$4, graeae_weight=$5
                    WHERE provider=$1 AND model_id=$2""",
-                prov, model_id, arena_score, arena_rank, weight,
+                prov,
+                model_id,
+                arena_score,
+                arena_rank,
+                weight,
             )
             rows_updated = int(result.split()[-1]) if result else 0
 
@@ -607,7 +691,11 @@ async def update_arena_scores(
                     """UPDATE model_registry
                        SET arena_score=$3, arena_rank=$4, graeae_weight=$5
                        WHERE provider=$1 AND family=$2""",
-                    prov, family, arena_score, arena_rank, weight,
+                    prov,
+                    family,
+                    arena_score,
+                    arena_rank,
+                    weight,
                 )
                 rows_updated = int(result.split()[-1]) if result else 0
                 if rows_updated:
@@ -646,6 +734,7 @@ if __name__ == "__main__":
         pool = None
         if not args.dry_run:
             from mnemos.core import lifecycle as _lc
+
             await _lc.startup()
             pool = _lc._pool
 

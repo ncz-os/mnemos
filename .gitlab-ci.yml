@@ -21,8 +21,15 @@ default:
         - pyproject.toml
     paths:
       - .cache/pip
+      - .venv
   before_script:
-    - pip install --cache-dir=.cache/pip -e ".[dev]"
+    # ARGOS runner is user-mode + Debian 13 (PEP 668). Cannot install into
+    # /usr/local/lib/python3.13/dist-packages without root and cannot use
+    # --system. Use a project-local venv that we cache between runs.
+    - export PATH="/usr/local/bin:/home/jasonperlow/.local/bin:$PATH"
+    - test -d .venv || uv venv .venv
+    - . .venv/bin/activate
+    - uv pip install --cache-dir=.cache/pip -e ".[dev]"
 
 variables:
   PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
@@ -55,6 +62,20 @@ lint:import-linter:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
+
+lint:migration-parity:
+  stage: lint
+  tags: [argos, ncz-os]
+  script:
+    # MR pipelines: --mode diff against CI_MERGE_REQUEST_DIFF_BASE_SHA
+    #               (only blocks NEW additions vs target branch).
+    # Branch pipelines (post-merge): full mode would flag the 20
+    #               grandfathered violations + always red, so skip.
+    # Prevents the audit-persistence gap pattern that surfaced 2026-05-23
+    # (GRAEAE consultations in PG, missing from Oracle, 503).
+    - python3 scripts/check_migration_parity.py --mode diff
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 lint:env-discipline:
   stage: lint
@@ -114,7 +135,7 @@ test:integration:
     MNEMOS_TEST_DB: "postgresql://postgres:test@postgres:5432/mnemos_test"
     RATE_LIMIT_STORAGE_URI: "redis://redis:6379/0"
   before_script:
-    - pip install --cache-dir=.cache/pip -e ".[dev]"
+    - . .venv/bin/activate && uv pip install --cache-dir=.cache/pip -e ".[dev]"
     # Wait for Postgres to accept connections (pgvector image does not
     # signal readiness; poll until psql connects).
     - |
@@ -226,7 +247,7 @@ test:persistence-parity:
     DATABASE_URL: "postgresql://postgres:test@postgres:5432/mnemos_test"
     MNEMOS_TEST_DB: "postgresql://postgres:test@postgres:5432/mnemos_test"
   before_script:
-    - pip install --cache-dir=.cache/pip -e ".[dev,sqlite]"
+    - . .venv/bin/activate && uv pip install --cache-dir=.cache/pip -e ".[dev,sqlite]"
     - |
       for i in $(seq 1 30); do
         if pg_isready -h postgres -U postgres -t 1 >/dev/null 2>&1; then
@@ -355,7 +376,7 @@ build:docker:
   stage: release
   tags: [argos, ncz-os]
   before_script:
-    - pip install --cache-dir=.cache/pip -e ".[build]"
+    - . .venv/bin/activate && uv pip install --cache-dir=.cache/pip -e ".[build]"
   script:
     - bash scripts/build-binary.sh
   artifacts:
@@ -396,7 +417,7 @@ test:oracle-smoke:
   stage: test
   tags: [argos, ncz-os]
   script:
-    - pip install oracledb
+    - . .venv/bin/activate && uv pip install oracledb
     - |
       python -c '
       import oracledb

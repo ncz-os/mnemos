@@ -28,6 +28,8 @@ from mnemos.core.lifecycle import (
 )
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
+from mnemos.audit import write_audit_entry
+from mnemos.domain.search import SearchProfile, apply_decay, get_reranker, load_decay_table, resolve_profile
 from mnemos.domain.artemis_dedup import (
     duplicate_content_error_body,
     evaluate_memory_create_dedup,
@@ -302,17 +304,15 @@ async def _bump_recall_counters(memory_ids: list) -> None:
     Single UPDATE for the whole hit set, so search hits with N memories
     cost one DB round-trip not N.
     """
-    if not memory_ids or not _lc._pool:
+    if not memory_ids:
         return
     try:
-        async with _lc.get_pool_manager().acquire() as conn:
-            await conn.execute(
+        backend = _backend_or_503()
+        async with backend.transactional() as tx:
+            await tx.conn.execute(
                 "UPDATE memories "
-                "SET recall_count = recall_count + 1, "
-                "    last_recalled_at = now() "
-                "WHERE id = ANY($1::text[]) "
-                "AND deleted_at IS NULL "
-                "AND archived_at IS NULL",
+                "SET recall_count = recall_count + 1, last_recalled_at = now() "
+                "WHERE id = ANY($1::text[]) AND deleted_at IS NULL AND archived_at IS NULL",
                 list(memory_ids),
             )
     except Exception as e:
@@ -464,9 +464,9 @@ async def get_memory(
             )
         from mnemos.domain.persephone.runner import restore_memory as _restore_archived_memory
 
-        require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}?restore=true")
+        pool = require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}?restore=true")
         try:
-            async with _lc.get_pool_manager().acquire() as conn:
+            async with pool.acquire() as conn:
                 await _restore_archived_memory(conn, memory_id, user.user_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -552,9 +552,9 @@ async def get_compression_manifests(
     operators can reason about what was tried, what scored how, and why
     each engine was or wasn't picked.
     """
-    require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}/compression-manifests")
+    pool = require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}/compression-manifests")
 
-    async with _lc.get_pool_manager().acquire() as conn:
+    async with pool.acquire() as conn:
         async with _rls_context(conn, user):
             # Enforce memory visibility — check owner + namespace for
             # non-root so manifests for cross-tenant memories don't
@@ -694,7 +694,20 @@ async def search_memories(
     """Search memories with optional 5-minute response caching."""
     search_trace_id = uuid4().hex[:8]
     search_started_at = time.monotonic()
-    request_limit = min(request.limit, 500)  # server-side cap regardless of model field
+    # v6.2 M-2.2.3: validate retrieval profile (unknown → 400). Default
+    # = balanced (current behavior); deep enables cross-encoder rerank.
+    try:
+        search_profile = resolve_profile(request.profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    # Per-profile limit cap (spec § Design table): fast=25, balanced=100,
+    # deep=200. Server-side hard cap of 500 still applies on top.
+    _profile_caps = {
+        SearchProfile.FAST: 25,
+        SearchProfile.BALANCED: 100,
+        SearchProfile.DEEP: 200,
+    }
+    request_limit = min(request.limit, _profile_caps[search_profile], 500)
     _log_search_phase(search_trace_id, search_started_at, "parse")
 
     # v3.1.2 Tier 3: pin owner_id + namespace to the caller's identity
@@ -754,6 +767,7 @@ async def search_memories(
         request.include_archived,
         request.boost_recency,
         request.recency_weight,
+        search_profile.value,  # v6.2 M-2.2.3: distinct cache per profile
     )
 
     if _lc._cache and not request.include_compressed:
@@ -830,6 +844,54 @@ async def search_memories(
     _log_search_phase(search_trace_id, search_started_at, "metadata_fetch")
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
 
+    # v6.2 M-2.2.3: cross-encoder rerank for deep profile.
+    # Reranker returns [] on breaker-open / error — we keep original
+    # order in that case (no hard failure on search path).
+    if search_profile is SearchProfile.DEEP and memories:
+        try:
+            reranker = get_reranker()
+            docs = [m.content or "" for m in memories]
+            scores = await reranker.rerank(request.query, docs)
+            if scores and len(scores) == len(memories):
+                indexed = sorted(
+                    range(len(memories)),
+                    key=lambda i: scores[i],
+                    reverse=True,
+                )
+                memories = [memories[i] for i in indexed]
+                logger.info(
+                    "[SEARCH] profile=deep reranked n=%d trace=%s",
+                    len(memories),
+                    search_trace_id,
+                )
+        except Exception as exc:  # safety net; reranker.rerank should not raise
+            logger.warning(
+                "[SEARCH] reranker dispatch failed trace=%s err=%s",
+                search_trace_id,
+                exc,
+            )
+
+    # v6.2 M-2.2.4: per-category temporal decay applied AFTER any
+    # reranker (deep profile) but BEFORE the response. Decay is
+    # cheap (process-local TTL cache + per-row math), so it runs
+    # unconditionally when the table exists. Override map from the
+    # request overrides per-category half-life or "*" flattens all.
+    if memories:
+        try:
+            decay_table = await load_decay_table(backend)
+            if decay_table or request.decay_overrides:
+                memories = apply_decay(
+                    memories,
+                    decay_table,
+                    overrides=request.decay_overrides,
+                    recency_weight=request.recency_weight,
+                )
+        except Exception:
+            logger.exception(
+                "[SEARCH] decay application failed trace=%s; returning unsorted",
+                search_trace_id,
+            )
+
     # Fire-and-forget recall-frequency bump for the hit set.
     # Doesn't block the response; failure here is logged and ignored
     # (recall counters are observability, not user-content correctness).
@@ -850,7 +912,19 @@ async def search_memories(
 
     if _lc._cache and not request.include_compressed and not compression_applied:
         try:
-            await _lc._cache.setex(cache_key, 300, response.model_dump_json())
+            # v6.2 M-2.2.3: per-profile cache TTL. fast/balanced 5min;
+            # deep 30s (less cacheable per spec — reranker scoring drifts
+            # faster as memories churn).
+            _profile_ttl = {
+                SearchProfile.FAST: 300,
+                SearchProfile.BALANCED: 300,
+                SearchProfile.DEEP: 30,
+            }
+            await _lc._cache.setex(
+                cache_key,
+                _profile_ttl[search_profile],
+                response.model_dump_json(),
+            )
         except Exception as e:
             logger.warning(f"[CACHE] search write error: {e}")
 
@@ -952,6 +1026,36 @@ async def create_memory(
                     "[create_memory] inline embed failed for %s; row will be backfilled",
                     mem_id,
                 )
+            # v6.2 M-2.2.1 audit chain entry. Gated by MNEMOS_AUDIT_CHAIN=on
+            # via the audit_sealer helper; backend.audit_chain is None on
+            # backends pre-implementation (Db2 live-test blocked on 12.1.5
+            # GA), so write_audit_entry no-ops there. Errors are logged
+            # but never re-raised — audit is a consistency layer, not a
+            # write prerequisite.
+            from mnemos.core.config import get_settings as _get_settings
+            from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
+
+            if _ace():
+                _settings = _get_settings()
+                _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
+                if _session_secret:
+                    await write_audit_entry(
+                        backend,
+                        tx,
+                        op="create",
+                        memory_id_str=mem_id,
+                        content=request.content,
+                        category=request.category,
+                        subcategory=request.subcategory,
+                        metadata=request.metadata,
+                        embedding=None,  # raw bytes for embedding hash; omitted for now
+                        writer_id=user.user_id,
+                        session_secret=_session_secret,
+                    )
+                else:
+                    logger.warning(
+                        "[create_memory] MNEMOS_AUDIT_CHAIN=on but " "session_secret is empty; skipping audit write"
+                    )
             # Same-tx outbox enqueue — preserves the v4.0 contract
             # that webhook_deliveries rows commit atomically with
             # the data write.
@@ -1176,6 +1280,28 @@ async def update_memory(
                     status_code=404,
                     detail=f"Memory {memory_id} not found",
                 )
+            # v6.2 M-2.2.1 audit-chain entry. Same gate + same-tx
+            # commit as create_memory above (see commit e6d0677).
+            from mnemos.core.config import get_settings as _get_settings
+            from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
+
+            if _ace():
+                _settings = _get_settings()
+                _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
+                if _session_secret:
+                    await write_audit_entry(
+                        backend,
+                        tx,
+                        op="update",
+                        memory_id_str=memory_id,
+                        content=row["content"],
+                        category=row["category"],
+                        subcategory=row["subcategory"],
+                        metadata=request.metadata,
+                        embedding=None,
+                        writer_id=user.user_id,
+                        session_secret=_session_secret,
+                    )
             delivery_ids = await backend.webhooks.dispatch_event(
                 tx,
                 "memory.updated",
@@ -1257,6 +1383,29 @@ async def delete_memory(
                     status_code=404,
                     detail=f"Memory {memory_id} not found",
                 )
+            # v6.2 M-2.2.1 audit-chain delete entry. Same gate as
+            # create/update; captures the final state of the row at
+            # the delete point so the chain still verifies post-purge.
+            from mnemos.core.config import get_settings as _get_settings
+            from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
+
+            if _ace():
+                _settings = _get_settings()
+                _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
+                if _session_secret:
+                    await write_audit_entry(
+                        backend,
+                        tx,
+                        op="delete",
+                        memory_id_str=memory_id,
+                        content=row["content"],
+                        category=row["category"],
+                        subcategory=row["subcategory"],
+                        metadata=None,
+                        embedding=None,
+                        writer_id=user.user_id,
+                        session_secret=_session_secret,
+                    )
             delivery_ids = await backend.webhooks.dispatch_event(
                 tx,
                 "memory.deleted",
@@ -1364,7 +1513,8 @@ async def rehydrate_memories(
         "ORDER BY rank DESC LIMIT $2"
     )
 
-    async with _lc.get_pool_manager().acquire() as conn:
+    pool = require_postgres_pool_or_503(route_label="POST /v1/memories/rehydrate")
+    async with pool.acquire() as conn:
         async with _rls_context(conn, user):
             rows = await conn.fetch(sql, *sql_params)
 

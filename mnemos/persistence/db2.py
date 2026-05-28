@@ -23,6 +23,7 @@ import asyncio
 import logging
 import os
 import re
+import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -30,20 +31,34 @@ from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 from mnemos.persistence.oracle import (
+    OracleAuditChainRepository,
     OracleBackend,
     OracleBranchRepository,
     OracleCompressionRepository,
     OracleConsultationAuditRepository,
+    OracleConsultationsRepository,
     OracleFederationRepository,
     OracleKGRepository,
     OracleMemoryRepository,
+    OracleOAuthRepository,
+    OracleSessionsRepository,
     OracleStateRepository,
     OracleVersionRepository,
     OracleWebhookRepository,
     _call,
     _conn_from_tx,
+    _content_hash,
     _fetch_all_dicts,
+    _is_unique_violation,
+    _json_text,
+    _json_value,
+    _raw_to_uuid,
+    _raw_token,
+    _raw_token_text,
     _render_visibility,
+    _row_to_dict,
+    _ts_for_oracle,
+    _uuid_to_raw,
     _validate_and_format_vector,
 )
 from mnemos.persistence.types import Row
@@ -420,6 +435,113 @@ class _Db2AsyncConnectionPool:
                 await self._idle.pop().close()
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Native-cursor pass-through (no Oracle → Db2 translation)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class _Db2NativeAsyncCursor:
+    """Async wrapper over ``ibm_db_dbi`` cursor — NO Oracle token translation.
+
+    This cursor passes SQL and params through to the sync cursor verbatim.
+    Use when every repository method emits Db2-native SQL (``?`` positional
+    binds, ``CURRENT TIMESTAMP``, ``FROM SYSIBM.SYSDUMMY1``, etc.).
+
+    Defensive guard: if the incoming SQL contains Oracle-style ``:name``
+    named binds, a ``RuntimeError`` is raised to fail fast rather than
+    silently mangling the query.
+    """
+
+    def __init__(self, sync_cursor: Any):
+        self._cur = sync_cursor
+        self.description = None
+        self.rowcount = -1
+
+    async def execute(self, sql: str, params: tuple | None = None) -> None:
+        if _BIND_RE.search(sql):
+            raise RuntimeError(
+                "native cursor received Oracle :name bind — "
+                "the native path expects ? positional binds only. "
+                "Switch back to Db2Backend (compat) or rewrite the "
+                "caller to emit Db2-native ? binds."
+            )
+
+        def _go():
+            if params:
+                self._cur.execute(sql, params)
+            else:
+                self._cur.execute(sql)
+            self.description = self._cur.description
+            self.rowcount = self._cur.rowcount
+
+        await asyncio.to_thread(_go)
+
+    async def fetchone(self) -> tuple | None:
+        return await asyncio.to_thread(self._cur.fetchone)
+
+    async def fetchall(self) -> list[tuple]:
+        return await asyncio.to_thread(self._cur.fetchall)
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._cur.close)
+
+
+class _Db2NativeAsyncConnection(_Db2AsyncConnection):
+    """Async connection wrapper that produces ``_Db2NativeAsyncCursor``
+    cursors instead of the translation-layer ``_Db2AsyncCursor``.
+    """
+
+    def cursor(self) -> _Db2NativeAsyncCursor:
+        return _Db2NativeAsyncCursor(self._conn.cursor())
+
+
+class _Db2NativeAsyncConnectionPool(_Db2AsyncConnectionPool):
+    """Pool that opens ``_Db2NativeAsyncConnection`` wrappers.
+
+    Shares all acquisition/warmup/timeout logic with
+    :class:`_Db2AsyncConnectionPool`; only the connection wrapper
+    class differs so the pool always yields native cursors.
+    """
+
+    async def _open(self) -> _Db2NativeAsyncConnection:
+        import ibm_db_dbi  # type: ignore
+
+        for k, v in self._dsn_kwargs.items():
+            if not isinstance(v, str):
+                continue
+            if ";" in v or "=" in v and k != "PORT":
+                raise ValueError(
+                    f"DSN attribute {k} contains forbidden char (; or =); " "would allow CLI attribute injection."
+                )
+        dsn_string = ";".join(f"{k}={v}" for k, v in self._dsn_kwargs.items()) + ";"
+        raw = await asyncio.to_thread(ibm_db_dbi.connect, dsn_string, "", "")
+        return _Db2NativeAsyncConnection(raw)
+
+
+async def create_db2_native_pool(
+    dsn: str,
+    *,
+    min_size: int = 1,
+    max_size: int = 8,
+    acquire_timeout: float = 30.0,
+) -> _Db2NativeAsyncConnectionPool:
+    """Create a DB2 native-cursor async pool from a DSN.
+
+    Mirrors :func:`create_db2_pool` but produces
+    :class:`_Db2NativeAsyncConnectionPool` so every acquired connection
+    yields :class:`_Db2NativeAsyncCursor` (no Oracle→Db2 translation).
+    """
+    kwargs = _parse_db2_dsn(dsn)
+    pool = _Db2NativeAsyncConnectionPool(
+        kwargs,
+        min_size=min_size,
+        max_size=max_size,
+        acquire_timeout=acquire_timeout,
+    )
+    await pool.warmup()
+    return pool
+
+
 # Forbidden chars per O10 — used by _parse_db2_dsn validation.
 _DSN_FORBIDDEN_CHARS = (";", "=")
 
@@ -561,11 +683,12 @@ def _resolve_db2_vector_index_mode(settings: Any) -> str:
 
 
 class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
-    """Memory repository — Db2-native ``semantic_search`` override.
+    """Memory repository — Db2-native overrides for core write/read paths.
 
-    All other methods inherit verbatim from
-    :class:`OracleMemoryRepository` and rely on the cursor-layer
-    Oracle→Db2 translation in :class:`_Db2AsyncCursor.execute`.
+    Provides Db2-native SQL for insert, fetch-by-id, update, and
+    semantic-search. These methods emit explicit ``?`` positional binds
+    + ``CURRENT TIMESTAMP`` / ``COALESCE`` instead of relying on the
+    cursor-layer Oracle→Db2 translation.
 
     ``semantic_search`` is overridden because the inherited Oracle SQL
     uses ``VECTOR_DISTANCE(..., COSINE)`` + ``FETCH FIRST K ROWS ONLY``
@@ -696,42 +819,3037 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
 
         return rows
 
+    async def insert_memory(
+        self,
+        tx: Any,
+        *,
+        memory_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        quality_rating: int,
+        owner_id: str,
+        namespace: str,
+        permission_mode: int,
+        source_model: str | None,
+        source_provider: str | None,
+        source_session: str | None,
+        source_agent: str | None,
+        verbatim_content: str | None,
+        created: Any,
+        updated: Any,
+    ) -> str:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        affected = 0
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memories (
+                    id, content, category, subcategory, metadata, content_hash,
+                    quality_rating, verbatim_content, owner_id, namespace,
+                    permission_mode, source_model, source_provider,
+                    source_session, source_agent, created, updated
+                )
+                SELECT
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP),
+                    COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP)
+                FROM SYSIBM.SYSDUMMY1
+                WHERE NOT EXISTS (SELECT 1 FROM memories WHERE id = ?)
+                """,
+                (
+                    memory_id,
+                    content,
+                    category,
+                    subcategory,
+                    metadata_json,
+                    _content_hash(content),
+                    quality_rating,
+                    verbatim_content,
+                    owner_id,
+                    namespace,
+                    permission_mode,
+                    source_model,
+                    source_provider,
+                    source_session,
+                    source_agent,
+                    created,
+                    updated,
+                    memory_id,
+                ),
+            )
+            affected = int(getattr(cursor, "rowcount", 0) or 0)
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                return "INSERT 0 0"
+            raise
+        finally:
+            await _call(cursor.close)
+        return "INSERT 0 1" if affected else "INSERT 0 0"
+
+    async def fetch_memory_by_id(self, tx: Any, memory_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, content, category, subcategory, metadata,
+                       quality_rating, compressed_content, verbatim_content,
+                       owner_id, namespace, permission_mode, source_model,
+                       source_provider, source_session, source_agent,
+                       group_id, created, updated, archived_at, deleted_at
+                  FROM memories
+                 WHERE id = ? AND deleted_at IS NULL
+                """,
+                (memory_id,),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
+        finally:
+            await _call(cursor.close)
+
+    async def upsert_memory_embedding(self, tx: Any, memory_id: str, embedding: Sequence[float]) -> None:
+        """Db2 override: positional bind (?) vs Oracle :name.
+
+        Same shape as Oracle's variant — VECTOR column accepts
+        array.array('f', vec). No-op when embedding is empty.
+        2026-05-24: added so Db2 backend create_memory inline-embed
+        actually writes the vector.
+        """
+        if not embedding:
+            return
+        import array as _array
+
+        arr = _array.array("f", [float(v) for v in embedding])
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET embedding = ? WHERE id = ?",
+                (arr, memory_id),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def update_memory(
+        self,
+        tx: Any,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        fields: dict[str, Any],
+    ) -> Row | None:
+        if not fields:
+            return await self.get_memory(tx, memory_id, visibility=visibility)
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            sets_parts: list[str] = []
+            params_list: list[Any] = []
+            for key, value in fields.items():
+                if key not in self._UPDATABLE_FIELDS:
+                    continue
+                sets_parts.append(f"{key} = ?")
+                params_list.append(value)
+            if "content" in fields and "content" in self._UPDATABLE_FIELDS:
+                sets_parts.append("content_hash = ?")
+                params_list.append(_content_hash(fields["content"]))
+            if not sets_parts:
+                return await self.get_memory(tx, memory_id, visibility=visibility)
+            sets_parts.append("updated = CURRENT TIMESTAMP")
+
+            clause, vis_params = _render_visibility(visibility)
+            where = ["id = ?", "deleted_at IS NULL"]
+            params_list.append(memory_id)
+            if clause:
+                # Convert named binds to positional (?).
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+
+            sql = f"UPDATE memories SET {', '.join(sets_parts)} WHERE " + " AND ".join(where)
+            await _call(cursor.execute, sql, tuple(params_list))
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return None
+        finally:
+            await _call(cursor.close)
+        return await self.get_memory(tx, memory_id, visibility=visibility)
+
+    async def delete_memory(
+        self,
+        tx: Any,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        requested_by: str | None = None,
+        requested_at: Any = None,
+        request_kind: str = "admin_purge",
+        reason: str | None = None,
+        source: Sequence[str] | None = None,
+    ) -> Row | None:
+        _ = (requested_by, requested_at, request_kind, reason, source)
+        row = await self.get_memory(tx, memory_id, visibility=visibility, include_archived=True)
+        if row is None:
+            return None
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility)
+            where = ["id = ?", "deleted_at IS NULL"]
+            params_list: list[Any] = [memory_id]
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET deleted_at = CURRENT TIMESTAMP WHERE " + " AND ".join(where),
+                tuple(params_list),
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return None
+        finally:
+            await _call(cursor.close)
+        return row
+
+    async def list_memories(
+        self,
+        tx: Any,
+        *,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        include_archived: bool = False,
+    ) -> tuple[list[Row], int]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility, table_alias="m")
+            where = ["m.deleted_at IS NULL"]
+            if not include_archived:
+                where.append("m.archived_at IS NULL")
+            params_list: list[Any] = []
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            if category is not None:
+                where.append("m.category = ?")
+                params_list.append(category)
+            if subcategory is not None:
+                where.append("m.subcategory = ?")
+                params_list.append(subcategory)
+            where_sql = " AND ".join(where)
+
+            await _call(
+                cursor.execute,
+                f"SELECT COUNT(*) FROM memories m WHERE {where_sql}",
+                tuple(params_list),
+            )
+            (total,) = await _call(cursor.fetchone) or (0,)
+
+            page_params = tuple(params_list + [offset, limit])
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT m.id, m.content, m.category, m.subcategory, m.metadata,
+                       m.quality_rating, m.compressed_content, m.verbatim_content,
+                       m.owner_id, m.namespace, m.permission_mode, m.source_model,
+                       m.source_provider, m.source_session, m.source_agent,
+                       m.group_id, m.created, m.updated, m.archived_at, m.deleted_at
+                  FROM memories m
+                 WHERE {where_sql}
+                 ORDER BY m.created DESC, m.id ASC
+                 OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+                """,
+                page_params,
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return rows, int(total or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def count_memories(
+        self,
+        tx: Any,
+        *,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        include_archived: bool = False,
+    ) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility, table_alias="m")
+            where = ["m.deleted_at IS NULL"]
+            if not include_archived:
+                where.append("m.archived_at IS NULL")
+            params_list: list[Any] = []
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            if category is not None:
+                where.append("m.category = ?")
+                params_list.append(category)
+            if subcategory is not None:
+                where.append("m.subcategory = ?")
+                params_list.append(subcategory)
+            where_sql = " AND ".join(where)
+            await _call(
+                cursor.execute,
+                f"SELECT COUNT(*) FROM memories m WHERE {where_sql}",
+                tuple(params_list),
+            )
+            (total,) = await _call(cursor.fetchone) or (0,)
+            return int(total or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def get_memory(
+        self,
+        tx: Any,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        include_archived: bool = False,
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility, table_alias="m")
+            where = ["m.id = ?", "m.deleted_at IS NULL"]
+            params_list: list[Any] = [memory_id]
+            if not include_archived:
+                where.append("m.archived_at IS NULL")
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            sql = (
+                "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
+                "m.quality_rating, m.compressed_content, m.verbatim_content, "
+                "m.owner_id, m.namespace, m.permission_mode, m.source_model, "
+                "m.source_provider, m.source_session, m.source_agent, m.group_id, "
+                "m.created, m.updated, m.archived_at, m.deleted_at, "
+                "m.recall_count, m.last_recalled_at, m.content_hash, "
+                "m.federation_source, m.federation_remote_updated "
+                "FROM memories m WHERE " + " AND ".join(where)
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
+        finally:
+            await _call(cursor.close)
+
+    async def assert_memory_readable(self, tx: Any, memory_id: str, user: Any) -> None:
+        from mnemos.core.auth_context import UserContext
+        from mnemos.persistence.visibility import VisibilityScope
+
+        if isinstance(user, UserContext):
+            ns = getattr(user, "namespace", None) or "default"
+            visibility = VisibilityFilter.for_read(user, namespace=ns)
+        else:
+            visibility = VisibilityFilter(
+                scope=VisibilityScope.ROOT_BYPASS,
+                user_id=None,
+                group_ids=(),
+                namespace=None,
+            )
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility, table_alias="m")
+            where = ["m.id = ?"]
+            params_list: list[Any] = [memory_id]
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            sql = "SELECT 1 FROM memories m WHERE " + " AND ".join(where)
+            await _call(cursor.execute, sql, tuple(params_list))
+            rows = await _fetch_all_dicts(cursor)
+            if not rows:
+                raise PermissionError("Memory not found")
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_memory_export(
+        self,
+        tx: Any,
+        *,
+        effective_owner: str | None,
+        effective_ns: str | None,
+        category: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = ["deleted_at IS NULL"]
+            params_list: list[Any] = []
+            for col, val in [
+                ("owner_id", effective_owner),
+                ("namespace", effective_ns),
+                ("category", category),
+            ]:
+                if val is not None:
+                    where.append(f"{col} = ?")
+                    params_list.append(val)
+            params_list.extend([offset, limit])
+            sql = (
+                "SELECT id, content, category, subcategory, created, updated, "
+                "owner_id, namespace, permission_mode, quality_rating, "
+                "source_model, source_provider, source_session, source_agent, "
+                "metadata "
+                "FROM memories WHERE " + " AND ".join(where) + " "
+                "ORDER BY created ASC "
+                "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def fts_search(
+        self,
+        tx: Any,
+        *,
+        query: str,
+        limit: int,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        source_provider: str | None = None,
+        source_model: str | None = None,
+        source_agent: str | None = None,
+        include_archived: bool = False,
+    ) -> list[Row]:
+        # LIKE-based substring search — works in stock Db2 without the
+        # Db2 Text Search Server installed. Operators with Db2 Text Search
+        # can subclass and replace this with CONTAINS(c, 'pattern').
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility, table_alias="m")
+            where = ["m.deleted_at IS NULL"]
+            params_list: list[Any] = []
+            if not include_archived:
+                where.append("m.archived_at IS NULL")
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            search_term = query.strip().strip("%")
+            where.append("UPPER(m.content) LIKE '%' || UPPER(?) || '%'")
+            params_list.append(search_term)
+            for col, val in [
+                ("category", category),
+                ("subcategory", subcategory),
+                ("source_provider", source_provider),
+                ("source_model", source_model),
+                ("source_agent", source_agent),
+            ]:
+                if val is not None:
+                    where.append(f"m.{col} = ?")
+                    params_list.append(val)
+            params_list.append(limit)
+            sql = (
+                "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
+                "m.quality_rating, m.owner_id, m.namespace, m.created, m.updated "
+                "FROM memories m WHERE " + " AND ".join(where) + " "
+                "ORDER BY m.updated DESC FETCH FIRST ? ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def find_active_duplicate_by_content_hash(
+        self,
+        tx: Any,
+        *,
+        owner_id: str,
+        namespace: str,
+        content_hash: str,
+        cross_namespace: bool = False,
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = [
+                "deleted_at IS NULL",
+                "archived_at IS NULL",
+                "content_hash = ?",
+                "owner_id = ?",
+            ]
+            params_list: list[Any] = [content_hash, owner_id]
+            if not cross_namespace:
+                where.append("namespace = ?")
+                params_list.append(namespace)
+            sql = (
+                "SELECT id, content, category, subcategory, owner_id, namespace, "
+                "created, updated FROM memories WHERE " + " AND ".join(where) + " FETCH FIRST 1 ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
+        finally:
+            await _call(cursor.close)
+
+    # ── PR #8d: version-snapshot + recall + stats + memory-log (5 methods) ──
+
+    async def set_suppress_version_snapshot(self, tx: Any) -> None:
+        # No-op — Db2 has no version-snapshot trigger to bypass.
+        # Oracle parent is also a no-op; this override prevents the
+        # compat-mixin from round-tripping through the cursor translator.
+        return None
+
+    async def fetch_versioned_memory_ids(self, tx: Any, memory_ids: Sequence[str]) -> list[Row]:
+        if not memory_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ",".join("?" for _ in memory_ids)
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT DISTINCT memory_id
+                  FROM memory_versions
+                 WHERE memory_id IN ({placeholders})
+                   AND deleted_at IS NULL
+                """,
+                tuple(memory_ids),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def gather_stats(self, tx: Any):
+        from mnemos.persistence.base import MemoryStatsRow
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN metadata IS NULL
+                                 OR LENGTH(COALESCE(metadata, '')) = 0
+                                 OR LOCATE('\"federation_origin\"', COALESCE(metadata, '')) = 0
+                                THEN 1 ELSE 0 END) AS native_count,
+                       SUM(CASE WHEN LOCATE('\"federation_origin\"', COALESCE(metadata, '')) > 0
+                                THEN 1 ELSE 0 END) AS federated_count,
+                       AVG(quality_rating) AS avg_quality
+                  FROM memories
+                 WHERE deleted_at IS NULL
+                """,
+            )
+            row = await _call(cursor.fetchone) or (0, 0, 0, None)
+            total, native, federated, avg_q = row
+            await _call(
+                cursor.execute,
+                """
+                SELECT category, COUNT(*)
+                  FROM memories
+                 WHERE deleted_at IS NULL AND category IS NOT NULL
+                 GROUP BY category
+                """,
+            )
+            by_cat: dict[str, int] = {}
+            for cat, n in await _call(cursor.fetchall) or []:
+                by_cat[str(cat)] = int(n)
+            return MemoryStatsRow(
+                total_memories=int(total or 0),
+                native_memories=int(native or 0),
+                federated_memories=int(federated or 0),
+                memories_by_category=by_cat,
+                avg_quality_rating=float(avg_q) if avg_q is not None else None,
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def bump_recall_and_get_memory(
+        self,
+        tx: Any,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility)
+            where = ["id = ?", "deleted_at IS NULL"]
+            params_list: list[Any] = [memory_id]
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET "
+                "recall_count = COALESCE(recall_count, 0) + 1, "
+                "last_recalled_at = CURRENT TIMESTAMP "
+                "WHERE " + " AND ".join(where),
+                tuple(params_list),
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return None
+        finally:
+            await _call(cursor.close)
+        return await self.get_memory(tx, memory_id, visibility=visibility)
+
+    async def fetch_memory_log(
+        self,
+        tx: Any,
+        memory_id: str,
+        branch: str,
+        limit: int,
+        user: Any,
+    ) -> list[Row]:
+        _ = user
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, memory_id, version_num, content, commit_hash,
+                       parent_version_id, branch, snapshot_at, snapshot_by,
+                       change_type, category, subcategory, owner_id, namespace
+                  FROM memory_versions
+                 WHERE memory_id = ?
+                   AND branch = ?
+                   AND deleted_at IS NULL
+                 ORDER BY version_num DESC
+                 FETCH FIRST ? ROWS ONLY
+                """,
+                (memory_id, branch, limit),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    # ── PR #8e: commit-head / diff / checkout / allowlist / dedup / context
+    #         (7 methods — closes out Memory repository) ──
+
+    async def fetch_memory_head_checks(self, tx: Any, memory_ids: Sequence[str]) -> list[Row]:
+        if not memory_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ",".join("?" for _ in memory_ids)
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT m.id, m.content AS memory_content, mv.content AS head_content
+                  FROM memories m
+                  LEFT JOIN memory_branches b
+                    ON b.memory_id = m.id
+                   AND b.name = 'main'
+                  LEFT JOIN memory_versions mv
+                    ON mv.id = b.head_version_id
+                   AND mv.deleted_at IS NULL
+                 WHERE m.id IN ({placeholders})
+                   AND m.deleted_at IS NULL
+                """,
+                tuple(memory_ids),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_diff_commit_pair(
+        self,
+        tx: Any,
+        memory_id: str,
+        commit_a: str,
+        commit_b: str,
+        user: Any,
+    ) -> tuple[Row | None, Row | None]:
+        _ = user
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            sql = (
+                "SELECT content, version_num FROM memory_versions "
+                "WHERE memory_id = ? AND commit_hash = ? "
+                "AND deleted_at IS NULL"
+            )
+            await _call(cursor.execute, sql, (memory_id, commit_a))
+            row_a = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            await _call(cursor.execute, sql, (memory_id, commit_b))
+            row_b = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            return row_a, row_b
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_checkout_commit(
+        self,
+        tx: Any,
+        memory_id: str,
+        commit_hash: str,
+        user: Any,
+    ) -> Row | None:
+        _ = user
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT commit_hash, version_num, branch, category, subcategory,
+                       content, change_type, snapshot_at, snapshot_by
+                  FROM memory_versions
+                 WHERE memory_id = ?
+                   AND commit_hash = ?
+                   AND deleted_at IS NULL
+                """,
+                (memory_id, commit_hash),
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_referenced_memory_allowlist(
+        self,
+        tx: Any,
+        *,
+        referenced_ids: Sequence[str],
+        scope_owner: str | None = None,
+        scope_namespace: str | None = None,
+    ) -> list[Row]:
+        if not referenced_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ",".join("?" for _ in referenced_ids)
+            where = [f"id IN ({placeholders})", "deleted_at IS NULL"]
+            params_list: list[Any] = list(referenced_ids)
+            if scope_owner is not None:
+                where.append("owner_id = ?")
+                params_list.append(scope_owner)
+            if scope_namespace is not None:
+                where.append("namespace = ?")
+                params_list.append(scope_namespace)
+            sql = "SELECT id, owner_id, namespace FROM memories WHERE " + " AND ".join(where)
+            await _call(cursor.execute, sql, tuple(params_list))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def find_duplicate_content_groups(
+        self,
+        tx: Any,
+        *,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = ["deleted_at IS NULL", "content_hash IS NOT NULL"]
+            params_list: list[Any] = []
+            if namespace is not None:
+                where.append("namespace = ?")
+                params_list.append(namespace)
+            ns_clause = "AND namespace = ?" if namespace is not None else ""
+            sql = (
+                "WITH dup_groups AS ("
+                "SELECT content_hash, COUNT(*) AS cnt "
+                "FROM memories "
+                "WHERE " + " AND ".join(where) + " "
+                "GROUP BY content_hash "
+                "HAVING COUNT(*) > 1"
+                "), "
+                "earliest AS ("
+                "SELECT m.content_hash, "
+                "FIRST_VALUE(m.id) OVER ("
+                "PARTITION BY m.content_hash ORDER BY m.created ASC, m.id ASC"
+                ") AS canonical_id, "
+                "ROW_NUMBER() OVER ("
+                "PARTITION BY m.content_hash ORDER BY m.content_hash"
+                ") AS rn "
+                "FROM memories m "
+                "WHERE m.deleted_at IS NULL AND m.content_hash IS NOT NULL " + ns_clause + ") "
+                "SELECT d.content_hash, d.cnt, e.canonical_id "
+                "FROM dup_groups d "
+                "JOIN (SELECT content_hash, canonical_id FROM earliest WHERE rn = 1) e "
+                "ON d.content_hash = e.content_hash "
+                "ORDER BY d.cnt DESC, d.content_hash ASC"
+            )
+            # Use the same params as where clause, but duplicate for CTE scan if namespace present
+            all_params = tuple(params_list + params_list) if namespace is not None else tuple(params_list)
+            await _call(cursor.execute, sql, all_params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def consolidate_duplicate_memories(
+        self,
+        tx: Any,
+        *,
+        canonical_id: str,
+        duplicate_ids: Sequence[str],
+    ) -> int:
+        if not duplicate_ids:
+            return 0
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ",".join("?" for _ in duplicate_ids)
+            params_list = list(duplicate_ids) + [canonical_id]
+            await _call(
+                cursor.execute,
+                f"""
+                UPDATE memories
+                   SET deleted_at = CURRENT TIMESTAMP
+                 WHERE id IN ({placeholders})
+                   AND id != ?
+                   AND deleted_at IS NULL
+                """,
+                tuple(params_list),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_memory_context(
+        self,
+        tx: Any,
+        query: str,
+        user: Any,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        # Resolve an embedding via the lifecycle-owned embedder. Import
+        # is local to avoid a hard top-level cycle on lifecycle.
+        from mnemos.core.lifecycle import _get_embedding
+        from mnemos.core.security import is_root
+        from mnemos.persistence.visibility import VisibilityScope
+
+        embedding = await _get_embedding(query)
+        if not embedding:
+            return []
+
+        if hasattr(user, "user_id"):
+            if is_root(user):
+                visibility = VisibilityFilter(
+                    scope=VisibilityScope.ROOT_BYPASS,
+                    user_id=None,
+                    group_ids=(),
+                    namespace=None,
+                )
+            else:
+                ns = getattr(user, "namespace", None) or "default"
+                visibility = VisibilityFilter.for_read(user, namespace=ns)
+        else:
+            visibility = VisibilityFilter(
+                scope=VisibilityScope.ROOT_BYPASS,
+                user_id=None,
+                group_ids=(),
+                namespace=None,
+            )
+
+        rows = await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=visibility)
+        return [dict(row) for row in rows]
+
 
 class Db2KGRepository(_Db2OraCompatMixin, OracleKGRepository):
-    """KG triples repository — Oracle SQL auto-translated by cursor layer."""
+    """KG triples repository — Db2-native overrides for insert + fetch.
+
+    All three methods emit explicit native Db2 SQL:
+    - ``?`` positional binds (no ``:name``)
+    - ``CURRENT TIMESTAMP`` / ``CURRENT DATE`` (no ``SYSTIMESTAMP`` / ``SYSDATE``)
+    - ``COALESCE`` (no ``NVL``)
+    - ``DECFLOAT`` for confidence floats (no ``NUMBER``)
+    """
+
+    async def insert_kg_triple(
+        self,
+        tx: Any,
+        *,
+        triple_id: str,
+        subject: str,
+        predicate: str,
+        obj: str,
+        subject_type: str | None,
+        object_type: str | None,
+        valid_from: Any,
+        valid_until: Any,
+        memory_id: str | None,
+        confidence: float | None,
+        created: Any,
+        owner_id: str,
+        namespace: str | None,
+    ) -> str:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        affected = 0
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO kg_triples (
+                    id, subject, predicate, object, subject_type, object_type,
+                    valid_from, valid_until, memory_id, confidence, created,
+                    owner_id, namespace
+                )
+                SELECT
+                    ?, ?, ?, ?, ?, ?,
+                    COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP),
+                    CAST(? AS TIMESTAMP),
+                    ?,
+                    COALESCE(CAST(? AS DECFLOAT), CAST(1.0 AS DECFLOAT)),
+                    COALESCE(CAST(? AS DATE), CURRENT DATE),
+                    ?, COALESCE(CAST(? AS VARCHAR(100)), 'default')
+                FROM SYSIBM.SYSDUMMY1
+                WHERE NOT EXISTS (SELECT 1 FROM kg_triples WHERE id = ?)
+                """,
+                (
+                    triple_id,
+                    subject,
+                    predicate,
+                    obj,
+                    subject_type,
+                    object_type,
+                    valid_from,
+                    valid_until,
+                    memory_id,
+                    confidence,
+                    created,
+                    owner_id,
+                    namespace,
+                    triple_id,
+                ),
+            )
+            affected = int(getattr(cursor, "rowcount", 0) or 0)
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                return "INSERT 0 0"
+            raise
+        finally:
+            await _call(cursor.close)
+        return "INSERT 0 1" if affected else "INSERT 0 0"
+
+    async def fetch_kg_triple_by_id(self, tx: Any, triple_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, subject, predicate, object, subject_type, object_type,
+                       valid_from, valid_until, memory_id, confidence,
+                       owner_id, namespace, metadata,
+                       created, deleted_at
+                  FROM kg_triples
+                 WHERE id = ? AND deleted_at IS NULL
+                """,
+                (triple_id,),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_kg_triples_for_export(
+        self,
+        tx: Any,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        effective_ns: str | None,
+        include_unattached: bool,
+        hard_limit: int,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where: list[str] = ["deleted_at IS NULL"]
+            params: list[Any] = []
+            if memory_ids:
+                placeholders = ",".join("?" for _ in memory_ids)
+                if include_unattached:
+                    where.append(f"(memory_id IS NULL OR memory_id IN ({placeholders}))")
+                else:
+                    where.append(f"memory_id IN ({placeholders})")
+                params.extend(memory_ids)
+            elif include_unattached:
+                where.append("memory_id IS NULL")
+            else:
+                return []
+            if effective_owner:
+                where.append("owner_id = ?")
+                params.append(effective_owner)
+            if effective_ns:
+                where.append("namespace = ?")
+                params.append(effective_ns)
+            sql = (
+                "SELECT id, subject, predicate, object, subject_type, object_type, "
+                "valid_from, valid_until, memory_id, confidence, created, owner_id, "
+                "namespace FROM kg_triples WHERE " + " AND ".join(where) + " "
+                f"FETCH FIRST {int(hard_limit) + 1} ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
 
 class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
-    """Version history repository — Oracle SQL auto-translated by cursor layer."""
+    """Version history repository — Db2-native overrides for insert + fetches.
+
+    All four methods emit explicit native Db2 SQL:
+    - ``?`` positional binds (no ``:name``)
+    - ``CURRENT TIMESTAMP`` (no ``SYSTIMESTAMP``)
+    - ``COALESCE`` (no ``NVL``)
+    - ``INTEGER`` for permission_mode (no ``NUMBER``)
+    - ``SYSIBM.SYSDUMMY1`` (no ``dual``)
+    """
+
+    async def insert_memory_version(
+        self,
+        tx: Any,
+        *,
+        version_id: str,
+        memory_id: str,
+        version_num: int,
+        content: str,
+        category: str | None,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str | None,
+        owner_id: str,
+        namespace: str | None,
+        permission_mode: int | None,
+        source_model: str | None,
+        source_provider: str | None,
+        source_session: str | None,
+        source_agent: str | None,
+        snapshot_at: Any,
+        snapshot_by: str | None,
+        change_type: str | None,
+        commit_hash: str | None,
+        parent_version_id: str | None,
+        branch: str | None,
+        merge_parents: Any,
+    ) -> str:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        affected = 0
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memory_versions (
+                    id, memory_id, version_num, content, category, subcategory,
+                    metadata, verbatim_content, owner_id, namespace,
+                    permission_mode, source_model, source_provider, source_session,
+                    source_agent, snapshot_at, snapshot_by, change_type,
+                    commit_hash, parent_version_id, branch, merge_parents
+                )
+                SELECT
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, COALESCE(CAST(? AS VARCHAR(100)), 'default'),
+                    COALESCE(CAST(? AS INTEGER), 600),
+                    ?, ?, ?, ?,
+                    COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP),
+                    ?, COALESCE(CAST(? AS VARCHAR(40)), 'create'),
+                    ?, ?, COALESCE(CAST(? AS VARCHAR(100)), 'main'),
+                    ?
+                FROM SYSIBM.SYSDUMMY1
+                WHERE NOT EXISTS (SELECT 1 FROM memory_versions WHERE id = ?)
+                """,
+                (
+                    version_id,
+                    memory_id,
+                    version_num,
+                    content,
+                    category,
+                    subcategory,
+                    metadata_json,
+                    verbatim_content,
+                    owner_id,
+                    namespace,
+                    permission_mode,
+                    source_model,
+                    source_provider,
+                    source_session,
+                    source_agent,
+                    snapshot_at,
+                    snapshot_by,
+                    change_type,
+                    commit_hash,
+                    parent_version_id,
+                    branch,
+                    merge_parents,
+                    version_id,  # for the NOT EXISTS subquery
+                ),
+            )
+            affected = int(getattr(cursor, "rowcount", 0) or 0)
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                return "INSERT 0 0"
+            raise
+        finally:
+            await _call(cursor.close)
+        return "INSERT 0 1" if affected else "INSERT 0 0"
+
+    async def fetch_memory_version_by_id(self, tx: Any, version_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, memory_id, version_num, content, category, subcategory,
+                       metadata, verbatim_content, owner_id, namespace,
+                       permission_mode, source_model, source_provider,
+                       source_session, source_agent, snapshot_at, snapshot_by,
+                       change_type, commit_hash, parent_version_id, branch,
+                       merge_parents, deleted_at
+                  FROM memory_versions
+                 WHERE id = ? AND deleted_at IS NULL
+                """,
+                (version_id,),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            if rows:
+                out = rows[0]
+                if isinstance(out.get("merge_parents"), str):
+                    try:
+                        import json
+
+                        out["merge_parents"] = json.loads(out["merge_parents"])
+                    except Exception:
+                        pass
+                return out
+            return None
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_memory_versions_for_export(
+        self,
+        tx: Any,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        effective_ns: str | None,
+        hard_limit: int,
+    ) -> list[Row]:
+        if not memory_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ", ".join("?" for _ in memory_ids)
+            params: list[Any] = list(memory_ids)
+            where = ["deleted_at IS NULL", f"memory_id IN ({placeholders})"]
+            if effective_owner:
+                where.append("owner_id = ?")
+                params.append(effective_owner)
+            if effective_ns:
+                where.append("namespace = ?")
+                params.append(effective_ns)
+            sql = (
+                "SELECT id, memory_id, version_num, content, category, subcategory, "
+                "metadata, verbatim_content, owner_id, namespace, permission_mode, "
+                "source_model, source_provider, source_session, source_agent, "
+                "snapshot_at, snapshot_by, change_type, commit_hash, parent_version_id, "
+                "branch, merge_parents "
+                "FROM memory_versions WHERE " + " AND ".join(where) + " "
+                "ORDER BY memory_id ASC, branch ASC, version_num ASC "
+                f"FETCH FIRST {int(hard_limit) + 1} ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_memory_versions_by_ids(self, tx: Any, version_ids: Sequence[str]) -> list[Row]:
+        if not version_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ", ".join("?" for _ in version_ids)
+            params = tuple(version_ids)
+            sql = (
+                f"SELECT id, memory_id, owner_id, namespace FROM memory_versions "
+                f"WHERE id IN ({placeholders}) AND deleted_at IS NULL"
+            )
+            await _call(cursor.execute, sql, params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
 
 class Db2BranchRepository(_Db2OraCompatMixin, OracleBranchRepository):
-    """Branch management repository — Oracle SQL auto-translated by cursor layer."""
+    """Branch management repository — Db2-native overrides (4 methods).
+
+    Second MERGE INTO native (after State PR #3). All emit explicit native Db2 SQL:
+    - ``?`` positional binds (no ``:name``)
+    - ``CURRENT TIMESTAMP`` (no ``SYSTIMESTAMP``)
+    - ``SYSIBM.SYSDUMMY1`` (no ``dual``)
+    - ``COALESCE`` where needed; IN-list with ``?``; FETCH FIRST + ROW_NUMBER native.
+    """
+
+    async def upsert_memory_branch_head(
+        self,
+        tx: Any,
+        *,
+        memory_id: str,
+        branch: str,
+        head_version_id: Any,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO memory_branches m
+                USING (SELECT
+                    CAST(? AS VARCHAR(100)) AS memory_id,
+                    CAST(? AS VARCHAR(100)) AS name,
+                    CAST(? AS VARCHAR(100)) AS head_version_id
+                       FROM SYSIBM.SYSDUMMY1) src
+                   ON (m.memory_id = src.memory_id AND m.name = src.name)
+                WHEN MATCHED THEN UPDATE SET
+                    head_version_id = src.head_version_id
+                WHEN NOT MATCHED THEN INSERT (
+                    id, memory_id, name, head_version_id, created_at
+                ) VALUES (
+                    src.memory_id || ':' || src.name,
+                    src.memory_id,
+                    src.name,
+                    src.head_version_id,
+                    CURRENT TIMESTAMP
+                )
+                """,
+                (memory_id, branch, head_version_id),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_memory_branch_heads(
+        self,
+        tx: Any,
+        memory_ids: Sequence[str],
+        *,
+        authorized_version_uuids: Sequence[str] | None = None,
+    ) -> list[Row]:
+        if not memory_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ", ".join("?" for _ in memory_ids)
+            params: list[Any] = list(memory_ids)
+            where = [f"memory_id IN ({placeholders})", "deleted_at IS NULL"]
+            if authorized_version_uuids is not None:
+                if not authorized_version_uuids:
+                    return []
+                vid_ph = ", ".join("?" for _ in authorized_version_uuids)
+                where.append(f"id IN ({vid_ph})")
+                params.extend(authorized_version_uuids)
+            sql = (
+                "SELECT memory_id, branch, id AS head_version_id FROM ("
+                "  SELECT memory_id, branch, id, "
+                "         ROW_NUMBER() OVER ("
+                "             PARTITION BY memory_id, branch "
+                "             ORDER BY version_num DESC"
+                "         ) AS rn "
+                "  FROM memory_versions"
+                "  WHERE " + " AND ".join(where) + ""
+                ") WHERE rn = 1"
+            )
+            await _call(cursor.execute, sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def delete_memory_branches_for_memories(self, tx: Any, memory_ids: Sequence[str]) -> None:
+        if not memory_ids:
+            return None
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ", ".join("?" for _ in memory_ids)
+            await _call(
+                cursor.execute,
+                f"DELETE FROM memory_branches WHERE memory_id IN ({placeholders})",
+                tuple(memory_ids),
+            )
+        finally:
+            await _call(cursor.close)
+        return None
+
+    async def create_memory_branch(
+        self,
+        tx: Any,
+        memory_id: str,
+        name: str,
+        from_commit: str | None,
+        user: Any,
+    ) -> dict[str, Any]:
+        _ = user
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            head_version_id: str | None = None
+            if from_commit is not None:
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT id FROM memory_versions
+                     WHERE memory_id = ?
+                       AND commit_hash = ?
+                       AND deleted_at IS NULL
+                       FETCH FIRST 1 ROWS ONLY
+                    """,
+                    (memory_id, from_commit),
+                )
+                rows = await _fetch_all_dicts(cursor)
+                if rows:
+                    head_version_id = rows[0].get("id") or rows[0].get("ID")
+            branch_id = f"{memory_id}:{name}"
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memory_branches (id, memory_id, name, head_version_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (branch_id, memory_id, name, head_version_id),
+            )
+            return {
+                "id": branch_id,
+                "memory_id": memory_id,
+                "name": name,
+                "head_version_id": head_version_id,
+            }
+        finally:
+            await _call(cursor.close)
 
 
 class Db2CompressionRepository(_Db2OraCompatMixin, OracleCompressionRepository):
-    """Compression statistics repository — Oracle SQL auto-translated by cursor layer."""
+    """Compression statistics repository — Db2-native overrides for candidate checks + variants.
+
+    All five methods emit explicit native Db2 SQL:
+    - ``?`` positional binds (no ``:name``)
+    - ``CURRENT TIMESTAMP`` (no ``SYSTIMESTAMP``)
+    - ``COALESCE`` (no ``NVL``)
+    - ``FROM SYSIBM.SYSDUMMY1`` (no ``FROM DUAL``)
+    """
+
+    async def compression_candidate_exists(
+        self,
+        tx: Any,
+        *,
+        candidate_id: str,
+        memory_id: str,
+        owner_id: str,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT 1 FROM memory_compression_candidates
+                 WHERE id = ?
+                   AND memory_id = ?
+                   AND owner_id = ?
+                """,
+                (candidate_id, memory_id, owner_id),
+            )
+            row = await _call(cursor.fetchone)
+            return row is not None
+        finally:
+            await _call(cursor.close)
+
+    async def insert_compressed_variant(
+        self,
+        tx: Any,
+        *,
+        memory_id: str,
+        owner_id: str,
+        winner_candidate_id: str | None,
+        engine_id: str,
+        engine_version: str | None,
+        compressed_content: str | None,
+        compressed_tokens: int | None,
+        compression_ratio: float | None,
+        quality_score: float | None,
+        composite_score: float | None,
+        scoring_profile: str | None,
+        judge_model: str | None,
+        selected_at: Any,
+    ) -> str:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        affected = 0
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memory_compressed_variants (
+                    memory_id, owner_id, winner_candidate_id, engine_id, engine_version,
+                    compressed_content, compressed_tokens, compression_ratio,
+                    quality_score, composite_score, scoring_profile, judge_model,
+                    selected_at
+                )
+                SELECT
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, COALESCE(CAST(? AS VARCHAR(40)), 'balanced'), ?,
+                    COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP)
+                FROM SYSIBM.SYSDUMMY1
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM memory_compressed_variants WHERE memory_id = ?
+                )
+                """,
+                (
+                    memory_id,
+                    owner_id,
+                    winner_candidate_id,
+                    engine_id,
+                    engine_version,
+                    compressed_content,
+                    compressed_tokens,
+                    compression_ratio,
+                    quality_score,
+                    composite_score,
+                    scoring_profile,
+                    judge_model,
+                    selected_at,
+                    memory_id,
+                ),
+            )
+            affected = int(getattr(cursor, "rowcount", 0) or 0)
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                return "INSERT 0 0"
+            raise
+        finally:
+            await _call(cursor.close)
+        return "INSERT 0 1" if affected else "INSERT 0 0"
+
+    async def fetch_compressed_variant_by_memory_id(self, tx: Any, memory_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT memory_id, owner_id, winner_candidate_id, engine_id, engine_version,
+                       compressed_content, compressed_tokens, compression_ratio,
+                       quality_score, composite_score, scoring_profile, judge_model,
+                       selected_at
+                  FROM memory_compressed_variants
+                 WHERE memory_id = ?
+                """,
+                (memory_id,),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
+        finally:
+            await _call(cursor.close)
+
+    async def gather_stats(self, tx: Any):
+        from mnemos.persistence.base import CompressionStatsRow
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT COUNT(*), AVG(compression_ratio),
+                       SUM(CASE WHEN quality_score IS NULL THEN 1 ELSE 0 END)
+                  FROM memory_compressed_variants
+                """,
+            )
+            row = await _call(cursor.fetchone) or (0, None, 0)
+            total, avg_ratio, unreviewed = row
+            return CompressionStatsRow(
+                total_compressions=int(total or 0),
+                average_compression_ratio=float(avg_ratio) if avg_ratio is not None else None,
+                unreviewed_compressions=int(unreviewed or 0),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_compressed_variants_for_export(
+        self,
+        tx: Any,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        hard_limit: int,
+    ) -> list[Row]:
+        if not memory_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ",".join("?" for _ in memory_ids)
+            where = [f"memory_id IN ({placeholders})"]
+            params: list[Any] = list(memory_ids)
+            if effective_owner:
+                where.append("owner_id = ?")
+                params.append(effective_owner)
+            sql = (
+                "SELECT memory_id, owner_id, winner_candidate_id, engine_id, "
+                "engine_version, compressed_content, compressed_tokens, "
+                "compression_ratio, quality_score, composite_score, "
+                "scoring_profile, judge_model, selected_at "
+                "FROM memory_compressed_variants WHERE " + " AND ".join(where) + " "
+                f"OFFSET 0 ROWS FETCH NEXT {int(hard_limit) + 1} ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
 
 class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
-    """Webhook dispatch repository — Oracle SQL auto-translated by cursor layer."""
+    """Webhook dispatch repository — Db2-native ``dispatch_event`` override.
+
+    All other methods inherit verbatim from
+    :class:`OracleWebhookRepository` and rely on the cursor-layer
+    Oracle→Db2 translation in :class:`_Db2AsyncCursor.execute`.
+    """
+
+    async def dispatch_event(
+        self,
+        tx: Any,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        owner_id: str | None = None,
+        namespace: str | None = None,
+    ) -> list[str]:
+        import json
+        import uuid as _uuid
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            sub_where = ["revoked = 0"]
+            sub_params: list[Any] = []
+            if owner_id is not None:
+                sub_where.append("owner_id = ?")
+                sub_params.append(owner_id)
+            if namespace is not None:
+                sub_where.append("namespace = ?")
+                sub_params.append(namespace)
+            # Subscription opts in to an event by listing it in the JSON
+            # array stored in ``events``. Db2-native LOCATE keeps this
+            # driver-side positional and matches Oracle's quoted-token
+            # behavior for compact or pretty-printed arrays.
+            sub_where.append("LOCATE(?, CAST(events AS VARCHAR(32672))) > 0")
+            sub_params.append(f'"{event_type}"')
+            sql_sub = (
+                "SELECT id, COALESCE(owner_id, 'default') AS owner_id, "
+                "COALESCE(namespace, 'default') AS namespace "
+                "FROM webhook_subscriptions WHERE " + " AND ".join(sub_where)
+            )
+            await _call(cursor.execute, sql_sub, tuple(sub_params))
+            subs = await _fetch_all_dicts(cursor)
+            if not subs:
+                return []
+
+            payload_json = json.dumps(payload, default=str, separators=(",", ":"))
+            delivery_ids: list[str] = []
+            for sub in subs:
+                d_id = _uuid.uuid4().hex
+                await _call(
+                    cursor.execute,
+                    """
+                    INSERT INTO webhook_deliveries (
+                        id, subscription_id, event_type, payload, owner_id,
+                        namespace, state, attempt_count, next_attempt_at
+                    ) VALUES (
+                        ?, ?, ?, ?, COALESCE(CAST(? AS VARCHAR(100)), 'default'),
+                        COALESCE(CAST(? AS VARCHAR(100)), 'default'),
+                        'pending', 0, CURRENT TIMESTAMP
+                    )
+                    """,
+                    (
+                        d_id,
+                        sub["id"],
+                        event_type,
+                        payload_json,
+                        sub.get("owner_id"),
+                        sub.get("namespace"),
+                    ),
+                )
+                delivery_ids.append(d_id)
+            return delivery_ids
+        finally:
+            await _call(cursor.close)
 
 
 class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAuditRepository):
-    """Consultation audit repository — Oracle SQL auto-translated by cursor layer."""
+    """Consultation audit repository — Db2-native overrides for model_registry queries.
+
+    All five methods use explicit native Db2 SQL (``?`` positional binds,
+    ``CURRENT TIMESTAMP`` where timestamps appear, ``COALESCE``) so the
+    Db2 optimizer sees canonical dialect without cursor-layer rewrite.
+    """
+
+    async def fetch_recommended_model(
+        self,
+        tx: Any,
+        task_type: str,
+        cost_budget: float,
+        quality_floor: float,
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        from mnemos.domain.pantheon.recommendation import choose_recommended_model
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            # Native Db2: COALESCE + CURRENT TIMESTAMP (no :name, no SYSTIMESTAMP)
+            await _call(
+                cursor.execute,
+                "SELECT provider, model_id, display_name, input_cost_per_mtok, "
+                "output_cost_per_mtok, capabilities, graeae_weight, context_window "
+                "FROM model_registry WHERE available = 1 AND deprecated = 0",
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return choose_recommended_model(rows, task_type, cost_budget, quality_floor)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_model_recommendation(
+        self,
+        tx: Any,
+        task_type: str,
+        cost_budget: float = 10.0,
+        quality_floor: float = 0.7,
+    ) -> dict[str, Any] | None:
+        model, _ = await self.fetch_recommended_model(tx, task_type, cost_budget, quality_floor)
+        return model
+
+    async def lookup_provider_for_model(self, tx: Any, model: str) -> str | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider FROM model_registry WHERE model_id = ? " "AND available = 1 AND deprecated = 0",
+                (model,),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            if rows:
+                return rows[0].get("provider")
+            return None
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_available_models(self, tx: Any) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider, model_id, display_name FROM model_registry "
+                "WHERE available = 1 AND deprecated = 0 "
+                "ORDER BY model_id ASC",
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_model_provider(self, tx: Any, model_id: str) -> str | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider FROM model_registry WHERE model_id = ? "
+                "AND available = 1 AND deprecated = 0 LIMIT 1",
+                (model_id,),
+            )
+            row = await _fetch_all_dicts(cursor)
+            return row[0].get("provider") if row else None
+        finally:
+            await _call(cursor.close)
 
 
 class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
-    """Federation peer management repository — Oracle SQL auto-translated by cursor layer."""
+    """Federation peer management repository — Db2-native overrides (PR #9a + #9b).
+
+    Eleven methods emit explicit native Db2 SQL:
+    - ``?`` positional binds (no ``:name``)
+    - ``CURRENT TIMESTAMP`` (no ``SYSTIMESTAMP``)
+    - ``SYSIBM.SYSDUMMY1`` for MERGE source (no ``DUAL``)
+    - ``COALESCE`` (no ``NVL``)
+    - ``CAST(? AS TIMESTAMP)`` (no ``CAST(:x AS TIMESTAMP WITH TIME ZONE)``)
+    Pattern reused from PR #3 (State) and PR #6 (Branch).
+
+    PR #9a (6 methods): list_peers, get_peer, delete_peer, list_due_peers,
+    fetch_memory_page, create_peer.
+    PR #9b (5 methods): fetch_federated_memory_marker, insert_federated_memory,
+    update_federated_memory_if_newer, apply_consolidation_tombstone,
+    delete_federated_memory.
+    """
+
+    # ── peer CRUD ──────────────────────────────────────────────────────────
+
+    async def list_peers(self, tx: Any) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT * FROM federation_peers ORDER BY created",
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_peer(self, tx: Any, peer_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT * FROM federation_peers WHERE id = ?",
+                (peer_id,),
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def delete_peer(self, tx: Any, peer_id: str) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM federation_peers WHERE id = ?",
+                (peer_id,),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def list_due_peers(self, tx: Any, *, limit: int = 10) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT * FROM federation_peers
+                 WHERE enabled = 1
+                   AND (last_sync_at IS NULL
+                        OR last_sync_at < CURRENT TIMESTAMP - sync_interval_secs SECONDS)
+                 ORDER BY COALESCE(last_sync_at, TIMESTAMP('1970-01-01 00:00:00'))
+                 FETCH FIRST ? ROWS ONLY
+                """,
+                (limit,),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    # ── sync helpers ───────────────────────────────────────────────────────
+
+    async def fetch_memory_page(
+        self,
+        tx: Any,
+        *,
+        updated_after: Any | None = None,
+        id_after: str | None = None,
+        limit: int = 100,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if updated_after is not None and id_after is not None:
+                sql = (
+                    "SELECT id, content, category, subcategory, metadata, "
+                    "owner_id, namespace, updated FROM memories "
+                    "WHERE deleted_at IS NULL "
+                    "AND (updated > ? OR (updated = ? AND id > ?)) "
+                    "ORDER BY updated ASC, id ASC "
+                    "FETCH FIRST ? ROWS ONLY"
+                )
+                params = (updated_after, updated_after, id_after, limit)
+            else:
+                sql = (
+                    "SELECT id, content, category, subcategory, metadata, "
+                    "owner_id, namespace, updated FROM memories "
+                    "WHERE deleted_at IS NULL "
+                    "ORDER BY updated ASC, id ASC "
+                    "FETCH FIRST ? ROWS ONLY"
+                )
+                params = (limit,)
+            await _call(cursor.execute, sql, params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def create_peer(
+        self,
+        tx: Any,
+        *,
+        name: str,
+        base_url: str,
+        auth_token: str,
+        namespace_filter: Sequence[str] | None,
+        category_filter: Sequence[str] | None,
+        enabled: bool,
+        sync_interval_secs: int,
+        compat_mode: str,
+    ) -> Row:
+        import json
+        import uuid as _uuid
+
+        peer_id = str(_uuid.uuid4())
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO federation_peers (
+                    id, name, base_url, auth_token, namespace_filter,
+                    category_filter, enabled, sync_interval_secs, compat_mode
+                ) VALUES (
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?
+                )
+                """,
+                (
+                    peer_id,
+                    name,
+                    base_url,
+                    auth_token,
+                    json.dumps(list(namespace_filter)) if namespace_filter is not None else None,
+                    json.dumps(list(category_filter)) if category_filter is not None else None,
+                    1 if enabled else 0,
+                    sync_interval_secs,
+                    compat_mode or "strict",
+                ),
+            )
+        finally:
+            await _call(cursor.close)
+        return await self.get_peer(tx, peer_id)
+
+    # ── consolidation + tombstone ────────────────────────────────────────
+
+    async def fetch_federated_memory_marker(self, tx: Any, local_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT federation_remote_updated
+                  FROM memories
+                 WHERE id = ? AND deleted_at IS NULL
+                """,
+                (local_id,),
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def insert_federated_memory(
+        self,
+        tx: Any,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        source_model: str | None,
+        source_provider: str | None,
+        source_session: str | None,
+        source_agent: str | None,
+        peer_name: str,
+        remote_updated: Any,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            try:
+                await _call(
+                    cursor.execute,
+                    """
+                    INSERT INTO memories (
+                        id, content, category, subcategory, metadata,
+                        verbatim_content, quality_rating, owner_id, namespace,
+                        permission_mode, source_model, source_provider,
+                        source_session, source_agent, federation_source,
+                        federation_remote_updated, created, updated
+                    ) VALUES (
+                        ?, ?, ?, ?, ?,
+                        ?, ?, 'federation', ?,
+                        644, ?, ?,
+                        ?, ?, ?,
+                        CAST(? AS TIMESTAMP),
+                        CURRENT TIMESTAMP,
+                        CAST(? AS TIMESTAMP)
+                    )
+                    """,
+                    (
+                        local_id,
+                        content,
+                        category,
+                        subcategory,
+                        metadata_json,
+                        verbatim_content,
+                        quality_rating,
+                        namespace,
+                        source_model,
+                        source_provider,
+                        source_session,
+                        source_agent,
+                        peer_name,
+                        remote_updated,
+                        remote_updated,
+                    ),
+                )
+                return True
+            except Exception as e:
+                if _is_unique_violation(e):
+                    return False
+                raise
+        finally:
+            await _call(cursor.close)
+
+    async def update_federated_memory_if_newer(
+        self,
+        tx: Any,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        remote_updated: Any,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE memories SET
+                    content = ?,
+                    category = ?,
+                    subcategory = ?,
+                    metadata = ?,
+                    verbatim_content = ?,
+                    quality_rating = ?,
+                    namespace = ?,
+                    federation_remote_updated = CAST(? AS TIMESTAMP),
+                    updated = CAST(? AS TIMESTAMP)
+                 WHERE id = ?
+                   AND deleted_at IS NULL
+                   AND (
+                        federation_remote_updated IS NULL
+                        OR federation_remote_updated < CAST(? AS TIMESTAMP)
+                   )
+                """,
+                (
+                    content,
+                    category,
+                    subcategory,
+                    metadata_json,
+                    verbatim_content,
+                    quality_rating,
+                    namespace,
+                    remote_updated,
+                    remote_updated,
+                    local_id,
+                    remote_updated,
+                ),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def apply_consolidation_tombstone(
+        self,
+        tx: Any,
+        *,
+        local_id: str,
+        local_canonical_id: str,
+        consolidated_at: Any,
+        remote_id: str,
+        canonical_remote_id: str,
+        peer_name: str,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO federation_consolidation_tombstones t
+                USING (
+                    SELECT ? AS peer_name, ? AS remote_id
+                      FROM SYSIBM.SYSDUMMY1
+                ) s
+                   ON (t.peer_name = s.peer_name AND t.remote_id = s.remote_id)
+                WHEN MATCHED THEN UPDATE SET
+                    local_id = ?,
+                    local_canonical_id = ?,
+                    canonical_remote_id = ?,
+                    consolidated_at = COALESCE(
+                        CAST(? AS TIMESTAMP),
+                        CURRENT TIMESTAMP
+                    )
+                WHEN NOT MATCHED THEN INSERT (
+                    peer_name, remote_id, local_id, local_canonical_id,
+                    canonical_remote_id, consolidated_at
+                ) VALUES (
+                    ?, ?, ?, ?,
+                    ?,
+                    COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP)
+                )
+                """,
+                (
+                    peer_name,
+                    remote_id,
+                    local_id,
+                    local_canonical_id,
+                    canonical_remote_id,
+                    consolidated_at,
+                    consolidated_at,
+                    peer_name,
+                    remote_id,
+                    local_id,
+                    local_canonical_id,
+                    canonical_remote_id,
+                    consolidated_at,
+                ),
+            )
+            await _call(
+                cursor.execute,
+                """
+                UPDATE memories
+                   SET deleted_at = CURRENT TIMESTAMP
+                 WHERE id = ?
+                   AND deleted_at IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM memories c
+                        WHERE c.id = ? AND c.deleted_at IS NULL
+                   )
+                """,
+                (local_id, local_canonical_id),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def delete_federated_memory(self, tx: Any, peer_name: str, memory_id: str) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE memories
+                   SET deleted_at = CURRENT TIMESTAMP
+                 WHERE id = ?
+                   AND federation_source = ?
+                   AND deleted_at IS NULL
+                """,
+                (memory_id, peer_name),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    # ── peer management (cont) ────────────────────────────────────────────
+
+    async def update_peer(self, tx: Any, peer_id: str, updates: dict[str, Any]) -> Row | None:
+        bad = set(updates) - self._ALLOWED_PEER_COLS
+        if bad:
+            raise ValueError(f"unknown federation peer fields: {sorted(bad)}")
+        if not updates:
+            return await self.get_peer(tx, peer_id)
+        import json
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            sets: list[str] = []
+            params_list: list[Any] = []
+            for col, value in updates.items():
+                if col == "enabled":
+                    sets.append("enabled = ?")
+                    params_list.append(1 if value else 0)
+                elif col in ("namespace_filter", "category_filter"):
+                    sets.append(f"{col} = ?")
+                    params_list.append(json.dumps(list(value)) if value is not None else None)
+                else:
+                    sets.append(f"{col} = ?")
+                    params_list.append(value)
+            if not sets:
+                return await self.get_peer(tx, peer_id)
+            sets.append("updated = CURRENT TIMESTAMP")
+            sql = f"UPDATE federation_peers SET {', '.join(sets)} WHERE id = ?"
+            params_list.append(peer_id)
+            await _call(cursor.execute, sql, tuple(params_list))
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return None
+        finally:
+            await _call(cursor.close)
+        return await self.get_peer(tx, peer_id)
+
+    async def upsert_peer(
+        self,
+        tx: Any,
+        *,
+        peer_id: str,
+        base_url: str,
+        name: str | None = None,
+        enabled: bool = True,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO federation_peers p
+                USING (
+                    SELECT ? AS id FROM SYSIBM.SYSDUMMY1
+                ) s
+                   ON (p.id = s.id)
+                WHEN MATCHED THEN UPDATE SET
+                    base_url = ?,
+                    name = COALESCE(CAST(? AS VARCHAR(200)), p.name),
+                    enabled = ?,
+                    updated = CURRENT TIMESTAMP
+                WHEN NOT MATCHED THEN INSERT (
+                    id, name, base_url, auth_token, enabled
+                ) VALUES (
+                    ?, COALESCE(CAST(? AS VARCHAR(200)), CAST(? AS VARCHAR(200))), ?, '', ?
+                )
+                """,
+                (
+                    peer_id,
+                    base_url,
+                    name,
+                    1 if enabled else 0,
+                    peer_id,
+                    name,
+                    peer_id,
+                    base_url,
+                    1 if enabled else 0,
+                ),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def get_sync_peer(self, tx: Any, peer_id: str) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT * FROM federation_peers WHERE id = ?",
+                (peer_id,),
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    # ── sync log CRUD ────────────────────────────────────────────────────
+
+    async def fetch_sync_log(self, tx: Any, peer_id: str, limit: int) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, started_at, finished_at, memories_pulled,
+                       memories_new, memories_updated, error,
+                       cursor_before, cursor_after
+                  FROM federation_sync_log
+                 WHERE peer_id = ?
+                 ORDER BY started_at DESC
+                 FETCH FIRST ? ROWS ONLY
+                """,
+                (peer_id, limit),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def create_sync_log(self, tx: Any, peer_id: str, cursor_before: Any) -> Any:
+        import uuid as _uuid
+
+        log_id = str(_uuid.uuid4())
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO federation_sync_log (id, peer_id, cursor_before)
+                VALUES (?, ?, ?)
+                """,
+                (log_id, peer_id, cursor_before),
+            )
+        finally:
+            await _call(cursor.close)
+        return log_id
+
+    async def finish_sync_log(
+        self,
+        tx: Any,
+        *,
+        log_id: Any,
+        memories_pulled: int,
+        memories_new: int,
+        memories_updated: int,
+        error: str | None,
+        cursor_after: Any,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE federation_sync_log SET
+                    finished_at = CURRENT TIMESTAMP,
+                    memories_pulled = ?,
+                    memories_new = ?,
+                    memories_updated = ?,
+                    error = ?,
+                    cursor_after = ?
+                 WHERE id = ?
+                """,
+                (
+                    memories_pulled,
+                    memories_new,
+                    memories_updated,
+                    error,
+                    cursor_after,
+                    log_id,
+                ),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def record_sync_error(self, tx: Any, peer_id: str, error: str) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE federation_peers SET
+                    last_sync_at = CURRENT TIMESTAMP,
+                    last_error = ?,
+                    last_error_at = CURRENT TIMESTAMP
+                 WHERE id = ?
+                """,
+                (error, peer_id),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def record_sync_success(
+        self,
+        tx: Any,
+        peer_id: str,
+        cursor: Any,
+        total_pulled: int,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cur = await _call(conn.cursor)
+        try:
+            await _call(
+                cur.execute,
+                """
+                UPDATE federation_peers SET
+                    last_sync_at = CURRENT TIMESTAMP,
+                    last_sync_cursor = ?,
+                    last_error = NULL,
+                    last_error_at = NULL,
+                    total_pulled = total_pulled + ?
+                 WHERE id = ?
+                """,
+                (cursor, total_pulled, peer_id),
+            )
+        finally:
+            await _call(cur.close)
+
+    async def update_peer_schema_check(
+        self,
+        tx: Any,
+        peer_id: str,
+        peer_version: str | None,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE federation_peers SET
+                    peer_mnemos_version = ?,
+                    last_schema_check_at = CURRENT TIMESTAMP
+                 WHERE id = ?
+                """,
+                (peer_version, peer_id),
+            )
+        finally:
+            await _call(cursor.close)
+
+    # ── feed queries ─────────────────────────────────────────────────────
+
+    async def feed_query(
+        self,
+        tx: Any,
+        *,
+        since_updated: Any | None,
+        since_id: str | None,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+        limit: int,
+        prefer_compressed: bool,
+        include_embedding: bool = False,
+    ) -> list[Row]:
+        _ = prefer_compressed
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = [
+                "m.deleted_at IS NULL",
+                "m.federation_source IS NULL",
+                "m.archived_at IS NULL",
+            ]
+            params_list: list[Any] = []
+            if since_updated is not None and since_id is not None:
+                where.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
+                params_list.extend([since_updated, since_updated, since_id])
+            if namespaces:
+                ns_ph = ",".join("?" for _ in namespaces)
+                where.append(f"m.namespace IN ({ns_ph})")
+                params_list.extend(namespaces)
+            if categories:
+                cat_ph = ",".join("?" for _ in categories)
+                where.append(f"m.category IN ({cat_ph})")
+                params_list.extend(categories)
+            # v6.1 F-1.2: optional embedding + embedding_model literal columns.
+            # See docs/v6.1-federation-embeddings-copy.md.
+            embed_cols = ""
+            if include_embedding:
+                from mnemos.core.config import get_settings as _gs
+
+                try:
+                    import os as _os
+
+                    _http_model = _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                    _model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
+                except Exception:
+                    _model = "unknown"
+                _model_escaped = _model.replace("'", "''")
+                embed_cols = f", m.embedding AS embedding, '{_model_escaped}' AS embedding_model"
+            params_list.append(limit)
+            sql = (
+                "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
+                "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
+                "m.permission_mode, m.source_model, m.source_provider, "
+                "m.source_session, m.source_agent, m.created, m.updated, "
+                "m.archived_at" + embed_cols + " FROM memories m WHERE " + " AND ".join(where) + " "
+                "ORDER BY m.updated ASC, m.id ASC "
+                "FETCH FIRST ? ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_feed_memory(
+        self,
+        tx: Any,
+        memory_id: str,
+        *,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = [
+                "m.id = ?",
+                "m.deleted_at IS NULL",
+                "m.federation_source IS NULL",
+            ]
+            params_list: list[Any] = [memory_id]
+            if namespaces:
+                ns_ph = ",".join("?" for _ in namespaces)
+                where.append(f"m.namespace IN ({ns_ph})")
+                params_list.extend(namespaces)
+            if categories:
+                cat_ph = ",".join("?" for _ in categories)
+                where.append(f"m.category IN ({cat_ph})")
+                params_list.extend(categories)
+            sql = (
+                "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
+                "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
+                "m.permission_mode, m.source_model, m.source_provider, "
+                "m.source_session, m.source_agent, m.created, m.updated, "
+                "m.archived_at "
+                "FROM memories m WHERE " + " AND ".join(where)
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
 
 
 class Db2StateRepository(_Db2OraCompatMixin, OracleStateRepository):
-    """Key/value state repository — Oracle SQL auto-translated by cursor layer.
+    """Key/value state repository — Db2-native overrides (first MERGE INTO on branch).
 
-    Db2 12.1.x MERGE syntax is fully compatible with the Oracle form
-    used in ``OracleStateRepository.set`` — SYSTIMESTAMP → CURRENT
-    TIMESTAMP is handled by the cursor layer, so no manual override
-    is needed for the 12.1.4/12.1.5 column set.
+    All five methods emit explicit native Db2 SQL:
+    - ``?`` positional binds (no ``:name``)
+    - ``CURRENT TIMESTAMP`` (no ``SYSTIMESTAMP``)
+    - ``SYSIBM.SYSDUMMY1`` for MERGE source (no ``DUAL``)
+    - ``TO_CHAR`` kept for timestamp formatting (native in Db2 12.1.x)
+    Pattern reused by PR #6 (Branch) and PR #9 (Federation).
+    """
+
+    async def get(
+        self,
+        tx: Any,
+        key: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT key, value, TO_CHAR(updated) AS updated, version, owner_id, namespace
+                  FROM state
+                 WHERE owner_id = ?
+                   AND namespace = ?
+                   AND key = ?
+                   AND deleted_at IS NULL
+                """,
+                (owner_id, namespace, key),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
+        finally:
+            await _call(cursor.close)
+
+    async def set(
+        self,
+        tx: Any,
+        key: str,
+        value: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+        expires_at: Any | None = None,
+    ) -> Row | None:
+        _ = expires_at  # TTL not yet modelled in the Oracle schema
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO state s
+                USING (SELECT ? AS owner_id, ? AS namespace,
+                              ? AS key, ? AS value FROM SYSIBM.SYSDUMMY1) src
+                   ON (s.owner_id = src.owner_id
+                       AND s.namespace = src.namespace
+                       AND s.key = src.key)
+                WHEN MATCHED THEN UPDATE SET
+                    value = src.value,
+                    updated = CURRENT TIMESTAMP,
+                    version = s.version + 1,
+                    deleted_at = NULL
+                WHEN NOT MATCHED THEN INSERT (
+                    owner_id, namespace, key, value, updated, version
+                ) VALUES (
+                    src.owner_id, src.namespace, src.key, src.value, CURRENT TIMESTAMP, 1
+                )
+                """,
+                (owner_id, namespace, key, value),
+            )
+        finally:
+            await _call(cursor.close)
+        return await self.get(tx, key, owner_id=owner_id, namespace=namespace)
+
+    async def delete(
+        self,
+        tx: Any,
+        key: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE state
+                   SET deleted_at = CURRENT TIMESTAMP
+                 WHERE owner_id = ?
+                   AND namespace = ?
+                   AND key = ?
+                   AND deleted_at IS NULL
+                """,
+                (owner_id, namespace, key),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def list_namespace(
+        self,
+        tx: Any,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if limit is None:
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT key, value, TO_CHAR(updated) AS updated, version, owner_id, namespace
+                      FROM state
+                     WHERE owner_id = ?
+                       AND namespace = ?
+                       AND deleted_at IS NULL
+                     ORDER BY key
+                     OFFSET ? ROWS
+                    """,
+                    (owner_id, namespace, offset),
+                )
+            else:
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT key, value, TO_CHAR(updated) AS updated, version, owner_id, namespace
+                      FROM state
+                     WHERE owner_id = ?
+                       AND namespace = ?
+                       AND deleted_at IS NULL
+                     ORDER BY key
+                     OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+                    """,
+                    (owner_id, namespace, offset, limit),
+                )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def delete_namespace(
+        self,
+        tx: Any,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE state
+                   SET deleted_at = CURRENT TIMESTAMP
+                 WHERE owner_id = ?
+                   AND namespace = ?
+                   AND deleted_at IS NULL
+                """,
+                (owner_id, namespace),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+
+class Db2OAuthRepository(OracleOAuthRepository):
+    """Db2-native OAuth token/state persistence."""
+
+    async def register_oauth_token(
+        self,
+        tx: Any,
+        *,
+        token: str | bytes,
+        user_id: str,
+        provider: str,
+        scopes: Sequence[str] | dict[str, Any] | None = None,
+        expires_at: Any = None,
+        refresh_token: str | None = None,
+    ) -> Row:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO oauth_tokens
+                  (token, user_id, provider, scopes, expires_at, refresh_token, created_at, last_used_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT TIMESTAMP, NULL)
+                """,
+                (
+                    _raw_token(token),
+                    user_id,
+                    provider,
+                    _json_text(scopes, []),
+                    _ts_for_oracle(expires_at),
+                    refresh_token,
+                ),
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.lookup_oauth_token(tx, token=token, touch=False)
+        assert row is not None
+        return row
+
+    async def lookup_oauth_token(self, tx: Any, *, token: str | bytes, touch: bool = True) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        raw = _raw_token(token)
+        try:
+            if touch:
+                await _call(
+                    cursor.execute, "UPDATE oauth_tokens SET last_used_at = CURRENT TIMESTAMP WHERE token = ?", (raw,)
+                )
+            await _call(
+                cursor.execute,
+                """
+                SELECT token, user_id, provider, scopes, expires_at, refresh_token, created_at, last_used_at
+                FROM oauth_tokens
+                WHERE token = ?
+                """,
+                (raw,),
+            )
+            return self._normalize_oauth_token_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_oauth_token(self, tx: Any, *, token: str | bytes) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute, "DELETE FROM oauth_tokens WHERE token = ?", (_raw_token(token),))
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def start_oauth_flow(
+        self,
+        tx: Any,
+        *,
+        state: str | bytes,
+        provider: str,
+        csrf_token: str,
+        return_url: str | None,
+        expires_at: Any,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO oauth_state (state, provider, csrf_token, return_url, created_at, expires_at)
+                VALUES (?, ?, ?, ?, CURRENT TIMESTAMP, ?)
+                """,
+                (_raw_token(state), provider, csrf_token, return_url, _ts_for_oracle(expires_at)),
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self._fetch_oauth_state(tx, state=state)
+        assert row is not None
+        return row
+
+    async def redeem_oauth_state(self, tx: Any, *, state: str | bytes) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        raw = _raw_token(state)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT state, provider, csrf_token, return_url, created_at, expires_at
+                FROM oauth_state
+                WHERE state = ? AND expires_at > CURRENT TIMESTAMP
+                """,
+                (raw,),
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            await _call(cursor.execute, "DELETE FROM oauth_state WHERE state = ?", (raw,))
+            return self._normalize_oauth_state_row(row)
+        finally:
+            await _call(cursor.close)
+
+    async def _fetch_oauth_state(self, tx: Any, *, state: str | bytes) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT state, provider, csrf_token, return_url, created_at, expires_at FROM oauth_state WHERE state = ?",
+                (_raw_token(state),),
+            )
+            return self._normalize_oauth_state_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+        finally:
+            await _call(cursor.close)
+
+    @staticmethod
+    def _normalize_oauth_token_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["token"] = _raw_token_text(out.get("token"))
+        out["scopes"] = _json_value(out.get("scopes"), [])
+        return out
+
+    @staticmethod
+    def _normalize_oauth_state_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["state"] = _raw_token_text(out.get("state"))
+        return out
+
+
+class Db2SessionsRepository(OracleSessionsRepository):
+    """Db2-native protocol sessions persistence."""
+
+    async def create_session(
+        self,
+        tx: Any,
+        *,
+        session_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        expires_at: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> Row:
+        sid = session_id or uuid.uuid4()
+        sid_raw = _uuid_to_raw(sid)
+        assert sid_raw is not None
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO sessions (id, session_id, user_id, started_at, last_active_at, expires_at, metadata)
+                VALUES (?, ?, ?, CURRENT TIMESTAMP, CURRENT TIMESTAMP, ?, ?)
+                """,
+                (str(uuid.UUID(bytes=sid_raw)), sid_raw, user_id, _ts_for_oracle(expires_at), _json_text(metadata, {})),
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.lookup_session(tx, session_id=sid)
+        assert row is not None
+        return row
+
+    async def lookup_session(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT session_id, user_id, started_at, last_active_at, expires_at, metadata
+                FROM sessions
+                WHERE session_id = ? AND expires_at > CURRENT TIMESTAMP
+                """,
+                (_uuid_to_raw(session_id),),
+            )
+            return self._normalize_session_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+        finally:
+            await _call(cursor.close)
+
+    async def update_session_active(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET last_active_at = CURRENT TIMESTAMP WHERE session_id = ?",
+                (_uuid_to_raw(session_id),),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def expire_session(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET expires_at = CURRENT TIMESTAMP WHERE session_id = ?",
+                (_uuid_to_raw(session_id),),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def log_session_event(
+        self,
+        tx: Any,
+        *,
+        session_id: str | bytes | uuid.UUID,
+        event_kind: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, session_id, event_kind, payload, ts
+                FROM FINAL TABLE (
+                    INSERT INTO session_logs (session_id, event_kind, payload, ts)
+                    VALUES (?, ?, ?, CURRENT TIMESTAMP)
+                )
+                """,
+                (_uuid_to_raw(session_id), event_kind, _json_text(payload, {})),
+            )
+            return self._normalize_session_log_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))  # type: ignore[return-value]
+        finally:
+            await _call(cursor.close)
+
+    @staticmethod
+    def _normalize_session_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _raw_to_uuid(out.get("session_id"))
+        out["metadata"] = _json_value(out.get("metadata"), {})
+        return out
+
+    @staticmethod
+    def _normalize_session_log_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _raw_to_uuid(out.get("session_id"))
+        out["payload"] = _json_value(out.get("payload"), {})
+        return out
+
+
+class Db2ConsultationsRepository(OracleConsultationsRepository):
+    """Db2-native user-facing consultations persistence."""
+
+    async def create_consultation(
+        self,
+        tx: Any,
+        *,
+        consultation_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        prompt: str,
+        task_type: str | None,
+        mode: str | None,
+        status: str = "pending",
+    ) -> Row:
+        cid = consultation_id or uuid.uuid4()
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO consultations (id, user_id, prompt, task_type, mode, status, created_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT TIMESTAMP, NULL)
+                """,
+                (_uuid_to_raw(cid), user_id, prompt, task_type, mode, status),
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.fetch_consultation(tx, consultation_id=cid)
+        assert row is not None
+        return row
+
+    async def append_consultation_response(
+        self,
+        tx: Any,
+        *,
+        consultation_id: str | bytes | uuid.UUID,
+        provider: str,
+        model_id: str,
+        response: str,
+        final_score: float | None = None,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        latency_ms: int | None = None,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, consultation_id, provider, model_id, response, final_score,
+                       tokens_in, tokens_out, latency_ms, created_at
+                FROM FINAL TABLE (
+                    INSERT INTO consultation_responses
+                      (consultation_id, provider, model_id, response, final_score,
+                       tokens_in, tokens_out, latency_ms, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT TIMESTAMP)
+                )
+                """,
+                (
+                    _uuid_to_raw(consultation_id),
+                    provider,
+                    model_id,
+                    response,
+                    final_score,
+                    tokens_in,
+                    tokens_out,
+                    latency_ms,
+                ),
+            )
+            return self._normalize_consultation_response_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))  # type: ignore[return-value]
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_consultation(self, tx: Any, *, consultation_id: str | bytes | uuid.UUID) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, user_id, prompt, task_type, mode, status, created_at, completed_at
+                FROM consultations
+                WHERE id = ?
+                """,
+                (_uuid_to_raw(consultation_id),),
+            )
+            row = self._normalize_consultation_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+            if row is None:
+                return None
+            row["responses"] = await self._fetch_consultation_responses(tx, consultation_id=consultation_id)
+            return row
+        finally:
+            await _call(cursor.close)
+
+    async def list_consultations(
+        self,
+        tx: Any,
+        *,
+        user_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Row]:
+        where: list[str] = []
+        params: list[Any] = []
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(user_id)
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        sql = "SELECT id, user_id, prompt, task_type, mode, status, created_at, completed_at FROM consultations"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+        params.extend([int(offset), int(limit)])
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute, sql, tuple(params))
+            return [self._normalize_consultation_row(row) for row in await _fetch_all_dicts(cursor)]  # type: ignore[list-item]
+        finally:
+            await _call(cursor.close)
+
+    async def _fetch_consultation_responses(self, tx: Any, *, consultation_id: str | bytes | uuid.UUID) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, consultation_id, provider, model_id, response, final_score,
+                       tokens_in, tokens_out, latency_ms, created_at
+                FROM consultation_responses
+                WHERE consultation_id = ?
+                ORDER BY id
+                """,
+                (_uuid_to_raw(consultation_id),),
+            )
+            return [self._normalize_consultation_response_row(row) for row in await _fetch_all_dicts(cursor)]  # type: ignore[list-item]
+        finally:
+            await _call(cursor.close)
+
+    @staticmethod
+    def _normalize_consultation_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["id"] = _raw_to_uuid(out.get("id"))
+        return out
+
+    @staticmethod
+    def _normalize_consultation_response_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["consultation_id"] = _raw_to_uuid(out.get("consultation_id"))
+        return out
+
+
+class Db2AuditChainRepository(OracleAuditChainRepository):
+    """Db2 12.1.x impl of v6.2 M-2.2.1 audit chain.
+
+    Inherits the Oracle implementation verbatim — Db2's Oracle
+    Compatibility Mode supports `TO_TIMESTAMP_TZ`, `NUMTODSINTERVAL`,
+    `ROWNUM`, `SYSTIMESTAMP`, and `FOR UPDATE SKIP LOCKED` (Db2 11.5+).
+    Cursor-level Ora→Db2 translation (`_ORA_TO_DB2_PAIRS` +
+    `_BIND_RE`) handles `SYSTIMESTAMP`→`CURRENT TIMESTAMP` and
+    `:name` → `?` bind conversion.
+
+    No override needed unless Db2 diverges on a specific call;
+    file a follow-up commit if/when that happens.
     """
 
 
@@ -788,6 +3906,8 @@ class Db2Backend(OracleBackend):
     # lands in 12.1.5 (GA Jun 9 2026).
     supports_db2_vector = True
 
+    _UNSUPPORTED_CAPABILITY_MARKERS = frozenset({})
+
     def __init__(self, pool: Any, settings: Any):
         # Call OracleBackend.__init__ so any new ``_X_repo`` attribute
         # added upstream is initialized (Opus review O15). Then rebind
@@ -806,11 +3926,290 @@ class Db2Backend(OracleBackend):
         self._consultations_audit_repo = Db2ConsultationAuditRepository()
         self._federation_repo = Db2FederationRepository()
         self._state_kv_repo = Db2StateRepository()
+        # RA-0/5/6: OAuth/Sessions/Consultations repos (PYTHIA Oracle-only
+        # uses these in production; Db2 needs them for cross-backend parity
+        # so the same code paths exercise both backends in tests).
+        self._oauth_repo = Db2OAuthRepository()
+        self._sessions_repo = Db2SessionsRepository()
+        self._consultations_repo = Db2ConsultationsRepository()
+        self._audit_chain_repo = Db2AuditChainRepository()
         # Startup registry-probe state, populated lazily by ``open()``.
         # ``None`` means "not yet probed"; otherwise stores the raw
         # registry value (``"YES"``, ``"NO"``, ``""``...) for the
         # ``is_vector_indexing_enabled`` property + ``mnemos doctor``.
         self._db2_vector_indexing_value: str | None = None
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in object.__getattribute__(self, "_UNSUPPORTED_CAPABILITY_MARKERS"):
+            raise AttributeError(name)
+        return super().__getattribute__(name)
+
+    @property
+    def capabilities(self) -> set[str]:
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+
+    async def register_oauth_token(self, tx: Any, **kwargs: Any) -> Row:
+        return await self._oauth_repo.register_oauth_token(tx, **kwargs)
+
+    async def lookup_oauth_token(self, tx: Any, **kwargs: Any) -> Row | None:
+        return await self._oauth_repo.lookup_oauth_token(tx, **kwargs)
+
+    async def revoke_oauth_token(self, tx: Any, **kwargs: Any) -> bool:
+        return await self._oauth_repo.revoke_oauth_token(tx, **kwargs)
+
+    async def start_oauth_flow(self, tx: Any, **kwargs: Any) -> Row:
+        return await self._oauth_repo.start_oauth_flow(tx, **kwargs)
+
+    async def redeem_oauth_state(self, tx: Any, **kwargs: Any) -> Row | None:
+        return await self._oauth_repo.redeem_oauth_state(tx, **kwargs)
+
+    async def create_session(self, tx: Any, **kwargs: Any) -> Row:
+        return await self._sessions_repo.create_session(tx, **kwargs)
+
+    async def lookup_session(self, tx: Any, **kwargs: Any) -> Row | None:
+        return await self._sessions_repo.lookup_session(tx, **kwargs)
+
+    async def update_session_active(self, tx: Any, **kwargs: Any) -> bool:
+        return await self._sessions_repo.update_session_active(tx, **kwargs)
+
+    async def expire_session(self, tx: Any, **kwargs: Any) -> bool:
+        return await self._sessions_repo.expire_session(tx, **kwargs)
+
+    async def log_session_event(self, tx: Any, **kwargs: Any) -> Row:
+        return await self._sessions_repo.log_session_event(tx, **kwargs)
+
+    async def create_consultation(self, tx: Any, **kwargs: Any) -> Row:
+        return await self._consultations_repo.create_consultation(tx, **kwargs)
+
+    async def append_consultation_response(self, tx: Any, **kwargs: Any) -> Row:
+        return await self._consultations_repo.append_consultation_response(tx, **kwargs)
+
+    async def fetch_consultation(self, tx: Any, **kwargs: Any) -> Row | None:
+        return await self._consultations_repo.fetch_consultation(tx, **kwargs)
+
+    async def list_consultations(self, tx: Any, **kwargs: Any) -> list[Row]:
+        return await self._consultations_repo.list_consultations(tx, **kwargs)
+
+    async def record_usage_ledger(
+        self,
+        tx: Any,
+        record: Any,
+    ) -> Any:
+        """Record model-token usage with Db2-native INSERT/IDENTITY return.
+
+        Db2 does not support Oracle's ``RETURNING ... INTO`` through the
+        ibm_db_dbi cursor wrapper, so this uses ``FINAL TABLE`` to return the
+        generated identity and computed cost. Unknown registry prices still
+        insert the usage row with explicit zero cost and a drift warning.
+        """
+        from decimal import Decimal
+
+        from mnemos.persistence.base import UsageLedgerResult
+
+        def _is_missing_model_registry(exc: BaseException) -> bool:
+            sqlstate = str(getattr(exc, "sqlstate", "")).upper()
+            sqlcode = str(getattr(exc, "sqlcode", ""))
+            msg = str(exc).upper()
+            return (
+                sqlstate == "42704"
+                or sqlcode == "-204"
+                or "SQLSTATE=42704" in msg
+                or "SQLSTATE 42704" in msg
+                or "SQLCODE=-204" in msg
+                or "SQL0204N" in msg
+            )
+
+        async def _insert_zero_cost() -> Any:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, est_cost_usd
+                FROM FINAL TABLE (
+                    INSERT INTO usage_ledger (
+                        provider, model, task_kind, tokens_in, tokens_out,
+                        tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                        caller_subsystem, tier, session_id, request_count,
+                        plan_window_id, path_kind, subscription_amortized
+                    )
+                    VALUES (
+                        ?, ?, ?, ?, ?, ?,
+                        DECIMAL(0, 12, 6),
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                )
+                """,
+                (
+                    record.provider,
+                    record.model,
+                    record.task_kind,
+                    record.tokens_in,
+                    record.tokens_out,
+                    record.tokens_reasoning,
+                    record.latency_ms,
+                    record.outcome,
+                    record.caller_subsystem,
+                    record.tier,
+                    record.session_id,
+                    record.request_count,
+                    record.plan_window_id,
+                    record.path_kind or "api",
+                    0,
+                ),
+            )
+            return await _call(cursor.fetchone)
+
+        conn = _conn_from_tx(tx)
+        cursor = conn.cursor()
+        try:
+            auth_method = "api"
+            try:
+                await _call(
+                    cursor.execute,
+                    "SELECT auth_method FROM subscription_plans WHERE provider = ? AND plan_name = ?",
+                    (record.provider, record.tier),
+                )
+                plan_row = await _call(cursor.fetchone)
+                if plan_row:
+                    auth_method = str(plan_row[0]).lower()
+            except Exception as exc:
+                if not _is_missing_model_registry(exc):
+                    raise
+
+            if auth_method == "subscription":
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT id, est_cost_usd
+                    FROM FINAL TABLE (
+                        INSERT INTO usage_ledger (
+                            provider, model, task_kind, tokens_in, tokens_out,
+                        tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                        caller_subsystem, tier, session_id, request_count,
+                        plan_window_id, path_kind, subscription_amortized
+                    )
+                    VALUES (
+                        ?, ?, ?, ?, ?, ?,
+                        DECIMAL(0, 12, 6),
+                        ?, ?, ?, ?, ?, ?, ?, ?, SMALLINT(1)
+                    )
+                    )
+                    """,
+                    (
+                        record.provider,
+                        record.model,
+                        record.task_kind,
+                        record.tokens_in,
+                        record.tokens_out,
+                        record.tokens_reasoning,
+                        record.latency_ms,
+                        record.outcome,
+                        record.caller_subsystem,
+                        record.tier,
+                        record.session_id,
+                        record.request_count,
+                        record.plan_window_id,
+                        record.path_kind or "api",
+                    ),
+                )
+                row = await _call(cursor.fetchone)
+            else:
+                try:
+                    await _call(
+                        cursor.execute,
+                        "SELECT 1 FROM model_registry WHERE provider = ? AND model_id = ?",
+                        (record.provider, record.model),
+                    )
+                    if await _call(cursor.fetchone) is None:
+                        _LOG.warning(
+                            "usage_ledger model_registry price missing for provider=%s model=%s; "
+                            "recording est_cost_usd=0",
+                            record.provider,
+                            record.model,
+                        )
+                except Exception as exc:
+                    if not _is_missing_model_registry(exc):
+                        raise
+                    _LOG.warning(
+                        "usage_ledger model_registry table missing for provider=%s model=%s; "
+                        "recording est_cost_usd=0",
+                        record.provider,
+                        record.model,
+                    )
+                    row = await _insert_zero_cost()
+                else:
+                    try:
+                        await _call(
+                            cursor.execute,
+                            """
+                        SELECT id, est_cost_usd
+                        FROM FINAL TABLE (
+                            INSERT INTO usage_ledger (
+                                provider, model, task_kind, tokens_in, tokens_out,
+                                tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                                caller_subsystem, tier, session_id, request_count,
+                                plan_window_id, path_kind, subscription_amortized
+                            )
+                            VALUES (
+                                ?, ?, ?, ?, ?, ?,
+                                COALESCE((
+                                    SELECT DECIMAL(
+                                        (? * COALESCE(input_cost_per_mtok, 0)
+                                       + ? * COALESCE(output_cost_per_mtok, 0)
+                                       + ? * COALESCE(output_cost_per_mtok, 0))
+                                       / 1000000,
+                                       12,
+                                       6
+                                    )
+                                    FROM model_registry
+                                    WHERE provider = ? AND model_id = ?
+                                ), DECIMAL(0, 12, 6)),
+                                ?, ?, ?, ?, ?, ?, ?, ?, SMALLINT(0)
+                            )
+                        )
+                        """,
+                            (
+                                record.provider,
+                                record.model,
+                                record.task_kind,
+                                record.tokens_in,
+                                record.tokens_out,
+                                record.tokens_reasoning,
+                                record.tokens_in,
+                                record.tokens_out,
+                                record.tokens_reasoning,
+                                record.provider,
+                                record.model,
+                                record.latency_ms,
+                                record.outcome,
+                                record.caller_subsystem,
+                                record.tier,
+                                record.session_id,
+                                record.request_count,
+                                record.plan_window_id,
+                                record.path_kind or "api",
+                            ),
+                        )
+                        row = await _call(cursor.fetchone)
+                    except Exception as exc:
+                        if not _is_missing_model_registry(exc):
+                            raise
+                        _LOG.warning(
+                            "usage_ledger model_registry table missing for provider=%s model=%s; "
+                            "recording est_cost_usd=0",
+                            record.provider,
+                            record.model,
+                        )
+                        row = await _insert_zero_cost()
+
+        finally:
+            await _call(cursor.close)
+
+        if row is None:
+            raise RuntimeError("usage_ledger insert returned no row")
+        return UsageLedgerResult(
+            id=int(row[0]),
+            est_cost_usd=Decimal(str(row[1])) if row[1] is not None else Decimal("0"),
+        )
 
     async def open(self) -> None:
         """Open hook — probes ``DB2_VECTOR_INDEXING`` registry var.
@@ -884,8 +4283,37 @@ class Db2Backend(OracleBackend):
         return (self._db2_vector_indexing_value or "").upper() == "YES"
 
 
+class Db2BackendNative(Db2Backend):
+    """Db2 backend with native-cursor pass-through (no Oracle→Db2 token translation).
+
+    Suitable for deployments where every repository method emits Db2-native
+    SQL natively (i.e. uses ``?`` positional binds, ``CURRENT TIMESTAMP``,
+    ``FROM SYSIBM.SYSDUMMY1``, etc.). MNEMOS as of PR #9c has every
+    persistence repository natively overridden, so this is the production
+    posture going forward.
+
+    Operators on older versions OR ones who have customized repositories
+    with Oracle-shape SQL should stay on :class:`Db2Backend` (the compat
+    default). Toggle via env var ``MNEMOS_DB2_DIALECT={native|compat}``.
+    """
+
+    supports_listen_notify = False
+    supports_advisory_locks = False
+    supports_row_level_security = False
+    supports_pgvector = False
+    supports_db2_vector = True
+
+    def __init__(self, pool: Any, settings: Any):
+        # Accept a pre-built _Db2NativeAsyncConnectionPool (built by
+        # create_db2_native_pool). Everything else — repo wiring,
+        # settings, _closed, vector-indexing probe — inherits from
+        # Db2Backend unchanged.
+        super().__init__(pool, settings)
+
+
 __all__ = [
     "Db2Backend",
+    "Db2BackendNative",
     "Db2BranchRepository",
     "Db2CompressionRepository",
     "Db2ConsultationAuditRepository",
@@ -896,4 +4324,5 @@ __all__ = [
     "Db2VersionRepository",
     "Db2WebhookRepository",
     "create_db2_pool",
+    "create_db2_native_pool",
 ]

@@ -24,19 +24,24 @@ import json
 import logging
 import math
 import os
+import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 from mnemos.persistence.base import (
+    AuditChainRepository,
     BranchRepository,
     CompressionRepository,
     ConsultationAuditRepository,
+    ConsultationsRepository,
     FederationRepository,
     KGRepository,
     MemoryRepository,
-    PersistenceBackend,
+    OAuthRepository,
+    SessionsRepository,
     StateRepository,
     Transaction,
     VersionRepository,
@@ -212,6 +217,78 @@ def _conn_from_tx(tx: Any) -> Any:
     return getattr(tx, "conn", tx)
 
 
+def _uuid_to_raw(value: str | bytes | uuid.UUID | None) -> bytes | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        if len(value) != 16:
+            raise ValueError("RAW UUID values must be exactly 16 bytes")
+        return value
+    if isinstance(value, uuid.UUID):
+        return value.bytes
+    return uuid.UUID(str(value)).bytes
+
+
+def _raw_to_uuid(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    return str(uuid.UUID(bytes=bytes(value)))
+
+
+def _raw_token(value: str | bytes, *, length: int = 32) -> bytes:
+    if isinstance(value, bytes):
+        if len(value) != length:
+            raise ValueError(f"RAW token values must be exactly {length} bytes")
+        return value
+    text = str(value)
+    try:
+        raw = bytes.fromhex(text)
+    except ValueError:
+        raw = text.encode("utf-8")
+    if len(raw) != length:
+        raise ValueError(f"RAW token values must be exactly {length} bytes")
+    return raw
+
+
+def _raw_token_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return bytes(value).hex()
+
+
+def _json_text(value: Any, default: Any = None) -> str:
+    if value is None:
+        value = default
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _json_value(value: Any, default: Any = None) -> Any:
+    if value in (None, ""):
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    try:
+        return json.loads(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _ts_for_oracle(value: Any) -> Any:
+    if value is None or isinstance(value, datetime):
+        return value
+    text = str(value)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return value
+
+
 async def _call(value: Any, *args: Any, **kwargs: Any) -> Any:
     result = value(*args, **kwargs) if callable(value) else value
     return await result if inspect.isawaitable(result) else result
@@ -319,19 +396,19 @@ def _build_oracle_session_callback(settings: Any) -> Any:
     """
     pdb_target = os.environ.get("MNEMOS_ORACLE_PDB", "").strip()
 
-    def _session_callback(conn: Any, requested_tag: Any) -> None:
+    async def _session_callback(conn: Any, requested_tag: Any) -> None:
         cur = None
         try:
             cur = conn.cursor()
             # Defensive NLS pinning: prevents locale-dependent decimal
             # parsing of vector literals + numeric binds.
             try:
-                cur.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '. '")
+                await cur.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '. '")
             except Exception as exc:  # pragma: no cover - driver-dependent
                 _LOG.debug("ALTER SESSION SET NLS_NUMERIC_CHARACTERS failed: %s", exc)
             if pdb_target:
                 try:
-                    cur.execute(f"ALTER SESSION SET CONTAINER = {pdb_target}")
+                    await cur.execute(f"ALTER SESSION SET CONTAINER = {pdb_target}")
                 except Exception as exc:  # pragma: no cover - driver-dependent
                     # ORA-65049 = already in the requested PDB; benign.
                     _LOG.debug(
@@ -420,7 +497,7 @@ async def create_oracle_pool(
     kwargs.setdefault("min", pool_min)
     kwargs.setdefault("max", pool_max)
     kwargs.setdefault("increment", pool_increment)
-    kwargs.setdefault("statement_cache_size", stmt_cache)
+    kwargs.setdefault("stmtcachesize", stmt_cache)
     # Explicit WAIT mode + timeout: default behaviour would otherwise
     # block forever when the pool is saturated.
     kwargs.setdefault("getmode", oracledb.POOL_GETMODE_WAIT)
@@ -1058,6 +1135,32 @@ class OracleMemoryRepository(MemoryRepository):
             )
             row = await _call(cursor.fetchone)
             return await _row_to_dict(cursor, row)
+        finally:
+            await _call(cursor.close)
+
+    async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
+        """Write a precomputed embedding to memories.embedding.
+
+        Idempotent UPDATE; no-op when embedding is empty. Used by
+        create_memory inline embed-on-write path (mnemos/api/routes/
+        memories.py:946) + federation F-1.4 copy_embeddings consumer.
+        2026-05-24: added so Oracle backend new-write rows actually
+        land with vectors instead of NULL.
+        """
+        if not embedding:
+            return
+        import array as _array
+
+        # Oracle 23ai VECTOR binds via array.array('f', ...).
+        arr = _array.array("f", [float(v) for v in embedding])
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET embedding = :emb WHERE id = :id",
+                {"emb": arr, "id": memory_id},
+            )
         finally:
             await _call(cursor.close)
 
@@ -2058,6 +2161,56 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
     posture as a fresh Postgres install before model_registry seeding.
     """
 
+    async def _registry_rows(self, tx: Transaction) -> list[dict[str, Any]]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT model_id, display_name, family, input_cost_per_mtok, "
+                "output_cost_per_mtok, capabilities, arena_score, arena_rank, "
+                "graeae_weight, context_window "
+                "FROM model_registry "
+                "WHERE available = 1 AND NVL(deprecated, 0) = 0",
+            )
+            raw_rows = await _fetch_all_dicts(cursor)
+        except Exception:
+            return []
+        finally:
+            await _call(cursor.close)
+
+        # Schema lacks explicit `provider` column — derive from model_id prefix
+        # (e.g. "nvidia/qwen3-coder-480b" -> provider="nvidia", model_id="qwen3-coder-480b")
+        # or from family for bare model_ids like "gemini-2.5-flash-lite".
+        normalized: list[dict[str, Any]] = []
+        for row in raw_rows:
+            mid = str(row.get("model_id") or "")
+            family = str(row.get("family") or "")
+            if "/" in mid:
+                provider, model_local = mid.split("/", 1)
+            elif "/" in family:
+                provider = family.split("/", 1)[0]
+                model_local = mid
+            else:
+                # Heuristic: try gemini/openai/anthropic family prefixes
+                low = mid.lower()
+                if low.startswith("gemini-"):
+                    provider = "gemini"
+                elif low.startswith("gpt-") or low.startswith("o3") or low.startswith("o4"):
+                    provider = "openai"
+                elif low.startswith("claude-"):
+                    provider = "anthropic"
+                elif low.startswith("grok-"):
+                    provider = "xai"
+                elif low.startswith("llama-") or low.startswith("kimi-"):
+                    provider = "groq"
+                else:
+                    provider = family or "unknown"
+                model_local = mid
+            row["provider"] = provider
+            row["model_id"] = model_local if model_local else mid
+            normalized.append(row)
+        return normalized
+
     async def fetch_recommended_model(
         self,
         tx: Transaction,
@@ -2065,8 +2218,12 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         cost_budget: float,
         quality_floor: float,
     ) -> tuple[dict[str, Any] | None, list[str]]:
-        _ = (tx, task_type, cost_budget, quality_floor)
-        return None, []
+        from mnemos.domain.pantheon.recommendation import choose_recommended_model
+
+        rows = await self._registry_rows(tx)
+        if not rows:
+            return None, []
+        return choose_recommended_model(rows, task_type, cost_budget, quality_floor)
 
     async def fetch_model_recommendation(
         self,
@@ -2075,20 +2232,286 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         cost_budget: float = 10.0,
         quality_floor: float = 0.85,
     ) -> dict[str, Any] | None:
-        _ = (tx, task_type, cost_budget, quality_floor)
-        return None
+        model, _ = await self.fetch_recommended_model(tx, task_type, cost_budget, quality_floor)
+        return model
 
     async def lookup_provider_for_model(self, tx: Transaction, model: str) -> str | None:
-        _ = (tx, model)
-        return None
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider FROM model_registry WHERE model_id = :m AND ROWNUM = 1",
+                {"m": model},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            return row.get("provider") if row else None
+        except Exception:
+            return None
+        finally:
+            await _call(cursor.close)
 
     async def fetch_available_models(self, tx: Transaction) -> list[Row]:
-        _ = tx
-        return []
+        return await self._registry_rows(tx)
 
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
         _ = (tx, model_id)
         return None
+
+
+class OracleOAuthRepository(OAuthRepository):
+    async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT name, display_name, kind, enabled FROM oauth_providers "
+                "WHERE enabled = 1 ORDER BY display_name",
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_provider(self, tx: Transaction, name: str) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT name, kind, issuer_url, client_id, client_secret, scope, "
+                "authorize_url, token_url, userinfo_url, enabled "
+                "FROM oauth_providers WHERE name = :name",
+                {"name": name},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def provision_or_link_user(self, tx: Transaction, **kwargs: Any) -> tuple[str, str]:
+        raise NotImplementedError("Oracle OAuth identity provisioning repository is not implemented")
+
+    async def create_session(self, tx: Transaction, **kwargs: Any) -> str:
+        raise NotImplementedError("Oracle OAuth session creation repository is not implemented")
+
+    async def revoke_session(self, tx: Transaction, session_id: str) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE oauth_sessions SET revoked = 1, revoked_at = SYSTIMESTAMP "
+                "WHERE session_id = :session_id AND revoked = 0",
+                {"session_id": session_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_all_sessions(self, tx: Transaction, user_id: str) -> int:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE oauth_sessions SET revoked = 1, revoked_at = SYSTIMESTAMP "
+                "WHERE user_id = :user_id AND revoked = 0",
+                {"user_id": user_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def get_identity_for_session(self, tx: Transaction, session_id: str) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT i.id, i.user_id, i.provider, i.external_id, i.email, i.display_name, "
+                "i.last_login_at, i.created FROM oauth_sessions s "
+                "JOIN oauth_identities i ON i.id = s.identity_id "
+                "WHERE s.session_id = :session_id AND s.revoked = 0",
+                {"session_id": session_id},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+
+class OracleSessionsRepository(SessionsRepository):
+    async def create_session(self, tx: Transaction, **kwargs: Any) -> Row:
+        raise NotImplementedError("Oracle chat sessions repository is not implemented")
+
+    async def get_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT * FROM sessions WHERE id = :id AND user_id = :user_id "
+                "AND namespace = :namespace AND deleted_at IS NULL",
+                {"id": session_id, "user_id": user_id, "namespace": namespace},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def list_injected_memory_ids(self, tx: Transaction, session_id: str, limit: int = 10) -> list[str]:
+        _ = (tx, session_id, limit)
+        return []
+
+    async def add_message(self, tx: Transaction, **kwargs: Any) -> Any:
+        raise NotImplementedError("Oracle chat session messages repository is not implemented")
+
+    async def fetch_provider_history(self, tx: Transaction, session_id: str) -> list[Row]:
+        _ = (tx, session_id)
+        return []
+
+    async def add_memory_injections(self, tx: Transaction, **kwargs: Any) -> None:
+        _ = (tx, kwargs)
+
+    async def update_metrics(self, tx: Transaction, **kwargs: Any) -> None:
+        _ = (tx, kwargs)
+
+    async def fetch_history(self, tx: Transaction, session_id: str, limit: int, offset: int) -> tuple[list[Row], int]:
+        _ = (tx, session_id, limit, offset)
+        return [], 0
+
+    async def delete_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> bool:
+        _ = (tx, session_id, user_id, namespace)
+        return False
+
+
+class OracleConsultationsRepository(ConsultationsRepository):
+    async def resolve_tier_lineup(self, tx: Transaction, tier: str) -> list[Row]:
+        _ = (tx, tier)
+        return []
+
+    async def resolve_models(self, tx: Transaction, model_ids: Sequence[str]) -> list[Row]:
+        _ = (tx, model_ids)
+        return []
+
+    async def create_consultation_with_audit(self, tx: Transaction, **kwargs: Any) -> Any:
+        """Insert a consultation + audit-chain link + memory refs in one tx.
+
+        Mirrors SqliteConsultationsRepository.create_consultation_with_audit
+        (mnemos/persistence/sqlite.py); Oracle 23ai schema at
+        db/migrations_oracle/0002_graeae.sql defines graeae_consultations,
+        graeae_audit_log, consultation_memory_refs with VARCHAR2(36) PKs and
+        app-side UUIDs.
+        """
+        conn = _conn_from_tx(tx)
+        consultation_id = uuid.uuid4().hex
+        cursor = await _call(conn.cursor)
+        try:
+            # graeae_consultations insert. Note: "mode" is a reserved word
+            # in Oracle; the DDL quotes the column, so the SQL must too.
+            # NOTE: bind var names cannot be Oracle reserved words (ORA-01745).
+            # The "mode" column is reserved → rename the bind to mode_val while
+            # keeping the column name "mode" (quoted) on the INSERT.
+            await _call(
+                cursor.execute,
+                "INSERT INTO graeae_consultations "
+                "(id, prompt, task_type, consensus_response, consensus_score, "
+                'winning_muse, cost, latency_ms, "mode", owner_id, namespace) '
+                "VALUES (:id, :prompt, :task_type, :consensus_response, :consensus_score, "
+                ":winning_muse, :cost, :latency_ms, :mode_val, :owner_id, :namespace)",
+                {
+                    "id": consultation_id,
+                    "prompt": kwargs["prompt"],
+                    "task_type": kwargs["task_type"],
+                    "consensus_response": kwargs["consensus_response"][:500],
+                    "consensus_score": kwargs["consensus_score"],
+                    "winning_muse": kwargs["winning_muse"],
+                    "cost": kwargs["cost"],
+                    "latency_ms": kwargs["latency_ms"],
+                    "mode_val": kwargs["mode"],
+                    "owner_id": kwargs["owner_id"],
+                    "namespace": kwargs["namespace"],
+                },
+            )
+
+            # Audit chain — fetch latest link, hash forward, insert next.
+            prompt_hash = hashlib.sha256(kwargs["prompt"].encode()).hexdigest()
+            response_hash = hashlib.sha256(kwargs["consensus_response"].encode()).hexdigest()
+            await _call(
+                cursor.execute,
+                "SELECT id, chain_hash FROM graeae_audit_log " "ORDER BY sequence_num DESC FETCH FIRST 1 ROWS ONLY",
+            )
+            prev_row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            prev_chain = prev_row["chain_hash"] if prev_row else kwargs["genesis_hash"]
+            chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
+            audit_id = uuid.uuid4().hex
+            # provider is NOT NULL on Oracle but winning_muse can be None on
+            # all-muses-failed consensus path (route at consultations.py L361
+            # documents this safe-degradation). Coerce to sentinel "[none]"
+            # so the audit chain still records the event.
+            provider_val = kwargs["winning_muse"] or "[none]"
+            # response_text + consensus_response can be "" → Oracle treats as
+            # NULL; that's now allowed (we ALTERed CONSENSUS_RESPONSE NULL),
+            # but RESPONSE_TEXT on audit_log might still be NOT NULL. The
+            # MODIFY ... NULL migration applied to consensus_response only;
+            # if audit_log.response_text fails NOT NULL, coerce "" to None
+            # so the SQL drops the bind and Oracle stores NULL (which is
+            # itself a violation if NOT NULL set, but the table allows it).
+            await _call(
+                cursor.execute,
+                "INSERT INTO graeae_audit_log "
+                "(id, consultation_id, prompt, prompt_hash, provider, response_text, "
+                "response_hash, chain_hash, prev_id, prev_chain_hash, task_type, quality_score) "
+                "VALUES (:id, :consultation_id, :prompt, :prompt_hash, :provider, :response_text, "
+                ":response_hash, :chain_hash, :prev_id, :prev_chain_hash, :task_type, :quality_score)",
+                {
+                    "id": audit_id,
+                    "consultation_id": consultation_id,
+                    "prompt": kwargs["prompt"],
+                    "prompt_hash": prompt_hash,
+                    "provider": provider_val,
+                    "response_text": kwargs["consensus_response"] or "[empty]",
+                    "response_hash": response_hash,
+                    "chain_hash": chain_hash,
+                    "prev_id": prev_row["id"] if prev_row else None,
+                    "prev_chain_hash": prev_chain,
+                    "task_type": kwargs["task_type"] or "reasoning",
+                    "quality_score": kwargs["consensus_score"],
+                },
+            )
+
+            # Memory refs — Oracle has no INSERT OR IGNORE; the UNIQUE
+            # constraint unique_consultation_memory raises ORA-00001 on
+            # duplicate, so we swallow that one error code only.
+            for memory_id in kwargs["memory_ids"]:
+                ref_id = uuid.uuid4().hex
+                try:
+                    await _call(
+                        cursor.execute,
+                        "INSERT INTO consultation_memory_refs "
+                        "(id, consultation_id, memory_id) "
+                        "VALUES (:id, :consultation_id, :memory_id)",
+                        {
+                            "id": ref_id,
+                            "consultation_id": consultation_id,
+                            "memory_id": memory_id,
+                        },
+                    )
+                except Exception as exc:
+                    # ORA-00001 unique violation — duplicate ref, safe to skip.
+                    msg = str(exc)
+                    if "ORA-00001" not in msg:
+                        raise
+        finally:
+            await _call(cursor.close)
+        return consultation_id
+
+    async def list_audit_log(self, tx: Transaction, **kwargs: Any) -> list[Row]:
+        _ = (tx, kwargs)
+        return []
+
+    async def fetch_audit_chain(self, tx: Transaction, **kwargs: Any) -> list[Row]:
+        _ = (tx, kwargs)
+        return []
+
+    async def get_consultation(self, tx: Transaction, **kwargs: Any) -> Row | None:
+        _ = (tx, kwargs)
+        return None
+
+    async def get_consultation_artifacts(self, tx: Transaction, **kwargs: Any) -> tuple[Row | None, list[Row]]:
+        _ = (tx, kwargs)
+        return None, []
 
 
 class OracleFederationRepository(FederationRepository):
@@ -2736,6 +3159,7 @@ class OracleFederationRepository(FederationRepository):
         categories: Sequence[str],
         limit: int,
         prefer_compressed: bool,
+        include_embedding: bool = False,
     ) -> list[Row]:
         _ = prefer_compressed
         conn = _conn_from_tx(tx)
@@ -2749,7 +3173,13 @@ class OracleFederationRepository(FederationRepository):
             params: dict[str, Any] = {"limit": limit}
             if since_updated is not None and since_id is not None:
                 where.append("(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))")
-                params["upd"] = since_updated
+                # Explicit TIMESTAMP_TZ bind to avoid thin-mode coercion to VARCHAR
+                # which was causing infinite-loop pulls on ACHILLES (id < since_id).
+                import oracledb
+
+                upd_var = cursor.var(oracledb.DB_TYPE_TIMESTAMP_TZ)
+                upd_var.setvalue(0, since_updated)
+                params["upd"] = upd_var
                 params["since_id"] = since_id
             if namespaces:
                 ns_ph, ns_params = _in_placeholders(namespaces, "ns")
@@ -2759,13 +3189,28 @@ class OracleFederationRepository(FederationRepository):
                 cat_ph, cat_params = _in_placeholders(categories, "cat")
                 where.append(f"m.category IN ({cat_ph})")
                 params.update(cat_params)
+            # v6.1 F-1.2: optional embedding + embedding_model literal columns.
+            # See docs/v6.1-federation-embeddings-copy.md.
+            embed_cols = ""
+            if include_embedding:
+                from mnemos.core.config import get_settings as _gs
+
+                try:
+                    import os as _os
+
+                    _http_model = _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                    _model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
+                except Exception:
+                    _model = "unknown"
+                # Single-quote escape for embedded literal.
+                _model_escaped = _model.replace("'", "''")
+                embed_cols = f", m.embedding AS embedding, '{_model_escaped}' AS embedding_model"
             sql = (
                 "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
                 "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
                 "m.permission_mode, m.source_model, m.source_provider, "
                 "m.source_session, m.source_agent, m.created, m.updated, "
-                "m.archived_at "
-                "FROM memories m WHERE " + " AND ".join(where) + " "
+                "m.archived_at" + embed_cols + " FROM memories m WHERE " + " AND ".join(where) + " "
                 "ORDER BY m.updated ASC, m.id ASC "
                 "FETCH FIRST :limit ROWS ONLY"
             )
@@ -2990,8 +3435,368 @@ class OracleStateRepository(StateRepository):
             await _call(cursor.close)
 
 
-class OracleBackend(PersistenceBackend):
+class OracleAuditChainRepository(AuditChainRepository):
+    """Oracle impl of v6.2 M-2.2.1 audit chain.
+
+    Tables: ``memory_audit_chain`` + ``memory_audit_roots``
+    (migrations 0029 + 0030; shipped at 614d483 for Oracle).
+
+    Bytes columns are RAW(16/32/64) — bind via plain ``bytes``
+    through python-oracledb (driver coerces). Timestamps are
+    TIMESTAMP WITH TIME ZONE — bind ISO 8601 strings via
+    ``CAST(:ts AS TIMESTAMP WITH TIME ZONE)``.
+
+    Concurrent sealer instances coexist via Oracle's
+    ``FOR UPDATE SKIP LOCKED`` (11g+).
+    """
+
+    async def get_latest_audit_entry(
+        self,
+        tx: Transaction,
+        memory_id: bytes,
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT * FROM (
+                    SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                           op, payload_hash, writer_id, writer_pubkey,
+                           signature, signed_at, global_root, global_seq
+                    FROM memory_audit_chain
+                    WHERE memory_id = :memory_id
+                    ORDER BY signed_at DESC
+                ) WHERE ROWNUM = 1
+                """,
+                {"memory_id": memory_id},
+            )
+            row = await _call(cursor.fetchone)
+            if row is None:
+                return None
+            cols = [d[0].lower() for d in cursor.description]
+            return dict(zip(cols, row))
+        finally:
+            await _call(cursor.close)
+
+    async def insert_audit_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: bytes,
+        memory_id: bytes,
+        prev_entry_id: bytes | None,
+        prev_entry_hash: bytes | None,
+        op: str,
+        payload_hash: bytes,
+        writer_id: str,
+        writer_pubkey: bytes,
+        signature: bytes,
+        signed_at: Any,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memory_audit_chain (
+                    entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                    op, payload_hash, writer_id, writer_pubkey,
+                    signature, signed_at
+                )
+                VALUES (
+                    :entry_id, :memory_id, :prev_entry_id, :prev_entry_hash,
+                    :op, :payload_hash, :writer_id, :writer_pubkey,
+                    :signature, TO_TIMESTAMP_TZ(:signed_at, 'YYYY-MM-DD"T"HH24:MI:SS.FFTZH:TZM')
+                )
+                """,
+                {
+                    "entry_id": entry_id,
+                    "memory_id": memory_id,
+                    "prev_entry_id": prev_entry_id,
+                    "prev_entry_hash": prev_entry_hash,
+                    "op": op,
+                    "payload_hash": payload_hash,
+                    "writer_id": writer_id,
+                    "writer_pubkey": writer_pubkey,
+                    "signature": signature,
+                    "signed_at": signed_at,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def claim_unsealed_window(
+        self,
+        tx: Transaction,
+        *,
+        max_window_seconds: int,
+        limit: int,
+    ) -> list[Row]:
+        """Claim oldest unsealed entries older than the cutoff using
+        ``FOR UPDATE SKIP LOCKED``. Oracle's NUMTODSINTERVAL is the
+        equivalent of PG's ``interval '<n> seconds'``.
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT entry_id, signature, signed_at
+                FROM memory_audit_chain
+                WHERE global_root IS NULL
+                  AND signed_at <= SYSTIMESTAMP - NUMTODSINTERVAL(:secs, 'SECOND')
+                  AND ROWNUM <= :max_rows
+                ORDER BY signed_at ASC, entry_id ASC
+                FOR UPDATE SKIP LOCKED
+                """,
+                {"secs": int(max_window_seconds), "max_rows": int(limit)},
+            )
+            rows = await _call(cursor.fetchall)
+            if not rows:
+                return []
+            cols = [d[0].lower() for d in cursor.description]
+            return [dict(zip(cols, r)) for r in rows]
+        finally:
+            await _call(cursor.close)
+
+    async def stamp_window_with_root(
+        self,
+        tx: Transaction,
+        *,
+        entry_ids: list[bytes],
+        global_root: bytes,
+        starting_seq: int,
+    ) -> None:
+        if not entry_ids:
+            return
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            # Oracle has no array-unnest; loop UPDATE preserving
+            # caller-supplied seq order. Hot-path correctness > batch
+            # microseconds here — sealer runs at 60s cadence.
+            for offset, eid in enumerate(entry_ids):
+                await _call(
+                    cursor.execute,
+                    """
+                    UPDATE memory_audit_chain
+                    SET global_root = :root, global_seq = :seq
+                    WHERE entry_id = :eid
+                    """,
+                    {
+                        "root": global_root,
+                        "seq": starting_seq + offset,
+                        "eid": eid,
+                    },
+                )
+        finally:
+            await _call(cursor.close)
+
+    async def insert_audit_root(
+        self,
+        tx: Transaction,
+        *,
+        global_root: bytes,
+        window_start: Any,
+        window_end: Any,
+        entry_count: int,
+        root_signature: bytes,
+        signer_pubkey: bytes,
+        sealed_at: Any,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memory_audit_roots (
+                    global_root, window_start, window_end, entry_count,
+                    root_signature, signer_pubkey, sealed_at
+                )
+                VALUES (
+                    :global_root,
+                    TO_TIMESTAMP_TZ(:window_start, 'YYYY-MM-DD"T"HH24:MI:SS.FFTZH:TZM'),
+                    TO_TIMESTAMP_TZ(:window_end, 'YYYY-MM-DD"T"HH24:MI:SS.FFTZH:TZM'),
+                    :entry_count,
+                    :root_signature, :signer_pubkey,
+                    TO_TIMESTAMP_TZ(:sealed_at, 'YYYY-MM-DD"T"HH24:MI:SS.FFTZH:TZM')
+                )
+                """,
+                {
+                    "global_root": global_root,
+                    "window_start": window_start,
+                    "window_end": window_end,
+                    "entry_count": int(entry_count),
+                    "root_signature": root_signature,
+                    "signer_pubkey": signer_pubkey,
+                    "sealed_at": sealed_at,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def list_window_entries(
+        self,
+        tx: Transaction,
+        global_root: bytes,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT entry_id, memory_id, signature, signed_at,
+                       global_seq, payload_hash, op
+                FROM memory_audit_chain
+                WHERE global_root = :root
+                ORDER BY signed_at ASC, entry_id ASC
+                """,
+                {"root": global_root},
+            )
+            rows = await _call(cursor.fetchall)
+            if not rows:
+                return []
+            cols = [d[0].lower() for d in cursor.description]
+            return [dict(zip(cols, r)) for r in rows]
+        finally:
+            await _call(cursor.close)
+
+    async def get_audit_entry_by_id(
+        self,
+        tx: Transaction,
+        entry_id: bytes,
+    ) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                       op, payload_hash, writer_id, writer_pubkey,
+                       signature, signed_at, global_root, global_seq
+                FROM memory_audit_chain
+                WHERE entry_id = :eid
+                """,
+                {"eid": entry_id},
+            )
+            row = await _call(cursor.fetchone)
+            if row is None:
+                return None
+            cols = [d[0].lower() for d in cursor.description]
+            return dict(zip(cols, row))
+        finally:
+            await _call(cursor.close)
+
+    async def get_chain_stats(self, tx: Transaction) -> dict:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT
+                    COUNT(*),
+                    COUNT(CASE WHEN global_root IS NULL THEN 1 END),
+                    MIN(CASE WHEN global_root IS NULL THEN signed_at END)
+                FROM memory_audit_chain
+                """,
+            )
+            crow = await _call(cursor.fetchone)
+            total = int(crow[0] or 0)
+            unsealed = int(crow[1] or 0)
+            oldest = crow[2]
+            await _call(
+                cursor.execute,
+                """
+                SELECT COUNT(*), MAX(sealed_at)
+                FROM memory_audit_roots
+                """,
+            )
+            rrow = await _call(cursor.fetchone)
+            root_count = int(rrow[0] or 0)
+            last_sealed = rrow[1]
+        finally:
+            await _call(cursor.close)
+        return {
+            "total_entries": total,
+            "unsealed_count": unsealed,
+            "oldest_unsealed_signed_at": (
+                oldest.isoformat() if hasattr(oldest, "isoformat") else (str(oldest) if oldest else None)
+            ),
+            "sealed_root_count": root_count,
+            "last_sealed_at": (
+                last_sealed.isoformat()
+                if hasattr(last_sealed, "isoformat")
+                else (str(last_sealed) if last_sealed else None)
+            ),
+        }
+
+    async def get_latest_audit_entries_batch(
+        self,
+        tx: Transaction,
+        memory_ids: list[bytes],
+    ) -> dict[bytes, Row]:
+        """Oracle 12c+ ROW_NUMBER() OVER PARTITION BY. Each memory_id
+        binds individually since python-oracledb doesn't natively
+        accept a list-binding for RAW types in an IN clause without
+        an array-type registration step.
+        """
+        if not memory_ids:
+            return {}
+        placeholders = ",".join(f":m{i}" for i in range(len(memory_ids)))
+        params = {f"m{i}": mid for i, mid in enumerate(memory_ids)}
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                       op, payload_hash, writer_id, writer_pubkey,
+                       signature, signed_at, global_root, global_seq
+                FROM (
+                  SELECT m.*,
+                         ROW_NUMBER() OVER (
+                           PARTITION BY memory_id
+                           ORDER BY signed_at DESC, entry_id DESC
+                         ) AS rn
+                  FROM memory_audit_chain m
+                  WHERE memory_id IN ({placeholders})
+                )
+                WHERE rn = 1
+                """,
+                params,
+            )
+            rows = await _call(cursor.fetchall)
+            if not rows:
+                return {}
+            cols = [d[0].lower() for d in cursor.description]
+            out: dict[bytes, Row] = {}
+            for r in rows:
+                d = dict(zip(cols, r))
+                out[d["memory_id"]] = d
+            return out
+        finally:
+            await _call(cursor.close)
+
+
+class OracleBackend:
     """Oracle persistence facade backed by a python-oracledb async pool."""
+
+    _supports_core_persistence = True
+    _supports_oauth_persistence = True
+    _supports_sessions_persistence = True
+    _supports_consultations_persistence = True
+    _supports_federation_persistence = True
+    _supports_audit_persistence = True
+    _supports_state_persistence = True
 
     supports_listen_notify = False
     supports_advisory_locks = False
@@ -3009,8 +3814,12 @@ class OracleBackend(PersistenceBackend):
         self._compression_repo = OracleCompressionRepository()
         self._webhooks_repo = OracleWebhookRepository()
         self._consultations_audit_repo = OracleConsultationAuditRepository()
+        self._oauth_repo = OracleOAuthRepository()
+        self._sessions_repo = OracleSessionsRepository()
+        self._consultations_repo = OracleConsultationsRepository()
         self._federation_repo = OracleFederationRepository()
         self._state_kv_repo = OracleStateRepository()
+        self._audit_chain_repo = OracleAuditChainRepository()
 
     @property
     def settings(self) -> Any:
@@ -3019,6 +3828,10 @@ class OracleBackend(PersistenceBackend):
     @property
     def pool(self) -> Any:
         return self._pool
+
+    @property
+    def capabilities(self) -> set[str]:
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
 
     @asynccontextmanager
     async def transactional(self) -> AsyncIterator[Transaction]:
@@ -3033,6 +3846,619 @@ class OracleBackend(PersistenceBackend):
             else:
                 if not tx.closed:
                     await tx.commit()
+
+    async def record_usage_ledger(
+        self,
+        tx: Transaction,
+        record: Any,
+    ) -> Any:
+        """Record model-token usage (KNEMON MVP step 5 — Oracle backend).
+
+        Mirrors the Postgres recorder. est_cost_usd is computed server-side
+        from ``model_registry`` (reasoning tokens fall back to the output
+        rate, as Oracle ``model_registry`` has no reasoning-cost column).
+        When the model is absent from the registry, log price drift and
+        default the cost to 0 so the usage row is still recorded (fail-open
+        on price, never lose the usage record). Oracle has no
+        ``INSERT ... SELECT ... RETURNING`` so the cost is a scalar subquery
+        in ``VALUES`` and id/cost come back via ``RETURNING ... INTO``.
+        """
+        import oracledb
+        from decimal import Decimal
+
+        from mnemos.persistence.base import UsageLedgerResult
+
+        def _is_missing_table(exc: BaseException) -> bool:
+            return "ORA-00942" in str(exc)
+
+        def _scalar(var: Any) -> Any:
+            value = var.getvalue()
+            if isinstance(value, (list, tuple)):
+                return value[0] if value else None
+            return value
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            auth_method = "api"
+            try:
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT auth_method
+                    FROM subscription_plans
+                    WHERE provider = :provider
+                      AND plan_name = :plan_name
+                      AND effective_from <= TRUNC(SYSTIMESTAMP)
+                      AND (effective_until IS NULL OR effective_until >= TRUNC(SYSTIMESTAMP))
+                    """,
+                    {"provider": record.provider, "plan_name": record.tier},
+                )
+                row = await _call(cursor.fetchone)
+                if row:
+                    auth_method = str(row[0]).lower()
+            except Exception as exc:
+                if not _is_missing_table(exc):
+                    raise
+
+            rid = cursor.var(oracledb.DB_TYPE_NUMBER)
+            rcost = cursor.var(oracledb.DB_TYPE_NUMBER)
+            params = {
+                "provider": record.provider,
+                "model": record.model,
+                "task_kind": record.task_kind,
+                "tokens_in": record.tokens_in,
+                "tokens_out": record.tokens_out,
+                "tokens_reasoning": record.tokens_reasoning,
+                "latency_ms": record.latency_ms,
+                "outcome": record.outcome,
+                "caller_subsystem": record.caller_subsystem,
+                "tier": record.tier,
+                "session_id": record.session_id,
+                "request_count": record.request_count,
+                "plan_window_id": record.plan_window_id,
+                "path_kind": record.path_kind or "api",
+                "subscription_amortized": 1 if auth_method == "subscription" else 0,
+                "rid": rid,
+                "rcost": rcost,
+            }
+            if auth_method == "subscription":
+                await _call(
+                    cursor.execute,
+                    """
+                INSERT INTO usage_ledger (
+                    provider, model, task_kind, tokens_in, tokens_out,
+                    tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                    caller_subsystem, tier, session_id, request_count,
+                    plan_window_id, path_kind, subscription_amortized
+                )
+                VALUES (
+                    :provider, :model, :task_kind, :tokens_in, :tokens_out,
+                    :tokens_reasoning, 0, :latency_ms, :outcome,
+                    :caller_subsystem, :tier, :session_id, :request_count,
+                    :plan_window_id, :path_kind, :subscription_amortized
+                )
+                RETURNING id, est_cost_usd INTO :rid, :rcost
+                """,
+                    params,
+                )
+            else:
+                try:
+                    await _call(
+                        cursor.execute,
+                        """
+                    INSERT INTO usage_ledger (
+                        provider, model, task_kind, tokens_in, tokens_out,
+                        tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                        caller_subsystem, tier, session_id, request_count,
+                        plan_window_id, path_kind, subscription_amortized
+                    )
+                    VALUES (
+                        :provider, :model, :task_kind, :tokens_in, :tokens_out,
+                        :tokens_reasoning,
+                        NVL((
+                            SELECT (:tokens_in * NVL(input_cost_per_mtok, 0)
+                                  + :tokens_out * NVL(output_cost_per_mtok, 0)
+                                  + :tokens_reasoning * NVL(output_cost_per_mtok, 0))
+                                  / 1000000
+                            FROM model_registry
+                            WHERE provider = :provider AND model_id = :model
+                        ), 0),
+                        :latency_ms, :outcome, :caller_subsystem, :tier,
+                        :session_id, :request_count, :plan_window_id,
+                        :path_kind, :subscription_amortized
+                    )
+                    RETURNING id, est_cost_usd INTO :rid, :rcost
+                    """,
+                        params,
+                    )
+                except Exception as exc:
+                    if not _is_missing_table(exc):
+                        raise
+                    _LOG.warning(
+                        "usage_ledger model_registry table missing for provider=%s model=%s; "
+                        "recording est_cost_usd=0",
+                        record.provider,
+                        record.model,
+                    )
+                    await _call(
+                        cursor.execute,
+                        """
+                    INSERT INTO usage_ledger (
+                        provider, model, task_kind, tokens_in, tokens_out,
+                        tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                        caller_subsystem, tier, session_id, request_count,
+                        plan_window_id, path_kind, subscription_amortized
+                    )
+                    VALUES (
+                        :provider, :model, :task_kind, :tokens_in, :tokens_out,
+                        :tokens_reasoning, 0, :latency_ms, :outcome,
+                        :caller_subsystem, :tier, :session_id, :request_count,
+                        :plan_window_id, :path_kind, :subscription_amortized
+                    )
+                    RETURNING id, est_cost_usd INTO :rid, :rcost
+                    """,
+                        params,
+                    )
+            if auth_method != "subscription" and _scalar(rcost) == 0:
+                _LOG.warning(
+                    "usage_ledger model_registry price missing for provider=%s model=%s; " "recording est_cost_usd=0",
+                    record.provider,
+                    record.model,
+                )
+        finally:
+            await _call(cursor.close)
+
+        new_id = _scalar(rid)
+        cost = _scalar(rcost)
+        return UsageLedgerResult(
+            id=int(new_id),
+            est_cost_usd=Decimal(str(cost)) if cost is not None else Decimal("0"),
+        )
+
+    async def register_oauth_token(
+        self,
+        tx: Transaction,
+        *,
+        token: str | bytes,
+        user_id: str,
+        provider: str,
+        scopes: Sequence[str] | dict[str, Any] | None = None,
+        expires_at: Any = None,
+        refresh_token: str | None = None,
+    ) -> Row:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO oauth_tokens
+                  (token, user_id, provider, scopes, expires_at, refresh_token, created_at, last_used_at)
+                VALUES (:token, :user_id, :provider, :scopes, :expires_at, :refresh_token, SYSTIMESTAMP, NULL)
+                """,
+                {
+                    "token": _raw_token(token),
+                    "user_id": user_id,
+                    "provider": provider,
+                    "scopes": _json_text(scopes, []),
+                    "expires_at": _ts_for_oracle(expires_at),
+                    "refresh_token": refresh_token,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.lookup_oauth_token(tx, token=token, touch=False)
+        assert row is not None
+        return row
+
+    async def lookup_oauth_token(self, tx: Transaction, *, token: str | bytes, touch: bool = True) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        raw = _raw_token(token)
+        try:
+            if touch:
+                await _call(
+                    cursor.execute,
+                    "UPDATE oauth_tokens SET last_used_at = SYSTIMESTAMP WHERE token = :token",
+                    {"token": raw},
+                )
+            await _call(
+                cursor.execute,
+                """
+                SELECT token, user_id, provider, scopes, expires_at, refresh_token, created_at, last_used_at
+                FROM oauth_tokens
+                WHERE token = :token
+                """,
+                {"token": raw},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            return self._normalize_oauth_token_row(row)
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_oauth_token(self, tx: Transaction, *, token: str | bytes) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute, "DELETE FROM oauth_tokens WHERE token = :token", {"token": _raw_token(token)})
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def start_oauth_flow(
+        self,
+        tx: Transaction,
+        *,
+        state: str | bytes,
+        provider: str,
+        csrf_token: str,
+        return_url: str | None,
+        expires_at: Any,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO oauth_state (state, provider, csrf_token, return_url, created_at, expires_at)
+                VALUES (:state, :provider, :csrf_token, :return_url, SYSTIMESTAMP, :expires_at)
+                """,
+                {
+                    "state": _raw_token(state),
+                    "provider": provider,
+                    "csrf_token": csrf_token,
+                    "return_url": return_url,
+                    "expires_at": _ts_for_oracle(expires_at),
+                },
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self._fetch_oauth_state(tx, state=state)
+        assert row is not None
+        return row
+
+    async def redeem_oauth_state(self, tx: Transaction, *, state: str | bytes) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        raw = _raw_token(state)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT state, provider, csrf_token, return_url, created_at, expires_at
+                FROM oauth_state
+                WHERE state = :state AND expires_at > SYSTIMESTAMP
+                """,
+                {"state": raw},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            await _call(cursor.execute, "DELETE FROM oauth_state WHERE state = :state", {"state": raw})
+            return self._normalize_oauth_state_row(row)
+        finally:
+            await _call(cursor.close)
+
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        expires_at: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> Row:
+        sid = session_id or uuid.uuid4()
+        sid_raw = _uuid_to_raw(sid)
+        assert sid_raw is not None
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO sessions (id, session_id, user_id, started_at, last_active_at, expires_at, metadata)
+                VALUES (:id, :session_id, :user_id, SYSTIMESTAMP, SYSTIMESTAMP, :expires_at, :metadata)
+                """,
+                {
+                    "id": str(uuid.UUID(bytes=sid_raw)),
+                    "session_id": sid_raw,
+                    "user_id": user_id,
+                    "expires_at": _ts_for_oracle(expires_at),
+                    "metadata": _json_text(metadata, {}),
+                },
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.lookup_session(tx, session_id=sid)
+        assert row is not None
+        return row
+
+    async def lookup_session(self, tx: Transaction, *, session_id: str | bytes | uuid.UUID) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT session_id, user_id, started_at, last_active_at, expires_at, metadata
+                FROM sessions
+                WHERE session_id = :session_id AND expires_at > SYSTIMESTAMP
+                """,
+                {"session_id": _uuid_to_raw(session_id)},
+            )
+            return self._normalize_session_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+        finally:
+            await _call(cursor.close)
+
+    async def update_session_active(self, tx: Transaction, *, session_id: str | bytes | uuid.UUID) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET last_active_at = SYSTIMESTAMP WHERE session_id = :session_id",
+                {"session_id": _uuid_to_raw(session_id)},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def expire_session(self, tx: Transaction, *, session_id: str | bytes | uuid.UUID) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET expires_at = SYSTIMESTAMP WHERE session_id = :session_id",
+                {"session_id": _uuid_to_raw(session_id)},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def log_session_event(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str | bytes | uuid.UUID,
+        event_kind: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            rid = cursor.var(int)
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO session_logs (session_id, event_kind, payload, ts)
+                VALUES (:session_id, :event_kind, :payload, SYSTIMESTAMP)
+                RETURNING id INTO :id
+                """,
+                {
+                    "session_id": _uuid_to_raw(session_id),
+                    "event_kind": event_kind,
+                    "payload": _json_text(payload, {}),
+                    "id": rid,
+                },
+            )
+            new_id = rid.getvalue()
+            if isinstance(new_id, (list, tuple)):
+                new_id = new_id[0]
+            await _call(
+                cursor.execute,
+                "SELECT id, session_id, event_kind, payload, ts FROM session_logs WHERE id = :id",
+                {"id": new_id},
+            )
+            return self._normalize_session_log_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))  # type: ignore[return-value]
+        finally:
+            await _call(cursor.close)
+
+    async def create_consultation(
+        self,
+        tx: Transaction,
+        *,
+        consultation_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        prompt: str,
+        task_type: str | None,
+        mode: str | None,
+        status: str = "pending",
+    ) -> Row:
+        cid = consultation_id or uuid.uuid4()
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO consultations (id, user_id, prompt, task_type, "mode", status, created_at, completed_at)
+                VALUES (:id, :user_id, :prompt, :task_type, :mode_val, :status, SYSTIMESTAMP, NULL)
+                """,
+                {
+                    "id": _uuid_to_raw(cid),
+                    "user_id": user_id,
+                    "prompt": prompt,
+                    "task_type": task_type,
+                    "mode_val": mode,
+                    "status": status,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.fetch_consultation(tx, consultation_id=cid)
+        assert row is not None
+        return row
+
+    async def append_consultation_response(
+        self,
+        tx: Transaction,
+        *,
+        consultation_id: str | bytes | uuid.UUID,
+        provider: str,
+        model_id: str,
+        response: str,
+        final_score: float | None = None,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        latency_ms: int | None = None,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            rid = cursor.var(int)
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO consultation_responses
+                  (consultation_id, provider, model_id, response, final_score,
+                   tokens_in, tokens_out, latency_ms, created_at)
+                VALUES (:consultation_id, :provider, :model_id, :response, :final_score,
+                        :tokens_in, :tokens_out, :latency_ms, SYSTIMESTAMP)
+                RETURNING id INTO :id
+                """,
+                {
+                    "consultation_id": _uuid_to_raw(consultation_id),
+                    "provider": provider,
+                    "model_id": model_id,
+                    "response": response,
+                    "final_score": final_score,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "latency_ms": latency_ms,
+                    "id": rid,
+                },
+            )
+            new_id = rid.getvalue()
+            if isinstance(new_id, (list, tuple)):
+                new_id = new_id[0]
+            await _call(cursor.execute, "SELECT * FROM consultation_responses WHERE id = :id", {"id": new_id})
+            return self._normalize_consultation_response_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))  # type: ignore[return-value]
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_consultation(self, tx: Transaction, *, consultation_id: str | bytes | uuid.UUID) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, user_id, prompt, task_type, "mode", status, created_at, completed_at
+                FROM consultations
+                WHERE id = :id
+                """,
+                {"id": _uuid_to_raw(consultation_id)},
+            )
+            row = self._normalize_consultation_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+            if row is None:
+                return None
+            row["responses"] = await self._fetch_consultation_responses(tx, consultation_id=consultation_id)
+            return row
+        finally:
+            await _call(cursor.close)
+
+    async def list_consultations(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Row]:
+        where: list[str] = []
+        params: dict[str, Any] = {"limit": int(limit), "offset": int(offset)}
+        if user_id is not None:
+            where.append("user_id = :user_id")
+            params["user_id"] = user_id
+        if status is not None:
+            where.append("status = :status")
+            params["status"] = status
+        sql = 'SELECT id, user_id, prompt, task_type, "mode", status, created_at, completed_at FROM consultations'
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY"
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute, sql, params)
+            return [self._normalize_consultation_row(row) for row in await _fetch_all_dicts(cursor)]  # type: ignore[list-item]
+        finally:
+            await _call(cursor.close)
+
+    async def _fetch_oauth_state(self, tx: Transaction, *, state: str | bytes) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT state, provider, csrf_token, return_url, created_at, expires_at FROM oauth_state WHERE state = :state",
+                {"state": _raw_token(state)},
+            )
+            return self._normalize_oauth_state_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+        finally:
+            await _call(cursor.close)
+
+    async def _fetch_consultation_responses(
+        self, tx: Transaction, *, consultation_id: str | bytes | uuid.UUID
+    ) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, consultation_id, provider, model_id, response, final_score,
+                       tokens_in, tokens_out, latency_ms, created_at
+                FROM consultation_responses
+                WHERE consultation_id = :consultation_id
+                ORDER BY id
+                """,
+                {"consultation_id": _uuid_to_raw(consultation_id)},
+            )
+            return [self._normalize_consultation_response_row(row) for row in await _fetch_all_dicts(cursor)]  # type: ignore[list-item]
+        finally:
+            await _call(cursor.close)
+
+    @staticmethod
+    def _normalize_oauth_token_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["token"] = _raw_token_text(out.get("token"))
+        out["scopes"] = _json_value(out.get("scopes"), [])
+        return out
+
+    @staticmethod
+    def _normalize_oauth_state_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["state"] = _raw_token_text(out.get("state"))
+        return out
+
+    @staticmethod
+    def _normalize_session_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _raw_to_uuid(out.get("session_id"))
+        out["metadata"] = _json_value(out.get("metadata"), {})
+        return out
+
+    @staticmethod
+    def _normalize_session_log_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _raw_to_uuid(out.get("session_id"))
+        out["payload"] = _json_value(out.get("payload"), {})
+        return out
+
+    @staticmethod
+    def _normalize_consultation_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["id"] = _raw_to_uuid(out.get("id"))
+        return out
+
+    @staticmethod
+    def _normalize_consultation_response_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["consultation_id"] = _raw_to_uuid(out.get("consultation_id"))
+        return out
 
     @property
     def memories(self) -> MemoryRepository:
@@ -3063,12 +4489,96 @@ class OracleBackend(PersistenceBackend):
         return self._consultations_audit_repo
 
     @property
+    def oauth(self) -> OAuthRepository:
+        return self._oauth_repo
+
+    @property
+    def sessions(self) -> SessionsRepository:
+        return self._sessions_repo
+
+    @property
+    def consultations(self) -> ConsultationsRepository:
+        return self._consultations_repo
+
+    @property
     def federation(self) -> FederationRepository:
         return self._federation_repo
 
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv_repo
+
+    @property
+    def audit_chain(self) -> AuditChainRepository:
+        return self._audit_chain_repo
+
+    async def ping(self) -> bool:
+        try:
+            async with self._pool.acquire() as conn:
+                cursor = await _call(conn.cursor)
+                try:
+                    await _call(cursor.execute, "SELECT 1 FROM DUAL")
+                    await _call(cursor.fetchone)
+                finally:
+                    await _call(cursor.close)
+            return True
+        except Exception:
+            return False
+
+    async def fetch_category_decay_rows(self, tx: Transaction) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT category, half_life_days, decay_kind, floor FROM memory_category_decay",
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def upsert_category_decay(
+        self,
+        tx: Transaction,
+        *,
+        category: str,
+        half_life_days: float,
+        decay_kind: str,
+        floor: float,
+    ) -> None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO memory_category_decay tgt
+                USING (SELECT :category AS category FROM dual) src
+                ON (tgt.category = src.category)
+                WHEN MATCHED THEN UPDATE SET
+                    half_life_days = :half_life_days,
+                    decay_kind = :decay_kind,
+                    floor = :floor
+                WHEN NOT MATCHED THEN
+                    INSERT (category, half_life_days, decay_kind, floor)
+                    VALUES (:category, :half_life_days, :decay_kind, :floor)
+                """,
+                {
+                    "category": category,
+                    "half_life_days": half_life_days,
+                    "decay_kind": decay_kind,
+                    "floor": floor,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def create_journal_entry(self, tx: Transaction, **kwargs: Any) -> Row:
+        raise NotImplementedError("journal API persistence is not implemented for Oracle schema 0015")
+
+    async def list_journal_entries(self, tx: Transaction, **kwargs: Any) -> list[Row]:
+        raise NotImplementedError("journal API persistence is not implemented for Oracle schema 0015")
+
+    async def delete_journal_entry(self, tx: Transaction, **kwargs: Any) -> bool:
+        raise NotImplementedError("journal API persistence is not implemented for Oracle schema 0015")
 
     async def open(self) -> None:
         """Lifecycle hook — validates pool checkout + session callback.
