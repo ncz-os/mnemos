@@ -3091,6 +3091,138 @@ class PostgresBackend:
             floor,
         )
 
+    async def create_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+    ) -> Row:
+        conn = _postgres_tx(tx).conn
+        metadata_json = json.dumps(metadata or {})
+        if entry_date is None:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                VALUES ($1, $2, $3, CURRENT_DATE, $4, $5, $6::jsonb)
+                RETURNING id, entry_date::text, topic, content, metadata, created::text
+                """,
+                entry_id,
+                owner_id,
+                namespace,
+                topic,
+                content,
+                metadata_json,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                RETURNING id, entry_date::text, topic, content, metadata, created::text
+                """,
+                entry_id,
+                owner_id,
+                namespace,
+                entry_date,
+                topic,
+                content,
+                metadata_json,
+            )
+        if row is None:
+            raise RuntimeError("journal insert returned no row")
+        return dict(row)
+
+    async def list_journal_entries(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str | None,
+        search: str | None,
+        limit: int,
+    ) -> list[Row]:
+        conn = _postgres_tx(tx).conn
+        if entry_date is not None:
+            rows = await conn.fetch(
+                """
+                SELECT id, entry_date::text, topic, content, metadata, created::text
+                FROM journal WHERE owner_id = $1 AND namespace = $2 AND entry_date = $3
+                  AND deleted_at IS NULL
+                ORDER BY created DESC LIMIT $4
+                """,
+                owner_id,
+                namespace,
+                entry_date,
+                limit,
+            )
+        elif topic:
+            rows = await conn.fetch(
+                """
+                SELECT id, entry_date::text, topic, content, metadata, created::text
+                FROM journal WHERE owner_id = $1 AND namespace = $2 AND topic = $3
+                  AND deleted_at IS NULL
+                ORDER BY created DESC LIMIT $4
+                """,
+                owner_id,
+                namespace,
+                topic,
+                limit,
+            )
+        elif search:
+            rows = await conn.fetch(
+                """
+                SELECT id, entry_date::text, topic, content, metadata, created::text
+                FROM journal WHERE owner_id = $1 AND namespace = $2 AND (content ILIKE $3 OR topic ILIKE $3)
+                  AND deleted_at IS NULL
+                ORDER BY created DESC LIMIT $4
+                """,
+                owner_id,
+                namespace,
+                f"%{search}%",
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT id, entry_date::text, topic, content, metadata, created::text
+                FROM journal WHERE owner_id = $1 AND namespace = $2
+                  AND deleted_at IS NULL
+                ORDER BY created DESC LIMIT $3
+                """,
+                owner_id,
+                namespace,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def delete_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+    ) -> bool:
+        result = await _postgres_tx(tx).conn.execute(
+            """
+            DELETE FROM journal
+            WHERE id = $1 AND owner_id = $2 AND namespace = $3
+              AND deleted_at IS NULL
+            """,
+            entry_id,
+            owner_id,
+            namespace,
+        )
+        return result != "DELETE 0"
+
     @property
     def memories(self) -> MemoryRepository:
         return self._memories
