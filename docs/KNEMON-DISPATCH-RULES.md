@@ -14,7 +14,7 @@ The fallback order is correct when implemented as:
 4. API/token auth at or above the cheap-API ceiling.
 5. Other auth methods.
 
-The `$0.50` boundary is intentionally not cheap API. Values `< $0.50` are bucket 2; `$0.50` and higher are bucket 3.
+The `$0.50` boundary is intentionally not cheap API. Values `< $0.50` are bucket 2; `$0.50` and higher are bucket 3. The cost is the router's per-request `estimated_cost_usd`, derived from the candidate model's input/output token prices and the request's estimated input/output tokens.
 
 Priority `>= 14` is the G1 escalation path and maps to `quality >= knemon.g1_quality_floor` (default `0.85`). That preserves the intended high-priority quality floor. Priority `>= 10` maps to tier A/B candidates with `quality >= knemon.g2_quality_floor` (default `0.75`).
 
@@ -40,7 +40,7 @@ These are the rows seeded or refreshed by `0039_knemon_dispatch_rule_refresh`. R
 | OpenAI | `codex_pro_200_25x` | Local planning cap: 375 GPT-5.5 messages per 5h through 2026-05-31 |
 | OpenAI | `codex_pro_200_20x` | Local planning cap: 300 GPT-5.5 messages per 5h from 2026-06-01 |
 
-OpenAI's public ChatGPT Pro documentation supports both $100 and $200 Pro tiers. The generic `chatgpt_pro` row remains as a backward-compatible $200 operator alias so existing workspace pools keep resolving; new pools should prefer the explicit `chatgpt_pro_100` or `chatgpt_pro_200` rows. Rows with no `msg_cap` or `token_cap` report `0%` utilization in KNEMON and are treated as unmetered subscription capacity, still subject to provider abuse guardrails and the local session-burn downgrade.
+OpenAI's public ChatGPT Pro documentation supports both $100 and $200 Pro tiers. The generic `chatgpt_pro` row remains as a backward-compatible $200 operator alias so existing workspace pools keep resolving; new pools should prefer the explicit `chatgpt_pro_100` or `chatgpt_pro_200` rows. Rows with no `msg_cap` or `token_cap` report no utilization percentage in the utilization API and `0%` utilization inside the router. That intentionally treats ChatGPT Pro as operator-owned unmetered subscription capacity for dispatch ranking, still subject to provider abuse guardrails and the local session-burn downgrade.
 
 Anthropic's public Max documentation supports the $100 Max 5x and $200 Max 20x tier relationship and publishes the `225` / `900` message counts as at-least usage estimates. KNEMON treats them as conservative planning caps for utilization accounting, not hard provider caps. The 2026-06-01 switch from `claude_max_200` to `claude_max_100` is a local operator policy encoded in KNEMON, not a provider-published tier migration.
 
@@ -102,7 +102,7 @@ The PR adds these operator policy defaults to `config.toml.example`, `.env.examp
 
 ## Cross-Check
 
-The audit was cross-checked with a Codex muse review and an external GRAEAE consultation. Codex found no blocking issues in the fallback, G1, burn-threshold, or plan-row audit questions, and flagged SQLite migration wording plus stale-window burn coverage as follow-ups; both are addressed here. The parent-alias parity fix is included so exact `codex_pro_100` and `codex_pro_200` pools map to the correct promo/current rows without granting Pro access to `codex_plus`-only workspaces. GRAEAE agreed the rules are internally consistent and reinforced that Codex Pro promo rows, Anthropic Max planning caps, and the 2026-06-01 tier flip should stay labeled as provider-promo/local-policy assumptions rather than provider billing facts. Direct hive submission to the online Claude worker was rejected because this session registered without a submitter URN, so the external GRAEAE consultation was used as the fallback cross-check. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
+The audit was cross-checked with a Codex muse review and external GRAEAE consultations. Codex found no blocking issues in the fallback, G1, burn-threshold, or plan-row audit questions, and flagged SQLite migration wording plus stale-window burn coverage as follow-ups; both are addressed here. The parent-alias parity fix is included so exact `codex_pro_100` and `codex_pro_200` pools map to the correct promo/current rows without granting Pro access to `codex_plus`-only workspaces. GRAEAE agreed that Codex Pro promo rows, Anthropic Max planning caps, and the 2026-06-01 tier flip must stay labeled as provider-promo/local-policy assumptions rather than provider billing facts. A later GRAEAE pass also raised policy clarity risks around unmetered Pro utilization, the automatic 2026-06-01 activation, burned-session quality floors, and the `$0.50` cost unit; those are intentional operator policy choices documented above, not code blockers. Direct hive submission to the online Claude worker was rejected because this session registered without a submitter URN, so the external GRAEAE consultation was used as the Claude-provider fallback cross-check. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
 
 ## Sources
 
