@@ -721,9 +721,14 @@ class GraeaeEngine:
         # — for those, early_return_after stays None and the loop drains
         # all tasks.
         early_return_after: Optional[int] = None
+        early_return_grace_seconds: float = 30.0  # iter56 widen — see below
         if mode in {"auto", "all", "external", "local"} and len(tasks) >= 3:
             # 2/3 = 0.66 quorum threshold (matches route_majority default).
-            early_return_after = max(2, (len(tasks) * 2) // 3)
+            # Was max(2,...) — bumped to max(3,...) so 3-of-5 lineup must
+            # complete before any cancellation. Pairs with the wider
+            # route_majority lineup (limit=5) so slow high-weight muses
+            # like claude-opus + gpt-5.5 get to land.
+            early_return_after = max(3, (len(tasks) * 2) // 3)
 
         results: list = [None] * len(tasks)
         try:
@@ -732,13 +737,31 @@ class GraeaeEngine:
                 for i, r in enumerate(gathered):
                     results[i] = r
             else:
+                import time as _time
                 successes = 0
                 remaining = set(tasks)
                 task_to_idx = {t: i for i, t in enumerate(tasks)}
+                quorum_met_at: Optional[float] = None
+                started_at = _time.monotonic()
                 while remaining:
+                    # iter56 grace: shrink wait timeout once quorum met
+                    # so we exit promptly after the grace window expires.
+                    if quorum_met_at is not None:
+                        grace_left = max(
+                            0.1,
+                            early_return_grace_seconds
+                            - (_time.monotonic() - quorum_met_at),
+                        )
+                    else:
+                        grace_left = None
                     done, remaining = await asyncio.wait(
-                        remaining, return_when=asyncio.FIRST_COMPLETED,
+                        remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=grace_left,
                     )
+                    if not done and grace_left is not None:
+                        # grace expired — cancel remaining + exit loop
+                        break
                     for t in done:
                         idx = task_to_idx[t]
                         try:
@@ -749,8 +772,10 @@ class GraeaeEngine:
                         results[idx] = r
                         if isinstance(r, dict) and r.get("status") == "success":
                             successes += 1
-                    if successes >= early_return_after:
-                        break
+                    if successes >= early_return_after and quorum_met_at is None:
+                        quorum_met_at = _time.monotonic()
+                        # do NOT break — keep waiting until grace expires
+                        # or all tasks finish, whichever comes first.
                 # Cancel any still-pending tasks. They may have partial work
                 # which we drop on the floor — the cost of fastness over
                 # completeness.
@@ -916,9 +941,16 @@ class GraeaeEngine:
         quorum: float = 0.66,
         selection: Optional[Dict[str, Optional[str]]] = None,
     ) -> Dict:
-        """Run up to three muses and report quorum agreement."""
+        """Run up to five muses and report quorum agreement.
+
+        iter56 widen: was limit=3 which cut off Grok-4.20 (0.86) +
+        Together MiniMax-M2.7 (0.78) + NGC Kimi (0.50) before they
+        could participate. limit=5 includes the next two highest-
+        weight muses for wider editorial coverage. Caller can still
+        force a smaller lineup via selection=.
+        """
         lineup = await self._ranked_lineup(
-            task_type=task_type, limit=3, selection=selection,
+            task_type=task_type, limit=5, selection=selection,
         )
         result = await self.consult(
             prompt, task_type, timeout=timeout, selection=lineup or selection, mode="all",
