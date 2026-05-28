@@ -79,6 +79,7 @@ EXPECTED_MIGRATIONS = [
     "0035_subscription_plans_date_aware.sql",
     "0036_hive_agents_subscription_pools.sql",
     "0037_deepseek_direct_provider_seed.sql",
+    "0038_oauth_sessions_consultations.sql",
 ]
 
 EXPECTED_SQLITE_MIGRATIONS = [
@@ -134,6 +135,7 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "migrations_v5_3_4_mcp_audit_log_sqlite.sql",
     "migrations_v6_2_audit_chain_sqlite.sql",
     "migrations_v6_2_category_decay_sqlite.sql",
+    "0038_oauth_sessions_consultations.sql",
 ]
 
 

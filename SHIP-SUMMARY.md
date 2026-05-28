@@ -1,25 +1,26 @@
-Oracle hive adapter completion
+Oracle OAuth/Sessions/Consultations persistence
 
 Implemented:
-- `OracleHiveMindRepository.insert_message` writes to `hive_messages` with UUIDv7 RAW(16) ids and JSON payloads.
-- `OracleHiveMindRepository.emit_event` writes to `hive_events`; it binds TIMESTAMP WITH TIME ZONE first and retries with epoch seconds only for live PYTHIA `ORA-00932` NUMBER compatibility.
-- `OracleHiveMindRepository.cache_get` and `cache_store` read/write `hive_cache` using Oracle `MERGE`.
-- `OracleHiveMindRepository.record_worker_kind_stats` upserts cumulative counters into `hive_worker_kind_stats`.
-- Added a minimal `SqliteHiveMindRepository` parity helper for the completed hive methods.
-- Added `tests/hive_mind/test_oracle_repository_complete.py`.
+- Added Oracle facade methods for OAuth tokens/state, protocol sessions/logs, and consultations/responses.
+- Oracle backend now advertises all seven persistence capabilities: core, oauth, sessions, consultations, federation, audit, state.
+- Added SQLite parity facade methods and a SQLite 0038 test migration.
+- Added 0038 migrations for Oracle, PostgreSQL, and Db2.
+- Registered PostgreSQL 0038 in installer and docker-compose migration lists.
+- Added `tests/persistence/test_oracle_oauth_sessions_consultations.py`.
 
 Verification:
-- `bash -n scripts/*.sh` passed.
-- `python3 -m py_compile mnemos/hive_mind/oracle_repository.py mnemos/hive_mind/repository.py tests/hive_mind/test_oracle_repository_complete.py` passed.
-- `./.venv/bin/python -m py_compile mnemos/hive_mind/oracle_repository.py mnemos/hive_mind/repository.py tests/hive_mind/test_oracle_repository_complete.py` passed.
-- `./.venv/bin/python -m pytest tests/hive_mind/ -q` passed: 1 test.
+- `python3 -m py_compile mnemos/persistence/oracle.py mnemos/persistence/sqlite.py` passed.
+- `.venv/bin/python -m pytest tests/persistence/test_oracle_oauth_sessions_consultations.py tests/persistence/test_capability_protocols.py tests/test_migration_lists_sync.py -q` passed: 16 tests.
+- `ruff` was not installed in `.venv`, so no ruff pass was available.
+
+Live Oracle:
+- Initial default DSN `192.168.207.25:1521/FREEPDB1` failed: service not registered.
+- Applied `db/migrations_oracle/0038_oauth_sessions_consultations.sql` to PYTHIA Oracle `192.168.207.67:1521/ORCLPDB1` as `mnemos`.
+- Live Oracle protocol roundtrip passed for token/state/session/log/consultation/response, then cleaned up synthetic rows.
 
 Smoke:
-- `/opt/agent-bus-venv/bin/python` was not present on this host.
-- Used repo `.venv` Python with `oracledb 4.0.1`.
-- PYTHIA Oracle smoke succeeded against `192.168.207.67:1521/ORCLPDB1` as `mnemos`.
-- Inserted synthetic message and emitted event: `message=019e6dba-d087-79cd-a230-b5210eaa6be6`, `topic=codex-smoke-29e3c32bd90c`.
-
-Operational notes:
-- No migration files changed.
-- No `mnemos-api` or `graeae-hive` redeploy performed.
+- Local Docker socket unavailable.
+- `root@argonas` did not resolve locally; `origin` resolves to `root@192.168.207.101`.
+- `root@192.168.207.101` Docker daemon was not reachable.
+- PYTHIA `docker logs mnemos-api | grep -i capabilit` still shows pre-redeploy capabilities: `audit, core, federation, state`.
+- No `mnemos-api` redeploy performed, per operator gate.

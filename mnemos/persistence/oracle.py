@@ -27,6 +27,7 @@ import os
 import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
@@ -214,6 +215,78 @@ def _conn_from_tx(tx: Any) -> Any:
     if tx is None:
         return None
     return getattr(tx, "conn", tx)
+
+
+def _uuid_to_raw(value: str | bytes | uuid.UUID | None) -> bytes | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        if len(value) != 16:
+            raise ValueError("RAW UUID values must be exactly 16 bytes")
+        return value
+    if isinstance(value, uuid.UUID):
+        return value.bytes
+    return uuid.UUID(str(value)).bytes
+
+
+def _raw_to_uuid(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    return str(uuid.UUID(bytes=bytes(value)))
+
+
+def _raw_token(value: str | bytes, *, length: int = 32) -> bytes:
+    if isinstance(value, bytes):
+        if len(value) != length:
+            raise ValueError(f"RAW token values must be exactly {length} bytes")
+        return value
+    text = str(value)
+    try:
+        raw = bytes.fromhex(text)
+    except ValueError:
+        raw = text.encode("utf-8")
+    if len(raw) != length:
+        raise ValueError(f"RAW token values must be exactly {length} bytes")
+    return raw
+
+
+def _raw_token_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return bytes(value).hex()
+
+
+def _json_text(value: Any, default: Any = None) -> str:
+    if value is None:
+        value = default
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _json_value(value: Any, default: Any = None) -> Any:
+    if value in (None, ""):
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    try:
+        return json.loads(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _ts_for_oracle(value: Any) -> Any:
+    if value is None or isinstance(value, datetime):
+        return value
+    text = str(value)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return value
 
 
 async def _call(value: Any, *args: Any, **kwargs: Any) -> Any:
@@ -3654,6 +3727,9 @@ class OracleBackend:
     """Oracle persistence facade backed by a python-oracledb async pool."""
 
     _supports_core_persistence = True
+    _supports_oauth_persistence = True
+    _supports_sessions_persistence = True
+    _supports_consultations_persistence = True
     _supports_federation_persistence = True
     _supports_audit_persistence = True
     _supports_state_persistence = True
@@ -3691,7 +3767,7 @@ class OracleBackend:
 
     @property
     def capabilities(self) -> set[str]:
-        return {"core", "federation", "audit", "state"}
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
 
     @asynccontextmanager
     async def transactional(self) -> AsyncIterator[Transaction]:
@@ -3875,6 +3951,450 @@ class OracleBackend:
             id=int(new_id),
             est_cost_usd=Decimal(str(cost)) if cost is not None else Decimal("0"),
         )
+
+    async def register_oauth_token(
+        self,
+        tx: Transaction,
+        *,
+        token: str | bytes,
+        user_id: str,
+        provider: str,
+        scopes: Sequence[str] | dict[str, Any] | None = None,
+        expires_at: Any = None,
+        refresh_token: str | None = None,
+    ) -> Row:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO oauth_tokens
+                  (token, user_id, provider, scopes, expires_at, refresh_token, created_at, last_used_at)
+                VALUES (:token, :user_id, :provider, :scopes, :expires_at, :refresh_token, SYSTIMESTAMP, NULL)
+                """,
+                {
+                    "token": _raw_token(token),
+                    "user_id": user_id,
+                    "provider": provider,
+                    "scopes": _json_text(scopes, []),
+                    "expires_at": _ts_for_oracle(expires_at),
+                    "refresh_token": refresh_token,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.lookup_oauth_token(tx, token=token, touch=False)
+        assert row is not None
+        return row
+
+    async def lookup_oauth_token(self, tx: Transaction, *, token: str | bytes, touch: bool = True) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        raw = _raw_token(token)
+        try:
+            if touch:
+                await _call(
+                    cursor.execute,
+                    "UPDATE oauth_tokens SET last_used_at = SYSTIMESTAMP WHERE token = :token",
+                    {"token": raw},
+                )
+            await _call(
+                cursor.execute,
+                """
+                SELECT token, user_id, provider, scopes, expires_at, refresh_token, created_at, last_used_at
+                FROM oauth_tokens
+                WHERE token = :token
+                """,
+                {"token": raw},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            return self._normalize_oauth_token_row(row)
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_oauth_token(self, tx: Transaction, *, token: str | bytes) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute, "DELETE FROM oauth_tokens WHERE token = :token", {"token": _raw_token(token)})
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def start_oauth_flow(
+        self,
+        tx: Transaction,
+        *,
+        state: str | bytes,
+        provider: str,
+        csrf_token: str,
+        return_url: str | None,
+        expires_at: Any,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO oauth_state (state, provider, csrf_token, return_url, created_at, expires_at)
+                VALUES (:state, :provider, :csrf_token, :return_url, SYSTIMESTAMP, :expires_at)
+                """,
+                {
+                    "state": _raw_token(state),
+                    "provider": provider,
+                    "csrf_token": csrf_token,
+                    "return_url": return_url,
+                    "expires_at": _ts_for_oracle(expires_at),
+                },
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self._fetch_oauth_state(tx, state=state)
+        assert row is not None
+        return row
+
+    async def redeem_oauth_state(self, tx: Transaction, *, state: str | bytes) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        raw = _raw_token(state)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT state, provider, csrf_token, return_url, created_at, expires_at
+                FROM oauth_state
+                WHERE state = :state AND expires_at > SYSTIMESTAMP
+                """,
+                {"state": raw},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            await _call(cursor.execute, "DELETE FROM oauth_state WHERE state = :state", {"state": raw})
+            return self._normalize_oauth_state_row(row)
+        finally:
+            await _call(cursor.close)
+
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        expires_at: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> Row:
+        sid = session_id or uuid.uuid4()
+        sid_raw = _uuid_to_raw(sid)
+        assert sid_raw is not None
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO sessions (id, session_id, user_id, started_at, last_active_at, expires_at, metadata)
+                VALUES (:id, :session_id, :user_id, SYSTIMESTAMP, SYSTIMESTAMP, :expires_at, :metadata)
+                """,
+                {
+                    "id": str(uuid.UUID(bytes=sid_raw)),
+                    "session_id": sid_raw,
+                    "user_id": user_id,
+                    "expires_at": _ts_for_oracle(expires_at),
+                    "metadata": _json_text(metadata, {}),
+                },
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.lookup_session(tx, session_id=sid)
+        assert row is not None
+        return row
+
+    async def lookup_session(self, tx: Transaction, *, session_id: str | bytes | uuid.UUID) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT session_id, user_id, started_at, last_active_at, expires_at, metadata
+                FROM sessions
+                WHERE session_id = :session_id AND expires_at > SYSTIMESTAMP
+                """,
+                {"session_id": _uuid_to_raw(session_id)},
+            )
+            return self._normalize_session_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+        finally:
+            await _call(cursor.close)
+
+    async def update_session_active(self, tx: Transaction, *, session_id: str | bytes | uuid.UUID) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET last_active_at = SYSTIMESTAMP WHERE session_id = :session_id",
+                {"session_id": _uuid_to_raw(session_id)},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def expire_session(self, tx: Transaction, *, session_id: str | bytes | uuid.UUID) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET expires_at = SYSTIMESTAMP WHERE session_id = :session_id",
+                {"session_id": _uuid_to_raw(session_id)},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def log_session_event(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str | bytes | uuid.UUID,
+        event_kind: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            rid = cursor.var(int)
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO session_logs (session_id, event_kind, payload, ts)
+                VALUES (:session_id, :event_kind, :payload, SYSTIMESTAMP)
+                RETURNING id INTO :id
+                """,
+                {
+                    "session_id": _uuid_to_raw(session_id),
+                    "event_kind": event_kind,
+                    "payload": _json_text(payload, {}),
+                    "id": rid,
+                },
+            )
+            new_id = rid.getvalue()
+            if isinstance(new_id, (list, tuple)):
+                new_id = new_id[0]
+            await _call(
+                cursor.execute,
+                "SELECT id, session_id, event_kind, payload, ts FROM session_logs WHERE id = :id",
+                {"id": new_id},
+            )
+            return self._normalize_session_log_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))  # type: ignore[return-value]
+        finally:
+            await _call(cursor.close)
+
+    async def create_consultation(
+        self,
+        tx: Transaction,
+        *,
+        consultation_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        prompt: str,
+        task_type: str | None,
+        mode: str | None,
+        status: str = "pending",
+    ) -> Row:
+        cid = consultation_id or uuid.uuid4()
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO consultations (id, user_id, prompt, task_type, "mode", status, created_at, completed_at)
+                VALUES (:id, :user_id, :prompt, :task_type, :mode_val, :status, SYSTIMESTAMP, NULL)
+                """,
+                {
+                    "id": _uuid_to_raw(cid),
+                    "user_id": user_id,
+                    "prompt": prompt,
+                    "task_type": task_type,
+                    "mode_val": mode,
+                    "status": status,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.fetch_consultation(tx, consultation_id=cid)
+        assert row is not None
+        return row
+
+    async def append_consultation_response(
+        self,
+        tx: Transaction,
+        *,
+        consultation_id: str | bytes | uuid.UUID,
+        provider: str,
+        model_id: str,
+        response: str,
+        final_score: float | None = None,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        latency_ms: int | None = None,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            rid = cursor.var(int)
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO consultation_responses
+                  (consultation_id, provider, model_id, response, final_score,
+                   tokens_in, tokens_out, latency_ms, created_at)
+                VALUES (:consultation_id, :provider, :model_id, :response, :final_score,
+                        :tokens_in, :tokens_out, :latency_ms, SYSTIMESTAMP)
+                RETURNING id INTO :id
+                """,
+                {
+                    "consultation_id": _uuid_to_raw(consultation_id),
+                    "provider": provider,
+                    "model_id": model_id,
+                    "response": response,
+                    "final_score": final_score,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "latency_ms": latency_ms,
+                    "id": rid,
+                },
+            )
+            new_id = rid.getvalue()
+            if isinstance(new_id, (list, tuple)):
+                new_id = new_id[0]
+            await _call(cursor.execute, "SELECT * FROM consultation_responses WHERE id = :id", {"id": new_id})
+            return self._normalize_consultation_response_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))  # type: ignore[return-value]
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_consultation(self, tx: Transaction, *, consultation_id: str | bytes | uuid.UUID) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, user_id, prompt, task_type, "mode", status, created_at, completed_at
+                FROM consultations
+                WHERE id = :id
+                """,
+                {"id": _uuid_to_raw(consultation_id)},
+            )
+            row = self._normalize_consultation_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+            if row is None:
+                return None
+            row["responses"] = await self._fetch_consultation_responses(tx, consultation_id=consultation_id)
+            return row
+        finally:
+            await _call(cursor.close)
+
+    async def list_consultations(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Row]:
+        where: list[str] = []
+        params: dict[str, Any] = {"limit": int(limit), "offset": int(offset)}
+        if user_id is not None:
+            where.append("user_id = :user_id")
+            params["user_id"] = user_id
+        if status is not None:
+            where.append("status = :status")
+            params["status"] = status
+        sql = 'SELECT id, user_id, prompt, task_type, "mode", status, created_at, completed_at FROM consultations'
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY"
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute, sql, params)
+            return [self._normalize_consultation_row(row) for row in await _fetch_all_dicts(cursor)]  # type: ignore[list-item]
+        finally:
+            await _call(cursor.close)
+
+    async def _fetch_oauth_state(self, tx: Transaction, *, state: str | bytes) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT state, provider, csrf_token, return_url, created_at, expires_at FROM oauth_state WHERE state = :state",
+                {"state": _raw_token(state)},
+            )
+            return self._normalize_oauth_state_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+        finally:
+            await _call(cursor.close)
+
+    async def _fetch_consultation_responses(
+        self, tx: Transaction, *, consultation_id: str | bytes | uuid.UUID
+    ) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, consultation_id, provider, model_id, response, final_score,
+                       tokens_in, tokens_out, latency_ms, created_at
+                FROM consultation_responses
+                WHERE consultation_id = :consultation_id
+                ORDER BY id
+                """,
+                {"consultation_id": _uuid_to_raw(consultation_id)},
+            )
+            return [self._normalize_consultation_response_row(row) for row in await _fetch_all_dicts(cursor)]  # type: ignore[list-item]
+        finally:
+            await _call(cursor.close)
+
+    @staticmethod
+    def _normalize_oauth_token_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["token"] = _raw_token_text(out.get("token"))
+        out["scopes"] = _json_value(out.get("scopes"), [])
+        return out
+
+    @staticmethod
+    def _normalize_oauth_state_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["state"] = _raw_token_text(out.get("state"))
+        return out
+
+    @staticmethod
+    def _normalize_session_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _raw_to_uuid(out.get("session_id"))
+        out["metadata"] = _json_value(out.get("metadata"), {})
+        return out
+
+    @staticmethod
+    def _normalize_session_log_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _raw_to_uuid(out.get("session_id"))
+        out["payload"] = _json_value(out.get("payload"), {})
+        return out
+
+    @staticmethod
+    def _normalize_consultation_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["id"] = _raw_to_uuid(out.get("id"))
+        return out
+
+    @staticmethod
+    def _normalize_consultation_response_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["consultation_id"] = _raw_to_uuid(out.get("consultation_id"))
+        return out
 
     @property
     def memories(self) -> MemoryRepository:

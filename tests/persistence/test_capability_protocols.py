@@ -49,19 +49,11 @@ def test_postgres_backend_advertises_all_capabilities() -> None:
     assert _protocol_results(backend) == {capability: True for capability in ALL_CAPABILITIES}
 
 
-def test_oracle_backend_advertises_supported_capabilities_only() -> None:
+def test_oracle_backend_advertises_all_capabilities() -> None:
     backend = OracleBackend(pool=object(), settings=_settings())
 
-    assert backend.capabilities == {"core", "federation", "audit", "state"}
-    assert _protocol_results(backend) == {
-        "core": True,
-        "oauth": False,
-        "sessions": False,
-        "consultations": False,
-        "federation": True,
-        "audit": True,
-        "state": True,
-    }
+    assert backend.capabilities == set(ALL_CAPABILITIES)
+    assert _protocol_results(backend) == {capability: True for capability in ALL_CAPABILITIES}
 
 
 def test_db2_backend_advertises_core_only() -> None:
