@@ -53,8 +53,21 @@ def stub_pool(monkeypatch):
     holder: dict = {}
 
     def install(raise_on_execute: bool = False) -> _Conn:
+        from contextlib import asynccontextmanager
+
         conn = _Conn(raise_on_execute=raise_on_execute)
         monkeypatch.setattr(_lc, "_pool", _Pool(conn))
+
+        class _FakeTx:
+            def __init__(self) -> None:
+                self.conn = conn
+
+        class _FakeBackend:
+            @asynccontextmanager
+            async def transactional(self):
+                yield _FakeTx()
+
+        monkeypatch.setattr(_lc, "_persistence_backend", _FakeBackend())
         holder["conn"] = conn
         return conn
 

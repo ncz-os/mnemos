@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 
 class PersistenceBackend(Protocol):
+    @property
+    def capabilities(self) -> set[str]: ...
+
     async def close(self) -> None: ...
 
 
@@ -276,6 +279,13 @@ def _select_persistence_backend(settings) -> str:
 
     if "backend" in explicit_database_fields and configured != "auto":
         return _normalize_backend_name(configured)
+    # Per-backend env var shortcuts: ORACLE_DSN / DB2_DSN override
+    # explicit postgres connection defaults (host/port/user).
+    if os.environ.get("ORACLE_DSN", "").strip():
+        return "oracle"
+    if os.environ.get("DB2_DSN", "").strip():
+        return "db2"
+
     if _has_explicit_postgres_connection_config(settings):
         return "postgres"
     if configured != "auto":
@@ -317,6 +327,25 @@ def _backend_from_database_url(database_url: str) -> str | None:
     if database_url.startswith(("db2:", "ibm_db2:", "db2+ibm_db:")):
         return "db2"
     return None
+
+
+def _parse_required_capabilities(raw: str) -> set[str]:
+    return {part.strip().lower() for part in raw.replace(";", ",").split(",") if part.strip()}
+
+
+def _log_and_validate_backend_capabilities(backend_type: str, backend: object) -> None:
+    capabilities = set(getattr(backend, "capabilities", set()))
+    logger.info(
+        "%s persistence capabilities: %s",
+        backend_type,
+        ", ".join(sorted(capabilities)) if capabilities else "(none)",
+    )
+    required = _parse_required_capabilities(os.environ.get("MNEMOS_REQUIRE_CAPABILITIES", ""))
+    missing = required - capabilities
+    if missing:
+        raise RuntimeError(
+            "Persistence backend " f"{backend_type!r} missing required capabilities: {', '.join(sorted(missing))}"
+        )
 
 
 def _explicit_fields(settings, group: str) -> set[str]:
@@ -389,18 +418,43 @@ def _db2_dsn_from_settings(settings) -> str:
 
 
 async def _build_db2_backend(dsn, settings):
-    """Build and open the IBM Db2 persistence backend (ORA-compat).
+    """Build and open the IBM Db2 persistence backend.
+
+    Obeys ``MNEMOS_DB2_DIALECT``: ``compat`` (default) uses
+    :class:`~mnemos.persistence.db2.Db2Backend` with cursor-layer
+    Oracle→Db2 translation; ``native`` uses
+    :class:`~mnemos.persistence.db2.Db2BackendNative` with pass-through
+    cursors. Unknown values warn and fall back to ``compat``.
 
     ``backend.open()`` runs the ``DB2_VECTOR_INDEXING`` registry probe
-    added in the prior Db2 hardening pass; without this call the probe
-    never fires and operators don't see the actionable startup warning
-    when native vector indexing is disabled.
+    added in the prior Db2 hardening pass — this applies to both
+    compat and native paths.
     """
+    import logging as _build_logging
+
+    _db2_log = _build_logging.getLogger(__name__)
+
     db2_module = importlib.import_module("mnemos.persistence.db2")
     min_size = PG_CONFIG.get("pool_min_size", 1)
     max_size = PG_CONFIG.get("pool_max_size", 8)
-    pool = await db2_module.create_db2_pool(dsn, min_size=min_size, max_size=max_size)
-    backend = db2_module.Db2Backend(pool, settings)
+
+    dialect = getattr(settings.database, "db2_dialect", "compat")
+    valid = {"compat", "native"}
+    if dialect not in valid:
+        _db2_log.warning(
+            "MNEMOS_DB2_DIALECT=%r is not one of %s; falling back to 'compat'.",
+            dialect,
+            sorted(valid),
+        )
+        dialect = "compat"
+
+    if dialect == "native":
+        pool = await db2_module.create_db2_native_pool(dsn, min_size=min_size, max_size=max_size)
+        backend = db2_module.Db2BackendNative(pool, settings)
+    else:
+        pool = await db2_module.create_db2_pool(dsn, min_size=min_size, max_size=max_size)
+        backend = db2_module.Db2Backend(pool, settings)
+
     await backend.open()
     return backend
 
@@ -620,6 +674,8 @@ async def lifespan(app):
     except Exception as e:
         logger.error(f"Failed to initialize {backend_type} persistence backend: {e}", exc_info=True)
         raise
+
+    _log_and_validate_backend_capabilities(backend_type, _persistence_backend)
 
     # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
     if _auth_configurer is not None:

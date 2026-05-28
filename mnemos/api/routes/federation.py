@@ -4,6 +4,7 @@ Two halves:
   * Admin side (root only): register peers, inspect sync status, trigger manual sync.
   * Protocol side (federation role): the `/feed` endpoint that remote peers pull from.
 """
+
 from __future__ import annotations
 
 import json
@@ -14,7 +15,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from mnemos.api.dependencies import UserContext, get_current_user, require_root
-from mnemos.api.persistence_helpers import backend_or_503
+from mnemos.api.persistence_helpers import require_federation_backend
 from mnemos.core.ids import parse_uuid_or_404
 from mnemos.domain import federation as _fed
 from mnemos.domain.models import (
@@ -36,6 +37,54 @@ router = APIRouter(prefix="/v1/federation", tags=["federation"])
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+# Class names + error strings that indicate the DB backend lost its
+# connection (vs a legitimate query failure / programming error).
+# Matched by name + chained-cause walk so we don't hard-import every
+# DB driver. Triggered by the 2026-05-23 CERBERUS investigation
+# (hive job 019e563f): mnemos-api-cerb's Oracle standby was MOUNTED
+# (not OPEN READ ONLY), oracledb raised DPY-6005 inside feed_query,
+# raw 500 propagated to PYTHIA federation pull worker.
+_DB_DISCONNECT_EXC_NAMES = frozenset(
+    {
+        "OperationalError",  # oracledb + sqlalchemy + psycopg
+        "InterfaceError",  # oracledb + psycopg
+        "ConnectionDoesNotExistError",  # asyncpg
+        "ConnectionRefusedError",  # builtin
+        "DisconnectionError",  # sqlalchemy
+        "CannotConnectNowError",  # asyncpg
+    }
+)
+_DB_DISCONNECT_TEXT_MARKERS = (
+    "dpy-6005",
+    "cannot connect",
+    "connection refused",
+    "connection reset",
+    "connection lost",
+    "no listener",
+    "ora-12541",  # TNS no listener
+    "ora-12514",  # listener doesn't currently know
+    "could not translate host name",
+)
+
+
+def _is_db_disconnect(exc: BaseException) -> bool:
+    """Walk the exception + its __cause__/__context__ chain matching
+    known DB-disconnect class names + text markers. Returns True when
+    the failure looks like the backend lost its connection rather than
+    a programming error."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if type(cur).__name__ in _DB_DISCONNECT_EXC_NAMES:
+            return True
+        text = str(cur).lower()
+        if any(marker in text for marker in _DB_DISCONNECT_TEXT_MARKERS):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 async def _require_federation_role(
@@ -107,7 +156,11 @@ def _cursor_datetime(value):
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
-def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
+def _memory_item_from_row(
+    row,
+    include_compressed: bool = False,
+    include_embedding: bool = False,
+) -> MemoryItem:
     """Build a MemoryItem from a feed row.
 
     ``include_compressed`` populates ``compressed_content`` from the
@@ -115,6 +168,12 @@ def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
     (and the caller of the row-fetch actually selected the column).
     Receivers that don't recognize compressed_content fall through
     to the raw ``content`` with no behavior change.
+
+    ``include_embedding`` populates ``embedding`` (base64 float32),
+    ``embedding_model``, and ``embedding_dim`` when the feed_query
+    selected those columns (per v6.1 F-1 copy_embeddings flow). Default
+    off preserves v6.0 wire format. Empty/missing fields when the row
+    has no embedding (NULL column or no join match).
     """
     compressed = None
     if include_compressed:
@@ -126,6 +185,51 @@ def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
         archived_at = row["archived_at"]
     except (KeyError, IndexError):
         archived_at = None
+    embedding_b64: Optional[str] = None
+    embedding_model: Optional[str] = None
+    embedding_dim: Optional[int] = None
+    if include_embedding:
+        try:
+            raw = row["embedding"]
+        except (KeyError, IndexError):
+            raw = None
+        if raw is not None:
+            import base64
+
+            # Backend-specific embedding shapes:
+            #   - postgres pgvector: list[float] / str representation
+            #   - oracle 23ai VECTOR: array.array / list of floats
+            #   - sqlite mnemos: JSON text "[0.1, 0.2, ...]"
+            #   - any bytes-like blob already in float32 LE
+            if isinstance(raw, (bytes, bytearray, memoryview)):
+                # Assume raw is float32 LE bytes (sqlite BLOB / db2 VARBINARY)
+                embedding_b64 = base64.b64encode(bytes(raw)).decode("ascii")
+                embedding_dim = len(raw) // 4
+            elif isinstance(raw, str):
+                # JSON text — parse + repack as float32 LE bytes
+                try:
+                    import array as _array
+
+                    arr = _array.array("f", [float(v) for v in json.loads(raw)])
+                    embedding_b64 = base64.b64encode(arr.tobytes()).decode("ascii")
+                    embedding_dim = len(arr)
+                except Exception:
+                    embedding_b64 = None
+            else:
+                # List/tuple/array of floats (pg pgvector + oracle native)
+                try:
+                    import array as _array
+
+                    floats = [float(v) for v in raw]
+                    arr = _array.array("f", floats)
+                    embedding_b64 = base64.b64encode(arr.tobytes()).decode("ascii")
+                    embedding_dim = len(floats)
+                except Exception:
+                    embedding_b64 = None
+        try:
+            embedding_model = row["embedding_model"]
+        except (KeyError, IndexError):
+            embedding_model = None
     return MemoryItem(
         id=row["id"],
         content=row["content"],
@@ -148,10 +252,11 @@ def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
         source_provider=row["source_provider"],
         source_session=row["source_session"],
         source_agent=row["source_agent"],
-        archived_at=(
-            _iso_value(archived_at)
-        ),
+        archived_at=(_iso_value(archived_at)),
         archived=archived_at is not None,
+        embedding=embedding_b64,
+        embedding_model=embedding_model,
+        embedding_dim=embedding_dim,
     )
 
 
@@ -159,6 +264,7 @@ def _feed_item_from_row(
     row,
     *,
     include_compressed: bool = False,
+    include_embedding: bool = False,
 ) -> MemoryItem | FederationConsolidationEvent:
     try:
         item_type = row["type"]
@@ -171,7 +277,11 @@ def _feed_item_from_row(
             consolidated_into=row["consolidated_into"],
             consolidated_at=_iso_value(consolidated_at) or "",
         )
-    return _memory_item_from_row(row, include_compressed=include_compressed)
+    return _memory_item_from_row(
+        row,
+        include_compressed=include_compressed,
+        include_embedding=include_embedding,
+    )
 
 
 def _federation_visibility_filters() -> list[str]:
@@ -210,6 +320,7 @@ async def federation_schema(
     """
     from mnemos._version import __version__ as _v
     from mnemos.domain.federation import _local_migrations_fingerprint
+
     parts = _v.split(".")
     major_minor = f"{parts[0]}.{parts[1]}" if len(parts) >= 2 else _v
     return {
@@ -220,9 +331,16 @@ async def federation_schema(
         # whether their schema matches enough to pull. Not used as a
         # hard gate yet.
         "core_fields": [
-            "id", "content", "category", "subcategory",
-            "owner_id", "namespace", "permission_mode",
-            "quality_rating", "created", "updated",
+            "id",
+            "content",
+            "category",
+            "subcategory",
+            "owner_id",
+            "namespace",
+            "permission_mode",
+            "quality_rating",
+            "created",
+            "updated",
         ],
     }
 
@@ -246,14 +364,13 @@ async def _validate_peer_base_url(base_url: str) -> None:
         return
     if parsed.scheme == "http" and allow_insecure:
         logger.warning(
-            "federation: registering insecure peer base_url=%s — "
-            "auth token will be sent in cleartext", base_url,
+            "federation: registering insecure peer base_url=%s — " "auth token will be sent in cleartext",
+            base_url,
         )
         return
     raise HTTPException(
         status_code=422,
-        detail="peer base_url must use https:// "
-               "(set FEDERATION_ALLOW_INSECURE=true to permit http, not for prod)",
+        detail="peer base_url must use https:// " "(set FEDERATION_ALLOW_INSECURE=true to permit http, not for prod)",
     )
 
 
@@ -266,7 +383,7 @@ async def register_peer(
     await _validate_peer_base_url(request.base_url)
     # #168: compat_mode is now Literal["strict", "permissive"] in
     # the request model — Pydantic auto-422s before we get here.
-    backend = backend_or_503()
+    backend = require_federation_backend()
     try:
         async with backend.transactional() as tx:
             row = await backend.federation.create_peer(
@@ -284,14 +401,15 @@ async def register_peer(
         raise HTTPException(status_code=503, detail=str(e))
     logger.info(
         "federation: peer registered name=%s compat_mode=%s",
-        request.name, request.compat_mode,
+        request.name,
+        request.compat_mode,
     )
     return _to_peer(row)
 
 
 @router.get("/peers", response_model=FederationPeerListResponse)
 async def list_peers(_: UserContext = Depends(require_root)):
-    backend = backend_or_503()
+    backend = require_federation_backend()
     async with backend.transactional() as tx:
         rows = await backend.federation.list_peers(tx)
     peers = [_to_peer(r) for r in rows]
@@ -301,7 +419,7 @@ async def list_peers(_: UserContext = Depends(require_root)):
 @router.get("/peers/{peer_id}", response_model=FederationPeer)
 async def get_peer(peer_id: str, _: UserContext = Depends(require_root)):
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    backend = backend_or_503()
+    backend = require_federation_backend()
     async with backend.transactional() as tx:
         row = await backend.federation.get_peer(tx, peer_id)
     if not row:
@@ -328,13 +446,19 @@ async def update_peer(
     # clause. Keys come from a Pydantic model today but this prevents future
     # additions from accidentally enabling injection.
     _ALLOWED_PEER_COLS = {
-        "name", "base_url", "auth_token", "namespace_filter", "category_filter",
-        "enabled", "sync_interval_secs", "compat_mode",
+        "name",
+        "base_url",
+        "auth_token",
+        "namespace_filter",
+        "category_filter",
+        "enabled",
+        "sync_interval_secs",
+        "compat_mode",
     }
     bad = set(updates.keys()) - _ALLOWED_PEER_COLS
     if bad:
         raise HTTPException(status_code=422, detail=f"unknown fields: {sorted(bad)}")
-    backend = backend_or_503()
+    backend = require_federation_backend()
     async with backend.transactional() as tx:
         row = await backend.federation.update_peer(tx, peer_id, updates)
     if not row:
@@ -345,7 +469,7 @@ async def update_peer(
 @router.delete("/peers/{peer_id}", status_code=204)
 async def delete_peer(peer_id: str, _: UserContext = Depends(require_root)):
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    backend = backend_or_503()
+    backend = require_federation_backend()
     async with backend.transactional() as tx:
         deleted = await backend.federation.delete_peer(tx, peer_id)
     if not deleted:
@@ -359,7 +483,7 @@ async def trigger_sync(
 ):
     """Run a sync against a peer right now (blocks on completion)."""
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    backend = backend_or_503()
+    backend = require_federation_backend()
     try:
         pulled, new, updated = await _fed.sync_peer(backend, peer_id)
     except _fed.FederationSchemaIncompatible as e:
@@ -381,7 +505,9 @@ async def trigger_sync(
         # Genuinely missing peer (UUID not in federation_peers).
         raise HTTPException(status_code=404, detail=str(e))
     return FederationSyncTriggerResponse(
-        pulled=pulled, new=new, updated=updated,
+        pulled=pulled,
+        new=new,
+        updated=updated,
     )
 
 
@@ -392,7 +518,7 @@ async def peer_sync_log(
     limit: int = 50,
 ):
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    backend = backend_or_503()
+    backend = require_federation_backend()
     async with backend.transactional() as tx:
         rows = await backend.federation.fetch_sync_log(tx, peer_id, limit)
     entries = [
@@ -414,7 +540,7 @@ async def peer_sync_log(
 
 @router.get("/status", response_model=FederationStatusResponse)
 async def federation_status(_: UserContext = Depends(require_root)):
-    backend = backend_or_503()
+    backend = require_federation_backend()
     async with backend.transactional() as tx:
         rows = await backend.federation.list_peers(tx)
     peers = [_to_peer(r) for r in rows]
@@ -450,9 +576,23 @@ async def federation_feed(
             "flag."
         ),
     ),
+    copy_embeddings: bool = Query(
+        False,
+        description=(
+            "v6.1 F-1 — when true, response MemoryItems include the "
+            "``embedding`` (base64 float32), ``embedding_model``, and "
+            "``embedding_dim`` fields so the receiver can ingest "
+            "pre-computed vectors instead of re-embedding locally. "
+            "Default off preserves v6.0 wire format. Per-call control: "
+            "receiver sets this when its local federation_peers row "
+            "has copy_embeddings=1 OR an out-of-band agreement with "
+            "the source peer exists. See docs/v6.1-federation-embeddings"
+            "-copy.md."
+        ),
+    ),
 ):
     """Serve memories for a remote peer to pull. Requires role='federation' or 'root'."""
-    backend = backend_or_503()
+    backend = require_federation_backend()
 
     since_ts: Optional[datetime] = None
     since_id: Optional[str] = None
@@ -467,6 +607,7 @@ async def federation_feed(
     namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
     categories = [s.strip() for s in category.split(",") if s.strip()] if category else []
 
+    audit_heads: dict[str, tuple[str, str]] = {}
     try:
         async with backend.transactional() as tx:
             rows = await backend.federation.feed_query(
@@ -477,14 +618,100 @@ async def federation_feed(
                 categories=categories,
                 limit=limit + 1,
                 prefer_compressed=prefer_compressed,
+                include_embedding=copy_embeddings,
             )
+            # v6.2 M-2.2.1 chain-head piggyback. Gated by
+            # MNEMOS_AUDIT_CHAIN=on + backend.audit_chain present.
+            # Batch fetch via `get_latest_audit_entries_batch` -- one
+            # SQL round-trip for all rows in the feed (PG: DISTINCT ON;
+            # SQLite/Oracle: ROW_NUMBER() OVER PARTITION).
+            try:
+                from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
+                from mnemos.audit import entry_hash as _eh, memory_id_to_audit_bytes
+                from mnemos.audit.crypto import AuditEntry as _AE
+
+                if _ace() and getattr(backend, "audit_chain", None) is not None:
+                    # Build memory_id list (skip consolidation rows + missing ids).
+                    pairs: list[tuple[str, bytes]] = []
+                    for r in rows:
+                        try:
+                            item_type = r.get("type") if hasattr(r, "get") else None
+                        except (AttributeError, TypeError, KeyError):
+                            item_type = None
+                        if item_type == "consolidation":
+                            continue
+                        mid_str = r["id"] if r else None
+                        if not mid_str:
+                            continue
+                        pairs.append((mid_str, memory_id_to_audit_bytes(mid_str)))
+
+                    if pairs:
+                        mid_bytes_list = [p[1] for p in pairs]
+                        latest_by_mid = await backend.audit_chain.get_latest_audit_entries_batch(tx, mid_bytes_list)
+                        for mid_str, mid_bytes in pairs:
+                            prev_row = latest_by_mid.get(mid_bytes)
+                            if prev_row is None:
+                                continue
+                            ent = _AE(
+                                entry_id=prev_row["entry_id"],
+                                memory_id=prev_row["memory_id"],
+                                prev_entry_id=prev_row.get("prev_entry_id"),
+                                prev_entry_hash=prev_row.get("prev_entry_hash"),
+                                op=prev_row["op"],
+                                payload_hash=prev_row["payload_hash"],
+                                writer_id=prev_row["writer_id"],
+                                writer_pubkey=prev_row["writer_pubkey"],
+                                signed_at=(
+                                    prev_row["signed_at"].isoformat()
+                                    if hasattr(prev_row["signed_at"], "isoformat")
+                                    else str(prev_row["signed_at"])
+                                ),
+                            )
+                            audit_heads[mid_str] = (
+                                prev_row["entry_id"].hex(),
+                                _eh(ent, prev_row["signature"]).hex(),
+                            )
+            except Exception:
+                # Audit lookup is best-effort; never fail the feed.
+                logger.exception("[federation/feed] audit chain-head lookup failed; continuing without piggyback")
     except NotImplementedError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        if _is_db_disconnect(e):
+            logger.warning(
+                "[federation/feed] backend DB disconnected: %s: %s",
+                type(e).__name__,
+                e,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "database_disconnected",
+                    "exception_type": type(e).__name__,
+                    "message": str(e),
+                },
+            )
+        logger.exception("[federation/feed] unexpected error in feed_query")
+        raise
 
     has_more = len(rows) > limit
     rows = rows[:limit]
 
-    memories = [_feed_item_from_row(r, include_compressed=prefer_compressed) for r in rows]
+    memories = [
+        _feed_item_from_row(r, include_compressed=prefer_compressed, include_embedding=copy_embeddings) for r in rows
+    ]
+    # v6.2 M-2.2.1: attach chain heads to the outbound items. Only
+    # MemoryItem variants (skip FederationConsolidationEvent rows).
+    if audit_heads:
+        for item in memories:
+            try:
+                mid = getattr(item, "id", None)
+                if mid and mid in audit_heads:
+                    eid, ehash = audit_heads[mid]
+                    item.audit_latest_entry_id = eid
+                    item.audit_latest_entry_hash = ehash
+            except Exception:
+                pass  # best-effort; never fail the feed on attach
     if rows and rows[-1]["updated"]:
         next_cursor = _fed._encode_feed_cursor(_cursor_datetime(rows[-1]["updated"]), rows[-1]["id"])
     else:
@@ -505,7 +732,7 @@ async def federation_memory(
     category: Optional[str] = Query(None, description="Comma-separated category filter"),
 ):
     """Serve one visible memory for a remote peer. Requires role='federation' or 'root'."""
-    backend = backend_or_503()
+    backend = require_federation_backend()
 
     namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
     categories = [s.strip() for s in category.split(",") if s.strip()] if category else []
@@ -520,6 +747,23 @@ async def federation_memory(
             )
     except NotImplementedError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        if _is_db_disconnect(e):
+            logger.warning(
+                "[federation/memory] backend DB disconnected: %s: %s",
+                type(e).__name__,
+                e,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "database_disconnected",
+                    "exception_type": type(e).__name__,
+                    "message": str(e),
+                },
+            )
+        logger.exception("[federation/memory] unexpected error in get_feed_memory")
+        raise
 
     if row is None:
         raise HTTPException(status_code=404, detail="memory not found")

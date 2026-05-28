@@ -59,31 +59,30 @@ def patched_audit_route(monkeypatch):
     import mnemos.api.routes.mcp_audit as audit_route
 
     monkeypatch.setattr(audit_route, "insert_audit_record", _fake_insert)
-    monkeypatch.setattr(
-        audit_route, "require_postgres_pool_or_503", lambda **_kw: None
-    )
 
-    # Fake pool manager + acquire context so the `async with
-    # _lc.get_pool_manager().acquire() as conn` path returns
-    # without touching real DB.
+    # Fake backend for backend_or_503() — the route does:
+    #   backend = backend_or_503()
+    #   async with backend.transactional() as tx:
+    #       await insert_audit_record(tx.conn, ...)
     class _FakeConn:
         async def execute(self, *_a, **_kw):
             return None
 
-    class _AcquireCtx:
+    class _FakeTx:
+        conn = _FakeConn()
+
+    class _TransactionalCtx:
         async def __aenter__(self):
-            return _FakeConn()
+            return _FakeTx()
 
         async def __aexit__(self, *_exc):
             return False
 
-    class _FakePoolManager:
-        def acquire(self):
-            return _AcquireCtx()
+    class _FakeBackend:
+        def transactional(self):
+            return _TransactionalCtx()
 
-    import mnemos.core.lifecycle as _lc
-
-    monkeypatch.setattr(_lc, "get_pool_manager", lambda: _FakePoolManager())
+    monkeypatch.setattr(audit_route, "backend_or_503", lambda: _FakeBackend())
 
     app = FastAPI()
     app.include_router(router)

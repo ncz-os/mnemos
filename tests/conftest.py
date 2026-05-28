@@ -257,15 +257,15 @@ class FakeConnection:
 
         if "SELECT id, prompt, task_type, consensus_response" in compact:
             consultation = self.state["consultations"].get(args[0])
-            if "AND owner_id = $2" in compact and (
+            if "AND owner_id=$2" in compact and (
                 not consultation or consultation.get("owner_id") != args[1]
             ):
                 return None
-            if "AND namespace = $2" in compact and (
+            if "AND namespace=$2" in compact and (
                 not consultation or consultation.get("namespace") != args[1]
             ):
                 return None
-            if "AND owner_id = $2 AND namespace = $3" in compact and (
+            if "AND owner_id=$2 AND namespace=$3" in compact and (
                 not consultation
                 or consultation.get("owner_id") != args[1]
                 or consultation.get("namespace") != args[2]
@@ -275,11 +275,11 @@ class FakeConnection:
 
         if "SELECT id, created FROM graeae_consultations" in compact:
             consultation = self.state["consultations"].get(args[0])
-            if "AND namespace = $2" in compact and (
+            if "AND namespace=$2" in compact and (
                 not consultation or consultation.get("namespace") != args[1]
             ):
                 return None
-            if "AND owner_id = $2 AND namespace = $3" in compact and (
+            if "AND owner_id=$2 AND namespace=$3" in compact and (
                 not consultation
                 or consultation.get("owner_id") != args[1]
                 or consultation.get("namespace") != args[2]
@@ -387,15 +387,25 @@ class FakeConnection:
                     for row in rows
                 ]
             if "scoped_sequence_num" in compact:
-                owner_id = args[0]
-                visible_rows = [
-                    row for row in rows
-                    if (
-                        self.state["consultations"]
-                        .get(row["consultation_id"], {})
-                        .get("owner_id") == owner_id
-                    )
-                ]
+                if "c.owner_id = $2" in compact:
+                    # fetch_audit_chain non-root: params=(namespace, user_id)
+                    owner_id = args[1]
+                elif "c.owner_id=$1" in compact:
+                    # list_audit_log non-root: params=(user_id, namespace, limit, offset)
+                    owner_id = args[0]
+                else:
+                    owner_id = None  # root with namespace scope
+                if owner_id is not None:
+                    visible_rows = [
+                        row for row in rows
+                        if (
+                            self.state["consultations"]
+                            .get(row["consultation_id"], {})
+                            .get("owner_id") == owner_id
+                        )
+                    ]
+                else:
+                    visible_rows = list(rows)
                 rows = []
                 scoped_prev_id = None
                 verifier_query = "expected_prev_hash" in compact
@@ -441,7 +451,7 @@ class FakeConnection:
                 rows = list(reversed(rows))
             return rows
 
-        if "FROM consultation_memory_refs WHERE consultation_id = $1" in compact:
+        if "FROM consultation_memory_refs WHERE consultation_id=$1" in compact:
             return [
                 ref for ref in self.state["memory_refs"] if ref["consultation_id"] == args[0]
             ]

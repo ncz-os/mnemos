@@ -11,7 +11,10 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncContextManager, Protocol, runtime_checkable
+from decimal import Decimal
+from typing import Any, AsyncContextManager, Literal, Protocol, TypeAlias, Union, runtime_checkable
+
+from fastapi import HTTPException
 
 from mnemos.core.auth_context import UserContext
 from mnemos.persistence.types import Row
@@ -49,6 +52,34 @@ class CompressionStatsRow:
     unreviewed_compressions: int
 
 
+@dataclass(frozen=True)
+class UsageLedgerRecord:
+    """Input payload for a usage_ledger insert."""
+
+    provider: str
+    model: str
+    task_kind: str
+    tokens_in: int
+    tokens_out: int
+    tokens_reasoning: int
+    latency_ms: int
+    outcome: str
+    caller_subsystem: str
+    tier: str
+    session_id: str | None = None
+    request_count: int = 1
+    plan_window_id: str | None = None
+    path_kind: str = "api"
+
+
+@dataclass(frozen=True)
+class UsageLedgerResult:
+    """Backend-neutral result returned after recording usage."""
+
+    id: int
+    est_cost_usd: Decimal
+
+
 @runtime_checkable
 class Transaction(Protocol):
     """Backend-neutral transaction handle.
@@ -71,8 +102,7 @@ class MemoryRepository(ABC):
     """Memory row, memory export, and memory DAG read operations."""
 
     @abstractmethod
-    async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None:
-        ...
+    async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None: ...
 
     @abstractmethod
     async def fetch_memory_log(
@@ -82,8 +112,7 @@ class MemoryRepository(ABC):
         branch: str,
         limit: int,
         user: UserContext,
-    ) -> list[Row]:
-        ...
+    ) -> list[Row]: ...
 
     @abstractmethod
     async def fetch_diff_commit_pair(
@@ -93,8 +122,7 @@ class MemoryRepository(ABC):
         commit_a: str,
         commit_b: str,
         user: UserContext,
-    ) -> tuple[Row | None, Row | None]:
-        ...
+    ) -> tuple[Row | None, Row | None]: ...
 
     @abstractmethod
     async def fetch_checkout_commit(
@@ -103,8 +131,7 @@ class MemoryRepository(ABC):
         memory_id: str,
         commit_hash: str,
         user: UserContext,
-    ) -> Row | None:
-        ...
+    ) -> Row | None: ...
 
     @abstractmethod
     async def fetch_memory_export(
@@ -116,8 +143,7 @@ class MemoryRepository(ABC):
         category: str | None,
         limit: int,
         offset: int,
-    ) -> list[Row]:
-        ...
+    ) -> list[Row]: ...
 
     @abstractmethod
     async def fetch_referenced_memory_allowlist(
@@ -127,8 +153,7 @@ class MemoryRepository(ABC):
         referenced_ids: Sequence[str],
         scope_owner: str | None = None,
         scope_namespace: str | None = None,
-    ) -> list[Row]:
-        ...
+    ) -> list[Row]: ...
 
     @abstractmethod
     async def insert_memory(
@@ -151,24 +176,19 @@ class MemoryRepository(ABC):
         verbatim_content: str | None,
         created: Any,
         updated: Any,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     @abstractmethod
-    async def fetch_memory_by_id(self, tx: Transaction, memory_id: str) -> Row | None:
-        ...
+    async def fetch_memory_by_id(self, tx: Transaction, memory_id: str) -> Row | None: ...
 
     @abstractmethod
-    async def set_suppress_version_snapshot(self, tx: Transaction) -> None:
-        ...
+    async def set_suppress_version_snapshot(self, tx: Transaction) -> None: ...
 
     @abstractmethod
-    async def fetch_versioned_memory_ids(self, tx: Transaction, memory_ids: Sequence[str]) -> list[Row]:
-        ...
+    async def fetch_versioned_memory_ids(self, tx: Transaction, memory_ids: Sequence[str]) -> list[Row]: ...
 
     @abstractmethod
-    async def fetch_memory_head_checks(self, tx: Transaction, memory_ids: Sequence[str]) -> list[Row]:
-        ...
+    async def fetch_memory_head_checks(self, tx: Transaction, memory_ids: Sequence[str]) -> list[Row]: ...
 
     @abstractmethod
     async def fetch_memory_context(
@@ -177,8 +197,7 @@ class MemoryRepository(ABC):
         query: str,
         user: Any,
         limit: int = 5,
-    ) -> list[dict[str, Any]]:
-        ...
+    ) -> list[dict[str, Any]]: ...
 
     # --- v4.1 handler-through-backend surface ---------------------------------
 
@@ -375,8 +394,7 @@ class KGRepository(ABC):
         effective_ns: str | None,
         include_unattached: bool,
         hard_limit: int,
-    ) -> list[Row]:
-        ...
+    ) -> list[Row]: ...
 
     @abstractmethod
     async def insert_kg_triple(
@@ -396,12 +414,10 @@ class KGRepository(ABC):
         created: Any,
         owner_id: str,
         namespace: str | None,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     @abstractmethod
-    async def fetch_kg_triple_by_id(self, tx: Transaction, triple_id: str) -> Row | None:
-        ...
+    async def fetch_kg_triple_by_id(self, tx: Transaction, triple_id: str) -> Row | None: ...
 
 
 class VersionRepository(ABC):
@@ -416,12 +432,10 @@ class VersionRepository(ABC):
         effective_owner: str | None,
         effective_ns: str | None,
         hard_limit: int,
-    ) -> list[Row]:
-        ...
+    ) -> list[Row]: ...
 
     @abstractmethod
-    async def fetch_memory_versions_by_ids(self, tx: Transaction, version_ids: Sequence[str]) -> list[Row]:
-        ...
+    async def fetch_memory_versions_by_ids(self, tx: Transaction, version_ids: Sequence[str]) -> list[Row]: ...
 
     @abstractmethod
     async def insert_memory_version(
@@ -450,12 +464,10 @@ class VersionRepository(ABC):
         parent_version_id: str | None,
         branch: str | None,
         merge_parents: Any,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     @abstractmethod
-    async def fetch_memory_version_by_id(self, tx: Transaction, version_id: str) -> Row | None:
-        ...
+    async def fetch_memory_version_by_id(self, tx: Transaction, version_id: str) -> Row | None: ...
 
 
 class BranchRepository(ABC):
@@ -469,12 +481,10 @@ class BranchRepository(ABC):
         name: str,
         from_commit: str | None,
         user: UserContext,
-    ) -> dict[str, Any]:
-        ...
+    ) -> dict[str, Any]: ...
 
     @abstractmethod
-    async def delete_memory_branches_for_memories(self, tx: Transaction, memory_ids: Sequence[str]) -> None:
-        ...
+    async def delete_memory_branches_for_memories(self, tx: Transaction, memory_ids: Sequence[str]) -> None: ...
 
     @abstractmethod
     async def fetch_memory_branch_heads(
@@ -483,8 +493,7 @@ class BranchRepository(ABC):
         memory_ids: Sequence[str],
         *,
         authorized_version_uuids: Sequence[str] | None = None,
-    ) -> list[Row]:
-        ...
+    ) -> list[Row]: ...
 
     @abstractmethod
     async def upsert_memory_branch_head(
@@ -494,8 +503,7 @@ class BranchRepository(ABC):
         memory_id: str,
         branch: str,
         head_version_id: Any,
-    ) -> None:
-        ...
+    ) -> None: ...
 
 
 class CompressionRepository(ABC):
@@ -509,8 +517,7 @@ class CompressionRepository(ABC):
         memory_ids: Sequence[str],
         effective_owner: str | None,
         hard_limit: int,
-    ) -> list[Row]:
-        ...
+    ) -> list[Row]: ...
 
     @abstractmethod
     async def compression_candidate_exists(
@@ -520,8 +527,7 @@ class CompressionRepository(ABC):
         candidate_id: str,
         memory_id: str,
         owner_id: str,
-    ) -> bool:
-        ...
+    ) -> bool: ...
 
     @abstractmethod
     async def insert_compressed_variant(
@@ -541,12 +547,10 @@ class CompressionRepository(ABC):
         scoring_profile: str | None,
         judge_model: str | None,
         selected_at: Any,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     @abstractmethod
-    async def fetch_compressed_variant_by_memory_id(self, tx: Transaction, memory_id: str) -> Row | None:
-        ...
+    async def fetch_compressed_variant_by_memory_id(self, tx: Transaction, memory_id: str) -> Row | None: ...
 
     @abstractmethod
     async def gather_stats(self, tx: Transaction) -> CompressionStatsRow:
@@ -600,8 +604,7 @@ class ConsultationAuditRepository(ABC):
         task_type: str,
         cost_budget: float,
         quality_floor: float,
-    ) -> tuple[dict[str, Any] | None, list[str]]:
-        ...
+    ) -> tuple[dict[str, Any] | None, list[str]]: ...
 
     @abstractmethod
     async def fetch_model_recommendation(
@@ -610,20 +613,197 @@ class ConsultationAuditRepository(ABC):
         task_type: str,
         cost_budget: float = 10.0,
         quality_floor: float = 0.85,
-    ) -> dict[str, Any] | None:
-        ...
+    ) -> dict[str, Any] | None: ...
 
     @abstractmethod
-    async def lookup_provider_for_model(self, tx: Transaction, model: str) -> str | None:
-        ...
+    async def lookup_provider_for_model(self, tx: Transaction, model: str) -> str | None: ...
 
     @abstractmethod
-    async def fetch_available_models(self, tx: Transaction) -> list[Row]:
-        ...
+    async def fetch_available_models(self, tx: Transaction) -> list[Row]: ...
 
     @abstractmethod
-    async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
-        ...
+    async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None: ...
+
+
+class OAuthRepository(ABC):
+    """OAuth provider, identity, and browser-session persistence."""
+
+    @abstractmethod
+    async def list_enabled_providers(self, tx: Transaction) -> list[Row]: ...
+
+    @abstractmethod
+    async def get_provider(self, tx: Transaction, name: str) -> Row | None: ...
+
+    @abstractmethod
+    async def provision_or_link_user(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        external_id: str,
+        claims: dict[str, Any],
+    ) -> tuple[str, str]: ...
+
+    @abstractmethod
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        user_id: str,
+        identity_id: str | None,
+        expires_at: Any,
+        user_agent: str,
+        ip_address: str | None,
+    ) -> str: ...
+
+    @abstractmethod
+    async def revoke_session(self, tx: Transaction, session_id: str) -> bool: ...
+
+    @abstractmethod
+    async def revoke_all_sessions(self, tx: Transaction, user_id: str) -> int: ...
+
+    @abstractmethod
+    async def get_identity_for_session(self, tx: Transaction, session_id: str) -> Row | None: ...
+
+
+class SessionsRepository(ABC):
+    """Stateful chat session persistence."""
+
+    @abstractmethod
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        namespace: str,
+        model: str,
+        initial_context: str | None,
+    ) -> Row: ...
+
+    @abstractmethod
+    async def get_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> Row | None: ...
+
+    @abstractmethod
+    async def list_injected_memory_ids(self, tx: Transaction, session_id: str, limit: int = 10) -> list[str]: ...
+
+    @abstractmethod
+    async def add_message(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        model: str | None = None,
+        tokens_used: int | None = None,
+        memories_injected: int | None = None,
+    ) -> Any: ...
+
+    @abstractmethod
+    async def fetch_provider_history(self, tx: Transaction, session_id: str) -> list[Row]: ...
+
+    @abstractmethod
+    async def add_memory_injections(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        message_id: Any,
+        memory_ids: Sequence[str],
+    ) -> None: ...
+
+    @abstractmethod
+    async def update_metrics(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        user_id: str,
+        namespace: str,
+        tokens_used: int,
+    ) -> None: ...
+
+    @abstractmethod
+    async def fetch_history(
+        self, tx: Transaction, session_id: str, limit: int, offset: int
+    ) -> tuple[list[Row], int]: ...
+
+    @abstractmethod
+    async def delete_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> bool: ...
+
+
+class ConsultationsRepository(ABC):
+    """GRAEAE consultation persistence separate from model recommendation audit."""
+
+    @abstractmethod
+    async def resolve_tier_lineup(self, tx: Transaction, tier: str) -> list[Row]: ...
+
+    @abstractmethod
+    async def resolve_models(self, tx: Transaction, model_ids: Sequence[str]) -> list[Row]: ...
+
+    @abstractmethod
+    async def create_consultation_with_audit(
+        self,
+        tx: Transaction,
+        *,
+        prompt: str,
+        task_type: str,
+        consensus_response: str,
+        consensus_score: float,
+        winning_muse: str | None,
+        cost: float,
+        latency_ms: int,
+        mode: str,
+        owner_id: str,
+        namespace: str,
+        memory_ids: Sequence[str],
+        genesis_hash: str,
+    ) -> Any: ...
+
+    @abstractmethod
+    async def list_audit_log(
+        self,
+        tx: Transaction,
+        *,
+        root: bool,
+        user_id: str,
+        namespace: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[Row]: ...
+
+    @abstractmethod
+    async def fetch_audit_chain(
+        self,
+        tx: Transaction,
+        *,
+        root: bool,
+        user_id: str,
+        namespace: str | None,
+    ) -> list[Row]: ...
+
+    @abstractmethod
+    async def get_consultation(
+        self,
+        tx: Transaction,
+        *,
+        consultation_id: str,
+        root: bool,
+        user_id: str,
+        namespace: str | None,
+    ) -> Row | None: ...
+
+    @abstractmethod
+    async def get_consultation_artifacts(
+        self,
+        tx: Transaction,
+        *,
+        consultation_id: str,
+        root: bool,
+        user_id: str,
+        namespace: str | None,
+    ) -> tuple[Row | None, list[Row]]: ...
 
 
 class FederationRepository(ABC):
@@ -637,8 +817,7 @@ class FederationRepository(ABC):
         updated_after: Any | None = None,
         id_after: str | None = None,
         limit: int = 100,
-    ) -> list[Row]:
-        ...
+    ) -> list[Row]: ...
 
     @abstractmethod
     async def create_peer(
@@ -653,20 +832,16 @@ class FederationRepository(ABC):
         enabled: bool,
         sync_interval_secs: int,
         compat_mode: str,
-    ) -> Row:
-        ...
+    ) -> Row: ...
 
     @abstractmethod
-    async def list_peers(self, tx: Transaction) -> list[Row]:
-        ...
+    async def list_peers(self, tx: Transaction) -> list[Row]: ...
 
     @abstractmethod
-    async def get_peer(self, tx: Transaction, peer_id: str) -> Row | None:
-        ...
+    async def get_peer(self, tx: Transaction, peer_id: str) -> Row | None: ...
 
     @abstractmethod
-    async def update_peer(self, tx: Transaction, peer_id: str, updates: dict[str, Any]) -> Row | None:
-        ...
+    async def update_peer(self, tx: Transaction, peer_id: str, updates: dict[str, Any]) -> Row | None: ...
 
     @abstractmethod
     async def upsert_peer(
@@ -677,16 +852,13 @@ class FederationRepository(ABC):
         base_url: str,
         name: str | None = None,
         enabled: bool = True,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @abstractmethod
-    async def delete_peer(self, tx: Transaction, peer_id: str) -> bool:
-        ...
+    async def delete_peer(self, tx: Transaction, peer_id: str) -> bool: ...
 
     @abstractmethod
-    async def fetch_sync_log(self, tx: Transaction, peer_id: str, limit: int) -> list[Row]:
-        ...
+    async def fetch_sync_log(self, tx: Transaction, peer_id: str, limit: int) -> list[Row]: ...
 
     @abstractmethod
     async def feed_query(
@@ -699,7 +871,17 @@ class FederationRepository(ABC):
         categories: Sequence[str],
         limit: int,
         prefer_compressed: bool,
+        include_embedding: bool = False,
     ) -> list[Row]:
+        """Return federation feed rows.
+
+        When ``include_embedding=True``, rows additionally include the
+        ``embedding`` column (raw vector bytes/list) and ``embedding_model``
+        literal column.  Used by the v6.1 F-1 ``copy_embeddings`` flow so
+        replicas can ingest pre-computed vectors instead of re-embedding.
+        Default ``False`` preserves v6.0 wire format / bandwidth profile.
+        See ``docs/v6.1-federation-embeddings-copy.md``.
+        """
         ...
 
     @abstractmethod
@@ -710,12 +892,10 @@ class FederationRepository(ABC):
         *,
         namespaces: Sequence[str],
         categories: Sequence[str],
-    ) -> Row | None:
-        ...
+    ) -> Row | None: ...
 
     @abstractmethod
-    async def get_sync_peer(self, tx: Transaction, peer_id: str) -> Row | None:
-        ...
+    async def get_sync_peer(self, tx: Transaction, peer_id: str) -> Row | None: ...
 
     @abstractmethod
     async def update_peer_schema_check(
@@ -723,8 +903,7 @@ class FederationRepository(ABC):
         tx: Transaction,
         peer_id: str,
         peer_version: str | None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @abstractmethod
     async def record_schema_abort(
@@ -736,12 +915,10 @@ class FederationRepository(ABC):
         cursor_before: Any,
         error: str,
         is_transient: bool,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @abstractmethod
-    async def create_sync_log(self, tx: Transaction, peer_id: str, cursor_before: Any) -> Any:
-        ...
+    async def create_sync_log(self, tx: Transaction, peer_id: str, cursor_before: Any) -> Any: ...
 
     @abstractmethod
     async def finish_sync_log(
@@ -754,12 +931,10 @@ class FederationRepository(ABC):
         memories_updated: int,
         error: str | None,
         cursor_after: Any,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @abstractmethod
-    async def record_sync_error(self, tx: Transaction, peer_id: str, error: str) -> None:
-        ...
+    async def record_sync_error(self, tx: Transaction, peer_id: str, error: str) -> None: ...
 
     @abstractmethod
     async def record_sync_success(
@@ -768,16 +943,13 @@ class FederationRepository(ABC):
         peer_id: str,
         cursor: Any,
         total_pulled: int,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @abstractmethod
-    async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]:
-        ...
+    async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]: ...
 
     @abstractmethod
-    async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
-        ...
+    async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None: ...
 
     @abstractmethod
     async def insert_federated_memory(
@@ -798,8 +970,7 @@ class FederationRepository(ABC):
         source_agent: str | None,
         peer_name: str,
         remote_updated: Any,
-    ) -> bool:
-        ...
+    ) -> bool: ...
 
     @abstractmethod
     async def update_federated_memory_if_newer(
@@ -815,8 +986,7 @@ class FederationRepository(ABC):
         quality_rating: int,
         namespace: str,
         remote_updated: Any,
-    ) -> bool:
-        ...
+    ) -> bool: ...
 
     @abstractmethod
     async def apply_consolidation_tombstone(
@@ -829,12 +999,10 @@ class FederationRepository(ABC):
         remote_id: str,
         canonical_remote_id: str,
         peer_name: str,
-    ) -> bool:
-        ...
+    ) -> bool: ...
 
     @abstractmethod
-    async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int:
-        ...
+    async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int: ...
 
 
 class StateRepository(ABC):
@@ -848,8 +1016,7 @@ class StateRepository(ABC):
         *,
         owner_id: str = "default",
         namespace: str = "default",
-    ) -> Row | None:
-        ...
+    ) -> Row | None: ...
 
     @abstractmethod
     async def set(
@@ -861,8 +1028,7 @@ class StateRepository(ABC):
         owner_id: str = "default",
         namespace: str = "default",
         expires_at: Any | None = None,
-    ) -> Row | None:
-        ...
+    ) -> Row | None: ...
 
     @abstractmethod
     async def delete(
@@ -872,8 +1038,7 @@ class StateRepository(ABC):
         *,
         owner_id: str = "default",
         namespace: str = "default",
-    ) -> bool:
-        ...
+    ) -> bool: ...
 
     @abstractmethod
     async def list_namespace(
@@ -884,8 +1049,7 @@ class StateRepository(ABC):
         namespace: str = "default",
         limit: int | None = None,
         offset: int = 0,
-    ) -> list[Row]:
-        ...
+    ) -> list[Row]: ...
 
     @abstractmethod
     async def delete_namespace(
@@ -894,66 +1058,434 @@ class StateRepository(ABC):
         *,
         owner_id: str = "default",
         namespace: str = "default",
-    ) -> int:
-        ...
+    ) -> int: ...
 
 
-class PersistenceBackend(ABC):
-    """Top-level facade exposing backend-specific repository families."""
+class AuditChainRepository(ABC):
+    """v6.2 M-2.2.1 per-memory append-only audit chain.
+
+    Backends provide two operations: fetch the latest entry for a
+    memory (so the next builder call has prev_entry_id +
+    prev_entry_hash) and atomically insert a new entry alongside the
+    memory upsert. Sealer worker (mnemos/workers/audit_sealer.py)
+    additionally claims unsealed-window entries via SELECT ... FOR
+    UPDATE SKIP LOCKED and stamps global_root + global_seq columns.
+
+    Schema reference: db/migrations*/0029_memory_audit_chain.sql +
+    0030_memory_audit_roots.sql (shipped at 614d483).
+
+    Implementations are intentionally minimal — the canonical
+    bytes/signing/hash logic lives in mnemos/audit/ and is backend-
+    agnostic. The backend only persists the bytes.
+    """
 
     @abstractmethod
+    async def get_latest_audit_entry(
+        self,
+        tx: Transaction,
+        memory_id: bytes,
+    ) -> Row | None:
+        """Return the most-recent audit chain row for ``memory_id``.
+
+        Used by the route handler to populate the next entry's
+        ``prev_entry_id`` and ``prev_entry_hash``. Returns ``None`` for
+        first-write memories. Implementations should ``ORDER BY
+        signed_at DESC LIMIT 1`` over the memory_audit_chain table.
+        """
+        ...
+
+    @abstractmethod
+    async def insert_audit_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: bytes,
+        memory_id: bytes,
+        prev_entry_id: bytes | None,
+        prev_entry_hash: bytes | None,
+        op: str,
+        payload_hash: bytes,
+        writer_id: str,
+        writer_pubkey: bytes,
+        signature: bytes,
+        signed_at: Any,
+    ) -> None:
+        """Insert a signed audit entry; commits in the caller's tx so
+        the memory UPSERT and the audit entry are atomic.
+
+        ``op`` MUST be one of: ``create``, ``update``, ``delete``,
+        ``archive``, ``replicate`` (enforced by CHECK constraint;
+        callers usually pass a build_entry() AuditOp Literal).
+        """
+        ...
+
+    @abstractmethod
+    async def claim_unsealed_window(
+        self,
+        tx: Transaction,
+        *,
+        max_window_seconds: int,
+        limit: int,
+    ) -> list[Row]:
+        """Sealer-side: claim the next unsealed window.
+
+        Backends pick rows where ``global_root IS NULL`` AND
+        ``signed_at <= now - max_window_seconds``, oldest-first, up
+        to ``limit`` entries, using a SKIP-LOCKED row lock so multiple
+        sealer instances coexist safely. Caller computes the Merkle
+        root + signs it + writes ``memory_audit_roots`` + UPDATEs
+        these rows' ``global_root`` + ``global_seq`` in the same tx.
+        """
+        ...
+
+    @abstractmethod
+    async def stamp_window_with_root(
+        self,
+        tx: Transaction,
+        *,
+        entry_ids: list[bytes],
+        global_root: bytes,
+        starting_seq: int,
+    ) -> None:
+        """Sealer-side: UPDATE memory_audit_chain SET global_root,
+        global_seq for the given entry_ids. Order preserved — entry
+        at position ``i`` gets ``starting_seq + i``.
+        """
+        ...
+
+    @abstractmethod
+    async def insert_audit_root(
+        self,
+        tx: Transaction,
+        *,
+        global_root: bytes,
+        window_start: Any,
+        window_end: Any,
+        entry_count: int,
+        root_signature: bytes,
+        signer_pubkey: bytes,
+        sealed_at: Any,
+    ) -> None:
+        """Sealer-side: INSERT into memory_audit_roots."""
+        ...
+
+    @abstractmethod
+    async def list_window_entries(
+        self,
+        tx: Transaction,
+        global_root: bytes,
+    ) -> list[Row]:
+        """Return all entries sealed under ``global_root`` ordered by
+        (signed_at, entry_id) -- the SAME order the sealer used to
+        compute the Merkle leaves. Critical for the inclusion-proof
+        endpoint to reconstruct the tree deterministically.
+
+        Returns ``[]`` when no entries match (root unknown OR
+        empty-window seal). Caller treats empty as 404.
+        """
+        ...
+
+    @abstractmethod
+    async def get_audit_entry_by_id(
+        self,
+        tx: Transaction,
+        entry_id: bytes,
+    ) -> Row | None:
+        """Fetch a single audit entry by its primary-key ``entry_id``.
+
+        Used by the inclusion-proof endpoint to look up the target
+        entry without going through ``get_latest_audit_entry`` (which
+        scans by memory_id). Returns ``None`` when entry_id is
+        unknown. Caller treats None as 404.
+        """
+        ...
+
+    @abstractmethod
+    async def get_chain_stats(self, tx: Transaction) -> dict:
+        """Return per-backend audit-chain health snapshot.
+
+        Used by the `/v1/audit/health` endpoint + operator dashboards.
+        Returns:
+            {
+                "total_entries": int,
+                "unsealed_count": int,
+                "oldest_unsealed_signed_at": str | None,  # ISO 8601
+                "sealed_root_count": int,
+                "last_sealed_at": str | None,             # ISO 8601
+            }
+        """
+        ...
+
+    async def get_latest_audit_entries_batch(
+        self,
+        tx: Transaction,
+        memory_ids: list[bytes],
+    ) -> dict[bytes, Row]:
+        """Batch version of ``get_latest_audit_entry`` for N memories.
+
+        Default fallback impl serially calls
+        ``get_latest_audit_entry`` per id; backends override with a
+        single SQL query (typically `WHERE memory_id = ANY(...)` +
+        window function or a CTE picking the max signed_at per
+        memory_id). The federation-feed audit-head piggyback hot-path
+        is the canonical caller -- N+1 audit reads otherwise.
+
+        Returns a dict keyed by ``memory_id`` for entries that have
+        any audit history; absent keys mean no audit entries for
+        that memory_id.
+        """
+        result: dict[bytes, Row] = {}
+        for mid in memory_ids:
+            row = await self.get_latest_audit_entry(tx, mid)
+            if row is not None:
+                result[mid] = row
+        return result
+
+
+CapabilityName: TypeAlias = Literal[
+    "core",
+    "oauth",
+    "sessions",
+    "consultations",
+    "federation",
+    "audit",
+    "state",
+]
+
+
+CORE_CAPABILITY: CapabilityName = "core"
+OAUTH_CAPABILITY: CapabilityName = "oauth"
+SESSIONS_CAPABILITY: CapabilityName = "sessions"
+CONSULTATIONS_CAPABILITY: CapabilityName = "consultations"
+FEDERATION_CAPABILITY: CapabilityName = "federation"
+AUDIT_CAPABILITY: CapabilityName = "audit"
+STATE_CAPABILITY: CapabilityName = "state"
+ALL_CAPABILITIES: frozenset[CapabilityName] = frozenset(
+    {
+        CORE_CAPABILITY,
+        OAUTH_CAPABILITY,
+        SESSIONS_CAPABILITY,
+        CONSULTATIONS_CAPABILITY,
+        FEDERATION_CAPABILITY,
+        AUDIT_CAPABILITY,
+        STATE_CAPABILITY,
+    }
+)
+
+
+class BackendCapabilityMissing(HTTPException):
+    """Raised when a caller reaches a repository unsupported by a backend."""
+
+    def __init__(self, capability: str, backend_name: str | None = None, status_code: int = 503):
+        self.capability = capability
+        self.backend_name = backend_name
+        suffix = f" for {backend_name}" if backend_name else ""
+        super().__init__(
+            status_code=status_code,
+            detail=f"persistence backend does not support {capability!r}{suffix}",
+        )
+
+
+class PersistenceCapabilityBase(Protocol):
+    """Common facade shape shared by every persistence capability."""
+
     def transactional(self) -> AsyncContextManager[Transaction]:
         """Open a backend-neutral transaction context."""
         ...
 
     @property
-    @abstractmethod
-    def memories(self) -> MemoryRepository:
+    def capabilities(self) -> set[str]:
+        """Capability names implemented by this backend."""
         ...
+
+    async def ping(self) -> bool: ...
+
+    async def close(self) -> None: ...
+
+
+@runtime_checkable
+class CorePersistence(PersistenceCapabilityBase, Protocol):
+    """Core memory/category/search persistence surface."""
+
+    _supports_core_persistence: Literal[True]
+
+    async def record_usage_ledger(
+        self,
+        tx: Transaction,
+        record: UsageLedgerRecord,
+    ) -> UsageLedgerResult:
+        """Record model-token usage.
+
+        Only the Postgres backend implements KNEMON MVP Step 1.
+        """
+        raise NotImplementedError("usage_ledger is Postgres-only")
+
+    async def fetch_category_decay_rows(self, tx: Transaction) -> list[Row]:
+        """Return rows from the per-category decay table."""
+        raise NotImplementedError("category decay is not implemented")
+
+    async def upsert_category_decay(
+        self,
+        tx: Transaction,
+        *,
+        category: str,
+        half_life_days: float,
+        decay_kind: str,
+        floor: float,
+    ) -> None:
+        """Insert or update one per-category decay row."""
+        raise NotImplementedError("category decay is not implemented")
+
+    async def create_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+    ) -> Row:
+        """Create one journal entry."""
+        raise NotImplementedError("journal persistence is not implemented")
+
+    async def list_journal_entries(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str | None,
+        search: str | None,
+        limit: int,
+    ) -> list[Row]:
+        """List journal entries within one owner namespace."""
+        raise NotImplementedError("journal persistence is not implemented")
+
+    async def delete_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+    ) -> bool:
+        """Delete one journal entry by scoped id."""
+        raise NotImplementedError("journal persistence is not implemented")
 
     @property
-    @abstractmethod
-    def kg_triples(self) -> KGRepository:
-        ...
+    def memories(self) -> MemoryRepository: ...
 
     @property
-    @abstractmethod
-    def memory_versions(self) -> VersionRepository:
-        ...
+    def kg_triples(self) -> KGRepository: ...
 
     @property
-    @abstractmethod
-    def memory_branches(self) -> BranchRepository:
-        ...
+    def memory_versions(self) -> VersionRepository: ...
 
     @property
-    @abstractmethod
-    def compression(self) -> CompressionRepository:
-        ...
+    def memory_branches(self) -> BranchRepository: ...
 
     @property
-    @abstractmethod
-    def webhooks(self) -> WebhookRepository:
-        ...
+    def compression(self) -> CompressionRepository: ...
 
     @property
-    @abstractmethod
-    def consultations_audit(self) -> ConsultationAuditRepository:
-        ...
+    def webhooks(self) -> WebhookRepository: ...
 
     @property
-    @abstractmethod
-    def federation(self) -> FederationRepository:
-        ...
+    def consultations_audit(self) -> ConsultationAuditRepository: ...
+
+
+@runtime_checkable
+class OAuthPersistence(PersistenceCapabilityBase, Protocol):
+    """OAuth provider, identity, token, and browser-session persistence."""
+
+    _supports_oauth_persistence: Literal[True]
 
     @property
-    @abstractmethod
-    def state_kv(self) -> StateRepository:
-        ...
+    def oauth(self) -> OAuthRepository: ...
 
-    @abstractmethod
-    async def close(self) -> None:
-        ...
+
+@runtime_checkable
+class SessionsPersistence(PersistenceCapabilityBase, Protocol):
+    """Chat session and session-log persistence."""
+
+    _supports_sessions_persistence: Literal[True]
+
+    @property
+    def sessions(self) -> SessionsRepository: ...
+
+
+@runtime_checkable
+class ConsultationsPersistence(PersistenceCapabilityBase, Protocol):
+    """GRAEAE consultation persistence."""
+
+    _supports_consultations_persistence: Literal[True]
+
+    @property
+    def consultations(self) -> ConsultationsRepository: ...
+
+
+@runtime_checkable
+class FederationPersistence(PersistenceCapabilityBase, Protocol):
+    """Federation peers, sync log, and feed-query persistence."""
+
+    _supports_federation_persistence: Literal[True]
+
+    @property
+    def federation(self) -> FederationRepository: ...
+
+
+@runtime_checkable
+class AuditPersistence(PersistenceCapabilityBase, Protocol):
+    """Memory audit-chain and audit-root persistence."""
+
+    _supports_audit_persistence: Literal[True]
+
+    @property
+    def audit_chain(self) -> AuditChainRepository | None:
+        """v6.2 M-2.2.1 audit chain repository.
+
+        Returns ``None`` on backends that haven't shipped the audit
+        chain rows yet — callers should treat None as
+        ``MNEMOS_AUDIT_CHAIN=off`` (no audit writes attempted).
+        Concrete backends override this property when the implementation
+        lands.
+        """
+        return None
+
+
+@runtime_checkable
+class StatePersistence(PersistenceCapabilityBase, Protocol):
+    """Job-state, distillation-state, and generic state-kv persistence."""
+
+    _supports_state_persistence: Literal[True]
+
+    @property
+    def state_kv(self) -> StateRepository: ...
+
+
+PersistenceBackend: TypeAlias = Union[
+    CorePersistence,
+    OAuthPersistence,
+    SessionsPersistence,
+    ConsultationsPersistence,
+    FederationPersistence,
+    AuditPersistence,
+    StatePersistence,
+]
+
+
+def has_capability(backend: object, capability: str) -> bool:
+    capabilities = getattr(backend, "capabilities", set())
+    return capability in capabilities
+
+
+def require_capability(backend: object, capability: str) -> None:
+    if not has_capability(backend, capability):
+        raise BackendCapabilityMissing(capability, type(backend).__name__)
 
 
 @asynccontextmanager

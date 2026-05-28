@@ -17,6 +17,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
@@ -28,18 +29,23 @@ except ImportError:  # pragma: no cover - local CI can run without optional extr
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import hot_rs_enabled
 from mnemos.persistence.base import (
+    AuditChainRepository,
     BranchRepository,
     CompressionRepository,
     CompressionStatsRow,
     ConsultationAuditRepository,
+    ConsultationsRepository,
     DuplicateMemoryError,
     FederationRepository,
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
-    PersistenceBackend,
+    OAuthRepository,
+    SessionsRepository,
     StateRepository,
     Transaction,
+    UsageLedgerRecord,
+    UsageLedgerResult,
     VersionRepository,
     WebhookRepository,
 )
@@ -103,6 +109,9 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v5_1_0_deletion_log_sqlite.sql",
     "migrations_v5_2_0_nats_outbox_idempotency_sqlite.sql",
     "migrations_v5_3_4_mcp_audit_log_sqlite.sql",
+    "migrations_v6_2_audit_chain_sqlite.sql",
+    "migrations_v6_2_category_decay_sqlite.sql",
+    "0038_oauth_sessions_consultations.sql",
 ]
 
 
@@ -152,6 +161,54 @@ def _json_list(value: Any) -> list[Any]:
             return []
         return decoded if isinstance(decoded, list) else []
     return []
+
+
+def _json_value(value: Any, default: Any = None) -> Any:
+    if value in (None, ""):
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    try:
+        return json.loads(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _uuid_to_blob(value: str | bytes | uuid.UUID | None) -> bytes | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        if len(value) != 16:
+            raise ValueError("UUID BLOB values must be exactly 16 bytes")
+        return value
+    if isinstance(value, uuid.UUID):
+        return value.bytes
+    return uuid.UUID(str(value)).bytes
+
+
+def _blob_to_uuid(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    return str(uuid.UUID(bytes=bytes(value)))
+
+
+def _token_blob(value: str | bytes, *, length: int = 32) -> bytes:
+    if isinstance(value, bytes):
+        if len(value) != length:
+            raise ValueError(f"token BLOB values must be exactly {length} bytes")
+        return value
+    text = str(value)
+    try:
+        raw = bytes.fromhex(text)
+    except ValueError:
+        raw = text.encode("utf-8")
+    if len(raw) != length:
+        raise ValueError(f"token BLOB values must be exactly {length} bytes")
+    return raw
 
 
 def _placeholders(values: Sequence[Any]) -> str:
@@ -313,6 +370,7 @@ _HOT_RS_ENABLED = hot_rs_enabled()
 if _HOT_RS_ENABLED:
     try:
         import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
+
         logger.info(
             "mnemos_hot Rust accelerator enabled (cosine UDF will use mnemos_hot %s)",
             getattr(_HOT_RS, "__version__", "?"),
@@ -570,7 +628,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         if _is_root(user):
             return rows
         return [
-            row for row in rows
+            row
+            for row in rows
             if row["namespace"] == user.namespace
             and (row["owner_id"] == user.user_id or (row["permission_mode"] % 10) >= 4)
         ]
@@ -770,7 +829,9 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
 
     async def set_suppress_version_snapshot(self, tx: Transaction) -> None:
         await _execute(self._conn(tx), "CREATE TEMP TABLE IF NOT EXISTS mnemos_tx_flags (key TEXT PRIMARY KEY)")
-        await _execute(self._conn(tx), "INSERT OR IGNORE INTO mnemos_tx_flags(key) VALUES ('suppress_version_snapshot')")
+        await _execute(
+            self._conn(tx), "INSERT OR IGNORE INTO mnemos_tx_flags(key) VALUES ('suppress_version_snapshot')"
+        )
 
     async def fetch_versioned_memory_ids(self, tx: Transaction, memory_ids: Sequence[str]) -> list[Row]:
         if not memory_ids:
@@ -841,10 +902,17 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         embedding_json = json.dumps([float(value) for value in embedding])
         conn = self._conn(tx)
         await _execute(conn, "UPDATE memories SET embedding = ? WHERE id = ?", (embedding_json, memory_id))
+        # On conflict, bump updated_at too — without it, an embedding
+        # refresh (federation re-pull, re-embed worker, manual backfill)
+        # leaves updated_at stale + the only signal that the row was
+        # touched is the embedding column itself, which is hard to
+        # diff. Surfaced 2026-05-24 during F-1 e2e verification.
         await _execute(
             conn,
             "INSERT INTO memory_embeddings(memory_id, embedding) VALUES (?, ?) "
-            "ON CONFLICT(memory_id) DO UPDATE SET embedding = excluded.embedding",
+            "ON CONFLICT(memory_id) DO UPDATE SET "
+            "  embedding = excluded.embedding, "
+            "  updated_at = strftime('%s', 'now')",
             (memory_id, embedding_json),
         )
 
@@ -967,7 +1035,9 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                     like_conditions.append(f"m.{col} = ?")
                     like_params.append(val)
             like_vis_clause = _render_sqlite_visibility(
-                visibility, like_params, table_alias="m",
+                visibility,
+                like_params,
+                table_alias="m",
             )
             if like_vis_clause:
                 like_conditions.append(like_vis_clause)
@@ -1009,8 +1079,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             where_parts.append(vis_clause)
         where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
         select_sql = (
-            f"SELECT {_sqlite_memory_cols()} FROM memories{where_sql} "
-            "ORDER BY created DESC LIMIT ? OFFSET ?"
+            f"SELECT {_sqlite_memory_cols()} FROM memories{where_sql} " "ORDER BY created DESC LIMIT ? OFFSET ?"
         )
         # COUNT(*) first (without limit/offset params), then paged
         # SELECT with the same predicate params plus limit/offset.
@@ -1066,15 +1135,10 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         vis_clause = _render_sqlite_visibility(visibility, params)
         if vis_clause:
             sql = (
-                f"UPDATE memories SET {set_sql} "
-                f"WHERE id = ? AND {vis_clause} "
-                f"RETURNING {_sqlite_memory_cols()}"
+                f"UPDATE memories SET {set_sql} " f"WHERE id = ? AND {vis_clause} " f"RETURNING {_sqlite_memory_cols()}"
             )
         else:
-            sql = (
-                f"UPDATE memories SET {set_sql} WHERE id = ? "
-                f"RETURNING {_sqlite_memory_cols()}"
-            )
+            sql = f"UPDATE memories SET {set_sql} WHERE id = ? " f"RETURNING {_sqlite_memory_cols()}"
         return await _fetch_one(conn, sql, params)
 
     async def find_active_duplicate_by_content_hash(
@@ -1236,8 +1300,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             )
         else:
             sql = (
-                "DELETE FROM memories WHERE id = ? "
-                "RETURNING owner_id, namespace, id, content, category, subcategory"
+                "DELETE FROM memories WHERE id = ? " "RETURNING owner_id, namespace, id, content, category, subcategory"
             )
         return await _fetch_one(conn, sql, params)
 
@@ -1245,7 +1308,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         conn = self._conn(tx)
         total = await _fetch_val(conn, "SELECT COUNT(*) FROM memories")
         native = await _fetch_val(
-            conn, "SELECT COUNT(*) FROM memories WHERE federation_source IS NULL",
+            conn,
+            "SELECT COUNT(*) FROM memories WHERE federation_source IS NULL",
         )
         federated = await _fetch_val(
             conn,
@@ -1397,9 +1461,7 @@ class SqliteKGRepository(_SqliteRepository, KGRepository):
         limit: int = 20,
     ) -> list[Row]:
         params: list[Any] = [f"%{query}%", f"%{query}%", f"%{query}%"]
-        conditions = [
-            "(lower(subject) LIKE lower(?) OR lower(predicate) LIKE lower(?) OR lower(object) LIKE lower(?))"
-        ]
+        conditions = ["(lower(subject) LIKE lower(?) OR lower(predicate) LIKE lower(?) OR lower(object) LIKE lower(?))"]
         if owner_id is not None:
             conditions.append("owner_id = ?")
             params.append(owner_id)
@@ -1856,15 +1918,16 @@ class SqliteCompressionRepository(_SqliteRepository, CompressionRepository):
     async def gather_stats(self, tx: Transaction) -> CompressionStatsRow:
         conn = self._conn(tx)
         total = await _fetch_val(
-            conn, "SELECT COUNT(*) FROM memory_compressed_variants",
+            conn,
+            "SELECT COUNT(*) FROM memory_compressed_variants",
         )
         avg_ratio = await _fetch_val(
-            conn, "SELECT AVG(compression_ratio) FROM memory_compressed_variants",
+            conn,
+            "SELECT AVG(compression_ratio) FROM memory_compressed_variants",
         )
         unreviewed = await _fetch_val(
             conn,
-            "SELECT COUNT(*) FROM memory_compressed_variants "
-            "WHERE quality_score IS NULL",
+            "SELECT COUNT(*) FROM memory_compressed_variants " "WHERE quality_score IS NULL",
         )
         return CompressionStatsRow(
             total_compressions=int(total or 0),
@@ -1943,6 +2006,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
                 ),
             )
             from mnemos.nats.webhook_events import publish_delivery_queued
+
             await publish_delivery_queued(
                 delivery_id=delivery_id,
                 subscription_id=sub["id"],
@@ -1973,78 +2037,22 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
         cost_budget: float,
         quality_floor: float,
     ) -> tuple[dict[str, Any] | None, list[str]]:
-        capability_map = {
-            "code_generation": ["coding"],
-            "reasoning": ["reasoning", "logic"],
-            "architecture_design": ["reasoning"],
-            "summarization": ["reasoning"],
-            "web_search": ["online", "search"],
-        }
-        required_caps = capability_map.get(task_type, ["reasoning"])
+        from mnemos.domain.pantheon.recommendation import choose_recommended_model
+
         rows = await _fetch_all(
             self._conn(tx),
             "SELECT provider, model_id, display_name, input_cost_per_mtok, output_cost_per_mtok, "
             "capabilities, graeae_weight, context_window "
             "FROM model_registry WHERE available = 1 AND deprecated = 0",
         )
-
-        def _has_priced(row: Row) -> bool:
-            return (
-                row["input_cost_per_mtok"] is not None
-                and row["output_cost_per_mtok"] is not None
-            )
-
-        def _avg_cost_or_none(row: Row) -> float | None:
-            if not _has_priced(row):
-                return None
-            return (
-                float(row["input_cost_per_mtok"]) + float(row["output_cost_per_mtok"])
-            ) / 2.0
-
-        # Budget tier EXCLUDES rows with NULL costs — an unknown
-        # cost cannot legally satisfy a "<= budget" constraint;
-        # treating NULL as 0 would let partially-synced rows rank
-        # ahead of priced ones. Mirrors the Postgres invariant in
-        # mnemos/db/mcp_repo.py and friends.
-        eligible = [
-            row for row in rows
-            if float(row["graeae_weight"] or 0) >= quality_floor
-            and _has_priced(row)
-            and (_avg_cost_or_none(row) or 0.0) <= cost_budget
-            and all(cap in _json_list(row["capabilities"]) for cap in required_caps)
-        ]
-        chosen_rows = sorted(eligible, key=lambda r: _avg_cost_or_none(r) or 0.0)
-        if not chosen_rows:
-            # Degraded fallback: no priced model met the budget.
-            # Allow NULL-cost rows here but sort priced ones first
-            # via "(unknown=infinity)" key — matches PG's NULLS LAST.
-            chosen_rows = sorted(
-                rows,
-                key=lambda r: (
-                    _avg_cost_or_none(r) if _avg_cost_or_none(r) is not None else float("inf")
-                ),
-            )
-        if not chosen_rows:
-            return None, required_caps
-        model = chosen_rows[0]
-        return {
-            "provider": model["provider"],
-            "model_id": model["model_id"],
-            "display_name": model["display_name"],
-            # cost_per_mtok is None when either cost column is NULL.
-            # Surface unknown honestly rather than fabricate 0.0
-            # which would silently lie about pricing semantics.
-            "cost_per_mtok": _avg_cost_or_none(model),
-            "quality_score": float(model["graeae_weight"] or 0),
-            "context_window": model["context_window"],
-        }, required_caps
+        return choose_recommended_model(rows, task_type, cost_budget, quality_floor)
 
     async def fetch_model_recommendation(
         self,
         tx: Transaction,
         task_type: str,
         cost_budget: float = 10.0,
-        quality_floor: float = 0.85,
+        quality_floor: float = 0.7,
     ) -> dict[str, Any] | None:
         model, _required = await self.fetch_recommended_model(tx, task_type, cost_budget, quality_floor)
         return model
@@ -2083,6 +2091,447 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
             (model_id,),
         )
         return row["provider"] if row is not None else None
+
+
+class SqliteOAuthRepository(_SqliteRepository, OAuthRepository):
+    async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
+        return await _fetch_all(
+            self._conn(tx),
+            "SELECT COALESCE(name, id) AS name, COALESCE(display_name, name, id) AS display_name, "
+            "kind, enabled FROM oauth_providers WHERE enabled=1 ORDER BY display_name",
+        )
+
+    async def get_provider(self, tx: Transaction, name: str) -> Row | None:
+        return await _fetch_one(
+            self._conn(tx),
+            "SELECT COALESCE(name, id) AS name, kind, issuer_url, client_id, client_secret, scope, "
+            "authorize_url, token_url, userinfo_url, enabled FROM oauth_providers "
+            "WHERE COALESCE(name, id) = ?",
+            (name,),
+        )
+
+    async def provision_or_link_user(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        external_id: str,
+        claims: dict[str, Any],
+    ) -> tuple[str, str]:
+        conn = self._conn(tx)
+        raw_claims = json.dumps(claims)
+        existing = await _fetch_one(
+            conn,
+            "SELECT id, user_id FROM oauth_identities WHERE provider=? AND external_id=?",
+            (provider, external_id),
+        )
+        if existing:
+            await _execute(
+                conn,
+                "UPDATE oauth_identities SET last_login_at=CURRENT_TIMESTAMP, raw_claims=? WHERE id=?",
+                (raw_claims, existing["id"]),
+            )
+            return existing["user_id"], str(existing["id"])
+
+        email = claims.get("email")
+        display_name = claims.get("name") or claims.get("preferred_username")
+        email_verified_claim = claims.get("email_verified")
+        email_verified = (
+            email_verified_claim
+            if isinstance(email_verified_claim, bool)
+            else isinstance(email_verified_claim, str) and email_verified_claim.strip().lower() == "true"
+        )
+        user_id = None
+        if email and email_verified:
+            link_target = await _fetch_one(conn, "SELECT id FROM users WHERE email=?", (email,))
+            if link_target:
+                user_id = link_target["id"]
+        if user_id is None:
+            user_id = (
+                re.sub(r"[^a-zA-Z0-9._:-]+", "", f"{provider}:{external_id}")[:64]
+                or f"{provider}:{uuid.uuid4().hex[:12]}"
+            )
+            await _execute(
+                conn,
+                "INSERT OR IGNORE INTO users (id, display_name, email, role) VALUES (?, ?, ?, 'user')",
+                (user_id, display_name, email),
+            )
+        identity_id = uuid.uuid4().hex
+        await _execute(
+            conn,
+            "INSERT INTO oauth_identities "
+            "(id, provider_id, user_id, subject, provider, external_id, email, display_name, raw_claims, last_login_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (identity_id, provider, user_id, external_id, provider, external_id, email, display_name, raw_claims),
+        )
+        return user_id, identity_id
+
+    async def create_session(self, tx: Transaction, **kwargs: Any) -> str:
+        await _execute(
+            self._conn(tx),
+            "INSERT INTO oauth_sessions "
+            "(id, session_id, user_id, provider_id, identity_id, expires_at, user_agent, ip_address) "
+            "VALUES (?, ?, ?, COALESCE(?, 'oauth'), ?, ?, ?, ?)",
+            (
+                kwargs["session_id"],
+                kwargs["session_id"],
+                kwargs["user_id"],
+                kwargs["identity_id"],
+                kwargs["identity_id"],
+                kwargs["expires_at"].isoformat()
+                if hasattr(kwargs["expires_at"], "isoformat")
+                else kwargs["expires_at"],
+                kwargs["user_agent"],
+                kwargs["ip_address"],
+            ),
+        )
+        return kwargs["session_id"]
+
+    async def revoke_session(self, tx: Transaction, session_id: str) -> bool:
+        return (
+            await _execute_count(
+                self._conn(tx),
+                "UPDATE oauth_sessions SET revoked=1, revoked_at=CURRENT_TIMESTAMP " "WHERE session_id=? AND revoked=0",
+                (session_id,),
+            )
+            > 0
+        )
+
+    async def revoke_all_sessions(self, tx: Transaction, user_id: str) -> int:
+        return await _execute_count(
+            self._conn(tx),
+            "UPDATE oauth_sessions SET revoked=1, revoked_at=CURRENT_TIMESTAMP WHERE user_id=? AND revoked=0",
+            (user_id,),
+        )
+
+    async def get_identity_for_session(self, tx: Transaction, session_id: str) -> Row | None:
+        return await _fetch_one(
+            self._conn(tx),
+            "SELECT i.id, i.user_id, COALESCE(i.provider, i.provider_id) AS provider, "
+            "COALESCE(i.external_id, i.subject) AS external_id, i.email, i.display_name, "
+            "i.last_login_at, i.created FROM oauth_sessions s "
+            "JOIN oauth_identities i ON i.id = s.identity_id "
+            "WHERE s.session_id=? AND s.revoked=0",
+            (session_id,),
+        )
+
+
+class SqliteSessionsRepository(_SqliteRepository, SessionsRepository):
+    async def create_session(
+        self, tx: Transaction, *, user_id: str, namespace: str, model: str, initial_context: str | None
+    ) -> Row:
+        conn = self._conn(tx)
+        session_id = uuid.uuid4().hex
+        await _execute(
+            conn,
+            "INSERT INTO sessions (id, user_id, namespace, model, last_activity) "
+            "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (session_id, user_id, namespace, model),
+        )
+        if initial_context:
+            await _execute(
+                conn,
+                "INSERT INTO session_messages (session_id, role, content) VALUES (?, 'system', ?)",
+                (session_id, initial_context),
+            )
+        return await _fetch_one(
+            conn,
+            "SELECT id, created_at, model FROM sessions WHERE id=? AND user_id=? AND namespace=? AND deleted_at IS NULL",
+            (session_id, user_id, namespace),
+        )
+
+    async def get_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> Row | None:
+        return await _fetch_one(
+            self._conn(tx),
+            "SELECT * FROM sessions WHERE id=? AND user_id=? AND namespace=? AND deleted_at IS NULL",
+            (session_id, user_id, namespace),
+        )
+
+    async def list_injected_memory_ids(self, tx: Transaction, session_id: str, limit: int = 10) -> list[str]:
+        rows = await _fetch_all(
+            self._conn(tx),
+            "SELECT memory_id FROM session_memory_injections WHERE session_id=? AND deleted_at IS NULL "
+            "GROUP BY memory_id ORDER BY MAX(COALESCE(injection_timestamp, injected_at)) DESC LIMIT ?",
+            (session_id, limit),
+        )
+        return [row["memory_id"] for row in rows]
+
+    async def add_message(self, tx: Transaction, **kwargs: Any) -> Any:
+        message_id = uuid.uuid4().hex
+        await _execute(
+            self._conn(tx),
+            "INSERT INTO session_messages (id, session_id, role, content, model, tokens_used, memories_injected) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                message_id,
+                kwargs["session_id"],
+                kwargs["role"],
+                kwargs["content"],
+                kwargs.get("model"),
+                kwargs.get("tokens_used"),
+                kwargs.get("memories_injected"),
+            ),
+        )
+        return message_id
+
+    async def fetch_provider_history(self, tx: Transaction, session_id: str) -> list[Row]:
+        return await _fetch_all(
+            self._conn(tx),
+            """
+            WITH first_system AS (
+                SELECT id, role, content, timestamp FROM session_messages
+                WHERE session_id=? AND role='system' AND deleted_at IS NULL
+                ORDER BY timestamp ASC, id ASC LIMIT 1
+            ), later_system AS (
+                SELECT s.id, s.role, s.content, s.timestamp FROM session_messages s
+                WHERE s.session_id=? AND s.role='system' AND s.deleted_at IS NULL
+                AND s.id <> (SELECT id FROM first_system)
+                ORDER BY s.timestamp DESC, s.id DESC LIMIT 4
+            ), pinned AS (
+                SELECT id, role, content, timestamp, 0 AS k FROM first_system
+                UNION ALL SELECT id, role, content, timestamp, 0 AS k FROM later_system
+            ), recent AS (
+                SELECT id, role, content, timestamp, 1 AS k FROM session_messages
+                WHERE session_id=? AND role <> 'system' AND deleted_at IS NULL
+                ORDER BY timestamp DESC, id DESC LIMIT 10
+            )
+            SELECT role, content FROM (SELECT * FROM pinned UNION ALL SELECT * FROM recent)
+            ORDER BY k, timestamp ASC, id ASC
+            """,
+            (session_id, session_id, session_id),
+        )
+
+    async def add_memory_injections(
+        self, tx: Transaction, *, session_id: str, message_id: Any, memory_ids: Sequence[str]
+    ) -> None:
+        conn = self._conn(tx)
+        for i, memory_id in enumerate(memory_ids):
+            await _execute(
+                conn,
+                "INSERT INTO session_memory_injections (session_id, message_id, memory_id, relevance_score) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, message_id, memory_id, 0.9 - (i * 0.1)),
+            )
+
+    async def update_metrics(
+        self, tx: Transaction, *, session_id: str, user_id: str, namespace: str, tokens_used: int
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            "UPDATE sessions SET message_count=message_count+2, total_tokens=total_tokens+?, "
+            "last_activity=CURRENT_TIMESTAMP WHERE id=? AND user_id=? AND namespace=? AND deleted_at IS NULL",
+            (tokens_used, session_id, user_id, namespace),
+        )
+
+    async def fetch_history(self, tx: Transaction, session_id: str, limit: int, offset: int) -> tuple[list[Row], int]:
+        conn = self._conn(tx)
+        rows = await _fetch_all(
+            conn,
+            "SELECT role, content, timestamp, model FROM session_messages "
+            "WHERE session_id=? AND deleted_at IS NULL ORDER BY timestamp ASC LIMIT ? OFFSET ?",
+            (session_id, limit, offset),
+        )
+        total = await _fetch_val(
+            conn,
+            "SELECT COUNT(*) FROM session_messages WHERE session_id=? AND deleted_at IS NULL",
+            (session_id,),
+        )
+        return rows, int(total or 0)
+
+    async def delete_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> bool:
+        return (
+            await _execute_count(
+                self._conn(tx),
+                "DELETE FROM sessions WHERE id=? AND user_id=? AND namespace=? AND deleted_at IS NULL",
+                (session_id, user_id, namespace),
+            )
+            > 0
+        )
+
+
+class SqliteConsultationsRepository(_SqliteRepository, ConsultationsRepository):
+    async def resolve_tier_lineup(self, tx: Transaction, tier: str) -> list[Row]:
+        rows = await _fetch_all(
+            self._conn(tx),
+            "SELECT provider, model_id, input_cost_per_mtok, output_cost_per_mtok, graeae_weight, arena_rank "
+            "FROM model_registry WHERE available=1 AND deprecated=0",
+        )
+        if tier == "frontier":
+            rows = [
+                r
+                for r in rows
+                if (r.get("arena_rank") is not None and r["arena_rank"] <= 5) or (r["graeae_weight"] or 0) >= 0.95
+            ]
+        elif tier == "premium":
+            rows = [
+                r
+                for r in rows
+                if (r.get("arena_rank") is not None and 6 <= r["arena_rank"] <= 15)
+                or (0.85 <= (r["graeae_weight"] or 0) < 0.95)
+            ]
+        else:
+            rows = [
+                r
+                for r in rows
+                if (r["graeae_weight"] or 0) >= 0.75
+                and r["input_cost_per_mtok"] is not None
+                and r["output_cost_per_mtok"] is not None
+            ]
+            rows = sorted(rows, key=lambda r: (r["input_cost_per_mtok"] or 0) + (r["output_cost_per_mtok"] or 0))
+        seen: set[str] = set()
+        out: list[Row] = []
+        for row in sorted(rows, key=lambda r: (r["provider"], -(r["graeae_weight"] or 0))):
+            if row["provider"] not in seen:
+                out.append(row)
+                seen.add(row["provider"])
+        return out
+
+    async def resolve_models(self, tx: Transaction, model_ids: Sequence[str]) -> list[Row]:
+        if not model_ids:
+            return []
+        placeholders = ",".join("?" for _ in model_ids)
+        return await _fetch_all(
+            self._conn(tx),
+            f"SELECT provider, model_id FROM model_registry WHERE model_id IN ({placeholders}) "
+            "AND available=1 AND deprecated=0",
+            tuple(model_ids),
+        )
+
+    async def create_consultation_with_audit(self, tx: Transaction, **kwargs: Any) -> Any:
+        conn = self._conn(tx)
+        consultation_id = uuid.uuid4().hex
+        await _execute(
+            conn,
+            "INSERT INTO graeae_consultations "
+            "(id, prompt, task_type, consensus_response, consensus_score, winning_muse, cost, latency_ms, mode, owner_id, namespace) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                consultation_id,
+                kwargs["prompt"],
+                kwargs["task_type"],
+                kwargs["consensus_response"][:500],
+                kwargs["consensus_score"],
+                kwargs["winning_muse"],
+                kwargs["cost"],
+                kwargs["latency_ms"],
+                kwargs["mode"],
+                kwargs["owner_id"],
+                kwargs["namespace"],
+            ),
+        )
+        prompt_hash = hashlib.sha256(kwargs["prompt"].encode()).hexdigest()
+        response_hash = hashlib.sha256(kwargs["consensus_response"].encode()).hexdigest()
+        prev = await _fetch_one(conn, "SELECT id, chain_hash FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT 1")
+        prev_chain = prev["chain_hash"] if prev else kwargs["genesis_hash"]
+        chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
+        await _execute(
+            conn,
+            "INSERT INTO graeae_audit_log "
+            "(consultation_id, prompt, prompt_hash, provider, response_text, response_hash, chain_hash, "
+            "prev_id, prev_chain_hash, task_type, quality_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                consultation_id,
+                kwargs["prompt"],
+                prompt_hash,
+                kwargs["winning_muse"],
+                kwargs["consensus_response"],
+                response_hash,
+                chain_hash,
+                prev["id"] if prev else None,
+                prev_chain,
+                kwargs["task_type"] or "reasoning",
+                kwargs["consensus_score"],
+            ),
+        )
+        for memory_id in kwargs["memory_ids"]:
+            await _execute(
+                conn,
+                "INSERT OR IGNORE INTO consultation_memory_refs (consultation_id, memory_id, injected_at) "
+                "VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (consultation_id, memory_id),
+            )
+        return consultation_id
+
+    async def list_audit_log(
+        self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None, limit: int, offset: int
+    ) -> list[Row]:
+        conn = self._conn(tx)
+        if root and namespace is None:
+            return await _fetch_all(
+                conn,
+                "SELECT id, sequence_num, consultation_id, prompt_hash, response_hash, chain_hash, prev_id, "
+                "task_type, provider, quality_score, created_at FROM graeae_audit_log WHERE deleted_at IS NULL "
+                "ORDER BY sequence_num DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+        owner_sql = "" if root else "c.owner_id=? AND "
+        params = (namespace, limit, offset) if root else (user_id, namespace, limit, offset)
+        return await _fetch_all(
+            conn,
+            "SELECT al.id, al.sequence_num, al.consultation_id, al.prompt_hash, al.response_hash, "
+            + ("al.chain_hash" if root else "NULL AS chain_hash")
+            + ", al.prev_id, al.task_type, al.provider, al.quality_score, al.created_at "
+            "FROM graeae_audit_log al JOIN graeae_consultations c ON c.id=al.consultation_id "
+            f"WHERE {owner_sql}c.namespace=? AND c.deleted_at IS NULL AND al.deleted_at IS NULL "
+            "ORDER BY al.sequence_num DESC LIMIT ? OFFSET ?",
+            params,
+        )
+
+    async def fetch_audit_chain(self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None) -> list[Row]:
+        conn = self._conn(tx)
+        if root and namespace is None:
+            return await _fetch_all(
+                conn,
+                "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id FROM graeae_audit_log ORDER BY sequence_num ASC",
+            )
+        owner_sql = "" if root else "c.owner_id=? AND "
+        params = (namespace,) if root else (user_id, namespace)
+        return await _fetch_all(
+            conn,
+            "SELECT al.sequence_num, ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+            "al.prompt_hash, al.response_hash, al.chain_hash, al.prev_id, al.prev_chain_hash, "
+            "(SELECT prev.chain_hash FROM graeae_audit_log prev WHERE prev.sequence_num < al.sequence_num "
+            "ORDER BY prev.sequence_num DESC LIMIT 1) AS expected_prev_hash "
+            "FROM graeae_audit_log al JOIN graeae_consultations c ON c.id=al.consultation_id "
+            f"WHERE {owner_sql}c.namespace=? AND c.deleted_at IS NULL AND al.deleted_at IS NULL "
+            "ORDER BY al.sequence_num ASC",
+            params,
+        )
+
+    async def get_consultation(
+        self, tx: Transaction, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> Row | None:
+        conn = self._conn(tx)
+        if root and namespace is None:
+            return await _fetch_one(
+                conn,
+                "SELECT id, prompt, task_type, consensus_response, consensus_score, winning_muse, cost, latency_ms, mode, created "
+                "FROM graeae_consultations WHERE id=? AND deleted_at IS NULL",
+                (consultation_id,),
+            )
+        owner_sql = "" if root else "owner_id=? AND "
+        params = (consultation_id, namespace) if root else (consultation_id, user_id, namespace)
+        return await _fetch_one(
+            conn,
+            "SELECT id, prompt, task_type, consensus_response, consensus_score, winning_muse, cost, latency_ms, mode, created "
+            f"FROM graeae_consultations WHERE id=? AND {owner_sql}namespace=? AND deleted_at IS NULL",
+            params,
+        )
+
+    async def get_consultation_artifacts(
+        self, tx: Transaction, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> tuple[Row | None, list[Row]]:
+        consultation = await self.get_consultation(
+            tx, consultation_id=consultation_id, root=root, user_id=user_id, namespace=namespace
+        )
+        if not consultation:
+            return None, []
+        refs = await _fetch_all(
+            self._conn(tx),
+            "SELECT memory_id, injected_at FROM consultation_memory_refs WHERE consultation_id=? ORDER BY injected_at",
+            (consultation_id,),
+        )
+        return consultation, refs
 
 
 class SqliteFederationRepository(_SqliteRepository, FederationRepository):
@@ -2179,11 +2628,13 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         return [self._peer_row(row) for row in rows]  # type: ignore[list-item]
 
     async def get_peer(self, tx: Transaction, peer_id: str) -> Row | None:
-        return self._peer_row(await _fetch_one(
-            self._conn(tx),
-            "SELECT * FROM federation_peers WHERE id = ?",
-            (peer_id,),
-        ))
+        return self._peer_row(
+            await _fetch_one(
+                self._conn(tx),
+                "SELECT * FROM federation_peers WHERE id = ?",
+                (peer_id,),
+            )
+        )
 
     async def update_peer(self, tx: Transaction, peer_id: str, updates: dict[str, Any]) -> Row | None:
         bad = set(updates) - self._ALLOWED_PEER_COLS
@@ -2228,11 +2679,14 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         )
 
     async def delete_peer(self, tx: Transaction, peer_id: str) -> bool:
-        return await _execute_count(
-            self._conn(tx),
-            "DELETE FROM federation_peers WHERE id = ?",
-            (peer_id,),
-        ) > 0
+        return (
+            await _execute_count(
+                self._conn(tx),
+                "DELETE FROM federation_peers WHERE id = ?",
+                (peer_id,),
+            )
+            > 0
+        )
 
     async def fetch_sync_log(self, tx: Transaction, peer_id: str, limit: int) -> list[Row]:
         return await _fetch_all(
@@ -2259,6 +2713,7 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         categories: Sequence[str],
         limit: int,
         prefer_compressed: bool,
+        include_embedding: bool = False,
     ) -> list[Row]:
         if prefer_compressed:
             raise NotImplementedError(
@@ -2298,6 +2753,29 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
 
         memory_where_clause = " AND ".join(memory_query_parts)
         tombstone_where_clause = " AND ".join(tombstone_query_parts)
+        # v6.1 F-1.2: optional embedding + embedding_model literal columns.
+        # See docs/v6.1-federation-embeddings-copy.md. SQLite reads
+        # embeddings from memory_embeddings join table (not memories.embedding
+        # which is a synced backup) — LEFT JOIN so rows with no embedding
+        # still appear.
+        if include_embedding:
+            from mnemos.core.config import get_settings as _gs
+
+            try:
+                import os as _os
+
+                _http_model = _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                _model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
+            except Exception:
+                _model = "unknown"
+            _model_escaped = _model.replace("'", "''")
+            mem_embed = f", me.embedding AS embedding, '{_model_escaped}' AS embedding_model"
+            mem_embed_join = "LEFT JOIN memory_embeddings me ON me.memory_id = m.id"
+            tomb_embed = ", NULL AS embedding, NULL AS embedding_model"
+        else:
+            mem_embed = ""
+            mem_embed_join = ""
+            tomb_embed = ""
         return await _fetch_all(
             self._conn(tx),
             f"""
@@ -2324,7 +2802,9 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                        NULL AS consolidated_into,
                        NULL AS consolidated_at,
                        NULL AS compressed_content
+                       {mem_embed}
                 FROM memories m
+                {mem_embed_join}
                 WHERE {memory_where_clause}
 
                 UNION ALL
@@ -2350,6 +2830,7 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                        m.consolidated_into,
                        m.consolidated_at,
                        NULL AS compressed_content
+                       {tomb_embed}
                 FROM memories m
                 WHERE {tombstone_where_clause}
             ) feed
@@ -2395,16 +2876,22 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         )
 
     async def get_sync_peer(self, tx: Transaction, peer_id: str) -> Row | None:
-        return self._peer_row(await _fetch_one(
-            self._conn(tx),
-            """
+        # v6.1 F-1: copy_embeddings flag (migration 0028) — COALESCE so
+        # DB rows that pre-date the migration still return 0 instead of
+        # KeyError on the consumer-side .get('copy_embeddings').
+        return self._peer_row(
+            await _fetch_one(
+                self._conn(tx),
+                """
             SELECT id, name, base_url, auth_token, namespace_filter,
                    category_filter, enabled, last_sync_cursor,
-                   compat_mode
+                   compat_mode,
+                   COALESCE(copy_embeddings, 0) AS copy_embeddings
             FROM federation_peers WHERE id = ?
             """,
-            (peer_id,),
-        ))
+                (peer_id,),
+            )
+        )
 
     async def update_peer_schema_check(self, tx: Transaction, peer_id: str, peer_version: str | None) -> None:
         await _execute(
@@ -2638,9 +3125,10 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         namespace: str,
         remote_updated: Any,
     ) -> bool:
-        return await _execute_count(
-            self._conn(tx),
-            """
+        return (
+            await _execute_count(
+                self._conn(tx),
+                """
             UPDATE memories SET
               content = ?,
               category = ?,
@@ -2657,20 +3145,22 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                   OR federation_remote_updated < ?
               )
             """,
-            (
-                content,
-                category,
-                subcategory,
-                metadata_json,
-                verbatim_content,
-                quality_rating,
-                namespace,
-                remote_updated,
-                remote_updated,
-                local_id,
-                remote_updated,
-            ),
-        ) > 0
+                (
+                    content,
+                    category,
+                    subcategory,
+                    metadata_json,
+                    verbatim_content,
+                    quality_rating,
+                    namespace,
+                    remote_updated,
+                    remote_updated,
+                    local_id,
+                    remote_updated,
+                ),
+            )
+            > 0
+        )
 
     async def apply_consolidation_tombstone(
         self,
@@ -2683,9 +3173,10 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         canonical_remote_id: str,
         peer_name: str,
     ) -> bool:
-        return await _execute_count(
-            self._conn(tx),
-            """
+        return (
+            await _execute_count(
+                self._conn(tx),
+                """
             UPDATE memories
             SET consolidated_into = ?,
                 consolidated_at = COALESCE(?, CURRENT_TIMESTAMP),
@@ -2706,17 +3197,19 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                   WHERE id = ?
               )
             """,
-            (
-                local_canonical_id,
-                consolidated_at,
-                remote_id,
-                canonical_remote_id,
-                peer_name,
-                local_id,
-                local_canonical_id,
-                local_canonical_id,
-            ),
-        ) > 0
+                (
+                    local_canonical_id,
+                    consolidated_at,
+                    remote_id,
+                    canonical_remote_id,
+                    peer_name,
+                    local_id,
+                    local_canonical_id,
+                    local_canonical_id,
+                ),
+            )
+            > 0
+        )
 
     async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int:
         local_id = f"fed:{peer_name}:{memory_id}"
@@ -2732,7 +3225,9 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
 
 
 class SqliteStateRepository(_SqliteRepository, StateRepository):
-    async def get(self, tx: Transaction, key: str, *, owner_id: str = "default", namespace: str = "default") -> Row | None:
+    async def get(
+        self, tx: Transaction, key: str, *, owner_id: str = "default", namespace: str = "default"
+    ) -> Row | None:
         return await _fetch_one(
             self._conn(tx),
             "SELECT key, value, updated, version, owner_id, namespace FROM state "
@@ -2762,11 +3257,14 @@ class SqliteStateRepository(_SqliteRepository, StateRepository):
         )
 
     async def delete(self, tx: Transaction, key: str, *, owner_id: str = "default", namespace: str = "default") -> bool:
-        return await _execute_count(
-            self._conn(tx),
-            "DELETE FROM state WHERE owner_id = ? AND namespace = ? AND key = ? AND deleted_at IS NULL",
-            (owner_id, namespace, key),
-        ) > 0
+        return (
+            await _execute_count(
+                self._conn(tx),
+                "DELETE FROM state WHERE owner_id = ? AND namespace = ? AND key = ? AND deleted_at IS NULL",
+                (owner_id, namespace, key),
+            )
+            > 0
+        )
 
     async def list_namespace(
         self,
@@ -2801,8 +3299,278 @@ class SqliteStateRepository(_SqliteRepository, StateRepository):
         )
 
 
-class SqliteBackend(PersistenceBackend):
+class SqliteAuditChainRepository(_SqliteRepository, AuditChainRepository):
+    """SQLite impl of v6.2 M-2.2.1 audit chain.
+
+    Tables: ``memory_audit_chain`` + ``memory_audit_roots``
+    (migration ``migrations_v6_2_audit_chain_sqlite.sql`` shipped
+    alongside the protocol scaffold).
+
+    No SKIP LOCKED in SQLite — the single-writer pattern (one
+    serialized connection per backend) makes concurrent-sealer
+    isolation unnecessary. Multiple sealer instances against the
+    same DB would deadlock anyway; deploy at most one sealer per
+    SQLite node.
+    """
+
+    async def get_latest_audit_entry(
+        self,
+        tx: Transaction,
+        memory_id: bytes,
+    ) -> Row | None:
+        return await _fetch_one(
+            self._conn(tx),
+            """
+            SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                   op, payload_hash, writer_id, writer_pubkey,
+                   signature, signed_at, global_root, global_seq
+            FROM memory_audit_chain
+            WHERE memory_id = ?
+            ORDER BY signed_at DESC
+            LIMIT 1
+            """,
+            (memory_id,),
+        )
+
+    async def insert_audit_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: bytes,
+        memory_id: bytes,
+        prev_entry_id: bytes | None,
+        prev_entry_hash: bytes | None,
+        op: str,
+        payload_hash: bytes,
+        writer_id: str,
+        writer_pubkey: bytes,
+        signature: bytes,
+        signed_at: Any,
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            """
+            INSERT INTO memory_audit_chain (
+                entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                op, payload_hash, writer_id, writer_pubkey,
+                signature, signed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entry_id,
+                memory_id,
+                prev_entry_id,
+                prev_entry_hash,
+                op,
+                payload_hash,
+                writer_id,
+                writer_pubkey,
+                signature,
+                signed_at,
+            ),
+        )
+
+    async def claim_unsealed_window(
+        self,
+        tx: Transaction,
+        *,
+        max_window_seconds: int,
+        limit: int,
+    ) -> list[Row]:
+        """Claim oldest unsealed entries. No row lock — single-writer
+        SQLite makes the SKIP-LOCKED dance moot.
+
+        ``signed_at`` is stored as TEXT (ISO 8601); compare against
+        ``datetime('now', '-N seconds')`` to pick rows older than the
+        window cutoff.
+        """
+        # signed_at is stored as ISO 8601 TEXT. Route handler may emit
+        # "2026-05-24T16:00:00+00:00" (Python datetime.isoformat()) or
+        # the SQL-style "2026-05-24 16:00:00". Wrap both sides in
+        # datetime() so SQLite normalizes the format before comparing.
+        cutoff_expr = f"datetime('now', '-{int(max_window_seconds)} seconds')"
+        return await _fetch_all(
+            self._conn(tx),
+            f"""
+            SELECT entry_id, signature, signed_at
+            FROM memory_audit_chain
+            WHERE global_root IS NULL
+              AND datetime(signed_at) <= {cutoff_expr}
+            ORDER BY datetime(signed_at) ASC, entry_id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+    async def stamp_window_with_root(
+        self,
+        tx: Transaction,
+        *,
+        entry_ids: list[bytes],
+        global_root: bytes,
+        starting_seq: int,
+    ) -> None:
+        if not entry_ids:
+            return
+        conn = self._conn(tx)
+        for offset, eid in enumerate(entry_ids):
+            await _execute(
+                conn,
+                """
+                UPDATE memory_audit_chain
+                SET global_root = ?, global_seq = ?
+                WHERE entry_id = ?
+                """,
+                (global_root, starting_seq + offset, eid),
+            )
+
+    async def insert_audit_root(
+        self,
+        tx: Transaction,
+        *,
+        global_root: bytes,
+        window_start: Any,
+        window_end: Any,
+        entry_count: int,
+        root_signature: bytes,
+        signer_pubkey: bytes,
+        sealed_at: Any,
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            """
+            INSERT INTO memory_audit_roots (
+                global_root, window_start, window_end, entry_count,
+                root_signature, signer_pubkey, sealed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                global_root,
+                window_start,
+                window_end,
+                entry_count,
+                root_signature,
+                signer_pubkey,
+                sealed_at,
+            ),
+        )
+
+    async def list_window_entries(
+        self,
+        tx: Transaction,
+        global_root: bytes,
+    ) -> list[Row]:
+        return await _fetch_all(
+            self._conn(tx),
+            """
+            SELECT entry_id, memory_id, signature, signed_at,
+                   global_seq, payload_hash, op
+            FROM memory_audit_chain
+            WHERE global_root = ?
+            ORDER BY datetime(signed_at) ASC, entry_id ASC
+            """,
+            (global_root,),
+        )
+
+    async def get_audit_entry_by_id(
+        self,
+        tx: Transaction,
+        entry_id: bytes,
+    ) -> Row | None:
+        return await _fetch_one(
+            self._conn(tx),
+            """
+            SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                   op, payload_hash, writer_id, writer_pubkey,
+                   signature, signed_at, global_root, global_seq
+            FROM memory_audit_chain
+            WHERE entry_id = ?
+            """,
+            (entry_id,),
+        )
+
+    async def get_chain_stats(self, tx: Transaction) -> dict:
+        conn = self._conn(tx)
+        chain = await _fetch_one(
+            conn,
+            """
+            SELECT
+                COUNT(*) AS total_entries,
+                SUM(CASE WHEN global_root IS NULL THEN 1 ELSE 0 END) AS unsealed_count,
+                MIN(CASE WHEN global_root IS NULL THEN signed_at END) AS oldest_unsealed_signed_at
+            FROM memory_audit_chain
+            """,
+            (),
+        )
+        root = await _fetch_one(
+            conn,
+            """
+            SELECT
+                COUNT(*) AS sealed_root_count,
+                MAX(sealed_at) AS last_sealed_at
+            FROM memory_audit_roots
+            """,
+            (),
+        )
+        chain = chain or {}
+        root = root or {}
+        return {
+            "total_entries": int(chain.get("total_entries") or 0),
+            "unsealed_count": int(chain.get("unsealed_count") or 0),
+            "oldest_unsealed_signed_at": chain.get("oldest_unsealed_signed_at") or None,
+            "sealed_root_count": int(root.get("sealed_root_count") or 0),
+            "last_sealed_at": root.get("last_sealed_at") or None,
+        }
+
+    async def get_latest_audit_entries_batch(
+        self,
+        tx: Transaction,
+        memory_ids: list[bytes],
+    ) -> dict[bytes, Row]:
+        """Batch via CTE with ROW_NUMBER() OVER (PARTITION BY memory_id
+        ORDER BY signed_at DESC). SQLite 3.25+ supports window
+        functions. Single round-trip beats N+1 serial reads.
+        """
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        rows = await _fetch_all(
+            self._conn(tx),
+            f"""
+            WITH ranked AS (
+              SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                     op, payload_hash, writer_id, writer_pubkey,
+                     signature, signed_at, global_root, global_seq,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY memory_id
+                       ORDER BY datetime(signed_at) DESC, entry_id DESC
+                     ) AS rn
+              FROM memory_audit_chain
+              WHERE memory_id IN ({placeholders})
+            )
+            SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                   op, payload_hash, writer_id, writer_pubkey,
+                   signature, signed_at, global_root, global_seq
+            FROM ranked
+            WHERE rn = 1
+            """,
+            tuple(memory_ids),
+        )
+        return {r["memory_id"]: r for r in rows}
+
+
+class SqliteBackend:
     """SQLite persistence facade backed by one serialized connection."""
+
+    _supports_core_persistence = True
+    _supports_oauth_persistence = True
+    _supports_sessions_persistence = True
+    _supports_consultations_persistence = True
+    _supports_federation_persistence = True
+    _supports_audit_persistence = True
+    _supports_state_persistence = True
 
     supports_listen_notify = False
     supports_advisory_locks = False
@@ -2825,8 +3593,12 @@ class SqliteBackend(PersistenceBackend):
         self._compression = SqliteCompressionRepository()
         self._webhooks = SqliteWebhookRepository()
         self._consultations_audit = SqliteConsultationAuditRepository()
+        self._oauth = SqliteOAuthRepository()
+        self._sessions = SqliteSessionsRepository()
+        self._consultations = SqliteConsultationsRepository()
         self._federation = SqliteFederationRepository()
         self._state_kv = SqliteStateRepository()
+        self._audit_chain = SqliteAuditChainRepository()
 
     @property
     def settings(self) -> Any:
@@ -2835,6 +3607,528 @@ class SqliteBackend(PersistenceBackend):
     @property
     def vec_loaded(self) -> bool:
         return self._vec_loaded
+
+    @property
+    def capabilities(self) -> set[str]:
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+
+    async def fetch_category_decay_rows(self, tx: Transaction) -> list[Row]:
+        return await _fetch_all(
+            _sqlite_tx(tx).conn,
+            "SELECT category, half_life_days, decay_kind, floor FROM memory_category_decay",
+            (),
+        )
+
+    async def upsert_category_decay(
+        self,
+        tx: Transaction,
+        *,
+        category: str,
+        half_life_days: float,
+        decay_kind: str,
+        floor: float,
+    ) -> None:
+        await _execute(
+            _sqlite_tx(tx).conn,
+            """
+            INSERT INTO memory_category_decay (category, half_life_days, decay_kind, floor)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (category) DO UPDATE SET
+                half_life_days = excluded.half_life_days,
+                decay_kind = excluded.decay_kind,
+                floor = excluded.floor
+            """,
+            (category, half_life_days, decay_kind, floor),
+        )
+
+    async def create_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+    ) -> Row:
+        conn = _sqlite_tx(tx).conn
+        if entry_date is None:
+            await _execute(
+                conn,
+                """
+                INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                VALUES (?, ?, ?, date('now'), ?, ?, ?)
+                """,
+                (entry_id, owner_id, namespace, topic, content, _json_text(metadata, default={})),
+            )
+        else:
+            await _execute(
+                conn,
+                """
+                INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (entry_id, owner_id, namespace, str(entry_date), topic, content, _json_text(metadata, default={})),
+            )
+        row = await _fetch_one(
+            conn,
+            """
+            SELECT id, entry_date, topic, content, metadata, created
+            FROM journal WHERE id = ?
+            """,
+            (entry_id,),
+        )
+        if row is None:
+            raise RuntimeError("journal insert returned no row")
+        return row
+
+    async def list_journal_entries(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str | None,
+        search: str | None,
+        limit: int,
+    ) -> list[Row]:
+        conn = _sqlite_tx(tx).conn
+        if entry_date is not None:
+            return await _fetch_all(
+                conn,
+                """
+                SELECT id, entry_date, topic, content, metadata, created
+                FROM journal WHERE owner_id = ? AND namespace = ? AND entry_date = ?
+                ORDER BY created DESC LIMIT ?
+                """,
+                (owner_id, namespace, str(entry_date), limit),
+            )
+        if topic:
+            return await _fetch_all(
+                conn,
+                """
+                SELECT id, entry_date, topic, content, metadata, created
+                FROM journal WHERE owner_id = ? AND namespace = ? AND topic = ?
+                ORDER BY created DESC LIMIT ?
+                """,
+                (owner_id, namespace, topic, limit),
+            )
+        if search:
+            return await _fetch_all(
+                conn,
+                """
+                SELECT id, entry_date, topic, content, metadata, created
+                FROM journal
+                WHERE owner_id = ? AND namespace = ?
+                  AND (lower(content) LIKE lower(?) OR lower(topic) LIKE lower(?))
+                ORDER BY created DESC LIMIT ?
+                """,
+                (owner_id, namespace, f"%{search}%", f"%{search}%", limit),
+            )
+        return await _fetch_all(
+            conn,
+            """
+            SELECT id, entry_date, topic, content, metadata, created
+            FROM journal WHERE owner_id = ? AND namespace = ?
+            ORDER BY created DESC LIMIT ?
+            """,
+            (owner_id, namespace, limit),
+        )
+
+    async def delete_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+    ) -> bool:
+        cursor = await _execute(
+            _sqlite_tx(tx).conn,
+            "DELETE FROM journal WHERE id = ? AND owner_id = ? AND namespace = ?",
+            (entry_id, owner_id, namespace),
+        )
+        return int(getattr(cursor, "rowcount", 0) or 0) > 0
+
+    async def register_oauth_token(
+        self,
+        tx: Transaction,
+        *,
+        token: str | bytes,
+        user_id: str,
+        provider: str,
+        scopes: Sequence[str] | dict[str, Any] | None = None,
+        expires_at: Any = None,
+        refresh_token: str | None = None,
+    ) -> Row:
+        conn = _sqlite_tx(tx).conn
+        await _execute(
+            conn,
+            "INSERT INTO oauth_tokens "
+            "(token, user_id, provider, scopes, expires_at, refresh_token, created_at, last_used_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, NULL)",
+            (_token_blob(token), user_id, provider, _json_text(scopes, default=[]), expires_at, refresh_token),
+        )
+        row = await self.lookup_oauth_token(tx, token=token, touch=False)
+        assert row is not None
+        return row
+
+    async def lookup_oauth_token(self, tx: Transaction, *, token: str | bytes, touch: bool = True) -> Row | None:
+        conn = _sqlite_tx(tx).conn
+        raw = _token_blob(token)
+        if touch:
+            await _execute(conn, "UPDATE oauth_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE token = ?", (raw,))
+        row = await _fetch_one(
+            conn,
+            "SELECT token, user_id, provider, scopes, expires_at, refresh_token, created_at, last_used_at "
+            "FROM oauth_tokens WHERE token = ?",
+            (raw,),
+        )
+        if row is None:
+            return None
+        out = dict(row)
+        out["token"] = bytes(out["token"]).hex()
+        out["scopes"] = _json_value(out.get("scopes"), [])
+        return out
+
+    async def revoke_oauth_token(self, tx: Transaction, *, token: str | bytes) -> bool:
+        return (
+            await _execute_count(_sqlite_tx(tx).conn, "DELETE FROM oauth_tokens WHERE token = ?", (_token_blob(token),))
+            > 0
+        )
+
+    async def start_oauth_flow(
+        self,
+        tx: Transaction,
+        *,
+        state: str | bytes,
+        provider: str,
+        csrf_token: str,
+        return_url: str | None,
+        expires_at: Any,
+    ) -> Row:
+        conn = _sqlite_tx(tx).conn
+        await _execute(
+            conn,
+            "INSERT INTO oauth_state (state, provider, csrf_token, return_url, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)",
+            (_token_blob(state), provider, csrf_token, return_url, expires_at),
+        )
+        row = await _fetch_one(conn, "SELECT * FROM oauth_state WHERE state = ?", (_token_blob(state),))
+        assert row is not None
+        out = dict(row)
+        out["state"] = bytes(out["state"]).hex()
+        return out
+
+    async def redeem_oauth_state(self, tx: Transaction, *, state: str | bytes) -> Row | None:
+        conn = _sqlite_tx(tx).conn
+        raw = _token_blob(state)
+        row = await _fetch_one(
+            conn,
+            "SELECT state, provider, csrf_token, return_url, created_at, expires_at "
+            "FROM oauth_state WHERE state = ? AND datetime(expires_at) > datetime('now')",
+            (raw,),
+        )
+        await _execute(conn, "DELETE FROM oauth_state WHERE state = ?", (raw,))
+        if row is None:
+            return None
+        out = dict(row)
+        out["state"] = bytes(out["state"]).hex()
+        return out
+
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        expires_at: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> Row:
+        sid = session_id or uuid.uuid4()
+        conn = _sqlite_tx(tx).conn
+        await _execute(
+            conn,
+            "INSERT INTO sessions (session_id, user_id, started_at, last_active_at, expires_at, metadata) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)",
+            (_uuid_to_blob(sid), user_id, expires_at, _json_text(metadata, default={})),
+        )
+        row = await self.lookup_session(tx, session_id=sid)
+        assert row is not None
+        return row
+
+    async def lookup_session(self, tx: Transaction, *, session_id: str | bytes | uuid.UUID) -> Row | None:
+        row = await _fetch_one(
+            _sqlite_tx(tx).conn,
+            "SELECT session_id, user_id, started_at, last_active_at, expires_at, metadata "
+            "FROM sessions WHERE session_id = ? AND datetime(expires_at) > datetime('now')",
+            (_uuid_to_blob(session_id),),
+        )
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _blob_to_uuid(out.get("session_id"))
+        out["metadata"] = _json_value(out.get("metadata"), {})
+        return out
+
+    async def update_session_active(self, tx: Transaction, *, session_id: str | bytes | uuid.UUID) -> bool:
+        return (
+            await _execute_count(
+                _sqlite_tx(tx).conn,
+                "UPDATE sessions SET last_active_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (_uuid_to_blob(session_id),),
+            )
+            > 0
+        )
+
+    async def expire_session(self, tx: Transaction, *, session_id: str | bytes | uuid.UUID) -> bool:
+        return (
+            await _execute_count(
+                _sqlite_tx(tx).conn,
+                "UPDATE sessions SET expires_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (_uuid_to_blob(session_id),),
+            )
+            > 0
+        )
+
+    async def log_session_event(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str | bytes | uuid.UUID,
+        event_kind: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Row:
+        row = await _fetch_one(
+            _sqlite_tx(tx).conn,
+            "INSERT INTO session_logs (session_id, event_kind, payload, ts) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) RETURNING id, session_id, event_kind, payload, ts",
+            (_uuid_to_blob(session_id), event_kind, _json_text(payload, default={})),
+        )
+        assert row is not None
+        out = dict(row)
+        out["session_id"] = _blob_to_uuid(out.get("session_id"))
+        out["payload"] = _json_value(out.get("payload"), {})
+        return out
+
+    async def create_consultation(
+        self,
+        tx: Transaction,
+        *,
+        consultation_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        prompt: str,
+        task_type: str | None,
+        mode: str | None,
+        status: str = "pending",
+    ) -> Row:
+        cid = consultation_id or uuid.uuid4()
+        conn = _sqlite_tx(tx).conn
+        await _execute(
+            conn,
+            "INSERT INTO consultations (id, user_id, prompt, task_type, mode, status, created_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, NULL)",
+            (_uuid_to_blob(cid), user_id, prompt, task_type, mode, status),
+        )
+        row = await self.fetch_consultation(tx, consultation_id=cid)
+        assert row is not None
+        return row
+
+    async def append_consultation_response(
+        self,
+        tx: Transaction,
+        *,
+        consultation_id: str | bytes | uuid.UUID,
+        provider: str,
+        model_id: str,
+        response: str,
+        final_score: float | None = None,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        latency_ms: int | None = None,
+    ) -> Row:
+        row = await _fetch_one(
+            _sqlite_tx(tx).conn,
+            "INSERT INTO consultation_responses "
+            "(consultation_id, provider, model_id, response, final_score, tokens_in, tokens_out, latency_ms, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) RETURNING *",
+            (
+                _uuid_to_blob(consultation_id),
+                provider,
+                model_id,
+                response,
+                final_score,
+                tokens_in,
+                tokens_out,
+                latency_ms,
+            ),
+        )
+        assert row is not None
+        out = dict(row)
+        out["consultation_id"] = _blob_to_uuid(out.get("consultation_id"))
+        return out
+
+    async def fetch_consultation(self, tx: Transaction, *, consultation_id: str | bytes | uuid.UUID) -> Row | None:
+        conn = _sqlite_tx(tx).conn
+        row = await _fetch_one(
+            conn,
+            "SELECT id, user_id, prompt, task_type, mode, status, created_at, completed_at "
+            "FROM consultations WHERE id = ?",
+            (_uuid_to_blob(consultation_id),),
+        )
+        if row is None:
+            return None
+        out = dict(row)
+        out["id"] = _blob_to_uuid(out.get("id"))
+        responses = await _fetch_all(
+            conn,
+            "SELECT id, consultation_id, provider, model_id, response, final_score, tokens_in, tokens_out, latency_ms, created_at "
+            "FROM consultation_responses WHERE consultation_id = ? ORDER BY id",
+            (_uuid_to_blob(consultation_id),),
+        )
+        out["responses"] = [dict(r, consultation_id=_blob_to_uuid(r["consultation_id"])) for r in responses]
+        return out
+
+    async def list_consultations(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Row]:
+        where: list[str] = []
+        params: list[Any] = []
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(user_id)
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        sql = "SELECT id, user_id, prompt, task_type, mode, status, created_at, completed_at FROM consultations"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        rows = await _fetch_all(_sqlite_tx(tx).conn, sql, [*params, limit, offset])
+        out: list[Row] = []
+        for row in rows:
+            item = dict(row)
+            item["id"] = _blob_to_uuid(item.get("id"))
+            out.append(item)
+        return out
+
+    async def record_usage_ledger(
+        self,
+        tx: Transaction,
+        record: UsageLedgerRecord,
+    ) -> UsageLedgerResult:
+        conn = _sqlite_tx(tx).conn
+        auth_method = "api"
+        try:
+            row = await _fetch_one(
+                conn,
+                "SELECT auth_method FROM subscription_plans WHERE provider = ? AND plan_name = ?",
+                (record.provider, record.tier),
+            )
+            if row:
+                auth_method = str(row["auth_method"] if isinstance(row, dict) else row[0]).lower()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+
+        registry_row: Row | None = None
+        if auth_method != "subscription":
+            try:
+                registry_row = await _fetch_one(
+                    conn,
+                    """
+                    SELECT input_cost_per_mtok, output_cost_per_mtok, raw
+                    FROM model_registry
+                    WHERE provider = ? AND model_id = ?
+                    """,
+                    (record.provider, record.model),
+                )
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
+                logger.warning(
+                    "usage_ledger model_registry table missing for provider=%s model=%s; recording est_cost_usd=0",
+                    record.provider,
+                    record.model,
+                )
+        if auth_method == "subscription":
+            est_cost = Decimal("0")
+        elif registry_row is None:
+            logger.warning(
+                "usage_ledger model_registry price missing for provider=%s model=%s; recording est_cost_usd=0",
+                record.provider,
+                record.model,
+            )
+            est_cost = Decimal("0")
+        else:
+            input_cost = Decimal(str(registry_row["input_cost_per_mtok"] or 0))
+            output_cost = Decimal(str(registry_row["output_cost_per_mtok"] or 0))
+            reasoning_cost = output_cost
+            raw = registry_row["raw"] if isinstance(registry_row, dict) else None
+            if raw:
+                try:
+                    parsed = json.loads(str(raw))
+                    reasoning_cost = Decimal(str(parsed.get("reasoning_cost_per_mtok") or output_cost))
+                except (TypeError, ValueError):
+                    reasoning_cost = output_cost
+            est_cost = (
+                Decimal(record.tokens_in) * input_cost
+                + Decimal(record.tokens_out) * output_cost
+                + Decimal(record.tokens_reasoning) * reasoning_cost
+            ) / Decimal(1000000)
+
+        cursor = await _execute(
+            conn,
+            """
+            INSERT INTO usage_ledger (
+                provider, model, task_kind, tokens_in, tokens_out,
+                tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                caller_subsystem, tier, session_id, request_count,
+                plan_window_id, path_kind, subscription_amortized
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id, est_cost_usd
+            """,
+            (
+                record.provider,
+                record.model,
+                record.task_kind,
+                record.tokens_in,
+                record.tokens_out,
+                record.tokens_reasoning,
+                str(est_cost),
+                record.latency_ms,
+                record.outcome,
+                record.caller_subsystem,
+                record.tier,
+                record.session_id,
+                record.request_count,
+                record.plan_window_id,
+                record.path_kind or "api",
+                1 if auth_method == "subscription" else 0,
+            ),
+        )
+        try:
+            row = await _maybe_await(cursor.fetchone())
+        finally:
+            close = getattr(cursor, "close", None)
+            if close is not None:
+                await _maybe_await(close())
+        if row is None:
+            raise RuntimeError("usage_ledger insert returned no row")
+        return UsageLedgerResult(
+            id=int(row["id"] if isinstance(row, dict) else row[0]),
+            est_cost_usd=Decimal(str(row["est_cost_usd"] if isinstance(row, dict) else row[1])),
+        )
 
     async def open(self) -> None:
         if self._conn is not None:
@@ -2870,8 +4164,7 @@ class SqliteBackend(PersistenceBackend):
             await _call(conn.close)
             required = ".".join(str(part) for part in MIN_SQLITE_VERSION)
             raise RuntimeError(
-                f"SQLite {required}+ is required for UPDATE ... RETURNING support; "
-                f"found {raw_version}"
+                f"SQLite {required}+ is required for UPDATE ... RETURNING support; " f"found {raw_version}"
             )
 
     async def _register_functions(self, conn: Any) -> None:
@@ -2926,6 +4219,75 @@ class SqliteBackend(PersistenceBackend):
     async def _ensure_repository_columns(self, conn: Any) -> None:
         await self._ensure_columns(
             conn,
+            "sessions",
+            {
+                "model": "model TEXT NOT NULL DEFAULT 'gpt-4o'",
+                "last_activity": "last_activity TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+                "message_count": "message_count INTEGER NOT NULL DEFAULT 0",
+                "total_tokens": "total_tokens INTEGER NOT NULL DEFAULT 0",
+                "deleted_at": "deleted_at TEXT",
+            },
+        )
+        await self._ensure_columns(
+            conn,
+            "session_messages",
+            {
+                "model": "model TEXT",
+                "tokens_used": "tokens_used INTEGER",
+                "memories_injected": "memories_injected INTEGER",
+                "deleted_at": "deleted_at TEXT",
+            },
+        )
+        await self._ensure_columns(
+            conn,
+            "session_memory_injections",
+            {
+                "message_id": "message_id TEXT",
+                "injection_timestamp": "injection_timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+                "deleted_at": "deleted_at TEXT",
+            },
+        )
+        await self._ensure_columns(
+            conn,
+            "oauth_providers",
+            {
+                "name": "name TEXT",
+                "display_name": "display_name TEXT",
+                "kind": "kind TEXT NOT NULL DEFAULT 'oidc'",
+                "enabled": "enabled INTEGER NOT NULL DEFAULT 1",
+                "issuer_url": "issuer_url TEXT",
+                "scope": "scope TEXT NOT NULL DEFAULT 'openid email profile'",
+                "authorize_url": "authorize_url TEXT",
+                "token_url": "token_url TEXT",
+                "userinfo_url": "userinfo_url TEXT",
+            },
+        )
+        await self._ensure_columns(
+            conn,
+            "oauth_identities",
+            {
+                "provider": "provider TEXT",
+                "external_id": "external_id TEXT",
+                "display_name": "display_name TEXT",
+                "raw_claims": "raw_claims TEXT NOT NULL DEFAULT '{}'",
+                "last_login_at": "last_login_at TEXT",
+                "created": "created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            },
+        )
+        await self._ensure_columns(
+            conn,
+            "oauth_sessions",
+            {
+                "session_id": "session_id TEXT",
+                "identity_id": "identity_id TEXT",
+                "user_agent": "user_agent TEXT",
+                "ip_address": "ip_address TEXT",
+                "last_used_at": "last_used_at TEXT",
+                "revoked_at": "revoked_at TEXT",
+            },
+        )
+        await self._ensure_columns(
+            conn,
             "state",
             {
                 "updated_by": "updated_by TEXT",
@@ -2966,6 +4328,7 @@ class SqliteBackend(PersistenceBackend):
                 "last_schema_check_at": "last_schema_check_at TEXT",
                 "created": "created TEXT",
                 "updated": "updated TEXT",
+                "copy_embeddings": "copy_embeddings INTEGER NOT NULL DEFAULT 0",
             },
         )
         await self._ensure_columns(
@@ -3048,8 +4411,7 @@ class SqliteBackend(PersistenceBackend):
         """
         row = await _fetch_one(
             conn,
-            "SELECT sql FROM sqlite_master WHERE type='table' "
-            "AND name='memory_embedding_vec'",
+            "SELECT sql FROM sqlite_master WHERE type='table' " "AND name='memory_embedding_vec'",
         )
         if not row:
             return None
@@ -3081,8 +4443,7 @@ class SqliteBackend(PersistenceBackend):
         """
         row_meta = await _fetch_one(
             conn,
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name='memory_embeddings'",
+            "SELECT name FROM sqlite_master WHERE type='table' " "AND name='memory_embeddings'",
         )
         if not row_meta:
             return {}
@@ -3172,12 +4533,37 @@ class SqliteBackend(PersistenceBackend):
         return self._consultations_audit
 
     @property
+    def oauth(self) -> OAuthRepository:
+        return self._oauth
+
+    @property
+    def sessions(self) -> SessionsRepository:
+        return self._sessions
+
+    @property
+    def consultations(self) -> ConsultationsRepository:
+        return self._consultations
+
+    @property
     def federation(self) -> FederationRepository:
         return self._federation
 
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv
+
+    @property
+    def audit_chain(self) -> AuditChainRepository:
+        return self._audit_chain
+
+    async def ping(self) -> bool:
+        try:
+            await self.open()
+            assert self._conn is not None
+            await _fetch_val(self._conn, "SELECT 1")
+            return True
+        except Exception:
+            return False
 
     async def close(self) -> None:
         if self._closed:

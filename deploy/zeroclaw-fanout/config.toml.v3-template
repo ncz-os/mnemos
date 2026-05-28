@@ -1,0 +1,173 @@
+schema_version = 3
+
+# Generated 2026-05-24 — clean v3 native shape.
+# Pattern: [providers.models.<type>.<profile>] — one model per profile.
+# Multiple profiles per muse for tier selection.
+
+# ============================================================
+# Tier A — PREMIUM
+# ============================================================
+
+[providers.models.anthropic.opus_4_6]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "claude-opus-4-1"
+
+[providers.models.anthropic.sonnet_4_6]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "claude-sonnet-4-5-20250929"
+
+[providers.models.openai.gpt5_2_pro]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "gpt-5-pro"
+
+[providers.models.openai.gpt5_2]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "gpt-5"
+
+[providers.models.gemini.pro_preview]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "gemini-3-pro-preview"
+
+[providers.models.together.minimax_premium]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "MiniMaxAI/MiniMax-M2.7"
+
+# ============================================================
+# Tier B — MID
+# ============================================================
+
+[providers.models.openai.gpt5_mini]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "gpt-5-mini"
+
+[providers.models.gemini.flash]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "gemini-2.5-flash"
+
+[providers.models.xai.grok_4_1_fast]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "grok-4-1-fast"
+
+[providers.models.xai.grok_4_3]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "grok-4-3"
+
+[providers.models.perplexity.sonar_pro]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "sonar-pro"
+
+[providers.models.groq.default]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "llama-3.3-70b-versatile"
+
+[providers.models.groq.qwen3]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "qwen/qwen3-32b"
+
+[providers.models.groq.gpt_oss_120b]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "openai/gpt-oss-120b"
+
+[providers.models.groq.llama4_scout]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+[providers.models.together.llama_70b]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+model = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+
+# ============================================================
+# Tier C — ROUTINE (free NGC + local)
+# ============================================================
+
+[providers.models.nvidia.default]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "moonshotai/kimi-k2.6"
+
+[providers.models.nvidia.kimi]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "moonshotai/kimi-k2.6"
+
+[providers.models.nvidia.nemotron]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "nvidia/nemotron-3-super-120b-a12b"
+
+[providers.models.nvidia.qwen3_coder]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "qwen/qwen3-coder-480b-a35b-instruct"
+
+[providers.models.nvidia.llama_70b]
+api_key = "__REPLACE_BY_DEPLOY_SCRIPT__"
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "meta/llama-3.3-70b-instruct"
+
+# ============================================================
+# Risk profiles
+# ============================================================
+
+[risk_profiles.hive_worker]
+auto_approve = ["file_read", "file_write", "file_delete", "bash", "shell", "memory_recall", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search"]
+workspace_only = false
+level = "full"
+sandbox_enabled = false
+block_high_risk_commands = false
+require_approval_for_medium_risk = false
+forbidden_paths = []
+allowed_roots = ["/home", "/tmp", "/var/tmp"]
+allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail", "date", "df", "du", "uname", "uptime", "hostname", "python", "python3", "pip", "node", "free", "sed", "awk", "bash", "sh", "mv", "cp", "mkdir", "rm", "chmod", "tee", "touch", "test", "true", "false"]
+shell_env_passthrough = ["PATH", "HOME", "USER", "LANG", "LC_ALL"]
+
+# ============================================================
+# Runtime profiles
+# ============================================================
+
+[runtime_profiles.coordinator]
+agentic = true
+max_depth = 5
+agentic_timeout_secs = 600
+
+[runtime_profiles.agent_hive]
+agentic = true
+
+[runtime_profiles.agent_hive_tier_a]
+agentic = true
+
+[runtime_profiles.agent_hive_tier_b]
+agentic = true
+
+[runtime_profiles.agent_hive_tier_c]
+agentic = true
+
+# ============================================================
+# Hive agents
+# ============================================================
+
+[agents.hive]
+risk_profile = "hive_worker"
+model_provider = "groq.default"
+runtime_profile = "coordinator"
+system_prompt = """
+You are a Hive Mind worker. Use bash + filesystem tools to complete the task. Return concise result.
+"""
+
+[agents.hive_tier_a]
+risk_profile = "hive_worker"
+model_provider = "anthropic.opus_4_6"
+runtime_profile = "coordinator"
+system_prompt = "Hive Mind premium-tier agent. Quality-critical. Use tools to execute completely."
+
+[agents.hive_tier_b]
+risk_profile = "hive_worker"
+model_provider = "groq.default"
+runtime_profile = "coordinator"
+system_prompt = "Hive Mind mid-tier worker. Use tools; bash -c for shell."
+
+[agents.hive_tier_c]
+risk_profile = "hive_worker"
+model_provider = "nvidia.kimi"
+runtime_profile = "coordinator"
+system_prompt = "Hive Mind routine-tier worker (free NGC). Use tools; bash -c for shell."

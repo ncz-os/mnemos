@@ -1,4 +1,5 @@
 """Pydantic models for MNEMOS API."""
+
 import json
 from typing import Any, Dict, List, Literal, Optional
 
@@ -39,10 +40,10 @@ class ConsultationRequest(BaseModel):
 
 
 class StatsResponse(BaseModel):
-    total_memories: int                              # native + federated
-    native_memories: int = 0                         # locally-created (federation_source IS NULL)
-    federated_memories: int = 0                      # pulled from peers (federation_source IS NOT NULL)
-    memories_by_peer: Dict[str, int] = {}            # per-peer count of pulled memories
+    total_memories: int  # native + federated
+    native_memories: int = 0  # locally-created (federation_source IS NULL)
+    federated_memories: int = 0  # pulled from peers (federation_source IS NOT NULL)
+    memories_by_peer: Dict[str, int] = {}  # per-peer count of pulled memories
     total_compressions: int
     average_compression_ratio: float
     average_quality_rating: int
@@ -63,6 +64,12 @@ class HealthResponse(BaseModel):
 
 
 class MemoryItem(BaseModel):
+    # v6.1 F-1.3 — accept unknown fields silently for forward-compat.
+    # A v6.0 peer pulling from a v6.1+ peer with copy_embeddings=1 will
+    # see an ``embedding`` field it doesn't know; default-ignore lets the
+    # row land without rejecting the entire payload.
+    model_config = {"extra": "ignore"}
+
     id: str
     content: str
     category: str
@@ -85,6 +92,20 @@ class MemoryItem(BaseModel):
     source_agent: Optional[str] = None
     archived_at: Optional[str] = None
     archived: bool = False
+    # v6.1 F-1 copy_embeddings payload — base64-encoded float32 bytes +
+    # metadata for receiver-side model match check. Empty/None on peers
+    # that don't opt in via federation_peers.copy_embeddings=1.
+    embedding: Optional[str] = None  # base64(float32 little-endian)
+    embedding_model: Optional[str] = None
+    embedding_dim: Optional[int] = None
+    # v6.2 M-2.2.1 chain head piggyback — primary publishes its chain
+    # head so replicas can validate continuity on inbound writes.
+    # Replicas compare audit_latest_entry_hash against their own
+    # prev_entry_hash for the federated memory; mismatch -> reject
+    # payload + log + halt peer. None/empty on peers that haven't
+    # enabled MNEMOS_AUDIT_CHAIN.
+    audit_latest_entry_id: Optional[str] = None  # hex(16-byte entry_id)
+    audit_latest_entry_hash: Optional[str] = None  # hex(32-byte sha256)
 
 
 class FederationConsolidationEvent(BaseModel):
@@ -148,7 +169,7 @@ class MemorySearchRequest(BaseModel):
     category: Optional[str] = None
     subcategory: Optional[str] = None
     include_compressed: Optional[bool] = False
-    semantic: Optional[bool] = False   # True = pgvector cosine similarity; False = FTS
+    semantic: Optional[bool] = False  # True = pgvector cosine similarity; False = FTS
     # Provenance filters — all optional, ANDed together when set
     source_provider: Optional[str] = None
     source_model: Optional[str] = None
@@ -157,6 +178,18 @@ class MemorySearchRequest(BaseModel):
     include_archived: Optional[bool] = False
     boost_recency: Optional[bool] = False
     recency_weight: float = Field(0.15, ge=0.0, le=1.0)
+    # v6.2 M-2.2.3: retrieval profile dispatcher.
+    # fast = semantic-only no rerank; balanced = current behavior (default);
+    # deep = semantic + cross-encoder rerank via MEDUSA :8091.
+    # Unknown values → 400 in route handler.
+    profile: Optional[str] = None
+    # v6.2 M-2.2.4: per-category temporal-decay override map.
+    # Keys = category names (or "*" to flatten all categories).
+    # Values = half-life-days OR multiplier when "*" is used.
+    # Most callers leave this None and rely on memory_category_decay
+    # table defaults; `synthesize`/`narrate` may set {"*": 1.0} to
+    # disable decay entirely for deep recall.
+    decay_overrides: Optional[Dict[str, float]] = None
 
 
 class MemoryCreateRequest(BaseModel):
@@ -236,8 +269,10 @@ class RehydrationResponse(BaseModel):
 
 # ── Session Management Models (NEW) ────────────────────────────────────────
 
+
 class ChatMessage(BaseModel):
     """Message in conversation history."""
+
     role: str  # "user", "assistant", "system"
     content: str
     timestamp: Optional[str] = None
@@ -246,6 +281,7 @@ class ChatMessage(BaseModel):
 
 class SessionContext(BaseModel):
     """Server-side context for a session."""
+
     session_id: str
     user_id: str
     created_at: str
@@ -258,12 +294,14 @@ class SessionContext(BaseModel):
 
 class SessionRequest(BaseModel):
     """Create a new session."""
+
     model: Optional[str] = "gpt-4o"
     initial_context: Optional[str] = None
 
 
 class SessionResponse(BaseModel):
     """Session created successfully."""
+
     session_id: str
     created_at: str
     model: str
@@ -271,6 +309,7 @@ class SessionResponse(BaseModel):
 
 class SessionMessage(BaseModel):
     """Add a message to a session (stateful chat)."""
+
     role: str  # "user" or "assistant"
     content: str
     model: Optional[str] = None  # Override session model
@@ -278,6 +317,7 @@ class SessionMessage(BaseModel):
 
 class SessionMessageResponse(BaseModel):
     """Response to a session message."""
+
     session_id: str
     message_id: str
     role: str
@@ -295,6 +335,7 @@ class SessionMessageResponse(BaseModel):
 
 class SessionHistoryResponse(BaseModel):
     """Session conversation history."""
+
     session_id: str
     messages: List[ChatMessage]
     total_messages: int
@@ -304,8 +345,10 @@ class SessionHistoryResponse(BaseModel):
 
 # ── Session Ingestion (Claude Code integration) ────────────────────────────────
 
+
 class SessionIngestRequest(BaseModel):
     """Ingest session data from Claude Code."""
+
     raw_data: Dict[str, Any]
     session_id: str
     source: Optional[str] = "claude-code"
@@ -317,6 +360,7 @@ class SessionIngestRequest(BaseModel):
 
 class SessionIngestResponse(BaseModel):
     """Response from session ingestion."""
+
     success: bool
     session_id: str
     stored_count: int
@@ -325,8 +369,10 @@ class SessionIngestResponse(BaseModel):
 
 # ── Knowledge Graph Models ────────────────────────────────────────────────────
 
+
 class KGTriple(BaseModel):
     """Knowledge graph triple (subject → predicate → object)."""
+
     id: str
     subject: str
     predicate: str
@@ -342,6 +388,7 @@ class KGTriple(BaseModel):
 
 class KGTripleCreate(BaseModel):
     """Create a knowledge graph triple."""
+
     subject: str
     predicate: str
     object: str
@@ -355,6 +402,7 @@ class KGTripleCreate(BaseModel):
 
 class KGTripleUpdate(BaseModel):
     """Update a knowledge graph triple."""
+
     object: Optional[str] = None
     confidence: Optional[float] = None
     valid_until: Optional[str] = None
@@ -366,14 +414,17 @@ class KGTripleUpdate(BaseModel):
 
 class KGTripleListResponse(BaseModel):
     """List of knowledge graph triples."""
+
     count: int
     triples: List[KGTriple]
 
 
 # ── Admin Models (User & API Key Management) ──────────────────────────────────
 
+
 class UserCreateRequest(BaseModel):
     """Create a new user."""
+
     id: str
     display_name: str
     email: Optional[str] = None
@@ -391,6 +442,7 @@ class UserCreateRequest(BaseModel):
 
 class UserResponse(BaseModel):
     """User response."""
+
     id: str
     display_name: str
     email: Optional[str] = None
@@ -401,11 +453,13 @@ class UserResponse(BaseModel):
 
 class ApiKeyCreateRequest(BaseModel):
     """Create an API key."""
+
     label: Optional[str] = None
 
 
 class ApiKeyResponse(BaseModel):
     """API key response."""
+
     id: str
     user_id: str
     key_prefix: str
@@ -418,8 +472,10 @@ class ApiKeyResponse(BaseModel):
 
 # ── v3.0.0 Consultations (GRAEAE Reasoning Domain) ────────────────────────────
 
+
 class ConsultationResponse(BaseModel):
     """Response from GRAEAE consultation."""
+
     consultation_id: Optional[str] = None
     all_responses: Dict[str, Any]  # provider → response data
     consensus_response: Optional[str] = None
@@ -438,6 +494,7 @@ class ConsultationResponse(BaseModel):
 
 class ConsultationArtifact(BaseModel):
     """Structured output from consultation."""
+
     consultation_id: str
     citations: List[str]  # memory IDs referenced
     memory_refs: List[Dict[str, Any]]  # {memory_id, relevance_score, content}
@@ -456,6 +513,7 @@ class ConsultationArtifact(BaseModel):
 
 class AuditLogEntry(BaseModel):
     """Hash-chained audit log entry."""
+
     id: str
     sequence_num: int
     consultation_id: Optional[str] = None
@@ -471,6 +529,7 @@ class AuditLogEntry(BaseModel):
 
 class AuditVerifyResponse(BaseModel):
     """Audit chain integrity verification."""
+
     valid: bool
     entries_checked: int
     first_broken_sequence: Optional[int] = None
@@ -496,17 +555,19 @@ class AuditVerifyResponse(BaseModel):
 
 # ── v3.0.0 Webhooks ───────────────────────────────────────────────────────────
 
-VALID_WEBHOOK_EVENTS = frozenset({
-    'memory.created',
-    'memory.updated',
-    'memory.deleted',
-    'consultation.completed',
-})
+VALID_WEBHOOK_EVENTS = frozenset(
+    {
+        "memory.created",
+        "memory.updated",
+        "memory.deleted",
+        "consultation.completed",
+    }
+)
 
 
 class WebhookCreateRequest(BaseModel):
     url: str
-    events: List[str] = Field(..., description='Event types to subscribe to')
+    events: List[str] = Field(..., description="Event types to subscribe to")
     description: Optional[str] = None
     namespace: Optional[str] = None
 
@@ -532,9 +593,7 @@ class WebhookCreateResponse(BaseModel):
     namespace: str
     created: str
     revoked: bool
-    secret: str = Field(
-        ..., description='HMAC signing secret — shown once only, store securely'
-    )
+    secret: str = Field(..., description="HMAC signing secret — shown once only, store securely")
 
 
 class WebhookListResponse(BaseModel):
@@ -563,6 +622,7 @@ class WebhookDeliveryListResponse(BaseModel):
 
 
 # ── v3.0.0 OAuth / OIDC ───────────────────────────────────────────────────────
+
 
 class OAuthProviderCreateRequest(BaseModel):
     name: str = Field(..., description="Unique provider name, e.g. 'google', 'github', 'company-sso'")
@@ -596,6 +656,7 @@ class OAuthProviderUpdateRequest(BaseModel):
 
 class OAuthProviderPublic(BaseModel):
     """Provider info safe to expose to unauthenticated login UI (no secrets)."""
+
     name: str
     display_name: str
     kind: str
@@ -604,6 +665,7 @@ class OAuthProviderPublic(BaseModel):
 
 class OAuthProviderAdmin(BaseModel):
     """Full provider record for admin UI (client_id visible, client_secret redacted)."""
+
     name: str
     display_name: str
     kind: str
@@ -652,15 +714,17 @@ class OAuthLogoutResponse(BaseModel):
 
 class OAuthMeResponse(BaseModel):
     """Who am I — useful for web UIs after redirect-callback."""
+
     user_id: str
     role: str
     namespace: str
     authenticated: bool
-    auth_method: str      # 'api_key' | 'session' | 'personal'
+    auth_method: str  # 'api_key' | 'session' | 'personal'
     identity: Optional[OAuthIdentity] = None
 
 
 # ── v3.0.0 Federation ─────────────────────────────────────────────────────────
+
 
 class FederationPeerCreateRequest(BaseModel):
     name: str = Field(
@@ -766,6 +830,7 @@ class FederationStatusResponse(BaseModel):
 
 class FederationFeedResponse(BaseModel):
     """Returned by /v1/federation/feed to remote peers pulling from us."""
+
     memories: List[MemoryItem | FederationConsolidationEvent]
     next_cursor: Optional[str] = None
     has_more: bool = False
@@ -787,6 +852,7 @@ class DeletionRequestCreate(BaseModel):
     Set explicitly to a namespace string to scope the wipe to a
     single tenant view of the user.
     """
+
     target_user_id: str
     target_namespace: Optional[str] = None
     notes: Optional[str] = None
@@ -795,6 +861,7 @@ class DeletionRequestCreate(BaseModel):
 class DeletionRequestItem(BaseModel):
     """A row from ``deletion_requests`` returned by admin
     endpoints (POST /admin/deletion-requests, GET, list)."""
+
     id: str
     target_user_id: str
     target_namespace: Optional[str] = None

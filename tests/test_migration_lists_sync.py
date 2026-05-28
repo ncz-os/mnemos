@@ -5,6 +5,7 @@ mnemos/installer/db.py is the single source of truth. These tests
 extract its `migration_files` list via AST and ensure compose files
 stay in sync.
 """
+
 from __future__ import annotations
 
 import ast
@@ -72,6 +73,13 @@ EXPECTED_MIGRATIONS = [
     "migrations_v5_3_3_deletion_log_export_index.sql",
     "migrations_v5_3_4_mcp_audit_log.sql",
     "migrations_v5_3_5_model_registry_capabilities_gin.sql",
+    "0032_usage_ledger.sql",
+    "0033_subscription_plans.sql",
+    "0034_usage_ledger_session_tracking.sql",
+    "0035_subscription_plans_date_aware.sql",
+    "0036_hive_agents_subscription_pools.sql",
+    "0037_deepseek_direct_provider_seed.sql",
+    "0038_oauth_sessions_consultations.sql",
 ]
 
 EXPECTED_SQLITE_MIGRATIONS = [
@@ -125,6 +133,9 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "migrations_v5_1_0_deletion_log_sqlite.sql",
     "migrations_v5_2_0_nats_outbox_idempotency_sqlite.sql",
     "migrations_v5_3_4_mcp_audit_log_sqlite.sql",
+    "migrations_v6_2_audit_chain_sqlite.sql",
+    "migrations_v6_2_category_decay_sqlite.sql",
+    "0038_oauth_sessions_consultations.sql",
 ]
 
 
@@ -158,9 +169,7 @@ def _extract_migration_list(source_path: Path, func_name: str) -> list[str]:
                                 if sub.value.endswith(".sql"):
                                     last_str = sub.value
                         if last_str is None:
-                            raise AssertionError(
-                                f"could not find .sql filename in list element: {ast.dump(elt)}"
-                            )
+                            raise AssertionError(f"could not find .sql filename in list element: {ast.dump(elt)}")
                         names.append(last_str)
                     return names
     raise AssertionError(f"no migration_files list found in {source_path}::{func_name}")
@@ -171,6 +180,29 @@ def test_installer_db_migration_list_matches_expected_order():
     installer_db_list = _extract_migration_list(repo_root / "mnemos" / "installer" / "db.py", "run_migrations")
 
     assert installer_db_list == EXPECTED_MIGRATIONS
+
+
+def test_installer_db_migration_list_includes_usage_ledger():
+    repo_root = Path(__file__).resolve().parents[1]
+    installer_db_list = _extract_migration_list(repo_root / "mnemos" / "installer" / "db.py", "run_migrations")
+
+    assert "0032_usage_ledger.sql" in installer_db_list
+    assert installer_db_list.index("0032_usage_ledger.sql") > installer_db_list.index(
+        "migrations_v5_3_5_model_registry_capabilities_gin.sql"
+    )
+
+
+def test_usage_ledger_migration_grants_runtime_roles():
+    repo_root = Path(__file__).resolve().parents[1]
+    usage_ledger_sql = (repo_root / "db/migrations/0032_usage_ledger.sql").read_text()
+    model_registry_sql = (repo_root / "db/migrations_model_registry.sql").read_text()
+
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON model_registry TO mnemos_user;" in model_registry_sql
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON model_registry TO mnemos;" in model_registry_sql
+    assert "GRANT SELECT, INSERT ON usage_ledger TO mnemos_user;" in usage_ledger_sql
+    assert "GRANT USAGE, SELECT ON SEQUENCE usage_ledger_id_seq TO mnemos_user;" in usage_ledger_sql
+    assert "GRANT SELECT, INSERT ON usage_ledger TO mnemos;" in usage_ledger_sql
+    assert "GRANT USAGE, SELECT ON SEQUENCE usage_ledger_id_seq TO mnemos;" in usage_ledger_sql
 
 
 def test_sqlite_migration_list_matches_expected_order():
@@ -185,9 +217,7 @@ def test_sqlite_migration_list_matches_expected_order():
             and isinstance(node.value, ast.List)
         ):
             names = [
-                elt.value
-                for elt in node.value.elts
-                if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                elt.value for elt in node.value.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
             ]
             assert names == EXPECTED_SQLITE_MIGRATIONS
             return
@@ -204,7 +234,8 @@ def test_every_migration_list_entry_exists_on_disk():
 
     missing = []
     for name in installer_db_list:
-        if not (repo_root / "db" / name).exists():
+        migration_path = repo_root / "db" / "migrations" / name if name[0].isdigit() else repo_root / "db" / name
+        if not migration_path.exists():
             missing.append(name)
     assert not missing, (
         f"Migration entries reference files that don't exist in db/: {missing}. "
@@ -215,13 +246,9 @@ def test_every_migration_list_entry_exists_on_disk():
 def test_every_sqlite_migration_list_entry_exists_on_disk():
     repo_root = Path(__file__).resolve().parents[1]
     missing = [
-        name
-        for name in EXPECTED_SQLITE_MIGRATIONS
-        if not (repo_root / "db" / "migrations_sqlite" / name).exists()
+        name for name in EXPECTED_SQLITE_MIGRATIONS if not (repo_root / "db" / "migrations_sqlite" / name).exists()
     ]
-    assert not missing, (
-        f"SQLite migration entries reference files that don't exist: {missing}."
-    )
+    assert not missing, f"SQLite migration entries reference files that don't exist: {missing}."
 
 
 def _extract_docker_compose_migrations(compose_path: Path) -> list[str]:
@@ -241,7 +268,7 @@ def _extract_docker_compose_migrations(compose_path: Path) -> list[str]:
         host_path = line.split(":", 1)[0]  # `- ./db/<file>.sql`
         host_path = host_path.removeprefix("- ").strip()
         name = Path(host_path).name
-        if not name.startswith("migrations"):
+        if not (name.startswith("migrations") or host_path.startswith("./db/migrations/")):
             continue
         out.append(name)
     return out
@@ -262,7 +289,8 @@ def test_docker_compose_migration_lists_match_installer():
     equality so a future drift is caught immediately."""
     repo_root = Path(__file__).resolve().parents[1]
     installer_list = _extract_migration_list(
-        repo_root / "mnemos" / "installer" / "db.py", "run_migrations",
+        repo_root / "mnemos" / "installer" / "db.py",
+        "run_migrations",
     )
     for compose_name in ("docker-compose.yml", "docker-compose.staging.yml"):
         compose_list = _extract_docker_compose_migrations(repo_root / compose_name)
@@ -299,8 +327,7 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
             "/docker-entrypoint-initdb.d/26-webhook-retry-terminal-state.sql"
         ) in text, compose_name
         assert (
-            "./db/migrations_v3_5_webhook_attempt_lease.sql:"
-            "/docker-entrypoint-initdb.d/27-webhook-attempt-lease.sql"
+            "./db/migrations_v3_5_webhook_attempt_lease.sql:" "/docker-entrypoint-initdb.d/27-webhook-attempt-lease.sql"
         ) in text, compose_name
         assert (
             "./db/migrations_v3_5_webhook_writer_revision.sql:"
@@ -347,52 +374,42 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
             "/docker-entrypoint-initdb.d/38-sessions-consultations-namespace.sql"
         ) in text, compose_name
         assert (
-            "./db/migrations_v3_5_trigger_same_memory_parent.sql:"
-            "/migrations/24-trigger-same-memory-parent.sql:ro"
+            "./db/migrations_v3_5_trigger_same_memory_parent.sql:" "/migrations/24-trigger-same-memory-parent.sql:ro"
         ) in text, compose_name
         assert (
-            "./db/migrations_v3_5_rls_group_select_unix_bits.sql:"
-            "/migrations/25-rls-group-select-unix-bits.sql:ro"
+            "./db/migrations_v3_5_rls_group_select_unix_bits.sql:" "/migrations/25-rls-group-select-unix-bits.sql:ro"
         ) in text, compose_name
         assert (
             "./db/migrations_v3_5_webhook_retry_terminal_state.sql:"
             "/migrations/26-webhook-retry-terminal-state.sql:ro"
         ) in text, compose_name
         assert (
-            "./db/migrations_v3_5_webhook_attempt_lease.sql:"
-            "/migrations/27-webhook-attempt-lease.sql:ro"
+            "./db/migrations_v3_5_webhook_attempt_lease.sql:" "/migrations/27-webhook-attempt-lease.sql:ro"
         ) in text, compose_name
         assert (
-            "./db/migrations_v3_5_webhook_writer_revision.sql:"
-            "/migrations/28-webhook-writer-revision.sql:ro"
+            "./db/migrations_v3_5_webhook_writer_revision.sql:" "/migrations/28-webhook-writer-revision.sql:ro"
         ) in text, compose_name
         assert (
-            "./db/migrations_v3_5_webhook_status_updated_at.sql:"
-            "/migrations/29-webhook-status-updated-at.sql:ro"
+            "./db/migrations_v3_5_webhook_status_updated_at.sql:" "/migrations/29-webhook-status-updated-at.sql:ro"
         ) in text, compose_name
         assert (
-            "./db/migrations_v3_5_webhook_superseded_marker.sql:"
-            "/migrations/30-webhook-superseded-marker.sql:ro"
+            "./db/migrations_v3_5_webhook_superseded_marker.sql:" "/migrations/30-webhook-superseded-marker.sql:ro"
         ) in text, compose_name
         assert (
-            "./db/migrations_v3_5_webhook_attempt_unique.sql:"
-            "/migrations/31-webhook-attempt-unique.sql:ro"
+            "./db/migrations_v3_5_webhook_attempt_unique.sql:" "/migrations/31-webhook-attempt-unique.sql:ro"
         ) in text, compose_name
         assert (
-            "./db/migrations_v3_5_webhook_succeeded_unique.sql:"
-            "/migrations/32-webhook-succeeded-unique.sql:ro"
+            "./db/migrations_v3_5_webhook_succeeded_unique.sql:" "/migrations/32-webhook-succeeded-unique.sql:ro"
         ) in text, compose_name
         assert (
             "./db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql:"
             "/migrations/33-webhook-succeeded-terminal-trigger.sql:ro"
         ) in text, compose_name
         assert (
-            "./db/migrations_v3_5_entities_namespace_unique.sql:"
-            "/migrations/34-entities-namespace-unique.sql:ro"
+            "./db/migrations_v3_5_entities_namespace_unique.sql:" "/migrations/34-entities-namespace-unique.sql:ro"
         ) in text, compose_name
         assert (
-            "./db/migrations_v3_5_state_journal_namespace.sql:"
-            "/migrations/35-state-journal-namespace.sql:ro"
+            "./db/migrations_v3_5_state_journal_namespace.sql:" "/migrations/35-state-journal-namespace.sql:ro"
         ) in text, compose_name
         assert (
             "./db/migrations_v3_5_session_compression_ratio_drop.sql:"
@@ -406,6 +423,7 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
             "./db/migrations_v3_5_sessions_consultations_namespace.sql:"
             "/migrations/38-sessions-consultations-namespace.sql:ro"
         ) in text, compose_name
+        assert ("./db/migrations/0032_usage_ledger.sql:" "/migrations/62-usage-ledger.sql:ro") in text, compose_name
         assert "psql -h postgres -U mnemos_user -d mnemos" in text, compose_name
         assert "-v ON_ERROR_STOP=1" in text, compose_name
         assert "-f /migrations/24-trigger-same-memory-parent.sql" in text, compose_name
@@ -423,6 +441,7 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
         assert "-f /migrations/36-session-compression-ratio-drop.sql" in text, compose_name
         assert "-f /migrations/37-session-compression-legacy-drop.sql" in text, compose_name
         assert "-f /migrations/38-sessions-consultations-namespace.sql" in text, compose_name
+        assert "-f /migrations/62-usage-ledger.sql" in text, compose_name
         assert "postgres-upgrade:\n        condition: service_completed_successfully" in text, compose_name
 
 
@@ -450,11 +469,7 @@ def test_v3_5_trigger_delete_branch_advances_head_to_delete_snapshot():
 
     assert "dead code" not in sql.lower()
     assert "AND mv.memory_id = mb.memory_id" in compact
+    assert ("_by, 'delete', _commit_hash, _branch, _parent_version ) " "RETURNING id INTO _new_version_id") in compact
     assert (
-        "_by, 'delete', _commit_hash, _branch, _parent_version ) "
-        "RETURNING id INTO _new_version_id"
-    ) in compact
-    assert (
-        "UPDATE memory_branches SET head_version_id = _new_version_id "
-        "WHERE memory_id = OLD.id AND name = _branch"
+        "UPDATE memory_branches SET head_version_id = _new_version_id " "WHERE memory_id = OLD.id AND name = _branch"
     ) in compact

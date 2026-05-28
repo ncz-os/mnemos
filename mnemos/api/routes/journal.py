@@ -4,7 +4,7 @@ Per-owner, per-namespace journal. Each entry is scoped to the creating user's
 `user_id` and `namespace`; root can target another owner/namespace via
 `?owner_id=` and `?namespace=`.
 """
-import json
+
 import logging
 import uuid
 from datetime import date
@@ -13,9 +13,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.core.security import scope_namespace, scope_owner
 
 logger = logging.getLogger(__name__)
@@ -25,7 +24,7 @@ router = APIRouter(tags=["journal"])
 class JournalCreateRequest(BaseModel):
     topic: str
     content: str
-    date: Optional[str] = None   # ISO date string; defaults to CURRENT_DATE if omitted
+    date: Optional[str] = None  # ISO date string; defaults to CURRENT_DATE if omitted
     metadata: Optional[dict] = None
 
 
@@ -41,33 +40,29 @@ async def create_journal_entry(
     owner_id: Optional[str] = Query(None, description="Admin-only: write on behalf of another owner"),
     namespace: Optional[str] = Query(None, description="Admin-only: write into another namespace"),
 ):
-    require_postgres_pool_or_503(route_label="POST /v1/journal")
+    backend = backend_or_503()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
         entry_id = str(uuid.uuid4())
-        async with _lc.get_pool_manager().transactional() as conn:
-            if req.date:
-                try:
-                    entry_date = date.fromisoformat(req.date)
-                except ValueError:
-                    raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD")
-                row = await conn.fetchrow(
-                    '''INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-                       RETURNING id, entry_date::text, topic, content, metadata, created::text''',
-                    entry_id, target_owner, target_ns, entry_date, req.topic, req.content,
-                    json.dumps(req.metadata or {}),
-                )
-            else:
-                row = await conn.fetchrow(
-                    '''INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
-                       VALUES ($1, $2, $3, CURRENT_DATE, $4, $5, $6::jsonb)
-                       RETURNING id, entry_date::text, topic, content, metadata, created::text''',
-                    entry_id, target_owner, target_ns, req.topic, req.content,
-                    json.dumps(req.metadata or {}),
-                )
-        return dict(row)
+        entry_date = None
+        if req.date:
+            try:
+                entry_date = date.fromisoformat(req.date)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD")
+        async with backend.transactional() as tx:
+            row = await backend.create_journal_entry(
+                tx,
+                entry_id=entry_id,
+                owner_id=target_owner,
+                namespace=target_ns,
+                entry_date=entry_date,
+                topic=req.topic,
+                content=req.content,
+                metadata=req.metadata,
+            )
+        return row
     except HTTPException:
         raise
     except Exception as e:
@@ -85,47 +80,26 @@ async def list_journal_entries(
     owner_id: Optional[str] = Query(None),
     namespace: Optional[str] = Query(None),
 ):
-    require_postgres_pool_or_503(route_label="GET /v1/journal")
+    backend = backend_or_503()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
-        async with _lc.get_pool_manager().acquire() as conn:
-            if date_str:
-                try:
-                    parsed_date = date.fromisoformat(date_str)
-                except ValueError:
-                    raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD")
-                rows = await conn.fetch(
-                    '''SELECT id, entry_date::text, topic, content, metadata, created::text
-                       FROM journal WHERE owner_id = $1 AND namespace = $2 AND entry_date = $3
-                         AND deleted_at IS NULL
-                       ORDER BY created DESC LIMIT $4''',
-                    target_owner, target_ns, parsed_date, limit
-                )
-            elif topic:
-                rows = await conn.fetch(
-                    '''SELECT id, entry_date::text, topic, content, metadata, created::text
-                       FROM journal WHERE owner_id = $1 AND namespace = $2 AND topic = $3
-                         AND deleted_at IS NULL
-                       ORDER BY created DESC LIMIT $4''',
-                    target_owner, target_ns, topic, limit
-                )
-            elif search:
-                rows = await conn.fetch(
-                    '''SELECT id, entry_date::text, topic, content, metadata, created::text
-                       FROM journal WHERE owner_id = $1 AND namespace = $2 AND (content ILIKE $3 OR topic ILIKE $3)
-                         AND deleted_at IS NULL
-                       ORDER BY created DESC LIMIT $4''',
-                    target_owner, target_ns, f'%{search}%', limit
-                )
-            else:
-                rows = await conn.fetch(
-                    '''SELECT id, entry_date::text, topic, content, metadata, created::text
-                       FROM journal WHERE owner_id = $1 AND namespace = $2
-                         AND deleted_at IS NULL
-                       ORDER BY created DESC LIMIT $3''',
-                    target_owner, target_ns, limit
-                )
+        parsed_date = None
+        if date_str:
+            try:
+                parsed_date = date.fromisoformat(date_str)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD")
+        async with backend.transactional() as tx:
+            rows = await backend.list_journal_entries(
+                tx,
+                owner_id=target_owner,
+                namespace=target_ns,
+                entry_date=parsed_date,
+                topic=topic,
+                search=search,
+                limit=limit,
+            )
         return {"entries": [dict(r) for r in rows], "count": len(rows)}
     except HTTPException:
         raise
@@ -141,14 +115,15 @@ async def delete_journal_entry(
     owner_id: Optional[str] = Query(None),
     namespace: Optional[str] = Query(None),
 ):
-    require_postgres_pool_or_503(route_label="DELETE /v1/journal/{entry_id}")
+    backend = backend_or_503()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
-    async with _lc.get_pool_manager().transactional() as conn:
-        result = await conn.execute(
-            'DELETE FROM journal WHERE id = $1 AND owner_id = $2 AND namespace = $3 '
-            'AND deleted_at IS NULL',
-            entry_id, target_owner, target_ns,
+    async with backend.transactional() as tx:
+        deleted = await backend.delete_journal_entry(
+            tx,
+            entry_id=entry_id,
+            owner_id=target_owner,
+            namespace=target_ns,
         )
-    if result == 'DELETE 0':
+    if not deleted:
         raise HTTPException(status_code=404, detail="Entry not found")

@@ -11,7 +11,7 @@ Then runs Arena.ai ranking sync so arena_score / graeae_weight are current.
 Usage:
   python3 scripts/sync_provider_models.py              # sync all providers
   python3 scripts/sync_provider_models.py --dry-run    # preview only
-  python3 scripts/sync_provider_models.py --provider openai xai
+  python3 scripts/sync_provider_models.py --provider openai xai deepseek-direct
   python3 scripts/sync_provider_models.py --arena-only # refresh scores only
 """
 
@@ -32,23 +32,26 @@ logger = logging.getLogger("sync_provider_models")
 
 
 async def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Daily sync of LLM provider model lists into MNEMOS registry"
-    )
+    parser = argparse.ArgumentParser(description="Daily sync of LLM provider model lists into MNEMOS registry")
     parser.add_argument(
-        "--provider", nargs="+", metavar="PROVIDER",
+        "--provider",
+        nargs="+",
+        metavar="PROVIDER",
         help="One or more provider names to sync (default: all)",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Fetch and display changes without writing to DB",
     )
     parser.add_argument(
-        "--arena-only", action="store_true",
+        "--arena-only",
+        action="store_true",
         help="Skip provider sync; only refresh Arena.ai rankings",
     )
     parser.add_argument(
-        "--skip-arena", action="store_true",
+        "--skip-arena",
+        action="store_true",
         help="Skip Arena.ai ranking refresh after provider sync",
     )
     args = parser.parse_args()
@@ -58,10 +61,8 @@ async def main() -> int:
     if not args.dry_run:
         try:
             import asyncpg
-            dsn = os.getenv(
-                "DATABASE_URL",
-                "postgresql://mnemos:mnemos@localhost/mnemos"
-            )
+
+            dsn = os.getenv("DATABASE_URL", "postgresql://mnemos:mnemos@localhost/mnemos")
             pool = await asyncpg.create_pool(dsn, min_size=2, max_size=5)
             logger.info("[SYNC] DB pool connected")
         except Exception as exc:
@@ -76,6 +77,7 @@ async def main() -> int:
         # ── 1. Provider API sync ───────────────────────────────────────────────
         if not args.arena_only:
             from mnemos.domain.graeae.provider_sync import sync_all_providers
+
             logger.info("=== Provider API sync ===")
             results = await sync_all_providers(
                 pool=pool,
@@ -97,8 +99,8 @@ async def main() -> int:
                 )
                 if r.get("error"):
                     errors.append(f"{r['provider']}: {r['error']}")
-                total_added     += r["models_added"]
-                total_updated   += r["models_updated"]
+                total_added += r["models_added"]
+                total_updated += r["models_updated"]
                 total_deprecated += r["models_deprecated"]
 
             logger.info(
@@ -126,7 +128,9 @@ async def main() -> int:
                     # Build arena scores dict for DB update
                     # {provider: (api_model_id, arena_score, arena_rank)}
                     arena_scores: dict = {}
-                    sorted_rows = sorted(rows, key=lambda r: float(r.get("rating") or r.get("score") or 0), reverse=True)
+                    sorted_rows = sorted(
+                        rows, key=lambda r: float(r.get("rating") or r.get("score") or 0), reverse=True
+                    )
                     rank_map = {
                         (r.get("model_name") or r.get("model") or "").lower().strip(): i + 1
                         for i, r in enumerate(sorted_rows)
@@ -137,16 +141,17 @@ async def main() -> int:
                     # key (claude_opus) but the registry stores the vendor name (anthropic).
                     _GRAEAE_TO_DB_PROVIDER: dict[str, str] = {
                         "claude_opus": "anthropic",
-                        "xai":         "xai",
-                        "openai":      "openai",
-                        "gemini":      "gemini",
-                        "together":    "together",
-                        "groq":        "groq",
-                        "nvidia":      "nvidia",
-                        "perplexity":  "perplexity",
+                        "xai": "xai",
+                        "openai": "openai",
+                        "gemini": "gemini",
+                        "together": "together",
+                        "groq": "groq",
+                        "nvidia": "nvidia",
+                        "perplexity": "perplexity",
                     }
 
                     from mnemos.domain.graeae.model_registry import _PROVIDER_FAMILIES
+
                     for prov, (arena_name, score) in best.items():
                         fam = _PROVIDER_FAMILIES.get(prov, {})
                         normalize = fam.get("normalize")
@@ -160,6 +165,7 @@ async def main() -> int:
 
                     if pool and not args.dry_run and arena_scores:
                         from mnemos.domain.graeae.provider_sync import update_arena_scores
+
                         await update_arena_scores(pool, arena_scores)
                         logger.info(f"[ARENA] updated scores for {len(arena_scores)} providers")
 

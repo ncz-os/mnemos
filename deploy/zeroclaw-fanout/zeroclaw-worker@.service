@@ -1,0 +1,17 @@
+[Unit]
+Description=Zeroclaw Hive Worker instance %i
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/zeroclaw-worker
+Environment=ZEROCLAW_INSTANCE_ID=%i
+Environment=INSTANCE=%i
+ExecStart=/usr/bin/python3 /home/%U/zeroclaw_worker.py
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

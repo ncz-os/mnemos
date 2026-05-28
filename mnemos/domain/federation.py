@@ -10,21 +10,29 @@ Peers are configured via admin endpoints (api/handlers/federation.py). A
 lifespan-owned worker iterates enabled peers on their individual sync
 intervals.
 """
+
 from __future__ import annotations
 
 import base64
 import binascii
 import json
 import logging
+import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import httpx
 
 from mnemos.db import eligibility as _eligibility
-from mnemos.persistence.base import FederationRepository, PersistenceBackend, Transaction
+from mnemos.persistence.base import AuditPersistence, FederationPersistence, FederationRepository, Transaction
+
+FederationBackend = Union[FederationPersistence, AuditPersistence]
 
 logger = logging.getLogger(__name__)
+
+# Keep this legacy module import-compatible while allowing additive
+# submodules under mnemos/domain/federation/.
+__path__ = [os.path.join(os.path.dirname(__file__), "federation")]
 
 FEDERATION_HTTP_TIMEOUT = 30.0
 FEDERATION_BATCH_LIMIT = 100
@@ -34,7 +42,7 @@ FEDERATION_CURSOR_LOWER_ID = ""
 # fill disk by pushing 50MB blobs; these caps bound a single memory to ~1.5MB.
 FEDERATION_MAX_CONTENT = 1_000_000  # 1 MB per content body
 FEDERATION_MAX_METADATA = 64 * 1024  # 64 KB metadata json
-FEDERATION_MAX_NAME = 256            # category/subcategory/namespace length
+FEDERATION_MAX_NAME = 256  # category/subcategory/namespace length
 
 
 def eligible_for_federation(alias: str = "m") -> str:
@@ -169,32 +177,34 @@ async def _check_peer_schema(
     (Codex review-round-3 finding #1).
     """
     import httpx
+
     url = f"{base_url.rstrip('/')}/v1/federation/schema"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                url, headers={"Authorization": f"Bearer {auth_token}"}
-            )
+            resp = await client.get(url, headers={"Authorization": f"Bearer {auth_token}"})
             if resp.status_code >= 500:
                 # 5xx — transient infra failure on the peer.
                 logger.warning(
                     "federation: peer %s /schema returned %d (transient)",
-                    name, resp.status_code,
+                    name,
+                    resp.status_code,
                 )
                 return {
-                    "ok": False, "transient": True,
+                    "ok": False,
+                    "transient": True,
                     "reason": f"http {resp.status_code}",
                 }
             if resp.status_code != 200:
                 # 4xx — durable: peer doesn't speak the protocol or
                 # rejected the auth. Pre-v3.4 peers land here too.
                 logger.info(
-                    "federation: peer %s /schema returned %d — "
-                    "peer may pre-date v3.4 federation_compat",
-                    name, resp.status_code,
+                    "federation: peer %s /schema returned %d — " "peer may pre-date v3.4 federation_compat",
+                    name,
+                    resp.status_code,
                 )
                 return {
-                    "ok": False, "transient": False,
+                    "ok": False,
+                    "transient": False,
                     "reason": f"http {resp.status_code}",
                 }
             try:
@@ -202,14 +212,16 @@ async def _check_peer_schema(
             except Exception as parse_err:
                 # 200 but unparseable JSON — durable shape problem.
                 return {
-                    "ok": False, "transient": False,
+                    "ok": False,
+                    "transient": False,
                     "reason": f"unparseable schema response: {parse_err}",
                 }
             mnemos_version = data.get("mnemos_version")
             schema_signature = data.get("schema_signature")
             if not mnemos_version or not schema_signature:
                 return {
-                    "ok": False, "transient": False,
+                    "ok": False,
+                    "transient": False,
                     "reason": "missing mnemos_version or schema_signature",
                 }
             return {
@@ -225,26 +237,35 @@ async def _check_peer_schema(
     # local/config failures (InvalidURL, UnsupportedProtocol,
     # LocalProtocolError) durable so a misconfigured peer doesn't
     # spin forever on transient retries.
-    except (httpx.ConnectError, httpx.ConnectTimeout,
-            httpx.ReadTimeout, httpx.WriteTimeout,
-            httpx.PoolTimeout, httpx.NetworkError,
-            httpx.RemoteProtocolError, httpx.ProxyError) as e:
+    except (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.ReadTimeout,
+        httpx.WriteTimeout,
+        httpx.PoolTimeout,
+        httpx.NetworkError,
+        httpx.RemoteProtocolError,
+        httpx.ProxyError,
+    ) as e:
         logger.warning(
             "federation: peer %s /schema fetch failed (transient): %s",
-            name, e,
+            name,
+            e,
         )
         return {
-            "ok": False, "transient": True,
+            "ok": False,
+            "transient": True,
             "reason": f"{type(e).__name__}: {e}",
         }
-    except (httpx.InvalidURL, httpx.UnsupportedProtocol,
-            httpx.LocalProtocolError) as e:
+    except (httpx.InvalidURL, httpx.UnsupportedProtocol, httpx.LocalProtocolError) as e:
         logger.warning(
             "federation: peer %s /schema config error: %s",
-            name, e,
+            name,
+            e,
         )
         return {
-            "ok": False, "transient": False,
+            "ok": False,
+            "transient": False,
             "reason": f"{type(e).__name__}: {e}",
         }
     except Exception as e:
@@ -252,10 +273,12 @@ async def _check_peer_schema(
         # backoff doesn't loop forever on a programming error.
         logger.warning(
             "federation: peer %s /schema fetch failed: %s",
-            name, e,
+            name,
+            e,
         )
         return {
-            "ok": False, "transient": False,
+            "ok": False,
+            "transient": False,
             "reason": f"{type(e).__name__}: {e}",
         }
 
@@ -292,6 +315,7 @@ def _local_migrations_fingerprint() -> str:
         return _MIGRATIONS_FINGERPRINT_CACHE
     import hashlib
     from pathlib import Path
+
     db_dir = Path(__file__).resolve().parents[2] / "db"
     if not db_dir.is_dir():
         _MIGRATIONS_FINGERPRINT_CACHE = ""
@@ -313,7 +337,7 @@ def _local_migrations_fingerprint() -> str:
 
 
 async def sync_peer(
-    backend: PersistenceBackend,
+    backend: FederationBackend,
     peer_id: str,
 ) -> Tuple[int, int, int]:
     """Run a full sync against one peer. Returns (pulled, new, updated).
@@ -337,14 +361,14 @@ async def sync_peer(
     # Schema-compatibility pre-flight (added in v3.4 federation_compat).
     # See db/migrations_v3_4_federation_compat.sql for column meaning.
     from mnemos._version import __version__ as _local_v
+
     _local_parts = _local_v.split(".")
-    local_signature = (
-        f"{_local_parts[0]}.{_local_parts[1]}"
-        if len(_local_parts) >= 2 else _local_v
-    )
+    local_signature = f"{_local_parts[0]}.{_local_parts[1]}" if len(_local_parts) >= 2 else _local_v
     local_fingerprint = _local_migrations_fingerprint()
     schema_resp = await _check_peer_schema(
-        peer["base_url"], peer["auth_token"], peer["name"],
+        peer["base_url"],
+        peer["auth_token"],
+        peer["name"],
     )
 
     schema_abort_reason: Optional[str] = None
@@ -354,11 +378,10 @@ async def sync_peer(
         peer_version = schema_resp["mnemos_version"]
         peer_signature = schema_resp["schema_signature"]
         peer_fingerprint = schema_resp.get("migrations_fingerprint")
-        sig_match = (peer_signature == local_signature)
+        sig_match = peer_signature == local_signature
         if not sig_match:
             schema_abort_reason = (
-                f"schema mismatch: peer={peer_signature} ({peer_version}) "
-                f"local={local_signature} ({_local_v})"
+                f"schema mismatch: peer={peer_signature} ({peer_version}) " f"local={local_signature} ({_local_v})"
             )
             schema_abort_kind = "incompat"
         elif local_fingerprint == "":
@@ -390,12 +413,8 @@ async def sync_peer(
         # transient (network/timeout/5xx) from durable (4xx, parse).
         # Both fail strict, but transient should NOT burn the full
         # sync_interval_secs — see strict-abort branch below.
-        schema_abort_reason = (
-            f"schema unverifiable ({schema_resp['reason']})"
-        )
-        schema_abort_kind = (
-            "transient" if schema_resp.get("transient") else "unverifiable"
-        )
+        schema_abort_reason = f"schema unverifiable ({schema_resp['reason']})"
+        schema_abort_kind = "transient" if schema_resp.get("transient") else "unverifiable"
     if schema_abort_reason is not None and peer["compat_mode"] == "strict":
         # Codex review-round-2 finding #2 — schema-metadata update,
         # sync_log row, and peer last_sync_at advance MUST commit as a
@@ -410,7 +429,7 @@ async def sync_peer(
         # and update peer metadata, but skip the last_sync_at advance
         # so the next 60s worker tick can re-attempt. Durable failures
         # (incompat, 4xx, parse) advance last_sync_at as normal.
-        is_transient = (schema_abort_kind == "transient")
+        is_transient = schema_abort_kind == "transient"
         async with backend.transactional() as tx:
             await repo.record_schema_abort(
                 tx,
@@ -422,7 +441,9 @@ async def sync_peer(
             )
         logger.error(
             "federation: peer %s — strict abort (%s): %s",
-            peer["name"], schema_abort_kind, schema_abort_reason,
+            peer["name"],
+            schema_abort_kind,
+            schema_abort_reason,
         )
         msg = (
             f"federation peer {peer['name']}: {schema_abort_reason}. "
@@ -447,12 +468,14 @@ async def sync_peer(
         # compat_mode == 'permissive' falls through to here.
         logger.warning(
             "federation: peer %s — permissive, proceeding despite: %s",
-            peer["name"], schema_abort_reason,
+            peer["name"],
+            schema_abort_reason,
         )
     else:
         logger.debug(
             "federation: peer %s schema-aligned at %s",
-            peer["name"], local_signature,
+            peer["name"],
+            local_signature,
         )
 
     async with backend.transactional() as tx:
@@ -465,16 +488,29 @@ async def sync_peer(
     cursor_persisted = cursor_before
     err: Optional[str] = None
 
+    # v6.1 F-1: per-peer copy_embeddings flag (added by migration 0028).
+    # Pass via _pull_batch query param so source emits embedding bytes.
+    peer_copy_embeddings = False
+    try:
+        ce = peer.get("copy_embeddings") if hasattr(peer, "get") else peer["copy_embeddings"]
+        peer_copy_embeddings = bool(ce) if ce is not None else False
+    except (KeyError, IndexError, TypeError):
+        peer_copy_embeddings = False
+
     try:
         while True:
             batch, next_cursor, has_more = await _pull_batch(
-                peer["base_url"], peer["auth_token"], cursor_request,
-                peer["namespace_filter"], peer["category_filter"],
+                peer["base_url"],
+                peer["auth_token"],
+                cursor_request,
+                peer["namespace_filter"],
+                peer["category_filter"],
+                copy_embeddings=peer_copy_embeddings,
             )
             if not batch:
                 break
             async with backend.transactional() as tx:
-                new_n, upd_n = await _store_memories(repo, tx, peer["name"], batch)
+                new_n, upd_n = await _store_memories(repo, tx, peer["name"], batch, backend=backend)
             total_pulled += len(batch)
             total_new += new_n
             total_updated += upd_n
@@ -504,7 +540,11 @@ async def sync_peer(
 
     logger.info(
         "federation: peer=%s pulled=%d new=%d updated=%d cursor=%s",
-        peer["name"], total_pulled, total_new, total_updated, cursor_persisted,
+        peer["name"],
+        total_pulled,
+        total_new,
+        total_updated,
+        cursor_persisted,
     )
     return total_pulled, total_new, total_updated
 
@@ -515,8 +555,15 @@ async def _pull_batch(
     since: Optional[datetime | FederationFeedCursor],
     namespace_filter: Optional[List[str]],
     category_filter: Optional[List[str]],
+    *,
+    copy_embeddings: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Optional[FederationFeedCursor], bool]:
-    """HTTP GET one batch. Returns (memories, next_cursor, has_more)."""
+    """HTTP GET one batch. Returns (memories, next_cursor, has_more).
+
+    v6.1 F-1: when copy_embeddings=True, requests embedding bytes via
+    the ?copy_embeddings=1 query param so the receiver can ingest
+    pre-computed vectors without re-embedding.
+    """
     url = base_url.rstrip("/") + "/v1/federation/feed"
     params: Dict[str, Any] = {"limit": FEDERATION_BATCH_LIMIT}
     if since is not None:
@@ -528,6 +575,8 @@ async def _pull_batch(
         params["namespace"] = ",".join(namespace_filter)
     if category_filter:
         params["category"] = ",".join(category_filter)
+    if copy_embeddings:
+        params["copy_embeddings"] = "true"
 
     headers = {"Authorization": f"Bearer {auth_token}"}
 
@@ -583,10 +632,43 @@ async def _store_memories(
     tx: Transaction,
     peer_name: str,
     memories: List[Dict[str, Any]],
+    backend: Optional[FederationBackend] = None,
 ) -> Tuple[int, int]:
-    """Upsert a batch. Returns (newly_inserted, updated_existing)."""
+    """Upsert a batch. Returns (newly_inserted, updated_existing).
+
+    v6.1 F-1.4: when ``backend`` is provided, also pulls embedding bytes
+    from inbound MemoryItem payloads when present + accepted by local
+    model-match. The embedding is written via the existing memories
+    repository ``upsert_memory_embedding`` so the join-table /
+    direct-column shapes per backend are handled.
+    """
     new_n = 0
     upd_n = 0
+    # v6.1 F-1.4: model match preflight. Skip embedding when peer's model
+    # doesn't match ours — store the row content as before.
+    local_embed_model: Optional[str] = None
+    embed_dim_expected: Optional[int] = None
+    if backend is not None:
+        try:
+            import os as _os
+
+            from mnemos.core.config import get_settings as _gs
+
+            _s = _gs()
+            # Prefer the HTTP-backend model env knob when active; fall back
+            # to settings.providers.inference_embed_model. The settings
+            # field is empty on instances that route embedding via HTTP
+            # (MEDUSA edge replica points at MEDUSA :8090 bge-m3 via
+            # MNEMOS_EMBED_HTTP_MODEL=bge-m3).
+            local_embed_model = (
+                _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                or (getattr(_s.providers, "inference_embed_model", "") or "").strip()
+                or None
+            )
+            embed_dim_expected = getattr(_s.database, "embedding_dim", None)
+        except Exception:
+            local_embed_model = None
+            embed_dim_expected = None
     for mem in memories:
         remote_id = mem.get("id")
         if not remote_id or not isinstance(remote_id, str):
@@ -617,8 +699,7 @@ async def _store_memories(
         meta_json = json.dumps(meta_raw)
         if len(meta_json) > FEDERATION_MAX_METADATA:
             # Drop metadata if it's absurdly large; keep the remote_id pointer.
-            meta_json = json.dumps({"federation_remote_id": remote_id,
-                                    "_metadata_truncated": True})
+            meta_json = json.dumps({"federation_remote_id": remote_id, "_metadata_truncated": True})
 
         if existing is None:
             inserted = await repo.insert_federated_memory(
@@ -640,15 +721,19 @@ async def _store_memories(
             )
             if inserted:
                 new_n += 1
-                continue
-            # Concurrent create from another federation consumer (the
-            # partial-fleet rollout window with queue-mode + legacy
-            # durables is the canonical trigger; both consumers see
-            # the same event, both pass the existence check, both attempt
-            # to insert, only one wins). Re-fetch and fall through to the
-            # update-when-newer branch so the losing path still applies
-            # a delta if its remote_updated is the freshest.
-            existing = await repo.fetch_federated_memory_marker(tx, local_id)
+                # NOTE: deliberately NOT 'continue' here — fall through to
+                # the F-1.4 embedding-copy block at the bottom of the loop
+                # so newly inserted rows get their embedding written same
+                # as updated rows. Pre-F-1.4 this 'continue' lived here.
+            else:
+                # Concurrent create from another federation consumer (the
+                # partial-fleet rollout window with queue-mode + legacy
+                # durables is the canonical trigger; both consumers see
+                # the same event, both pass the existence check, both attempt
+                # to insert, only one wins). Re-fetch and fall through to the
+                # update-when-newer branch so the losing path still applies
+                # a delta if its remote_updated is the freshest.
+                existing = await repo.fetch_federated_memory_marker(tx, local_id)
 
         if existing is not None:
             # Update only if the inbound remote_updated beats the
@@ -660,13 +745,10 @@ async def _store_memories(
             # one's write can commit second, rolling local state
             # backward to the older remote_updated. Codex round-3
             # audit (2026-05-01).
-            if (
-                _coerce_datetime(existing["federation_remote_updated"]) is None
-                or (
-                    remote_updated
-                    and _coerce_datetime(remote_updated)
-                    and _coerce_datetime(remote_updated) > _coerce_datetime(existing["federation_remote_updated"])
-                )
+            if _coerce_datetime(existing["federation_remote_updated"]) is None or (
+                remote_updated
+                and _coerce_datetime(remote_updated)
+                and _coerce_datetime(remote_updated) > _coerce_datetime(existing["federation_remote_updated"])
             ):
                 updated = await repo.update_federated_memory_if_newer(
                     tx,
@@ -688,6 +770,130 @@ async def _store_memories(
                 if updated:
                     upd_n += 1
 
+        # v6.1 F-1.4: optional embedding copy. Only attempt when:
+        #   1. backend was passed in (caller opted in)
+        #   2. payload carries an embedding field (peer sent it via F-1.3)
+        #   3. embedding_model matches local config (skip on drift; row stays)
+        #   4. embedding_dim matches local-DB-expected dim
+        # On any mismatch the memory content still lands; embedding column
+        # stays NULL until a local re-embed worker fills it.
+        if backend is not None:
+            emb_b64 = mem.get("embedding")
+            emb_model = mem.get("embedding_model")
+            emb_dim = mem.get("embedding_dim")
+            logger.info(
+                "[federation/embed] check %s emb_b64_len=%d emb_model=%s emb_dim=%s local_model=%s local_dim=%s",
+                local_id,
+                len(emb_b64 or ""),
+                emb_model,
+                emb_dim,
+                local_embed_model,
+                embed_dim_expected,
+            )
+            if emb_b64 and emb_model:
+                if local_embed_model and emb_model != local_embed_model:
+                    logger.debug(
+                        "[federation/embed] skip %s — peer model=%s != local %s",
+                        local_id,
+                        emb_model,
+                        local_embed_model,
+                    )
+                elif embed_dim_expected and emb_dim and emb_dim != embed_dim_expected:
+                    logger.debug(
+                        "[federation/embed] skip %s — dim=%s != expected %s",
+                        local_id,
+                        emb_dim,
+                        embed_dim_expected,
+                    )
+                else:
+                    try:
+                        import base64
+                        import array as _array
+
+                        raw_bytes = base64.b64decode(emb_b64)
+                        arr = _array.array("f")
+                        arr.frombytes(raw_bytes)
+                        vec = list(arr)
+                        logger.info(
+                            "[federation/embed] decoded %s vec_len=%d expected=%s",
+                            local_id,
+                            len(vec),
+                            embed_dim_expected,
+                        )
+                        if not embed_dim_expected or len(vec) == embed_dim_expected:
+                            await backend.memories.upsert_memory_embedding(tx, local_id, vec)
+                            logger.info("[federation/embed] upsert OK %s", local_id)
+                        else:
+                            logger.warning(
+                                "[federation/embed] dim mismatch %s vec=%d expected=%d",
+                                local_id,
+                                len(vec),
+                                embed_dim_expected,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "[federation/embed] failed to decode/store %s",
+                            local_id,
+                            exc_info=True,
+                        )
+
+        # v6.2 M-2.2.1 federation audit write. Replica records the
+        # inbound write under op="replicate" with writer_id="fed:<peer>"
+        # so its local audit chain reflects what was federated in.
+        # Spec § Federation interaction: audit chain becomes a federated
+        # Merkle DAG. Replica chains to its own prior entry for this
+        # local_id (NOT the primary's prev_entry_id) — the primary's
+        # chain is its own concern; we attest our local write.
+        if backend is not None and backend.audit_chain is not None:
+            try:
+                from mnemos.workers.audit_sealer import audit_chain_enabled
+
+                if audit_chain_enabled():
+                    from mnemos.core.config import get_settings as _gs2
+
+                    _s = _gs2()
+                    _ss = (getattr(_s.server, "session_secret", "") or "").encode("utf-8")
+                    if _ss:
+                        # v6.2 chain-head continuity check (best-effort).
+                        # If the primary sent its audit_latest_entry_hash
+                        # for this memory, we record a metadata-side
+                        # hint so post-hoc divergence audits can flag
+                        # any future mismatch. Active rejection of
+                        # mismatched feeds is a future hardening once
+                        # we've fielded the chain at scale.
+                        primary_eid = mem.get("audit_latest_entry_id")
+                        primary_hash = mem.get("audit_latest_entry_hash")
+                        if primary_eid and primary_hash:
+                            logger.info(
+                                "[federation/audit] peer=%s memory=%s primary_chain_head eid=%s hash=%s",
+                                peer_name,
+                                local_id,
+                                primary_eid[:16],
+                                primary_hash[:16],
+                            )
+
+                        from mnemos.audit import write_audit_entry
+
+                        await write_audit_entry(
+                            backend,
+                            tx,
+                            op="replicate",
+                            memory_id_str=local_id,
+                            content=content,
+                            category=category,
+                            subcategory=subcategory,
+                            metadata=meta_raw if isinstance(meta_raw, dict) else None,
+                            embedding=None,
+                            writer_id=f"fed:{peer_name}",
+                            session_secret=_ss,
+                        )
+            except Exception:
+                logger.warning(
+                    "[federation/audit] replicate-op audit write failed for %s",
+                    local_id,
+                    exc_info=True,
+                )
+
     return new_n, upd_n
 
 
@@ -704,9 +910,7 @@ async def _apply_consolidation_tombstone(
     raw_consolidated_at = event.get("consolidated_at")
     if isinstance(raw_consolidated_at, str):
         try:
-            consolidated_at = datetime.fromisoformat(
-                raw_consolidated_at.replace("Z", "+00:00")
-            )
+            consolidated_at = datetime.fromisoformat(raw_consolidated_at.replace("Z", "+00:00"))
         except ValueError:
             consolidated_at = None
     else:
@@ -728,7 +932,7 @@ async def _apply_consolidation_tombstone(
 # ── Background worker ────────────────────────────────────────────────────────
 
 
-async def federation_worker_loop(backend: PersistenceBackend) -> None:
+async def federation_worker_loop(backend: FederationPersistence) -> None:
     """Background loop: iterate enabled peers, sync those whose interval has elapsed.
 
     Started from the FastAPI lifespan. Cancels cleanly on shutdown.

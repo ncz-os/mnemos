@@ -15,6 +15,7 @@ Slice 1 shipped the surface. Slice 2 filled in
 REPLAY/CLUSTER/SYNTHESISE. Slice 3 adds optional CONSOLIDATE.
 Slice 4 adds optional EXTRACT.
 """
+
 from __future__ import annotations
 
 import logging
@@ -23,7 +24,6 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, require_root
 from mnemos.api.routes._postgres_only import _require_postgres_backend
 from mnemos.core.extras import is_extra_installed, missing_extra_detail
@@ -61,14 +61,11 @@ class MorpheusRunList(BaseModel):
 
 
 class MorpheusTriggerRequest(BaseModel):
-    window_hours: int = Field(168, ge=1, le=8760)        # 1h … 1 year
+    window_hours: int = Field(168, ge=1, le=8760)  # 1h … 1 year
     cluster_min_size: int = Field(3, ge=2, le=100)
     consolidate: bool = Field(
         False,
-        description=(
-            "Enable the optional CONSOLIDATE phase between CLUSTER and "
-            "SYNTHESISE for this run."
-        ),
+        description=("Enable the optional CONSOLIDATE phase between CLUSTER and " "SYNTHESISE for this run."),
     )
     extract: bool = Field(
         False,
@@ -124,28 +121,18 @@ def _row_to_run(r) -> MorpheusRun:
         status=r["status"],
         phase=r["phase"],
         triggered_by=r["triggered_by"],
-        window_started_at=(r["window_started_at"].isoformat()
-                           if r["window_started_at"] else None),
-        window_ended_at=(r["window_ended_at"].isoformat()
-                         if r["window_ended_at"] else None),
+        window_started_at=(r["window_started_at"].isoformat() if r["window_started_at"] else None),
+        window_ended_at=(r["window_ended_at"].isoformat() if r["window_ended_at"] else None),
         window_hours=r["window_hours"],
         cluster_min_size=r["cluster_min_size"],
         memories_scanned=r["memories_scanned"],
         clusters_found=r["clusters_found"],
         summaries_created=r["summaries_created"],
-        memories_consolidated=(
-            r["memories_consolidated"] if "memories_consolidated" in keys else 0
-        ),
-        clusters_consolidated=(
-            r["clusters_consolidated"] if "clusters_consolidated" in keys else 0
-        ),
-        triples_extracted=(
-            r["triples_extracted"] if "triples_extracted" in keys else 0
-        ),
+        memories_consolidated=(r["memories_consolidated"] if "memories_consolidated" in keys else 0),
+        clusters_consolidated=(r["clusters_consolidated"] if "clusters_consolidated" in keys else 0),
+        triples_extracted=(r["triples_extracted"] if "triples_extracted" in keys else 0),
         memories_processed_for_extraction=(
-            r["memories_processed_for_extraction"]
-            if "memories_processed_for_extraction" in keys
-            else 0
+            r["memories_processed_for_extraction"] if "memories_processed_for_extraction" in keys else 0
         ),
         error=r["error"],
         config=dict(r["config"]) if isinstance(r["config"], dict) else {},
@@ -165,7 +152,7 @@ async def list_runs(
     namespaces, configs, errors, and synthesized memory IDs.
     """
     _require_morpheus_installed()
-    _require_postgres_backend()
+    pg_backend = _require_postgres_backend()
     where = ""
     args: list = []
     if status:
@@ -182,7 +169,8 @@ async def list_runs(
         f"FROM morpheus_runs{where} "
         f"ORDER BY started_at DESC LIMIT ${len(args)}"
     )
-    async with _lc.get_pool_manager().acquire() as conn:
+    pool_handle = pg_backend._pool
+    async with pool_handle.acquire() as conn:
         rows = await conn.fetch(sql, *args)
     return MorpheusRunList(count=len(rows), runs=[_row_to_run(r) for r in rows])
 
@@ -191,8 +179,9 @@ async def list_runs(
 async def get_run(run_id: str, _: UserContext = Depends(require_root)):
     """Return one MORPHEUS run. Operator-only telemetry."""
     _require_morpheus_installed()
-    _require_postgres_backend()
-    async with _lc.get_pool_manager().acquire() as conn:
+    pg_backend = _require_postgres_backend()
+    pool_handle = pg_backend._pool
+    async with pool_handle.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, started_at, finished_at, status, phase, triggered_by, "
             "       window_started_at, window_ended_at, window_hours, "
@@ -228,15 +217,18 @@ async def list_clusters(run_id: str, _: UserContext = Depends(require_root)):
     above cluster_min_size.
     """
     _require_morpheus_installed()
-    _require_postgres_backend()
-    async with _lc.get_pool_manager().acquire() as conn:
+    pg_backend = _require_postgres_backend()
+    pool_handle = pg_backend._pool
+    async with pool_handle.acquire() as conn:
         config_raw = await conn.fetchval(
-            "SELECT config FROM morpheus_runs WHERE id=$1::uuid", run_id,
+            "SELECT config FROM morpheus_runs WHERE id=$1::uuid",
+            run_id,
         )
         if config_raw is None:
             # Disambiguate "run not found" from "run found, no clusters yet".
             exists = await conn.fetchval(
-                "SELECT 1 FROM morpheus_runs WHERE id=$1::uuid", run_id,
+                "SELECT 1 FROM morpheus_runs WHERE id=$1::uuid",
+                run_id,
             )
             if not exists:
                 raise HTTPException(
@@ -270,12 +262,14 @@ async def list_clusters(run_id: str, _: UserContext = Depends(require_root)):
     for c in raw_clusters:
         members = list(c.get("member_memory_ids") or [])
         synth_id = synth_by_sources.get(tuple(sorted(members)))
-        out.append(MorpheusCluster(
-            cluster_id=int(c.get("cluster_id", len(out))),
-            member_memory_ids=members,
-            member_count=len(members),
-            synthesised_memory_id=synth_id,
-        ))
+        out.append(
+            MorpheusCluster(
+                cluster_id=int(c.get("cluster_id", len(out))),
+                member_memory_ids=members,
+                member_count=len(members),
+                synthesised_memory_id=synth_id,
+            )
+        )
     return MorpheusClusterList(run_id=run_id, count=len(out), clusters=out)
 
 
@@ -293,7 +287,7 @@ async def trigger_run(
     runner is a no-op so this returns near-instantly.
     """
     _require_morpheus_installed()
-    _require_postgres_backend()
+    pg_backend = _require_postgres_backend()
     from mnemos.domain.morpheus.runner import run_dream
 
     run_config = dict(request.config)
@@ -310,14 +304,15 @@ async def trigger_run(
     else:
         run_config.setdefault("extract_verify", False)
     run_id = await run_dream(
-        _lc._pool,
+        pg_backend._pool,
         triggered_by="api",
         window_hours=request.window_hours,
         cluster_min_size=request.cluster_min_size,
         config=run_config,
         namespace=request.namespace,
     )
-    async with _lc.get_pool_manager().acquire() as conn:
+    pool_handle = pg_backend._pool
+    async with pool_handle.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, started_at, finished_at, status, phase, triggered_by, "
             "       window_started_at, window_ended_at, window_hours, "
@@ -345,10 +340,12 @@ async def rollback(
     run_id doesn't exist.
     """
     _require_morpheus_installed()
-    _require_postgres_backend()
-    async with _lc.get_pool_manager().acquire() as conn:
+    pg_backend = _require_postgres_backend()
+    pool_handle = pg_backend._pool
+    async with pool_handle.acquire() as conn:
         existing = await conn.fetchval(
-            "SELECT id FROM morpheus_runs WHERE id=$1::uuid", run_id,
+            "SELECT id FROM morpheus_runs WHERE id=$1::uuid",
+            run_id,
         )
     if existing is None:
         raise HTTPException(status_code=404, detail=f"morpheus run {run_id} not found")
@@ -356,7 +353,7 @@ async def rollback(
         from mnemos.domain.morpheus.runner import rollback_run
 
         n_deleted, _n_run = await rollback_run(
-            _lc._pool,
+            pg_backend._pool,
             run_id,
             requested_by=user.user_id,
         )
