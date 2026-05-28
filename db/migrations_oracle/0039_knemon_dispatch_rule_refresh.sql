@@ -1,5 +1,9 @@
 -- migration: 0039_knemon_dispatch_rule_refresh
 -- Oracle mirror of PostgreSQL 0039_knemon_dispatch_rule_refresh.
+-- Provenance links live in docs/KNEMON-DISPATCH-RULES.md. Rows that
+-- start on 2026-06-01 are local operator-policy projections from
+-- provider promo end dates or local pool changes, not provider-published
+-- migration promises.
 
 UPDATE subscription_plans
 SET effective_until = DATE '2026-05-31',
@@ -44,19 +48,19 @@ USING (
   UNION ALL SELECT 'openai', 'codex_pro_100_10x', 'subscription',
          100, 160, 18000, NULL, NULL, 'rolling', NULL, NULL,
          'Codex Pro $100 launch promo: GPT-5.5 lower-bound, 160 messages per 5h through 2026-05-31',
-         DATE '2026-05-28', DATE '2026-05-31', 'interactive', 'codex_plus' FROM dual
+         DATE '2026-05-28', DATE '2026-05-31', 'interactive', 'codex_pro_100' FROM dual
   UNION ALL SELECT 'openai', 'codex_pro_100_5x', 'subscription',
          100, 80, 18000, NULL, NULL, 'rolling', NULL, NULL,
          'Codex Pro $100: GPT-5.5 5x lower-bound, 80 of 80-400 messages per 5h from 2026-06-01',
-         DATE '2026-06-01', NULL, 'interactive', 'codex_plus' FROM dual
+         DATE '2026-06-01', NULL, 'interactive', 'codex_pro_100' FROM dual
   UNION ALL SELECT 'openai', 'codex_pro_200_25x', 'subscription',
          200, 375, 18000, NULL, NULL, 'rolling', NULL, NULL,
          'Codex Pro $200 temporary 25x GPT-5.5 lower-bound, 375 messages per 5h through 2026-05-31',
-         DATE '2026-05-28', DATE '2026-05-31', 'interactive', 'codex_plus' FROM dual
+         DATE '2026-05-28', DATE '2026-05-31', 'interactive', 'codex_pro_200' FROM dual
   UNION ALL SELECT 'openai', 'codex_pro_200_20x', 'subscription',
          200, 300, 18000, NULL, NULL, 'rolling', NULL, NULL,
          'Codex Pro $200: GPT-5.5 20x lower-bound, 300 of 300-1600 messages per 5h from 2026-06-01',
-         DATE '2026-06-01', NULL, 'interactive', 'codex_plus' FROM dual
+         DATE '2026-06-01', NULL, 'interactive', 'codex_pro_200' FROM dual
 ) src
 ON (dst.provider = src.provider AND dst.plan_name = src.plan_name)
 WHEN MATCHED THEN UPDATE SET
