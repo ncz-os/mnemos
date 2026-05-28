@@ -4507,6 +4507,15 @@ class OracleBackend:
         finally:
             await _call(cursor.close)
 
+    async def create_journal_entry(self, tx: Transaction, **kwargs: Any) -> Row:
+        raise NotImplementedError("journal API persistence is not implemented for Oracle schema 0015")
+
+    async def list_journal_entries(self, tx: Transaction, **kwargs: Any) -> list[Row]:
+        raise NotImplementedError("journal API persistence is not implemented for Oracle schema 0015")
+
+    async def delete_journal_entry(self, tx: Transaction, **kwargs: Any) -> bool:
+        raise NotImplementedError("journal API persistence is not implemented for Oracle schema 0015")
+
     async def open(self) -> None:
         """Lifecycle hook — validates pool checkout + session callback.
 

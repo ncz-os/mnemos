@@ -1336,6 +1336,46 @@ class CorePersistence(PersistenceCapabilityBase, Protocol):
         """Insert or update one per-category decay row."""
         raise NotImplementedError("category decay is not implemented")
 
+    async def create_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+    ) -> Row:
+        """Create one journal entry."""
+        raise NotImplementedError("journal persistence is not implemented")
+
+    async def list_journal_entries(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str | None,
+        search: str | None,
+        limit: int,
+    ) -> list[Row]:
+        """List journal entries within one owner namespace."""
+        raise NotImplementedError("journal persistence is not implemented")
+
+    async def delete_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+    ) -> bool:
+        """Delete one journal entry by scoped id."""
+        raise NotImplementedError("journal persistence is not implemented")
+
     @property
     def memories(self) -> MemoryRepository: ...
 
