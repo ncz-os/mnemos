@@ -166,13 +166,19 @@ async def test_knemon_utilization_routes_with_in_memory_sqlite(monkeypatch):
     assert plus["requests_used"] == 2
     assert plus["msg_cap"] == 160
     assert plus["cap_unit"] == "messages"
+    assert plus["notes"] == "test plus"
     assert plus["utilization_pct"] == 1.25
     token_plan = next(row for row in util_rows if row["provider"] == "testai")
     assert token_plan["tokens_used"] == 800
     assert token_plan["token_cap"] == 1000
     assert token_plan["cap_unit"] == "tokens"
+    assert token_plan["notes"] == "token cap"
     assert token_plan["utilization_pct"] == 80.0
     assert {row["plan_name"] for row in util_rows} == {"chatgpt_plus", "ngc_inference", "token_plan"}
+
+    projection_rows = projection.json()
+    projected_plus = next(row for row in projection_rows if row["provider"] == "openai")
+    assert projected_plus["notes"] == "test plus"
 
     sessions = by_session.json()
     assert {row["session_id"] for row in sessions} == {"s1", "s2", "s-token"}
