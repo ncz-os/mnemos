@@ -137,6 +137,10 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
     },
     "claude": {
         "url": "https://api.anthropic.com/v1/messages",
+        # iter 56 operator override: keep opus-4-6 for quality. Early-return
+        # short-circuit (consult() gather block) handles the latency by
+        # cancelling whichever muse is slowest once quorum reached, so opus
+        # being slow on arch-design prompts is no longer a blocker.
         "model": "claude-opus-4-6", "weight": 0.90, "api": "anthropic", "key_name": "claude",
     },
     "perplexity": {
@@ -693,8 +697,78 @@ class GraeaeEngine:
             ))
             for name in active
         ]
+
+        # iter 56 — early-return on quorum reached.
+        # Old behaviour gathered ALL tasks before returning, so the slowest
+        # muse (often claude-opus on long-thinking prompts) blocked
+        # consensus even when 2/3 had already succeeded. Now: race the
+        # tasks via asyncio.wait(FIRST_COMPLETED); once `early_return_after`
+        # successful tasks are in, cancel the rest and proceed.
+        #
+        # Trigger only when mode is one of the quorum-style modes (auto,
+        # all, external, local). `single`/`debate`/`majority` route to
+        # specialised methods that wrap this call and want full results
+        # — for those, early_return_after stays None and the loop drains
+        # all tasks.
+        early_return_after: Optional[int] = None
+        if mode in {"auto", "all", "external", "local"} and len(tasks) >= 3:
+            # 2/3 = 0.66 quorum threshold (matches route_majority default).
+            early_return_after = max(2, (len(tasks) * 2) // 3)
+
+        results: list = [None] * len(tasks)
         try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            if early_return_after is None:
+                gathered = await asyncio.gather(*tasks, return_exceptions=True)
+                for i, r in enumerate(gathered):
+                    results[i] = r
+            else:
+                successes = 0
+                remaining = set(tasks)
+                task_to_idx = {t: i for i, t in enumerate(tasks)}
+                while remaining:
+                    done, remaining = await asyncio.wait(
+                        remaining, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in done:
+                        idx = task_to_idx[t]
+                        try:
+                            r = t.result()
+                        except BaseException as exc:
+                            results[idx] = exc
+                            continue
+                        results[idx] = r
+                        if isinstance(r, dict) and r.get("status") == "success":
+                            successes += 1
+                    if successes >= early_return_after:
+                        break
+                # Cancel any still-pending tasks. They may have partial work
+                # which we drop on the floor — the cost of fastness over
+                # completeness.
+                for t in remaining:
+                    if not t.done():
+                        t.cancel()
+                if remaining:
+                    cancelled = await asyncio.gather(
+                        *remaining, return_exceptions=True,
+                    )
+                    for t, r in zip(remaining, cancelled):
+                        idx = task_to_idx[t]
+                        if results[idx] is None:
+                            results[idx] = r if not isinstance(
+                                r, asyncio.CancelledError
+                            ) else {
+                                "status": "cancelled",
+                                "response_text": "",
+                                "error": (
+                                    "cancelled: quorum reached before this "
+                                    "muse responded"
+                                ),
+                                "latency_ms": 0,
+                                "final_score": 0.0,
+                                "model_id": self.providers.get(
+                                    active[idx], {}
+                                ).get("model", ""),
+                            }
         except asyncio.CancelledError:
             for task in tasks:
                 if not task.done():
