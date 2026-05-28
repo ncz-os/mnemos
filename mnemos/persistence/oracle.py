@@ -2161,6 +2161,23 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
     posture as a fresh Postgres install before model_registry seeding.
     """
 
+    async def _registry_rows(self, tx: Transaction) -> list[dict[str, Any]]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider, model_id, display_name, input_cost_per_mtok, "
+                "output_cost_per_mtok, capabilities, arena_score, arena_rank, "
+                "graeae_weight, context_window, cost_tier "
+                "FROM model_registry "
+                "WHERE available = 1 AND NVL(deprecated, 0) = 0",
+            )
+            return await _fetch_all_dicts(cursor)
+        except Exception:
+            return []
+        finally:
+            await _call(cursor.close)
+
     async def fetch_recommended_model(
         self,
         tx: Transaction,
@@ -2168,8 +2185,12 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         cost_budget: float,
         quality_floor: float,
     ) -> tuple[dict[str, Any] | None, list[str]]:
-        _ = (tx, task_type, cost_budget, quality_floor)
-        return None, []
+        from mnemos.domain.pantheon.recommendation import choose_recommended_model
+
+        rows = await self._registry_rows(tx)
+        if not rows:
+            return None, []
+        return choose_recommended_model(rows, task_type, cost_budget, quality_floor)
 
     async def fetch_model_recommendation(
         self,
@@ -2178,16 +2199,26 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         cost_budget: float = 10.0,
         quality_floor: float = 0.85,
     ) -> dict[str, Any] | None:
-        _ = (tx, task_type, cost_budget, quality_floor)
-        return None
+        model, _ = await self.fetch_recommended_model(tx, task_type, cost_budget, quality_floor)
+        return model
 
     async def lookup_provider_for_model(self, tx: Transaction, model: str) -> str | None:
-        _ = (tx, model)
-        return None
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider FROM model_registry WHERE model_id = :m AND ROWNUM = 1",
+                {"m": model},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            return row.get("provider") if row else None
+        except Exception:
+            return None
+        finally:
+            await _call(cursor.close)
 
     async def fetch_available_models(self, tx: Transaction) -> list[Row]:
-        _ = tx
-        return []
+        return await self._registry_rows(tx)
 
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
         _ = (tx, model_id)
