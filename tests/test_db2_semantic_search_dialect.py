@@ -122,6 +122,7 @@ def test_db2_semantic_search_uses_native_dialect() -> None:
     assert "FETCH APPROX FIRST" in sql_u, sql
     assert "EUCLIDEAN" in sql_u, sql
     assert "COSINE" not in sql_u, sql
+    assert ":" not in sql, sql
 
 
 def test_db2_semantic_search_exact_mode_falls_back() -> None:
@@ -136,6 +137,90 @@ def test_db2_semantic_search_exact_mode_falls_back() -> None:
     assert "FETCH FIRST" in sql_u
     assert "FETCH APPROX FIRST" not in sql_u
     assert "EUCLIDEAN" in sql_u
+    assert ":" not in sql
+
+
+def test_db2_semantic_search_runs_on_native_cursor() -> None:
+    """Native dialect uses pass-through cursors, so semantic_search must
+    emit positional Db2 SQL directly rather than relying on compat
+    Oracle-bind translation.
+    """
+    from mnemos.persistence.db2 import Db2MemoryRepository, _Db2NativeAsyncCursor
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    captured: dict[str, object] = {}
+
+    class _FakeSyncCursor:
+        description = (
+            ("id",),
+            ("content",),
+            ("category",),
+            ("subcategory",),
+            ("metadata",),
+            ("quality_rating",),
+            ("compressed_content",),
+            ("verbatim_content",),
+            ("owner_id",),
+            ("namespace",),
+            ("permission_mode",),
+            ("source_model",),
+            ("source_provider",),
+            ("source_session",),
+            ("source_agent",),
+            ("group_id",),
+            ("created",),
+            ("updated",),
+            ("archived_at",),
+            ("recall_count",),
+            ("last_recalled_at",),
+            ("rank_score",),
+        )
+        rowcount = 0
+
+        def execute(self, sql, params=None):
+            captured["sql"] = sql
+            captured["params"] = params
+
+        def fetchall(self):
+            return []
+
+        def close(self):
+            return None
+
+    class _FakeConn:
+        def cursor(self):
+            return _Db2NativeAsyncCursor(_FakeSyncCursor())
+
+    visibility = VisibilityFilter(
+        scope=VisibilityScope.OWN_ONLY,
+        user_id="alice",
+        namespace="ns1",
+        group_ids=frozenset(),
+    )
+    tx = SimpleNamespace(conn=_FakeConn())
+    repo = Db2MemoryRepository()
+    os.environ["MNEMOS_DB2_VECTOR_INDEX"] = "approx"
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(
+            repo.semantic_search(
+                tx,
+                embedding=[0.1, 0.2, 0.3],
+                limit=5,
+                visibility=visibility,
+                category="notes",
+            )
+        )
+    finally:
+        loop.close()
+
+    sql = str(captured["sql"])
+    params = captured["params"]
+    assert ":" not in sql
+    assert "VECTOR(?, 3, FLOAT32)" in sql
+    assert "FETCH APPROX FIRST ? ROWS ONLY" in sql
+    assert params == ("[0.1000000,0.2000000,0.3000000]", "alice", "ns1", "notes", "[0.1000000,0.2000000,0.3000000]", 5)
 
 
 def test_db2_semantic_search_filters_preserved() -> None:

@@ -739,7 +739,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         mode = _resolve_db2_vector_index_mode(self._settings)
         # FETCH APPROX FIRST engages the DiskANN index; FETCH FIRST is
         # an exact scan. Both query the same VECTOR_DISTANCE function.
-        fetch_clause = "FETCH APPROX FIRST :limit ROWS ONLY" if mode == "approx" else "FETCH FIRST :limit ROWS ONLY"
+        fetch_clause = "FETCH APPROX FIRST ? ROWS ONLY" if mode == "approx" else "FETCH FIRST ? ROWS ONLY"
 
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -751,7 +751,8 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             if not include_archived:
                 where.append("m.archived_at IS NULL")
             if clause:
-                where.append(clause)
+                where.append(_BIND_RE.sub("?", clause))
+            where_params = [params[m.group(1)] for m in _BIND_RE.finditer(clause)] if clause else []
             for col, val in (
                 ("category", category),
                 ("subcategory", subcategory),
@@ -760,10 +761,8 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 ("source_agent", source_agent),
             ):
                 if val is not None:
-                    where.append(f"m.{col} = :flt_{col}")
-                    params[f"flt_{col}"] = val
-            params["q"] = vec_literal
-            params["limit"] = limit
+                    where.append(f"m.{col} = ?")
+                    where_params.append(val)
 
             # Db2 12.1.5 EAP: the DiskANN vector index supports EUCLIDEAN
             # distance only. For L2-normalized embeddings (MNEMOS default)
@@ -777,7 +776,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             # apply the recency adjustment in Python after fetch. This
             # keeps ``FETCH APPROX FIRST`` engaging the index even when
             # ``boost_recency=True``.
-            rank_sql = "VECTOR_DISTANCE(m.embedding, TO_VECTOR(:q), EUCLIDEAN)"
+            rank_sql = f"VECTOR_DISTANCE(m.embedding, VECTOR(?, {len(embedding)}, FLOAT32), EUCLIDEAN)"
             sql = (
                 "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
                 "m.quality_rating, m.compressed_content, m.verbatim_content, "
@@ -790,7 +789,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 f"ORDER BY {rank_sql} ASC "
                 f"{fetch_clause}"
             )
-            await _call(cursor.execute, sql, params)
+            await _call(cursor.execute, sql, (vec_literal, *where_params, vec_literal, limit))
             rows = await _fetch_all_dicts(cursor)
         finally:
             await _call(cursor.close)
@@ -3928,35 +3927,19 @@ class Db2Backend(OracleBackend):
     **Important — performance posture and roadmap.** This backend ships
     on top of Db2's *Oracle Compatibility Mode* (``DB CFG ORA_COMPATIBILITY ON``
     + ``ENABLE_ORACLE_COMPATIBILITY=true`` in the container env). The
-    repository classes :class:`Db2MemoryRepository` etc. subclass their
-    Oracle counterparts and inherit the Oracle SQL surface verbatim;
-    :class:`_Db2AsyncCursor.execute` rewrites Oracle tokens
+    repository classes :class:`Db2MemoryRepository` etc. still subclass
+    their Oracle counterparts, but most hot-path methods now emit native
+    Db2 SQL directly. Remaining inherited methods are protected by
+    :class:`_Db2AsyncCursor.execute`, which rewrites Oracle tokens
     (``SYSTIMESTAMP``→``CURRENT TIMESTAMP``, ``:name`` named binds →
     ``?`` positional binds, etc.) at query time.
 
-    This was the fastest path to a working Db2 backend with same-ABC
-    parity to Oracle / PostgreSQL / SQLite — days, not weeks. But it
-    has a real performance cost: every query carries parse-time
-    translation overhead, and the Db2 optimizer cannot see native
-    Db2-dialect tokens directly (it sees the rewritten output). The
-    Db2 backend carries this
-    overhead.
-
-    The :meth:`Db2MemoryRepository.semantic_search` override is the
-    one site that emits native Db2 SQL directly (EUCLIDEAN +
-    ``FETCH APPROX FIRST``) so that the DiskANN vector index from
-    ``db/migrations_db2/0001_core_schema.sql`` is actually engaged.
-    All other repository methods still travel through the Oracle-compat
-    path.
-
-    **A full native-Db2 dialect port** (dropping the Oracle subclassing
-    + cursor translation layer in favor of hand-written Db2 SQL with
-    native ``VARBINARY``/``BIGINT``/``CLOB`` typing and ``MERGE INTO``
-    upserts) is tracked on the v6.x roadmap (``docs/v6.1-roadmap.md``).
-    The goal is to A/B Oracle-compat-mode vs native-dialect on the
-    same DiskANN index and ship whichever is faster as the v6.x
-    default. Until that lands, Db2 performance numbers should be read
-    as a floor, not a ceiling.
+    This hybrid was the fastest path to backend parity while allowing
+    native overrides to land incrementally. It still carries a
+    maintainability cost: native SQL and Oracle-compat inheritance live
+    in one large module, and compat-mode deployments can hide a method
+    that would fail under :class:`Db2BackendNative` unless native-cursor
+    tests exercise it.
 
     On ``open()``, probes the ``DB2_VECTOR_INDEXING`` registry variable
     and logs a clear warning if the operator hasn't enabled native
