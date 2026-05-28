@@ -70,7 +70,9 @@ async def test_mysql_semantic_search_without_recency_uses_visibility_params_once
     assert "recency" not in compact_sql
     assert "timestampdiff" not in compact_sql
     assert "created_at" not in compact_sql
-    assert compact_sql.count("vec_fromtext(%s)") == 1
+    assert compact_sql.count("vector_distance(m.embedding, to_vector(%s), 'cosine')") == 1
+    assert "vec_fromtext" not in compact_sql
+    assert "vec_distance_cosine" not in compact_sql
     assert "where" in compact_sql
     assert "m.owner_id = %s and m.namespace = %s" in compact_sql
     assert "order by rank_score asc" in compact_sql
