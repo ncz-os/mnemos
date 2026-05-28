@@ -3739,7 +3739,10 @@ class OracleBackend(PersistenceBackend):
                     """
                     SELECT auth_method
                     FROM subscription_plans
-                    WHERE provider = :provider AND plan_name = :plan_name
+                    WHERE provider = :provider
+                      AND plan_name = :plan_name
+                      AND effective_from <= TRUNC(SYSTIMESTAMP)
+                      AND (effective_until IS NULL OR effective_until >= TRUNC(SYSTIMESTAMP))
                     """,
                     {"provider": record.provider, "plan_name": record.tier},
                 )
@@ -3766,6 +3769,7 @@ class OracleBackend(PersistenceBackend):
                 "session_id": record.session_id,
                 "request_count": record.request_count,
                 "plan_window_id": record.plan_window_id,
+                "path_kind": record.path_kind or "api",
                 "subscription_amortized": 1 if auth_method == "subscription" else 0,
                 "rid": rid,
                 "rcost": rcost,
@@ -3778,13 +3782,13 @@ class OracleBackend(PersistenceBackend):
                     provider, model, task_kind, tokens_in, tokens_out,
                     tokens_reasoning, est_cost_usd, latency_ms, outcome,
                     caller_subsystem, tier, session_id, request_count,
-                    plan_window_id, subscription_amortized
+                    plan_window_id, path_kind, subscription_amortized
                 )
                 VALUES (
                     :provider, :model, :task_kind, :tokens_in, :tokens_out,
                     :tokens_reasoning, 0, :latency_ms, :outcome,
                     :caller_subsystem, :tier, :session_id, :request_count,
-                    :plan_window_id, :subscription_amortized
+                    :plan_window_id, :path_kind, :subscription_amortized
                 )
                 RETURNING id, est_cost_usd INTO :rid, :rcost
                 """,
@@ -3799,7 +3803,7 @@ class OracleBackend(PersistenceBackend):
                         provider, model, task_kind, tokens_in, tokens_out,
                         tokens_reasoning, est_cost_usd, latency_ms, outcome,
                         caller_subsystem, tier, session_id, request_count,
-                        plan_window_id, subscription_amortized
+                        plan_window_id, path_kind, subscription_amortized
                     )
                     VALUES (
                         :provider, :model, :task_kind, :tokens_in, :tokens_out,
@@ -3814,7 +3818,7 @@ class OracleBackend(PersistenceBackend):
                         ), 0),
                         :latency_ms, :outcome, :caller_subsystem, :tier,
                         :session_id, :request_count, :plan_window_id,
-                        :subscription_amortized
+                        :path_kind, :subscription_amortized
                     )
                     RETURNING id, est_cost_usd INTO :rid, :rcost
                     """,
@@ -3836,13 +3840,13 @@ class OracleBackend(PersistenceBackend):
                         provider, model, task_kind, tokens_in, tokens_out,
                         tokens_reasoning, est_cost_usd, latency_ms, outcome,
                         caller_subsystem, tier, session_id, request_count,
-                        plan_window_id, subscription_amortized
+                        plan_window_id, path_kind, subscription_amortized
                     )
                     VALUES (
                         :provider, :model, :task_kind, :tokens_in, :tokens_out,
                         :tokens_reasoning, 0, :latency_ms, :outcome,
                         :caller_subsystem, :tier, :session_id, :request_count,
-                        :plan_window_id, :subscription_amortized
+                        :plan_window_id, :path_kind, :subscription_amortized
                     )
                     RETURNING id, est_cost_usd INTO :rid, :rcost
                     """,

@@ -501,6 +501,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations" / "0032_usage_ledger.sql",
         repo_path / "db" / "migrations" / "0033_subscription_plans.sql",
         repo_path / "db" / "migrations" / "0034_usage_ledger_session_tracking.sql",
+        repo_path / "db" / "migrations" / "0035_subscription_plans_date_aware.sql",
     ]
 
     print("[db] Running migrations...")
