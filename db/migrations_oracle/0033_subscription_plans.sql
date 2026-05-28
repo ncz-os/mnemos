@@ -34,12 +34,12 @@ USING (
          900 msg_cap, 18000 msg_window_seconds, NULL token_cap, NULL token_window_seconds,
          'rolling' reset_anchor, NULL overage_pricing_per_mtok_in, NULL overage_pricing_per_mtok_out,
          'Claude Max 200: 900 messages per 5h window' notes FROM dual
-  UNION ALL SELECT 'anthropic', 'claude_max_100', 'subscription', 100, 450, 18000, NULL, NULL,
-         'rolling', NULL, NULL, 'Claude Max 100: 450 messages per 5h window until 2026-06-01' FROM dual
-  UNION ALL SELECT 'openai', 'chatgpt_plus', 'subscription', 20, 40, 10800, NULL, NULL,
-         'rolling', NULL, NULL, 'ChatGPT Plus: 40 messages per 3h window' FROM dual
-  UNION ALL SELECT 'openai', 'chatgpt_pro', 'subscription', 200, NULL, NULL, 200, 604800,
-         'weekly', NULL, NULL, 'ChatGPT Pro: unmetered plus 200 GPT-5 messages per week' FROM dual
+  UNION ALL SELECT 'anthropic', 'claude_max_100', 'subscription', 100, 225, 18000, NULL, NULL,
+         'rolling', NULL, NULL, 'Claude Max 100 (5x): at least 225 messages per 5h window' FROM dual
+  UNION ALL SELECT 'openai', 'chatgpt_plus', 'subscription', 20, 15, 18000, NULL, NULL,
+         'rolling', NULL, NULL, 'ChatGPT Codex Plus: conservative GPT-5.5 local-message floor per 5h; official limits vary by model and surface' FROM dual
+  UNION ALL SELECT 'openai', 'chatgpt_pro', 'subscription', 200, 375, 18000, NULL, NULL,
+         'rolling', NULL, NULL, 'ChatGPT Codex Pro $200 promo: conservative GPT-5.5 local-message floor per 5h through 2026-05-31' FROM dual
   UNION ALL SELECT 'nvidia', 'ngc_integrate', 'free', 0, NULL, NULL, NULL, NULL,
          'monthly', 0, 0, 'NVIDIA NGC Integrate free tier' FROM dual
   UNION ALL SELECT 'nvidia', 'ngc_inference', 'free', 0, NULL, NULL, NULL, NULL,
