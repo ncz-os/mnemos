@@ -1,34 +1,27 @@
-Concurrency parity tests for hive job claims
+Db2 OAuth/sessions/consultations persistence
 
 Implemented:
-- Added `tests/hive_mind/test_concurrency_parity.py`.
-- The test pre-seeds 1000 queued jobs, races 8 async workers through an in-process `POST /v1/jobs/next?agent_urn=...` route, and asserts:
-  - total claims are exactly 1000,
-  - claimed job IDs are unique across workers,
-  - every seeded job was claimed,
-  - no foreign jobs were claimed,
-  - no seeded jobs remain queued.
-- Parameterized the parity arm across:
-  - `SqliteHiveMindRepository` always,
-  - `OracleHiveMindRepository` when `ORACLE_DSN` is set,
-  - `Db2HiveMindRepository` skipped until the class and `DB2_DSN` exist.
-- Added an Oracle claim-path guard that pins `FOR UPDATE SKIP LOCKED`, the `status='queued'` update predicate, and the P0-1 `rowcount != 1` correctness check.
-- Added the SQLite job-queue surface needed for repository parity:
-  - `memory_jobs` test schema in `init()`,
-  - `insert_job` / `insert_job_queued`,
-  - `claim_next_job` / `find_and_claim_job`,
-  - `list_jobs`.
+- Added Db2-native OAuth token/state, protocol session, session event, consultation, and consultation response methods in `mnemos/persistence/db2.py`.
+- Added Db2Backend facade overrides so the new protocol methods use native Db2 SQL instead of Oracle `RETURNING ... INTO`.
+- Updated Db2 capability advertising to include core, oauth, sessions, consultations, federation, audit, and state.
+- Reworked `db/migrations_db2/0038_oauth_sessions_consultations.sql` into idempotent Db2 dynamic compound statements guarded by `SYSCAT.TABLES`, `SYSCAT.COLUMNS`, and `SYSCAT.INDEXES`.
+- Added `tests/persistence/test_db2_oauth_sessions_consultations.py` for SQLite parity shape, Db2 method/capability checks, migration assertions, and native positional SQL checks.
+- Updated capability protocol tests for full Db2 capability advertising.
+
+Live Db2:
+- Applied `0038_oauth_sessions_consultations.sql` to CERBERUS Db2 EAP at `192.168.207.96:50001/MNEMOS`.
+- Verified tables: `CONSULTATIONS`, `CONSULTATION_RESPONSES`, `OAUTH_STATE`, `OAUTH_TOKENS`, `SESSIONS`, `SESSION_LOGS`.
+- Verified new `sessions` columns: `SESSION_ID`, `STARTED_AT`, `LAST_ACTIVE_AT`, `EXPIRES_AT`, `METADATA`.
+- Ran a live OAuth/session/consultation roundtrip through `Db2Backend`; cleaned up `codex_db2_test` rows afterward.
+
+Db2 dialect note:
+- Live Db2 rejected `BLOB` for keyed/equality protocol ids (`SQL0350N`), so the migration uses `CHAR(n) FOR BIT DATA` for indexed binary ids. Runtime values remain bytes.
+- Live Db2 rejected `IS JSON` check constraints in this DDL path, so JSON payloads are stored as CLOB and parsed by the backend without Db2 check constraints.
 
 Verification:
-- `.venv/bin/pytest tests/hive_mind/test_concurrency_parity.py` passed: 2 passed, 2 skipped.
-- `.venv/bin/pytest tests/hive_mind/test_oracle_repository_complete.py tests/hive_mind/test_concurrency_parity.py` passed: 3 passed, 2 skipped.
-- `.venv/bin/python -m py_compile mnemos/hive_mind/repository.py tests/hive_mind/test_concurrency_parity.py` passed.
-- Plain system `pytest` could not load the repo test suite because `/opt/homebrew/bin/python3` lacks `pytest_asyncio`; the repo `.venv` test runner was used.
-- `ruff` was not installed in `.venv`.
-
-Live backend note:
-- `ORACLE_DSN` and `DB2_DSN` were not present in this shell, so the live Oracle and Db2 arms skipped locally.
-- The test is wired to run Oracle automatically when `ORACLE_DSN` is supplied; no migrations or redeploy were performed.
+- `.venv/bin/python -m py_compile mnemos/persistence/db2.py tests/persistence/test_db2_oauth_sessions_consultations.py tests/persistence/test_capability_protocols.py`
+- `.venv/bin/pytest -q tests/persistence/test_db2_oauth_sessions_consultations.py tests/persistence/test_capability_protocols.py` passed: 8 passed.
+- Live migration idempotency rerun passed: 16/16 statements OK.
 
 Artifacts:
-- Pytest output: `/tmp/concurrency-parity/codex-out.log`
+- Work log: `/tmp/db2-backend-impl/codex-out.log`
