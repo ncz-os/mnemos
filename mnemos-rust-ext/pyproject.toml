@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "mnemos-native-search"
+version = "0.1.0"
+description = "PyO3 vector similarity accelerator for MNEMOS search hot paths"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "MNEMOS Contributors" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+]
+
+[tool.maturin]
+features = ["extension-module"]
+module-name = "mnemos_native_search"
