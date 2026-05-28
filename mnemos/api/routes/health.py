@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException
 import mnemos.core.lifecycle as _lc
 from mnemos._version import __version__ as _MNEMOS_VERSION
 from mnemos.core.config import get_settings
+from mnemos.persistence.base import capability_details_for_backend
 from mnemos.nats.client import publishing_enabled
 from mnemos.domain.models import HealthResponse, StatsResponse
 
@@ -23,9 +24,11 @@ async def health_check() -> HealthResponse:
     backend = _lc._persistence_backend
     backend_name = None
     backend_capabilities: list[str] = []
+    backend_capability_details: list[str] = []
     if backend is not None:
         backend_name = type(backend).__name__
         backend_capabilities = sorted(str(cap) for cap in getattr(backend, "capabilities", set()))
+        backend_capability_details = sorted(capability_details_for_backend(backend))
         db_ok = await backend.ping()
 
     # Get worker status
@@ -41,6 +44,7 @@ async def health_check() -> HealthResponse:
         nats_publishing_enabled=publishing_enabled(),
         persistence_backend=backend_name,
         persistence_capabilities=backend_capabilities,
+        persistence_capability_details=backend_capability_details,
     )
 
 

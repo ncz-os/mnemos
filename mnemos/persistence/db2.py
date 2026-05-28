@@ -86,6 +86,12 @@ _ORA_TO_DB2_PAIRS: tuple[tuple[str, str], ...] = (
 _TO_VECTOR_RE = re.compile(r"\bTO_VECTOR\b")
 _BIND_RE = re.compile(r":([a-zA-Z_][a-zA-Z0-9_]*)")
 _VECTOR_CALL_RE = re.compile(r"VECTOR\(\?\)")
+_NATIVE_FORBIDDEN_ORACLE_TOKENS: tuple[tuple[str, str], ...] = (
+    ("SYSTIMESTAMP", "Oracle SYSTIMESTAMP token"),
+    ("SYSDATE", "Oracle SYSDATE token"),
+    ("FROM DUAL", "Oracle DUAL table"),
+    ("TO_VECTOR(", "Oracle TO_VECTOR call"),
+)
 # Db2's ``NVL(?, 'literal')`` infers the result column type from the
 # literal width (e.g. VARCHAR(7) from 'default'), then truncates any
 # longer bound value with CLI0109E SQLSTATE=22001. Widen the literal
@@ -459,8 +465,9 @@ class _Db2NativeAsyncCursor:
     binds, ``CURRENT TIMESTAMP``, ``FROM SYSIBM.SYSDUMMY1``, etc.).
 
     Defensive guard: if the incoming SQL contains Oracle-style ``:name``
-    named binds, a ``RuntimeError`` is raised to fail fast rather than
-    silently mangling the query.
+    named binds or Oracle-only tokens the compat cursor would normally
+    translate, a ``RuntimeError`` is raised to fail fast rather than silently
+    sending the wrong dialect to Db2.
     """
 
     def __init__(self, sync_cursor: Any):
@@ -469,12 +476,23 @@ class _Db2NativeAsyncCursor:
         self.rowcount = -1
 
     async def execute(self, sql: str, params: tuple | None = None) -> None:
-        if _BIND_RE.search(sql):
+        masked_sql, _ = _mask_sql_literals_and_comments(sql)
+        guard_reason = None
+        if _BIND_RE.search(masked_sql):
+            guard_reason = "Oracle :name bind"
+        else:
+            upper_sql = masked_sql.upper()
+            for token, label in _NATIVE_FORBIDDEN_ORACLE_TOKENS:
+                if token in upper_sql:
+                    guard_reason = label
+                    break
+        if guard_reason is not None:
             raise RuntimeError(
-                "native cursor received Oracle :name bind — "
-                "the native path expects ? positional binds only. "
+                f"native cursor received {guard_reason} — "
+                "the native path expects Db2-native SQL only. "
                 "Switch back to Db2Backend (compat) or rewrite the "
-                "caller to emit Db2-native ? binds."
+                "caller to emit ? binds, CURRENT TIMESTAMP/DATE, "
+                "SYSIBM.SYSDUMMY1, and VECTOR(...)."
             )
 
         def _go():

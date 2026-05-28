@@ -38,6 +38,7 @@ from mnemos.persistence.base import (
     ConsultationsRepository,
     DuplicateMemoryError,
     FederationRepository,
+    FULL_STORAGE_CAPABILITY_DETAILS,
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
@@ -3596,6 +3597,10 @@ class SqliteBackend:
     @property
     def capabilities(self) -> set[str]:
         return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+
+    @property
+    def capability_details(self) -> set[str]:
+        return set(FULL_STORAGE_CAPABILITY_DETAILS)
 
     async def fetch_category_decay_rows(self, tx: Transaction) -> list[Row]:
         return await _fetch_all(
