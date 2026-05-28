@@ -92,7 +92,7 @@ The PR adds these operator policy defaults to `config.toml.example`, `.env.examp
 
 | Setting | Default | Role |
 | --- | ---: | --- |
-| `session_burn_requests_per_hour` | `10` | Burn a session at the tenth request in the rolling window |
+| `session_burn_requests_per_hour` | `10` | Burn routing after the tenth recorded ledger request in the rolling window |
 | `session_burn_window_seconds` | `3600` | Rolling burn window |
 | `subscription_preferred_utilization_pct` | `70.0` | Preferred subscription bucket ceiling; the comparison is strict `< 70` |
 | `subscription_near_cap_pct` | `90.0` | High-priority subscription override threshold |
