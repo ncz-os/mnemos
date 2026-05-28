@@ -3709,11 +3709,11 @@ class OracleBackend(PersistenceBackend):
         Mirrors the Postgres recorder. est_cost_usd is computed server-side
         from ``model_registry`` (reasoning tokens fall back to the output
         rate, as Oracle ``model_registry`` has no reasoning-cost column).
-        When the model is absent from the registry the cost defaults to 0 so
-        the usage row is still recorded (fail-open on price, never lose the
-        usage record). Oracle has no ``INSERT ... SELECT ... RETURNING`` so
-        the cost is a scalar subquery in ``VALUES`` and id/cost come back via
-        ``RETURNING ... INTO``.
+        When the model is absent from the registry, log price drift and
+        default the cost to 0 so the usage row is still recorded (fail-open
+        on price, never lose the usage record). Oracle has no
+        ``INSERT ... SELECT ... RETURNING`` so the cost is a scalar subquery
+        in ``VALUES`` and id/cost come back via ``RETURNING ... INTO``.
         """
         import oracledb
         from decimal import Decimal
@@ -3723,6 +3723,17 @@ class OracleBackend(PersistenceBackend):
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
+            await _call(
+                cursor.execute,
+                "SELECT 1 FROM model_registry WHERE provider = :provider AND model_id = :model",
+                {"provider": record.provider, "model": record.model},
+            )
+            if await _call(cursor.fetchone) is None:
+                _LOG.warning(
+                    "usage_ledger model_registry price missing for provider=%s model=%s; " "recording est_cost_usd=0",
+                    record.provider,
+                    record.model,
+                )
             rid = cursor.var(oracledb.DB_TYPE_NUMBER)
             rcost = cursor.var(oracledb.DB_TYPE_NUMBER)
             await _call(

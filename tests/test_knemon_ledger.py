@@ -28,7 +28,7 @@ class _RecorderConn:
     def __init__(self) -> None:
         self.sql: str | None = None
         self.args: tuple | None = None
-        self.row = {"id": 42, "est_cost_usd": Decimal("0.000324")}
+        self.row = {"id": 42, "est_cost_usd": Decimal("0.000324"), "registry_match": True}
 
     async def fetchrow(self, sql: str, *args):
         self.sql = sql
@@ -80,18 +80,18 @@ async def test_postgres_record_usage_ledger_inserts_with_registry_prices():
     assert "INSERT INTO usage_ledger" in conn.sql
     assert "est_cost_usd" in conn.sql
     assert "$1" in conn.sql and "$10" in conn.sql
-    assert "resolved_prices" not in conn.sql
+    assert "resolved_prices" in conn.sql
 
 
 @pytest.mark.asyncio
-async def test_postgres_record_usage_ledger_fails_closed_for_unknown_model():
+async def test_postgres_record_usage_ledger_records_and_warns_for_unknown_model(caplog):
     conn = _RecorderConn()
-    conn.row = None
+    conn.row = {"id": 43, "est_cost_usd": Decimal("0"), "registry_match": False}
     tx = PostgresTransaction(conn, _RawTx())  # type: ignore[arg-type]
     backend = PostgresBackend(pool=SimpleNamespace(), settings=_settings())  # type: ignore[arg-type]
 
-    with pytest.raises(RuntimeError, match="usage_ledger insert returned no row"):
-        await backend.record_usage_ledger(
+    with caplog.at_level("WARNING"):
+        result = await backend.record_usage_ledger(
             tx,
             UsageLedgerRecord(
                 provider="unknown",
@@ -106,6 +106,9 @@ async def test_postgres_record_usage_ledger_fails_closed_for_unknown_model():
                 tier="standard",
             ),
         )
+
+    assert result == UsageLedgerResult(id=43, est_cost_usd=Decimal("0"))
+    assert "model_registry price missing" in caplog.text
 
 
 class _EndpointBackend:
@@ -131,8 +134,18 @@ def _user() -> UserContext:
     )
 
 
+def _root() -> UserContext:
+    return UserContext(
+        user_id="root",
+        group_ids=[],
+        role="root",
+        namespace="default",
+        authenticated=True,
+    )
+
+
 @pytest.mark.asyncio
-async def test_ledger_endpoint_records_and_validates(monkeypatch):
+async def test_ledger_endpoint_requires_root_and_records(monkeypatch):
     backend = _EndpointBackend()
     monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
 
@@ -140,6 +153,27 @@ async def test_ledger_endpoint_records_and_validates(monkeypatch):
     app.include_router(ledger_router)
     app.dependency_overrides[get_current_user] = _user
 
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        forbidden_response = await client.post(
+            "/v1/ledger",
+            json={
+                "provider": "openai",
+                "model": "gpt-4o",
+                "task_kind": "code",
+                "tokens_in": 1200,
+                "tokens_out": 340,
+                "tokens_reasoning": 0,
+                "latency_ms": 1240,
+                "outcome": "ok",
+                "caller_subsystem": "pantheon",
+                "tier": "standard",
+            },
+        )
+    assert forbidden_response.status_code == 403
+    assert backend.records == []
+
+    app.dependency_overrides[get_current_user] = _root
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(

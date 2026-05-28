@@ -2983,24 +2983,33 @@ class PostgresBackend(PersistenceBackend):
     ) -> UsageLedgerResult:
         row = await _postgres_tx(tx).conn.fetchrow(
             """
-            INSERT INTO usage_ledger (
-                provider, model, task_kind, tokens_in, tokens_out,
-                tokens_reasoning, est_cost_usd, latency_ms, outcome,
-                caller_subsystem, tier
+            WITH resolved_prices AS (
+                SELECT input_cost_per_mtok, output_cost_per_mtok, raw
+                FROM model_registry
+                WHERE provider=$1 AND model_id=$2
+            ),
+            inserted AS (
+                INSERT INTO usage_ledger (
+                    provider, model, task_kind, tokens_in, tokens_out,
+                    tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                    caller_subsystem, tier
+                )
+                SELECT
+                    $1, $2, $3, $4, $5, $6,
+                    (($4::NUMERIC * COALESCE(rp.input_cost_per_mtok, 0)::NUMERIC)
+                     + ($5::NUMERIC * COALESCE(rp.output_cost_per_mtok, 0)::NUMERIC)
+                     + ($6::NUMERIC * COALESCE(
+                        NULLIF(rp.raw->>'reasoning_cost_per_mtok', '')::NUMERIC,
+                        rp.output_cost_per_mtok,
+                        0
+                     )::NUMERIC)) / 1000000,
+                    $7, $8, $9, $10
+                FROM (SELECT 1) seed
+                LEFT JOIN resolved_prices rp ON TRUE
+                RETURNING id, est_cost_usd
             )
-            SELECT
-                $1, $2, $3, $4, $5, $6,
-                (($4::NUMERIC * COALESCE(input_cost_per_mtok, 0)::NUMERIC)
-                 + ($5::NUMERIC * COALESCE(output_cost_per_mtok, 0)::NUMERIC)
-                 + ($6::NUMERIC * COALESCE(
-                    NULLIF(raw->>'reasoning_cost_per_mtok', '')::NUMERIC,
-                    output_cost_per_mtok,
-                    0
-                 )::NUMERIC)) / 1000000,
-                $7, $8, $9, $10
-            FROM model_registry
-            WHERE provider=$1 AND model_id=$2
-            RETURNING id, est_cost_usd
+            SELECT id, est_cost_usd, EXISTS(SELECT 1 FROM resolved_prices) AS registry_match
+            FROM inserted
             """,
             record.provider,
             record.model,
@@ -3015,6 +3024,12 @@ class PostgresBackend(PersistenceBackend):
         )
         if row is None:
             raise RuntimeError("usage_ledger insert returned no row")
+        if not row["registry_match"]:
+            logger.warning(
+                "usage_ledger model_registry price missing for provider=%s model=%s; recording est_cost_usd=0",
+                record.provider,
+                record.model,
+            )
         return UsageLedgerResult(id=int(row["id"]), est_cost_usd=row["est_cost_usd"])
 
     @property
