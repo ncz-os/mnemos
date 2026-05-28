@@ -18,6 +18,7 @@ lifecycle and restore route.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import asyncpg
@@ -35,6 +36,7 @@ from mnemos.api.routes.admin import (
     restore_deletion_request,
 )
 from mnemos.domain.models import DeletionRequestCreate
+from tests._fake_backend import install_fake_backend
 
 
 def _root_user() -> UserContext:
@@ -74,13 +76,22 @@ class _TxCtx:
 
 
 def _wire_pool(monkeypatch, mock_conn):
-    """Make ``_lc.get_pool_manager().acquire()`` yield ``mock_conn``
-    AND set ``_lc._pool`` so the route's profile-aware 503 helper
-    passes through. Also stubs ``mock_conn.transaction()`` for
-    the CREATE path's advisory-lock + overlap-SELECT block.
+    """Make the backend transaction yield ``mock_conn``.
+
+    The deletion-request routes now enter through
+    ``backend_or_503()`` and delegate SQL to AdminLifecycleRepository.
+    Keep the old connection spy in place by wiring a fake backend
+    transaction whose ``tx.conn`` is ``mock_conn``.
     """
     import mnemos.core.lifecycle as lc
 
+    backend = install_fake_backend(monkeypatch)
+    backend.transactional = MagicMock(
+        return_value=_AsyncContext(SimpleNamespace(conn=mock_conn))
+    )
+
+    # Legacy pool wiring remains for any helper path this test file
+    # still wants to inspect directly.
     pool_manager = MagicMock()
     pool_manager.acquire = MagicMock(return_value=_AsyncContext(mock_conn))
     pool_manager.transactional = MagicMock(return_value=_AsyncContext(mock_conn))
@@ -90,7 +101,7 @@ def _wire_pool(monkeypatch, mock_conn):
     if not hasattr(mock_conn, "transaction") or not callable(getattr(mock_conn, "transaction", None)):
         pass
     mock_conn.transaction = MagicMock(return_value=_TxCtx())
-    return pool_manager
+    return backend
 
 
 def _row(

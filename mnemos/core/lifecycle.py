@@ -14,7 +14,7 @@ except ModuleNotFoundError:
     import tomli as tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 from urllib.parse import urlparse
 
 import asyncpg
@@ -312,9 +312,11 @@ def _normalize_backend_name(configured: str) -> str:
         return "oracle"
     if configured in {"db2", "ibm_db2", "ibmdb2", "db2+ibm_db"}:
         return "db2"
+    if configured in {"mysql", "mysql+aiomysql"}:
+        return "mysql"
     if configured == "auto":
         return "auto"
-    raise ValueError(f"Unsupported persistence backend {configured!r}; expected postgres, sqlite, oracle, db2, or auto")
+    raise ValueError(f"Unsupported persistence backend {configured!r}; expected postgres, sqlite, oracle, db2, mysql, or auto")
 
 
 def _backend_from_database_url(database_url: str) -> str | None:
@@ -326,6 +328,8 @@ def _backend_from_database_url(database_url: str) -> str | None:
         return "oracle"
     if database_url.startswith(("db2:", "ibm_db2:", "db2+ibm_db:")):
         return "db2"
+    if database_url.startswith(("mysql:", "mysql+aiomysql:")):
+        return "mysql"
     return None
 
 
@@ -455,6 +459,28 @@ async def _build_db2_backend(dsn, settings):
         pool = await db2_module.create_db2_pool(dsn, min_size=min_size, max_size=max_size)
         backend = db2_module.Db2Backend(pool, settings)
 
+    await backend.open()
+    return backend
+
+
+def _mysql_dsn_from_settings(settings) -> str:
+    database_settings = getattr(settings, "database", None)
+    if database_settings is None:
+        return ""
+    for field_name in ("dsn", "url"):
+        database_url = getattr(database_settings, field_name, "").strip()
+        if database_url.startswith(("mysql:", "mysql+aiomysql:")):
+            return database_url
+    return ""
+
+
+async def _build_mysql_backend(dsn: str, settings: Any):
+    """Build and open the MySQL 9.0+ persistence backend."""
+    mysql_module = importlib.import_module("mnemos.persistence.mysql")
+    min_size = PG_CONFIG.get("pool_min_size", 1)
+    max_size = PG_CONFIG.get("pool_max_size", 8)
+    pool = await mysql_module.create_mysql_pool(dsn, min_size=min_size, max_size=max_size, settings=settings)
+    backend = mysql_module.MysqlBackend(pool, settings)
     await backend.open()
     return backend
 
@@ -633,6 +659,24 @@ async def lifespan(app):
             app.state.persistence_backend = _persistence_backend
             logger.info(
                 "Db2 persistence backend initialized (pool min=%s max=%s)",
+                PG_CONFIG.get("pool_min_size"),
+                PG_CONFIG.get("pool_max_size"),
+            )
+        elif backend_type == "mysql":
+            mysql_dsn = _mysql_dsn_from_settings(settings)
+            if not mysql_dsn:
+                raise RuntimeError(
+                    "MySQL backend selected but no mysql:// DSN configured. "
+                    "Set MNEMOS_DATABASE_DSN=mysql://user:pass@host:3306/mnemos"
+                )
+            _pool = None
+            _pool_manager = None
+            _persistence_backend = await _build_mysql_backend(mysql_dsn, settings)
+            app.state.pool = None
+            app.state.pool_manager = None
+            app.state.persistence_backend = _persistence_backend
+            logger.info(
+                "MySQL persistence backend initialized (pool min=%s max=%s)",
                 PG_CONFIG.get("pool_min_size"),
                 PG_CONFIG.get("pool_max_size"),
             )
