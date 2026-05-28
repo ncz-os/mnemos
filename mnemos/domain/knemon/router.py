@@ -21,12 +21,17 @@ class NoModelAvailable(RuntimeError):
 class KnemonRouteRequest:
     task_kind: str
     priority: int
-    est_tokens_in: int
-    est_tokens_out: int
-    caller_session_id: Optional[str]
-    caller_subsystem: str
+    est_tokens_in: int = 0
+    est_tokens_out: int = 0
+    caller_session_id: Optional[str] = None
+    caller_subsystem: str = "api"
     exclude_providers: list[str] = field(default_factory=list)
     require_capability: list[str] = field(default_factory=list)
+    est_tokens: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.est_tokens is not None and self.est_tokens_in == 0 and self.est_tokens_out == 0:
+            self.est_tokens_in = max(0, int(self.est_tokens))
 
 
 @dataclass
@@ -284,11 +289,10 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
 
 def _apply_priority_ceiling(candidates: list[dict[str, Any]], priority: int) -> list[dict[str, Any]]:
     if priority >= 14:
-        return [row for row in candidates if row["quality"] >= 0.85]
+        return list(candidates)
     if priority >= 10:
-        return [row for row in candidates if row["tier"] in {"A", "B"} and row["quality"] >= 0.75]
-    eligible = [row for row in candidates if row["tier"] in {"A", "B"}]
-    return sorted(eligible, key=lambda row: (row["tier"] != "A", -_to_float(row.get("graeae_weight"))))
+        return [row for row in candidates if row["tier"] in {"A", "B"}]
+    return sorted(candidates, key=lambda row: (row["tier"] != "A", -_to_float(row.get("graeae_weight"))))
 
 
 async def _plans_by_provider(backend: Any) -> dict[str, list[dict[str, Any]]]:
@@ -493,20 +497,14 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
                 selected = item
                 reasons.append(f"selected subscription under 70% utilization ({util:.2f}%)")
                 break
-            if util <= 90 and effective_priority >= 12:
+            if util < 90 and effective_priority >= 12:
                 selected = item
                 reasons.append(f"selected subscription near cap for priority {effective_priority} ({util:.2f}%)")
                 break
-            no_other_candidate = index == len(candidates) - 1
-            if util > 90 and util < 100 and effective_priority >= 14:
-                selected = item
-                reasons.append(f"selected over-90% subscription for G1 priority {effective_priority} ({util:.2f}%)")
-                break
-            if util > 90 and no_other_candidate:
-                selected = item
-                reasons.append(f"selected over-90% subscription because no alternate remained ({util:.2f}%)")
-                break
-            reasons.append(f"skipped subscription at {util:.2f}% utilization")
+            if util >= 90:
+                reasons.append(f"skipped subscription at {util:.2f}% utilization; falling back to api")
+                continue
+            reasons.append(f"skipped subscription at {util:.2f}% utilization for priority {effective_priority}")
             continue
         if auth_method == "free" and effective_priority < 12:
             selected = item
@@ -520,9 +518,6 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
             reasons.append(f"selected {auth_method} candidate")
             break
 
-    if selected is None and enriched:
-        selected = enriched[0]
-        reasons.append("selected first remaining candidate because no lower-cost rule matched")
     if selected is None:
         raise NoModelAvailable("no model survived subscription, free, and API waterfall rules")
 
