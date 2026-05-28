@@ -74,6 +74,13 @@ Priority filtering is applied before waterfall selection:
 - Effective priority `>= 10` requires tier A or B and quality `>= 0.75`.
 - Lower priority keeps tier A/B candidates and sorts tier A ahead of tier B.
 
+`quality` is the normalized router quality score. The router prefers
+`quality_score`, then `graeae_weight`, then `weight`, normalizing values above
+`1.0` as percentages; if none are present, it derives a bounded score from
+`arena_score / 1500`. Tier comes from `cost_tier` or `usage_tier` when present;
+otherwise quality `>= 0.85` maps to tier A, quality `>= 0.75` maps to tier B,
+and the remaining candidates are tier C.
+
 Session burn can lower the effective priority for spend and utilization
 decisions, but G1 quality is based on the original requested priority. A burned
 G1 request therefore still requires quality `>= 0.85`, but it does not receive
