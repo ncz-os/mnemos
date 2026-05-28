@@ -9,6 +9,7 @@ stay in sync.
 from __future__ import annotations
 
 import ast
+import sqlite3
 from pathlib import Path
 
 EXPECTED_MIGRATIONS = [
@@ -137,6 +138,7 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "migrations_v6_2_audit_chain_sqlite.sql",
     "migrations_v6_2_category_decay_sqlite.sql",
     "0038_oauth_sessions_consultations.sql",
+    "0039_subscription_plan_current_limits.sql",
 ]
 
 
@@ -212,6 +214,7 @@ def test_subscription_plan_current_limits_deletes_superseded_claude_future_rows(
         repo_root / "db/migrations/0039_subscription_plan_current_limits.sql",
         repo_root / "db/migrations_oracle/0039_subscription_plan_current_limits.sql",
         repo_root / "db/migrations_db2/0039_subscription_plan_current_limits.sql",
+        repo_root / "db/migrations_sqlite/0039_subscription_plan_current_limits.sql",
     ]
 
     for path in migration_paths:
@@ -273,12 +276,76 @@ def test_subscription_plan_current_limits_pin_current_codex_and_claude_caps():
             "DATE('2026-05-28'), NULL, 'interactive', NULL)",
             "('anthropic', 'claude_max_200', 'subscription', 200, 900, 18000",
         ],
+        "db/migrations_sqlite/0039_subscription_plan_current_limits.sql": [
+            "'openai', 'chatgpt_plus', 'subscription', 20, 15, 18000",
+            "'2026-05-01', NULL, 'interactive', NULL)",
+            "'openai', 'chatgpt_pro', 'subscription', 200, 375, 18000",
+            "'2026-05-01', '2026-05-31', 'interactive', 'chatgpt_pro_200_codex')",
+            "'openai', 'chatgpt_pro_100_codex_promo', 'subscription', 100, 160, 18000",
+            "'2026-05-01', '2026-05-31', 'interactive', 'chatgpt_pro_100_codex')",
+            "'openai', 'chatgpt_pro_100_codex', 'subscription', 100, 80, 18000",
+            "'2026-06-01', NULL, 'interactive', 'chatgpt_pro')",
+            "'openai', 'chatgpt_pro_200_codex', 'subscription', 200, 300, 18000",
+            "'anthropic', 'claude_max_100', 'subscription', 100, 225, 18000",
+            "'2026-05-28', NULL, 'interactive', NULL)",
+            "'anthropic', 'claude_max_200', 'subscription', 200, 900, 18000",
+        ],
     }
 
     for migration, fragments in expected_fragments.items():
         sql = " ".join((repo_root / migration).read_text().split())
         for fragment in fragments:
             assert " ".join(fragment.split()) in sql, (migration, fragment)
+
+
+def test_sqlite_subscription_plan_current_limits_final_state():
+    repo_root = Path(__file__).resolve().parents[1]
+    migration = (repo_root / "db/migrations_sqlite/0039_subscription_plan_current_limits.sql").read_text()
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+
+    conn.executescript(migration)
+    conn.execute(
+        """
+        INSERT INTO subscription_plans (
+          provider, plan_name, auth_method, monthly_usd, msg_cap,
+          msg_window_seconds, reset_anchor, notes, effective_from,
+          effective_until, path_kind, parent_plan_id
+        ) VALUES
+          ('anthropic', 'claude_max_interactive_post_jun15', 'subscription', 100, 225,
+           18000, 'rolling', 'stale interactive split', '2026-06-15', NULL,
+           'interactive', 'claude_max_100'),
+          ('anthropic', 'agent_sdk_credit_pool_post_jun15', 'subscription', 0, NULL,
+           NULL, 'monthly', 'stale SDK credit split', '2026-06-15', NULL,
+           'sdk_credit_pool', 'claude_max_100')
+        """
+    )
+
+    conn.executescript(migration)
+    rows = conn.execute(
+        """
+        SELECT provider, plan_name, monthly_usd, msg_cap, msg_window_seconds,
+               effective_from, effective_until, path_kind, parent_plan_id
+        FROM subscription_plans
+        WHERE provider IN ('openai', 'anthropic')
+        """
+    ).fetchall()
+    plans = {(row["provider"], row["plan_name"]): dict(row) for row in rows}
+
+    assert ("anthropic", "claude_max_interactive_post_jun15") not in plans
+    assert ("anthropic", "agent_sdk_credit_pool_post_jun15") not in plans
+    assert plans[("anthropic", "claude_max_100")]["msg_cap"] == 225
+    assert plans[("anthropic", "claude_max_100")]["effective_until"] is None
+    assert plans[("anthropic", "claude_max_200")]["monthly_usd"] == 200
+    assert plans[("anthropic", "claude_max_200")]["msg_cap"] == 900
+    assert plans[("openai", "chatgpt_plus")]["msg_cap"] == 15
+    assert plans[("openai", "chatgpt_pro")]["effective_until"] == "2026-05-31"
+    assert plans[("openai", "chatgpt_pro_100_codex_promo")]["msg_cap"] == 160
+    assert plans[("openai", "chatgpt_pro_100_codex")]["effective_from"] == "2026-06-01"
+    assert plans[("openai", "chatgpt_pro_200_codex")]["msg_cap"] == 300
+
+    usage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(usage_ledger)")}
+    assert {"session_id", "request_count", "plan_window_id", "path_kind", "subscription_amortized"} <= usage_columns
 
 
 def test_sqlite_migration_list_matches_expected_order():
