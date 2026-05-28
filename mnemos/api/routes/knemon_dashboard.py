@@ -429,10 +429,18 @@ _DASHBOARD_HTML = f"""<!doctype html>
     .err, .timeout {{ color: var(--bad); }}
     .toolbar {{ display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }}
     .status {{ color: var(--muted); font-size: 12px; min-height: 18px; margin: 8px 0 0; }}
+    .gauges {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }}
+    .gauge {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #131922; }}
+    .gaugeTop {{ display: flex; justify-content: space-between; gap: 10px; font-size: 13px; }}
+    .bar {{ margin-top: 8px; height: 8px; border-radius: 999px; background: #27313c; overflow: hidden; }}
+    .fill {{ height: 100%; background: var(--accent); }}
+    .fill.warn {{ background: var(--warn); }}
+    .fill.bad {{ background: var(--bad); }}
     @media (max-width: 1000px) {{
       header {{ align-items: stretch; flex-direction: column; }}
       .summary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .grid {{ grid-template-columns: 1fr; }}
+      .gauges {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -451,6 +459,9 @@ _DASHBOARD_HTML = f"""<!doctype html>
   <main>
     <div class="summary" id="summary"></div>
     <div class="grid">
+      <section class="full"><h2>Sub-Plans</h2><div id="subPlans"></div></section>
+      <section class="full"><h2>Utilization</h2><div id="utilization"></div></section>
+      <section><h2>Cost Split</h2><div id="costSplit"></div></section>
       <section><h2>By Provider</h2><div id="byProvider"></div></section>
       <section><h2>By Model</h2><div id="byModel"></div></section>
       <section><h2>By Caller</h2><div id="byCaller"></div></section>
@@ -489,6 +500,19 @@ _DASHBOARD_HTML = f"""<!doctype html>
       const body = rows.map(r => `<tr>${{cols.map(c => `<td class="${{c.right ? "right" : ""}} ${{c.className ? c.className(r) : ""}}">${{c.render ? c.render(r) : (r[c.key] ?? "")}}</td>`).join("")}}</tr>`).join("");
       return `<table><thead><tr>${{head}}</tr></thead><tbody>${{body || `<tr><td colspan="${{cols.length}}">No rows</td></tr>`}}</tbody></table>`;
     }}
+    function gauge(rows) {{
+      const items = (rows || []).filter(r => r.auth_method === "subscription" || r.msg_cap).slice(0, 12);
+      return `<div class="gauges">${{items.map(r => {{
+        const pct = r.utilization_pct == null ? 0 : Math.min(100, Number(r.utilization_pct));
+        const cls = pct >= 100 ? "bad" : pct >= 80 ? "warn" : "";
+        const label = r.utilization_pct == null ? "uncapped" : `${{Number(r.utilization_pct).toFixed(1)}}%`;
+        return `<div class="gauge">
+          <div class="gaugeTop"><strong>${{r.provider}}/${{r.plan_name}}</strong><span>${{label}}</span></div>
+          <div class="bar"><div class="fill ${{cls}}" style="width:${{pct}}%"></div></div>
+          <div class="sub">${{fmtNum(r.requests_used)}} / ${{r.msg_cap == null ? "unmetered" : fmtNum(r.msg_cap)}} requests</div>
+        </div>`;
+      }}).join("") || `<div class="sub">No subscription utilization rows</div>`}}</div>`;
+    }}
     async function loadSummary() {{
       const s = await get("/v1/knemon/summary");
       $("summary").innerHTML = [
@@ -501,35 +525,48 @@ _DASHBOARD_HTML = f"""<!doctype html>
       ].map(([label, value]) => `<div class="metric"><div class="label">${{label}}</div><div class="value">${{value}}</div></div>`).join("");
     }}
     async function loadTables() {{
-      const [providers, models, callers, tasks, timeline, recent] = await Promise.all([
+      const [providers, models, callers, tasks, timeline, recent, utilization, costSplit] = await Promise.all([
         get("/v1/knemon/by_provider"),
         get("/v1/knemon/by_model?limit=20"),
         get("/v1/knemon/by_caller"),
         get("/v1/knemon/by_task_kind"),
         get("/v1/knemon/timeline?bucket=1h"),
-        get("/v1/knemon/recent?limit=50")
+        get("/v1/knemon/recent?limit=50"),
+        get("/v1/knemon/utilization?window=current"),
+        get("/v1/knemon/cost_split?period=monthly")
       ]);
+      $("subPlans").innerHTML = table([
+        {{key:"provider", label:"Provider"}}, {{key:"plan_name", label:"Plan"}},
+        {{key:"auth_method", label:"Auth"}}, {{key:"msg_cap", label:"Msg Cap", right:true, render:r=>r.msg_cap == null ? "unmetered" : fmtNum(r.msg_cap)}},
+        {{key:"window_end", label:"Window End"}}
+      ], utilization);
+      $("utilization").innerHTML = gauge(utilization);
+      $("costSplit").innerHTML = table([
+        {{key:"cost_bucket", label:"Bucket"}}, {{key:"requests", label:"Requests", right:true, render:r=>fmtNum(r.requests)}},
+        {{key:"row_count", label:"Rows", right:true, render:r=>fmtNum(r.row_count)}},
+        {{key:"cost_usd", label:"Cost", right:true, render:r=>fmtMoney(r.cost_usd)}}
+      ], costSplit);
       $("byProvider").innerHTML = table([
-        {{key:"provider", label:"Provider"}}, {{key:"rows", label:"Rows", right:true, render:r=>fmtNum(r.rows)}},
+        {{key:"provider", label:"Provider"}}, {{key:"row_count", label:"Rows", right:true, render:r=>fmtNum(r.row_count)}},
         {{key:"cost_usd", label:"Cost", right:true, render:r=>fmtMoney(r.cost_usd)}},
         {{key:"tokens", label:"Tokens", right:true, render:r=>fmtNum(r.tokens)}},
         {{key:"avg_latency_ms", label:"Latency", right:true, render:r=>`${{Number(r.avg_latency_ms || 0).toFixed(1)}} ms`}}
       ], providers);
       $("byModel").innerHTML = table([
         {{key:"provider", label:"Provider"}}, {{key:"model", label:"Model"}},
-        {{key:"rows", label:"Rows", right:true, render:r=>fmtNum(r.rows)}},
+        {{key:"row_count", label:"Rows", right:true, render:r=>fmtNum(r.row_count)}},
         {{key:"cost_usd", label:"Cost", right:true, render:r=>fmtMoney(r.cost_usd)}}
       ], models);
       $("byCaller").innerHTML = table([
-        {{key:"caller_subsystem", label:"Caller"}}, {{key:"rows", label:"Rows", right:true, render:r=>fmtNum(r.rows)}},
+        {{key:"caller_subsystem", label:"Caller"}}, {{key:"row_count", label:"Rows", right:true, render:r=>fmtNum(r.row_count)}},
         {{key:"cost_usd", label:"Cost", right:true, render:r=>fmtMoney(r.cost_usd)}}
       ], callers);
       $("byTask").innerHTML = table([
-        {{key:"task_kind", label:"Task"}}, {{key:"rows", label:"Rows", right:true, render:r=>fmtNum(r.rows)}},
+        {{key:"task_kind", label:"Task"}}, {{key:"row_count", label:"Rows", right:true, render:r=>fmtNum(r.row_count)}},
         {{key:"cost_usd", label:"Cost", right:true, render:r=>fmtMoney(r.cost_usd)}}
       ], tasks);
       $("timeline").innerHTML = table([
-        {{key:"ts_bucket", label:"UTC Bucket"}}, {{key:"rows", label:"Rows", right:true, render:r=>fmtNum(r.rows)}},
+        {{key:"ts_bucket", label:"UTC Bucket"}}, {{key:"row_count", label:"Rows", right:true, render:r=>fmtNum(r.row_count)}},
         {{key:"cost_usd", label:"Cost", right:true, render:r=>fmtMoney(r.cost_usd)}}
       ], timeline);
       $("recent").innerHTML = table([
