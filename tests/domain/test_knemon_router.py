@@ -464,8 +464,15 @@ def test_burned_g1_session_keeps_requested_quality_floor(monkeypatch):
     assert _apply_priority_ceiling(candidates, 13, requested_priority=14) == [candidates[1]]
 
 
+@pytest.mark.parametrize(
+    ("as_of", "expected_plan"),
+    [
+        (date(2026, 5, 31), "claude_max_200"),
+        (date(2026, 6, 1), "claude_max_100"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_date_aware_plan_selection_honors_tier_flip_date():
+async def test_date_aware_plan_selection_honors_tier_flip_date(as_of: date, expected_plan: str):
     backend = _SqliteKnemonBackend(0)
     backend.conn.executescript(
         """
@@ -502,6 +509,6 @@ async def test_date_aware_plan_selection_honors_tier_flip_date():
     )
     backend.conn.commit()
 
-    plans = await _plans_by_provider(backend, as_of=date(2026, 6, 1))
+    plans = await _plans_by_provider(backend, as_of=as_of)
 
-    assert [plan["plan_name"] for plan in plans["anthropic"]] == ["claude_max_100"]
+    assert [plan["plan_name"] for plan in plans["anthropic"]] == [expected_plan]
