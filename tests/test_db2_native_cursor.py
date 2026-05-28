@@ -81,6 +81,44 @@ async def test_native_cursor_rejects_oracle_binds() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT SYSTIMESTAMP FROM SYSIBM.SYSDUMMY1",
+        "SELECT SYSDATE FROM SYSIBM.SYSDUMMY1",
+        "SELECT 1 FROM DUAL",
+        "SELECT TO_VECTOR(?) FROM SYSIBM.SYSDUMMY1",
+    ],
+)
+async def test_native_cursor_rejects_oracle_dialect_tokens(sql: str) -> None:
+    """Native cursor fails fast on SQL that belongs on the compat path."""
+    sync = _FakeSyncCursor()
+    from mnemos.persistence.db2 import _Db2NativeAsyncCursor
+
+    cur = _Db2NativeAsyncCursor(sync)
+    with pytest.raises(RuntimeError, match="native cursor received Oracle"):
+        await cur.execute(sql, None)
+
+
+@pytest.mark.asyncio
+async def test_native_cursor_guard_ignores_literals_identifiers_and_comments() -> None:
+    """Guard only inspects SQL syntax, not literal/comment text."""
+    sync = _FakeSyncCursor()
+    from mnemos.persistence.db2 import _Db2NativeAsyncCursor
+
+    cur = _Db2NativeAsyncCursor(sync)
+    sql = """
+    SELECT
+        'SYSTIMESTAMP :name TO_VECTOR(?) FROM DUAL',
+        "SYSDATE"
+    FROM SYSIBM.SYSDUMMY1
+    -- FROM DUAL
+    """
+    await cur.execute(sql, None)
+    assert sync._executed == [(sql, None)]
+
+
+@pytest.mark.asyncio
 async def test_native_cursor_fetchone_and_fetchall() -> None:
     """Rows pass through fetchone / fetchall unchanged."""
     rows = [(1, "hello"), (2, "world")]

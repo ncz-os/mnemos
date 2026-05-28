@@ -38,6 +38,7 @@ from mnemos.persistence.base import (
     ConsultationAuditRepository,
     ConsultationsRepository,
     FederationRepository,
+    FULL_STORAGE_CAPABILITY_DETAILS,
     KGRepository,
     MemoryRepository,
     OAuthRepository,
@@ -3833,6 +3834,10 @@ class OracleBackend:
     @property
     def capabilities(self) -> set[str]:
         return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+
+    @property
+    def capability_details(self) -> set[str]:
+        return set(FULL_STORAGE_CAPABILITY_DETAILS)
 
     @asynccontextmanager
     async def transactional(self) -> AsyncIterator[Transaction]:

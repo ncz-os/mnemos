@@ -268,6 +268,8 @@ async def test_health_returns_active_profile(monkeypatch: pytest.MonkeyPatch, tm
     assert response.nats_publishing_enabled is True
     assert response.persistence_backend == "_PingableBackend"
     assert response.persistence_capabilities == ["core", "state"]
+    assert "memory_crud" in response.persistence_capability_details
+    assert "state" in response.persistence_capability_details
 
 
 # ─── Enterprise backend DSN detection ─────────────────────────────────────────

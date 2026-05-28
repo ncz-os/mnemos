@@ -63,6 +63,7 @@ class HealthResponse(BaseModel):
     nats_publishing_enabled: bool = False
     persistence_backend: Optional[str] = None
     persistence_capabilities: List[str] = Field(default_factory=list)
+    persistence_capability_details: List[str] = Field(default_factory=list)
 
 
 class MemoryItem(BaseModel):
