@@ -22,9 +22,9 @@ If a session is burned, the router lowers the economic routing priority but stil
 
 The session burn threshold aligns with operator practice when it trips at `>= 10` requests in the rolling one-hour window. That is a local guardrail for interactive sessions: normal hand-driven use stays below it, while repeated retries, fanout loops, or automation bursts get downgraded before they drain subscription headroom. The policy is configurable through `MNEMOS_KNEMON_SESSION_BURN_REQUESTS_PER_HOUR` and `MNEMOS_KNEMON_SESSION_BURN_WINDOW_SECONDS`; bulk workers should use separate sessions or raise the threshold explicitly.
 
-## Current Plan Rows
+## Seeded Plan Rows
 
-These are the current rows after `0039_knemon_dispatch_rule_refresh`.
+These are the rows seeded or refreshed by `0039_knemon_dispatch_rule_refresh`. Rows with future `effective_from` dates are present for the tier flips but are not active until that date.
 
 | Provider | Plan | Cap |
 | --- | --- | --- |
@@ -42,7 +42,7 @@ These are the current rows after `0039_knemon_dispatch_rule_refresh`.
 
 OpenAI's public ChatGPT Pro documentation supports both $100 and $200 Pro tiers. The generic `chatgpt_pro` row remains as a backward-compatible $200 operator alias so existing workspace pools keep resolving; new pools should prefer the explicit `chatgpt_pro_100` or `chatgpt_pro_200` rows.
 
-Anthropic's public Max documentation supports the $100 Max 5x and $200 Max 20x tier relationship. The `900` and `225` message caps are conservative local planning caps for KNEMON utilization accounting. The 2026-06-01 switch from `claude_max_200` to `claude_max_100` is a local operator policy encoded in KNEMON, not a provider-published tier migration.
+Anthropic's public Max documentation supports the $100 Max 5x and $200 Max 20x tier relationship and publishes the `225` / `900` message counts as at-least usage estimates. KNEMON treats them as conservative planning caps for utilization accounting, not hard provider caps. The 2026-06-01 switch from `claude_max_200` to `claude_max_100` is a local operator policy encoded in KNEMON, not a provider-published tier migration.
 
 Do not treat Codex `msg_cap` values as the billing source of truth. OpenAI's Codex docs publish included usage ranges for plan headroom and a separate credit/rate-card path for usage beyond included limits and migrated workspaces. KNEMON utilization now reports `msg_cap` rows by request count and `token_cap` rows by token count; a future schema should add an explicit cap unit such as `message`, `token`, or `credit` before moving Codex accounting from local message headroom to credit telemetry.
 
@@ -80,6 +80,8 @@ codex_* -> codex_subscription
 
 Both still carry `openai_subscription` for operators that intentionally pool all OpenAI subscriptions.
 
+Codex Pro promo rows use stable parent aliases `codex_pro_100` and `codex_pro_200`. A workspace with only `codex_plus` must not match a Pro row; use `codex_subscription` only when intentionally pooling all Codex tiers.
+
 When no workspace pool is known, the router uses model metadata as a fallback family discriminator. Generic OpenAI `gpt-*` candidates map to ChatGPT subscription rows; OpenAI model metadata containing `codex` maps to Codex rows. Workspace pools remain authoritative when present.
 
 ## Config Defaults
@@ -98,7 +100,7 @@ The PR adds these operator policy defaults to `config.toml.example`, `.env.examp
 
 ## Cross-Check
 
-The audit was cross-checked with a Codex muse review. Codex confirmed the fallback, G1, and burn rules, verified the targeted router/utilization/config tests, and flagged token-cap utilization plus provider-level OpenAI plan collapse as the main follow-ups; both fixes are included here. The requested Claude cross-check could not complete in this environment: the external GRAEAE consultation timed out, and hive job submission to the online Claude worker was rejected because this session registered without a submitter URN. Provider-limit conclusions are therefore grounded in the official source links below rather than model assertion. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
+The audit was cross-checked with a root-only Codex muse review and an external GRAEAE consultation with the Claude provider available. Codex confirmed the fallback, G1, burn, and 10 req/hr rules, then flagged the Oracle Codex Pro parent-alias mismatch; that parity fix is included here. GRAEAE feedback was mixed, but the actionable caveat was to keep Codex Pro promo rows and Anthropic Max planning caps documented as provider-promo/local-policy assumptions. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
 
 ## Sources
 
