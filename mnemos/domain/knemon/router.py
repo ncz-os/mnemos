@@ -584,9 +584,8 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
     if not candidates:
         raise NoModelAvailable("no model satisfies required capabilities, provider exclusions, and context window")
 
-    effective_priority = (
-        _downgrade_priority(req.priority) if await _session_burned(backend, req.caller_session_id) else req.priority
-    )
+    session_burned = await _session_burned(backend, req.caller_session_id)
+    effective_priority = _downgrade_priority(req.priority) if session_burned else req.priority
     candidates = _apply_priority_ceiling(candidates, effective_priority, requested_priority=req.priority)
     if not candidates:
         raise NoModelAvailable("no model satisfies priority tier and quality constraints")
@@ -628,7 +627,7 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
                     f"{policy.subscription_preferred_utilization_pct:.0f}% utilization ({util:.2f}%)"
                 )
                 break
-            if util <= policy.subscription_near_cap_pct and effective_priority >= 12:
+            if not session_burned and util <= policy.subscription_near_cap_pct and effective_priority >= 12:
                 selected = item
                 reasons.append(f"selected subscription near cap for priority {effective_priority} ({util:.2f}%)")
                 break
