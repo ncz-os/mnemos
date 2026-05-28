@@ -2988,27 +2988,39 @@ class PostgresBackend(PersistenceBackend):
                 FROM model_registry
                 WHERE provider=$1 AND model_id=$2
             ),
+            resolved_plan AS (
+                SELECT auth_method
+                FROM subscription_plans
+                WHERE provider=$1 AND plan_name=$10
+            ),
             inserted AS (
                 INSERT INTO usage_ledger (
                     provider, model, task_kind, tokens_in, tokens_out,
                     tokens_reasoning, est_cost_usd, latency_ms, outcome,
-                    caller_subsystem, tier
+                    caller_subsystem, tier, session_id, request_count,
+                    plan_window_id, subscription_amortized
                 )
                 SELECT
                     $1, $2, $3, $4, $5, $6,
-                    (($4::NUMERIC * COALESCE(rp.input_cost_per_mtok, 0)::NUMERIC)
-                     + ($5::NUMERIC * COALESCE(rp.output_cost_per_mtok, 0)::NUMERIC)
-                     + ($6::NUMERIC * COALESCE(
-                        NULLIF(rp.raw->>'reasoning_cost_per_mtok', '')::NUMERIC,
-                        rp.output_cost_per_mtok,
-                        0
-                     )::NUMERIC)) / 1000000,
-                    $7, $8, $9, $10
+                    CASE WHEN COALESCE(pl.auth_method, 'api') = 'subscription' THEN 0
+                         ELSE (($4::NUMERIC * COALESCE(rp.input_cost_per_mtok, 0)::NUMERIC)
+                              + ($5::NUMERIC * COALESCE(rp.output_cost_per_mtok, 0)::NUMERIC)
+                              + ($6::NUMERIC * COALESCE(
+                                  NULLIF(rp.raw->>'reasoning_cost_per_mtok', '')::NUMERIC,
+                                  rp.output_cost_per_mtok,
+                                  0
+                                )::NUMERIC)) / 1000000
+                    END,
+                    $7, $8, $9, $10, $11, $12, $13,
+                    COALESCE(pl.auth_method, 'api') = 'subscription'
                 FROM (SELECT 1) seed
                 LEFT JOIN resolved_prices rp ON TRUE
+                LEFT JOIN resolved_plan pl ON TRUE
                 RETURNING id, est_cost_usd
             )
-            SELECT id, est_cost_usd, EXISTS(SELECT 1 FROM resolved_prices) AS registry_match
+            SELECT id, est_cost_usd,
+                   EXISTS(SELECT 1 FROM resolved_prices) AS registry_match,
+                   COALESCE((SELECT auth_method FROM resolved_plan), 'api') AS auth_method
             FROM inserted
             """,
             record.provider,
@@ -3021,10 +3033,13 @@ class PostgresBackend(PersistenceBackend):
             record.outcome,
             record.caller_subsystem,
             record.tier,
+            record.session_id,
+            record.request_count,
+            record.plan_window_id,
         )
         if row is None:
             raise RuntimeError("usage_ledger insert returned no row")
-        if not row["registry_match"]:
+        if row["auth_method"] != "subscription" and not row["registry_match"]:
             logger.warning(
                 "usage_ledger model_registry price missing for provider=%s model=%s; recording est_cost_usd=0",
                 record.provider,

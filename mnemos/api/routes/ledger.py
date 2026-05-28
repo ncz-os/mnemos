@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Literal
 
@@ -13,6 +14,49 @@ from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.persistence.base import UsageLedgerRecord
 
 router = APIRouter(prefix="/v1", tags=["ledger"])
+
+_PLAN_WINDOWS: dict[tuple[str, str], tuple[str, int | None]] = {
+    ("anthropic", "claude_max_200"): ("rolling", 18000),
+    ("anthropic", "claude_max_100"): ("rolling", 18000),
+    ("openai", "chatgpt_plus"): ("rolling", 10800),
+    ("openai", "chatgpt_pro"): ("weekly", 604800),
+    ("nvidia", "ngc_integrate"): ("monthly", None),
+    ("nvidia", "ngc_inference"): ("monthly", None),
+    ("groq", "dev_tier"): ("monthly", None),
+    ("together", "api"): ("monthly", None),
+    ("deepseek-direct", "api"): ("monthly", None),
+    ("xai", "api"): ("monthly", None),
+    ("gemini", "api"): ("monthly", None),
+    ("perplexity", "api"): ("monthly", None),
+}
+
+
+def compute_plan_window_id(
+    provider: str,
+    plan_name: str,
+    ts: datetime | None = None,
+    *,
+    reset_anchor: str | None = None,
+    window_seconds: int | None = None,
+) -> str:
+    """Return the deterministic KNEMON plan-window id for a usage record."""
+    ts = ts or datetime.now(timezone.utc)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    ts = ts.astimezone(timezone.utc)
+    provider_key = provider.strip().lower()
+    plan_key = plan_name.strip().lower()
+    anchor, seconds = _PLAN_WINDOWS.get((provider_key, plan_key), ("monthly", None))
+    anchor = (reset_anchor or anchor or "monthly").lower()
+    seconds = int(window_seconds or seconds or 0)
+    if anchor in {"daily", "day"}:
+        return f"{provider_key}-{plan_key}-{ts:%Y-%m-%d}"
+    if anchor in {"monthly", "month"}:
+        return f"{provider_key}-{plan_key}-{ts:%Y-%m}"
+    iso = ts.isocalendar()
+    day_seconds = ts.hour * 3600 + ts.minute * 60 + ts.second
+    window_index = day_seconds // max(seconds, 1)
+    return f"{provider_key}-{plan_key}-{iso.year}-W{iso.week:02d}-d{iso.weekday}-w{window_index}"
 
 
 class LedgerRecordRequest(BaseModel):
@@ -26,6 +70,8 @@ class LedgerRecordRequest(BaseModel):
     outcome: Literal["ok", "err", "timeout"]
     caller_subsystem: str = Field(..., min_length=1)
     tier: str = Field(..., min_length=1)
+    session_id: str | None = Field(default=None, max_length=64)
+    request_count: int = Field(default=1, ge=1)
 
 
 class LedgerRecordResponse(BaseModel):
@@ -43,7 +89,10 @@ async def record_ledger_usage(
     if recorder is None:
         raise HTTPException(status_code=503, detail="usage_ledger requires a ledger-capable backend")
 
-    record = UsageLedgerRecord(**payload.model_dump())
+    record = UsageLedgerRecord(
+        **payload.model_dump(),
+        plan_window_id=compute_plan_window_id(payload.provider, payload.tier),
+    )
     try:
         async with backend.transactional() as tx:
             result = await recorder(tx, record)
