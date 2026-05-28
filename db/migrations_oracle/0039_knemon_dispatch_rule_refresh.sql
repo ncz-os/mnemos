@@ -27,7 +27,15 @@ USING (
          DATE '2026-05-28', NULL, 'interactive', NULL FROM dual
   UNION ALL SELECT 'openai', 'chatgpt_pro', 'subscription',
          200, NULL, NULL, NULL, NULL, 'monthly', NULL, NULL,
-         'ChatGPT Pro GPT-5.5: unlimited access subject to abuse guardrails',
+         'ChatGPT Pro $200 GPT-5.5: legacy/default row; unlimited GPT-5.5 access subject to abuse guardrails',
+         DATE '2026-05-28', NULL, 'unmetered', NULL FROM dual
+  UNION ALL SELECT 'openai', 'chatgpt_pro_100', 'subscription',
+         100, NULL, NULL, NULL, NULL, 'monthly', NULL, NULL,
+         'ChatGPT Pro $100 GPT-5.5: unlimited GPT-5.5 access subject to abuse guardrails; 5x Plus overall Pro tier',
+         DATE '2026-05-28', NULL, 'unmetered', NULL FROM dual
+  UNION ALL SELECT 'openai', 'chatgpt_pro_200', 'subscription',
+         200, NULL, NULL, NULL, NULL, 'monthly', NULL, NULL,
+         'ChatGPT Pro $200 GPT-5.5: unlimited GPT-5.5 access subject to abuse guardrails; 20x Plus overall Pro tier',
          DATE '2026-05-28', NULL, 'unmetered', NULL FROM dual
   UNION ALL SELECT 'openai', 'codex_plus', 'subscription',
          20, 15, 18000, NULL, NULL, 'rolling', NULL, NULL,
