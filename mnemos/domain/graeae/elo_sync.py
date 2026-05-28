@@ -62,15 +62,20 @@ _HF_ROWS_URL = (
 # Providers whose models are not in Arena's top-100 snapshot will not match
 # and will silently retain their config.toml base weight.
 # Update these when provider models change in config.toml [graeae.providers].
+# Keys MUST match _BUILTIN_PROVIDERS muse names in engine.py so the apply
+# loop (engine.py:461 elo.items() -> self.providers[name][weight]) actually
+# rewrites the live muse weight. The old claude_opus key was silently
+# dropped because providers[claude_opus] does not exist (provider is
+# claude). Values track the model NAME that appears in Arena leaderboard.
 _ELO_MODEL_MAP: dict[str, str] = {
-    "perplexity":  "sonar-pro",
-    "groq":        "gpt-oss-120b",        # openai/gpt-oss-120b served via Groq
-    "claude_opus": "claude-opus-4-6",
-    "xai":         "grok-4.20-0309-reasoning",
-    "openai":      "gpt-5.4",
-    "gemini":      "gemini-3.1-pro",
-    "nvidia":      "llama-4-maverick",     # meta/llama-4-maverick-17b-128e-instruct via NIM
-    "together":    "qwen3-235b",          # Qwen3-235B-A22B served via Together
+    "perplexity": "sonar-pro",
+    "groq":       "gpt-oss-120b",       # openai/gpt-oss-120b served via Groq
+    "claude":     "claude-opus-4-7",    # arena leader iter56; newer-version override
+    "xai":        "grok-4.20-0309-reasoning",
+    "openai":     "gpt-5.5",            # arena rank 8 iter56
+    "gemini":     "gemini-3.1-pro",     # arena variant of provider gemini
+    "nvidia":     "kimi-k2.6",          # moonshotai/kimi-k2.6 via NGC NIM
+    "together":   "minimax-m2.7",       # MiniMax-M2.7 FP4 via Together
 }
 
 # ── On-disk weight registry ───────────────────────────────────────────────

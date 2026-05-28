@@ -125,7 +125,10 @@ def _normalize_gemini_finish_reason(raw: str | None) -> str:
 _BUILTIN_PROVIDERS: dict[str, dict] = {
     "together": {
         "url": "https://api.together.xyz/v1/chat/completions",
-        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "weight": 0.80, "api": "openai", "key_name": "together_ai",
+        # iter 56 registry-align: MiniMax-M2.7 FP4 is the current Together
+        # default per llm-usage-policy-2026-05-22.md ($0.40/$1.20, 4M ctx,
+        # weight=0.78 in model_registry).
+        "model": "MiniMaxAI/MiniMax-M2.7", "weight": 0.78, "api": "openai", "key_name": "together_ai",
     },
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
@@ -133,7 +136,9 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
     },
     "openai": {
         "url": "https://api.openai.com/v1/chat/completions",
-        "model": "gpt-5.2-chat-latest", "weight": 0.88, "api": "openai", "key_name": "openai",
+        # iter 56 registry-align: gpt-5.5 is arena rank 8 (score 1481) per
+        # 2026-05-28 snapshot; supersedes 5.2-chat-latest.
+        "model": "gpt-5.5", "weight": 0.88, "api": "openai", "key_name": "openai",
     },
     "claude": {
         "url": "https://api.anthropic.com/v1/messages",
@@ -141,7 +146,7 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
         # short-circuit (consult() gather block) handles the latency by
         # cancelling whichever muse is slowest once quorum reached, so opus
         # being slow on arch-design prompts is no longer a blocker.
-        "model": "claude-opus-4-6", "weight": 0.90, "api": "anthropic", "key_name": "claude",
+        "model": "claude-opus-4-7", "weight": 0.90, "api": "anthropic", "key_name": "claude",
     },
     "perplexity": {
         "url": "https://api.perplexity.ai/chat/completions",
@@ -149,11 +154,16 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
     },
     "xai": {
         "url": "https://api.x.ai/v1/chat/completions",
-        "model": "grok-4-1-fast", "weight": 0.86, "api": "openai", "key_name": "xai",
+        # iter 56 registry-align: grok-4.20-0309-reasoning is arena rank 21
+        # (score 1453) per 2026-05-28 snapshot; supersedes 4-1-fast.
+        "model": "grok-4.20-0309-reasoning", "weight": 0.86, "api": "openai", "key_name": "xai",
     },
     "nvidia": {
         "url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "model": "meta/llama-3.3-70b-instruct", "weight": 0.80, "api": "openai", "key_name": "nvidia",
+        # iter 56 registry-align: NGC Kimi K2.6 is arena rank 19 (score
+        # 1457) + 80.2% SWE-bench Verified, free Tier-A per
+        # llm-usage-policy-2026-05-22.md.
+        "model": "moonshotai/kimi-k2.6", "weight": 0.80, "api": "openai", "key_name": "nvidia",
     },
     "gemini": {
         "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent",
