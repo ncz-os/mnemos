@@ -1989,72 +1989,22 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
         cost_budget: float,
         quality_floor: float,
     ) -> tuple[dict[str, Any] | None, list[str]]:
-        capability_map = {
-            "code_generation": ["coding"],
-            "reasoning": ["reasoning", "logic"],
-            "architecture_design": ["reasoning"],
-            "summarization": ["reasoning"],
-            "web_search": ["online", "search"],
-        }
-        required_caps = capability_map.get(task_type, ["reasoning"])
+        from mnemos.domain.pantheon.recommendation import choose_recommended_model
+
         rows = await _fetch_all(
             self._conn(tx),
             "SELECT provider, model_id, display_name, input_cost_per_mtok, output_cost_per_mtok, "
             "capabilities, graeae_weight, context_window "
             "FROM model_registry WHERE available = 1 AND deprecated = 0",
         )
-
-        def _has_priced(row: Row) -> bool:
-            return row["input_cost_per_mtok"] is not None and row["output_cost_per_mtok"] is not None
-
-        def _avg_cost_or_none(row: Row) -> float | None:
-            if not _has_priced(row):
-                return None
-            return (float(row["input_cost_per_mtok"]) + float(row["output_cost_per_mtok"])) / 2.0
-
-        # Budget tier EXCLUDES rows with NULL costs — an unknown
-        # cost cannot legally satisfy a "<= budget" constraint;
-        # treating NULL as 0 would let partially-synced rows rank
-        # ahead of priced ones. Mirrors the Postgres invariant in
-        # mnemos/db/mcp_repo.py and friends.
-        eligible = [
-            row
-            for row in rows
-            if float(row["graeae_weight"] or 0) >= quality_floor
-            and _has_priced(row)
-            and (_avg_cost_or_none(row) or 0.0) <= cost_budget
-            and all(cap in _json_list(row["capabilities"]) for cap in required_caps)
-        ]
-        chosen_rows = sorted(eligible, key=lambda r: _avg_cost_or_none(r) or 0.0)
-        if not chosen_rows:
-            # Degraded fallback: no priced model met the budget.
-            # Allow NULL-cost rows here but sort priced ones first
-            # via "(unknown=infinity)" key — matches PG's NULLS LAST.
-            chosen_rows = sorted(
-                rows,
-                key=lambda r: (_avg_cost_or_none(r) if _avg_cost_or_none(r) is not None else float("inf")),
-            )
-        if not chosen_rows:
-            return None, required_caps
-        model = chosen_rows[0]
-        return {
-            "provider": model["provider"],
-            "model_id": model["model_id"],
-            "display_name": model["display_name"],
-            # cost_per_mtok is None when either cost column is NULL.
-            # Surface unknown honestly rather than fabricate 0.0
-            # which would silently lie about pricing semantics.
-            "cost_per_mtok": _avg_cost_or_none(model),
-            "quality_score": float(model["graeae_weight"] or 0),
-            "context_window": model["context_window"],
-        }, required_caps
+        return choose_recommended_model(rows, task_type, cost_budget, quality_floor)
 
     async def fetch_model_recommendation(
         self,
         tx: Transaction,
         task_type: str,
         cost_budget: float = 10.0,
-        quality_floor: float = 0.85,
+        quality_floor: float = 0.7,
     ) -> dict[str, Any] | None:
         model, _required = await self.fetch_recommended_model(tx, task_type, cost_budget, quality_floor)
         return model

@@ -56,7 +56,7 @@ async def provider_health(
 async def recommend_model(
     task_type: str = Query(..., description="Task type: code_generation, reasoning, architecture_design, etc."),
     cost_budget: float = Query(10.0, description="Max cost per 1M tokens ($/MTok)"),
-    quality_floor: float = Query(0.80, description="Minimum quality score (0-1)"),
+    quality_floor: float = Query(0.70, description="Minimum quality score (0-1)"),
     user: UserContext = Depends(get_current_user),
 ):
     """Recommend cheapest model meeting quality + capability requirements.
@@ -137,7 +137,7 @@ async def recommend_model(
                     "display_name": model.get("display_name"),
                     "cost_per_mtok": avg_cost,
                 },
-                "reasoning": f"Cheapest model with {', '.join(required_caps)} capability "
+                "reasoning": f"Recommended model with {', '.join(required_caps)} capability "
                 f"above quality floor {quality_floor}",
                 "quality_score": safe_float(model["quality_score"]),
                 "context_window": model.get("context_window"),
