@@ -14,6 +14,7 @@ External plan facts were checked against official vendor documentation:
 - Claude Max plan usage: https://support.claude.com/en/articles/11014257-about-claude-s-max-plan-usage
 - Claude Max plan: https://support.claude.com/en/articles/11049741-what-is-the-max-plan
 - Claude Code with Pro or Max: https://support.claude.com/en/articles/11145838-use-claude-code-with-your-pro-or-max-plan
+- Claude Agent SDK with a Claude plan: https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan
 
 OpenAI publishes model- and surface-specific ranges, not one universal Codex
 message cap. KNEMON stores conservative local-message lower bounds using the
@@ -40,6 +41,12 @@ No official Anthropic source found for a Claude Max 200-to-100 tier flip on
 2026-06-01. Current Claude docs keep Max 5x and Max 20x as active tiers, and
 Claude Code usage is shared with the same Pro/Max allocation. The older
 post-2026-06-15 Claude split rows are removed by `0039_subscription_plan_current_limits`.
+
+Anthropic's separate Agent SDK / `claude -p` monthly credit starts on
+2026-06-15, but it is not modeled as a router-visible subscription plan yet.
+KNEMON currently has message/token utilization caps, not a credit-denominated
+cap with route intent, so keeping the old SDK credit pool row would let a
+non-interactive credit path compete in the interactive waterfall.
 
 The router filters `effective_from` and `effective_until` in Python after
 fetching rows. This keeps Oracle, PostgreSQL, SQLite, and Db2 behavior aligned
