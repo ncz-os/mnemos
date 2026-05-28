@@ -56,7 +56,6 @@ from mnemos.persistence.base import (
     FederationRepository,
     KGRepository,
     MemoryRepository,
-    PersistenceBackend,
     StateRepository,
     Transaction,
     VersionRepository,
@@ -434,11 +433,23 @@ class MysqlMemoryRepository(MemoryRepository):
                         id = id
                     """,
                     (
-                        memory_id, content, _content_hash(content), category, subcategory,
-                        metadata_json, quality_rating, verbatim_content, owner_id, namespace,
-                        permission_mode, source_model, source_provider,
-                        source_session, source_agent,
-                        created, updated,
+                        memory_id,
+                        content,
+                        _content_hash(content),
+                        category,
+                        subcategory,
+                        metadata_json,
+                        quality_rating,
+                        verbatim_content,
+                        owner_id,
+                        namespace,
+                        permission_mode,
+                        source_model,
+                        source_provider,
+                        source_session,
+                        source_agent,
+                        created,
+                        updated,
                     ),
                 )
                 return "INSERT 0 1" if cursor.rowcount else "INSERT 0 0"
@@ -769,12 +780,12 @@ class MysqlMemoryRepository(MemoryRepository):
         # VECTOR_DISTANCE … COSINE.
         if boost_recency:
             rank_expr = (
-                "VEC_DISTANCE_COSINE(m.embedding, TO_VECTOR(%s))"
+                "VEC_DISTANCE_COSINE(m.embedding, VEC_FromText(%s))"
                 f" - {float(recency_weight)}"
                 " * (1.0 / (1.0 + TIMESTAMPDIFF(SECOND, m.updated, NOW(6)) / 86400.0))"
             )
         else:
-            rank_expr = "VEC_DISTANCE_COSINE(m.embedding, TO_VECTOR(%s))"
+            rank_expr = "VEC_DISTANCE_COSINE(m.embedding, VEC_FromText(%s))"
 
         # Bind the TO_VECTOR placeholder before the rest of the params.
         # ORDER BY uses the selected alias so the vector is bound once.
@@ -1164,8 +1175,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                 await conn.commit()
         except Exception as exc:
             _LOG.warning(
-                "MysqlBackend.open probe failed (%s); backend remains open but first "
-                "acquire() may also fail.",
+                "MysqlBackend.open probe failed (%s); backend remains open but first " "acquire() may also fail.",
                 exc,
             )
 
