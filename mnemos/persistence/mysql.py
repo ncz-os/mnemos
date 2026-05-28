@@ -2,13 +2,13 @@
 
 Uses ``aiomysql`` (asyncio wrapper around PyMySQL) with a native async
 connection pool.  MySQL 9.0+ is required for the native ``VECTOR``
-column type and ``VEC_DISTANCE_COSINE`` / ``TO_VECTOR`` functions
+column type and ``VECTOR_DISTANCE`` / ``TO_VECTOR`` functions
 used by semantic search.
 
 Key SQL-level differences from Postgres/Oracle:
 
 - Positional ``%s`` placeholders (aiomysql / PyMySQL convention).
-- ``TO_VECTOR(%s)`` to bind an embedding string; ``VEC_DISTANCE_COSINE``
+- ``TO_VECTOR(%s)`` to bind an embedding string; ``VECTOR_DISTANCE``
   for ANN distance (MySQL 9.0 nomenclature).
 - ``DATETIME(6)`` with ``SET time_zone = '+00:00'`` for UTC timestamps.
 - ``INSERT … ON DUPLICATE KEY UPDATE id = id`` to preserve
@@ -35,7 +35,7 @@ Configuration example::
 References:
 - aiomysql: https://aiomysql.readthedocs.io/
 - MySQL 9.0 VECTOR: https://dev.mysql.com/doc/refman/9.0/en/vector-functions.html
-- VEC_DISTANCE_COSINE: https://dev.mysql.com/doc/refman/9.0/en/vector-functions.html
+- VECTOR_DISTANCE: https://dev.mysql.com/doc/refman/9.0/en/vector-functions.html
 """
 
 from __future__ import annotations
@@ -775,17 +775,17 @@ class MysqlMemoryRepository(MemoryRepository):
                 where.append(f"m.{col} = %s")
                 params.append(val)
 
-        # MySQL 9.0 VEC_DISTANCE_COSINE returns 0 for identical vectors and
+        # MySQL 9.0 VECTOR_DISTANCE returns 0 for identical vectors and
         # grows with dissimilarity — same ordering as pgvector <=> and Oracle
         # VECTOR_DISTANCE … COSINE.
         if boost_recency:
             rank_expr = (
-                "VEC_DISTANCE_COSINE(m.embedding, VEC_FromText(%s))"
+                "VECTOR_DISTANCE(m.embedding, TO_VECTOR(%s), 'COSINE')"
                 f" - {float(recency_weight)}"
                 " * (1.0 / (1.0 + TIMESTAMPDIFF(SECOND, m.updated, NOW(6)) / 86400.0))"
             )
         else:
-            rank_expr = "VEC_DISTANCE_COSINE(m.embedding, VEC_FromText(%s))"
+            rank_expr = "VECTOR_DISTANCE(m.embedding, TO_VECTOR(%s), 'COSINE')"
 
         # Bind the TO_VECTOR placeholder before the rest of the params.
         # ORDER BY uses the selected alias so the vector is bound once.
