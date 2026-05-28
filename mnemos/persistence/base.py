@@ -12,7 +12,9 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, AsyncContextManager, Protocol, runtime_checkable
+from typing import Any, AsyncContextManager, Literal, Protocol, TypeAlias, Union, runtime_checkable
+
+from fastapi import HTTPException
 
 from mnemos.core.auth_context import UserContext
 from mnemos.persistence.types import Row
@@ -1240,13 +1242,72 @@ class AuditChainRepository(ABC):
         return result
 
 
-class PersistenceBackend(ABC):
-    """Top-level facade exposing backend-specific repository families."""
+CapabilityName: TypeAlias = Literal[
+    "core",
+    "oauth",
+    "sessions",
+    "consultations",
+    "federation",
+    "audit",
+    "state",
+]
 
-    @abstractmethod
+
+CORE_CAPABILITY: CapabilityName = "core"
+OAUTH_CAPABILITY: CapabilityName = "oauth"
+SESSIONS_CAPABILITY: CapabilityName = "sessions"
+CONSULTATIONS_CAPABILITY: CapabilityName = "consultations"
+FEDERATION_CAPABILITY: CapabilityName = "federation"
+AUDIT_CAPABILITY: CapabilityName = "audit"
+STATE_CAPABILITY: CapabilityName = "state"
+ALL_CAPABILITIES: frozenset[CapabilityName] = frozenset(
+    {
+        CORE_CAPABILITY,
+        OAUTH_CAPABILITY,
+        SESSIONS_CAPABILITY,
+        CONSULTATIONS_CAPABILITY,
+        FEDERATION_CAPABILITY,
+        AUDIT_CAPABILITY,
+        STATE_CAPABILITY,
+    }
+)
+
+
+class BackendCapabilityMissing(HTTPException):
+    """Raised when a caller reaches a repository unsupported by a backend."""
+
+    def __init__(self, capability: str, backend_name: str | None = None, status_code: int = 503):
+        self.capability = capability
+        self.backend_name = backend_name
+        suffix = f" for {backend_name}" if backend_name else ""
+        super().__init__(
+            status_code=status_code,
+            detail=f"persistence backend does not support {capability!r}{suffix}",
+        )
+
+
+class PersistenceCapabilityBase(Protocol):
+    """Common facade shape shared by every persistence capability."""
+
     def transactional(self) -> AsyncContextManager[Transaction]:
         """Open a backend-neutral transaction context."""
         ...
+
+    @property
+    def capabilities(self) -> set[str]:
+        """Capability names implemented by this backend."""
+        ...
+
+    async def ping(self) -> bool: ...
+
+    async def close(self) -> None: ...
+
+
+@runtime_checkable
+class CorePersistence(PersistenceCapabilityBase, Protocol):
+    """Core memory/category/search persistence surface."""
+
+    _supports_core_persistence: Literal[True]
 
     async def record_usage_ledger(
         self,
@@ -1260,48 +1321,72 @@ class PersistenceBackend(ABC):
         raise NotImplementedError("usage_ledger is Postgres-only")
 
     @property
-    @abstractmethod
     def memories(self) -> MemoryRepository: ...
 
     @property
-    @abstractmethod
     def kg_triples(self) -> KGRepository: ...
 
     @property
-    @abstractmethod
     def memory_versions(self) -> VersionRepository: ...
 
     @property
-    @abstractmethod
     def memory_branches(self) -> BranchRepository: ...
 
     @property
-    @abstractmethod
     def compression(self) -> CompressionRepository: ...
 
     @property
-    @abstractmethod
     def webhooks(self) -> WebhookRepository: ...
 
     @property
-    @abstractmethod
     def consultations_audit(self) -> ConsultationAuditRepository: ...
 
+
+@runtime_checkable
+class OAuthPersistence(PersistenceCapabilityBase, Protocol):
+    """OAuth provider, identity, token, and browser-session persistence."""
+
+    _supports_oauth_persistence: Literal[True]
+
     @property
-    @abstractmethod
     def oauth(self) -> OAuthRepository: ...
 
+
+@runtime_checkable
+class SessionsPersistence(PersistenceCapabilityBase, Protocol):
+    """Chat session and session-log persistence."""
+
+    _supports_sessions_persistence: Literal[True]
+
     @property
-    @abstractmethod
     def sessions(self) -> SessionsRepository: ...
 
-    @property
-    @abstractmethod
-    def consultations(self) -> ConsultationsRepository: ...
+
+@runtime_checkable
+class ConsultationsPersistence(PersistenceCapabilityBase, Protocol):
+    """GRAEAE consultation persistence."""
+
+    _supports_consultations_persistence: Literal[True]
 
     @property
-    @abstractmethod
+    def consultations(self) -> ConsultationsRepository: ...
+
+
+@runtime_checkable
+class FederationPersistence(PersistenceCapabilityBase, Protocol):
+    """Federation peers, sync log, and feed-query persistence."""
+
+    _supports_federation_persistence: Literal[True]
+
+    @property
     def federation(self) -> FederationRepository: ...
+
+
+@runtime_checkable
+class AuditPersistence(PersistenceCapabilityBase, Protocol):
+    """Memory audit-chain and audit-root persistence."""
+
+    _supports_audit_persistence: Literal[True]
 
     @property
     def audit_chain(self) -> AuditChainRepository | None:
@@ -1315,15 +1400,36 @@ class PersistenceBackend(ABC):
         """
         return None
 
-    @abstractmethod
-    async def ping(self) -> bool: ...
+
+@runtime_checkable
+class StatePersistence(PersistenceCapabilityBase, Protocol):
+    """Job-state, distillation-state, and generic state-kv persistence."""
+
+    _supports_state_persistence: Literal[True]
 
     @property
-    @abstractmethod
     def state_kv(self) -> StateRepository: ...
 
-    @abstractmethod
-    async def close(self) -> None: ...
+
+PersistenceBackend: TypeAlias = Union[
+    CorePersistence,
+    OAuthPersistence,
+    SessionsPersistence,
+    ConsultationsPersistence,
+    FederationPersistence,
+    AuditPersistence,
+    StatePersistence,
+]
+
+
+def has_capability(backend: object, capability: str) -> bool:
+    capabilities = getattr(backend, "capabilities", set())
+    return capability in capabilities
+
+
+def require_capability(backend: object, capability: str) -> None:
+    if not has_capability(backend, capability):
+        raise BackendCapabilityMissing(capability, type(backend).__name__)
 
 
 @asynccontextmanager

@@ -41,7 +41,6 @@ from mnemos.persistence.base import (
     MemoryRepository,
     MemoryStatsRow,
     OAuthRepository,
-    PersistenceBackend,
     SessionsRepository,
     StateRepository,
     Transaction,
@@ -3513,8 +3512,16 @@ class SqliteAuditChainRepository(_SqliteRepository, AuditChainRepository):
         return {r["memory_id"]: r for r in rows}
 
 
-class SqliteBackend(PersistenceBackend):
+class SqliteBackend:
     """SQLite persistence facade backed by one serialized connection."""
+
+    _supports_core_persistence = True
+    _supports_oauth_persistence = True
+    _supports_sessions_persistence = True
+    _supports_consultations_persistence = True
+    _supports_federation_persistence = True
+    _supports_audit_persistence = True
+    _supports_state_persistence = True
 
     supports_listen_notify = False
     supports_advisory_locks = False
@@ -3551,6 +3558,10 @@ class SqliteBackend(PersistenceBackend):
     @property
     def vec_loaded(self) -> bool:
         return self._vec_loaded
+
+    @property
+    def capabilities(self) -> set[str]:
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
 
     async def record_usage_ledger(
         self,

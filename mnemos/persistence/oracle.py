@@ -40,7 +40,6 @@ from mnemos.persistence.base import (
     KGRepository,
     MemoryRepository,
     OAuthRepository,
-    PersistenceBackend,
     SessionsRepository,
     StateRepository,
     Transaction,
@@ -3651,8 +3650,13 @@ class OracleAuditChainRepository(AuditChainRepository):
             await _call(cursor.close)
 
 
-class OracleBackend(PersistenceBackend):
+class OracleBackend:
     """Oracle persistence facade backed by a python-oracledb async pool."""
+
+    _supports_core_persistence = True
+    _supports_federation_persistence = True
+    _supports_audit_persistence = True
+    _supports_state_persistence = True
 
     supports_listen_notify = False
     supports_advisory_locks = False
@@ -3684,6 +3688,10 @@ class OracleBackend(PersistenceBackend):
     @property
     def pool(self) -> Any:
         return self._pool
+
+    @property
+    def capabilities(self) -> set[str]:
+        return {"core", "federation", "audit", "state"}
 
     @asynccontextmanager
     async def transactional(self) -> AsyncIterator[Transaction]:

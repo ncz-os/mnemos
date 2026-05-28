@@ -33,6 +33,7 @@ from mnemos.audit import (
     merkle_leaf,
     merkle_root,
 )
+from mnemos.persistence.base import AuditPersistence
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ class AuditSealer:
 
     def __init__(
         self,
-        backend: Any,
+        backend: AuditPersistence,
         *,
         window_seconds: int = DEFAULT_WINDOW_SECONDS,
         batch_size: int = DEFAULT_BATCH_SIZE,
