@@ -23,6 +23,7 @@ from mnemos.api.routes.journal import router as journal_router
 from mnemos.api.routes.kronos import router as kronos_router
 from mnemos.api.routes.kg import router as kg_router
 from mnemos.api.routes.knemon_dashboard import router as knemon_dashboard_router
+from mnemos.api.routes.knemon_utilization import router as knemon_utilization_router
 from mnemos.api.routes.ledger import router as ledger_router
 from mnemos.api.routes.memories import router as memories_router
 from mnemos.api.routes.morpheus import router as morpheus_router
@@ -338,6 +339,7 @@ app.include_router(consultations_router)  # v3.0.0: Unified /v1/consultations (G
 app.include_router(providers_router)  # v3.0.0: Unified /v1/providers (model routing)
 app.include_router(ledger_router)  # KNEMON MVP Step 1: token/cost usage ledger
 app.include_router(knemon_dashboard_router)  # KNEMON dashboard and read-side ledger analytics
+app.include_router(knemon_utilization_router)  # KNEMON subscription-plan utilization analytics
 app.include_router(openai_compat_router)  # Phase 0: OpenAI-compatible gateway
 app.include_router(pantheon_router)  # PANTHEON v0.1: unified LLM facade (503-gated when disabled)
 app.include_router(sessions_router)  # Phase 0: Session management for stateful chat
