@@ -1129,9 +1129,73 @@ class OracleHiveMindRepository(HiveMindRepository):
             )
             conn.commit()
 
-    async def list_messages(self, **kwargs: Any) -> list[dict[str, Any]]:
-        # TODO(Phase-2): messages are outside the four-table Oracle hive spec.
-        raise NotImplementedError("Oracle message storage is not in Phase-2 scope.")
+    async def list_messages(
+        self,
+        *,
+        to_urn: Optional[str] = None,
+        topic: Optional[str] = None,
+        since_ts: Optional[float] = None,
+        limit: int = 100,
+        **_legacy: Any,
+    ) -> list[dict[str, Any]]:
+        """Recent messages from hive_messages (option B: reuse agent_bus-owned table)."""
+        return await self._run(
+            self._list_messages_sync,
+            to_urn=to_urn,
+            topic=topic,
+            since_ts=since_ts,
+            limit=int(limit),
+        )
+
+    def _list_messages_sync(
+        self,
+        *,
+        to_urn: Optional[str],
+        topic: Optional[str],
+        since_ts: Optional[float],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        sql = (
+            "SELECT id, from_urn, to_urn, in_reply_to, topic, payload, ts "
+            "FROM hive_messages WHERE 1=1"
+        )
+        params: dict[str, Any] = {}
+        if to_urn is not None:
+            sql += " AND to_urn = :to_urn"
+            params["to_urn"] = to_urn
+        if topic is not None:
+            sql += " AND topic = :topic"
+            params["topic"] = topic
+        if since_ts is not None:
+            sql += " AND ts >= :since_ts"
+            params["since_ts"] = float(since_ts)
+        sql += " ORDER BY ts DESC FETCH FIRST :lim ROWS ONLY"
+        params["lim"] = max(1, min(int(limit), 1000))
+        with self._pool.acquire() as conn:
+            cur = self._execute(conn, sql, params)
+            rows = cur.fetchall() if hasattr(cur, "fetchall") else []
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                # hive_messages.id + in_reply_to are VARCHAR2(64) UUIDs (not RAW).
+                rid = str(r[0]) if r and r[0] is not None else ""
+                payload_raw = r[5]
+                try:
+                    payload = (
+                        payload_raw if isinstance(payload_raw, (dict, list))
+                        else (_json_loads(payload_raw) if payload_raw else {})
+                    )
+                except Exception:
+                    payload = {"_raw": str(payload_raw)}
+                out.append({
+                    "id": rid,
+                    "from_urn": r[1],
+                    "to_urn": r[2],
+                    "in_reply_to": (str(r[3]) if r[3] is not None else None),
+                    "topic": r[4],
+                    "payload": payload,
+                    "ts": float(r[6]) if r[6] is not None else 0.0,
+                })
+            return out
 
     async def emit_event(
         self,
@@ -1180,17 +1244,194 @@ class OracleHiveMindRepository(HiveMindRepository):
                 self._execute(conn, sql, params)
             conn.commit()
 
-    async def tail_events(self, **kwargs: Any) -> list[dict[str, Any]]:
-        # TODO(Phase-2): events are outside the four-table Oracle hive spec.
-        raise NotImplementedError("Oracle event storage is not in Phase-2 scope.")
+    async def tail_events(
+        self,
+        *,
+        kind: Optional[str] = None,
+        agent_urn: Optional[str] = None,
+        since_ts: Optional[float] = None,
+        limit: int = 100,
+        **_legacy: Any,
+    ) -> list[dict[str, Any]]:
+        """Recent events from hive_events (option B: reuse agent_bus-owned table)."""
+        return await self._run(
+            self._tail_events_sync,
+            kind=kind,
+            agent_urn=agent_urn,
+            since_ts=since_ts,
+            limit=int(limit),
+        )
 
-    async def cache_record_hit(self, **kwargs: Any) -> None:
-        # TODO(Phase-2): memory_hive_cache has no hit counters in this schema.
-        raise NotImplementedError("Oracle cache hit accounting is not in Phase-2 scope.")
+    def _tail_events_sync(
+        self,
+        *,
+        kind: Optional[str],
+        agent_urn: Optional[str],
+        since_ts: Optional[float],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT id, ts, kind, payload, agent_urn FROM hive_events WHERE 1=1"
+        params: dict[str, Any] = {}
+        if kind is not None:
+            sql += " AND kind = :kind"
+            params["kind"] = kind
+        if agent_urn is not None:
+            sql += " AND agent_urn = :agent_urn"
+            params["agent_urn"] = agent_urn
+        if since_ts is not None:
+            sql += " AND ts >= :since_ts"
+            params["since_ts"] = float(since_ts)
+        sql += " ORDER BY ts DESC, id DESC FETCH FIRST :lim ROWS ONLY"
+        params["lim"] = max(1, min(int(limit), 5000))
+        with self._pool.acquire() as conn:
+            cur = self._execute(conn, sql, params)
+            rows = cur.fetchall() if hasattr(cur, "fetchall") else []
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                payload_raw = r[3]
+                try:
+                    payload = (
+                        payload_raw if isinstance(payload_raw, (dict, list))
+                        else (_json_loads(payload_raw) if payload_raw else {})
+                    )
+                except Exception:
+                    payload = {"_raw": str(payload_raw)}
+                out.append({
+                    "id": int(r[0]) if r[0] is not None else 0,
+                    "ts": float(r[1]) if r[1] is not None else 0.0,
+                    "kind": r[2],
+                    "payload": payload,
+                    "agent_urn": r[4],
+                })
+            return out
 
-    async def stats_costs(self, **kwargs: Any) -> dict[str, Any]:
-        # TODO(Phase-2): cost stats need job token/cost columns not in this schema.
-        raise NotImplementedError("Oracle cost stats are not in Phase-2 scope.")
+    async def cache_record_hit(
+        self,
+        *,
+        cache_key: str,
+        delta: int = 1,
+        **_legacy: Any,
+    ) -> None:
+        """Increment hits counter for cache_key. Best-effort ALTER TABLE adds the
+        hits column on first call (idempotent via ORA-01430 swallow); subsequent
+        calls UPDATE only. Failures are silent so cache reads stay usable on
+        snapshots that disallow ALTER — schema owners should land hits via
+        proper migration."""
+        await self._run(
+            self._cache_record_hit_sync,
+            cache_key=cache_key,
+            delta=int(delta),
+        )
+
+    def _cache_record_hit_sync(
+        self,
+        *,
+        cache_key: str,
+        delta: int,
+    ) -> None:
+        with self._pool.acquire() as conn:
+            try:
+                self._execute(
+                    conn,
+                    "ALTER TABLE memory_hive_cache ADD (hits NUMBER DEFAULT 0 NOT NULL)",
+                    None,
+                )
+                conn.commit()
+            except Exception as exc:
+                msg = str(exc)
+                if "ORA-01430" not in msg and "ORA-00955" not in msg:
+                    return
+            try:
+                self._execute(
+                    conn,
+                    "UPDATE memory_hive_cache SET hits = NVL(hits,0) + :delta "
+                    "WHERE cache_key = :ck",
+                    {"delta": int(delta), "ck": cache_key},
+                )
+                conn.commit()
+            except Exception:
+                pass
+
+    async def stats_costs(
+        self,
+        *,
+        since_ts: Optional[float] = None,
+        limit: int = 100,
+        **_legacy: Any,
+    ) -> dict[str, Any]:
+        """Aggregate cost/token totals from memory_worker_kind_stats. Returns
+        {total, by_agent, by_kind}. since_ts filter on last_seen_at."""
+        return await self._run(
+            self._stats_costs_sync,
+            since_ts=since_ts,
+            limit=int(limit),
+        )
+
+    def _stats_costs_sync(
+        self,
+        *,
+        since_ts: Optional[float],
+        limit: int,
+    ) -> dict[str, Any]:
+        where = ""
+        params: dict[str, Any] = {}
+        if since_ts is not None:
+            where = " WHERE last_seen_at >= :since_ts"
+            params["since_ts"] = float(since_ts)
+        with self._pool.acquire() as conn:
+            cur = self._execute(
+                conn,
+                "SELECT NVL(SUM(tokens_in),0), NVL(SUM(tokens_out),0), "
+                "NVL(SUM(est_cost_usd),0), COUNT(DISTINCT agent_urn), "
+                "COUNT(DISTINCT kind) FROM memory_worker_kind_stats" + where,
+                params,
+            )
+            tr = cur.fetchone() if hasattr(cur, "fetchone") else None
+            total = {
+                "tokens_in": int(tr[0]) if tr else 0,
+                "tokens_out": int(tr[1]) if tr else 0,
+                "est_cost_usd": float(tr[2]) if tr else 0.0,
+                "distinct_agents": int(tr[3]) if tr else 0,
+                "distinct_kinds": int(tr[4]) if tr else 0,
+            }
+            lim = max(1, min(int(limit), 1000))
+            params_lim = dict(params)
+            params_lim["lim"] = lim
+            cur = self._execute(
+                conn,
+                "SELECT agent_urn, SUM(tokens_in), SUM(tokens_out), "
+                "SUM(est_cost_usd) FROM memory_worker_kind_stats" + where +
+                " GROUP BY agent_urn ORDER BY 4 DESC "
+                "FETCH FIRST :lim ROWS ONLY",
+                params_lim,
+            )
+            by_agent = [
+                {
+                    "agent_urn": r[0],
+                    "tokens_in": int(r[1]) if r[1] is not None else 0,
+                    "tokens_out": int(r[2]) if r[2] is not None else 0,
+                    "est_cost_usd": float(r[3]) if r[3] is not None else 0.0,
+                }
+                for r in (cur.fetchall() if hasattr(cur, "fetchall") else [])
+            ]
+            cur = self._execute(
+                conn,
+                "SELECT kind, SUM(tokens_in), SUM(tokens_out), "
+                "SUM(est_cost_usd) FROM memory_worker_kind_stats" + where +
+                " GROUP BY kind ORDER BY 4 DESC "
+                "FETCH FIRST :lim ROWS ONLY",
+                params_lim,
+            )
+            by_kind = [
+                {
+                    "kind": r[0],
+                    "tokens_in": int(r[1]) if r[1] is not None else 0,
+                    "tokens_out": int(r[2]) if r[2] is not None else 0,
+                    "est_cost_usd": float(r[3]) if r[3] is not None else 0.0,
+                }
+                for r in (cur.fetchall() if hasattr(cur, "fetchall") else [])
+            ]
+            return {"total": total, "by_agent": by_agent, "by_kind": by_kind}
 
     async def record_worker_kind_stats(
         self,
@@ -1287,9 +1528,64 @@ class OracleHiveMindRepository(HiveMindRepository):
             )
             conn.commit()
 
-    async def stats_workers(self, **kwargs: Any) -> list[dict[str, Any]]:
-        # TODO(Phase-2): worker stats list endpoint is not in this cut.
-        raise NotImplementedError("Oracle worker stat listing is not in Phase-2 scope.")
+    async def stats_workers(
+        self,
+        *,
+        kind: Optional[str] = None,
+        since_ts: Optional[float] = None,
+        limit: int = 100,
+        **_legacy: Any,
+    ) -> list[dict[str, Any]]:
+        """List rows from memory_worker_kind_stats sorted by last_seen_at DESC,
+        est_cost_usd DESC. Optional kind/since_ts filters."""
+        return await self._run(
+            self._stats_workers_sync,
+            kind=kind,
+            since_ts=since_ts,
+            limit=int(limit),
+        )
+
+    def _stats_workers_sync(
+        self,
+        *,
+        kind: Optional[str],
+        since_ts: Optional[float],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        sql = (
+            "SELECT agent_urn, kind, claims, completions, failures, "
+            "tokens_in, tokens_out, est_cost_usd, last_seen_at "
+            "FROM memory_worker_kind_stats WHERE 1=1"
+        )
+        params: dict[str, Any] = {}
+        if kind is not None:
+            sql += " AND kind = :kind"
+            params["kind"] = kind
+        if since_ts is not None:
+            sql += " AND last_seen_at >= :since_ts"
+            params["since_ts"] = float(since_ts)
+        sql += (
+            " ORDER BY last_seen_at DESC, est_cost_usd DESC "
+            "FETCH FIRST :lim ROWS ONLY"
+        )
+        params["lim"] = max(1, min(int(limit), 1000))
+        with self._pool.acquire() as conn:
+            cur = self._execute(conn, sql, params)
+            rows = cur.fetchall() if hasattr(cur, "fetchall") else []
+            return [
+                {
+                    "agent_urn": r[0],
+                    "kind": r[1],
+                    "claims": int(r[2]) if r[2] is not None else 0,
+                    "completions": int(r[3]) if r[3] is not None else 0,
+                    "failures": int(r[4]) if r[4] is not None else 0,
+                    "tokens_in": int(r[5]) if r[5] is not None else 0,
+                    "tokens_out": int(r[6]) if r[6] is not None else 0,
+                    "est_cost_usd": float(r[7]) if r[7] is not None else 0.0,
+                    "last_seen_at": float(r[8]) if r[8] is not None else 0.0,
+                }
+                for r in rows
+            ]
 
 
 __all__ = ["OracleHiveMindRepository"]
