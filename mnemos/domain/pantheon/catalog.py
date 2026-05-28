@@ -32,8 +32,8 @@ def _cost_per_mtok(source: dict[str, Any]) -> float | None:
     explicit = source.get("cost_per_mtok")
     if explicit is not None:
         return safe_float(explicit)
-    in_cost = source.get("input_cost_per_mtok")
-    out_cost = source.get("output_cost_per_mtok")
+    in_cost = source.get("price_in", source.get("input_cost_per_mtok"))
+    out_cost = source.get("price_out", source.get("output_cost_per_mtok"))
     if in_cost is None or out_cost is None:
         cost = source.get("cost")
         if isinstance(cost, dict):
@@ -147,10 +147,20 @@ def _normalize_model(
         "capabilities": capabilities,
         "usage_tier": _usage_tier({**provider_cfg, **model_source}, quality_score, cost),
         "cost_per_mtok": cost,
+        "price_in": model_source.get("price_in") or provider_cfg.get("price_in"),
+        "price_out": model_source.get("price_out") or provider_cfg.get("price_out"),
         "input_cost_per_mtok": model_source.get("input_cost_per_mtok") or provider_cfg.get("input_cost_per_mtok"),
         "output_cost_per_mtok": model_source.get("output_cost_per_mtok") or provider_cfg.get("output_cost_per_mtok"),
         "quality_score": quality_score,
+        "arena_rank": model_source.get("arena_rank") or provider_cfg.get("arena_rank"),
+        "graeae_weight": model_source.get("graeae_weight") or provider_cfg.get("graeae_weight"),
+        "release_date": model_source.get("release_date") or provider_cfg.get("release_date"),
+        "last_synced": model_source.get("last_synced") or provider_cfg.get("last_synced"),
         "context_window": model_source.get("context_window") or provider_cfg.get("context_window"),
+        "model_max_ctx": model_source.get("model_max_ctx")
+        or model_source.get("context_window")
+        or provider_cfg.get("model_max_ctx")
+        or provider_cfg.get("context_window"),
         "max_output_tokens": model_source.get("max_output_tokens") or provider_cfg.get("max_output_tokens"),
         "p50_latency_ms": p50_latency_ms,
         "available": bool(model_source.get("available", provider_cfg.get("available", True))),
@@ -163,22 +173,36 @@ async def _registry_rows() -> list[Any]:
     pool = _lc._pool
     if pool is None:
         return []
+    queries = [
+        """
+        SELECT provider, model_id, display_name, capabilities,
+               price_in, price_out, input_cost_per_mtok, output_cost_per_mtok,
+               context_window, model_max_ctx, max_output_tokens,
+               arena_rank, COALESCE(graeae_weight, 0) AS graeae_weight,
+               release_date, last_synced, available, deprecated
+        FROM model_registry
+        WHERE available = true
+        ORDER BY provider, model_id
+        """,
+        """
+        SELECT provider, model_id, display_name, capabilities,
+               input_cost_per_mtok, output_cost_per_mtok,
+               context_window, max_output_tokens, arena_rank,
+               COALESCE(graeae_weight, 0) AS graeae_weight,
+               last_synced, available, deprecated
+        FROM model_registry
+        WHERE available = true
+        ORDER BY provider, model_id
+        """,
+    ]
     try:
         async with pool.acquire() as conn:
-            return list(
-                await conn.fetch(
-                    """
-                    SELECT provider, model_id, display_name, capabilities,
-                           input_cost_per_mtok, output_cost_per_mtok,
-                           context_window, max_output_tokens,
-                           COALESCE(graeae_weight, 0) AS graeae_weight,
-                           available, deprecated
-                    FROM model_registry
-                    WHERE available = true
-                    ORDER BY provider, model_id
-                    """
-                )
-            )
+            for query in queries:
+                try:
+                    return list(await conn.fetch(query))
+                except Exception as exc:
+                    logger.debug("[PANTHEON] model_registry catalog overlay unavailable: %s", exc)
+            return []
     except Exception as exc:
         logger.debug("[PANTHEON] model_registry catalog overlay unavailable: %s", exc)
         return []
@@ -220,10 +244,7 @@ async def list_models() -> list[dict[str, Any]]:
             )
             models[(normalized["provider"], normalized["id"])] = normalized
 
-    registry_to_graeae = {
-        cfg["registry_provider"]: name
-        for name, cfg in GRAEAE_REGISTRY_MAP.items()
-    }
+    registry_to_graeae = {cfg["registry_provider"]: name for name, cfg in GRAEAE_REGISTRY_MAP.items()}
     provider_cfgs = {name: dict(cfg) for name, cfg in engine.providers.items()}
     for row in await _registry_rows():
         registry_provider = str(_row_get(row, "provider") or "")
@@ -233,11 +254,17 @@ async def list_models() -> list[dict[str, Any]]:
             "model_id": _row_get(row, "model_id"),
             "display_name": _row_get(row, "display_name"),
             "capabilities": _row_get(row, "capabilities") or [],
+            "price_in": _row_get(row, "price_in"),
+            "price_out": _row_get(row, "price_out"),
             "input_cost_per_mtok": _row_get(row, "input_cost_per_mtok"),
             "output_cost_per_mtok": _row_get(row, "output_cost_per_mtok"),
             "context_window": _row_get(row, "context_window"),
+            "model_max_ctx": _row_get(row, "model_max_ctx"),
             "max_output_tokens": _row_get(row, "max_output_tokens"),
+            "arena_rank": _row_get(row, "arena_rank"),
             "graeae_weight": _row_get(row, "graeae_weight"),
+            "release_date": _row_get(row, "release_date"),
+            "last_synced": _row_get(row, "last_synced"),
             "available": _row_get(row, "available", True),
             "deprecated": _row_get(row, "deprecated", False),
         }

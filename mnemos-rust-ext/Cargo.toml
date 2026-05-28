@@ -1,0 +1,32 @@
+[package]
+name = "mnemos-native-search"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 vector similarity accelerator for MNEMOS search hot paths"
+license = "Apache-2.0"
+
+[lib]
+name = "mnemos_native_search"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ndarray = "0.16"
+numpy = "0.22"
+pyo3 = { version = "0.22", features = ["abi3-py311"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simd-json = "0.17"
+wide = "0.7"
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+
+[package.metadata.maturin]
+module-name = "mnemos_native_search"
+features = ["extension-module"]
+python-source = "."

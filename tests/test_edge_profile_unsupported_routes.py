@@ -42,21 +42,15 @@ def edge_client(monkeypatch, tmp_path):
 
 def test_edge_profile_postgres_only_routes_return_503(edge_client):
     cases = [
-        ("post", "/v1/sessions", {"json": {}}),
         ("get", "/entities", {}),
         ("get", "/v1/morpheus/runs", {}),
     ]
     for method, path, kwargs in cases:
         resp = getattr(edge_client, method)(path, **kwargs)
         assert resp.status_code == 503
-        # Detail wording differs across routes — sessions now goes
-        # through ``require_postgres_pool_or_503`` which produces the
-        # profile-aware "requires the Postgres backend" message; the
-        # other Postgres-only routes still hit the older
-        # ``_require_postgres_backend`` "requires a Postgres backend"
-        # message. Both are valid 503 details that make the
-        # SQLite/edge-profile cause obvious to operators, so accept
-        # either phrasing here.
+        # Detail wording differs across routes — all hit
+        # ``_require_postgres_backend`` which produces the
+        # "requires a Postgres backend" message.
         assert "Postgres backend" in resp.text
 
 

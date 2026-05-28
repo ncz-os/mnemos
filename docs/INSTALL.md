@@ -8,12 +8,12 @@ operator picks a deployment shape instead of hand-selecting every subsystem.
 
 | Install | Command | Use it for |
 |---|---|---|
-| Core | `pip install mnemos-os==5.0.1` | Memory CRUD, search, version DAG, federation, auth/RLS, GRAEAE, MCP, webhooks |
-| Edge | `pip install 'mnemos-os[edge]==5.0.1'` | SQLite-only edge devices with `aiosqlite` and `sqlite-vec` |
-| Server | `pip install 'mnemos-os[server]==5.0.1'` | Production Postgres deployments with NATS, PERSEPHONE, and PANTHEON |
-| ML | `pip install 'mnemos-os[ml]==5.0.1'` | Compression-heavy and dream-state-active deployments |
-| Interop | `pip install 'mnemos-os[interop]==5.0.1'` | Cross-platform agent fleets using the KNOSSOS/MemPalace shim |
-| Full | `pip install 'mnemos-os[full]==5.0.1'` | All optional MNEMOS subsystems |
+| Core | `pip install mnemos-os==6.0.0rc1` | Memory CRUD, search, version DAG, federation, auth/RLS, GRAEAE, MCP, webhooks |
+| Edge | `pip install 'mnemos-os[edge]==6.0.0rc1'` | SQLite-only edge devices with `aiosqlite` and `sqlite-vec` |
+| Server | `pip install 'mnemos-os[server]==6.0.0rc1'` | Production Postgres deployments with NATS, PERSEPHONE, and PANTHEON |
+| ML | `pip install 'mnemos-os[ml]==6.0.0rc1'` | Compression-heavy and dream-state-active deployments |
+| Interop | `pip install 'mnemos-os[interop]==6.0.0rc1'` | Cross-platform agent fleets using the KNOSSOS/MemPalace shim |
+| Full | `pip install 'mnemos-os[full]==6.0.0rc1'` | All optional MNEMOS subsystems |
 | Oracle (enterprise) | `pip install 'mnemos-os[oracle]'` (or source on `feat/oracle-port`) | Oracle Database 26ai backend (HNSW INMEMORY NEIGHBOR GRAPH, JSON Duality, TDE) |
 | Db2 (enterprise) | `pip install 'mnemos-os[db2]'` (or source on `feat/oracle-port`) | IBM Db2 12.1.5 backend (DiskANN VECTOR(768, FLOAT32)) |
 | Enterprise (both) | `pip install 'mnemos-os[server,enterprise]'` | server bundle + Oracle + Db2 drivers |
@@ -31,8 +31,8 @@ python -m pip install -e '.[dev,server,enterprise]'
 Extras compose normally:
 
 ```bash
-pip install 'mnemos-os[server,ml]==5.0.1'
-pip install 'mnemos-os[edge,interop]==5.0.1'
+pip install 'mnemos-os[server,ml]==6.0.0rc1'
+pip install 'mnemos-os[edge,interop]==6.0.0rc1'
 ```
 
 `server,ml` is the usual production-plus-dream-state shape: Postgres + NATS +
@@ -85,7 +85,7 @@ PERSEPHONE/PANTHEON plus MORPHEUS/KRONOS/APOLLO/ARTEMIS/hot-path acceleration.
 Upgrade the existing environment with the extra and restart MNEMOS:
 
 ```bash
-pip install 'mnemos-os[persephone]==5.0.1'
+pip install 'mnemos-os[persephone]==6.0.0rc1'
 systemctl restart mnemos
 ```
 
@@ -284,13 +284,13 @@ all-bundled install. After this change it is core-only.
 If you were on v5.0.0 and want the old all-bundled behavior:
 
 ```bash
-pip install 'mnemos-os[full]==5.0.1'
+pip install 'mnemos-os[full]==6.0.0rc1'
 ```
 
 If you only need production server features:
 
 ```bash
-pip install 'mnemos-os[server]==5.0.1'
+pip install 'mnemos-os[server]==6.0.0rc1'
 ```
 
 ### Migrating to Oracle Database 26ai or Db2 12.1.5

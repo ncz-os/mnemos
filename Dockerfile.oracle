@@ -1,0 +1,56 @@
+# MNEMOS-OS Dockerfile — Oracle 23ai-profile image (PYTHIA production).
+#
+# Extends the default PG-profile Dockerfile with oracledb (Python thin-mode
+# driver — no Oracle Instant Client required). asyncpg + libpq5 still
+# bundled so PG fallback works for cross-backend parity tests + edge
+# profiles, but PYTHIA Oracle is the production target.
+#
+# Build:
+#   docker build -f Dockerfile.oracle -t mnemos-os:oracle .
+#
+# Run (PYTHIA pythia-oracle at host 192.168.207.67:1521 PDB ORCLPDB1):
+#   docker run -d --name mnemos-oracle \
+#     --restart=always \
+#     -p 5002:5002 \
+#     -e MNEMOS_DATABASE_DSN='oracle://mnemos:mnemos_dev@192.168.207.67:1521/ORCLPDB1' \
+#     -e MNEMOS_PERSISTENCE_BACKEND=oracle \
+#     mnemos-os:oracle
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libpq-dev curl git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+COPY pyproject.toml .
+COPY requirements.txt .
+
+RUN uv pip install --system -r requirements.txt && \
+    uv pip install --system "oracledb>=4.0.1"
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 libgomp1 curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+COPY . .
+
+RUN python -m pip install --no-deps --no-build-isolation .
+
+ENV PYTHONUNBUFFERED=1
+ENV MNEMOS_PERSISTENCE_BACKEND=oracle
+
+EXPOSE 5002
+
+CMD ["python", "-m", "uvicorn", "mnemos.api.main:app", "--host", "0.0.0.0", "--port", "5002"]

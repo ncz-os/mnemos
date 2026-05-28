@@ -24,6 +24,12 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+from mnemos.persistence.postgres import (
+    PostgresConsultationAuditRepository,
+    PostgresConsultationsRepository,
+    PostgresTransaction,
+)
+
 
 def _content_hash(content: str) -> str:
     normalized = (content or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -349,9 +355,20 @@ class FakeBackend:
         return None
 
 
-class _PoolBackedTx:
-    def __init__(self, conn):
-        self.conn = conn
+class _PoolBackedTx(PostgresTransaction):
+    """PostgresTransaction subclass backed by a FakeConnection.
+
+    Inheriting from PostgresTransaction makes isinstance(tx, PostgresTransaction)
+    return True, so _postgres_tx(tx) in repository methods accepts it.
+    """
+
+    def __init__(self, conn) -> None:
+        # Bypass PostgresTransaction.__init__ (requires asyncpg.Connection + tx)
+        # and set the same attributes directly.
+        self._conn = conn
+        self._tx = None
+        self._closed = False
+        self._after_commit = []
 
     async def commit(self) -> None:
         return None
@@ -598,7 +615,8 @@ class FakePoolBackedBackend:
         self._kg_triples = _FakeRepo()
         self._memory_versions = _FakeRepo()
         self._memory_branches = _FakeRepo()
-        self._consultations_audit = _FakeRepo()
+        self._consultations_audit = PostgresConsultationAuditRepository()
+        self._consultations = PostgresConsultationsRepository()
         self._federation = _FakeRepo()
         self._state_kv = _FakeRepo()
 
@@ -625,6 +643,10 @@ class FakePoolBackedBackend:
     @property
     def webhooks(self):
         return self._webhooks
+
+    @property
+    def consultations(self):
+        return self._consultations
 
     @property
     def consultations_audit(self):
