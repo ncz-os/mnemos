@@ -33,3 +33,8 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
 
 CREATE INDEX IF NOT EXISTS usage_ledger_ts_idx ON usage_ledger(ts);
 CREATE INDEX IF NOT EXISTS usage_ledger_model_idx ON usage_ledger(provider, model);
+
+GRANT SELECT, INSERT ON usage_ledger TO mnemos_user;
+GRANT USAGE, SELECT ON SEQUENCE usage_ledger_id_seq TO mnemos_user;
+GRANT SELECT, INSERT ON usage_ledger TO mnemos;
+GRANT USAGE, SELECT ON SEQUENCE usage_ledger_id_seq TO mnemos;
