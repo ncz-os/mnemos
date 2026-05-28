@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Literal
 
@@ -11,6 +12,8 @@ import mnemos.core.lifecycle as lifecycle
 from mnemos.domain.graeae.engine import get_graeae_engine
 from mnemos.domain.pantheon import triage
 from mnemos.persistence.base import UsageLedgerRecord
+
+logger = logging.getLogger(__name__)
 
 
 class Task(BaseModel):
@@ -61,8 +64,10 @@ def _usage_value(result: Any, key: str) -> int:
 
 async def _record_usage(record: UsageLedgerRecord) -> None:
     backend = lifecycle._persistence_backend
+    if backend is None:
+        raise RuntimeError("usage_ledger requires a configured persistence backend")
     recorder = getattr(backend, "record_usage_ledger", None)
-    if backend is None or recorder is None:
+    if recorder is None:
         raise RuntimeError("usage_ledger requires a configured persistence backend")
     async with backend.transactional() as tx:
         await recorder(tx, record)
@@ -102,20 +107,29 @@ async def call(task: Task | dict[str, Any]) -> dict[str, Any]:
         latency_ms = int((time.monotonic() - started) * 1000)
         if isinstance(result, dict) and result.get("latency_ms") is not None:
             latency_ms = max(0, int(result["latency_ms"]))
-        await _record_usage(
-            UsageLedgerRecord(
-                provider=provider,
-                model=model,
-                task_kind=request.task_kind,
-                tokens_in=_usage_value(result, "tokens_in"),
-                tokens_out=_usage_value(result, "tokens_out"),
-                tokens_reasoning=_usage_value(result, "tokens_reasoning"),
-                latency_ms=latency_ms,
-                outcome=outcome,
-                caller_subsystem=request.caller_subsystem,
-                tier=request.tier,
+        try:
+            await _record_usage(
+                UsageLedgerRecord(
+                    provider=provider,
+                    model=model,
+                    task_kind=request.task_kind,
+                    tokens_in=_usage_value(result, "tokens_in"),
+                    tokens_out=_usage_value(result, "tokens_out"),
+                    tokens_reasoning=_usage_value(result, "tokens_reasoning"),
+                    latency_ms=latency_ms,
+                    outcome=outcome,
+                    caller_subsystem=request.caller_subsystem,
+                    tier=request.tier,
+                )
             )
-        )
+        except Exception:
+            logger.warning(
+                "usage_ledger recording failed for provider=%s model=%s task_kind=%s",
+                provider,
+                model,
+                request.task_kind,
+                exc_info=True,
+            )
 
 
 __all__ = ["Task", "call"]
