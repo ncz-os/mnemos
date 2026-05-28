@@ -1,6 +1,6 @@
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PySequence, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PySequence, PyTuple};
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
 
@@ -85,6 +85,142 @@ fn get_json_or_default(row: &Bound<'_, PyDict>, keys: &[&str], default: Value) -
     }
 }
 
+fn get_json_or_null(row: &Bound<'_, PyDict>, keys: &[&str]) -> PyResult<Value> {
+    get_json_or_default(row, keys, Value::Null)
+}
+
+fn iso_json_or_null(row: &Bound<'_, PyDict>, keys: &[&str]) -> PyResult<Value> {
+    match get_optional(row, keys)? {
+        Some(value) => Ok(Value::String(py_to_iso_string(&value)?)),
+        None => Ok(Value::Null),
+    }
+}
+
+fn py_to_iso_string(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(isoformat) = value.getattr("isoformat") {
+        if isoformat.is_callable() {
+            return isoformat.call0()?.extract::<String>();
+        }
+    }
+    value.str()?.extract::<String>()
+}
+
+fn metadata_json(row: &Bound<'_, PyDict>) -> PyResult<Value> {
+    match get_optional(row, &["metadata"])? {
+        Some(value) => {
+            if let Ok(raw) = value.extract::<String>() {
+                if raw.is_empty() {
+                    return Ok(Value::Null);
+                }
+                serde_json::from_str(&raw).map_err(|err| {
+                    PyValueError::new_err(format!("metadata is not valid JSON: {err}"))
+                })
+            } else {
+                py_to_json(&value)
+            }
+        }
+        None => Ok(Value::Null),
+    }
+}
+
+fn row_has_non_null(row: &Bound<'_, PyDict>, key: &str) -> PyResult<bool> {
+    Ok(row.get_item(key)?.is_some_and(|value| !value.is_none()))
+}
+
+fn serialize_memory_item_value(row: &Bound<'_, PyDict>) -> PyResult<Value> {
+    let mut object = Map::with_capacity(27);
+    object.insert("id".to_string(), py_to_json(&get_required(row, &["id"])?)?);
+    object.insert(
+        "content".to_string(),
+        py_to_json(&get_required(row, &["content"])?)?,
+    );
+    object.insert(
+        "category".to_string(),
+        py_to_json(&get_required(row, &["category"])?)?,
+    );
+    object.insert("subcategory".to_string(), get_json_or_null(row, &["subcategory"])?);
+    object.insert(
+        "created".to_string(),
+        Value::String(py_to_iso_string(&get_required(row, &["created", "created_at"])?)?),
+    );
+    object.insert("updated".to_string(), iso_json_or_null(row, &["updated", "updated_at"])?);
+    object.insert("metadata".to_string(), metadata_json(row)?);
+    object.insert("quality_rating".to_string(), get_json_or_null(row, &["quality_rating"])?);
+    object.insert(
+        "compressed_content".to_string(),
+        get_json_or_null(row, &["compressed_content"])?,
+    );
+    object.insert(
+        "verbatim_content".to_string(),
+        get_json_or_null(row, &["verbatim_content"])?,
+    );
+    object.insert("source".to_string(), Value::String("openclaw".to_string()));
+    object.insert("owner_id".to_string(), get_json_or_null(row, &["owner_id"])?);
+    object.insert("group_id".to_string(), get_json_or_null(row, &["group_id"])?);
+    object.insert("namespace".to_string(), get_json_or_null(row, &["namespace"])?);
+    object.insert(
+        "permission_mode".to_string(),
+        get_json_or_null(row, &["permission_mode"])?,
+    );
+    object.insert("source_model".to_string(), get_json_or_null(row, &["source_model"])?);
+    object.insert(
+        "source_provider".to_string(),
+        get_json_or_null(row, &["source_provider"])?,
+    );
+    object.insert(
+        "source_session".to_string(),
+        get_json_or_null(row, &["source_session"])?,
+    );
+    object.insert("source_agent".to_string(), get_json_or_null(row, &["source_agent"])?);
+    object.insert("archived_at".to_string(), iso_json_or_null(row, &["archived_at"])?);
+    object.insert(
+        "archived".to_string(),
+        Value::Bool(row_has_non_null(row, "archived_at")?),
+    );
+    object.insert("embedding".to_string(), get_json_or_null(row, &["embedding"])?);
+    object.insert(
+        "embedding_model".to_string(),
+        get_json_or_null(row, &["embedding_model"])?,
+    );
+    object.insert(
+        "embedding_dim".to_string(),
+        get_json_or_null(row, &["embedding_dim"])?,
+    );
+    object.insert(
+        "audit_latest_entry_id".to_string(),
+        get_json_or_null(row, &["audit_latest_entry_id"])?,
+    );
+    object.insert(
+        "audit_latest_entry_hash".to_string(),
+        get_json_or_null(row, &["audit_latest_entry_hash"])?,
+    );
+    Ok(Value::Object(object))
+}
+
+fn serialize_consolidation_value(row: &Bound<'_, PyDict>) -> PyResult<Value> {
+    let mut object = Map::with_capacity(4);
+    object.insert("type".to_string(), Value::String("consolidation".to_string()));
+    object.insert("id".to_string(), py_to_json(&get_required(row, &["id"])?)?);
+    object.insert(
+        "consolidated_into".to_string(),
+        py_to_json(&get_required(row, &["consolidated_into"])?)?,
+    );
+    object.insert(
+        "consolidated_at".to_string(),
+        Value::String(py_to_iso_string(&get_required(row, &["consolidated_at"])?)?),
+    );
+    Ok(Value::Object(object))
+}
+
+fn serialize_feed_row_value(row: &Bound<'_, PyDict>) -> PyResult<Value> {
+    if let Some(item_type) = row.get_item("type")? {
+        if !item_type.is_none() && item_type.extract::<String>()? == "consolidation" {
+            return serialize_consolidation_value(row);
+        }
+    }
+    serialize_memory_item_value(row)
+}
+
 #[derive(Serialize)]
 struct FeedMemoryRow {
     id: Value,
@@ -135,6 +271,35 @@ pub fn serialize_memory_for_feed(rows: &Bound<'_, PyAny>) -> PyResult<Vec<String
         out.push(serialize_memory_row_for_feed(row)?);
     }
     Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(text_signature = "(rows, /)")]
+pub fn serialize_memory_rows<'py>(
+    py: Python<'py>,
+    rows: &Bound<'py, PyAny>,
+) -> PyResult<Py<PyBytes>> {
+    let rows = rows
+        .downcast::<PySequence>()
+        .map_err(|_| PyTypeError::new_err("rows must be a sequence of mappings"))?;
+    let row_count = rows.len()?;
+    let mut out = Vec::with_capacity(row_count.saturating_mul(512));
+    out.push(b'[');
+    for idx in 0..row_count {
+        if idx > 0 {
+            out.push(b',');
+        }
+        let row = rows.get_item(idx)?;
+        let row = row
+            .downcast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("rows must contain dict mappings"))?;
+        let value = serialize_feed_row_value(row)?;
+        serde_json::to_writer(&mut out, &value).map_err(|err| {
+            PyValueError::new_err(format!("failed to serialize federation feed row: {err}"))
+        })?;
+    }
+    out.push(b']');
+    Ok(PyBytes::new_bound(py, &out).unbind())
 }
 
 #[cfg(test)]
