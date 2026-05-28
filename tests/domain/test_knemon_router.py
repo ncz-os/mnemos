@@ -298,6 +298,17 @@ async def test_parallel_same_session_burn_tracking_serializes():
     assert backend.max_active == 1
 
 
+@pytest.mark.asyncio
+async def test_burned_g1_session_loses_near_cap_subscription_lane():
+    session_id = "burned-near-cap"
+    backend = _SqliteKnemonBackend(70, burned_session=session_id, burned_request_count=10)
+    decision = await route(_req(14, session_id), backend)
+
+    assert decision.provider == "xai"
+    assert decision.auth_method == "api"
+    assert "skipped subscription at 70.00% utilization" in decision.reasoning
+
+
 @pytest.mark.parametrize(
     ("request_count", "expected_provider"),
     [
