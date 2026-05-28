@@ -3554,6 +3554,94 @@ class Db2Backend(OracleBackend):
         # ``is_vector_indexing_enabled`` property + ``mnemos doctor``.
         self._db2_vector_indexing_value: str | None = None
 
+    async def record_usage_ledger(
+        self,
+        tx: Any,
+        record: Any,
+    ) -> Any:
+        """Record model-token usage with Db2-native INSERT/IDENTITY return.
+
+        Db2 does not support Oracle's ``RETURNING ... INTO`` through the
+        ibm_db_dbi cursor wrapper, so this uses ``FINAL TABLE`` to return the
+        generated identity and computed cost. Unknown registry prices still
+        insert the usage row with explicit zero cost and a drift warning.
+        """
+        from decimal import Decimal
+
+        from mnemos.persistence.base import UsageLedgerResult
+
+        conn = _conn_from_tx(tx)
+        cursor = conn.cursor()
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT 1 FROM model_registry WHERE provider = ? AND model_id = ?",
+                (record.provider, record.model),
+            )
+            if await _call(cursor.fetchone) is None:
+                _LOG.warning(
+                    "usage_ledger model_registry price missing for provider=%s model=%s; " "recording est_cost_usd=0",
+                    record.provider,
+                    record.model,
+                )
+
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, est_cost_usd
+                FROM FINAL TABLE (
+                    INSERT INTO usage_ledger (
+                        provider, model, task_kind, tokens_in, tokens_out,
+                        tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                        caller_subsystem, tier
+                    )
+                    VALUES (
+                        ?, ?, ?, ?, ?, ?,
+                        COALESCE((
+                            SELECT DECIMAL(
+                                (? * COALESCE(input_cost_per_mtok, 0)
+                               + ? * COALESCE(output_cost_per_mtok, 0)
+                               + ? * COALESCE(output_cost_per_mtok, 0))
+                               / 1000000,
+                               12,
+                               6
+                            )
+                            FROM model_registry
+                            WHERE provider = ? AND model_id = ?
+                        ), DECIMAL(0, 12, 6)),
+                        ?, ?, ?, ?
+                    )
+                )
+                """,
+                (
+                    record.provider,
+                    record.model,
+                    record.task_kind,
+                    record.tokens_in,
+                    record.tokens_out,
+                    record.tokens_reasoning,
+                    record.tokens_in,
+                    record.tokens_out,
+                    record.tokens_reasoning,
+                    record.provider,
+                    record.model,
+                    record.latency_ms,
+                    record.outcome,
+                    record.caller_subsystem,
+                    record.tier,
+                ),
+            )
+            row = await _call(cursor.fetchone)
+        finally:
+            await _call(cursor.close)
+
+        if row is None:
+            raise RuntimeError("usage_ledger insert returned no row")
+        return UsageLedgerResult(
+            id=int(row[0]),
+            est_cost_usd=Decimal(str(row[1])) if row[1] is not None else Decimal("0"),
+        )
+
     async def open(self) -> None:
         """Open hook — probes ``DB2_VECTOR_INDEXING`` registry var.
 
