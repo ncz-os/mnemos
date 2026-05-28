@@ -134,7 +134,7 @@ full = ["mnemos-os[morpheus,persephone,pantheon,kronos,knossos,apollo,artemis,na
 oracle = ["oracledb>=4.0.1"]  # async pool + VECTOR support; thin mode default; tested with 4.0.1
 db2 = ["ibm_db>=3.2.4"]  # ibm_db_dbi + Db2 CLI driver build
 # MySQL 9.0+ backend (aiomysql async driver). MySQL 9.0 is required for
-# native VECTOR columns and VEC_DISTANCE_COSINE / VEC_FromText functions.
+# native VECTOR columns and VECTOR_DISTANCE / TO_VECTOR functions.
 # MariaDB does NOT support native VECTOR in mainline 11.x — use MySQL 9.0+.
 mysql = ["aiomysql>=0.2.0"]
 # Enterprise bundle — all three enterprise drivers suitable for hosts that

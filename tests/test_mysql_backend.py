@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mnemos.persistence.mysql import MysqlMemoryRepository
+from mnemos.persistence.base import ALL_CAPABILITIES, CORE_CAPABILITY, CorePersistence
+from mnemos.persistence.mysql import MysqlBackend, MysqlMemoryRepository
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
 
@@ -27,6 +28,46 @@ def _tx_for_cursor(cursor):
     conn = MagicMock()
     conn.cursor = MagicMock(return_value=_AsyncCursorContext(cursor))
     return SimpleNamespace(conn=conn)
+
+
+class _AsyncPoolContext:
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+
+class _FakePool:
+    def __init__(self, conn):
+        self._conn = conn
+        self.closed = False
+
+    def acquire(self):
+        return _AsyncPoolContext(self._conn)
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        return None
+
+
+async def test_mysql_backend_advertises_core_only_and_pings():
+    cursor = MagicMock()
+    cursor.execute = AsyncMock()
+    cursor.fetchone = AsyncMock(return_value=(1,))
+    conn = MagicMock()
+    conn.cursor = MagicMock(return_value=_AsyncCursorContext(cursor))
+    backend = MysqlBackend(_FakePool(conn), SimpleNamespace(database=SimpleNamespace(embedding_dim=3)))
+
+    assert backend.capabilities == {CORE_CAPABILITY}
+    assert backend.capabilities != set(ALL_CAPABILITIES)
+    assert isinstance(backend, CorePersistence)
+    assert await backend.ping() is True
 
 
 async def test_mysql_semantic_search_without_recency_uses_visibility_params_once():
