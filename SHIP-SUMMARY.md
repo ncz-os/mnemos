@@ -25,3 +25,29 @@ Verification:
 
 Artifacts:
 - Work log: `/tmp/db2-backend-impl/codex-out.log`
+
+---
+
+Rust vector similarity extension
+
+Implemented:
+- Added `mnemos-rust-ext/` PyO3 crate exposing `mnemos_native_search`.
+- Implemented SIMD-backed cosine and batch cosine helpers with Python-compatible invalid-vector semantics.
+- Added zero-copy NumPy `float32` fast paths for batch retrieval workloads, while keeping Python list inputs supported.
+- Added `mnemos/domain/search/native_bridge.py` adapter with pure-Python fallback.
+- Added `scripts/bench_native_search.py` for native-vs-Python timing.
+- Added focused parity/fallback tests in `tests/domain/test_native_search.py`.
+
+Build:
+- Development: `cd mnemos-rust-ext && maturin develop`
+- Release: `cd mnemos-rust-ext && maturin build --release`
+
+Verification:
+- `cd mnemos-rust-ext && PYO3_PYTHON=/Users/jasonperlow/Projects/mnemos-prod-working/.venv/bin/python cargo check`
+- `cd mnemos-rust-ext && PYO3_PYTHON=/Users/jasonperlow/Projects/mnemos-prod-working/.venv/bin/python cargo test`
+- `cd mnemos-rust-ext && PYO3_PYTHON=/Users/jasonperlow/Projects/mnemos-prod-working/.venv/bin/python ../.venv/bin/maturin develop --release`
+- `.venv/bin/pytest tests/domain/test_native_search.py` passed: 6 passed.
+- `.venv/bin/python scripts/bench_native_search.py --rows 10000 --dims 384 --rounds 2`: release native-list 12.86x, native-numpy 139.25x over pure Python on this host.
+
+Artifacts:
+- Work log: `/tmp/rust-vector/codex-out.log`
