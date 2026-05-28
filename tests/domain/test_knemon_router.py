@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from mnemos.api.routes.ledger import compute_plan_window_id
+from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.core.config import get_settings
 from mnemos.domain.knemon.router import (
     KnemonRouteRequest,
@@ -65,6 +65,7 @@ class _SqliteKnemonBackend:
               provider TEXT NOT NULL,
               plan_name TEXT NOT NULL,
               auth_method TEXT NOT NULL,
+              path_kind TEXT NOT NULL DEFAULT 'api',
               monthly_usd NUMERIC,
               msg_cap NUMERIC,
               msg_window_seconds NUMERIC,
@@ -72,7 +73,10 @@ class _SqliteKnemonBackend:
               token_window_seconds NUMERIC,
               reset_anchor TEXT,
               overage_pricing_per_mtok_in NUMERIC,
-              overage_pricing_per_mtok_out NUMERIC
+              overage_pricing_per_mtok_out NUMERIC,
+              effective_from DATE NOT NULL DEFAULT '2026-01-01',
+              effective_until DATE,
+              parent_plan_id TEXT
             );
             CREATE TABLE usage_ledger (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,6 +95,7 @@ class _SqliteKnemonBackend:
               session_id TEXT,
               request_count NUMERIC NOT NULL DEFAULT 1,
               plan_window_id TEXT,
+              path_kind TEXT NOT NULL DEFAULT 'api',
               subscription_amortized INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE hive_agents (
@@ -132,9 +137,12 @@ class _SqliteKnemonBackend:
               ('nvidia', 'ngc-free', 'NGC Free', '["chat","code"]', 0, 0, 200000, 1250, 0.88, 1, 0),
               ('xai', 'grok-api', 'Grok API', '["chat","code"]', 3, 15, 200000, 1220, 0.86, 1, 0);
             INSERT INTO subscription_plans VALUES
-              ('openai', 'chatgpt_plus', 'subscription', 20, 160, 10800, NULL, NULL, 'rolling', NULL, NULL),
-              ('nvidia', 'ngc_inference', 'free', 0, NULL, NULL, NULL, NULL, 'monthly', 0, 0),
-              ('xai', 'api', 'api', NULL, NULL, NULL, NULL, NULL, 'monthly', NULL, NULL);
+              ('openai', 'chatgpt_plus', 'subscription', 'interactive', 20, 160, 10800,
+               NULL, NULL, 'rolling', NULL, NULL, '2026-01-01', NULL, NULL),
+              ('nvidia', 'ngc_inference', 'free', 'free', 0, NULL, NULL,
+               NULL, NULL, 'monthly', 0, 0, '2026-01-01', NULL, NULL),
+              ('xai', 'api', 'api', 'api', NULL, NULL, NULL,
+               NULL, NULL, 'monthly', NULL, NULL, '2026-01-01', NULL, NULL);
             """
         )
         self.conn.execute(
@@ -142,9 +150,9 @@ class _SqliteKnemonBackend:
             INSERT INTO usage_ledger (
               ts, provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
               est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
-              request_count, plan_window_id, subscription_amortized
+              request_count, plan_window_id, path_kind, subscription_amortized
             ) VALUES (?, 'openai', 'gpt-sub', 'chat', 100, 50, 0, 0, 100, 'ok',
-                      'test', 'chatgpt_plus', 'usage-fixture', ?, ?, 1)
+                      'test', 'chatgpt_plus', 'usage-fixture', ?, ?, 'api', 1)
             """,
             (now, used, window_id),
         )
@@ -155,9 +163,9 @@ class _SqliteKnemonBackend:
                 INSERT INTO usage_ledger (
                   ts, provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
                   est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
-                  request_count, plan_window_id, subscription_amortized
+                  request_count, plan_window_id, path_kind, subscription_amortized
                 ) VALUES (?, 'xai', 'grok-api', 'chat', 100, 50, 0, 0, 100, 'ok',
-                          'test', 'api', ?, ?, ?, 0)
+                          'test', 'api', ?, ?, ?, 'api', 0)
                 """,
                 (burn_ts, burned_session, burned_request_count, window_id),
             )
@@ -251,7 +259,8 @@ async def test_subscription_plan_selection_respects_exact_workspace_pool():
     backend.conn.execute(
         """
         INSERT INTO subscription_plans VALUES
-          ('openai', 'chatgpt_pro', 'subscription', 200, 200, 18000, NULL, NULL, 'rolling', NULL, NULL)
+          ('openai', 'chatgpt_pro', 'subscription', 'unmetered', 200, 200, 18000,
+           NULL, NULL, 'rolling', NULL, NULL, '2026-01-01', NULL, NULL)
         """
     )
     backend.conn.commit()
@@ -268,8 +277,8 @@ async def test_openai_no_workspace_pool_uses_chatgpt_family_for_generic_gpt_mode
     backend.conn.execute(
         """
         INSERT INTO subscription_plans VALUES
-          ('openai', 'codex_pro_200_20x', 'subscription', 200, 300, 18000,
-           NULL, NULL, 'rolling', NULL, NULL)
+          ('openai', 'codex_pro_200_20x', 'subscription', 'interactive', 200, 300, 18000,
+           NULL, NULL, 'rolling', NULL, NULL, '2026-01-01', NULL, 'codex_pro_200')
         """
     )
     backend.conn.commit()
@@ -365,8 +374,8 @@ async def test_fallback_chain_checks_subscription_utilization_for_unevaluated_ca
     backend.conn.execute(
         """
         INSERT INTO subscription_plans VALUES
-          ('anthropic', 'claude_max_100', 'subscription', 100, 160, 18000,
-           NULL, NULL, 'rolling', NULL, NULL)
+          ('anthropic', 'claude_max_100', 'subscription', 'interactive', 100, 160, 18000,
+           NULL, NULL, 'rolling', NULL, NULL, '2026-01-01', NULL, NULL)
         """
     )
     backend.conn.execute(
@@ -374,9 +383,9 @@ async def test_fallback_chain_checks_subscription_utilization_for_unevaluated_ca
         INSERT INTO usage_ledger (
           ts, provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
           est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
-          request_count, plan_window_id, subscription_amortized
+          request_count, plan_window_id, path_kind, subscription_amortized
         ) VALUES (?, 'anthropic', 'claude-sub', 'chat', 100, 50, 0, 0, 100, 'ok',
-                  'test', 'claude_max_100', 'usage-fixture', 147, ?, 1)
+                  'test', 'claude_max_100', 'usage-fixture', 147, ?, 'api', 1)
         """,
         (now, window_id),
     )
