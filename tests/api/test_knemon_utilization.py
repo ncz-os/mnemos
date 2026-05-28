@@ -25,6 +25,7 @@ class _SqliteBackend:
               provider TEXT NOT NULL,
               plan_name TEXT NOT NULL,
               auth_method TEXT NOT NULL,
+              path_kind TEXT NOT NULL DEFAULT 'api',
               monthly_usd NUMERIC,
               msg_cap NUMERIC,
               msg_window_seconds NUMERIC,
@@ -34,6 +35,9 @@ class _SqliteBackend:
               overage_pricing_per_mtok_in NUMERIC,
               overage_pricing_per_mtok_out NUMERIC,
               notes TEXT,
+              effective_from DATE NOT NULL DEFAULT '2026-01-01',
+              effective_until DATE,
+              parent_plan_id TEXT,
               PRIMARY KEY (provider, plan_name)
             );
             CREATE TABLE usage_ledger (
@@ -53,6 +57,7 @@ class _SqliteBackend:
               session_id TEXT,
               request_count NUMERIC NOT NULL DEFAULT 1,
               plan_window_id TEXT,
+              path_kind TEXT NOT NULL DEFAULT 'api',
               subscription_amortized INTEGER NOT NULL DEFAULT 0
             );
             """
@@ -61,15 +66,22 @@ class _SqliteBackend:
         self.conn.execute(
             """
             INSERT INTO subscription_plans
-            VALUES ('openai', 'chatgpt_plus', 'subscription', 20, 40, 10800,
-                    NULL, NULL, 'rolling', NULL, NULL, 'test plus')
+            VALUES ('openai', 'chatgpt_plus', 'subscription', 'interactive', 20, 160, 10800,
+                    NULL, NULL, 'rolling', NULL, NULL, 'test plus', '2026-05-28', NULL, NULL)
             """
         )
         self.conn.execute(
             """
             INSERT INTO subscription_plans
-            VALUES ('nvidia', 'ngc_inference', 'free', 0, NULL, NULL,
-                    NULL, NULL, 'monthly', 0, 0, 'test free')
+            VALUES ('openai', 'codex_pro_200_25x', 'subscription', 'interactive', 200, 375, 18000,
+                    NULL, NULL, 'rolling', NULL, NULL, 'expired promo', '2026-05-01', '2026-05-27', 'codex_plus')
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO subscription_plans
+            VALUES ('nvidia', 'ngc_inference', 'free', 'free', 0, NULL, NULL,
+                    NULL, NULL, 'monthly', 0, 0, 'test free', '2026-01-01', NULL, NULL)
             """
         )
         self.conn.execute(
@@ -77,9 +89,9 @@ class _SqliteBackend:
             INSERT INTO usage_ledger (
               ts, provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
               est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
-              request_count, plan_window_id, subscription_amortized
+              request_count, plan_window_id, path_kind, subscription_amortized
             ) VALUES (?, 'openai', 'gpt-5', 'chat', 100, 40, 0, 0, 250,
-                      'ok', 'test', 'chatgpt_plus', 's1', 2, NULL, 1)
+                      'ok', 'test', 'chatgpt_plus', 's1', 2, NULL, 'interactive', 1)
             """,
             (now,),
         )
@@ -88,9 +100,9 @@ class _SqliteBackend:
             INSERT INTO usage_ledger (
               ts, provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
               est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
-              request_count, plan_window_id, subscription_amortized
+              request_count, plan_window_id, path_kind, subscription_amortized
             ) VALUES (?, 'nvidia', 'free-model', 'chat', 100, 40, 0, 0, 100,
-                      'ok', 'test', 'ngc_inference', 's2', 1, NULL, 0)
+                      'ok', 'test', 'ngc_inference', 's2', 1, NULL, 'free', 0)
             """,
             (now,),
         )
@@ -134,8 +146,9 @@ async def test_knemon_utilization_routes_with_in_memory_sqlite(monkeypatch):
     util_rows = utilization.json()
     plus = next(row for row in util_rows if row["provider"] == "openai")
     assert plus["requests_used"] == 2
-    assert plus["msg_cap"] == 40
-    assert plus["utilization_pct"] == 5.0
+    assert plus["msg_cap"] == 160
+    assert plus["utilization_pct"] == 1.25
+    assert {row["plan_name"] for row in util_rows} == {"chatgpt_plus", "ngc_inference"}
 
     sessions = by_session.json()
     assert {row["session_id"] for row in sessions} == {"s1", "s2"}
