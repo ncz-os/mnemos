@@ -222,6 +222,65 @@ def test_subscription_plan_current_limits_deletes_superseded_claude_future_rows(
         assert "2026-05-27" not in sql, path
 
 
+def test_subscription_plan_current_limits_pin_current_codex_and_claude_caps():
+    repo_root = Path(__file__).resolve().parents[1]
+    expected_fragments = {
+        "db/migrations/0039_subscription_plan_current_limits.sql": [
+            "monthly_usd = 20, msg_cap = 15, msg_window_seconds = 18000",
+            "effective_from = DATE '2026-05-01', effective_until = NULL",
+            "WHERE provider = 'openai' AND plan_name = 'chatgpt_plus'",
+            "monthly_usd = 200, msg_cap = 375, msg_window_seconds = 18000",
+            "effective_until = DATE '2026-05-31'",
+            "WHERE provider = 'openai' AND plan_name = 'chatgpt_pro'",
+            "('openai', 'chatgpt_pro_100_codex_promo', 'subscription', 100, 160, 18000",
+            "DATE '2026-05-01', DATE '2026-05-31', 'interactive', 'chatgpt_pro_100_codex')",
+            "('openai', 'chatgpt_pro_100_codex', 'subscription', 100, 80, 18000",
+            "DATE '2026-06-01', NULL, 'interactive', 'chatgpt_pro')",
+            "('openai', 'chatgpt_pro_200_codex', 'subscription', 200, 300, 18000",
+            "('anthropic', 'claude_max_100', 'subscription', 100, 225, 18000",
+            "DATE '2026-05-28', NULL, 'interactive', NULL)",
+            "('anthropic', 'claude_max_200', 'subscription', 200, 900, 18000",
+        ],
+        "db/migrations_oracle/0039_subscription_plan_current_limits.sql": [
+            "monthly_usd = 20, msg_cap = 15, msg_window_seconds = 18000",
+            "effective_from = DATE '2026-05-01', effective_until = NULL",
+            "WHERE provider = 'openai' AND plan_name = 'chatgpt_plus'",
+            "monthly_usd = 200, msg_cap = 375, msg_window_seconds = 18000",
+            "effective_until = DATE '2026-05-31'",
+            "WHERE provider = 'openai' AND plan_name = 'chatgpt_pro'",
+            "'chatgpt_pro_100_codex_promo' plan_name, 'subscription' auth_method, 100 monthly_usd, 160 msg_cap",
+            "DATE '2026-05-01' effective_from, DATE '2026-05-31' effective_until",
+            "UNION ALL SELECT 'openai', 'chatgpt_pro_100_codex', 'subscription', 100, 80, 18000",
+            "DATE '2026-06-01', NULL, 'interactive', 'chatgpt_pro'",
+            "UNION ALL SELECT 'openai', 'chatgpt_pro_200_codex', 'subscription', 200, 300, 18000",
+            "UNION ALL SELECT 'anthropic', 'claude_max_100', 'subscription', 100, 225, 18000",
+            "DATE '2026-05-28', NULL, 'interactive', NULL",
+            "UNION ALL SELECT 'anthropic', 'claude_max_200', 'subscription', 200, 900, 18000",
+        ],
+        "db/migrations_db2/0039_subscription_plan_current_limits.sql": [
+            "monthly_usd = 20, msg_cap = 15, msg_window_seconds = 18000",
+            "effective_from = DATE('2026-05-01'), effective_until = NULL",
+            "WHERE provider = 'openai' AND plan_name = 'chatgpt_plus'",
+            "monthly_usd = 200, msg_cap = 375, msg_window_seconds = 18000",
+            "effective_until = DATE('2026-05-31')",
+            "WHERE provider = 'openai' AND plan_name = 'chatgpt_pro'",
+            "('openai', 'chatgpt_pro_100_codex_promo', 'subscription', 100, 160, 18000",
+            "DATE('2026-05-01'), DATE('2026-05-31'), 'interactive', 'chatgpt_pro_100_codex')",
+            "('openai', 'chatgpt_pro_100_codex', 'subscription', 100, 80, 18000",
+            "DATE('2026-06-01'), NULL, 'interactive', 'chatgpt_pro')",
+            "('openai', 'chatgpt_pro_200_codex', 'subscription', 200, 300, 18000",
+            "('anthropic', 'claude_max_100', 'subscription', 100, 225, 18000",
+            "DATE('2026-05-28'), NULL, 'interactive', NULL)",
+            "('anthropic', 'claude_max_200', 'subscription', 200, 900, 18000",
+        ],
+    }
+
+    for migration, fragments in expected_fragments.items():
+        sql = " ".join((repo_root / migration).read_text().split())
+        for fragment in fragments:
+            assert " ".join(fragment.split()) in sql, (migration, fragment)
+
+
 def test_sqlite_migration_list_matches_expected_order():
     repo_root = Path(__file__).resolve().parents[1]
     tree = ast.parse((repo_root / "mnemos" / "persistence" / "sqlite.py").read_text())
