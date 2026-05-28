@@ -626,16 +626,19 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
         if (row["provider"], row["model_id"]) in seen:
             continue
         plan = _best_plan(plans, row["provider"], worker_pools)
-        if str(plan.get("auth_method") or "api").lower() == "subscription" and not _worker_has_pool(worker_pools, plan):
+        auth_method = str(plan.get("auth_method") or "api").lower()
+        path_kind = str(plan.get("path_kind") or plan.get("auth_method") or "api").lower()
+        if auth_method == "subscription" and not _worker_has_pool(worker_pools, plan):
             blocked_subscription_keys.add((row["provider"], row["model_id"]))
             continue
+        requests_used, tokens_used = await _usage_for_plan(backend, plan) if auth_method == "subscription" else (0, 0)
         fallback_candidates.append(
             {
                 **row,
-                "auth_method": str(plan.get("auth_method") or "api").lower(),
-                "path_kind": str(plan.get("path_kind") or plan.get("auth_method") or "api").lower(),
+                "auth_method": auth_method,
+                "path_kind": path_kind,
                 "plan_name": plan.get("plan_name", "api"),
-                "sub_window_utilization_pct": 0.0,
+                "sub_window_utilization_pct": _utilization(plan, requests_used, tokens_used),
             }
         )
     if blocked_subscription_keys:

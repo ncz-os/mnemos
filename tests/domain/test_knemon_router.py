@@ -308,6 +308,50 @@ def test_fallback_bucket_order_and_strict_boundaries(monkeypatch, item, expected
     assert _fallback_bucket(item) == expected_bucket
 
 
+@pytest.mark.asyncio
+async def test_fallback_chain_checks_subscription_utilization_for_unevaluated_candidates():
+    backend = _SqliteKnemonBackend(92)
+    now = datetime.now(timezone.utc)
+    window_id = compute_plan_window_id(
+        "anthropic",
+        "claude_max_100",
+        now,
+        reset_anchor="rolling",
+        window_seconds=18000,
+    )
+    backend.conn.execute(
+        """
+        INSERT INTO model_registry VALUES
+          ('anthropic', 'claude-sub', 'Claude Sub', '["chat","code"]',
+           1, 5, 200000, 1200, 0.80, 1, 0)
+        """
+    )
+    backend.conn.execute(
+        """
+        INSERT INTO subscription_plans VALUES
+          ('anthropic', 'claude_max_100', 'subscription', 100, 160, 18000,
+           NULL, NULL, 'rolling', NULL, NULL)
+        """
+    )
+    backend.conn.execute(
+        """
+        INSERT INTO usage_ledger (
+          ts, provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
+          est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
+          request_count, plan_window_id, subscription_amortized
+        ) VALUES (?, 'anthropic', 'claude-sub', 'chat', 100, 50, 0, 0, 100, 'ok',
+                  'test', 'claude_max_100', 'usage-fixture', 147, ?, 1)
+        """,
+        (now, window_id),
+    )
+    backend.conn.commit()
+
+    decision = await route(_req(5), backend)
+
+    assert decision.provider == "nvidia"
+    assert decision.fallback_chain[0][0:2] == ("xai", "grok-api")
+
+
 def test_openai_subscription_aliases_split_chatgpt_and_codex():
     chatgpt_aliases = _subscription_pool_aliases({"provider": "openai", "plan_name": "chatgpt_plus"})
     codex_aliases = _subscription_pool_aliases({"provider": "openai", "plan_name": "codex_plus"})
