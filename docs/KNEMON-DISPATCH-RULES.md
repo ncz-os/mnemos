@@ -50,7 +50,7 @@ For the `codex_pro_200_25x` expiry, this audit follows the Codex-specific pricin
 
 The deprecated `claude_max_interactive_post_jun15` and `agent_sdk_credit_pool_post_jun15` rows are expired at 2026-05-31 because no current official source supports that split as an active operator assumption.
 
-The router filters `effective_from` and `effective_until` in Python after fetching rows. The comparison uses the current UTC date. That avoids Oracle-only date syntax in shared router code and prevents expired promo/tier-flip rows from winning on PostgreSQL, SQLite, or Db2 fallback paths.
+The router filters `effective_from` and `effective_until` in Python after fetching rows. The comparison uses the current UTC date. That avoids Oracle-only date syntax in shared router code and prevents expired promo/tier-flip rows from winning on PostgreSQL, Oracle, or Db2 paths. The in-memory SQLite tests exercise the same Python filter, but SQLite migration expansion is outside this plan-row refresh.
 
 ## Router Policy
 
@@ -102,7 +102,7 @@ The PR adds these operator policy defaults to `config.toml.example`, `.env.examp
 
 ## Cross-Check
 
-The audit was cross-checked with a root-only Codex muse review and an external GRAEAE consultation with the Claude provider available. Codex found no issues in the fallback, G1, burn-threshold, or plan-row audit questions. The primary follow-up was a Codex Pro parent-alias correction so exact `codex_pro_100` and `codex_pro_200` pools map to the correct promo/current rows without granting Pro access to `codex_plus`-only workspaces. GRAEAE feedback was mixed, but the actionable caveat was to keep Codex Pro promo rows, Anthropic Max planning caps, and the 2026-06-01 tier flip labeled as provider-promo/local-policy assumptions rather than provider billing facts. Direct hive submission to the online Claude worker was rejected because this session registered without a submitter URN. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
+The audit was cross-checked with a Codex muse review and an external GRAEAE consultation. Codex found no blocking issues in the fallback, G1, burn-threshold, or plan-row audit questions, and flagged SQLite migration wording plus stale-window burn coverage as follow-ups; both are addressed here. The parent-alias parity fix is included so exact `codex_pro_100` and `codex_pro_200` pools map to the correct promo/current rows without granting Pro access to `codex_plus`-only workspaces. GRAEAE agreed the rules are internally consistent and reinforced that Codex Pro promo rows, Anthropic Max planning caps, and the 2026-06-01 tier flip should stay labeled as provider-promo/local-policy assumptions rather than provider billing facts. Direct hive submission to the online Claude worker was rejected because this session registered without a submitter URN, so the external GRAEAE consultation was used as the fallback cross-check. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
 
 ## Sources
 
