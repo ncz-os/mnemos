@@ -98,7 +98,7 @@ class _SqliteBackend:
               est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
               request_count, plan_window_id, path_kind, subscription_amortized
             ) VALUES (?, 'openai', 'gpt-5', 'chat', 100, 40, 0, 0, 250,
-                      'ok', 'test', 'chatgpt_plus', 's1', 2, NULL, 'interactive', 1)
+                      'ok', 'test', 'chatgpt_plus', 's1', 2, NULL, 'api', 1)
             """,
             (now,),
         )
