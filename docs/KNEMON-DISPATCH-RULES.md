@@ -11,15 +11,15 @@ External plan facts were checked against official vendor documentation:
 
 - OpenAI Codex pricing: https://developers.openai.com/codex/pricing
 - OpenAI Codex with ChatGPT plans: https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan
-- Claude Max plan usage: https://support.claude.com/en/articles/11014257-about-claude-s-max-plan-usage
 - Claude Max plan: https://support.claude.com/en/articles/11049741-what-is-the-max-plan
 - Claude Code with Pro or Max: https://support.claude.com/en/articles/11145838-use-claude-code-with-your-pro-or-max-plan
+- Claude usage and length limits: https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work
 
 OpenAI publishes model- and surface-specific ranges, not one universal Codex
 message cap. KNEMON stores conservative local-message lower bounds using the
-most constrained current local model row, GPT-5.5. Claude Max publishes
-five-hour lower-bound estimates for the 5x and 20x tiers; KNEMON stores those as
-local planning caps for utilization accounting.
+most constrained current local model row, GPT-5.5. Claude publishes relative
+capacity tiers rather than message counts, so Claude `msg_cap` values are local
+planning caps for utilization accounting.
 
 ## Subscription Plans
 
