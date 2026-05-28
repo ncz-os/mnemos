@@ -324,6 +324,7 @@ fn mnemos_native_search(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cosine, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_batch, m)?)?;
     m.add_function(wrap_pyfunction!(federation::serialize_memory_for_feed, m)?)?;
+    m.add_function(wrap_pyfunction!(federation::serialize_memory_rows, m)?)?;
     Ok(())
 }
 
