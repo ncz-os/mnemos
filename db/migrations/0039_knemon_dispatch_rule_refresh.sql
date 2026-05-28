@@ -69,3 +69,19 @@ ON CONFLICT (provider, plan_name) DO UPDATE SET
   effective_until = EXCLUDED.effective_until,
   path_kind = EXCLUDED.path_kind,
   parent_plan_id = EXCLUDED.parent_plan_id;
+
+UPDATE usage_ledger
+SET path_kind = CASE
+  WHEN provider = 'openai' AND tier IN ('chatgpt_pro', 'chatgpt_pro_100', 'chatgpt_pro_200')
+    THEN 'unmetered'
+  ELSE 'interactive'
+END
+WHERE path_kind = 'api'
+  AND (
+    (provider = 'anthropic' AND tier IN ('claude_max_200', 'claude_max_100'))
+    OR (provider = 'openai' AND tier IN (
+      'chatgpt_plus', 'chatgpt_pro', 'chatgpt_pro_100', 'chatgpt_pro_200',
+      'codex_plus', 'codex_pro_100_10x', 'codex_pro_100_5x',
+      'codex_pro_200_25x', 'codex_pro_200_20x'
+    ))
+  );
