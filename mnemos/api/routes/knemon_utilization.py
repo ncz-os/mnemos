@@ -97,16 +97,33 @@ def _overage_cost(overage_msgs: int, plan: dict[str, Any]) -> float:
 
 
 async def _plans() -> list[dict[str, Any]]:
-    return await _rows(
-        """
-        SELECT provider, plan_name, auth_method, monthly_usd, msg_cap,
+    sql = """
+        SELECT provider, plan_name, auth_method, path_kind, monthly_usd, msg_cap,
                msg_window_seconds, token_cap, token_window_seconds,
                reset_anchor, overage_pricing_per_mtok_in,
-               overage_pricing_per_mtok_out, notes
+               overage_pricing_per_mtok_out, notes, effective_from,
+               effective_until, parent_plan_id
         FROM subscription_plans
+        WHERE effective_from <= TRUNC(SYSTIMESTAMP)
+          AND (effective_until IS NULL OR effective_until >= TRUNC(SYSTIMESTAMP))
         ORDER BY provider, plan_name
         """
-    )
+    try:
+        return await _rows(sql)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "trunc" not in msg and "effective_from" not in msg and "path_kind" not in msg:
+            raise
+        return await _rows(
+            """
+            SELECT provider, plan_name, auth_method, monthly_usd, msg_cap,
+                   msg_window_seconds, token_cap, token_window_seconds,
+                   reset_anchor, overage_pricing_per_mtok_in,
+                   overage_pricing_per_mtok_out, notes
+            FROM subscription_plans
+            ORDER BY provider, plan_name
+            """
+        )
 
 
 async def _usage_for_plan(
@@ -115,12 +132,12 @@ async def _usage_for_plan(
     params = {
         "provider": plan["provider"],
         "plan_name": plan["plan_name"],
+        "path_kind": plan.get("path_kind") or "api",
         "start_ts": start,
         "end_ts": end,
         "window_id": window_id,
     }
-    rows = await _rows(
-        """
+    sql = """
         SELECT COUNT(*) AS row_count,
                COALESCE(SUM(request_count), 0) AS requests_used,
                COALESCE(SUM(est_cost_usd), 0) AS cost_usd,
@@ -128,11 +145,29 @@ async def _usage_for_plan(
         FROM usage_ledger
         WHERE provider = :provider
           AND tier = :plan_name
+          AND path_kind = :path_kind
           AND ((:window_id IS NOT NULL AND plan_window_id = :window_id)
                OR (ts >= :start_ts AND ts < :end_ts))
-        """,
-        params,
-    )
+        """
+    try:
+        rows = await _rows(sql, params)
+    except Exception as exc:
+        if "path_kind" not in str(exc).lower():
+            raise
+        rows = await _rows(
+            """
+            SELECT COUNT(*) AS row_count,
+                   COALESCE(SUM(request_count), 0) AS requests_used,
+                   COALESCE(SUM(est_cost_usd), 0) AS cost_usd,
+                   COALESCE(SUM(tokens_in + tokens_out + tokens_reasoning), 0) AS tokens
+            FROM usage_ledger
+            WHERE provider = :provider
+              AND tier = :plan_name
+              AND ((:window_id IS NOT NULL AND plan_window_id = :window_id)
+                   OR (ts >= :start_ts AND ts < :end_ts))
+            """,
+            params,
+        )
     return rows[0] if rows else {"row_count": 0, "requests_used": 0, "cost_usd": 0, "tokens": 0}
 
 
@@ -161,6 +196,7 @@ async def utilization(
                 "provider": plan["provider"],
                 "plan_name": plan["plan_name"],
                 "auth_method": plan.get("auth_method"),
+                "path_kind": plan.get("path_kind") or "api",
                 "window_id": window_id,
                 "window_start": _jsonable(start),
                 "window_end": _jsonable(end),
@@ -192,6 +228,7 @@ async def overage_projection(
             {
                 "provider": plan["provider"],
                 "plan_name": plan["plan_name"],
+                "path_kind": plan.get("path_kind") or "api",
                 "days_ahead": days_ahead,
                 "current_7d_requests": int(usage.get("requests_used") or 0),
                 "projected_requests": projected,
@@ -209,22 +246,42 @@ async def by_session(
     _: UserContext = Depends(require_root),
 ) -> list[dict[str, Any]]:
     since = datetime.now(timezone.utc) - timedelta(days=days)
-    return await _rows(
-        """
+    sql = """
         SELECT session_id,
                provider,
                tier AS plan_name,
+               path_kind,
                COUNT(*) AS row_count,
                COALESCE(SUM(request_count), 0) AS requests,
                COALESCE(SUM(tokens_in + tokens_out + tokens_reasoning), 0) AS tokens,
                COALESCE(SUM(est_cost_usd), 0) AS cost_usd
         FROM usage_ledger
         WHERE ts >= :since_ts
-        GROUP BY session_id, provider, tier
+        GROUP BY session_id, provider, tier, path_kind
         ORDER BY requests DESC, cost_usd DESC
-        """,
-        {"since_ts": since},
-    )
+        """
+    try:
+        return await _rows(sql, {"since_ts": since})
+    except Exception as exc:
+        if "path_kind" not in str(exc).lower():
+            raise
+        return await _rows(
+            """
+            SELECT session_id,
+                   provider,
+                   tier AS plan_name,
+                   'api' AS path_kind,
+                   COUNT(*) AS row_count,
+                   COALESCE(SUM(request_count), 0) AS requests,
+                   COALESCE(SUM(tokens_in + tokens_out + tokens_reasoning), 0) AS tokens,
+                   COALESCE(SUM(est_cost_usd), 0) AS cost_usd
+            FROM usage_ledger
+            WHERE ts >= :since_ts
+            GROUP BY session_id, provider, tier
+            ORDER BY requests DESC, cost_usd DESC
+            """,
+            {"since_ts": since},
+        )
 
 
 @router.get("/cost_split")
@@ -233,33 +290,62 @@ async def cost_split(
     _: UserContext = Depends(require_root),
 ) -> list[dict[str, Any]]:
     start = _period_start(period, datetime.now(timezone.utc))
-    rows = await _rows(
-        """
+    sql = """
         SELECT CASE
                  WHEN ul.subscription_amortized = 1 THEN 'subscription_amortized'
                  WHEN COALESCE(sp.auth_method, 'api') = 'free' THEN 'free'
                  WHEN COALESCE(ul.est_cost_usd, 0) = 0 THEN 'free'
                  ELSE 'api'
                END AS cost_bucket,
+               ul.path_kind,
                COUNT(*) AS row_count,
                COALESCE(SUM(ul.request_count), 0) AS requests,
                COALESCE(SUM(ul.est_cost_usd), 0) AS cost_usd
         FROM usage_ledger ul
         LEFT JOIN subscription_plans sp
           ON sp.provider = ul.provider AND sp.plan_name = ul.tier
+         AND sp.effective_from <= TRUNC(SYSTIMESTAMP)
+         AND (sp.effective_until IS NULL OR sp.effective_until >= TRUNC(SYSTIMESTAMP))
         WHERE ul.ts >= :start_ts
         GROUP BY CASE
                    WHEN ul.subscription_amortized = 1 THEN 'subscription_amortized'
                    WHEN COALESCE(sp.auth_method, 'api') = 'free' THEN 'free'
                    WHEN COALESCE(ul.est_cost_usd, 0) = 0 THEN 'free'
                    ELSE 'api'
-                 END
-        ORDER BY cost_bucket
-        """,
-        {"start_ts": start},
-    )
-    buckets = {row["cost_bucket"]: row for row in rows}
-    return [
-        buckets.get(name, {"cost_bucket": name, "row_count": 0, "requests": 0, "cost_usd": 0})
-        for name in ("subscription_amortized", "api", "free", "overage")
-    ]
+                 END,
+                 ul.path_kind
+        ORDER BY cost_bucket, ul.path_kind
+        """
+    try:
+        rows = await _rows(sql, {"start_ts": start})
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "path_kind" not in msg and "trunc" not in msg and "effective_from" not in msg:
+            raise
+        rows = await _rows(
+            """
+            SELECT CASE
+                     WHEN ul.subscription_amortized = 1 THEN 'subscription_amortized'
+                     WHEN COALESCE(sp.auth_method, 'api') = 'free' THEN 'free'
+                     WHEN COALESCE(ul.est_cost_usd, 0) = 0 THEN 'free'
+                     ELSE 'api'
+                   END AS cost_bucket,
+                   'api' AS path_kind,
+                   COUNT(*) AS row_count,
+                   COALESCE(SUM(ul.request_count), 0) AS requests,
+                   COALESCE(SUM(ul.est_cost_usd), 0) AS cost_usd
+            FROM usage_ledger ul
+            LEFT JOIN subscription_plans sp
+              ON sp.provider = ul.provider AND sp.plan_name = ul.tier
+            WHERE ul.ts >= :start_ts
+            GROUP BY CASE
+                       WHEN ul.subscription_amortized = 1 THEN 'subscription_amortized'
+                       WHEN COALESCE(sp.auth_method, 'api') = 'free' THEN 'free'
+                       WHEN COALESCE(ul.est_cost_usd, 0) = 0 THEN 'free'
+                       ELSE 'api'
+                     END
+            ORDER BY cost_bucket
+            """,
+            {"start_ts": start},
+        )
+    return rows
