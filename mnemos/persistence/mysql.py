@@ -53,6 +53,7 @@ from mnemos.persistence.base import (
     BranchRepository,
     CompressionRepository,
     CORE_CAPABILITY,
+    MYSQL_CAPABILITY_DETAILS,
     ConsultationAuditRepository,
     FederationRepository,
     KGRepository,
@@ -1111,6 +1112,10 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     @property
     def capabilities(self) -> set[str]:
         return {CORE_CAPABILITY}
+
+    @property
+    def capability_details(self) -> set[str]:
+        return set(MYSQL_CAPABILITY_DETAILS)
 
     async def record_usage_ledger(self, tx: Transaction, record: Any) -> Any:
         raise NotImplementedError("mysql: usage_ledger is not yet implemented")

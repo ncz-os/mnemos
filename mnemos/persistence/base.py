@@ -1274,6 +1274,66 @@ ALL_CAPABILITIES: frozenset[CapabilityName] = frozenset(
     }
 )
 
+DetailedCapabilityName: TypeAlias = str
+
+MEMORY_CRUD_CAPABILITY: DetailedCapabilityName = "memory_crud"
+VECTOR_SEARCH_CAPABILITY: DetailedCapabilityName = "vector_search"
+FTS_CAPABILITY: DetailedCapabilityName = "fts"
+WEBHOOKS_CAPABILITY: DetailedCapabilityName = "webhooks"
+JOURNAL_CAPABILITY: DetailedCapabilityName = "journal"
+LEDGER_CAPABILITY: DetailedCapabilityName = "ledger"
+KG_CAPABILITY: DetailedCapabilityName = "kg"
+VERSIONS_CAPABILITY: DetailedCapabilityName = "versions"
+BRANCHES_CAPABILITY: DetailedCapabilityName = "branches"
+COMPRESSION_CAPABILITY: DetailedCapabilityName = "compression"
+OAUTH_DETAIL_CAPABILITY: DetailedCapabilityName = "oauth"
+SESSIONS_DETAIL_CAPABILITY: DetailedCapabilityName = "sessions"
+CONSULTATIONS_DETAIL_CAPABILITY: DetailedCapabilityName = "consultations"
+FEDERATION_DETAIL_CAPABILITY: DetailedCapabilityName = "federation"
+STATE_DETAIL_CAPABILITY: DetailedCapabilityName = "state"
+AUDIT_DETAIL_CAPABILITY: DetailedCapabilityName = "audit"
+ROW_LEVEL_SECURITY_CAPABILITY: DetailedCapabilityName = "row_level_security"
+LISTEN_NOTIFY_CAPABILITY: DetailedCapabilityName = "listen_notify"
+ADVISORY_LOCKS_CAPABILITY: DetailedCapabilityName = "advisory_locks"
+
+FULL_STORAGE_CAPABILITY_DETAILS: frozenset[DetailedCapabilityName] = frozenset(
+    {
+        MEMORY_CRUD_CAPABILITY,
+        VECTOR_SEARCH_CAPABILITY,
+        FTS_CAPABILITY,
+        WEBHOOKS_CAPABILITY,
+        JOURNAL_CAPABILITY,
+        LEDGER_CAPABILITY,
+        KG_CAPABILITY,
+        VERSIONS_CAPABILITY,
+        BRANCHES_CAPABILITY,
+        COMPRESSION_CAPABILITY,
+        OAUTH_DETAIL_CAPABILITY,
+        SESSIONS_DETAIL_CAPABILITY,
+        CONSULTATIONS_DETAIL_CAPABILITY,
+        FEDERATION_DETAIL_CAPABILITY,
+        STATE_DETAIL_CAPABILITY,
+        AUDIT_DETAIL_CAPABILITY,
+    }
+)
+
+POSTGRES_CAPABILITY_DETAILS: frozenset[DetailedCapabilityName] = frozenset(
+    {
+        *FULL_STORAGE_CAPABILITY_DETAILS,
+        ROW_LEVEL_SECURITY_CAPABILITY,
+        LISTEN_NOTIFY_CAPABILITY,
+        ADVISORY_LOCKS_CAPABILITY,
+    }
+)
+
+MYSQL_CAPABILITY_DETAILS: frozenset[DetailedCapabilityName] = frozenset(
+    {
+        MEMORY_CRUD_CAPABILITY,
+        VECTOR_SEARCH_CAPABILITY,
+        FTS_CAPABILITY,
+    }
+)
+
 
 class BackendCapabilityMissing(HTTPException):
     """Raised when a caller reaches a repository unsupported by a backend."""
@@ -1483,6 +1543,49 @@ PersistenceBackend: TypeAlias = Union[
 def has_capability(backend: object, capability: str) -> bool:
     capabilities = getattr(backend, "capabilities", set())
     return capability in capabilities
+
+
+def capability_details_for_backend(backend: object) -> set[str]:
+    details = getattr(backend, "capability_details", None)
+    if details is not None:
+        return set(details)
+
+    legacy = set(getattr(backend, "capabilities", set()) or set())
+    out: set[str] = set()
+    if CORE_CAPABILITY in legacy:
+        out.update(
+            {
+                MEMORY_CRUD_CAPABILITY,
+                VECTOR_SEARCH_CAPABILITY,
+                FTS_CAPABILITY,
+                WEBHOOKS_CAPABILITY,
+                JOURNAL_CAPABILITY,
+                LEDGER_CAPABILITY,
+                KG_CAPABILITY,
+                VERSIONS_CAPABILITY,
+                BRANCHES_CAPABILITY,
+                COMPRESSION_CAPABILITY,
+            }
+        )
+    if OAUTH_CAPABILITY in legacy:
+        out.add(OAUTH_DETAIL_CAPABILITY)
+    if SESSIONS_CAPABILITY in legacy:
+        out.add(SESSIONS_DETAIL_CAPABILITY)
+    if CONSULTATIONS_CAPABILITY in legacy:
+        out.add(CONSULTATIONS_DETAIL_CAPABILITY)
+    if FEDERATION_CAPABILITY in legacy:
+        out.add(FEDERATION_DETAIL_CAPABILITY)
+    if STATE_CAPABILITY in legacy:
+        out.add(STATE_DETAIL_CAPABILITY)
+    if AUDIT_CAPABILITY in legacy:
+        out.add(AUDIT_DETAIL_CAPABILITY)
+    if getattr(backend, "supports_row_level_security", False):
+        out.add(ROW_LEVEL_SECURITY_CAPABILITY)
+    if getattr(backend, "supports_listen_notify", False):
+        out.add(LISTEN_NOTIFY_CAPABILITY)
+    if getattr(backend, "supports_advisory_locks", False):
+        out.add(ADVISORY_LOCKS_CAPABILITY)
+    return out
 
 
 def require_capability(backend: object, capability: str) -> None:

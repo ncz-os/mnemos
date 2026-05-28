@@ -31,6 +31,7 @@ from mnemos.core.visibility import (
 from mnemos.db import eligibility as _eligibility
 from mnemos.db import mcp_repo, openai_compat_repo, portability_repo
 from mnemos.persistence.base import (
+    POSTGRES_CAPABILITY_DETAILS,
     AuditChainRepository,
     BranchRepository,
     CompressionRepository,
@@ -2958,6 +2959,10 @@ class PostgresBackend:
     @property
     def capabilities(self) -> set[str]:
         return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+
+    @property
+    def capability_details(self) -> set[str]:
+        return set(POSTGRES_CAPABILITY_DETAILS)
 
     @asynccontextmanager
     async def transactional(self) -> AsyncIterator[Transaction]:
