@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
@@ -37,10 +39,44 @@ jobs:
           # Allowed exceptions:
           #   - mnemos/installer/* runs before package configuration exists.
           #   - tests/* may set process environment for test isolation (outside mnemos/).
-          if grep -RInE '(^|[^[:alnum:]_])_?os\.(environ|getenv)' mnemos --exclude-dir=installer | grep -v '^mnemos/core/config.py:'; then
-            echo "Forbidden os.environ/os.getenv usage outside mnemos/core/config.py or mnemos/installer/."
-            exit 1
-          fi
+          python - <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          base = "${{ github.event.pull_request.base.sha }}"
+          head = "${{ github.event.pull_request.head.sha }}"
+          proc = subprocess.run(
+              [
+                  "git",
+                  "diff",
+                  "--unified=0",
+                  "--diff-filter=ACMRT",
+                  base,
+                  head,
+                  "--",
+                  "mnemos",
+                  ":(exclude)mnemos/core/config.py",
+                  ":(exclude)mnemos/installer",
+              ],
+              check=True,
+              text=True,
+              stdout=subprocess.PIPE,
+          )
+          forbidden = re.compile(r"(^|[^A-Za-z0-9_])_?os\.(environ|getenv)")
+          path = "<unknown>"
+          violations: list[str] = []
+          for raw in proc.stdout.splitlines():
+              if raw.startswith("+++ b/"):
+                  path = raw.removeprefix("+++ b/")
+                  continue
+              if raw.startswith("+") and not raw.startswith("+++") and forbidden.search(raw[1:]):
+                  violations.append(f"{path}: {raw[1:]}")
+          if violations:
+              print("Forbidden new os.environ/os.getenv usage outside mnemos/core/config.py or mnemos/installer/.")
+              print("\n".join(violations))
+              sys.exit(1)
+          PY
 
       - name: Lint imports
         run: .venv/bin/lint-imports --config pyproject.toml
