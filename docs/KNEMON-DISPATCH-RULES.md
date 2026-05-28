@@ -4,7 +4,7 @@ Audit date: 2026-05-28
 
 ## Verdict
 
-The pre-audit `subscription_plans` catalog was not current. It still carried ChatGPT Plus at 40 messages per 3h, ChatGPT Pro as a weekly 200-token-style cap, Claude Max 100 at 450 messages per 5h, and speculative Claude post-2026-06-15 rows. Migration `0039_knemon_dispatch_rule_refresh` refreshes the active rows, keeps Codex separate from ChatGPT so workspace pools can route correctly, and uses conservative current Codex GPT-5.5 lower bounds for generic Codex plan headroom.
+The pre-audit `subscription_plans` catalog was not current. It still carried ChatGPT Plus at 40 messages per 3h, ChatGPT Pro as a weekly 200-token-style cap, Claude Max 100 at 450 messages per 5h, and speculative Claude post-2026-06-15 rows. Migration `0039_knemon_dispatch_rule_refresh` refreshes the active rows and keeps Codex separate from ChatGPT so workspace pools can route correctly. Current public Codex billing is credit/token based, so the Codex `msg_cap` rows are conservative local planning caps for KNEMON headroom, not provider-published universal message limits.
 
 The fallback order is correct when implemented as:
 
@@ -28,17 +28,19 @@ These are the current rows after `0039_knemon_dispatch_rule_refresh`.
 
 | Provider | Plan | Cap |
 | --- | --- | --- |
-| Anthropic | `claude_max_200` | 900 messages per 5h through 2026-05-31 |
-| Anthropic | `claude_max_100` | 225 messages per 5h from 2026-06-01 |
+| Anthropic | `claude_max_200` | At least 900 messages per 5h through 2026-05-31 |
+| Anthropic | `claude_max_100` | At least 225 messages per 5h from 2026-06-01 |
 | OpenAI | `chatgpt_plus` | 160 ChatGPT GPT-5.5 messages per 3h |
 | OpenAI | `chatgpt_pro` | Unmetered ChatGPT GPT-5.5 access subject to abuse guardrails |
-| OpenAI | `codex_plus` | 15 GPT-5.5 local messages per 5h, lower bound of 15-80 |
-| OpenAI | `codex_pro_100_10x` | 160 GPT-5.5 local messages per 5h through 2026-05-31, doubled Pro 5x lower bound |
-| OpenAI | `codex_pro_100_5x` | 80 GPT-5.5 local messages per 5h from 2026-06-01, lower bound of 80-400 |
-| OpenAI | `codex_pro_200_25x` | 375 GPT-5.5 local messages per 5h through 2026-05-31, temporary 25x Plus lower bound |
-| OpenAI | `codex_pro_200_20x` | 300 GPT-5.5 local messages per 5h from 2026-06-01, lower bound of 300-1600 |
+| OpenAI | `codex_plus` | Local planning cap: 15 GPT-5.5 messages per 5h |
+| OpenAI | `codex_pro_100_10x` | Local planning cap: 160 GPT-5.5 messages per 5h through 2026-05-31 |
+| OpenAI | `codex_pro_100_5x` | Local planning cap: 80 GPT-5.5 messages per 5h from 2026-06-01 |
+| OpenAI | `codex_pro_200_25x` | Local planning cap: 375 GPT-5.5 messages per 5h through 2026-05-31 |
+| OpenAI | `codex_pro_200_20x` | Local planning cap: 300 GPT-5.5 messages per 5h from 2026-06-01 |
 
-Anthropic's public Max usage documentation supports the $100 Max 5x and $200 Max 20x tiers and publishes at-least estimates of 225 and 900 messages per 5h for short conversations. KNEMON uses those as conservative planning caps for utilization accounting. The 2026-06-01 switch from `claude_max_200` to `claude_max_100` is a local operator policy encoded in KNEMON, not a provider-published tier migration.
+Anthropic's public Max documentation supports the $100 Max 5x and $200 Max 20x tier relationship. The `900` and `225` message caps are conservative local planning caps for KNEMON utilization accounting. The 2026-06-01 switch from `claude_max_200` to `claude_max_100` is a local operator policy encoded in KNEMON, not a provider-published tier migration.
+
+Do not treat Codex `msg_cap` values as the billing source of truth. OpenAI's current Codex rate card maps usage to credits per million input, cached input, and output tokens. A future schema should add an explicit cap unit such as `message`, `token`, or `credit` before moving Codex accounting from local message headroom to credit telemetry.
 
 The deprecated `claude_max_interactive_post_jun15` and `agent_sdk_credit_pool_post_jun15` rows are expired at 2026-05-31 because no current official source supports that split as an active operator assumption.
 
@@ -79,5 +81,9 @@ The audit was cross-checked with a Codex muse review and a Claude-only GRAEAE co
 ## Sources
 
 - OpenAI ChatGPT GPT-5.5 limits: https://help.openai.com/en/articles/11909943-gpt-55-in-chatgpt
-- OpenAI Codex pricing and limits: https://developers.openai.com/codex/pricing
+- OpenAI ChatGPT Pro tiers: https://help.openai.com/en/articles/9793128-what-is-chatgpt-pro
+- OpenAI Codex pricing and usage limits: https://developers.openai.com/codex/pricing
+- OpenAI Codex credit rate card: https://help.openai.com/en/articles/20001106-codex-rate-card
+- OpenAI Plus/Pro flexible credits: https://help.openai.com/en/articles/12642688-using-credits-for-flexible-usage-in-chatgpt-free-go-plus-pro
 - Anthropic Claude Max plan tiers: https://support.claude.com/en/articles/11049741-what-is-the-max-plan
+- Anthropic Claude Max usage estimates: https://support.claude.com/en/articles/11014257-about-claude-s-max-plan-usage
