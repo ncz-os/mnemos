@@ -1,3 +1,31 @@
+# Rust Federation JSON Serializer
+
+Implemented hive `019e6d13-0597` federation feed JSON serialization port on branch `feat/knemon-mvp`.
+
+## Shipped
+
+- Added `mnemos-rust-ext/src/federation.rs` with a PyO3-exposed, simd-json/serde-backed compact JSON serializer for federation memory rows.
+- Exposed `mnemos_native_search.serialize_memory_for_feed(rows)` from the existing native extension crate.
+- Added `mnemos/domain/federation/native_bridge.py` with native import and stdlib `json` fallback.
+- Added parity/fallback/native tests in `tests/domain/test_native_federation.py`.
+- Kept the existing `mnemos/domain/federation.py` module import-compatible while allowing additive federation submodules.
+
+## Verification
+
+- `cargo test --manifest-path mnemos-rust-ext/Cargo.toml`
+- `.venv/bin/python -m pytest tests/domain/test_native_federation.py tests/domain/test_native_search.py`
+
+## Benchmark
+
+Recorded in `/tmp/rust-federation/codex-out.log`.
+
+- 10k mixed rows with datetimes and optional embeddings: native 138k rows/s, stdlib fallback 195k rows/s, byte parity true.
+- 10k 1KiB feed rows: native 230k rows/s, stdlib fallback 181k rows/s, 1.27x speedup, byte parity true.
+
+No redeploy performed.
+
+---
+
 Db2 OAuth/sessions/consultations persistence
 
 Implemented:
