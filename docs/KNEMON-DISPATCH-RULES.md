@@ -42,6 +42,8 @@ Anthropic's public Max documentation supports the $100 Max 5x and $200 Max 20x t
 
 Do not treat Codex `msg_cap` values as the billing source of truth. OpenAI's Codex docs publish included usage ranges for plan headroom and a separate credit/rate-card path for usage beyond included limits and migrated workspaces. KNEMON utilization now reports `msg_cap` rows by request count and `token_cap` rows by token count; a future schema should add an explicit cap unit such as `message`, `token`, or `credit` before moving Codex accounting from local message headroom to credit telemetry.
 
+For the `codex_pro_200_25x` expiry, this audit follows the Codex-specific pricing page's May 31, 2026 date for the temporary 5-hour boost. OpenAI's generic ChatGPT Pro article still contains older/conflicting March 31 wording for that same boost, so keep this row tied to the Codex pricing page unless OpenAI updates the Codex usage-limit table.
+
 The deprecated `claude_max_interactive_post_jun15` and `agent_sdk_credit_pool_post_jun15` rows are expired at 2026-05-31 because no current official source supports that split as an active operator assumption.
 
 The router filters `effective_from` and `effective_until` in Python after fetching rows. That avoids Oracle-only date syntax in shared router code and prevents expired promo/tier-flip rows from winning on PostgreSQL, SQLite, or Db2 fallback paths.
@@ -74,6 +76,8 @@ codex_* -> codex_subscription
 
 Both still carry `openai_subscription` for operators that intentionally pool all OpenAI subscriptions.
 
+When no workspace pool is known, the router uses model metadata as a fallback family discriminator. Generic OpenAI `gpt-*` candidates map to ChatGPT subscription rows; OpenAI model metadata containing `codex` maps to Codex rows. Workspace pools remain authoritative when present.
+
 ## Config Defaults
 
 The PR adds these operator policy defaults to `config.toml.example`, `.env.example`, and `KnemonSettings`:
@@ -90,7 +94,7 @@ The PR adds these operator policy defaults to `config.toml.example`, `.env.examp
 
 ## Cross-Check
 
-The audit was cross-checked with a Codex muse review. Codex confirmed the fallback, G1, and burn rules, verified the targeted router/utilization/config tests, and flagged token-cap utilization as the main follow-up; that fix is included here. The requested Claude cross-check could not complete in this environment: the external GRAEAE consultation timed out, and hive job submission to the online Claude worker was rejected because this session registered without a submitter URN. Provider-limit conclusions are therefore grounded in the official source links below rather than model assertion. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
+The audit was cross-checked with a Codex muse review. Codex confirmed the fallback, G1, and burn rules, verified the targeted router/utilization/config tests, and flagged token-cap utilization plus provider-level OpenAI plan collapse as the main follow-ups; both fixes are included here. The requested Claude cross-check could not complete in this environment: the external GRAEAE consultation timed out, and hive job submission to the online Claude worker was rejected because this session registered without a submitter URN. Provider-limit conclusions are therefore grounded in the official source links below rather than model assertion. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
 
 ## Sources
 
