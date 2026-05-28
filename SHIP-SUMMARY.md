@@ -1,44 +1,33 @@
-# KNEMON DeepSeek Direct Registry Cleanup
+# KNEMON Task-Aware Recommender
 
 ## Delivered
 
-- Added `db/migrations_oracle/0037_deepseek_direct_provider_seed.sql` to delete `parity_postgres_%` residue and upsert `deepseek-direct` rows for `deepseek-v4-flash` and `deepseek-v4-pro`.
-- Added PostgreSQL and Db2 mirror migrations.
-- Added `deepseek-direct` to provider sync static seeds and `data/llm_provider_registry.json`.
-- Taught KNEMON routing to parse JSON-object capabilities from Oracle CLOB values.
-
-## Production
-
-- Applied Oracle 0037 to PYTHIA `ORCLPDB1` as `mnemos`.
-- Verified `deepseek-direct = 2` rows and `parity_postgres_% = 0` rows in live `model_registry`.
-
-## Verification
-
-- `.venv/bin/python -m json.tool data/llm_provider_registry.json`
-- `.venv/bin/python -m py_compile scripts/sync_provider_models.py mnemos/domain/graeae/provider_sync.py mnemos/domain/knemon/router.py`
-- `.venv/bin/pytest tests/domain/test_knemon_router.py -q`
-- Live smoke: `/v1/knemon/route?require_capability=reasoning` returned a valid route; after excluding subscription providers, current deployed code returned no matching model until the router JSON-object parser patch is deployed.
-- Logs: `/tmp/knemon-deepseek-cleanup/codex-out.log`
-
----
-
-# KNEMON Workspace-Aware Subscription Pools
-
-## Delivered
-
-- Added `0036_hive_agents_subscription_pools.sql` for Oracle, PostgreSQL, and Db2.
-- Patched live PYTHIA `/srv/agent-bus/agent_bus.py` registration and `/v1/hosts` to carry `subscription_pools`.
-- Added startup subscription-pool detection to `zeroclaw_worker.py`; patched live PYTHIA `codex_worker.py` similarly.
-- Updated KNEMON routing to skip subscription plans when the caller workspace agent lacks the required pool.
-
-## Production
-
-- Applied Oracle 0036 to PYTHIA `ORCLPDB1` as `mnemos`.
-- Restarted `graeae-hive.service`; `/health` is healthy and `/v1/hosts` exposes `subscription_pools`.
+- Added a shared Pantheon recommendation policy for `/v1/providers/recommend`.
+- Mapped task types to explicit capability requirements:
+  - `code-fix`, `code-generation`, `coding` require `coding`.
+  - `narrative`, `chat`, `summarize`, `copywriting` require `chat` and exclude embeddings.
+  - `reasoning` requires `reasoning`.
+  - `embedding`, `embed` require a dedicated `embedding` model.
+  - `routing`, `classification` require `routing` or small-context `chat`.
+  - `web_search` requires `web_search`.
+- Added per-task quality/cost policy and deterministic preferred-model fallbacks.
+- Excluded special-purpose content-safety/moderation models from general recommendations.
+- Reused the same recommender from Postgres MCP repo, SQLite persistence, and Db2 persistence.
 
 ## Verification
 
-- `python3 -m py_compile deploy/zeroclaw-fanout/zeroclaw_worker.py mnemos/domain/knemon/router.py mnemos/installer/db.py tests/domain/test_knemon_router.py`
-- `bash -n deploy/zeroclaw-fanout/deploy_fleet.sh deploy/zeroclaw-fanout/zeroclaw-fanout-init.sh`
-- `.venv/bin/python -m pytest tests/domain/test_knemon_router.py tests/test_migration_lists_sync.py -q`
-- Logs: `/tmp/knemon-workspace-aware/codex-out.log`
+- `.venv/bin/pytest -q tests/domain/test_knemon_recommender.py tests/domain/test_knemon_router.py tests/test_persistence_parity.py::test_model_recommendation_lookup_and_available_models tests/test_db2_dialect_parity.py::test_db2_consultation_fetch_recommended_model_native`
+  - Result: `22 passed in 0.40s`
+- `python3 -m compileall -q mnemos/domain/pantheon/recommendation.py mnemos/db/mcp_repo.py mnemos/persistence/sqlite.py mnemos/persistence/db2.py mnemos/api/routes/providers.py`
+  - Result: passed
+
+## Live Smoke
+
+- Target: `http://192.168.207.67:5002`
+- `/health`: healthy, version `6.0.0rc1`
+- `/v1/providers/recommend` for `code-fix`, `narrative`, `reasoning`, `embedding`, `routing`, and `web_search` still returned the deployed fallback `claude/claude-opus-4-6` with reason `model_registry empty; recommended highest-weight configured provider`.
+- No redeploy was performed, per instruction. The live smoke confirms the currently deployed service has not picked up this branch's recommender patch yet.
+
+## Logs
+
+- `/tmp/knemon-recommender/codex-out.log`

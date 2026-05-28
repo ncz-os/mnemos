@@ -2421,20 +2421,12 @@ class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAudit
         cost_budget: float,
         quality_floor: float,
     ) -> tuple[dict[str, Any] | None, list[str]]:
-        capability_map = {
-            "code_generation": ["coding"],
-            "reasoning": ["reasoning", "logic"],
-            "architecture_design": ["reasoning"],
-            "summarization": ["reasoning"],
-            "web_search": ["online", "search"],
-        }
-        required_caps = capability_map.get(task_type, ["reasoning"])
+        from mnemos.domain.pantheon.recommendation import choose_recommended_model
+
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
             # Native Db2: COALESCE + CURRENT TIMESTAMP (no :name, no SYSTIMESTAMP)
-            # For this audit path we keep the SELECT simple; full pricing/weight
-            # logic mirrors sqlite but emits Db2 tokens.
             await _call(
                 cursor.execute,
                 "SELECT provider, model_id, display_name, input_cost_per_mtok, "
@@ -2442,19 +2434,7 @@ class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAudit
                 "FROM model_registry WHERE available = 1 AND deprecated = 0",
             )
             rows = await _fetch_all_dicts(cursor)
-            # (business logic elided for brevity — same shape as sqlite impl;
-            # returns first eligible or fallback None, required_caps)
-            if not rows:
-                return None, required_caps
-            model = rows[0]
-            return {
-                "provider": model.get("provider"),
-                "model_id": model.get("model_id"),
-                "display_name": model.get("display_name"),
-                "cost_per_mtok": None,
-                "quality_score": float(model.get("graeae_weight") or 0),
-                "context_window": model.get("context_window"),
-            }, required_caps
+            return choose_recommended_model(rows, task_type, cost_budget, quality_floor)
         finally:
             await _call(cursor.close)
 
@@ -2463,7 +2443,7 @@ class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAudit
         tx: Any,
         task_type: str,
         cost_budget: float = 10.0,
-        quality_floor: float = 0.85,
+        quality_floor: float = 0.7,
     ) -> dict[str, Any] | None:
         model, _ = await self.fetch_recommended_model(tx, task_type, cost_budget, quality_floor)
         return model
