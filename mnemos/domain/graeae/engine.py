@@ -146,7 +146,7 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
         # short-circuit (consult() gather block) handles the latency by
         # cancelling whichever muse is slowest once quorum reached, so opus
         # being slow on arch-design prompts is no longer a blocker.
-        "model": "claude-opus-4-7", "weight": 0.90, "api": "anthropic", "key_name": "claude",
+        "model": "claude-opus-4-8", "weight": 0.90, "api": "anthropic", "key_name": "claude",
     },
     "perplexity": {
         "url": "https://api.perplexity.ai/chat/completions",
