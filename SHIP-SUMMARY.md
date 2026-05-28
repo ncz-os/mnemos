@@ -1,23 +1,21 @@
-# KNEMON Date-Aware Plan Transitions
+# KNEMON DeepSeek Direct Registry Cleanup
 
 ## Delivered
 
-- Added Oracle migration `0035_subscription_plans_date_aware.sql` with guarded `subscription_plans` date/path columns, `usage_ledger.path_kind`, Anthropic Max transition rows, Agent SDK credit-pool row, and xAI SuperGrok.
-- Added PostgreSQL and Db2 mirror migrations for schema parity.
-- Updated KNEMON routing and utilization queries to use active plans only with `effective_from <= TRUNC(SYSTIMESTAMP)` and open-ended/active `effective_until`.
-- Threaded `path_kind` through ledger API payloads and Oracle/Postgres/Db2/SQLite ledger inserts.
-- Added `path_kind` to utilization/session/cost split breakdowns.
-- Kept fresh-install migration lists aligned in installer and docker-compose files.
+- Added `db/migrations_oracle/0037_deepseek_direct_provider_seed.sql` to delete `parity_postgres_%` residue and upsert `deepseek-direct` rows for `deepseek-v4-flash` and `deepseek-v4-pro`.
+- Added PostgreSQL and Db2 mirror migrations.
+- Added `deepseek-direct` to provider sync static seeds and `data/llm_provider_registry.json`.
+- Taught KNEMON routing to parse JSON-object capabilities from Oracle CLOB values.
 
 ## Production
 
-- Applied `db/migrations_oracle/0035_subscription_plans_date_aware.sql` to PYTHIA Oracle `ORCLPDB1` as `mnemos`.
-- Verified expected Anthropic/xAI rows and `usage_ledger.path_kind` on PYTHIA.
-- No redeploy performed.
+- Applied Oracle 0037 to PYTHIA `ORCLPDB1` as `mnemos`.
+- Verified `deepseek-direct = 2` rows and `parity_postgres_% = 0` rows in live `model_registry`.
 
 ## Verification
 
-- `bash -n scripts/oracle_add_nomic_col.sh scripts/oracle_swap_to_bge_m3.sh deploy/zeroclaw-fanout/deploy_fleet.sh`
-- `.venv/bin/python -m py_compile ...`
-- `.venv/bin/python -m pytest tests/test_knemon_ledger.py tests/domain/test_knemon_router.py tests/api/test_knemon_utilization.py tests/test_migration_lists_sync.py`
-- Logs: `/tmp/knemon-date-aware/codex-out.log`
+- `.venv/bin/python -m json.tool data/llm_provider_registry.json`
+- `.venv/bin/python -m py_compile scripts/sync_provider_models.py mnemos/domain/graeae/provider_sync.py mnemos/domain/knemon/router.py`
+- `.venv/bin/pytest tests/domain/test_knemon_router.py -q`
+- Live smoke: `/v1/knemon/route?require_capability=reasoning` returned a valid route; after excluding subscription providers, current deployed code returned no matching model until the router JSON-object parser patch is deployed.
+- Logs: `/tmp/knemon-deepseek-cleanup/codex-out.log`

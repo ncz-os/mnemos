@@ -75,6 +75,18 @@
         "deepseek-v4-pro": {"cost_in_per_m": 0.435, "cost_out_per_m": 0.87, "cache_hit_in_per_m": 0.003625, "promo_until": "2026-05-31T15:59:00Z", "post_promo_in_per_m": 1.74, "post_promo_out_per_m": 3.48, "ctx": 1000000, "max_out": 384000, "concurrency": 500, "capabilities": ["chat","tools","json","fim","prefix","reasoning"], "quality": 0.87, "swe_bench": 0.806, "tier": "B_quality", "tags": ["g1","best-value-promo","cache-king"]}
       }
     },
+    "deepseek-direct": {
+      "base_url": "https://api.deepseek.com/v1",
+      "anthropic_base_url": "https://api.deepseek.com/anthropic",
+      "auth_env": "DEEPSEEK_API_KEY",
+      "notes": "Direct DeepSeek model_registry provider key. V4 Pro promo pricing effective until 2026-05-31, then reverts to 1.74/3.48 USD per mtok.",
+      "account_status": "funded_50usd_2026_05_25",
+      "balance_usd": 50.00,
+      "models": {
+        "deepseek-v4-flash": {"cost_in_per_m": 0.14, "cost_out_per_m": 0.28, "cache_hit_in_per_m": 0.0028, "ctx": 128000, "max_out": 8192, "capabilities": {"chat": true, "coding": true, "reasoning": false}, "quality": 0.78, "graeae_weight": 0.7, "tier": "B_fanout", "tags": ["fanout","low-cost"]},
+        "deepseek-v4-pro": {"cost_in_per_m": 0.435, "cost_out_per_m": 0.87, "cache_hit_in_per_m": 0.003625, "promo_until": "2026-05-31T15:59:00Z", "post_promo_in_per_m": 1.74, "post_promo_out_per_m": 3.48, "ctx": 128000, "max_out": 8192, "capabilities": {"chat": true, "coding": true, "reasoning": true}, "quality": 0.87, "graeae_weight": 0.85, "swe_bench": 0.806, "tier": "B_quality", "tags": ["reasoning","best-value-promo"]}
+      }
+    },
     "siliconflow": {
       "base_url": "https://api.siliconflow.com/v1",
       "auth_env": "SILICONFLOW_API_KEY",
@@ -213,6 +225,7 @@
     "gemini": 20,
     "perplexity": 15,
     "deepseek_direct": 30,
+    "deepseek-direct": 30,
     "groq": 50,
     "siliconflow": 20,
     "ngc_integrate": 999999,

@@ -110,6 +110,7 @@ services:
       - ./db/migrations/0033_subscription_plans.sql:/docker-entrypoint-initdb.d/63-subscription-plans.sql
       - ./db/migrations/0034_usage_ledger_session_tracking.sql:/docker-entrypoint-initdb.d/64-usage-ledger-session-tracking.sql
       - ./db/migrations/0035_subscription_plans_date_aware.sql:/docker-entrypoint-initdb.d/65-subscription-plans-date-aware.sql
+      - ./db/migrations/0037_deepseek_direct_provider_seed.sql:/docker-entrypoint-initdb.d/66-deepseek-direct-provider-seed.sql
     ports:
       - '127.0.0.1:5433:5432'  # NOTE: 5433 (not 5432) to avoid host-Postgres collision on PROTEUS / any host with system Postgres
     healthcheck:
@@ -169,6 +170,7 @@ services:
       - ./db/migrations/0033_subscription_plans.sql:/migrations/63-subscription-plans.sql:ro
       - ./db/migrations/0034_usage_ledger_session_tracking.sql:/migrations/64-usage-ledger-session-tracking.sql:ro
       - ./db/migrations/0035_subscription_plans_date_aware.sql:/migrations/65-subscription-plans-date-aware.sql:ro
+      - ./db/migrations/0037_deepseek_direct_provider_seed.sql:/migrations/66-deepseek-direct-provider-seed.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -213,7 +215,8 @@ services:
       -f /migrations/62-usage-ledger.sql
       -f /migrations/63-subscription-plans.sql
       -f /migrations/64-usage-ledger-session-tracking.sql
-      -f /migrations/65-subscription-plans-date-aware.sql"
+      -f /migrations/65-subscription-plans-date-aware.sql
+      -f /migrations/66-deepseek-direct-provider-seed.sql"
     restart: "no"
 
   mnemos:
