@@ -12,7 +12,7 @@ from httpx import ASGITransport, AsyncClient
 
 import mnemos.core.lifecycle as lifecycle
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.routes.ledger import router as ledger_router
+from mnemos.api.routes.ledger import _PLAN_WINDOWS, router as ledger_router
 from mnemos.persistence.base import UsageLedgerRecord, UsageLedgerResult
 from mnemos.persistence.postgres import PostgresBackend, PostgresTransaction
 
@@ -397,3 +397,8 @@ def test_usage_ledger_migrations_preserve_constraint_parity():
         assert "est_cost_usd" in normalized and "check (est_cost_usd >= 0)" in normalized
         assert "check (outcome in ('ok','err','timeout'))" in normalized
         assert "check (latency_ms >= 0)" in normalized
+
+
+def test_plan_window_hints_exclude_deleted_claude_future_rows():
+    assert ("anthropic", "claude_max_interactive_post_jun15") not in _PLAN_WINDOWS
+    assert ("anthropic", "agent_sdk_credit_pool_post_jun15") not in _PLAN_WINDOWS

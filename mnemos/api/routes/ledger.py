@@ -18,8 +18,6 @@ router = APIRouter(prefix="/v1", tags=["ledger"])
 _PLAN_WINDOWS: dict[tuple[str, str], tuple[str, int | None]] = {
     ("anthropic", "claude_max_200"): ("rolling", 18000),
     ("anthropic", "claude_max_100"): ("rolling", 18000),
-    ("anthropic", "claude_max_interactive_post_jun15"): ("rolling", 18000),
-    ("anthropic", "agent_sdk_credit_pool_post_jun15"): ("monthly", None),
     ("openai", "chatgpt_plus"): ("rolling", 18000),
     ("openai", "chatgpt_pro"): ("rolling", 18000),
     ("openai", "chatgpt_pro_100_codex_promo"): ("rolling", 18000),
