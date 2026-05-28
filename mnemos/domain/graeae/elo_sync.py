@@ -70,7 +70,7 @@ _HF_ROWS_URL = (
 _ELO_MODEL_MAP: dict[str, str] = {
     "perplexity": "sonar-pro",
     "groq":       "gpt-oss-120b",       # openai/gpt-oss-120b served via Groq
-    "claude":     "claude-opus-4-7",    # arena leader iter56; newer-version override
+    "claude":     "claude-opus-4-8",    # arena leader iter56; newer-version override
     "xai":        "grok-4.20-0309-reasoning",
     "openai":     "gpt-5.5",            # arena rank 8 iter56
     "gemini":     "gemini-3.1-pro",     # arena variant of provider gemini
