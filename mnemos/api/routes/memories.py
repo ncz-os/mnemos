@@ -837,10 +837,7 @@ async def search_memories(
                 # corpora silently returned empty. FTS still hits the
                 # FTS5 index regardless of embedding state.
                 if not rows:
-                    logger.info(
-                        "[VECTOR] semantic returned 0 rows for "
-                        f"'{request.query[:30]}'; falling back to FTS"
-                    )
+                    logger.info("[VECTOR] semantic returned 0 rows for " f"'{request.query[:30]}'; falling back to FTS")
                     rows = await backend.memories.fts_search(
                         tx,
                         query=request.query,
@@ -1085,20 +1082,23 @@ async def create_memory(
             # Same-tx outbox enqueue — preserves the v4.0 contract
             # that webhook_deliveries rows commit atomically with
             # the data write.
-            delivery_ids = await backend.webhooks.dispatch_event(
-                tx,
-                "memory.created",
-                {
-                    "memory_id": mem_id,
-                    "category": request.category,
-                    "subcategory": request.subcategory,
-                    "content": request.content,
-                    "owner_id": owner_id,
-                    "namespace": namespace,
-                },
-                owner_id=owner_id,
-                namespace=namespace,
-            )
+            if getattr(backend, "supports_webhooks", True):
+                delivery_ids = await backend.webhooks.dispatch_event(
+                    tx,
+                    "memory.created",
+                    {
+                        "memory_id": mem_id,
+                        "category": request.category,
+                        "subcategory": request.subcategory,
+                        "content": request.content,
+                        "owner_id": owner_id,
+                        "namespace": namespace,
+                    },
+                    owner_id=owner_id,
+                    namespace=namespace,
+                )
+            else:
+                delivery_ids = []
             # Re-fetch the row inside the same tx so the response
             # carries DB-resolved values (created/updated, etc).
             row = await backend.memories.get_memory(
@@ -1212,20 +1212,23 @@ async def bulk_create_memories(
                     created=None,
                     updated=None,
                 )
-                item_delivery_ids = await backend.webhooks.dispatch_event(
-                    tx,
-                    "memory.created",
-                    {
-                        "memory_id": mid,
-                        "category": mem.category,
-                        "subcategory": mem.subcategory,
-                        "content": mem.content,
-                        "owner_id": owner_id,
-                        "namespace": namespace,
-                    },
-                    owner_id=owner_id,
-                    namespace=namespace,
-                )
+                if getattr(backend, "supports_webhooks", True):
+                    item_delivery_ids = await backend.webhooks.dispatch_event(
+                        tx,
+                        "memory.created",
+                        {
+                            "memory_id": mid,
+                            "category": mem.category,
+                            "subcategory": mem.subcategory,
+                            "content": mem.content,
+                            "owner_id": owner_id,
+                            "namespace": namespace,
+                        },
+                        owner_id=owner_id,
+                        namespace=namespace,
+                    )
+                else:
+                    item_delivery_ids = []
         except Exception as e:
             errors.append(f"[{i}] {e}")
             continue
@@ -1328,20 +1331,23 @@ async def update_memory(
                         writer_id=user.user_id,
                         session_secret=_session_secret,
                     )
-            delivery_ids = await backend.webhooks.dispatch_event(
-                tx,
-                "memory.updated",
-                {
-                    "memory_id": memory_id,
-                    "category": row["category"],
-                    "subcategory": row["subcategory"],
-                    "content": row["content"],
-                    "owner_id": row["owner_id"],
-                    "namespace": row["namespace"],
-                },
-                owner_id=row["owner_id"],
-                namespace=row["namespace"],
-            )
+            if getattr(backend, "supports_webhooks", True):
+                delivery_ids = await backend.webhooks.dispatch_event(
+                    tx,
+                    "memory.updated",
+                    {
+                        "memory_id": memory_id,
+                        "category": row["category"],
+                        "subcategory": row["subcategory"],
+                        "content": row["content"],
+                        "owner_id": row["owner_id"],
+                        "namespace": row["namespace"],
+                    },
+                    owner_id=row["owner_id"],
+                    namespace=row["namespace"],
+                )
+            else:
+                delivery_ids = []
     except HTTPException:
         raise
     _schedule_outbox_deliveries(delivery_ids)
@@ -1432,20 +1438,23 @@ async def delete_memory(
                         writer_id=user.user_id,
                         session_secret=_session_secret,
                     )
-            delivery_ids = await backend.webhooks.dispatch_event(
-                tx,
-                "memory.deleted",
-                {
-                    "memory_id": row["id"],
-                    "category": row["category"],
-                    "subcategory": row["subcategory"],
-                    "content": row["content"],
-                    "owner_id": row["owner_id"],
-                    "namespace": row["namespace"],
-                },
-                owner_id=row["owner_id"],
-                namespace=row["namespace"],
-            )
+            if getattr(backend, "supports_webhooks", True):
+                delivery_ids = await backend.webhooks.dispatch_event(
+                    tx,
+                    "memory.deleted",
+                    {
+                        "memory_id": row["id"],
+                        "category": row["category"],
+                        "subcategory": row["subcategory"],
+                        "content": row["content"],
+                        "owner_id": row["owner_id"],
+                        "namespace": row["namespace"],
+                    },
+                    owner_id=row["owner_id"],
+                    namespace=row["namespace"],
+                )
+            else:
+                delivery_ids = []
     except HTTPException:
         raise
     _schedule_outbox_deliveries(delivery_ids)
