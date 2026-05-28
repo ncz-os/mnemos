@@ -100,7 +100,7 @@ The PR adds these operator policy defaults to `config.toml.example`, `.env.examp
 
 ## Cross-Check
 
-The audit was cross-checked with a root-only Codex muse review and an external GRAEAE consultation with the Claude provider available. Codex confirmed the fallback, G1, burn, and 10 req/hr rules, then flagged the Oracle Codex Pro parent-alias mismatch; that parity fix is included here. GRAEAE feedback was mixed, but the actionable caveat was to keep Codex Pro promo rows and Anthropic Max planning caps documented as provider-promo/local-policy assumptions. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
+The audit was cross-checked with a root-only Codex muse review and an external GRAEAE consultation. Codex confirmed the fallback, G1, burn-threshold, and plan-row audit questions, then flagged the Oracle parent-alias parity mismatch. The fix is included here so exact `codex_pro_100` and `codex_pro_200` pools map to the correct promo/current rows without granting Pro access to `codex_plus`-only workspaces. GRAEAE feedback was mixed, but the actionable caveat was to keep Codex Pro promo rows and Anthropic Max planning caps documented as provider-promo/local-policy assumptions. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
 
 ## Sources
 
