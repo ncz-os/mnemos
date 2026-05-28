@@ -89,6 +89,10 @@ local = "Use local VLLM (zero cost)"
 external = "Use multi-LLM consensus ($0.02-0.05)"
 auto = "Intelligent routing (adaptive)"
 
+# ── Runtime policy ────────────────────────────────────────────────────────────
+[runtime]
+knemon_session_burn_requests_per_hour = 10
+
 # ── GRAEAE provider registry ──────────────────────────────────────────────────
 # Add a new provider by adding a [graeae.providers.<name>] stanza here and
 # an entry under llm_providers in ~/.config/mnemos/api_keys.json.
