@@ -5,6 +5,8 @@ use pyo3::prelude::*;
 use pyo3::types::PySequence;
 use wide::f32x8;
 
+pub mod federation;
+
 const LANES: usize = 8;
 
 fn horizontal_sum(values: f32x8) -> f32 {
@@ -321,6 +323,7 @@ fn mnemos_native_search(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_cosine_similarity, m)?)?;
     m.add_function(wrap_pyfunction!(cosine, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(federation::serialize_memory_for_feed, m)?)?;
     Ok(())
 }
 

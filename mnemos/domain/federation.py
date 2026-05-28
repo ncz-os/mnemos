@@ -17,6 +17,7 @@ import base64
 import binascii
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
@@ -28,6 +29,10 @@ from mnemos.persistence.base import AuditPersistence, FederationPersistence, Fed
 FederationBackend = Union[FederationPersistence, AuditPersistence]
 
 logger = logging.getLogger(__name__)
+
+# Keep this legacy module import-compatible while allowing additive
+# submodules under mnemos/domain/federation/.
+__path__ = [os.path.join(os.path.dirname(__file__), "federation")]
 
 FEDERATION_HTTP_TIMEOUT = 30.0
 FEDERATION_BATCH_LIMIT = 100
