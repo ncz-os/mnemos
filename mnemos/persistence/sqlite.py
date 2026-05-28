@@ -111,6 +111,7 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v5_3_4_mcp_audit_log_sqlite.sql",
     "migrations_v6_2_audit_chain_sqlite.sql",
     "migrations_v6_2_category_decay_sqlite.sql",
+    "0038_oauth_sessions_consultations.sql",
 ]
 
 
@@ -160,6 +161,54 @@ def _json_list(value: Any) -> list[Any]:
             return []
         return decoded if isinstance(decoded, list) else []
     return []
+
+
+def _json_value(value: Any, default: Any = None) -> Any:
+    if value in (None, ""):
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    try:
+        return json.loads(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _uuid_to_blob(value: str | bytes | uuid.UUID | None) -> bytes | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        if len(value) != 16:
+            raise ValueError("UUID BLOB values must be exactly 16 bytes")
+        return value
+    if isinstance(value, uuid.UUID):
+        return value.bytes
+    return uuid.UUID(str(value)).bytes
+
+
+def _blob_to_uuid(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    return str(uuid.UUID(bytes=bytes(value)))
+
+
+def _token_blob(value: str | bytes, *, length: int = 32) -> bytes:
+    if isinstance(value, bytes):
+        if len(value) != length:
+            raise ValueError(f"token BLOB values must be exactly {length} bytes")
+        return value
+    text = str(value)
+    try:
+        raw = bytes.fromhex(text)
+    except ValueError:
+        raw = text.encode("utf-8")
+    if len(raw) != length:
+        raise ValueError(f"token BLOB values must be exactly {length} bytes")
+    return raw
 
 
 def _placeholders(values: Sequence[Any]) -> str:
@@ -3562,6 +3611,274 @@ class SqliteBackend:
     @property
     def capabilities(self) -> set[str]:
         return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+
+    async def register_oauth_token(
+        self,
+        tx: Transaction,
+        *,
+        token: str | bytes,
+        user_id: str,
+        provider: str,
+        scopes: Sequence[str] | dict[str, Any] | None = None,
+        expires_at: Any = None,
+        refresh_token: str | None = None,
+    ) -> Row:
+        conn = _sqlite_tx(tx).conn
+        await _execute(
+            conn,
+            "INSERT INTO oauth_tokens "
+            "(token, user_id, provider, scopes, expires_at, refresh_token, created_at, last_used_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, NULL)",
+            (_token_blob(token), user_id, provider, _json_text(scopes, default=[]), expires_at, refresh_token),
+        )
+        row = await self.lookup_oauth_token(tx, token=token, touch=False)
+        assert row is not None
+        return row
+
+    async def lookup_oauth_token(self, tx: Transaction, *, token: str | bytes, touch: bool = True) -> Row | None:
+        conn = _sqlite_tx(tx).conn
+        raw = _token_blob(token)
+        if touch:
+            await _execute(conn, "UPDATE oauth_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE token = ?", (raw,))
+        row = await _fetch_one(
+            conn,
+            "SELECT token, user_id, provider, scopes, expires_at, refresh_token, created_at, last_used_at "
+            "FROM oauth_tokens WHERE token = ?",
+            (raw,),
+        )
+        if row is None:
+            return None
+        out = dict(row)
+        out["token"] = bytes(out["token"]).hex()
+        out["scopes"] = _json_value(out.get("scopes"), [])
+        return out
+
+    async def revoke_oauth_token(self, tx: Transaction, *, token: str | bytes) -> bool:
+        return (
+            await _execute_count(_sqlite_tx(tx).conn, "DELETE FROM oauth_tokens WHERE token = ?", (_token_blob(token),))
+            > 0
+        )
+
+    async def start_oauth_flow(
+        self,
+        tx: Transaction,
+        *,
+        state: str | bytes,
+        provider: str,
+        csrf_token: str,
+        return_url: str | None,
+        expires_at: Any,
+    ) -> Row:
+        conn = _sqlite_tx(tx).conn
+        await _execute(
+            conn,
+            "INSERT INTO oauth_state (state, provider, csrf_token, return_url, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)",
+            (_token_blob(state), provider, csrf_token, return_url, expires_at),
+        )
+        row = await _fetch_one(conn, "SELECT * FROM oauth_state WHERE state = ?", (_token_blob(state),))
+        assert row is not None
+        out = dict(row)
+        out["state"] = bytes(out["state"]).hex()
+        return out
+
+    async def redeem_oauth_state(self, tx: Transaction, *, state: str | bytes) -> Row | None:
+        conn = _sqlite_tx(tx).conn
+        raw = _token_blob(state)
+        row = await _fetch_one(
+            conn,
+            "SELECT state, provider, csrf_token, return_url, created_at, expires_at "
+            "FROM oauth_state WHERE state = ? AND datetime(expires_at) > datetime('now')",
+            (raw,),
+        )
+        await _execute(conn, "DELETE FROM oauth_state WHERE state = ?", (raw,))
+        if row is None:
+            return None
+        out = dict(row)
+        out["state"] = bytes(out["state"]).hex()
+        return out
+
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        expires_at: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> Row:
+        sid = session_id or uuid.uuid4()
+        conn = _sqlite_tx(tx).conn
+        await _execute(
+            conn,
+            "INSERT INTO sessions (session_id, user_id, started_at, last_active_at, expires_at, metadata) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)",
+            (_uuid_to_blob(sid), user_id, expires_at, _json_text(metadata, default={})),
+        )
+        row = await self.lookup_session(tx, session_id=sid)
+        assert row is not None
+        return row
+
+    async def lookup_session(self, tx: Transaction, *, session_id: str | bytes | uuid.UUID) -> Row | None:
+        row = await _fetch_one(
+            _sqlite_tx(tx).conn,
+            "SELECT session_id, user_id, started_at, last_active_at, expires_at, metadata "
+            "FROM sessions WHERE session_id = ? AND datetime(expires_at) > datetime('now')",
+            (_uuid_to_blob(session_id),),
+        )
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _blob_to_uuid(out.get("session_id"))
+        out["metadata"] = _json_value(out.get("metadata"), {})
+        return out
+
+    async def update_session_active(self, tx: Transaction, *, session_id: str | bytes | uuid.UUID) -> bool:
+        return (
+            await _execute_count(
+                _sqlite_tx(tx).conn,
+                "UPDATE sessions SET last_active_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (_uuid_to_blob(session_id),),
+            )
+            > 0
+        )
+
+    async def expire_session(self, tx: Transaction, *, session_id: str | bytes | uuid.UUID) -> bool:
+        return (
+            await _execute_count(
+                _sqlite_tx(tx).conn,
+                "UPDATE sessions SET expires_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (_uuid_to_blob(session_id),),
+            )
+            > 0
+        )
+
+    async def log_session_event(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str | bytes | uuid.UUID,
+        event_kind: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Row:
+        row = await _fetch_one(
+            _sqlite_tx(tx).conn,
+            "INSERT INTO session_logs (session_id, event_kind, payload, ts) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) RETURNING id, session_id, event_kind, payload, ts",
+            (_uuid_to_blob(session_id), event_kind, _json_text(payload, default={})),
+        )
+        assert row is not None
+        out = dict(row)
+        out["session_id"] = _blob_to_uuid(out.get("session_id"))
+        out["payload"] = _json_value(out.get("payload"), {})
+        return out
+
+    async def create_consultation(
+        self,
+        tx: Transaction,
+        *,
+        consultation_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        prompt: str,
+        task_type: str | None,
+        mode: str | None,
+        status: str = "pending",
+    ) -> Row:
+        cid = consultation_id or uuid.uuid4()
+        conn = _sqlite_tx(tx).conn
+        await _execute(
+            conn,
+            "INSERT INTO consultations (id, user_id, prompt, task_type, mode, status, created_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, NULL)",
+            (_uuid_to_blob(cid), user_id, prompt, task_type, mode, status),
+        )
+        row = await self.fetch_consultation(tx, consultation_id=cid)
+        assert row is not None
+        return row
+
+    async def append_consultation_response(
+        self,
+        tx: Transaction,
+        *,
+        consultation_id: str | bytes | uuid.UUID,
+        provider: str,
+        model_id: str,
+        response: str,
+        final_score: float | None = None,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        latency_ms: int | None = None,
+    ) -> Row:
+        row = await _fetch_one(
+            _sqlite_tx(tx).conn,
+            "INSERT INTO consultation_responses "
+            "(consultation_id, provider, model_id, response, final_score, tokens_in, tokens_out, latency_ms, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) RETURNING *",
+            (
+                _uuid_to_blob(consultation_id),
+                provider,
+                model_id,
+                response,
+                final_score,
+                tokens_in,
+                tokens_out,
+                latency_ms,
+            ),
+        )
+        assert row is not None
+        out = dict(row)
+        out["consultation_id"] = _blob_to_uuid(out.get("consultation_id"))
+        return out
+
+    async def fetch_consultation(self, tx: Transaction, *, consultation_id: str | bytes | uuid.UUID) -> Row | None:
+        conn = _sqlite_tx(tx).conn
+        row = await _fetch_one(
+            conn,
+            "SELECT id, user_id, prompt, task_type, mode, status, created_at, completed_at "
+            "FROM consultations WHERE id = ?",
+            (_uuid_to_blob(consultation_id),),
+        )
+        if row is None:
+            return None
+        out = dict(row)
+        out["id"] = _blob_to_uuid(out.get("id"))
+        responses = await _fetch_all(
+            conn,
+            "SELECT id, consultation_id, provider, model_id, response, final_score, tokens_in, tokens_out, latency_ms, created_at "
+            "FROM consultation_responses WHERE consultation_id = ? ORDER BY id",
+            (_uuid_to_blob(consultation_id),),
+        )
+        out["responses"] = [dict(r, consultation_id=_blob_to_uuid(r["consultation_id"])) for r in responses]
+        return out
+
+    async def list_consultations(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Row]:
+        where: list[str] = []
+        params: list[Any] = []
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(user_id)
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        sql = "SELECT id, user_id, prompt, task_type, mode, status, created_at, completed_at FROM consultations"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        rows = await _fetch_all(_sqlite_tx(tx).conn, sql, [*params, limit, offset])
+        out: list[Row] = []
+        for row in rows:
+            item = dict(row)
+            item["id"] = _blob_to_uuid(item.get("id"))
+            out.append(item)
+        return out
 
     async def record_usage_ledger(
         self,
