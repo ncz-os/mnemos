@@ -17,7 +17,11 @@ class RecommendationPolicy:
     excluded_caps: tuple[str, ...] = ()
     max_context_window: int | None = None
     cost_ceiling: float | None = None
+    allowed_tiers: tuple[str, ...] = ()
+    fallback_tiers: tuple[str, ...] = ()
     preferred_models: tuple[tuple[str, str], ...] = ()
+    preferred_name_tokens: tuple[str, ...] = ()
+    excluded_name_tokens: tuple[str, ...] = ()
 
 
 _TASK_ALIASES = {
@@ -50,44 +54,61 @@ _POLICIES = {
         task_type="coding",
         required_caps=("coding",),
         excluded_caps=("embedding",),
-        cost_ceiling=50.0,
+        cost_ceiling=10.0,
+        allowed_tiers=("A", "B"),
+        fallback_tiers=("C",),
         preferred_models=(
             ("nvidia", "qwen/qwen3-coder-480b"),
-            ("anthropic", "claude-opus-4-7"),
+            ("deepseek-direct", "deepseek-coder"),
+            ("deepseek-direct", "deepseek-v4-flash"),
+            ("anthropic", "claude-sonnet"),
         ),
+        preferred_name_tokens=("coder", "deepseek", "sonnet"),
     ),
     "narrative": RecommendationPolicy(
         task_type="narrative",
         required_caps=("chat",),
-        excluded_caps=("embedding",),
+        excluded_caps=("embedding", "routing"),
         cost_ceiling=10.0,
+        allowed_tiers=("A", "B"),
         preferred_models=(
             ("anthropic", "claude-sonnet-4-6"),
+            ("anthropic", "claude-sonnet"),
             ("gemini", "gemini-2.5-flash"),
         ),
+        preferred_name_tokens=("sonnet", "gemini", "flash"),
+        excluded_name_tokens=("opus",),
     ),
     "reasoning": RecommendationPolicy(
         task_type="reasoning",
         required_caps=("reasoning",),
         excluded_caps=("embedding",),
         cost_ceiling=50.0,
+        allowed_tiers=("A", "B", "C"),
         preferred_models=(
             ("anthropic", "claude-opus-4-7"),
+            ("anthropic", "claude-opus-4-6"),
             ("nvidia", "deepseek-v4-pro"),
             ("deepseek-direct", "deepseek-v4-pro"),
+            ("openai", "gpt-5.5"),
         ),
+        preferred_name_tokens=("opus", "deepseek-v4-pro", "gpt-5.5"),
     ),
     "embedding": RecommendationPolicy(
         task_type="embedding",
         required_caps=("embedding",),
         excluded_caps=("chat",),
         cost_ceiling=1.0,
+        allowed_tiers=("A",),
+        fallback_tiers=("B",),
         preferred_models=(
             ("mnemos-local", "bge-m3"),
+            ("local", "bge-m3"),
             ("openai", "text-embedding-3-small"),
             ("openai", "text-embedding-3-large"),
             ("voyage", "voyage-3"),
         ),
+        preferred_name_tokens=("bge-m3", "voyage-3", "text-embedding-3"),
     ),
     "routing": RecommendationPolicy(
         task_type="routing",
@@ -96,18 +117,23 @@ _POLICIES = {
         excluded_caps=("embedding",),
         max_context_window=32768,
         cost_ceiling=1.0,
+        allowed_tiers=("A",),
+        fallback_tiers=("B",),
         preferred_models=(
             ("groq", "llama-3.1-8b-instant"),
             ("nvidia", "kimi-k2.6"),
             ("nvidia", "moonshotai/kimi-k2.6"),
         ),
+        preferred_name_tokens=("llama-3.1-8b-instant", "kimi-k2.6"),
     ),
     "web_search": RecommendationPolicy(
         task_type="web_search",
         required_caps=("web_search",),
         excluded_caps=("embedding",),
         cost_ceiling=10.0,
+        allowed_tiers=("A", "B"),
         preferred_models=(("perplexity", "sonar"), ("perplexity", "sonar-pro")),
+        preferred_name_tokens=("sonar",),
     ),
 }
 
@@ -179,6 +205,25 @@ def _avg_cost(row: Any) -> float | None:
     return (safe_float(in_cost) + safe_float(out_cost)) / 2.0
 
 
+def _tier(row: Any) -> str:
+    raw = str(_row_get(row, "cost_tier") or _row_get(row, "usage_tier") or "").strip().upper()
+    if raw in {"A", "B", "C"}:
+        return raw
+    cost = _avg_cost(row)
+    if cost is not None:
+        if cost <= 1.0:
+            return "A"
+        if cost <= 10.0:
+            return "B"
+        return "C"
+    quality = _quality(row)
+    if quality >= 0.95:
+        return "C"
+    if quality >= 0.85:
+        return "B"
+    return "A"
+
+
 def _quality(row: Any) -> float:
     return safe_float(_row_get(row, "graeae_weight") or _row_get(row, "quality_score") or 0)
 
@@ -212,6 +257,17 @@ def _is_special_purpose(row: Any) -> bool:
     return any(token in text for token in _SPECIAL_PURPOSE_MODEL_TOKENS)
 
 
+def _model_text(row: Any) -> str:
+    provider, model_id = _model_key(row)
+    display_name = str(_row_get(row, "display_name") or "")
+    return f"{provider}/{model_id} {display_name}".lower()
+
+
+def _has_name_token(row: Any, tokens: tuple[str, ...]) -> bool:
+    text = _model_text(row)
+    return any(token.lower() in text for token in tokens)
+
+
 def _caps_match(caps: set[str], policy: RecommendationPolicy) -> bool:
     if policy.required_caps and not set(policy.required_caps).issubset(caps):
         return False
@@ -220,6 +276,26 @@ def _caps_match(caps: set[str], policy: RecommendationPolicy) -> bool:
     if any(cap in caps for cap in policy.excluded_caps):
         return False
     return True
+
+
+def _tier_filter(rows: list[Any], policy: RecommendationPolicy) -> list[Any]:
+    if not policy.allowed_tiers:
+        return rows
+    allowed = [row for row in rows if _tier(row) in set(policy.allowed_tiers)]
+    if allowed:
+        return allowed
+    if not policy.fallback_tiers:
+        return []
+    return [row for row in rows if _tier(row) in set(policy.fallback_tiers)]
+
+
+def _preference_rank(row: Any, policy: RecommendationPolicy) -> int:
+    for index, preferred in enumerate(policy.preferred_models):
+        if _model_matches_preference(row, preferred):
+            return index
+    if policy.preferred_name_tokens and _has_name_token(row, policy.preferred_name_tokens):
+        return len(policy.preferred_models)
+    return len(policy.preferred_models) + 1
 
 
 def choose_recommended_model(
@@ -244,6 +320,9 @@ def choose_recommended_model(
         capable.append(row)
 
     capable = [row for row in capable if not _is_special_purpose(row)]
+    if policy.excluded_name_tokens:
+        capable = [row for row in capable if not _has_name_token(row, policy.excluded_name_tokens)]
+    capable = _tier_filter(capable, policy)
 
     qualified = [
         row
@@ -251,26 +330,28 @@ def choose_recommended_model(
         if _quality(row) >= effective_floor and _avg_cost(row) is not None and (_avg_cost(row) or 0.0) <= budget
     ]
 
-    for preferred in policy.preferred_models:
-        preferred_rows = [row for row in qualified if _model_matches_preference(row, preferred)]
-        if preferred_rows:
-            return _format_model(sorted(preferred_rows, key=lambda row: _avg_cost(row) or 0.0)[0]), list(
-                policy.required_caps or policy.any_caps
-            )
-
     if qualified:
-        chosen = sorted(qualified, key=lambda row: (_avg_cost(row) or 0.0, -_quality(row)))[0]
+        chosen = sorted(
+            qualified,
+            key=lambda row: (
+                _preference_rank(row, policy),
+                _avg_cost(row) or 0.0,
+                -_quality(row),
+            ),
+        )[0]
         return _format_model(chosen), list(policy.required_caps or policy.any_caps)
 
     degraded = [row for row in capable if _quality(row) >= effective_floor]
-    for preferred in policy.preferred_models:
-        preferred_rows = [row for row in degraded if _model_matches_preference(row, preferred)]
-        if preferred_rows:
-            chosen = sorted(preferred_rows, key=lambda row: (_avg_cost(row) is None, _avg_cost(row) or 0.0))[0]
-            return _format_model(chosen), list(policy.required_caps or policy.any_caps)
-
     if degraded:
-        chosen = sorted(degraded, key=lambda row: (_avg_cost(row) is None, _avg_cost(row) or 0.0, -_quality(row)))[0]
+        chosen = sorted(
+            degraded,
+            key=lambda row: (
+                _preference_rank(row, policy),
+                _avg_cost(row) is None,
+                _avg_cost(row) or 0.0,
+                -_quality(row),
+            ),
+        )[0]
         return _format_model(chosen), list(policy.required_caps or policy.any_caps)
 
     return None, list(policy.required_caps or policy.any_caps)
