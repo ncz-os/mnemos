@@ -13,7 +13,7 @@ External plan facts were checked against official vendor documentation:
 - OpenAI Codex with ChatGPT plans: https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan
 - Claude Max plan: https://support.claude.com/en/articles/11049741-what-is-the-max-plan
 - Claude Code with Pro or Max: https://support.claude.com/en/articles/11145838-use-claude-code-with-your-pro-or-max-plan
-- Claude usage and length limits: https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work
+- Claude usage and length limits: https://support.claude.com/en/articles/11647753-understanding-usage-and-length-limits
 
 OpenAI publishes model- and surface-specific ranges, not one universal Codex
 message cap. KNEMON stores conservative local-message lower bounds using the
@@ -39,7 +39,7 @@ router.
 No official Anthropic source found for a Claude Max 200-to-100 tier flip on
 2026-06-01. Current Claude docs keep Max 5x and Max 20x as active tiers, and
 Claude Code usage is shared with the same Pro/Max allocation. The older
-post-2026-06-15 Claude split rows are retired by `0039_subscription_plan_current_limits`.
+post-2026-06-15 Claude split rows are removed by `0039_subscription_plan_current_limits`.
 
 The router filters `effective_from` and `effective_until` in Python after
 fetching rows. This keeps Oracle, PostgreSQL, SQLite, and Db2 behavior aligned
