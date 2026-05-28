@@ -3061,6 +3061,36 @@ class PostgresBackend:
             )
         return UsageLedgerResult(id=int(row["id"]), est_cost_usd=row["est_cost_usd"])
 
+    async def fetch_category_decay_rows(self, tx: Transaction) -> list[Row]:
+        rows = await _postgres_tx(tx).conn.fetch(
+            "SELECT category, half_life_days, decay_kind, floor FROM memory_category_decay"
+        )
+        return [dict(row) for row in rows]
+
+    async def upsert_category_decay(
+        self,
+        tx: Transaction,
+        *,
+        category: str,
+        half_life_days: float,
+        decay_kind: str,
+        floor: float,
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            INSERT INTO memory_category_decay (category, half_life_days, decay_kind, floor)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (category) DO UPDATE SET
+                half_life_days = EXCLUDED.half_life_days,
+                decay_kind = EXCLUDED.decay_kind,
+                floor = EXCLUDED.floor
+            """,
+            category,
+            half_life_days,
+            decay_kind,
+            floor,
+        )
+
     @property
     def memories(self) -> MemoryRepository:
         return self._memories

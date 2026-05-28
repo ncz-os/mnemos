@@ -4461,6 +4461,52 @@ class OracleBackend:
         except Exception:
             return False
 
+    async def fetch_category_decay_rows(self, tx: Transaction) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT category, half_life_days, decay_kind, floor FROM memory_category_decay",
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def upsert_category_decay(
+        self,
+        tx: Transaction,
+        *,
+        category: str,
+        half_life_days: float,
+        decay_kind: str,
+        floor: float,
+    ) -> None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO memory_category_decay tgt
+                USING (SELECT :category AS category FROM dual) src
+                ON (tgt.category = src.category)
+                WHEN MATCHED THEN UPDATE SET
+                    half_life_days = :half_life_days,
+                    decay_kind = :decay_kind,
+                    floor = :floor
+                WHEN NOT MATCHED THEN
+                    INSERT (category, half_life_days, decay_kind, floor)
+                    VALUES (:category, :half_life_days, :decay_kind, :floor)
+                """,
+                {
+                    "category": category,
+                    "half_life_days": half_life_days,
+                    "decay_kind": decay_kind,
+                    "floor": floor,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
     async def open(self) -> None:
         """Lifecycle hook — validates pool checkout + session callback.
 

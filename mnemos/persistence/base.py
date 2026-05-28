@@ -1320,6 +1320,22 @@ class CorePersistence(PersistenceCapabilityBase, Protocol):
         """
         raise NotImplementedError("usage_ledger is Postgres-only")
 
+    async def fetch_category_decay_rows(self, tx: Transaction) -> list[Row]:
+        """Return rows from the per-category decay table."""
+        raise NotImplementedError("category decay is not implemented")
+
+    async def upsert_category_decay(
+        self,
+        tx: Transaction,
+        *,
+        category: str,
+        half_life_days: float,
+        decay_kind: str,
+        floor: float,
+    ) -> None:
+        """Insert or update one per-category decay row."""
+        raise NotImplementedError("category decay is not implemented")
+
     @property
     def memories(self) -> MemoryRepository: ...
 
