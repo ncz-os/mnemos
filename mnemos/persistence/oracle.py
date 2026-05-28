@@ -3699,6 +3699,86 @@ class OracleBackend(PersistenceBackend):
                 if not tx.closed:
                     await tx.commit()
 
+    async def record_usage_ledger(
+        self,
+        tx: Transaction,
+        record: Any,
+    ) -> Any:
+        """Record model-token usage (KNEMON MVP step 5 — Oracle backend).
+
+        Mirrors the Postgres recorder. est_cost_usd is computed server-side
+        from ``model_registry`` (reasoning tokens fall back to the output
+        rate, as Oracle ``model_registry`` has no reasoning-cost column).
+        When the model is absent from the registry the cost defaults to 0 so
+        the usage row is still recorded (fail-open on price, never lose the
+        usage record). Oracle has no ``INSERT ... SELECT ... RETURNING`` so
+        the cost is a scalar subquery in ``VALUES`` and id/cost come back via
+        ``RETURNING ... INTO``.
+        """
+        import oracledb
+        from decimal import Decimal
+
+        from mnemos.persistence.base import UsageLedgerResult
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            rid = cursor.var(oracledb.DB_TYPE_NUMBER)
+            rcost = cursor.var(oracledb.DB_TYPE_NUMBER)
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO usage_ledger (
+                    provider, model, task_kind, tokens_in, tokens_out,
+                    tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                    caller_subsystem, tier
+                )
+                VALUES (
+                    :provider, :model, :task_kind, :tokens_in, :tokens_out,
+                    :tokens_reasoning,
+                    NVL((
+                        SELECT (:tokens_in * NVL(input_cost_per_mtok, 0)
+                              + :tokens_out * NVL(output_cost_per_mtok, 0)
+                              + :tokens_reasoning * NVL(output_cost_per_mtok, 0))
+                              / 1000000
+                        FROM model_registry
+                        WHERE provider = :provider AND model_id = :model
+                    ), 0),
+                    :latency_ms, :outcome, :caller_subsystem, :tier
+                )
+                RETURNING id, est_cost_usd INTO :rid, :rcost
+                """,
+                {
+                    "provider": record.provider,
+                    "model": record.model,
+                    "task_kind": record.task_kind,
+                    "tokens_in": record.tokens_in,
+                    "tokens_out": record.tokens_out,
+                    "tokens_reasoning": record.tokens_reasoning,
+                    "latency_ms": record.latency_ms,
+                    "outcome": record.outcome,
+                    "caller_subsystem": record.caller_subsystem,
+                    "tier": record.tier,
+                    "rid": rid,
+                    "rcost": rcost,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
+        def _scalar(var: Any) -> Any:
+            value = var.getvalue()
+            if isinstance(value, (list, tuple)):
+                return value[0] if value else None
+            return value
+
+        new_id = _scalar(rid)
+        cost = _scalar(rcost)
+        return UsageLedgerResult(
+            id=int(new_id),
+            est_cost_usd=Decimal(str(cost)) if cost is not None else Decimal("0"),
+        )
+
     @property
     def memories(self) -> MemoryRepository:
         return self._memories_repo
