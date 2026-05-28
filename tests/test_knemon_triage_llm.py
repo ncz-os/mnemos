@@ -220,8 +220,10 @@ async def test_llm_wrapper_records_in_finally_on_exception(monkeypatch):
             outcome="err",
             caller_subsystem="unit-test",
             tier="standard",
+            plan_window_id=backend.records[0].plan_window_id,
         )
     ]
+    assert backend.records[0].plan_window_id.startswith("openai-standard-")
 
 
 @pytest.mark.asyncio
