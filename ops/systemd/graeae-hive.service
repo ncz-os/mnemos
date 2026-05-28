@@ -1,0 +1,16 @@
+[Unit]
+Description=GRAEAE Hive Mind — agent coordination + triage queue
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/agent-bus
+Environment=AGENT_BUS_DB=/srv/agent-bus/agents.db
+LimitNOFILE=65535
+ExecStart=/usr/bin/python3 -m uvicorn agent_bus:app --host 0.0.0.0 --port 5005 --timeout-keep-alive 30
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

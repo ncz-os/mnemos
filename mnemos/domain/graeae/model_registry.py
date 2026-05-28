@@ -19,12 +19,70 @@ Run via: scripts/update_model_registry.py
 import json
 import logging
 import re
+from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def row_get(row: Any, key: str, default: Any = None) -> Any:
+    """Read a model-registry field from dict-like or asyncpg rows."""
+    if hasattr(row, "get"):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except (KeyError, TypeError):
+        return default
+
+
+def perf_rank(row: Any) -> float:
+    """Return a 1-100 quality rank for routing.
+
+    Prefer Arena rank when present; fall back to the normalized GRAEAE
+    weight already maintained by the registry sync path.
+    """
+    arena_rank = row_get(row, "arena_rank")
+    if arena_rank is not None:
+        try:
+            return max(1.0, min(100.0, 101.0 - float(arena_rank)))
+        except (TypeError, ValueError):
+            pass
+    for key in ("graeae_weight", "quality_score", "weight"):
+        value = row_get(row, key)
+        if value is None:
+            continue
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            continue
+        return max(1.0, min(100.0, score * 100.0 if score <= 1.0 else score))
+    return 1.0
+
+
+def newness_value(row: Any) -> float | None:
+    """Return a sortable freshness value for registry-backed routing."""
+    value = (
+        row_get(row, "release_date")
+        or row_get(row, "last_synced")
+        or row_get(row, "last_seen")
+        or row_get(row, "created")
+    )
+    if value is None:
+        return None
+    if hasattr(value, "timestamp"):
+        return float(value.timestamp())
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 # ── HuggingFace Datasets Server (same source as elo_sync) ─────────────────
 _HF_ROWS_URL = (
