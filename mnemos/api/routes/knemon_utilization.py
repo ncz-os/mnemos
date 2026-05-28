@@ -86,6 +86,21 @@ def _pct(used: int, cap: Any) -> float | None:
     return round((used / float(cap)) * 100.0, 2)
 
 
+def _positive_cap(value: Any) -> bool:
+    try:
+        return value is not None and float(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _cap_basis(plan: dict[str, Any], usage: dict[str, Any]) -> tuple[str | None, int, Any]:
+    if _positive_cap(plan.get("msg_cap")):
+        return "messages", int(usage.get("requests_used") or 0), plan.get("msg_cap")
+    if _positive_cap(plan.get("token_cap")):
+        return "tokens", int(usage.get("tokens") or 0), plan.get("token_cap")
+    return None, int(usage.get("requests_used") or 0), None
+
+
 def _overage_cost(overage_msgs: int, plan: dict[str, Any]) -> float:
     if overage_msgs <= 0:
         return 0.0
@@ -94,6 +109,16 @@ def _overage_cost(overage_msgs: int, plan: dict[str, Any]) -> float:
     if price_in == 0 and price_out == 0:
         return 0.0
     return round(overage_msgs * (price_in + price_out) / 2.0, 6)
+
+
+def _token_overage_cost(overage_tokens: int, plan: dict[str, Any]) -> float:
+    if overage_tokens <= 0:
+        return 0.0
+    price_in = float(plan.get("overage_pricing_per_mtok_in") or 0)
+    price_out = float(plan.get("overage_pricing_per_mtok_out") or 0)
+    if price_in == 0 and price_out == 0:
+        return 0.0
+    return round((overage_tokens / 1_000_000.0) * (price_in + price_out) / 2.0, 6)
 
 
 def _to_date(value: Any) -> date | None:
@@ -214,9 +239,19 @@ async def utilization(
             window_seconds=int(plan.get("msg_window_seconds") or plan.get("token_window_seconds") or 0) or None,
         )
         usage = await _usage_for_plan(plan, start, end, window_id)
-        used = int(usage.get("requests_used") or 0)
-        cap = plan.get("msg_cap")
-        overage = max(0, used - int(cap or 0)) if cap else 0
+        requests_used = int(usage.get("requests_used") or 0)
+        tokens_used = int(usage.get("tokens") or 0)
+        cap_unit, used, cap = _cap_basis(plan, usage)
+        overage_msgs = 0
+        overage_tokens = 0
+        if cap_unit == "messages":
+            overage_msgs = max(0, used - int(float(cap or 0)))
+            overage_cost = _overage_cost(overage_msgs, plan)
+        elif cap_unit == "tokens":
+            overage_tokens = max(0, used - int(float(cap or 0)))
+            overage_cost = _token_overage_cost(overage_tokens, plan)
+        else:
+            overage_cost = 0.0
         out.append(
             {
                 "provider": plan["provider"],
@@ -226,11 +261,15 @@ async def utilization(
                 "window_id": window_id,
                 "window_start": _jsonable(start),
                 "window_end": _jsonable(end),
-                "requests_used": used,
-                "msg_cap": cap,
+                "requests_used": requests_used,
+                "tokens_used": tokens_used,
+                "msg_cap": plan.get("msg_cap"),
+                "token_cap": plan.get("token_cap"),
+                "cap_unit": cap_unit,
                 "utilization_pct": _pct(used, cap),
-                "projected_overage_msgs": overage,
-                "projected_overage_cost_usd": _overage_cost(overage, plan),
+                "projected_overage_msgs": overage_msgs,
+                "projected_overage_tokens": overage_tokens,
+                "projected_overage_cost_usd": overage_cost,
             }
         )
     return out
@@ -246,21 +285,40 @@ async def overage_projection(
     out = []
     for plan in await _plans():
         usage = await _usage_for_plan(plan, since, now, None)
-        daily_rate = int(usage.get("requests_used") or 0) / 7.0
-        projected = int(round(daily_rate * days_ahead))
-        cap = int(plan.get("msg_cap") or 0)
-        overage = max(0, projected - cap) if cap else 0
+        current_requests = int(usage.get("requests_used") or 0)
+        current_tokens = int(usage.get("tokens") or 0)
+        projected_requests = int(round((current_requests / 7.0) * days_ahead))
+        projected_tokens = int(round((current_tokens / 7.0) * days_ahead))
+        cap_unit, projected_used, cap = _cap_basis(
+            plan,
+            {"requests_used": projected_requests, "tokens": projected_tokens},
+        )
+        overage_msgs = 0
+        overage_tokens = 0
+        if cap_unit == "messages":
+            overage_msgs = max(0, projected_used - int(float(cap or 0)))
+            overage_cost = _overage_cost(overage_msgs, plan)
+        elif cap_unit == "tokens":
+            overage_tokens = max(0, projected_used - int(float(cap or 0)))
+            overage_cost = _token_overage_cost(overage_tokens, plan)
+        else:
+            overage_cost = 0.0
         out.append(
             {
                 "provider": plan["provider"],
                 "plan_name": plan["plan_name"],
                 "path_kind": plan.get("path_kind") or "api",
                 "days_ahead": days_ahead,
-                "current_7d_requests": int(usage.get("requests_used") or 0),
-                "projected_requests": projected,
+                "current_7d_requests": current_requests,
+                "current_7d_tokens": current_tokens,
+                "projected_requests": projected_requests,
+                "projected_tokens": projected_tokens,
                 "msg_cap": plan.get("msg_cap"),
-                "projected_overage_msgs": overage,
-                "projected_overage_cost_usd": _overage_cost(overage, plan),
+                "token_cap": plan.get("token_cap"),
+                "cap_unit": cap_unit,
+                "projected_overage_msgs": overage_msgs,
+                "projected_overage_tokens": overage_tokens,
+                "projected_overage_cost_usd": overage_cost,
             }
         )
     return out

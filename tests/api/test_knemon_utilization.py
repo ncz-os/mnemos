@@ -86,6 +86,13 @@ class _SqliteBackend:
         )
         self.conn.execute(
             """
+            INSERT INTO subscription_plans
+            VALUES ('testai', 'token_plan', 'subscription', 'api', 10, NULL, NULL,
+                    1000, 3600, 'rolling', 2, 8, 'token cap', '2026-01-01', NULL, NULL)
+            """
+        )
+        self.conn.execute(
+            """
             INSERT INTO usage_ledger (
               ts, provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
               est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
@@ -103,6 +110,17 @@ class _SqliteBackend:
               request_count, plan_window_id, path_kind, subscription_amortized
             ) VALUES (?, 'nvidia', 'free-model', 'chat', 100, 40, 0, 0, 100,
                       'ok', 'test', 'ngc_inference', 's2', 1, NULL, 'free', 0)
+            """,
+            (now,),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO usage_ledger (
+              ts, provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
+              est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
+              request_count, plan_window_id, path_kind, subscription_amortized
+            ) VALUES (?, 'testai', 'token-model', 'chat', 600, 150, 50, 0, 200,
+                      'ok', 'test', 'token_plan', 's-token', 3, NULL, 'api', 1)
             """,
             (now,),
         )
@@ -147,12 +165,22 @@ async def test_knemon_utilization_routes_with_in_memory_sqlite(monkeypatch):
     plus = next(row for row in util_rows if row["provider"] == "openai")
     assert plus["requests_used"] == 2
     assert plus["msg_cap"] == 160
+    assert plus["cap_unit"] == "messages"
     assert plus["utilization_pct"] == 1.25
-    assert {row["plan_name"] for row in util_rows} == {"chatgpt_plus", "ngc_inference"}
+    token_plan = next(row for row in util_rows if row["provider"] == "testai")
+    assert token_plan["tokens_used"] == 800
+    assert token_plan["token_cap"] == 1000
+    assert token_plan["cap_unit"] == "tokens"
+    assert token_plan["utilization_pct"] == 80.0
+    assert {row["plan_name"] for row in util_rows} == {"chatgpt_plus", "ngc_inference", "token_plan"}
 
     sessions = by_session.json()
-    assert {row["session_id"] for row in sessions} == {"s1", "s2"}
+    assert {row["session_id"] for row in sessions} == {"s1", "s2", "s-token"}
 
-    buckets = {row["cost_bucket"]: row for row in cost_split.json()}
-    assert buckets["subscription_amortized"]["requests"] == 2
+    bucket_rows = cost_split.json()
+    subscription_requests = sum(
+        row["requests"] for row in bucket_rows if row["cost_bucket"] == "subscription_amortized"
+    )
+    buckets = {row["cost_bucket"]: row for row in bucket_rows}
+    assert subscription_requests == 5
     assert buckets["free"]["requests"] == 1
