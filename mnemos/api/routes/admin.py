@@ -1,4 +1,5 @@
 """MNEMOS v1 admin endpoints — user and API key management (root only)."""
+
 import hashlib
 import logging
 import secrets
@@ -42,6 +43,7 @@ _admin_lifecycle_repo = AdminLifecycleRepository()
 
 # ── Users ─────────────────────────────────────────────────────────────────────
 
+
 @router.post("/users", response_model=UserResponse, status_code=201)
 async def create_user(
     request: UserCreateRequest,
@@ -60,7 +62,10 @@ async def create_user(
             "INSERT INTO users (id, display_name, email, role, namespace) "
             "VALUES ($1, $2, $3, $4, $5) "
             "RETURNING id, display_name, email, role, namespace, created_at",
-            request.id, request.display_name, request.email, request.role,
+            request.id,
+            request.display_name,
+            request.email,
+            request.role,
             request.namespace,
         )
     return UserResponse(
@@ -79,8 +84,7 @@ async def list_users(_: UserContext = Depends(require_root)):
     require_postgres_pool_or_503(route_label="GET /admin/users")
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, display_name, email, role, namespace, created_at "
-            "FROM users ORDER BY created_at"
+            "SELECT id, display_name, email, role, namespace, created_at " "FROM users ORDER BY created_at"
         )
     return [
         UserResponse(
@@ -97,6 +101,7 @@ async def list_users(_: UserContext = Depends(require_root)):
 
 # ── API Keys ──────────────────────────────────────────────────────────────────
 
+
 @router.post("/users/{user_id}/apikeys", response_model=ApiKeyResponse, status_code=201)
 async def create_api_key(
     user_id: str,
@@ -111,24 +116,25 @@ async def create_api_key(
         if not user:
             raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
 
-        key_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM api_keys WHERE user_id=$1 AND NOT revoked", user_id
-        )
+        key_count = await conn.fetchval("SELECT COUNT(*) FROM api_keys WHERE user_id=$1 AND NOT revoked", user_id)
         if key_count >= 10:
             raise HTTPException(
                 status_code=422,
                 detail="Maximum of 10 active API keys per user",
             )
 
-        raw_key = secrets.token_hex(32)       # 64 hex chars = 256 bits
+        raw_key = secrets.token_hex(32)  # 64 hex chars = 256 bits
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-        key_prefix = raw_key[:8]              # shown in listings for identification
+        key_prefix = raw_key[:8]  # shown in listings for identification
 
         row = await conn.fetchrow(
             "INSERT INTO api_keys (user_id, key_hash, key_prefix, label) "
             "VALUES ($1, $2, $3, $4) "
             "RETURNING id, user_id, key_prefix, label, created_at, last_used, revoked",
-            user_id, key_hash, key_prefix, request.label,
+            user_id,
+            key_hash,
+            key_prefix,
+            request.label,
         )
 
     logger.info(f"[ADMIN] Created API key prefix={key_prefix} for user={user_id}")
@@ -239,9 +245,16 @@ async def create_oauth_provider(
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING *
             """,
-            request.name, request.display_name, request.kind, request.issuer_url,
-            request.client_id, request.client_secret, request.scope,
-            request.authorize_url, request.token_url, request.userinfo_url,
+            request.name,
+            request.display_name,
+            request.kind,
+            request.issuer_url,
+            request.client_id,
+            request.client_secret,
+            request.scope,
+            request.authorize_url,
+            request.token_url,
+            request.userinfo_url,
             request.enabled,
         )
     return _to_provider_admin(row)
@@ -270,9 +283,9 @@ async def update_oauth_provider(
     set_clauses.append("updated=NOW()")
     async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
-            f"UPDATE oauth_providers SET {', '.join(set_clauses)} "
-            f"WHERE name=$1 RETURNING *",
-            name, *updates.values(),
+            f"UPDATE oauth_providers SET {', '.join(set_clauses)} " f"WHERE name=$1 RETURNING *",
+            name,
+            *updates.values(),
         )
     if not row:
         raise HTTPException(status_code=404, detail="Provider not found")
@@ -287,7 +300,8 @@ async def delete_oauth_provider(
     require_postgres_pool_or_503(route_label="DELETE /admin/oauth/providers/{name}")
     async with _lc.get_pool_manager().acquire() as conn:
         result = await conn.execute(
-            "DELETE FROM oauth_providers WHERE name=$1", name,
+            "DELETE FROM oauth_providers WHERE name=$1",
+            name,
         )
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail="Provider not found")
@@ -369,8 +383,8 @@ class CompressionEnqueueRequest(BaseModel):
     memory_ids: List[str] = Field(
         ...,
         description="Memory IDs to enqueue. Each row becomes a pending task "
-                    "in memory_compression_queue; the distillation worker drains "
-                    "them on its next tick.",
+        "in memory_compression_queue; the distillation worker drains "
+        "them on its next tick.",
         min_length=1,
         max_length=1000,
     )
@@ -380,8 +394,7 @@ class CompressionEnqueueRequest(BaseModel):
     )
     scoring_profile: CompressionProfile = Field(
         default="balanced",
-        description="Scoring profile for this batch. One of: "
-                    "balanced | quality_first | speed_first | custom",
+        description="Scoring profile for this batch. One of: " "balanced | quality_first | speed_first | custom",
     )
     priority: int = Field(default=0, description="Higher = drained sooner")
 
@@ -497,16 +510,16 @@ class CompressionEnqueueAllRequest(BaseModel):
     only_uncompressed: bool = Field(
         default=True,
         description="When True (default), skip memories that already have a "
-                    "row in memory_compressed_variants. Flip to False to "
-                    "force re-running the contest on every matching memory.",
+        "row in memory_compressed_variants. Flip to False to "
+        "force re-running the contest on every matching memory.",
     )
     limit: int = Field(
         default=500,
         ge=1,
         le=10000,
         description="Cap on how many memories this call enqueues. Default 500; "
-                    "max 10,000. Run the endpoint repeatedly to drain a larger "
-                    "corpus.",
+        "max 10,000. Run the endpoint repeatedly to drain a larger "
+        "corpus.",
     )
 
 
@@ -550,6 +563,7 @@ async def compression_enqueue_all(
 
 # ── PERSEPHONE archival admin ────────────────────────────────────────────────
 
+
 @router.post("/persephone/sweep", response_model=PersephoneSweepResponse)
 async def persephone_sweep(
     request: PersephoneSweepRequest,
@@ -590,7 +604,48 @@ async def persephone_archive_memory(
 
     try:
         async with backend.transactional() as tx:
+            archive_row_snapshot = await tx.conn.fetchrow(
+                "SELECT content, category, subcategory, metadata "
+                "FROM memories WHERE id = $1 AND archived_at IS NULL "
+                "AND deleted_at IS NULL",
+                memory_id,
+            )
             await _admin_lifecycle_repo.archive_memory(tx, memory_id, user.user_id)
+            try:
+                from mnemos.audit import write_audit_entry
+                from mnemos.core.config import get_settings as _get_settings
+                from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
+
+                if _ace() and archive_row_snapshot is not None and backend.audit_chain is not None:
+                    _settings = _get_settings()
+                    _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
+                    if _session_secret:
+                        import json as _json
+
+                        raw_meta = archive_row_snapshot["metadata"]
+                        parsed_meta = (
+                            _json.loads(raw_meta)
+                            if isinstance(raw_meta, str)
+                            else (dict(raw_meta) if raw_meta else None)
+                        )
+                        await write_audit_entry(
+                            backend,
+                            tx,
+                            op="archive",
+                            memory_id_str=memory_id,
+                            content=archive_row_snapshot["content"],
+                            category=archive_row_snapshot["category"],
+                            subcategory=archive_row_snapshot["subcategory"],
+                            metadata=parsed_meta,
+                            embedding=None,
+                            writer_id=user.user_id,
+                            session_secret=_session_secret,
+                        )
+            except Exception:
+                logger.exception(
+                    "[archive] audit-chain write failed for memory %s; archive still committed",
+                    memory_id,
+                )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     await _invalidate_memory_read_caches()
@@ -638,11 +693,9 @@ async def persephone_status(
     _require_persephone_installed()
     backend = backend_or_503()
     async with backend.transactional() as tx:
-        archived_count, last_run_at, oldest_unrecalled = (
-            await _admin_lifecycle_repo.fetch_persephone_status(
-                tx,
-                namespace=namespace,
-            )
+        archived_count, last_run_at, oldest_unrecalled = await _admin_lifecycle_repo.fetch_persephone_status(
+            tx,
+            namespace=namespace,
         )
     return PersephoneStatusResponse(
         enabled=get_settings().persephone.enabled,
@@ -655,6 +708,7 @@ async def persephone_status(
 
 # ── GRAEAE provider manifest ──────────────────────────────────────────────────
 
+
 @router.post("/graeae/reload-providers")
 async def reload_graeae_providers(_: UserContext = Depends(require_root)):
     """Refresh the GRAEAE muse manifest from model_registry.
@@ -664,12 +718,13 @@ async def reload_graeae_providers(_: UserContext = Depends(require_root)):
     """
     backend = backend_or_503()
     from mnemos.domain.graeae.engine import get_graeae_engine
+
     engine = get_graeae_engine()
     changes = await _admin_lifecycle_repo.reload_graeae_providers(backend, engine)
-    return {"changes": changes, "providers": {
-        n: {"model": cfg["model"], "weight": cfg["weight"]}
-        for n, cfg in engine.providers.items()
-    }}
+    return {
+        "changes": changes,
+        "providers": {n: {"model": cfg["model"], "weight": cfg["weight"]} for n, cfg in engine.providers.items()},
+    }
 
 
 # ── GDPR right-to-be-forgotten ────────────────────────────────────────────────
@@ -694,6 +749,7 @@ def _row_to_deletion_request(row) -> DeletionRequestItem:
     back from asyncpg as native types; the response model uses
     ISO strings.
     """
+
     def _ts(value):
         return value.isoformat() if value is not None else None
 
@@ -870,9 +926,7 @@ async def create_deletion_request(
     """
     backend = backend_or_503()
 
-    target_user_id, target_namespace = _normalize_deletion_target(
-        request.target_user_id, request.target_namespace
-    )
+    target_user_id, target_namespace = _normalize_deletion_target(request.target_user_id, request.target_namespace)
     notes = (request.notes or "").strip() or None
 
     try:
@@ -908,9 +962,10 @@ async def create_deletion_request(
         ) from exc
 
     logger.info(
-        "[ADMIN] Created deletion request %s for target_user_id=%s "
-        "target_namespace=%s by %s",
-        row["id"], row["target_user_id"], row["target_namespace"],
+        "[ADMIN] Created deletion request %s for target_user_id=%s " "target_namespace=%s by %s",
+        row["id"],
+        row["target_user_id"],
+        row["target_namespace"],
         row["requested_by"],
     )
     return _row_to_deletion_request(row)
@@ -1007,7 +1062,8 @@ async def confirm_deletion_request(
         )
     logger.info(
         "[ADMIN] Confirmed deletion request %s (target_user_id=%s)",
-        row["id"], row["target_user_id"],
+        row["id"],
+        row["target_user_id"],
     )
     return _row_to_deletion_request(row)
 
@@ -1051,7 +1107,8 @@ async def cancel_deletion_request(
         )
     logger.info(
         "[ADMIN] Cancelled deletion request %s (target_user_id=%s)",
-        row["id"], row["target_user_id"],
+        row["id"],
+        row["target_user_id"],
     )
     return _row_to_deletion_request(row)
 
@@ -1090,20 +1147,14 @@ async def restore_deletion_request(
         if existing["restore_by"] is None or existing["soft_deleted_at"] is None:
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    f"deletion request {request_id} is missing "
-                    "restore metadata"
-                ),
+                detail=(f"deletion request {request_id} is missing " "restore metadata"),
             )
-        restore_window_expired = existing["restore_by"] <= datetime.now(
-            existing["restore_by"].tzinfo
-        )
+        restore_window_expired = existing["restore_by"] <= datetime.now(existing["restore_by"].tzinfo)
         if restore_window_expired:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"deletion request {request_id} restore window "
-                    f"expired at {existing['restore_by'].isoformat()}"
+                    f"deletion request {request_id} restore window " f"expired at {existing['restore_by'].isoformat()}"
                 ),
             )
 
@@ -1119,7 +1170,8 @@ async def restore_deletion_request(
 
     logger.info(
         "[ADMIN] Restored deletion request %s (target_user_id=%s)",
-        row["id"], row["target_user_id"],
+        row["id"],
+        row["target_user_id"],
     )
     return _row_to_deletion_request(row)
 
@@ -1171,15 +1223,14 @@ async def force_purge_deletion_request(
             reason=_row_get(existing, "notes"),
         )
         if row is None:
-            raise RuntimeError(
-                f"deletion request {request_id} disappeared before hard-delete transition"
-            )
+            raise RuntimeError(f"deletion request {request_id} disappeared before hard-delete transition")
 
     if purged_target is not None:
         await invalidate_deletion_scope_caches(*purged_target)
 
     logger.info(
         "[ADMIN] Force-purged deletion request %s (target_user_id=%s)",
-        row["id"], row["target_user_id"],
+        row["id"],
+        row["target_user_id"],
     )
     return _row_to_deletion_request(row)

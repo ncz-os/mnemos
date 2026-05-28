@@ -1,6 +1,8 @@
 """Pytest configuration and shared fixtures for MNEMOS tests."""
+
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Any
@@ -43,6 +45,15 @@ def reset_rate_limiter_state():
     from mnemos.core.rate_limit import limiter
 
     _clear_slowapi_limiter(limiter)
+
+
+@pytest.fixture(autouse=True)
+def ensure_default_event_loop():
+    """Keep legacy sync tests using asyncio.get_event_loop() working on 3.11+."""
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def _build_memory_row(
@@ -131,9 +142,7 @@ class FakeConnection:
 
         if compact.startswith("INSERT INTO consultation_memory_refs "):
             consultation_id, memory_id = args[:2]
-            existing = {
-                (ref["consultation_id"], ref["memory_id"]) for ref in self.state["memory_refs"]
-            }
+            existing = {(ref["consultation_id"], ref["memory_id"]) for ref in self.state["memory_refs"]}
             if (consultation_id, memory_id) not in existing:
                 self.state["memory_refs"].append(
                     {
@@ -257,32 +266,22 @@ class FakeConnection:
 
         if "SELECT id, prompt, task_type, consensus_response" in compact:
             consultation = self.state["consultations"].get(args[0])
-            if "AND owner_id=$2" in compact and (
-                not consultation or consultation.get("owner_id") != args[1]
-            ):
+            if "AND owner_id=$2" in compact and (not consultation or consultation.get("owner_id") != args[1]):
                 return None
-            if "AND namespace=$2" in compact and (
-                not consultation or consultation.get("namespace") != args[1]
-            ):
+            if "AND namespace=$2" in compact and (not consultation or consultation.get("namespace") != args[1]):
                 return None
             if "AND owner_id=$2 AND namespace=$3" in compact and (
-                not consultation
-                or consultation.get("owner_id") != args[1]
-                or consultation.get("namespace") != args[2]
+                not consultation or consultation.get("owner_id") != args[1] or consultation.get("namespace") != args[2]
             ):
                 return None
             return consultation
 
         if "SELECT id, created FROM graeae_consultations" in compact:
             consultation = self.state["consultations"].get(args[0])
-            if "AND namespace=$2" in compact and (
-                not consultation or consultation.get("namespace") != args[1]
-            ):
+            if "AND namespace=$2" in compact and (not consultation or consultation.get("namespace") != args[1]):
                 return None
             if "AND owner_id=$2 AND namespace=$3" in compact and (
-                not consultation
-                or consultation.get("owner_id") != args[1]
-                or consultation.get("namespace") != args[2]
+                not consultation or consultation.get("owner_id") != args[1] or consultation.get("namespace") != args[2]
             ):
                 return None
             if not consultation:
@@ -397,12 +396,9 @@ class FakeConnection:
                     owner_id = None  # root with namespace scope
                 if owner_id is not None:
                     visible_rows = [
-                        row for row in rows
-                        if (
-                            self.state["consultations"]
-                            .get(row["consultation_id"], {})
-                            .get("owner_id") == owner_id
-                        )
+                        row
+                        for row in rows
+                        if (self.state["consultations"].get(row["consultation_id"], {}).get("owner_id") == owner_id)
                     ]
                 else:
                     visible_rows = list(rows)
@@ -433,28 +429,20 @@ class FakeConnection:
             elif "c.owner_id = $1" in compact:
                 owner_id = args[0]
                 rows = [
-                    row for row in rows
-                    if (
-                        self.state["consultations"]
-                        .get(row["consultation_id"], {})
-                        .get("owner_id") == owner_id
-                    )
+                    row
+                    for row in rows
+                    if (self.state["consultations"].get(row["consultation_id"], {}).get("owner_id") == owner_id)
                 ]
             if (
                 "ORDER BY global_sequence_num DESC" in compact
-                or (
-                    "FROM graeae_audit_log" in compact
-                    and "ORDER BY sequence_num DESC" in compact
-                )
+                or ("FROM graeae_audit_log" in compact and "ORDER BY sequence_num DESC" in compact)
                 or "ORDER BY al.sequence_num DESC" in compact
             ):
                 rows = list(reversed(rows))
             return rows
 
         if "FROM consultation_memory_refs WHERE consultation_id=$1" in compact:
-            return [
-                ref for ref in self.state["memory_refs"] if ref["consultation_id"] == args[0]
-            ]
+            return [ref for ref in self.state["memory_refs"] if ref["consultation_id"] == args[0]]
 
         if "SELECT indexname FROM pg_indexes" in compact:
             return [
