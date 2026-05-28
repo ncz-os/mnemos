@@ -1,5 +1,5 @@
 """
-StateManager: Key-value session state backed by PersistenceBackend.
+StateManager: Key-value session state backed by StatePersistence.
 
 Provides:
 - get(key): Load value for key
@@ -11,7 +11,7 @@ Provides:
 
 # Library API: This module provides a programmatic interface to the journal/state/entities
 # subsystem for use in Python applications that embed MNEMOS directly.
-# The REST API handlers use the PersistenceBackend state repository.
+# The REST API handlers use the StatePersistence repository.
 
 import asyncio
 import json
@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from mnemos.core.auth_context import UserContext
-from mnemos.persistence.base import PersistenceBackend
+from mnemos.persistence.base import StatePersistence
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ def _decode_state_value(raw: Any) -> Any:
     if raw is None or not isinstance(raw, str):
         return raw
     if raw.startswith(_SM_ENVELOPE_PREFIX):
-        suffix = raw[len(_SM_ENVELOPE_PREFIX):]
+        suffix = raw[len(_SM_ENVELOPE_PREFIX) :]
         try:
             return json.loads(suffix)
         except (json.JSONDecodeError, TypeError):
@@ -105,7 +105,7 @@ def _decode_state_value(raw: Any) -> Any:
 class StateManager:
     """Manages session state as key-value pairs in the state table."""
 
-    def __init__(self, db_pool=None, backend: PersistenceBackend | None = None):
+    def __init__(self, db_pool=None, backend: StatePersistence | None = None):
         self.db_pool = db_pool
         self._backend = backend
         if self._backend is None and db_pool is not None:
@@ -166,7 +166,7 @@ class StateManager:
                         namespace=namespace,
                     )
                     if row:
-                        raw = row['value']
+                        raw = row["value"]
                         val = _decode_state_value(raw)
                         self._cache[cache_key] = val
                         return val
@@ -205,7 +205,7 @@ class StateManager:
         # Canonical = what _decode_state_value would yield for
         # this serialized envelope. Strip the prefix and json.loads
         # the JSON suffix.
-        canonical = json.loads(serialized[len(_SM_ENVELOPE_PREFIX):])
+        canonical = json.loads(serialized[len(_SM_ENVELOPE_PREFIX) :])
 
         async with self._lock_for(cache_key):
             if self._backend is None:
@@ -274,24 +274,24 @@ class StateManager:
     # ── Convenience accessors ────────────────────────────────────────────────
 
     async def load_identity(self, *, user: UserContext) -> Dict[str, Any]:
-        val = await self.get('identity', user=user)
-        return val or {'id': 'unknown', 'name': 'Unknown User', 'workspace': 'default'}
+        val = await self.get("identity", user=user)
+        return val or {"id": "unknown", "name": "Unknown User", "workspace": "default"}
 
     async def load_today(self, *, user: UserContext) -> Dict[str, Any]:
-        val = await self.get('today', user=user)
+        val = await self.get("today", user=user)
         if val:
             return val
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         return {
-            'date': now.isoformat(),
-            'day_of_week': now.strftime('%A'),
-            'schedule': [],
-            'events': [],
+            "date": now.isoformat(),
+            "day_of_week": now.strftime("%A"),
+            "schedule": [],
+            "events": [],
         }
 
     async def load_workspace(self, *, user: UserContext) -> Dict[str, Any]:
-        val = await self.get('workspace', user=user)
-        return val or {'id': 'default', 'name': 'Default Workspace', 'projects': []}
+        val = await self.get("workspace", user=user)
+        return val or {"id": "default", "name": "Default Workspace", "projects": []}
 
     def clear_cache(self) -> None:
         self._cache.clear()

@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 
 class PersistenceBackend(Protocol):
+    @property
+    def capabilities(self) -> set[str]: ...
+
     async def close(self) -> None: ...
 
 
@@ -324,6 +327,25 @@ def _backend_from_database_url(database_url: str) -> str | None:
     if database_url.startswith(("db2:", "ibm_db2:", "db2+ibm_db:")):
         return "db2"
     return None
+
+
+def _parse_required_capabilities(raw: str) -> set[str]:
+    return {part.strip().lower() for part in raw.replace(";", ",").split(",") if part.strip()}
+
+
+def _log_and_validate_backend_capabilities(backend_type: str, backend: object) -> None:
+    capabilities = set(getattr(backend, "capabilities", set()))
+    logger.info(
+        "%s persistence capabilities: %s",
+        backend_type,
+        ", ".join(sorted(capabilities)) if capabilities else "(none)",
+    )
+    required = _parse_required_capabilities(os.environ.get("MNEMOS_REQUIRE_CAPABILITIES", ""))
+    missing = required - capabilities
+    if missing:
+        raise RuntimeError(
+            "Persistence backend " f"{backend_type!r} missing required capabilities: {', '.join(sorted(missing))}"
+        )
 
 
 def _explicit_fields(settings, group: str) -> set[str]:
@@ -652,6 +674,8 @@ async def lifespan(app):
     except Exception as e:
         logger.error(f"Failed to initialize {backend_type} persistence backend: {e}", exc_info=True)
         raise
+
+    _log_and_validate_backend_capabilities(backend_type, _persistence_backend)
 
     # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
     if _auth_configurer is not None:

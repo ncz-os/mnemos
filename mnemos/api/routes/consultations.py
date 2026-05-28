@@ -10,9 +10,8 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import backend_or_503
+from mnemos.api.persistence_helpers import require_consultations_backend
 from mnemos.core.rate_limit import limiter
 from mnemos.core.security import is_root, scope_namespace
 from mnemos.domain.graeae.engine import _REGISTRY_MAP
@@ -74,7 +73,7 @@ async def _tier_lineup(tier: str) -> dict:
             status_code=400,
             detail=(f"unknown tier {tier!r}; " f"expected one of {sorted(_VALID_TIERS)}"),
         )
-    backend = backend_or_503()
+    backend = require_consultations_backend()
     async with backend.transactional() as tx:
         rows = await backend.consultations.resolve_tier_lineup(tx, tier)
     # Translate registry provider → GRAEAE engine provider key
@@ -90,7 +89,7 @@ async def _resolve_models(model_ids: List[str]) -> dict:
     unrecognized model_id — fail-loudly beats silently narrowing a
     deliberately-chosen lineup.
     """
-    backend = backend_or_503()
+    backend = require_consultations_backend()
     async with backend.transactional() as tx:
         rows = await backend.consultations.resolve_models(tx, model_ids)
     found = {r["model_id"]: r["provider"] for r in rows}
@@ -302,6 +301,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         f"[CONSULTATION] {user.user_id}: {body.task_type} " f"(limit_chars={body.limit_chars}, format={body.format})"
     )
     try:
+        backend = require_consultations_backend()
         from mnemos.domain.graeae.engine import get_graeae_engine
 
         engine = get_graeae_engine()
@@ -340,8 +340,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         consultation_id = None
         memory_ids = _extract_memory_ids(result)
         delivery_ids: list[str] = []
-        backend = _lc._persistence_backend
-        if backend is not None and result.get("all_responses"):
+        if result.get("all_responses"):
             # Persistence reads consensus fields FROM THE ENGINE return
             # dict instead of re-deriving them locally. The engine's
             # _compute_consensus is the single source of truth for
@@ -475,7 +474,7 @@ async def list_audit_log(
     """
     target_ns = scope_namespace(user, namespace)
     root = is_root(user)
-    backend = backend_or_503()
+    backend = require_consultations_backend()
     async with backend.transactional() as tx:
         rows = await backend.consultations.list_audit_log(
             tx,
@@ -520,7 +519,7 @@ async def verify_audit_chain(
     """
     target_ns = scope_namespace(user, namespace)
     verify_global_chain = is_root(user) and namespace is None
-    backend = backend_or_503()
+    backend = require_consultations_backend()
     async with backend.transactional() as tx:
         rows = await backend.consultations.fetch_audit_chain(
             tx,
@@ -719,7 +718,7 @@ async def get_consultation(
     """
     target_ns = scope_namespace(user, namespace)
     root = is_root(user)
-    backend = backend_or_503()
+    backend = require_consultations_backend()
     async with backend.transactional() as tx:
         row = await backend.consultations.get_consultation(
             tx,
@@ -755,7 +754,7 @@ async def get_consultation_artifacts(
     """Retrieve structured outputs and citations from a consultation."""
     target_ns = scope_namespace(user, namespace)
     root = is_root(user)
-    backend = backend_or_503()
+    backend = require_consultations_backend()
     async with backend.transactional() as tx:
         consultation, memory_refs = await backend.consultations.get_consultation_artifacts(
             tx,
