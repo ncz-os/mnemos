@@ -505,6 +505,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations" / "0036_hive_agents_subscription_pools.sql",
         repo_path / "db" / "migrations" / "0037_deepseek_direct_provider_seed.sql",
         repo_path / "db" / "migrations" / "0038_oauth_sessions_consultations.sql",
+        repo_path / "db" / "migrations" / "0039_knemon_dispatch_rule_refresh.sql",
     ]
 
     print("[db] Running migrations...")
