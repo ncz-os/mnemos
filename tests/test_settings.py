@@ -65,7 +65,11 @@ def test_default_values_when_env_unset(monkeypatch: pytest.MonkeyPatch, tmp_path
         assert settings.graeae.nats_fanout is False
         assert settings.knemon.session_burn_requests_per_hour == 10
         assert settings.knemon.session_burn_window_seconds == 3600
+        assert settings.knemon.subscription_preferred_utilization_pct == 70.0
+        assert settings.knemon.subscription_near_cap_pct == 90.0
         assert settings.knemon.low_priority_api_cost_ceiling_usd == 0.50
+        assert settings.knemon.g1_quality_floor == 0.85
+        assert settings.knemon.g2_quality_floor == 0.75
         assert settings.nats.publish_pantheon_routing is False
         assert settings.nats.audit_consumer_enabled is False
 
