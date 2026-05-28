@@ -4,7 +4,7 @@
 
 # MNEMOS + GRAEAE
 
-**MNEMOS (v6.0-rc — `release/v6.0-rc` branch, `v6.0-rc` tag) is the memory operating system for
+**MNEMOS v6.0.0rc1 is the — `release/v6.0-rc` branch, `v6.0-rc` tag) is the memory operating system for
 serious agentic work: a packaged FastAPI runtime, **four-backend** persistence
 layer (PostgreSQL + pgvector, Oracle Database 26ai HNSW INMEMORY NEIGHBOR GRAPH,
 IBM Db2 12.1.5 (EAP) DiskANN vector, SQLite + sqlite-vec), GRAEAE reasoning bus,
@@ -104,6 +104,7 @@ Key MCP tools the agent gets:
 | `get_memory` | Fetch a memory by ID |
 | `kg_search` | Query the knowledge-graph triple store |
 | `kronos_anomalies` | Surface recall anomalies and memory health signals |
+| `list_deletions` | List soft-deleted memories pending hard deletion |
 
 ---
 

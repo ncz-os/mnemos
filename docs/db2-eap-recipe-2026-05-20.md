@@ -100,8 +100,9 @@ docker run -d --name pythia-db2 \
   --shm-size=2g \
   -p 50000:50000 \
   -e DBNAME=MNEMOS \
-  -e ENABLE_ORACLE_COMPATIBILITY=true \
   mnemos/db2-eap:vnext
+# ENABLE_ORACLE_COMPATIBILITY defaults to false as of PR #12 (2026-05-22).
+# Set ENABLE_ORACLE_COMPATIBILITY=true to fall back to ORA-compat mode.
 ```
 
 Container reaches "ready" in ~90-120s on first start (creates instance + database). Subsequent restarts ~10s.
@@ -120,7 +121,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DB2INSTANCE=db2inst1 \
     DB2INST1_PASSWORD=<password> \
     DBNAME=MNEMOS \
-    ENABLE_ORACLE_COMPATIBILITY=true \
+    ENABLE_ORACLE_COMPATIBILITY=false \
     PATH=/opt/ibm/db2/V12.1/bin:/opt/ibm/db2/V12.1/adm:/opt/ibm/db2/V12.1/misc:${PATH}
 
 SHELL ["/bin/bash", "-c"]
@@ -368,8 +369,9 @@ docker build \
 docker run -d --name db2-ga-test \
   --privileged=true --ulimit memlock=-1:-1 --shm-size=2g \
   -p 50002:50000 \
-  -e DBNAME=MNEMOS -e ENABLE_ORACLE_COMPATIBILITY=true \
+  -e DBNAME=MNEMOS \
   mnemos/db2:12.1.5-ga
+# Note: ENABLE_ORACLE_COMPATIBILITY default is false as of PR #12 (2026-05-22)
 
 # 6. Run the validation probes above. If they pass, retire EAP image:
 docker tag mnemos/db2-eap:vnext mnemos/db2:12.1.5-eap-archive

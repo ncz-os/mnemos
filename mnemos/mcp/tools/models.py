@@ -56,7 +56,7 @@ def _validate_model_or_alias(value: str) -> str:
 async def tool_recommend_model(
     task_type: str,
     cost_budget: float = 10.0,
-    quality_floor: float = 0.85,
+    quality_floor: float = 0.7,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
     """Query model optimizer for cost-aware recommendation."""
@@ -120,8 +120,7 @@ async def tool_recommend_model(
                 "task_type": task_type,
                 "recommended": model,
                 "reasoning": (
-                    f"Cheapest model with {', '.join(required_caps)} capability "
-                    f"above quality floor {quality_floor}"
+                    f"Cheapest model with {', '.join(required_caps)} capability " f"above quality floor {quality_floor}"
                 ),
                 "budget_met": budget_met,
             }
@@ -164,10 +163,12 @@ async def tool_pantheon_route_explain(
         raise ValueError("messages must be a list with at most 100 items")
     return {
         "success": True,
-        **await explain_route({
-            "messages": messages,
-            "model_or_alias": _validate_model_or_alias(model_or_alias),
-        }),
+        **await explain_route(
+            {
+                "messages": messages,
+                "model_or_alias": _validate_model_or_alias(model_or_alias),
+            }
+        ),
     }
 
 
@@ -180,7 +181,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "description": "Task type (code_generation, reasoning, architecture_design, etc.)",
             },
             "cost_budget": {"type": "number", "description": "Max $/MTok (default: 10.0)"},
-            "quality_floor": {"type": "number", "description": "Min quality score (default: 0.85)"},
+            "quality_floor": {"type": "number", "description": "Min quality score (default: 0.7)"},
         },
         ["task_type"],
         tool_recommend_model,
