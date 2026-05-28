@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -9,6 +10,7 @@ from httpx import ASGITransport, AsyncClient
 
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.workers import deletion_request_worker as worker
+from tests._fake_backend import install_fake_backend
 
 
 def _user(role: str) -> UserContext:
@@ -161,6 +163,10 @@ async def test_admin_deletion_log_endpoint_is_root_only(monkeypatch):
     pool_manager.acquire = MagicMock(return_value=_AsyncContext(conn))
     monkeypatch.setattr(lifecycle, "get_pool_manager", lambda: pool_manager)
     monkeypatch.setattr(lifecycle, "_pool", MagicMock())
+    backend = install_fake_backend(monkeypatch)
+    backend.transactional = MagicMock(
+        return_value=_AsyncContext(SimpleNamespace(conn=conn))
+    )
 
     params = {
         "from": "2026-05-01T00:00:00Z",
