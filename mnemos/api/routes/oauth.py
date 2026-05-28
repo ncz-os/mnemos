@@ -16,8 +16,9 @@ from starlette.responses import JSONResponse, RedirectResponse
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import backend_or_503
+from mnemos.api.persistence_helpers import require_oauth_backend
 from mnemos.core import oauth as _oauth
+from mnemos.persistence.base import OAuthPersistence
 from mnemos.domain.models import (
     OAuthIdentity,
     OAuthLogoutResponse,
@@ -36,7 +37,7 @@ router = APIRouter(prefix="/auth/oauth", tags=["oauth"])
 @router.get("/providers", response_model=OAuthProviderListResponse)
 async def list_providers_public():
     """List enabled providers for a login UI. No secrets returned."""
-    backend = backend_or_503()
+    backend = require_oauth_backend()
     async with backend.transactional() as tx:
         rows = await backend.oauth.list_enabled_providers(tx)
     providers = [
@@ -56,7 +57,7 @@ async def list_providers_public():
 
 async def _load_provider(name: str):
     """Fetch an enabled provider row, else 404."""
-    backend = backend_or_503()
+    backend = require_oauth_backend()
     async with backend.transactional() as tx:
         row = await backend.oauth.get_provider(tx, name)
     if not row or not row["enabled"]:
@@ -105,7 +106,7 @@ async def oauth_callback(provider: str, request: Request):
         expires = datetime.now(timezone.utc) + _oauth.SESSION_TTL
         user_agent = request.headers.get("user-agent", "")[:500]
         ip = request.client.host if request.client else None
-        backend = backend_or_503()
+        backend = require_oauth_backend()
         async with backend.transactional() as tx:
             user_id, identity_id = await backend.oauth.provision_or_link_user(
                 tx,
@@ -178,7 +179,7 @@ async def oauth_logout(
     user: UserContext = Depends(get_current_user),
 ):
     """Invalidate the current session cookie (or all sessions for the user)."""
-    backend = backend_or_503()
+    backend = require_oauth_backend()
     sessions_revoked = 0
     async with backend.transactional() as tx:
         if all_devices:
@@ -211,7 +212,7 @@ async def oauth_me(
 
     if cookie_session:
         backend = _lc._persistence_backend
-        if backend is not None:
+        if backend is not None and isinstance(backend, OAuthPersistence):
             async with backend.transactional() as tx:
                 ident = await backend.oauth.get_identity_for_session(tx, cookie_session)
             if ident:

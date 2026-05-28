@@ -24,7 +24,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import backend_or_503 as _backend_or_503
+from mnemos.api.persistence_helpers import require_audit_backend
 from mnemos.audit import derive_writer_keypair, load_root_keypair
 from mnemos.audit.crypto import merkle_leaf, merkle_proof, merkle_root
 from mnemos.audit.route_helper import memory_id_to_audit_bytes
@@ -105,7 +105,7 @@ async def audit_proof_head(
             status_code=503,
             detail="audit chain disabled (MNEMOS_AUDIT_CHAIN not 'on')",
         )
-    backend = _backend_or_503()
+    backend = require_audit_backend()
     if backend.audit_chain is None:
         raise HTTPException(
             status_code=503,
@@ -176,7 +176,7 @@ async def audit_inclusion_proof(
             status_code=503,
             detail="audit chain disabled (MNEMOS_AUDIT_CHAIN not 'on')",
         )
-    backend = _backend_or_503()
+    backend = require_audit_backend()
     if backend.audit_chain is None:
         raise HTTPException(
             status_code=503,
@@ -280,7 +280,7 @@ async def audit_health(
     still exist (lets operators inspect a disabled chain without
     re-enabling).
     """
-    backend = _backend_or_503()
+    backend = require_audit_backend()
     if backend.audit_chain is None:
         raise HTTPException(
             status_code=503,

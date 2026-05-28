@@ -15,7 +15,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from mnemos.api.dependencies import UserContext, get_current_user, require_root
-from mnemos.api.persistence_helpers import backend_or_503
+from mnemos.api.persistence_helpers import require_federation_backend
 from mnemos.core.ids import parse_uuid_or_404
 from mnemos.domain import federation as _fed
 from mnemos.domain.models import (
@@ -383,7 +383,7 @@ async def register_peer(
     await _validate_peer_base_url(request.base_url)
     # #168: compat_mode is now Literal["strict", "permissive"] in
     # the request model — Pydantic auto-422s before we get here.
-    backend = backend_or_503()
+    backend = require_federation_backend()
     try:
         async with backend.transactional() as tx:
             row = await backend.federation.create_peer(
@@ -409,7 +409,7 @@ async def register_peer(
 
 @router.get("/peers", response_model=FederationPeerListResponse)
 async def list_peers(_: UserContext = Depends(require_root)):
-    backend = backend_or_503()
+    backend = require_federation_backend()
     async with backend.transactional() as tx:
         rows = await backend.federation.list_peers(tx)
     peers = [_to_peer(r) for r in rows]
@@ -419,7 +419,7 @@ async def list_peers(_: UserContext = Depends(require_root)):
 @router.get("/peers/{peer_id}", response_model=FederationPeer)
 async def get_peer(peer_id: str, _: UserContext = Depends(require_root)):
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    backend = backend_or_503()
+    backend = require_federation_backend()
     async with backend.transactional() as tx:
         row = await backend.federation.get_peer(tx, peer_id)
     if not row:
@@ -458,7 +458,7 @@ async def update_peer(
     bad = set(updates.keys()) - _ALLOWED_PEER_COLS
     if bad:
         raise HTTPException(status_code=422, detail=f"unknown fields: {sorted(bad)}")
-    backend = backend_or_503()
+    backend = require_federation_backend()
     async with backend.transactional() as tx:
         row = await backend.federation.update_peer(tx, peer_id, updates)
     if not row:
@@ -469,7 +469,7 @@ async def update_peer(
 @router.delete("/peers/{peer_id}", status_code=204)
 async def delete_peer(peer_id: str, _: UserContext = Depends(require_root)):
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    backend = backend_or_503()
+    backend = require_federation_backend()
     async with backend.transactional() as tx:
         deleted = await backend.federation.delete_peer(tx, peer_id)
     if not deleted:
@@ -483,7 +483,7 @@ async def trigger_sync(
 ):
     """Run a sync against a peer right now (blocks on completion)."""
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    backend = backend_or_503()
+    backend = require_federation_backend()
     try:
         pulled, new, updated = await _fed.sync_peer(backend, peer_id)
     except _fed.FederationSchemaIncompatible as e:
@@ -518,7 +518,7 @@ async def peer_sync_log(
     limit: int = 50,
 ):
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    backend = backend_or_503()
+    backend = require_federation_backend()
     async with backend.transactional() as tx:
         rows = await backend.federation.fetch_sync_log(tx, peer_id, limit)
     entries = [
@@ -540,7 +540,7 @@ async def peer_sync_log(
 
 @router.get("/status", response_model=FederationStatusResponse)
 async def federation_status(_: UserContext = Depends(require_root)):
-    backend = backend_or_503()
+    backend = require_federation_backend()
     async with backend.transactional() as tx:
         rows = await backend.federation.list_peers(tx)
     peers = [_to_peer(r) for r in rows]
@@ -592,7 +592,7 @@ async def federation_feed(
     ),
 ):
     """Serve memories for a remote peer to pull. Requires role='federation' or 'root'."""
-    backend = backend_or_503()
+    backend = require_federation_backend()
 
     since_ts: Optional[datetime] = None
     since_id: Optional[str] = None
@@ -732,7 +732,7 @@ async def federation_memory(
     category: Optional[str] = Query(None, description="Comma-separated category filter"),
 ):
     """Serve one visible memory for a remote peer. Requires role='federation' or 'root'."""
-    backend = backend_or_503()
+    backend = require_federation_backend()
 
     namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
     categories = [s.strip() for s in category.split(",") if s.strip()] if category else []

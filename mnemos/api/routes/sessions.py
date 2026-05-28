@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import backend_or_503
+from mnemos.api.persistence_helpers import require_sessions_backend
 from mnemos.core.security import scope_namespace
 from mnemos.domain.openai_compat.router import search_memory_context as _search_mnemos_context
 from mnemos.domain.openai_compat.providers import _route_to_provider
@@ -36,7 +36,7 @@ async def create_session(
     user: UserContext = Depends(get_current_user),
 ):
     """Create a new session for multi-turn conversation."""
-    backend = backend_or_503()
+    backend = require_sessions_backend()
 
     try:
         async with backend.transactional() as tx:
@@ -70,7 +70,7 @@ async def get_session(
     user: UserContext = Depends(get_current_user),
 ):
     """Get session context and metadata."""
-    backend = backend_or_503()
+    backend = require_sessions_backend()
     target_ns = scope_namespace(user, namespace)
 
     async with backend.transactional() as tx:
@@ -113,7 +113,7 @@ async def add_session_message(
     5. Stores assistant response in history
     6. Updates session metrics
     """
-    backend = backend_or_503()
+    backend = require_sessions_backend()
     target_ns = scope_namespace(user, namespace)
 
     # Verify session ownership
@@ -271,7 +271,7 @@ async def get_session_history(
     user: UserContext = Depends(get_current_user),
 ):
     """Get conversation history for session."""
-    backend = backend_or_503()
+    backend = require_sessions_backend()
     target_ns = scope_namespace(user, namespace)
 
     async with backend.transactional() as tx:
@@ -312,7 +312,7 @@ async def delete_session(
     user: UserContext = Depends(get_current_user),
 ):
     """Close and delete session."""
-    backend = backend_or_503()
+    backend = require_sessions_backend()
     target_ns = scope_namespace(user, namespace)
 
     async with backend.transactional() as tx:
