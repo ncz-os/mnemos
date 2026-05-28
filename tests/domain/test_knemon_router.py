@@ -4,7 +4,7 @@ import asyncio
 import json
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -28,6 +28,7 @@ class _SqliteKnemonBackend:
         *,
         burned_session: str | None = None,
         burned_request_count: int = 11,
+        burned_age_seconds: int = 0,
         agent_session_id: str | None = None,
         subscription_pools: list[str] | None = None,
     ) -> None:
@@ -39,6 +40,7 @@ class _SqliteKnemonBackend:
             utilization_pct,
             burned_session=burned_session,
             burned_request_count=burned_request_count,
+            burned_age_seconds=burned_age_seconds,
             agent_session_id=agent_session_id,
             subscription_pools=subscription_pools,
         )
@@ -109,6 +111,7 @@ class _SqliteKnemonBackend:
         *,
         burned_session: str | None,
         burned_request_count: int,
+        burned_age_seconds: int,
         agent_session_id: str | None,
         subscription_pools: list[str] | None,
     ) -> None:
@@ -146,6 +149,7 @@ class _SqliteKnemonBackend:
             (now, used, window_id),
         )
         if burned_session:
+            burn_ts = now - timedelta(seconds=burned_age_seconds)
             self.conn.execute(
                 """
                 INSERT INTO usage_ledger (
@@ -155,7 +159,7 @@ class _SqliteKnemonBackend:
                 ) VALUES (?, 'xai', 'grok-api', 'chat', 100, 50, 0, 0, 100, 'ok',
                           'test', 'api', ?, ?, ?, 0)
                 """,
-                (now, burned_session, burned_request_count, window_id),
+                (burn_ts, burned_session, burned_request_count, window_id),
             )
         if agent_session_id:
             self.conn.execute(
@@ -298,6 +302,19 @@ async def test_session_burn_threshold_defaults_to_ten_requests(request_count, ex
     backend = _SqliteKnemonBackend(92, burned_session=session_id, burned_request_count=request_count)
     decision = await route(_req(14, session_id), backend)
     assert decision.provider == expected_provider
+
+
+@pytest.mark.asyncio
+async def test_session_burn_ignores_requests_outside_rolling_window():
+    session_id = "burn-window-expired"
+    backend = _SqliteKnemonBackend(
+        92,
+        burned_session=session_id,
+        burned_request_count=10,
+        burned_age_seconds=get_settings().knemon.session_burn_window_seconds + 1,
+    )
+    decision = await route(_req(14, session_id), backend)
+    assert decision.provider == "openai"
 
 
 @pytest.mark.asyncio
