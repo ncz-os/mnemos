@@ -52,6 +52,7 @@ from urllib.parse import unquote, urlparse
 from mnemos.persistence.base import (
     BranchRepository,
     CompressionRepository,
+    CORE_CAPABILITY,
     ConsultationAuditRepository,
     FederationRepository,
     KGRepository,
@@ -1078,6 +1079,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     supports_pgvector = False
     supports_mysql_vector = True  # MySQL 9.0 native VECTOR
     supports_webhooks = False
+    _supports_core_persistence = True
 
     def __init__(self, pool: Any, settings: Any) -> None:
         self._pool = pool
@@ -1105,6 +1107,64 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     @property
     def pool(self) -> Any:
         return self._pool
+
+    @property
+    def capabilities(self) -> set[str]:
+        return {CORE_CAPABILITY}
+
+    async def record_usage_ledger(self, tx: Transaction, record: Any) -> Any:
+        raise NotImplementedError("mysql: usage_ledger is not yet implemented")
+
+    async def fetch_category_decay_rows(self, tx: Transaction) -> list[Row]:
+        raise NotImplementedError("mysql: category decay is not yet implemented")
+
+    async def upsert_category_decay(
+        self,
+        tx: Transaction,
+        *,
+        category: str,
+        half_life_days: float,
+        decay_kind: str,
+        floor: float,
+    ) -> None:
+        raise NotImplementedError("mysql: category decay is not yet implemented")
+
+    async def create_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+    ) -> Row:
+        raise NotImplementedError("mysql: journal persistence is not yet implemented")
+
+    async def list_journal_entries(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str | None,
+        search: str | None,
+        limit: int,
+    ) -> list[Row]:
+        raise NotImplementedError("mysql: journal persistence is not yet implemented")
+
+    async def delete_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+    ) -> bool:
+        raise NotImplementedError("mysql: journal persistence is not yet implemented")
 
     @asynccontextmanager
     async def transactional(self) -> AsyncIterator[Transaction]:
@@ -1186,6 +1246,18 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
             self._pool.close()
             await self._pool.wait_closed()
         self._closed = True
+
+    async def ping(self) -> bool:
+        if self._closed or self._pool is None:
+            return False
+        try:
+            async with self._pool.acquire() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute("SELECT 1")
+                    await cursor.fetchone()
+            return True
+        except Exception:
+            return False
 
 
 __all__ = [
