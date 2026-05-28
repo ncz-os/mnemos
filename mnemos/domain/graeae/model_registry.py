@@ -26,6 +26,45 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+
+def perf_rank(model: dict) -> float:
+    """Return a normalized quality score for model-selection heuristics."""
+    for key in ("quality_score", "graeae_weight", "weight"):
+        value = model.get(key)
+        if value is None:
+            continue
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            continue
+    arena_rank = model.get("arena_rank")
+    if arena_rank is None:
+        return 0.5
+    try:
+        rank = max(1.0, float(arena_rank))
+    except (TypeError, ValueError):
+        return 0.5
+    return 1.0 / rank
+
+
+def newness_value(model: dict) -> float | None:
+    """Return a monotonic freshness value when registry rows expose one."""
+    for key in ("release_date", "last_synced", "updated_at", "created_at"):
+        value = model.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value)
+        try:
+            from datetime import datetime
+
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
 # ── HuggingFace Datasets Server (same source as elo_sync) ─────────────────
 _HF_ROWS_URL = (
     "https://datasets-server.huggingface.co/rows"
@@ -43,29 +82,33 @@ _HF_ROWS_URL = (
 #             Return None if normalization is ambiguous → candidate-only (no auto-apply)
 # url_fn:     for providers where the URL embeds the model name (e.g. Gemini)
 
+
 def _xai_norm(name: str) -> str:
     """grok-4.20-beta1 → grok-4.2 ; grok-4.20-beta-0309-reasoning → grok-4.2"""
-    n = re.sub(r'(\d+)\.(\d)0+\b', r'\1.\2', name)   # 4.20 → 4.2
-    n = re.sub(r'-(beta\d*|beta-[0-9-]+|reasoning|non-reasoning|thinking|multi-agent[^-]*)', '', n)
-    return n.rstrip('-')
+    n = re.sub(r"(\d+)\.(\d)0+\b", r"\1.\2", name)  # 4.20 → 4.2
+    n = re.sub(r"-(beta\d*|beta-[0-9-]+|reasoning|non-reasoning|thinking|multi-agent[^-]*)", "", n)
+    return n.rstrip("-")
+
 
 def _openai_norm(name: str) -> Optional[str]:
     """gpt-5.4-high → gpt-5.4  (strip -high, -mini-high, but not -mini itself)"""
-    n = re.sub(r'-(high|chat-latest|20\d{6})$', '', name)
+    n = re.sub(r"-(high|chat-latest|20\d{6})$", "", name)
     return n
+
 
 def _gemini_norm(name: str) -> str:
     """gemini-3.1-pro-preview stays as-is — Arena name == API name."""
     return name
 
+
 def _gemini_url(model: str) -> str:
-    return (
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    )
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
 
 def _claude_norm(name: str) -> str:
     """claude-opus-4-6-thinking → claude-opus-4-6"""
-    return re.sub(r'-(thinking(-\d+k)?)$', '', name)
+    return re.sub(r"-(thinking(-\d+k)?)$", "", name)
+
 
 # Together API IDs use vendor-prefixed capitalization and provider-specific
 # suffixes (-tput, -Turbo, -FP8) that can't be derived algorithmically.
@@ -73,16 +116,17 @@ def _claude_norm(name: str) -> str:
 # Key: lowercase substring of Arena model name (first match wins)
 # Value: exact Together API model ID
 _TOGETHER_API_MAP: dict[str, str] = {
-    "qwen3-235b-a22b-instruct-2507":    "Qwen/Qwen3-235B-A22B-Instruct-2507-tput",
-    "qwen3-235b-a22b-thinking-2507":    "Qwen/Qwen3-235B-A22B-Thinking-2507",
-    "qwen3-235b":                        "Qwen/Qwen3-235B-A22B-Instruct-2507-tput",
-    "llama-4-maverick":                  "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
-    "llama-4-scout":                     "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-    "llama-3.3-70b":                     "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-    "deepseek-v3":                       "deepseek-ai/DeepSeek-V3",
-    "deepseek-r1":                       "deepseek-ai/DeepSeek-R1",
-    "mistral-large":                     "mistralai/Mistral-Large-Instruct-2411",
+    "qwen3-235b-a22b-instruct-2507": "Qwen/Qwen3-235B-A22B-Instruct-2507-tput",
+    "qwen3-235b-a22b-thinking-2507": "Qwen/Qwen3-235B-A22B-Thinking-2507",
+    "qwen3-235b": "Qwen/Qwen3-235B-A22B-Instruct-2507-tput",
+    "llama-4-maverick": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "llama-4-scout": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+    "llama-3.3-70b": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "deepseek-v3": "deepseek-ai/DeepSeek-V3",
+    "deepseek-r1": "deepseek-ai/DeepSeek-R1",
+    "mistral-large": "mistralai/Mistral-Large-Instruct-2411",
 }
+
 
 def _together_norm(name: str) -> Optional[str]:
     """Map Arena model name → Together API model ID via explicit lookup table.
@@ -146,6 +190,7 @@ _PROVIDER_FAMILIES: dict[str, dict] = {
 
 # ── Fetch + parse Arena rows ───────────────────────────────────────────────
 
+
 def _fetch_arena_rows(timeout: int = 30) -> list[dict]:
     try:
         resp = httpx.get(_HF_ROWS_URL, timeout=timeout, follow_redirects=True)
@@ -177,6 +222,7 @@ def _best_per_family(rows: list[dict]) -> dict[str, tuple[str, float]]:
 
 # ── GRAEAE config.toml update ─────────────────────────────────────────────
 
+
 def update_graeae_config(
     config_path: Path,
     dry_run: bool = False,
@@ -206,6 +252,7 @@ def update_graeae_config(
 
         # Find current model in config.toml (simple text search)
         import re as _re
+
         section_re = _re.compile(
             rf'(\[graeae\.providers\.{provider}\][^\[]*?model\s*=\s*")([^"]+)(")',
             _re.DOTALL,
@@ -225,7 +272,7 @@ def update_graeae_config(
         logger.info(f"[REGISTRY] UPDATE {msg}")
 
         if not dry_run:
-            text = section_re.sub(rf'\g<1>{api_id}\g<3>', text)
+            text = section_re.sub(rf"\g<1>{api_id}\g<3>", text)
 
             # If provider has URL that embeds model name (Gemini), update URL too
             url_fn = fam.get("url_fn")
@@ -235,7 +282,7 @@ def update_graeae_config(
                     _re.DOTALL,
                 )
                 new_url = url_fn(api_id)
-                text = url_re.sub(rf'\g<1>{new_url}\g<3>', text)
+                text = url_re.sub(rf"\g<1>{new_url}\g<3>", text)
                 logger.info(f"[REGISTRY]   URL updated → {new_url!r}")
 
     if changes and not dry_run:
@@ -246,6 +293,7 @@ def update_graeae_config(
 
 
 # ── Model family detection ────────────────────────────────────────────────
+
 
 def _model_family(model_id: str) -> str:
     """Extract the major version family from a model ID for update-vs-add decisions.
@@ -267,11 +315,11 @@ def _model_family(model_id: str) -> str:
     name = model_id.lower().strip()
     # Match: word-chars + dash + single digit optionally followed by .digit
     # Captures the "name-MAJOR" part before any further version/variant info
-    m = re.match(r'^((?:[a-z][a-z0-9]*-)*[a-z][a-z0-9]*-\d+)[\.\-]', name)
+    m = re.match(r"^((?:[a-z][a-z0-9]*-)*[a-z][a-z0-9]*-\d+)[\.\-]", name)
     if m:
         return m.group(1)
     # Fallback: everything up to first dot
-    return name.split('.')[0]
+    return name.split(".")[0]
 
 
 def _same_family(a: str, b: str) -> bool:
@@ -280,6 +328,7 @@ def _same_family(a: str, b: str) -> bool:
 
 
 # ── OpenClaw openclaw.json update ─────────────────────────────────────────
+
 
 def update_openclaw_models(
     openclaw_path: Path,
@@ -325,9 +374,7 @@ def update_openclaw_models(
 
         # ── Already present (exact or substring match) ─────────────────────
         if any(
-            api_id.lower() == eid.lower()
-            or api_id.lower() in eid.lower()
-            or eid.lower() in api_id.lower()
+            api_id.lower() == eid.lower() or api_id.lower() in eid.lower() or eid.lower() in api_id.lower()
             for eid in existing_ids
         ):
             logger.info(f"[REGISTRY] openclaw/{oc_provider}: {api_id!r} already present — skip")

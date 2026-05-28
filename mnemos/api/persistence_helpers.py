@@ -50,49 +50,52 @@ def _capability_503(capability: str, backend: object) -> HTTPException:
 
 def require_backend_capability(backend: object, capability: str):
     """Return backend if it advertises ``capability``; otherwise raise 503."""
-    if capability not in set(getattr(backend, "capabilities", set())):
+    capabilities = getattr(backend, "capabilities", None)
+    if capabilities is None:
+        return backend
+    if capability not in set(capabilities):
         raise _capability_503(capability, backend)
     return backend
 
 
 def require_oauth_backend():
     backend = require_backend_capability(backend_or_503(), OAUTH_CAPABILITY)
-    if not isinstance(backend, OAuthPersistence):
+    if not isinstance(backend, OAuthPersistence) and not hasattr(backend, "oauth"):
         raise _capability_503(OAUTH_CAPABILITY, backend)
     return backend
 
 
 def require_sessions_backend():
     backend = require_backend_capability(backend_or_503(), SESSIONS_CAPABILITY)
-    if not isinstance(backend, SessionsPersistence):
+    if not isinstance(backend, SessionsPersistence) and not hasattr(backend, "sessions"):
         raise _capability_503(SESSIONS_CAPABILITY, backend)
     return backend
 
 
 def require_consultations_backend():
     backend = require_backend_capability(backend_or_503(), CONSULTATIONS_CAPABILITY)
-    if not isinstance(backend, ConsultationsPersistence):
+    if not isinstance(backend, ConsultationsPersistence) and not hasattr(backend, "consultations"):
         raise _capability_503(CONSULTATIONS_CAPABILITY, backend)
     return backend
 
 
 def require_federation_backend():
     backend = require_backend_capability(backend_or_503(), FEDERATION_CAPABILITY)
-    if not isinstance(backend, FederationPersistence):
+    if not isinstance(backend, FederationPersistence) and not hasattr(backend, "federation"):
         raise _capability_503(FEDERATION_CAPABILITY, backend)
     return backend
 
 
 def require_audit_backend():
     backend = require_backend_capability(backend_or_503(), AUDIT_CAPABILITY)
-    if not isinstance(backend, AuditPersistence):
+    if not isinstance(backend, AuditPersistence) and not hasattr(backend, "audit_chain"):
         raise _capability_503(AUDIT_CAPABILITY, backend)
     return backend
 
 
 def require_state_backend():
     backend = require_backend_capability(backend_or_503(), STATE_CAPABILITY)
-    if not isinstance(backend, StatePersistence):
+    if not isinstance(backend, StatePersistence) and not hasattr(backend, "state_kv"):
         raise _capability_503(STATE_CAPABILITY, backend)
     return backend
 

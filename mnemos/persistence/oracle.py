@@ -419,7 +419,7 @@ def _build_oracle_session_callback(settings: Any) -> Any:
         finally:
             if cur is not None:
                 try:
-                    cur.close()
+                    await _call(cur.close)
                 except Exception:  # pragma: no cover
                     pass
 
@@ -497,7 +497,11 @@ async def create_oracle_pool(
     kwargs.setdefault("min", pool_min)
     kwargs.setdefault("max", pool_max)
     kwargs.setdefault("increment", pool_increment)
-    kwargs.setdefault("stmtcachesize", stmt_cache)
+    create_pool_params = inspect.signature(oracledb.create_pool_async).parameters
+    if "statement_cache_size" in create_pool_params:
+        kwargs.setdefault("statement_cache_size", stmt_cache)
+    else:
+        kwargs.setdefault("stmtcachesize", stmt_cache)
     # Explicit WAIT mode + timeout: default behaviour would otherwise
     # block forever when the pool is saturated.
     kwargs.setdefault("getmode", oracledb.POOL_GETMODE_WAIT)
@@ -1149,17 +1153,14 @@ class OracleMemoryRepository(MemoryRepository):
         """
         if not embedding:
             return
-        import array as _array
-
-        # Oracle 23ai VECTOR binds via array.array('f', ...).
-        arr = _array.array("f", [float(v) for v in embedding])
+        vec_literal = _validate_and_format_vector(embedding)
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
             await _call(
                 cursor.execute,
-                "UPDATE memories SET embedding = :emb WHERE id = :id",
-                {"emb": arr, "id": memory_id},
+                "UPDATE memories SET embedding = TO_VECTOR(:vec) WHERE id = :id",
+                {"vec": vec_literal, "id": memory_id},
             )
         finally:
             await _call(cursor.close)

@@ -24,7 +24,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_audit_backend
+from mnemos.api.persistence_helpers import AUDIT_CAPABILITY, backend_or_503 as _backend_or_503
+from mnemos.api.persistence_helpers import _capability_503
 from mnemos.audit import derive_writer_keypair, load_root_keypair
 from mnemos.audit.crypto import merkle_leaf, merkle_proof, merkle_root
 from mnemos.audit.route_helper import memory_id_to_audit_bytes
@@ -32,6 +33,16 @@ from mnemos.workers.audit_sealer import audit_chain_enabled
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/audit", tags=["audit"])
+
+
+def _require_audit_backend():
+    backend = _backend_or_503()
+    capabilities = getattr(backend, "capabilities", None)
+    if capabilities is not None and AUDIT_CAPABILITY not in set(capabilities):
+        raise _capability_503(AUDIT_CAPABILITY, backend)
+    if not hasattr(backend, "audit_chain"):
+        raise _capability_503(AUDIT_CAPABILITY, backend)
+    return backend
 
 
 @router.get("/pubkey")
@@ -105,7 +116,7 @@ async def audit_proof_head(
             status_code=503,
             detail="audit chain disabled (MNEMOS_AUDIT_CHAIN not 'on')",
         )
-    backend = require_audit_backend()
+    backend = _require_audit_backend()
     if backend.audit_chain is None:
         raise HTTPException(
             status_code=503,
@@ -176,7 +187,7 @@ async def audit_inclusion_proof(
             status_code=503,
             detail="audit chain disabled (MNEMOS_AUDIT_CHAIN not 'on')",
         )
-    backend = require_audit_backend()
+    backend = _require_audit_backend()
     if backend.audit_chain is None:
         raise HTTPException(
             status_code=503,
@@ -280,7 +291,7 @@ async def audit_health(
     still exist (lets operators inspect a disabled chain without
     re-enabling).
     """
-    backend = require_audit_backend()
+    backend = _require_audit_backend()
     if backend.audit_chain is None:
         raise HTTPException(
             status_code=503,
