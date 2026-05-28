@@ -3612,6 +3612,35 @@ class SqliteBackend:
     def capabilities(self) -> set[str]:
         return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
 
+    async def fetch_category_decay_rows(self, tx: Transaction) -> list[Row]:
+        return await _fetch_all(
+            _sqlite_tx(tx).conn,
+            "SELECT category, half_life_days, decay_kind, floor FROM memory_category_decay",
+            (),
+        )
+
+    async def upsert_category_decay(
+        self,
+        tx: Transaction,
+        *,
+        category: str,
+        half_life_days: float,
+        decay_kind: str,
+        floor: float,
+    ) -> None:
+        await _execute(
+            _sqlite_tx(tx).conn,
+            """
+            INSERT INTO memory_category_decay (category, half_life_days, decay_kind, floor)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (category) DO UPDATE SET
+                half_life_days = excluded.half_life_days,
+                decay_kind = excluded.decay_kind,
+                floor = excluded.floor
+            """,
+            (category, half_life_days, decay_kind, floor),
+        )
+
     async def register_oauth_token(
         self,
         tx: Transaction,

@@ -5,11 +5,10 @@ memory's age and the category's half-life. Decay parameters live in
 the ``memory_category_decay`` table (migration 0031) — 9 default
 rows seeded by the schema migration; admin endpoints follow.
 
-Why post-recall instead of in SQL:
+Why post-recall instead of in persistence:
 1. Table is tiny (<= 20 rows). Process-local TTL cache, 60s refresh.
-2. Filtering by score in SQL would prune real hits before rerank.
-3. exp() in SQL is fine on PG/Oracle/Db2 but broken on SQLite.
-   Keeps the SQL identical across backends.
+2. Filtering by score in the datastore would prune real hits before rerank.
+3. exp() support differs by backend, so scoring remains in Python.
 
 Public surface::
 
@@ -149,36 +148,11 @@ async def load_decay_table(backend: Any) -> dict[str, DecayParams]:
 
 
 async def _fetch_decay_rows(backend: Any, tx: Any) -> list[Mapping[str, Any]]:
-    """Backend-agnostic SELECT * FROM memory_category_decay."""
-    # All four backends accept the same simple SELECT — we route via
-    # the existing memories repo path is overkill; use the connection
-    # accessor each backend exposes.
-    conn_attr = getattr(tx, "conn", None)
-    sql = "SELECT category, half_life_days, decay_kind, floor FROM memory_category_decay"
-    # Postgres asyncpg
-    if conn_attr is not None and hasattr(conn_attr, "fetch") and hasattr(conn_attr, "fetchrow"):
-        rows = await conn_attr.fetch(sql)
-        return [dict(r) for r in rows]
-    # SQLite (mnemos wrapper)
-    if conn_attr is not None and "sqlite" in type(conn_attr).__module__:
-        from mnemos.persistence.sqlite import _fetch_all
-
-        return await _fetch_all(conn_attr, sql, ())
-    # Oracle / Db2 (python-oracledb async)
-    if conn_attr is not None and hasattr(conn_attr, "cursor"):
-        from mnemos.persistence.oracle import _call as _ora_call
-
-        cursor = await _ora_call(conn_attr.cursor)
-        try:
-            await _ora_call(cursor.execute, sql)
-            rows = await _ora_call(cursor.fetchall)
-            if not rows:
-                return []
-            cols = [d[0].lower() for d in cursor.description]
-            return [dict(zip(cols, r)) for r in rows]
-        finally:
-            await _ora_call(cursor.close)
-    raise RuntimeError(f"[decay] unsupported tx shape {type(tx)!r}")
+    """Backend-agnostic category-decay row load."""
+    fetch_rows = getattr(backend, "fetch_category_decay_rows", None)
+    if not callable(fetch_rows):
+        raise RuntimeError(f"[decay] unsupported backend {type(backend)!r}")
+    return await fetch_rows(tx)
 
 
 def apply_decay(

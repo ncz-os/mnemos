@@ -144,75 +144,12 @@ async def _upsert_category_row(
     decay_kind: str,
     floor: float,
 ) -> None:
-    """Backend-agnostic UPSERT for memory_category_decay.
-
-    PG / SQLite: INSERT ... ON CONFLICT (category) DO UPDATE.
-    Oracle / Db2: MERGE INTO ... ON ... WHEN MATCHED.
-    """
+    """Backend-agnostic category-decay write."""
     async with backend.transactional() as tx:
-        conn_attr = getattr(tx, "conn", None)
-        # Postgres
-        if conn_attr is not None and hasattr(conn_attr, "fetch") and hasattr(conn_attr, "execute"):
-            await conn_attr.execute(
-                """
-                INSERT INTO memory_category_decay (category, half_life_days, decay_kind, floor)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (category) DO UPDATE SET
-                    half_life_days = EXCLUDED.half_life_days,
-                    decay_kind = EXCLUDED.decay_kind,
-                    floor = EXCLUDED.floor
-                """,
-                category,
-                half_life_days,
-                decay_kind,
-                floor,
-            )
-            return
-        # SQLite
-        if conn_attr is not None and "sqlite" in type(conn_attr).__module__:
-            from mnemos.persistence.sqlite import _execute
-
-            await _execute(
-                conn_attr,
-                """
-                INSERT INTO memory_category_decay (category, half_life_days, decay_kind, floor)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT (category) DO UPDATE SET
-                    half_life_days = excluded.half_life_days,
-                    decay_kind = excluded.decay_kind,
-                    floor = excluded.floor
-                """,
-                (category, half_life_days, decay_kind, floor),
-            )
-            return
-        # Oracle / Db2
-        if conn_attr is not None and hasattr(conn_attr, "cursor"):
-            from mnemos.persistence.oracle import _call
-
-            cursor = await _call(conn_attr.cursor)
-            try:
-                await _call(
-                    cursor.execute,
-                    """
-                    MERGE INTO memory_category_decay tgt
-                    USING (SELECT :category AS category FROM dual) src
-                    ON (tgt.category = src.category)
-                    WHEN MATCHED THEN UPDATE SET
-                        half_life_days = :half_life_days,
-                        decay_kind = :decay_kind,
-                        floor = :floor
-                    WHEN NOT MATCHED THEN
-                        INSERT (category, half_life_days, decay_kind, floor)
-                        VALUES (:category, :half_life_days, :decay_kind, :floor)
-                    """,
-                    {
-                        "category": category,
-                        "half_life_days": half_life_days,
-                        "decay_kind": decay_kind,
-                        "floor": floor,
-                    },
-                )
-            finally:
-                await _call(cursor.close)
-            return
-        raise RuntimeError(f"[decay-admin] unsupported tx shape {type(tx)!r}")
+        await backend.upsert_category_decay(
+            tx,
+            category=category,
+            half_life_days=half_life_days,
+            decay_kind=decay_kind,
+            floor=floor,
+        )
