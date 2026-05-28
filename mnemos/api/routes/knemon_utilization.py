@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Query
 
 from mnemos.api.dependencies import UserContext, require_root
 from mnemos.api.persistence_helpers import backend_or_503
-from mnemos.api.routes.ledger import compute_plan_window_id
+from mnemos.core.plan_windows import compute_plan_window_id
 
 router = APIRouter(prefix="/v1/knemon", tags=["knemon"])
 
@@ -101,6 +101,13 @@ def _cap_basis(plan: dict[str, Any], usage: dict[str, Any]) -> tuple[str | None,
     return None, int(usage.get("requests_used") or 0), None
 
 
+def _usage_path_kinds(plan: dict[str, Any]) -> tuple[str, str | None]:
+    path_kind = str(plan.get("path_kind") or "api").lower()
+    auth_method = str(plan.get("auth_method") or "api").lower()
+    legacy_path_kind = "api" if auth_method == "subscription" and path_kind != "api" else None
+    return path_kind, legacy_path_kind
+
+
 def _overage_cost(overage_msgs: int, plan: dict[str, Any]) -> float:
     if overage_msgs <= 0:
         return 0.0
@@ -180,10 +187,12 @@ async def _plans() -> list[dict[str, Any]]:
 async def _usage_for_plan(
     plan: dict[str, Any], start: datetime, end: datetime, window_id: str | None = None
 ) -> dict[str, Any]:
+    path_kind, legacy_path_kind = _usage_path_kinds(plan)
     params = {
         "provider": plan["provider"],
         "plan_name": plan["plan_name"],
-        "path_kind": plan.get("path_kind") or "api",
+        "path_kind": path_kind,
+        "legacy_path_kind": legacy_path_kind,
         "start_ts": start,
         "end_ts": end,
         "window_id": window_id,
@@ -196,7 +205,7 @@ async def _usage_for_plan(
         FROM usage_ledger
         WHERE provider = :provider
           AND tier = :plan_name
-          AND path_kind = :path_kind
+          AND (path_kind = :path_kind OR (:legacy_path_kind IS NOT NULL AND path_kind = :legacy_path_kind))
           AND ((:window_id IS NOT NULL AND plan_window_id = :window_id)
                OR (ts >= :start_ts AND ts < :end_ts))
         """

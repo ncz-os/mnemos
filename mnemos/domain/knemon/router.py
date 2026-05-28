@@ -11,8 +11,8 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
-from mnemos.api.routes.ledger import compute_plan_window_id
 from mnemos.core.config import get_settings
+from mnemos.core.plan_windows import compute_plan_window_id
 
 
 class NoModelAvailable(RuntimeError):
@@ -453,7 +453,7 @@ async def _usage_for_plan(backend: Any, plan: dict[str, Any]) -> tuple[int, int]
     now = datetime.now(timezone.utc)
     plan_name = str(plan.get("plan_name") or "api")
     provider = str(plan.get("provider") or "")
-    path_kind = str(plan.get("path_kind") or "api")
+    path_kind, legacy_path_kind = _usage_path_kinds(plan)
     window_id = compute_plan_window_id(
         provider,
         plan_name,
@@ -467,10 +467,16 @@ async def _usage_for_plan(backend: Any, plan: dict[str, Any]) -> tuple[int, int]
         FROM usage_ledger
         WHERE provider = :provider
           AND tier = :plan_name
-          AND path_kind = :path_kind
+          AND (path_kind = :path_kind OR (:legacy_path_kind IS NOT NULL AND path_kind = :legacy_path_kind))
           AND plan_window_id LIKE :window_pattern
         """
-    params = {"provider": provider, "plan_name": plan_name, "path_kind": path_kind, "window_pattern": f"{window_id}%"}
+    params = {
+        "provider": provider,
+        "plan_name": plan_name,
+        "path_kind": path_kind,
+        "legacy_path_kind": legacy_path_kind,
+        "window_pattern": f"{window_id}%",
+    }
     try:
         rows = await _rows(backend, sql, params)
     except Exception as exc:
@@ -500,6 +506,13 @@ def _utilization(plan: dict[str, Any], requests_used: int, tokens_used: int) -> 
     if token_cap > 0:
         return round((tokens_used / token_cap) * 100.0, 2)
     return 0.0
+
+
+def _usage_path_kinds(plan: dict[str, Any]) -> tuple[str, str | None]:
+    path_kind = str(plan.get("path_kind") or "api").lower()
+    auth_method = str(plan.get("auth_method") or "api").lower()
+    legacy_path_kind = "api" if auth_method == "subscription" and path_kind != "api" else None
+    return path_kind, legacy_path_kind
 
 
 async def _session_burned(backend: Any, session_id: str | None) -> bool:

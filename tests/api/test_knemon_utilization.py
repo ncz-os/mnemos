@@ -108,6 +108,17 @@ class _SqliteBackend:
               ts, provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
               est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
               request_count, plan_window_id, path_kind, subscription_amortized
+            ) VALUES (?, 'openai', 'gpt-5', 'chat', 200, 80, 0, 0, 300,
+                      'ok', 'test', 'chatgpt_plus', 's1-legacy', 3, NULL, 'api', 1)
+            """,
+            (now,),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO usage_ledger (
+              ts, provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
+              est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
+              request_count, plan_window_id, path_kind, subscription_amortized
             ) VALUES (?, 'nvidia', 'free-model', 'chat', 100, 40, 0, 0, 100,
                       'ok', 'test', 'ngc_inference', 's2', 1, NULL, 'free', 0)
             """,
@@ -163,11 +174,11 @@ async def test_knemon_utilization_routes_with_in_memory_sqlite(monkeypatch):
 
     util_rows = utilization.json()
     plus = next(row for row in util_rows if row["provider"] == "openai")
-    assert plus["requests_used"] == 2
+    assert plus["requests_used"] == 5
     assert plus["msg_cap"] == 160
     assert plus["cap_unit"] == "messages"
     assert plus["notes"] == "test plus"
-    assert plus["utilization_pct"] == 1.25
+    assert plus["utilization_pct"] == 3.12
     token_plan = next(row for row in util_rows if row["provider"] == "testai")
     assert token_plan["tokens_used"] == 800
     assert token_plan["token_cap"] == 1000
@@ -181,12 +192,12 @@ async def test_knemon_utilization_routes_with_in_memory_sqlite(monkeypatch):
     assert projected_plus["notes"] == "test plus"
 
     sessions = by_session.json()
-    assert {row["session_id"] for row in sessions} == {"s1", "s2", "s-token"}
+    assert {row["session_id"] for row in sessions} == {"s1", "s1-legacy", "s2", "s-token"}
 
     bucket_rows = cost_split.json()
     subscription_requests = sum(
         row["requests"] for row in bucket_rows if row["cost_bucket"] == "subscription_amortized"
     )
     buckets = {row["cost_bucket"]: row for row in bucket_rows}
-    assert subscription_requests == 5
+    assert subscription_requests == 8
     assert buckets["free"]["requests"] == 1
