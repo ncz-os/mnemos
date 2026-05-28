@@ -30,7 +30,7 @@ _ROWS = [
         "provider": "anthropic",
         "model_id": "claude-sonnet-4-6",
         "display_name": "Claude Sonnet 4.6",
-        "capabilities": ["chat", "coding", "reasoning"],
+        "capabilities": ["chat", "code", "reasoning"],
         "input_cost_per_mtok": 3.0,
         "output_cost_per_mtok": 15.0,
         "graeae_weight": 0.94,
@@ -38,9 +38,9 @@ _ROWS = [
     },
     {
         "provider": "anthropic",
-        "model_id": "claude-opus-4-7",
-        "display_name": "Claude Opus 4.7",
-        "capabilities": ["chat", "coding", "reasoning"],
+        "model_id": "claude-opus-4-6",
+        "display_name": "Claude Opus 4.6",
+        "capabilities": ["chat", "code", "reasoning"],
         "input_cost_per_mtok": 15.0,
         "output_cost_per_mtok": 75.0,
         "graeae_weight": 0.99,
@@ -85,7 +85,7 @@ _ROWS = [
         ("code-fix", "nvidia", "qwen/qwen3-coder-480b-a35b-instruct"),
         ("code-generation", "nvidia", "qwen/qwen3-coder-480b-a35b-instruct"),
         ("narrative", "anthropic", "claude-sonnet-4-6"),
-        ("reasoning", "anthropic", "claude-opus-4-7"),
+        ("reasoning", "anthropic", "claude-opus-4-6"),
         ("embedding", "mnemos-local", "bge-m3"),
         ("routing", "groq", "llama-3.1-8b-instant"),
         ("web_search", "perplexity", "sonar"),
@@ -128,3 +128,27 @@ def test_json_object_capabilities_match_task_requirements():
     assert required == ["coding"]
     assert model is not None
     assert model["model_id"] == "deepseek-v4-pro"
+
+
+def test_task_type_smoke_returns_distinct_models():
+    task_types = ("code-fix", "narrative", "reasoning", "embedding", "routing", "web_search")
+
+    recommendations = {
+        task_type: choose_recommended_model(_ROWS, task_type, cost_budget=10.0, quality_floor=0.7)[0]
+        for task_type in task_types
+    }
+
+    model_ids = {model["model_id"] for model in recommendations.values() if model is not None}
+    assert len(model_ids) >= 5
+    assert recommendations["narrative"]["model_id"] != recommendations["reasoning"]["model_id"]
+    assert recommendations["embedding"]["model_id"] == "bge-m3"
+    assert recommendations["routing"]["model_id"] == "llama-3.1-8b-instant"
+
+
+def test_narrative_does_not_choose_opus_when_sonnet_is_available():
+    model, required = choose_recommended_model(_ROWS, "chat", cost_budget=10.0, quality_floor=0.7)
+
+    assert required == ["chat"]
+    assert model is not None
+    assert "sonnet" in model["model_id"]
+    assert "opus" not in model["model_id"]
