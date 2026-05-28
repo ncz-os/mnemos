@@ -34,11 +34,7 @@ SET auth_method = 'subscription',
 WHERE provider = 'openai'
   AND plan_name = 'chatgpt_pro';
 
-UPDATE subscription_plans
-SET effective_until = DATE '2026-05-27',
-    notes = COALESCE(notes, '')
-      || CASE WHEN COALESCE(notes, '') = '' THEN '' ELSE ' ' END
-      || 'Retired by 0039; current Claude Max docs keep 5x and 20x tiers active without the prior post-Jun15 split.'
+DELETE FROM subscription_plans
 WHERE provider = 'anthropic'
   AND plan_name IN ('claude_max_interactive_post_jun15', 'agent_sdk_credit_pool_post_jun15');
 
