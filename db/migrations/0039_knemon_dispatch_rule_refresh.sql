@@ -18,10 +18,10 @@ INSERT INTO subscription_plans (
   path_kind, parent_plan_id
 ) VALUES
   ('anthropic', 'claude_max_200', 'subscription', 200, 900, 18000, NULL, NULL,
-   'rolling', NULL, NULL, 'Claude Max $200 / 20x: at least 900 messages per 5h; local operator tier flip ends 2026-05-31',
+   'rolling', NULL, NULL, 'Claude Max $200 / 20x: operator-normalized 900-message 5h capacity; local tier flip ends 2026-05-31',
    DATE '2026-04-01', DATE '2026-05-31', 'interactive', NULL),
   ('anthropic', 'claude_max_100', 'subscription', 100, 225, 18000, NULL, NULL,
-   'rolling', NULL, NULL, 'Claude Max $100 / 5x: at least 225 messages per 5h; local operator tier flip starts 2026-06-01',
+   'rolling', NULL, NULL, 'Claude Max $100 / 5x: operator-normalized 225-message 5h capacity; local tier flip starts 2026-06-01',
    DATE '2026-06-01', NULL, 'interactive', 'claude_max_200'),
   ('openai', 'chatgpt_plus', 'subscription', 20, 160, 10800, NULL, NULL,
    'rolling', NULL, NULL, 'ChatGPT Plus GPT-5.5: 160 messages per 3h window',

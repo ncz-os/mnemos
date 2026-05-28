@@ -38,6 +38,8 @@ These are the current rows after `0039_knemon_dispatch_rule_refresh`.
 | OpenAI | `codex_pro_200_25x` | 375 GPT-5.5 local messages per 5h through 2026-05-31, temporary 25x Plus lower bound |
 | OpenAI | `codex_pro_200_20x` | 300 GPT-5.5 local messages per 5h from 2026-06-01, lower bound of 300-1600 |
 
+Anthropic's public Max documentation supports both Max 100 and Max 200 caps. The 2026-06-01 switch from `claude_max_200` to `claude_max_100` is a local operator policy encoded in KNEMON, not a provider-published tier migration.
+
 The deprecated `claude_max_interactive_post_jun15` and `agent_sdk_credit_pool_post_jun15` rows are expired at 2026-05-31 because no current official source supports that split as an active operator assumption.
 
 The router filters `effective_from` and `effective_until` in Python after fetching rows. That avoids Oracle-only date syntax in shared router code and prevents expired promo/tier-flip rows from winning on PostgreSQL, SQLite, or Db2 fallback paths.
@@ -72,10 +74,10 @@ Both still carry `openai_subscription` for operators that intentionally pool all
 
 ## Cross-Check
 
-The audit was cross-checked with a Codex muse review and a GRAEAE external consultation. Codex confirmed the fallback, G1, and burn rules and flagged two fixes that are included here: portable effective-date filtering and tighter generic Codex GPT-5.5 caps. GRAEAE consultation `2753f9b2c0f4499caee1fc78c06af02e` returned consensus that the choices were OK as of 2026-05-28, with the expected caveat that provider limits can change. Claude-specific GRAEAE calls timed out or returned unavailable in this session, so the provider-limit verdict is grounded in the official source links below rather than Claude assertion.
+The audit was cross-checked with a Codex muse review. Codex confirmed the fallback, G1, and burn rules and flagged the portable effective-date filtering fix that is included here. The requested Claude/GRAEAE consultation path was unavailable in this environment: one external consultation returned without Claude and a shorter retry timed out. Provider-limit conclusions are therefore grounded in the official source links below rather than model assertion. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
 
 ## Sources
 
 - OpenAI ChatGPT GPT-5.5 limits: https://help.openai.com/en/articles/11909943-gpt-55-in-chatgpt
 - OpenAI Codex pricing and limits: https://developers.openai.com/codex/pricing
-- Anthropic Claude Max usage limits: https://support.anthropic.com/en/articles/11014257-about-claude-s-max-plan-usage/
+- Anthropic Claude Max usage limits: https://support.claude.com/en/articles/11014257-about-claude-s-max-plan-usage
