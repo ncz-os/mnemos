@@ -74,10 +74,10 @@ Both still carry `openai_subscription` for operators that intentionally pool all
 
 ## Cross-Check
 
-The audit was cross-checked with a Codex muse review and a Claude-only GRAEAE consultation (`66800d7688ad4e86ad31ce6abfdfa89e`). Codex confirmed the fallback, G1, and burn rules and flagged the portable effective-date filtering fix that is included here. Claude declined to certify provider-limit facts without live source access, which is the right residual risk: provider-limit conclusions are grounded in the official source links below rather than model assertion. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
+The audit was cross-checked with a Codex muse review. Codex confirmed the fallback, G1, and burn rules and flagged the portable effective-date filtering fix that is included here. The requested Claude/GRAEAE consultation path did not produce a Claude result in this environment: one external consultation returned with Claude unavailable, and a shorter retry timed out. Provider-limit conclusions are therefore grounded in the official source links below rather than model assertion. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
 
 ## Sources
 
 - OpenAI ChatGPT GPT-5.5 limits: https://help.openai.com/en/articles/11909943-gpt-55-in-chatgpt
 - OpenAI Codex pricing and limits: https://developers.openai.com/codex/pricing
-- Anthropic Claude Max plan tiers: https://support.claude.com/en/articles/11049741-what-is-the-max-plan
+- Anthropic Claude Max usage estimates: https://support.claude.com/en/articles/11014257-about-claude-s-max-plan-usage
