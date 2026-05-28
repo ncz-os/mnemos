@@ -251,6 +251,8 @@ async def test_health_returns_active_profile(monkeypatch: pytest.MonkeyPatch, tm
     from mnemos.api.routes import health
 
     class _PingableBackend:
+        capabilities = {"core", "state"}
+
         async def ping(self) -> bool:
             return True
 
@@ -264,6 +266,8 @@ async def test_health_returns_active_profile(monkeypatch: pytest.MonkeyPatch, tm
     assert response.profile == "edge"
     assert response.database_connected is True
     assert response.nats_publishing_enabled is True
+    assert response.persistence_backend == "_PingableBackend"
+    assert response.persistence_capabilities == ["core", "state"]
 
 
 # ─── Enterprise backend DSN detection ─────────────────────────────────────────
