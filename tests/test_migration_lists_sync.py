@@ -206,6 +206,22 @@ def test_usage_ledger_migration_grants_runtime_roles():
     assert "GRANT USAGE, SELECT ON SEQUENCE usage_ledger_id_seq TO mnemos;" in usage_ledger_sql
 
 
+def test_subscription_plan_current_limits_deletes_superseded_claude_future_rows():
+    repo_root = Path(__file__).resolve().parents[1]
+    migration_paths = [
+        repo_root / "db/migrations/0039_subscription_plan_current_limits.sql",
+        repo_root / "db/migrations_oracle/0039_subscription_plan_current_limits.sql",
+        repo_root / "db/migrations_db2/0039_subscription_plan_current_limits.sql",
+    ]
+
+    for path in migration_paths:
+        sql = path.read_text()
+        assert "DELETE FROM subscription_plans" in sql, path
+        assert "claude_max_interactive_post_jun15" in sql, path
+        assert "agent_sdk_credit_pool_post_jun15" in sql, path
+        assert "2026-05-27" not in sql, path
+
+
 def test_sqlite_migration_list_matches_expected_order():
     repo_root = Path(__file__).resolve().parents[1]
     tree = ast.parse((repo_root / "mnemos" / "persistence" / "sqlite.py").read_text())
