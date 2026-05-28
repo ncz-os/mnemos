@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import random
+import time
 import uuid
 from typing import Any, Optional
 
@@ -65,6 +67,16 @@ def _ts_to_dt(value: Optional[float | int | dt.datetime]) -> Optional[dt.datetim
     return dt.datetime.fromtimestamp(float(value), UTC).replace(tzinfo=None)
 
 
+def _ts_to_tstz(value: Optional[float | int | dt.datetime]) -> Optional[dt.datetime]:
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    return dt.datetime.fromtimestamp(float(value), UTC)
+
+
 def _dt_to_ts(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -79,6 +91,17 @@ def _read_lob(value: Any) -> Any:
     if hasattr(value, "read"):
         return value.read()
     return value
+
+
+def _uuid7_raw() -> bytes:
+    try:
+        return uuid.uuid7().bytes  # type: ignore[attr-defined]
+    except AttributeError:
+        unix_ms = int(time.time() * 1000) & ((1 << 48) - 1)
+        rand_a = random.getrandbits(12)
+        rand_b = random.getrandbits(62)
+        value = (unix_ms << 80) | (0x7 << 76) | (rand_a << 64) | (0b10 << 62) | rand_b
+        return uuid.UUID(int=value).bytes
 
 
 class OracleHiveMindRepository(HiveMindRepository):
@@ -806,28 +829,113 @@ class OracleHiveMindRepository(HiveMindRepository):
             expires_at=_ts_to_dt(expires_at),
         )
 
+    async def cache_get(self, cache_key: str) -> Optional[dict[str, Any]]:
+        return await self._run(self._cache_get_sync, cache_key)
+
     async def cache_store(
         self,
         *,
         cache_key: str,
-        source_job_id: str,
-        result: dict[str, Any],
-        provider: Optional[str],
-        model: Optional[str],
-        result_mnemos_id: Optional[str],
-        stored_at: float,
+        source_job_id: Optional[str] = None,
+        result: Optional[dict[str, Any]] = None,
+        result_json: Optional[dict[str, Any]] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        result_mnemos_id: Optional[str] = None,
+        stored_at: Optional[float] = None,
+        cached_at: Optional[float] = None,
     ) -> None:
-        await self.set_cache(
+        await self._run(
+            self._cache_store_sync,
             cache_key=cache_key,
-            value={
-                "result": result,
-                "source_job_id": source_job_id,
-                "provider": provider,
-                "model": model,
-                "result_mnemos_id": result_mnemos_id,
-                "stored_at": stored_at,
-            },
+            result_json=result_json if result_json is not None else result,
+            source_job_id=source_job_id,
+            result_mnemos_id=result_mnemos_id,
+            model=model,
+            provider=provider,
+            cached_at=cached_at if cached_at is not None else stored_at,
         )
+
+    def _cache_get_sync(self, cache_key: str) -> Optional[dict[str, Any]]:
+        with self._pool.acquire() as conn:
+            cur = self._execute(
+                conn,
+                """
+                SELECT result_json, source_job_id, result_mnemos_id,
+                       hit_count, cost_saved_usd, model, provider, cached_at
+                FROM hive_cache
+                WHERE cache_key = :cache_key
+                """,
+                {"cache_key": cache_key},
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "result": _json_loads(row[0], None),
+                "source_job_id": row[1],
+                "result_mnemos_id": row[2],
+                "hit_count": row[3],
+                "cost_saved_usd": float(row[4] or 0),
+                "model": row[5],
+                "provider": row[6],
+                "cached_at": _dt_to_ts(row[7]) if isinstance(row[7], dt.datetime) else row[7],
+            }
+
+    def _cache_store_sync(
+        self,
+        *,
+        cache_key: str,
+        result_json: Optional[dict[str, Any]],
+        source_job_id: Optional[str],
+        result_mnemos_id: Optional[str],
+        model: Optional[str],
+        provider: Optional[str],
+        cached_at: Optional[float],
+    ) -> None:
+        with self._pool.acquire() as conn:
+            self._execute(
+                conn,
+                """
+                MERGE INTO hive_cache dst
+                USING (
+                  SELECT :cache_key AS cache_key,
+                         :result_json AS result_json,
+                         :source_job_id AS source_job_id,
+                         :result_mnemos_id AS result_mnemos_id,
+                         :model AS model,
+                         :provider AS provider,
+                         :cached_at AS cached_at
+                  FROM dual
+                ) src
+                ON (dst.cache_key = src.cache_key)
+                WHEN MATCHED THEN UPDATE SET
+                  dst.result_json = src.result_json,
+                  dst.source_job_id = src.source_job_id,
+                  dst.result_mnemos_id = src.result_mnemos_id,
+                  dst.model = src.model,
+                  dst.provider = src.provider,
+                  dst.cached_at = src.cached_at
+                WHEN NOT MATCHED THEN INSERT (
+                  cache_key, result_json, source_job_id, result_mnemos_id,
+                  hit_count, cost_saved_usd, model, provider, cached_at, last_hit_at
+                ) VALUES (
+                  src.cache_key, src.result_json, src.source_job_id,
+                  src.result_mnemos_id, 0, 0, src.model, src.provider,
+                  src.cached_at, NULL
+                )
+                """,
+                {
+                    "cache_key": cache_key,
+                    "result_json": _json_dumps(result_json or {}),
+                    "source_job_id": source_job_id,
+                    "result_mnemos_id": result_mnemos_id,
+                    "model": model,
+                    "provider": provider,
+                    "cached_at": float(cached_at if cached_at is not None else time.time()),
+                },
+            )
+            conn.commit()
 
     def _set_cache_sync(
         self,
@@ -953,19 +1061,124 @@ class OracleHiveMindRepository(HiveMindRepository):
             )
             conn.commit()
 
-    # ---------- out-of-scope Protocol surface ----------
+    # ---------- messages + events ----------
+
+    async def insert_message(
+        self,
+        *,
+        from_urn: str,
+        to_urn: Optional[str],
+        in_reply_to: Optional[str],
+        topic: str,
+        payload: dict[str, Any],
+        ts: float,
+    ) -> str:
+        msg_id = _uuid7_raw()
+        await self._run(
+            self._insert_message_sync,
+            msg_id=msg_id,
+            from_urn=from_urn,
+            to_urn=to_urn,
+            in_reply_to=in_reply_to,
+            topic=topic,
+            payload=payload,
+            ts=ts,
+        )
+        return _raw_to_uuid(msg_id) or ""
 
     async def post_message(self, **kwargs: Any) -> None:
-        # TODO(Phase-2): messages are outside the four-table Oracle hive spec.
-        raise NotImplementedError("Oracle message storage is not in Phase-2 scope.")
+        await self.insert_message(
+            from_urn=kwargs["from_urn"],
+            to_urn=kwargs.get("to_urn"),
+            in_reply_to=kwargs.get("in_reply_to"),
+            topic=kwargs["topic"],
+            payload=kwargs["payload"],
+            ts=kwargs["ts"],
+        )
+
+    def _insert_message_sync(
+        self,
+        *,
+        msg_id: bytes,
+        from_urn: str,
+        to_urn: Optional[str],
+        in_reply_to: Optional[str],
+        topic: str,
+        payload: dict[str, Any],
+        ts: float,
+    ) -> None:
+        with self._pool.acquire() as conn:
+            self._execute(
+                conn,
+                """
+                INSERT INTO hive_messages (
+                  id, from_urn, to_urn, in_reply_to, topic, payload, ts
+                ) VALUES (
+                  :id, :from_urn, :to_urn, :in_reply_to, :topic, :payload, :ts
+                )
+                """,
+                {
+                    "id": msg_id,
+                    "from_urn": from_urn,
+                    "to_urn": to_urn,
+                    "in_reply_to": _uuid_to_raw(in_reply_to) if in_reply_to else None,
+                    "topic": topic,
+                    "payload": _json_dumps(payload),
+                    "ts": float(ts),
+                },
+            )
+            conn.commit()
 
     async def list_messages(self, **kwargs: Any) -> list[dict[str, Any]]:
         # TODO(Phase-2): messages are outside the four-table Oracle hive spec.
         raise NotImplementedError("Oracle message storage is not in Phase-2 scope.")
 
-    async def emit_event(self, **kwargs: Any) -> None:
-        # TODO(Phase-2): events are outside the four-table Oracle hive spec.
-        raise NotImplementedError("Oracle event storage is not in Phase-2 scope.")
+    async def emit_event(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        agent_urn: Optional[str] = None,
+        ts: Optional[float | dt.datetime] = None,
+    ) -> None:
+        event_ts = ts if ts is not None else time.time()
+        await self._run(
+            self._emit_event_sync,
+            kind=kind,
+            payload=payload,
+            agent_urn=agent_urn or payload.get("urn") or payload.get("agent_urn"),
+            ts=_ts_to_tstz(event_ts),
+            ts_epoch=_dt_to_ts(event_ts) if isinstance(event_ts, dt.datetime) else float(event_ts),
+        )
+
+    def _emit_event_sync(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        agent_urn: Optional[str],
+        ts: Optional[dt.datetime],
+        ts_epoch: float,
+    ) -> None:
+        with self._pool.acquire() as conn:
+            params = {
+                "ts": ts,
+                "kind": kind,
+                "payload": _json_dumps(payload),
+                "agent_urn": agent_urn,
+            }
+            sql = """
+            INSERT INTO hive_events (ts, kind, payload, agent_urn)
+            VALUES (:ts, :kind, :payload, :agent_urn)
+            """
+            try:
+                self._execute(conn, sql, params)
+            except Exception as exc:
+                if "ORA-00932" not in str(exc) or "NUMBER" not in str(exc):
+                    raise
+                params["ts"] = ts_epoch
+                self._execute(conn, sql, params)
+            conn.commit()
 
     async def tail_events(self, **kwargs: Any) -> list[dict[str, Any]]:
         # TODO(Phase-2): events are outside the four-table Oracle hive spec.
@@ -978,6 +1191,101 @@ class OracleHiveMindRepository(HiveMindRepository):
     async def stats_costs(self, **kwargs: Any) -> dict[str, Any]:
         # TODO(Phase-2): cost stats need job token/cost columns not in this schema.
         raise NotImplementedError("Oracle cost stats are not in Phase-2 scope.")
+
+    async def record_worker_kind_stats(
+        self,
+        *,
+        urn: str,
+        kind: str,
+        success_delta: int,
+        fail_delta: int,
+        cancelled_delta: int,
+        tokens_in: int,
+        tokens_out: int,
+        cost_usd: float,
+        duration_sec: float,
+        last_run: float,
+    ) -> None:
+        await self._run(
+            self._record_worker_kind_stats_sync,
+            urn=urn,
+            kind=kind,
+            success_delta=success_delta,
+            fail_delta=fail_delta,
+            cancelled_delta=cancelled_delta,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+            duration_sec=duration_sec,
+            last_run=last_run,
+        )
+
+    def _record_worker_kind_stats_sync(
+        self,
+        *,
+        urn: str,
+        kind: str,
+        success_delta: int,
+        fail_delta: int,
+        cancelled_delta: int,
+        tokens_in: int,
+        tokens_out: int,
+        cost_usd: float,
+        duration_sec: float,
+        last_run: float,
+    ) -> None:
+        with self._pool.acquire() as conn:
+            self._execute(
+                conn,
+                """
+                MERGE INTO hive_worker_kind_stats dst
+                USING (
+                  SELECT :urn AS urn,
+                         :kind AS kind,
+                         :success_delta AS success_count,
+                         :fail_delta AS fail_count,
+                         :cancelled_delta AS cancelled_count,
+                         :tokens_in AS total_tokens_in,
+                         :tokens_out AS total_tokens_out,
+                         :cost_usd AS total_cost_usd,
+                         :duration_sec AS total_duration_sec,
+                         :last_run AS last_run
+                  FROM dual
+                ) src
+                ON (dst.urn = src.urn AND dst.kind = src.kind)
+                WHEN MATCHED THEN UPDATE SET
+                  dst.success_count = dst.success_count + src.success_count,
+                  dst.fail_count = dst.fail_count + src.fail_count,
+                  dst.cancelled_count = dst.cancelled_count + src.cancelled_count,
+                  dst.total_tokens_in = dst.total_tokens_in + src.total_tokens_in,
+                  dst.total_tokens_out = dst.total_tokens_out + src.total_tokens_out,
+                  dst.total_cost_usd = dst.total_cost_usd + src.total_cost_usd,
+                  dst.total_duration_sec = dst.total_duration_sec + src.total_duration_sec,
+                  dst.last_run = src.last_run
+                WHEN NOT MATCHED THEN INSERT (
+                  urn, kind, success_count, fail_count, cancelled_count,
+                  total_tokens_in, total_tokens_out, total_cost_usd,
+                  total_duration_sec, last_run
+                ) VALUES (
+                  src.urn, src.kind, src.success_count, src.fail_count,
+                  src.cancelled_count, src.total_tokens_in, src.total_tokens_out,
+                  src.total_cost_usd, src.total_duration_sec, src.last_run
+                )
+                """,
+                {
+                    "urn": urn,
+                    "kind": kind,
+                    "success_delta": int(success_delta),
+                    "fail_delta": int(fail_delta),
+                    "cancelled_delta": int(cancelled_delta),
+                    "tokens_in": int(tokens_in),
+                    "tokens_out": int(tokens_out),
+                    "cost_usd": float(cost_usd),
+                    "duration_sec": float(duration_sec),
+                    "last_run": float(last_run),
+                },
+            )
+            conn.commit()
 
     async def stats_workers(self, **kwargs: Any) -> list[dict[str, Any]]:
         # TODO(Phase-2): worker stats list endpoint is not in this cut.
