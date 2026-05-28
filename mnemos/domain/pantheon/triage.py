@@ -32,11 +32,14 @@ _TASK_CAPABILITIES = {
 
 
 def _price_blended(model: dict[str, Any]) -> float | None:
-    price_in = model.get("price_in")
-    price_out = model.get("price_out")
-    if price_in is None or price_out is None:
-        return None
-    return (safe_float(price_in) + safe_float(price_out)) / 2.0
+    price_in = model.get("price_in", model.get("input_cost_per_mtok"))
+    price_out = model.get("price_out", model.get("output_cost_per_mtok"))
+    if price_in is not None and price_out is not None:
+        return (safe_float(price_in) + safe_float(price_out)) / 2.0
+    cost_per_mtok = model.get("cost_per_mtok")
+    if cost_per_mtok is not None:
+        return safe_float(cost_per_mtok)
+    return None
 
 
 def _ctx_factor(model: dict[str, Any], requested: int) -> float | None:

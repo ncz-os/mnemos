@@ -8,7 +8,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.dependencies import UserContext, require_root
 from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.persistence.base import UsageLedgerRecord
 
@@ -36,18 +36,18 @@ class LedgerRecordResponse(BaseModel):
 @router.post("/ledger", response_model=LedgerRecordResponse)
 async def record_ledger_usage(
     payload: LedgerRecordRequest,
-    user: UserContext = Depends(get_current_user),
+    _: UserContext = Depends(require_root),
 ) -> LedgerRecordResponse:
     backend = backend_or_503()
     recorder = getattr(backend, "record_usage_ledger", None)
     if recorder is None:
-        raise HTTPException(status_code=503, detail="usage_ledger requires the Postgres backend")
+        raise HTTPException(status_code=503, detail="usage_ledger requires a ledger-capable backend")
 
     record = UsageLedgerRecord(**payload.model_dump())
     try:
         async with backend.transactional() as tx:
             result = await recorder(tx, record)
     except NotImplementedError:
-        raise HTTPException(status_code=503, detail="usage_ledger requires the Postgres backend")
+        raise HTTPException(status_code=503, detail="usage_ledger requires a ledger-capable backend")
 
     return LedgerRecordResponse(id=result.id, est_cost_usd=result.est_cost_usd)
