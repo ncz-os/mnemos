@@ -112,6 +112,7 @@ services:
       - ./db/migrations/0035_subscription_plans_date_aware.sql:/docker-entrypoint-initdb.d/65-subscription-plans-date-aware.sql
       - ./db/migrations/0036_hive_agents_subscription_pools.sql:/docker-entrypoint-initdb.d/66-hive-agents-subscription-pools.sql
       - ./db/migrations/0037_deepseek_direct_provider_seed.sql:/docker-entrypoint-initdb.d/67-deepseek-direct-provider-seed.sql
+      - ./db/migrations/0038_oauth_sessions_consultations.sql:/docker-entrypoint-initdb.d/68-oauth-sessions-consultations.sql
     ports:
       - '127.0.0.1:5433:5432'  # NOTE: 5433 (not 5432) to avoid host-Postgres collision on PROTEUS / any host with system Postgres
     healthcheck:
@@ -173,6 +174,7 @@ services:
       - ./db/migrations/0035_subscription_plans_date_aware.sql:/migrations/65-subscription-plans-date-aware.sql:ro
       - ./db/migrations/0036_hive_agents_subscription_pools.sql:/migrations/66-hive-agents-subscription-pools.sql:ro
       - ./db/migrations/0037_deepseek_direct_provider_seed.sql:/migrations/67-deepseek-direct-provider-seed.sql:ro
+      - ./db/migrations/0038_oauth_sessions_consultations.sql:/migrations/68-oauth-sessions-consultations.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
