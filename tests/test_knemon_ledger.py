@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
@@ -34,6 +35,43 @@ class _RecorderConn:
         self.sql = sql
         self.args = args
         return self.row
+
+
+class _OracleVar:
+    def __init__(self) -> None:
+        self.value = None
+
+    def getvalue(self):
+        return self.value
+
+    def setvalue(self, value):
+        self.value = value
+
+
+class _OracleLedgerCursor:
+    def __init__(self) -> None:
+        self.sql_calls: list[str] = []
+
+    def var(self, _kind):
+        return _OracleVar()
+
+    async def execute(self, sql: str, params: dict):
+        self.sql_calls.append(sql)
+        if "FROM model_registry" in sql:
+            raise Exception("ORA-00942: table or view does not exist")
+        params["rid"].setvalue(77)
+        params["rcost"].setvalue(Decimal("0"))
+
+    async def close(self) -> None:
+        return None
+
+
+class _OracleLedgerConn:
+    def __init__(self) -> None:
+        self.cursor_obj = _OracleLedgerCursor()
+
+    def cursor(self):
+        return self.cursor_obj
 
 
 def _settings():
@@ -109,6 +147,39 @@ async def test_postgres_record_usage_ledger_records_and_warns_for_unknown_model(
 
     assert result == UsageLedgerResult(id=43, est_cost_usd=Decimal("0"))
     assert "model_registry price missing" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_oracle_record_usage_ledger_records_when_model_registry_missing(monkeypatch, caplog):
+    monkeypatch.setitem(sys.modules, "oracledb", SimpleNamespace(DB_TYPE_NUMBER=object()))
+
+    from mnemos.persistence.oracle import OracleBackend
+
+    conn = _OracleLedgerConn()
+    backend = OracleBackend(pool=SimpleNamespace(), settings=SimpleNamespace())  # type: ignore[arg-type]
+
+    with caplog.at_level("WARNING"):
+        result = await backend.record_usage_ledger(
+            SimpleNamespace(conn=conn),
+            UsageLedgerRecord(
+                provider="unknown",
+                model="missing",
+                task_kind="code",
+                tokens_in=1,
+                tokens_out=1,
+                tokens_reasoning=0,
+                latency_ms=1,
+                outcome="ok",
+                caller_subsystem="pantheon",
+                tier="standard",
+            ),
+        )
+
+    assert result == UsageLedgerResult(id=77, est_cost_usd=Decimal("0"))
+    assert len(conn.cursor_obj.sql_calls) == 2
+    assert "FROM model_registry" in conn.cursor_obj.sql_calls[0]
+    assert "FROM model_registry" not in conn.cursor_obj.sql_calls[1]
+    assert "model_registry table missing" in caplog.text
 
 
 class _EndpointBackend:
