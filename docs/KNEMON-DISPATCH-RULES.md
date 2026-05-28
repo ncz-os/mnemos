@@ -34,11 +34,11 @@ These are the rows seeded or refreshed by `0039_knemon_dispatch_rule_refresh`. R
 | OpenAI | `chatgpt_pro` | Backward-compatible ChatGPT Pro $200 alias: unmetered GPT-5.5 access subject to abuse guardrails |
 | OpenAI | `chatgpt_pro_100` | ChatGPT Pro $100 tier: unmetered GPT-5.5 access subject to abuse guardrails; 5x Plus overall Pro tier |
 | OpenAI | `chatgpt_pro_200` | ChatGPT Pro $200 tier: unmetered GPT-5.5 access subject to abuse guardrails; 20x Plus overall Pro tier |
-| OpenAI | `codex_plus` | Local planning cap: 15 GPT-5.5 messages per 5h |
-| OpenAI | `codex_pro_100_10x` | Local planning cap: 160 GPT-5.5 messages per 5h through 2026-05-31 |
-| OpenAI | `codex_pro_100_5x` | Local planning cap: 80 GPT-5.5 messages per 5h from 2026-06-01 |
-| OpenAI | `codex_pro_200_25x` | Local planning cap: 375 GPT-5.5 messages per 5h through 2026-05-31 |
-| OpenAI | `codex_pro_200_20x` | Local planning cap: 300 GPT-5.5 messages per 5h from 2026-06-01 |
+| OpenAI | `codex_plus` | `msg_cap=15`, the lower bound of OpenAI's published 15-80 GPT-5.5 local-message range per 5h |
+| OpenAI | `codex_pro_100_10x` | `msg_cap=160`, the lower bound of the temporary 160-800 GPT-5.5 local-message range per 5h through 2026-05-31 |
+| OpenAI | `codex_pro_100_5x` | `msg_cap=80`, the lower bound of the standard 80-400 GPT-5.5 local-message range per 5h from 2026-06-01 |
+| OpenAI | `codex_pro_200_25x` | `msg_cap=375`, the lower bound of the temporary 375-2000 GPT-5.5 local-message range per 5h through 2026-05-31 |
+| OpenAI | `codex_pro_200_20x` | `msg_cap=300`, the lower bound of the standard 300-1600 GPT-5.5 local-message range per 5h from 2026-06-01 |
 
 OpenAI's public ChatGPT Pro documentation supports both $100 and $200 Pro tiers. The generic `chatgpt_pro` row remains as a backward-compatible $200 operator alias so existing workspace pools keep resolving; new pools should prefer the explicit `chatgpt_pro_100` or `chatgpt_pro_200` rows. Rows with no `msg_cap` or `token_cap` report no utilization percentage in the utilization API and `0%` utilization inside the router. That intentionally treats ChatGPT Pro as operator-owned unmetered subscription capacity for dispatch ranking, still subject to provider abuse guardrails and the local session-burn downgrade.
 
@@ -84,6 +84,8 @@ Codex Pro promo rows use stable parent aliases `codex_pro_100` and `codex_pro_20
 
 When no workspace pool is known, the router uses model metadata as a fallback family discriminator. Generic OpenAI `gpt-*` candidates map to ChatGPT subscription rows; OpenAI model metadata containing `codex` maps to Codex rows. Workspace pools remain authoritative when present.
 
+Zeroclaw worker pool detection follows the same split. Use `CHATGPT_PLAN` for ChatGPT pools, `CODEX_PLAN` for Codex pools, and `OPENAI_SUBSCRIPTION_POOLS=openai_subscription` only when intentionally pooling ChatGPT and Codex subscription capacity together. A generic OpenAI auth file is not enough evidence to advertise either family pool.
+
 Session burn is scoped to `usage_ledger.session_id` across providers and plans. It sums `request_count`, so retries and fanout attempts count when they are recorded against the same session. The burn window is sliding, not bucketed.
 
 ## Config Defaults
@@ -102,7 +104,7 @@ The PR adds these operator policy defaults to `config.toml.example`, `.env.examp
 
 ## Cross-Check
 
-The audit was cross-checked with a Codex muse review and external GRAEAE consultations. Codex found no blocking issues in the fallback, G1, burn-threshold, or plan-row audit questions, and flagged SQLite migration wording plus stale-window burn coverage as follow-ups; both are addressed here. The parent-alias parity fix is included so exact `codex_pro_100` and `codex_pro_200` pools map to the correct promo/current rows without granting Pro access to `codex_plus`-only workspaces. GRAEAE agreed that Codex Pro promo rows, Anthropic Max planning caps, and the 2026-06-01 tier flip must stay labeled as provider-promo/local-policy assumptions rather than provider billing facts. A later GRAEAE pass also raised policy clarity risks around unmetered Pro utilization, the automatic 2026-06-01 activation, burned-session quality floors, and the `$0.50` cost unit; those are intentional operator policy choices documented above, not code blockers. Direct hive submission to the online Claude worker was rejected because this session registered without a submitter URN, so the external GRAEAE consultation was used as the Claude-provider fallback cross-check. Treat `70%`, `$0.50`, `0.85`, and `10 req/hr` as explicit operator policy thresholds, not external provider facts.
+The audit was cross-checked with a Codex muse review and external GRAEAE consultations. Codex found no blocking issues in the fallback, G1, burn-threshold, or plan-row audit questions, and flagged SQLite migration wording plus stale-window burn coverage as follow-ups; both are addressed here. The parent-alias parity fix is included so exact `codex_pro_100` and `codex_pro_200` pools map to the correct promo/current rows without granting Pro access to `codex_plus`-only workspaces. GRAEAE agreed that Codex Pro promo rows, Anthropic Max planning caps, and the 2026-06-01 tier flip must stay labeled as provider-promo/local-policy assumptions rather than provider billing facts. A later GRAEAE pass also raised policy clarity risks around unmetered Pro utilization, the automatic 2026-06-01 activation, burned-session quality floors, the `$0.50` cost unit, and Codex ranges versus scalar caps; those are intentional operator policy choices documented above, not code blockers. Direct hive submission to the online Claude worker was rejected because this session registered without a submitter URN, so the external GRAEAE consultation was used as the Claude-provider fallback cross-check. Treat `70%`, `$0.50`, `0.85`, `10 req/hr`, and Codex lower-bound `msg_cap` values as explicit operator policy thresholds, not external provider facts.
 
 ## Sources
 

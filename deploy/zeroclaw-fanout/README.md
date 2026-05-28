@@ -85,6 +85,18 @@ These had zeroclaw-worker@1 stopped+disabled on 2026-05-24.
 
 For each agent-pool host:
 
+Set subscription pools explicitly in the worker environment when a host has
+interactive subscription access. Use family-specific pools by default:
+
+```bash
+CHATGPT_PLAN=chatgpt_pro_100          # or chatgpt_plus / chatgpt_pro_200
+CODEX_PLAN=codex_pro_200             # or codex_plus / codex_pro_100
+CLAUDE_SUBSCRIPTION_TIER=claude_max_100
+
+# Only set this when intentionally sharing all OpenAI subscription capacity.
+OPENAI_SUBSCRIPTION_POOLS=openai_subscription
+```
+
 ```bash
 # 1. Substitute keys into config
 python3 -c "
