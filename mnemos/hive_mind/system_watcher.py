@@ -187,19 +187,30 @@ def dynamic_load() -> dict:
 
 def capabilities_from_specs(specs: dict) -> list[str]:
     caps = ["system", "host"]
-    if specs.get("has_docker"):     caps.append("docker")
-    if specs.get("has_podman"):     caps.append("podman")
-    if specs.get("has_buildx"):     caps.extend(["build", "buildx", "multi-arch-build"])
-    if specs.get("has_gitlab_runner"): caps.append("ci-runner")
+    if specs.get("has_docker"):
+        caps.append("docker")
+    if specs.get("has_podman"):
+        caps.append("podman")
+    if specs.get("has_buildx"):
+        caps.extend(["build", "buildx", "multi-arch-build"])
+    if specs.get("has_gitlab_runner"):
+        caps.append("ci-runner")
     for g in specs.get("gpus", []) or []:
         v = g.get("vendor", "")
-        if v == "nvidia": caps.extend(["gpu", "nvidia-gpu", "cuda"])
-        elif v == "amd": caps.extend(["gpu", "amd-gpu", "rocm", "vulkan-compute"])
-        elif v == "intel": caps.extend(["gpu", "intel-igpu"])
-    if specs.get("ram_gb", 0) >= 32:  caps.append("ram-32g+")
-    if specs.get("ram_gb", 0) >= 64:  caps.append("ram-64g+")
-    if specs.get("cpu_count", 0) >= 16: caps.append("cpu-16t+")
-    if specs.get("cpu_count", 0) >= 32: caps.append("cpu-32t+")
+        if v == "nvidia":
+            caps.extend(["gpu", "nvidia-gpu", "cuda"])
+        elif v == "amd":
+            caps.extend(["gpu", "amd-gpu", "rocm", "vulkan-compute"])
+        elif v == "intel":
+            caps.extend(["gpu", "intel-igpu"])
+    if specs.get("ram_gb", 0) >= 32:
+        caps.append("ram-32g+")
+    if specs.get("ram_gb", 0) >= 64:
+        caps.append("ram-64g+")
+    if specs.get("cpu_count", 0) >= 16:
+        caps.append("cpu-16t+")
+    if specs.get("cpu_count", 0) >= 32:
+        caps.append("cpu-32t+")
     return caps
 
 
