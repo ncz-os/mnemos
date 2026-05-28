@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 import mnemos.core.lifecycle as lifecycle
 from mnemos.domain.graeae.engine import get_graeae_engine
 from mnemos.domain.pantheon import triage
-from mnemos.persistence.base import UsageLedgerRecord
+from mnemos.persistence.base import UsageLedgerRecord, UsageLedgerResult
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ def _usage_value(result: Any, key: str) -> int:
     return max(0, int(value or 0))
 
 
-async def _record_usage(record: UsageLedgerRecord) -> None:
+async def _record_usage(record: UsageLedgerRecord) -> UsageLedgerResult:
     backend = lifecycle._persistence_backend
     if backend is None:
         raise RuntimeError("usage_ledger requires a configured persistence backend")
@@ -70,11 +70,18 @@ async def _record_usage(record: UsageLedgerRecord) -> None:
     if recorder is None:
         raise RuntimeError("usage_ledger requires a configured persistence backend")
     async with backend.transactional() as tx:
-        await recorder(tx, record)
+        return await recorder(tx, record)
 
 
 async def call(task: Task | dict[str, Any]) -> dict[str, Any]:
-    """Route one task through PANTHEON triage and always record usage."""
+    """Route one task through PANTHEON triage and always record usage.
+
+    Returned provider dictionaries are annotated with ledger health fields:
+    ``ledger_status`` is ``"ok"`` with ``ledger_record_id`` populated when
+    usage recording succeeds. If usage recording fails after an LLM result is
+    available, the result is still returned with ``ledger_status="degraded"``,
+    ``ledger_error=repr(exc)``, and ``ledger_record_id=None``.
+    """
     request = task if isinstance(task, Task) else Task(**task)
     selected = await triage.recommend(
         request.task_kind,
@@ -108,7 +115,7 @@ async def call(task: Task | dict[str, Any]) -> dict[str, Any]:
         if isinstance(result, dict) and result.get("latency_ms") is not None:
             latency_ms = max(0, int(result["latency_ms"]))
         try:
-            await _record_usage(
+            ledger_result = await _record_usage(
                 UsageLedgerRecord(
                     provider=provider,
                     model=model,
@@ -122,8 +129,16 @@ async def call(task: Task | dict[str, Any]) -> dict[str, Any]:
                     tier=request.tier,
                 )
             )
-        except Exception:
-            logger.warning(
+            if result is not None:
+                result["ledger_status"] = "ok"
+                result["ledger_error"] = None
+                result["ledger_record_id"] = ledger_result.id
+        except Exception as exc:
+            if result is not None:
+                result["ledger_status"] = "degraded"
+                result["ledger_error"] = repr(exc)
+                result["ledger_record_id"] = None
+            logger.error(
                 "usage_ledger recording failed for provider=%s model=%s task_kind=%s",
                 provider,
                 model,

@@ -225,7 +225,7 @@ async def test_llm_wrapper_records_in_finally_on_exception(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_llm_wrapper_swallows_ledger_recording_failure_after_success(monkeypatch, caplog):
+async def test_llm_wrapper_marks_result_degraded_on_ledger_failure(monkeypatch, caplog):
     import mnemos.llm as llm
 
     backend = _FailingLedgerBackend()
@@ -237,7 +237,7 @@ async def test_llm_wrapper_swallows_ledger_recording_failure_after_success(monke
     monkeypatch.setattr(llm.triage, "recommend", fake_recommend)
     monkeypatch.setattr(llm, "get_graeae_engine", lambda: _SuccessEngine())
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("ERROR"):
         result = await llm.call(
             llm.Task(
                 prompt="hello",
@@ -248,7 +248,42 @@ async def test_llm_wrapper_swallows_ledger_recording_failure_after_success(monke
         )
 
     assert result["status"] == "success"
+    assert result["ledger_status"] == "degraded"
+    assert result["ledger_error"]
+    assert result["ledger_record_id"] is None
     assert backend.records[0].tokens_in == 12
     assert backend.records[0].tokens_out == 5
     assert backend.records[0].tokens_reasoning == 2
     assert "usage_ledger recording failed" in caplog.text
+    assert any(record.levelname == "ERROR" for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_llm_wrapper_marks_result_ok_on_successful_ledger_record(monkeypatch):
+    import mnemos.llm as llm
+
+    backend = _LedgerBackend()
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+
+    async def fake_recommend(*args, **kwargs):
+        return {"id": "gpt-test", "provider": "openai"}
+
+    monkeypatch.setattr(llm.triage, "recommend", fake_recommend)
+    monkeypatch.setattr(llm, "get_graeae_engine", lambda: _SuccessEngine())
+
+    result = await llm.call(
+        llm.Task(
+            prompt="hello",
+            task_kind="chat",
+            caller_subsystem="unit-test",
+            tier="standard",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["ledger_status"] == "ok"
+    assert result["ledger_error"] is None
+    assert isinstance(result["ledger_record_id"], int)
+    assert backend.records[0].tokens_in == 12
+    assert backend.records[0].tokens_out == 5
+    assert backend.records[0].tokens_reasoning == 2
