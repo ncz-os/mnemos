@@ -133,6 +133,84 @@ def _normalize_capabilities(value: Any) -> set[str]:
     return {item.strip().strip('"').strip("'") for item in raw.strip("{}[]").split(",") if item.strip()}
 
 
+def _normalize_pool(value: Any) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in str(value or "").strip().lower()).strip("_")
+
+
+def _normalize_pools(value: Any) -> set[str]:
+    return {_normalize_pool(pool) for pool in _normalize_capabilities(value) if _normalize_pool(pool)}
+
+
+def _subscription_pool_aliases(plan: dict[str, Any]) -> set[str]:
+    provider = _normalize_pool(plan.get("provider"))
+    plan_name = _normalize_pool(plan.get("plan_name"))
+    parent_plan_id = _normalize_pool(plan.get("parent_plan_id"))
+    aliases = {pool for pool in (plan_name, parent_plan_id) if pool}
+    if provider:
+        aliases.add(f"{provider}_subscription")
+    if provider == "anthropic":
+        aliases.add("claude_subscription")
+    if provider == "openai":
+        aliases.update({"chatgpt_subscription", "codex_subscription"})
+    return aliases
+
+
+async def _worker_pools_for_session(backend: Any, session_id: str | None) -> set[str] | None:
+    if not session_id:
+        return None
+    try:
+        rows = await _rows(
+            backend,
+            """
+            SELECT subscription_pools
+            FROM hive_agents
+            WHERE session_id = :session_id
+              AND status IN ('online', 'idle')
+            ORDER BY last_heartbeat DESC
+            FETCH FIRST 1 ROW ONLY
+            """,
+            {"session_id": session_id},
+        )
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "fetch" not in msg:
+            if "hive_agents" in msg or "subscription_pools" in msg or "no such table" in msg or "no such column" in msg:
+                return None
+            raise
+        try:
+            rows = await _rows(
+                backend,
+                """
+                SELECT subscription_pools
+                FROM hive_agents
+                WHERE session_id = :session_id
+                  AND status IN ('online', 'idle')
+                ORDER BY last_heartbeat DESC
+                LIMIT 1
+                """,
+                {"session_id": session_id},
+            )
+        except Exception as fallback_exc:
+            fallback_msg = str(fallback_exc).lower()
+            if (
+                "hive_agents" in fallback_msg
+                or "subscription_pools" in fallback_msg
+                or "no such table" in fallback_msg
+                or "no such column" in fallback_msg
+            ):
+                return None
+            raise
+    if not rows:
+        return None
+    return _normalize_pools(rows[0].get("subscription_pools"))
+
+
+def _worker_has_pool(worker_pools: set[str] | None, plan: dict[str, Any]) -> bool:
+    if worker_pools is None:
+        return True
+    return bool(worker_pools.intersection(_subscription_pool_aliases(plan)))
+
+
 def _quality(row: dict[str, Any]) -> float:
     for key in ("quality_score", "graeae_weight", "weight"):
         value = _to_float(row.get(key), -1.0)
@@ -383,9 +461,11 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
         raise NoModelAvailable("no model satisfies priority tier and quality constraints")
 
     plans = await _plans_by_provider(backend)
+    worker_pools = await _worker_pools_for_session(backend, req.caller_session_id)
     enriched: list[dict[str, Any]] = []
     selected: dict[str, Any] | None = None
     reasons: list[str] = []
+    blocked_subscription_keys: set[tuple[str, str]] = set()
     for index, row in enumerate(candidates):
         plan = _best_plan(plans, row["provider"])
         auth_method = str(plan.get("auth_method") or "api").lower()
@@ -401,6 +481,14 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
         }
         enriched.append(item)
         if auth_method == "subscription":
+            if not _worker_has_pool(worker_pools, plan):
+                blocked_subscription_keys.add((row["provider"], row["model_id"]))
+                required = sorted(_subscription_pool_aliases(plan))
+                reasons.append(
+                    "skipped subscription because caller workspace lacks pool "
+                    f"{required[0] if required else item['plan_name']}"
+                )
+                continue
             if util < 70:
                 selected = item
                 reasons.append(f"selected subscription under 70% utilization ({util:.2f}%)")
@@ -444,6 +532,9 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
         if (row["provider"], row["model_id"]) in seen:
             continue
         plan = _best_plan(plans, row["provider"])
+        if str(plan.get("auth_method") or "api").lower() == "subscription" and not _worker_has_pool(worker_pools, plan):
+            blocked_subscription_keys.add((row["provider"], row["model_id"]))
+            continue
         fallback_candidates.append(
             {
                 **row,
@@ -453,6 +544,10 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
                 "sub_window_utilization_pct": 0.0,
             }
         )
+    if blocked_subscription_keys:
+        fallback_candidates = [
+            row for row in fallback_candidates if (row["provider"], row["model_id"]) not in blocked_subscription_keys
+        ]
     return KnemonRouteDecision(
         provider=selected["provider"],
         model_id=selected["model_id"],

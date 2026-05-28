@@ -19,3 +19,26 @@
 - `.venv/bin/pytest tests/domain/test_knemon_router.py -q`
 - Live smoke: `/v1/knemon/route?require_capability=reasoning` returned a valid route; after excluding subscription providers, current deployed code returned no matching model until the router JSON-object parser patch is deployed.
 - Logs: `/tmp/knemon-deepseek-cleanup/codex-out.log`
+
+---
+
+# KNEMON Workspace-Aware Subscription Pools
+
+## Delivered
+
+- Added `0036_hive_agents_subscription_pools.sql` for Oracle, PostgreSQL, and Db2.
+- Patched live PYTHIA `/srv/agent-bus/agent_bus.py` registration and `/v1/hosts` to carry `subscription_pools`.
+- Added startup subscription-pool detection to `zeroclaw_worker.py`; patched live PYTHIA `codex_worker.py` similarly.
+- Updated KNEMON routing to skip subscription plans when the caller workspace agent lacks the required pool.
+
+## Production
+
+- Applied Oracle 0036 to PYTHIA `ORCLPDB1` as `mnemos`.
+- Restarted `graeae-hive.service`; `/health` is healthy and `/v1/hosts` exposes `subscription_pools`.
+
+## Verification
+
+- `python3 -m py_compile deploy/zeroclaw-fanout/zeroclaw_worker.py mnemos/domain/knemon/router.py mnemos/installer/db.py tests/domain/test_knemon_router.py`
+- `bash -n deploy/zeroclaw-fanout/deploy_fleet.sh deploy/zeroclaw-fanout/zeroclaw-fanout-init.sh`
+- `.venv/bin/python -m pytest tests/domain/test_knemon_router.py tests/test_migration_lists_sync.py -q`
+- Logs: `/tmp/knemon-workspace-aware/codex-out.log`
