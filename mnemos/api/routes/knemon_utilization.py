@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import inspect
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -96,6 +96,32 @@ def _overage_cost(overage_msgs: int, plan: dict[str, Any]) -> float:
     return round(overage_msgs * (price_in + price_out) / 2.0, 6)
 
 
+def _to_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+
+
+def _plan_effective_on(row: dict[str, Any], today: date) -> bool:
+    effective_from = _to_date(row.get("effective_from"))
+    effective_until = _to_date(row.get("effective_until"))
+    if effective_from is not None and effective_from > today:
+        return False
+    if effective_until is not None and effective_until < today:
+        return False
+    return True
+
+
 async def _plans() -> list[dict[str, Any]]:
     sql = """
         SELECT provider, plan_name, auth_method, path_kind, monthly_usd, msg_cap,
@@ -104,15 +130,15 @@ async def _plans() -> list[dict[str, Any]]:
                overage_pricing_per_mtok_out, notes, effective_from,
                effective_until, parent_plan_id
         FROM subscription_plans
-        WHERE effective_from <= TRUNC(SYSTIMESTAMP)
-          AND (effective_until IS NULL OR effective_until >= TRUNC(SYSTIMESTAMP))
         ORDER BY provider, plan_name
         """
     try:
-        return await _rows(sql)
+        rows = await _rows(sql)
+        today = datetime.now(timezone.utc).date()
+        return [row for row in rows if _plan_effective_on(row, today)]
     except Exception as exc:
         msg = str(exc).lower()
-        if "trunc" not in msg and "effective_from" not in msg and "path_kind" not in msg:
+        if "effective_from" not in msg and "path_kind" not in msg and "parent_plan_id" not in msg:
             raise
         return await _rows(
             """
@@ -290,62 +316,64 @@ async def cost_split(
     _: UserContext = Depends(require_root),
 ) -> list[dict[str, Any]]:
     start = _period_start(period, datetime.now(timezone.utc))
+    plans = {
+        (str(plan.get("provider")), str(plan.get("plan_name"))): str(plan.get("auth_method") or "api").lower()
+        for plan in await _plans()
+    }
     sql = """
-        SELECT CASE
-                 WHEN ul.subscription_amortized = 1 THEN 'subscription_amortized'
-                 WHEN COALESCE(sp.auth_method, 'api') = 'free' THEN 'free'
-                 WHEN COALESCE(ul.est_cost_usd, 0) = 0 THEN 'free'
-                 ELSE 'api'
-               END AS cost_bucket,
+        SELECT ul.provider,
+               ul.tier AS plan_name,
                ul.path_kind,
+               ul.subscription_amortized,
                COUNT(*) AS row_count,
                COALESCE(SUM(ul.request_count), 0) AS requests,
                COALESCE(SUM(ul.est_cost_usd), 0) AS cost_usd
         FROM usage_ledger ul
-        LEFT JOIN subscription_plans sp
-          ON sp.provider = ul.provider AND sp.plan_name = ul.tier
-         AND sp.effective_from <= TRUNC(SYSTIMESTAMP)
-         AND (sp.effective_until IS NULL OR sp.effective_until >= TRUNC(SYSTIMESTAMP))
         WHERE ul.ts >= :start_ts
-        GROUP BY CASE
-                   WHEN ul.subscription_amortized = 1 THEN 'subscription_amortized'
-                   WHEN COALESCE(sp.auth_method, 'api') = 'free' THEN 'free'
-                   WHEN COALESCE(ul.est_cost_usd, 0) = 0 THEN 'free'
-                   ELSE 'api'
-                 END,
-                 ul.path_kind
-        ORDER BY cost_bucket, ul.path_kind
+        GROUP BY ul.provider, ul.tier, ul.path_kind, ul.subscription_amortized
         """
     try:
         rows = await _rows(sql, {"start_ts": start})
     except Exception as exc:
         msg = str(exc).lower()
-        if "path_kind" not in msg and "trunc" not in msg and "effective_from" not in msg:
+        if "path_kind" not in msg:
             raise
         rows = await _rows(
             """
-            SELECT CASE
-                     WHEN ul.subscription_amortized = 1 THEN 'subscription_amortized'
-                     WHEN COALESCE(sp.auth_method, 'api') = 'free' THEN 'free'
-                     WHEN COALESCE(ul.est_cost_usd, 0) = 0 THEN 'free'
-                     ELSE 'api'
-                   END AS cost_bucket,
+            SELECT ul.provider,
+                   ul.tier AS plan_name,
                    'api' AS path_kind,
+                   ul.subscription_amortized,
                    COUNT(*) AS row_count,
                    COALESCE(SUM(ul.request_count), 0) AS requests,
                    COALESCE(SUM(ul.est_cost_usd), 0) AS cost_usd
             FROM usage_ledger ul
-            LEFT JOIN subscription_plans sp
-              ON sp.provider = ul.provider AND sp.plan_name = ul.tier
             WHERE ul.ts >= :start_ts
-            GROUP BY CASE
-                       WHEN ul.subscription_amortized = 1 THEN 'subscription_amortized'
-                       WHEN COALESCE(sp.auth_method, 'api') = 'free' THEN 'free'
-                       WHEN COALESCE(ul.est_cost_usd, 0) = 0 THEN 'free'
-                       ELSE 'api'
-                     END
-            ORDER BY cost_bucket
+            GROUP BY ul.provider, ul.tier, ul.subscription_amortized
             """,
             {"start_ts": start},
         )
-    return rows
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        auth_method = plans.get((str(row.get("provider")), str(row.get("plan_name"))), "api")
+        if int(row.get("subscription_amortized") or 0) == 1:
+            cost_bucket = "subscription_amortized"
+        elif auth_method == "free" or float(row.get("cost_usd") or 0) == 0:
+            cost_bucket = "free"
+        else:
+            cost_bucket = "api"
+        path_kind = str(row.get("path_kind") or "api")
+        item = grouped.setdefault(
+            (cost_bucket, path_kind),
+            {
+                "cost_bucket": cost_bucket,
+                "path_kind": path_kind,
+                "row_count": 0,
+                "requests": 0,
+                "cost_usd": 0.0,
+            },
+        )
+        item["row_count"] += int(row.get("row_count") or 0)
+        item["requests"] += int(row.get("requests") or 0)
+        item["cost_usd"] = round(float(item["cost_usd"]) + float(row.get("cost_usd") or 0), 6)
+    return [grouped[key] for key in sorted(grouped)]
