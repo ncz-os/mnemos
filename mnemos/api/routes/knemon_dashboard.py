@@ -150,13 +150,13 @@ async def by_provider(_: UserContext = Depends(require_root)):
         return await _rows(
             """
             SELECT provider,
-                   COUNT(*) AS rows,
+                   COUNT(*) AS row_count,
                    NVL(SUM(est_cost_usd), 0) AS cost_usd,
                    NVL(SUM(tokens_in + tokens_out + tokens_reasoning), 0) AS tokens,
                    ROUND(AVG(latency_ms), 2) AS avg_latency_ms
             FROM usage_ledger
             GROUP BY provider
-            ORDER BY cost_usd DESC, rows DESC
+            ORDER BY cost_usd DESC, row_count DESC
             """
         )
 
@@ -171,13 +171,13 @@ async def by_model(limit: int = Query(20, ge=1, le=200), _: UserContext = Depend
             SELECT * FROM (
                 SELECT provider,
                        model,
-                       COUNT(*) AS rows,
+                       COUNT(*) AS row_count,
                        NVL(SUM(est_cost_usd), 0) AS cost_usd,
                        ROUND(AVG(tokens_in), 2) AS avg_tokens_in,
                        ROUND(AVG(tokens_out), 2) AS avg_tokens_out
                 FROM usage_ledger
                 GROUP BY provider, model
-                ORDER BY cost_usd DESC, rows DESC
+                ORDER BY cost_usd DESC, row_count DESC
             )
             WHERE ROWNUM <= :limit
             """,
@@ -193,11 +193,11 @@ async def by_caller(_: UserContext = Depends(require_root)):
         return await _rows(
             """
             SELECT caller_subsystem,
-                   COUNT(*) AS rows,
+                   COUNT(*) AS row_count,
                    NVL(SUM(est_cost_usd), 0) AS cost_usd
             FROM usage_ledger
             GROUP BY caller_subsystem
-            ORDER BY cost_usd DESC, rows DESC
+            ORDER BY cost_usd DESC, row_count DESC
             """
         )
 
@@ -210,11 +210,11 @@ async def by_task_kind(_: UserContext = Depends(require_root)):
         return await _rows(
             """
             SELECT task_kind,
-                   COUNT(*) AS rows,
+                   COUNT(*) AS row_count,
                    NVL(SUM(est_cost_usd), 0) AS cost_usd
             FROM usage_ledger
             GROUP BY task_kind
-            ORDER BY cost_usd DESC, rows DESC
+            ORDER BY cost_usd DESC, row_count DESC
             """
         )
 
@@ -230,7 +230,7 @@ async def timeline(bucket: str = Query("1h", pattern="^(1h|1d)$"), _: UserContex
             f"""
             SELECT TO_CHAR(TRUNC(CAST(SYS_EXTRACT_UTC(ts) AS TIMESTAMP), {fmt}),
                            'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS ts_bucket,
-                   COUNT(*) AS rows,
+                   COUNT(*) AS row_count,
                    NVL(SUM(est_cost_usd), 0) AS cost_usd
             FROM usage_ledger
             WHERE ts >= SYSTIMESTAMP - INTERVAL '7' DAY
