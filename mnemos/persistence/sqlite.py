@@ -3641,6 +3641,118 @@ class SqliteBackend:
             (category, half_life_days, decay_kind, floor),
         )
 
+    async def create_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+    ) -> Row:
+        conn = _sqlite_tx(tx).conn
+        if entry_date is None:
+            await _execute(
+                conn,
+                """
+                INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                VALUES (?, ?, ?, date('now'), ?, ?, ?)
+                """,
+                (entry_id, owner_id, namespace, topic, content, _json_text(metadata, default={})),
+            )
+        else:
+            await _execute(
+                conn,
+                """
+                INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (entry_id, owner_id, namespace, str(entry_date), topic, content, _json_text(metadata, default={})),
+            )
+        row = await _fetch_one(
+            conn,
+            """
+            SELECT id, entry_date, topic, content, metadata, created
+            FROM journal WHERE id = ?
+            """,
+            (entry_id,),
+        )
+        if row is None:
+            raise RuntimeError("journal insert returned no row")
+        return row
+
+    async def list_journal_entries(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str | None,
+        search: str | None,
+        limit: int,
+    ) -> list[Row]:
+        conn = _sqlite_tx(tx).conn
+        if entry_date is not None:
+            return await _fetch_all(
+                conn,
+                """
+                SELECT id, entry_date, topic, content, metadata, created
+                FROM journal WHERE owner_id = ? AND namespace = ? AND entry_date = ?
+                ORDER BY created DESC LIMIT ?
+                """,
+                (owner_id, namespace, str(entry_date), limit),
+            )
+        if topic:
+            return await _fetch_all(
+                conn,
+                """
+                SELECT id, entry_date, topic, content, metadata, created
+                FROM journal WHERE owner_id = ? AND namespace = ? AND topic = ?
+                ORDER BY created DESC LIMIT ?
+                """,
+                (owner_id, namespace, topic, limit),
+            )
+        if search:
+            return await _fetch_all(
+                conn,
+                """
+                SELECT id, entry_date, topic, content, metadata, created
+                FROM journal
+                WHERE owner_id = ? AND namespace = ?
+                  AND (lower(content) LIKE lower(?) OR lower(topic) LIKE lower(?))
+                ORDER BY created DESC LIMIT ?
+                """,
+                (owner_id, namespace, f"%{search}%", f"%{search}%", limit),
+            )
+        return await _fetch_all(
+            conn,
+            """
+            SELECT id, entry_date, topic, content, metadata, created
+            FROM journal WHERE owner_id = ? AND namespace = ?
+            ORDER BY created DESC LIMIT ?
+            """,
+            (owner_id, namespace, limit),
+        )
+
+    async def delete_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+    ) -> bool:
+        cursor = await _execute(
+            _sqlite_tx(tx).conn,
+            "DELETE FROM journal WHERE id = ? AND owner_id = ? AND namespace = ?",
+            (entry_id, owner_id, namespace),
+        )
+        return int(getattr(cursor, "rowcount", 0) or 0) > 0
+
     async def register_oauth_token(
         self,
         tx: Transaction,
