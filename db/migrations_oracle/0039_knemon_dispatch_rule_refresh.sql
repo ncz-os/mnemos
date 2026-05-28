@@ -14,12 +14,12 @@ USING (
          200 monthly_usd, 900 msg_cap, 18000 msg_window_seconds,
          NULL token_cap, NULL token_window_seconds, 'rolling' reset_anchor,
          NULL overage_pricing_per_mtok_in, NULL overage_pricing_per_mtok_out,
-         'Claude Max $200 / 20x: at least 900 messages per 5h; local operator tier flip ends 2026-05-31' notes,
+         'Claude Max $200 / 20x: operator-normalized 900-message 5h capacity; local tier flip ends 2026-05-31' notes,
          DATE '2026-04-01' effective_from, DATE '2026-05-31' effective_until,
          'interactive' path_kind, NULL parent_plan_id FROM dual
   UNION ALL SELECT 'anthropic', 'claude_max_100', 'subscription',
          100, 225, 18000, NULL, NULL, 'rolling', NULL, NULL,
-         'Claude Max $100 / 5x: at least 225 messages per 5h; local operator tier flip starts 2026-06-01',
+         'Claude Max $100 / 5x: operator-normalized 225-message 5h capacity; local tier flip starts 2026-06-01',
          DATE '2026-06-01', NULL, 'interactive', 'claude_max_200' FROM dual
   UNION ALL SELECT 'openai', 'chatgpt_plus', 'subscription',
          20, 160, 10800, NULL, NULL, 'rolling', NULL, NULL,
