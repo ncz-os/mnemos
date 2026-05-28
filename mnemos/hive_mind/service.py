@@ -15,7 +15,7 @@ import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional, Any
+from typing import Optional
 
 import aiosqlite
 from fastapi import FastAPI, HTTPException, Request
@@ -533,7 +533,6 @@ async def reaper_task(app: FastAPI):
                         tpl = json.loads(tpl_json)
                         tpl["submitter_urn"] = sub_urn
                         # synth a JobCreate + go through the cache+role machinery
-                        from fastapi import HTTPException as _HE
                         await create_job(JobCreate(**tpl))  # type: ignore
                         await db.execute(
                             "UPDATE scheduled_jobs SET last_fired_at=?, next_fire_at=?, "
@@ -704,12 +703,24 @@ async def list_agents(
            "pid, runtime, model, provider, cost_tier, autonomy_level "
            "FROM agents WHERE 1=1")
     args: list = []
-    if status:    sql += " AND status=?";    args.append(status)
-    if kind:      sql += " AND kind=?";      args.append(kind)
-    if host:      sql += " AND host=?";      args.append(host)
-    if runtime:   sql += " AND runtime=?";   args.append(runtime)
-    if pid is not None: sql += " AND pid=?"; args.append(pid)
-    if cost_tier: sql += " AND cost_tier=?"; args.append(cost_tier)
+    if status:
+        sql += " AND status=?"
+        args.append(status)
+    if kind:
+        sql += " AND kind=?"
+        args.append(kind)
+    if host:
+        sql += " AND host=?"
+        args.append(host)
+    if runtime:
+        sql += " AND runtime=?"
+        args.append(runtime)
+    if pid is not None:
+        sql += " AND pid=?"
+        args.append(pid)
+    if cost_tier:
+        sql += " AND cost_tier=?"
+        args.append(cost_tier)
     sql += " ORDER BY last_heartbeat DESC"
     rows = []
     async with aiosqlite.connect(DB_PATH) as db:
