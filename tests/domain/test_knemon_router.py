@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import pytest
 
 from mnemos.api.routes.ledger import compute_plan_window_id
-from mnemos.domain.knemon.router import KnemonRouteRequest, route
+from mnemos.domain.knemon.router import KnemonRouteRequest, NoModelAvailable, route
 
 
 class _SqliteKnemonBackend:
@@ -113,6 +113,7 @@ class _SqliteKnemonBackend:
             """
             INSERT INTO model_registry VALUES
               ('openai', 'gpt-sub', 'GPT Sub', '["chat","code"]', 2, 8, 200000, 1400, 0.95, 1, 0),
+              ('openai', 'gpt-c-tier', 'GPT C Tier', '["vision"]', 2, 8, 200000, 900, 0.70, 1, 0),
               ('nvidia', 'ngc-free', 'NGC Free', '["chat","code"]', 0, 0, 200000, 1250, 0.88, 1, 0),
               ('xai', 'grok-api', 'Grok API', '["chat","code"]', 3, 15, 200000, 1220, 0.86, 1, 0);
             INSERT INTO subscription_plans VALUES
@@ -178,6 +179,20 @@ def _req(priority: int, session_id: str | None = None) -> KnemonRouteRequest:
     )
 
 
+@pytest.mark.asyncio
+async def test_single_est_tokens_request_shape_supported():
+    req = KnemonRouteRequest(
+        task_kind="code-fix",
+        priority=14,
+        est_tokens=12_000,
+        caller_subsystem="pytest",
+        require_capability=["code"],
+    )
+    decision = await route(req, _SqliteKnemonBackend(40))
+    assert decision.provider == "openai"
+    assert decision.auth_method == "subscription"
+
+
 @pytest.mark.parametrize("utilization_pct", [40, 70, 92, 100])
 @pytest.mark.asyncio
 async def test_synthetic_utilization_fixtures_route(utilization_pct):
@@ -194,11 +209,26 @@ async def test_low_priority_92_pct_subscription_routes_to_free_ngc():
 
 
 @pytest.mark.asyncio
-async def test_high_priority_92_pct_subscription_still_routes_to_subscription():
-    decision = await route(_req(14), _SqliteKnemonBackend(92))
+async def test_high_priority_87_pct_subscription_still_routes_to_subscription():
+    decision = await route(_req(14), _SqliteKnemonBackend(87))
     assert decision.provider == "openai"
     assert decision.auth_method == "subscription"
-    assert decision.sub_window_utilization_pct == 92.5
+    assert decision.sub_window_utilization_pct == 87.5
+
+
+@pytest.mark.asyncio
+async def test_high_priority_92_pct_subscription_routes_to_api_fallback():
+    decision = await route(_req(14), _SqliteKnemonBackend(92))
+    assert decision.provider == "xai"
+    assert decision.auth_method == "api"
+    assert "falling back to api" in decision.reasoning
+
+
+@pytest.mark.asyncio
+async def test_exact_90_pct_subscription_routes_to_api_fallback():
+    decision = await route(_req(14), _SqliteKnemonBackend(90))
+    assert decision.provider == "xai"
+    assert decision.auth_method == "api"
 
 
 @pytest.mark.asyncio
@@ -206,6 +236,36 @@ async def test_g1_at_100_pct_subscription_routes_to_api_fallback():
     decision = await route(_req(14), _SqliteKnemonBackend(100))
     assert decision.provider == "xai"
     assert decision.auth_method == "api"
+
+
+@pytest.mark.asyncio
+async def test_g1_priority_allows_tier_c_when_required():
+    req = KnemonRouteRequest(
+        task_kind="vision",
+        priority=14,
+        est_tokens_in=10_000,
+        est_tokens_out=2_000,
+        caller_session_id=None,
+        caller_subsystem="pytest",
+        require_capability=["vision"],
+    )
+    decision = await route(req, _SqliteKnemonBackend(40))
+    assert decision.model_id == "gpt-c-tier"
+
+
+@pytest.mark.asyncio
+async def test_mid_priority_rejects_tier_c_ceiling():
+    req = KnemonRouteRequest(
+        task_kind="vision",
+        priority=10,
+        est_tokens_in=10_000,
+        est_tokens_out=2_000,
+        caller_session_id=None,
+        caller_subsystem="pytest",
+        require_capability=["vision"],
+    )
+    with pytest.raises(NoModelAvailable, match="priority tier"):
+        await route(req, _SqliteKnemonBackend(40))
 
 
 @pytest.mark.asyncio
