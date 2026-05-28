@@ -34,6 +34,7 @@ class KnemonRouteDecision:
     provider: str
     model_id: str
     auth_method: str
+    path_kind: str
     estimated_cost_usd: float
     sub_window_utilization_pct: float
     fallback_chain: list[tuple]
@@ -211,17 +212,34 @@ def _apply_priority_ceiling(candidates: list[dict[str, Any]], priority: int) -> 
 
 
 async def _plans_by_provider(backend: Any) -> dict[str, list[dict[str, Any]]]:
-    rows = await _rows(
-        backend,
-        """
-        SELECT provider, plan_name, auth_method, monthly_usd, msg_cap,
+    sql = """
+        SELECT provider, plan_name, auth_method, path_kind, monthly_usd, msg_cap,
                msg_window_seconds, token_cap, token_window_seconds,
                reset_anchor, overage_pricing_per_mtok_in,
-               overage_pricing_per_mtok_out
+               overage_pricing_per_mtok_out, effective_from, effective_until,
+               parent_plan_id
         FROM subscription_plans
+        WHERE effective_from <= TRUNC(SYSTIMESTAMP)
+          AND (effective_until IS NULL OR effective_until >= TRUNC(SYSTIMESTAMP))
         ORDER BY provider, monthly_usd DESC, msg_cap DESC
-        """,
-    )
+        """
+    try:
+        rows = await _rows(backend, sql)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "trunc" not in msg and "effective_from" not in msg and "path_kind" not in msg:
+            raise
+        rows = await _rows(
+            backend,
+            """
+            SELECT provider, plan_name, auth_method, monthly_usd, msg_cap,
+                   msg_window_seconds, token_cap, token_window_seconds,
+                   reset_anchor, overage_pricing_per_mtok_in,
+                   overage_pricing_per_mtok_out
+            FROM subscription_plans
+            ORDER BY provider, monthly_usd DESC, msg_cap DESC
+            """,
+        )
     out: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         out.setdefault(str(row.get("provider") or "").lower(), []).append(row)
@@ -232,13 +250,14 @@ def _best_plan(plans: dict[str, list[dict[str, Any]]], provider: str) -> dict[st
     provider_plans = plans.get(provider.lower()) or []
     if provider_plans:
         return provider_plans[0]
-    return {"provider": provider, "plan_name": "api", "auth_method": "api"}
+    return {"provider": provider, "plan_name": "api", "auth_method": "api", "path_kind": "api"}
 
 
 async def _usage_for_plan(backend: Any, plan: dict[str, Any]) -> tuple[int, int]:
     now = datetime.now(timezone.utc)
     plan_name = str(plan.get("plan_name") or "api")
     provider = str(plan.get("provider") or "")
+    path_kind = str(plan.get("path_kind") or "api")
     window_id = compute_plan_window_id(
         provider,
         plan_name,
@@ -246,18 +265,33 @@ async def _usage_for_plan(backend: Any, plan: dict[str, Any]) -> tuple[int, int]
         reset_anchor=str(plan.get("reset_anchor") or "monthly"),
         window_seconds=_to_int(plan.get("msg_window_seconds") or plan.get("token_window_seconds"), 0) or None,
     )
-    rows = await _rows(
-        backend,
-        """
+    sql = """
         SELECT COALESCE(SUM(request_count), 0) AS requests_used,
                COALESCE(SUM(tokens_in + tokens_out + tokens_reasoning), 0) AS tokens_used
         FROM usage_ledger
         WHERE provider = :provider
           AND tier = :plan_name
+          AND path_kind = :path_kind
           AND plan_window_id LIKE :window_pattern
-        """,
-        {"provider": provider, "plan_name": plan_name, "window_pattern": f"{window_id}%"},
-    )
+        """
+    params = {"provider": provider, "plan_name": plan_name, "path_kind": path_kind, "window_pattern": f"{window_id}%"}
+    try:
+        rows = await _rows(backend, sql, params)
+    except Exception as exc:
+        if "path_kind" not in str(exc).lower():
+            raise
+        rows = await _rows(
+            backend,
+            """
+            SELECT COALESCE(SUM(request_count), 0) AS requests_used,
+                   COALESCE(SUM(tokens_in + tokens_out + tokens_reasoning), 0) AS tokens_used
+            FROM usage_ledger
+            WHERE provider = :provider
+              AND tier = :plan_name
+              AND plan_window_id LIKE :window_pattern
+            """,
+            params,
+        )
     row = rows[0] if rows else {}
     return _to_int(row.get("requests_used")), _to_int(row.get("tokens_used"))
 
@@ -327,6 +361,7 @@ def _fallback_chain(candidates: list[dict[str, Any]], selected: dict[str, Any]) 
             row["provider"],
             row["model_id"],
             row.get("auth_method", "api"),
+            row.get("path_kind", "api"),
             row.get("estimated_cost_usd", 0.0),
         )
         for row in alternates[:3]
@@ -352,11 +387,13 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
     for index, row in enumerate(candidates):
         plan = _best_plan(plans, row["provider"])
         auth_method = str(plan.get("auth_method") or "api").lower()
+        path_kind = str(plan.get("path_kind") or auth_method).lower()
         requests_used, tokens_used = await _usage_for_plan(backend, plan) if auth_method == "subscription" else (0, 0)
         util = _utilization(plan, requests_used, tokens_used)
         item = {
             **row,
             "auth_method": auth_method,
+            "path_kind": path_kind,
             "plan_name": plan.get("plan_name", "api"),
             "sub_window_utilization_pct": util,
         }
@@ -409,6 +446,7 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
             {
                 **row,
                 "auth_method": str(plan.get("auth_method") or "api").lower(),
+                "path_kind": str(plan.get("path_kind") or plan.get("auth_method") or "api").lower(),
                 "plan_name": plan.get("plan_name", "api"),
                 "sub_window_utilization_pct": 0.0,
             }
@@ -417,6 +455,7 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
         provider=selected["provider"],
         model_id=selected["model_id"],
         auth_method=selected["auth_method"],
+        path_kind=selected["path_kind"],
         estimated_cost_usd=float(selected["estimated_cost_usd"]),
         sub_window_utilization_pct=float(selected["sub_window_utilization_pct"]),
         fallback_chain=_fallback_chain(fallback_candidates, selected),

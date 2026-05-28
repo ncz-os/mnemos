@@ -18,6 +18,8 @@ router = APIRouter(prefix="/v1", tags=["ledger"])
 _PLAN_WINDOWS: dict[tuple[str, str], tuple[str, int | None]] = {
     ("anthropic", "claude_max_200"): ("rolling", 18000),
     ("anthropic", "claude_max_100"): ("rolling", 18000),
+    ("anthropic", "claude_max_interactive_post_jun15"): ("rolling", 18000),
+    ("anthropic", "agent_sdk_credit_pool_post_jun15"): ("monthly", None),
     ("openai", "chatgpt_plus"): ("rolling", 10800),
     ("openai", "chatgpt_pro"): ("weekly", 604800),
     ("nvidia", "ngc_integrate"): ("monthly", None),
@@ -26,6 +28,7 @@ _PLAN_WINDOWS: dict[tuple[str, str], tuple[str, int | None]] = {
     ("together", "api"): ("monthly", None),
     ("deepseek-direct", "api"): ("monthly", None),
     ("xai", "api"): ("monthly", None),
+    ("xai", "supergrok"): ("monthly", None),
     ("gemini", "api"): ("monthly", None),
     ("perplexity", "api"): ("monthly", None),
 }
@@ -72,6 +75,7 @@ class LedgerRecordRequest(BaseModel):
     tier: str = Field(..., min_length=1)
     session_id: str | None = Field(default=None, max_length=64)
     request_count: int = Field(default=1, ge=1)
+    path_kind: str | None = Field(default="api", max_length=64)
 
 
 class LedgerRecordResponse(BaseModel):
