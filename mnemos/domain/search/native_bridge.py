@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover
+    import numpy as np
 
 try:
     import mnemos_native_search as _NATIVE_SEARCH  # type: ignore[import-not-found]
@@ -42,6 +45,30 @@ def pure_python_batch_cosine_similarity(
     corpus: Sequence[Sequence[float]],
 ) -> list[float]:
     return [pure_python_cosine_similarity(query, candidate) for candidate in corpus]
+
+
+def pure_python_similarity_dot_normalized(
+    query: "np.ndarray",
+    candidates: "np.ndarray",
+) -> "np.ndarray":
+    import numpy as np
+
+    query_array = np.asarray(query, dtype=np.float64)
+    candidate_array = np.asarray(candidates, dtype=np.float64)
+    if query_array.ndim != 1 or candidate_array.ndim != 2:
+        raise ValueError("query must be 1-D and candidates must be 2-D")
+    if candidate_array.shape[1] != query_array.shape[0]:
+        return np.zeros(candidate_array.shape[0], dtype=np.float64)
+
+    query_norm = float(np.linalg.norm(query_array))
+    if query_norm == 0.0:
+        return np.zeros(candidate_array.shape[0], dtype=np.float64)
+
+    candidate_norms = np.linalg.norm(candidate_array, axis=1)
+    denominator = candidate_norms * query_norm
+    scores = np.zeros(candidate_array.shape[0], dtype=np.float64)
+    np.divide(candidate_array @ query_array, denominator, out=scores, where=denominator != 0.0)
+    return scores
 
 
 def cosine_similarity(a: Iterable[Any], b: Iterable[Any]) -> float:
@@ -83,6 +110,18 @@ def batch_cosine_similarity(
     query_values = _to_float_list(query)
     corpus_values = [_to_float_list(candidate) for candidate in corpus]
     return pure_python_batch_cosine_similarity(query_values, corpus_values)
+
+
+def similarity_dot_normalized(
+    query: "np.ndarray",
+    candidates: "np.ndarray",
+) -> "np.ndarray":
+    if _NATIVE_SEARCH is not None:
+        try:
+            return _NATIVE_SEARCH.similarity_dot_normalized(query, candidates)
+        except Exception:
+            pass
+    return pure_python_similarity_dot_normalized(query, candidates)
 
 
 cosine = cosine_similarity
