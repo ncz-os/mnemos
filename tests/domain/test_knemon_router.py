@@ -360,6 +360,24 @@ async def test_session_burns_on_exact_threshold():
 
 
 @pytest.mark.asyncio
+async def test_session_burn_threshold_honors_env_override(monkeypatch):
+    import mnemos.core.config as config_mod
+
+    monkeypatch.setenv("MNEMOS_KNEMON_SESSION_BURN_REQUESTS_PER_HOUR", "12")
+    monkeypatch.setattr(config_mod, "_settings", None)
+
+    below = _SqliteKnemonBackend(70, burned_session="custom-threshold-below", burned_request_count=10)
+    below_decision = await route(_req(14, "custom-threshold-below"), below)
+    assert below_decision.provider == "openai"
+    assert below_decision.auth_method == "subscription"
+
+    at_threshold = _SqliteKnemonBackend(70, burned_session="custom-threshold-at", burned_request_count=12)
+    at_threshold_decision = await route(_req(14, "custom-threshold-at"), at_threshold)
+    assert at_threshold_decision.provider == "xai"
+    assert at_threshold_decision.auth_method == "api"
+
+
+@pytest.mark.asyncio
 async def test_session_below_burn_threshold_keeps_g1_subscription_escalation():
     backend = _SqliteKnemonBackend(70, burned_session="not-yet-burned", burned_request_count=9)
     decision = await route(_req(14, "not-yet-burned"), backend)
