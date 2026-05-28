@@ -87,3 +87,15 @@ def test_knemon_0039_codex_pro_rows_use_stable_parent_aliases(
 
     assert f"'interactive', '{parent_plan}'" in row
     assert "'interactive', 'codex_plus'" not in row
+
+
+@pytest.mark.parametrize("migration", MIGRATIONS, ids=lambda path: path.parent.name)
+def test_knemon_0039_backfills_legacy_subscription_path_kind(migration: Path) -> None:
+    sql = migration.read_text(encoding="utf-8")
+
+    assert "UPDATE usage_ledger" in sql
+    assert "path_kind = 'api'" in sql
+    assert "chatgpt_plus" in sql
+    assert "claude_max_100" in sql
+    assert "codex_pro_200_20x" in sql
+    assert "unmetered" in sql
