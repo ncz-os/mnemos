@@ -12,6 +12,8 @@ _PLAN_WINDOWS: dict[tuple[str, str], tuple[str, int | None]] = {
     ("anthropic", "agent_sdk_credit_pool_post_jun15"): ("monthly", None),
     ("openai", "chatgpt_plus"): ("rolling", 10800),
     ("openai", "chatgpt_pro"): ("monthly", None),
+    ("openai", "chatgpt_pro_100"): ("monthly", None),
+    ("openai", "chatgpt_pro_200"): ("monthly", None),
     ("openai", "codex_plus"): ("rolling", 18000),
     ("openai", "codex_pro_100_10x"): ("rolling", 18000),
     ("openai", "codex_pro_100_5x"): ("rolling", 18000),
