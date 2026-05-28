@@ -152,8 +152,8 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
         "model": "meta/llama-3.3-70b-instruct", "weight": 0.80, "api": "openai", "key_name": "nvidia",
     },
     "gemini": {
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent",
-        "model": "gemini-3-pro-preview", "weight": 0.88, "api": "gemini", "key_name": "gemini",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent",
+        "model": "gemini-3.1-pro-preview", "weight": 0.88, "api": "gemini", "key_name": "gemini",
     },
 }
 
