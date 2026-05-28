@@ -31,12 +31,16 @@ These are the current rows after `0039_knemon_dispatch_rule_refresh`.
 | Anthropic | `claude_max_200` | Local planning cap: 900 messages per 5h through 2026-05-31 |
 | Anthropic | `claude_max_100` | Local planning cap: 225 messages per 5h from 2026-06-01 |
 | OpenAI | `chatgpt_plus` | 160 ChatGPT GPT-5.5 messages per 3h |
-| OpenAI | `chatgpt_pro` | Unmetered ChatGPT GPT-5.5 access subject to abuse guardrails |
+| OpenAI | `chatgpt_pro` | Backward-compatible ChatGPT Pro $200 alias: unmetered GPT-5.5 access subject to abuse guardrails |
+| OpenAI | `chatgpt_pro_100` | ChatGPT Pro $100 tier: unmetered GPT-5.5 access subject to abuse guardrails; 5x Plus overall Pro tier |
+| OpenAI | `chatgpt_pro_200` | ChatGPT Pro $200 tier: unmetered GPT-5.5 access subject to abuse guardrails; 20x Plus overall Pro tier |
 | OpenAI | `codex_plus` | Local planning cap: 15 GPT-5.5 messages per 5h |
 | OpenAI | `codex_pro_100_10x` | Local planning cap: 160 GPT-5.5 messages per 5h through 2026-05-31 |
 | OpenAI | `codex_pro_100_5x` | Local planning cap: 80 GPT-5.5 messages per 5h from 2026-06-01 |
 | OpenAI | `codex_pro_200_25x` | Local planning cap: 375 GPT-5.5 messages per 5h through 2026-05-31 |
 | OpenAI | `codex_pro_200_20x` | Local planning cap: 300 GPT-5.5 messages per 5h from 2026-06-01 |
+
+OpenAI's public ChatGPT Pro documentation supports both $100 and $200 Pro tiers. The generic `chatgpt_pro` row remains as a backward-compatible $200 operator alias so existing workspace pools keep resolving; new pools should prefer the explicit `chatgpt_pro_100` or `chatgpt_pro_200` rows.
 
 Anthropic's public Max documentation supports the $100 Max 5x and $200 Max 20x tier relationship. The `900` and `225` message caps are conservative local planning caps for KNEMON utilization accounting. The 2026-06-01 switch from `claude_max_200` to `claude_max_100` is a local operator policy encoded in KNEMON, not a provider-published tier migration.
 
