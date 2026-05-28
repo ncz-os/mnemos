@@ -1,26 +1,34 @@
-Oracle OAuth/Sessions/Consultations persistence
+Concurrency parity tests for hive job claims
 
 Implemented:
-- Added Oracle facade methods for OAuth tokens/state, protocol sessions/logs, and consultations/responses.
-- Oracle backend now advertises all seven persistence capabilities: core, oauth, sessions, consultations, federation, audit, state.
-- Added SQLite parity facade methods and a SQLite 0038 test migration.
-- Added 0038 migrations for Oracle, PostgreSQL, and Db2.
-- Registered PostgreSQL 0038 in installer and docker-compose migration lists.
-- Added `tests/persistence/test_oracle_oauth_sessions_consultations.py`.
+- Added `tests/hive_mind/test_concurrency_parity.py`.
+- The test pre-seeds 1000 queued jobs, races 8 async workers through an in-process `POST /v1/jobs/next?agent_urn=...` route, and asserts:
+  - total claims are exactly 1000,
+  - claimed job IDs are unique across workers,
+  - every seeded job was claimed,
+  - no foreign jobs were claimed,
+  - no seeded jobs remain queued.
+- Parameterized the parity arm across:
+  - `SqliteHiveMindRepository` always,
+  - `OracleHiveMindRepository` when `ORACLE_DSN` is set,
+  - `Db2HiveMindRepository` skipped until the class and `DB2_DSN` exist.
+- Added an Oracle claim-path guard that pins `FOR UPDATE SKIP LOCKED`, the `status='queued'` update predicate, and the P0-1 `rowcount != 1` correctness check.
+- Added the SQLite job-queue surface needed for repository parity:
+  - `memory_jobs` test schema in `init()`,
+  - `insert_job` / `insert_job_queued`,
+  - `claim_next_job` / `find_and_claim_job`,
+  - `list_jobs`.
 
 Verification:
-- `python3 -m py_compile mnemos/persistence/oracle.py mnemos/persistence/sqlite.py` passed.
-- `.venv/bin/python -m pytest tests/persistence/test_oracle_oauth_sessions_consultations.py tests/persistence/test_capability_protocols.py tests/test_migration_lists_sync.py -q` passed: 16 tests.
-- `ruff` was not installed in `.venv`, so no ruff pass was available.
+- `.venv/bin/pytest tests/hive_mind/test_concurrency_parity.py` passed: 2 passed, 2 skipped.
+- `.venv/bin/pytest tests/hive_mind/test_oracle_repository_complete.py tests/hive_mind/test_concurrency_parity.py` passed: 3 passed, 2 skipped.
+- `.venv/bin/python -m py_compile mnemos/hive_mind/repository.py tests/hive_mind/test_concurrency_parity.py` passed.
+- Plain system `pytest` could not load the repo test suite because `/opt/homebrew/bin/python3` lacks `pytest_asyncio`; the repo `.venv` test runner was used.
+- `ruff` was not installed in `.venv`.
 
-Live Oracle:
-- Initial default DSN `192.168.207.25:1521/FREEPDB1` failed: service not registered.
-- Applied `db/migrations_oracle/0038_oauth_sessions_consultations.sql` to PYTHIA Oracle `192.168.207.67:1521/ORCLPDB1` as `mnemos`.
-- Live Oracle protocol roundtrip passed for token/state/session/log/consultation/response, then cleaned up synthetic rows.
+Live backend note:
+- `ORACLE_DSN` and `DB2_DSN` were not present in this shell, so the live Oracle and Db2 arms skipped locally.
+- The test is wired to run Oracle automatically when `ORACLE_DSN` is supplied; no migrations or redeploy were performed.
 
-Smoke:
-- Local Docker socket unavailable.
-- `root@argonas` did not resolve locally; `origin` resolves to `root@192.168.207.101`.
-- `root@192.168.207.101` Docker daemon was not reachable.
-- PYTHIA `docker logs mnemos-api | grep -i capabilit` still shows pre-redeploy capabilities: `audit, core, federation, state`.
-- No `mnemos-api` redeploy performed, per operator gate.
+Artifacts:
+- Pytest output: `/tmp/concurrency-parity/codex-out.log`
