@@ -23,6 +23,7 @@ import asyncio
 import logging
 import os
 import re
+import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -49,8 +50,15 @@ from mnemos.persistence.oracle import (
     _content_hash,
     _fetch_all_dicts,
     _is_unique_violation,
+    _json_text,
+    _json_value,
+    _raw_to_uuid,
+    _raw_token,
+    _raw_token_text,
     _render_visibility,
     _row_to_dict,
+    _ts_for_oracle,
+    _uuid_to_raw,
     _validate_and_format_vector,
 )
 from mnemos.persistence.types import Row
@@ -3413,26 +3421,421 @@ class Db2StateRepository(_Db2OraCompatMixin, OracleStateRepository):
             await _call(cursor.close)
 
 
-class Db2OAuthRepository(_Db2OraCompatMixin, OracleOAuthRepository):
-    """OAuth repository for Db2 via Oracle compatibility.
+class Db2OAuthRepository(OracleOAuthRepository):
+    """Db2-native OAuth token/state persistence."""
 
-    Inherits all SQL from :class:`OracleOAuthRepository`; the mixin
-    applies Db2 cursor translation (``SYSTIMESTAMP``→``CURRENT TIMESTAMP``,
-    ``:name`` binds → ``?`` positional binds) at execution time.
-    """
+    async def register_oauth_token(
+        self,
+        tx: Any,
+        *,
+        token: str | bytes,
+        user_id: str,
+        provider: str,
+        scopes: Sequence[str] | dict[str, Any] | None = None,
+        expires_at: Any = None,
+        refresh_token: str | None = None,
+    ) -> Row:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO oauth_tokens
+                  (token, user_id, provider, scopes, expires_at, refresh_token, created_at, last_used_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT TIMESTAMP, NULL)
+                """,
+                (
+                    _raw_token(token),
+                    user_id,
+                    provider,
+                    _json_text(scopes, []),
+                    _ts_for_oracle(expires_at),
+                    refresh_token,
+                ),
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.lookup_oauth_token(tx, token=token, touch=False)
+        assert row is not None
+        return row
+
+    async def lookup_oauth_token(self, tx: Any, *, token: str | bytes, touch: bool = True) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        raw = _raw_token(token)
+        try:
+            if touch:
+                await _call(
+                    cursor.execute, "UPDATE oauth_tokens SET last_used_at = CURRENT TIMESTAMP WHERE token = ?", (raw,)
+                )
+            await _call(
+                cursor.execute,
+                """
+                SELECT token, user_id, provider, scopes, expires_at, refresh_token, created_at, last_used_at
+                FROM oauth_tokens
+                WHERE token = ?
+                """,
+                (raw,),
+            )
+            return self._normalize_oauth_token_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_oauth_token(self, tx: Any, *, token: str | bytes) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute, "DELETE FROM oauth_tokens WHERE token = ?", (_raw_token(token),))
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def start_oauth_flow(
+        self,
+        tx: Any,
+        *,
+        state: str | bytes,
+        provider: str,
+        csrf_token: str,
+        return_url: str | None,
+        expires_at: Any,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO oauth_state (state, provider, csrf_token, return_url, created_at, expires_at)
+                VALUES (?, ?, ?, ?, CURRENT TIMESTAMP, ?)
+                """,
+                (_raw_token(state), provider, csrf_token, return_url, _ts_for_oracle(expires_at)),
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self._fetch_oauth_state(tx, state=state)
+        assert row is not None
+        return row
+
+    async def redeem_oauth_state(self, tx: Any, *, state: str | bytes) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        raw = _raw_token(state)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT state, provider, csrf_token, return_url, created_at, expires_at
+                FROM oauth_state
+                WHERE state = ? AND expires_at > CURRENT TIMESTAMP
+                """,
+                (raw,),
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            await _call(cursor.execute, "DELETE FROM oauth_state WHERE state = ?", (raw,))
+            return self._normalize_oauth_state_row(row)
+        finally:
+            await _call(cursor.close)
+
+    async def _fetch_oauth_state(self, tx: Any, *, state: str | bytes) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT state, provider, csrf_token, return_url, created_at, expires_at FROM oauth_state WHERE state = ?",
+                (_raw_token(state),),
+            )
+            return self._normalize_oauth_state_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+        finally:
+            await _call(cursor.close)
+
+    @staticmethod
+    def _normalize_oauth_token_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["token"] = _raw_token_text(out.get("token"))
+        out["scopes"] = _json_value(out.get("scopes"), [])
+        return out
+
+    @staticmethod
+    def _normalize_oauth_state_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["state"] = _raw_token_text(out.get("state"))
+        return out
 
 
-class Db2SessionsRepository(_Db2OraCompatMixin, OracleSessionsRepository):
-    """Sessions repository for Db2 via Oracle compatibility."""
+class Db2SessionsRepository(OracleSessionsRepository):
+    """Db2-native protocol sessions persistence."""
+
+    async def create_session(
+        self,
+        tx: Any,
+        *,
+        session_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        expires_at: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> Row:
+        sid = session_id or uuid.uuid4()
+        sid_raw = _uuid_to_raw(sid)
+        assert sid_raw is not None
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO sessions (id, session_id, user_id, started_at, last_active_at, expires_at, metadata)
+                VALUES (?, ?, ?, CURRENT TIMESTAMP, CURRENT TIMESTAMP, ?, ?)
+                """,
+                (str(uuid.UUID(bytes=sid_raw)), sid_raw, user_id, _ts_for_oracle(expires_at), _json_text(metadata, {})),
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.lookup_session(tx, session_id=sid)
+        assert row is not None
+        return row
+
+    async def lookup_session(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT session_id, user_id, started_at, last_active_at, expires_at, metadata
+                FROM sessions
+                WHERE session_id = ? AND expires_at > CURRENT TIMESTAMP
+                """,
+                (_uuid_to_raw(session_id),),
+            )
+            return self._normalize_session_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+        finally:
+            await _call(cursor.close)
+
+    async def update_session_active(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET last_active_at = CURRENT TIMESTAMP WHERE session_id = ?",
+                (_uuid_to_raw(session_id),),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def expire_session(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET expires_at = CURRENT TIMESTAMP WHERE session_id = ?",
+                (_uuid_to_raw(session_id),),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def log_session_event(
+        self,
+        tx: Any,
+        *,
+        session_id: str | bytes | uuid.UUID,
+        event_kind: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, session_id, event_kind, payload, ts
+                FROM FINAL TABLE (
+                    INSERT INTO session_logs (session_id, event_kind, payload, ts)
+                    VALUES (?, ?, ?, CURRENT TIMESTAMP)
+                )
+                """,
+                (_uuid_to_raw(session_id), event_kind, _json_text(payload, {})),
+            )
+            return self._normalize_session_log_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))  # type: ignore[return-value]
+        finally:
+            await _call(cursor.close)
+
+    @staticmethod
+    def _normalize_session_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _raw_to_uuid(out.get("session_id"))
+        out["metadata"] = _json_value(out.get("metadata"), {})
+        return out
+
+    @staticmethod
+    def _normalize_session_log_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _raw_to_uuid(out.get("session_id"))
+        out["payload"] = _json_value(out.get("payload"), {})
+        return out
 
 
-class Db2ConsultationsRepository(_Db2OraCompatMixin, OracleConsultationsRepository):
-    """Consultations repository for Db2 via Oracle compatibility.
+class Db2ConsultationsRepository(OracleConsultationsRepository):
+    """Db2-native user-facing consultations persistence."""
 
-    Distinct from :class:`Db2ConsultationAuditRepository` — this is the
-    user-facing consultations table that consultations.py routes operate
-    on. Audit is the lower-level event log.
-    """
+    async def create_consultation(
+        self,
+        tx: Any,
+        *,
+        consultation_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        prompt: str,
+        task_type: str | None,
+        mode: str | None,
+        status: str = "pending",
+    ) -> Row:
+        cid = consultation_id or uuid.uuid4()
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO consultations (id, user_id, prompt, task_type, mode, status, created_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT TIMESTAMP, NULL)
+                """,
+                (_uuid_to_raw(cid), user_id, prompt, task_type, mode, status),
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.fetch_consultation(tx, consultation_id=cid)
+        assert row is not None
+        return row
+
+    async def append_consultation_response(
+        self,
+        tx: Any,
+        *,
+        consultation_id: str | bytes | uuid.UUID,
+        provider: str,
+        model_id: str,
+        response: str,
+        final_score: float | None = None,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        latency_ms: int | None = None,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, consultation_id, provider, model_id, response, final_score,
+                       tokens_in, tokens_out, latency_ms, created_at
+                FROM FINAL TABLE (
+                    INSERT INTO consultation_responses
+                      (consultation_id, provider, model_id, response, final_score,
+                       tokens_in, tokens_out, latency_ms, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT TIMESTAMP)
+                )
+                """,
+                (
+                    _uuid_to_raw(consultation_id),
+                    provider,
+                    model_id,
+                    response,
+                    final_score,
+                    tokens_in,
+                    tokens_out,
+                    latency_ms,
+                ),
+            )
+            return self._normalize_consultation_response_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))  # type: ignore[return-value]
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_consultation(self, tx: Any, *, consultation_id: str | bytes | uuid.UUID) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, user_id, prompt, task_type, mode, status, created_at, completed_at
+                FROM consultations
+                WHERE id = ?
+                """,
+                (_uuid_to_raw(consultation_id),),
+            )
+            row = self._normalize_consultation_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+            if row is None:
+                return None
+            row["responses"] = await self._fetch_consultation_responses(tx, consultation_id=consultation_id)
+            return row
+        finally:
+            await _call(cursor.close)
+
+    async def list_consultations(
+        self,
+        tx: Any,
+        *,
+        user_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Row]:
+        where: list[str] = []
+        params: list[Any] = []
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(user_id)
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        sql = "SELECT id, user_id, prompt, task_type, mode, status, created_at, completed_at FROM consultations"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+        params.extend([int(offset), int(limit)])
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute, sql, tuple(params))
+            return [self._normalize_consultation_row(row) for row in await _fetch_all_dicts(cursor)]  # type: ignore[list-item]
+        finally:
+            await _call(cursor.close)
+
+    async def _fetch_consultation_responses(self, tx: Any, *, consultation_id: str | bytes | uuid.UUID) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, consultation_id, provider, model_id, response, final_score,
+                       tokens_in, tokens_out, latency_ms, created_at
+                FROM consultation_responses
+                WHERE consultation_id = ?
+                ORDER BY id
+                """,
+                (_uuid_to_raw(consultation_id),),
+            )
+            return [self._normalize_consultation_response_row(row) for row in await _fetch_all_dicts(cursor)]  # type: ignore[list-item]
+        finally:
+            await _call(cursor.close)
+
+    @staticmethod
+    def _normalize_consultation_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["id"] = _raw_to_uuid(out.get("id"))
+        return out
+
+    @staticmethod
+    def _normalize_consultation_response_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["consultation_id"] = _raw_to_uuid(out.get("consultation_id"))
+        return out
 
 
 class Db2AuditChainRepository(OracleAuditChainRepository):
@@ -3503,16 +3906,7 @@ class Db2Backend(OracleBackend):
     # lands in 12.1.5 (GA Jun 9 2026).
     supports_db2_vector = True
 
-    _UNSUPPORTED_CAPABILITY_MARKERS = frozenset(
-        {
-            "_supports_oauth_persistence",
-            "_supports_sessions_persistence",
-            "_supports_consultations_persistence",
-            "_supports_federation_persistence",
-            "_supports_audit_persistence",
-            "_supports_state_persistence",
-        }
-    )
+    _UNSUPPORTED_CAPABILITY_MARKERS = frozenset({})
 
     def __init__(self, pool: Any, settings: Any):
         # Call OracleBackend.__init__ so any new ``_X_repo`` attribute
@@ -3552,7 +3946,49 @@ class Db2Backend(OracleBackend):
 
     @property
     def capabilities(self) -> set[str]:
-        return {"core"}
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+
+    async def register_oauth_token(self, tx: Any, **kwargs: Any) -> Row:
+        return await self._oauth_repo.register_oauth_token(tx, **kwargs)
+
+    async def lookup_oauth_token(self, tx: Any, **kwargs: Any) -> Row | None:
+        return await self._oauth_repo.lookup_oauth_token(tx, **kwargs)
+
+    async def revoke_oauth_token(self, tx: Any, **kwargs: Any) -> bool:
+        return await self._oauth_repo.revoke_oauth_token(tx, **kwargs)
+
+    async def start_oauth_flow(self, tx: Any, **kwargs: Any) -> Row:
+        return await self._oauth_repo.start_oauth_flow(tx, **kwargs)
+
+    async def redeem_oauth_state(self, tx: Any, **kwargs: Any) -> Row | None:
+        return await self._oauth_repo.redeem_oauth_state(tx, **kwargs)
+
+    async def create_session(self, tx: Any, **kwargs: Any) -> Row:
+        return await self._sessions_repo.create_session(tx, **kwargs)
+
+    async def lookup_session(self, tx: Any, **kwargs: Any) -> Row | None:
+        return await self._sessions_repo.lookup_session(tx, **kwargs)
+
+    async def update_session_active(self, tx: Any, **kwargs: Any) -> bool:
+        return await self._sessions_repo.update_session_active(tx, **kwargs)
+
+    async def expire_session(self, tx: Any, **kwargs: Any) -> bool:
+        return await self._sessions_repo.expire_session(tx, **kwargs)
+
+    async def log_session_event(self, tx: Any, **kwargs: Any) -> Row:
+        return await self._sessions_repo.log_session_event(tx, **kwargs)
+
+    async def create_consultation(self, tx: Any, **kwargs: Any) -> Row:
+        return await self._consultations_repo.create_consultation(tx, **kwargs)
+
+    async def append_consultation_response(self, tx: Any, **kwargs: Any) -> Row:
+        return await self._consultations_repo.append_consultation_response(tx, **kwargs)
+
+    async def fetch_consultation(self, tx: Any, **kwargs: Any) -> Row | None:
+        return await self._consultations_repo.fetch_consultation(tx, **kwargs)
+
+    async def list_consultations(self, tx: Any, **kwargs: Any) -> list[Row]:
+        return await self._consultations_repo.list_consultations(tx, **kwargs)
 
     async def record_usage_ledger(
         self,
