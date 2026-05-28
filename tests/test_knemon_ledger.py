@@ -154,12 +154,13 @@ async def test_postgres_record_usage_ledger_inserts_with_registry_prices():
         None,
         1,
         None,
+        "api",
     )
     assert conn.sql is not None
     assert "FROM model_registry" in conn.sql
     assert "INSERT INTO usage_ledger" in conn.sql
     assert "est_cost_usd" in conn.sql
-    assert "$1" in conn.sql and "$13" in conn.sql
+    assert "$1" in conn.sql and "$14" in conn.sql
     assert "resolved_prices" in conn.sql
     assert "resolved_plan" in conn.sql
 
@@ -269,6 +270,7 @@ async def test_db2_record_usage_ledger_records_when_model_registry_missing(caplo
         None,
         1,
         None,
+        "api",
         0,
     )
     assert "model_registry table missing" in caplog.text

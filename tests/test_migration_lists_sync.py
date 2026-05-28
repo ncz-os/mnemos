@@ -74,6 +74,9 @@ EXPECTED_MIGRATIONS = [
     "migrations_v5_3_4_mcp_audit_log.sql",
     "migrations_v5_3_5_model_registry_capabilities_gin.sql",
     "0032_usage_ledger.sql",
+    "0033_subscription_plans.sql",
+    "0034_usage_ledger_session_tracking.sql",
+    "0035_subscription_plans_date_aware.sql",
 ]
 
 EXPECTED_SQLITE_MIGRATIONS = [

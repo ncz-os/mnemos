@@ -3674,9 +3674,9 @@ class SqliteBackend(PersistenceBackend):
                 provider, model, task_kind, tokens_in, tokens_out,
                 tokens_reasoning, est_cost_usd, latency_ms, outcome,
                 caller_subsystem, tier, session_id, request_count,
-                plan_window_id, subscription_amortized
+                plan_window_id, path_kind, subscription_amortized
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id, est_cost_usd
             """,
             (
@@ -3694,6 +3694,7 @@ class SqliteBackend(PersistenceBackend):
                 record.session_id,
                 record.request_count,
                 record.plan_window_id,
+                record.path_kind or "api",
                 1 if auth_method == "subscription" else 0,
             ),
         )

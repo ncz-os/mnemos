@@ -67,6 +67,7 @@ class UsageLedgerRecord:
     session_id: str | None = None
     request_count: int = 1
     plan_window_id: str | None = None
+    path_kind: str = "api"
 
 
 @dataclass(frozen=True)

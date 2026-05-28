@@ -2992,13 +2992,15 @@ class PostgresBackend(PersistenceBackend):
                 SELECT auth_method
                 FROM subscription_plans
                 WHERE provider=$1 AND plan_name=$10
+                  AND effective_from <= CURRENT_DATE
+                  AND (effective_until IS NULL OR effective_until >= CURRENT_DATE)
             ),
             inserted AS (
                 INSERT INTO usage_ledger (
                     provider, model, task_kind, tokens_in, tokens_out,
                     tokens_reasoning, est_cost_usd, latency_ms, outcome,
                     caller_subsystem, tier, session_id, request_count,
-                    plan_window_id, subscription_amortized
+                    plan_window_id, path_kind, subscription_amortized
                 )
                 SELECT
                     $1, $2, $3, $4, $5, $6,
@@ -3011,7 +3013,7 @@ class PostgresBackend(PersistenceBackend):
                                   0
                                 )::NUMERIC)) / 1000000
                     END,
-                    $7, $8, $9, $10, $11, $12, $13,
+                    $7, $8, $9, $10, $11, $12, $13, $14,
                     COALESCE(pl.auth_method, 'api') = 'subscription'
                 FROM (SELECT 1) seed
                 LEFT JOIN resolved_prices rp ON TRUE
@@ -3036,6 +3038,7 @@ class PostgresBackend(PersistenceBackend):
             record.session_id,
             record.request_count,
             record.plan_window_id,
+            record.path_kind or "api",
         )
         if row is None:
             raise RuntimeError("usage_ledger insert returned no row")

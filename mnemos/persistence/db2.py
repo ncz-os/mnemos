@@ -3593,12 +3593,12 @@ class Db2Backend(OracleBackend):
                         provider, model, task_kind, tokens_in, tokens_out,
                         tokens_reasoning, est_cost_usd, latency_ms, outcome,
                         caller_subsystem, tier, session_id, request_count,
-                        plan_window_id, subscription_amortized
+                        plan_window_id, path_kind, subscription_amortized
                     )
                     VALUES (
                         ?, ?, ?, ?, ?, ?,
                         DECIMAL(0, 12, 6),
-                        ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                 )
                 """,
@@ -3616,6 +3616,7 @@ class Db2Backend(OracleBackend):
                     record.session_id,
                     record.request_count,
                     record.plan_window_id,
+                    record.path_kind or "api",
                     0,
                 ),
             )
@@ -3646,15 +3647,15 @@ class Db2Backend(OracleBackend):
                     FROM FINAL TABLE (
                         INSERT INTO usage_ledger (
                             provider, model, task_kind, tokens_in, tokens_out,
-                            tokens_reasoning, est_cost_usd, latency_ms, outcome,
-                            caller_subsystem, tier, session_id, request_count,
-                            plan_window_id, subscription_amortized
-                        )
-                        VALUES (
-                            ?, ?, ?, ?, ?, ?,
-                            DECIMAL(0, 12, 6),
-                            ?, ?, ?, ?, ?, ?, SMALLINT(1)
-                        )
+                        tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                        caller_subsystem, tier, session_id, request_count,
+                        plan_window_id, path_kind, subscription_amortized
+                    )
+                    VALUES (
+                        ?, ?, ?, ?, ?, ?,
+                        DECIMAL(0, 12, 6),
+                        ?, ?, ?, ?, ?, ?, ?, ?, SMALLINT(1)
+                    )
                     )
                     """,
                     (
@@ -3671,6 +3672,7 @@ class Db2Backend(OracleBackend):
                         record.session_id,
                         record.request_count,
                         record.plan_window_id,
+                        record.path_kind or "api",
                     ),
                 )
                 row = await _call(cursor.fetchone)
@@ -3709,7 +3711,7 @@ class Db2Backend(OracleBackend):
                                 provider, model, task_kind, tokens_in, tokens_out,
                                 tokens_reasoning, est_cost_usd, latency_ms, outcome,
                                 caller_subsystem, tier, session_id, request_count,
-                                plan_window_id, subscription_amortized
+                                plan_window_id, path_kind, subscription_amortized
                             )
                             VALUES (
                                 ?, ?, ?, ?, ?, ?,
@@ -3725,7 +3727,7 @@ class Db2Backend(OracleBackend):
                                     FROM model_registry
                                     WHERE provider = ? AND model_id = ?
                                 ), DECIMAL(0, 12, 6)),
-                                ?, ?, ?, ?, ?, ?, SMALLINT(0)
+                                ?, ?, ?, ?, ?, ?, ?, ?, SMALLINT(0)
                             )
                         )
                         """,
@@ -3748,6 +3750,7 @@ class Db2Backend(OracleBackend):
                                 record.session_id,
                                 record.request_count,
                                 record.plan_window_id,
+                                record.path_kind or "api",
                             ),
                         )
                         row = await _call(cursor.fetchone)
