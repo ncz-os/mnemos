@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -104,6 +104,39 @@ def _to_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _to_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        pass
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+
+
+def _plan_is_effective(row: dict[str, Any], today: date | None = None) -> bool:
+    if "effective_from" not in row and "effective_until" not in row:
+        return True
+    today = today or datetime.now(timezone.utc).date()
+    effective_from = _to_date(row.get("effective_from"))
+    effective_until = _to_date(row.get("effective_until"))
+    if effective_from is not None and effective_from > today:
+        return False
+    if effective_until is not None and effective_until < today:
+        return False
+    return True
 
 
 def _truthy(value: Any) -> bool:
@@ -282,8 +315,14 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
     return candidates
 
 
-def _apply_priority_ceiling(candidates: list[dict[str, Any]], priority: int) -> list[dict[str, Any]]:
-    if priority >= 14:
+def _apply_priority_ceiling(
+    candidates: list[dict[str, Any]],
+    priority: int,
+    *,
+    requested_priority: int | None = None,
+) -> list[dict[str, Any]]:
+    quality_priority = max(priority, requested_priority if requested_priority is not None else priority)
+    if quality_priority >= 14:
         return [row for row in candidates if row["quality"] >= 0.85]
     if priority >= 10:
         return [row for row in candidates if row["tier"] in {"A", "B"} and row["quality"] >= 0.75]
@@ -299,15 +338,13 @@ async def _plans_by_provider(backend: Any) -> dict[str, list[dict[str, Any]]]:
                overage_pricing_per_mtok_out, effective_from, effective_until,
                parent_plan_id
         FROM subscription_plans
-        WHERE effective_from <= TRUNC(SYSTIMESTAMP)
-          AND (effective_until IS NULL OR effective_until >= TRUNC(SYSTIMESTAMP))
-        ORDER BY provider, monthly_usd DESC, msg_cap DESC
+        ORDER BY provider, COALESCE(monthly_usd, 0) DESC, COALESCE(msg_cap, 0) DESC, plan_name
         """
     try:
         rows = await _rows(backend, sql)
     except Exception as exc:
         msg = str(exc).lower()
-        if "trunc" not in msg and "effective_from" not in msg and "path_kind" not in msg:
+        if "coalesce" not in msg and "effective_from" not in msg and "path_kind" not in msg:
             raise
         rows = await _rows(
             backend,
@@ -322,12 +359,22 @@ async def _plans_by_provider(backend: Any) -> dict[str, list[dict[str, Any]]]:
         )
     out: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
+        if not _plan_is_effective(row):
+            continue
         out.setdefault(str(row.get("provider") or "").lower(), []).append(row)
     return out
 
 
-def _best_plan(plans: dict[str, list[dict[str, Any]]], provider: str) -> dict[str, Any]:
+def _best_plan(
+    plans: dict[str, list[dict[str, Any]]],
+    provider: str,
+    worker_pools: set[str] | None = None,
+) -> dict[str, Any]:
     provider_plans = plans.get(provider.lower()) or []
+    if worker_pools is not None:
+        for plan in provider_plans:
+            if _worker_has_pool(worker_pools, plan):
+                return plan
     if provider_plans:
         return provider_plans[0]
     return {"provider": provider, "plan_name": "api", "auth_method": "api", "path_kind": "api"}
@@ -389,6 +436,9 @@ def _utilization(plan: dict[str, Any], requests_used: int, tokens_used: int) -> 
 async def _session_burned(backend: Any, session_id: str | None) -> bool:
     if not session_id:
         return False
+    threshold = _session_burn_requests_per_hour()
+    if threshold <= 0:
+        return False
     since = datetime.now(timezone.utc) - timedelta(hours=1)
     rows = await _rows(
         backend,
@@ -399,7 +449,16 @@ async def _session_burned(backend: Any, session_id: str | None) -> bool:
         """,
         {"session_id": session_id, "since_ts": since},
     )
-    return _to_int((rows[0] if rows else {}).get("requests_used")) > _SESSION_BURN_REQUESTS_PER_HOUR
+    return _to_int((rows[0] if rows else {}).get("requests_used")) >= threshold
+
+
+def _session_burn_requests_per_hour() -> int:
+    try:
+        from mnemos.core.config import get_settings
+
+        return int(get_settings().runtime.knemon_session_burn_requests_per_hour)
+    except Exception:
+        return _SESSION_BURN_REQUESTS_PER_HOUR
 
 
 def _downgrade_priority(priority: int) -> int:
@@ -418,7 +477,7 @@ def _fallback_bucket(item: dict[str, Any]) -> int:
         return 0
     if auth == "subscription" and util < 70:
         return 1
-    if auth in {"api", "token"} and cost <= _LOW_PRIORITY_API_COST_CEILING_USD:
+    if auth in {"api", "token"} and cost < _LOW_PRIORITY_API_COST_CEILING_USD:
         return 2
     if auth in {"api", "token"}:
         return 3
@@ -456,7 +515,7 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
     effective_priority = (
         _downgrade_priority(req.priority) if await _session_burned(backend, req.caller_session_id) else req.priority
     )
-    candidates = _apply_priority_ceiling(candidates, effective_priority)
+    candidates = _apply_priority_ceiling(candidates, effective_priority, requested_priority=req.priority)
     if not candidates:
         raise NoModelAvailable("no model satisfies priority tier and quality constraints")
 
@@ -467,7 +526,7 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
     reasons: list[str] = []
     blocked_subscription_keys: set[tuple[str, str]] = set()
     for index, row in enumerate(candidates):
-        plan = _best_plan(plans, row["provider"])
+        plan = _best_plan(plans, row["provider"], worker_pools)
         auth_method = str(plan.get("auth_method") or "api").lower()
         path_kind = str(plan.get("path_kind") or auth_method).lower()
         requests_used, tokens_used = await _usage_for_plan(backend, plan) if auth_method == "subscription" else (0, 0)
@@ -531,17 +590,23 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
     for row in candidates:
         if (row["provider"], row["model_id"]) in seen:
             continue
-        plan = _best_plan(plans, row["provider"])
-        if str(plan.get("auth_method") or "api").lower() == "subscription" and not _worker_has_pool(worker_pools, plan):
-            blocked_subscription_keys.add((row["provider"], row["model_id"]))
-            continue
+        plan = _best_plan(plans, row["provider"], worker_pools)
+        auth_method = str(plan.get("auth_method") or "api").lower()
+        path_kind = str(plan.get("path_kind") or auth_method).lower()
+        util = 0.0
+        if auth_method == "subscription":
+            if not _worker_has_pool(worker_pools, plan):
+                blocked_subscription_keys.add((row["provider"], row["model_id"]))
+                continue
+            requests_used, tokens_used = await _usage_for_plan(backend, plan)
+            util = _utilization(plan, requests_used, tokens_used)
         fallback_candidates.append(
             {
                 **row,
-                "auth_method": str(plan.get("auth_method") or "api").lower(),
-                "path_kind": str(plan.get("path_kind") or plan.get("auth_method") or "api").lower(),
+                "auth_method": auth_method,
+                "path_kind": path_kind,
                 "plan_name": plan.get("plan_name", "api"),
-                "sub_window_utilization_pct": 0.0,
+                "sub_window_utilization_pct": util,
             }
         )
     if blocked_subscription_keys:
