@@ -64,6 +64,9 @@ class UsageLedgerRecord:
     outcome: str
     caller_subsystem: str
     tier: str
+    session_id: str | None = None
+    request_count: int = 1
+    plan_window_id: str | None = None
 
 
 @dataclass(frozen=True)

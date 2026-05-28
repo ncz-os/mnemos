@@ -3592,12 +3592,13 @@ class Db2Backend(OracleBackend):
                     INSERT INTO usage_ledger (
                         provider, model, task_kind, tokens_in, tokens_out,
                         tokens_reasoning, est_cost_usd, latency_ms, outcome,
-                        caller_subsystem, tier
+                        caller_subsystem, tier, session_id, request_count,
+                        plan_window_id, subscription_amortized
                     )
                     VALUES (
                         ?, ?, ?, ?, ?, ?,
                         DECIMAL(0, 12, 6),
-                        ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?
                     )
                 )
                 """,
@@ -3612,6 +3613,10 @@ class Db2Backend(OracleBackend):
                     record.outcome,
                     record.caller_subsystem,
                     record.tier,
+                    record.session_id,
+                    record.request_count,
+                    record.plan_window_id,
+                    0,
                 ),
             )
             return await _call(cursor.fetchone)
@@ -3619,39 +3624,92 @@ class Db2Backend(OracleBackend):
         conn = _conn_from_tx(tx)
         cursor = conn.cursor()
         try:
+            auth_method = "api"
             try:
                 await _call(
                     cursor.execute,
-                    "SELECT 1 FROM model_registry WHERE provider = ? AND model_id = ?",
-                    (record.provider, record.model),
+                    "SELECT auth_method FROM subscription_plans WHERE provider = ? AND plan_name = ?",
+                    (record.provider, record.tier),
                 )
-                if await _call(cursor.fetchone) is None:
-                    _LOG.warning(
-                        "usage_ledger model_registry price missing for provider=%s model=%s; "
-                        "recording est_cost_usd=0",
-                        record.provider,
-                        record.model,
-                    )
+                plan_row = await _call(cursor.fetchone)
+                if plan_row:
+                    auth_method = str(plan_row[0]).lower()
             except Exception as exc:
                 if not _is_missing_model_registry(exc):
                     raise
-                _LOG.warning(
-                    "usage_ledger model_registry table missing for provider=%s model=%s; " "recording est_cost_usd=0",
-                    record.provider,
-                    record.model,
+
+            if auth_method == "subscription":
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT id, est_cost_usd
+                    FROM FINAL TABLE (
+                        INSERT INTO usage_ledger (
+                            provider, model, task_kind, tokens_in, tokens_out,
+                            tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                            caller_subsystem, tier, session_id, request_count,
+                            plan_window_id, subscription_amortized
+                        )
+                        VALUES (
+                            ?, ?, ?, ?, ?, ?,
+                            DECIMAL(0, 12, 6),
+                            ?, ?, ?, ?, ?, ?, SMALLINT(1)
+                        )
+                    )
+                    """,
+                    (
+                        record.provider,
+                        record.model,
+                        record.task_kind,
+                        record.tokens_in,
+                        record.tokens_out,
+                        record.tokens_reasoning,
+                        record.latency_ms,
+                        record.outcome,
+                        record.caller_subsystem,
+                        record.tier,
+                        record.session_id,
+                        record.request_count,
+                        record.plan_window_id,
+                    ),
                 )
-                row = await _insert_zero_cost()
+                row = await _call(cursor.fetchone)
             else:
                 try:
                     await _call(
                         cursor.execute,
-                        """
+                        "SELECT 1 FROM model_registry WHERE provider = ? AND model_id = ?",
+                        (record.provider, record.model),
+                    )
+                    if await _call(cursor.fetchone) is None:
+                        _LOG.warning(
+                            "usage_ledger model_registry price missing for provider=%s model=%s; "
+                            "recording est_cost_usd=0",
+                            record.provider,
+                            record.model,
+                        )
+                except Exception as exc:
+                    if not _is_missing_model_registry(exc):
+                        raise
+                    _LOG.warning(
+                        "usage_ledger model_registry table missing for provider=%s model=%s; "
+                        "recording est_cost_usd=0",
+                        record.provider,
+                        record.model,
+                    )
+                    row = await _insert_zero_cost()
+                else:
+                    try:
+                        await _call(
+                            cursor.execute,
+                            """
                         SELECT id, est_cost_usd
                         FROM FINAL TABLE (
                             INSERT INTO usage_ledger (
                                 provider, model, task_kind, tokens_in, tokens_out,
                                 tokens_reasoning, est_cost_usd, latency_ms, outcome,
-                                caller_subsystem, tier
+                                caller_subsystem, tier, session_id, request_count,
+                                plan_window_id, subscription_amortized
                             )
                             VALUES (
                                 ?, ?, ?, ?, ?, ?,
@@ -3667,39 +3725,42 @@ class Db2Backend(OracleBackend):
                                     FROM model_registry
                                     WHERE provider = ? AND model_id = ?
                                 ), DECIMAL(0, 12, 6)),
-                                ?, ?, ?, ?
+                                ?, ?, ?, ?, ?, ?, SMALLINT(0)
                             )
                         )
                         """,
-                        (
+                            (
+                                record.provider,
+                                record.model,
+                                record.task_kind,
+                                record.tokens_in,
+                                record.tokens_out,
+                                record.tokens_reasoning,
+                                record.tokens_in,
+                                record.tokens_out,
+                                record.tokens_reasoning,
+                                record.provider,
+                                record.model,
+                                record.latency_ms,
+                                record.outcome,
+                                record.caller_subsystem,
+                                record.tier,
+                                record.session_id,
+                                record.request_count,
+                                record.plan_window_id,
+                            ),
+                        )
+                        row = await _call(cursor.fetchone)
+                    except Exception as exc:
+                        if not _is_missing_model_registry(exc):
+                            raise
+                        _LOG.warning(
+                            "usage_ledger model_registry table missing for provider=%s model=%s; "
+                            "recording est_cost_usd=0",
                             record.provider,
                             record.model,
-                            record.task_kind,
-                            record.tokens_in,
-                            record.tokens_out,
-                            record.tokens_reasoning,
-                            record.tokens_in,
-                            record.tokens_out,
-                            record.tokens_reasoning,
-                            record.provider,
-                            record.model,
-                            record.latency_ms,
-                            record.outcome,
-                            record.caller_subsystem,
-                            record.tier,
-                        ),
-                    )
-                    row = await _call(cursor.fetchone)
-                except Exception as exc:
-                    if not _is_missing_model_registry(exc):
-                        raise
-                    _LOG.warning(
-                        "usage_ledger model_registry table missing for provider=%s model=%s; "
-                        "recording est_cost_usd=0",
-                        record.provider,
-                        record.model,
-                    )
-                    row = await _insert_zero_cost()
+                        )
+                        row = await _insert_zero_cost()
 
         finally:
             await _call(cursor.close)

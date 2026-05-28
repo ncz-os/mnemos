@@ -3732,6 +3732,24 @@ class OracleBackend(PersistenceBackend):
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
+            auth_method = "api"
+            try:
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT auth_method
+                    FROM subscription_plans
+                    WHERE provider = :provider AND plan_name = :plan_name
+                    """,
+                    {"provider": record.provider, "plan_name": record.tier},
+                )
+                row = await _call(cursor.fetchone)
+                if row:
+                    auth_method = str(row[0]).lower()
+            except Exception as exc:
+                if not _is_missing_table(exc):
+                    raise
+
             rid = cursor.var(oracledb.DB_TYPE_NUMBER)
             rcost = cursor.var(oracledb.DB_TYPE_NUMBER)
             params = {
@@ -3745,61 +3763,92 @@ class OracleBackend(PersistenceBackend):
                 "outcome": record.outcome,
                 "caller_subsystem": record.caller_subsystem,
                 "tier": record.tier,
+                "session_id": record.session_id,
+                "request_count": record.request_count,
+                "plan_window_id": record.plan_window_id,
+                "subscription_amortized": 1 if auth_method == "subscription" else 0,
                 "rid": rid,
                 "rcost": rcost,
             }
-            try:
+            if auth_method == "subscription":
                 await _call(
                     cursor.execute,
                     """
                 INSERT INTO usage_ledger (
                     provider, model, task_kind, tokens_in, tokens_out,
                     tokens_reasoning, est_cost_usd, latency_ms, outcome,
-                    caller_subsystem, tier
-                )
-                VALUES (
-                    :provider, :model, :task_kind, :tokens_in, :tokens_out,
-                    :tokens_reasoning,
-                    NVL((
-                        SELECT (:tokens_in * NVL(input_cost_per_mtok, 0)
-                              + :tokens_out * NVL(output_cost_per_mtok, 0)
-                              + :tokens_reasoning * NVL(output_cost_per_mtok, 0))
-                              / 1000000
-                        FROM model_registry
-                        WHERE provider = :provider AND model_id = :model
-                    ), 0),
-                    :latency_ms, :outcome, :caller_subsystem, :tier
-                )
-                RETURNING id, est_cost_usd INTO :rid, :rcost
-                """,
-                    params,
-                )
-            except Exception as exc:
-                if not _is_missing_table(exc):
-                    raise
-                _LOG.warning(
-                    "usage_ledger model_registry table missing for provider=%s model=%s; " "recording est_cost_usd=0",
-                    record.provider,
-                    record.model,
-                )
-                await _call(
-                    cursor.execute,
-                    """
-                INSERT INTO usage_ledger (
-                    provider, model, task_kind, tokens_in, tokens_out,
-                    tokens_reasoning, est_cost_usd, latency_ms, outcome,
-                    caller_subsystem, tier
+                    caller_subsystem, tier, session_id, request_count,
+                    plan_window_id, subscription_amortized
                 )
                 VALUES (
                     :provider, :model, :task_kind, :tokens_in, :tokens_out,
                     :tokens_reasoning, 0, :latency_ms, :outcome,
-                    :caller_subsystem, :tier
+                    :caller_subsystem, :tier, :session_id, :request_count,
+                    :plan_window_id, :subscription_amortized
                 )
                 RETURNING id, est_cost_usd INTO :rid, :rcost
                 """,
                     params,
                 )
-            if _scalar(rcost) == 0:
+            else:
+                try:
+                    await _call(
+                        cursor.execute,
+                        """
+                    INSERT INTO usage_ledger (
+                        provider, model, task_kind, tokens_in, tokens_out,
+                        tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                        caller_subsystem, tier, session_id, request_count,
+                        plan_window_id, subscription_amortized
+                    )
+                    VALUES (
+                        :provider, :model, :task_kind, :tokens_in, :tokens_out,
+                        :tokens_reasoning,
+                        NVL((
+                            SELECT (:tokens_in * NVL(input_cost_per_mtok, 0)
+                                  + :tokens_out * NVL(output_cost_per_mtok, 0)
+                                  + :tokens_reasoning * NVL(output_cost_per_mtok, 0))
+                                  / 1000000
+                            FROM model_registry
+                            WHERE provider = :provider AND model_id = :model
+                        ), 0),
+                        :latency_ms, :outcome, :caller_subsystem, :tier,
+                        :session_id, :request_count, :plan_window_id,
+                        :subscription_amortized
+                    )
+                    RETURNING id, est_cost_usd INTO :rid, :rcost
+                    """,
+                        params,
+                    )
+                except Exception as exc:
+                    if not _is_missing_table(exc):
+                        raise
+                    _LOG.warning(
+                        "usage_ledger model_registry table missing for provider=%s model=%s; "
+                        "recording est_cost_usd=0",
+                        record.provider,
+                        record.model,
+                    )
+                    await _call(
+                        cursor.execute,
+                        """
+                    INSERT INTO usage_ledger (
+                        provider, model, task_kind, tokens_in, tokens_out,
+                        tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                        caller_subsystem, tier, session_id, request_count,
+                        plan_window_id, subscription_amortized
+                    )
+                    VALUES (
+                        :provider, :model, :task_kind, :tokens_in, :tokens_out,
+                        :tokens_reasoning, 0, :latency_ms, :outcome,
+                        :caller_subsystem, :tier, :session_id, :request_count,
+                        :plan_window_id, :subscription_amortized
+                    )
+                    RETURNING id, est_cost_usd INTO :rid, :rcost
+                    """,
+                        params,
+                    )
+            if auth_method != "subscription" and _scalar(rcost) == 0:
                 _LOG.warning(
                     "usage_ledger model_registry price missing for provider=%s model=%s; " "recording est_cost_usd=0",
                     record.provider,
