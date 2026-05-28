@@ -1,6 +1,6 @@
 use ndarray::ArrayView1;
-use numpy::{PyReadonlyArray1, PyReadonlyArray2};
-use pyo3::exceptions::PyTypeError;
+use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2};
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PySequence;
 use wide::f32x8;
@@ -69,6 +69,114 @@ fn dot_norms_scalar(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     let norm_a = left.dot(&left);
     let norm_b = right.dot(&right);
     (dot, norm_a, norm_b)
+}
+
+fn dot_and_norm_right_f64(query: &[f64], candidate: &[f64]) -> (f64, f64) {
+    query
+        .iter()
+        .zip(candidate.iter())
+        .fold((0.0, 0.0), |(dot, norm), (left, right)| {
+            (dot + (left * right), norm + (right * right))
+        })
+}
+
+fn dot_and_norm_right_f32_as_f64(query: &[f32], candidate: &[f32]) -> (f64, f64) {
+    query
+        .iter()
+        .zip(candidate.iter())
+        .fold((0.0, 0.0), |(dot, norm), (left, right)| {
+            let left = *left as f64;
+            let right = *right as f64;
+            (dot + (left * right), norm + (right * right))
+        })
+}
+
+fn norm_f64(values: &[f64]) -> f64 {
+    values.iter().map(|value| value * value).sum()
+}
+
+fn norm_f32_as_f64(values: &[f32]) -> f64 {
+    values
+        .iter()
+        .map(|value| {
+            let value = *value as f64;
+            value * value
+        })
+        .sum()
+}
+
+fn normalized_dot_from_parts(dot: f64, norm_query_sqrt: f64, norm_candidate: f64) -> f64 {
+    if norm_candidate == 0.0 {
+        0.0
+    } else {
+        dot / (norm_query_sqrt * norm_candidate.sqrt())
+    }
+}
+
+fn similarity_dot_normalized_f64_impl(query: &[f64], candidates: PyReadonlyArray2<'_, f64>) -> Vec<f64> {
+    let candidates_view = candidates.as_array();
+    if query.is_empty() {
+        return vec![0.0; candidates_view.nrows()];
+    }
+
+    let norm_query = norm_f64(query);
+    if norm_query == 0.0 {
+        return vec![0.0; candidates_view.nrows()];
+    }
+
+    let norm_query_sqrt = norm_query.sqrt();
+    let mut scores = Vec::with_capacity(candidates_view.nrows());
+    for row in candidates_view.outer_iter() {
+        if row.len() != query.len() || row.is_empty() {
+            scores.push(0.0);
+            continue;
+        }
+        let (dot, norm_candidate) = if let Some(row_slice) = row.as_slice() {
+            dot_and_norm_right_f64(query, row_slice)
+        } else {
+            row.iter()
+                .zip(query.iter())
+                .fold((0.0, 0.0), |(dot, norm), (right, left)| {
+                    (dot + (left * right), norm + (right * right))
+                })
+        };
+        scores.push(normalized_dot_from_parts(dot, norm_query_sqrt, norm_candidate));
+    }
+    scores
+}
+
+fn similarity_dot_normalized_f32_impl(query: &[f32], candidates: PyReadonlyArray2<'_, f32>) -> Vec<f64> {
+    let candidates_view = candidates.as_array();
+    if query.is_empty() {
+        return vec![0.0; candidates_view.nrows()];
+    }
+
+    let norm_query = norm_f32_as_f64(query);
+    if norm_query == 0.0 {
+        return vec![0.0; candidates_view.nrows()];
+    }
+
+    let norm_query_sqrt = norm_query.sqrt();
+    let mut scores = Vec::with_capacity(candidates_view.nrows());
+    for row in candidates_view.outer_iter() {
+        if row.len() != query.len() || row.is_empty() {
+            scores.push(0.0);
+            continue;
+        }
+        let (dot, norm_candidate) = if let Some(row_slice) = row.as_slice() {
+            dot_and_norm_right_f32_as_f64(query, row_slice)
+        } else {
+            row.iter()
+                .zip(query.iter())
+                .fold((0.0, 0.0), |(dot, norm), (right, left)| {
+                    let left = *left as f64;
+                    let right = *right as f64;
+                    (dot + (left * right), norm + (right * right))
+                })
+        };
+        scores.push(normalized_dot_from_parts(dot, norm_query_sqrt, norm_candidate));
+    }
+    scores
 }
 
 fn norm_simd(values: &[f32]) -> f32 {
@@ -307,6 +415,40 @@ fn batch_cosine_similarity(
 }
 
 #[pyfunction]
+fn similarity_dot_normalized<'py>(
+    py: Python<'py>,
+    query: &Bound<'py, PyAny>,
+    candidates: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    if let (Ok(query_array), Ok(candidates_array)) = (
+        query.extract::<PyReadonlyArray1<f64>>(),
+        candidates.extract::<PyReadonlyArray2<f64>>(),
+    ) {
+        let query_slice = query_array
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("query must be a contiguous 1-D NumPy array"))?;
+        let scores = similarity_dot_normalized_f64_impl(query_slice, candidates_array);
+        return Ok(PyArray1::from_vec_bound(py, scores));
+    }
+
+    if let (Ok(query_array), Ok(candidates_array)) = (
+        query.extract::<PyReadonlyArray1<f32>>(),
+        candidates.extract::<PyReadonlyArray2<f32>>(),
+    ) {
+        let query_slice = query_array
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("query must be a contiguous 1-D NumPy array"))?;
+        let scores = similarity_dot_normalized_f32_impl(query_slice, candidates_array);
+        return Ok(PyArray1::from_vec_bound(py, scores));
+    }
+
+    Err(PyTypeError::new_err(concat!(
+        "query must be a 1-D NumPy array and candidates must be a 2-D NumPy array ",
+        "with matching float32 or float64 dtype",
+    )))
+}
+
+#[pyfunction]
 fn cosine(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<f32> {
     cosine_similarity(a, b)
 }
@@ -321,6 +463,7 @@ fn mnemos_native_search(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(cosine_similarity, m)?)?;
     m.add_function(wrap_pyfunction!(batch_cosine_similarity, m)?)?;
+    m.add_function(wrap_pyfunction!(similarity_dot_normalized, m)?)?;
     m.add_function(wrap_pyfunction!(cosine, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_batch, m)?)?;
     m.add_function(wrap_pyfunction!(federation::serialize_memory_for_feed, m)?)?;
@@ -329,7 +472,10 @@ fn mnemos_native_search(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_cosine_similarity_impl, cosine_similarity_impl};
+    use super::{
+        batch_cosine_similarity_impl, cosine_similarity_impl, dot_and_norm_right_f64, norm_f64,
+        normalized_dot_from_parts,
+    };
 
     #[test]
     fn cosine_handles_basic_geometry() {
@@ -371,5 +517,28 @@ mod tests {
         assert!((scores[0] - 1.0).abs() < 1e-6);
         assert!(scores[1].abs() < 1e-6);
         assert!((scores[2] + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f64_normalized_dot_matches_reference_precision() {
+        let query: Vec<f64> = (0..1024).map(|idx| ((idx + 1) as f64).sin()).collect();
+        let candidate: Vec<f64> = (0..1024).map(|idx| ((idx + 7) as f64).cos()).collect();
+        let (dot, norm_candidate) = dot_and_norm_right_f64(&query, &candidate);
+        let actual = normalized_dot_from_parts(dot, norm_f64(&query).sqrt(), norm_candidate);
+
+        let expected_dot: f64 = query
+            .iter()
+            .zip(candidate.iter())
+            .map(|(left, right)| left * right)
+            .sum();
+        let expected = expected_dot
+            / (query.iter().map(|value| value * value).sum::<f64>().sqrt()
+                * candidate
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>()
+                    .sqrt());
+
+        assert!((actual - expected).abs() < 1e-12);
     }
 }
