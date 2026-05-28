@@ -45,6 +45,18 @@ _SESSION_LOCKS: dict[str, asyncio.Lock] = {}
 _SESSION_BURN_REQUESTS_PER_HOUR = 10
 _LOW_PRIORITY_API_COST_CEILING_USD = 0.50
 
+# Caller-subsystem -> dispatchable provider allowlist (GRAEAE consult de8f4b2b 2026-05-28:
+# Option A centralized allowlist, config-driven/version-controlled, NoModelAvailable -> caller blocks).
+# A dispatch worker can only EXECUTE providers that have a gateway agent alias; KNEMON must never
+# route it to a provider it cannot run (e.g. anthropic/claude, which is also policy-forbidden in the
+# zeroclaw stack per CLAUDE.md directive 5). openai is intentionally absent: it is reserved for the
+# explicit codex scarce path (kind=codex/review:/doctor:codex-fix), not the general dispatch route.
+CALLER_DISPATCHABLE_PROVIDERS: dict[str, frozenset[str]] = {
+    "zeroclaw": frozenset(
+        {"groq", "xai", "deepseek", "deepseek-direct", "nvidia", "together", "gemini"}
+    ),
+}
+
 
 async def _call(value: Any, *args: Any, **kwargs: Any) -> Any:
     result = value(*args, **kwargs) if callable(value) else value
@@ -258,12 +270,17 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
         """,
     )
     excluded = {provider.strip().lower() for provider in req.exclude_providers if provider.strip()}
+    allowed = CALLER_DISPATCHABLE_PROVIDERS.get((req.caller_subsystem or "").strip().lower())
     required = {cap.strip() for cap in req.require_capability if cap.strip()}
     min_context = int(max(0, req.est_tokens_in) * 1.2)
     candidates: list[dict[str, Any]] = []
     for row in rows:
         provider = str(row.get("provider") or "").strip()
         if not provider or provider.lower() in excluded:
+            continue
+        # Caller-eligibility allowlist: dispatch workers (e.g. zeroclaw) can only execute providers
+        # backed by a gateway alias. Callers absent from the map (api, internal) are unrestricted.
+        if allowed is not None and provider.lower() not in allowed:
             continue
         if not _truthy(row.get("available", True)) or _truthy(row.get("deprecated", False)):
             continue
