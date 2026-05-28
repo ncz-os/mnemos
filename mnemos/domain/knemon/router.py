@@ -194,6 +194,35 @@ def _subscription_pool_aliases(plan: dict[str, Any]) -> set[str]:
     return aliases
 
 
+def _plan_family_alias(plan: dict[str, Any]) -> str | None:
+    aliases = _subscription_pool_aliases(plan)
+    for family in ("chatgpt_subscription", "codex_subscription", "claude_subscription"):
+        if family in aliases:
+            return family
+    return None
+
+
+def _candidate_plan_family(candidate: dict[str, Any] | None) -> str | None:
+    if not candidate:
+        return None
+    provider = _normalize_pool(candidate.get("provider"))
+    if provider == "anthropic":
+        return "claude_subscription"
+    if provider != "openai":
+        return None
+    raw = " ".join(
+        str(part or "")
+        for part in (
+            candidate.get("model_id"),
+            candidate.get("display_name"),
+            " ".join(candidate.get("capabilities") or []),
+        )
+    ).lower()
+    if "codex" in raw:
+        return "codex_subscription"
+    return "chatgpt_subscription"
+
+
 async def _worker_pools_for_session(backend: Any, session_id: str | None) -> set[str] | None:
     if not session_id:
         return None
@@ -402,6 +431,7 @@ def _best_plan(
     plans: dict[str, list[dict[str, Any]]],
     provider: str,
     worker_pools: set[str] | None = None,
+    candidate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     provider_plans = plans.get(provider.lower()) or []
     if provider_plans:
@@ -409,6 +439,12 @@ def _best_plan(
             for plan in provider_plans:
                 if _worker_has_pool(worker_pools, plan):
                     return plan
+        else:
+            family = _candidate_plan_family(candidate)
+            if family is not None:
+                for plan in provider_plans:
+                    if _plan_family_alias(plan) == family:
+                        return plan
         return provider_plans[0]
     return {"provider": provider, "plan_name": "api", "auth_method": "api", "path_kind": "api"}
 
@@ -550,7 +586,7 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
     reasons: list[str] = []
     blocked_subscription_keys: set[tuple[str, str]] = set()
     for index, row in enumerate(candidates):
-        plan = _best_plan(plans, row["provider"], worker_pools)
+        plan = _best_plan(plans, row["provider"], worker_pools, row)
         auth_method = str(plan.get("auth_method") or "api").lower()
         path_kind = str(plan.get("path_kind") or auth_method).lower()
         requests_used, tokens_used = await _usage_for_plan(backend, plan) if auth_method == "subscription" else (0, 0)
@@ -625,7 +661,7 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
     for row in candidates:
         if (row["provider"], row["model_id"]) in seen:
             continue
-        plan = _best_plan(plans, row["provider"], worker_pools)
+        plan = _best_plan(plans, row["provider"], worker_pools, row)
         auth_method = str(plan.get("auth_method") or "api").lower()
         path_kind = str(plan.get("path_kind") or plan.get("auth_method") or "api").lower()
         if auth_method == "subscription" and not _worker_has_pool(worker_pools, plan):

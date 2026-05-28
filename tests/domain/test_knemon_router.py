@@ -259,6 +259,25 @@ async def test_subscription_plan_selection_respects_exact_workspace_pool():
 
 
 @pytest.mark.asyncio
+async def test_openai_no_workspace_pool_uses_chatgpt_family_for_generic_gpt_model():
+    backend = _SqliteKnemonBackend(40)
+    backend.conn.execute(
+        """
+        INSERT INTO subscription_plans VALUES
+          ('openai', 'codex_pro_200_20x', 'subscription', 200, 300, 18000,
+           NULL, NULL, 'rolling', NULL, NULL)
+        """
+    )
+    backend.conn.commit()
+
+    decision = await route(_req(14), backend)
+
+    assert decision.provider == "openai"
+    assert decision.auth_method == "subscription"
+    assert decision.sub_window_utilization_pct == 40.0
+
+
+@pytest.mark.asyncio
 async def test_parallel_same_session_burn_tracking_serializes():
     backend = _SqliteKnemonBackend(92, burned_session="burned-session")
     decisions = await asyncio.gather(*(route(_req(14, "burned-session"), backend) for _ in range(10)))
@@ -374,6 +393,21 @@ def test_best_plan_honors_chatgpt_and_codex_workspace_pools():
 
     assert _best_plan(plans, "openai", {"chatgpt_subscription"})["plan_name"] == "chatgpt_pro"
     assert _best_plan(plans, "openai", {"codex_subscription"})["plan_name"] == "codex_pro_200_20x"
+
+
+def test_best_plan_infers_openai_family_without_workspace_pool():
+    plans = {
+        "openai": [
+            {"provider": "openai", "plan_name": "codex_pro_200_20x", "auth_method": "subscription"},
+            {"provider": "openai", "plan_name": "chatgpt_pro", "auth_method": "subscription"},
+        ]
+    }
+
+    chatgpt_candidate = {"provider": "openai", "model_id": "gpt-5.5", "display_name": "GPT-5.5"}
+    codex_candidate = {"provider": "openai", "model_id": "gpt-5.3-codex", "display_name": "GPT-5.3 Codex"}
+
+    assert _best_plan(plans, "openai", candidate=chatgpt_candidate)["plan_name"] == "chatgpt_pro"
+    assert _best_plan(plans, "openai", candidate=codex_candidate)["plan_name"] == "codex_pro_200_20x"
 
 
 def test_g1_priority_quality_floor_boundary(monkeypatch):
