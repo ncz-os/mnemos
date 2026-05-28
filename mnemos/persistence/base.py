@@ -1079,6 +1079,8 @@ class AuditChainRepository(ABC):
     agnostic. The backend only persists the bytes.
     """
 
+    supports_webhooks = True
+
     @abstractmethod
     async def get_latest_audit_entry(
         self,

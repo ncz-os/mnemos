@@ -327,6 +327,8 @@ class FakeBackend:
     a partial write commit.
     """
 
+    supports_webhooks = True
+
     def __init__(self) -> None:
         self.memories = _FakeMemoryRepo()
         self.compression = _FakeCompressionRepo()
@@ -595,6 +597,7 @@ class FakePoolBackedBackend:
     supports_advisory_locks = True
     supports_row_level_security = True
     supports_pgvector = True
+    supports_webhooks = True
 
     def __new__(cls, *args, **kwargs):
         from mnemos.persistence.postgres import PostgresBackend
