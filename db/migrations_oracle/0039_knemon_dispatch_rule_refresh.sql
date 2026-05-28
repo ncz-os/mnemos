@@ -43,23 +43,23 @@ USING (
          DATE '2026-05-28', NULL, 'unmetered', NULL FROM dual
   UNION ALL SELECT 'openai', 'codex_plus', 'subscription',
          20, 15, 18000, NULL, NULL, 'rolling', NULL, NULL,
-         'Codex Plus GPT-5.5 local lower-bound: 15 of 15-80 messages per 5h',
+         'Codex Plus GPT-5.5 planning cap: 15 lower bound of published 15-80 messages per 5h',
          DATE '2026-05-28', NULL, 'interactive', NULL FROM dual
   UNION ALL SELECT 'openai', 'codex_pro_100_10x', 'subscription',
          100, 160, 18000, NULL, NULL, 'rolling', NULL, NULL,
-         'Codex Pro $100 launch promo: GPT-5.5 lower-bound, 160 messages per 5h through 2026-05-31',
+         'Codex Pro $100 launch promo planning cap: 160 lower bound of 160-800 messages per 5h through 2026-05-31',
          DATE '2026-05-28', DATE '2026-05-31', 'interactive', 'codex_pro_100' FROM dual
   UNION ALL SELECT 'openai', 'codex_pro_100_5x', 'subscription',
          100, 80, 18000, NULL, NULL, 'rolling', NULL, NULL,
-         'Codex Pro $100: GPT-5.5 5x lower-bound, 80 of 80-400 messages per 5h from 2026-06-01',
+         'Codex Pro $100 planning cap: GPT-5.5 5x lower bound of 80-400 messages per 5h from 2026-06-01',
          DATE '2026-06-01', NULL, 'interactive', 'codex_pro_100' FROM dual
   UNION ALL SELECT 'openai', 'codex_pro_200_25x', 'subscription',
          200, 375, 18000, NULL, NULL, 'rolling', NULL, NULL,
-         'Codex Pro $200 temporary 25x GPT-5.5 lower-bound, 375 messages per 5h through 2026-05-31',
+         'Codex Pro $200 temporary 25x planning cap: 375 lower bound of 375-2000 messages per 5h through 2026-05-31',
          DATE '2026-05-28', DATE '2026-05-31', 'interactive', 'codex_pro_200' FROM dual
   UNION ALL SELECT 'openai', 'codex_pro_200_20x', 'subscription',
          200, 300, 18000, NULL, NULL, 'rolling', NULL, NULL,
-         'Codex Pro $200: GPT-5.5 20x lower-bound, 300 of 300-1600 messages per 5h from 2026-06-01',
+         'Codex Pro $200 planning cap: GPT-5.5 20x lower bound of 300-1600 messages per 5h from 2026-06-01',
          DATE '2026-06-01', NULL, 'interactive', 'codex_pro_200' FROM dual
 ) src
 ON (dst.provider = src.provider AND dst.plan_name = src.plan_name)
