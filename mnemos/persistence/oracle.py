@@ -2199,6 +2199,19 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
             # Ordered SKIP-LOCKED claim. No SQL row cap (FOR UPDATE +
             # FETCH FIRST is illegal in Oracle); fetch only `limit` rows
             # — the SKIP-LOCKED cursor locks rows as they are read.
+            #
+            # Bound the locked set to exactly `limit`: python-oracledb /
+            # OCI prefetch + array-fetch would otherwise read (and, under
+            # SKIP LOCKED, LOCK) more pending rows than we update before
+            # the next fetchmany boundary, stranding them locked until the
+            # tx commits and starving peer workers. Disabling prefetch and
+            # sizing the array to `limit` makes the driver fetch+lock only
+            # the rows we claim.
+            try:
+                cursor.prefetchrows = 0
+                cursor.arraysize = int(limit)
+            except Exception:  # pragma: no cover - driver attr differences
+                pass
             await _call(
                 cursor.execute,
                 "SELECT id, memory_id, owner_id, reason, scoring_profile, attempts "
