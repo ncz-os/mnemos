@@ -1,17 +1,17 @@
 """NATS v0.3 consumer for webhook outbox dispatch nudges."""
+
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
 import logging
-import os
 import re
 from typing import Any, Awaitable, Callable, Mapping
 
 import asyncpg
 
-from mnemos.core.config import Settings, get_settings
+from mnemos.core.config import Settings, get_settings, nats_webhooks_enabled
 from mnemos.core.extras import is_extra_installed
 from mnemos.nats.backoff import ReconnectBackoff
 from mnemos.nats.client import get_node_name
@@ -30,12 +30,7 @@ class PoisonMessageError(ValueError):
 
 
 def _enabled() -> bool:
-    return os.environ.get("MNEMOS_NATS_WEBHOOKS_ENABLED", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return nats_webhooks_enabled()
 
 
 async def consumer_loop(
@@ -58,7 +53,7 @@ async def consumer_loop(
         return
 
     connect = connect or _connect
-    queue_group = os.environ.get(QUEUE_ENV, "").strip() or settings.nats.webhook_queue_group
+    queue_group = settings.nats.webhooks_queue_group.strip() or settings.nats.webhook_queue_group
     backoff = ReconnectBackoff(base_seconds=1.0, cap_seconds=retry_seconds)
 
     while True:
