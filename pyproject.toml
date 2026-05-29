@@ -224,8 +224,8 @@ type = "layers"
 layers = [
   "mnemos.api",
   "mnemos.domain",
-  "mnemos.persistence",
   "mnemos.db",
+  "mnemos.persistence",
   "mnemos.core",
 ]
 
