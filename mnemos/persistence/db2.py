@@ -2515,7 +2515,7 @@ class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAudit
         cost_budget: float,
         quality_floor: float,
     ) -> tuple[dict[str, Any] | None, list[str]]:
-        from mnemos.domain.pantheon.recommendation import choose_recommended_model
+        from mnemos.core.recommendation import choose_recommended_model
 
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)

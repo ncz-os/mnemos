@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Query
 
 from mnemos.api.dependencies import UserContext, require_root
 from mnemos.api.persistence_helpers import backend_or_503
-from mnemos.api.routes.ledger import compute_plan_window_id
+from mnemos.core.plan_windows import compute_plan_window_id
 
 router = APIRouter(prefix="/v1/knemon", tags=["knemon"])
 

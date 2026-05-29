@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
-from mnemos.api.routes.ledger import compute_plan_window_id
+from mnemos.core.plan_windows import compute_plan_window_id
 
 
 class NoModelAvailable(RuntimeError):
