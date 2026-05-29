@@ -69,6 +69,22 @@ BEGIN
     )';
 END%
 
+-- Reconcile a table left by a prior 0040 that created memory_id too narrow
+-- (36); real ids (mnemos_<sha32>, 39 chars) overflow it. Widen in place.
+-- Idempotent: no-op once already 100 (and on a fresh create above).
+BEGIN
+  DECLARE v_narrow INTEGER DEFAULT 0;
+  DECLARE CONTINUE HANDLER FOR SQLEXCEPTION BEGIN END;
+  SELECT COUNT(*) INTO v_narrow FROM SYSCAT.COLUMNS
+    WHERE TABNAME = 'MEMORY_COMPRESSION_QUEUE'
+      AND TABSCHEMA = CURRENT SCHEMA
+      AND COLNAME = 'MEMORY_ID'
+      AND LENGTH < 100;
+  IF v_narrow > 0 THEN
+    EXECUTE IMMEDIATE 'ALTER TABLE memory_compression_queue ALTER COLUMN memory_id SET DATA TYPE VARCHAR(100)';
+  END IF;
+END%
+
 -- DB-side id generation (parity with PG gen_random_uuid + Oracle SYS_GUID
 -- defaults): populate id when the INSERT omits it. HEX(GENERATE_UNIQUE())
 -- is 26 chars, fits VARCHAR(36).
