@@ -48,7 +48,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
-from mnemos.core.config import get_settings, runtime_env_value_stripped
+from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
 from mnemos.persistence.base import (
     BranchRepository,
     CompressionRepository,
@@ -68,7 +68,7 @@ from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
 _LOG = logging.getLogger(__name__)
 
-_DEFAULT_EMBEDDING_DIM = get_settings().database.embedding_dim
+_DEFAULT_EMBEDDING_DIM = embedding_dim_env()
 _DEFAULT_MYSQL_POOL_MIN = 2
 _DEFAULT_MYSQL_POOL_MAX = 10
 _DEFAULT_MYSQL_ACQUIRE_TIMEOUT = 60.0

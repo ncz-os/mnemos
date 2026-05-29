@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 from types import ModuleType
 
-from mnemos.core.config import get_settings
+from mnemos.core.config import kronos_backend_env
 
 
 _BACKEND_ENV = "MNEMOS_KRONOS_BACKEND"
@@ -13,7 +13,7 @@ _BACKEND_ENV = "MNEMOS_KRONOS_BACKEND"
 
 def get_backend() -> ModuleType:
     """Return the active KRONOS compute backend module."""
-    requested = get_settings().kronos.backend.strip().lower()
+    requested = kronos_backend_env()
     if requested == "cpu":
         return importlib.import_module("mnemos.domain.kronos.backends.cpu")
     if requested == "gpu":

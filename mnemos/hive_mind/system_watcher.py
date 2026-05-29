@@ -32,13 +32,12 @@ import urllib.request
 import urllib.error
 import signal
 
-from mnemos.core.config import get_settings
+from mnemos.core.config import agent_host_env, claim_jobs_enabled_env, heartbeat_interval_env, system_hive_url_env
 
-_settings = get_settings().hive_mind
-HIVE_URL = _settings.system_hive_url
-AGENT_HOST = _settings.agent_host
-HEARTBEAT_INTERVAL = float(_settings.heartbeat_interval)
-CLAIM_JOBS = _settings.claim_jobs == "1"
+HIVE_URL = system_hive_url_env()
+AGENT_HOST = agent_host_env()
+HEARTBEAT_INTERVAL = heartbeat_interval_env()
+CLAIM_JOBS = claim_jobs_enabled_env()
 
 _urn: str = ""
 _running = True
