@@ -32,6 +32,7 @@ from mnemos.core.native_accel import load_hot_rs
 from mnemos.persistence.base import (
     AuditChainRepository,
     BranchRepository,
+    CompressionQueueRepository,
     CompressionRepository,
     CompressionStatsRow,
     ConsultationAuditRepository,
@@ -1922,6 +1923,201 @@ class SqliteCompressionRepository(_SqliteRepository, CompressionRepository):
         )
 
 
+class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueRepository):
+    """SQLite impl of the v3.1 compression queue (job 019e7049 CHILD E).
+
+    ABC-completeness only — SQLite is not a hive contest target. SQLite has
+    no ``FOR UPDATE SKIP LOCKED``; the backend's ``transactional()`` opens
+    ``BEGIN IMMEDIATE`` (a reserved write lock) and SQLite is single-writer,
+    so the dequeue select+claim is already serialised against peers. Same
+    schema + feature set + terminalization semantics as the other backends.
+    """
+
+    async def enqueue_compression(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: list[str],
+        reason: str,
+        priority: int,
+        scoring_profile: str,
+    ) -> list[str]:
+        if not memory_ids:
+            return []
+        conn = self._conn(tx)
+        placeholders = ",".join("?" for _ in memory_ids)
+        known = await _fetch_all(
+            conn,
+            f"SELECT id, owner_id FROM memories " f"WHERE id IN ({placeholders}) AND deleted_at IS NULL",
+            tuple(memory_ids),
+        )
+        owner_by_id = {r["id"]: r["owner_id"] for r in known}
+        enqueued: list[str] = []
+        for mid in memory_ids:
+            if mid not in owner_by_id:
+                continue
+            await _execute(
+                conn,
+                "INSERT INTO memory_compression_queue "
+                "(memory_id, owner_id, reason, priority, scoring_profile) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (mid, owner_by_id[mid], reason, priority, scoring_profile),
+            )
+            enqueued.append(mid)
+        return enqueued
+
+    async def enqueue_all_compression(
+        self,
+        tx: Transaction,
+        *,
+        reason: str,
+        priority: int,
+        scoring_profile: str,
+        category: str | None,
+        only_uncompressed: bool,
+        limit: int,
+    ) -> int:
+        conn = self._conn(tx)
+        where_parts = ["m.deleted_at IS NULL"]
+        params: list[Any] = [reason, priority, scoring_profile]
+        if only_uncompressed:
+            where_parts.append("NOT EXISTS (SELECT 1 FROM memory_compressed_variants v WHERE v.memory_id = m.id)")
+        if category is not None:
+            where_parts.append("m.category = ?")
+            params.append(category)
+        params.append(int(limit))
+        sql = (
+            "INSERT INTO memory_compression_queue "
+            "(memory_id, owner_id, reason, priority, scoring_profile) "
+            "SELECT m.id, m.owner_id, ?, ?, ? "
+            f"FROM memories m WHERE {' AND '.join(where_parts)} "
+            "ORDER BY length(m.content) DESC "
+            "LIMIT ?"
+        )
+        return await _execute_count(conn, sql, tuple(params))
+
+    async def dequeue_compression(
+        self,
+        tx: Transaction,
+        *,
+        limit: int,
+    ) -> list[Row]:
+        if limit <= 0:
+            return []
+        conn = self._conn(tx)
+        claimed = await _fetch_all(
+            conn,
+            "SELECT id, memory_id, owner_id, reason, scoring_profile, attempts "
+            "FROM memory_compression_queue "
+            "WHERE status = 'pending' "
+            "ORDER BY priority DESC, enqueued_at "
+            "LIMIT ?",
+            (int(limit),),
+        )
+        if not claimed:
+            return []
+        ids = [row["id"] for row in claimed]
+        placeholders = ",".join("?" for _ in ids)
+        await _execute(
+            conn,
+            "UPDATE memory_compression_queue "
+            "SET status = 'running', started_at = CURRENT_TIMESTAMP, "
+            "    attempts = attempts + 1 "
+            f"WHERE id IN ({placeholders})",
+            tuple(ids),
+        )
+        for row in claimed:
+            row["attempts"] = int(row.get("attempts") or 0) + 1
+        return claimed
+
+    async def mark_compression_done(
+        self,
+        tx: Transaction,
+        *,
+        queue_id: str,
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            "UPDATE memory_compression_queue "
+            "SET status = 'done', finished_at = CURRENT_TIMESTAMP, error = NULL "
+            "WHERE id = ?",
+            (queue_id,),
+        )
+
+    async def mark_compression_failed(
+        self,
+        tx: Transaction,
+        *,
+        queue_id: str,
+        error: str,
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            "UPDATE memory_compression_queue "
+            "SET status = 'failed', finished_at = CURRENT_TIMESTAMP, error = ? "
+            "WHERE id = ?",
+            (error, queue_id),
+        )
+
+    async def sweep_stale_compression(
+        self,
+        tx: Transaction,
+        *,
+        stale_threshold_secs: int,
+        max_attempts: int,
+    ) -> int:
+        conn = self._conn(tx)
+        # Single-writer transaction makes the read+classify+update atomic vs
+        # peers; no SKIP LOCKED needed. Epoch-seconds comparison avoids
+        # SQLite text-datetime pitfalls.
+        stale = await _fetch_all(
+            conn,
+            "SELECT id, attempts, error FROM memory_compression_queue "
+            "WHERE status = 'running' "
+            "  AND (started_at IS NULL "
+            "       OR CAST(strftime('%s', started_at) AS INTEGER) "
+            "          < CAST(strftime('%s', 'now') AS INTEGER) - ?)",
+            (int(stale_threshold_secs),),
+        )
+        swept = 0
+        for row in stale:
+            qid = row["id"]
+            attempts = int(row.get("attempts") or 0)
+            err = row.get("error")
+            terminalize = attempts >= max_attempts and err is not None and not str(err).startswith("infra_retry:")
+            if terminalize:
+                await _execute(
+                    conn,
+                    "UPDATE memory_compression_queue "
+                    "SET status = 'failed', finished_at = CURRENT_TIMESTAMP, error = ? "
+                    "WHERE id = ?",
+                    (
+                        f"stranded_running: exceeded stale threshold after {attempts} attempts",
+                        qid,
+                    ),
+                )
+            elif attempts >= max_attempts:
+                await _execute(
+                    conn,
+                    "UPDATE memory_compression_queue "
+                    "SET status = 'pending', started_at = NULL, finished_at = NULL, "
+                    "    attempts = MAX(attempts - 1, 0), "
+                    "    error = 'infra_retry: stale-recovered without content-failure breadcrumb' "
+                    "WHERE id = ?",
+                    (qid,),
+                )
+            else:
+                await _execute(
+                    conn,
+                    "UPDATE memory_compression_queue "
+                    "SET status = 'pending', started_at = NULL, finished_at = NULL, error = NULL "
+                    "WHERE id = ?",
+                    (qid,),
+                )
+            swept += 1
+        return swept
+
+
 class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
     async def insert_subscription(
         self,
@@ -3577,6 +3773,7 @@ class SqliteBackend:
         self._memory_versions = SqliteVersionRepository()
         self._memory_branches = SqliteBranchRepository()
         self._compression = SqliteCompressionRepository()
+        self._compression_queue = SqliteCompressionQueueRepository()
         self._webhooks = SqliteWebhookRepository()
         self._consultations_audit = SqliteConsultationAuditRepository()
         self._oauth = SqliteOAuthRepository()
@@ -4513,6 +4710,10 @@ class SqliteBackend:
     @property
     def compression(self) -> CompressionRepository:
         return self._compression
+
+    @property
+    def compression_queue(self) -> CompressionQueueRepository:
+        return self._compression_queue
 
     @property
     def webhooks(self) -> WebhookRepository:
