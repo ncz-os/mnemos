@@ -1,0 +1,85 @@
+# MNEMOS production dependencies
+# Generated 2026-04-10 — reflects actual imports
+
+# API framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+starlette>=0.40.0
+pydantic>=2.8.0
+# Pinned <2.12: see pyproject.toml for the precedence rationale (#199).
+pydantic-settings>=2.0.0,<2.12
+python-multipart>=0.0.9
+
+# Database
+asyncpg>=0.29.0          # async API path (lifecycle.py + handlers)
+# psycopg / psycopg2 deliberately NOT here — both are LGPL-3.0.
+# mnemos's runtime closure stays on permissive licenses
+# (Apache/MIT/BSD/MPL). The installer's create-API-key path falls
+# back to invoking psql via subprocess if neither asyncpg nor psycopg
+# is suitable. Operators who want the psycopg installer path can
+# `pip install psycopg[binary]` separately and the existing import
+# guards in mnemos/installer/db.py will pick it up.
+#
+# Enterprise backend drivers are NOT in default deps (the runtime imports
+# them lazily inside the matching backend modules). Install via the
+# pyproject extras (`pip install 'mnemos-os[oracle]'` etc.) or uncomment
+# the lines below for a flat requirements-driven build. See
+# docs/INSTALL.md "Enterprise Backends" for full setup.
+# oracledb>=2.0    # Oracle 23ai backend (mnemos/persistence/oracle.py)
+# ibm_db>=3.2      # IBM Db2 12.1.5 backend (mnemos/persistence/db2.py)
+
+# HTTP client (single library — replaces requests + aiohttp)
+httpx>=0.27.0
+
+# In-process embedding generation (architectural decision
+# mem_1779334716543_f8ebd4, operator-locked 2026-05-21). Loads an
+# embedding model in the mnemos worker; no Ollama / no llama-server HTTP.
+# Two backends — runtime auto-selects:
+#   openvino + optimum-intel: Intel CPU/iGPU/NPU; PYTHIA Xe iGPU does
+#     50 rec/s vs ~11 rec/s on llama-cpp CPU (Phase 1B 2026-05-21).
+#   llama-cpp-python: portable GGUF path. CUDA wheels at
+#     https://abetlen.github.io/llama-cpp-python/whl/cu124/
+llama-cpp-python>=0.3
+
+# Cache
+slowapi>=0.1.9
+limits>=3.6.0
+redis>=5.0.0
+
+# Memory/config
+python-dotenv>=1.0.0
+
+# MCP server
+mcp>=1.0.0
+
+# Async utilities (transitive, pinned for stability)
+anyio>=4.4.0
+
+# Utilities
+# psutil dropped 2026-05-01 (zero imports in mnemos/ source)
+typer>=0.9.0
+
+# Optional subsystem dependencies now live in pyproject extras:
+#   morpheus/kronos -> numpy
+#   persephone      -> zstandard
+#   nats            -> nats-py
+#
+# v4.2 NATS JetStream substrate (event bus, federation push, MCP push).
+# v4.2.0a8+ queue-group support depends on nats-py 2.14+ subscribe
+# semantics (queue==durable enforcement). Older versions silently
+# accepted mismatched queue/durable values — keep the floor here.
+# Install with: pip install 'mnemos-os[nats]'
+
+# Optional: Intel OpenVINO / phi_server.py (local GPU inference)
+# Install on GPU systems only: pip install mnemos-os[phi]
+# openvino-genai>=2024.4.0
+# fastembed>=0.3.0
+
+# Optional: ARTEMIS/Judge quality extras
+# sentence-transformers>=2.7.0
+# spacy>=3.7.0
+
+# Optional: graph-based scoring experiments
+# networkx>=3.3
+authlib>=1.3.0
+itsdangerous>=2.2.0
