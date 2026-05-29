@@ -35,8 +35,9 @@
 --     owner_id                → no-op (already parity).
 
 DECLARE
-  v_tbl  NUMBER;
-  v_col  NUMBER;
+  v_tbl     NUMBER;
+  v_col     NUMBER;
+  v_narrow  NUMBER;
 
   PROCEDURE create_table IS
   BEGIN
@@ -87,6 +88,18 @@ BEGIN
       -- pre-parity stub: drop transient work table + recreate at parity.
       EXECUTE IMMEDIATE 'DROP TABLE memory_compression_queue CASCADE CONSTRAINTS';
       create_table;
+    ELSE
+      -- owner_id present but a prior 0040 may have created memory_id too
+      -- narrow (36); real ids (mnemos_<sha32>, 39 chars) overflow it.
+      -- Widen in place — idempotent (no-op once already 100).
+      SELECT COUNT(*) INTO v_narrow FROM user_tab_columns
+       WHERE table_name = 'MEMORY_COMPRESSION_QUEUE'
+         AND column_name = 'MEMORY_ID'
+         AND char_length < 100;
+      IF v_narrow > 0 THEN
+        EXECUTE IMMEDIATE
+          'ALTER TABLE memory_compression_queue MODIFY (memory_id VARCHAR2(100))';
+      END IF;
     END IF;
   END IF;
 END;
