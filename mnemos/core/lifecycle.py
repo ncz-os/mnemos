@@ -22,7 +22,7 @@ import redis.asyncio as aioredis
 from fastapi import HTTPException
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-from mnemos.core.config import PG_CONFIG, get_settings
+from mnemos.core.config import PG_CONFIG, db2_dsn_env, get_settings, oracle_dsn_env, required_capabilities_env
 from mnemos.core.pool import PoolManager
 
 logger = logging.getLogger(__name__)
@@ -281,9 +281,9 @@ def _select_persistence_backend(settings) -> str:
         return _normalize_backend_name(configured)
     # Per-backend env var shortcuts: ORACLE_DSN / DB2_DSN override
     # explicit postgres connection defaults (host/port/user).
-    if getattr(database_settings, "oracle_dsn", "").strip():
+    if oracle_dsn_env():
         return "oracle"
-    if getattr(database_settings, "db2_dsn", "").strip():
+    if db2_dsn_env():
         return "db2"
 
     if _has_explicit_postgres_connection_config(settings):
@@ -346,7 +346,7 @@ def _log_and_validate_backend_capabilities(backend_type: str, backend: object) -
         backend_type,
         ", ".join(sorted(capabilities)) if capabilities else "(none)",
     )
-    required = _parse_required_capabilities(get_settings().database.required_capabilities)
+    required = _parse_required_capabilities(required_capabilities_env())
     missing = required - capabilities
     if missing:
         raise RuntimeError(

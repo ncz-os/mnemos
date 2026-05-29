@@ -19,7 +19,7 @@ import time as _t
 from threading import Lock
 from typing import Any
 
-from mnemos.core.config import get_settings
+from mnemos.core.config import reranker_model_env, reranker_timeout_secs_env, reranker_url_env
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +46,9 @@ class Reranker:
         cb_threshold: int = DEFAULT_CB_THRESHOLD,
         cb_cooldown: float = DEFAULT_CB_COOLDOWN,
     ) -> None:
-        settings = get_settings().providers
-        self.url = url or settings.reranker_url
-        self.model = model or settings.reranker_model
-        env_timeout = settings.reranker_timeout_secs
+        self.url = url or reranker_url_env()
+        self.model = model or reranker_model_env()
+        env_timeout = reranker_timeout_secs_env()
         if timeout is not None:
             self.timeout = timeout
         elif env_timeout:

@@ -43,7 +43,25 @@ import os
 from pathlib import Path
 from typing import Iterable
 
-from mnemos.core.config import get_settings
+from mnemos.core.config import (
+    embed_backend_env,
+    embed_cix_max_seq_len_env,
+    embed_cix_model_path_env,
+    embed_cix_tokenizer_id_env,
+    embed_gpu_layers_env,
+    embed_http_model_env,
+    embed_http_timeout_env,
+    embed_http_url_env,
+    embed_http_url_fallback_env,
+    embed_hybrid_env,
+    embed_max_chars_env,
+    embed_model_path_env,
+    embed_n_ctx_env,
+    embed_npu_threshold_chars_env,
+    embed_ov_device_env,
+    embed_ov_model_id_env,
+    embed_threads_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -557,7 +575,7 @@ def _cix_npu_available() -> bool:
         import libnoe  # noqa: F401
     except Exception:
         return False
-    model_path = get_settings().providers.embed_cix_model_path
+    model_path = embed_cix_model_path_env()
     if not Path(model_path).exists():
         return False
     return True
@@ -634,34 +652,33 @@ class InProcessEmbedder:
         # shared
         max_text_chars: int | None = None,
     ) -> None:
-        settings = get_settings().providers
-        requested = backend or settings.embed_backend
+        requested = backend or embed_backend_env()
         self.backend_choice = requested
 
-        self.ov_model_id = ov_model_id or settings.embed_ov_model_id
-        self.ov_device = (ov_device or settings.embed_ov_device).upper()
+        self.ov_model_id = ov_model_id or embed_ov_model_id_env()
+        self.ov_device = (ov_device or embed_ov_device_env()).upper()
 
-        self.model_path = model_path or settings.embed_model_path
-        self.cix_model_path = cix_model_path or settings.embed_cix_model_path
-        self.cix_tokenizer_id = cix_tokenizer_id or settings.embed_cix_tokenizer_id
-        self.cix_max_seq_len = int(cix_max_seq_len if cix_max_seq_len is not None else settings.embed_cix_max_seq_len)
-        hybrid_env = settings.embed_hybrid
+        self.model_path = model_path or embed_model_path_env()
+        self.cix_model_path = cix_model_path or embed_cix_model_path_env()
+        self.cix_tokenizer_id = cix_tokenizer_id or embed_cix_tokenizer_id_env()
+        self.cix_max_seq_len = int(cix_max_seq_len if cix_max_seq_len is not None else embed_cix_max_seq_len_env())
+        hybrid_env = embed_hybrid_env()
         self.hybrid = hybrid if hybrid is not None else hybrid_env.lower() in ("1", "true", "yes")
         self.npu_threshold_chars = int(
-            npu_threshold_chars if npu_threshold_chars is not None else settings.embed_npu_threshold_chars
+            npu_threshold_chars if npu_threshold_chars is not None else embed_npu_threshold_chars_env()
         )
-        self.n_ctx = int(n_ctx if n_ctx is not None else settings.embed_n_ctx)
-        self.n_threads = int(n_threads if n_threads is not None else settings.embed_threads)
-        self.n_gpu_layers = int(n_gpu_layers if n_gpu_layers is not None else settings.embed_gpu_layers)
-        self.http_url = http_url or settings.embed_http_url
+        self.n_ctx = int(n_ctx if n_ctx is not None else embed_n_ctx_env())
+        self.n_threads = int(n_threads if n_threads is not None else embed_threads_env())
+        self.n_gpu_layers = int(n_gpu_layers if n_gpu_layers is not None else embed_gpu_layers_env())
+        self.http_url = http_url or embed_http_url_env()
         # Fallback URL: empty string disables; default = MEDUSA so the primary
         # TYPHON outage path falls to MEDUSA before in-process llamacpp.
         self.http_url_fallback = (
-            http_url_fallback if http_url_fallback is not None else settings.embed_http_url_fallback
+            http_url_fallback if http_url_fallback is not None else embed_http_url_fallback_env()
         )
-        self.http_model = http_model or settings.embed_http_model
-        self.http_timeout = float(http_timeout if http_timeout is not None else settings.embed_http_timeout)
-        self.max_text_chars = int(max_text_chars if max_text_chars is not None else settings.embed_max_chars)
+        self.http_model = http_model or embed_http_model_env()
+        self.http_timeout = float(http_timeout if http_timeout is not None else embed_http_timeout_env())
+        self.max_text_chars = int(max_text_chars if max_text_chars is not None else embed_max_chars_env())
         self._backend = None  # type: ignore[assignment]
         self._backend_name: str | None = None
         # Hybrid sidecar: when self.hybrid + cix-npu available, route short

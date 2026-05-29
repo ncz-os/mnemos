@@ -30,7 +30,7 @@ from datetime import datetime
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
-from mnemos.core.config import get_settings, runtime_env_value_stripped
+from mnemos.core.config import oracle_pdb_env, runtime_env_value_stripped, vector_dim_max_env
 from mnemos.persistence.base import (
     AuditChainRepository,
     BranchRepository,
@@ -70,7 +70,7 @@ def _vector_dim_max() -> int:
     change. Falls back to :data:`_DEFAULT_VECTOR_DIM_MAX` if the env
     var is missing or unparsable.
     """
-    return get_settings().database.vector_dim_max
+    return vector_dim_max_env()
 
 
 def _validate_and_format_vector(
@@ -387,7 +387,7 @@ def _build_oracle_session_callback(settings: Any) -> Any:
     continues. This keeps the pool usable in mixed PDB/CDB topologies
     while still giving operators a defensive locale + container pin.
     """
-    pdb_target = get_settings().database.oracle_pdb.strip()
+    pdb_target = oracle_pdb_env()
 
     async def _session_callback(conn: Any, requested_tag: Any) -> None:
         cur = None
