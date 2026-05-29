@@ -23,7 +23,6 @@ import inspect
 import json
 import logging
 import math
-import os
 import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
@@ -31,6 +30,7 @@ from datetime import datetime
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
+from mnemos.core.config import get_settings, runtime_env_value_stripped
 from mnemos.persistence.base import (
     AuditChainRepository,
     BranchRepository,
@@ -70,16 +70,7 @@ def _vector_dim_max() -> int:
     change. Falls back to :data:`_DEFAULT_VECTOR_DIM_MAX` if the env
     var is missing or unparsable.
     """
-    raw = os.environ.get("MNEMOS_VECTOR_DIM_MAX", "").strip()
-    if not raw:
-        return _DEFAULT_VECTOR_DIM_MAX
-    try:
-        parsed = int(raw)
-    except ValueError:
-        return _DEFAULT_VECTOR_DIM_MAX
-    if parsed <= 0:
-        return _DEFAULT_VECTOR_DIM_MAX
-    return parsed
+    return get_settings().database.vector_dim_max
 
 
 def _validate_and_format_vector(
@@ -361,7 +352,7 @@ _DEFAULT_ORACLE_POOL_ACQUIRE_TIMEOUT = 60.0
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
+    raw = runtime_env_value_stripped(name)
     if not raw:
         return default
     try:
@@ -372,7 +363,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name, "").strip()
+    raw = runtime_env_value_stripped(name)
     if not raw:
         return default
     try:
@@ -384,7 +375,7 @@ def _env_float(name: str, default: float) -> float:
 
 def _env_flag(name: str) -> bool:
     """Return True if the env var equals ``YES`` / ``1`` / ``TRUE`` (case-insensitive)."""
-    return os.environ.get(name, "").strip().upper() in {"YES", "1", "TRUE", "ON"}
+    return runtime_env_value_stripped(name).upper() in {"YES", "1", "TRUE", "ON"}
 
 
 def _build_oracle_session_callback(settings: Any) -> Any:
@@ -396,7 +387,7 @@ def _build_oracle_session_callback(settings: Any) -> Any:
     continues. This keeps the pool usable in mixed PDB/CDB topologies
     while still giving operators a defensive locale + container pin.
     """
-    pdb_target = os.environ.get("MNEMOS_ORACLE_PDB", "").strip()
+    pdb_target = get_settings().database.oracle_pdb.strip()
 
     async def _session_callback(conn: Any, requested_tag: Any) -> None:
         cur = None
@@ -2116,7 +2107,7 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
             placeholders = ",".join(f":id{i}" for i in range(len(memory_ids)))
             await _call(
                 cursor.execute,
-                f"SELECT id, owner_id FROM memories " f"WHERE id IN ({placeholders}) AND deleted_at IS NULL",
+                f"SELECT id, owner_id FROM memories WHERE id IN ({placeholders}) AND deleted_at IS NULL",
                 binds,
             )
             rows = await _call(cursor.fetchall) or []
@@ -2165,9 +2156,7 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
                 "row_limit": int(limit),
             }
             if only_uncompressed:
-                where_parts.append(
-                    "NOT EXISTS (SELECT 1 FROM memory_compressed_variants v " "WHERE v.memory_id = m.id)"
-                )
+                where_parts.append("NOT EXISTS (SELECT 1 FROM memory_compressed_variants v WHERE v.memory_id = m.id)")
             if category is not None:
                 where_parts.append("m.category = :category")
                 params["category"] = category
@@ -2324,7 +2313,7 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
                         "    error = :error WHERE id = :id",
                         {
                             "id": qid,
-                            "error": ("stranded_running: exceeded stale threshold after " f"{attempts} attempts"),
+                            "error": (f"stranded_running: exceeded stale threshold after {attempts} attempts"),
                         },
                     )
                 elif attempts >= max_attempts:
@@ -2537,8 +2526,7 @@ class OracleOAuthRepository(OAuthRepository):
         try:
             await _call(
                 cursor.execute,
-                "SELECT name, display_name, kind, enabled FROM oauth_providers "
-                "WHERE enabled = 1 ORDER BY display_name",
+                "SELECT name, display_name, kind, enabled FROM oauth_providers WHERE enabled = 1 ORDER BY display_name",
             )
             return await _fetch_all_dicts(cursor)
         finally:
@@ -2703,7 +2691,7 @@ class OracleConsultationsRepository(ConsultationsRepository):
             response_hash = hashlib.sha256(kwargs["consensus_response"].encode()).hexdigest()
             await _call(
                 cursor.execute,
-                "SELECT id, chain_hash FROM graeae_audit_log " "ORDER BY sequence_num DESC FETCH FIRST 1 ROWS ONLY",
+                "SELECT id, chain_hash FROM graeae_audit_log ORDER BY sequence_num DESC FETCH FIRST 1 ROWS ONLY",
             )
             prev_row = await _row_to_dict(cursor, await _call(cursor.fetchone))
             prev_chain = prev_row["chain_hash"] if prev_row else kwargs["genesis_hash"]
@@ -3466,12 +3454,10 @@ class OracleFederationRepository(FederationRepository):
             # See docs/v6.1-federation-embeddings-copy.md.
             embed_cols = ""
             if include_embedding:
-                from mnemos.core.config import get_settings as _gs
+                from mnemos.core.config import embed_http_model_override, get_settings as _gs
 
                 try:
-                    import os as _os
-
-                    _http_model = _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                    _http_model = embed_http_model_override()
                     _model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
                 except Exception:
                     _model = "unknown"
@@ -4254,8 +4240,7 @@ class OracleBackend:
                     if not _is_missing_table(exc):
                         raise
                     _LOG.warning(
-                        "usage_ledger model_registry table missing for provider=%s model=%s; "
-                        "recording est_cost_usd=0",
+                        "usage_ledger model_registry table missing for provider=%s model=%s; recording est_cost_usd=0",
                         record.provider,
                         record.model,
                     )
@@ -4280,7 +4265,7 @@ class OracleBackend:
                     )
             if auth_method != "subscription" and _scalar(rcost) == 0:
                 _LOG.warning(
-                    "usage_ledger model_registry price missing for provider=%s model=%s; " "recording est_cost_usd=0",
+                    "usage_ledger model_registry price missing for provider=%s model=%s; recording est_cost_usd=0",
                     record.provider,
                     record.model,
                 )
@@ -4893,7 +4878,7 @@ class OracleBackend:
                     await _call(cursor.close)
         except Exception as exc:
             _LOG.warning(
-                "OracleBackend.open probe failed (%s); backend remains open " "but first acquire() may also fail.",
+                "OracleBackend.open probe failed (%s); backend remains open but first acquire() may also fail.",
                 exc,
             )
 
