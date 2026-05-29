@@ -43,7 +43,7 @@ DECLARE
     EXECUTE IMMEDIATE q'[
       CREATE TABLE memory_compression_queue (
         id               VARCHAR2(36)             DEFAULT LOWER(RAWTOHEX(SYS_GUID())) NOT NULL,
-        memory_id        VARCHAR2(36)             NOT NULL,
+        memory_id        VARCHAR2(100)            NOT NULL,
         owner_id         VARCHAR2(255)            DEFAULT 'default'  NOT NULL,
         reason           VARCHAR2(32)             NOT NULL,
         status           VARCHAR2(16)             DEFAULT 'pending'  NOT NULL,
