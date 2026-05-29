@@ -415,18 +415,33 @@ CREATE INDEX IF NOT EXISTS idx_model_registry_sync_log_provider
 CREATE INDEX IF NOT EXISTS idx_model_registry_sync_log_synced_at
   ON model_registry_sync_log(synced_at DESC);
 
+-- job 019e7049 GAP1 CHILD E: full-parity with the canonical Postgres
+-- schema (db/migrations/0040) so the compression queue has an identical
+-- schema + feature set on every backend behind the persistence ABC
+-- (architectural law mem_1780005765033). SQLite is ABC-completeness only,
+-- not a hive contest target. id is DB-generated (INSERT omits id, like
+-- PG gen_random_uuid / Oracle SYS_GUID). enqueued_at/started_at/
+-- finished_at/error/reason/priority/scoring_profile match the other
+-- backends. CHECK constraints mirror PG.
 CREATE TABLE IF NOT EXISTS memory_compression_queue (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
   owner_id TEXT NOT NULL DEFAULT 'default',
-  status TEXT NOT NULL DEFAULT 'pending',
+  reason TEXT NOT NULL DEFAULT 'manual'
+    CHECK (reason IN ('on_write','manual','scheduled','reprocess')),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','running','done','failed')),
+  priority INTEGER NOT NULL DEFAULT 0,
+  scoring_profile TEXT NOT NULL DEFAULT 'balanced'
+    CHECK (scoring_profile IN ('balanced','quality_first','speed_first','custom')),
   attempts INTEGER NOT NULL DEFAULT 0,
-  scheduled_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  enqueued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at TEXT,
+  finished_at TEXT,
+  error TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_mcq_ready ON memory_compression_queue(status, scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_mcq_ready ON memory_compression_queue(status, priority DESC, enqueued_at);
 CREATE INDEX IF NOT EXISTS idx_mcq_memory ON memory_compression_queue(memory_id);
 CREATE INDEX IF NOT EXISTS idx_mcq_owner ON memory_compression_queue(owner_id);
 
