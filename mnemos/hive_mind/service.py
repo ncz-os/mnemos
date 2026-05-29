@@ -24,9 +24,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from mnemos.core.config import get_settings
+from mnemos.core.config import agent_bus_db_env
 
-DB_PATH = get_settings().hive_mind.agent_bus_db
+DB_PATH = agent_bus_db_env()
 
 # Phase 2 migration cut 1 (2026-05-23): storage abstraction. SQL methods
 # migrate into the repo one at a time; service-level helpers forward.

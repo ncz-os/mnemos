@@ -67,20 +67,6 @@ _PROFILE_DEFAULT_TARGETS = {
     "auth_enabled": ("auth", "enabled"),
 }
 
-_DATABASE_INT_DEFAULTS = {
-    "oracle_pool_min": 2,
-    "oracle_pool_max": 10,
-    "oracle_pool_increment": 1,
-    "oracle_stmt_cache_size": 20,
-    "mysql_pool_min": 2,
-    "mysql_pool_max": 10,
-}
-_DATABASE_FLOAT_DEFAULTS = {
-    "oracle_pool_acquire_timeout": 60.0,
-    "mysql_connect_timeout": 10.0,
-}
-
-
 def _config_model_config(*, env_prefix: str = "", extra: str = "ignore") -> SettingsConfigDict:
     return SettingsConfigDict(
         env_prefix=env_prefix,
@@ -136,70 +122,75 @@ class _DatabaseSettings(BaseSettings):
             "at schema-init time; switching dim on a populated DB requires a re-embed."
         ),
     )
-    oracle_dsn: str = Field("", validation_alias="ORACLE_DSN")
-    db2_dsn: str = Field("", validation_alias="DB2_DSN")
-    required_capabilities: str = Field("", validation_alias="MNEMOS_REQUIRE_CAPABILITIES")
-    vector_dim_max: int = Field(4096, validation_alias="MNEMOS_VECTOR_DIM_MAX")
-    db2_vector_index: str = Field("approx", validation_alias="MNEMOS_DB2_VECTOR_INDEX")
-    oracle_pdb: str = Field("", validation_alias="MNEMOS_ORACLE_PDB")
-    oracle_thick: str = Field("", validation_alias="MNEMOS_ORACLE_THICK")
-    oracle_drcp: str = Field("", validation_alias="MNEMOS_ORACLE_DRCP")
-    oracle_pool_min: int = Field(2, validation_alias="MNEMOS_ORACLE_POOL_MIN")
-    oracle_pool_max: int = Field(10, validation_alias="MNEMOS_ORACLE_POOL_MAX")
-    oracle_pool_increment: int = Field(1, validation_alias="MNEMOS_ORACLE_POOL_INCREMENT")
-    oracle_stmt_cache_size: int = Field(20, validation_alias="MNEMOS_ORACLE_STMT_CACHE_SIZE")
-    oracle_pool_acquire_timeout: float = Field(60.0, validation_alias="MNEMOS_ORACLE_POOL_ACQUIRE_TIMEOUT")
-    mysql_pool_min: int = Field(2, validation_alias="MNEMOS_MYSQL_POOL_MIN")
-    mysql_pool_max: int = Field(10, validation_alias="MNEMOS_MYSQL_POOL_MAX")
-    mysql_connect_timeout: float = Field(10.0, validation_alias="MNEMOS_MYSQL_CONNECT_TIMEOUT")
-
     @field_validator("sqlite_path", mode="before")
     @classmethod
     def _expand_sqlite_path(cls, raw: Any) -> Path:
         return Path(raw).expanduser()
 
-    @field_validator("vector_dim_max", mode="before")
-    @classmethod
-    def _positive_vector_dim_cap(cls, raw: Any) -> int:
-        if raw is None or str(raw).strip() == "":
-            return 4096
-        try:
-            parsed = int(str(raw).strip())
-        except ValueError:
-            return 4096
-        return parsed if parsed > 0 else 4096
+    @property
+    def oracle_dsn(self) -> str:
+        return oracle_dsn_env()
 
-    @field_validator(
-        "oracle_pool_min",
-        "oracle_pool_max",
-        "oracle_pool_increment",
-        "oracle_stmt_cache_size",
-        "mysql_pool_min",
-        "mysql_pool_max",
-        mode="before",
-    )
-    @classmethod
-    def _int_or_default(cls, raw: Any, info: Any) -> int:
-        field_name = getattr(info, "field_name", "")
-        default = _DATABASE_INT_DEFAULTS[field_name]
-        if raw is None or str(raw).strip() == "":
-            return default
-        try:
-            return int(str(raw).strip())
-        except ValueError:
-            return default
+    @property
+    def db2_dsn(self) -> str:
+        return db2_dsn_env()
 
-    @field_validator("oracle_pool_acquire_timeout", "mysql_connect_timeout", mode="before")
-    @classmethod
-    def _float_or_default(cls, raw: Any, info: Any) -> float:
-        field_name = getattr(info, "field_name", "")
-        default = _DATABASE_FLOAT_DEFAULTS[field_name]
-        if raw is None or str(raw).strip() == "":
-            return default
-        try:
-            return float(str(raw).strip())
-        except ValueError:
-            return default
+    @property
+    def required_capabilities(self) -> str:
+        return required_capabilities_env()
+
+    @property
+    def vector_dim_max(self) -> int:
+        return vector_dim_max_env()
+
+    @property
+    def db2_vector_index(self) -> str:
+        raw = db2_vector_index_override()
+        return raw if raw is not None else "approx"
+
+    @property
+    def oracle_pdb(self) -> str:
+        return oracle_pdb_env()
+
+    @property
+    def oracle_thick(self) -> str:
+        return runtime_env_value_stripped("MNEMOS_ORACLE_THICK")
+
+    @property
+    def oracle_drcp(self) -> str:
+        return runtime_env_value_stripped("MNEMOS_ORACLE_DRCP")
+
+    @property
+    def oracle_pool_min(self) -> int:
+        return runtime_env_int("MNEMOS_ORACLE_POOL_MIN", 2)
+
+    @property
+    def oracle_pool_max(self) -> int:
+        return runtime_env_int("MNEMOS_ORACLE_POOL_MAX", 10)
+
+    @property
+    def oracle_pool_increment(self) -> int:
+        return runtime_env_int("MNEMOS_ORACLE_POOL_INCREMENT", 1)
+
+    @property
+    def oracle_stmt_cache_size(self) -> int:
+        return runtime_env_int("MNEMOS_ORACLE_STMT_CACHE_SIZE", 20)
+
+    @property
+    def oracle_pool_acquire_timeout(self) -> float:
+        return runtime_env_float("MNEMOS_ORACLE_POOL_ACQUIRE_TIMEOUT", 60.0)
+
+    @property
+    def mysql_pool_min(self) -> int:
+        return runtime_env_int("MNEMOS_MYSQL_POOL_MIN", 2)
+
+    @property
+    def mysql_pool_max(self) -> int:
+        return runtime_env_int("MNEMOS_MYSQL_POOL_MAX", 10)
+
+    @property
+    def mysql_connect_timeout(self) -> float:
+        return runtime_env_float("MNEMOS_MYSQL_CONNECT_TIMEOUT", 10.0)
 
 
 class _GraeaeSettings(BaseSettings):
@@ -300,8 +291,9 @@ class _ProviderSettings(BaseSettings):
     gpu_provider_timeout: float = Field(30.0, validation_alias="GPU_PROVIDER_TIMEOUT")
     # Embedding generation is in-process — see mnemos/runtime/embedder.py.
     # Architectural decision mem_1779334716543_f8ebd4, operator-locked 2026-05-21.
-    # Runtime embedding knobs. New deployments should set MNEMOS_EMBED_*
-    # (model path / threads / gpu_layers) rather than legacy INFERENCE_*.
+    # Fields below are retained for installer compatibility only and are no
+    # longer read by the runtime. New deployments should set MNEMOS_EMBED_*
+    # (model path / threads / gpu_layers) instead.
     inference_embed_host: str = Field("", validation_alias="INFERENCE_EMBED_HOST")
     inference_embed_model: str = Field("", validation_alias="INFERENCE_EMBED_MODEL")
     inference_embed_timeout: float = Field(10.0, validation_alias="INFERENCE_EMBED_TIMEOUT")
@@ -310,38 +302,72 @@ class _ProviderSettings(BaseSettings):
         validation_alias="MNEMOS_EMBED_MODEL_PATH",
     )
     embed_n_ctx: int = Field(8192, validation_alias="MNEMOS_EMBED_N_CTX")
-    embed_threads: int = Field(
-        default_factory=lambda: max(1, os.cpu_count() or 4),
-        validation_alias="MNEMOS_EMBED_THREADS",
-    )
+    embed_threads: int = Field(0, validation_alias="MNEMOS_EMBED_THREADS")  # 0 = auto
     embed_gpu_layers: int = Field(0, validation_alias="MNEMOS_EMBED_GPU_LAYERS")
-    embed_backend: str = Field("auto", validation_alias="MNEMOS_EMBED_BACKEND")
-    embed_ov_model_id: str = Field("BAAI/bge-base-en-v1.5", validation_alias="MNEMOS_EMBED_OV_MODEL_ID")
-    embed_ov_device: str = Field("AUTO", validation_alias="MNEMOS_EMBED_OV_DEVICE")
-    embed_cix_model_path: str = Field(
-        "/opt/mnemos/models/bge-small-zh-v1.5_256.cix",
-        validation_alias="MNEMOS_EMBED_CIX_MODEL_PATH",
-    )
-    embed_cix_tokenizer_id: str = Field("BAAI/bge-small-zh-v1.5", validation_alias="MNEMOS_EMBED_CIX_TOKENIZER_ID")
-    embed_cix_max_seq_len: int = Field(256, validation_alias="MNEMOS_EMBED_CIX_MAX_SEQ_LEN")
-    embed_hybrid: str = Field("False", validation_alias="MNEMOS_EMBED_HYBRID")
-    embed_npu_threshold_chars: int = Field(1000, validation_alias="MNEMOS_EMBED_NPU_THRESHOLD_CHARS")
-    embed_http_url: str = Field("http://192.168.207.61:8090/v1/embeddings", validation_alias="MNEMOS_EMBED_HTTP_URL")
-    embed_http_url_fallback: str = Field(
-        "http://192.168.207.64:8090/v1/embeddings",
-        validation_alias="MNEMOS_EMBED_HTTP_URL_FALLBACK",
-    )
-    embed_http_model: str = Field("bge-m3", validation_alias="MNEMOS_EMBED_HTTP_MODEL")
-    embed_http_timeout: float = Field(30.0, validation_alias="MNEMOS_EMBED_HTTP_TIMEOUT")
-    embed_max_chars: int = Field(8000, validation_alias="MNEMOS_EMBED_MAX_CHARS")
-    reranker_url: str = Field("http://192.168.207.64:8091/v1/rerank", validation_alias="MNEMOS_RERANKER_URL")
-    reranker_model: str = Field("bge-reranker-v2-m3", validation_alias="MNEMOS_RERANKER_MODEL")
-    reranker_timeout_secs: str = Field("", validation_alias="MNEMOS_RERANKER_TIMEOUT_SECS")
 
-    @field_validator("embed_hybrid", "reranker_timeout_secs", mode="before")
-    @classmethod
-    def _stringify_raw_knob(cls, raw: Any) -> str:
-        return "" if raw is None else str(raw)
+    @property
+    def embed_backend(self) -> str:
+        return embed_backend_env()
+
+    @property
+    def embed_ov_model_id(self) -> str:
+        return embed_ov_model_id_env()
+
+    @property
+    def embed_ov_device(self) -> str:
+        return embed_ov_device_env()
+
+    @property
+    def embed_cix_model_path(self) -> str:
+        return embed_cix_model_path_env()
+
+    @property
+    def embed_cix_tokenizer_id(self) -> str:
+        return embed_cix_tokenizer_id_env()
+
+    @property
+    def embed_cix_max_seq_len(self) -> int:
+        return embed_cix_max_seq_len_env()
+
+    @property
+    def embed_hybrid(self) -> str:
+        return embed_hybrid_env()
+
+    @property
+    def embed_npu_threshold_chars(self) -> int:
+        return embed_npu_threshold_chars_env()
+
+    @property
+    def embed_http_url(self) -> str:
+        return embed_http_url_env()
+
+    @property
+    def embed_http_url_fallback(self) -> str:
+        return embed_http_url_fallback_env()
+
+    @property
+    def embed_http_model(self) -> str:
+        return embed_http_model_env()
+
+    @property
+    def embed_http_timeout(self) -> float:
+        return embed_http_timeout_env()
+
+    @property
+    def embed_max_chars(self) -> int:
+        return embed_max_chars_env()
+
+    @property
+    def reranker_url(self) -> str:
+        return reranker_url_env()
+
+    @property
+    def reranker_model(self) -> str:
+        return reranker_model_env()
+
+    @property
+    def reranker_timeout_secs(self) -> str:
+        return reranker_timeout_secs_env() or ""
 
     def api_key_for(self, provider: str) -> str:
         keys = {
@@ -487,12 +513,10 @@ class _MorpheusSettings(BaseSettings):
     extract_min_confidence: float = Field(0.6, validation_alias="MNEMOS_MORPHEUS_EXTRACT_MIN_CONFIDENCE")
     extract_muse: str = Field("qwen3-7b", validation_alias="MNEMOS_MORPHEUS_EXTRACT_MUSE")
     extract_verifier: str = Field("openai", validation_alias="MNEMOS_MORPHEUS_EXTRACT_VERIFIER")
-    orphan_timeout_hours: str = Field("", validation_alias="MNEMOS_MORPHEUS_ORPHAN_TIMEOUT_HOURS")
 
-    @field_validator("orphan_timeout_hours", mode="before")
-    @classmethod
-    def _stringify_orphan_timeout(cls, raw: Any) -> str:
-        return "" if raw is None else str(raw)
+    @property
+    def orphan_timeout_hours(self) -> str | None:
+        return morpheus_orphan_timeout_hours_env()
 
 
 class _PersephoneSettings(BaseSettings):
@@ -530,10 +554,13 @@ class KronosSettings(BaseSettings):
     model_config = _config_model_config()
 
     enabled: bool = Field(False, validation_alias="MNEMOS_KRONOS_ENABLED")
-    backend: str = Field("auto", validation_alias="MNEMOS_KRONOS_BACKEND")
     default_sensitivity: float = Field(2.5, validation_alias="MNEMOS_KRONOS_SENSITIVITY")
     default_lookback_hours: int = Field(168, validation_alias="MNEMOS_KRONOS_LOOKBACK_HOURS")
     default_baseline_days: int = Field(30, validation_alias="MNEMOS_KRONOS_BASELINE_DAYS")
+
+    @property
+    def backend(self) -> str:
+        return kronos_backend_env()
 
     @field_validator("default_sensitivity", mode="before")
     @classmethod
@@ -705,8 +732,6 @@ class _NatsSettings(BaseSettings):
     url: str | None = Field(None, validation_alias="MNEMOS_NATS_URL")
     token: str | None = Field(None, validation_alias="MNEMOS_NATS_TOKEN")
     node_name: str = Field("", validation_alias="MNEMOS_NODE_NAME")
-    webhooks_enabled: str = Field("", validation_alias="MNEMOS_NATS_WEBHOOKS_ENABLED")
-    federation_enabled: str = Field("", validation_alias="MNEMOS_NATS_FEDERATION_ENABLED")
     publish_pantheon_routing: bool = Field(
         False,
         validation_alias="MNEMOS_NATS_PUBLISH_PANTHEON_ROUTING",
@@ -728,8 +753,22 @@ class _NatsSettings(BaseSettings):
     # multi-replica case. Flip to a non-empty group name only after all
     # replicas understand it. (Audit Finding 5.)
     webhook_queue_group: str = Field("", validation_alias="MNEMOS_WEBHOOK_NATS_QUEUE_GROUP")
-    webhooks_queue_group: str = Field("", validation_alias="MNEMOS_NATS_WEBHOOKS_QUEUE_GROUP")
-    federation_queue_group: str = Field("", validation_alias="MNEMOS_NATS_FEDERATION_QUEUE_GROUP")
+
+    @property
+    def webhooks_enabled(self) -> str:
+        return runtime_env_value_stripped("MNEMOS_NATS_WEBHOOKS_ENABLED")
+
+    @property
+    def federation_enabled(self) -> str:
+        return runtime_env_value_stripped("MNEMOS_NATS_FEDERATION_ENABLED")
+
+    @property
+    def webhooks_queue_group(self) -> str:
+        return nats_webhooks_queue_group_env()
+
+    @property
+    def federation_queue_group(self) -> str:
+        return nats_federation_queue_group_env()
 
     @field_validator("publish_timeout_seconds", mode="before")
     @classmethod
@@ -741,37 +780,22 @@ class _NatsSettings(BaseSettings):
         return value if value > 0 else 1.0
 
 
-class _AuditSettings(BaseSettings):
-    model_config = _config_model_config()
-
-    require_session_secret: str = Field("", validation_alias="MNEMOS_REQUIRE_SESSION_SECRET")
-    chain: str = Field("", validation_alias="MNEMOS_AUDIT_CHAIN")
-    root_private_key: str = Field("", validation_alias="MNEMOS_AUDIT_ROOT_PRIVKEY")
+class _AuditSettings(BaseModel):
+    require_session_secret: str = Field(default_factory=lambda: runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET"))
+    chain: str = Field(default_factory=lambda: runtime_env_value("MNEMOS_AUDIT_CHAIN", ""))
+    root_private_key: str = Field(default_factory=lambda: runtime_env_value_stripped("MNEMOS_AUDIT_ROOT_PRIVKEY"))
 
 
-class _HiveMindSettings(BaseSettings):
-    model_config = _config_model_config()
-
-    system_hive_url: str = Field("http://192.168.207.8:5005", validation_alias="HIVE_URL")
-    mcp_hive_url: str = Field("http://127.0.0.1:5005", validation_alias="HIVE_URL")
-    agent_host: str = Field(
-        default_factory=lambda: socket.gethostname().split(".")[0],
-        validation_alias="AGENT_HOST",
-    )
-    heartbeat_interval: float = Field(15.0, validation_alias="HEARTBEAT_INTERVAL")
-    claim_jobs: str = Field("0", validation_alias="CLAIM_JOBS")
-    mcp_mnemos_url: str = Field("http://192.168.207.67:5002", validation_alias="MNEMOS_URL")
-    mcp_mnemos_token: str = Field(
-        "d3a3bc609583005f4a077b6ffd00154b4f03f70104d0cdbfbb019fceb28daca9",
-        validation_alias="MNEMOS_TOKEN",
-    )
-    mcp_port: int = Field(5006, validation_alias="PORT")
-    agent_bus_db: str = Field("/srv/agent-bus/agents.db", validation_alias="AGENT_BUS_DB")
-
-    @field_validator("claim_jobs", mode="before")
-    @classmethod
-    def _stringify_claim_jobs(cls, raw: Any) -> str:
-        return "" if raw is None else str(raw)
+class _HiveMindSettings(BaseModel):
+    system_hive_url: str = Field(default_factory=lambda: system_hive_url_env())
+    mcp_hive_url: str = Field(default_factory=lambda: mcp_hive_url_env())
+    agent_host: str = Field(default_factory=lambda: agent_host_env())
+    heartbeat_interval: float = Field(default_factory=lambda: heartbeat_interval_env())
+    claim_jobs: str = Field(default_factory=lambda: claim_jobs_env())
+    mcp_mnemos_url: str = Field(default_factory=lambda: mcp_mnemos_url_env())
+    mcp_mnemos_token: str = Field(default_factory=lambda: mcp_mnemos_token_env())
+    mcp_port: int = Field(default_factory=lambda: mcp_port_env())
+    agent_bus_db: str = Field(default_factory=lambda: agent_bus_db_env())
 
 
 class Settings(BaseSettings):
@@ -1051,9 +1075,148 @@ def runtime_env_value_stripped(name: str, default: str = "") -> str:
     return runtime_env_value(name, default).strip()
 
 
+def runtime_env_int(name: str, default: int) -> int:
+    raw = runtime_env_value_stripped(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def runtime_env_float(name: str, default: float) -> float:
+    raw = runtime_env_value_stripped(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def embedding_dim_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBEDDING_DIM", "768"))
+
+
+def oracle_dsn_env() -> str:
+    return runtime_env_value_stripped("ORACLE_DSN")
+
+
+def db2_dsn_env() -> str:
+    return runtime_env_value_stripped("DB2_DSN")
+
+
+def required_capabilities_env() -> str:
+    return runtime_env_value("MNEMOS_REQUIRE_CAPABILITIES", "")
+
+
+def vector_dim_max_env() -> int:
+    raw = runtime_env_value_stripped("MNEMOS_VECTOR_DIM_MAX")
+    if not raw:
+        return 4096
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return 4096
+    return parsed if parsed > 0 else 4096
+
+
 def embed_http_model_override() -> str:
     """Return the explicit MNEMOS_EMBED_HTTP_MODEL env override, if set."""
     return runtime_env_value_stripped("MNEMOS_EMBED_HTTP_MODEL")
+
+
+def embed_backend_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_BACKEND", "auto")
+
+
+def embed_ov_model_id_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_OV_MODEL_ID", "BAAI/bge-base-en-v1.5")
+
+
+def embed_ov_device_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_OV_DEVICE", "AUTO")
+
+
+def embed_model_path_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_MODEL_PATH", "/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf")
+
+
+def embed_n_ctx_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBED_N_CTX", "8192"))
+
+
+def embed_threads_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBED_THREADS", str(max(1, os.cpu_count() or 4))))
+
+
+def embed_gpu_layers_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBED_GPU_LAYERS", "0"))
+
+
+def embed_cix_model_path_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_CIX_MODEL_PATH", "/opt/mnemos/models/bge-small-zh-v1.5_256.cix")
+
+
+def embed_cix_tokenizer_id_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_CIX_TOKENIZER_ID", "BAAI/bge-small-zh-v1.5")
+
+
+def embed_cix_max_seq_len_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBED_CIX_MAX_SEQ_LEN", "256"))
+
+
+def embed_hybrid_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_HYBRID", "False")
+
+
+def embed_npu_threshold_chars_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBED_NPU_THRESHOLD_CHARS", "1000"))
+
+
+def embed_http_url_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_HTTP_URL", "http://192.168.207.61:8090/v1/embeddings")
+
+
+def embed_http_url_fallback_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_HTTP_URL_FALLBACK", "http://192.168.207.64:8090/v1/embeddings")
+
+
+def embed_http_model_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_HTTP_MODEL", "bge-m3")
+
+
+def embed_http_timeout_env() -> float:
+    return float(runtime_env_value("MNEMOS_EMBED_HTTP_TIMEOUT", "30.0"))
+
+
+def embed_max_chars_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBED_MAX_CHARS", "8000"))
+
+
+def reranker_url_env() -> str:
+    return runtime_env_value("MNEMOS_RERANKER_URL", "http://192.168.207.64:8091/v1/rerank")
+
+
+def reranker_model_env() -> str:
+    return runtime_env_value("MNEMOS_RERANKER_MODEL", "bge-reranker-v2-m3")
+
+
+def reranker_timeout_secs_env() -> str | None:
+    return os.environ.get("MNEMOS_RERANKER_TIMEOUT_SECS")
+
+
+def morpheus_orphan_timeout_hours_env() -> str | None:
+    return os.environ.get("MNEMOS_MORPHEUS_ORPHAN_TIMEOUT_HOURS")
+
+
+def kronos_backend_env() -> str:
+    return runtime_env_value("MNEMOS_KRONOS_BACKEND", "auto").strip().lower()
+
+
+def oracle_pdb_env() -> str:
+    return runtime_env_value_stripped("MNEMOS_ORACLE_PDB")
 
 
 def db2_vector_index_override() -> str | None:
@@ -1061,6 +1224,14 @@ def db2_vector_index_override() -> str | None:
     if "MNEMOS_DB2_VECTOR_INDEX" not in os.environ:
         return None
     return os.environ.get("MNEMOS_DB2_VECTOR_INDEX")
+
+
+def nats_webhooks_queue_group_env() -> str:
+    return runtime_env_value_stripped("MNEMOS_NATS_WEBHOOKS_QUEUE_GROUP")
+
+
+def nats_federation_queue_group_env() -> str:
+    return runtime_env_value_stripped("MNEMOS_NATS_FEDERATION_QUEUE_GROUP")
 
 
 def nats_webhooks_enabled() -> bool:
@@ -1081,6 +1252,49 @@ def session_secret_required() -> bool:
 def audit_chain_enabled_flag() -> bool:
     """Return whether MNEMOS_AUDIT_CHAIN enables audit-chain writes."""
     return runtime_env_value("MNEMOS_AUDIT_CHAIN", "").lower() == "on"
+
+
+def system_hive_url_env() -> str:
+    return runtime_env_value("HIVE_URL", "http://192.168.207.8:5005")
+
+
+def mcp_hive_url_env() -> str:
+    return runtime_env_value("HIVE_URL", "http://127.0.0.1:5005")
+
+
+def agent_host_env() -> str:
+    return runtime_env_value("AGENT_HOST", socket.gethostname().split(".")[0])
+
+
+def heartbeat_interval_env() -> float:
+    return float(runtime_env_value("HEARTBEAT_INTERVAL", "15"))
+
+
+def claim_jobs_env() -> str:
+    return runtime_env_value("CLAIM_JOBS", "0")
+
+
+def claim_jobs_enabled_env() -> bool:
+    return claim_jobs_env() == "1"
+
+
+def mcp_mnemos_url_env() -> str:
+    return runtime_env_value("MNEMOS_URL", "http://192.168.207.67:5002")
+
+
+def mcp_mnemos_token_env() -> str:
+    return runtime_env_value(
+        "MNEMOS_TOKEN",
+        "d3a3bc609583005f4a077b6ffd00154b4f03f70104d0cdbfbb019fceb28daca9",
+    )
+
+
+def mcp_port_env() -> int:
+    return int(runtime_env_value("PORT", "5006"))
+
+
+def agent_bus_db_env() -> str:
+    return runtime_env_value("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
 
 
 def connector_default_namespace() -> str | None:
