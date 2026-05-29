@@ -481,7 +481,11 @@ async def compression_enqueue(
     # we get here.
 
     async with backend.transactional() as tx:
-        enqueued_ids = await _admin_lifecycle_repo.enqueue_compression(
+        # Backend-agnostic compression queue (job 019e7049 GAP1): route
+        # through the persistence ABC so enqueue works on every backend
+        # (Postgres + Oracle live) instead of the asyncpg-only
+        # AdminLifecycleRepository path that 503'd on Oracle.
+        enqueued_ids = await backend.compression_queue.enqueue_compression(
             tx,
             memory_ids=request.memory_ids,
             reason=request.reason,
@@ -548,7 +552,9 @@ async def compression_enqueue_all(
     # we get here.
 
     async with backend.transactional() as tx:
-        n = await _admin_lifecycle_repo.enqueue_all_compression(
+        # Backend-agnostic compression queue (job 019e7049 GAP1) — see
+        # compression_enqueue above.
+        n = await backend.compression_queue.enqueue_all_compression(
             tx,
             reason=request.reason,
             priority=request.priority,
