@@ -410,7 +410,7 @@ async def fetch_recommended_model(
     cost_budget: float,
     quality_floor: float,
 ) -> tuple[dict[str, Any] | None, list[str]]:
-    from mnemos.domain.pantheon.recommendation import choose_recommended_model
+    from mnemos.core.recommendation import choose_recommended_model
 
     rows = await conn.fetch(
         """

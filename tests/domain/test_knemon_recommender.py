@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from mnemos.domain.pantheon.recommendation import choose_recommended_model
+from mnemos.core.recommendation import choose_recommended_model
 
 
 _ROWS = [

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from mnemos.api.routes.ledger import compute_plan_window_id
+from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.domain.knemon.router import KnemonRouteRequest, route
 
 

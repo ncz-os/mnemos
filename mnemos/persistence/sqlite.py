@@ -2219,7 +2219,7 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
         cost_budget: float,
         quality_floor: float,
     ) -> tuple[dict[str, Any] | None, list[str]]:
-        from mnemos.domain.pantheon.recommendation import choose_recommended_model
+        from mnemos.core.recommendation import choose_recommended_model
 
         rows = await _fetch_all(
             self._conn(tx),
