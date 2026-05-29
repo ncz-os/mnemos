@@ -5,7 +5,7 @@ import inspect
 import textwrap
 
 from mnemos.api.routes import document_import
-from mnemos.db.document_repo import DocumentRepository
+from mnemos.domain.document_repo import DocumentRepository
 
 
 def _call_names(func) -> set[str]:
@@ -29,10 +29,7 @@ def _call_names(func) -> set[str]:
 
 
 def test_document_import_routes_are_registered():
-    routes = {
-        (tuple(sorted(route.methods or ())), route.path)
-        for route in document_import.router.routes
-    }
+    routes = {(tuple(sorted(route.methods or ())), route.path) for route in document_import.router.routes}
     assert (("POST",), "/v1/documents/import") in routes
     assert (("POST",), "/v1/documents/batch-import") in routes
 

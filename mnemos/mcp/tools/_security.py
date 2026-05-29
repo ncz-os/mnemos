@@ -29,7 +29,7 @@ MCP_READ_RATE_LIMIT_PER_MINUTE = 600
 # below cap.
 _TOOL_RATE_BUCKETS: dict[tuple[str, str], deque[float]] = defaultdict(deque)
 _GC_SWEEP_INTERVAL = 256  # touches between sweeps
-_MAX_BUCKETS = 4096        # hard cap; eviction kicks in past this
+_MAX_BUCKETS = 4096  # hard cap; eviction kicks in past this
 _gc_touch_counter: int = 0
 
 _MCP_AUDIT_LOGGER = logging.getLogger("mnemos.mcp.audit")
@@ -74,6 +74,7 @@ def _evict_oldest_buckets(target_size: int) -> None:
     drop_count = len(_TOOL_RATE_BUCKETS) - target_size
     for key, _ in items[:drop_count]:
         _TOOL_RATE_BUCKETS.pop(key, None)
+
 
 # Round-3 residual #2 of #146 (#149): track in-flight audit tasks so
 # transports can drain them on shutdown. Without this, a stdio
@@ -242,7 +243,7 @@ def _schedule_audit_persist(
         return
 
     try:
-        from mnemos.db.mcp_audit_repo import persist_audit_record
+        from mnemos.domain.mcp_audit_repo import persist_audit_record
     except Exception:  # pragma: no cover — defensive import guard
         return
 
@@ -254,7 +255,9 @@ def _schedule_audit_persist(
         _MCP_AUDIT_LOGGER.warning(
             "mcp_audit_log inflight backlog >= %d; dropping persist for "
             "tool=%s caller=%s (logger entry retained, table row dropped)",
-            _MAX_INFLIGHT_AUDIT_TASKS, tool, caller_user_id,
+            _MAX_INFLIGHT_AUDIT_TASKS,
+            tool,
+            caller_user_id,
         )
         return
 
@@ -301,9 +304,9 @@ async def drain_pending_audit_tasks(timeout: float = 5.0) -> int:
         # but don't propagate — shutdown must complete.
         still_running = sum(1 for t in pending if not t.done())
         _MCP_AUDIT_LOGGER.warning(
-            "mcp_audit_log drain timed out: %d task(s) still pending "
-            "after %.1fs",
-            still_running, timeout,
+            "mcp_audit_log drain timed out: %d task(s) still pending after %.1fs",
+            still_running,
+            timeout,
         )
     return len(pending)
 

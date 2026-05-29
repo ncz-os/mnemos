@@ -26,7 +26,7 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
-from mnemos.db.eligibility import eligible_for_compression
+from mnemos.core.eligibility import eligible_for_compression
 
 from .contest import ContestOutcome
 
@@ -112,7 +112,7 @@ INNER JOIN memories m
     ON m.id = mb.memory_id
 WHERE mb.memory_id = $1
   AND mb.name = 'main'
-  AND {eligible_for_compression('m', reject_private_parent=True)}
+  AND {eligible_for_compression("m", reject_private_parent=True)}
 FOR UPDATE OF mb
 """
 
@@ -324,8 +324,7 @@ async def _persist_compression_version(
     variant_content = result.compressed_content
     if variant_content is None:
         raise RuntimeError(
-            f"winner for memory {memory_id} has no compressed_content; "
-            "cannot create compression DAG version"
+            f"winner for memory {memory_id} has no compressed_content; cannot create compression DAG version"
         )
 
     branch = _variant_branch(result)
@@ -337,10 +336,7 @@ async def _persist_compression_version(
 
     source = await conn.fetchrow(_FETCH_SOURCE_MAIN_HEAD_SQL, memory_id)
     if source is None:
-        raise RuntimeError(
-            f"main branch HEAD missing for memory {memory_id}; "
-            "cannot create compression DAG version"
-        )
+        raise RuntimeError(f"main branch HEAD missing for memory {memory_id}; cannot create compression DAG version")
 
     parent_commit_hash = source["parent_commit_hash"]
     commit_hash = _compression_commit_hash(
@@ -375,10 +371,7 @@ async def _persist_compression_version(
             commit_hash,
         )
     if version_row is None:
-        raise RuntimeError(
-            f"compression DAG version insert produced no row for memory "
-            f"{memory_id} branch {branch}"
-        )
+        raise RuntimeError(f"compression DAG version insert produced no row for memory {memory_id} branch {branch}")
 
     await conn.execute(
         _UPSERT_COMPRESSION_BRANCH_SQL,

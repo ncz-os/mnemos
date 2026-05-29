@@ -9,6 +9,7 @@ The default pipeline is REPLAY → CLUSTER → SYNTHESISE → COMMIT. The
 optional CONSOLIDATE phase can be enabled between CLUSTER and SYNTHESISE
 once an operator is ready for soft mutation paths.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -28,7 +29,7 @@ import numpy as np
 from mnemos.core.config import get_settings, hot_rs_enabled
 from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.ids import new_memory_id
-from mnemos.db.eligibility import eligible_for_morpheus
+from mnemos.core.eligibility import eligible_for_morpheus
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +101,7 @@ def _cosine_similarities(query: np.ndarray, candidates: list[np.ndarray]) -> lis
                 normalized = _HOT_RS.normalize_embeddings([query_values, *candidate_values])
                 if len(normalized) == len(candidate_values) + 1:
                     query_values = [float(value) for value in normalized[0]]
-                    candidate_values = [
-                        [float(value) for value in vector]
-                        for vector in normalized[1:]
-                    ]
+                    candidate_values = [[float(value) for value in vector] for vector in normalized[1:]]
             except Exception:
                 pass
             scores = _HOT_RS.cosine_batch(
@@ -252,15 +250,21 @@ async def begin_run(
             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
             RETURNING id
             """,
-            triggered_by, window_start, window_end,
-            window_hours, cluster_min_size,
+            triggered_by,
+            window_start,
+            window_end,
+            window_hours,
+            cluster_min_size,
             json.dumps(config or {}),
             namespace,
         )
     run_id = str(row["id"])
     logger.info(
         "[MORPHEUS] run %s opened (window=%dh, triggered_by=%s, namespace=%s)",
-        run_id, window_hours, triggered_by, namespace or "<all>",
+        run_id,
+        window_hours,
+        triggered_by,
+        namespace or "<all>",
     )
     return run_id
 
@@ -269,7 +273,8 @@ async def set_phase(pool: asyncpg.Pool, run_id: str, phase: str) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE morpheus_runs SET phase=$2 WHERE id=$1::uuid",
-            run_id, phase,
+            run_id,
+            phase,
         )
     logger.info("[MORPHEUS] run %s → phase=%s", run_id, phase)
 
@@ -315,8 +320,7 @@ async def update_counters(
     args.append(run_id)
     async with pool.acquire() as conn:
         await conn.execute(
-            f"UPDATE morpheus_runs SET {', '.join(sets)} "
-            f"WHERE id=${len(args)}::uuid",
+            f"UPDATE morpheus_runs SET {', '.join(sets)} WHERE id=${len(args)}::uuid",
             *args,
         )
 
@@ -346,8 +350,7 @@ async def increment_extract_counters(
 async def finish_run(pool: asyncpg.Pool, run_id: str) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE morpheus_runs SET status='success', finished_at=now() "
-            "WHERE id=$1::uuid",
+            "UPDATE morpheus_runs SET status='success', finished_at=now() WHERE id=$1::uuid",
             run_id,
         )
     logger.info("[MORPHEUS] run %s finished SUCCESS", run_id)
@@ -356,9 +359,9 @@ async def finish_run(pool: asyncpg.Pool, run_id: str) -> None:
 async def fail_run(pool: asyncpg.Pool, run_id: str, error: str) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE morpheus_runs SET status='failed', finished_at=now(), error=$2 "
-            "WHERE id=$1::uuid",
-            run_id, error[:4000],
+            "UPDATE morpheus_runs SET status='failed', finished_at=now(), error=$2 WHERE id=$1::uuid",
+            run_id,
+            error[:4000],
         )
     logger.warning("[MORPHEUS] run %s finished FAILED: %s", run_id, error[:200])
 
@@ -384,8 +387,7 @@ async def sweep_orphan_runs(
 
     for row in rows:
         logger.info(
-            "[MORPHEUS] orphan timeout sweep marked run %s failed "
-            "(started_at=%s, max_age_hours=%.2f)",
+            "[MORPHEUS] orphan timeout sweep marked run %s failed (started_at=%s, max_age_hours=%.2f)",
             row["id"],
             row["started_at"],
             threshold_hours,
@@ -454,7 +456,8 @@ async def rollback_run(
                   AND deleted_at IS NULL
                   AND COALESCE(metadata, '{}'::jsonb) ? $2
                 """,
-                run_id, _PRE_CONSOLIDATE_PERMISSION_KEY,
+                run_id,
+                _PRE_CONSOLIDATE_PERMISSION_KEY,
             )
             n_restored = _command_count(restore_result)
             # Per-row tagging means rollback never crosses runs.
@@ -484,7 +487,10 @@ async def rollback_run(
     logger.warning(
         "[MORPHEUS] run %s rolled back: %d memories deleted, "
         "%d consolidated rows restored, %d extraction markers reset",
-        run_id, n_deleted, n_restored, n_extract_reset,
+        run_id,
+        n_deleted,
+        n_restored,
+        n_extract_reset,
     )
     return n_deleted, n_run
 
@@ -496,6 +502,7 @@ async def rollback_run(
 # memory the run creates or mutates is tagged with its ``morpheus_run_id``
 # so rollback can remain scoped to the run and ``morpheus_runs`` stays
 # authoritative for what the run did.
+
 
 async def phase_replay(pool: asyncpg.Pool, run_id: str) -> int:
     """Scan memories from the run's window. Returns count scanned.
@@ -512,7 +519,7 @@ async def phase_replay(pool: asyncpg.Pool, run_id: str) -> int:
             WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
               AND m.provenance IS DISTINCT FROM 'morpheus_local'
               AND m.morpheus_run_id IS NULL
-              AND {eligible_for_morpheus('m')}
+              AND {eligible_for_morpheus("m")}
               AND (r.namespace IS NULL OR m.namespace = r.namespace)
             """,
             run_id,
@@ -558,11 +565,12 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
               AND provenance IS DISTINCT FROM 'morpheus_local'
               AND morpheus_run_id IS NULL
               AND embedding IS NOT NULL
-              AND {eligible_for_morpheus('')}
+              AND {eligible_for_morpheus("")}
               AND ($3::text IS NULL OR namespace = $3)
             ORDER BY created
             """,
-            run_row["window_started_at"], run_row["window_ended_at"],
+            run_row["window_started_at"],
+            run_row["window_ended_at"],
             run_row["namespace"],
         )
 
@@ -596,10 +604,7 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
             clusters.append({"centroid": vec.copy(), "members": [row["id"]]})
 
     surviving = [c for c in clusters if len(c["members"]) >= min_size]
-    cluster_payload = [
-        {"cluster_id": i, "member_memory_ids": c["members"]}
-        for i, c in enumerate(surviving)
-    ]
+    cluster_payload = [{"cluster_id": i, "member_memory_ids": c["members"]} for i, c in enumerate(surviving)]
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -608,7 +613,8 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
             SET config = config || jsonb_build_object('clusters', $2::jsonb)
             WHERE id=$1::uuid
             """,
-            run_id, json.dumps(cluster_payload),
+            run_id,
+            json.dumps(cluster_payload),
         )
 
     n_clusters = len(surviving)
@@ -616,7 +622,11 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
     logger.info(
         "[MORPHEUS] run %s clustered %d memories into %d cluster(s) "
         "(threshold=%.2f, min_size=%d, dropped %d below min)",
-        run_id, len(rows), n_clusters, threshold, min_size,
+        run_id,
+        len(rows),
+        n_clusters,
+        threshold,
+        min_size,
         len(clusters) - n_clusters,
     )
     return n_clusters
@@ -638,8 +648,7 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
     """
     async with pool.acquire() as conn:
         run_row = await conn.fetchrow(
-            "SELECT config, cluster_min_size, namespace "
-            "FROM morpheus_runs WHERE id=$1::uuid",
+            "SELECT config, cluster_min_size, namespace FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
         )
     if run_row is None:
@@ -679,17 +688,19 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
                        consolidated_into, morpheus_run_id, metadata
                 FROM memories
                 WHERE id = ANY($1::text[])
-                  AND {eligible_for_morpheus('')}
+                  AND {eligible_for_morpheus("")}
                   AND ($2::text IS NULL OR namespace = $2)
                 """,
-                member_ids, namespace,
+                member_ids,
+                namespace,
             )
         if len(rows) < min_size:
             already_count = 0
             if len(rows) == 1:
                 async with pool.acquire() as conn:
-                    already_count = int(await conn.fetchval(
-                        """
+                    already_count = int(
+                        await conn.fetchval(
+                            """
                         SELECT COUNT(*)
                         FROM memories
                         WHERE id = ANY($1::text[])
@@ -701,11 +712,13 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
                               ? 'pre_consolidate_permission_mode'
                           AND ($4::text IS NULL OR namespace=$4)
                         """,
-                        member_ids,
-                        str(rows[0]["id"]),
-                        run_id,
-                        namespace,
-                    ) or 0)
+                            member_ids,
+                            str(rows[0]["id"]),
+                            run_id,
+                            namespace,
+                        )
+                        or 0
+                    )
             if len(rows) + already_count < min_size:
                 continue
 
@@ -719,8 +732,9 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
         )[0]
         canonical_id = str(canonical["id"])
         async with pool.acquire() as conn:
-            cluster_count = int(await conn.fetchval(
-                """
+            cluster_count = int(
+                await conn.fetchval(
+                    """
                 SELECT COUNT(*)
                 FROM memories
                 WHERE id = ANY($1::text[])
@@ -732,11 +746,13 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
                       ? 'pre_consolidate_permission_mode'
                   AND ($4::text IS NULL OR namespace=$4)
                 """,
-                member_ids,
-                canonical_id,
-                run_id,
-                namespace,
-            ) or 0)
+                    member_ids,
+                    canonical_id,
+                    run_id,
+                    namespace,
+                )
+                or 0
+            )
 
         for row in rows:
             member_id = str(row["id"])
@@ -821,7 +837,8 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
 
     async with pool.acquire() as conn:
         config_raw = await conn.fetchval(
-            "SELECT config FROM morpheus_runs WHERE id=$1::uuid", run_id,
+            "SELECT config FROM morpheus_runs WHERE id=$1::uuid",
+            run_id,
         )
     if config_raw is None:
         await update_counters(pool, run_id, summaries_created=0)
@@ -844,7 +861,7 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
                 SELECT id, content, category, owner_id, namespace
                 FROM memories
                 WHERE id = ANY($1::text[])
-                  AND {eligible_for_morpheus('')}
+                  AND {eligible_for_morpheus("")}
                 """,
                 member_ids,
             )
@@ -853,7 +870,8 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
         visible_member_ids = [str(m["id"]) for m in members]
 
         summary = await _synthesise_cluster_summary(
-            [m["content"] for m in members], use_llm=use_llm,
+            [m["content"] for m in members],
+            use_llm=use_llm,
         )
 
         # Inherit category/owner/namespace from the cluster majority,
@@ -875,23 +893,31 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
                         $6, $7, 600,
                         $8::uuid, $9::text[], 'morpheus_local')
                 """,
-                new_id, summary, category, "morpheus-synthesis",
-                json.dumps({
-                    "morpheus_run_id": run_id,
-                    "cluster_id": cluster.get("cluster_id"),
-                    "member_count": len(visible_member_ids),
-                    "synthesis_mode": "llm" if use_llm else "extractive",
-                }),
-                owner_id, namespace,
-                run_id, visible_member_ids,
+                new_id,
+                summary,
+                category,
+                "morpheus-synthesis",
+                json.dumps(
+                    {
+                        "morpheus_run_id": run_id,
+                        "cluster_id": cluster.get("cluster_id"),
+                        "member_count": len(visible_member_ids),
+                        "synthesis_mode": "llm" if use_llm else "extractive",
+                    }
+                ),
+                owner_id,
+                namespace,
+                run_id,
+                visible_member_ids,
             )
         n_created += 1
 
     await update_counters(pool, run_id, summaries_created=n_created)
     logger.info(
-        "[MORPHEUS] run %s synthesised %d summary memor%s "
-        "(mode=%s)",
-        run_id, n_created, "y" if n_created == 1 else "ies",
+        "[MORPHEUS] run %s synthesised %d summary memor%s (mode=%s)",
+        run_id,
+        n_created,
+        "y" if n_created == 1 else "ies",
         "llm" if use_llm else "extractive",
     )
     return n_created
@@ -940,14 +966,15 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
             f"""
             SELECT id, verbatim_content, owner_id, namespace
             FROM memories
-            WHERE {eligible_for_morpheus('')}
+            WHERE {eligible_for_morpheus("")}
               AND triples_extracted_at IS NULL
               AND verbatim_content IS NOT NULL
               AND length(verbatim_content) >= $1
               AND ($2::text IS NULL OR namespace = $2)
             ORDER BY created
             """,
-            min_chars, namespace,
+            min_chars,
+            namespace,
         )
 
     memories_processed = 0
@@ -968,11 +995,12 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
                     SET triples_extracted_at = NOW()
                     WHERE id=$1
                       AND triples_extracted_at IS NULL
-                      AND {eligible_for_morpheus('')}
+                      AND {eligible_for_morpheus("")}
                       AND ($2::text IS NULL OR namespace = $2)
                     RETURNING id
                     """,
-                    memory_id, namespace,
+                    memory_id,
+                    namespace,
                 )
                 if marked_id is None:
                     continue
@@ -1151,17 +1179,13 @@ def _morpheus_muse_selection(engine: Any, muse: str) -> Optional[dict[str, Optio
 
     from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 
-    registry_to_graeae = {
-        cfg["registry_provider"]: name
-        for name, cfg in GRAEAE_REGISTRY_MAP.items()
-    }
+    registry_to_graeae = {cfg["registry_provider"]: name for name, cfg in GRAEAE_REGISTRY_MAP.items()}
     provider_name = registry_to_graeae.get(muse)
     if provider_name in providers:
         return {provider_name: None}
 
     logger.warning(
-        "[MORPHEUS] configured muse %r is not in the GRAEAE provider map; "
-        "falling back to single best available muse",
+        "[MORPHEUS] configured muse %r is not in the GRAEAE provider map; falling back to single best available muse",
         muse,
     )
     return None
@@ -1277,9 +1301,7 @@ def _first_sentence(text: str) -> str:
     return text[:200].strip()
 
 
-async def _synthesise_cluster_summary(
-    contents: List[str], *, use_llm: bool
-) -> str:
+async def _synthesise_cluster_summary(contents: List[str], *, use_llm: bool) -> str:
     """Generate a summary string from a cluster's member memory contents.
 
     Default extractive mode: first sentence of each member, bulleted.
@@ -1295,11 +1317,11 @@ async def _synthesise_cluster_summary(
         bullets = [f"• {_first_sentence(c)}" for c in contents]
         return (
             "MORPHEUS synthesis (extractive — first sentence of each "
-            f"member of this {len(contents)}-memory cluster):\n\n"
-            + "\n".join(bullets)
+            f"member of this {len(contents)}-memory cluster):\n\n" + "\n".join(bullets)
         )
     try:
         from mnemos.domain.graeae.engine import get_graeae_engine
+
         engine = get_graeae_engine()
         prompt = (
             "You are MORPHEUS, the dream-state of a memory system. "
@@ -1307,8 +1329,7 @@ async def _synthesise_cluster_summary(
             "concise summary memory (3-5 sentences). Preserve identifiers, "
             "names, dates, and code references verbatim. Output ONLY the "
             "summary text — no preamble, no headers, no quoting of the "
-            "input.\n\nFragments:\n\n"
-            + "\n\n---\n\n".join(contents)
+            "input.\n\nFragments:\n\n" + "\n\n---\n\n".join(contents)
         )
         result = await engine.consult(prompt=prompt, task_type="summarisation")
         for resp in (result.get("all_responses") or {}).values():

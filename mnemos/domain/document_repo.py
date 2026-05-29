@@ -3,6 +3,7 @@
 The document import API owns parsing and response shaping; this module owns the
 backend-specific chunk write so routes do not reach for raw driver pools.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -133,8 +134,7 @@ class DocumentRepository:
             constraint_name = getattr(uv, "constraint_name", None) or ""
             message = str(uv)
             is_chunk_key_uniq = (
-                constraint_name == "memories_import_chunk_key_uniq"
-                or "memories_import_chunk_key_uniq" in message
+                constraint_name == "memories_import_chunk_key_uniq" or "memories_import_chunk_key_uniq" in message
             )
             if not is_chunk_key_uniq:
                 raise
