@@ -56,63 +56,86 @@ class _FakeMemoryRepo:
         return self._returns.get(method, default)
 
     async def list_memories(
-        self, tx, *, visibility, category=None, subcategory=None,
-        limit=20, offset=0, include_archived=False,
+        self,
+        tx,
+        *,
+        visibility,
+        category=None,
+        subcategory=None,
+        limit=20,
+        offset=0,
+        include_archived=False,
     ):
-        self.calls.append((
-            "list_memories",
-            {
-                "visibility": visibility,
-                "category": category,
-                "subcategory": subcategory,
-                "limit": limit,
-                "offset": offset,
-                "include_archived": include_archived,
-            },
-        ))
+        self.calls.append(
+            (
+                "list_memories",
+                {
+                    "visibility": visibility,
+                    "category": category,
+                    "subcategory": subcategory,
+                    "limit": limit,
+                    "offset": offset,
+                    "include_archived": include_archived,
+                },
+            )
+        )
         return self._resolve("list_memories", ([], 0))
 
     async def get_memory(self, tx, memory_id, *, visibility, include_archived=False):
-        self.calls.append((
-            "get_memory",
-            {
-                "memory_id": memory_id,
-                "visibility": visibility,
-                "include_archived": include_archived,
-            },
-        ))
+        self.calls.append(
+            (
+                "get_memory",
+                {
+                    "memory_id": memory_id,
+                    "visibility": visibility,
+                    "include_archived": include_archived,
+                },
+            )
+        )
         return self._resolve("get_memory", None)
 
     async def update_memory(self, tx, memory_id, *, visibility, fields):
-        self.calls.append((
-            "update_memory",
-            {
-                "memory_id": memory_id,
-                "visibility": visibility,
-                "fields": fields,
-            },
-        ))
+        self.calls.append(
+            (
+                "update_memory",
+                {
+                    "memory_id": memory_id,
+                    "visibility": visibility,
+                    "fields": fields,
+                },
+            )
+        )
         return self._resolve("update_memory", None)
 
     async def find_active_duplicate_by_content_hash(
-        self, tx, *, owner_id, namespace, content_hash, cross_namespace=False,
+        self,
+        tx,
+        *,
+        owner_id,
+        namespace,
+        content_hash,
+        cross_namespace=False,
     ):
-        self.calls.append((
-            "find_active_duplicate_by_content_hash",
-            {
-                "owner_id": owner_id,
-                "namespace": namespace,
-                "content_hash": content_hash,
-                "cross_namespace": cross_namespace,
-            },
-        ))
+        self.calls.append(
+            (
+                "find_active_duplicate_by_content_hash",
+                {
+                    "owner_id": owner_id,
+                    "namespace": namespace,
+                    "content_hash": content_hash,
+                    "cross_namespace": cross_namespace,
+                },
+            )
+        )
         return self._resolve("find_active_duplicate_by_content_hash", None)
 
     async def bump_recall_and_get_memory(self, tx, memory_id, *, visibility):
-        self.calls.append((
-            "bump_recall_and_get_memory",
-            {"memory_id": memory_id, "visibility": visibility},
-        ))
+        self.calls.append(
+            (
+                "bump_recall_and_get_memory",
+                {"memory_id": memory_id, "visibility": visibility},
+            )
+        )
         return self._resolve("bump_recall_and_get_memory", None)
 
     async def find_duplicate_content_groups(self, tx, *, namespace=None):
@@ -120,10 +143,12 @@ class _FakeMemoryRepo:
         return self._resolve("find_duplicate_content_groups", [])
 
     async def consolidate_duplicate_memories(self, tx, *, canonical_id, duplicate_ids):
-        self.calls.append((
-            "consolidate_duplicate_memories",
-            {"canonical_id": canonical_id, "duplicate_ids": list(duplicate_ids)},
-        ))
+        self.calls.append(
+            (
+                "consolidate_duplicate_memories",
+                {"canonical_id": canonical_id, "duplicate_ids": list(duplicate_ids)},
+            )
+        )
         return self._resolve("consolidate_duplicate_memories", len(duplicate_ids))
 
     async def delete_memory(
@@ -138,18 +163,20 @@ class _FakeMemoryRepo:
         reason=None,
         source=None,
     ):
-        self.calls.append((
-            "delete_memory",
-            {
-                "memory_id": memory_id,
-                "visibility": visibility,
-                "requested_by": requested_by,
-                "requested_at": requested_at,
-                "request_kind": request_kind,
-                "reason": reason,
-                "source": source,
-            },
-        ))
+        self.calls.append(
+            (
+                "delete_memory",
+                {
+                    "memory_id": memory_id,
+                    "visibility": visibility,
+                    "requested_by": requested_by,
+                    "requested_at": requested_at,
+                    "request_kind": request_kind,
+                    "reason": reason,
+                    "source": source,
+                },
+            )
+        )
         return self._resolve(
             "delete_memory",
             {
@@ -163,49 +190,71 @@ class _FakeMemoryRepo:
         )
 
     async def semantic_search(
-        self, tx, *, embedding, limit, visibility,
-        category=None, subcategory=None,
-        source_provider=None, source_model=None, source_agent=None,
-        include_archived=False, boost_recency=False, recency_weight=0.15,
+        self,
+        tx,
+        *,
+        embedding,
+        limit,
+        visibility,
+        category=None,
+        subcategory=None,
+        source_provider=None,
+        source_model=None,
+        source_agent=None,
+        include_archived=False,
+        boost_recency=False,
+        recency_weight=0.15,
     ):
-        self.calls.append((
-            "semantic_search",
-            {
-                "embedding": list(embedding),
-                "limit": limit,
-                "visibility": visibility,
-                "category": category,
-                "subcategory": subcategory,
-                "source_provider": source_provider,
-                "source_model": source_model,
-                "source_agent": source_agent,
-                "include_archived": include_archived,
-                "boost_recency": boost_recency,
-                "recency_weight": recency_weight,
-            },
-        ))
+        self.calls.append(
+            (
+                "semantic_search",
+                {
+                    "embedding": list(embedding),
+                    "limit": limit,
+                    "visibility": visibility,
+                    "category": category,
+                    "subcategory": subcategory,
+                    "source_provider": source_provider,
+                    "source_model": source_model,
+                    "source_agent": source_agent,
+                    "include_archived": include_archived,
+                    "boost_recency": boost_recency,
+                    "recency_weight": recency_weight,
+                },
+            )
+        )
         return self._resolve("semantic_search", [])
 
     async def fts_search(
-        self, tx, *, query, limit, visibility,
-        category=None, subcategory=None,
-        source_provider=None, source_model=None, source_agent=None,
+        self,
+        tx,
+        *,
+        query,
+        limit,
+        visibility,
+        category=None,
+        subcategory=None,
+        source_provider=None,
+        source_model=None,
+        source_agent=None,
         include_archived=False,
     ):
-        self.calls.append((
-            "fts_search",
-            {
-                "query": query,
-                "limit": limit,
-                "visibility": visibility,
-                "category": category,
-                "subcategory": subcategory,
-                "source_provider": source_provider,
-                "source_model": source_model,
-                "source_agent": source_agent,
-                "include_archived": include_archived,
-            },
-        ))
+        self.calls.append(
+            (
+                "fts_search",
+                {
+                    "query": query,
+                    "limit": limit,
+                    "visibility": visibility,
+                    "category": category,
+                    "subcategory": subcategory,
+                    "source_provider": source_provider,
+                    "source_model": source_model,
+                    "source_agent": source_agent,
+                    "include_archived": include_archived,
+                },
+            )
+        )
         return self._resolve("fts_search", [])
 
     async def insert_memory(self, tx, **kwargs):
@@ -214,6 +263,7 @@ class _FakeMemoryRepo:
 
     async def gather_stats(self, tx):
         from mnemos.persistence.base import MemoryStatsRow
+
         return self._resolve(
             "gather_stats",
             MemoryStatsRow(
@@ -246,17 +296,25 @@ class _FakeWebhookRepo:
         self._raise = exc
 
     async def dispatch_event(
-        self, tx, event_type, payload, *, owner_id=None, namespace=None,
+        self,
+        tx,
+        event_type,
+        payload,
+        *,
+        owner_id=None,
+        namespace=None,
     ):
-        self.calls.append((
-            "dispatch_event",
-            {
-                "event_type": event_type,
-                "payload": payload,
-                "owner_id": owner_id,
-                "namespace": namespace,
-            },
-        ))
+        self.calls.append(
+            (
+                "dispatch_event",
+                {
+                    "event_type": event_type,
+                    "payload": payload,
+                    "owner_id": owner_id,
+                    "namespace": namespace,
+                },
+            )
+        )
         if self._raise is not None:
             raise self._raise
         return list(self._delivery_ids)
@@ -285,6 +343,7 @@ class _FakeCompressionRepo:
 
     async def gather_stats(self, tx):
         from mnemos.persistence.base import CompressionStatsRow
+
         return self._stats or CompressionStatsRow(
             total_compressions=0,
             average_compression_ratio=None,
@@ -302,6 +361,37 @@ class _FakeCompressionRepo:
 
             return _stub
         return AsyncMock()
+
+
+class _FakeCompressionQueueRepo:
+    """Fake CompressionQueueRepository (job 019e7049). Concrete defaults
+    so route handlers calling ``backend.compression_queue.*`` get typed
+    return values (list/int/None) instead of AsyncMock objects that fail
+    Pydantic response validation. ``configure_return`` stubs a method."""
+
+    def __init__(self) -> None:
+        self._returns: dict[str, Any] = {}
+
+    def configure_return(self, method: str, value: Any) -> None:
+        self._returns[method] = value
+
+    async def enqueue_compression(self, tx, **kwargs) -> list:
+        return self._returns.get("enqueue_compression", [])
+
+    async def enqueue_all_compression(self, tx, **kwargs) -> int:
+        return self._returns.get("enqueue_all_compression", 0)
+
+    async def dequeue_compression(self, tx, **kwargs) -> list:
+        return self._returns.get("dequeue_compression", [])
+
+    async def mark_compression_done(self, tx, **kwargs) -> None:
+        return None
+
+    async def mark_compression_failed(self, tx, **kwargs) -> None:
+        return None
+
+    async def sweep_stale_compression(self, tx, **kwargs) -> int:
+        return self._returns.get("sweep_stale_compression", 0)
 
 
 class _FakeRepo:
@@ -407,10 +497,7 @@ class _PoolBackedMemoryRepo:
         subcategory=None,
         include_archived=False,
     ) -> list[dict[str, Any]]:
-        rows = [
-            row for row in self._pool.state["memories"].values()
-            if self._visible(row, visibility)
-        ]
+        rows = [row for row in self._pool.state["memories"].values() if self._visible(row, visibility)]
         rows = [row for row in rows if row.get("deleted_at") is None]
         if not include_archived:
             rows = [row for row in rows if row.get("archived_at") is None]
@@ -421,7 +508,14 @@ class _PoolBackedMemoryRepo:
         return sorted(rows, key=lambda row: row.get("created"), reverse=True)
 
     async def list_memories(
-        self, tx, *, visibility, category=None, subcategory=None, limit=20, offset=0,
+        self,
+        tx,
+        *,
+        visibility,
+        category=None,
+        subcategory=None,
+        limit=20,
+        offset=0,
         include_archived=False,
     ):
         rows = self._rows(
@@ -430,7 +524,7 @@ class _PoolBackedMemoryRepo:
             subcategory=subcategory,
             include_archived=include_archived,
         )
-        return rows[offset:offset + limit], len(rows)
+        return rows[offset : offset + limit], len(rows)
 
     async def get_memory(self, tx, memory_id, *, visibility, include_archived=False):
         row = self._pool.state["memories"].get(memory_id)
@@ -443,13 +537,23 @@ class _PoolBackedMemoryRepo:
         return row
 
     async def fts_search(
-        self, tx, *, query, limit, visibility,
-        category=None, subcategory=None, source_provider=None,
-        source_model=None, source_agent=None, include_archived=False,
+        self,
+        tx,
+        *,
+        query,
+        limit,
+        visibility,
+        category=None,
+        subcategory=None,
+        source_provider=None,
+        source_model=None,
+        source_agent=None,
+        include_archived=False,
     ):
         needle = query.lower()
         rows = [
-            row for row in self._rows(
+            row
+            for row in self._rows(
                 visibility,
                 category=category,
                 subcategory=subcategory,
@@ -460,10 +564,20 @@ class _PoolBackedMemoryRepo:
         return rows[:limit]
 
     async def semantic_search(
-        self, tx, *, embedding, limit, visibility,
-        category=None, subcategory=None, source_provider=None,
-        source_model=None, source_agent=None, include_archived=False,
-        boost_recency=False, recency_weight=0.15,
+        self,
+        tx,
+        *,
+        embedding,
+        limit,
+        visibility,
+        category=None,
+        subcategory=None,
+        source_provider=None,
+        source_model=None,
+        source_agent=None,
+        include_archived=False,
+        boost_recency=False,
+        recency_weight=0.15,
     ):
         rows = self._rows(
             visibility,
@@ -509,7 +623,13 @@ class _PoolBackedMemoryRepo:
         return memory_id
 
     async def find_active_duplicate_by_content_hash(
-        self, tx, *, owner_id, namespace, content_hash, cross_namespace=False,
+        self,
+        tx,
+        *,
+        owner_id,
+        namespace,
+        content_hash,
+        cross_namespace=False,
     ):
         rows = []
         for row in self._pool.state["memories"].values():
@@ -556,14 +676,16 @@ class _PoolBackedMemoryRepo:
                 continue
             rows.sort(key=lambda row: (row.get("created") or "", row.get("id") or ""))
             memory_ids = [row["id"] for row in rows]
-            result.append({
-                "owner_id": owner_id,
-                "namespace": ns,
-                "content_hash": content_hash,
-                "duplicate_count": len(memory_ids),
-                "memory_ids": memory_ids,
-                "canonical_id": memory_ids[0],
-            })
+            result.append(
+                {
+                    "owner_id": owner_id,
+                    "namespace": ns,
+                    "content_hash": content_hash,
+                    "duplicate_count": len(memory_ids),
+                    "memory_ids": memory_ids,
+                    "canonical_id": memory_ids[0],
+                }
+            )
         return result
 
     async def consolidate_duplicate_memories(self, tx, *, canonical_id, duplicate_ids):
@@ -615,6 +737,7 @@ class FakePoolBackedBackend:
         self._memories = _PoolBackedMemoryRepo(pool)
         self._webhooks = _FakeWebhookRepo()
         self._compression = _FakeCompressionRepo()
+        self._compression_queue = _FakeCompressionQueueRepo()
         self._kg_triples = _FakeRepo()
         self._memory_versions = _FakeRepo()
         self._memory_branches = _FakeRepo()
@@ -686,6 +809,7 @@ def install_fake_backend(monkeypatch, *, rls_enabled: bool = False) -> FakeBacke
     exercise cache invalidation can monkeypatch ``_cache`` themselves.
     """
     import mnemos.core.lifecycle as lc
+
     backend = FakeBackend()
     monkeypatch.setattr(lc, "_pool", None)
     monkeypatch.setattr(lc, "_persistence_backend", backend)
