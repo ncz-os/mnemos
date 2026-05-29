@@ -32,10 +32,13 @@ import urllib.request
 import urllib.error
 import signal
 
-HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.8:5005")
-AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
-HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
-CLAIM_JOBS = os.environ.get("CLAIM_JOBS", "0") == "1"
+from mnemos.core.config import get_settings
+
+_settings = get_settings().hive_mind
+HIVE_URL = _settings.system_hive_url
+AGENT_HOST = _settings.agent_host
+HEARTBEAT_INTERVAL = float(_settings.heartbeat_interval)
+CLAIM_JOBS = _settings.claim_jobs == "1"
 
 _urn: str = ""
 _running = True

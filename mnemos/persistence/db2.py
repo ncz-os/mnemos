@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import uuid
 from collections.abc import Sequence
@@ -30,6 +29,7 @@ from functools import lru_cache
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
+from mnemos.core.config import db2_vector_index_override
 from mnemos.persistence.oracle import (
     OracleAuditChainRepository,
     OracleBackend,
@@ -362,7 +362,7 @@ class _Db2AsyncConnectionPool:
                 continue
             if ";" in v or "=" in v and k != "PORT":
                 raise ValueError(
-                    f"DSN attribute {k} contains forbidden char (; or =); " "would allow CLI attribute injection."
+                    f"DSN attribute {k} contains forbidden char (; or =); would allow CLI attribute injection."
                 )
         dsn_string = ";".join(f"{k}={v}" for k, v in self._dsn_kwargs.items()) + ";"
         raw = await asyncio.to_thread(ibm_db_dbi.connect, dsn_string, "", "")
@@ -540,7 +540,7 @@ class _Db2NativeAsyncConnectionPool(_Db2AsyncConnectionPool):
                 continue
             if ";" in v or "=" in v and k != "PORT":
                 raise ValueError(
-                    f"DSN attribute {k} contains forbidden char (; or =); " "would allow CLI attribute injection."
+                    f"DSN attribute {k} contains forbidden char (; or =); would allow CLI attribute injection."
                 )
         dsn_string = ";".join(f"{k}={v}" for k, v in self._dsn_kwargs.items()) + ";"
         raw = await asyncio.to_thread(ibm_db_dbi.connect, dsn_string, "", "")
@@ -693,7 +693,7 @@ def _resolve_db2_vector_index_mode(settings: Any) -> str:
     ``settings.db2_vector_index`` attribute; both default to
     ``"approx"`` so a fresh deployment engages the DiskANN index.
     """
-    raw = os.environ.get(_DB2_VEC_INDEX_ENV)
+    raw = db2_vector_index_override()
     if raw is None and settings is not None:
         raw = getattr(settings, "db2_vector_index", None)
     if raw is None:
@@ -2548,7 +2548,7 @@ class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAudit
         try:
             await _call(
                 cursor.execute,
-                "SELECT provider FROM model_registry WHERE model_id = ? " "AND available = 1 AND deprecated = 0",
+                "SELECT provider FROM model_registry WHERE model_id = ? AND available = 1 AND deprecated = 0",
                 (model,),
             )
             rows = await _fetch_all_dicts(cursor)
@@ -2578,8 +2578,7 @@ class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAudit
         try:
             await _call(
                 cursor.execute,
-                "SELECT provider FROM model_registry WHERE model_id = ? "
-                "AND available = 1 AND deprecated = 0 LIMIT 1",
+                "SELECT provider FROM model_registry WHERE model_id = ? AND available = 1 AND deprecated = 0 LIMIT 1",
                 (model_id,),
             )
             row = await _fetch_all_dicts(cursor)
@@ -3266,12 +3265,10 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
             # See docs/v6.1-federation-embeddings-copy.md.
             embed_cols = ""
             if include_embedding:
-                from mnemos.core.config import get_settings as _gs
+                from mnemos.core.config import embed_http_model_override, get_settings as _gs
 
                 try:
-                    import os as _os
-
-                    _http_model = _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                    _http_model = embed_http_model_override()
                     _model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
                 except Exception:
                     _model = "unknown"
@@ -4200,8 +4197,7 @@ class Db2Backend(OracleBackend):
                     if not _is_missing_model_registry(exc):
                         raise
                     _LOG.warning(
-                        "usage_ledger model_registry table missing for provider=%s model=%s; "
-                        "recording est_cost_usd=0",
+                        "usage_ledger model_registry table missing for provider=%s model=%s; recording est_cost_usd=0",
                         record.provider,
                         record.model,
                     )
@@ -4309,7 +4305,7 @@ class Db2Backend(OracleBackend):
         """
         if self._pool is None:
             return
-        sql = "SELECT REG_VAR_VALUE FROM SYSIBMADM.REG_VARIABLES " "WHERE REG_VAR_NAME = 'DB2_VECTOR_INDEXING'"
+        sql = "SELECT REG_VAR_VALUE FROM SYSIBMADM.REG_VARIABLES WHERE REG_VAR_NAME = 'DB2_VECTOR_INDEXING'"
         value: str | None = None
         try:
             async with self._pool.acquire() as conn:

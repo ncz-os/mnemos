@@ -650,9 +650,7 @@ async def _store_memories(
     embed_dim_expected: Optional[int] = None
     if backend is not None:
         try:
-            import os as _os
-
-            from mnemos.core.config import get_settings as _gs
+            from mnemos.core.config import embed_http_model_override, get_settings as _gs
 
             _s = _gs()
             # Prefer the HTTP-backend model env knob when active; fall back
@@ -661,7 +659,7 @@ async def _store_memories(
             # (MEDUSA edge replica points at MEDUSA :8090 bge-m3 via
             # MNEMOS_EMBED_HTTP_MODEL=bge-m3).
             local_embed_model = (
-                _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                embed_http_model_override()
                 or (getattr(_s.providers, "inference_embed_model", "") or "").strip()
                 or None
             )

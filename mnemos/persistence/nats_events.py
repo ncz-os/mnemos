@@ -1,15 +1,15 @@
 """NATS v0.3 event helpers for persistence-owned data changes."""
+
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
 import json
 import logging
-import os
 import re
 from typing import Any, Mapping
 
-from mnemos.core.config import get_settings
+from mnemos.core.config import get_settings, nats_federation_enabled, nats_webhooks_enabled
 from mnemos.nats import client as nats_client
 from mnemos.nats import publisher as nats_publisher
 
@@ -18,10 +18,6 @@ logger = logging.getLogger("mnemos.persistence.nats_events")
 WEBHOOKS_OUTBOX_SUBJECT_PREFIX = "mnemos.webhooks.outbox"
 FEDERATION_MEMORY_SUBJECT_PREFIX = "mnemos.federation.memory"
 FEDERATION_MEMORY_SCHEMA_VERSION = "1"
-
-
-def _truthy_env(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 async def _publish_event(subject: str, payload: Mapping[str, Any], *, msg_id: str) -> None:
@@ -36,11 +32,11 @@ async def _publish_event(subject: str, payload: Mapping[str, Any], *, msg_id: st
 
 
 def webhooks_nats_enabled() -> bool:
-    return _truthy_env("MNEMOS_NATS_WEBHOOKS_ENABLED")
+    return nats_webhooks_enabled()
 
 
 def federation_nats_enabled() -> bool:
-    return _truthy_env("MNEMOS_NATS_FEDERATION_ENABLED")
+    return nats_federation_enabled()
 
 
 def safe_subject_segment(value: Any, *, default: str = "default") -> str:

@@ -24,7 +24,6 @@ Tools:
 
 from __future__ import annotations
 import json
-import os
 from typing import Any
 
 import httpx
@@ -36,9 +35,12 @@ from mcp.types import Tool, TextContent, Resource, Prompt
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
 
-HIVE_URL = os.environ.get("HIVE_URL", "http://127.0.0.1:5005")
-MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002")
-MNEMOS_TOKEN = os.environ.get("MNEMOS_TOKEN", "d3a3bc609583005f4a077b6ffd00154b4f03f70104d0cdbfbb019fceb28daca9")
+from mnemos.core.config import get_settings
+
+_settings = get_settings().hive_mind
+HIVE_URL = _settings.mcp_hive_url
+MNEMOS_URL = _settings.mcp_mnemos_url
+MNEMOS_TOKEN = _settings.mcp_mnemos_token
 
 server = Server("graeae-hive-mind")
 client = httpx.AsyncClient(timeout=15.0)
@@ -338,4 +340,4 @@ app = Starlette(
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "5006")))
+    uvicorn.run(app, host="0.0.0.0", port=_settings.mcp_port)

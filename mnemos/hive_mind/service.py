@@ -24,7 +24,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
+from mnemos.core.config import get_settings
+
+DB_PATH = get_settings().hive_mind.agent_bus_db
 
 # Phase 2 migration cut 1 (2026-05-23): storage abstraction. SQL methods
 # migrate into the repo one at a time; service-level helpers forward.
@@ -816,7 +818,7 @@ async def agent_throttle(urn_path: str):
     """Inspect an agent's plan-cap throttle state."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT urn, kind, runtime, auth_method, plan_cap_usd, plan_period_used_usd " "FROM agents WHERE urn=?",
+            "SELECT urn, kind, runtime, auth_method, plan_cap_usd, plan_period_used_usd FROM agents WHERE urn=?",
             (urn_path,),
         ) as cur:
             row = await cur.fetchone()
@@ -1533,8 +1535,7 @@ async def publish_message(req: MessagePublish):
     now = time.time()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO messages (id, from_urn, to_urn, in_reply_to, topic, payload, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (id, from_urn, to_urn, in_reply_to, topic, payload, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (msg_id, req.from_urn, req.to_urn, req.in_reply_to, req.topic, json.dumps(req.payload), now),
         )
         await db.commit()

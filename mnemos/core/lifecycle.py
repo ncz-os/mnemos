@@ -281,9 +281,9 @@ def _select_persistence_backend(settings) -> str:
         return _normalize_backend_name(configured)
     # Per-backend env var shortcuts: ORACLE_DSN / DB2_DSN override
     # explicit postgres connection defaults (host/port/user).
-    if os.environ.get("ORACLE_DSN", "").strip():
+    if getattr(database_settings, "oracle_dsn", "").strip():
         return "oracle"
-    if os.environ.get("DB2_DSN", "").strip():
+    if getattr(database_settings, "db2_dsn", "").strip():
         return "db2"
 
     if _has_explicit_postgres_connection_config(settings):
@@ -316,7 +316,9 @@ def _normalize_backend_name(configured: str) -> str:
         return "mysql"
     if configured == "auto":
         return "auto"
-    raise ValueError(f"Unsupported persistence backend {configured!r}; expected postgres, sqlite, oracle, db2, mysql, or auto")
+    raise ValueError(
+        f"Unsupported persistence backend {configured!r}; expected postgres, sqlite, oracle, db2, mysql, or auto"
+    )
 
 
 def _backend_from_database_url(database_url: str) -> str | None:
@@ -344,11 +346,11 @@ def _log_and_validate_backend_capabilities(backend_type: str, backend: object) -
         backend_type,
         ", ".join(sorted(capabilities)) if capabilities else "(none)",
     )
-    required = _parse_required_capabilities(os.environ.get("MNEMOS_REQUIRE_CAPABILITIES", ""))
+    required = _parse_required_capabilities(get_settings().database.required_capabilities)
     missing = required - capabilities
     if missing:
         raise RuntimeError(
-            "Persistence backend " f"{backend_type!r} missing required capabilities: {', '.join(sorted(missing))}"
+            f"Persistence backend {backend_type!r} missing required capabilities: {', '.join(sorted(missing))}"
         )
 
 

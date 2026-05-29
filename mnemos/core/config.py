@@ -12,6 +12,7 @@ Allowed exceptions to the ban are:
 from __future__ import annotations
 
 import os
+import socket
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,19 @@ _PROFILE_DEFAULT_TARGETS = {
     "auth_enabled": ("auth", "enabled"),
 }
 
+_DATABASE_INT_DEFAULTS = {
+    "oracle_pool_min": 2,
+    "oracle_pool_max": 10,
+    "oracle_pool_increment": 1,
+    "oracle_stmt_cache_size": 20,
+    "mysql_pool_min": 2,
+    "mysql_pool_max": 10,
+}
+_DATABASE_FLOAT_DEFAULTS = {
+    "oracle_pool_acquire_timeout": 60.0,
+    "mysql_connect_timeout": 10.0,
+}
+
 
 def _config_model_config(*, env_prefix: str = "", extra: str = "ignore") -> SettingsConfigDict:
     return SettingsConfigDict(
@@ -91,7 +105,7 @@ class _DatabaseSettings(BaseSettings):
         validation_alias=AliasChoices("MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL"),
     )
     sqlite_path: Path = Field(
-        default_factory=lambda: (Path.home() / ".mnemos" / "mnemos.db"),
+        default_factory=lambda: Path.home() / ".mnemos" / "mnemos.db",
         validation_alias=AliasChoices("MNEMOS_SQLITE_PATH", "SQLITE_DB_PATH", "PG_SQLITE_PATH"),
     )
     host: str = "localhost"
@@ -122,11 +136,70 @@ class _DatabaseSettings(BaseSettings):
             "at schema-init time; switching dim on a populated DB requires a re-embed."
         ),
     )
+    oracle_dsn: str = Field("", validation_alias="ORACLE_DSN")
+    db2_dsn: str = Field("", validation_alias="DB2_DSN")
+    required_capabilities: str = Field("", validation_alias="MNEMOS_REQUIRE_CAPABILITIES")
+    vector_dim_max: int = Field(4096, validation_alias="MNEMOS_VECTOR_DIM_MAX")
+    db2_vector_index: str = Field("approx", validation_alias="MNEMOS_DB2_VECTOR_INDEX")
+    oracle_pdb: str = Field("", validation_alias="MNEMOS_ORACLE_PDB")
+    oracle_thick: str = Field("", validation_alias="MNEMOS_ORACLE_THICK")
+    oracle_drcp: str = Field("", validation_alias="MNEMOS_ORACLE_DRCP")
+    oracle_pool_min: int = Field(2, validation_alias="MNEMOS_ORACLE_POOL_MIN")
+    oracle_pool_max: int = Field(10, validation_alias="MNEMOS_ORACLE_POOL_MAX")
+    oracle_pool_increment: int = Field(1, validation_alias="MNEMOS_ORACLE_POOL_INCREMENT")
+    oracle_stmt_cache_size: int = Field(20, validation_alias="MNEMOS_ORACLE_STMT_CACHE_SIZE")
+    oracle_pool_acquire_timeout: float = Field(60.0, validation_alias="MNEMOS_ORACLE_POOL_ACQUIRE_TIMEOUT")
+    mysql_pool_min: int = Field(2, validation_alias="MNEMOS_MYSQL_POOL_MIN")
+    mysql_pool_max: int = Field(10, validation_alias="MNEMOS_MYSQL_POOL_MAX")
+    mysql_connect_timeout: float = Field(10.0, validation_alias="MNEMOS_MYSQL_CONNECT_TIMEOUT")
 
     @field_validator("sqlite_path", mode="before")
     @classmethod
     def _expand_sqlite_path(cls, raw: Any) -> Path:
         return Path(raw).expanduser()
+
+    @field_validator("vector_dim_max", mode="before")
+    @classmethod
+    def _positive_vector_dim_cap(cls, raw: Any) -> int:
+        if raw is None or str(raw).strip() == "":
+            return 4096
+        try:
+            parsed = int(str(raw).strip())
+        except ValueError:
+            return 4096
+        return parsed if parsed > 0 else 4096
+
+    @field_validator(
+        "oracle_pool_min",
+        "oracle_pool_max",
+        "oracle_pool_increment",
+        "oracle_stmt_cache_size",
+        "mysql_pool_min",
+        "mysql_pool_max",
+        mode="before",
+    )
+    @classmethod
+    def _int_or_default(cls, raw: Any, info: Any) -> int:
+        field_name = getattr(info, "field_name", "")
+        default = _DATABASE_INT_DEFAULTS[field_name]
+        if raw is None or str(raw).strip() == "":
+            return default
+        try:
+            return int(str(raw).strip())
+        except ValueError:
+            return default
+
+    @field_validator("oracle_pool_acquire_timeout", "mysql_connect_timeout", mode="before")
+    @classmethod
+    def _float_or_default(cls, raw: Any, info: Any) -> float:
+        field_name = getattr(info, "field_name", "")
+        default = _DATABASE_FLOAT_DEFAULTS[field_name]
+        if raw is None or str(raw).strip() == "":
+            return default
+        try:
+            return float(str(raw).strip())
+        except ValueError:
+            return default
 
 
 class _GraeaeSettings(BaseSettings):
@@ -227,9 +300,8 @@ class _ProviderSettings(BaseSettings):
     gpu_provider_timeout: float = Field(30.0, validation_alias="GPU_PROVIDER_TIMEOUT")
     # Embedding generation is in-process — see mnemos/runtime/embedder.py.
     # Architectural decision mem_1779334716543_f8ebd4, operator-locked 2026-05-21.
-    # Fields below are retained for installer compatibility only and are no
-    # longer read by the runtime. New deployments should set MNEMOS_EMBED_*
-    # (model path / threads / gpu_layers) instead.
+    # Runtime embedding knobs. New deployments should set MNEMOS_EMBED_*
+    # (model path / threads / gpu_layers) rather than legacy INFERENCE_*.
     inference_embed_host: str = Field("", validation_alias="INFERENCE_EMBED_HOST")
     inference_embed_model: str = Field("", validation_alias="INFERENCE_EMBED_MODEL")
     inference_embed_timeout: float = Field(10.0, validation_alias="INFERENCE_EMBED_TIMEOUT")
@@ -238,8 +310,38 @@ class _ProviderSettings(BaseSettings):
         validation_alias="MNEMOS_EMBED_MODEL_PATH",
     )
     embed_n_ctx: int = Field(8192, validation_alias="MNEMOS_EMBED_N_CTX")
-    embed_threads: int = Field(0, validation_alias="MNEMOS_EMBED_THREADS")  # 0 = auto
+    embed_threads: int = Field(
+        default_factory=lambda: max(1, os.cpu_count() or 4),
+        validation_alias="MNEMOS_EMBED_THREADS",
+    )
     embed_gpu_layers: int = Field(0, validation_alias="MNEMOS_EMBED_GPU_LAYERS")
+    embed_backend: str = Field("auto", validation_alias="MNEMOS_EMBED_BACKEND")
+    embed_ov_model_id: str = Field("BAAI/bge-base-en-v1.5", validation_alias="MNEMOS_EMBED_OV_MODEL_ID")
+    embed_ov_device: str = Field("AUTO", validation_alias="MNEMOS_EMBED_OV_DEVICE")
+    embed_cix_model_path: str = Field(
+        "/opt/mnemos/models/bge-small-zh-v1.5_256.cix",
+        validation_alias="MNEMOS_EMBED_CIX_MODEL_PATH",
+    )
+    embed_cix_tokenizer_id: str = Field("BAAI/bge-small-zh-v1.5", validation_alias="MNEMOS_EMBED_CIX_TOKENIZER_ID")
+    embed_cix_max_seq_len: int = Field(256, validation_alias="MNEMOS_EMBED_CIX_MAX_SEQ_LEN")
+    embed_hybrid: str = Field("False", validation_alias="MNEMOS_EMBED_HYBRID")
+    embed_npu_threshold_chars: int = Field(1000, validation_alias="MNEMOS_EMBED_NPU_THRESHOLD_CHARS")
+    embed_http_url: str = Field("http://192.168.207.61:8090/v1/embeddings", validation_alias="MNEMOS_EMBED_HTTP_URL")
+    embed_http_url_fallback: str = Field(
+        "http://192.168.207.64:8090/v1/embeddings",
+        validation_alias="MNEMOS_EMBED_HTTP_URL_FALLBACK",
+    )
+    embed_http_model: str = Field("bge-m3", validation_alias="MNEMOS_EMBED_HTTP_MODEL")
+    embed_http_timeout: float = Field(30.0, validation_alias="MNEMOS_EMBED_HTTP_TIMEOUT")
+    embed_max_chars: int = Field(8000, validation_alias="MNEMOS_EMBED_MAX_CHARS")
+    reranker_url: str = Field("http://192.168.207.64:8091/v1/rerank", validation_alias="MNEMOS_RERANKER_URL")
+    reranker_model: str = Field("bge-reranker-v2-m3", validation_alias="MNEMOS_RERANKER_MODEL")
+    reranker_timeout_secs: str = Field("", validation_alias="MNEMOS_RERANKER_TIMEOUT_SECS")
+
+    @field_validator("embed_hybrid", "reranker_timeout_secs", mode="before")
+    @classmethod
+    def _stringify_raw_knob(cls, raw: Any) -> str:
+        return "" if raw is None else str(raw)
 
     def api_key_for(self, provider: str) -> str:
         keys = {
@@ -385,6 +487,12 @@ class _MorpheusSettings(BaseSettings):
     extract_min_confidence: float = Field(0.6, validation_alias="MNEMOS_MORPHEUS_EXTRACT_MIN_CONFIDENCE")
     extract_muse: str = Field("qwen3-7b", validation_alias="MNEMOS_MORPHEUS_EXTRACT_MUSE")
     extract_verifier: str = Field("openai", validation_alias="MNEMOS_MORPHEUS_EXTRACT_VERIFIER")
+    orphan_timeout_hours: str = Field("", validation_alias="MNEMOS_MORPHEUS_ORPHAN_TIMEOUT_HOURS")
+
+    @field_validator("orphan_timeout_hours", mode="before")
+    @classmethod
+    def _stringify_orphan_timeout(cls, raw: Any) -> str:
+        return "" if raw is None else str(raw)
 
 
 class _PersephoneSettings(BaseSettings):
@@ -422,6 +530,7 @@ class KronosSettings(BaseSettings):
     model_config = _config_model_config()
 
     enabled: bool = Field(False, validation_alias="MNEMOS_KRONOS_ENABLED")
+    backend: str = Field("auto", validation_alias="MNEMOS_KRONOS_BACKEND")
     default_sensitivity: float = Field(2.5, validation_alias="MNEMOS_KRONOS_SENSITIVITY")
     default_lookback_hours: int = Field(168, validation_alias="MNEMOS_KRONOS_LOOKBACK_HOURS")
     default_baseline_days: int = Field(30, validation_alias="MNEMOS_KRONOS_BASELINE_DAYS")
@@ -596,6 +705,8 @@ class _NatsSettings(BaseSettings):
     url: str | None = Field(None, validation_alias="MNEMOS_NATS_URL")
     token: str | None = Field(None, validation_alias="MNEMOS_NATS_TOKEN")
     node_name: str = Field("", validation_alias="MNEMOS_NODE_NAME")
+    webhooks_enabled: str = Field("", validation_alias="MNEMOS_NATS_WEBHOOKS_ENABLED")
+    federation_enabled: str = Field("", validation_alias="MNEMOS_NATS_FEDERATION_ENABLED")
     publish_pantheon_routing: bool = Field(
         False,
         validation_alias="MNEMOS_NATS_PUBLISH_PANTHEON_ROUTING",
@@ -617,6 +728,8 @@ class _NatsSettings(BaseSettings):
     # multi-replica case. Flip to a non-empty group name only after all
     # replicas understand it. (Audit Finding 5.)
     webhook_queue_group: str = Field("", validation_alias="MNEMOS_WEBHOOK_NATS_QUEUE_GROUP")
+    webhooks_queue_group: str = Field("", validation_alias="MNEMOS_NATS_WEBHOOKS_QUEUE_GROUP")
+    federation_queue_group: str = Field("", validation_alias="MNEMOS_NATS_FEDERATION_QUEUE_GROUP")
 
     @field_validator("publish_timeout_seconds", mode="before")
     @classmethod
@@ -626,6 +739,39 @@ class _NatsSettings(BaseSettings):
         except (TypeError, ValueError):
             return 1.0
         return value if value > 0 else 1.0
+
+
+class _AuditSettings(BaseSettings):
+    model_config = _config_model_config()
+
+    require_session_secret: str = Field("", validation_alias="MNEMOS_REQUIRE_SESSION_SECRET")
+    chain: str = Field("", validation_alias="MNEMOS_AUDIT_CHAIN")
+    root_private_key: str = Field("", validation_alias="MNEMOS_AUDIT_ROOT_PRIVKEY")
+
+
+class _HiveMindSettings(BaseSettings):
+    model_config = _config_model_config()
+
+    system_hive_url: str = Field("http://192.168.207.8:5005", validation_alias="HIVE_URL")
+    mcp_hive_url: str = Field("http://127.0.0.1:5005", validation_alias="HIVE_URL")
+    agent_host: str = Field(
+        default_factory=lambda: socket.gethostname().split(".")[0],
+        validation_alias="AGENT_HOST",
+    )
+    heartbeat_interval: float = Field(15.0, validation_alias="HEARTBEAT_INTERVAL")
+    claim_jobs: str = Field("0", validation_alias="CLAIM_JOBS")
+    mcp_mnemos_url: str = Field("http://192.168.207.67:5002", validation_alias="MNEMOS_URL")
+    mcp_mnemos_token: str = Field(
+        "d3a3bc609583005f4a077b6ffd00154b4f03f70104d0cdbfbb019fceb28daca9",
+        validation_alias="MNEMOS_TOKEN",
+    )
+    mcp_port: int = Field(5006, validation_alias="PORT")
+    agent_bus_db: str = Field("/srv/agent-bus/agents.db", validation_alias="AGENT_BUS_DB")
+
+    @field_validator("claim_jobs", mode="before")
+    @classmethod
+    def _stringify_claim_jobs(cls, raw: Any) -> str:
+        return "" if raw is None else str(raw)
 
 
 class Settings(BaseSettings):
@@ -655,6 +801,8 @@ class Settings(BaseSettings):
     tools: _ToolSettings
     logging: _LoggingSettings
     nats: _NatsSettings
+    audit: _AuditSettings
+    hive_mind: _HiveMindSettings
 
     @property
     def profile(self) -> str:
@@ -761,6 +909,8 @@ def _build_settings() -> Settings:
         "tools": _ToolSettings(**_toml_section(toml_config, "tools")),
         "logging": _LoggingSettings(**_toml_section(toml_config, "logging")),
         "nats": _NatsSettings(**_toml_section(toml_config, "nats")),
+        "audit": _AuditSettings(**_toml_section(toml_config, "audit")),
+        "hive_mind": _HiveMindSettings(**_toml_section(toml_config, "hive_mind")),
     }
     settings = Settings(
         database=groups["database"],
@@ -785,6 +935,8 @@ def _build_settings() -> Settings:
         tools=groups["tools"],
         logging=groups["logging"],
         nats=groups["nats"],
+        audit=groups["audit"],
+        hive_mind=groups["hive_mind"],
     )
     settings._explicit_fields = {
         group_name: set(group.model_fields_set)
@@ -887,6 +1039,48 @@ def set_profile_override(profile_value: str) -> Settings:
     os.environ["MNEMOS_PROFILE_OVERRIDE"] = profile_value
     os.environ["MNEMOS_PROFILE"] = profile_value
     return reload_settings()
+
+
+def runtime_env_value(name: str, default: str = "") -> str:
+    """Return a raw environment value for dynamic-name runtime accessors."""
+    return os.environ.get(name, default)
+
+
+def runtime_env_value_stripped(name: str, default: str = "") -> str:
+    """Return a stripped environment value for dynamic-name runtime accessors."""
+    return runtime_env_value(name, default).strip()
+
+
+def embed_http_model_override() -> str:
+    """Return the explicit MNEMOS_EMBED_HTTP_MODEL env override, if set."""
+    return runtime_env_value_stripped("MNEMOS_EMBED_HTTP_MODEL")
+
+
+def db2_vector_index_override() -> str | None:
+    """Return the raw Db2 vector-index env override, if present."""
+    if "MNEMOS_DB2_VECTOR_INDEX" not in os.environ:
+        return None
+    return os.environ.get("MNEMOS_DB2_VECTOR_INDEX")
+
+
+def nats_webhooks_enabled() -> bool:
+    """Return whether webhook outbox NATS publishing/consuming is enabled."""
+    return runtime_env_value_stripped("MNEMOS_NATS_WEBHOOKS_ENABLED").lower() in {"1", "true", "yes", "on"}
+
+
+def nats_federation_enabled() -> bool:
+    """Return whether federation memory NATS publishing/consuming is enabled."""
+    return runtime_env_value_stripped("MNEMOS_NATS_FEDERATION_ENABLED").lower() in {"1", "true", "yes", "on"}
+
+
+def session_secret_required() -> bool:
+    """Return whether startup must fail when MNEMOS_SESSION_SECRET is unset."""
+    return runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET").lower() in {"yes", "1", "true"}
+
+
+def audit_chain_enabled_flag() -> bool:
+    """Return whether MNEMOS_AUDIT_CHAIN enables audit-chain writes."""
+    return runtime_env_value("MNEMOS_AUDIT_CHAIN", "").lower() == "on"
 
 
 def connector_default_namespace() -> str | None:

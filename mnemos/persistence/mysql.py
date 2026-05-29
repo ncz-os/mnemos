@@ -43,12 +43,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-import os
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
+from mnemos.core.config import get_settings, runtime_env_value_stripped
 from mnemos.persistence.base import (
     BranchRepository,
     CompressionRepository,
@@ -68,7 +68,7 @@ from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
 _LOG = logging.getLogger(__name__)
 
-_DEFAULT_EMBEDDING_DIM = int(os.environ.get("MNEMOS_EMBEDDING_DIM", "768"))
+_DEFAULT_EMBEDDING_DIM = get_settings().database.embedding_dim
 _DEFAULT_MYSQL_POOL_MIN = 2
 _DEFAULT_MYSQL_POOL_MAX = 10
 _DEFAULT_MYSQL_ACQUIRE_TIMEOUT = 60.0
@@ -81,7 +81,7 @@ _VECTOR_COLUMN = f"VECTOR({_DEFAULT_EMBEDDING_DIM})"
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
+    raw = runtime_env_value_stripped(name)
     if not raw:
         return default
     try:
@@ -92,7 +92,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name, "").strip()
+    raw = runtime_env_value_stripped(name)
     if not raw:
         return default
     try:
@@ -1240,7 +1240,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                 await conn.commit()
         except Exception as exc:
             _LOG.warning(
-                "MysqlBackend.open probe failed (%s); backend remains open but first " "acquire() may also fail.",
+                "MysqlBackend.open probe failed (%s); backend remains open but first acquire() may also fail.",
                 exc,
             )
 
