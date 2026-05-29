@@ -25,11 +25,13 @@ import asyncpg
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import hot_rs_enabled
 from mnemos.core.native_accel import load_hot_rs
+from mnemos.core.recommendation import choose_recommended_model
 from mnemos.core.visibility import (
     read_visibility_predicate as _core_read_visibility_predicate,
+    version_visibility_predicate as _core_version_visibility_predicate,
 )
 from mnemos.db import eligibility as _eligibility
-from mnemos.db import mcp_repo, openai_compat_repo, portability_repo
+from mnemos.db import mcp_repo, openai_compat_repo, portability_repo  # noqa: F401
 from mnemos.persistence.base import (
     POSTGRES_CAPABILITY_DETAILS,
     AuditChainRepository,
@@ -385,7 +387,70 @@ class PostgresMemoryRepository(MemoryRepository):
         limit: int,
         user: UserContext,
     ) -> list[Row]:
-        return await mcp_repo.fetch_memory_log(_postgres_tx(tx).conn, memory_id, branch, limit, user)
+        conn = _postgres_tx(tx).conn
+        if user.role == "root":
+            anchor_scope = ""
+            recursive_scope = ""
+            params = (memory_id, branch, limit)
+        else:
+            vis_clause, vis_params = _core_version_visibility_predicate(
+                user.user_id,
+                start_param_idx=4,
+                table_alias="mv",
+            )
+            ns_ph = f"${len(vis_params) + 4}"
+            anchor_scope = f"AND {vis_clause} AND mv.namespace = {ns_ph}"
+            recursive_scope = f"AND {vis_clause} AND mv.namespace = {ns_ph}"
+            params = (memory_id, branch, limit, *vis_params, user.namespace)
+
+        rows = await conn.fetch(
+            f"""
+            WITH RECURSIVE commit_walk AS (
+                SELECT
+                    mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
+                    mv.version_num, mv.branch, mv.content, mv.category,
+                    mv.change_type, mv.snapshot_at, mv.snapshot_by,
+                    mv.owner_id, mv.namespace, mv.permission_mode,
+                    1 AS depth
+                FROM memory_versions mv
+                INNER JOIN memory_branches mb ON (
+                    mb.memory_id = mv.memory_id AND
+                    mb.name = $2 AND
+                    mb.head_version_id = mv.id
+                )
+                WHERE mv.memory_id = $1
+                  AND mv.deleted_at IS NULL
+                  AND mb.deleted_at IS NULL
+                  {anchor_scope}
+                UNION ALL
+                -- Same-memory predicate (mv.memory_id = cw.memory_id)
+                -- prevents corrupt parent_version_id from pulling another
+                -- memory's version into this memory's log. Mirrors the HTTP
+                -- log handler in api/routes/dag.py.
+                SELECT
+                    mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
+                    mv.version_num, mv.branch, mv.content, mv.category,
+                    mv.change_type, mv.snapshot_at, mv.snapshot_by,
+                    mv.owner_id, mv.namespace, mv.permission_mode,
+                    cw.depth + 1
+                FROM memory_versions mv
+                INNER JOIN commit_walk cw
+                    ON mv.id = cw.parent_version_id
+                   AND mv.memory_id = cw.memory_id
+                WHERE cw.depth < $3
+                  AND mv.deleted_at IS NULL
+                  {recursive_scope}
+            )
+            SELECT
+                commit_hash, version_num, branch, category, change_type,
+                snapshot_at, snapshot_by, owner_id, namespace, permission_mode
+            FROM commit_walk
+            ORDER BY depth ASC
+            LIMIT $3
+            """,
+            *params,
+        )
+        return list(rows)
 
     async def fetch_diff_commit_pair(
         self,
@@ -395,7 +460,32 @@ class PostgresMemoryRepository(MemoryRepository):
         commit_b: str,
         user: UserContext,
     ) -> tuple[Row | None, Row | None]:
-        return await mcp_repo.fetch_diff_commit_pair(_postgres_tx(tx).conn, memory_id, commit_a, commit_b, user)
+        conn = _postgres_tx(tx).conn
+        if user.role == "root":
+            base_sql = (
+                "SELECT content, version_num FROM memory_versions "
+                "WHERE memory_id = $1 AND commit_hash = $2 "
+                "AND deleted_at IS NULL"
+            )
+            return (
+                await conn.fetchrow(base_sql, memory_id, commit_a),
+                await conn.fetchrow(base_sql, memory_id, commit_b),
+            )
+
+        vis_clause, vis_params = _core_version_visibility_predicate(
+            user.user_id,
+            start_param_idx=3,
+        )
+        ns_ph = f"${len(vis_params) + 3}"
+        gated_sql = (
+            "SELECT content, version_num FROM memory_versions "
+            "WHERE memory_id = $1 AND commit_hash = $2 "
+            f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}"
+        )
+        return (
+            await conn.fetchrow(gated_sql, memory_id, commit_a, *vis_params, user.namespace),
+            await conn.fetchrow(gated_sql, memory_id, commit_b, *vis_params, user.namespace),
+        )
 
     async def fetch_checkout_commit(
         self,
@@ -404,7 +494,41 @@ class PostgresMemoryRepository(MemoryRepository):
         commit_hash: str,
         user: UserContext,
     ) -> Row | None:
-        return await mcp_repo.fetch_checkout_commit(_postgres_tx(tx).conn, memory_id, commit_hash, user)
+        conn = _postgres_tx(tx).conn
+        if user.role == "root":
+            return await conn.fetchrow(
+                """
+                SELECT
+                    commit_hash, version_num, branch, category, subcategory,
+                    content, change_type, snapshot_at, snapshot_by
+                FROM memory_versions
+                WHERE memory_id = $1 AND commit_hash = $2
+                  AND deleted_at IS NULL
+                """,
+                memory_id,
+                commit_hash,
+            )
+
+        vis_clause, vis_params = _core_version_visibility_predicate(
+            user.user_id,
+            start_param_idx=3,
+        )
+        ns_ph = f"${len(vis_params) + 3}"
+        return await conn.fetchrow(
+            f"""
+            SELECT
+                commit_hash, version_num, branch, category, subcategory,
+                content, change_type, snapshot_at, snapshot_by
+            FROM memory_versions
+            WHERE memory_id = $1 AND commit_hash = $2
+              AND deleted_at IS NULL
+              AND {vis_clause} AND namespace = {ns_ph}
+            """,
+            memory_id,
+            commit_hash,
+            *vis_params,
+            user.namespace,
+        )
 
     async def fetch_memory_export(
         self,
@@ -1199,7 +1323,184 @@ class PostgresBranchRepository(BranchRepository):
         from_commit: str | None,
         user: UserContext,
     ) -> dict[str, Any]:
-        return await mcp_repo.create_memory_branch(_postgres_tx(tx).conn, memory_id, name, from_commit, user)
+        conn = _postgres_tx(tx).conn
+
+        async def _fetch_branch_start_by_commit() -> Any | None:
+            if user.role == "root":
+                return await conn.fetchrow(
+                    "SELECT id, commit_hash FROM memory_versions "
+                    "WHERE memory_id = $1 AND commit_hash = $2 "
+                    "AND deleted_at IS NULL",
+                    memory_id,
+                    from_commit,
+                )
+
+            vis_clause, vis_params = _core_version_visibility_predicate(
+                user.user_id,
+                start_param_idx=3,
+            )
+            ns_ph = f"${len(vis_params) + 3}"
+            return await conn.fetchrow(
+                "SELECT id, commit_hash FROM memory_versions "
+                "WHERE memory_id = $1 AND commit_hash = $2 "
+                f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
+                memory_id,
+                from_commit,
+                *vis_params,
+                user.namespace,
+            )
+
+        async def _fetch_main_branch_start() -> Any | None:
+            if user.role == "root":
+                return await conn.fetchrow(
+                    """
+                    SELECT mv.id, mv.commit_hash
+                    FROM memory_versions mv
+                    INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
+                    WHERE mv.memory_id = $1 AND mb.name = 'main'
+                      AND mv.deleted_at IS NULL
+                      AND mb.deleted_at IS NULL
+                    """,
+                    memory_id,
+                )
+
+            vis_clause, vis_params = _core_version_visibility_predicate(
+                user.user_id,
+                start_param_idx=2,
+                table_alias="mv",
+            )
+            ns_ph = f"${len(vis_params) + 2}"
+            return await conn.fetchrow(
+                f"""
+                SELECT mv.id, mv.commit_hash
+                FROM memory_versions mv
+                INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
+                WHERE mv.memory_id = $1 AND mb.name = 'main'
+                  AND mv.deleted_at IS NULL
+                  AND mb.deleted_at IS NULL
+                  AND {vis_clause} AND mv.namespace = {ns_ph}
+                """,
+                memory_id,
+                *vis_params,
+                user.namespace,
+            )
+
+        async def _fetch_existing_branch() -> Any | None:
+            if user.role == "root":
+                return await conn.fetchrow(
+                    "SELECT mb.head_version_id, mv.commit_hash "
+                    "FROM memory_branches mb "
+                    "INNER JOIN memory_versions mv "
+                    "    ON mv.id = mb.head_version_id "
+                    "   AND mv.memory_id = mb.memory_id "
+                    "WHERE mb.memory_id = $1 AND mb.name = $2 "
+                    "AND mb.deleted_at IS NULL AND mv.deleted_at IS NULL",
+                    memory_id,
+                    name,
+                )
+
+            vis_clause, vis_params = _core_version_visibility_predicate(
+                user.user_id,
+                start_param_idx=3,
+                table_alias="mv",
+            )
+            ns_ph = f"${len(vis_params) + 3}"
+            return await conn.fetchrow(
+                "SELECT mb.head_version_id, mv.commit_hash "
+                "FROM memory_branches mb "
+                "INNER JOIN memory_versions mv "
+                "    ON mv.id = mb.head_version_id "
+                "   AND mv.memory_id = mb.memory_id "
+                f"   AND {vis_clause} "
+                f"   AND mv.namespace = {ns_ph} "
+                "WHERE mb.memory_id = $1 AND mb.name = $2 "
+                "AND mb.deleted_at IS NULL AND mv.deleted_at IS NULL",
+                memory_id,
+                name,
+                *vis_params,
+                user.namespace,
+            )
+
+        async def _handle_existing_branch(start: Any) -> dict[str, Any]:
+            existing = await _fetch_existing_branch()
+            if existing is None:
+                return {
+                    "success": False,
+                    "error": (
+                        "branch exists but its head is not visible "
+                        "or points at a foreign memory version; "
+                        "reconciliation required"
+                    ),
+                }
+
+            head_matches = existing["head_version_id"] == start["id"]
+            if from_commit is None or head_matches:
+                return {
+                    "success": True,
+                    "memory_id": memory_id,
+                    "branch": name,
+                    "commit_hash": existing["commit_hash"],
+                    "created_by": user.user_id,
+                    "idempotent": True,
+                }
+
+            return {
+                "success": False,
+                "error": ("branch already exists at a different head; " "refusing to silently move it"),
+            }
+
+        async with conn.transaction():
+            # Lock the live memory row for the duration of the transaction.
+            # This closes the TOCTOU between auth check and branch insert.
+            if user.role == "root":
+                live = await conn.fetchrow(
+                    "SELECT 1 FROM memories " "WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
+                    memory_id,
+                )
+            else:
+                live = await conn.fetchrow(
+                    "SELECT 1 FROM memories WHERE id = $1 "
+                    "AND deleted_at IS NULL "
+                    "AND owner_id = $2 AND namespace = $3 FOR SHARE",
+                    memory_id,
+                    user.user_id,
+                    user.namespace,
+                )
+            if not live:
+                return {"success": False, "error": "Memory not found"}
+
+            if from_commit:
+                start = await _fetch_branch_start_by_commit()
+                if not start:
+                    return {"success": False, "error": "Commit not found"}
+            else:
+                start = await _fetch_main_branch_start()
+                if not start:
+                    return {"success": False, "error": "main branch not found"}
+
+            inserted = await conn.fetchrow(
+                """
+                INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (memory_id, name) DO NOTHING
+                RETURNING head_version_id
+                """,
+                memory_id,
+                name,
+                start["id"],
+                user.user_id,
+            )
+
+        if inserted is None:
+            return await _handle_existing_branch(start)
+
+        return {
+            "success": True,
+            "memory_id": memory_id,
+            "branch": name,
+            "commit_hash": start["commit_hash"],
+            "created_by": user.user_id,
+        }
 
     async def delete_memory_branches_for_memories(self, tx: Transaction, memory_ids: Sequence[str]) -> None:
         await portability_repo.delete_memory_branches_for_memories(_postgres_tx(tx).conn, memory_ids)
@@ -1652,7 +1953,21 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
         cost_budget: float,
         quality_floor: float,
     ) -> tuple[dict[str, Any] | None, list[str]]:
-        return await mcp_repo.fetch_recommended_model(_postgres_tx(tx).conn, task_type, cost_budget, quality_floor)
+        conn = _postgres_tx(tx).conn
+        rows = await conn.fetch(
+            """
+            SELECT
+                provider, model_id, display_name,
+                capabilities,
+                input_cost_per_mtok, output_cost_per_mtok,
+                COALESCE(graeae_weight, 0) AS graeae_weight,
+                context_window
+            FROM model_registry
+            WHERE available = true
+            AND deprecated = false
+            """
+        )
+        return choose_recommended_model(list(rows), task_type, cost_budget, quality_floor)
 
     async def fetch_model_recommendation(
         self,
