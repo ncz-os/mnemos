@@ -21,10 +21,10 @@ Tools:
   mnemos.memory_create      -> POST /memories
   mnemos.memory_get         -> GET /memories/{id}
 """
+
 from __future__ import annotations
 import json
 import os
-import sys
 from typing import Any
 
 import httpx
@@ -62,119 +62,189 @@ async def _mnemos(method: str, path: str, **kw) -> dict:
 
 # ---------- tool definitions ----------
 
+
 @server.list_tools()
 async def handle_list_tools() -> list[Tool]:
     return [
-        Tool(name="hive.agent_list", description="List registered agents in the GRAEAE Hive Mind.",
-             inputSchema={"type": "object", "properties": {"kind": {"type": "string"}, "status": {"type": "string"}}}),
-        Tool(name="hive.agent_register",
-             description="Register this session as an agent in the Hive. Returns urn + session_id.",
-             inputSchema={"type": "object",
-                          "properties": {
-                              "kind": {"type": "string", "description": "claude/goose/opencode/codex/zeroclaw/openclaw/hermes/ic-engine/mnemos/human"},
-                              "host": {"type": "string"},
-                              "capabilities": {"type": "array", "items": {"type": "string"}},
-                              "version": {"type": "string"},
-                              "metadata": {"type": "object"},
-                          }, "required": ["kind", "host"]}),
-        Tool(name="hive.job_create",
-             description="Submit work into the Hive Mind triage queue. Eligible agents self-claim.",
-             inputSchema={"type": "object",
-                          "properties": {
-                              "submitter_urn": {"type": "string"},
-                              "kind": {"type": "string"},
-                              "description": {"type": "string"},
-                              "priority": {"type": "integer", "default": 0},
-                              "required_capabilities": {"type": "array", "items": {"type": "string"}},
-                              "eligible_kinds": {"type": "array", "items": {"type": "string"}},
-                              "deadline": {"type": "number"},
-                              "parent_job_id": {"type": "string"},
-                          }, "required": ["submitter_urn", "kind"]}),
-        Tool(name="hive.job_next",
-             description="Atomic dequeue: claim highest-priority eligible job for this agent. Returns job or {204: no work}.",
-             inputSchema={"type": "object",
-                          "properties": {"agent_urn": {"type": "string"}},
-                          "required": ["agent_urn"]}),
-        Tool(name="hive.job_list",
-             description="List jobs in the Hive. Filter by status/agent/since.",
-             inputSchema={"type": "object",
-                          "properties": {
-                              "status": {"type": "string"},
-                              "agent_urn": {"type": "string"},
-                              "since": {"type": "number"},
-                              "limit": {"type": "integer", "default": 100},
-                          }}),
-        Tool(name="hive.job_update",
-             description="Update job status/result. Status: queued/claimed/running/done/failed/cancelled.",
-             inputSchema={"type": "object",
-                          "properties": {
-                              "id": {"type": "string"},
-                              "status": {"type": "string"},
-                              "result": {"type": "object"},
-                              "claimed_by": {"type": "string"},
-                          }, "required": ["id", "status"]}),
-        Tool(name="hive.message_publish",
-             description="Publish a Hive message. to_urn=null for broadcast.",
-             inputSchema={"type": "object",
-                          "properties": {
-                              "from_urn": {"type": "string"},
-                              "to_urn": {"type": "string"},
-                              "topic": {"type": "string"},
-                              "payload": {"type": "object"},
-                              "in_reply_to": {"type": "string"},
-                          }, "required": ["from_urn", "topic", "payload"]}),
-        Tool(name="hive.message_list",
-             description="List Hive messages. Filter by recipient/topic.",
-             inputSchema={"type": "object",
-                          "properties": {
-                              "to_urn": {"type": "string"},
-                              "topic": {"type": "string"},
-                              "since": {"type": "number"},
-                              "limit": {"type": "integer", "default": 100},
-                          }}),
-        Tool(name="mnemos.memory_search",
-             description="Search MNEMOS memory (PYTHIA). Semantic+keyword.",
-             inputSchema={"type": "object",
-                          "properties": {
-                              "query": {"type": "string"},
-                              "category": {"type": "string"},
-                              "limit": {"type": "integer", "default": 10},
-                              "min_score": {"type": "number"},
-                          }, "required": ["query"]}),
-        Tool(name="mnemos.memory_create",
-             description="Save a memory to MNEMOS. Category: infrastructure/solutions/patterns/decisions/projects/standards.",
-             inputSchema={"type": "object",
-                          "properties": {
-                              "content": {"type": "string"},
-                              "category": {"type": "string"},
-                              "tags": {"type": "array", "items": {"type": "string"}},
-                          }, "required": ["content", "category"]}),
-        Tool(name="mnemos.memory_get",
-             description="Get a MNEMOS memory by id (mem_XXX).",
-             inputSchema={"type": "object",
-                          "properties": {"id": {"type": "string"}}, "required": ["id"]}),
-        Tool(name="graeae.consult",
-             description="Submit a multi-LLM consensus consultation to GRAEAE (PYTHIA). Modes: auto/single/all/debate/majority.",
-             inputSchema={"type": "object",
-                          "properties": {
-                              "prompt": {"type": "string"},
-                              "task_type": {"type": "string", "description": "reasoning/architecture_design/code_generation/web_search"},
-                              "mode": {"type": "string", "enum": ["auto","local","external","all","single","debate","majority"], "default": "auto"},
-                              "models": {"type": "array", "items": {"type": "string"}, "description": "explicit model list (overrides mode)"},
-                              "limit_chars": {"type": "integer"},
-                              "format": {"type": "string", "default": "full"},
-                          }, "required": ["prompt"]}),
-        Tool(name="graeae.muses",
-             description="List available GRAEAE muses (LLM providers + models).",
-             inputSchema={"type": "object", "properties": {}}),
-        Tool(name="graeae.modes",
-             description="List GRAEAE consultation modes + their descriptions.",
-             inputSchema={"type": "object", "properties": {}}),
-        Tool(name="graeae.get",
-             description="Get a previous GRAEAE consultation by id.",
-             inputSchema={"type": "object",
-                          "properties": {"consultation_id": {"type": "string"}},
-                          "required": ["consultation_id"]}),
+        Tool(
+            name="hive.agent_list",
+            description="List registered agents in the GRAEAE Hive Mind.",
+            inputSchema={"type": "object", "properties": {"kind": {"type": "string"}, "status": {"type": "string"}}},
+        ),
+        Tool(
+            name="hive.agent_register",
+            description="Register this session as an agent in the Hive. Returns urn + session_id.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "description": "claude/goose/opencode/codex/zeroclaw/openclaw/hermes/ic-engine/mnemos/human",
+                    },
+                    "host": {"type": "string"},
+                    "capabilities": {"type": "array", "items": {"type": "string"}},
+                    "version": {"type": "string"},
+                    "metadata": {"type": "object"},
+                },
+                "required": ["kind", "host"],
+            },
+        ),
+        Tool(
+            name="hive.job_create",
+            description="Submit work into the Hive Mind triage queue. Eligible agents self-claim.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "submitter_urn": {"type": "string"},
+                    "kind": {"type": "string"},
+                    "description": {"type": "string"},
+                    "priority": {"type": "integer", "default": 0},
+                    "required_capabilities": {"type": "array", "items": {"type": "string"}},
+                    "eligible_kinds": {"type": "array", "items": {"type": "string"}},
+                    "deadline": {"type": "number"},
+                    "parent_job_id": {"type": "string"},
+                },
+                "required": ["submitter_urn", "kind"],
+            },
+        ),
+        Tool(
+            name="hive.job_next",
+            description="Atomic dequeue: claim highest-priority eligible job for this agent. Returns job or {204: no work}.",
+            inputSchema={"type": "object", "properties": {"agent_urn": {"type": "string"}}, "required": ["agent_urn"]},
+        ),
+        Tool(
+            name="hive.job_list",
+            description="List jobs in the Hive. Filter by status/agent/since.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "agent_urn": {"type": "string"},
+                    "since": {"type": "number"},
+                    "limit": {"type": "integer", "default": 100},
+                },
+            },
+        ),
+        Tool(
+            name="hive.job_update",
+            description="Update job status/result. Status: queued/claimed/running/done/failed/cancelled.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "status": {"type": "string"},
+                    "result": {"type": "object"},
+                    "claimed_by": {"type": "string"},
+                },
+                "required": ["id", "status"],
+            },
+        ),
+        Tool(
+            name="hive.message_publish",
+            description="Publish a Hive message. to_urn=null for broadcast.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "from_urn": {"type": "string"},
+                    "to_urn": {"type": "string"},
+                    "topic": {"type": "string"},
+                    "payload": {"type": "object"},
+                    "in_reply_to": {"type": "string"},
+                },
+                "required": ["from_urn", "topic", "payload"],
+            },
+        ),
+        Tool(
+            name="hive.message_list",
+            description="List Hive messages. Filter by recipient/topic.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "to_urn": {"type": "string"},
+                    "topic": {"type": "string"},
+                    "since": {"type": "number"},
+                    "limit": {"type": "integer", "default": 100},
+                },
+            },
+        ),
+        Tool(
+            name="mnemos.memory_search",
+            description="Search MNEMOS memory (PYTHIA). Semantic+keyword.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "category": {"type": "string"},
+                    "limit": {"type": "integer", "default": 10},
+                    "min_score": {"type": "number"},
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="mnemos.memory_create",
+            description="Save a memory to MNEMOS. Category: infrastructure/solutions/patterns/decisions/projects/standards.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string"},
+                    "category": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["content", "category"],
+            },
+        ),
+        Tool(
+            name="mnemos.memory_get",
+            description="Get a MNEMOS memory by id (mem_XXX).",
+            inputSchema={"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+        ),
+        Tool(
+            name="graeae.consult",
+            description="Submit a multi-LLM consensus consultation to GRAEAE (PYTHIA). Modes: auto/single/all/debate/majority.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "task_type": {
+                        "type": "string",
+                        "description": "reasoning/architecture_design/code_generation/web_search",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "local", "external", "all", "single", "debate", "majority"],
+                        "default": "auto",
+                    },
+                    "models": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "explicit model list (overrides mode)",
+                    },
+                    "limit_chars": {"type": "integer"},
+                    "format": {"type": "string", "default": "full"},
+                },
+                "required": ["prompt"],
+            },
+        ),
+        Tool(
+            name="graeae.muses",
+            description="List available GRAEAE muses (LLM providers + models).",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="graeae.modes",
+            description="List GRAEAE consultation modes + their descriptions.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="graeae.get",
+            description="Get a previous GRAEAE consultation by id.",
+            inputSchema={
+                "type": "object",
+                "properties": {"consultation_id": {"type": "string"}},
+                "required": ["consultation_id"],
+            },
+        ),
     ]
 
 
@@ -216,7 +286,12 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
             return [TextContent(type="text", text=json.dumps({"error": f"unknown tool: {name}"}))]
         return [TextContent(type="text", text=json.dumps(r, default=str))]
     except httpx.HTTPStatusError as e:
-        return [TextContent(type="text", text=json.dumps({"error": str(e), "status": e.response.status_code, "body": e.response.text[:500]}))]
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps({"error": str(e), "status": e.response.status_code, "body": e.response.text[:500]}),
+            )
+        ]
     except Exception as e:
         return [TextContent(type="text", text=json.dumps({"error": type(e).__name__, "msg": str(e)}))]
 
@@ -240,7 +315,8 @@ sse = SseServerTransport("/messages/")
 async def handle_sse(request):
     async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
         await server.run(
-            read_stream, write_stream,
+            read_stream,
+            write_stream,
             InitializationOptions(
                 server_name="graeae-hive-mind",
                 server_version="0.1.0",
