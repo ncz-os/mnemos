@@ -58,6 +58,7 @@ def test_enqueue_rejects_unknown_reason(reason):
     values are rejected at parse time (FastAPI surfaces this as
     422). Test now exercises the Pydantic-level rejection."""
     from pydantic import ValidationError
+
     with pytest.raises(ValidationError) as exc:
         CompressionEnqueueRequest(memory_ids=["mem-1"], reason=reason)
     assert "reason" in str(exc.value).lower()
@@ -70,6 +71,7 @@ def test_enqueue_rejects_unknown_reason(reason):
 def test_enqueue_rejects_unknown_scoring_profile(profile):
     """#170: scoring_profile is now Literal[...] on the model."""
     from pydantic import ValidationError
+
     with pytest.raises(ValidationError) as exc:
         CompressionEnqueueRequest(memory_ids=["mem-1"], scoring_profile=profile)
     assert "scoring_profile" in str(exc.value).lower()
@@ -102,6 +104,7 @@ async def test_enqueue_accepts_every_documented_reason(fake_pool):
 def test_enqueue_all_rejects_unknown_reason():
     """#170: reason is now Literal[...] — Pydantic auto-422s at parse."""
     from pydantic import ValidationError
+
     with pytest.raises(ValidationError):
         CompressionEnqueueAllRequest(reason="yolo")
 
@@ -109,57 +112,89 @@ def test_enqueue_all_rejects_unknown_reason():
 def test_enqueue_all_rejects_unknown_scoring_profile():
     """#170: scoring_profile is now Literal[...]."""
     from pydantic import ValidationError
+
     with pytest.raises(ValidationError):
         CompressionEnqueueAllRequest(scoring_profile="yolo")
 
 
 @pytest.mark.asyncio
-async def test_enqueue_all_bulk_sql_honors_only_uncompressed(fake_pool):
-    # Watch the SQL that gets executed so operators can trust what the
-    # flag actually does: only_uncompressed=True → NOT EXISTS subquery;
-    # only_uncompressed=False → no variant filter.
-    conn = MagicMock()
-    conn.execute = AsyncMock(return_value="INSERT 0 42")
-    fake_pool.acquire = MagicMock(return_value=_AsyncContext(conn))
+async def test_enqueue_all_delegates_to_queue_abc(fake_pool):
+    # job 019e7049 CHILD C-admin: the route now delegates to the
+    # backend.compression_queue ABC (works on Postgres + Oracle). Pin
+    # that it surfaces the ABC's count in the response.
+    from mnemos.core import lifecycle as _lc
 
-    # Only-uncompressed ON — should reference memory_compressed_variants
+    _lc._persistence_backend._compression_queue.configure_return("enqueue_all_compression", 42)
     resp = await compression_enqueue_all(
         request=CompressionEnqueueAllRequest(only_uncompressed=True, limit=100),
         _=None,
     )
     assert resp.enqueued == 42
-    sql_called = conn.execute.call_args.args[0]
-    assert "memory_compressed_variants" in sql_called
-    assert "NOT EXISTS" in sql_called
 
-    # Only-uncompressed OFF — must NOT reference variants filter
-    conn.execute.reset_mock()
-    conn.execute = AsyncMock(return_value="INSERT 0 100")
-    fake_pool.acquire = MagicMock(return_value=_AsyncContext(conn))
-    resp = await compression_enqueue_all(
-        request=CompressionEnqueueAllRequest(only_uncompressed=False, limit=100),
-        _=None,
+
+# ---- enqueue-all SQL behaviour now lives on the PG queue repo --------------
+# The only_uncompressed / category-bind guarantees moved out of the route
+# (which delegates to the ABC) into PostgresCompressionQueueRepository, so
+# they are pinned at that layer here.
+
+
+def _pg_repo_and_conn():
+    from mnemos.persistence.postgres import (
+        PostgresCompressionQueueRepository,
+        PostgresTransaction,
     )
-    assert resp.enqueued == 100
-    sql_called = conn.execute.call_args.args[0]
-    assert "memory_compressed_variants" not in sql_called
+
+    conn = MagicMock()
+    conn.execute = AsyncMock(return_value="INSERT 0 42")
+    tx = PostgresTransaction(conn, MagicMock())
+    return PostgresCompressionQueueRepository(), tx, conn
 
 
 @pytest.mark.asyncio
-async def test_enqueue_all_category_filter_param_bound(fake_pool):
-    conn = MagicMock()
-    conn.execute = AsyncMock(return_value="INSERT 0 3")
-    fake_pool.acquire = MagicMock(return_value=_AsyncContext(conn))
+async def test_pg_enqueue_all_honors_only_uncompressed():
+    repo, tx, conn = _pg_repo_and_conn()
 
-    req = CompressionEnqueueAllRequest(category="solutions", limit=10)
-    resp = await compression_enqueue_all(request=req, _=None)
-    assert resp.enqueued == 3
+    await repo.enqueue_all_compression(
+        tx,
+        reason="manual",
+        priority=0,
+        scoring_profile="balanced",
+        category=None,
+        only_uncompressed=True,
+        limit=100,
+    )
+    sql_on = conn.execute.call_args.args[0]
+    assert "memory_compressed_variants" in sql_on
+    assert "NOT EXISTS" in sql_on
 
-    # The category filter must be passed as a bind parameter, not
-    # string-interpolated (SQLi guard). Check that the literal
-    # "solutions" doesn't appear in the SQL text but is in the bind
-    # args.
-    call = conn.execute.call_args
-    sql, *args = call.args
+    conn.execute.reset_mock()
+    await repo.enqueue_all_compression(
+        tx,
+        reason="manual",
+        priority=0,
+        scoring_profile="balanced",
+        category=None,
+        only_uncompressed=False,
+        limit=100,
+    )
+    sql_off = conn.execute.call_args.args[0]
+    assert "memory_compressed_variants" not in sql_off
+
+
+@pytest.mark.asyncio
+async def test_pg_enqueue_all_category_filter_param_bound():
+    repo, tx, conn = _pg_repo_and_conn()
+
+    await repo.enqueue_all_compression(
+        tx,
+        reason="manual",
+        priority=0,
+        scoring_profile="balanced",
+        category="solutions",
+        only_uncompressed=True,
+        limit=10,
+    )
+    # category must be bound, not string-interpolated (SQLi guard).
+    sql, *args = conn.execute.call_args.args
     assert "solutions" not in sql, "category must be bound, not interpolated"
     assert "solutions" in args
