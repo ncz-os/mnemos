@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field, field_validator
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.core.config import get_settings
-from mnemos.db.mcp_audit_repo import VALID_OUTCOMES, insert_audit_record
+from mnemos.domain.mcp_audit_repo import VALID_OUTCOMES, insert_audit_record
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/internal", tags=["internal"])
@@ -77,21 +77,19 @@ def _validate_parameter_shape(value: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("parameter_shape must be an object")
     if len(value) > _MAX_PARAMETER_SHAPE_KEYS:
-        raise ValueError(f"parameter_shape has too many keys " f"(max {_MAX_PARAMETER_SHAPE_KEYS})")
+        raise ValueError(f"parameter_shape has too many keys (max {_MAX_PARAMETER_SHAPE_KEYS})")
     for key, entry in value.items():
         if not isinstance(key, str):
             raise ValueError("parameter_shape keys must be strings")
         if len(key) > _MAX_PARAMETER_SHAPE_KEY_LENGTH:
-            raise ValueError(
-                f"parameter_shape key {key[:32]!r} exceeds max length " f"({_MAX_PARAMETER_SHAPE_KEY_LENGTH})"
-            )
+            raise ValueError(f"parameter_shape key {key[:32]!r} exceeds max length ({_MAX_PARAMETER_SHAPE_KEY_LENGTH})")
         if not isinstance(entry, dict):
             raise ValueError(f"parameter_shape[{key}] must be an object")
         # Allowed entry keys: type (required), length, count, item_types.
         allowed = {"type", "length", "count", "item_types"}
         extra = set(entry) - allowed
         if extra:
-            raise ValueError(f"parameter_shape[{key}] has unexpected fields: " f"{sorted(extra)}")
+            raise ValueError(f"parameter_shape[{key}] has unexpected fields: {sorted(extra)}")
         type_name = entry.get("type")
         if not isinstance(type_name, str):
             raise ValueError(f"parameter_shape[{key}].type must be a string")
@@ -101,8 +99,7 @@ def _validate_parameter_shape(value: Dict[str, Any]) -> Dict[str, Any]:
         # JSON primitive type names + a few Python type names.
         if type_name not in _ALLOWED_SHAPE_TYPE_NAMES:
             raise ValueError(
-                f"parameter_shape[{key}].type {type_name!r} is not in "
-                f"the allowed type allowlist (raw values forbidden)"
+                f"parameter_shape[{key}].type {type_name!r} is not in the allowed type allowlist (raw values forbidden)"
             )
         if "length" in entry and not isinstance(entry["length"], int):
             raise ValueError(f"parameter_shape[{key}].length must be int")
@@ -120,7 +117,7 @@ def _validate_parameter_shape(value: Dict[str, Any]) -> Dict[str, Any]:
                 # Round-3: same closed allowlist applies to item_types.
                 if item not in _ALLOWED_SHAPE_TYPE_NAMES:
                     raise ValueError(
-                        f"parameter_shape[{key}].item_types entry {item!r} " f"is not in the allowed type allowlist"
+                        f"parameter_shape[{key}].item_types entry {item!r} is not in the allowed type allowlist"
                     )
     return value
 
@@ -135,7 +132,7 @@ class MCPAuditRequest(BaseModel):
     @classmethod
     def _valid_outcome(cls, v: str) -> str:
         if v not in VALID_OUTCOMES:
-            raise ValueError(f"invalid outcome {v!r}; expected one of: " f"{sorted(VALID_OUTCOMES)}")
+            raise ValueError(f"invalid outcome {v!r}; expected one of: {sorted(VALID_OUTCOMES)}")
         return v
 
     @field_validator("parameter_shape")

@@ -29,9 +29,7 @@ def test_mcp_audit_log_migration_in_postgres_list():
 
     assert "migrations_v5_3_4_mcp_audit_log.sql" in EXPECTED_MIGRATIONS
     repo_root = Path(__file__).resolve().parents[1]
-    assert (
-        repo_root / "db" / "migrations_v5_3_4_mcp_audit_log.sql"
-    ).exists()
+    assert (repo_root / "db" / "migrations_v5_3_4_mcp_audit_log.sql").exists()
 
 
 def test_mcp_audit_log_migration_in_sqlite_list():
@@ -39,15 +37,9 @@ def test_mcp_audit_log_migration_in_sqlite_list():
     from pathlib import Path
     from tests.test_migration_lists_sync import EXPECTED_SQLITE_MIGRATIONS
 
-    assert (
-        "migrations_v5_3_4_mcp_audit_log_sqlite.sql"
-        in EXPECTED_SQLITE_MIGRATIONS
-    )
+    assert "migrations_v5_3_4_mcp_audit_log_sqlite.sql" in EXPECTED_SQLITE_MIGRATIONS
     repo_root = Path(__file__).resolve().parents[1]
-    assert (
-        repo_root / "db" / "migrations_sqlite"
-        / "migrations_v5_3_4_mcp_audit_log_sqlite.sql"
-    ).exists()
+    assert (repo_root / "db" / "migrations_sqlite" / "migrations_v5_3_4_mcp_audit_log_sqlite.sql").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +68,7 @@ class _StubSqliteConn:
 
 
 def test_insert_audit_record_writes_via_postgres_conn():
-    from mnemos.db.mcp_audit_repo import insert_audit_record
+    from mnemos.domain.mcp_audit_repo import insert_audit_record
 
     conn = _StubPgConn()
 
@@ -110,7 +102,7 @@ def test_insert_audit_record_writes_via_postgres_conn():
 def test_insert_audit_record_skips_sqlite_conn():
     """SQLite installs keep the logger-only behavior. Mirrors the
     deletion_log postgres-only writer pattern."""
-    from mnemos.db.mcp_audit_repo import insert_audit_record
+    from mnemos.domain.mcp_audit_repo import insert_audit_record
 
     conn = _StubSqliteConn()
 
@@ -130,7 +122,7 @@ def test_insert_audit_record_skips_sqlite_conn():
 
 
 def test_insert_audit_record_skips_none_conn():
-    from mnemos.db.mcp_audit_repo import insert_audit_record
+    from mnemos.domain.mcp_audit_repo import insert_audit_record
 
     async def run():
         return await insert_audit_record(
@@ -147,7 +139,7 @@ def test_insert_audit_record_skips_none_conn():
 
 
 def test_insert_audit_record_rejects_invalid_outcome():
-    from mnemos.db.mcp_audit_repo import insert_audit_record
+    from mnemos.domain.mcp_audit_repo import insert_audit_record
 
     conn = _StubPgConn()
 
@@ -178,7 +170,7 @@ def test_insert_audit_record_accepts_each_valid_outcome(outcome):
     (rate-limit "denied"), #156 (context-mismatch "denied"), and
     #157 (handler-failure "failure") could regress if the schema
     or repo validation drifted out of sync with the dispatcher."""
-    from mnemos.db.mcp_audit_repo import insert_audit_record
+    from mnemos.domain.mcp_audit_repo import insert_audit_record
 
     conn = _StubPgConn()
 
@@ -202,7 +194,7 @@ def test_insert_audit_record_accepts_each_valid_outcome(outcome):
 
 
 def test_insert_audit_record_includes_error_class():
-    from mnemos.db.mcp_audit_repo import insert_audit_record
+    from mnemos.domain.mcp_audit_repo import insert_audit_record
 
     conn = _StubPgConn()
 
@@ -232,10 +224,7 @@ def test_postgres_migration_creates_mcp_audit_log_table():
     """Schema includes the table + indexes + outcome CHECK."""
     from pathlib import Path
 
-    sql = (
-        Path(__file__).resolve().parents[1]
-        / "db" / "migrations_v5_3_4_mcp_audit_log.sql"
-    ).read_text()
+    sql = (Path(__file__).resolve().parents[1] / "db" / "migrations_v5_3_4_mcp_audit_log.sql").read_text()
     assert "CREATE TABLE IF NOT EXISTS mcp_audit_log" in sql
     assert "parameter_shape JSONB NOT NULL DEFAULT '{}'::jsonb" in sql
     # Outcome CHECK constraint matches VALID_OUTCOMES in the repo.
@@ -252,9 +241,7 @@ def test_sqlite_migration_creates_parallel_table():
     from pathlib import Path
 
     sql = (
-        Path(__file__).resolve().parents[1]
-        / "db" / "migrations_sqlite"
-        / "migrations_v5_3_4_mcp_audit_log_sqlite.sql"
+        Path(__file__).resolve().parents[1] / "db" / "migrations_sqlite" / "migrations_v5_3_4_mcp_audit_log_sqlite.sql"
     ).read_text()
     assert "CREATE TABLE IF NOT EXISTS mcp_audit_log" in sql
     # Same outcome CHECK, sqlite version stores parameter_shape as TEXT.
@@ -280,7 +267,7 @@ def test_log_tool_audit_schedules_persist_when_loop_running(monkeypatch):
         return True
 
     monkeypatch.setattr(
-        "mnemos.db.mcp_audit_repo.persist_audit_record",
+        "mnemos.domain.mcp_audit_repo.persist_audit_record",
         fake_persist,
     )
 
@@ -303,9 +290,7 @@ def test_log_tool_audit_schedules_persist_when_loop_running(monkeypatch):
     assert record["tool"] == "search_memories"
     assert record["outcome"] == "success"
     # parameter_shape is the redacted shape, not raw values.
-    assert record["parameter_shape"] == {
-        "query": {"type": "str", "length": 3}
-    }
+    assert record["parameter_shape"] == {"query": {"type": "str", "length": 3}}
 
 
 def test_log_tool_audit_no_running_loop_does_not_raise(monkeypatch):
@@ -321,7 +306,7 @@ def test_log_tool_audit_no_running_loop_does_not_raise(monkeypatch):
         return True
 
     monkeypatch.setattr(
-        "mnemos.db.mcp_audit_repo.persist_audit_record",
+        "mnemos.domain.mcp_audit_repo.persist_audit_record",
         fake_persist,
     )
 
@@ -348,7 +333,7 @@ def test_log_root_bypass_schedules_persist_with_root_bypass_outcome(monkeypatch)
         return True
 
     monkeypatch.setattr(
-        "mnemos.db.mcp_audit_repo.persist_audit_record",
+        "mnemos.domain.mcp_audit_repo.persist_audit_record",
         fake_persist,
     )
 
@@ -369,7 +354,7 @@ def test_log_root_bypass_schedules_persist_with_root_bypass_outcome(monkeypatch)
 def test_persist_audit_record_via_pool_returns_false_when_no_pool(monkeypatch):
     """Pool unavailable → silently False. Audit failures must never
     propagate to the tool dispatcher."""
-    from mnemos.db.mcp_audit_repo import persist_audit_record_via_pool
+    from mnemos.domain.mcp_audit_repo import persist_audit_record_via_pool
 
     def raise_no_pool():
         raise RuntimeError("pool not initialized")
@@ -404,7 +389,7 @@ def test_persist_audit_record_falls_back_to_http_when_pool_unavailable(monkeypat
     persist_audit_record must fall back to httpx POST against
     /v1/internal/mcp_audit. The bridge's own bearer token authenticates."""
     import mnemos.core.lifecycle as _lc
-    import mnemos.db.mcp_audit_repo as repo
+    import mnemos.domain.mcp_audit_repo as repo
 
     def raise_no_pool():
         raise RuntimeError("pool not initialized")
@@ -433,6 +418,7 @@ def test_persist_audit_record_falls_back_to_http_when_pool_unavailable(monkeypat
             return _StubResponse()
 
     import httpx
+
     monkeypatch.setattr(httpx, "AsyncClient", _StubClient)
 
     # Stub settings to point at a known base + token.
@@ -444,9 +430,7 @@ def test_persist_audit_record_falls_back_to_http_when_pool_unavailable(monkeypat
     class _StubSettings:
         server = _StubServer()
 
-    monkeypatch.setattr(
-        "mnemos.core.config.get_settings", lambda: _StubSettings()
-    )
+    monkeypatch.setattr("mnemos.core.config.get_settings", lambda: _StubSettings())
 
     async def run():
         return await repo.persist_audit_record(
@@ -467,14 +451,12 @@ def test_persist_audit_record_falls_back_to_http_when_pool_unavailable(monkeypat
     assert "role" not in captured["json"]
     assert captured["json"]["tool"] == "search_memories"
     assert captured["json"]["outcome"] == "success"
-    assert captured["json"]["parameter_shape"] == {
-        "query": {"type": "str", "length": 5}
-    }
+    assert captured["json"]["parameter_shape"] == {"query": {"type": "str", "length": 5}}
 
 
 def test_persist_audit_record_via_http_skips_when_no_base(monkeypatch):
     """No MNEMOS_BASE → http path is a no-op (silent False)."""
-    import mnemos.db.mcp_audit_repo as repo
+    import mnemos.domain.mcp_audit_repo as repo
 
     class _EmptyServer:
         base = ""
@@ -484,9 +466,7 @@ def test_persist_audit_record_via_http_skips_when_no_base(monkeypatch):
     class _EmptySettings:
         server = _EmptyServer()
 
-    monkeypatch.setattr(
-        "mnemos.core.config.get_settings", lambda: _EmptySettings()
-    )
+    monkeypatch.setattr("mnemos.core.config.get_settings", lambda: _EmptySettings())
 
     async def run():
         return await repo.persist_audit_record_via_http(
@@ -501,7 +481,7 @@ def test_persist_audit_record_via_http_skips_when_no_base(monkeypatch):
 
 def test_persist_audit_record_via_http_skips_when_no_token(monkeypatch):
     """No MNEMOS_API_KEY → http path is a no-op."""
-    import mnemos.db.mcp_audit_repo as repo
+    import mnemos.domain.mcp_audit_repo as repo
 
     class _EmptyServer:
         base = "http://localhost:5002"
@@ -511,9 +491,7 @@ def test_persist_audit_record_via_http_skips_when_no_token(monkeypatch):
     class _EmptySettings:
         server = _EmptyServer()
 
-    monkeypatch.setattr(
-        "mnemos.core.config.get_settings", lambda: _EmptySettings()
-    )
+    monkeypatch.setattr("mnemos.core.config.get_settings", lambda: _EmptySettings())
 
     async def run():
         return await repo.persist_audit_record_via_http(
@@ -528,7 +506,7 @@ def test_persist_audit_record_via_http_skips_when_no_token(monkeypatch):
 
 def test_persist_audit_record_via_http_swallows_post_errors(monkeypatch):
     """httpx errors must NOT propagate — audit failures break tools otherwise."""
-    import mnemos.db.mcp_audit_repo as repo
+    import mnemos.domain.mcp_audit_repo as repo
 
     class _StubServer:
         base = "http://localhost:5002"
@@ -538,9 +516,7 @@ def test_persist_audit_record_via_http_swallows_post_errors(monkeypatch):
     class _StubSettings:
         server = _StubServer()
 
-    monkeypatch.setattr(
-        "mnemos.core.config.get_settings", lambda: _StubSettings()
-    )
+    monkeypatch.setattr("mnemos.core.config.get_settings", lambda: _StubSettings())
 
     class _BoomClient:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -556,6 +532,7 @@ def test_persist_audit_record_via_http_swallows_post_errors(monkeypatch):
             raise ConnectionError("API unreachable")
 
     import httpx
+
     monkeypatch.setattr(httpx, "AsyncClient", _BoomClient)
 
     async def run():
@@ -606,7 +583,7 @@ def test_persist_audit_record_via_http_prefers_mcp_backend_context_api_key(monke
     sets the active backend api_key in MCP context. The httpx fallback
     must use that context's key, not settings.server.api_key (which
     would either be empty or a global key)."""
-    import mnemos.db.mcp_audit_repo as repo
+    import mnemos.domain.mcp_audit_repo as repo
     import mnemos.mcp.tools._runtime as _runtime
 
     captured: dict[str, Any] = {}
@@ -629,6 +606,7 @@ def test_persist_audit_record_via_http_prefers_mcp_backend_context_api_key(monke
             return _StubResponse()
 
     import httpx
+
     monkeypatch.setattr(httpx, "AsyncClient", _StubClient)
 
     # No global api_key — per-user MCP mode shape.
@@ -640,9 +618,7 @@ def test_persist_audit_record_via_http_prefers_mcp_backend_context_api_key(monke
     class _StubSettings:
         server = _StubServer()
 
-    monkeypatch.setattr(
-        "mnemos.core.config.get_settings", lambda: _StubSettings()
-    )
+    monkeypatch.setattr("mnemos.core.config.get_settings", lambda: _StubSettings())
 
     # Set the per-call MCP backend context to a per-user api_key.
     tokens = _runtime.set_mcp_backend_context(
@@ -652,6 +628,7 @@ def test_persist_audit_record_via_http_prefers_mcp_backend_context_api_key(monke
         namespace="alice-ns",
     )
     try:
+
         async def run():
             return await repo.persist_audit_record_via_http(
                 tool="search_memories",
@@ -683,12 +660,14 @@ def test_mcp_audit_route_rejects_nested_dict_in_shape():
     from mnemos.api.routes.mcp_audit import _validate_parameter_shape
 
     with pytest.raises(ValueError) as exc_info:
-        _validate_parameter_shape({
-            "query": {
-                "type": "str",
-                "secret": "hidden-value",  # NOT in allowed entry keys
+        _validate_parameter_shape(
+            {
+                "query": {
+                    "type": "str",
+                    "secret": "hidden-value",  # NOT in allowed entry keys
+                }
             }
-        })
+        )
     assert "unexpected fields" in str(exc_info.value)
 
 
@@ -739,9 +718,7 @@ def test_mcp_audit_route_rejects_too_many_item_types():
 
     too_many = ["str"] * (_MAX_PARAMETER_SHAPE_ITEM_TYPES + 1)
     with pytest.raises(ValueError) as exc_info:
-        _validate_parameter_shape({
-            "tags": {"type": "list", "count": 0, "item_types": too_many}
-        })
+        _validate_parameter_shape({"tags": {"type": "list", "count": 0, "item_types": too_many}})
     assert "item_types too long" in str(exc_info.value)
 
 
@@ -754,9 +731,7 @@ def test_mcp_audit_route_accepts_item_types_at_max_length():
 
     items = ["str"] * _MAX_PARAMETER_SHAPE_ITEM_TYPES
     # Must not raise.
-    _validate_parameter_shape({
-        "tags": {"type": "list", "count": 0, "item_types": items}
-    })
+    _validate_parameter_shape({"tags": {"type": "list", "count": 0, "item_types": items}})
 
 
 def test_mcp_audit_route_no_dead_type_name_length_constant():
@@ -779,12 +754,14 @@ def test_mcp_audit_route_accepts_valid_shape_from_mcp_parameter_shape():
     from mnemos.api.routes.mcp_audit import _validate_parameter_shape
     from mnemos.mcp.tools._security import _mcp_parameter_shape
 
-    shape = _mcp_parameter_shape({
-        "query": "hello",
-        "limit": 10,
-        "tags": ["a", "b", "c"],
-        "config": {"nested": "value"},
-    })
+    shape = _mcp_parameter_shape(
+        {
+            "query": "hello",
+            "limit": 10,
+            "tags": ["a", "b", "c"],
+            "config": {"nested": "value"},
+        }
+    )
     # Must not raise.
     result = _validate_parameter_shape(shape)
     assert result == shape
@@ -796,10 +773,7 @@ def test_postgres_migration_grants_insert_to_runtime_role():
     silently fail with permission denied."""
     from pathlib import Path
 
-    sql = (
-        Path(__file__).resolve().parents[1]
-        / "db" / "migrations_v5_3_4_mcp_audit_log.sql"
-    ).read_text()
+    sql = (Path(__file__).resolve().parents[1] / "db" / "migrations_v5_3_4_mcp_audit_log.sql").read_text()
     assert "GRANT SELECT, INSERT ON mcp_audit_log TO mnemos_user" in sql
     # Idempotent: only granted if role exists.
     assert "FROM pg_roles WHERE rolname = 'mnemos_user'" in sql
@@ -827,9 +801,7 @@ def test_mcp_audit_route_rejects_raw_value_in_type_field():
     from mnemos.api.routes.mcp_audit import _validate_parameter_shape
 
     with pytest.raises(ValueError) as exc_info:
-        _validate_parameter_shape({
-            "api_key": {"type": "sk_live_secret"}
-        })
+        _validate_parameter_shape({"api_key": {"type": "sk_live_secret"}})
     assert "not in the allowed type allowlist" in str(exc_info.value)
 
 
@@ -838,13 +810,15 @@ def test_mcp_audit_route_rejects_raw_value_in_item_types():
     from mnemos.api.routes.mcp_audit import _validate_parameter_shape
 
     with pytest.raises(ValueError) as exc_info:
-        _validate_parameter_shape({
-            "tags": {
-                "type": "list",
-                "count": 1,
-                "item_types": ["raw-secret-value"],
+        _validate_parameter_shape(
+            {
+                "tags": {
+                    "type": "list",
+                    "count": 1,
+                    "item_types": ["raw-secret-value"],
+                }
             }
-        })
+        )
     assert "not in the allowed type allowlist" in str(exc_info.value)
 
 
@@ -853,8 +827,18 @@ def test_mcp_audit_route_accepts_all_allowlist_type_names():
     from mnemos.api.routes.mcp_audit import _validate_parameter_shape
 
     for type_name in (
-        "str", "bool", "int", "float", "list", "dict", "none",
-        "bytes", "tuple", "set", "frozenset", "NoneType",
+        "str",
+        "bool",
+        "int",
+        "float",
+        "list",
+        "dict",
+        "none",
+        "bytes",
+        "tuple",
+        "set",
+        "frozenset",
+        "NoneType",
     ):
         # Must not raise.
         _validate_parameter_shape({"k": {"type": type_name}})
@@ -899,9 +883,7 @@ def test_internal_audit_token_required_when_configured(monkeypatch):
     assert exc_info.value.status_code == 401
 
     # Correct token → returns None (no raise).
-    result = _require_internal_audit_token(
-        x_mnemos_audit_token="secret-bridge-token"
-    )
+    result = _require_internal_audit_token(x_mnemos_audit_token="secret-bridge-token")
     assert result is None
 
 
@@ -926,16 +908,14 @@ def test_internal_audit_token_unset_falls_back_to_legacy(monkeypatch):
     result = _require_internal_audit_token(x_mnemos_audit_token=None)
     assert result is None
     # Even a wrong header is ignored in legacy mode.
-    result = _require_internal_audit_token(
-        x_mnemos_audit_token="anything"
-    )
+    result = _require_internal_audit_token(x_mnemos_audit_token="anything")
     assert result is None
 
 
 def test_persist_audit_record_via_http_includes_audit_token_when_configured(monkeypatch):
     """The bridge-side httpx writer includes X-Mnemos-Audit-Token
     when the service-only credential is configured."""
-    import mnemos.db.mcp_audit_repo as repo
+    import mnemos.domain.mcp_audit_repo as repo
 
     captured: dict[str, Any] = {}
 
@@ -957,6 +937,7 @@ def test_persist_audit_record_via_http_includes_audit_token_when_configured(monk
             return _StubResponse()
 
     import httpx
+
     monkeypatch.setattr(httpx, "AsyncClient", _StubClient)
 
     class _StubServer:
@@ -967,9 +948,7 @@ def test_persist_audit_record_via_http_includes_audit_token_when_configured(monk
     class _StubSettings:
         server = _StubServer()
 
-    monkeypatch.setattr(
-        "mnemos.core.config.get_settings", lambda: _StubSettings()
-    )
+    monkeypatch.setattr("mnemos.core.config.get_settings", lambda: _StubSettings())
 
     async def run():
         return await repo.persist_audit_record_via_http(
@@ -988,7 +967,7 @@ def test_persist_audit_record_via_http_includes_audit_token_when_configured(monk
 def test_persist_audit_record_via_http_omits_audit_token_when_not_configured(monkeypatch):
     """When token is unset, no X-Mnemos-Audit-Token header is sent
     (matching legacy mode on the route side)."""
-    import mnemos.db.mcp_audit_repo as repo
+    import mnemos.domain.mcp_audit_repo as repo
 
     captured: dict[str, Any] = {}
 
@@ -1010,6 +989,7 @@ def test_persist_audit_record_via_http_omits_audit_token_when_not_configured(mon
             return _StubResponse()
 
     import httpx
+
     monkeypatch.setattr(httpx, "AsyncClient", _StubClient)
 
     class _StubServer:
@@ -1020,9 +1000,7 @@ def test_persist_audit_record_via_http_omits_audit_token_when_not_configured(mon
     class _StubSettings:
         server = _StubServer()
 
-    monkeypatch.setattr(
-        "mnemos.core.config.get_settings", lambda: _StubSettings()
-    )
+    monkeypatch.setattr("mnemos.core.config.get_settings", lambda: _StubSettings())
 
     async def run():
         return await repo.persist_audit_record_via_http(
@@ -1057,7 +1035,7 @@ def test_schedule_audit_persist_tracks_inflight_task(monkeypatch):
         return True
 
     monkeypatch.setattr(
-        "mnemos.db.mcp_audit_repo.persist_audit_record",
+        "mnemos.domain.mcp_audit_repo.persist_audit_record",
         slow_persist,
     )
 
@@ -1106,7 +1084,7 @@ def test_drain_pending_audit_tasks_handles_timeout(monkeypatch):
         return True
 
     monkeypatch.setattr(
-        "mnemos.db.mcp_audit_repo.persist_audit_record",
+        "mnemos.domain.mcp_audit_repo.persist_audit_record",
         never_finishes,
     )
 
@@ -1147,7 +1125,7 @@ def test_schedule_audit_persist_bounded_backlog(monkeypatch, caplog):
         return True
 
     monkeypatch.setattr(
-        "mnemos.db.mcp_audit_repo.persist_audit_record",
+        "mnemos.domain.mcp_audit_repo.persist_audit_record",
         stuck_persist,
     )
     caplog.set_level(_logging.WARNING, logger="mnemos.mcp.audit")
@@ -1189,10 +1167,9 @@ def test_schedule_audit_persist_bounded_backlog(monkeypatch, caplog):
     # rows are being dropped (the table-row loss is silent at the
     # repo layer; the only signal is this warning).
     backlog_warnings = [
-        rec.message for rec in caplog.records
-        if rec.levelno >= _logging.WARNING
-        and "inflight backlog" in rec.message
-        and "dropping persist" in rec.message
+        rec.message
+        for rec in caplog.records
+        if rec.levelno >= _logging.WARNING and "inflight backlog" in rec.message and "dropping persist" in rec.message
     ]
     assert backlog_warnings, (
         f"expected an inflight-backlog warning when _MAX_INFLIGHT_AUDIT_TASKS "
@@ -1239,11 +1216,9 @@ def test_stdio_transport_logs_drained_count():
 
     src = inspect.getsource(stdio.main)
     # Capture return value and gate on truthiness.
-    assert "drained = await drain_pending_audit_tasks" in src or \
-           "drained=await drain_pending_audit_tasks" in src, (
-        "expected `drained = await drain_pending_audit_tasks(...)` "
-        "to capture the return value"
-    )
+    assert (
+        "drained = await drain_pending_audit_tasks" in src or "drained=await drain_pending_audit_tasks" in src
+    ), "expected `drained = await drain_pending_audit_tasks(...)` to capture the return value"
     assert "if drained:" in src
     # Round-2 of #163: stdio's basicConfig sets WARNING level, so
     # logger.info would be suppressed. logger.warning is required so
@@ -1268,10 +1243,7 @@ def test_http_transport_registers_drain_on_shutdown():
     the context manager's exit."""
     from pathlib import Path
 
-    src = (
-        Path(__file__).resolve().parents[1]
-        / "mnemos" / "mcp" / "http.py"
-    ).read_text()
+    src = (Path(__file__).resolve().parents[1] / "mnemos" / "mcp" / "http.py").read_text()
     assert "_drain_audit_tasks_on_shutdown" in src
     # Pre-Starlette-1.0 shape was `on_shutdown=[...]`; current is
     # the lifespan context manager `_mcp_http_lifespan` that

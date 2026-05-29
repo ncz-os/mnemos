@@ -7,7 +7,7 @@ import textwrap
 import pytest
 
 from mnemos.api.routes import admin
-from mnemos.db.admin_lifecycle_repo import AdminLifecycleRepository
+from mnemos.domain.admin_lifecycle_repo import AdminLifecycleRepository
 
 
 LIFECYCLE_ENDPOINTS = [
@@ -69,10 +69,7 @@ def _call_names(func) -> set[str]:
 
 
 def test_admin_lifecycle_route_inventory_is_registered():
-    routes = {
-        (tuple(sorted(route.methods or ())), route.path)
-        for route in admin.router.routes
-    }
+    routes = {(tuple(sorted(route.methods or ())), route.path) for route in admin.router.routes}
     assert EXPECTED_LIFECYCLE_ROUTES <= routes
 
 

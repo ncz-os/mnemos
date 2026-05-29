@@ -76,7 +76,7 @@ import logging
 from collections import Counter
 from typing import Any, Dict, Optional, Sequence
 
-from mnemos.db.eligibility import eligible_for_compression
+from mnemos.core.eligibility import eligible_for_compression
 
 from .base import CompressionEngine, CompressionRequest, IdentifierPolicy
 from .contest import run_contest
@@ -117,7 +117,7 @@ _MEMORY_CONTENT_SQL = f"""
 SELECT id, content, category, task_type
 FROM memories
 WHERE id = $1
-  AND {eligible_for_compression('', reject_private_parent=True)}
+  AND {eligible_for_compression("", reject_private_parent=True)}
 """
 
 _MARK_DONE_SQL = """
@@ -331,10 +331,7 @@ def _candidate_error_details(outcome: Any) -> list[str]:
 
 def _format_no_winner_error(outcome: Any) -> str:
     reasons = Counter(c.reject_reason or "unknown" for c in outcome.candidates)
-    reason_summary = ", ".join(
-        f"{reason}={count}"
-        for reason, count in reasons.most_common()
-    )
+    reason_summary = ", ".join(f"{reason}={count}" for reason, count in reasons.most_common())
     error = f"no winner: {reason_summary}"
     engine_errors = _candidate_error_details(outcome)
     if engine_errors:
@@ -343,7 +340,9 @@ def _format_no_winner_error(outcome: Any) -> str:
 
 
 async def _reset_rows_for_infra_retry(
-    pool: Any, queue_ids: Sequence[Any], error_marker: str,
+    pool: Any,
+    queue_ids: Sequence[Any],
+    error_marker: str,
 ) -> None:
     """Reset multiple 'running' queue rows to 'pending' in one
     UPDATE so a mid-batch infrastructure error does NOT consume
@@ -365,14 +364,17 @@ async def _reset_rows_for_infra_retry(
     try:
         async with pool.acquire() as conn:
             await conn.execute(
-                _INFRA_RESET_BATCH_SQL, list(queue_ids), error_marker,
+                _INFRA_RESET_BATCH_SQL,
+                list(queue_ids),
+                error_marker,
             )
     except Exception as reset_exc:
         if is_infrastructure_error(reset_exc):
             logger.warning(
                 "contest_queue: infra-reset acquire timed out (%s) for "
                 "%d row(s); rows left at 'running' for stale-recovery",
-                type(reset_exc).__name__, len(queue_ids),
+                type(reset_exc).__name__,
+                len(queue_ids),
             )
         else:
             logger.exception(
@@ -419,24 +421,24 @@ async def _sweep_stale_running(
     counts: Counter[str] = Counter()
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            _SWEEP_STALE_SQL, int(stale_threshold_secs), int(max_attempts)
-        )
+        rows = await conn.fetch(_SWEEP_STALE_SQL, int(stale_threshold_secs), int(max_attempts))
 
     for row in rows:
         if row["status"] == "pending":
             counts["stranded_reset"] += 1
             logger.warning(
-                "contest_queue sweep: row %s reset to pending "
-                "(attempts=%d, exceeded %ds stale threshold)",
-                row["id"], row["attempts"], stale_threshold_secs,
+                "contest_queue sweep: row %s reset to pending (attempts=%d, exceeded %ds stale threshold)",
+                row["id"],
+                row["attempts"],
+                stale_threshold_secs,
             )
         else:  # 'failed'
             counts["stranded_failed"] += 1
             logger.warning(
-                "contest_queue sweep: row %s marked failed "
-                "(attempts=%d >= max, exceeded %ds stale threshold)",
-                row["id"], row["attempts"], stale_threshold_secs,
+                "contest_queue sweep: row %s marked failed (attempts=%d >= max, exceeded %ds stale threshold)",
+                row["id"],
+                row["attempts"],
+                stale_threshold_secs,
             )
 
     return dict(counts)
@@ -543,7 +545,9 @@ async def process_contest_queue(
                 counts["failed"] += 1
                 logger.warning(
                     "contest_queue[%s]: skipped, attempts=%d > max=%d",
-                    memory_id, attempts, max_attempts,
+                    memory_id,
+                    attempts,
+                    max_attempts,
                 )
                 continue
 
@@ -567,9 +571,7 @@ async def process_contest_queue(
                     # runs once at a single site rather than at every
                     # acquire boundary.
                     raise
-                logger.exception(
-                    "contest_queue[%s]: unhandled exception", memory_id
-                )
+                logger.exception("contest_queue[%s]: unhandled exception", memory_id)
                 # Content / contest error: mark this row failed.
                 # If THAT acquire is itself an infra error, raise
                 # to the outer handler (which then resets the tail
@@ -586,9 +588,9 @@ async def process_contest_queue(
                 except Exception as mark_exc:
                     if is_infrastructure_error(mark_exc):
                         logger.warning(
-                            "contest_queue[%s]: failed-mark acquire timed out "
-                            "(%s); re-raising for tail reset",
-                            memory_id, type(mark_exc).__name__,
+                            "contest_queue[%s]: failed-mark acquire timed out (%s); re-raising for tail reset",
+                            memory_id,
+                            type(mark_exc).__name__,
                         )
                         raise mark_exc from inner_exc
                     raise
@@ -601,14 +603,15 @@ async def process_contest_queue(
                     "%s; resetting %d unprocessed row(s) (current + %d "
                     "tail) for retry without consuming attempts budget, "
                     "then re-raising",
-                    memory_id, type(outer_exc).__name__,
-                    len(tail_ids), len(tail_ids) - 1,
+                    memory_id,
+                    type(outer_exc).__name__,
+                    len(tail_ids),
+                    len(tail_ids) - 1,
                 )
                 await _reset_rows_for_infra_retry(
                     pool,
                     tail_ids,
-                    f"infra_retry: {type(outer_exc).__name__}: "
-                    f"{str(outer_exc)[:200]}",
+                    f"infra_retry: {type(outer_exc).__name__}: {str(outer_exc)[:200]}",
                 )
                 counts["infra_errors"] += 1
                 raise
@@ -674,7 +677,9 @@ async def _process_one(
         counts["failed"] += 1
         logger.info(
             "contest_queue[%s]: skipped, content %d chars < threshold %d",
-            memory_id, content_len, min_content_length,
+            memory_id,
+            content_len,
+            min_content_length,
         )
         return
 
@@ -690,8 +695,7 @@ async def _process_one(
         outcome = await run_contest(_guard_engines(engines), request, judge=judge)
     except Exception as exc:
         logger.warning(
-            "contest_queue[%s]: compression contest raised %s: %s; "
-            "marking row failed",
+            "contest_queue[%s]: compression contest raised %s: %s; marking row failed",
             memory_id,
             type(exc).__name__,
             exc,
@@ -723,11 +727,7 @@ async def _process_one(
         async with pool.acquire() as conn:
             async with conn.transaction():
                 cur = await conn.fetchrow(_PRECONDITION_SQL, queue_id)
-                if (
-                    cur is None
-                    or cur["status"] != "running"
-                    or cur["attempts"] != expected_attempts
-                ):
+                if cur is None or cur["status"] != "running" or cur["attempts"] != expected_attempts:
                     logger.info(
                         "contest_queue[%s]: abandoning work — row no longer "
                         "owned (status=%s, attempts=%s, expected=%d); "
@@ -777,14 +777,13 @@ async def _process_one(
                 "error %s; re-raising to worker loop (outer caller resets "
                 "the row to 'pending' so this retry doesn't burn a "
                 "content-attempts cycle)",
-                memory_id, type(exc).__name__,
+                memory_id,
+                type(exc).__name__,
             )
             counts["infra_errors"] += 1
             raise
 
-        logger.exception(
-            "contest_queue[%s]: contest persistence failed, rolled back", memory_id
-        )
+        logger.exception("contest_queue[%s]: contest persistence failed, rolled back", memory_id)
         try:
             async with pool.acquire() as conn:
                 await conn.execute(
@@ -802,7 +801,8 @@ async def _process_one(
                     "contest_queue[%s]: persist failed AND fallback "
                     "mark-failed acquire timed out (%s); re-raising for "
                     "worker reconnect; original error: %s",
-                    memory_id, type(mark_exc).__name__,
+                    memory_id,
+                    type(mark_exc).__name__,
                     type(exc).__name__,
                 )
                 counts["infra_errors"] += 1
@@ -826,9 +826,7 @@ async def _process_one(
         )
     else:
         counts["failed"] += 1
-        logger.info(
-            "contest_queue[%s]: no winner", memory_id
-        )
+        logger.info("contest_queue[%s]: no winner", memory_id)
 
 
 __all__ = ["process_contest_queue"]

@@ -4,6 +4,7 @@ Routes in ``mnemos.api.routes.admin`` should not acquire raw driver pools for
 compression, PERSEPHONE, GRAEAE, or deletion lifecycle work. This module keeps
 those backend-specific operations behind a repository boundary.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -52,8 +53,7 @@ class AdminLifecycleRepository:
     ) -> list[str]:
         conn = _conn(tx)
         known = await conn.fetch(
-            "SELECT id, owner_id FROM memories "
-            "WHERE id = ANY($1::text[]) AND deleted_at IS NULL",
+            "SELECT id, owner_id FROM memories WHERE id = ANY($1::text[]) AND deleted_at IS NULL",
             memory_ids,
         )
         owner_by_id = {r["id"]: r["owner_id"] for r in known}
@@ -88,9 +88,7 @@ class AdminLifecycleRepository:
         where_parts: list[str] = ["m.deleted_at IS NULL"]
         params: list[Any] = []
         if only_uncompressed:
-            where_parts.append(
-                "NOT EXISTS (SELECT 1 FROM memory_compressed_variants v WHERE v.memory_id = m.id)"
-            )
+            where_parts.append("NOT EXISTS (SELECT 1 FROM memory_compressed_variants v WHERE v.memory_id = m.id)")
         if category is not None:
             params.append(category)
             where_parts.append(f"m.category = ${len(params)}")
@@ -199,7 +197,7 @@ class AdminLifecycleRepository:
             f"""
             SELECT MIN(COALESCE(last_recalled_at, created))
               FROM memories
-             WHERE {' AND '.join(oldest_clauses)}
+             WHERE {" AND ".join(oldest_clauses)}
             """,
             *oldest_args,
         )
@@ -210,9 +208,7 @@ class AdminLifecycleRepository:
     async def reload_graeae_providers(self, backend: PersistenceBackend, engine: Any) -> dict[str, str]:
         pool = getattr(backend, "pool", None) or getattr(backend, "_pool", None)
         if pool is None:
-            raise NotImplementedError(
-                f"{type(backend).__name__} does not expose a pool for GRAEAE registry reload"
-            )
+            raise NotImplementedError(f"{type(backend).__name__} does not expose a pool for GRAEAE registry reload")
         return await engine.reload_from_registry(pool)
 
     async def fetch_deletion_log(
@@ -300,10 +296,7 @@ class AdminLifecycleRepository:
             clauses.append(f"target_user_id = ${len(args)}")
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         args.append(limit)
-        sql = (
-            "SELECT * FROM deletion_requests"
-            f"{where} ORDER BY requested_at DESC LIMIT ${len(args)}"
-        )
+        sql = f"SELECT * FROM deletion_requests{where} ORDER BY requested_at DESC LIMIT ${len(args)}"
         return await _conn(tx).fetch(sql, *args)
 
     async def get_deletion_request(self, tx: Transaction, request_id: str) -> Any | None:
