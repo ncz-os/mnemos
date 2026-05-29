@@ -1250,7 +1250,7 @@ class CompressionQueueRepository(ABC):
     GAP 1 of job 019e7049: the queue + worker-pool claim were written
     directly against asyncpg/Postgres (``workers/distillation.py``
     imports ``asyncpg``; ``domain/compression/worker_contest.py`` runs
-    raw ``FOR UPDATE SKIP LOCKED``; ``db/admin_lifecycle_repo.py``
+    raw ``FOR UPDATE SKIP LOCKED``; ``domain/admin_lifecycle_repo.py``
     enqueue is asyncpg-only). On Oracle the admin enqueue routes 503 and
     the contest never drains. This ABC moves the queue mechanics behind
     the persistence surface so every hive backend (Postgres, Oracle,

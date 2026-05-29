@@ -1,8 +1,7 @@
 """Postgres persistence backend.
 
-Most legacy memory/DAG helpers still delegate to ``mnemos.db`` repository
-functions. Federation and state KV SQL now live directly behind this
-backend-neutral persistence interface.
+Legacy memory/DAG helpers live directly behind this backend-neutral
+persistence interface.
 """
 
 from __future__ import annotations
@@ -18,20 +17,20 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 import asyncpg
 
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import hot_rs_enabled
 from mnemos.core.native_accel import load_hot_rs
+from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.core.recommendation import choose_recommended_model
 from mnemos.core.visibility import (
     read_visibility_predicate as _core_read_visibility_predicate,
     version_visibility_predicate as _core_version_visibility_predicate,
 )
-from mnemos.db import eligibility as _eligibility
-from mnemos.db import mcp_repo, openai_compat_repo, portability_repo  # noqa: F401
+from mnemos.core import eligibility as _eligibility
 from mnemos.persistence.base import (
     POSTGRES_CAPABILITY_DETAILS,
     AuditChainRepository,
@@ -231,6 +230,54 @@ def _render_postgres_visibility(
     return clause, vis_params, next_idx
 
 
+async def _fetch_sidecar(
+    conn,
+    *,
+    table: str,
+    columns: str,
+    memory_id_column: str,
+    memory_ids: Sequence[str],
+    effective_owner: Optional[str],
+    effective_ns: Optional[str],
+    bound_to_memories: bool,
+    hard_limit: int,
+    null_ok: bool = False,
+    order_by: Optional[str] = None,
+):
+    if bound_to_memories and not memory_ids and not null_ok:
+        return []
+
+    conditions: list[str] = []
+    params: list[Any] = []
+    idx = 1
+    if table in {"kg_triples", "memory_versions"}:
+        conditions.append("deleted_at IS NULL")
+    if bound_to_memories:
+        if null_ok and memory_ids:
+            conditions.append(f"({memory_id_column} IS NULL OR {memory_id_column} = ANY(${idx}::text[]))")
+            params.append(list(memory_ids))
+            idx += 1
+        elif null_ok:
+            conditions.append(f"{memory_id_column} IS NULL")
+        else:
+            conditions.append(f"{memory_id_column} = ANY(${idx}::text[])")
+            params.append(list(memory_ids))
+            idx += 1
+    if effective_owner:
+        conditions.append(f"owner_id = ${idx}")
+        params.append(effective_owner)
+        idx += 1
+    if effective_ns:
+        conditions.append(f"namespace = ${idx}")
+        params.append(effective_ns)
+        idx += 1
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    order = f"ORDER BY {order_by}" if order_by else ""
+    sql = f"SELECT {columns} FROM {table} {where} {order} LIMIT {hard_limit + 1}"
+    return await conn.fetch(sql, *params)
+
+
 class PostgresTransaction:
     """Transaction wrapper that keeps asyncpg private to the Postgres adapter."""
 
@@ -352,7 +399,7 @@ class PostgresMemoryRepository(MemoryRepository):
 
     async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None:
         # Inlined Postgres impl (matches oracle/db2/sqlite backends) so this
-        # concrete backend no longer reaches up into mnemos.db.mcp_repo.
+        # concrete backend owns the repository SQL directly.
         conn = _postgres_tx(tx).conn
         if user.role == "root":
             row = await conn.fetchrow(
@@ -540,14 +587,45 @@ class PostgresMemoryRepository(MemoryRepository):
         limit: int,
         offset: int,
     ) -> list[Row]:
-        return await portability_repo.fetch_memory_export(
-            _postgres_tx(tx).conn,
-            effective_owner=effective_owner,
-            effective_ns=effective_ns,
-            category=category,
-            limit=limit,
-            offset=offset,
+        conn = _postgres_tx(tx).conn
+        conditions: list[str] = ["deleted_at IS NULL"]
+        params: list[Any] = []
+        idx = 1
+        if effective_owner:
+            conditions.append(f"owner_id = ${idx}")
+            params.append(effective_owner)
+            idx += 1
+        if effective_ns:
+            conditions.append(f"namespace = ${idx}")
+            params.append(effective_ns)
+            idx += 1
+        if category:
+            conditions.append(f"category = ${idx}")
+            params.append(category)
+            idx += 1
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = (
+            "SELECT id, content, category, subcategory, created, updated, "
+            "owner_id, namespace, permission_mode, quality_rating, "
+            "source_model, source_provider, source_session, source_agent, "
+            "metadata, "
+            # Provenance-bearing columns for MPF v0.2 emission. Morpheus
+            # writes (provenance='morpheus_local', morpheus_run_id,
+            # source_memories[]); federation pulls write
+            # (federation_source). The serializer's _record_provenance_v0_2
+            # helper uses these to populate PROV-DM wasGeneratedBy +
+            # wasInfluencedBy with real lineage rather than heuristic
+            # source_agent guesses.
+            "provenance AS prov_kind, morpheus_run_id::text AS morpheus_run_id, "
+            "source_memories, federation_source "
+            "FROM memories "
+            f"{where} "
+            f"ORDER BY created ASC "
+            f"LIMIT ${idx} OFFSET ${idx + 1}"
         )
+        params.extend([limit, offset])
+        return await conn.fetch(sql, *params)
 
     async def fetch_referenced_memory_allowlist(
         self,
@@ -557,12 +635,19 @@ class PostgresMemoryRepository(MemoryRepository):
         scope_owner: str | None = None,
         scope_namespace: str | None = None,
     ) -> list[Row]:
-        return await portability_repo.fetch_referenced_memory_allowlist(
-            _postgres_tx(tx).conn,
-            referenced_ids=referenced_ids,
-            scope_owner=scope_owner,
-            scope_namespace=scope_namespace,
-        )
+        conn = _postgres_tx(tx).conn
+        sql = "SELECT id, owner_id, namespace FROM memories WHERE id = ANY($1::text[]) AND deleted_at IS NULL"
+        params: list[Any] = [list(referenced_ids)]
+        if scope_owner is not None:
+            sql += " AND owner_id = $2"
+            params.append(scope_owner)
+            if scope_namespace is not None:
+                sql += " AND namespace = $3"
+                params.append(scope_namespace)
+        elif scope_namespace is not None:
+            sql += " AND namespace = $2"
+            params.append(scope_namespace)
+        return await conn.fetch(sql, *params)
 
     async def insert_memory(
         self,
@@ -586,24 +671,39 @@ class PostgresMemoryRepository(MemoryRepository):
         updated: Any,
     ) -> str:
         pg_tx = _postgres_tx(tx)
-        result = await portability_repo.insert_memory(
-            pg_tx.conn,
-            memory_id=memory_id,
-            content=content,
-            category=category,
-            subcategory=subcategory,
-            metadata_json=metadata_json,
-            quality_rating=quality_rating,
-            owner_id=owner_id,
-            namespace=namespace,
-            permission_mode=permission_mode,
-            source_model=source_model,
-            source_provider=source_provider,
-            source_session=source_session,
-            source_agent=source_agent,
-            verbatim_content=verbatim_content,
-            created=created,
-            updated=updated,
+        conn = pg_tx.conn
+        result = await conn.execute(
+            """
+            INSERT INTO memories (
+                id, content, category, subcategory, metadata,
+                quality_rating, verbatim_content, owner_id, namespace, permission_mode,
+                source_model, source_provider, source_session, source_agent,
+                created, updated
+            )
+            VALUES (
+                $1, $2, $3, $4, $5::jsonb,
+                $6, $7, $8, $9, $10,
+                $11, $12, $13, $14,
+                COALESCE($15, NOW()), COALESCE($16, NOW())
+            )
+            ON CONFLICT (id) DO NOTHING
+            """,
+            memory_id,
+            content,
+            category,
+            subcategory,
+            metadata_json,
+            quality_rating,
+            verbatim_content,
+            owner_id,
+            namespace,
+            permission_mode,
+            source_model,
+            source_provider,
+            source_session,
+            source_agent,
+            created,
+            updated,
         )
         if _pg_result_count(result) > 0:
             await _queue_federation_nats_upsert_from_db(pg_tx, memory_id)
@@ -629,16 +729,47 @@ class PostgresMemoryRepository(MemoryRepository):
         )
 
     async def fetch_memory_by_id(self, tx: Transaction, memory_id: str) -> Row | None:
-        return await portability_repo.fetch_memory_by_id(_postgres_tx(tx).conn, memory_id)
+        conn = _postgres_tx(tx).conn
+        return await conn.fetchrow(
+            "SELECT content, category, subcategory, "
+            "metadata, quality_rating, owner_id, "
+            "namespace, permission_mode, "
+            "source_model, source_provider, "
+            "source_session, source_agent, "
+            "created, updated "
+            "FROM memories WHERE id = $1 AND deleted_at IS NULL",
+            memory_id,
+        )
 
     async def set_suppress_version_snapshot(self, tx: Transaction) -> None:
-        await portability_repo.set_suppress_version_snapshot(_postgres_tx(tx).conn)
+        conn = _postgres_tx(tx).conn
+        await conn.execute("SET LOCAL mnemos.suppress_version_snapshot = '1'")
 
     async def fetch_versioned_memory_ids(self, tx: Transaction, memory_ids: Sequence[str]) -> list[Row]:
-        return await portability_repo.fetch_versioned_memory_ids(_postgres_tx(tx).conn, memory_ids)
+        conn = _postgres_tx(tx).conn
+        return await conn.fetch(
+            "SELECT DISTINCT memory_id FROM memory_versions WHERE memory_id = ANY($1::text[]) AND deleted_at IS NULL",
+            list(memory_ids),
+        )
 
     async def fetch_memory_head_checks(self, tx: Transaction, memory_ids: Sequence[str]) -> list[Row]:
-        return await portability_repo.fetch_memory_head_checks(_postgres_tx(tx).conn, memory_ids)
+        conn = _postgres_tx(tx).conn
+        return await conn.fetch(
+            """
+            SELECT m.id, m.content AS memory_content,
+                   mv.content AS head_content
+            FROM memories m
+            LEFT JOIN memory_branches b
+              ON b.memory_id = m.id AND b.name = 'main'
+             AND b.deleted_at IS NULL
+            LEFT JOIN memory_versions mv
+              ON mv.id = b.head_version_id
+             AND mv.deleted_at IS NULL
+            WHERE m.id = ANY($1::text[])
+              AND m.deleted_at IS NULL
+            """,
+            list(memory_ids),
+        )
 
     async def fetch_memory_context(
         self,
@@ -647,8 +778,67 @@ class PostgresMemoryRepository(MemoryRepository):
         user: Any,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
-        _postgres_tx(tx)
-        return await openai_compat_repo.fetch_memory_context(query, user, limit=limit)
+        conn = _postgres_tx(tx).conn
+        try:
+            if user.role == "root":
+                memories = await conn.fetch(
+                    """
+                    SELECT m.id, m.category,
+                           COALESCE(v.compressed_content, m.content) AS content
+                    FROM memories m
+                    LEFT JOIN memory_compressed_variants v
+                        ON v.memory_id = m.id
+                    WHERE
+                        m.deleted_at IS NULL
+                        AND m.archived_at IS NULL
+                        AND (
+                            to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)
+                            OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
+                        )
+                    ORDER BY m.updated DESC NULLS LAST
+                    LIMIT $2
+                    """,
+                    query,
+                    limit,
+                )
+            else:
+                vis_clause, vis_params = _core_read_visibility_predicate(
+                    user.user_id,
+                    list(user.group_ids),
+                    start_param_idx=1,
+                    table_alias="m",
+                )
+                ns_ph = f"${len(vis_params) + 1}"
+                q_ph = f"${len(vis_params) + 2}"
+                lim_ph = f"${len(vis_params) + 3}"
+                memories = await conn.fetch(
+                    f"""
+                    SELECT m.id, m.category,
+                           COALESCE(v.compressed_content, m.content) AS content
+                    FROM memories m
+                    LEFT JOIN memory_compressed_variants v
+                        ON v.memory_id = m.id
+                    WHERE m.deleted_at IS NULL
+                      AND m.archived_at IS NULL
+                      AND {vis_clause}
+                      AND m.namespace = {ns_ph}
+                      AND (
+                          to_tsvector('english', m.content) @@ plainto_tsquery('english', {q_ph})
+                          OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
+                      )
+                    ORDER BY m.updated DESC NULLS LAST
+                    LIMIT {lim_ph}
+                    """,
+                    *vis_params,
+                    user.namespace,
+                    query,
+                    limit,
+                )
+            logger.info("[MNEMOS] Found %s memories for query '%s...'", len(memories), query[:30])
+            return [{"id": memory["id"], "content": memory["content"]} for memory in memories]
+        except Exception as exc:
+            logger.warning("[MNEMOS] Search failed for '%s...': %s", query[:50], exc)
+            return []
 
     # --- v4.1 handler-through-backend impls -----------------------------------
 
@@ -711,8 +901,7 @@ class PostgresMemoryRepository(MemoryRepository):
             start_idx=2,
         )
         sql = (
-            f"SELECT {_MEMORY_COLS} FROM memories "
-            f"WHERE id=$1 AND deleted_at IS NULL{archived_clause} AND {vis_clause}"
+            f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1 AND deleted_at IS NULL{archived_clause} AND {vis_clause}"
         )
         return await conn.fetchrow(sql, memory_id, *vis_params)
 
@@ -749,7 +938,7 @@ class PostgresMemoryRepository(MemoryRepository):
             if row is not None:
                 await _queue_federation_nats_upsert_from_db(_postgres_tx(tx), memory_id)
             return row
-        sql = f"UPDATE memories SET {set_sql} WHERE id=$1 AND deleted_at IS NULL " f"RETURNING {_MEMORY_COLS}"
+        sql = f"UPDATE memories SET {set_sql} WHERE id=$1 AND deleted_at IS NULL RETURNING {_MEMORY_COLS}"
         row = await conn.fetchrow(sql, memory_id, *values)
         if row is not None:
             await _queue_federation_nats_upsert_from_db(_postgres_tx(tx), memory_id)
@@ -1153,7 +1342,7 @@ class PostgresMemoryRepository(MemoryRepository):
             "GROUP BY federation_source ORDER BY cnt DESC",
         )
         cat_rows = await conn.fetch(
-            "SELECT category, COUNT(*) AS cnt FROM memories " "WHERE deleted_at IS NULL GROUP BY category",
+            "SELECT category, COUNT(*) AS cnt FROM memories WHERE deleted_at IS NULL GROUP BY category",
         )
         sub_rows = await conn.fetch(
             "SELECT category, subcategory, COUNT(*) AS cnt FROM memories "
@@ -1161,7 +1350,7 @@ class PostgresMemoryRepository(MemoryRepository):
             "GROUP BY category, subcategory ORDER BY cnt DESC",
         )
         avg_quality = await conn.fetchval(
-            "SELECT AVG(quality_rating) FROM memories " "WHERE quality_rating IS NOT NULL AND deleted_at IS NULL",
+            "SELECT AVG(quality_rating) FROM memories WHERE quality_rating IS NOT NULL AND deleted_at IS NULL",
         )
         memories_by_subcategory: dict[str, dict[str, int]] = {}
         for r in sub_rows:
@@ -1188,13 +1377,22 @@ class PostgresKGRepository(KGRepository):
         include_unattached: bool,
         hard_limit: int,
     ) -> list[Row]:
-        return await portability_repo.fetch_kg_triples_for_export(
-            _postgres_tx(tx).conn,
+        conn = _postgres_tx(tx).conn
+        return await _fetch_sidecar(
+            conn,
+            table="kg_triples",
+            columns=(
+                "id, subject, predicate, object, subject_type, "
+                "object_type, valid_from, valid_until, memory_id, "
+                "confidence, created, owner_id, namespace"
+            ),
+            memory_id_column="memory_id",
             memory_ids=memory_ids,
             effective_owner=effective_owner,
             effective_ns=effective_ns,
-            include_unattached=include_unattached,
+            bound_to_memories=True,
             hard_limit=hard_limit,
+            null_ok=include_unattached,
         )
 
     async def insert_kg_triple(
@@ -1215,25 +1413,50 @@ class PostgresKGRepository(KGRepository):
         owner_id: str,
         namespace: str | None,
     ) -> str:
-        return await portability_repo.insert_kg_triple(
-            _postgres_tx(tx).conn,
-            triple_id=triple_id,
-            subject=subject,
-            predicate=predicate,
-            obj=obj,
-            subject_type=subject_type,
-            object_type=object_type,
-            valid_from=valid_from,
-            valid_until=valid_until,
-            memory_id=memory_id,
-            confidence=confidence,
-            created=created,
-            owner_id=owner_id,
-            namespace=namespace,
+        conn = _postgres_tx(tx).conn
+        return await conn.execute(
+            """
+            INSERT INTO kg_triples (
+                id, subject, predicate, object,
+                subject_type, object_type,
+                valid_from, valid_until,
+                memory_id, confidence, created,
+                owner_id, namespace
+            )
+            VALUES (
+                $1, $2, $3, $4,
+                $5, $6,
+                COALESCE($7, NOW()), $8,
+                $9, COALESCE($10, 1.0),
+                COALESCE($11, NOW()),
+                $12, $13
+            )
+            ON CONFLICT (id) DO NOTHING
+            """,
+            triple_id,
+            subject,
+            predicate,
+            obj,
+            subject_type,
+            object_type,
+            valid_from,
+            valid_until,
+            memory_id,
+            confidence,
+            created,
+            owner_id,
+            namespace,
         )
 
     async def fetch_kg_triple_by_id(self, tx: Transaction, triple_id: str) -> Row | None:
-        return await portability_repo.fetch_kg_triple_by_id(_postgres_tx(tx).conn, triple_id)
+        conn = _postgres_tx(tx).conn
+        return await conn.fetchrow(
+            "SELECT subject, predicate, object, subject_type, "
+            "object_type, memory_id, confidence, owner_id, "
+            "namespace, valid_from, valid_until, created "
+            "FROM kg_triples WHERE id = $1 AND deleted_at IS NULL",
+            triple_id,
+        )
 
 
 class PostgresVersionRepository(VersionRepository):
@@ -1246,16 +1469,41 @@ class PostgresVersionRepository(VersionRepository):
         effective_ns: str | None,
         hard_limit: int,
     ) -> list[Row]:
-        return await portability_repo.fetch_memory_versions_for_export(
-            _postgres_tx(tx).conn,
+        conn = _postgres_tx(tx).conn
+        # ``id`` and ``parent_version_id`` are PG UUID columns; cast to
+        # text so callers (and the persistence-parity tests) see the
+        # same str shape SQLite returns. Without the casts asyncpg
+        # decodes UUIDs as ``uuid.UUID`` instances and equality against
+        # ``str(uuid)`` fails.
+        return await _fetch_sidecar(
+            conn,
+            table="memory_versions",
+            columns=(
+                "id::text AS id, memory_id, version_num, content, category, "
+                "subcategory, metadata, verbatim_content, owner_id, "
+                "namespace, permission_mode, source_model, source_provider, "
+                "source_session, source_agent, snapshot_at, snapshot_by, "
+                "change_type, commit_hash, "
+                "parent_version_id::text AS parent_version_id, branch, "
+                "merge_parents"
+            ),
+            memory_id_column="memory_id",
             memory_ids=memory_ids,
             effective_owner=effective_owner,
             effective_ns=effective_ns,
+            bound_to_memories=True,
             hard_limit=hard_limit,
+            order_by="memory_id ASC, branch ASC, version_num ASC",
         )
 
     async def fetch_memory_versions_by_ids(self, tx: Transaction, version_ids: Sequence[str]) -> list[Row]:
-        return await portability_repo.fetch_memory_versions_by_ids(_postgres_tx(tx).conn, version_ids)
+        conn = _postgres_tx(tx).conn
+        return await conn.fetch(
+            "SELECT id::text AS id, memory_id, owner_id, namespace "
+            "FROM memory_versions WHERE id = ANY($1::uuid[]) "
+            "AND deleted_at IS NULL",
+            list(version_ids),
+        )
 
     async def insert_memory_version(
         self,
@@ -1284,34 +1532,65 @@ class PostgresVersionRepository(VersionRepository):
         branch: str | None,
         merge_parents: Any,
     ) -> str:
-        return await portability_repo.insert_memory_version(
-            _postgres_tx(tx).conn,
-            version_id=version_id,
-            memory_id=memory_id,
-            version_num=version_num,
-            content=content,
-            category=category,
-            subcategory=subcategory,
-            metadata_json=metadata_json,
-            verbatim_content=verbatim_content,
-            owner_id=owner_id,
-            namespace=namespace,
-            permission_mode=permission_mode,
-            source_model=source_model,
-            source_provider=source_provider,
-            source_session=source_session,
-            source_agent=source_agent,
-            snapshot_at=snapshot_at,
-            snapshot_by=snapshot_by,
-            change_type=change_type,
-            commit_hash=commit_hash,
-            parent_version_id=parent_version_id,
-            branch=branch,
-            merge_parents=merge_parents,
+        conn = _postgres_tx(tx).conn
+        return await conn.execute(
+            """
+            INSERT INTO memory_versions (
+                id, memory_id, version_num, content,
+                category, subcategory, metadata, verbatim_content,
+                owner_id, namespace, permission_mode,
+                source_model, source_provider, source_session, source_agent,
+                snapshot_at, snapshot_by, change_type,
+                commit_hash, parent_version_id, branch, merge_parents
+            )
+            VALUES (
+                $1::uuid, $2, $3, $4,
+                $5, $6, $7::jsonb, $8,
+                $9, $10, COALESCE($11, 600),
+                $12, $13, $14, $15,
+                COALESCE($16, NOW()), $17, COALESCE($18, 'create'),
+                $19, $20::uuid, COALESCE($21, 'main'), $22::uuid[]
+            )
+            ON CONFLICT (id) DO NOTHING
+            """,
+            version_id,
+            memory_id,
+            version_num,
+            content,
+            category,
+            subcategory,
+            metadata_json,
+            verbatim_content,
+            owner_id,
+            namespace,
+            permission_mode,
+            source_model,
+            source_provider,
+            source_session,
+            source_agent,
+            snapshot_at,
+            snapshot_by,
+            change_type,
+            commit_hash,
+            parent_version_id,
+            branch,
+            merge_parents,
         )
 
     async def fetch_memory_version_by_id(self, tx: Transaction, version_id: str) -> Row | None:
-        return await portability_repo.fetch_memory_version_by_id(_postgres_tx(tx).conn, version_id)
+        conn = _postgres_tx(tx).conn
+        return await conn.fetchrow(
+            "SELECT memory_id, owner_id, namespace, "
+            "version_num, content, commit_hash, "
+            "parent_version_id::text AS parent_version_id, "
+            "branch, merge_parents, category, subcategory, "
+            "metadata, verbatim_content, permission_mode, "
+            "source_model, source_provider, source_session, "
+            "source_agent, snapshot_at, snapshot_by, "
+            "change_type "
+            "FROM memory_versions WHERE id = $1::uuid AND deleted_at IS NULL",
+            version_id,
+        )
 
 
 class PostgresBranchRepository(BranchRepository):
@@ -1446,7 +1725,7 @@ class PostgresBranchRepository(BranchRepository):
 
             return {
                 "success": False,
-                "error": ("branch already exists at a different head; " "refusing to silently move it"),
+                "error": ("branch already exists at a different head; refusing to silently move it"),
             }
 
         async with conn.transaction():
@@ -1454,7 +1733,7 @@ class PostgresBranchRepository(BranchRepository):
             # This closes the TOCTOU between auth check and branch insert.
             if user.role == "root":
                 live = await conn.fetchrow(
-                    "SELECT 1 FROM memories " "WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
+                    "SELECT 1 FROM memories WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
                     memory_id,
                 )
             else:
@@ -1503,7 +1782,11 @@ class PostgresBranchRepository(BranchRepository):
         }
 
     async def delete_memory_branches_for_memories(self, tx: Transaction, memory_ids: Sequence[str]) -> None:
-        await portability_repo.delete_memory_branches_for_memories(_postgres_tx(tx).conn, memory_ids)
+        conn = _postgres_tx(tx).conn
+        await conn.execute(
+            "DELETE FROM memory_branches WHERE memory_id = ANY($1::text[])",
+            list(memory_ids),
+        )
 
     async def fetch_memory_branch_heads(
         self,
@@ -1512,10 +1795,31 @@ class PostgresBranchRepository(BranchRepository):
         *,
         authorized_version_uuids: Sequence[str] | None = None,
     ) -> list[Row]:
-        return await portability_repo.fetch_memory_branch_heads(
-            _postgres_tx(tx).conn,
-            memory_ids,
-            authorized_version_uuids=authorized_version_uuids,
+        conn = _postgres_tx(tx).conn
+        if authorized_version_uuids is not None:
+            return await conn.fetch(
+                """
+                SELECT DISTINCT ON (memory_id, branch)
+                    memory_id, branch, id::text AS head_version_id
+                FROM memory_versions
+                WHERE memory_id = ANY($1::text[])
+                  AND id = ANY($2::uuid[])
+                  AND deleted_at IS NULL
+                ORDER BY memory_id, branch, version_num DESC
+                """,
+                list(memory_ids),
+                list(authorized_version_uuids),
+            )
+        return await conn.fetch(
+            """
+            SELECT DISTINCT ON (memory_id, branch)
+                memory_id, branch, id::text AS head_version_id
+            FROM memory_versions
+            WHERE memory_id = ANY($1::text[])
+              AND deleted_at IS NULL
+            ORDER BY memory_id, branch, version_num DESC
+            """,
+            list(memory_ids),
         )
 
     async def upsert_memory_branch_head(
@@ -1526,11 +1830,17 @@ class PostgresBranchRepository(BranchRepository):
         branch: str,
         head_version_id: Any,
     ) -> None:
-        await portability_repo.upsert_memory_branch_head(
-            _postgres_tx(tx).conn,
-            memory_id=memory_id,
-            branch=branch,
-            head_version_id=head_version_id,
+        conn = _postgres_tx(tx).conn
+        await conn.execute(
+            """
+            INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
+            VALUES ($1, $2, $3, NULL)
+            ON CONFLICT (memory_id, name) DO UPDATE
+            SET head_version_id = EXCLUDED.head_version_id
+            """,
+            memory_id,
+            branch,
+            head_version_id,
         )
 
 
@@ -1543,10 +1853,21 @@ class PostgresCompressionRepository(CompressionRepository):
         effective_owner: str | None,
         hard_limit: int,
     ) -> list[Row]:
-        return await portability_repo.fetch_compressed_variants_for_export(
-            _postgres_tx(tx).conn,
+        conn = _postgres_tx(tx).conn
+        return await _fetch_sidecar(
+            conn,
+            table="memory_compressed_variants",
+            columns=(
+                "memory_id, owner_id, winner_candidate_id, engine_id, "
+                "engine_version, compressed_content, compressed_tokens, "
+                "compression_ratio, quality_score, composite_score, "
+                "scoring_profile, judge_model, selected_at"
+            ),
+            memory_id_column="memory_id",
             memory_ids=memory_ids,
             effective_owner=effective_owner,
+            effective_ns=None,
+            bound_to_memories=True,
             hard_limit=hard_limit,
         )
 
@@ -1558,12 +1879,14 @@ class PostgresCompressionRepository(CompressionRepository):
         memory_id: str,
         owner_id: str,
     ) -> bool:
-        return await portability_repo.compression_candidate_exists(
-            _postgres_tx(tx).conn,
-            candidate_id=candidate_id,
-            memory_id=memory_id,
-            owner_id=owner_id,
+        conn = _postgres_tx(tx).conn
+        exists = await conn.fetchval(
+            "SELECT 1 FROM memory_compression_candidates WHERE id = $1::uuid AND memory_id = $2 AND owner_id = $3",
+            candidate_id,
+            memory_id,
+            owner_id,
         )
+        return bool(exists)
 
     async def insert_compressed_variant(
         self,
@@ -1583,25 +1906,54 @@ class PostgresCompressionRepository(CompressionRepository):
         judge_model: str | None,
         selected_at: Any,
     ) -> str:
-        return await portability_repo.insert_compressed_variant(
-            _postgres_tx(tx).conn,
-            memory_id=memory_id,
-            owner_id=owner_id,
-            winner_candidate_id=winner_candidate_id,
-            engine_id=engine_id,
-            engine_version=engine_version,
-            compressed_content=compressed_content,
-            compressed_tokens=compressed_tokens,
-            compression_ratio=compression_ratio,
-            quality_score=quality_score,
-            composite_score=composite_score,
-            scoring_profile=scoring_profile,
-            judge_model=judge_model,
-            selected_at=selected_at,
+        conn = _postgres_tx(tx).conn
+        return await conn.execute(
+            """
+            INSERT INTO memory_compressed_variants (
+                memory_id, owner_id, winner_candidate_id,
+                engine_id, engine_version, compressed_content,
+                compressed_tokens, compression_ratio,
+                quality_score, composite_score,
+                scoring_profile, judge_model, selected_at
+            )
+            VALUES (
+                $1, $2, $3::uuid,
+                $4, $5, $6,
+                $7, $8,
+                $9, $10,
+                COALESCE($11, 'balanced'), $12,
+                COALESCE($13, NOW())
+            )
+            ON CONFLICT (memory_id) DO NOTHING
+            """,
+            memory_id,
+            owner_id,
+            winner_candidate_id,
+            engine_id,
+            engine_version,
+            compressed_content,
+            compressed_tokens,
+            compression_ratio,
+            quality_score,
+            composite_score,
+            scoring_profile,
+            judge_model,
+            selected_at,
         )
 
     async def fetch_compressed_variant_by_memory_id(self, tx: Transaction, memory_id: str) -> Row | None:
-        return await portability_repo.fetch_compressed_variant_by_memory_id(_postgres_tx(tx).conn, memory_id)
+        conn = _postgres_tx(tx).conn
+        return await conn.fetchrow(
+            "SELECT owner_id, winner_candidate_id::text "
+            "AS winner_candidate_id, engine_id, "
+            "engine_version, compressed_content, "
+            "compressed_tokens, compression_ratio, "
+            "quality_score, composite_score, "
+            "scoring_profile, judge_model, selected_at "
+            "FROM memory_compressed_variants "
+            "WHERE memory_id = $1",
+            memory_id,
+        )
 
     async def gather_stats(self, tx: Transaction) -> CompressionStatsRow:
         conn = _postgres_tx(tx).conn
@@ -1616,7 +1968,7 @@ class PostgresCompressionRepository(CompressionRepository):
         )
         unreviewed = (
             await conn.fetchval(
-                "SELECT COUNT(*) FROM memory_compressed_variants " "WHERE quality_score IS NULL",
+                "SELECT COUNT(*) FROM memory_compressed_variants WHERE quality_score IS NULL",
             )
             or 0
         )
@@ -1629,7 +1981,7 @@ class PostgresCompressionRepository(CompressionRepository):
 
 # ── compression-queue SQL (canonical) ───────────────────────────────────────
 # These are the authoritative Postgres queue statements, moved here from
-# mnemos/domain/compression/worker_contest.py + mnemos/db/admin_lifecycle_repo.py
+# mnemos/domain/compression/worker_contest.py + mnemos/domain/admin_lifecycle_repo.py
 # so the queue mechanics live behind the persistence ABC
 # (CompressionQueueRepository) and run identically on every backend
 # (architectural law mem_1780005765033). CHILD C rewires the worker +
@@ -1737,7 +2089,7 @@ class PostgresCompressionQueueRepository(CompressionQueueRepository):
             return []
         conn = _postgres_tx(tx).conn
         known = await conn.fetch(
-            "SELECT id, owner_id FROM memories " "WHERE id = ANY($1::text[]) AND deleted_at IS NULL",
+            "SELECT id, owner_id FROM memories WHERE id = ANY($1::text[]) AND deleted_at IS NULL",
             memory_ids,
         )
         owner_by_id = {r["id"]: r["owner_id"] for r in known}
@@ -1976,26 +2328,75 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
         cost_budget: float = 10.0,
         quality_floor: float = 0.85,
     ) -> dict[str, Any] | None:
-        _postgres_tx(tx)
-        return await openai_compat_repo.fetch_model_recommendation(task_type, cost_budget, quality_floor)
+        model, _required = await self.fetch_recommended_model(tx, task_type, cost_budget, quality_floor)
+        return model
 
     async def lookup_provider_for_model(self, tx: Transaction, model: str) -> str | None:
-        _postgres_tx(tx)
-        return await openai_compat_repo.lookup_provider_for_model(model)
+        conn = _postgres_tx(tx).conn
+        try:
+            row = await conn.fetchrow(
+                "SELECT provider FROM model_registry WHERE model_id = $1   AND available = true AND deprecated = false",
+                model,
+            )
+            if row is not None:
+                return row["provider"]
+
+            if "/" in model:
+                head, tail = model.split("/", 1)
+                head_registry = GRAEAE_REGISTRY_MAP.get(head, {"registry_provider": head})["registry_provider"]
+                row = await conn.fetchrow(
+                    "SELECT provider FROM model_registry "
+                    "WHERE provider = $1 AND model_id = $2 "
+                    "  AND available = true AND deprecated = false",
+                    head_registry,
+                    tail,
+                )
+                if row is not None:
+                    return row["provider"]
+        except Exception as exc:
+            logger.warning("[MNEMOS] model_registry lookup failed for model=%s: %s", model, exc)
+        return None
 
     async def fetch_available_models(self, tx: Transaction) -> list[Row]:
-        _postgres_tx(tx)
-        return await openai_compat_repo.fetch_available_models()
+        conn = _postgres_tx(tx).conn
+        try:
+            return await conn.fetch(
+                """
+                SELECT provider, model_id, display_name
+                FROM model_registry
+                WHERE available = true AND deprecated = false
+                ORDER BY graeae_weight DESC NULLS LAST, model_id ASC
+                """
+            )
+        except Exception as exc:
+            logger.warning(
+                "[/v1/models] model_registry query failed, returning an empty discovery list: %s",
+                exc,
+            )
+            return []
 
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
-        _postgres_tx(tx)
-        return await openai_compat_repo.fetch_model_provider(model_id)
+        conn = _postgres_tx(tx).conn
+        row = await conn.fetchrow(
+            """
+            SELECT provider
+            FROM model_registry
+            WHERE model_id = $1
+              AND available = true
+              AND deprecated = false
+            LIMIT 1
+            """,
+            model_id,
+        )
+        if row is not None:
+            return row["provider"]
+        return None
 
 
 class PostgresOAuthRepository(OAuthRepository):
     async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
         return await _postgres_tx(tx).conn.fetch(
-            "SELECT name, display_name, kind, enabled " "FROM oauth_providers WHERE enabled=TRUE ORDER BY display_name"
+            "SELECT name, display_name, kind, enabled FROM oauth_providers WHERE enabled=TRUE ORDER BY display_name"
         )
 
     async def get_provider(self, tx: Transaction, name: str) -> Row | None:
@@ -2554,7 +2955,7 @@ class PostgresFederationRepository(FederationRepository):
         set_clauses = [f"{col}=${i + 2}" for i, col in enumerate(updates.keys())]
         set_clauses.append("updated=NOW()")
         return await _postgres_tx(tx).conn.fetchrow(
-            f"UPDATE federation_peers SET {', '.join(set_clauses)} " "WHERE id=$1::uuid RETURNING *",
+            f"UPDATE federation_peers SET {', '.join(set_clauses)} WHERE id=$1::uuid RETURNING *",
             peer_id,
             *updates.values(),
         )
@@ -2633,8 +3034,7 @@ class PostgresFederationRepository(FederationRepository):
             args.append(since_id)
             since_id_arg = len(args)
             memory_query_parts.append(
-                f"(m.updated > ${since_updated_arg} "
-                f"OR (m.updated = ${since_updated_arg} AND m.id > ${since_id_arg}))"
+                f"(m.updated > ${since_updated_arg} OR (m.updated = ${since_updated_arg} AND m.id > ${since_id_arg}))"
             )
             tombstone_query_parts.append(
                 f"(m.consolidated_at > ${since_updated_arg} "
@@ -2658,11 +3058,11 @@ class PostgresFederationRepository(FederationRepository):
                 "  < (octet_length(to_json(m.content)::text) "
                 "     + COALESCE(octet_length(to_json(m.verbatim_content)::text), 0))"
             )
-            content_select = f"CASE WHEN {use_variant} THEN v.compressed_content " "ELSE m.content END AS content,"
+            content_select = f"CASE WHEN {use_variant} THEN v.compressed_content ELSE m.content END AS content,"
             compressed_select = (
-                f"CASE WHEN {use_variant} THEN v.compressed_content " "ELSE NULL::text END AS compressed_content,"
+                f"CASE WHEN {use_variant} THEN v.compressed_content ELSE NULL::text END AS compressed_content,"
             )
-            verbatim_select = f"CASE WHEN {use_variant} THEN NULL " "ELSE m.verbatim_content END AS verbatim_content,"
+            verbatim_select = f"CASE WHEN {use_variant} THEN NULL ELSE m.verbatim_content END AS verbatim_content,"
             join_compressed = "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
         else:
             content_select = "m.content,"
@@ -2957,7 +3357,7 @@ class PostgresFederationRepository(FederationRepository):
 
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
         return await _postgres_tx(tx).conn.fetchrow(
-            "SELECT federation_remote_updated FROM memories " "WHERE id = $1 AND deleted_at IS NULL",
+            "SELECT federation_remote_updated FROM memories WHERE id = $1 AND deleted_at IS NULL",
             local_id,
         )
 
@@ -3172,7 +3572,7 @@ class PostgresStateRepository(StateRepository):
         namespace: str = "default",
     ) -> bool:
         result = await _postgres_tx(tx).conn.execute(
-            "DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3 " "AND deleted_at IS NULL",
+            "DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3 AND deleted_at IS NULL",
             owner_id,
             namespace,
             key,

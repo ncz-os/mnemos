@@ -1,4 +1,5 @@
 """Document import utilities using Docling for intelligent content extraction."""
+
 import hashlib
 import json
 import logging
@@ -11,6 +12,7 @@ from fastapi.responses import JSONResponse
 
 try:
     from docling.document_converter import DocumentConverter
+
     DOCLING_AVAILABLE = True
 except ImportError:
     DOCLING_AVAILABLE = False
@@ -20,7 +22,7 @@ from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.api.routes.memories import _validate_permission_mode
 from mnemos.core.ids import new_memory_id
-from mnemos.db.document_repo import (
+from mnemos.domain.document_repo import (
     DocumentChunkSoftDeletedConflictError,
     DocumentRepository,
 )
@@ -74,9 +76,7 @@ class DoclingImporter:
             raise ImportError("Docling not installed. Install with: pip install mnemos-os[docling]")
         self.converter = DocumentConverter()
 
-    def parse_document(
-        self, file_content: bytes, filename: str
-    ) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
+    def parse_document(self, file_content: bytes, filename: str) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
         """Parse document and extract content, metadata, and chunks.
 
         Returns:
@@ -102,9 +102,7 @@ class DoclingImporter:
             }
 
             # Create memory chunks (split by semantic boundaries)
-            chunks = self._chunk_content(
-                full_text, metadata, doc
-            )
+            chunks = self._chunk_content(full_text, metadata, doc)
 
             logger.info(
                 f"[DOCLING] Parsed {filename}: {len(full_text)} chars, "
@@ -115,10 +113,7 @@ class DoclingImporter:
 
         except Exception as e:
             logger.error(f"[DOCLING] Parse error for {filename}: {e}", exc_info=True)
-            raise HTTPException(
-                status_code=400,
-                detail=f"Document parsing failed: {str(e)}"
-            )
+            raise HTTPException(status_code=400, detail=f"Document parsing failed: {str(e)}")
 
     def _guess_format(self, filename: str) -> str:
         """Guess document format from filename."""
@@ -174,12 +169,14 @@ class DoclingImporter:
         for section_title, section_text in sections:
             if len(current_chunk) + len(section_text) > target_chunk_size:
                 if current_chunk:
-                    chunks.append({
-                        "chunk_num": chunk_num,
-                        "title": section_title or current_metadata.get("chunk_title", ""),
-                        "content": current_chunk.strip(),
-                        "metadata": {**current_metadata, "chunk_num": chunk_num},
-                    })
+                    chunks.append(
+                        {
+                            "chunk_num": chunk_num,
+                            "title": section_title or current_metadata.get("chunk_title", ""),
+                            "content": current_chunk.strip(),
+                            "metadata": {**current_metadata, "chunk_num": chunk_num},
+                        }
+                    )
                     chunk_num += 1
                 current_chunk = section_text
             else:
@@ -187,12 +184,14 @@ class DoclingImporter:
 
         # Final chunk
         if current_chunk:
-            chunks.append({
-                "chunk_num": chunk_num,
-                "title": sections[-1][0] if sections else "Content",
-                "content": current_chunk.strip(),
-                "metadata": {**current_metadata, "chunk_num": chunk_num},
-            })
+            chunks.append(
+                {
+                    "chunk_num": chunk_num,
+                    "title": sections[-1][0] if sections else "Content",
+                    "content": current_chunk.strip(),
+                    "metadata": {**current_metadata, "chunk_num": chunk_num},
+                }
+            )
 
         return chunks
 
@@ -287,8 +286,7 @@ async def import_memories_from_document(
 
     if not DOCLING_AVAILABLE:
         raise HTTPException(
-            status_code=501,
-            detail="Docling not installed. Install with: pip install mnemos-os[docling]"
+            status_code=501, detail="Docling not installed. Install with: pip install mnemos-os[docling]"
         )
 
     # Read file
@@ -298,9 +296,7 @@ async def import_memories_from_document(
 
     # Parse with Docling
     importer = DoclingImporter()
-    full_text, doc_metadata, chunks = importer.parse_document(
-        content, file.filename or "document"
-    )
+    full_text, doc_metadata, chunks = importer.parse_document(content, file.filename or "document")
     archive_reason = _archive_snapshot_reason(
         file.filename,
         full_text,
@@ -320,10 +316,12 @@ async def import_memories_from_document(
         "import_source": "doc-import",
     }
     if archive_reason and allow_archive_snapshot:
-        doc_metadata.update({
-            "archive_override_at": datetime.now(timezone.utc).isoformat(),
-            "archive_override_reason": archive_reason,
-        })
+        doc_metadata.update(
+            {
+                "archive_override_at": datetime.now(timezone.utc).isoformat(),
+                "archive_override_reason": archive_reason,
+            }
+        )
 
     # Create memories from chunks. Match the canonical /v1/memories create
     # path exactly: timestamped `mem_...` id, populate verbatim_content +
@@ -346,6 +344,7 @@ async def import_memories_from_document(
     pending_delivery_ids: list[str] = []
 
     from mnemos.core.pool import is_infrastructure_error
+
     # Infrastructure errors (asyncio.TimeoutError + asyncpg
     # connection family) at acquire time OR mid-loop AFTER one or
     # more chunks have committed must surface as 503 WITHOUT
@@ -407,9 +406,7 @@ async def import_memories_from_document(
         regression — the new key shape is correct but the legacy
         rows wouldn't match it.
         """
-        content_digest = hashlib.sha256(
-            (content or "").encode("utf-8")
-        ).hexdigest()
+        content_digest = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
         return hashlib.sha256(
             (
                 (user.user_id or "")
@@ -454,9 +451,7 @@ async def import_memories_from_document(
         it, gated by the unique index from migrations
         _v4_2_document_import_chunk_idempotency.sql.
         """
-        content_digest = hashlib.sha256(
-            (content or "").encode("utf-8")
-        ).hexdigest()
+        content_digest = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
         return hashlib.sha256(
             (
                 (user.user_id or "")
@@ -478,6 +473,7 @@ async def import_memories_from_document(
                 + project_tag_value
             ).encode("utf-8")
         ).hexdigest()
+
     try:
         for chunk in chunks:
             chunk_delivery_ids: list[str] = []
@@ -493,9 +489,7 @@ async def import_memories_from_document(
                 }
 
                 chunk_key = _chunk_key(chunk["chunk_num"], chunk["content"])
-                chunk_key_legacy_v70 = _chunk_key_v70(
-                    chunk["chunk_num"], chunk["content"]
-                )
+                chunk_key_legacy_v70 = _chunk_key_v70(chunk["chunk_num"], chunk["content"])
                 async with backend.transactional() as tx:
                     imported = await _document_repo.import_chunk(
                         backend,
@@ -576,10 +570,12 @@ async def import_memories_from_document(
             # Capture for post-loop processing — return a
             # 503-shaped payload that preserves committed chunks.
             infra_failure = acquire_err
-            errors.append({
-                "chunk": None,
-                "error": f"infrastructure error: {acquire_err}",
-            })
+            errors.append(
+                {
+                    "chunk": None,
+                    "error": f"infrastructure error: {acquire_err}",
+                }
+            )
         else:
             raise
 
@@ -603,6 +599,7 @@ async def import_memories_from_document(
             try:
                 from mnemos.core.lifecycle import _schedule_delivery_attempt
                 from mnemos.webhooks.sender import _attempt_delivery
+
                 for delivery_id in pending_delivery_ids:
                     _schedule_delivery_attempt(_attempt_delivery(delivery_id))
             except Exception:
@@ -613,7 +610,8 @@ async def import_memories_from_document(
                 logger.warning(
                     "document_import: send-task scheduling failed for %d "
                     "deliveries (recovery worker will pick them up)",
-                    len(pending_delivery_ids), exc_info=True,
+                    len(pending_delivery_ids),
+                    exc_info=True,
                 )
 
     payload = {
@@ -755,12 +753,14 @@ async def batch_import_documents(
             if status_code != 200:
                 has_partial_or_full_failure = True
         except HTTPException as e:
-            results.append({
-                "source_file": file.filename,
-                "error": e.detail,
-                "memories_created": 0,
-                "status_code": e.status_code,
-            })
+            results.append(
+                {
+                    "source_file": file.filename,
+                    "error": e.detail,
+                    "memories_created": 0,
+                    "status_code": e.status_code,
+                }
+            )
             has_partial_or_full_failure = True
     # Top-level batch HTTP status — codex round-3 of round-47
     # caught that "all files had memories_created=0" wasn't the
@@ -790,15 +790,9 @@ async def batch_import_documents(
     # aware clients can distinguish committed files from rolled-
     # back / unsupported ones.
     if has_partial_or_full_failure:
-        per_file_statuses = [
-            int(r.get("status_code", 0)) for r in results
-        ]
+        per_file_statuses = [int(r.get("status_code", 0)) for r in results]
         any_503 = any(code == 503 for code in per_file_statuses)
-        all_502 = (
-            not any_503
-            and len(per_file_statuses) > 0
-            and all(code == 502 for code in per_file_statuses)
-        )
+        all_502 = not any_503 and len(per_file_statuses) > 0 and all(code == 502 for code in per_file_statuses)
         if any_503:
             top = 503
         elif all_502:

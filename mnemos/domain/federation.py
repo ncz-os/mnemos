@@ -23,7 +23,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import httpx
 
-from mnemos.db import eligibility as _eligibility
+from mnemos.core import eligibility as _eligibility
 from mnemos.persistence.base import AuditPersistence, FederationPersistence, FederationRepository, Transaction
 
 FederationBackend = Union[FederationPersistence, AuditPersistence]
@@ -198,7 +198,7 @@ async def _check_peer_schema(
                 # 4xx — durable: peer doesn't speak the protocol or
                 # rejected the auth. Pre-v3.4 peers land here too.
                 logger.info(
-                    "federation: peer %s /schema returned %d — " "peer may pre-date v3.4 federation_compat",
+                    "federation: peer %s /schema returned %d — peer may pre-date v3.4 federation_compat",
                     name,
                     resp.status_code,
                 )
@@ -381,7 +381,7 @@ async def sync_peer(
         sig_match = peer_signature == local_signature
         if not sig_match:
             schema_abort_reason = (
-                f"schema mismatch: peer={peer_signature} ({peer_version}) " f"local={local_signature} ({_local_v})"
+                f"schema mismatch: peer={peer_signature} ({peer_version}) local={local_signature} ({_local_v})"
             )
             schema_abort_kind = "incompat"
         elif local_fingerprint == "":

@@ -15,7 +15,7 @@ from mnemos.api.persistence_helpers import backend_or_503, require_postgres_pool
 from mnemos.core.config import get_settings
 from mnemos.core.extras import is_extra_installed, missing_extra_detail
 from mnemos.core.security import is_root
-from mnemos.db.admin_lifecycle_repo import (
+from mnemos.domain.admin_lifecycle_repo import (
     AdminLifecycleRepository,
     DeletionRequestActiveDuplicateError,
     DeletionRequestOverlapError,
@@ -84,7 +84,7 @@ async def list_users(_: UserContext = Depends(require_root)):
     require_postgres_pool_or_503(route_label="GET /admin/users")
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, display_name, email, role, namespace, created_at " "FROM users ORDER BY created_at"
+            "SELECT id, display_name, email, role, namespace, created_at FROM users ORDER BY created_at"
         )
     return [
         UserResponse(
@@ -279,11 +279,11 @@ async def update_oauth_provider(
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update")
-    set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
+    set_clauses = [f"{col}=${i + 2}" for i, col in enumerate(updates.keys())]
     set_clauses.append("updated=NOW()")
     async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
-            f"UPDATE oauth_providers SET {', '.join(set_clauses)} " f"WHERE name=$1 RETURNING *",
+            f"UPDATE oauth_providers SET {', '.join(set_clauses)} WHERE name=$1 RETURNING *",
             name,
             *updates.values(),
         )
@@ -394,7 +394,7 @@ class CompressionEnqueueRequest(BaseModel):
     )
     scoring_profile: CompressionProfile = Field(
         default="balanced",
-        description="Scoring profile for this batch. One of: " "balanced | quality_first | speed_first | custom",
+        description="Scoring profile for this batch. One of: balanced | quality_first | speed_first | custom",
     )
     priority: int = Field(default=0, description="Higher = drained sooner")
 
@@ -968,7 +968,7 @@ async def create_deletion_request(
         ) from exc
 
     logger.info(
-        "[ADMIN] Created deletion request %s for target_user_id=%s " "target_namespace=%s by %s",
+        "[ADMIN] Created deletion request %s for target_user_id=%s target_namespace=%s by %s",
         row["id"],
         row["target_user_id"],
         row["target_namespace"],
@@ -1153,14 +1153,14 @@ async def restore_deletion_request(
         if existing["restore_by"] is None or existing["soft_deleted_at"] is None:
             raise HTTPException(
                 status_code=409,
-                detail=(f"deletion request {request_id} is missing " "restore metadata"),
+                detail=(f"deletion request {request_id} is missing restore metadata"),
             )
         restore_window_expired = existing["restore_by"] <= datetime.now(existing["restore_by"].tzinfo)
         if restore_window_expired:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"deletion request {request_id} restore window " f"expired at {existing['restore_by'].isoformat()}"
+                    f"deletion request {request_id} restore window expired at {existing['restore_by'].isoformat()}"
                 ),
             )
 

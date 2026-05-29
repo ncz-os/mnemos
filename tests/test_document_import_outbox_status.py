@@ -6,6 +6,7 @@ actual backend-specific write. Tests that need to inject repository outcomes
 replace the module-level repository with a small recording stub rather than
 mocking asyncpg calls.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mnemos.api.routes import document_import
-from mnemos.db.document_repo import DocumentRepository, ImportedDocumentChunk
+from mnemos.domain.document_repo import DocumentRepository, ImportedDocumentChunk
 from tests._fake_backend import install_fake_backend
 
 pytestmark = pytest.mark.asyncio
@@ -381,10 +382,7 @@ async def test_single_import_mid_file_infra_loss_preserves_committed_chunks(
     payload = resp.json()
     assert payload["memories_created"] == 1
     assert len(payload["memory_ids"]) == 1
-    assert any(
-        "infrastructure" in (e.get("error") or "").lower()
-        for e in payload.get("errors", [])
-    )
+    assert any("infrastructure" in (e.get("error") or "").lower() for e in payload.get("errors", []))
 
 
 @patch("mnemos.api.routes.document_import.DOCLING_AVAILABLE", True)

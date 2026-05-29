@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-MEMORY_ELIGIBILITY_PREDICATE = (
-    "deleted_at IS NULL AND archived_at IS NULL AND consolidated_into IS NULL"
-)
+MEMORY_ELIGIBILITY_PREDICATE = "deleted_at IS NULL AND archived_at IS NULL AND consolidated_into IS NULL"
 
 
 def qualify_memory_predicate(predicate: str, alias: str = "m") -> str:

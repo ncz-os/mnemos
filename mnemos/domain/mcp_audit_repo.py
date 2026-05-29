@@ -62,10 +62,7 @@ async def insert_audit_record(
         # strings — keep the table in sync with the CHECK constraint
         # so an unexpected value doesn't surface as a generic
         # ConstraintError later.
-        raise ValueError(
-            f"invalid mcp_audit_log outcome {outcome!r}; "
-            f"expected one of: {sorted(VALID_OUTCOMES)}"
-        )
+        raise ValueError(f"invalid mcp_audit_log outcome {outcome!r}; expected one of: {sorted(VALID_OUTCOMES)}")
 
     await execute(
         """
@@ -194,7 +191,8 @@ async def persist_audit_record_via_http(
     if not base or not api_key:
         logger.debug(
             "mcp_audit_log http skipped (base=%r api_key_set=%s)",
-            base, bool(api_key),
+            base,
+            bool(api_key),
         )
         return False
 
@@ -236,13 +234,15 @@ async def persist_audit_record_via_http(
             return True
         logger.debug(
             "mcp_audit_log http write returned %s for tool=%s",
-            r.status_code, tool,
+            r.status_code,
+            tool,
         )
         return False
     except Exception as exc:
         logger.debug(
             "mcp_audit_log http write failed (tool=%s): %s",
-            tool, exc,
+            tool,
+            exc,
         )
         return False
 
