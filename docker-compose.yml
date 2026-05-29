@@ -234,7 +234,9 @@ services:
   mnemos:
     build:
       context: .
-      dockerfile: Dockerfile.arm64
+      dockerfile: Dockerfile.arm64-cuda
+    image: mnemos-os:arm64-cuda
+    runtime: nvidia
     command: ["mnemos", "serve"]
     depends_on:
       postgres:
@@ -250,6 +252,9 @@ services:
       # MNEMOS_DATABASE_DSN: oracle://MNEMOS:${ORACLE_PASSWORD:-changeme}@oracle-ee:1521/ORCLPDB1
       # MNEMOS_DATABASE_DSN: db2://MNEMOS:${DB2_PASSWORD:-changeme}@db2-eap:50000/MNEMOS
       MNEMOS_EMBED_BACKEND: llamacpp
+      MNEMOS_EMBED_GPU_LAYERS: "999"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
       # On Linux: use http://172.17.0.1:5001 or add --add-host=host.docker.internal:host-gateway
       GRAEAE_URL: ${GRAEAE_URL:-http://host.docker.internal:5001}
       MNEMOS_PROFILE: personal
