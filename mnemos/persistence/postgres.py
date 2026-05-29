@@ -34,6 +34,7 @@ from mnemos.persistence.base import (
     POSTGRES_CAPABILITY_DETAILS,
     AuditChainRepository,
     BranchRepository,
+    CompressionQueueRepository,
     CompressionRepository,
     CompressionStatsRow,
     ConsultationAuditRepository,
@@ -1297,6 +1298,220 @@ class PostgresCompressionRepository(CompressionRepository):
             average_compression_ratio=float(avg_ratio) if avg_ratio is not None else None,
             unreviewed_compressions=int(unreviewed),
         )
+
+
+# ── compression-queue SQL (canonical) ───────────────────────────────────────
+# These are the authoritative Postgres queue statements, moved here from
+# mnemos/domain/compression/worker_contest.py + mnemos/db/admin_lifecycle_repo.py
+# so the queue mechanics live behind the persistence ABC
+# (CompressionQueueRepository) and run identically on every backend
+# (architectural law mem_1780005765033). CHILD C rewires the worker +
+# admin routes onto this repo and deletes the domain-layer copies. Semantics
+# preserved verbatim (codex round-28 hardened terminalization).
+_PG_DEQUEUE_SQL = """
+WITH next AS (
+    SELECT id
+    FROM memory_compression_queue
+    WHERE status = 'pending'
+    ORDER BY priority DESC, enqueued_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT $1
+)
+UPDATE memory_compression_queue q
+SET status      = 'running',
+    started_at  = NOW(),
+    attempts    = q.attempts + 1
+FROM next
+WHERE q.id = next.id
+RETURNING q.id, q.memory_id, q.owner_id, q.reason,
+          q.scoring_profile, q.attempts
+"""
+
+_PG_MARK_DONE_SQL = """
+UPDATE memory_compression_queue
+SET status      = 'done',
+    finished_at = NOW(),
+    error       = NULL
+WHERE id = $1::uuid
+"""
+
+_PG_MARK_FAILED_SQL = """
+UPDATE memory_compression_queue
+SET status      = 'failed',
+    finished_at = NOW(),
+    error       = $2
+WHERE id = $1::uuid
+"""
+
+# Reclaim 'running' rows stranded past the stale threshold. Terminalization:
+#   * attempts >= max AND error is a recorded content failure (NOT NULL,
+#     not an infra_retry: breadcrumb) -> 'failed'.
+#   * attempts >= max but error NULL / infra_retry: -> reset 'pending' AND
+#     decrement attempts (wedged-pool path).
+#   * attempts < max -> reset 'pending', attempts preserved.
+_PG_SWEEP_STALE_SQL = """
+WITH stale AS (
+    SELECT id, attempts, error
+    FROM memory_compression_queue
+    WHERE status = 'running'
+      AND (started_at IS NULL
+           OR started_at < NOW() - ($1::int * INTERVAL '1 second'))
+    FOR UPDATE SKIP LOCKED
+), classified AS (
+    SELECT id,
+           attempts,
+           error,
+           (attempts >= $2
+            AND error IS NOT NULL
+            AND error NOT LIKE 'infra_retry:%'
+           ) AS terminalize
+    FROM stale
+)
+UPDATE memory_compression_queue q
+SET status      = CASE WHEN c.terminalize THEN 'failed' ELSE 'pending' END,
+    started_at  = CASE WHEN c.terminalize THEN q.started_at ELSE NULL END,
+    finished_at = CASE WHEN c.terminalize THEN NOW()        ELSE NULL END,
+    attempts    = CASE
+                    WHEN c.terminalize THEN q.attempts
+                    WHEN c.attempts >= $2 THEN GREATEST(c.attempts - 1, 0)
+                    ELSE q.attempts
+                  END,
+    error       = CASE
+                    WHEN c.terminalize
+                      THEN 'stranded_running: exceeded stale threshold after '
+                           || c.attempts || ' attempts'
+                    WHEN c.attempts >= $2
+                      THEN 'infra_retry: stale-recovered without content-failure breadcrumb'
+                    ELSE NULL
+                  END
+FROM classified c
+WHERE q.id = c.id
+RETURNING q.id, q.status, c.attempts
+"""
+
+
+class PostgresCompressionQueueRepository(CompressionQueueRepository):
+    """Postgres impl of the v3.1 compression work queue (job 019e7049
+    CHILD B). Wraps the canonical queue SQL behind the ABC with NO
+    behaviour change — the contest semantics are identical to the prior
+    asyncpg-direct path in worker_contest.py / admin_lifecycle_repo.py.
+    """
+
+    async def enqueue_compression(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: list[str],
+        reason: str,
+        priority: int,
+        scoring_profile: str,
+    ) -> list[str]:
+        if not memory_ids:
+            return []
+        conn = _postgres_tx(tx).conn
+        known = await conn.fetch(
+            "SELECT id, owner_id FROM memories " "WHERE id = ANY($1::text[]) AND deleted_at IS NULL",
+            memory_ids,
+        )
+        owner_by_id = {r["id"]: r["owner_id"] for r in known}
+        enqueued: list[str] = []
+        for mid in memory_ids:
+            if mid not in owner_by_id:
+                continue
+            await conn.execute(
+                "INSERT INTO memory_compression_queue "
+                "(memory_id, owner_id, reason, priority, scoring_profile) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                mid,
+                owner_by_id[mid],
+                reason,
+                priority,
+                scoring_profile,
+            )
+            enqueued.append(mid)
+        return enqueued
+
+    async def enqueue_all_compression(
+        self,
+        tx: Transaction,
+        *,
+        reason: str,
+        priority: int,
+        scoring_profile: str,
+        category: str | None,
+        only_uncompressed: bool,
+        limit: int,
+    ) -> int:
+        conn = _postgres_tx(tx).conn
+        where_parts: list[str] = ["m.deleted_at IS NULL"]
+        params: list[Any] = []
+        if only_uncompressed:
+            where_parts.append("NOT EXISTS (SELECT 1 FROM memory_compressed_variants v WHERE v.memory_id = m.id)")
+        if category is not None:
+            params.append(category)
+            where_parts.append(f"m.category = ${len(params)}")
+        where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+        params.extend([reason, priority, scoring_profile, limit])
+        reason_idx = len(params) - 3
+        priority_idx = len(params) - 2
+        profile_idx = len(params) - 1
+        limit_idx = len(params)
+
+        sql = (
+            "INSERT INTO memory_compression_queue "
+            "(memory_id, owner_id, reason, priority, scoring_profile) "
+            "SELECT m.id, m.owner_id, "
+            f"${reason_idx}, ${priority_idx}, ${profile_idx} "
+            f"FROM memories m{where_sql} "
+            "ORDER BY LENGTH(m.content) DESC "
+            f"LIMIT ${limit_idx}"
+        )
+        return _pg_result_count(await conn.execute(sql, *params))
+
+    async def dequeue_compression(
+        self,
+        tx: Transaction,
+        *,
+        limit: int,
+    ) -> list[Row]:
+        if limit <= 0:
+            return []
+        conn = _postgres_tx(tx).conn
+        rows = await conn.fetch(_PG_DEQUEUE_SQL, int(limit))
+        out: list[Row] = []
+        for r in rows:
+            d = dict(r)
+            d["id"] = str(d["id"])  # normalise UUID -> str for the ABC contract
+            out.append(d)
+        return out
+
+    async def mark_compression_done(
+        self,
+        tx: Transaction,
+        *,
+        queue_id: str,
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(_PG_MARK_DONE_SQL, str(queue_id))
+
+    async def mark_compression_failed(
+        self,
+        tx: Transaction,
+        *,
+        queue_id: str,
+        error: str,
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(_PG_MARK_FAILED_SQL, str(queue_id), error)
+
+    async def sweep_stale_compression(
+        self,
+        tx: Transaction,
+        *,
+        stale_threshold_secs: int,
+        max_attempts: int,
+    ) -> int:
+        rows = await _postgres_tx(tx).conn.fetch(_PG_SWEEP_STALE_SQL, int(stale_threshold_secs), int(max_attempts))
+        return len(rows)
 
 
 class PostgresWebhookRepository(WebhookRepository):
@@ -2942,6 +3157,7 @@ class PostgresBackend:
         self._memory_versions = PostgresVersionRepository()
         self._memory_branches = PostgresBranchRepository()
         self._compression = PostgresCompressionRepository()
+        self._compression_queue = PostgresCompressionQueueRepository()
         self._webhooks = PostgresWebhookRepository()
         self._consultations_audit = PostgresConsultationAuditRepository()
         self._oauth = PostgresOAuthRepository()
@@ -3235,6 +3451,10 @@ class PostgresBackend:
     @property
     def compression(self) -> CompressionRepository:
         return self._compression
+
+    @property
+    def compression_queue(self) -> CompressionQueueRepository:
+        return self._compression_queue
 
     @property
     def webhooks(self) -> WebhookRepository:
