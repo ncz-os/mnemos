@@ -35,12 +35,11 @@ from mcp.types import Tool, TextContent, Resource, Prompt
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
 
-from mnemos.core.config import get_settings
+from mnemos.core.config import mcp_hive_url_env, mcp_mnemos_token_env, mcp_mnemos_url_env, mcp_port_env
 
-_settings = get_settings().hive_mind
-HIVE_URL = _settings.mcp_hive_url
-MNEMOS_URL = _settings.mcp_mnemos_url
-MNEMOS_TOKEN = _settings.mcp_mnemos_token
+HIVE_URL = mcp_hive_url_env()
+MNEMOS_URL = mcp_mnemos_url_env()
+MNEMOS_TOKEN = mcp_mnemos_token_env()
 
 server = Server("graeae-hive-mind")
 client = httpx.AsyncClient(timeout=15.0)
@@ -340,4 +339,4 @@ app = Starlette(
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=_settings.mcp_port)
+    uvicorn.run(app, host="0.0.0.0", port=mcp_port_env())
