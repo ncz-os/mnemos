@@ -1244,6 +1244,154 @@ class AuditChainRepository(ABC):
         return result
 
 
+class CompressionQueueRepository(ABC):
+    """v3.1 distillation/compression work queue — backend-agnostic.
+
+    GAP 1 of job 019e7049: the queue + worker-pool claim were written
+    directly against asyncpg/Postgres (``workers/distillation.py``
+    imports ``asyncpg``; ``domain/compression/worker_contest.py`` runs
+    raw ``FOR UPDATE SKIP LOCKED``; ``db/admin_lifecycle_repo.py``
+    enqueue is asyncpg-only). On Oracle the admin enqueue routes 503 and
+    the contest never drains. This ABC moves the queue mechanics behind
+    the persistence surface so every hive backend (Postgres, Oracle,
+    DB2, MySQL) runs the contest with an IDENTICAL schema + feature set
+    (architectural law mem_1780005765033). SQLite implements it for
+    ABC-completeness only — not a hive target.
+
+    The six primitives below are the SQL-level contract. Worker-side
+    orchestration (asyncpg pool management, infra-retry connection
+    resets) stays in the worker layer and is rewired to call these
+    primitives in CHILD C.
+
+    Schema reference (canonical): db/migrations_v3_1_compression.sql
+    (Postgres) + db/migrations_oracle/0040_memory_compression_queue_parity.sql.
+    Columns: id, memory_id, owner_id, reason, status, priority,
+    scoring_profile, attempts, enqueued_at, started_at, finished_at,
+    error.
+
+    Concurrency contract: ``dequeue`` and ``sweep_stale`` MUST claim
+    rows with a SKIP-LOCKED row lock so multiple contest workers
+    coexist without double-processing. Backends without SKIP LOCKED
+    (SQLite) serialise via a single-writer transaction
+    (``BEGIN IMMEDIATE``) instead.
+
+    GRAEAE consult 1c3e8a7f (athena/hephaestus/metis).
+    """
+
+    @abstractmethod
+    async def enqueue_compression(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: list[str],
+        reason: str,
+        priority: int,
+        scoring_profile: str,
+    ) -> list[str]:
+        """Enqueue specific memories for compression.
+
+        Skips ids that don't resolve to a live (non-deleted) memory;
+        resolves each row's ``owner_id`` from ``memories`` and inserts a
+        ``pending`` queue row. Returns the list of memory_ids that were
+        actually enqueued (subset of ``memory_ids``). ``reason`` is one
+        of ``on_write|manual|scheduled|reprocess``; ``scoring_profile``
+        is ``balanced|quality_first|speed_first|custom`` (CHECK-enforced).
+        Queue-row ids are DB-default generated (the INSERT omits ``id`` on
+        every backend, matching PG's ``gen_random_uuid()`` default).
+        """
+        ...
+
+    @abstractmethod
+    async def enqueue_all_compression(
+        self,
+        tx: Transaction,
+        *,
+        reason: str,
+        priority: int,
+        scoring_profile: str,
+        category: str | None,
+        only_uncompressed: bool,
+        limit: int,
+    ) -> int:
+        """Bulk-enqueue eligible memories, longest-content-first.
+
+        Selects live memories (optionally filtered by ``category`` and,
+        when ``only_uncompressed``, those with no row in
+        ``memory_compressed_variants``), ordered by content length DESC,
+        capped at ``limit``, and inserts a ``pending`` queue row for
+        each in a single set-based statement. Returns the number of rows
+        enqueued.
+        """
+        ...
+
+    @abstractmethod
+    async def dequeue_compression(
+        self,
+        tx: Transaction,
+        *,
+        limit: int,
+    ) -> list[Row]:
+        """Atomically claim the next ``limit`` pending tasks.
+
+        Selects ``status = 'pending'`` rows ordered by ``priority DESC,
+        enqueued_at`` under a SKIP-LOCKED row lock, flips them to
+        ``running`` (stamping ``started_at`` and incrementing
+        ``attempts``) in the same statement/transaction, and returns the
+        claimed rows with at least ``id, memory_id, owner_id, reason,
+        scoring_profile, attempts``. Returns ``[]`` when the queue is
+        empty or all candidates are locked by peers.
+        """
+        ...
+
+    @abstractmethod
+    async def mark_compression_done(
+        self,
+        tx: Transaction,
+        *,
+        queue_id: str,
+    ) -> None:
+        """Mark a claimed task ``done`` (sets finished_at, clears error)."""
+        ...
+
+    @abstractmethod
+    async def mark_compression_failed(
+        self,
+        tx: Transaction,
+        *,
+        queue_id: str,
+        error: str,
+    ) -> None:
+        """Mark a claimed task ``failed`` (sets finished_at + error)."""
+        ...
+
+    @abstractmethod
+    async def sweep_stale_compression(
+        self,
+        tx: Transaction,
+        *,
+        stale_threshold_secs: int,
+        max_attempts: int,
+    ) -> int:
+        """Reclaim ``running`` rows stranded past ``stale_threshold_secs``.
+
+        Claims stale rows under SKIP-LOCKED and applies the
+        terminalization rules (identical on every backend):
+
+        * ``attempts >= max_attempts`` AND ``error`` is a recorded
+          content/contest failure (NOT NULL and not an ``infra_retry:``
+          breadcrumb) → mark ``failed``.
+        * ``attempts >= max_attempts`` but ``error`` is NULL or an
+          ``infra_retry:`` breadcrumb → reset to ``pending`` AND
+          decrement ``attempts`` (the wedged-pool path: don't
+          terminalize a content-OK row from pure infra pressure).
+        * ``attempts < max_attempts`` → reset to ``pending`` (next
+          dequeue retries), attempts preserved.
+
+        Returns the number of rows reclaimed/terminalized.
+        """
+        ...
+
+
 CapabilityName: TypeAlias = Literal[
     "core",
     "oauth",
@@ -1286,6 +1434,7 @@ KG_CAPABILITY: DetailedCapabilityName = "kg"
 VERSIONS_CAPABILITY: DetailedCapabilityName = "versions"
 BRANCHES_CAPABILITY: DetailedCapabilityName = "branches"
 COMPRESSION_CAPABILITY: DetailedCapabilityName = "compression"
+COMPRESSION_QUEUE_CAPABILITY: DetailedCapabilityName = "compression_queue"
 OAUTH_DETAIL_CAPABILITY: DetailedCapabilityName = "oauth"
 SESSIONS_DETAIL_CAPABILITY: DetailedCapabilityName = "sessions"
 CONSULTATIONS_DETAIL_CAPABILITY: DetailedCapabilityName = "consultations"
@@ -1452,6 +1601,9 @@ class CorePersistence(PersistenceCapabilityBase, Protocol):
 
     @property
     def compression(self) -> CompressionRepository: ...
+
+    @property
+    def compression_queue(self) -> CompressionQueueRepository: ...
 
     @property
     def webhooks(self) -> WebhookRepository: ...
