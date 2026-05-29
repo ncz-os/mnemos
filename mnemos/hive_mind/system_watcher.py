@@ -17,6 +17,7 @@ Env:
   HEARTBEAT_INTERVAL        seconds (default 15)
   CLAIM_JOBS                if "1", actively claim eligible jobs and dispatch to local executor (default "0" = passive monitor only)
 """
+
 from __future__ import annotations
 import json
 import os
@@ -112,13 +113,23 @@ def static_specs() -> dict:
     # NVIDIA
     if shutil.which("nvidia-smi"):
         try:
-            r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
-                                "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5)
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
             for line in r.stdout.strip().splitlines():
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) >= 2:
-                    gpus.append({"vendor": "nvidia", "name": parts[0], "vram_mib": int(parts[1]),
-                                 "driver": parts[2] if len(parts) > 2 else ""})
+                    gpus.append(
+                        {
+                            "vendor": "nvidia",
+                            "name": parts[0],
+                            "vram_mib": int(parts[1]),
+                            "driver": parts[2] if len(parts) > 2 else "",
+                        }
+                    )
         except Exception:
             pass
     # AMD
@@ -144,8 +155,14 @@ def static_specs() -> dict:
     # Container runtimes
     out["has_docker"] = bool(shutil.which("docker"))
     out["has_podman"] = bool(shutil.which("podman"))
-    out["has_buildx"] = bool(shutil.which("docker") and subprocess.run(
-        ["docker", "buildx", "version"], capture_output=True).returncode == 0) if shutil.which("docker") else False
+    out["has_buildx"] = (
+        bool(
+            shutil.which("docker")
+            and subprocess.run(["docker", "buildx", "version"], capture_output=True).returncode == 0
+        )
+        if shutil.which("docker")
+        else False
+    )
     # CI runners
     out["has_gitlab_runner"] = bool(shutil.which("gitlab-runner"))
     return out
@@ -187,19 +204,30 @@ def dynamic_load() -> dict:
 
 def capabilities_from_specs(specs: dict) -> list[str]:
     caps = ["system", "host"]
-    if specs.get("has_docker"):     caps.append("docker")
-    if specs.get("has_podman"):     caps.append("podman")
-    if specs.get("has_buildx"):     caps.extend(["build", "buildx", "multi-arch-build"])
-    if specs.get("has_gitlab_runner"): caps.append("ci-runner")
+    if specs.get("has_docker"):
+        caps.append("docker")
+    if specs.get("has_podman"):
+        caps.append("podman")
+    if specs.get("has_buildx"):
+        caps.extend(["build", "buildx", "multi-arch-build"])
+    if specs.get("has_gitlab_runner"):
+        caps.append("ci-runner")
     for g in specs.get("gpus", []) or []:
         v = g.get("vendor", "")
-        if v == "nvidia": caps.extend(["gpu", "nvidia-gpu", "cuda"])
-        elif v == "amd": caps.extend(["gpu", "amd-gpu", "rocm", "vulkan-compute"])
-        elif v == "intel": caps.extend(["gpu", "intel-igpu"])
-    if specs.get("ram_gb", 0) >= 32:  caps.append("ram-32g+")
-    if specs.get("ram_gb", 0) >= 64:  caps.append("ram-64g+")
-    if specs.get("cpu_count", 0) >= 16: caps.append("cpu-16t+")
-    if specs.get("cpu_count", 0) >= 32: caps.append("cpu-32t+")
+        if v == "nvidia":
+            caps.extend(["gpu", "nvidia-gpu", "cuda"])
+        elif v == "amd":
+            caps.extend(["gpu", "amd-gpu", "rocm", "vulkan-compute"])
+        elif v == "intel":
+            caps.extend(["gpu", "intel-igpu"])
+    if specs.get("ram_gb", 0) >= 32:
+        caps.append("ram-32g+")
+    if specs.get("ram_gb", 0) >= 64:
+        caps.append("ram-64g+")
+    if specs.get("cpu_count", 0) >= 16:
+        caps.append("cpu-16t+")
+    if specs.get("cpu_count", 0) >= 32:
+        caps.append("cpu-32t+")
     return caps
 
 
@@ -239,12 +267,16 @@ def heartbeat():
     # Update via heartbeat endpoint; payload-side metadata refresh would need new endpoint — for now load goes in metadata only at re-register; emit load as a hive message every heartbeat for live visibility
     _http("POST", "/v1/agents/heartbeat", {"urn": _urn})
     # broadcast load as a system.load message
-    _http("POST", "/v1/messages", {
-        "from_urn": _urn,
-        "to_urn": None,
-        "topic": "system.load",
-        "payload": load,
-    })
+    _http(
+        "POST",
+        "/v1/messages",
+        {
+            "from_urn": _urn,
+            "to_urn": None,
+            "topic": "system.load",
+            "payload": load,
+        },
+    )
 
 
 def main():
