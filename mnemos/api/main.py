@@ -39,7 +39,7 @@ from mnemos.api.routes.state import router as state_router
 from mnemos.api.routes.versions import router as versions_router
 from mnemos.api.routes.webhooks import router as webhooks_router
 from mnemos.api.lifecycle_hooks import register_lifespan_hooks
-from mnemos.core.config import get_settings
+from mnemos.core.config import get_settings, session_secret_required
 from mnemos.core.lifecycle import lifespan
 from mnemos.core.rate_limit import (
     RateLimitExceeded,
@@ -286,11 +286,7 @@ if not _oauth_state_secret:
     # fail-loud at startup instead of silently generating a per-process
     # ephemeral key (which invalidates every logged-in session on every
     # restart).
-    _require_secret = os.environ.get("MNEMOS_REQUIRE_SESSION_SECRET", "").strip().lower() in (
-        "yes",
-        "1",
-        "true",
-    )
+    _require_secret = session_secret_required()
     if _require_secret:
         raise RuntimeError(
             "MNEMOS_SESSION_SECRET is required but not set "

@@ -43,6 +43,8 @@ import os
 from pathlib import Path
 from typing import Iterable
 
+from mnemos.core.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BACKEND = "auto"
@@ -440,7 +442,7 @@ class _HttpBackend:
         if self._consecutive_failures >= self._cb_threshold and self._breaker_opened_at is None:
             self._breaker_opened_at = _t.monotonic()
             logger.warning(
-                "[EMBED][http] circuit breaker OPEN after %d consecutive failures; " "cooling down %.1fs (url=%s)",
+                "[EMBED][http] circuit breaker OPEN after %d consecutive failures; cooling down %.1fs (url=%s)",
                 self._consecutive_failures,
                 self._cb_cooldown,
                 self.url,
@@ -555,7 +557,7 @@ def _cix_npu_available() -> bool:
         import libnoe  # noqa: F401
     except Exception:
         return False
-    model_path = os.environ.get("MNEMOS_EMBED_CIX_MODEL_PATH", DEFAULT_CIX_MODEL_PATH)
+    model_path = get_settings().providers.embed_cix_model_path
     if not Path(model_path).exists():
         return False
     return True
@@ -632,57 +634,34 @@ class InProcessEmbedder:
         # shared
         max_text_chars: int | None = None,
     ) -> None:
-        requested = backend or os.environ.get("MNEMOS_EMBED_BACKEND", DEFAULT_BACKEND)
+        settings = get_settings().providers
+        requested = backend or settings.embed_backend
         self.backend_choice = requested
 
-        self.ov_model_id = ov_model_id or os.environ.get("MNEMOS_EMBED_OV_MODEL_ID", DEFAULT_OV_MODEL_ID)
-        self.ov_device = (ov_device or os.environ.get("MNEMOS_EMBED_OV_DEVICE", DEFAULT_OV_DEVICE)).upper()
+        self.ov_model_id = ov_model_id or settings.embed_ov_model_id
+        self.ov_device = (ov_device or settings.embed_ov_device).upper()
 
-        self.model_path = model_path or os.environ.get("MNEMOS_EMBED_MODEL_PATH", DEFAULT_MODEL_PATH)
-        self.cix_model_path = cix_model_path or os.environ.get("MNEMOS_EMBED_CIX_MODEL_PATH", DEFAULT_CIX_MODEL_PATH)
-        self.cix_tokenizer_id = cix_tokenizer_id or os.environ.get(
-            "MNEMOS_EMBED_CIX_TOKENIZER_ID", DEFAULT_CIX_TOKENIZER_ID
-        )
-        self.cix_max_seq_len = int(
-            cix_max_seq_len
-            if cix_max_seq_len is not None
-            else os.environ.get("MNEMOS_EMBED_CIX_MAX_SEQ_LEN", DEFAULT_CIX_MAX_SEQ_LEN)
-        )
-        hybrid_env = os.environ.get("MNEMOS_EMBED_HYBRID", str(DEFAULT_HYBRID))
+        self.model_path = model_path or settings.embed_model_path
+        self.cix_model_path = cix_model_path or settings.embed_cix_model_path
+        self.cix_tokenizer_id = cix_tokenizer_id or settings.embed_cix_tokenizer_id
+        self.cix_max_seq_len = int(cix_max_seq_len if cix_max_seq_len is not None else settings.embed_cix_max_seq_len)
+        hybrid_env = settings.embed_hybrid
         self.hybrid = hybrid if hybrid is not None else hybrid_env.lower() in ("1", "true", "yes")
         self.npu_threshold_chars = int(
-            npu_threshold_chars
-            if npu_threshold_chars is not None
-            else os.environ.get("MNEMOS_EMBED_NPU_THRESHOLD_CHARS", DEFAULT_NPU_THRESHOLD_CHARS)
+            npu_threshold_chars if npu_threshold_chars is not None else settings.embed_npu_threshold_chars
         )
-        self.n_ctx = int(n_ctx if n_ctx is not None else os.environ.get("MNEMOS_EMBED_N_CTX", DEFAULT_N_CTX))
-        self.n_threads = int(
-            n_threads if n_threads is not None else os.environ.get("MNEMOS_EMBED_THREADS", DEFAULT_N_THREADS)
-        )
-        self.n_gpu_layers = int(
-            n_gpu_layers
-            if n_gpu_layers is not None
-            else os.environ.get("MNEMOS_EMBED_GPU_LAYERS", DEFAULT_N_GPU_LAYERS)
-        )
-        self.http_url = http_url or os.environ.get("MNEMOS_EMBED_HTTP_URL", DEFAULT_HTTP_URL)
+        self.n_ctx = int(n_ctx if n_ctx is not None else settings.embed_n_ctx)
+        self.n_threads = int(n_threads if n_threads is not None else settings.embed_threads)
+        self.n_gpu_layers = int(n_gpu_layers if n_gpu_layers is not None else settings.embed_gpu_layers)
+        self.http_url = http_url or settings.embed_http_url
         # Fallback URL: empty string disables; default = MEDUSA so the primary
         # TYPHON outage path falls to MEDUSA before in-process llamacpp.
         self.http_url_fallback = (
-            http_url_fallback
-            if http_url_fallback is not None
-            else os.environ.get("MNEMOS_EMBED_HTTP_URL_FALLBACK", DEFAULT_HTTP_URL_FALLBACK)
+            http_url_fallback if http_url_fallback is not None else settings.embed_http_url_fallback
         )
-        self.http_model = http_model or os.environ.get("MNEMOS_EMBED_HTTP_MODEL", DEFAULT_HTTP_MODEL)
-        self.http_timeout = float(
-            http_timeout
-            if http_timeout is not None
-            else os.environ.get("MNEMOS_EMBED_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT)
-        )
-        self.max_text_chars = int(
-            max_text_chars
-            if max_text_chars is not None
-            else os.environ.get("MNEMOS_EMBED_MAX_CHARS", DEFAULT_MAX_TEXT_CHARS)
-        )
+        self.http_model = http_model or settings.embed_http_model
+        self.http_timeout = float(http_timeout if http_timeout is not None else settings.embed_http_timeout)
+        self.max_text_chars = int(max_text_chars if max_text_chars is not None else settings.embed_max_chars)
         self._backend = None  # type: ignore[assignment]
         self._backend_name: str | None = None
         # Hybrid sidecar: when self.hybrid + cix-npu available, route short

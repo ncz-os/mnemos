@@ -1,18 +1,18 @@
 """NATS v0.3 consumer for federation memory upserts."""
+
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 import asyncpg
 
-from mnemos.core.config import Settings, get_settings
+from mnemos.core.config import Settings, get_settings, nats_federation_enabled
 from mnemos.core.extras import is_extra_installed
 from mnemos.domain.federation import _store_memories
 from mnemos.nats.backoff import ReconnectBackoff
@@ -42,12 +42,7 @@ class PoisonMessageError(ValueError):
 
 
 def _enabled() -> bool:
-    return os.environ.get("MNEMOS_NATS_FEDERATION_ENABLED", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return nats_federation_enabled()
 
 
 def configured_peers(settings: Settings | None = None) -> list[FederationMemoryPeer]:
@@ -61,8 +56,7 @@ def configured_peers(settings: Settings | None = None) -> list[FederationMemoryP
             logger.warning("federation memory nats peer missing name or nats_url: %r", raw)
             continue
         subjects = tuple(
-            subject for subject in raw.subjects
-            if subject.startswith(FEDERATION_MEMORY_SUBJECT_PREFIX)
+            subject for subject in raw.subjects if subject.startswith(FEDERATION_MEMORY_SUBJECT_PREFIX)
         ) or (SUBJECT,)
         peers.append(
             FederationMemoryPeer(
@@ -92,10 +86,7 @@ async def run_configured_consumers(
     if not peers:
         logger.info("federation memory nats consumer disabled (MNEMOS_FEDERATION_NATS_PEERS empty)")
         return
-    queue_group = (
-        os.environ.get(QUEUE_ENV, "").strip()
-        or settings.federation.nats_queue_group
-    )
+    queue_group = settings.nats.federation_queue_group.strip() or settings.federation.nats_queue_group
     tasks = [
         asyncio.create_task(
             consumer_loop(
@@ -150,10 +141,7 @@ async def consumer_loop(
                 peer.name,
                 ",".join(peer.subjects),
             )
-            subscriptions = [
-                await _subscribe(js, peer, subject, queue_group=queue_group)
-                for subject in peer.subjects
-            ]
+            subscriptions = [await _subscribe(js, peer, subject, queue_group=queue_group) for subject in peer.subjects]
             backoff.reset()
             async with _SubscriptionGroup(pool, peer, subscriptions) as group:
                 subscriptions = []
@@ -254,8 +242,7 @@ class _SubscriptionGroup:
 
     async def __aenter__(self):
         self.tasks = [
-            asyncio.create_task(_consume_subscription(self.pool, self.peer, sub))
-            for sub in self.subscriptions
+            asyncio.create_task(_consume_subscription(self.pool, self.peer, sub)) for sub in self.subscriptions
         ]
         return self
 

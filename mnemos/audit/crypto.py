@@ -25,17 +25,18 @@ import base64
 import hashlib
 import hmac
 import json
-import os
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
-from cryptography.exceptions import InvalidSignature
+
+from mnemos.core.config import runtime_env_value_stripped
 
 
 # ---------- JCS-lite ----------
@@ -179,7 +180,7 @@ def load_root_keypair(
     v6.2) but the env var is unset or malformed — same fail-loud
     pattern as session-secret hardening (v6.1 P3 #38).
     """
-    raw = os.environ.get(env_var, "").strip()
+    raw = runtime_env_value_stripped(env_var)
     if not raw:
         raise ValueError(
             f"{env_var} is unset; required when MNEMOS_AUDIT_CHAIN is on. "

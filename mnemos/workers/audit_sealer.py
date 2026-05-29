@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,6 +32,7 @@ from mnemos.audit import (
     merkle_leaf,
     merkle_root,
 )
+from mnemos.core.config import audit_chain_enabled_flag
 from mnemos.persistence.base import AuditPersistence
 
 logger = logging.getLogger(__name__)
@@ -74,7 +74,7 @@ class AuditSealer:
     ) -> None:
         if backend.audit_chain is None:
             raise ValueError(
-                "backend has no audit_chain repository; cannot seal " "(check MNEMOS_AUDIT_CHAIN env + backend impl)"
+                "backend has no audit_chain repository; cannot seal (check MNEMOS_AUDIT_CHAIN env + backend impl)"
             )
         self._backend = backend
         self._window_seconds = max(int(window_seconds), 1)
@@ -185,4 +185,4 @@ def audit_chain_enabled() -> bool:
     else disables it. Same opt-in semantics as in spec § 1
     "MNEMOS_AUDIT_CHAIN=on (default in v6.2)".
     """
-    return os.environ.get("MNEMOS_AUDIT_CHAIN", "").lower() == "on"
+    return audit_chain_enabled_flag()

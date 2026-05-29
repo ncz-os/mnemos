@@ -22,7 +22,7 @@ from typing import Any, Optional
 import asyncpg
 
 from mnemos.core.auth_context import UserContext
-from mnemos.core.config import hot_rs_enabled
+from mnemos.core.config import embed_http_model_override, hot_rs_enabled
 from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.core.recommendation import choose_recommended_model
@@ -3079,9 +3079,7 @@ class PostgresFederationRepository(FederationRepository):
             from mnemos.core.config import get_settings as _gs
 
             try:
-                import os as _os
-
-                _http_model = _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                _http_model = embed_http_model_override()
                 _embed_model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
             except Exception:
                 _embed_model = "unknown"
