@@ -349,7 +349,33 @@ class PostgresMemoryRepository(MemoryRepository):
             )
 
     async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None:
-        await mcp_repo.assert_memory_readable(_postgres_tx(tx).conn, memory_id, user)
+        # Inlined Postgres impl (matches oracle/db2/sqlite backends) so this
+        # concrete backend no longer reaches up into mnemos.db.mcp_repo.
+        conn = _postgres_tx(tx).conn
+        if user.role == "root":
+            row = await conn.fetchrow(
+                "SELECT 1 FROM memory_versions WHERE memory_id = $1 AND deleted_at IS NULL LIMIT 1",
+                memory_id,
+            )
+            if not row:
+                raise PermissionError("Memory not found")
+            return
+        vis_clause, vis_params = _core_read_visibility_predicate(
+            user.user_id,
+            list(user.group_ids),
+            2,
+        )
+        ns_ph = f"${len(vis_params) + 2}"
+        row = await conn.fetchrow(
+            f"SELECT 1 FROM memories WHERE id = $1 "
+            f"AND deleted_at IS NULL AND {vis_clause} "
+            f"AND namespace = {ns_ph} LIMIT 1",
+            memory_id,
+            *vis_params,
+            user.namespace,
+        )
+        if not row:
+            raise PermissionError("Memory not found")
 
     async def fetch_memory_log(
         self,
