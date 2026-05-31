@@ -23,9 +23,24 @@ default:
       - .venv
       - .cache/pip
   before_script:
-    - python3 -m venv .venv
-    - .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev]"
-    - export PATH="$CI_PROJECT_DIR/.venv/bin:$PATH"
+    # Policy-injected security analyzers (SAST / secret-detection /
+    # dependency-scanning / etc.) run in their own analyzer images and inherit
+    # this default before_script. Those images may lack python3 or cannot
+    # resolve heavy optional deps like openvino, and they do not need our venv
+    # to scan — so skip the venv build for them and let the analyzer's own
+    # script run. Project jobs (lint:* / test:* / release:*) do not match these
+    # patterns and keep identical behavior.
+    - |
+      case "$CI_JOB_NAME" in
+        *sast*|*secret-detection*|*dependency-scanning*|*container-scanning*|*dast*|*license-scanning*|*api-fuzzing*|*coverage-fuzzing*)
+          echo "security analyzer job ($CI_JOB_NAME) — skipping venv setup"
+          ;;
+        *)
+          python3 -m venv .venv
+          .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev]"
+          export PATH="$CI_PROJECT_DIR/.venv/bin:$PATH"
+          ;;
+      esac
 
 variables:
   PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
