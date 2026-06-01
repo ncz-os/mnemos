@@ -25,9 +25,9 @@ INSERT INTO subscription_plans (
   overage_pricing_per_mtok_out, notes
 ) VALUES
   ('anthropic', 'claude_max_200', 'subscription', 200, 900, 18000, NULL, NULL, 'rolling', NULL, NULL, 'Claude Max 200: 900 messages per 5h window'),
-  ('anthropic', 'claude_max_100', 'subscription', 100, 450, 18000, NULL, NULL, 'rolling', NULL, NULL, 'Claude Max 100: 450 messages per 5h window until 2026-06-01'),
-  ('openai', 'chatgpt_plus', 'subscription', 20, 40, 10800, NULL, NULL, 'rolling', NULL, NULL, 'ChatGPT Plus: 40 messages per 3h window'),
-  ('openai', 'chatgpt_pro', 'subscription', 200, NULL, NULL, 200, 604800, 'weekly', NULL, NULL, 'ChatGPT Pro: unmetered plus 200 GPT-5 messages per week'),
+  ('anthropic', 'claude_max_100', 'subscription', 100, 225, 18000, NULL, NULL, 'rolling', NULL, NULL, 'Claude Max 100 (5x): at least 225 messages per 5h window'),
+  ('openai', 'chatgpt_plus', 'subscription', 20, 15, 18000, NULL, NULL, 'rolling', NULL, NULL, 'ChatGPT Codex Plus: conservative GPT-5.5 local-message floor per 5h; official limits vary by model and surface'),
+  ('openai', 'chatgpt_pro', 'subscription', 200, 375, 18000, NULL, NULL, 'rolling', NULL, NULL, 'ChatGPT Codex Pro $200 promo: conservative GPT-5.5 local-message floor per 5h through 2026-05-31'),
   ('nvidia', 'ngc_integrate', 'free', 0, NULL, NULL, NULL, NULL, 'monthly', 0, 0, 'NVIDIA NGC Integrate free tier'),
   ('nvidia', 'ngc_inference', 'free', 0, NULL, NULL, NULL, NULL, 'monthly', 0, 0, 'NVIDIA NGC Inference free tier'),
   ('groq', 'dev_tier', 'token', NULL, NULL, NULL, NULL, NULL, 'monthly', NULL, NULL, 'Groq developer tier token-based usage'),

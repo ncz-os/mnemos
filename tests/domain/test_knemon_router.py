@@ -8,13 +8,15 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from mnemos.core.plan_windows import compute_plan_window_id
+from mnemos.core import config as config_mod
 from mnemos.core.config import get_settings
+from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.domain.knemon.router import (
     KnemonRouteRequest,
     _apply_priority_ceiling,
     _best_plan,
     _fallback_bucket,
+    _plan_is_effective,
     _plans_by_provider,
     _subscription_pool_aliases,
     route,
@@ -31,6 +33,7 @@ class _SqliteKnemonBackend:
         burned_age_seconds: int = 0,
         agent_session_id: str | None = None,
         subscription_pools: list[str] | None = None,
+        extra_subscription_utilization_pct: int | None = None,
     ) -> None:
         self.conn = sqlite3.connect(":memory:")
         self.active = 0
@@ -43,6 +46,7 @@ class _SqliteKnemonBackend:
             burned_age_seconds=burned_age_seconds,
             agent_session_id=agent_session_id,
             subscription_pools=subscription_pools,
+            extra_subscription_utilization_pct=extra_subscription_utilization_pct,
         )
 
     def _create_schema(self) -> None:
@@ -119,6 +123,7 @@ class _SqliteKnemonBackend:
         burned_age_seconds: int,
         agent_session_id: str | None,
         subscription_pools: list[str] | None,
+        extra_subscription_utilization_pct: int | None,
     ) -> None:
         now = datetime.now(timezone.utc)
         window_id = compute_plan_window_id(
@@ -126,7 +131,7 @@ class _SqliteKnemonBackend:
             "chatgpt_plus",
             now,
             reset_anchor="rolling",
-            window_seconds=10800,
+            window_seconds=18000,
         )
         msg_cap = 160
         used = round(msg_cap * utilization_pct / 100)
@@ -137,7 +142,7 @@ class _SqliteKnemonBackend:
               ('nvidia', 'ngc-free', 'NGC Free', '["chat","code"]', 0, 0, 200000, 1250, 0.88, 1, 0),
               ('xai', 'grok-api', 'Grok API', '["chat","code"]', 3, 15, 200000, 1220, 0.86, 1, 0);
             INSERT INTO subscription_plans VALUES
-              ('openai', 'chatgpt_plus', 'subscription', 'interactive', 20, 160, 10800,
+              ('openai', 'chatgpt_plus', 'subscription', 'interactive', 20, 160, 18000,
                NULL, NULL, 'rolling', NULL, NULL, '2026-01-01', NULL, NULL),
               ('nvidia', 'ngc_inference', 'free', 'free', 0, NULL, NULL,
                NULL, NULL, 'monthly', 0, 0, '2026-01-01', NULL, NULL),
@@ -168,6 +173,40 @@ class _SqliteKnemonBackend:
                           'test', 'api', ?, ?, ?, 'api', 0)
                 """,
                 (burn_ts, burned_session, burned_request_count, window_id),
+            )
+        if extra_subscription_utilization_pct is not None:
+            extra_window_id = compute_plan_window_id(
+                "anthropic",
+                "claude_max_200",
+                now,
+                reset_anchor="rolling",
+                window_seconds=18000,
+            )
+            extra_used = round(40 * extra_subscription_utilization_pct / 100)
+            self.conn.execute(
+                """
+                INSERT INTO model_registry VALUES
+                  ('anthropic', 'claude-sub', 'Claude Sub', '["chat","code"]', 3, 15,
+                   200000, 1300, 0.87, 1, 0)
+                """
+            )
+            self.conn.execute(
+                """
+                INSERT INTO subscription_plans VALUES
+                  ('anthropic', 'claude_max_200', 'subscription', 'interactive', 200, 40, 18000,
+                   NULL, NULL, 'rolling', NULL, NULL, '2026-01-01', NULL, NULL)
+                """
+            )
+            self.conn.execute(
+                """
+                INSERT INTO usage_ledger (
+                  ts, provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
+                  est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
+                  request_count, plan_window_id, path_kind, subscription_amortized
+                ) VALUES (?, 'anthropic', 'claude-sub', 'chat', 100, 50, 0, 0, 100, 'ok',
+                          'test', 'claude_max_200', 'usage-fixture', ?, ?, 'api', 1)
+                """,
+                (now, extra_used, extra_window_id),
             )
         if agent_session_id:
             self.conn.execute(
@@ -231,6 +270,75 @@ async def test_g1_at_100_pct_subscription_routes_to_api_fallback():
     decision = await route(_req(14), _SqliteKnemonBackend(100))
     assert decision.provider == "xai"
     assert decision.auth_method == "api"
+
+
+@pytest.mark.asyncio
+async def test_fallback_chain_uses_actual_utilization_for_unvisited_subscription():
+    backend = _SqliteKnemonBackend(92, extra_subscription_utilization_pct=92)
+    decision = await route(_req(5), backend)
+    assert decision.provider == "nvidia"
+    assert decision.fallback_chain[0][:2] == ("xai", "grok-api")
+
+
+def test_fallback_bucket_boundaries():
+    assert _fallback_bucket({"auth_method": "free"}) == 0
+    assert _fallback_bucket({"auth_method": "subscription", "sub_window_utilization_pct": 69.99}) == 1
+    assert _fallback_bucket({"auth_method": "subscription", "sub_window_utilization_pct": 70.0}) == 4
+    assert _fallback_bucket({"auth_method": "api", "estimated_cost_usd": 0.499999}) == 2
+    assert _fallback_bucket({"auth_method": "api", "estimated_cost_usd": 0.50}) == 3
+
+
+def test_g1_quality_floor_survives_burn_downgrade():
+    candidates = [
+        {"quality": 0.80, "tier": "B", "graeae_weight": 0.99},
+        {"quality": 0.86, "tier": "A", "graeae_weight": 0.80},
+    ]
+
+    assert _apply_priority_ceiling(candidates, 13, requested_priority=14) == [candidates[1]]
+
+
+def test_best_plan_prefers_matching_workspace_pool_over_highest_price():
+    plans = {
+        "openai": [
+            {
+                "provider": "openai",
+                "plan_name": "chatgpt_pro_200_codex",
+                "parent_plan_id": "chatgpt_pro",
+                "auth_method": "subscription",
+                "monthly_usd": 200,
+                "msg_cap": 300,
+            },
+            {
+                "provider": "openai",
+                "plan_name": "chatgpt_plus",
+                "auth_method": "subscription",
+                "monthly_usd": 20,
+                "msg_cap": 15,
+            },
+        ]
+    }
+
+    assert _best_plan(plans, "openai", {"chatgpt_plus"})["plan_name"] == "chatgpt_plus"
+    assert _best_plan(plans, "openai", {"chatgpt_pro"})["plan_name"] == "chatgpt_pro_200_codex"
+    assert _best_plan(plans, "openai")["plan_name"] == "chatgpt_pro_200_codex"
+
+
+def test_plan_effective_dates_filter_expired_and_future_rows():
+    today = date(2026, 6, 1)
+
+    assert not _plan_is_effective(
+        {"effective_from": "2026-05-01", "effective_until": "2026-05-31"},
+        today,
+    )
+    assert _plan_is_effective(
+        {"effective_from": "2026-06-01", "effective_until": None},
+        today,
+    )
+    assert not _plan_is_effective(
+        {"effective_from": date(2026, 6, 2), "effective_until": None},
+        today,
+    )
+    assert _plan_is_effective({"provider": "legacy"}, today)
 
 
 @pytest.mark.asyncio
@@ -523,3 +631,29 @@ async def test_date_aware_plan_selection_honors_tier_flip_date(as_of: date, expe
     plans = await _plans_by_provider(backend, as_of=as_of)
 
     assert [plan["plan_name"] for plan in plans["anthropic"]] == [expected_plan]
+
+
+@pytest.mark.asyncio
+async def test_session_burn_threshold_honors_env_override(monkeypatch):
+    monkeypatch.setenv("MNEMOS_KNEMON_SESSION_BURN_REQUESTS_PER_HOUR", "12")
+    config_mod._reset_settings_for_tests()
+    try:
+        below = _SqliteKnemonBackend(70, burned_session="custom-threshold-below", burned_request_count=10)
+        below_decision = await route(_req(14, "custom-threshold-below"), below)
+        assert below_decision.provider == "openai"
+        assert below_decision.auth_method == "subscription"
+
+        at_threshold = _SqliteKnemonBackend(70, burned_session="custom-threshold-at", burned_request_count=12)
+        at_threshold_decision = await route(_req(14, "custom-threshold-at"), at_threshold)
+        assert at_threshold_decision.provider == "xai"
+        assert at_threshold_decision.auth_method == "api"
+    finally:
+        config_mod._reset_settings_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_session_below_burn_threshold_keeps_g1_subscription_escalation():
+    backend = _SqliteKnemonBackend(70, burned_session="not-yet-burned", burned_request_count=9)
+    decision = await route(_req(14, "not-yet-burned"), backend)
+    assert decision.provider == "openai"
+    assert decision.auth_method == "subscription"

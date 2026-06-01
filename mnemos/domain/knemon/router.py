@@ -154,6 +154,39 @@ def _to_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _to_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        pass
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+
+
+def _plan_is_effective(row: dict[str, Any], today: date | None = None) -> bool:
+    if "effective_from" not in row and "effective_until" not in row:
+        return True
+    today = today or datetime.now(timezone.utc).date()
+    effective_from = _to_date(row.get("effective_from"))
+    effective_until = _to_date(row.get("effective_until"))
+    if effective_from is not None and effective_from > today:
+        return False
+    if effective_until is not None and effective_until < today:
+        return False
+    return True
+
+
 def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -383,32 +416,6 @@ def _apply_priority_ceiling(
     return sorted(eligible, key=lambda row: (row["tier"] != "A", -_to_float(row.get("graeae_weight"))))
 
 
-def _to_date(value: Any) -> date | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    raw = str(value).strip()
-    if not raw:
-        return None
-    try:
-        return date.fromisoformat(raw[:10])
-    except ValueError:
-        return None
-
-
-def _plan_effective_on(row: dict[str, Any], today: date) -> bool:
-    effective_from = _to_date(row.get("effective_from"))
-    effective_until = _to_date(row.get("effective_until"))
-    if effective_from is not None and effective_from > today:
-        return False
-    if effective_until is not None and effective_until < today:
-        return False
-    return True
-
-
 async def _plans_by_provider(backend: Any, as_of: date | None = None) -> dict[str, list[dict[str, Any]]]:
     sql = """
         SELECT provider, plan_name, auth_method, path_kind, monthly_usd, msg_cap,
@@ -422,10 +429,15 @@ async def _plans_by_provider(backend: Any, as_of: date | None = None) -> dict[st
     try:
         rows = await _rows(backend, sql)
         today = as_of or datetime.now(timezone.utc).date()
-        rows = [row for row in rows if _plan_effective_on(row, today)]
+        rows = [row for row in rows if _plan_is_effective(row, today)]
     except Exception as exc:
         msg = str(exc).lower()
-        if "effective_from" not in msg and "path_kind" not in msg and "parent_plan_id" not in msg:
+        if (
+            "coalesce" not in msg
+            and "effective_from" not in msg
+            and "path_kind" not in msg
+            and "parent_plan_id" not in msg
+        ):
             raise
         rows = await _rows(
             backend,
@@ -435,11 +447,13 @@ async def _plans_by_provider(backend: Any, as_of: date | None = None) -> dict[st
                    reset_anchor, overage_pricing_per_mtok_in,
                    overage_pricing_per_mtok_out
             FROM subscription_plans
-            ORDER BY provider, COALESCE(monthly_usd, 0) DESC, COALESCE(msg_cap, 0) DESC, plan_name
+            ORDER BY provider, monthly_usd DESC, msg_cap DESC, plan_name
             """,
         )
     out: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
+        if not _plan_is_effective(row, as_of):
+            continue
         out.setdefault(str(row.get("provider") or "").lower(), []).append(row)
     return out
 
@@ -451,16 +465,16 @@ def _best_plan(
     candidate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     provider_plans = plans.get(provider.lower()) or []
+    if worker_pools is not None:
+        for plan in provider_plans:
+            if _worker_has_pool(worker_pools, plan):
+                return plan
     if provider_plans:
-        if worker_pools is not None:
-            for plan in provider_plans:
-                if _worker_has_pool(worker_pools, plan):
-                    return plan
-        else:
+        if worker_pools is None:
             family = _candidate_plan_family(candidate)
             if family is not None:
                 for plan in provider_plans:
-                    if _plan_family_alias(plan) == family:
+                    if family in _subscription_pool_aliases(plan):
                         return plan
         return provider_plans[0]
     return {"provider": provider, "plan_name": "api", "auth_method": "api", "path_kind": "api"}
@@ -536,6 +550,9 @@ async def _session_burned(backend: Any, session_id: str | None) -> bool:
     if not session_id:
         return False
     policy = get_settings().knemon
+    threshold = policy.session_burn_requests_per_hour
+    if threshold <= 0:
+        return False
     since = datetime.now(timezone.utc) - timedelta(seconds=policy.session_burn_window_seconds)
     rows = await _rows(
         backend,
@@ -546,7 +563,7 @@ async def _session_burned(backend: Any, session_id: str | None) -> bool:
         """,
         {"session_id": session_id, "since_ts": since},
     )
-    return _to_int((rows[0] if rows else {}).get("requests_used")) >= policy.session_burn_requests_per_hour
+    return _to_int((rows[0] if rows else {}).get("requests_used")) >= threshold
 
 
 def _downgrade_priority(priority: int) -> int:
@@ -692,18 +709,21 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
             continue
         plan = _best_plan(plans, row["provider"], worker_pools, row)
         auth_method = str(plan.get("auth_method") or "api").lower()
-        path_kind = str(plan.get("path_kind") or plan.get("auth_method") or "api").lower()
+        path_kind = str(plan.get("path_kind") or auth_method).lower()
+        util = 0.0
         if auth_method == "subscription" and not _worker_has_pool(worker_pools, plan):
             blocked_subscription_keys.add((row["provider"], row["model_id"]))
             continue
-        requests_used, tokens_used = await _usage_for_plan(backend, plan) if auth_method == "subscription" else (0, 0)
+        if auth_method == "subscription":
+            requests_used, tokens_used = await _usage_for_plan(backend, plan)
+            util = _utilization(plan, requests_used, tokens_used)
         fallback_candidates.append(
             {
                 **row,
                 "auth_method": auth_method,
                 "path_kind": path_kind,
                 "plan_name": plan.get("plan_name", "api"),
-                "sub_window_utilization_pct": _utilization(plan, requests_used, tokens_used),
+                "sub_window_utilization_pct": util,
             }
         )
     if blocked_subscription_keys:
