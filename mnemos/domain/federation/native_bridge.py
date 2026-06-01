@@ -58,6 +58,54 @@ def _feed_payload(row: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _memory_item_payload(row: Mapping[str, Any]) -> dict[str, Any]:
+    archived_at = _first_optional(row, "archived_at")
+    metadata = row.get("metadata")
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata) if metadata else None
+    elif metadata is not None:
+        metadata = dict(metadata)
+    return {
+        "id": row["id"],
+        "content": row["content"],
+        "category": row["category"],
+        "subcategory": row.get("subcategory"),
+        "created": _iso_value(_first_present(row, "created", "created_at")) or "",
+        "updated": _iso_value(_first_optional(row, "updated", "updated_at")),
+        "metadata": metadata,
+        "quality_rating": row.get("quality_rating"),
+        "compressed_content": row.get("compressed_content"),
+        "verbatim_content": row.get("verbatim_content"),
+        "source": "openclaw",
+        "owner_id": row.get("owner_id"),
+        "group_id": row.get("group_id"),
+        "namespace": row.get("namespace"),
+        "permission_mode": row.get("permission_mode"),
+        "source_model": row.get("source_model"),
+        "source_provider": row.get("source_provider"),
+        "source_session": row.get("source_session"),
+        "source_agent": row.get("source_agent"),
+        "archived_at": _iso_value(archived_at),
+        "archived": archived_at is not None,
+        "embedding": row.get("embedding"),
+        "embedding_model": row.get("embedding_model"),
+        "embedding_dim": row.get("embedding_dim"),
+        "audit_latest_entry_id": row.get("audit_latest_entry_id"),
+        "audit_latest_entry_hash": row.get("audit_latest_entry_hash"),
+    }
+
+
+def _wire_payload(row: Mapping[str, Any]) -> dict[str, Any]:
+    if row.get("type") == "consolidation":
+        return {
+            "type": "consolidation",
+            "id": row["id"],
+            "consolidated_into": row["consolidated_into"],
+            "consolidated_at": _iso_value(row["consolidated_at"]) or "",
+        }
+    return _memory_item_payload(row)
+
+
 def pure_python_serialize_memory_for_feed(rows: Sequence[Mapping[str, Any]]) -> list[str]:
     return [json.dumps(_feed_payload(row), separators=(",", ":"), ensure_ascii=False) for row in rows]
 
@@ -69,3 +117,33 @@ def serialize_memory_for_feed(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         except Exception:
             pass
     return pure_python_serialize_memory_for_feed(rows)
+
+
+def pure_python_serialize_memory_rows(rows: Sequence[Mapping[str, Any]]) -> bytes:
+    return json.dumps(
+        [_wire_payload(row) for row in rows],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def serialize_memory_rows(rows: Sequence[Mapping[str, Any]]) -> bytes:
+    dict_rows = [dict(row) for row in rows]
+    if _NATIVE_FEDERATION is not None:
+        try:
+            return bytes(_NATIVE_FEDERATION.serialize_memory_rows(dict_rows))
+        except Exception:
+            pass
+    return pure_python_serialize_memory_rows(dict_rows)
+
+
+def serialize_feed_response(rows: Sequence[Mapping[str, Any]], *, next_cursor: str | None, has_more: bool) -> bytes:
+    return (
+        b'{"memories":'
+        + serialize_memory_rows(rows)
+        + b',"next_cursor":'
+        + json.dumps(next_cursor, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        + b',"has_more":'
+        + (b"true" if has_more else b"false")
+        + b"}"
+    )
