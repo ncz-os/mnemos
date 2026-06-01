@@ -28,10 +28,59 @@ class HiveMindRepository(Protocol):
 
     async def close(self) -> None: ...
 
+    async def insert_agent(
+        self,
+        *,
+        urn: str,
+        kind: str,
+        runtime: str,
+        model: str,
+        provider: str,
+        cost_tier: str,
+        autonomy_level: str,
+        auth_method: str,
+        plan_cap_usd: float | None,
+        host: str,
+        session_id: str,
+        pid: int | None,
+        capabilities: Optional[list[str]],
+        version: Optional[str],
+        started_at: float,
+        last_heartbeat: float,
+        metadata: Optional[dict[str, Any]],
+    ) -> None: ...
+
+    async def insert_job_queued(self, **kwargs: Any) -> None: ...
+
+    async def insert_job_cache_hit(self, **kwargs: Any) -> None: ...
+
+    async def update_job_routing(self, *, job_id: str, routed_at: float, **kwargs: Any) -> bool: ...
+
+    async def find_and_claim_job(
+        self,
+        *,
+        agent_urn: str,
+        agent_kind: str,
+        agent_caps: set[str],
+        agent_runtime: str,
+        agent_model: str,
+        agent_provider: str,
+        agent_tier: str,
+        cost_tier_order: list[str],
+        sub_throttled: bool,
+        now: float,
+    ) -> Optional[dict[str, Any]]: ...
+
 
 class SqliteHiveMindRepository:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
+
+    @staticmethod
+    def _json(value: Any) -> str | None:
+        if value is None:
+            return None
+        return json.dumps(value, separators=(",", ":"), default=str)
 
     async def init(self) -> None:
         with sqlite3.connect(self.db_path) as db:
@@ -105,12 +154,188 @@ class SqliteHiveMindRepository:
                   ON memory_jobs(project);
                 CREATE INDEX IF NOT EXISTS ix_memory_jobs_claimed_by
                   ON memory_jobs(claimed_by);
+                CREATE TABLE IF NOT EXISTS agents (
+                  urn TEXT PRIMARY KEY,
+                  kind TEXT NOT NULL,
+                  host TEXT NOT NULL,
+                  session_id TEXT NOT NULL,
+                  pid INTEGER,
+                  runtime TEXT,
+                  model TEXT,
+                  provider TEXT,
+                  cost_tier TEXT,
+                  autonomy_level TEXT,
+                  auth_method TEXT,
+                  plan_cap_usd REAL,
+                  plan_period_used_usd REAL NOT NULL DEFAULT 0,
+                  capabilities TEXT,
+                  version TEXT,
+                  started_at REAL NOT NULL,
+                  last_heartbeat REAL NOT NULL,
+                  status TEXT NOT NULL CHECK(status IN ('online','idle','offline','error')),
+                  metadata TEXT
+                );
+                CREATE TABLE IF NOT EXISTS jobs (
+                  id TEXT PRIMARY KEY,
+                  submitter_urn TEXT NOT NULL,
+                  parent_job_id TEXT,
+                  kind TEXT NOT NULL,
+                  description TEXT,
+                  priority INTEGER NOT NULL DEFAULT 0,
+                  deadline REAL,
+                  required_capabilities TEXT,
+                  eligible_kinds TEXT,
+                  project TEXT,
+                  max_cost_tier TEXT NOT NULL DEFAULT 'A',
+                  preferred_providers TEXT,
+                  preferred_models TEXT,
+                  mnemos_refs TEXT,
+                  depends_on TEXT,
+                  status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','cancelled')),
+                  claimed_by TEXT,
+                  claimed_at REAL,
+                  claimed_runtime TEXT,
+                  claimed_model TEXT,
+                  claimed_provider TEXT,
+                  claimed_cost_tier TEXT,
+                  started_at REAL NOT NULL,
+                  retry_backoff_until REAL,
+                  routed_at REAL,
+                  routing_metadata TEXT,
+                  ended_at REAL,
+                  result TEXT,
+                  result_mnemos_id TEXT,
+                  tokens_in INTEGER,
+                  tokens_out INTEGER,
+                  estimated_cost_usd REAL,
+                  retry_count INTEGER NOT NULL DEFAULT 0,
+                  max_retries INTEGER NOT NULL DEFAULT 2
+                );
+                CREATE INDEX IF NOT EXISTS idx_jobs_queue
+                  ON jobs(status, priority DESC, started_at ASC);
+                CREATE TABLE IF NOT EXISTS worker_kind_stats (
+                  urn TEXT NOT NULL,
+                  kind TEXT NOT NULL,
+                  success_count INTEGER NOT NULL DEFAULT 0,
+                  fail_count INTEGER NOT NULL DEFAULT 0,
+                  cancelled_count INTEGER NOT NULL DEFAULT 0,
+                  total_tokens_in INTEGER NOT NULL DEFAULT 0,
+                  total_tokens_out INTEGER NOT NULL DEFAULT 0,
+                  total_cost_usd REAL NOT NULL DEFAULT 0,
+                  total_duration_sec REAL NOT NULL DEFAULT 0,
+                  last_run REAL,
+                  PRIMARY KEY (urn, kind)
+                );
                 """
             )
             db.commit()
 
     async def close(self) -> None:
         return None
+
+    async def insert_agent(
+        self,
+        *,
+        urn: str,
+        kind: str,
+        runtime: str,
+        model: str,
+        provider: str,
+        cost_tier: str,
+        autonomy_level: str,
+        auth_method: str,
+        plan_cap_usd: float | None,
+        host: str,
+        session_id: str,
+        pid: int | None,
+        capabilities: Optional[list[str]],
+        version: Optional[str],
+        started_at: float,
+        last_heartbeat: float,
+        metadata: Optional[dict[str, Any]],
+    ) -> None:
+        await asyncio.to_thread(
+            self._insert_agent_sync,
+            urn=urn,
+            kind=kind,
+            runtime=runtime,
+            model=model,
+            provider=provider,
+            cost_tier=cost_tier,
+            autonomy_level=autonomy_level,
+            auth_method=auth_method,
+            plan_cap_usd=plan_cap_usd,
+            host=host,
+            session_id=session_id,
+            pid=pid,
+            capabilities=capabilities,
+            version=version,
+            started_at=started_at,
+            last_heartbeat=last_heartbeat,
+            metadata=metadata,
+        )
+
+    def _insert_agent_sync(
+        self,
+        *,
+        urn: str,
+        kind: str,
+        runtime: str,
+        model: str,
+        provider: str,
+        cost_tier: str,
+        autonomy_level: str,
+        auth_method: str,
+        plan_cap_usd: float | None,
+        host: str,
+        session_id: str,
+        pid: int | None,
+        capabilities: Optional[list[str]],
+        version: Optional[str],
+        started_at: float,
+        last_heartbeat: float,
+        metadata: Optional[dict[str, Any]],
+    ) -> None:
+        with sqlite3.connect(self.db_path, timeout=30.0) as db:
+            db.execute(
+                "INSERT INTO agents "
+                "(urn, kind, host, session_id, pid, runtime, model, provider, "
+                "cost_tier, autonomy_level, auth_method, plan_cap_usd, "
+                "plan_period_used_usd, capabilities, version, started_at, "
+                "last_heartbeat, status, metadata) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "COALESCE((SELECT plan_period_used_usd FROM agents WHERE urn=?), 0), "
+                "?, ?, ?, ?, 'online', ?) "
+                "ON CONFLICT(urn) DO UPDATE SET "
+                "kind=excluded.kind, host=excluded.host, session_id=excluded.session_id, "
+                "pid=excluded.pid, runtime=excluded.runtime, model=excluded.model, "
+                "provider=excluded.provider, cost_tier=excluded.cost_tier, "
+                "autonomy_level=excluded.autonomy_level, auth_method=excluded.auth_method, "
+                "plan_cap_usd=excluded.plan_cap_usd, capabilities=excluded.capabilities, "
+                "version=excluded.version, last_heartbeat=excluded.last_heartbeat, "
+                "status='online', metadata=excluded.metadata",
+                (
+                    urn,
+                    kind,
+                    host,
+                    session_id,
+                    pid,
+                    runtime,
+                    model,
+                    provider,
+                    cost_tier,
+                    autonomy_level,
+                    auth_method,
+                    plan_cap_usd,
+                    urn,
+                    json.dumps(capabilities, separators=(",", ":")) if capabilities is not None else None,
+                    version,
+                    float(started_at),
+                    float(last_heartbeat),
+                    json.dumps(metadata, separators=(",", ":"), default=str) if metadata is not None else None,
+                ),
+            )
+            db.commit()
 
     async def insert_message(
         self,
@@ -164,7 +389,124 @@ class SqliteHiveMindRepository:
         )
 
     async def insert_job_queued(self, **kwargs: Any) -> None:
-        await self.insert_job(**kwargs)
+        await asyncio.to_thread(self._insert_job_queued_sync, **kwargs)
+
+    def _insert_job_queued_sync(self, **kwargs: Any) -> None:
+        started = float(kwargs.get("started_at") or kwargs.get("created_at") or time.time())
+        with sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None) as db:
+            db.execute("PRAGMA busy_timeout=30000")
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute(
+                    "INSERT INTO jobs "
+                    "(id, submitter_urn, parent_job_id, kind, description, priority, "
+                    "deadline, required_capabilities, eligible_kinds, project, "
+                    "max_cost_tier, preferred_providers, preferred_models, mnemos_refs, "
+                    "depends_on, status, claimed_by, claimed_at, claimed_runtime, "
+                    "claimed_model, claimed_provider, claimed_cost_tier, started_at, "
+                    "retry_backoff_until, ended_at, result, result_mnemos_id, "
+                    "tokens_in, tokens_out, estimated_cost_usd, retry_count, max_retries) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "'queued', NULL, NULL, NULL, NULL, NULL, NULL, ?, "
+                    "NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, ?)",
+                    (
+                        kwargs["job_id"],
+                        kwargs["submitter_urn"],
+                        kwargs.get("parent_job_id"),
+                        kwargs["kind"],
+                        kwargs.get("description"),
+                        int(kwargs.get("priority") or 0),
+                        kwargs.get("deadline"),
+                        self._json(kwargs.get("required_capabilities")),
+                        self._json(kwargs.get("eligible_kinds")),
+                        kwargs.get("project"),
+                        (kwargs.get("max_cost_tier") or "A").upper(),
+                        self._json(kwargs.get("preferred_providers")),
+                        self._json(kwargs.get("preferred_models")),
+                        self._json(kwargs.get("mnemos_refs")),
+                        self._json(kwargs.get("depends_on")),
+                        started,
+                        int(kwargs.get("max_retries") if kwargs.get("max_retries") is not None else 2),
+                    ),
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
+    async def insert_job_cache_hit(self, **kwargs: Any) -> None:
+        await asyncio.to_thread(self._insert_job_cache_hit_sync, **kwargs)
+
+    async def update_job_routing(self, *, job_id: str, routed_at: float, **kwargs: Any) -> bool:
+        return await asyncio.to_thread(self._update_job_routing_sync, job_id=job_id, routed_at=routed_at, **kwargs)
+
+    def _update_job_routing_sync(self, *, job_id: str, routed_at: float, **kwargs: Any) -> bool:
+        fields = ["routed_at=?", "routing_metadata=?"]
+        args: list[Any] = [float(routed_at), self._json(kwargs.get("routing_metadata") or {})]
+        for column in (
+            "required_capabilities",
+            "eligible_kinds",
+            "preferred_providers",
+            "preferred_models",
+            "mnemos_refs",
+            "depends_on",
+        ):
+            if column in kwargs and kwargs[column] is not None:
+                fields.append(f"{column}=?")
+                args.append(self._json(kwargs[column]))
+        if kwargs.get("max_cost_tier") is not None:
+            fields.append("max_cost_tier=?")
+            args.append(str(kwargs["max_cost_tier"]).upper())
+        args.append(job_id)
+        with sqlite3.connect(self.db_path, timeout=30.0) as db:
+            cur = db.execute(
+                f"UPDATE jobs SET {', '.join(fields)} WHERE id=? AND status='queued' AND claimed_by IS NULL",
+                args,
+            )
+            db.commit()
+            return cur.rowcount == 1
+
+    def _insert_job_cache_hit_sync(self, **kwargs: Any) -> None:
+        started = float(kwargs.get("started_at") or time.time())
+        ended = float(kwargs.get("ended_at") or started)
+        with sqlite3.connect(self.db_path, timeout=30.0) as db:
+            db.execute(
+                "INSERT INTO jobs "
+                "(id, submitter_urn, parent_job_id, kind, description, priority, "
+                "deadline, required_capabilities, eligible_kinds, project, "
+                "max_cost_tier, preferred_providers, preferred_models, mnemos_refs, "
+                "depends_on, status, claimed_by, claimed_at, claimed_runtime, "
+                "claimed_model, claimed_provider, claimed_cost_tier, started_at, "
+                "retry_backoff_until, ended_at, result, result_mnemos_id, "
+                "tokens_in, tokens_out, estimated_cost_usd, retry_count, max_retries) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, "
+                "'done', NULL, NULL, NULL, ?, ?, NULL, ?, NULL, ?, ?, ?, "
+                "NULL, NULL, NULL, 0, ?)",
+                (
+                    kwargs["job_id"],
+                    kwargs["submitter_urn"],
+                    kwargs.get("parent_job_id"),
+                    kwargs["kind"],
+                    kwargs.get("description"),
+                    int(kwargs.get("priority") or 0),
+                    kwargs.get("deadline"),
+                    self._json(kwargs.get("required_capabilities")),
+                    self._json(kwargs.get("eligible_kinds")),
+                    kwargs.get("project"),
+                    (kwargs.get("max_cost_tier") or "A").upper(),
+                    self._json(kwargs.get("preferred_providers")),
+                    self._json(kwargs.get("preferred_models")),
+                    self._json(kwargs.get("mnemos_refs")),
+                    kwargs.get("model"),
+                    kwargs.get("provider"),
+                    started,
+                    ended,
+                    self._json(kwargs.get("result") or {}),
+                    kwargs.get("result_mnemos_id"),
+                    int(kwargs.get("max_retries") if kwargs.get("max_retries") is not None else 2),
+                ),
+            )
+            db.commit()
 
     def _insert_job_sync(
         self,
@@ -240,20 +582,169 @@ class SqliteHiveMindRepository:
         sub_throttled: bool,
         now: float,
     ) -> Optional[dict[str, Any]]:
-        claimed = await self.claim_next_job(
+        return await asyncio.to_thread(
+            self._find_and_claim_job_sync,
             agent_urn=agent_urn,
             agent_kind=agent_kind,
-            agent_capabilities=list(agent_caps),
-            agent_cost_tier=agent_tier,
+            agent_caps=set(agent_caps),
+            agent_runtime=agent_runtime,
+            agent_model=agent_model,
+            agent_provider=agent_provider,
+            agent_tier=agent_tier,
+            cost_tier_order=list(cost_tier_order),
+            sub_throttled=sub_throttled,
+            now=float(now),
         )
-        if claimed:
-            claimed["claimed_resources"] = {
-                "runtime": agent_runtime,
-                "model": agent_model,
-                "provider": agent_provider,
-                "cost_tier": agent_tier,
-            }
-        return claimed
+
+    def _find_and_claim_job_sync(
+        self,
+        *,
+        agent_urn: str,
+        agent_kind: str,
+        agent_caps: set[str],
+        agent_runtime: str,
+        agent_model: str,
+        agent_provider: str,
+        agent_tier: str,
+        cost_tier_order: list[str],
+        sub_throttled: bool,
+        now: float,
+    ) -> Optional[dict[str, Any]]:
+        with sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None) as db:
+            if not self._table_exists(db, "jobs"):
+                return self._claim_next_job_sync(agent_urn=agent_urn, agent_kind=agent_kind)
+            db.execute("PRAGMA busy_timeout=30000")
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                rows = db.execute(
+                    "SELECT id, submitter_urn, parent_job_id, kind, description, "
+                    "priority, deadline, required_capabilities, eligible_kinds, "
+                    "project, max_cost_tier, preferred_providers, preferred_models, "
+                    "mnemos_refs, depends_on, status, claimed_by, claimed_at, "
+                    "claimed_runtime, claimed_model, claimed_provider, "
+                    "claimed_cost_tier, started_at, retry_backoff_until, ended_at, "
+                    "result, result_mnemos_id, tokens_in, tokens_out, "
+                    "estimated_cost_usd, retry_count, max_retries "
+                    "FROM jobs "
+                    "WHERE status='queued' "
+                    "AND claimed_by IS NULL "
+                    "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
+                    "ORDER BY priority DESC, started_at ASC",
+                    (now,),
+                ).fetchall()
+                for row in rows:
+                    if not self._service_job_is_claimable(
+                        db,
+                        row=row,
+                        agent_kind=agent_kind,
+                        agent_caps=agent_caps,
+                        agent_model=agent_model,
+                        agent_provider=agent_provider,
+                        agent_tier=agent_tier,
+                        cost_tier_order=cost_tier_order,
+                        sub_throttled=sub_throttled,
+                    ):
+                        continue
+                    cur = db.execute(
+                        "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
+                        "claimed_runtime=?, claimed_model=?, claimed_provider=?, "
+                        "claimed_cost_tier=? "
+                        "WHERE id=? AND status='queued' AND claimed_by IS NULL",
+                        (
+                            agent_urn,
+                            now,
+                            agent_runtime,
+                            agent_model,
+                            agent_provider,
+                            agent_tier,
+                            row[0],
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        continue
+                    db.commit()
+                    claimed_row = list(row)
+                    claimed_row[15] = "claimed"
+                    claimed_row[16] = agent_urn
+                    claimed_row[17] = now
+                    claimed_row[18] = agent_runtime
+                    claimed_row[19] = agent_model
+                    claimed_row[20] = agent_provider
+                    claimed_row[21] = agent_tier
+                    claimed = self._service_job_from_row(claimed_row)
+                    claimed["claimed_resources"] = {
+                        "runtime": agent_runtime,
+                        "model": agent_model,
+                        "provider": agent_provider,
+                        "cost_tier": agent_tier,
+                    }
+                    return claimed
+                db.rollback()
+                return None
+            except Exception:
+                db.rollback()
+                raise
+
+    @staticmethod
+    def _table_exists(db: sqlite3.Connection, table: str) -> bool:
+        row = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _loads(value: Any, default: Any = None) -> Any:
+        if value in (None, ""):
+            return default
+        return json.loads(value)
+
+    def _service_job_is_claimable(
+        self,
+        db: sqlite3.Connection,
+        *,
+        row: Any,
+        agent_kind: str,
+        agent_caps: set[str],
+        agent_model: str,
+        agent_provider: str,
+        agent_tier: str,
+        cost_tier_order: list[str],
+        sub_throttled: bool,
+    ) -> bool:
+        required_caps = set(self._loads(row[7], []) or [])
+        if required_caps and not required_caps.issubset(agent_caps):
+            return False
+        eligible_kinds = self._loads(row[8], None)
+        if eligible_kinds and agent_kind not in set(eligible_kinds):
+            return False
+        preferred_providers = self._loads(row[11], []) or []
+        if preferred_providers and (agent_provider or "").lower() not in {
+            str(provider).lower() for provider in preferred_providers
+        }:
+            return False
+        preferred_models = self._loads(row[12], []) or []
+        if preferred_models and (agent_model or "").lower() not in {str(model).lower() for model in preferred_models}:
+            return False
+        if sub_throttled and (row[10] or "A").upper() != "A":
+            return False
+        try:
+            agent_tier_idx = cost_tier_order.index((agent_tier or "C").upper())
+            max_tier_idx = cost_tier_order.index((row[10] or "A").upper())
+        except ValueError:
+            return False
+        if agent_tier_idx > max_tier_idx:
+            return False
+        depends_on = self._loads(row[14], []) or []
+        if depends_on:
+            placeholders = ",".join("?" * len(depends_on))
+            done_count = db.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE id IN ({placeholders}) AND status='done'",
+                tuple(depends_on),
+            ).fetchone()[0]
+            if int(done_count) != len(depends_on):
+                return False
+        return True
 
     def _claim_next_job_sync(self, *, agent_urn: str, agent_kind: str) -> Optional[dict[str, Any]]:
         with sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None) as db:
@@ -383,6 +874,43 @@ class SqliteHiveMindRepository:
             "tags": json.loads(row[14]) if row[14] else None,
             "retry_count": row[15],
             "max_retries": row[16],
+        }
+
+    @classmethod
+    def _service_job_from_row(cls, row: Any) -> dict[str, Any]:
+        return {
+            "id": row[0],
+            "submitter_urn": row[1],
+            "parent_job_id": row[2],
+            "kind": row[3],
+            "description": row[4],
+            "priority": row[5],
+            "deadline": row[6],
+            "required_capabilities": cls._loads(row[7], None),
+            "eligible_kinds": cls._loads(row[8], None),
+            "project": row[9],
+            "max_cost_tier": row[10],
+            "preferred_providers": cls._loads(row[11], None),
+            "preferred_models": cls._loads(row[12], None),
+            "mnemos_refs": cls._loads(row[13], None),
+            "depends_on": cls._loads(row[14], None),
+            "status": row[15],
+            "claimed_by": row[16],
+            "claimed_at": row[17],
+            "claimed_runtime": row[18],
+            "claimed_model": row[19],
+            "claimed_provider": row[20],
+            "claimed_cost_tier": row[21],
+            "started_at": row[22],
+            "retry_backoff_until": row[23],
+            "ended_at": row[24],
+            "result": cls._loads(row[25], None),
+            "result_mnemos_id": row[26],
+            "tokens_in": row[27],
+            "tokens_out": row[28],
+            "estimated_cost_usd": row[29],
+            "retry_count": row[30],
+            "max_retries": row[31],
         }
 
     async def emit_event(
