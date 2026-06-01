@@ -2534,7 +2534,6 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
             )
             existing = await _call(cursor.fetchone)
             binds = {
-                "id": f"{model['provider']}:{model['model_id']}"[:100],
                 "p": model["provider"],
                 "m": model["model_id"],
                 "dn": (model.get("display_name") or model["model_id"])[:400],
@@ -2546,7 +2545,7 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
                 "oc": model.get("output_cost_per_mtok", 0) or 0,
                 "cr": model.get("cache_read_per_mtok", 0) or 0,
                 "cwr": model.get("cache_write_per_mtok", 0) or 0,
-                "raw": _json.dumps(model.get("raw", {})),
+                "rawp": _json.dumps(model.get("raw", {})),
             }
             if existing is None:
                 await _call(
@@ -2557,8 +2556,8 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
                     "cache_write_per_mtok, available, deprecated, first_seen, last_seen, "
                     "last_synced, raw_payload) VALUES (:id, :p, :m, :dn, :fam, :cw, :mot, "
                     ":caps, :ic, :oc, :cr, :cwr, 1, 0, SYSTIMESTAMP, SYSTIMESTAMP, "
-                    "SYSTIMESTAMP, :raw)",
-                    binds,
+                    "SYSTIMESTAMP, :rawp)",
+                    {**binds, "id": f"{model['provider']}:{model['model_id']}"[:100]},
                 )
                 return True
             await _call(
@@ -2569,7 +2568,7 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
                 "capabilities = :caps, input_cost_per_mtok = :ic, "
                 "output_cost_per_mtok = :oc, cache_read_per_mtok = :cr, "
                 "cache_write_per_mtok = :cwr, available = 1, deprecated = 0, "
-                "last_seen = SYSTIMESTAMP, last_synced = SYSTIMESTAMP, raw_payload = :raw "
+                "last_seen = SYSTIMESTAMP, last_synced = SYSTIMESTAMP, raw_payload = :rawp "
                 "WHERE provider = :p AND model_id = :m",
                 binds,
             )
@@ -2653,19 +2652,12 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
-            binds = {
-                "p": provider,
-                "m": model_id,
-                "fam": family,
-                "sc": arena_score,
-                "rk": arena_rank,
-                "w": graeae_weight,
-            }
+            score_binds = {"sc": arena_score, "rk": arena_rank, "w": graeae_weight}
             await _call(
                 cursor.execute,
                 "UPDATE model_registry SET arena_score = :sc, arena_rank = :rk, "
                 "graeae_weight = :w WHERE provider = :p AND model_id = :m",
-                binds,
+                {**score_binds, "p": provider, "m": model_id},
             )
             n = int(getattr(cursor, "rowcount", 0) or 0)
             if n == 0:
@@ -2673,7 +2665,7 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
                     cursor.execute,
                     "UPDATE model_registry SET arena_score = :sc, arena_rank = :rk, "
                     "graeae_weight = :w WHERE provider = :p AND family = :fam",
-                    binds,
+                    {**score_binds, "p": provider, "fam": family},
                 )
                 n = int(getattr(cursor, "rowcount", 0) or 0)
             return n
