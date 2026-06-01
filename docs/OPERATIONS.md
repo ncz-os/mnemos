@@ -177,7 +177,7 @@ sshpass -p $pg-host_SUDO_PASS ssh root@<host> "
   pip install -e . && \
 
   # Run migrations (see §5 for safety checks)
-  python -m mnemos.installer migrate --db-name=mnemos
+  python -m mnemos.installer --upgrade
 
   # Restart
   sudo systemctl restart mnemos
@@ -240,8 +240,8 @@ Every migration must be **safely re-runnable without data loss or corruption**. 
 Migrations run **privileged** (postgres superuser), never as the MNEMOS app role:
 
 ```bash
-# Via installer (recommended)
-python -m mnemos.installer migrate --db-name=mnemos --db-user=postgres
+# Via installer (recommended) — re-runs migrations only
+python -m mnemos.installer --upgrade
 
 # Manually (if needed)
 sudo -u postgres psql -d mnemos -v ON_ERROR_STOP=1 \
