@@ -29,6 +29,7 @@ async def route_knemon(
     caller_subsystem: str = Query(default="api", min_length=1),
     exclude_providers: str | None = Query(default=None),
     require_capability: str | None = Query(default=None),
+    max_cost_tier: str | None = Query(default=None, pattern="^[ABCabc]$"),
     _: UserContext = Depends(require_root),
 ):
     backend = backend_or_503()
@@ -41,6 +42,7 @@ async def route_knemon(
         caller_subsystem=caller_subsystem,
         exclude_providers=_csv(exclude_providers),
         require_capability=_csv(require_capability),
+        max_cost_tier=max_cost_tier.upper() if max_cost_tier else None,
     )
     try:
         decision = await route(req, backend)
