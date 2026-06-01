@@ -67,6 +67,7 @@ class KnemonRouteDecision:
     dispatch_kind: str = ""
     dispatch_required_capabilities: list[str] = field(default_factory=list)
     dispatch_cost_tier: str = ""
+    dispatch_subscription_pools: list[str] = field(default_factory=list)
 
 
 _SESSION_LOCKS: dict[str, asyncio.Lock] = {}
@@ -325,57 +326,51 @@ def _candidate_plan_family(candidate: dict[str, Any] | None) -> str | None:
 async def _worker_pools_for_session(backend: Any, session_id: str | None) -> set[str] | None:
     if not session_id:
         return None
-    for table_name in ("agents", "hive_agents"):
-        rows: list[dict[str, Any]]
+    rows: list[dict[str, Any]]
+    try:
+        rows = await _rows(
+            backend,
+            """
+            SELECT subscription_pools
+            FROM agents
+            WHERE session_id = :session_id
+              AND status IN ('online', 'idle')
+            ORDER BY last_heartbeat DESC
+            FETCH FIRST 1 ROW ONLY
+            """,
+            {"session_id": session_id},
+        )
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "fetch" not in msg:
+            if "agents" in msg or "subscription_pools" in msg or "no such table" in msg or "no such column" in msg:
+                return None
+            raise
         try:
             rows = await _rows(
                 backend,
-                f"""
+                """
                 SELECT subscription_pools
-                FROM {table_name}
+                FROM agents
                 WHERE session_id = :session_id
                   AND status IN ('online', 'idle')
                 ORDER BY last_heartbeat DESC
-                FETCH FIRST 1 ROW ONLY
+                LIMIT 1
                 """,
                 {"session_id": session_id},
             )
-        except Exception as exc:
-            msg = str(exc).lower()
-            if "fetch" not in msg:
-                if (
-                    table_name in msg
-                    or "subscription_pools" in msg
-                    or "no such table" in msg
-                    or "no such column" in msg
-                ):
-                    continue
-                raise
-            try:
-                rows = await _rows(
-                    backend,
-                    f"""
-                    SELECT subscription_pools
-                    FROM {table_name}
-                    WHERE session_id = :session_id
-                      AND status IN ('online', 'idle')
-                    ORDER BY last_heartbeat DESC
-                    LIMIT 1
-                    """,
-                    {"session_id": session_id},
-                )
-            except Exception as fallback_exc:
-                fallback_msg = str(fallback_exc).lower()
-                if (
-                    table_name in fallback_msg
-                    or "subscription_pools" in fallback_msg
-                    or "no such table" in fallback_msg
-                    or "no such column" in fallback_msg
-                ):
-                    continue
-                raise
-        if rows:
-            return _normalize_pools(rows[0].get("subscription_pools"))
+        except Exception as fallback_exc:
+            fallback_msg = str(fallback_exc).lower()
+            if (
+                "agents" in fallback_msg
+                or "subscription_pools" in fallback_msg
+                or "no such table" in fallback_msg
+                or "no such column" in fallback_msg
+            ):
+                return None
+            raise
+    if rows:
+        return _normalize_pools(rows[0].get("subscription_pools"))
     return None
 
 
@@ -829,6 +824,13 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
             req.caller_subsystem,
         ),
         dispatch_cost_tier=str(selected.get("tier") or ""),
+        dispatch_subscription_pools=(
+            sorted(
+                _subscription_pool_aliases({"provider": selected["provider"], "plan_name": selected.get("plan_name")})
+            )
+            if selected.get("auth_method") == "subscription"
+            else []
+        ),
     )
 
 

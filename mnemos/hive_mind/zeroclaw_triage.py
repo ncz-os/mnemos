@@ -123,6 +123,7 @@ def routing_patch_for_decision(job: dict[str, Any], decision: dict[str, Any]) ->
             "caller_subsystem": "zeroclaw",
             "decision": decision,
             "estimated_cost_usd": decision.get("estimated_cost_usd"),
+            "required_subscription_pools": list(decision.get("dispatch_subscription_pools") or []),
             "submitter_max_cost_tier_explicit": _submitter_max_cost_tier_explicit(job),
         },
     }
