@@ -399,7 +399,7 @@ def _infer_capabilities(model_id: str, item: dict) -> list[str]:
     caps = ["chat"]
     mid = model_id.lower()
 
-    if any(x in mid for x in ["vision", "vl", "4o", "gemini", "claude", "grok"]):
+    if any(x in mid for x in ["vision", "vl", "4o", "gemini", "grok"]):
         caps.append("vision")
     if any(x in mid for x in ["code", "coder", "codestral"]):
         caps.append("code")
