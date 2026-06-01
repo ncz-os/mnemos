@@ -9,6 +9,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 import mnemos.core.lifecycle as lifecycle
+from mnemos.core.plan_windows import compute_plan_window_id, plan_path_kind
 from mnemos.domain.graeae.engine import get_graeae_engine
 from mnemos.domain.pantheon import triage
 from mnemos.persistence.base import UsageLedgerRecord, UsageLedgerResult
@@ -127,6 +128,8 @@ async def call(task: Task | dict[str, Any]) -> dict[str, Any]:
                     outcome=outcome,
                     caller_subsystem=request.caller_subsystem,
                     tier=request.tier,
+                    plan_window_id=compute_plan_window_id(provider, request.tier),
+                    path_kind=plan_path_kind(provider, request.tier),
                 )
             )
             if result is not None:

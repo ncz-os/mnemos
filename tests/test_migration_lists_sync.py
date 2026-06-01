@@ -80,6 +80,7 @@ EXPECTED_MIGRATIONS = [
     "0036_hive_agents_subscription_pools.sql",
     "0037_deepseek_direct_provider_seed.sql",
     "0038_oauth_sessions_consultations.sql",
+    "0039_knemon_dispatch_rule_refresh.sql",
 ]
 
 EXPECTED_SQLITE_MIGRATIONS = [

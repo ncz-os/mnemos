@@ -19,6 +19,13 @@ _ENV_KEYS = (
     "PG_POOL_MAX",
     "MNEMOS_CONFIG_PATH",
     "MNEMOS_GRAEAE_NATS_FANOUT",
+    "MNEMOS_KNEMON_SESSION_BURN_REQUESTS_PER_HOUR",
+    "MNEMOS_KNEMON_SESSION_BURN_WINDOW_SECONDS",
+    "MNEMOS_KNEMON_SUBSCRIPTION_PREFERRED_UTILIZATION_PCT",
+    "MNEMOS_KNEMON_SUBSCRIPTION_NEAR_CAP_PCT",
+    "MNEMOS_KNEMON_LOW_PRIORITY_API_COST_CEILING_USD",
+    "MNEMOS_KNEMON_G1_QUALITY_FLOOR",
+    "MNEMOS_KNEMON_G2_QUALITY_FLOOR",
     "MNEMOS_NATS_PUBLISH_PANTHEON_ROUTING",
     "MNEMOS_NATS_AUDIT_CONSUMER_ENABLED",
 )
@@ -56,6 +63,13 @@ def test_default_values_when_env_unset(monkeypatch: pytest.MonkeyPatch, tmp_path
         assert settings.database.password == ""
         assert settings.server.port == 5002
         assert settings.graeae.nats_fanout is False
+        assert settings.knemon.session_burn_requests_per_hour == 10
+        assert settings.knemon.session_burn_window_seconds == 3600
+        assert settings.knemon.subscription_preferred_utilization_pct == 70.0
+        assert settings.knemon.subscription_near_cap_pct == 90.0
+        assert settings.knemon.low_priority_api_cost_ceiling_usd == 0.50
+        assert settings.knemon.g1_quality_floor == 0.85
+        assert settings.knemon.g2_quality_floor == 0.75
         assert settings.nats.publish_pantheon_routing is False
         assert settings.nats.audit_consumer_enabled is False
 
@@ -77,6 +91,45 @@ def test_graeae_nats_fanout_feature_flag_defaults_off_and_can_enable(
         settings = config.get_settings()
         assert settings.graeae.nats_fanout is True
         assert config.GRAEAE_CONFIG["nats_fanout"] is True
+
+
+def test_knemon_policy_env_overrides(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    with _isolated_settings(
+        monkeypatch,
+        str(tmp_path / "missing.toml"),
+        {
+            "MNEMOS_KNEMON_SESSION_BURN_REQUESTS_PER_HOUR": "6",
+            "MNEMOS_KNEMON_SESSION_BURN_WINDOW_SECONDS": "1800",
+            "MNEMOS_KNEMON_LOW_PRIORITY_API_COST_CEILING_USD": "0.25",
+        },
+    ):
+        settings = config.get_settings()
+        assert settings.knemon.session_burn_requests_per_hour == 6
+        assert settings.knemon.session_burn_window_seconds == 1800
+        assert settings.knemon.low_priority_api_cost_ceiling_usd == 0.25
+
+
+def test_knemon_policy_config_toml_override(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[knemon]
+session_burn_requests_per_hour = 8
+subscription_preferred_utilization_pct = 65.0
+g1_quality_floor = 0.90
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    with _isolated_settings(
+        monkeypatch,
+        str(config_file),
+        {"MNEMOS_KNEMON_SESSION_BURN_REQUESTS_PER_HOUR": "6"},
+    ):
+        settings = config.get_settings()
+        assert settings.knemon.session_burn_requests_per_hour == 8
+        assert settings.knemon.subscription_preferred_utilization_pct == 65.0
+        assert settings.knemon.g1_quality_floor == 0.90
 
 
 def test_nats_substrate_flags_default_off_and_can_enable(
