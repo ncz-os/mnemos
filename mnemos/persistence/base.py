@@ -1697,6 +1697,46 @@ def has_capability(backend: object, capability: str) -> bool:
     return capability in capabilities
 
 
+# ── Feature-layer support matrix (GRAEAE consult de8f4b2b, 2026-06-01) ────────
+# Each install layer needs a set of backend capabilities. A backend "supports" a
+# layer only if it implements all required capabilities — derived from the
+# existing per-backend ``capabilities`` set, so no per-backend edits are needed.
+# core is always supported. See docs/LAYERED_INSTALL.md.
+# TODO(codex): pin the exact capability names each layer needs once the
+# capability taxonomy is finalised (graeae=consultations; hive=usage_ledger +
+# hive_mind claim path). Oracle/Db2 gaps (NotImplementedError) must surface here.
+LAYER_REQUIRED_CAPABILITIES: dict[str, set[str]] = {
+    "core": set(),
+    "graeae": {"consultations"},
+    "hive": {"usage_ledger"},
+}
+
+
+def backend_supported_layers(backend: object) -> set[str]:
+    """Return the install layers a backend can fully serve (always incl. core)."""
+    caps = set(getattr(backend, "capabilities", set()))
+    supported = {"core"}
+    for layer, required in LAYER_REQUIRED_CAPABILITIES.items():
+        if layer == "core":
+            continue
+        if required <= caps:
+            supported.add(layer)
+    return supported
+
+
+def assert_backend_supports_layers(backend: object, active_layers: set[str]) -> None:
+    """Fail fast at startup if the backend cannot serve an enabled layer."""
+    unsupported = set(active_layers) - backend_supported_layers(backend)
+    if unsupported:
+        backend_name = type(backend).__name__
+        raise NotImplementedError(
+            f"persistence backend {backend_name!r} does not support enabled "
+            f"layer(s): {sorted(unsupported)}. Disable the layer "
+            f"(MNEMOS_ENABLE_*) or choose a backend that implements it. "
+            f"See docs/LAYERED_INSTALL.md."
+        )
+
+
 def capability_details_for_backend(backend: object) -> set[str]:
     details = getattr(backend, "capability_details", None)
     if details is not None:
