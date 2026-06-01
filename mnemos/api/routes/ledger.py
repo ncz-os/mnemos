@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from mnemos.api.dependencies import UserContext, require_root
 from mnemos.api.persistence_helpers import backend_or_503
-from mnemos.core.plan_windows import compute_plan_window_id
+from mnemos.core.plan_windows import compute_plan_window_id, plan_path_kind
 from mnemos.persistence.base import UsageLedgerRecord
 
 router = APIRouter(prefix="/v1", tags=["ledger"])
@@ -29,7 +29,7 @@ class LedgerRecordRequest(BaseModel):
     tier: str = Field(..., min_length=1)
     session_id: str | None = Field(default=None, max_length=64)
     request_count: int = Field(default=1, ge=1)
-    path_kind: str | None = Field(default="api", max_length=64)
+    path_kind: str | None = Field(default=None, max_length=64)
 
 
 class LedgerRecordResponse(BaseModel):
@@ -47,8 +47,10 @@ async def record_ledger_usage(
     if recorder is None:
         raise HTTPException(status_code=503, detail="usage_ledger requires a ledger-capable backend")
 
+    record_payload = payload.model_dump()
+    record_payload["path_kind"] = plan_path_kind(payload.provider, payload.tier, payload.path_kind)
     record = UsageLedgerRecord(
-        **payload.model_dump(),
+        **record_payload,
         plan_window_id=compute_plan_window_id(payload.provider, payload.tier),
     )
     try:

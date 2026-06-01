@@ -650,6 +650,54 @@ class PantheonSettings(BaseSettings):
         return value if value >= 0.0 else 0.0
 
 
+class KnemonSettings(BaseSettings):
+    model_config = _config_model_config(env_prefix="MNEMOS_KNEMON_")
+
+    session_burn_requests_per_hour: int = 10
+    session_burn_window_seconds: int = 3600
+    subscription_preferred_utilization_pct: float = 70.0
+    subscription_near_cap_pct: float = 90.0
+    low_priority_api_cost_ceiling_usd: float = 0.50
+    g1_quality_floor: float = 0.85
+    g2_quality_floor: float = 0.75
+
+    @field_validator("session_burn_requests_per_hour", "session_burn_window_seconds", mode="before")
+    @classmethod
+    def _positive_int(cls, raw: Any) -> int:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 1
+        return value if value >= 1 else 1
+
+    @field_validator("subscription_preferred_utilization_pct", "subscription_near_cap_pct", mode="before")
+    @classmethod
+    def _bounded_pct(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(100.0, value))
+
+    @field_validator("g1_quality_floor", "g2_quality_floor", mode="before")
+    @classmethod
+    def _bounded_quality_floor(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(1.0, value))
+
+    @field_validator("low_priority_api_cost_ceiling_usd", mode="before")
+    @classmethod
+    def _non_negative_cost(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if value >= 0.0 else 0.0
+
+
 class _FederationNatsPeerSettings(BaseModel):
     name: str
     nats_url: str
@@ -818,6 +866,7 @@ class Settings(BaseSettings):
     persephone: _PersephoneSettings
     kronos: KronosSettings
     pantheon: PantheonSettings
+    knemon: KnemonSettings
     federation: _FederationSettings
     oauth: _OAuthSettings
     auth: _AuthSettings
@@ -926,6 +975,7 @@ def _build_settings() -> Settings:
         "persephone": _PersephoneSettings(**_toml_section(toml_config, "persephone")),
         "kronos": KronosSettings(**_toml_section(toml_config, "kronos")),
         "pantheon": PantheonSettings(**_toml_section(toml_config, "pantheon")),
+        "knemon": KnemonSettings(**_toml_section(toml_config, "knemon")),
         "federation": _FederationSettings(**_toml_section(toml_config, "federation")),
         "oauth": _OAuthSettings(**_toml_section(toml_config, "oauth")),
         "auth": _AuthSettings(**_toml_section(toml_config, "auth")),
@@ -952,6 +1002,7 @@ def _build_settings() -> Settings:
         persephone=groups["persephone"],
         kronos=groups["kronos"],
         pantheon=groups["pantheon"],
+        knemon=groups["knemon"],
         federation=groups["federation"],
         oauth=groups["oauth"],
         auth=groups["auth"],
