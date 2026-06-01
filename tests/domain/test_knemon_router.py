@@ -373,6 +373,24 @@ async def test_mid_priority_rejects_tier_c_ceiling():
 
 
 @pytest.mark.asyncio
+async def test_max_cost_tier_cap_rejects_higher_tier_candidates():
+    req = KnemonRouteRequest(
+        task_kind="code-fix",
+        priority=14,
+        est_tokens_in=10_000,
+        est_tokens_out=2_000,
+        caller_subsystem="zeroclaw",
+        require_capability=["code"],
+        max_cost_tier="A",
+    )
+
+    decision = await route(req, _SqliteKnemonBackend(40))
+
+    assert decision.dispatch_cost_tier == "A"
+    assert decision.provider in {"nvidia", "xai"}
+
+
+@pytest.mark.asyncio
 async def test_subscription_requires_caller_workspace_pool():
     session_id = "workspace-without-openai"
     backend = _SqliteKnemonBackend(40, agent_session_id=session_id, subscription_pools=["anthropic_subscription"])

@@ -25,6 +25,7 @@ POLL_INTERVAL = float(os.environ.get("ZEROCLAW_TRIAGE_POLL_INTERVAL", "10"))
 BATCH_LIMIT = int(os.environ.get("ZEROCLAW_TRIAGE_BATCH_LIMIT", "25"))
 DEFAULT_EST_TOKENS_IN = int(os.environ.get("ZEROCLAW_TRIAGE_EST_TOKENS_IN", "10000"))
 DEFAULT_EST_TOKENS_OUT = int(os.environ.get("ZEROCLAW_TRIAGE_EST_TOKENS_OUT", "2000"))
+COST_TIER_ORDER = ["A", "B", "C"]
 
 _running = True
 
@@ -83,6 +84,27 @@ def _needs_routing(job: dict[str, Any]) -> bool:
     return not (job.get("preferred_models") and job.get("preferred_providers"))
 
 
+def _submitter_max_cost_tier_explicit(job: dict[str, Any]) -> bool:
+    metadata = job.get("routing_metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = {}
+    return bool(isinstance(metadata, dict) and metadata.get("submitter_max_cost_tier_explicit"))
+
+
+def _widen_default_cap(job: dict[str, Any], decision: dict[str, Any]) -> str:
+    current = str(job.get("max_cost_tier") or "A").upper()
+    if _submitter_max_cost_tier_explicit(job):
+        return current
+    selected = str(decision.get("dispatch_cost_tier") or current).upper()
+    try:
+        return COST_TIER_ORDER[max(COST_TIER_ORDER.index(current), COST_TIER_ORDER.index(selected))]
+    except ValueError:
+        return current
+
+
 def routing_patch_for_decision(job: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
     existing_caps = list(job.get("required_capabilities") or [])
     decision_caps = list(decision.get("dispatch_required_capabilities") or [])
@@ -95,30 +117,34 @@ def routing_patch_for_decision(job: dict[str, Any], decision: dict[str, Any]) ->
         "eligible_kinds": [decision.get("dispatch_kind") or "zeroclaw"],
         "preferred_providers": list(decision.get("dispatch_preferred_providers") or [decision.get("provider")]),
         "preferred_models": list(decision.get("dispatch_preferred_models") or [decision.get("model_id")]),
-        "max_cost_tier": job.get("max_cost_tier") or "A",
+        "max_cost_tier": _widen_default_cap(job, decision),
         "routing_metadata": {
             "router": "knemon",
             "caller_subsystem": "zeroclaw",
             "decision": decision,
             "estimated_cost_usd": decision.get("estimated_cost_usd"),
+            "submitter_max_cost_tier_explicit": _submitter_max_cost_tier_explicit(job),
         },
     }
 
 
 def route_job(job: dict[str, Any]) -> dict[str, Any] | None:
     est_in, est_out = _estimate_tokens(job)
+    query = {
+        "task_kind": job.get("kind") or "code-fix",
+        "priority": int(job.get("priority") or 0),
+        "est_tokens_in": est_in,
+        "est_tokens_out": est_out,
+        "caller_subsystem": "zeroclaw",
+        "require_capability": ",".join(job.get("required_capabilities") or []),
+    }
+    if _submitter_max_cost_tier_explicit(job):
+        query["max_cost_tier"] = str(job.get("max_cost_tier") or "A").upper()
     code, decision = _http_json(
         "GET",
         MNEMOS_URL,
         "/v1/knemon/route",
-        query={
-            "task_kind": job.get("kind") or "code-fix",
-            "priority": int(job.get("priority") or 0),
-            "est_tokens_in": est_in,
-            "est_tokens_out": est_out,
-            "caller_subsystem": "zeroclaw",
-            "require_capability": ",".join(job.get("required_capabilities") or []),
-        },
+        query=query,
         bearer=MNEMOS_TOKEN,
     )
     if code != 200 or not decision:

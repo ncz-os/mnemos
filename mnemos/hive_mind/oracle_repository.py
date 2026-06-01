@@ -187,6 +187,7 @@ class OracleHiveMindRepository(HiveMindRepository):
         autonomy_level: str,
         auth_method: str,
         plan_cap_usd: float,
+        subscription_pools: Optional[list[str]],
         host: str,
         session_id: str,
         pid: Optional[int],
@@ -1155,10 +1156,7 @@ class OracleHiveMindRepository(HiveMindRepository):
         since_ts: Optional[float],
         limit: int,
     ) -> list[dict[str, Any]]:
-        sql = (
-            "SELECT id, from_urn, to_urn, in_reply_to, topic, payload, ts "
-            "FROM hive_messages WHERE 1=1"
-        )
+        sql = "SELECT id, from_urn, to_urn, in_reply_to, topic, payload, ts " "FROM hive_messages WHERE 1=1"
         params: dict[str, Any] = {}
         if to_urn is not None:
             sql += " AND to_urn = :to_urn"
@@ -1181,20 +1179,23 @@ class OracleHiveMindRepository(HiveMindRepository):
                 payload_raw = r[5]
                 try:
                     payload = (
-                        payload_raw if isinstance(payload_raw, (dict, list))
+                        payload_raw
+                        if isinstance(payload_raw, (dict, list))
                         else (_json_loads(payload_raw) if payload_raw else {})
                     )
                 except Exception:
                     payload = {"_raw": str(payload_raw)}
-                out.append({
-                    "id": rid,
-                    "from_urn": r[1],
-                    "to_urn": r[2],
-                    "in_reply_to": (str(r[3]) if r[3] is not None else None),
-                    "topic": r[4],
-                    "payload": payload,
-                    "ts": float(r[6]) if r[6] is not None else 0.0,
-                })
+                out.append(
+                    {
+                        "id": rid,
+                        "from_urn": r[1],
+                        "to_urn": r[2],
+                        "in_reply_to": (str(r[3]) if r[3] is not None else None),
+                        "topic": r[4],
+                        "payload": payload,
+                        "ts": float(r[6]) if r[6] is not None else 0.0,
+                    }
+                )
             return out
 
     async def emit_event(
@@ -1291,18 +1292,21 @@ class OracleHiveMindRepository(HiveMindRepository):
                 payload_raw = r[3]
                 try:
                     payload = (
-                        payload_raw if isinstance(payload_raw, (dict, list))
+                        payload_raw
+                        if isinstance(payload_raw, (dict, list))
                         else (_json_loads(payload_raw) if payload_raw else {})
                     )
                 except Exception:
                     payload = {"_raw": str(payload_raw)}
-                out.append({
-                    "id": int(r[0]) if r[0] is not None else 0,
-                    "ts": float(r[1]) if r[1] is not None else 0.0,
-                    "kind": r[2],
-                    "payload": payload,
-                    "agent_urn": r[4],
-                })
+                out.append(
+                    {
+                        "id": int(r[0]) if r[0] is not None else 0,
+                        "ts": float(r[1]) if r[1] is not None else 0.0,
+                        "kind": r[2],
+                        "payload": payload,
+                        "agent_urn": r[4],
+                    }
+                )
             return out
 
     async def cache_record_hit(
@@ -1344,8 +1348,7 @@ class OracleHiveMindRepository(HiveMindRepository):
             try:
                 self._execute(
                     conn,
-                    "UPDATE memory_hive_cache SET hits = NVL(hits,0) + :delta "
-                    "WHERE cache_key = :ck",
+                    "UPDATE memory_hive_cache SET hits = NVL(hits,0) + :delta " "WHERE cache_key = :ck",
                     {"delta": int(delta), "ck": cache_key},
                 )
                 conn.commit()
@@ -1400,8 +1403,7 @@ class OracleHiveMindRepository(HiveMindRepository):
             cur = self._execute(
                 conn,
                 "SELECT agent_urn, SUM(tokens_in), SUM(tokens_out), "
-                "SUM(est_cost_usd) FROM memory_worker_kind_stats" + where +
-                " GROUP BY agent_urn ORDER BY 4 DESC "
+                "SUM(est_cost_usd) FROM memory_worker_kind_stats" + where + " GROUP BY agent_urn ORDER BY 4 DESC "
                 "FETCH FIRST :lim ROWS ONLY",
                 params_lim,
             )
@@ -1417,8 +1419,7 @@ class OracleHiveMindRepository(HiveMindRepository):
             cur = self._execute(
                 conn,
                 "SELECT kind, SUM(tokens_in), SUM(tokens_out), "
-                "SUM(est_cost_usd) FROM memory_worker_kind_stats" + where +
-                " GROUP BY kind ORDER BY 4 DESC "
+                "SUM(est_cost_usd) FROM memory_worker_kind_stats" + where + " GROUP BY kind ORDER BY 4 DESC "
                 "FETCH FIRST :lim ROWS ONLY",
                 params_lim,
             )
@@ -1564,10 +1565,7 @@ class OracleHiveMindRepository(HiveMindRepository):
         if since_ts is not None:
             sql += " AND last_seen_at >= :since_ts"
             params["since_ts"] = float(since_ts)
-        sql += (
-            " ORDER BY last_seen_at DESC, est_cost_usd DESC "
-            "FETCH FIRST :lim ROWS ONLY"
-        )
+        sql += " ORDER BY last_seen_at DESC, est_cost_usd DESC " "FETCH FIRST :lim ROWS ONLY"
         params["lim"] = max(1, min(int(limit), 1000))
         with self._pool.acquire() as conn:
             cur = self._execute(conn, sql, params)
