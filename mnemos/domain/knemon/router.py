@@ -23,12 +23,17 @@ class NoModelAvailable(RuntimeError):
 class KnemonRouteRequest:
     task_kind: str
     priority: int
-    est_tokens_in: int
-    est_tokens_out: int
-    caller_session_id: Optional[str]
-    caller_subsystem: str
+    est_tokens_in: int = 0
+    est_tokens_out: int = 0
+    caller_session_id: Optional[str] = None
+    caller_subsystem: str = "api"
     exclude_providers: list[str] = field(default_factory=list)
     require_capability: list[str] = field(default_factory=list)
+    est_tokens: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.est_tokens is not None and self.est_tokens_in == 0 and self.est_tokens_out == 0:
+            self.est_tokens_in = max(0, int(self.est_tokens))
 
 
 @dataclass
@@ -696,9 +701,6 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
             reasons.append(f"selected {auth_method} candidate")
             break
 
-    if selected is None and enriched:
-        selected = enriched[0]
-        reasons.append("selected first remaining candidate because no lower-cost rule matched")
     if selected is None:
         raise NoModelAvailable("no model survived subscription, free, and API waterfall rules")
 
