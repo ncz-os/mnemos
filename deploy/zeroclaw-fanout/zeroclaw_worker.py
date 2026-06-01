@@ -323,6 +323,7 @@ def register() -> str:
     global _urn, _last_heartbeat
     body = {
         "kind": "zeroclaw",
+        "runtime": "zeroclaw",
         "host": AGENT_HOST,
         "pid": os.getpid(),
         "capabilities": AGENT_CAPABILITIES,

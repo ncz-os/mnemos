@@ -40,6 +40,7 @@ class HiveMindRepository(Protocol):
         autonomy_level: str,
         auth_method: str,
         plan_cap_usd: float | None,
+        subscription_pools: Optional[list[str]],
         host: str,
         session_id: str,
         pid: int | None,
@@ -168,6 +169,7 @@ class SqliteHiveMindRepository:
                   auth_method TEXT,
                   plan_cap_usd REAL,
                   plan_period_used_usd REAL NOT NULL DEFAULT 0,
+                  subscription_pools TEXT,
                   capabilities TEXT,
                   version TEXT,
                   started_at REAL NOT NULL,
@@ -245,6 +247,7 @@ class SqliteHiveMindRepository:
         autonomy_level: str,
         auth_method: str,
         plan_cap_usd: float | None,
+        subscription_pools: Optional[list[str]],
         host: str,
         session_id: str,
         pid: int | None,
@@ -265,6 +268,7 @@ class SqliteHiveMindRepository:
             autonomy_level=autonomy_level,
             auth_method=auth_method,
             plan_cap_usd=plan_cap_usd,
+            subscription_pools=subscription_pools,
             host=host,
             session_id=session_id,
             pid=pid,
@@ -287,6 +291,7 @@ class SqliteHiveMindRepository:
         autonomy_level: str,
         auth_method: str,
         plan_cap_usd: float | None,
+        subscription_pools: Optional[list[str]],
         host: str,
         session_id: str,
         pid: int | None,
@@ -301,17 +306,18 @@ class SqliteHiveMindRepository:
                 "INSERT INTO agents "
                 "(urn, kind, host, session_id, pid, runtime, model, provider, "
                 "cost_tier, autonomy_level, auth_method, plan_cap_usd, "
-                "plan_period_used_usd, capabilities, version, started_at, "
+                "plan_period_used_usd, subscription_pools, capabilities, version, started_at, "
                 "last_heartbeat, status, metadata) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                 "COALESCE((SELECT plan_period_used_usd FROM agents WHERE urn=?), 0), "
-                "?, ?, ?, ?, 'online', ?) "
+                "?, ?, ?, ?, ?, 'online', ?) "
                 "ON CONFLICT(urn) DO UPDATE SET "
                 "kind=excluded.kind, host=excluded.host, session_id=excluded.session_id, "
                 "pid=excluded.pid, runtime=excluded.runtime, model=excluded.model, "
                 "provider=excluded.provider, cost_tier=excluded.cost_tier, "
                 "autonomy_level=excluded.autonomy_level, auth_method=excluded.auth_method, "
-                "plan_cap_usd=excluded.plan_cap_usd, capabilities=excluded.capabilities, "
+                "plan_cap_usd=excluded.plan_cap_usd, subscription_pools=excluded.subscription_pools, "
+                "capabilities=excluded.capabilities, "
                 "version=excluded.version, last_heartbeat=excluded.last_heartbeat, "
                 "status='online', metadata=excluded.metadata",
                 (
@@ -328,6 +334,7 @@ class SqliteHiveMindRepository:
                     auth_method,
                     plan_cap_usd,
                     urn,
+                    json.dumps(subscription_pools, separators=(",", ":")) if subscription_pools is not None else None,
                     json.dumps(capabilities, separators=(",", ":")) if capabilities is not None else None,
                     version,
                     float(started_at),
@@ -404,11 +411,11 @@ class SqliteHiveMindRepository:
                     "max_cost_tier, preferred_providers, preferred_models, mnemos_refs, "
                     "depends_on, status, claimed_by, claimed_at, claimed_runtime, "
                     "claimed_model, claimed_provider, claimed_cost_tier, started_at, "
-                    "retry_backoff_until, ended_at, result, result_mnemos_id, "
+                    "retry_backoff_until, routed_at, routing_metadata, ended_at, result, result_mnemos_id, "
                     "tokens_in, tokens_out, estimated_cost_usd, retry_count, max_retries) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                     "'queued', NULL, NULL, NULL, NULL, NULL, NULL, ?, "
-                    "NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, ?)",
+                    "NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, ?)",
                     (
                         kwargs["job_id"],
                         kwargs["submitter_urn"],
@@ -426,6 +433,7 @@ class SqliteHiveMindRepository:
                         self._json(kwargs.get("mnemos_refs")),
                         self._json(kwargs.get("depends_on")),
                         started,
+                        self._json(kwargs.get("routing_metadata")),
                         int(kwargs.get("max_retries") if kwargs.get("max_retries") is not None else 2),
                     ),
                 )

@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS agents (
   auth_method TEXT,
   plan_cap_usd REAL,
   plan_period_used_usd REAL NOT NULL DEFAULT 0,
+  subscription_pools TEXT,
   capabilities TEXT,
   version TEXT,
   started_at REAL NOT NULL,
@@ -496,6 +497,7 @@ class AgentRegister(BaseModel):
     autonomy_level: str = Field("unknown", description="autonomous / confirm-risky / interactive / unknown")
     auth_method: str = Field("unknown", description="subscription (Max plan), api (pay-per-token), free, unknown")
     plan_cap_usd: Optional[float] = None  # monthly cap; defaults from DEFAULT_PLAN_CAPS by auth_method
+    subscription_pools: Optional[list[str]] = None
     pid: Optional[int] = None
     capabilities: Optional[list[str]] = None
     version: Optional[str] = None
@@ -692,6 +694,7 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE agents ADD COLUMN auth_method TEXT",
             "ALTER TABLE agents ADD COLUMN plan_cap_usd REAL",
             "ALTER TABLE agents ADD COLUMN plan_period_used_usd REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE agents ADD COLUMN subscription_pools TEXT",
             "ALTER TABLE jobs ADD COLUMN project TEXT",
             "ALTER TABLE jobs ADD COLUMN max_cost_tier TEXT NOT NULL DEFAULT 'A'",
             "ALTER TABLE jobs ADD COLUMN preferred_providers TEXT",
@@ -764,6 +767,11 @@ async def register(req: AgentRegister):
             "must provide runtime (claude-code/opencode/goose/codex/...) OR explicit kind. "
             "Defaulting to 'unknown' was masking session-bricking misregistrations.",
         )
+    if runtime == "unknown" and kind in WORKER_ONLY_RUNTIMES:
+        raise HTTPException(
+            422,
+            f"worker kind={kind!r} must declare its runtime; runtime='unknown' cannot register as a worker",
+        )
     allowed = RUNTIME_KIND_MAP.get(runtime, {runtime, "unknown"})
     if runtime != "unknown" and kind not in allowed and kind != runtime:
         raise HTTPException(
@@ -800,6 +808,7 @@ async def register(req: AgentRegister):
         autonomy_level=autonomy,
         auth_method=auth_method,
         plan_cap_usd=plan_cap_usd,
+        subscription_pools=req.subscription_pools,
         host=req.host,
         session_id=session_id,
         pid=req.pid,
@@ -822,6 +831,7 @@ async def register(req: AgentRegister):
                 "cost_tier": tier,
                 "host": req.host,
                 "autonomy_level": autonomy,
+                "subscription_pools": req.subscription_pools,
             },
         )
         await db.commit()
@@ -837,6 +847,7 @@ async def register(req: AgentRegister):
         "autonomy_level": autonomy,
         "auth_method": auth_method,
         "plan_cap_usd": plan_cap_usd,
+        "subscription_pools": req.subscription_pools,
     }
 
 
@@ -865,7 +876,7 @@ async def list_agents(
 ):
     sql = (
         "SELECT urn, kind, host, status, last_heartbeat, capabilities, version, metadata, "
-        "pid, runtime, model, provider, cost_tier, autonomy_level "
+        "pid, runtime, model, provider, cost_tier, autonomy_level, subscription_pools "
         "FROM agents WHERE 1=1"
     )
     args: list = []
@@ -917,6 +928,7 @@ async def list_agents(
                         "provider": r[11],
                         "cost_tier": r[12],
                         "autonomy_level": r[13],
+                        "subscription_pools": json.loads(r[14]) if r[14] else None,
                         "display": display,
                     }
                 )
@@ -1107,6 +1119,9 @@ async def create_job(req: JobCreate):
             depends_on=req.depends_on,
             max_retries=req.max_retries,
             started_at=now,
+            routing_metadata={
+                "submitter_max_cost_tier_explicit": "max_cost_tier" in getattr(req, "model_fields_set", set())
+            },
         )
         await emit_event(
             db,
