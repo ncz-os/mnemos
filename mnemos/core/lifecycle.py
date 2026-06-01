@@ -723,6 +723,13 @@ async def lifespan(app):
 
     _log_and_validate_backend_capabilities(backend_type, _persistence_backend)
 
+    # Layered-install fail-fast (GRAEAE de8f4b2b): refuse to start if an enabled
+    # feature layer (graeae/hive) needs a capability this backend lacks. See
+    # docs/LAYERED_INSTALL.md. core is always supported; default flags = all on.
+    from mnemos.persistence.base import assert_backend_supports_layers
+
+    assert_backend_supports_layers(_persistence_backend, settings.layers.active_layers)
+
     # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
     if _auth_configurer is not None:
         _auth_configurer(None)
