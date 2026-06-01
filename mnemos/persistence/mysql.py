@@ -312,7 +312,27 @@ CREATE TABLE IF NOT EXISTS kg_triples (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
-_INIT_DDLS = [_DDL_MEMORIES, _DDL_KG_TRIPLES]
+_DDL_COMPRESSION_QUEUE = """\
+CREATE TABLE IF NOT EXISTS memory_compression_queue (
+    id              VARCHAR(64)  NOT NULL DEFAULT (UUID()),
+    memory_id       VARCHAR(64)  NOT NULL,
+    owner_id        VARCHAR(256) NOT NULL,
+    reason          VARCHAR(256) NOT NULL,
+    status          VARCHAR(32)  NOT NULL DEFAULT 'pending',
+    priority        INT          NOT NULL DEFAULT 0,
+    scoring_profile VARCHAR(256) NOT NULL,
+    attempts        INT          NOT NULL DEFAULT 0,
+    enqueued_at     TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    started_at      TIMESTAMP(6),
+    finished_at     TIMESTAMP(6),
+    error           TEXT,
+    PRIMARY KEY (id),
+    INDEX idx_compression_queue_status   (status),
+    INDEX idx_compression_queue_priority (priority)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_INIT_DDLS = [_DDL_MEMORIES, _DDL_KG_TRIPLES, _DDL_COMPRESSION_QUEUE]
 
 
 # ── Pool factory ──────────────────────────────────────────────────────────────
