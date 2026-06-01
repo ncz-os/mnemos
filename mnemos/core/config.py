@@ -864,11 +864,43 @@ class _HiveMindSettings(BaseModel):
     agent_bus_db: str = Field(default_factory=lambda: agent_bus_db_env())
 
 
+class _LayerSettings(BaseSettings):
+    """Feature-layer enable flags (GRAEAE consult de8f4b2b layering, 2026-06-01).
+
+    Three install layers stack: core (memory/persistence, always on) <- graeae
+    (reasoning) <- hive (job coordination + KNEMON routing). Flags default ON so
+    an existing full deployment is byte-for-byte unchanged; slim/base installs
+    opt OUT via env. Direction enforced by Settings.enforce_layer_direction:
+    hive requires graeae. See docs/LAYERED_INSTALL.md.
+    """
+
+    model_config = _config_model_config()
+
+    enable_graeae: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("MNEMOS_ENABLE_GRAEAE", "ENABLE_GRAEAE"),
+    )
+    enable_hive: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("MNEMOS_ENABLE_HIVE", "ENABLE_HIVE"),
+    )
+
+    @property
+    def active_layers(self) -> set[str]:
+        active = {"core"}
+        if self.enable_graeae:
+            active.add("graeae")
+        if self.enable_hive:
+            active.add("hive")
+        return active
+
+
 class Settings(BaseSettings):
     model_config = _config_model_config()
 
     _explicit_fields: dict[str, set[str]] = PrivateAttr(default_factory=dict)
 
+    layers: _LayerSettings
     database: _DatabaseSettings
     graeae: _GraeaeSettings
     server: _ServerSettings
@@ -894,6 +926,18 @@ class Settings(BaseSettings):
     nats: _NatsSettings
     audit: _AuditSettings
     hive_mind: _HiveMindSettings
+
+    @model_validator(mode="after")
+    def enforce_layer_direction(self) -> "Settings":
+        # Layer dependency direction: core <- graeae <- hive. Hive (job
+        # coordination + KNEMON routing) requires GRAEAE (reasoning). See
+        # docs/LAYERED_INSTALL.md (GRAEAE consult de8f4b2b, 2026-06-01).
+        if self.layers.enable_hive and not self.layers.enable_graeae:
+            raise ValueError(
+                "MNEMOS_ENABLE_HIVE requires MNEMOS_ENABLE_GRAEAE: the hive/KNEMON "
+                "layer depends on the GRAEAE reasoning layer."
+            )
+        return self
 
     @property
     def profile(self) -> str:
@@ -978,6 +1022,7 @@ def _build_settings() -> Settings:
         if env_filled_field in db_section and db_section[env_filled_field] == "":
             db_section.pop(env_filled_field)
     groups = {
+        "layers": _LayerSettings(**_toml_section(toml_config, "layers")),
         "database": _DatabaseSettings(**db_section),
         "graeae": _GraeaeSettings(**_toml_section(toml_config, "graeae")),
         "server": server,
@@ -1005,6 +1050,7 @@ def _build_settings() -> Settings:
         "hive_mind": _HiveMindSettings(**_toml_section(toml_config, "hive_mind")),
     }
     settings = Settings(
+        layers=groups["layers"],
         database=groups["database"],
         graeae=groups["graeae"],
         server=groups["server"],
