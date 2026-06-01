@@ -624,6 +624,44 @@ class ConsultationAuditRepository(ABC):
     @abstractmethod
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None: ...
 
+    # ── model-registry WRITES (daily provider sync; backend-overridable) ───────
+    # Non-abstract so existing backends keep instantiating; backends that own a
+    # live model_registry (Oracle) override these.
+    async def upsert_model(self, tx: Transaction, model: dict[str, Any]) -> bool:
+        raise NotImplementedError("upsert_model not implemented for this backend")
+
+    async def mark_models_unavailable(
+        self, tx: Transaction, provider: str, seen_model_ids: Sequence[str]
+    ) -> int:
+        raise NotImplementedError("mark_models_unavailable not implemented for this backend")
+
+    async def write_model_sync_log(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        models_found: int,
+        added: int,
+        updated: int,
+        deprecated: int,
+        error: str | None,
+        duration_ms: int,
+    ) -> None:
+        raise NotImplementedError("write_model_sync_log not implemented for this backend")
+
+    async def update_arena_score(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        family: str,
+        arena_score: float,
+        arena_rank: int,
+        graeae_weight: float,
+    ) -> int:
+        raise NotImplementedError("update_arena_score not implemented for this backend")
+
 
 class OAuthRepository(ABC):
     """OAuth provider, identity, and browser-session persistence."""
