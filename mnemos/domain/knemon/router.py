@@ -42,6 +42,7 @@ class KnemonRouteRequest:
     caller_subsystem: str = "api"
     exclude_providers: list[str] = field(default_factory=list)
     require_capability: list[str] = field(default_factory=list)
+    max_cost_tier: Optional[str] = None
     est_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:
@@ -65,6 +66,7 @@ class KnemonRouteDecision:
     # callers (api/internal) so existing consumers are unaffected.
     dispatch_kind: str = ""
     dispatch_required_capabilities: list[str] = field(default_factory=list)
+    dispatch_cost_tier: str = ""
 
 
 _SESSION_LOCKS: dict[str, asyncio.Lock] = {}
@@ -323,51 +325,58 @@ def _candidate_plan_family(candidate: dict[str, Any] | None) -> str | None:
 async def _worker_pools_for_session(backend: Any, session_id: str | None) -> set[str] | None:
     if not session_id:
         return None
-    try:
-        rows = await _rows(
-            backend,
-            """
-            SELECT subscription_pools
-            FROM hive_agents
-            WHERE session_id = :session_id
-              AND status IN ('online', 'idle')
-            ORDER BY last_heartbeat DESC
-            FETCH FIRST 1 ROW ONLY
-            """,
-            {"session_id": session_id},
-        )
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "fetch" not in msg:
-            if "hive_agents" in msg or "subscription_pools" in msg or "no such table" in msg or "no such column" in msg:
-                return None
-            raise
+    for table_name in ("agents", "hive_agents"):
+        rows: list[dict[str, Any]]
         try:
             rows = await _rows(
                 backend,
-                """
+                f"""
                 SELECT subscription_pools
-                FROM hive_agents
+                FROM {table_name}
                 WHERE session_id = :session_id
                   AND status IN ('online', 'idle')
                 ORDER BY last_heartbeat DESC
-                LIMIT 1
+                FETCH FIRST 1 ROW ONLY
                 """,
                 {"session_id": session_id},
             )
-        except Exception as fallback_exc:
-            fallback_msg = str(fallback_exc).lower()
-            if (
-                "hive_agents" in fallback_msg
-                or "subscription_pools" in fallback_msg
-                or "no such table" in fallback_msg
-                or "no such column" in fallback_msg
-            ):
-                return None
-            raise
-    if not rows:
-        return None
-    return _normalize_pools(rows[0].get("subscription_pools"))
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "fetch" not in msg:
+                if (
+                    table_name in msg
+                    or "subscription_pools" in msg
+                    or "no such table" in msg
+                    or "no such column" in msg
+                ):
+                    continue
+                raise
+            try:
+                rows = await _rows(
+                    backend,
+                    f"""
+                    SELECT subscription_pools
+                    FROM {table_name}
+                    WHERE session_id = :session_id
+                      AND status IN ('online', 'idle')
+                    ORDER BY last_heartbeat DESC
+                    LIMIT 1
+                    """,
+                    {"session_id": session_id},
+                )
+            except Exception as fallback_exc:
+                fallback_msg = str(fallback_exc).lower()
+                if (
+                    table_name in fallback_msg
+                    or "subscription_pools" in fallback_msg
+                    or "no such table" in fallback_msg
+                    or "no such column" in fallback_msg
+                ):
+                    continue
+                raise
+        if rows:
+            return _normalize_pools(rows[0].get("subscription_pools"))
+    return None
 
 
 def _worker_has_pool(worker_pools: set[str] | None, plan: dict[str, Any]) -> bool:
@@ -397,6 +406,16 @@ def _tier(row: dict[str, Any]) -> str:
     if quality >= 0.75:
         return "B"
     return "C"
+
+
+def _tier_allowed(tier: str, max_cost_tier: str | None) -> bool:
+    if not max_cost_tier:
+        return True
+    order = ["A", "B", "C"]
+    try:
+        return order.index((tier or "C").upper()) <= order.index(max_cost_tier.upper())
+    except ValueError:
+        return False
 
 
 def _price(row: dict[str, Any], tokens_in: int, tokens_out: int) -> float:
@@ -449,6 +468,8 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
         enriched["capabilities"] = sorted(caps)
         enriched["quality"] = _quality(enriched)
         enriched["tier"] = _tier(enriched)
+        if not _tier_allowed(enriched["tier"], req.max_cost_tier):
+            continue
         enriched["estimated_cost_usd"] = _price(enriched, req.est_tokens_in, req.est_tokens_out)
         candidates.append(enriched)
     preference = _csv_providers(providers_cfg.knemon_provider_preference)
@@ -807,6 +828,7 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
             [c.strip() for c in req.require_capability if c.strip()],
             req.caller_subsystem,
         ),
+        dispatch_cost_tier=str(selected.get("tier") or ""),
     )
 
 
