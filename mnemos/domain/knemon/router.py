@@ -14,6 +14,19 @@ from typing import Any, Optional
 from mnemos.core.config import get_settings
 from mnemos.core.plan_windows import compute_plan_window_id
 
+# Canonical provider identity — collapses historical/duplicate labels so a
+# single policy entry covers all of them (e.g. "claude" -> "anthropic").
+_PROVIDER_ALIASES = {"claude": "anthropic"}
+
+
+def _canon_provider(name: str) -> str:
+    canon = (name or "").strip().lower()
+    return _PROVIDER_ALIASES.get(canon, canon)
+
+
+def _csv_providers(raw: str) -> list[str]:
+    return [_canon_provider(part) for part in (raw or "").split(",") if part.strip()]
+
 
 class NoModelAvailable(RuntimeError):
     """Raised when the registry has no model satisfying hard constraints."""
@@ -58,9 +71,7 @@ _NAMED_PARAM_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
 # zeroclaw stack per CLAUDE.md directive 5). openai is intentionally absent: it is reserved for the
 # explicit codex scarce path (kind=codex/review:/doctor:codex-fix), not the general dispatch route.
 CALLER_DISPATCHABLE_PROVIDERS: dict[str, frozenset[str]] = {
-    "zeroclaw": frozenset(
-        {"groq", "xai", "deepseek", "deepseek-direct", "nvidia", "together", "gemini"}
-    ),
+    "zeroclaw": frozenset({"groq", "xai", "deepseek", "deepseek-direct", "nvidia", "together", "gemini"}),
 }
 
 
@@ -375,14 +386,17 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
         ORDER BY graeae_weight DESC
         """,
     )
-    excluded = {provider.strip().lower() for provider in req.exclude_providers if provider.strip()}
+    providers_cfg = get_settings().providers
+    # Deployment-default excludes (canonicalised) merged with per-request set.
+    excluded = set(_csv_providers(providers_cfg.knemon_exclude_providers))
+    excluded |= {_canon_provider(p) for p in req.exclude_providers if p.strip()}
     allowed = CALLER_DISPATCHABLE_PROVIDERS.get((req.caller_subsystem or "").strip().lower())
     required = {cap.strip() for cap in req.require_capability if cap.strip()}
     min_context = int(max(0, req.est_tokens_in) * 1.2)
     candidates: list[dict[str, Any]] = []
     for row in rows:
         provider = str(row.get("provider") or "").strip()
-        if not provider or provider.lower() in excluded:
+        if not provider or _canon_provider(provider) in excluded:
             continue
         # Caller-eligibility allowlist: dispatch workers (e.g. zeroclaw) can only execute providers
         # backed by a gateway alias. Callers absent from the map (api, internal) are unrestricted.
@@ -401,7 +415,17 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
         enriched["tier"] = _tier(enriched)
         enriched["estimated_cost_usd"] = _price(enriched, req.est_tokens_in, req.est_tokens_out)
         candidates.append(enriched)
-    candidates.sort(key=lambda row: _to_float(row.get("graeae_weight")), reverse=True)
+    preference = _csv_providers(providers_cfg.knemon_provider_preference)
+    if preference:
+        rank = {name: idx for idx, name in enumerate(preference)}
+        candidates.sort(
+            key=lambda row: (
+                rank.get(_canon_provider(str(row.get("provider") or "")), len(preference)),
+                -_to_float(row.get("graeae_weight")),
+            )
+        )
+    else:
+        candidates.sort(key=lambda row: _to_float(row.get("graeae_weight")), reverse=True)
     return candidates
 
 

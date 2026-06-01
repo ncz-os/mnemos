@@ -67,6 +67,7 @@ _PROFILE_DEFAULT_TARGETS = {
     "auth_enabled": ("auth", "enabled"),
 }
 
+
 def _config_model_config(*, env_prefix: str = "", extra: str = "ignore") -> SettingsConfigDict:
     return SettingsConfigDict(
         env_prefix=env_prefix,
@@ -122,6 +123,7 @@ class _DatabaseSettings(BaseSettings):
             "at schema-init time; switching dim on a populated DB requires a re-embed."
         ),
     )
+
     @field_validator("sqlite_path", mode="before")
     @classmethod
     def _expand_sqlite_path(cls, raw: Any) -> Path:
@@ -279,6 +281,16 @@ class _ProviderSettings(BaseSettings):
     xai_api_key: str = Field("", validation_alias="XAI_API_KEY")
     groq_api_key: str = Field("", validation_alias="GROQ_API_KEY")
     perplexity_api_key: str = Field("", validation_alias="PERPLEXITY_API_KEY")
+    # KNEMON routing policy (deployment-configurable; no-op defaults).
+    # Comma-separated provider ids/aliases excluded from KNEMON route
+    # selection by default (merged with any per-request exclude_providers).
+    # The Anthropic ban is THIS deployment's policy, not a universal rule —
+    # other deployments leave this empty or choose differently.
+    knemon_exclude_providers: str = Field("", validation_alias="KNEMON_DEFAULT_EXCLUDE_PROVIDERS")
+    # Comma-separated ordered provider preference; candidates are bucketed by
+    # this order first, then by graeae_weight within each bucket. Empty
+    # preserves pure graeae_weight ordering.
+    knemon_provider_preference: str = Field("", validation_alias="KNEMON_PROVIDER_PREFERENCE")
     together_api_key: str = Field("", validation_alias="TOGETHER_API_KEY")
     nvidia_api_key: str = Field("", validation_alias="NVIDIA_API_KEY")
     keys_path: Path | None = Field(None, validation_alias="MNEMOS_KEYS_PATH")
@@ -833,7 +845,9 @@ class _NatsSettings(BaseSettings):
 
 
 class _AuditSettings(BaseModel):
-    require_session_secret: str = Field(default_factory=lambda: runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET"))
+    require_session_secret: str = Field(
+        default_factory=lambda: runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET")
+    )
     chain: str = Field(default_factory=lambda: runtime_env_value("MNEMOS_AUDIT_CHAIN", ""))
     root_private_key: str = Field(default_factory=lambda: runtime_env_value_stripped("MNEMOS_AUDIT_ROOT_PRIVKEY"))
 
