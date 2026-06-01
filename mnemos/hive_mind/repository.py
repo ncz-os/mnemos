@@ -449,6 +449,28 @@ class SqliteHiveMindRepository:
         return await asyncio.to_thread(self._update_job_routing_sync, job_id=job_id, routed_at=routed_at, **kwargs)
 
     def _update_job_routing_sync(self, *, job_id: str, routed_at: float, **kwargs: Any) -> bool:
+        requested_max_cost_tier = kwargs.get("max_cost_tier")
+        with sqlite3.connect(self.db_path, timeout=30.0) as db:
+            existing = db.execute(
+                "SELECT max_cost_tier, routing_metadata FROM jobs WHERE id=? AND status='queued' AND claimed_by IS NULL",
+                (job_id,),
+            ).fetchone()
+            if not existing:
+                return False
+            existing_metadata = self._loads(existing[1], {}) or {}
+            if (
+                requested_max_cost_tier is not None
+                and isinstance(existing_metadata, dict)
+                and existing_metadata.get("submitter_max_cost_tier_explicit")
+            ):
+                order = ["A", "B", "C"]
+                current_tier = str(existing[0] or "A").upper()
+                requested_tier = str(requested_max_cost_tier).upper()
+                try:
+                    if order.index(requested_tier) > order.index(current_tier):
+                        requested_max_cost_tier = current_tier
+                except ValueError:
+                    requested_max_cost_tier = current_tier
         fields = ["routed_at=?", "routing_metadata=?"]
         args: list[Any] = [float(routed_at), self._json(kwargs.get("routing_metadata") or {})]
         for column in (
@@ -462,9 +484,9 @@ class SqliteHiveMindRepository:
             if column in kwargs and kwargs[column] is not None:
                 fields.append(f"{column}=?")
                 args.append(self._json(kwargs[column]))
-        if kwargs.get("max_cost_tier") is not None:
+        if requested_max_cost_tier is not None:
             fields.append("max_cost_tier=?")
-            args.append(str(kwargs["max_cost_tier"]).upper())
+            args.append(str(requested_max_cost_tier).upper())
         args.append(job_id)
         with sqlite3.connect(self.db_path, timeout=30.0) as db:
             cur = db.execute(
@@ -632,7 +654,7 @@ class SqliteHiveMindRepository:
                     "claimed_runtime, claimed_model, claimed_provider, "
                     "claimed_cost_tier, started_at, retry_backoff_until, ended_at, "
                     "result, result_mnemos_id, tokens_in, tokens_out, "
-                    "estimated_cost_usd, retry_count, max_retries "
+                    "estimated_cost_usd, retry_count, max_retries, routing_metadata "
                     "FROM jobs "
                     "WHERE status='queued' "
                     "AND claimed_by IS NULL "
@@ -644,6 +666,7 @@ class SqliteHiveMindRepository:
                     if not self._service_job_is_claimable(
                         db,
                         row=row,
+                        agent_urn=agent_urn,
                         agent_kind=agent_kind,
                         agent_caps=agent_caps,
                         agent_model=agent_model,
@@ -707,11 +730,35 @@ class SqliteHiveMindRepository:
             return default
         return json.loads(value)
 
+    @classmethod
+    def _normalized_strings(cls, value: Any) -> set[str]:
+        if isinstance(value, str):
+            try:
+                loaded = cls._loads(value, value)
+            except json.JSONDecodeError:
+                loaded = value
+        else:
+            loaded = value
+        if not loaded:
+            return set()
+        if isinstance(loaded, dict):
+            items = loaded.keys()
+        elif isinstance(loaded, (list, tuple, set)):
+            items = loaded
+        else:
+            items = str(loaded).strip("{}[]").split(",")
+        return {
+            "".join(ch if ch.isalnum() else "_" for ch in str(item).strip().lower()).strip("_")
+            for item in items
+            if str(item).strip()
+        }
+
     def _service_job_is_claimable(
         self,
         db: sqlite3.Connection,
         *,
         row: Any,
+        agent_urn: str,
         agent_kind: str,
         agent_caps: set[str],
         agent_model: str,
@@ -734,6 +781,18 @@ class SqliteHiveMindRepository:
         preferred_models = self._loads(row[12], []) or []
         if preferred_models and (agent_model or "").lower() not in {str(model).lower() for model in preferred_models}:
             return False
+        routing_metadata = self._loads(row[32], {}) if len(row) > 32 else {}
+        required_pools = self._normalized_strings(
+            routing_metadata.get("required_subscription_pools") if isinstance(routing_metadata, dict) else None
+        )
+        if required_pools:
+            agent_pools_row = db.execute(
+                "SELECT subscription_pools FROM agents WHERE urn=? AND status IN ('online','idle')",
+                (agent_urn,),
+            ).fetchone()
+            agent_pools = self._normalized_strings(agent_pools_row[0] if agent_pools_row else None)
+            if not agent_pools.intersection(required_pools):
+                return False
         if sub_throttled and (row[10] or "A").upper() != "A":
             return False
         try:
