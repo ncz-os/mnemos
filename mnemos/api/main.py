@@ -13,7 +13,6 @@ from mnemos.api.routes.admin import router as admin_router
 from mnemos.api.routes.admin_decay import router as admin_decay_router
 from mnemos.api.routes.audit import router as audit_router
 from mnemos.api.routes.mcp_audit import router as mcp_audit_router
-from mnemos.api.routes.consultations import router as consultations_router
 from mnemos.api.routes.dag import router as dag_router
 from mnemos.api.routes.entities import router as entities_router
 from mnemos.api.routes.federation import router as federation_router
@@ -22,10 +21,6 @@ from mnemos.api.routes.ingest import router as ingest_router
 from mnemos.api.routes.journal import router as journal_router
 from mnemos.api.routes.kronos import router as kronos_router
 from mnemos.api.routes.kg import router as kg_router
-from mnemos.api.routes.knemon_dashboard import router as knemon_dashboard_router
-from mnemos.api.routes.knemon_router import router as knemon_router_router
-from mnemos.api.routes.knemon_utilization import router as knemon_utilization_router
-from mnemos.api.routes.ledger import router as ledger_router
 from mnemos.api.routes.memories import router as memories_router
 from mnemos.api.routes.morpheus import router as morpheus_router
 from mnemos.api.routes.narrate import router as narrate_router
@@ -338,9 +333,18 @@ app.include_router(metrics_router)  # v3.2 observability: Prometheus /metrics
 # TODO(codex): classify remaining routers (pantheon, openai_compat, sessions)
 # into layers + add the matching pyproject extras gating per the doc.
 if _settings.layers.enable_graeae:
+    # Lazy import: a base (core-only) install must not import the GRAEAE module.
+    from mnemos.api.routes.consultations import router as consultations_router
+
     app.include_router(consultations_router)  # GRAEAE reasoning: /v1/consultations
 app.include_router(providers_router)  # v3.0.0: Unified /v1/providers (model routing)
 if _settings.layers.enable_hive:
+    # Lazy import: a base/GRAEAE-only install must not import the hive/KNEMON modules.
+    from mnemos.api.routes.knemon_dashboard import router as knemon_dashboard_router
+    from mnemos.api.routes.knemon_router import router as knemon_router_router
+    from mnemos.api.routes.knemon_utilization import router as knemon_utilization_router
+    from mnemos.api.routes.ledger import router as ledger_router
+
     app.include_router(ledger_router)  # KNEMON MVP Step 1: token/cost usage ledger
     app.include_router(knemon_dashboard_router)  # KNEMON dashboard and read-side ledger analytics
     app.include_router(knemon_router_router)  # KNEMON hybrid router
