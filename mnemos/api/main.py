@@ -332,12 +332,19 @@ app.add_middleware(RequestIDMiddleware)
 
 app.include_router(health_router)
 app.include_router(metrics_router)  # v3.2 observability: Prometheus /metrics
-app.include_router(consultations_router)  # v3.0.0: Unified /v1/consultations (GRAEAE reasoning)
+# ── Layered router mounts (GRAEAE consult de8f4b2b, 2026-06-01) ──────────────
+# core <- graeae <- hive. Flags default ON (full deployment unchanged); slim
+# installs set MNEMOS_ENABLE_GRAEAE/_HIVE=0. See docs/LAYERED_INSTALL.md.
+# TODO(codex): classify remaining routers (pantheon, openai_compat, sessions)
+# into layers + add the matching pyproject extras gating per the doc.
+if _settings.layers.enable_graeae:
+    app.include_router(consultations_router)  # GRAEAE reasoning: /v1/consultations
 app.include_router(providers_router)  # v3.0.0: Unified /v1/providers (model routing)
-app.include_router(ledger_router)  # KNEMON MVP Step 1: token/cost usage ledger
-app.include_router(knemon_dashboard_router)  # KNEMON dashboard and read-side ledger analytics
-app.include_router(knemon_router_router)  # KNEMON hybrid router
-app.include_router(knemon_utilization_router)  # KNEMON subscription-plan utilization analytics
+if _settings.layers.enable_hive:
+    app.include_router(ledger_router)  # KNEMON MVP Step 1: token/cost usage ledger
+    app.include_router(knemon_dashboard_router)  # KNEMON dashboard and read-side ledger analytics
+    app.include_router(knemon_router_router)  # KNEMON hybrid router
+    app.include_router(knemon_utilization_router)  # KNEMON subscription-plan utilization analytics
 app.include_router(openai_compat_router)  # Phase 0: OpenAI-compatible gateway
 app.include_router(pantheon_router)  # PANTHEON v0.1: unified LLM facade (503-gated when disabled)
 app.include_router(sessions_router)  # Phase 0: Session management for stateful chat
