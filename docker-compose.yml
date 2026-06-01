@@ -100,6 +100,7 @@ services:
       - ./db/migrations/0036_hive_agents_subscription_pools.sql:/docker-entrypoint-initdb.d/66-hive-agents-subscription-pools.sql
       - ./db/migrations/0037_deepseek_direct_provider_seed.sql:/docker-entrypoint-initdb.d/67-deepseek-direct-provider-seed.sql
       - ./db/migrations/0038_oauth_sessions_consultations.sql:/docker-entrypoint-initdb.d/68-oauth-sessions-consultations.sql
+      - ./db/migrations/0039_knemon_dispatch_rule_refresh.sql:/docker-entrypoint-initdb.d/69-knemon-dispatch-rule-refresh.sql
     ports:
       - '127.0.0.1:5432:5432'
     healthcheck:
@@ -161,6 +162,7 @@ services:
       - ./db/migrations/0036_hive_agents_subscription_pools.sql:/migrations/66-hive-agents-subscription-pools.sql:ro
       - ./db/migrations/0037_deepseek_direct_provider_seed.sql:/migrations/67-deepseek-direct-provider-seed.sql:ro
       - ./db/migrations/0038_oauth_sessions_consultations.sql:/migrations/68-oauth-sessions-consultations.sql:ro
+      - ./db/migrations/0039_knemon_dispatch_rule_refresh.sql:/migrations/69-knemon-dispatch-rule-refresh.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -206,7 +208,10 @@ services:
       -f /migrations/63-subscription-plans.sql
       -f /migrations/64-usage-ledger-session-tracking.sql
       -f /migrations/65-subscription-plans-date-aware.sql
-      -f /migrations/66-deepseek-direct-provider-seed.sql"
+      -f /migrations/66-hive-agents-subscription-pools.sql
+      -f /migrations/67-deepseek-direct-provider-seed.sql
+      -f /migrations/68-oauth-sessions-consultations.sql
+      -f /migrations/69-knemon-dispatch-rule-refresh.sql"
     restart: "no"
 
   ollama:
