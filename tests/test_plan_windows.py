@@ -5,10 +5,24 @@ from datetime import datetime, timezone
 from mnemos.core.plan_windows import compute_plan_window_id, plan_path_kind
 
 
-def test_chatgpt_pro_variants_use_monthly_unmetered_windows() -> None:
+def test_chatgpt_codex_rows_use_rolling_interactive_windows() -> None:
     ts = datetime(2026, 5, 28, 18, 30, tzinfo=timezone.utc)
 
-    for plan_name in ("chatgpt_pro", "chatgpt_pro_100", "chatgpt_pro_200"):
+    for plan_name in (
+        "chatgpt_plus",
+        "chatgpt_pro",
+        "chatgpt_pro_100_codex_promo",
+        "chatgpt_pro_100_codex",
+        "chatgpt_pro_200_codex",
+    ):
+        assert compute_plan_window_id("openai", plan_name, ts).startswith(f"openai-{plan_name}-2026-W22")
+        assert plan_path_kind("openai", plan_name) == "interactive"
+
+
+def test_head_only_chatgpt_pro_variants_keep_monthly_unmetered_windows() -> None:
+    ts = datetime(2026, 5, 28, 18, 30, tzinfo=timezone.utc)
+
+    for plan_name in ("chatgpt_pro_100", "chatgpt_pro_200"):
         assert compute_plan_window_id("openai", plan_name, ts) == f"openai-{plan_name}-2026-05"
         assert plan_path_kind("openai", plan_name) == "unmetered"
 

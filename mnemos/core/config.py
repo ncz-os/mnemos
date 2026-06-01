@@ -752,6 +752,10 @@ class _RuntimeSettings(BaseSettings):
     pool_acquire_timeout: float = Field(10.0, validation_alias="MNEMOS_POOL_ACQUIRE_TIMEOUT")
     loose_timeouts: bool = Field(False, validation_alias="MNEMOS_LOOSE_TIMEOUTS")
     task_classifier_factory: str = Field("", validation_alias="MNEMOS_TASK_CLASSIFIER_FACTORY")
+    knemon_session_burn_requests_per_hour: int = Field(
+        10,
+        validation_alias="MNEMOS_KNEMON_SESSION_BURN_REQUESTS_PER_HOUR",
+    )
 
 
 class _ToolSettings(BaseSettings):

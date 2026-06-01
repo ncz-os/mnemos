@@ -38,23 +38,67 @@ SET effective_from = DATE '2026-04-01',
 WHERE provider = 'anthropic'
   AND plan_name = 'claude_max_200';
 
+UPDATE subscription_plans
+SET auth_method = 'subscription',
+    monthly_usd = 20,
+    msg_cap = 15,
+    msg_window_seconds = 18000,
+    token_cap = NULL,
+    token_window_seconds = NULL,
+    reset_anchor = 'rolling',
+    notes = 'ChatGPT Codex Plus: conservative GPT-5.5 local-message floor per 5h; official limits vary by model and surface',
+    effective_from = DATE '2026-05-01',
+    effective_until = NULL,
+    path_kind = 'interactive',
+    parent_plan_id = NULL
+WHERE provider = 'openai'
+  AND plan_name = 'chatgpt_plus';
+
+UPDATE subscription_plans
+SET auth_method = 'subscription',
+    monthly_usd = 200,
+    msg_cap = 375,
+    msg_window_seconds = 18000,
+    token_cap = NULL,
+    token_window_seconds = NULL,
+    reset_anchor = 'rolling',
+    notes = 'ChatGPT Codex Pro $200 promo: conservative GPT-5.5 local-message floor per 5h through 2026-05-31',
+    effective_from = DATE '2026-05-01',
+    effective_until = DATE '2026-05-31',
+    path_kind = 'interactive',
+    parent_plan_id = 'chatgpt_pro_200_codex'
+WHERE provider = 'openai'
+  AND plan_name = 'chatgpt_pro';
+
 MERGE INTO subscription_plans dst
 USING (
   SELECT 'anthropic' provider, 'claude_max_100' plan_name, 'subscription' auth_method,
-         100 monthly_usd, 450 msg_cap, 18000 msg_window_seconds,
+         100 monthly_usd, 225 msg_cap, 18000 msg_window_seconds,
          NULL token_cap, NULL token_window_seconds, 'rolling' reset_anchor,
          NULL overage_pricing_per_mtok_in, NULL overage_pricing_per_mtok_out,
-         'Claude Max 100: 450 messages per 5h window until 2026-06-14' notes,
+         'Claude Max 100 (5x): at least 225 messages per 5h window until 2026-06-14' notes,
          DATE '2026-06-01' effective_from, DATE '2026-06-14' effective_until,
          'interactive' path_kind, 'claude_max_200' parent_plan_id FROM dual
   UNION ALL SELECT 'anthropic', 'claude_max_interactive_post_jun15', 'subscription',
-         100, 450, 18000, NULL, NULL, 'rolling', NULL, NULL,
-         'Claude Max interactive plan after 2026-06-15',
+         100, 225, 18000, NULL, NULL, 'rolling', NULL, NULL,
+         'Claude Max 100 (5x) interactive plan after 2026-06-15',
          DATE '2026-06-15', NULL, 'interactive', 'claude_max_100' FROM dual
   UNION ALL SELECT 'anthropic', 'agent_sdk_credit_pool_post_jun15', 'subscription',
          0, NULL, NULL, NULL, NULL, 'monthly', NULL, NULL,
          'Claude Max Agent SDK credit pool after 2026-06-15',
          DATE '2026-06-15', NULL, 'sdk_credit_pool', 'claude_max_100' FROM dual
+  UNION ALL SELECT 'openai', 'chatgpt_pro_100_codex_promo', 'subscription',
+         100, 160, 18000, NULL, NULL, 'rolling', NULL, NULL,
+         'ChatGPT Codex Pro $100 launch promo: conservative GPT-5.5 local-message floor per 5h through 2026-05-31',
+         DATE '2026-05-01', DATE '2026-05-31', 'interactive', 'chatgpt_pro_100_codex' FROM dual
+  UNION ALL SELECT 'openai', 'chatgpt_pro_100_codex', 'subscription',
+         100, 80, 18000, NULL, NULL, 'rolling', NULL, NULL,
+         'ChatGPT Codex Pro $100: conservative GPT-5.5 local-message floor per 5h from 2026-06-01',
+         DATE '2026-06-01', NULL, 'interactive', 'chatgpt_pro' FROM dual
+  UNION ALL SELECT 'openai', 'chatgpt_pro_200_codex', 'subscription',
+         200, 300, 18000, NULL, NULL, 'rolling', NULL, NULL,
+         'ChatGPT Codex Pro $200: conservative GPT-5.5 local-message floor per 5h from 2026-06-01',
+         DATE '2026-06-01', NULL, 'interactive', 'chatgpt_pro' FROM dual
   UNION ALL SELECT 'xai', 'supergrok', 'subscription',
          30, NULL, NULL, NULL, NULL, 'monthly', NULL, NULL,
          'xAI SuperGrok interactive subscription',
