@@ -56,17 +56,21 @@ async def main() -> int:
     )
     args = parser.parse_args()
 
-    # ── Connect to MNEMOS PostgreSQL pool ─────────────────────────────────────
-    pool = None
+    # ── Connect via the MNEMOS persistence ABC (Oracle-native; NO raw asyncpg) ─
+    backend = None
     if not args.dry_run:
         try:
-            import asyncpg
+            from mnemos.core import lifecycle as _lc
+            from mnemos.core.config import get_settings
 
-            dsn = os.getenv("DATABASE_URL", "postgresql://mnemos:mnemos@localhost/mnemos")
-            pool = await asyncpg.create_pool(dsn, min_size=2, max_size=5)
-            logger.info("[SYNC] DB pool connected")
+            settings = get_settings()
+            oracle_dsn = _lc._oracle_dsn_from_settings(settings)
+            if not oracle_dsn:
+                raise RuntimeError("no oracle:// DSN configured (MNEMOS_DATABASE_DSN)")
+            backend = await _lc._build_oracle_backend(oracle_dsn, settings)
+            logger.info("[SYNC] Oracle persistence backend ready")
         except Exception as exc:
-            logger.error(f"[SYNC] cannot connect to DB: {exc}")
+            logger.error(f"[SYNC] cannot init persistence backend: {exc}")
             return 1
     else:
         logger.info("[SYNC] DRY-RUN mode — no DB writes")
@@ -80,7 +84,7 @@ async def main() -> int:
 
             logger.info("=== Provider API sync ===")
             results = await sync_all_providers(
-                pool=pool,
+                backend=backend,
                 dry_run=args.dry_run,
                 providers=args.provider or None,
             )
@@ -163,10 +167,10 @@ async def main() -> int:
                             db_prov = _GRAEAE_TO_DB_PROVIDER.get(prov, prov)
                             arena_scores[db_prov] = (api_id, score, rank_map.get(arena_name, 0))
 
-                    if pool and not args.dry_run and arena_scores:
+                    if backend and not args.dry_run and arena_scores:
                         from mnemos.domain.graeae.provider_sync import update_arena_scores
 
-                        await update_arena_scores(pool, arena_scores)
+                        await update_arena_scores(backend, arena_scores)
                         logger.info(f"[ARENA] updated scores for {len(arena_scores)} providers")
 
                     # Also refresh the Elo weights cache used by the GRAEAE engine
@@ -184,9 +188,12 @@ async def main() -> int:
                 exit_code = max(exit_code, 2)
 
     finally:
-        if pool:
-            await pool.close()
-            logger.info("[SYNC] DB pool closed")
+        if backend is not None:
+            try:
+                await backend.close()
+                logger.info("[SYNC] persistence backend closed")
+            except Exception:  # noqa: BLE001
+                pass
 
     return exit_code
 

@@ -2519,6 +2519,167 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         _ = (tx, model_id)
         return None
 
+    # ── model-registry WRITES (Oracle MERGE; daily provider sync) ──────────────
+    async def upsert_model(self, tx: Transaction, model: dict[str, Any]) -> bool:
+        """Insert-or-update one model_registry row. Returns True if inserted."""
+        import json as _json
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT id FROM model_registry WHERE provider = :p AND model_id = :m",
+                {"p": model["provider"], "m": model["model_id"]},
+            )
+            existing = await _call(cursor.fetchone)
+            binds = {
+                "id": f"{model['provider']}:{model['model_id']}"[:100],
+                "p": model["provider"],
+                "m": model["model_id"],
+                "dn": (model.get("display_name") or model["model_id"])[:400],
+                "fam": (model.get("family") or "")[:200] or None,
+                "cw": model.get("context_window"),
+                "mot": model.get("max_output_tokens"),
+                "caps": _json.dumps(model.get("capabilities", [])),
+                "ic": model.get("input_cost_per_mtok", 0) or 0,
+                "oc": model.get("output_cost_per_mtok", 0) or 0,
+                "cr": model.get("cache_read_per_mtok", 0) or 0,
+                "cwr": model.get("cache_write_per_mtok", 0) or 0,
+                "raw": _json.dumps(model.get("raw", {})),
+            }
+            if existing is None:
+                await _call(
+                    cursor.execute,
+                    "INSERT INTO model_registry (id, provider, model_id, display_name, "
+                    "family, context_window, max_output_tokens, capabilities, "
+                    "input_cost_per_mtok, output_cost_per_mtok, cache_read_per_mtok, "
+                    "cache_write_per_mtok, available, deprecated, first_seen, last_seen, "
+                    "last_synced, raw_payload) VALUES (:id, :p, :m, :dn, :fam, :cw, :mot, "
+                    ":caps, :ic, :oc, :cr, :cwr, 1, 0, SYSTIMESTAMP, SYSTIMESTAMP, "
+                    "SYSTIMESTAMP, :raw)",
+                    binds,
+                )
+                return True
+            await _call(
+                cursor.execute,
+                "UPDATE model_registry SET display_name = :dn, family = :fam, "
+                "context_window = NVL(:cw, context_window), "
+                "max_output_tokens = NVL(:mot, max_output_tokens), "
+                "capabilities = :caps, input_cost_per_mtok = :ic, "
+                "output_cost_per_mtok = :oc, cache_read_per_mtok = :cr, "
+                "cache_write_per_mtok = :cwr, available = 1, deprecated = 0, "
+                "last_seen = SYSTIMESTAMP, last_synced = SYSTIMESTAMP, raw_payload = :raw "
+                "WHERE provider = :p AND model_id = :m",
+                binds,
+            )
+            return False
+        finally:
+            await _call(cursor.close)
+
+    async def mark_models_unavailable(
+        self, tx: Transaction, provider: str, seen_model_ids: Sequence[str]
+    ) -> int:
+        """Mark this provider's models NOT seen in the latest sync as unavailable."""
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            binds: dict[str, Any] = {"p": provider}
+            if seen_model_ids:
+                placeholders = ", ".join(f":s{i}" for i in range(len(seen_model_ids)))
+                for i, mid in enumerate(seen_model_ids):
+                    binds[f"s{i}"] = mid
+                sql = (
+                    "UPDATE model_registry SET available = 0, deprecated = 1, "
+                    "last_synced = SYSTIMESTAMP WHERE provider = :p AND available = 1 "
+                    f"AND model_id NOT IN ({placeholders})"
+                )
+            else:
+                sql = (
+                    "UPDATE model_registry SET available = 0, deprecated = 1, "
+                    "last_synced = SYSTIMESTAMP WHERE provider = :p AND available = 1"
+                )
+            await _call(cursor.execute, sql, binds)
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def write_model_sync_log(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        models_found: int,
+        added: int,
+        updated: int,
+        deprecated: int,
+        error: str | None,
+        duration_ms: int,
+    ) -> None:
+        _ = duration_ms  # Oracle model_registry_sync_log has no duration column
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "INSERT INTO model_registry_sync_log (id, provider, synced_at, "
+                "models_found, models_added, models_updated, models_deprecated, error) "
+                "VALUES (:id, :p, SYSTIMESTAMP, :f, :a, :u, :d, :e)",
+                {
+                    "id": uuid.uuid4().bytes,
+                    "p": provider,
+                    "f": models_found,
+                    "a": added,
+                    "u": updated,
+                    "d": deprecated,
+                    "e": (error or None) and str(error)[:4000],
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def update_arena_score(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        family: str,
+        arena_score: float,
+        arena_rank: int,
+        graeae_weight: float,
+    ) -> int:
+        """Apply arena score by exact model_id, else by family. Returns rows updated."""
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            binds = {
+                "p": provider,
+                "m": model_id,
+                "fam": family,
+                "sc": arena_score,
+                "rk": arena_rank,
+                "w": graeae_weight,
+            }
+            await _call(
+                cursor.execute,
+                "UPDATE model_registry SET arena_score = :sc, arena_rank = :rk, "
+                "graeae_weight = :w WHERE provider = :p AND model_id = :m",
+                binds,
+            )
+            n = int(getattr(cursor, "rowcount", 0) or 0)
+            if n == 0:
+                await _call(
+                    cursor.execute,
+                    "UPDATE model_registry SET arena_score = :sc, arena_rank = :rk, "
+                    "graeae_weight = :w WHERE provider = :p AND family = :fam",
+                    binds,
+                )
+                n = int(getattr(cursor, "rowcount", 0) or 0)
+            return n
+        finally:
+            await _call(cursor.close)
+
 
 class OracleOAuthRepository(OAuthRepository):
     async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
