@@ -476,6 +476,35 @@ async def cache_record_hit(db, cache_key: str, cost_saved: float):
     )
 
 
+async def _claim_agent_context(agent_urn: str) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
+            "auth_method, plan_cap_usd, plan_period_used_usd "
+            "FROM agents WHERE urn=? AND status IN ('online','idle')",
+            (agent_urn,),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"agent not registered or offline: {agent_urn}")
+    agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier, a_auth, a_cap, a_used = row
+    agent_caps = set(json.loads(caps_json)) if caps_json else set()
+    a_tier = a_tier or "C"
+    a_auth = (a_auth or "unknown").lower()
+    # Throttle: subscription agents over 85% MTD usage get refused tier-B/C jobs;
+    # they can still claim tier-A (free) work. Forces API/free fallback as plan cap nears.
+    sub_throttled = a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap
+    return {
+        "agent_kind": agent_kind,
+        "agent_caps": agent_caps,
+        "agent_runtime": a_runtime or "unknown",
+        "agent_model": a_model or "unknown",
+        "agent_provider": a_provider or "unknown",
+        "agent_tier": a_tier,
+        "sub_throttled": bool(sub_throttled),
+    }
+
+
 class AgentRegister(BaseModel):
     # OPEN REGISTRATION + RUNTIME→KIND ENFORCEMENT (per Kimi advisory 2026-05-23).
     # Any agent registers; identity is recorded for transparency. Kind must align
@@ -1154,36 +1183,20 @@ async def dequeue_next_job(agent_urn: str):
     Race-safe via SQLite immediate-mode UPDATE...WHERE rowid=(SELECT...LIMIT 1) under a transaction.
     """
     now = time.time()
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
-            "auth_method, plan_cap_usd, plan_period_used_usd "
-            "FROM agents WHERE urn=? AND status IN ('online','idle')",
-            (agent_urn,),
-        ) as cur:
-            row = await cur.fetchone()
-        if not row:
-            raise HTTPException(404, f"agent not registered or offline: {agent_urn}")
-        agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier, a_auth, a_cap, a_used = row
-        agent_caps = set(json.loads(caps_json)) if caps_json else set()
-        a_tier = a_tier or "C"
-        a_auth = (a_auth or "unknown").lower()
-        # Throttle: subscription agents over 85% MTD usage get refused tier-B/C jobs;
-        # they can still claim tier-A (free) work. Forces API/free fallback as plan cap nears.
-        sub_throttled = a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap
+    agent = await _claim_agent_context(agent_urn)
 
     # Phase 2 cut 4: atomic claim delegated to repo (transaction +
     # filter chain are storage semantics; only event emission stays here).
     claimed = await _REPO.find_and_claim_job(
         agent_urn=agent_urn,
-        agent_kind=agent_kind,
-        agent_caps=agent_caps,
-        agent_runtime=a_runtime or "unknown",
-        agent_model=a_model or "unknown",
-        agent_provider=a_provider or "unknown",
-        agent_tier=a_tier,
+        agent_kind=agent["agent_kind"],
+        agent_caps=agent["agent_caps"],
+        agent_runtime=agent["agent_runtime"],
+        agent_model=agent["agent_model"],
+        agent_provider=agent["agent_provider"],
+        agent_tier=agent["agent_tier"],
         cost_tier_order=list(COST_TIERS),
-        sub_throttled=bool(sub_throttled),
+        sub_throttled=agent["sub_throttled"],
         now=now,
     )
     if claimed:
@@ -1195,10 +1208,10 @@ async def dequeue_next_job(agent_urn: str):
                     "id": claimed["id"],
                     "claimed_by": agent_urn,
                     "kind": claimed["kind"],
-                    "runtime": a_runtime,
-                    "model": a_model,
-                    "provider": a_provider,
-                    "cost_tier": a_tier,
+                    "runtime": agent["agent_runtime"],
+                    "model": agent["agent_model"],
+                    "provider": agent["agent_provider"],
+                    "cost_tier": agent["agent_tier"],
                 },
             )
         return claimed
@@ -1631,18 +1644,40 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
 
 @app.post("/v1/jobs/{job_id}/claim")
 async def claim_job(job_id: str, by: str):
-    """First-write-wins claim: prevents duplicate execution by multiple agents."""
+    """First-write-wins claim after the same eligibility gates as /v1/jobs/next."""
     now = time.time()
+    agent = await _claim_agent_context(by)
+    status, claimed = await _REPO.claim_job_by_id(
+        job_id=job_id,
+        agent_urn=by,
+        agent_kind=agent["agent_kind"],
+        agent_caps=agent["agent_caps"],
+        agent_runtime=agent["agent_runtime"],
+        agent_model=agent["agent_model"],
+        agent_provider=agent["agent_provider"],
+        agent_tier=agent["agent_tier"],
+        cost_tier_order=list(COST_TIERS),
+        sub_throttled=agent["sub_throttled"],
+        now=now,
+    )
+    if status == "ineligible":
+        raise HTTPException(403, "agent is not eligible to claim this job")
+    if status != "claimed" or not claimed:
+        raise HTTPException(409, "job already claimed or not available")
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=? "
-            "WHERE id=? AND status IN ('queued','offered') AND claimed_by IS NULL",
-            (by, now, job_id),
+        await emit_event(
+            db,
+            "job.claimed",
+            {
+                "id": job_id,
+                "claimed_by": by,
+                "kind": claimed["kind"],
+                "runtime": agent["agent_runtime"],
+                "model": agent["agent_model"],
+                "provider": agent["agent_provider"],
+                "cost_tier": agent["agent_tier"],
+            },
         )
-        await db.commit()
-        if cur.rowcount == 0:
-            raise HTTPException(409, "job already claimed or not available")
-        await emit_event(db, "job.claimed", {"id": job_id, "claimed_by": by})
     return {"claimed": True, "ts": now}
 
 
