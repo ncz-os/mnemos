@@ -13,7 +13,6 @@ Providers and their API patterns:
   together  → GET /v1/models (OpenAI-compatible, type=chat filter)
   nvidia    → GET /v1/models (OpenAI-compatible, filter nim/ prefix)
   gemini    → GET /v1beta/models (Google Generative AI — paginated)
-  anthropic → static list (Anthropic does not expose a public /models endpoint)
 
 Arena.ai rankings are written separately by update_model_registry.py / elo_sync.py.
 This module only sets arena_score/arena_rank if passed in via update_arena_scores().
@@ -225,76 +224,6 @@ async def _fetch_gemini(timeout: int = 20) -> list[dict]:
     return models
 
 
-def _fetch_anthropic_static() -> list[dict]:
-    """Anthropic does not expose a public /models endpoint; use a static list.
-
-    Updated manually here when new Claude models ship.
-    Capabilities and pricing are hardcoded from public Anthropic docs.
-    """
-    return [
-        {
-            "provider": "anthropic",
-            "model_id": "claude-opus-4-7",
-            "display_name": "Claude Opus 4.7",
-            "family": "claude-opus-4",
-            "context_window": 200000,
-            "max_output_tokens": 32768,
-            "capabilities": ["chat", "code", "reasoning", "vision"],
-            "input_cost_per_mtok":  15.00,
-            "output_cost_per_mtok": 75.00,
-            "cache_read_per_mtok":   1.50,
-            "cache_write_per_mtok":  3.75,
-            "available": True,
-            "raw": {"source": "static", "docs": "https://docs.anthropic.com/en/docs/about-claude/models"},
-        },
-        {
-            "provider": "anthropic",
-            "model_id": "claude-opus-4-6",
-            "display_name": "Claude Opus 4.6",
-            "family": "claude-opus-4",
-            "context_window": 200000,
-            "max_output_tokens": 32768,
-            "capabilities": ["chat", "code", "reasoning", "vision"],
-            "input_cost_per_mtok":  15.00,
-            "output_cost_per_mtok": 75.00,
-            "cache_read_per_mtok":   1.50,
-            "cache_write_per_mtok":  3.75,
-            "available": True,
-            "raw": {"source": "static", "docs": "https://docs.anthropic.com/en/docs/about-claude/models"},
-        },
-        {
-            "provider": "anthropic",
-            "model_id": "claude-sonnet-4-6",
-            "display_name": "Claude Sonnet 4.6",
-            "family": "claude-sonnet-4",
-            "context_window": 200000,
-            "max_output_tokens": 16384,
-            "capabilities": ["chat", "code", "reasoning", "vision"],
-            "input_cost_per_mtok":  3.00,
-            "output_cost_per_mtok": 15.00,
-            "cache_read_per_mtok":   0.30,
-            "cache_write_per_mtok":  3.75,
-            "available": True,
-            "raw": {"source": "static", "docs": "https://docs.anthropic.com/en/docs/about-claude/models"},
-        },
-        {
-            "provider": "anthropic",
-            "model_id": "claude-haiku-4-5-20251001",
-            "display_name": "Claude Haiku 4.5",
-            "family": "claude-haiku-4",
-            "context_window": 200000,
-            "max_output_tokens": 8192,
-            "capabilities": ["chat", "code", "vision"],
-            "input_cost_per_mtok":  0.80,
-            "output_cost_per_mtok": 4.00,
-            "cache_read_per_mtok":  0.08,
-            "cache_write_per_mtok": 1.00,
-            "available": True,
-            "raw": {"source": "static", "docs": "https://docs.anthropic.com/en/docs/about-claude/models"},
-        },
-    ]
-
-
 def _fetch_perplexity_static() -> list[dict]:
     """Perplexity's /models endpoint requires a subscription; use a static list."""
     return [
@@ -482,7 +411,6 @@ _LIVE_PROVIDERS = {
 }
 
 _STATIC_PROVIDERS = {
-    "anthropic":  _fetch_anthropic_static,
     "perplexity": _fetch_perplexity_static,
 }
 
