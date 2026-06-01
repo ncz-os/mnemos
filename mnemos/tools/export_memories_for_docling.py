@@ -93,7 +93,7 @@ def print_usage():
     """Print usage instructions."""
     print("""
 MNEMOS Memory Export for Docling
-================================
+--------------------------------
 
 This module provides formatters to render MNEMOS memories as Markdown, plain
 text, or HTML suitable for ingestion by IBM Docling.
