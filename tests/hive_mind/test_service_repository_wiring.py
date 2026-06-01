@@ -630,6 +630,135 @@ async def test_subscription_pool_route_controls_provider_and_claimability(monkey
         assert right_claim.json()["id"] == job_id
 
 
+def test_direct_claim_enforces_pool_tier_and_kind_eligibility(monkeypatch, tmp_path) -> None:
+    db_path = str(tmp_path / "hive-service-direct-claim-eligibility.sqlite3")
+    monkeypatch.setattr(service, "DB_PATH", db_path)
+    monkeypatch.setattr(service, "_REPO", SqliteHiveMindRepository(db_path))
+
+    with TestClient(service.app) as client:
+        orchestrator = client.post(
+            "/v1/agents/register",
+            json={"runtime": "claude-code", "host": "studio", "capabilities": ["code"]},
+        )
+        assert orchestrator.status_code == 200, orchestrator.text
+        wrong_pool_worker = client.post(
+            "/v1/agents/register",
+            json={
+                "runtime": "openai",
+                "host": "wrong-pool",
+                "provider": "openai",
+                "model": "gpt-sub",
+                "capabilities": ["code"],
+                "subscription_pools": ["anthropic_subscription"],
+            },
+        )
+        assert wrong_pool_worker.status_code == 200, wrong_pool_worker.text
+        right_pool_worker = client.post(
+            "/v1/agents/register",
+            json={
+                "runtime": "openai",
+                "host": "right-pool",
+                "provider": "openai",
+                "model": "gpt-sub",
+                "capabilities": ["code"],
+                "subscription_pools": ["chatgpt_plus"],
+            },
+        )
+        assert right_pool_worker.status_code == 200, right_pool_worker.text
+        free_codex_worker = client.post(
+            "/v1/agents/register",
+            json={
+                "runtime": "codex",
+                "host": "free-codex",
+                "provider": "local",
+                "model": "native",
+                "capabilities": ["code"],
+            },
+        )
+        assert free_codex_worker.status_code == 200, free_codex_worker.text
+
+        pooled_job = client.post(
+            "/v1/jobs",
+            json={
+                "submitter_urn": orchestrator.json()["urn"],
+                "kind": "code-fix",
+                "description": "direct claim pool gate",
+                "priority": 20,
+                "required_capabilities": ["code"],
+                "max_cost_tier": "C",
+            },
+        )
+        assert pooled_job.status_code == 200, pooled_job.text
+        pooled_job_id = pooled_job.json()["id"]
+        routed = client.patch(
+            f"/v1/jobs/{pooled_job_id}/routing",
+            json={
+                "required_capabilities": ["code"],
+                "eligible_kinds": ["openai"],
+                "max_cost_tier": "C",
+                "routing_metadata": {"required_subscription_pools": ["chatgpt_plus"]},
+            },
+        )
+        assert routed.status_code == 200, routed.text
+
+        wrong_pool_claim = client.post(
+            f"/v1/jobs/{pooled_job_id}/claim",
+            params={"by": wrong_pool_worker.json()["urn"]},
+        )
+        assert wrong_pool_claim.status_code == 403, wrong_pool_claim.text
+
+        right_pool_claim = client.post(
+            f"/v1/jobs/{pooled_job_id}/claim",
+            params={"by": right_pool_worker.json()["urn"]},
+        )
+        assert right_pool_claim.status_code == 200, right_pool_claim.text
+        assert right_pool_claim.json()["claimed"] is True
+
+        over_tier_job = client.post(
+            "/v1/jobs",
+            json={
+                "submitter_urn": orchestrator.json()["urn"],
+                "kind": "code-fix",
+                "description": "direct claim tier gate",
+                "priority": 10,
+                "required_capabilities": ["code"],
+                "eligible_kinds": ["openai"],
+                "max_cost_tier": "A",
+            },
+        )
+        assert over_tier_job.status_code == 200, over_tier_job.text
+        over_tier_claim = client.post(
+            f"/v1/jobs/{over_tier_job.json()['id']}/claim",
+            params={"by": right_pool_worker.json()["urn"]},
+        )
+        assert over_tier_claim.status_code == 403, over_tier_claim.text
+
+        wrong_kind_job = client.post(
+            "/v1/jobs",
+            json={
+                "submitter_urn": orchestrator.json()["urn"],
+                "kind": "code-fix",
+                "description": "direct claim kind gate",
+                "priority": 10,
+                "required_capabilities": ["code"],
+                "eligible_kinds": ["codex"],
+                "max_cost_tier": "C",
+            },
+        )
+        assert wrong_kind_job.status_code == 200, wrong_kind_job.text
+        wrong_kind_claim = client.post(
+            f"/v1/jobs/{wrong_kind_job.json()['id']}/claim",
+            params={"by": right_pool_worker.json()["urn"]},
+        )
+        assert wrong_kind_claim.status_code == 403, wrong_kind_claim.text
+
+        right_kind_claim = client.post(
+            f"/v1/jobs/{wrong_kind_job.json()['id']}/claim",
+            params={"by": free_codex_worker.json()["urn"]},
+        )
+        assert right_kind_claim.status_code == 200, right_kind_claim.text
+
+
 def test_zeroclaw_worker_registration_must_declare_runtime(monkeypatch, tmp_path) -> None:
     db_path = str(tmp_path / "hive-service-zeroclaw-runtime.sqlite3")
     monkeypatch.setattr(service, "DB_PATH", db_path)

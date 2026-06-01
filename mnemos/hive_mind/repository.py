@@ -72,6 +72,34 @@ class HiveMindRepository(Protocol):
         now: float,
     ) -> Optional[dict[str, Any]]: ...
 
+    async def claim_job_by_id(
+        self,
+        *,
+        job_id: str,
+        agent_urn: str,
+        agent_kind: str,
+        agent_caps: set[str],
+        agent_runtime: str,
+        agent_model: str,
+        agent_provider: str,
+        agent_tier: str,
+        cost_tier_order: list[str],
+        sub_throttled: bool,
+        now: float,
+    ) -> tuple[str, Optional[dict[str, Any]]]: ...
+
+
+_SERVICE_JOB_SELECT_COLUMNS = (
+    "id, submitter_urn, parent_job_id, kind, description, "
+    "priority, deadline, required_capabilities, eligible_kinds, "
+    "project, max_cost_tier, preferred_providers, preferred_models, "
+    "mnemos_refs, depends_on, status, claimed_by, claimed_at, "
+    "claimed_runtime, claimed_model, claimed_provider, "
+    "claimed_cost_tier, started_at, retry_backoff_until, ended_at, "
+    "result, result_mnemos_id, tokens_in, tokens_out, "
+    "estimated_cost_usd, retry_count, max_retries, routing_metadata"
+)
+
 
 class SqliteHiveMindRepository:
     def __init__(self, db_path: str) -> None:
@@ -647,14 +675,7 @@ class SqliteHiveMindRepository:
             db.execute("BEGIN IMMEDIATE")
             try:
                 rows = db.execute(
-                    "SELECT id, submitter_urn, parent_job_id, kind, description, "
-                    "priority, deadline, required_capabilities, eligible_kinds, "
-                    "project, max_cost_tier, preferred_providers, preferred_models, "
-                    "mnemos_refs, depends_on, status, claimed_by, claimed_at, "
-                    "claimed_runtime, claimed_model, claimed_provider, "
-                    "claimed_cost_tier, started_at, retry_backoff_until, ended_at, "
-                    "result, result_mnemos_id, tokens_in, tokens_out, "
-                    "estimated_cost_usd, retry_count, max_retries, routing_metadata "
+                    f"SELECT {_SERVICE_JOB_SELECT_COLUMNS} "
                     "FROM jobs "
                     "WHERE status='queued' "
                     "AND claimed_by IS NULL "
@@ -712,6 +733,120 @@ class SqliteHiveMindRepository:
                     return claimed
                 db.rollback()
                 return None
+            except Exception:
+                db.rollback()
+                raise
+
+    async def claim_job_by_id(
+        self,
+        *,
+        job_id: str,
+        agent_urn: str,
+        agent_kind: str,
+        agent_caps: set[str],
+        agent_runtime: str,
+        agent_model: str,
+        agent_provider: str,
+        agent_tier: str,
+        cost_tier_order: list[str],
+        sub_throttled: bool,
+        now: float,
+    ) -> tuple[str, Optional[dict[str, Any]]]:
+        return await asyncio.to_thread(
+            self._claim_job_by_id_sync,
+            job_id=job_id,
+            agent_urn=agent_urn,
+            agent_kind=agent_kind,
+            agent_caps=set(agent_caps),
+            agent_runtime=agent_runtime,
+            agent_model=agent_model,
+            agent_provider=agent_provider,
+            agent_tier=agent_tier,
+            cost_tier_order=list(cost_tier_order),
+            sub_throttled=sub_throttled,
+            now=float(now),
+        )
+
+    def _claim_job_by_id_sync(
+        self,
+        *,
+        job_id: str,
+        agent_urn: str,
+        agent_kind: str,
+        agent_caps: set[str],
+        agent_runtime: str,
+        agent_model: str,
+        agent_provider: str,
+        agent_tier: str,
+        cost_tier_order: list[str],
+        sub_throttled: bool,
+        now: float,
+    ) -> tuple[str, Optional[dict[str, Any]]]:
+        with sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None) as db:
+            if not self._table_exists(db, "jobs"):
+                return ("unavailable", None)
+            db.execute("PRAGMA busy_timeout=30000")
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                row = db.execute(
+                    f"SELECT {_SERVICE_JOB_SELECT_COLUMNS} "
+                    "FROM jobs "
+                    "WHERE id=? AND status IN ('queued','offered') AND claimed_by IS NULL "
+                    "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?)",
+                    (job_id, now),
+                ).fetchone()
+                if not row:
+                    db.rollback()
+                    return ("unavailable", None)
+                if not self._service_job_is_claimable(
+                    db,
+                    row=row,
+                    agent_urn=agent_urn,
+                    agent_kind=agent_kind,
+                    agent_caps=agent_caps,
+                    agent_model=agent_model,
+                    agent_provider=agent_provider,
+                    agent_tier=agent_tier,
+                    cost_tier_order=cost_tier_order,
+                    sub_throttled=sub_throttled,
+                ):
+                    db.rollback()
+                    return ("ineligible", None)
+                cur = db.execute(
+                    "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
+                    "claimed_runtime=?, claimed_model=?, claimed_provider=?, "
+                    "claimed_cost_tier=? "
+                    "WHERE id=? AND status IN ('queued','offered') AND claimed_by IS NULL",
+                    (
+                        agent_urn,
+                        now,
+                        agent_runtime,
+                        agent_model,
+                        agent_provider,
+                        agent_tier,
+                        job_id,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    db.rollback()
+                    return ("unavailable", None)
+                db.commit()
+                claimed_row = list(row)
+                claimed_row[15] = "claimed"
+                claimed_row[16] = agent_urn
+                claimed_row[17] = now
+                claimed_row[18] = agent_runtime
+                claimed_row[19] = agent_model
+                claimed_row[20] = agent_provider
+                claimed_row[21] = agent_tier
+                claimed = self._service_job_from_row(claimed_row)
+                claimed["claimed_resources"] = {
+                    "runtime": agent_runtime,
+                    "model": agent_model,
+                    "provider": agent_provider,
+                    "cost_tier": agent_tier,
+                }
+                return ("claimed", claimed)
             except Exception:
                 db.rollback()
                 raise
