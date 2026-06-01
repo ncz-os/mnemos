@@ -13,6 +13,7 @@ from mnemos.core.config import get_settings
 from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.domain.knemon.router import (
     KnemonRouteRequest,
+    NoModelAvailable,
     _apply_priority_ceiling,
     _best_plan,
     _fallback_bucket,
@@ -139,6 +140,7 @@ class _SqliteKnemonBackend:
             """
             INSERT INTO model_registry VALUES
               ('openai', 'gpt-sub', 'GPT Sub', '["chat","code"]', 2, 8, 200000, 1400, 0.95, 1, 0),
+              ('openai', 'gpt-c-tier', 'GPT C Tier', '["vision"]', 2, 8, 200000, 900, 0.70, 1, 0),
               ('nvidia', 'ngc-free', 'NGC Free', '["chat","code"]', 0, 0, 200000, 1250, 0.88, 1, 0),
               ('xai', 'grok-api', 'Grok API', '["chat","code"]', 3, 15, 200000, 1220, 0.86, 1, 0);
             INSERT INTO subscription_plans VALUES
@@ -242,6 +244,20 @@ def _req(priority: int, session_id: str | None = None) -> KnemonRouteRequest:
     )
 
 
+@pytest.mark.asyncio
+async def test_single_est_tokens_request_shape_supported():
+    req = KnemonRouteRequest(
+        task_kind="code-fix",
+        priority=14,
+        est_tokens=12_000,
+        caller_subsystem="pytest",
+        require_capability=["code"],
+    )
+    decision = await route(req, _SqliteKnemonBackend(40))
+    assert decision.provider == "openai"
+    assert decision.auth_method == "subscription"
+
+
 @pytest.mark.parametrize("utilization_pct", [40, 70, 92, 100])
 @pytest.mark.asyncio
 async def test_synthetic_utilization_fixtures_route(utilization_pct):
@@ -339,6 +355,21 @@ def test_plan_effective_dates_filter_expired_and_future_rows():
         today,
     )
     assert _plan_is_effective({"provider": "legacy"}, today)
+
+
+@pytest.mark.asyncio
+async def test_mid_priority_rejects_tier_c_ceiling():
+    req = KnemonRouteRequest(
+        task_kind="vision",
+        priority=10,
+        est_tokens_in=10_000,
+        est_tokens_out=2_000,
+        caller_session_id=None,
+        caller_subsystem="pytest",
+        require_capability=["vision"],
+    )
+    with pytest.raises(NoModelAvailable, match="priority tier"):
+        await route(req, _SqliteKnemonBackend(40))
 
 
 @pytest.mark.asyncio
