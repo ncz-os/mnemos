@@ -52,6 +52,7 @@ from urllib.parse import unquote, urlparse
 from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
 from mnemos.persistence.base import (
     BranchRepository,
+    CompressionQueueRepository,
     CompressionRepository,
     CORE_CAPABILITY,
     MYSQL_CAPABILITY_DETAILS,
@@ -1071,6 +1072,250 @@ class MysqlCompressionRepository(CompressionRepository):
     insert_manifest = _stub_method("insert_manifest")
 
 
+class MysqlCompressionQueueRepository(CompressionQueueRepository):
+    """MySQL implementation of the v3.1 compression work queue."""
+
+    async def enqueue_compression(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: list[str],
+        reason: str,
+        priority: int,
+        scoring_profile: str,
+    ) -> list[str]:
+        if not memory_ids:
+            return []
+        conn = tx.conn
+        placeholders = ", ".join(["%s"] * len(memory_ids))
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT id, owner_id
+                  FROM memories
+                 WHERE id IN ({placeholders}) AND deleted_at IS NULL
+                """,
+                list(memory_ids),
+            )
+            known = await _fetch_all_dicts(cursor)
+
+        owner_by_id = {row["id"]: row["owner_id"] for row in known}
+        enqueued: list[str] = []
+        async with conn.cursor() as cursor:
+            for mid in memory_ids:
+                if mid not in owner_by_id:
+                    continue
+                await cursor.execute(
+                    """
+                    INSERT INTO memory_compression_queue
+                        (memory_id, owner_id, reason, priority, scoring_profile)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (mid, owner_by_id[mid], reason, priority, scoring_profile),
+                )
+                enqueued.append(mid)
+        return enqueued
+
+    async def enqueue_all_compression(
+        self,
+        tx: Transaction,
+        *,
+        reason: str,
+        priority: int,
+        scoring_profile: str,
+        category: str | None,
+        only_uncompressed: bool,
+        limit: int,
+    ) -> int:
+        if limit <= 0:
+            return 0
+        where_parts: list[str] = ["m.deleted_at IS NULL"]
+        params: list[Any] = [reason, priority, scoring_profile]
+        if only_uncompressed:
+            where_parts.append("NOT EXISTS (SELECT 1 FROM memory_compressed_variants v WHERE v.memory_id = m.id)")
+        if category is not None:
+            where_parts.append("m.category = %s")
+            params.append(category)
+        params.append(limit)
+
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                INSERT INTO memory_compression_queue
+                    (memory_id, owner_id, reason, priority, scoring_profile)
+                SELECT m.id, m.owner_id, %s, %s, %s
+                  FROM memories m
+                 WHERE {" AND ".join(where_parts)}
+                 ORDER BY LENGTH(m.content) DESC
+                 LIMIT %s
+                """,
+                params,
+            )
+            return int(cursor.rowcount or 0)
+
+    async def dequeue_compression(
+        self,
+        tx: Transaction,
+        *,
+        limit: int,
+    ) -> list[Row]:
+        if limit <= 0:
+            return []
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT id
+                  FROM memory_compression_queue
+                 WHERE status = 'pending'
+                 ORDER BY priority DESC, enqueued_at
+                 LIMIT %s
+                 FOR UPDATE SKIP LOCKED
+                """,
+                (int(limit),),
+            )
+            locked = await cursor.fetchall()
+            queue_ids = [row[0] for row in locked]
+            if not queue_ids:
+                return []
+
+            placeholders = ", ".join(["%s"] * len(queue_ids))
+            await cursor.execute(
+                f"""
+                UPDATE memory_compression_queue
+                   SET status = 'running',
+                       started_at = NOW(6),
+                       attempts = attempts + 1
+                 WHERE id IN ({placeholders})
+                """,
+                queue_ids,
+            )
+            await cursor.execute(
+                f"""
+                SELECT id, memory_id, owner_id, reason, scoring_profile, attempts
+                  FROM memory_compression_queue
+                 WHERE id IN ({placeholders})
+                """,
+                queue_ids,
+            )
+            rows = await _fetch_all_dicts(cursor)
+
+        by_id = {str(row["id"]): row for row in rows}
+        out: list[Row] = []
+        for queue_id in queue_ids:
+            row = by_id.get(str(queue_id))
+            if row is not None:
+                row["id"] = str(row["id"])
+                out.append(row)
+        return out
+
+    async def mark_compression_done(
+        self,
+        tx: Transaction,
+        *,
+        queue_id: str,
+    ) -> None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE memory_compression_queue
+                   SET status = 'done',
+                       finished_at = NOW(6),
+                       error = NULL
+                 WHERE id = %s
+                """,
+                (queue_id,),
+            )
+
+    async def mark_compression_failed(
+        self,
+        tx: Transaction,
+        *,
+        queue_id: str,
+        error: str,
+    ) -> None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE memory_compression_queue
+                   SET status = 'failed',
+                       finished_at = NOW(6),
+                       error = %s
+                 WHERE id = %s
+                """,
+                (error, queue_id),
+            )
+
+    async def sweep_stale_compression(
+        self,
+        tx: Transaction,
+        *,
+        stale_threshold_secs: int,
+        max_attempts: int,
+    ) -> int:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT id, attempts, error
+                  FROM memory_compression_queue
+                 WHERE status = 'running'
+                   AND (started_at IS NULL
+                        OR started_at < DATE_SUB(NOW(6), INTERVAL %s SECOND))
+                 FOR UPDATE SKIP LOCKED
+                """,
+                (int(stale_threshold_secs),),
+            )
+            stale_rows = await _fetch_all_dicts(cursor)
+            for row in stale_rows:
+                attempts = int(row["attempts"] or 0)
+                error = row.get("error")
+                terminalize = attempts >= max_attempts and error is not None and not str(error).startswith("infra_retry:")
+                if terminalize:
+                    await cursor.execute(
+                        """
+                        UPDATE memory_compression_queue
+                           SET status = 'failed',
+                               finished_at = NOW(6),
+                               error = %s
+                         WHERE id = %s
+                        """,
+                        (
+                            f"stranded_running: exceeded stale threshold after {attempts} attempts",
+                            row["id"],
+                        ),
+                    )
+                elif attempts >= max_attempts:
+                    await cursor.execute(
+                        """
+                        UPDATE memory_compression_queue
+                           SET status = 'pending',
+                               started_at = NULL,
+                               finished_at = NULL,
+                               attempts = %s,
+                               error = 'infra_retry: stale-recovered without content-failure breadcrumb'
+                         WHERE id = %s
+                        """,
+                        (max(attempts - 1, 0), row["id"]),
+                    )
+                else:
+                    await cursor.execute(
+                        """
+                        UPDATE memory_compression_queue
+                           SET status = 'pending',
+                               started_at = NULL,
+                               finished_at = NULL,
+                               error = NULL
+                         WHERE id = %s
+                        """,
+                        (row["id"],),
+                    )
+        return len(stale_rows)
+
+
 class MysqlWebhookRepository(WebhookRepository):
     async def dispatch_event(
         self,
@@ -1185,6 +1430,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         self._memory_versions_repo = MysqlVersionRepository()
         self._memory_branches_repo = MysqlBranchRepository()
         self._compression_repo = MysqlCompressionRepository()
+        self._compression_queue_repo = MysqlCompressionQueueRepository()
         self._consultations_audit_repo = MysqlConsultationAuditRepository()
         self._federation_repo = MysqlFederationRepository()
         self._state_kv_repo = MysqlStateRepository()
@@ -1295,6 +1541,10 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         return self._compression_repo
 
     @property
+    def compression_queue(self) -> CompressionQueueRepository:
+        return self._compression_queue_repo
+
+    @property
     def webhooks(self) -> WebhookRepository:
         return MysqlWebhookRepository()
 
@@ -1356,6 +1606,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
 __all__ = [
     "MysqlBackend",
     "MysqlBranchRepository",
+    "MysqlCompressionQueueRepository",
     "MysqlCompressionRepository",
     "MysqlConsultationAuditRepository",
     "MysqlFederationRepository",
