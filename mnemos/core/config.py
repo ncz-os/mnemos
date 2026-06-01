@@ -279,6 +279,16 @@ class _ProviderSettings(BaseSettings):
     xai_api_key: str = Field("", validation_alias="XAI_API_KEY")
     groq_api_key: str = Field("", validation_alias="GROQ_API_KEY")
     perplexity_api_key: str = Field("", validation_alias="PERPLEXITY_API_KEY")
+    # KNEMON routing policy (deployment-configurable; no-op defaults).
+    # Comma-separated provider ids/aliases excluded from KNEMON route
+    # selection by default (merged with any per-request exclude_providers).
+    # The Anthropic ban is THIS deployment's policy, not a universal rule —
+    # other deployments leave this empty or choose differently.
+    knemon_exclude_providers: str = Field("", validation_alias="KNEMON_DEFAULT_EXCLUDE_PROVIDERS")
+    # Comma-separated ordered provider preference; candidates are bucketed by
+    # this order first, then by graeae_weight within each bucket. Empty
+    # preserves pure graeae_weight ordering.
+    knemon_provider_preference: str = Field("", validation_alias="KNEMON_PROVIDER_PREFERENCE")
     together_api_key: str = Field("", validation_alias="TOGETHER_API_KEY")
     nvidia_api_key: str = Field("", validation_alias="NVIDIA_API_KEY")
     keys_path: Path | None = Field(None, validation_alias="MNEMOS_KEYS_PATH")
