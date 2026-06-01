@@ -742,7 +742,6 @@ class GraeaeEngine:
                 remaining = set(tasks)
                 task_to_idx = {t: i for i, t in enumerate(tasks)}
                 quorum_met_at: Optional[float] = None
-                started_at = _time.monotonic()
                 while remaining:
                     # iter56 grace: shrink wait timeout once quorum met
                     # so we exit promptly after the grace window expires.
