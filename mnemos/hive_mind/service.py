@@ -82,6 +82,14 @@ CREATE TABLE IF NOT EXISTS agents (
   host TEXT NOT NULL,
   session_id TEXT NOT NULL,
   pid INTEGER,
+  runtime TEXT,
+  model TEXT,
+  provider TEXT,
+  cost_tier TEXT,
+  autonomy_level TEXT,
+  auth_method TEXT,
+  plan_cap_usd REAL,
+  plan_period_used_usd REAL NOT NULL DEFAULT 0,
   capabilities TEXT,
   version TEXT,
   started_at REAL NOT NULL,
@@ -103,12 +111,30 @@ CREATE TABLE IF NOT EXISTS jobs (
   required_capabilities TEXT,                   -- json array; worker must have ALL
   eligible_kinds TEXT,                          -- json array; agent kinds eligible (null = any)
   project TEXT,                                 -- #10 FIX: separate project tag from capabilities (riskyeats/investorclaw/etc)
+  max_cost_tier TEXT NOT NULL DEFAULT 'A',
+  preferred_providers TEXT,
+  preferred_models TEXT,
+  mnemos_refs TEXT,
+  depends_on TEXT,
   status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','cancelled')),
   claimed_by TEXT,                              -- worker urn (set on claim/dequeue)
   claimed_at REAL,
+  claimed_runtime TEXT,
+  claimed_model TEXT,
+  claimed_provider TEXT,
+  claimed_cost_tier TEXT,
   started_at REAL NOT NULL,                     -- when job ENTERED queue
+  retry_backoff_until REAL,
+  routed_at REAL,
+  routing_metadata TEXT,
   ended_at REAL,
-  result TEXT
+  result TEXT,
+  result_mnemos_id TEXT,
+  tokens_in INTEGER,
+  tokens_out INTEGER,
+  estimated_cost_usd REAL,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  max_retries INTEGER NOT NULL DEFAULT 2
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_submitter ON jobs(submitter_urn);
@@ -116,6 +142,48 @@ CREATE INDEX IF NOT EXISTS idx_jobs_claimed_by ON jobs(claimed_by);
 CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(status, priority DESC, started_at ASC);
 CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project);  -- #10 FIX
+CREATE INDEX IF NOT EXISTS idx_jobs_retry_backoff ON jobs(retry_backoff_until);
+
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_by_urn TEXT NOT NULL,
+  interval_seconds INTEGER NOT NULL,
+  job_template TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_fired_at REAL,
+  next_fire_at REAL NOT NULL,
+  fire_count INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due ON scheduled_jobs(enabled, next_fire_at);
+
+CREATE TABLE IF NOT EXISTS worker_kind_stats (
+  urn TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  success_count INTEGER NOT NULL DEFAULT 0,
+  fail_count INTEGER NOT NULL DEFAULT 0,
+  cancelled_count INTEGER NOT NULL DEFAULT 0,
+  total_tokens_in INTEGER NOT NULL DEFAULT 0,
+  total_tokens_out INTEGER NOT NULL DEFAULT 0,
+  total_cost_usd REAL NOT NULL DEFAULT 0,
+  total_duration_sec REAL NOT NULL DEFAULT 0,
+  last_run REAL,
+  PRIMARY KEY (urn, kind)
+);
+
+CREATE TABLE IF NOT EXISTS hive_cache (
+  cache_key TEXT PRIMARY KEY,
+  result_json TEXT NOT NULL,
+  source_job_id TEXT,
+  result_mnemos_id TEXT,
+  hit_count INTEGER NOT NULL DEFAULT 0,
+  cost_saved_usd REAL NOT NULL DEFAULT 0,
+  model TEXT,
+  provider TEXT,
+  cached_at REAL NOT NULL,
+  last_hit_at REAL
+);
 
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -472,6 +540,17 @@ class JobUpdate(BaseModel):
     result_mnemos_id: Optional[str] = None  # mem_XXX id where worker stored the outcome — closes provenance loop
 
 
+class JobRoutingUpdate(BaseModel):
+    required_capabilities: Optional[list[str]] = None
+    eligible_kinds: Optional[list[str]] = None
+    max_cost_tier: Optional[str] = None
+    preferred_providers: Optional[list[str]] = None
+    preferred_models: Optional[list[str]] = None
+    mnemos_refs: Optional[list[str]] = None
+    depends_on: Optional[list[str]] = None
+    routing_metadata: Optional[dict] = None
+
+
 class ScheduleCreate(BaseModel):
     name: str
     interval_seconds: int = Field(..., ge=60, le=86400 * 30, description="60s minimum (avoid hot-loop); 30d maximum")
@@ -601,15 +680,46 @@ async def lifespan(app: FastAPI):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
         await db.executescript(SCHEMA)
-        # #10 FIX (review 2026-05-23): additive migrations for live DBs (jobs.project).
+        # Additive migrations for live DBs. Keep this list in lockstep with
+        # columns used by endpoints and SqliteHiveMindRepository.
         # Add-only via ALTER TABLE; ignore "duplicate column" errors so reruns are no-ops.
-        for stmt in ("ALTER TABLE jobs ADD COLUMN project TEXT",):
+        migrations = (
+            "ALTER TABLE agents ADD COLUMN runtime TEXT",
+            "ALTER TABLE agents ADD COLUMN model TEXT",
+            "ALTER TABLE agents ADD COLUMN provider TEXT",
+            "ALTER TABLE agents ADD COLUMN cost_tier TEXT",
+            "ALTER TABLE agents ADD COLUMN autonomy_level TEXT",
+            "ALTER TABLE agents ADD COLUMN auth_method TEXT",
+            "ALTER TABLE agents ADD COLUMN plan_cap_usd REAL",
+            "ALTER TABLE agents ADD COLUMN plan_period_used_usd REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN project TEXT",
+            "ALTER TABLE jobs ADD COLUMN max_cost_tier TEXT NOT NULL DEFAULT 'A'",
+            "ALTER TABLE jobs ADD COLUMN preferred_providers TEXT",
+            "ALTER TABLE jobs ADD COLUMN preferred_models TEXT",
+            "ALTER TABLE jobs ADD COLUMN mnemos_refs TEXT",
+            "ALTER TABLE jobs ADD COLUMN depends_on TEXT",
+            "ALTER TABLE jobs ADD COLUMN claimed_runtime TEXT",
+            "ALTER TABLE jobs ADD COLUMN claimed_model TEXT",
+            "ALTER TABLE jobs ADD COLUMN claimed_provider TEXT",
+            "ALTER TABLE jobs ADD COLUMN claimed_cost_tier TEXT",
+            "ALTER TABLE jobs ADD COLUMN retry_backoff_until REAL",
+            "ALTER TABLE jobs ADD COLUMN routed_at REAL",
+            "ALTER TABLE jobs ADD COLUMN routing_metadata TEXT",
+            "ALTER TABLE jobs ADD COLUMN result_mnemos_id TEXT",
+            "ALTER TABLE jobs ADD COLUMN tokens_in INTEGER",
+            "ALTER TABLE jobs ADD COLUMN tokens_out INTEGER",
+            "ALTER TABLE jobs ADD COLUMN estimated_cost_usd REAL",
+            "ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 2",
+        )
+        for stmt in migrations:
             try:
                 await db.execute(stmt)
             except Exception as e:
                 if "duplicate column" not in str(e).lower():
                     print(f"migration warn ({stmt!r}): {e}", flush=True)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_retry_backoff ON jobs(retry_backoff_until)")
         await db.commit()
     task = asyncio.create_task(reaper_task(app))
     yield
@@ -1242,6 +1352,39 @@ async def update_job(job_id: str, req: JobUpdate):
     return {"ok": True, "ts": now, "estimated_cost_usd": cost_estimate}
 
 
+@app.patch("/v1/jobs/{job_id}/routing")
+async def route_job(job_id: str, req: JobRoutingUpdate):
+    """Apply KNEMON/Hive triage metadata to a queued job before workers claim it."""
+    now = time.time()
+    updated = await _REPO.update_job_routing(
+        job_id=job_id,
+        routed_at=now,
+        required_capabilities=req.required_capabilities,
+        eligible_kinds=req.eligible_kinds,
+        max_cost_tier=req.max_cost_tier,
+        preferred_providers=req.preferred_providers,
+        preferred_models=req.preferred_models,
+        mnemos_refs=req.mnemos_refs,
+        depends_on=req.depends_on,
+        routing_metadata=req.routing_metadata,
+    )
+    if not updated:
+        raise HTTPException(409, "job not queued, already claimed, or not found")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await emit_event(
+            db,
+            "job.routed",
+            {
+                "id": job_id,
+                "eligible_kinds": req.eligible_kinds,
+                "preferred_providers": req.preferred_providers,
+                "preferred_models": req.preferred_models,
+                "required_capabilities": req.required_capabilities,
+            },
+        )
+    return {"ok": True, "id": job_id, "routed_at": now}
+
+
 @app.post("/v1/schedules")
 async def create_schedule(req: ScheduleCreate):
     """Create a recurring scheduled job. Re-fires every `interval_seconds`.
@@ -1495,7 +1638,12 @@ async def list_jobs(
     since: Optional[float] = None,
     limit: int = 100,
 ):
-    sql = "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, claimed_by, started_at, ended_at, result FROM jobs WHERE 1=1"
+    sql = (
+        "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, claimed_by, "
+        "started_at, ended_at, result, required_capabilities, eligible_kinds, max_cost_tier, "
+        "preferred_providers, preferred_models, mnemos_refs, depends_on, routed_at, routing_metadata "
+        "FROM jobs WHERE 1=1"
+    )
     args: list = []
     if status:
         sql += " AND status=?"
@@ -1524,6 +1672,15 @@ async def list_jobs(
                         "started_at": r[8],
                         "ended_at": r[9],
                         "result": json.loads(r[10]) if r[10] else None,
+                        "required_capabilities": json.loads(r[11]) if r[11] else None,
+                        "eligible_kinds": json.loads(r[12]) if r[12] else None,
+                        "max_cost_tier": r[13],
+                        "preferred_providers": json.loads(r[14]) if r[14] else None,
+                        "preferred_models": json.loads(r[15]) if r[15] else None,
+                        "mnemos_refs": json.loads(r[16]) if r[16] else None,
+                        "depends_on": json.loads(r[17]) if r[17] else None,
+                        "routed_at": r[18],
+                        "routing_metadata": json.loads(r[19]) if r[19] else None,
                     }
                 )
     return {"count": len(rows), "jobs": rows}

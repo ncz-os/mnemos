@@ -1,0 +1,17 @@
+[Unit]
+Description=GRAEAE Hive Zeroclaw KNEMON triage daemon
+After=network-online.target graeae-hive.service mnemos.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/zeroclaw-fanout
+Environment=PYTHONUNBUFFERED=1
+Environment=ZEROCLAW_TRIAGE_POLL_INTERVAL=10
+WorkingDirectory=/opt/mnemos
+ExecStart=/opt/mnemos/.venv/bin/python -m mnemos.hive_mind.zeroclaw_triage
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

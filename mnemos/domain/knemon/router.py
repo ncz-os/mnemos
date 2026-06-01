@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 from mnemos.core.config import get_settings
 from mnemos.core.plan_windows import compute_plan_window_id
+from mnemos.core.recommendation import recommendation_policy
 
 # Canonical provider identity — collapses historical/duplicate labels so a
 # single policy entry covers all of them (e.g. "claude" -> "anthropic").
@@ -59,6 +60,10 @@ class KnemonRouteDecision:
     sub_window_utilization_pct: float
     fallback_chain: list[tuple]
     reasoning: str
+    dispatch_kind: str
+    dispatch_required_capabilities: list[str]
+    dispatch_preferred_models: list[str]
+    dispatch_preferred_providers: list[str]
 
 
 _SESSION_LOCKS: dict[str, asyncio.Lock] = {}
@@ -73,6 +78,20 @@ _NAMED_PARAM_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
 CALLER_DISPATCHABLE_PROVIDERS: dict[str, frozenset[str]] = {
     "zeroclaw": frozenset({"groq", "xai", "deepseek", "deepseek-direct", "nvidia", "together", "gemini"}),
 }
+
+_SESSION_BURN_REQUESTS_PER_HOUR = 10
+_LOW_PRIORITY_API_COST_CEILING_USD = 0.50
+_CAPABILITY_ALIASES = {
+    "code": "coding",
+    "coder": "coding",
+    "embeddings": "embedding",
+    "embed": "embedding",
+    "logic": "reasoning",
+    "online": "web_search",
+    "search": "web_search",
+    "internet": "web_search",
+}
+_ZEROCLAW_PROVIDER_ALIASES = {"zeroclaw", "openclaw", "local", "local-llamacpp", "local-vllm"}
 
 
 async def _call(value: Any, *args: Any, **kwargs: Any) -> Any:
@@ -215,19 +234,64 @@ def _normalize_capabilities(value: Any) -> set[str]:
     if value is None:
         return set()
     if isinstance(value, (list, tuple, set)):
-        return {str(item).strip() for item in value if str(item).strip()}
+        return {_canonical_capability(str(item)) for item in value if str(item).strip()}
     raw = str(value).strip()
     if not raw:
         return set()
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, list):
-            return {str(item).strip() for item in parsed if str(item).strip()}
+            return {_canonical_capability(str(item)) for item in parsed if str(item).strip()}
         if isinstance(parsed, dict):
-            return {str(key).strip() for key, enabled in parsed.items() if enabled and str(key).strip()}
+            return {_canonical_capability(str(key)) for key, enabled in parsed.items() if enabled and str(key).strip()}
     except json.JSONDecodeError:
         pass
-    return {item.strip().strip('"').strip("'") for item in raw.strip("{}[]").split(",") if item.strip()}
+    return {
+        _canonical_capability(item.strip().strip('"').strip("'"))
+        for item in raw.strip("{}[]").split(",")
+        if item.strip()
+    }
+
+
+def _canonical_capability(capability: str) -> str:
+    cap = capability.strip().lower().replace("-", "_")
+    return _CAPABILITY_ALIASES.get(cap, cap)
+
+
+def _required_capabilities_for_request(req: KnemonRouteRequest) -> list[str]:
+    manual = [_canonical_capability(cap) for cap in req.require_capability if cap.strip()]
+    policy = recommendation_policy(req.task_kind)
+    policy_caps = list(policy.required_caps or policy.any_caps)
+    out: list[str] = []
+    for cap in [*policy_caps, *manual]:
+        canonical = _canonical_capability(cap)
+        if canonical and canonical not in out:
+            out.append(canonical)
+    return out
+
+
+def _model_capability(provider: str, model_id: str) -> str:
+    safe = _normalize_pool(f"{provider}_{model_id}")
+    return f"model:{safe}" if safe else "model:unknown"
+
+
+def _dispatch_kind(provider: str, caller_subsystem: str = "") -> str:
+    if (caller_subsystem or "").strip().lower() == "zeroclaw":
+        return "zeroclaw"
+    provider_key = _canon_provider(provider)
+    if provider_key in _ZEROCLAW_PROVIDER_ALIASES:
+        return "zeroclaw"
+    return provider_key or "provider-worker"
+
+
+def _dispatch_required_capabilities(
+    selected: dict[str, Any], required_caps: list[str], caller_subsystem: str = ""
+) -> list[str]:
+    out = list(required_caps)
+    model_cap = _model_capability(str(selected.get("provider") or ""), str(selected.get("model_id") or ""))
+    if _dispatch_kind(str(selected.get("provider") or ""), caller_subsystem) == "zeroclaw" and model_cap not in out:
+        out.append(model_cap)
+    return out
 
 
 def _normalize_pool(value: Any) -> str:
@@ -355,12 +419,21 @@ def _tier(row: dict[str, Any]) -> str:
     raw = str(row.get("cost_tier") or row.get("usage_tier") or "").strip().upper()
     if raw in {"A", "B", "C"}:
         return raw
+    in_cost = row.get("input_cost_per_mtok")
+    out_cost = row.get("output_cost_per_mtok")
+    if in_cost is not None and out_cost is not None:
+        avg_cost = (_to_float(in_cost) + _to_float(out_cost)) / 2.0
+        if avg_cost <= 1.0:
+            return "A"
+        if avg_cost <= 10.0:
+            return "B"
+        return "C"
     quality = _quality(row)
+    if quality >= 0.95:
+        return "C"
     if quality >= 0.85:
-        return "A"
-    if quality >= 0.75:
         return "B"
-    return "C"
+    return "A"
 
 
 def _price(row: dict[str, Any], tokens_in: int, tokens_out: int) -> float:
@@ -391,7 +464,7 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
     excluded = set(_csv_providers(providers_cfg.knemon_exclude_providers))
     excluded |= {_canon_provider(p) for p in req.exclude_providers if p.strip()}
     allowed = CALLER_DISPATCHABLE_PROVIDERS.get((req.caller_subsystem or "").strip().lower())
-    required = {cap.strip() for cap in req.require_capability if cap.strip()}
+    required = set(_required_capabilities_for_request(req))
     min_context = int(max(0, req.est_tokens_in) * 1.2)
     candidates: list[dict[str, Any]] = []
     for row in rows:
@@ -765,6 +838,12 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
         sub_window_utilization_pct=float(selected["sub_window_utilization_pct"]),
         fallback_chain=_fallback_chain(fallback_candidates, selected),
         reasoning="; ".join(reasons),
+        dispatch_kind=_dispatch_kind(str(selected["provider"]), req.caller_subsystem),
+        dispatch_required_capabilities=_dispatch_required_capabilities(
+            selected, _required_capabilities_for_request(req), req.caller_subsystem
+        ),
+        dispatch_preferred_models=[str(selected["model_id"])],
+        dispatch_preferred_providers=[str(selected["provider"])],
     )
 
 

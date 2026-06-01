@@ -126,7 +126,25 @@ ZEROCLAW_TIMEOUT = int(os.environ.get("ZEROCLAW_TIMEOUT", "600"))
 PER_ATTEMPT_TIMEOUT = int(os.environ.get("PER_ATTEMPT_TIMEOUT", "1200"))
 ORCHESTRATION_TIMEOUT = int(os.environ.get("ORCHESTRATION_TIMEOUT", "3600"))
 WORKDIR = os.environ.get("HIVE_WORKDIR", os.getcwd())
-AGENT_MODEL = os.environ.get("AGENT_MODEL", "groq/qwen3-32b")
+_AGENT_MODEL_RAW = os.environ.get("AGENT_MODEL", "groq/qwen3-32b")
+AGENT_PROVIDER = os.environ.get(
+    "AGENT_PROVIDER",
+    _AGENT_MODEL_RAW.split("/", 1)[0] if "/" in _AGENT_MODEL_RAW else "groq",
+).lower()
+AGENT_MODEL = os.environ.get(
+    "AGENT_MODEL_ID",
+    _AGENT_MODEL_RAW.split("/", 1)[1] if "/" in _AGENT_MODEL_RAW else _AGENT_MODEL_RAW,
+).lower()
+
+
+def _model_capability(provider: str, model: str) -> str:
+    safe = _re.sub(r"[^a-z0-9]+", "_", f"{provider}_{model}".strip().lower()).strip("_")
+    return f"model:{safe}" if safe else "model:unknown"
+
+
+for _cap in ("coding", _model_capability(AGENT_PROVIDER, AGENT_MODEL)):
+    if _cap not in AGENT_CAPABILITIES:
+        AGENT_CAPABILITIES.append(_cap)
 
 JOB_HEARTBEAT_INTERVAL = int(os.environ.get("JOB_HEARTBEAT_INTERVAL", "300"))
 
@@ -286,7 +304,9 @@ def _detect_subscription_pools() -> list[str]:
         _add_plan_aliases(pools, "openai", os.environ["CODEX_PLAN"], family="codex")
     for pool in os.environ.get("OPENAI_SUBSCRIPTION_POOLS", "").split(","):
         if pool.strip():
-            _add_plan_aliases(pools, "openai", pool, family="openai" if _pool_slug(pool) == "openai_subscription" else None)
+            _add_plan_aliases(
+                pools, "openai", pool, family="openai" if _pool_slug(pool) == "openai_subscription" else None
+            )
 
     for config_path in (home / ".claude" / "config.toml", home / ".codex" / "config.toml"):
         _scan_subscription_config(config_path, pools)
@@ -306,7 +326,7 @@ def register() -> str:
         "host": AGENT_HOST,
         "pid": os.getpid(),
         "capabilities": AGENT_CAPABILITIES,
-        "provider": "groq",
+        "provider": AGENT_PROVIDER,
         "model": AGENT_MODEL,
         "version": _zeroclaw_version(),
         "subscription_pools": _detect_subscription_pools(),
