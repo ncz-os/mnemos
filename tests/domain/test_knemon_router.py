@@ -103,7 +103,7 @@ class _SqliteKnemonBackend:
               path_kind TEXT NOT NULL DEFAULT 'api',
               subscription_amortized INTEGER NOT NULL DEFAULT 0
             );
-            CREATE TABLE hive_agents (
+            CREATE TABLE agents (
               urn TEXT PRIMARY KEY,
               kind TEXT NOT NULL,
               host TEXT NOT NULL,
@@ -213,7 +213,7 @@ class _SqliteKnemonBackend:
         if agent_session_id:
             self.conn.execute(
                 """
-                INSERT INTO hive_agents (
+                INSERT INTO agents (
                   urn, kind, host, session_id, last_heartbeat, status, subscription_pools
                 ) VALUES ('urn:agent:test:1', 'codex', 'pytest', ?, ?, 'online', ?)
                 """,

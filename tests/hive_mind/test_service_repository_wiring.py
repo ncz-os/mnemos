@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 import pytest
@@ -12,6 +13,7 @@ from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.domain.knemon.router import KnemonRouteRequest, route
 from mnemos.hive_mind import service
 from mnemos.hive_mind.repository import SqliteHiveMindRepository
+from mnemos.hive_mind.zeroclaw_triage import routing_patch_for_decision
 
 
 class _ServiceDbKnemonBackend:
@@ -298,6 +300,47 @@ def test_explicit_tier_a_cap_rejects_tier_b_worker_after_routing(monkeypatch, tm
         assert claimed.status_code == 204, claimed.text
 
 
+def test_routing_patch_does_not_widen_explicit_submitter_cost_cap(monkeypatch, tmp_path) -> None:
+    db_path = str(tmp_path / "hive-service-explicit-cap-patch.sqlite3")
+    monkeypatch.setattr(service, "DB_PATH", db_path)
+    monkeypatch.setattr(service, "_REPO", SqliteHiveMindRepository(db_path))
+
+    with TestClient(service.app) as client:
+        orchestrator = client.post("/v1/agents/register", json={"runtime": "claude-code", "host": "studio"})
+        assert orchestrator.status_code == 200, orchestrator.text
+        created = client.post(
+            "/v1/jobs",
+            json={
+                "submitter_urn": orchestrator.json()["urn"],
+                "kind": "code-fix",
+                "description": "explicit cap must not widen",
+                "priority": 10,
+                "max_cost_tier": "A",
+            },
+        )
+        assert created.status_code == 200, created.text
+        job_id = created.json()["id"]
+
+        routed = client.patch(
+            f"/v1/jobs/{job_id}/routing",
+            json={
+                "required_capabilities": ["coding", "model:groq_qwen3_32b"],
+                "eligible_kinds": ["zeroclaw"],
+                "preferred_providers": ["groq"],
+                "preferred_models": ["qwen3-32b"],
+                "max_cost_tier": "B",
+                "routing_metadata": {"router": "knemon", "submitter_max_cost_tier_explicit": True},
+            },
+        )
+        assert routed.status_code == 200, routed.text
+
+        listed = client.get("/v1/jobs", params={"status": "queued"})
+        assert listed.status_code == 200, listed.text
+        [job] = listed.json()["jobs"]
+        assert job["id"] == job_id
+        assert job["max_cost_tier"] == "A"
+
+
 @pytest.mark.asyncio
 async def test_registered_worker_subscription_pools_feed_knemon_routing(monkeypatch, tmp_path) -> None:
     db_path = str(tmp_path / "hive-service-pools.sqlite3")
@@ -417,6 +460,174 @@ async def test_registered_worker_subscription_pools_feed_knemon_routing(monkeypa
 
     assert decision.provider == "xai"
     assert "lacks pool" in decision.reasoning
+
+
+@pytest.mark.asyncio
+async def test_subscription_pool_route_controls_provider_and_claimability(monkeypatch, tmp_path) -> None:
+    db_path = str(tmp_path / "hive-service-pool-claim.sqlite3")
+    monkeypatch.setattr(service, "DB_PATH", db_path)
+    monkeypatch.setattr(service, "_REPO", SqliteHiveMindRepository(db_path))
+
+    with TestClient(service.app) as client:
+        orchestrator = client.post(
+            "/v1/agents/register",
+            json={"runtime": "claude-code", "host": "studio", "capabilities": ["code"]},
+        )
+        assert orchestrator.status_code == 200, orchestrator.text
+        wrong_worker = client.post(
+            "/v1/agents/register",
+            json={
+                "runtime": "openai",
+                "host": "wrong",
+                "provider": "openai",
+                "model": "gpt-sub",
+                "capabilities": ["code"],
+                "subscription_pools": ["anthropic_subscription"],
+            },
+        )
+        assert wrong_worker.status_code == 200, wrong_worker.text
+        right_worker = client.post(
+            "/v1/agents/register",
+            json={
+                "runtime": "openai",
+                "host": "right",
+                "provider": "openai",
+                "model": "gpt-sub",
+                "capabilities": ["code"],
+                "subscription_pools": ["chatgpt_plus"],
+            },
+        )
+        assert right_worker.status_code == 200, right_worker.text
+
+        created = client.post(
+            "/v1/jobs",
+            json={
+                "submitter_urn": orchestrator.json()["urn"],
+                "kind": "code-fix",
+                "description": "pool routed job",
+                "priority": 14,
+                "required_capabilities": ["code"],
+                "max_cost_tier": "C",
+            },
+        )
+        assert created.status_code == 200, created.text
+        job_id = created.json()["id"]
+
+    now = datetime.now(timezone.utc)
+    window_id = compute_plan_window_id("openai", "chatgpt_plus", now, reset_anchor="rolling", window_seconds=18000)
+    with sqlite3.connect(db_path) as db:
+        db.executescript(
+            """
+            CREATE TABLE model_registry (
+              provider TEXT NOT NULL,
+              model_id TEXT NOT NULL,
+              display_name TEXT,
+              capabilities TEXT NOT NULL DEFAULT '[]',
+              input_cost_per_mtok REAL NOT NULL DEFAULT 0,
+              output_cost_per_mtok REAL NOT NULL DEFAULT 0,
+              context_window INTEGER,
+              arena_score REAL,
+              graeae_weight REAL NOT NULL DEFAULT 0,
+              available INTEGER NOT NULL DEFAULT 1,
+              deprecated INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE subscription_plans (
+              provider TEXT NOT NULL,
+              plan_name TEXT NOT NULL,
+              auth_method TEXT NOT NULL,
+              path_kind TEXT NOT NULL DEFAULT 'api',
+              monthly_usd NUMERIC,
+              msg_cap NUMERIC,
+              msg_window_seconds NUMERIC,
+              token_cap NUMERIC,
+              token_window_seconds NUMERIC,
+              reset_anchor TEXT,
+              overage_pricing_per_mtok_in NUMERIC,
+              overage_pricing_per_mtok_out NUMERIC,
+              effective_from DATE NOT NULL DEFAULT '2026-01-01',
+              effective_until DATE,
+              parent_plan_id TEXT
+            );
+            CREATE TABLE usage_ledger (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TIMESTAMP NOT NULL,
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              task_kind TEXT NOT NULL,
+              tokens_in INTEGER NOT NULL,
+              tokens_out INTEGER NOT NULL,
+              tokens_reasoning INTEGER NOT NULL,
+              est_cost_usd NUMERIC NOT NULL,
+              latency_ms INTEGER NOT NULL,
+              outcome TEXT NOT NULL,
+              caller_subsystem TEXT NOT NULL,
+              tier TEXT NOT NULL,
+              session_id TEXT,
+              request_count NUMERIC NOT NULL DEFAULT 1,
+              plan_window_id TEXT,
+              path_kind TEXT NOT NULL DEFAULT 'api',
+              subscription_amortized INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        db.execute(
+            "INSERT INTO model_registry VALUES "
+            "('openai', 'gpt-sub', 'GPT Sub', ?, 2, 8, 200000, 1400, 0.95, 1, 0), "
+            "('xai', 'grok-api', 'Grok API', ?, 3, 15, 200000, 1220, 0.86, 1, 0)",
+            (json.dumps(["code"]), json.dumps(["code"])),
+        )
+        db.execute(
+            "INSERT INTO subscription_plans VALUES "
+            "('openai', 'chatgpt_plus', 'subscription', 'interactive', 20, 160, 18000, "
+            "NULL, NULL, 'rolling', NULL, NULL, '2026-01-01', NULL, NULL), "
+            "('xai', 'api', 'api', 'api', NULL, NULL, NULL, "
+            "NULL, NULL, 'monthly', NULL, NULL, '2026-01-01', NULL, NULL)"
+        )
+        db.execute(
+            """
+            INSERT INTO usage_ledger (
+              ts, provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
+              est_cost_usd, latency_ms, outcome, caller_subsystem, tier, session_id,
+              request_count, plan_window_id, path_kind, subscription_amortized
+            ) VALUES (?, 'openai', 'gpt-sub', 'code-fix', 100, 50, 0, 0, 100, 'ok',
+                      'test', 'chatgpt_plus', 'usage-fixture', 1, ?, 'api', 1)
+            """,
+            (now, window_id),
+        )
+
+    decision = await route(
+        KnemonRouteRequest(
+            task_kind="code-fix",
+            priority=14,
+            est_tokens_in=10_000,
+            est_tokens_out=2_000,
+            caller_session_id=right_worker.json()["session_id"],
+            caller_subsystem="pytest",
+            require_capability=["code"],
+            max_cost_tier="C",
+        ),
+        _ServiceDbKnemonBackend(db_path),
+    )
+    assert decision.provider == "openai"
+    assert decision.dispatch_subscription_pools
+
+    patch = routing_patch_for_decision(
+        {
+            "required_capabilities": ["code"],
+            "max_cost_tier": "C",
+            "routing_metadata": {"submitter_max_cost_tier_explicit": True},
+        },
+        asdict(decision),
+    )
+
+    with TestClient(service.app) as client:
+        routed = client.patch(f"/v1/jobs/{job_id}/routing", json=patch)
+        assert routed.status_code == 200, routed.text
+        wrong_claim = client.post("/v1/jobs/next", params={"agent_urn": wrong_worker.json()["urn"]})
+        assert wrong_claim.status_code == 204, wrong_claim.text
+        right_claim = client.post("/v1/jobs/next", params={"agent_urn": right_worker.json()["urn"]})
+        assert right_claim.status_code == 200, right_claim.text
+        assert right_claim.json()["id"] == job_id
 
 
 def test_zeroclaw_worker_registration_must_declare_runtime(monkeypatch, tmp_path) -> None:
