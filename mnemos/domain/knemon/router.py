@@ -10,7 +10,21 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
+from mnemos.core.config import get_settings
 from mnemos.core.plan_windows import compute_plan_window_id
+
+# Canonical provider identity — collapses historical/duplicate labels so a
+# single policy entry covers all of them (e.g. "claude" -> "anthropic").
+_PROVIDER_ALIASES = {"claude": "anthropic"}
+
+
+def _canon_provider(name: str) -> str:
+    canon = (name or "").strip().lower()
+    return _PROVIDER_ALIASES.get(canon, canon)
+
+
+def _csv_providers(raw: str) -> list[str]:
+    return [_canon_provider(part) for part in (raw or "").split(",") if part.strip()]
 
 
 class NoModelAvailable(RuntimeError):
@@ -257,13 +271,16 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
         ORDER BY graeae_weight DESC
         """,
     )
-    excluded = {provider.strip().lower() for provider in req.exclude_providers if provider.strip()}
+    providers_cfg = get_settings().providers
+    # Deployment-default excludes (canonicalised) merged with per-request set.
+    excluded = set(_csv_providers(providers_cfg.knemon_exclude_providers))
+    excluded |= {_canon_provider(p) for p in req.exclude_providers if p.strip()}
     required = {cap.strip() for cap in req.require_capability if cap.strip()}
     min_context = int(max(0, req.est_tokens_in) * 1.2)
     candidates: list[dict[str, Any]] = []
     for row in rows:
         provider = str(row.get("provider") or "").strip()
-        if not provider or provider.lower() in excluded:
+        if not provider or _canon_provider(provider) in excluded:
             continue
         if not _truthy(row.get("available", True)) or _truthy(row.get("deprecated", False)):
             continue
@@ -278,7 +295,17 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
         enriched["tier"] = _tier(enriched)
         enriched["estimated_cost_usd"] = _price(enriched, req.est_tokens_in, req.est_tokens_out)
         candidates.append(enriched)
-    candidates.sort(key=lambda row: _to_float(row.get("graeae_weight")), reverse=True)
+    preference = _csv_providers(providers_cfg.knemon_provider_preference)
+    if preference:
+        rank = {name: idx for idx, name in enumerate(preference)}
+        candidates.sort(
+            key=lambda row: (
+                rank.get(_canon_provider(str(row.get("provider") or "")), len(preference)),
+                -_to_float(row.get("graeae_weight")),
+            )
+        )
+    else:
+        candidates.sort(key=lambda row: _to_float(row.get("graeae_weight")), reverse=True)
     return candidates
 
 
