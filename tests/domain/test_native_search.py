@@ -72,3 +72,40 @@ def test_native_numpy_batch_scores_match_python_reference() -> None:
     query_np = np.asarray(query, dtype=np.float32)
     corpus_np = np.asarray(corpus, dtype=np.float32)
     assert native.batch_cosine_similarity(query_np, corpus_np) == pytest.approx(expected, abs=1e-6)
+
+
+def test_similarity_dot_normalized_matches_python_reference_float64() -> None:
+    native = pytest.importorskip("mnemos_native_search")
+    np = pytest.importorskip("numpy")
+    query = np.asarray([math.sin(idx + 1) for idx in range(1024)], dtype=np.float64)
+    candidates = np.asarray(
+        [[math.sin(idx + offset) for idx in range(1024)] for offset in range(1, 8)],
+        dtype=np.float64,
+    )
+
+    expected = native_bridge.pure_python_similarity_dot_normalized(query, candidates)
+    actual = native.similarity_dot_normalized(query, candidates)
+
+    assert isinstance(actual, np.ndarray)
+    assert actual.dtype == np.float64
+    np.testing.assert_allclose(actual, expected, atol=1e-9, rtol=0.0)
+
+
+def test_bridge_similarity_dot_normalized_falls_back_when_native_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    np = pytest.importorskip("numpy")
+
+    def broken_similarity_dot_normalized(_query, _candidates):
+        raise RuntimeError("synthetic native failure")
+
+    fake = types.SimpleNamespace(similarity_dot_normalized=broken_similarity_dot_normalized)
+    monkeypatch.setitem(sys.modules, "mnemos_native_search", fake)
+    bridge = importlib.reload(native_bridge)
+
+    query = np.asarray([1.0, 0.0], dtype=np.float64)
+    candidates = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
+    np.testing.assert_allclose(
+        bridge.similarity_dot_normalized(query, candidates),
+        np.asarray([1.0, 0.0]),
+        atol=1e-9,
+        rtol=0.0,
+    )
