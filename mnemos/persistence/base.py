@@ -1702,13 +1702,18 @@ def has_capability(backend: object, capability: str) -> bool:
 # layer only if it implements all required capabilities — derived from the
 # existing per-backend ``capabilities`` set, so no per-backend edits are needed.
 # core is always supported. See docs/LAYERED_INSTALL.md.
-# TODO(codex): pin the exact capability names each layer needs once the
-# capability taxonomy is finalised (graeae=consultations; hive=usage_ledger +
-# hive_mind claim path). Oracle/Db2 gaps (NotImplementedError) must surface here.
+#   graeae -> "consultations": GRAEAE persists muse consultations; a backend
+#             lacking it (e.g. a Db2 build that NotImplementedErrors consultation
+#             persistence) cannot serve GRAEAE and fails fast at startup.
+#   hive   -> no ADDITIONAL persistence-backend capability: the hive job bus is a
+#             self-contained SQLite store, and KNEMON usage_ledger recording is
+#             best-effort (degrades, never loses the row). The hive layer's real
+#             requirement is GRAEAE (enforced by Settings.enforce_layer_direction
+#             + the graeae gate), so it transitively needs "consultations".
 LAYER_REQUIRED_CAPABILITIES: dict[str, set[str]] = {
     "core": set(),
     "graeae": {"consultations"},
-    "hive": {"usage_ledger"},
+    "hive": set(),
 }
 
 
