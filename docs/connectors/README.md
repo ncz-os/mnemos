@@ -6,7 +6,7 @@
 > Codex CLI). Defaults are off; configuration is opt-in; surface area is
 > intentionally narrow. APIs may change between minor releases without a
 > deprecation cycle until the surface is promoted to `stable` in a later
-> release. v5.0.1 keeps stdio/HTTP registry parity in the `mnemos.mcp`
+> release. v6.0.0rc1 keeps stdio/HTTP registry parity in the `mnemos.mcp`
 > package, but broad remote connector packaging remains experimental.
 
 For surfaces without native MCP support, the `mnemos-bridge-*` adapter
@@ -20,8 +20,7 @@ glue.
 MNEMOS is a power-user / developer memory operating system. The connector
 work makes its existing MCP surface usable from agent surfaces beyond
 Claude Code (the original deployment target). It does not target
-non-technical end users — that's a different problem space (see
-`docs/positioning.md`).
+non-technical end users — that's a different problem space.
 
 If you fit this profile, the connectors are for you:
 
@@ -343,7 +342,7 @@ open to them. Public evidence:
   critical gateway fix, merged 2026-04-22. Contributor status as
   @ncz-os.
 - **Zeroclaw**: provider-config + backend work in
-  [perlowja/zeroclaw](https://github.com/ncz-os/zeroclaw); ongoing.
+  [ncz-os/zeroclaw](https://github.com/ncz-os/zeroclaw); ongoing.
 - **Hermes Agent**: design-inspiration credit on the zterm-family
   side; PRs scoped where the runtime intersects MNEMOS's MCP surface.
 - **MemPalace, Mem0, Letta, Graphiti, Cognee**: bug reports and
