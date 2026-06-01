@@ -22,15 +22,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
-import math
 import os
 import random
-import statistics
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import Any
 
 import asyncpg
 import httpx
