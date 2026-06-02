@@ -994,20 +994,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         where_extra = f" AND {' AND '.join(conditions)}" if conditions else ""
         params.append(limit)
         select_cols = _sqlite_memory_cols("m")
-        try:
-            return await _fetch_all(
-                conn,
-                f"SELECT {select_cols}, bm25(memories_fts) AS rank "
-                "FROM memories_fts "
-                "JOIN memories m ON m.id = memories_fts.id "
-                f"WHERE memories_fts MATCH ?{where_extra} "
-                "ORDER BY rank ASC, m.updated DESC LIMIT ?",
-                params,
-            )
-        except sqlite3.Error:
-            # ILIKE-equivalent fallback when FTS5 isn't available or
-            # the query is malformed for tsquery purposes. Same
-            # predicate shape, content LIKE instead of MATCH.
+
+        async def _like_search() -> list[Row]:
             like_params: list[Any] = [f"%{query}%"]
             like_conditions: list[str] = ["lower(m.content) LIKE lower(?)"]
             if not include_archived:
@@ -1037,6 +1025,26 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 "ORDER BY m.updated DESC LIMIT ?",
                 like_params,
             )
+
+        try:
+            rows = await _fetch_all(
+                conn,
+                f"SELECT {select_cols}, bm25(memories_fts) AS rank "
+                "FROM memories_fts "
+                "JOIN memories m ON m.id = memories_fts.id "
+                f"WHERE memories_fts MATCH ?{where_extra} "
+                "ORDER BY rank ASC, m.updated DESC LIMIT ?",
+                params,
+            )
+            if rows:
+                return rows
+            return await _like_search()
+        except sqlite3.Error:
+            # ILIKE-equivalent fallback when FTS5 isn't available or
+            # the query is malformed for tsquery purposes. We also use
+            # the same rescue when FTS returns no rows, which can happen
+            # after legacy installs with a stale/missing FTS trigger.
+            return await _like_search()
 
     # --- v4.1 handler-through-backend impls -----------------------------------
 
