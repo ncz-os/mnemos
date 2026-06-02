@@ -18,7 +18,6 @@ Usage:
 import argparse
 import asyncio
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -192,8 +191,8 @@ async def main() -> int:
             try:
                 await backend.close()
                 logger.info("[SYNC] persistence backend closed")
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[SYNC] persistence backend close failed: {exc}", exc_info=True)
 
     return exit_code
 
