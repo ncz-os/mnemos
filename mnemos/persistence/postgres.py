@@ -1293,11 +1293,8 @@ class PostgresMemoryRepository(MemoryRepository):
             f"WHERE {' AND '.join(conditions)} "
             "ORDER BY rank DESC LIMIT $2"
         )
-        try:
-            return list(await conn.fetch(sql, *params))
-        except Exception:
-            # ILIKE fallback: same predicate shape, $1 becomes the LIKE
-            # pattern, $2 still the limit.
+
+        async def _ilike_search() -> list[Row]:
             like_q = f"%{query}%"
             ilike_params: list[Any] = [like_q, limit]
             ilike_conditions: list[str] = ["content ILIKE $1", "deleted_at IS NULL"]
@@ -1326,6 +1323,18 @@ class PostgresMemoryRepository(MemoryRepository):
                 "ORDER BY created DESC LIMIT $2"
             )
             return list(await conn.fetch(ilike_sql, *ilike_params))
+
+        try:
+            rows = list(await conn.fetch(sql, *params))
+            if rows:
+                return rows
+            return await _ilike_search()
+        except Exception:
+            # ILIKE fallback: same predicate shape, $1 becomes the LIKE
+            # pattern, $2 still the limit. We also use it for zero FTS
+            # results so exact-substring searches survive stale FTS
+            # config or stop-word/tokenization misses.
+            return await _ilike_search()
 
     async def gather_stats(self, tx: Transaction) -> MemoryStatsRow:
         conn = _postgres_tx(tx).conn
