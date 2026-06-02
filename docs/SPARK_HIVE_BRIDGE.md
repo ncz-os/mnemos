@@ -55,3 +55,25 @@ Spark runs a stale MNEMOS 6.0.0rc1 Postgres with **768-dim nomic** embeddings; t
 2. `.4` Bridge Agent (claim-lease on PYTHIA, `bridge_state.db` state machine, scp push, ssh pull, rsync→ARGONAS, `/complete` reconcile, backoff).
 3. PYTHIA: `target=spark-ngc` claim path + lease columns + home-side context pre-packaging on enqueue.
 4. End-to-end smoke: a `target=spark-ngc` job → Spark qwen3-coder-480b → commit → rsync→ARGONAS → PYTHIA done.
+
+---
+
+# REVISION 2026-06-02 — transport = cloud-object relay (E2EE), .4 eliminated
+
+GRAEAE re-consult (8 muses, winner gemini, cost $0) on transport + on the embedding-dim question. Two changes supersede the original .4-SSH-spooling design:
+
+## A. Mnemos: FEDERATE (dims now match)
+The 768-dim was a deployment choice, not a constraint. Rebuild the Spark's mnemos to current master with **bge-m3 1024-dim** (GB10 GPU) → the dim-mismatch that forced "isolate" is gone → the Spark mnemos becomes an **asynchronous bridged federation peer** (like ACHILLES/MEDUSA), queried by the home fleet through the relay. **Stay Postgres/pgvector ARM64** (Storage ABC supports it; don't add Oracle to an edge node). **Re-embed in place** (don't restart): `pg_dump` → `ADD COLUMN embedding_1024 vector(1024)` → batch re-embed each row's stored text via bge-m3 on the GB10 → switch config → drop the old 768-dim column. LLM-Wiki text preserved.
+
+## B. Transport: cloud-object relay with E2EE (NOT .4 SSH, NOT Drive, NOT NGC)
+Both Spark and home reach the internet; only the home LAN is unreachable from the Spark. So route the bridge through a **cloud object store (GCS `ifGenerationMatch=0` or S3 `If-None-Match: *`)** with **client-side AES-GCM E2EE** (shared symmetric key; the cloud sees only ciphertext → private MNEMOS context never exposed). This **beats the .4 SSH-spool on reliability** (.4 was a single point of failure; the bucket is 99.99% and decouples both fleets — jobs queue safely if either side is down) while matching its security (E2EE) and atomicity (conditional writes give exactly-once claim). **Google Drive rejected** (eventual consistency / weak locking). **NGC rejected** (inference+registry, no queue — message-broker-on-registry is an anti-pattern).
+
+**`.4` is eliminated:** PYTHIA reaches the internet, so PYTHIA writes encrypted job objects to `prefix/pending/<uuid>.json.enc` directly; the Spark polls `pending/`, **claims via atomic conditional-write** of `claimed/<uuid>` (loser backs off), runs NGC qwen3-coder-480b, pushes code to GitHub, writes `results/<uuid>.json.enc`; PYTHIA polls `results/`, decrypts, reconciles to the hive + ARGONAS fan-out. Two stateless pollers, one bucket, no on-prem bridge host.
+
+## Build sequence (revised)
+1. Provision the bucket (S3 — fleet has AWS creds — or GCS) + the shared E2EE key (in ~/.api_keys_master.json + each endpoint, never in the bucket).
+2. Shared `relay_crypto.py` (AES-GCM seal/open) + `relay_client.py` (put/list/claim-conditional/get).
+3. PYTHIA enqueuer: nvidia-eligible job → context-prepackage (home Oracle bge-m3 retrieval) → seal → put pending/.
+4. Spark poller: list pending/ → conditional-claim → NGC exec → push GitHub → seal result → put results/.
+5. PYTHIA reconciler: poll results/ → open → PATCH hive done + ARGONAS fan-out.
+6. Smoke: target=spark-ngc job round-trips through the bucket.
