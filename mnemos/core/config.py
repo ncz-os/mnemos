@@ -1400,7 +1400,7 @@ def mcp_mnemos_url_env() -> str:
 def mcp_mnemos_token_env() -> str:
     return runtime_env_value(
         "MNEMOS_TOKEN",
-        "d3a3bc609583005f4a077b6ffd00154b4f03f70104d0cdbfbb019fceb28daca9",
+        ""  # no hardcoded fallback; set MNEMOS_TOKEN in env (leaked token, rotate server-side),
     )
 
 
