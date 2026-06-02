@@ -52,7 +52,7 @@ class NgcChatExecutor:
     def execute(self, job: dict) -> dict:
         import requests
 
-        model = job.get("model", "qwen3-coder-480b")
+        model = job.get("model", "qwen/qwen3-coder-480b-a35b-instruct")
         context = "\n\n".join(c["content"] for c in job.get("context", []))
         sys_prompt = (
             f"You are a Spark coding worker. Use the provided MNEMOS context.\n\nCONTEXT:\n{context}"
