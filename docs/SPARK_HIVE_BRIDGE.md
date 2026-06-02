@@ -77,3 +77,29 @@ Both Spark and home reach the internet; only the home LAN is unreachable from th
 4. Spark poller: list pending/ → conditional-claim → NGC exec → push GitHub → seal result → put results/.
 5. PYTHIA reconciler: poll results/ → open → PATCH hive done + ARGONAS fan-out.
 6. Smoke: target=spark-ngc job round-trips through the bucket.
+
+---
+
+# AS BUILT 2026-06-02 — `spark_relay/` (GCS, codex-approved)
+
+Implemented in [`../spark_relay/`](../spark_relay/) on GCS. Deviations from the
+sketch above, all hardening surfaced by adversarial review:
+
+- **GCS, not S3.** Project `spark-hive-relay`, bucket `gs://spark-hive-relay-bkt`
+  (us-east1, uniform access, public-access-prevention, lifecycle delete >7d). SA
+  `relay-rw` with `roles/storage.objectAdmin`. Atomic claim = `ifGenerationMatch=0`.
+- **Single `terminal/<uuid>` object**, not split `results/`+`failed/`. One
+  create-only object is the exactly-once terminal gate (status in the sealed
+  payload) so two workers can never record conflicting done/failed for one job.
+- **Leased claims.** `claimed/<uuid>` holds `{owner, claimed_at}`; a claim older
+  than `DEFAULT_LEASE_SECONDS` (2h) is taken over via generation CAS (loaded with
+  `get_blob`, bails if no generation). A dead worker no longer strands a job; an
+  empty/unparseable marker is treated as expired.
+- **AAD binding.** Every blob is sealed with `aad_for(kind, uuid)` (kind ∈
+  pending/terminal) so a ciphertext can't be replayed across prefix or job.
+- **Quarantine + purge-after-ack.** Undecryptable/uuid-mismatch pending → durable
+  `terminal` failure (claim never stranded). Reconciler purges ONLY after the
+  hive PATCH returns success — never deletes evidence the hive hasn't acked.
+
+Bucket prefixes as built: `pending/<uuid>.json.enc`, `claimed/<uuid>`,
+`terminal/<uuid>.json.enc`.
