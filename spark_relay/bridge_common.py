@@ -82,10 +82,26 @@ class HiveClient:
         except (requests.RequestException, ValueError) as exc:
             log.warning("hive register failed (non-fatal): %s", exc)
 
+    def heartbeat(self, status: str = "online") -> None:
+        """Keep the agent active. The hive reaps agents to 'stale' after ~90s
+        without a heartbeat, after which dequeue stops offering work — so the
+        loops must call this every iteration (interval < the stale window)."""
+        try:
+            self._session.post(
+                f"{self.base}/v1/agents/heartbeat",
+                json={"urn": self.urn, "status": status},
+                timeout=_TIMEOUT,
+            ).raise_for_status()
+        except requests.RequestException as exc:
+            log.warning("heartbeat failed (non-fatal): %s", exc)
+
     def claim_next(self) -> dict[str, Any] | None:
         """Atomically dequeue+claim the next job this agent is eligible for, or
         None if the queue is dry. Eligibility = job.eligible_hosts covers this
-        agent's host (parsed from the URN at registration)."""
+        agent's host (parsed from the URN at registration).
+
+        Never raises: any non-2xx (204 empty, 409 claim race, 403 stale, 5xx) is
+        treated as 'no claim this round' so the drain loop keeps running."""
         try:
             resp = self._session.post(
                 f"{self.base}/v1/jobs/next",
@@ -97,8 +113,13 @@ class HiveClient:
             return None
         if resp.status_code == 204:
             return None
-        resp.raise_for_status()
-        return resp.json() or None
+        if resp.status_code >= 400:
+            log.warning("claim_next %s: %s", resp.status_code, resp.text[:200])
+            return None
+        try:
+            return resp.json() or None
+        except ValueError:
+            return None
 
     def patch_status(
         self,

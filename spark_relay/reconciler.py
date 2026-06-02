@@ -94,6 +94,7 @@ def main() -> None:
     attempt = 0
     while True:
         try:
+            hive.heartbeat()  # stay 'online'
             run_once(hive, relay, key)
             attempt = 0
             time.sleep(args.interval)
