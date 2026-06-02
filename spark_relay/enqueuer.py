@@ -36,7 +36,9 @@ def build_payload(job: dict) -> dict:
     return {
         "job_id": job["id"],
         "prompt": prompt,
-        "model": job.get("claimed_model") or job.get("model") or "qwen/qwen3-coder-480b-a35b-instruct",
+        # No hardcoded model: the Spark executor picks (local GB10 coder primary,
+        # NGC fallback). A submitter MAY pin one via the job's model field.
+        "model": job.get("claimed_model") or job.get("model"),
         "repo": job.get("repo"),
         "branch": job.get("branch"),
         "context": context,

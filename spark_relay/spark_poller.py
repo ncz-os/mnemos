@@ -39,29 +39,34 @@ class Executor(Protocol):
         ...
 
 
-class NgcChatExecutor:
-    """Reference executor: calls the Spark's host-locked NGC model and returns
-    its output as metrics. Does NOT yet edit/commit/push a repo — that is the
+class OpenAIChatExecutor:
+    """Calls any OpenAI-compatible /chat/completions endpoint (local llama.cpp /
+    ollama / vLLM, or NGC). The local GB10 coder is the primary; NGC is the
+    cloud fallback. Does NOT yet edit/commit/push a repo — that is the
     integration point for the full agentic runtime (see module docstring).
     """
 
-    def __init__(self) -> None:
-        self.base = os.environ.get("NGC_BASE", "https://integrate.api.nvidia.com/v1")
-        self.api_key = os.environ.get("NGC_API_KEY", "")
+    def __init__(self, base: str, api_key: str, default_model: str, *, label: str, timeout: float):
+        self.base = base.rstrip("/")
+        self.api_key = api_key
+        self.default_model = default_model
+        self.label = label
+        self.timeout = timeout
 
     def execute(self, job: dict) -> dict:
         import requests
 
-        model = job.get("model", "qwen/qwen3-coder-480b-a35b-instruct")
+        model = job.get("model") or self.default_model
         context = "\n\n".join(c["content"] for c in job.get("context", []))
         sys_prompt = (
             f"You are a Spark coding worker. Use the provided MNEMOS context.\n\nCONTEXT:\n{context}"
             if context
             else "You are a Spark coding worker."
         )
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         resp = requests.post(
             f"{self.base}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
+            headers=headers,
             json={
                 "model": model,
                 "messages": [
@@ -69,7 +74,7 @@ class NgcChatExecutor:
                     {"role": "user", "content": job["prompt"]},
                 ],
             },
-            timeout=float(os.environ.get("NGC_TIMEOUT", "600")),
+            timeout=self.timeout,
         )
         resp.raise_for_status()
         out = resp.json()["choices"][0]["message"]["content"]
@@ -77,13 +82,55 @@ class NgcChatExecutor:
         return {
             "commit_sha": None,
             "branch": job.get("branch"),
-            "metrics": {"model": model, "output_chars": len(out), "output": out},
+            "metrics": {"backend": self.label, "model": model, "output_chars": len(out), "output": out},
         }
 
 
+class FallbackExecutor:
+    """Try executors in order; use the first that succeeds. Lets the local GB10
+    coder serve by default and fall back to NGC only when local is down."""
+
+    def __init__(self, chain: list[tuple[str, OpenAIChatExecutor]]):
+        self.chain = chain
+
+    def execute(self, job: dict) -> dict:
+        errors = []
+        for name, ex in self.chain:
+            try:
+                return ex.execute(job)
+            except Exception as exc:  # noqa: BLE001 — try the next backend
+                log.warning("executor %s failed, trying next: %s", name, exc)
+                errors.append(f"{name}: {exc}")
+        raise RuntimeError("all executors failed: " + " | ".join(errors))
+
+
+def _local_executor() -> OpenAIChatExecutor:
+    return OpenAIChatExecutor(
+        os.environ.get("LLM_BASE", "http://localhost:11434/v1"),
+        os.environ.get("LLM_API_KEY", ""),
+        os.environ.get("LLM_MODEL", "qwen2.5-coder:32b"),
+        label="local",
+        timeout=float(os.environ.get("LLM_TIMEOUT", "900")),
+    )
+
+
+def _ngc_executor() -> OpenAIChatExecutor:
+    return OpenAIChatExecutor(
+        os.environ.get("NGC_BASE", "https://integrate.api.nvidia.com/v1"),
+        os.environ.get("NGC_API_KEY", ""),
+        os.environ.get("NGC_MODEL", "qwen/qwen3-coder-480b-a35b-instruct"),
+        label="ngc",
+        timeout=float(os.environ.get("NGC_TIMEOUT", "600")),
+    )
+
+
 def make_executor(name: str) -> Executor:
+    if name == "local":
+        return _local_executor()
     if name == "ngc":
-        return NgcChatExecutor()
+        return _ngc_executor()
+    if name in ("local+ngc", "auto"):  # local primary, NGC fallback
+        return FallbackExecutor([("local", _local_executor()), ("ngc", _ngc_executor())])
     raise SystemExit(f"unknown executor {name!r}")
 
 
@@ -143,22 +190,29 @@ def run_once(relay: RelayClient, key: bytes, executor: Executor, *, owner: str |
 def main() -> None:
     ap = argparse.ArgumentParser(description="Spark relay poller (Spark side)")
     ap.add_argument("--interval", type=float, default=10.0)
-    ap.add_argument("--executor", default="ngc")
+    ap.add_argument("--executor", default="local+ngc", help="local | ngc | local+ngc (local primary)")
     ap.add_argument("--once", action="store_true")
+    ap.add_argument(
+        "--worker-id",
+        default=None,
+        help="claim owner + identity; run several with distinct ids for concurrency",
+    )
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
     key = relay_crypto.load_key()
     relay = RelayClient()
     executor = make_executor(args.executor)
+    owner = args.worker_id or worker_id()
+    log.info("poller starting worker=%s executor=%s", owner, args.executor)
 
     if args.once:
-        run_once(relay, key, executor)
+        run_once(relay, key, executor, owner=owner)
         return
 
     while True:
         try:
-            run_once(relay, key, executor)
+            run_once(relay, key, executor, owner=owner)
             time.sleep(args.interval)
         except KeyboardInterrupt:
             log.info("poller stopped")
