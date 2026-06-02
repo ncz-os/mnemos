@@ -1,0 +1,190 @@
+"""MCP tool handler for GRAEAE multi-provider consensus consultations.
+
+Exposes the GRAEAE engine's consult() method over MCP so reasoning
+consultations are callable from STUDIO and jperlow-mlt(.4) without
+HTTP loopback — the engine runs in-process, exactly as the
+/v1/consultations route does.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any
+
+from mnemos.core.auth_context import UserContext
+
+from ._runtime import _safe_path_segment, _tool
+
+logger = logging.getLogger(__name__)
+
+_MUSE_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+
+
+def _validate_muses(value: list[str] | None) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) > 16:
+        raise ValueError("muses must be a list with at most 16 items")
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not _MUSE_RE.match(item):
+            raise ValueError(f"invalid muse name: {item!r}")
+        out.append(item)
+    return out
+
+
+async def tool_graeae_consult(
+    prompt: str,
+    category: str = "general",
+    muses: list[str] | None = None,
+    mode: str = "auto",
+    user: UserContext | None = None,
+) -> dict[str, Any]:
+    """Consult GRAEAE multi-provider consensus engine over MCP.
+
+    Calls the SAME in-process engine function the /v1/consultations
+    route uses — no HTTP loopback. Returns synthesis + per-muse
+    outputs when available.
+
+    Args:
+        prompt: The consultation prompt / question.
+        category: Task category (maps to task_type). Default "general".
+        muses: Optional list of provider names to consult. When set,
+               only those providers are queried; when None, the engine
+               uses its default auto lineup.
+        mode: Consultation mode (auto, single, debate, majority, all,
+              local, external). Default "auto".
+        user: MCP caller context (injected by the dispatcher).
+
+    Returns:
+        dict with synthesis (consensus_response), per_muse outputs,
+        winning_muse, consensus_score, cost, and latency_ms.
+    """
+    del user  # GRAEAE engine consults are user-agnostic at this layer
+    _safe_path_segment(category, label="category")
+
+    from mnemos.domain.graeae.engine import get_graeae_engine
+
+    engine = get_graeae_engine()
+
+    # Map `category` → engine `task_type` (one-to-one for MCP callers)
+    task_type = category or "general"
+
+    # Build a selection dict when muses are explicitly provided.
+    # When muses is None, selection=None → engine uses auto lineup.
+    # An empty list is an explicit "query no providers" — error it.
+    selection: dict[str, str | None] | None = None
+    if muses is not None:
+        # Accept either GRAEAE engine key (e.g. "claude") or registry
+        # name (e.g. "anthropic") and normalize to the engine key.
+        unknown: list[str] = []
+        selection = {}
+        for m in muses:
+            if m in engine.providers:
+                selection[m] = None
+            else:
+                unknown.append(m)
+        if unknown:
+            # Mirror the consultations route's fail-loudly semantics:
+            # don't silently drop unknown providers.
+            return {
+                "success": False,
+                "error": f"unknown provider(s): {unknown}",
+                "available": sorted(engine.providers.keys()),
+            }
+        if not selection:
+            return {
+                "success": False,
+                "error": "no valid providers in muses list",
+                "available": sorted(engine.providers.keys()),
+            }
+
+    try:
+        result = await engine.consult(
+            prompt=prompt,
+            task_type=task_type,
+            selection=selection,
+            mode=mode,
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error(f"[MCP] graeae_consult engine failed: {e}", exc_info=True)
+        return {"success": False, "error": f"Consultation engine error: {e}"}
+
+    # Build a caller-friendly response shape:
+    #   synthesis   — the winning consensus response text (if any)
+    #   per_muse    — each provider's result keyed by provider name
+    #   metadata    — winning_muse, consensus_score, cost, latency_ms
+    all_responses = result.get("all_responses", {})
+    per_muse: dict[str, dict[str, Any]] = {}
+    for name, resp in all_responses.items():
+        per_muse[name] = {
+            "status": resp.get("status", "unknown"),
+            "response_text": resp.get("response_text", ""),
+            "model_id": resp.get("model_id", ""),
+            "final_score": resp.get("final_score", 0.0),
+        }
+        if resp.get("error"):
+            per_muse[name]["error"] = resp["error"]
+
+    return {
+        "success": True,
+        "synthesis": result.get("consensus_response", ""),
+        "per_muse": per_muse,
+        "winning_muse": result.get("winning_muse"),
+        "consensus_score": result.get("consensus_score", 0.0),
+        "cost": result.get("cost", 0.0),
+        "latency_ms": result.get("latency_ms", 0),
+        "mode": mode,
+        "cache_hit": bool(result.get("cache_hit")),
+        "round_1": result.get("round_1"),
+        "round_2": result.get("round_2"),
+        "quorum_reached": result.get("quorum_reached"),
+        "quorum_threshold": result.get("quorum_threshold"),
+        "similarity_pairs": result.get("similarity_pairs"),
+    }
+
+
+TOOLS: dict[str, dict[str, Any]] = {
+    "graeae_consult": _tool(
+        "Consult GRAEAE multi-provider consensus engine. "
+        "Submits a reasoning consultation to the GRAEAE engine "
+        "in-process (same as the /v1/consultations HTTP route) and "
+        "returns a synthesis with per-muse outputs. Supports all "
+        "consultation modes: auto, single, debate, majority, all, "
+        "local, external. When muses is specified, only those "
+        "providers are queried.",
+        {
+            "prompt": {
+                "type": "string",
+                "description": "The consultation prompt or question to submit.",
+            },
+            "category": {
+                "type": "string",
+                "description": "Task category mapped to GRAEAE task_type. "
+                               "Default: 'general'. Common values: reasoning, "
+                               "architecture_design, code_generation, web_search.",
+            },
+            "muses": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 16,
+                "description": "Optional list of provider names to consult "
+                               "(e.g. ['claude', 'openai', 'gemini']). "
+                               "When set, only those providers are queried. "
+                               "When omitted, the engine uses its default "
+                               "auto lineup.",
+            },
+            "mode": {
+                "type": "string",
+                "description": "Consultation mode. Default: 'auto'. "
+                               "Supported: auto, single, debate, majority, "
+                               "all, local, external.",
+            },
+        },
+        ["prompt"],
+        tool_graeae_consult,
+    ),
+}
