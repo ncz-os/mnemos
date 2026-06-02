@@ -38,7 +38,9 @@ from starlette.routing import Mount, Route
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://127.0.0.1:5005")
 MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002")
-MNEMOS_TOKEN = os.environ.get("MNEMOS_TOKEN", "d3a3bc609583005f4a077b6ffd00154b4f03f70104d0cdbfbb019fceb28daca9")
+MNEMOS_TOKEN = os.environ.get("MNEMOS_TOKEN")
+if not MNEMOS_TOKEN:
+    raise RuntimeError("MNEMOS_TOKEN must be set (no in-source fallback; rotated 2026-06-02)")
 
 server = Server("graeae-hive-mind")
 client = httpx.AsyncClient(timeout=15.0)
