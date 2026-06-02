@@ -98,3 +98,28 @@ def test_search_root_without_namespace_has_no_ns_or_owner_filter(monkeypatch):
     assert vis.scope == VisibilityScope.ROOT_BYPASS
     assert vis.namespace is None
     assert vis.user_id is None
+
+
+async def _fake_embedding(_query: str) -> list[float]:
+    return [0.25, 0.5, 0.75]
+
+
+def test_search_semantic_routes_rerank_controls_to_backend(monkeypatch):
+    """Regression guard for the post-fix semantic rerank controls path."""
+    backend = install_fake_backend(monkeypatch)
+    monkeypatch.setattr(memories_handler, "_get_embedding", _fake_embedding)
+    req = MemorySearchRequest(
+        query="hello",
+        limit=10,
+        semantic=True,
+        boost_recency=True,
+        recency_weight=0.35,
+    )
+
+    asyncio.run(memories_handler.search_memories(req, user=_alice("alice-ns")))
+
+    assert backend.memories.calls[-1][0] == "semantic_search"
+    call = _last_search_call(backend)
+    assert call["embedding"] == [0.25, 0.5, 0.75]
+    assert call["boost_recency"] is True
+    assert call["recency_weight"] == pytest.approx(0.35)

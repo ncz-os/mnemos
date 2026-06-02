@@ -811,6 +811,8 @@ async def search_memories(
                     source_model=request.source_model,
                     source_agent=request.source_agent,
                     include_archived=bool(request.include_archived),
+                    boost_recency=bool(request.boost_recency),
+                    recency_weight=request.recency_weight,
                     **semantic_trace_kwargs,
                 )
         else:
