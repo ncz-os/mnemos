@@ -23,30 +23,73 @@ _TIMEOUT = float(os.environ.get("RELAY_HTTP_TIMEOUT", "30"))
 
 
 class HiveClient:
-    """Minimal client for the hive endpoints the bridge needs."""
+    """Minimal client for the hive endpoints the bridge needs.
 
-    def __init__(self, base: str = HIVE_BASE, urn: str = "mnemos:pythia:spark-bridge"):
+    Spark routing is by HOST, not kind: the hive has no ``nvidia`` kind, and
+    dequeue eligibility filters a job's ``eligible_hosts`` against the agent host
+    parsed from its URN (``urn:agent:<kind>:<host>:<sid>``). So the enqueuer
+    registers AS the Spark — ``urn:agent:system:spark-0c53:…`` — and drains jobs
+    submitted with ``eligible_hosts=["spark-0c53"]``. ``capabilities=["*"]``
+    bypasses capability/workspace claim gates. The reconciler only PATCHes.
+    """
+
+    def __init__(
+        self,
+        urn: str,
+        *,
+        runtime: str,
+        kind: str,
+        host: str,
+        capabilities: list[str] | None = None,
+        provider: str = "unknown",
+        model: str = "unknown",
+        base: str = HIVE_BASE,
+    ):
         self.base = base.rstrip("/")
         self.urn = urn
+        self.runtime = runtime
+        self.kind = kind
+        self.host = host
+        self.capabilities = capabilities
+        self.provider = provider
+        self.model = model
         self._session = requests.Session()
 
-    def register(self, kind: str = "mnemos", host: str = "pythia") -> None:
+    def register(self) -> None:
+        """Register and ADOPT the server-assigned URN. The hive replaces the
+        session segment with its own uuid; subsequent claim/patch must use the
+        returned URN or the agent reads as 'not registered'."""
         try:
-            self._session.post(
+            resp = self._session.post(
                 f"{self.base}/v1/agents/register",
-                json={"urn": self.urn, "kind": kind, "host": host},
+                json={
+                    "urn": self.urn,
+                    "runtime": self.runtime,
+                    "kind": self.kind,
+                    "host": self.host,
+                    "provider": self.provider,
+                    "model": self.model,
+                    "capabilities": self.capabilities,
+                    "autonomy_level": "autonomous",
+                    "metadata": {"role": "spark-relay-bridge"},
+                },
                 timeout=_TIMEOUT,
-            ).raise_for_status()
-        except requests.RequestException as exc:
+            )
+            resp.raise_for_status()
+            assigned = (resp.json() or {}).get("urn")
+            if assigned:
+                self.urn = assigned
+        except (requests.RequestException, ValueError) as exc:
             log.warning("hive register failed (non-fatal): %s", exc)
 
-    def claim_next(self, eligible_kinds: list[str]) -> dict[str, Any] | None:
-        """Atomically claim the next eligible job, or None if the queue is dry."""
+    def claim_next(self) -> dict[str, Any] | None:
+        """Atomically dequeue+claim the next job this agent is eligible for, or
+        None if the queue is dry. Eligibility = job.eligible_hosts covers this
+        agent's host (parsed from the URN at registration)."""
         try:
             resp = self._session.post(
                 f"{self.base}/v1/jobs/next",
                 params={"agent_urn": self.urn},
-                json={"eligible_kinds": eligible_kinds},
                 timeout=_TIMEOUT,
             )
         except requests.RequestException as exc:
@@ -57,8 +100,13 @@ class HiveClient:
         resp.raise_for_status()
         return resp.json() or None
 
-    def patch_status(self, job_id: str, status: str, **fields: Any) -> bool:
-        body = {"status": status, "claimed_by": self.urn, **fields}
+    def patch_status(self, job_id: str, status: str, *, result: dict[str, Any] | None = None) -> bool:
+        """PATCH a job to ``status`` per the JobUpdate contract. Non-status data
+        (commit_sha, branch, metrics, error) goes inside ``result`` — the hive
+        model ignores stray top-level fields."""
+        body: dict[str, Any] = {"status": status, "claimed_by": self.urn}
+        if result is not None:
+            body["result"] = result
         try:
             resp = self._session.patch(f"{self.base}/v1/jobs/{job_id}", json=body, timeout=_TIMEOUT)
             resp.raise_for_status()

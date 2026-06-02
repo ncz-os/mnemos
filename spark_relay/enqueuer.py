@@ -22,8 +22,10 @@ from .relay_client import RelayClient
 
 log = logging.getLogger("spark_relay.enqueuer")
 
-# Jobs whose work must run on the Spark's host-locked NGC models.
-ELIGIBLE_KINDS = ["nvidia"]
+# The bridge registers AS the Spark host so the hive offers it jobs submitted
+# with eligible_hosts=["spark-0c53"]. (The hive has no nvidia kind; routing is
+# by host parsed from the URN.)
+SPARK_HOST = "spark-0c53"
 CONTEXT_LIMIT = 6
 
 
@@ -46,7 +48,7 @@ def run_once(hive: HiveClient, relay: RelayClient, key: bytes) -> int:
     """Drain the hive of eligible jobs into the bucket. Returns count enqueued."""
     enqueued = 0
     while True:
-        job = hive.claim_next(ELIGIBLE_KINDS)
+        job = hive.claim_next()
         if job is None:
             break
         job_id = job["id"]
@@ -54,12 +56,12 @@ def run_once(hive: HiveClient, relay: RelayClient, key: bytes) -> int:
             payload = build_payload(job)
             sealed = relay_crypto.seal(payload, key, aad=relay_crypto.aad_for("pending", job_id))
             relay.put_pending(job_id, sealed)
-            hive.patch_status(job_id, "running", note="offloaded to spark relay bucket")
+            hive.patch_status(job_id, "running", result={"note": "offloaded to spark relay bucket"})
             log.info("enqueued %s (context=%d)", job_id, len(payload["context"]))
             enqueued += 1
         except Exception as exc:  # noqa: BLE001 — surface to hive, keep draining
             log.exception("enqueue failed for %s", job_id)
-            hive.patch_status(job_id, "failed", error=f"enqueue: {exc}")
+            hive.patch_status(job_id, "failed", result={"error": f"enqueue: {exc}"})
     return enqueued
 
 
@@ -71,7 +73,15 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
     key = relay_crypto.load_key()
-    hive = HiveClient(urn="mnemos:pythia:spark-bridge-enqueuer")
+    hive = HiveClient(
+        urn=f"urn:agent:system:{SPARK_HOST}:spark-relay-enqueuer",
+        runtime="system",
+        kind="system",
+        host=SPARK_HOST,
+        capabilities=["*"],
+        provider="nvidia-ngc",
+        model="qwen/qwen3-coder-480b-a35b-instruct",
+    )
     relay = RelayClient()
     hive.register()
 
