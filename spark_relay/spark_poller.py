@@ -91,7 +91,11 @@ def _seal_terminal(uuid: str, payload: dict, key: bytes) -> bytes:
     return relay_crypto.seal(payload, key, aad=relay_crypto.aad_for("terminal", uuid))
 
 
-def _write_terminal(relay: RelayClient, uuid: str, payload: dict, key: bytes) -> None:
+def _write_terminal(relay: RelayClient, uuid: str, payload: dict, key: bytes, *, claimant: str | None = None) -> None:
+    # Echo the claimant URN through so the reconciler can PATCH the hive as the
+    # job's claimant (the enqueuer that claimed it).
+    if claimant and "claimant_urn" not in payload:
+        payload = {**payload, "claimant_urn": claimant}
     if not relay.put_terminal(uuid, _seal_terminal(uuid, payload, key)):
         log.warning("terminal for %s already existed — keeping first", uuid)
 
@@ -112,19 +116,26 @@ def run_once(relay: RelayClient, key: bytes, executor: Executor, *, owner: str |
             _write_terminal(relay, uuid, {"status": "failed", "error": f"undecryptable pending: {exc}"}, key)
             done += 1
             continue
+        claimant = job.get("claimant_urn")
         if job.get("job_id") not in (None, uuid):
             log.error("payload job_id %r != object %s — quarantining", job.get("job_id"), uuid)
-            _write_terminal(relay, uuid, {"status": "failed", "error": "job_id/object uuid mismatch"}, key)
+            _write_terminal(
+                relay,
+                uuid,
+                {"status": "failed", "error": "job_id/object uuid mismatch"},
+                key,
+                claimant=claimant,
+            )
             done += 1
             continue
         try:
             result = executor.execute(job)
             result.setdefault("status", "done")
-            _write_terminal(relay, uuid, result, key)
+            _write_terminal(relay, uuid, result, key, claimant=claimant)
             log.info("executed %s sha=%s", uuid, result.get("commit_sha"))
         except Exception as exc:  # noqa: BLE001 — report failure, keep polling
             log.exception("execute %s failed", uuid)
-            _write_terminal(relay, uuid, {"status": "failed", "error": str(exc)}, key)
+            _write_terminal(relay, uuid, {"status": "failed", "error": str(exc)}, key, claimant=claimant)
         done += 1
     return done
 

@@ -28,9 +28,15 @@ def _reconcile_one(hive: HiveClient, relay: RelayClient, key: bytes, uuid: str) 
     sweep to retry — never delete evidence the hive hasn't acknowledged.
     """
     payload = relay_crypto.open_blob(relay.get_terminal(uuid), key, aad=relay_crypto.aad_for("terminal", uuid))
+    # The hive only lets a job's current claimant update it; the enqueuer claimed
+    # it under a different URN than this reconciler and echoed that URN through
+    # the terminal payload, so PATCH as that claimant.
+    claimant = payload.get("claimant_urn")
     failed = payload.get("status") == "failed"
     if failed:
-        ok = hive.patch_status(uuid, "failed", result={"error": payload.get("error", "spark failure")})
+        ok = hive.patch_status(
+            uuid, "failed", result={"error": payload.get("error", "spark failure")}, claimed_by=claimant
+        )
     else:
         ok = hive.patch_status(
             uuid,
@@ -40,6 +46,7 @@ def _reconcile_one(hive: HiveClient, relay: RelayClient, key: bytes, uuid: str) 
                 "branch": payload.get("branch"),
                 "metrics": payload.get("metrics"),
             },
+            claimed_by=claimant,
         )
     if not ok:
         log.error("hive PATCH for %s failed — leaving bucket objects for retry", uuid)

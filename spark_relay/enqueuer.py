@@ -54,6 +54,10 @@ def run_once(hive: HiveClient, relay: RelayClient, key: bytes) -> int:
         job_id = job["id"]
         try:
             payload = build_payload(job)
+            # Embed the claimant URN so the Spark echoes it back in the terminal
+            # object; the reconciler needs it to PATCH as the job's claimant (the
+            # hive has no GET-single-job endpoint to look it up).
+            payload["claimant_urn"] = hive.urn
             sealed = relay_crypto.seal(payload, key, aad=relay_crypto.aad_for("pending", job_id))
             relay.put_pending(job_id, sealed)
             hive.patch_status(job_id, "running", result={"note": "offloaded to spark relay bucket"})

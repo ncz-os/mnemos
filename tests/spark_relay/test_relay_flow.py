@@ -75,7 +75,9 @@ class RecordingHive:
         self.calls: list[tuple[str, str, dict]] = []
         self._ok = ok
 
-    def patch_status(self, job_id: str, status: str, *, result: dict | None = None) -> bool:
+    def patch_status(
+        self, job_id: str, status: str, *, result: dict | None = None, claimed_by: str | None = None
+    ) -> bool:
         self.calls.append((job_id, status, result or {}))
         return self._ok
 
