@@ -34,7 +34,7 @@ def build_payload(job: dict) -> dict:
     return {
         "job_id": job["id"],
         "prompt": prompt,
-        "model": job.get("claimed_model") or job.get("model") or "qwen3-coder-480b",
+        "model": job.get("claimed_model") or job.get("model") or "qwen/qwen3-coder-480b-a35b-instruct",
         "repo": job.get("repo"),
         "branch": job.get("branch"),
         "context": context,
