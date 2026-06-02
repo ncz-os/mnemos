@@ -30,14 +30,16 @@ def _reconcile_one(hive: HiveClient, relay: RelayClient, key: bytes, uuid: str) 
     payload = relay_crypto.open_blob(relay.get_terminal(uuid), key, aad=relay_crypto.aad_for("terminal", uuid))
     failed = payload.get("status") == "failed"
     if failed:
-        ok = hive.patch_status(uuid, "failed", error=payload.get("error", "spark failure"))
+        ok = hive.patch_status(uuid, "failed", result={"error": payload.get("error", "spark failure")})
     else:
         ok = hive.patch_status(
             uuid,
             "done",
-            commit_sha=payload.get("commit_sha"),
-            branch=payload.get("branch"),
-            result=payload.get("metrics"),
+            result={
+                "commit_sha": payload.get("commit_sha"),
+                "branch": payload.get("branch"),
+                "metrics": payload.get("metrics"),
+            },
         )
     if not ok:
         log.error("hive PATCH for %s failed — leaving bucket objects for retry", uuid)
@@ -68,7 +70,13 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
     key = relay_crypto.load_key()
-    hive = HiveClient(urn="mnemos:pythia:spark-bridge-reconciler")
+    hive = HiveClient(
+        urn="urn:agent:mnemos:pythia:spark-relay-reconciler",
+        runtime="mnemos",
+        kind="mnemos",
+        host="pythia",
+        capabilities=["*"],
+    )
     relay = RelayClient()
     hive.register()
 
