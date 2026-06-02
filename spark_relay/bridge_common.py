@@ -100,11 +100,22 @@ class HiveClient:
         resp.raise_for_status()
         return resp.json() or None
 
-    def patch_status(self, job_id: str, status: str, *, result: dict[str, Any] | None = None) -> bool:
+    def patch_status(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        result: dict[str, Any] | None = None,
+        claimed_by: str | None = None,
+    ) -> bool:
         """PATCH a job to ``status`` per the JobUpdate contract. Non-status data
-        (commit_sha, branch, metrics, error) goes inside ``result`` — the hive
-        model ignores stray top-level fields."""
-        body: dict[str, Any] = {"status": status, "claimed_by": self.urn}
+        (commit_sha, branch, metrics, error) goes inside ``result``.
+
+        ``claimed_by`` MUST equal the job's current claimant or the hive returns
+        403. The reconciler (a different agent than the enqueuer that claimed the
+        job) passes the job's actual claimant; the enqueuer omits it and defaults
+        to its own URN (it is the claimant)."""
+        body: dict[str, Any] = {"status": status, "claimed_by": claimed_by or self.urn}
         if result is not None:
             body["result"] = result
         try:
