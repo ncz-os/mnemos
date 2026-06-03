@@ -41,6 +41,9 @@ class _FakeCursor:
     def fetchone(self):
         return self._result
 
+    def close(self):
+        pass
+
 
 class _FakeConn:
     def __init__(self, db):

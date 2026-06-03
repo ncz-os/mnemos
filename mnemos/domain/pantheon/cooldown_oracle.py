@@ -22,6 +22,12 @@ from mnemos.domain.pantheon.cooldown import CooldownStore
 
 DEFAULT_PRUNE_MINUTES = 2
 
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    """Oracle ORA-00001 unique/PK violation (from a concurrent first-insert race)."""
+    return "ORA-00001" in str(exc)
+
+
 _DDL_COOLDOWN = (
     "CREATE TABLE pantheon_cooldown ("
     " tenant VARCHAR2(128) NOT NULL,"
@@ -80,9 +86,20 @@ class OracleCooldownStore(CooldownStore):
         with self._lock:
             conn = self._pool.acquire()
             try:
-                cur = conn.cursor()
-                cur.execute(sql, params)
-                conn.commit()
+                # retry once on a concurrent first-insert race: the MERGE
+                # MATCHes (row now exists) and takes its UPDATE branch.
+                for attempt in range(2):
+                    cur = conn.cursor()
+                    try:
+                        cur.execute(sql, params)
+                        conn.commit()
+                        return
+                    except Exception as exc:
+                        if attempt == 0 and _is_unique_violation(exc):
+                            continue
+                        raise
+                    finally:
+                        cur.close()
             finally:
                 self._pool.release(conn)
 
@@ -91,8 +108,11 @@ class OracleCooldownStore(CooldownStore):
             conn = self._pool.acquire()
             try:
                 cur = conn.cursor()
-                cur.execute(sql, params)
-                return cur.fetchone()
+                try:
+                    cur.execute(sql, params)
+                    return cur.fetchone()
+                finally:
+                    cur.close()
             finally:
                 self._pool.release(conn)
 

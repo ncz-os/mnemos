@@ -146,18 +146,27 @@ def build_fallback_chain(
     if primary.route_type != "single":
         return [primary]
     by_id: dict[str, dict[str, Any]] = {}
+    ambiguous: set[str] = set()
     for m in models:
         mid = m.get("id") if isinstance(m, dict) else None
-        if mid:
-            by_id[str(mid)] = m
+        if not mid:
+            continue
+        mid = str(mid)
+        if mid in by_id and by_id[mid].get("provider") != m.get("provider"):
+            ambiguous.add(mid)  # same id across providers -> can't disambiguate from a bare id
+        else:
+            by_id[mid] = m
     chain = [primary]
     seen = {(primary.provider, primary.model_id)}
     for cid in primary.candidates or []:
-        m = by_id.get(str(cid))
+        cid = str(cid)
+        if cid in ambiguous:
+            continue
+        m = by_id.get(cid)
         if not m:
             continue
         provider = m.get("provider")
-        key = (provider, str(cid))
+        key = (provider, cid)
         if not provider or key in seen:
             continue
         seen.add(key)
@@ -165,7 +174,7 @@ def build_fallback_chain(
             RouteDecision(
                 alias=primary.alias,
                 provider=str(provider),
-                model_id=str(cid),
+                model_id=cid,
                 route_type="single",
                 reason="fallback-candidate",
                 model=m,
