@@ -131,3 +131,14 @@ def test_store_counts_are_minute_bucketed():
     assert s.get_counts("t", "d", 100) == (1, 1)
     assert s.get_counts("t", "d", 101) == (0, 1)
     assert s.get_counts("t", "d", 999) == (0, 0)
+
+
+def test_store_prunes_stale_minute_buckets():
+    s = InMemoryCooldownStore()
+    s.incr("t", "d", 100, success=True)
+    s.incr("t", "d", 101, success=False)  # cutoff=100 -> minute 100 kept (not < 100)
+    assert s.get_counts("t", "d", 100) == (1, 0)
+    s.incr("t", "d", 102, success=False)  # cutoff=101 -> minute 100 pruned (< 101)
+    assert s.get_counts("t", "d", 100) == (0, 0)  # pruned
+    assert s.get_counts("t", "d", 101) == (0, 1)  # previous minute kept
+    assert s.get_counts("t", "d", 102) == (0, 1)
