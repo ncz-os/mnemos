@@ -23,7 +23,7 @@ from mnemos.api.routes.consultations import (
 )
 from mnemos.core.auth_context import UserContext
 
-from ._runtime import _mcp_user_required, _safe_path_segment, _tool
+from ._runtime import _mcp_user_or_system, _mcp_user_required, _safe_path_segment, _tool
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ async def tool_graeae_consult(
     from mnemos.domain.graeae.engine import get_graeae_engine
 
     try:
-        user = _mcp_user_required(user)
+        user = _mcp_user_or_system(user)
     except PermissionError as e:
         return {"success": False, "error": str(e)}
 
