@@ -74,18 +74,30 @@ class WriteBehindCooldownStore(CooldownStore):
             self.flush()
 
     def flush(self) -> int:
-        """Drain buffered writes to the durable store. Returns ops flushed."""
+        """Drain buffered writes to the durable store. Returns ops flushed.
+
+        On a durable-write failure mid-flush, the unflushed remainder is
+        requeued (ahead of any newly-buffered ops) before re-raising, so no
+        write is silently lost during a DB/pool outage.
+        """
         with self._lock:
             ops, self._pending = self._pending, []
-        for op in ops:
-            kind = op[0]
-            if kind == "cooldown":
-                _, tenant, deployment, cooled_until = op
-                self._durable.set_cooldown(tenant, deployment, cooled_until)
-            else:  # "incr"
-                _, tenant, deployment, minute, success = op
-                self._durable.incr(tenant, deployment, minute, success=success)
-        return len(ops)
+        done = 0
+        try:
+            for op in ops:
+                kind = op[0]
+                if kind == "cooldown":
+                    _, tenant, deployment, cooled_until = op
+                    self._durable.set_cooldown(tenant, deployment, cooled_until)
+                else:  # "incr"
+                    _, tenant, deployment, minute, success = op
+                    self._durable.incr(tenant, deployment, minute, success=success)
+                done += 1
+        except Exception:
+            with self._lock:
+                self._pending = ops[done:] + self._pending
+            raise
+        return done
 
     @property
     def pending(self) -> int:
