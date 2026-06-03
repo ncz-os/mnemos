@@ -81,6 +81,7 @@ async def execute_with_fallbacks(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: Callable[[], float] | None = None,
     retry_after_of: Callable[[BaseException], float | None] = _default_retry_after,
+    can_retry: Callable[[Any], bool] | None = None,
 ) -> FallbackResult:
     """Run ``call`` over ``chain`` with retry+fallover; return the first success.
 
@@ -117,6 +118,8 @@ async def execute_with_fallbacks(
                 # action is RETRY
                 if retry >= num_retries:
                     break  # retries exhausted -> fall over to next deployment
+                if can_retry is not None and not can_retry(deployment):
+                    break  # deployment no longer usable (e.g. just cooled) -> fall over
                 delay = compute_backoff(
                     retry,
                     retry_after=retry_after_of(exc),

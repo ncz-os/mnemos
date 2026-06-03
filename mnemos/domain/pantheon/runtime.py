@@ -64,6 +64,7 @@ class RouterRuntime:
         *,
         classify: Callable[[BaseException], NormalizedError],
         tenant: str = DEFAULT_TENANT,
+        key_of: Callable[[Any], str] = str,
     ) -> FallbackResult:
         """Run ``call`` over the model group's ``deployments`` with cooldown
         pre-filtering, retry/fall-over, and per-attempt outcome recording."""
@@ -72,18 +73,24 @@ class RouterRuntime:
             raise ValueError("RouterRuntime.route: empty deployment group")
 
         is_single = len(group) == 1
-        available = self._cooldown.filter_available(group, self._clock(), tenant=tenant)
+
+        def cooled(deployment: Any) -> bool:
+            return self._cooldown.is_cooled(key_of(deployment), self._clock(), tenant=tenant)
+
+        available = [d for d in group if not cooled(d)]
         chain = available or group  # all cooled -> try the full chain anyway
 
         async def instrumented(deployment: Any) -> Any:
-            now = self._clock()
             try:
                 result = await call(deployment)
             except Exception as exc:  # noqa: BLE001 — record then re-raise for the fallback loop
+                now = self._clock()  # observation time, not request start
                 err = classify(exc)
-                self._cooldown.record_failure(deployment, err, now, is_single_deployment_group=is_single, tenant=tenant)
+                self._cooldown.record_failure(
+                    key_of(deployment), err, now, is_single_deployment_group=is_single, tenant=tenant
+                )
                 raise
-            self._cooldown.record_success(deployment, now, tenant=tenant)
+            self._cooldown.record_success(key_of(deployment), self._clock(), tenant=tenant)
             return result
 
         return await execute_with_fallbacks(
@@ -94,4 +101,5 @@ class RouterRuntime:
             max_fallbacks=self._max_fallbacks,
             sleep=self._sleep,
             rng=self._rng,
+            can_retry=lambda d: not cooled(d),
         )
