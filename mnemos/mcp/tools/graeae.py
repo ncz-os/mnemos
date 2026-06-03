@@ -96,7 +96,20 @@ async def tool_graeae_consult(
         )
 
     try:
-        backend = require_consultations_backend()
+        # Audit persistence needs the in-process persistence backend, which is
+        # initialised by the HTTP app lifespan. The stdio MCP server runs the
+        # tools without that lifespan, so the backend global is absent there.
+        # Resolve it softly: when present (HTTP route / in-process callers) we
+        # persist + audit as required; when absent (stdio MCP) we still return
+        # the engine synthesis but skip the audit row — the long-standing MCP
+        # behaviour before audit persistence was made mandatory.
+        from mnemos.core import lifecycle as _lifecycle
+
+        backend = (
+            require_consultations_backend()
+            if _lifecycle._persistence_backend is not None
+            else None
+        )
         engine = get_graeae_engine()
 
         # Map `category` → engine `task_type` (one-to-one for MCP callers)
@@ -153,7 +166,15 @@ async def tool_graeae_consult(
             }
 
         consultation_id: str | None = None
-        if result.get("all_responses"):
+        if backend is None and result.get("all_responses"):
+            # stdio MCP context (no in-process backend) — return synthesis
+            # without persisting an audit row, as graeae_consult did for months
+            # before audit persistence became mandatory on the HTTP route.
+            logger.warning(
+                "[MCP] graeae_consult: no in-process persistence backend "
+                "(stdio MCP context) — returning synthesis without audit row"
+            )
+        elif result.get("all_responses"):
             memory_ids = _extract_memory_ids(result)
             consensus_response = result.get("consensus_response", "") or ""
             consensus_score = float(result.get("consensus_score", 0.0) or 0.0)
