@@ -18,7 +18,8 @@ from mnemos.domain.openai_compat.content import _content_text, _flatten_messages
 from mnemos.domain.pantheon.router import RouteDecision
 from mnemos.domain.pantheon.cooldown import CooldownManager, InMemoryCooldownStore
 from mnemos.domain.pantheon.fallback import AllDeploymentsFailed
-from mnemos.domain.pantheon.http_bridge import classify
+from mnemos.domain.pantheon.cooldown import DEFAULT_TENANT
+from mnemos.domain.pantheon.http_bridge import classify, retry_after_seconds
 from mnemos.domain.pantheon.runtime import RouterRuntime
 
 logger = logging.getLogger(__name__)
@@ -54,10 +55,11 @@ async def aclose_http_client() -> None:
 
 
 class PantheonGatewayError(Exception):
-    def __init__(self, status_code: int, message: str):
+    def __init__(self, status_code: int, message: str, retry_after: float | None = None):
         super().__init__(message)
         self.status_code = status_code
         self.message = message
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -184,10 +186,23 @@ async def _forward_chat_once(decision: RouteDecision, body: dict[str, Any]) -> d
         timeout=cfg.get("timeout", 200),
     )
     if response.status_code >= 400:
-        raise PantheonGatewayError(response.status_code, response.text[:500])
+        raise PantheonGatewayError(response.status_code, response.text[:500], retry_after_seconds(response))
     data = response.json()
     data.setdefault("model", decision.model_id)
     return data
+
+
+def _decision_cooldown_key(decision: RouteDecision) -> str:
+    """Stable cooldown key for a routed provider (avoids hashing RouteDecision)."""
+    return f"{decision.provider}:{decision.model_id or decision.alias}"
+
+
+def _tenant_of(body: dict[str, Any]) -> str:
+    """Per-tenant cooldown scope from the upstream identity (or the default)."""
+    identity = _pop_upstream_identity(dict(body))
+    if identity is None:
+        return DEFAULT_TENANT
+    return f"{identity.namespace}:{identity.user_id}"
 
 
 async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
@@ -209,6 +224,8 @@ async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any])
             [decision],
             lambda d: _forward_chat_once(d, body),
             classify=classify,
+            tenant=_tenant_of(body),
+            key_of=_decision_cooldown_key,
         )
     except AllDeploymentsFailed as exc:
         last = exc.last_exception
