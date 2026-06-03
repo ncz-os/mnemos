@@ -91,3 +91,10 @@ PYTHONPATH=$PWD .venv/bin/python -m pytest tests/test_pantheon_*.py -q --noconft
 
 All routing modules are pure / dependency-injected, so the suite runs with no
 network and no real sleeping.
+
+## Cooldown storage tiers
+
+- `cooldown.py` — `CooldownStore` ABC + `InMemoryCooldownStore` (process-local L1) + `CooldownManager` + pure `evaluate_cooldown`.
+- `cooldown_sqlite.py` — `SqliteCooldownStore`: durable backend (logical-TTL cooldowns, minute-bucket counters via `ON CONFLICT` upsert, tenant-scoped, WAL). Survives process restart.
+- `cooldown_cache.py` — `WriteBehindCooldownStore`: L1 + durable backend. Cooldowns read-through (survive restart); counters L1-authoritative per process+minute; writes hit L1 immediately and flush to durable in batches (auto at threshold or via `flush()` on a timer). Satisfies the GRAEAE cache-aside mandate.
+- Production wiring: `CooldownManager(WriteBehindCooldownStore(SqliteCooldownStore(path)))` — swap SQLite for an Oracle `CooldownStore` to ride the persistence ABC. End-to-end composition proven in `tests/test_pantheon_integration.py` (trip → persist → fallover → restart-recovery → TTL expiry).
