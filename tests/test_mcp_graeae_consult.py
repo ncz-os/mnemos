@@ -463,6 +463,39 @@ async def test_graeae_consult_persists_audit_row_and_returns_consultation_id(
 
 
 @pytest.mark.asyncio
+async def test_graeae_consult_no_auth_uses_system_owner_and_context(
+    monkeypatch,
+    patch_engine,
+):
+    from mnemos.core import lifecycle
+    from mnemos.mcp.tools._runtime import user_from_context
+    from mnemos.mcp.tools.graeae import tool_graeae_consult
+
+    backend = FakeBackend()
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+
+    async def consult_with_nested_context(**_kwargs):
+        nested_user = user_from_context()
+        assert nested_user is not None
+        assert nested_user.user_id == "mcp-system"
+        assert nested_user.role == "root"
+        assert nested_user.namespace == "default"
+        assert nested_user.authenticated is True
+        return FakeEngine._default()
+
+    patch_engine.consult.side_effect = consult_with_nested_context
+
+    result = await tool_graeae_consult(prompt="test prompt")
+
+    assert result["success"] is True
+    assert result["consultation_id"] == "consult-123"
+    _tx, kwargs = backend.consultations.calls[0]
+    assert kwargs["owner_id"] == "mcp-system"
+    assert kwargs["namespace"] == "default"
+    assert user_from_context() is None
+
+
+@pytest.mark.asyncio
 async def test_graeae_consult_persistence_failure_fails_closed(
     monkeypatch,
     patch_engine,
