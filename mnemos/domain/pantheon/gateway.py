@@ -24,6 +24,34 @@ from mnemos.domain.pantheon.runtime import RouterRuntime
 logger = logging.getLogger(__name__)
 _IDENTITY_BODY_KEY = "_mnemos_upstream_identity"
 
+# ── Shared pooled HTTP client. Reused across requests so keep-alive
+# connections are recycled instead of paying a fresh TCP+TLS handshake on
+# every call — the main source of added latency when fronting providers.
+_http_client: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """Process-wide pooled httpx client (lazily created, reused)."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(200.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=50,
+                max_connections=200,
+                keepalive_expiry=30.0,
+            ),
+        )
+    return _http_client
+
+
+async def aclose_http_client() -> None:
+    """Close the shared client (call on app shutdown)."""
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
+
 
 class PantheonGatewayError(Exception):
     def __init__(self, status_code: int, message: str):
@@ -147,13 +175,14 @@ def set_runtime(runtime: RouterRuntime | None) -> None:
 async def _forward_chat_once(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
     """One provider attempt: POST to the resolved provider, raise on >= 400."""
     cfg = _provider_config(decision)
-    async with httpx.AsyncClient(timeout=cfg.get("timeout", 200)) as client:
-        payload = _chat_payload(decision, body, stream=False)
-        response = await client.post(
-            str(cfg["url"]),
-            json=payload,
-            headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
-        )
+    client = get_http_client()
+    payload = _chat_payload(decision, body, stream=False)
+    response = await client.post(
+        str(cfg["url"]),
+        json=payload,
+        headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
+        timeout=cfg.get("timeout", 200),
+    )
     if response.status_code >= 400:
         raise PantheonGatewayError(response.status_code, response.text[:500])
     data = response.json()
@@ -201,35 +230,34 @@ async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) 
             yield event
         return
 
-    client = httpx.AsyncClient(timeout=None)
-    try:
-        payload = _chat_payload(decision, body, stream=True)
-        async with client.stream(
-            "POST",
-            str(cfg["url"]),
-            json=payload,
-            headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
-        ) as response:
-            if response.status_code >= 400:
-                body_bytes = await response.aread()
-                raise PantheonGatewayError(response.status_code, body_bytes[:500].decode("utf-8", "replace"))
-            async for chunk in response.aiter_bytes():
-                yield chunk
-    finally:
-        await client.aclose()
+    client = get_http_client()
+    payload = _chat_payload(decision, body, stream=True)
+    async with client.stream(
+        "POST",
+        str(cfg["url"]),
+        json=payload,
+        headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
+        timeout=None,
+    ) as response:
+        if response.status_code >= 400:
+            body_bytes = await response.aread()
+            raise PantheonGatewayError(response.status_code, body_bytes[:500].decode("utf-8", "replace"))
+        async for chunk in response.aiter_bytes():
+            yield chunk
 
 
 async def forward_embeddings(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
     if decision.route_type == "consensus":
         raise PantheonGatewayError(400, "consensus aliases are not valid for embeddings")
     cfg = _provider_config(decision)
-    async with httpx.AsyncClient(timeout=cfg.get("timeout", 200)) as client:
-        payload = _chat_payload(decision, body, stream=None)
-        response = await client.post(
-            _embeddings_url(cfg),
-            json=payload,
-            headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
-        )
+    client = get_http_client()
+    payload = _chat_payload(decision, body, stream=None)
+    response = await client.post(
+        _embeddings_url(cfg),
+        json=payload,
+        headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
+        timeout=cfg.get("timeout", 200),
+    )
     if response.status_code >= 400:
         raise PantheonGatewayError(response.status_code, response.text[:500])
     data = response.json()
