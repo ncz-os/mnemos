@@ -97,7 +97,9 @@ def user_from_context() -> UserContext | None:
     user_id = _MCP_BACKEND_USER_ID.get()
     role = _MCP_BACKEND_ROLE.get()
     namespace = _MCP_BACKEND_NAMESPACE.get()
-    if not all((api_key, user_id, role, namespace)):
+    if not all((user_id, role, namespace)):
+        return None
+    if not api_key and get_settings().auth.enabled:
         return None
     return UserContext(
         user_id=user_id,
