@@ -488,7 +488,17 @@ class GraeaeEngine:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=200)
+            # Pool sized for fan-out consults (mode=all queries ~8 muses
+            # concurrently); default httpx keepalive=20 would cap reuse and
+            # force re-handshakes under fan-out.
+            self._client = httpx.AsyncClient(
+                timeout=200,
+                limits=httpx.Limits(
+                    max_keepalive_connections=50,
+                    max_connections=200,
+                    keepalive_expiry=30.0,
+                ),
+            )
         return self._client
 
     async def close(self) -> None:
