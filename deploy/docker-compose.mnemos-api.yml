@@ -1,0 +1,23 @@
+# MNEMOS API — declarative replacement for the orphan `docker run`.
+# Image rebuilt from mnemos master (Dockerfile.oracle). Secrets live in
+# /etc/mnemos/mnemos-api.env (root 600), NOT in this file.
+services:
+  mnemos-api:
+    image: mnemos-os:latest
+    container_name: mnemos-api
+    network_mode: host          # Oracle/NATS on 127.0.0.1, embed on .61:8090
+    restart: unless-stopped
+    env_file:
+      - /etc/mnemos/mnemos-api.env
+    volumes:
+      - mnemos-api-data:/data
+      - /etc/mnemos/api_keys.json:/root/.config/mnemos/api_keys.json
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:5002/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # command inherited from image CMD: uvicorn mnemos.api.main:app --host 0.0.0.0 --port 5002
+volumes:
+  mnemos-api-data:
+    external: true
