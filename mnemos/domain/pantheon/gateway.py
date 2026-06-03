@@ -175,6 +175,13 @@ def set_runtime(runtime: RouterRuntime | None) -> None:
     _RUNTIME = runtime
 
 
+def _is_openai_api(decision: RouteDecision) -> bool:
+    try:
+        return _provider_config(decision).get("api", "openai") == "openai"
+    except Exception:
+        return False
+
+
 async def _forward_chat_once(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
     """One provider attempt: POST to the resolved provider, raise on >= 400."""
     cfg = _provider_config(decision)
@@ -224,7 +231,10 @@ async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any])
     if get_settings().pantheon.cross_provider_fallback and decision.route_type == "single":
         from mnemos.domain.pantheon import catalog, router
 
-        chain = router.build_fallback_chain(decision, await catalog.list_models())
+        built = router.build_fallback_chain(decision, await catalog.list_models())
+        # only providers served by this openai-compatible path can run in the
+        # chain; drop graeae-only providers (anthropic/gemini) — keep primary.
+        chain = [d for d in built if _is_openai_api(d)] or [decision]
     try:
         result = await runtime.route(
             chain,
