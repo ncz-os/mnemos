@@ -12,9 +12,18 @@ import logging
 import re
 from typing import Any
 
+from fastapi import HTTPException
+
+from mnemos.api.persistence_helpers import require_consultations_backend
+from mnemos.api.routes.consultations import (
+    _GENESIS_HASH,
+    _extract_memory_ids,
+    _require_non_empty_consultation_result,
+    _to_graeae_provider,
+)
 from mnemos.core.auth_context import UserContext
 
-from ._runtime import _safe_path_segment, _tool
+from ._runtime import _mcp_user_required, _safe_path_segment, _tool
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +70,16 @@ async def tool_graeae_consult(
         dict with synthesis (consensus_response), per_muse outputs,
         winning_muse, consensus_score, cost, and latency_ms.
     """
-    del user  # GRAEAE engine consults are user-agnostic at this layer
     _safe_path_segment(category, label="category")
 
     from mnemos.domain.graeae.engine import get_graeae_engine
 
+    try:
+        user = _mcp_user_required(user)
+    except PermissionError as e:
+        return {"success": False, "error": str(e)}
+
+    backend = require_consultations_backend()
     engine = get_graeae_engine()
 
     # Map `category` → engine `task_type` (one-to-one for MCP callers)
@@ -76,18 +90,19 @@ async def tool_graeae_consult(
     # An empty list is an explicit "query no providers" — error it.
     selection: dict[str, str | None] | None = None
     if muses is not None:
-        # Accept either GRAEAE engine key (e.g. "claude") or registry
-        # name (e.g. "anthropic") and normalize to the engine key.
+        muses = _validate_muses(muses)
+        normalised = [_to_graeae_provider(m) for m in muses]
         unknown: list[str] = []
+        seen: set[str] = set()
         selection = {}
-        for m in muses:
+        for m in normalised:
             if m in engine.providers:
-                selection[m] = None
+                if m not in seen:
+                    selection[m] = None
+                    seen.add(m)
             else:
                 unknown.append(m)
         if unknown:
-            # Mirror the consultations route's fail-loudly semantics:
-            # don't silently drop unknown providers.
             return {
                 "success": False,
                 "error": f"unknown provider(s): {unknown}",
@@ -107,11 +122,55 @@ async def tool_graeae_consult(
             selection=selection,
             mode=mode,
         )
+        result = _require_non_empty_consultation_result(result, mode)
     except ValueError as e:
         return {"success": False, "error": str(e)}
+    except HTTPException as e:
+        return {"success": False, "error": str(e.detail)}
     except Exception as e:
-        logger.error(f"[MCP] graeae_consult engine failed: {e}", exc_info=True)
-        return {"success": False, "error": f"Consultation engine error: {e}"}
+        logger.exception("[MCP] graeae_consult engine failed")
+        return {
+            "success": False,
+            "error": "Consultation engine error",
+            "error_type": type(e).__name__,
+        }
+
+    consultation_id: str | None = None
+    if result.get("all_responses"):
+        memory_ids = _extract_memory_ids(result)
+        consensus_response = result.get("consensus_response", "") or ""
+        consensus_score = float(result.get("consensus_score", 0.0) or 0.0)
+        winning_muse = result.get("winning_muse")
+        engine_cost = float(result.get("cost", 0.0) or 0.0)
+        engine_latency_ms = int(result.get("latency_ms", 0) or 0)
+        try:
+            async with backend.transactional() as tx:
+                consultation_id = str(
+                    await backend.consultations.create_consultation_with_audit(
+                        tx,
+                        prompt=prompt,
+                        task_type=task_type,
+                        consensus_response=consensus_response,
+                        consensus_score=consensus_score,
+                        winning_muse=winning_muse,
+                        cost=engine_cost,
+                        latency_ms=engine_latency_ms,
+                        mode=mode,
+                        owner_id=user.user_id,
+                        namespace=user.namespace,
+                        memory_ids=memory_ids,
+                        genesis_hash=_GENESIS_HASH,
+                    )
+                )
+        except HTTPException as e:
+            return {"success": False, "error": str(e.detail)}
+        except Exception as e:
+            logger.exception("[MCP] graeae_consult persistence failed")
+            return {
+                "success": False,
+                "error": "Consultation persistence failed; audit trail is required.",
+                "error_type": type(e).__name__,
+            }
 
     # Build a caller-friendly response shape:
     #   synthesis   — the winning consensus response text (if any)
@@ -131,6 +190,7 @@ async def tool_graeae_consult(
 
     return {
         "success": True,
+        "consultation_id": consultation_id,
         "synthesis": result.get("consensus_response", ""),
         "per_muse": per_muse,
         "winning_muse": result.get("winning_muse"),
