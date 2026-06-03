@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from mnemos.core.config import get_settings
 from mnemos.domain.graeae.api_keys import get_key
 from mnemos.domain.graeae.engine import get_graeae_engine
 from mnemos.domain.openai_compat.content import _content_text, _flatten_messages_for_prompt
@@ -219,9 +220,14 @@ async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any])
     # single-element chain keeps routing semantics unchanged; a non-retryable
     # error (e.g. 400) still surfaces as the original PantheonGatewayError.
     runtime = get_runtime()
+    chain = [decision]
+    if get_settings().pantheon.cross_provider_fallback and decision.route_type == "single":
+        from mnemos.domain.pantheon import catalog, router
+
+        chain = router.build_fallback_chain(decision, await catalog.list_models())
     try:
         result = await runtime.route(
-            [decision],
+            chain,
             lambda d: _forward_chat_once(d, body),
             classify=classify,
             tenant=_tenant_of(body),
