@@ -24,6 +24,12 @@ async def _close_graeae_engine() -> None:
     await get_graeae_engine().close()
 
 
+async def _close_pantheon_http_client() -> None:
+    from mnemos.domain.pantheon.gateway import aclose_http_client
+
+    await aclose_http_client()
+
+
 async def _run_distillation_worker(_pool: Any) -> None:
     """Supervise the distillation worker loop with bounded restart backoff."""
     try:
@@ -183,6 +189,7 @@ def register_lifespan_hooks() -> None:
     lifecycle.register_provider_manifest_reloader(_reload_provider_manifest)
     lifecycle.register_lifespan_cleanup_hook("mcp rest client", _close_rest_client)
     lifecycle.register_lifespan_cleanup_hook("graeae engine", _close_graeae_engine)
+    lifecycle.register_lifespan_cleanup_hook("pantheon http client", _close_pantheon_http_client)
     lifecycle.register_lifespan_cleanup_hook("mcp audit drain", _drain_audit_tasks)
     lifecycle.register_lifespan_worker(
         "distillation_worker",
