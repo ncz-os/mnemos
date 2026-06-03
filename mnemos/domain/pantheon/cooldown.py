@@ -137,6 +137,12 @@ class InMemoryCooldownStore(CooldownStore):
 
     def incr(self, tenant: str, deployment: str, minute: int, *, success: bool) -> None:
         with self._lock:
+            # Prune stale minute buckets (only the current minute is ever read;
+            # keep the previous one for the minute-boundary race) so memory stays
+            # bounded in a long-running process.
+            cutoff = minute - 1
+            for key in [k for k in self._counts if k[2] < cutoff]:
+                del self._counts[key]
             bucket = self._counts.setdefault((tenant, deployment, minute), [0, 0])
             bucket[0 if success else 1] += 1
 
