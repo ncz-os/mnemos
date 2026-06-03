@@ -23,7 +23,14 @@ from mnemos.api.routes.consultations import (
 )
 from mnemos.core.auth_context import UserContext
 
-from ._runtime import _mcp_user_or_system, _mcp_user_required, _safe_path_segment, _tool
+from ._runtime import (
+    current_mcp_backend_api_key,
+    reset_mcp_backend_context,
+    set_mcp_backend_context,
+    _mcp_user_or_system,
+    _safe_path_segment,
+    _tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,132 +86,145 @@ async def tool_graeae_consult(
     except PermissionError as e:
         return {"success": False, "error": str(e)}
 
-    backend = require_consultations_backend()
-    engine = get_graeae_engine()
-
-    # Map `category` → engine `task_type` (one-to-one for MCP callers)
-    task_type = category or "general"
-
-    # Build a selection dict when muses are explicitly provided.
-    # When muses is None, selection=None → engine uses auto lineup.
-    # An empty list is an explicit "query no providers" — error it.
-    selection: dict[str, str | None] | None = None
-    if muses is not None:
-        muses = _validate_muses(muses)
-        normalised = [_to_graeae_provider(m) for m in muses]
-        unknown: list[str] = []
-        seen: set[str] = set()
-        selection = {}
-        for m in normalised:
-            if m in engine.providers:
-                if m not in seen:
-                    selection[m] = None
-                    seen.add(m)
-            else:
-                unknown.append(m)
-        if unknown:
-            return {
-                "success": False,
-                "error": f"unknown provider(s): {unknown}",
-                "available": sorted(engine.providers.keys()),
-            }
-        if not selection:
-            return {
-                "success": False,
-                "error": "no valid providers in muses list",
-                "available": sorted(engine.providers.keys()),
-            }
+    context_tokens = None
+    if not user.authenticated:
+        context_tokens = set_mcp_backend_context(
+            api_key=current_mcp_backend_api_key(),
+            user_id=user.user_id,
+            role=user.role,
+            namespace=user.namespace,
+        )
 
     try:
-        result = await engine.consult(
-            prompt=prompt,
-            task_type=task_type,
-            selection=selection,
-            mode=mode,
-        )
-        result = _require_non_empty_consultation_result(result, mode)
-    except ValueError as e:
-        return {"success": False, "error": str(e)}
-    except HTTPException as e:
-        return {"success": False, "error": str(e.detail)}
-    except Exception as e:
-        logger.exception("[MCP] graeae_consult engine failed")
-        return {
-            "success": False,
-            "error": "Consultation engine error",
-            "error_type": type(e).__name__,
-        }
+        backend = require_consultations_backend()
+        engine = get_graeae_engine()
 
-    consultation_id: str | None = None
-    if result.get("all_responses"):
-        memory_ids = _extract_memory_ids(result)
-        consensus_response = result.get("consensus_response", "") or ""
-        consensus_score = float(result.get("consensus_score", 0.0) or 0.0)
-        winning_muse = result.get("winning_muse")
-        engine_cost = float(result.get("cost", 0.0) or 0.0)
-        engine_latency_ms = int(result.get("latency_ms", 0) or 0)
+        # Map `category` → engine `task_type` (one-to-one for MCP callers)
+        task_type = category or "general"
+
+        # Build a selection dict when muses are explicitly provided.
+        # When muses is None, selection=None → engine uses auto lineup.
+        # An empty list is an explicit "query no providers" — error it.
+        selection: dict[str, str | None] | None = None
+        if muses is not None:
+            muses = _validate_muses(muses)
+            normalised = [_to_graeae_provider(m) for m in muses]
+            unknown: list[str] = []
+            seen: set[str] = set()
+            selection = {}
+            for m in normalised:
+                if m in engine.providers:
+                    if m not in seen:
+                        selection[m] = None
+                        seen.add(m)
+                else:
+                    unknown.append(m)
+            if unknown:
+                return {
+                    "success": False,
+                    "error": f"unknown provider(s): {unknown}",
+                    "available": sorted(engine.providers.keys()),
+                }
+            if not selection:
+                return {
+                    "success": False,
+                    "error": "no valid providers in muses list",
+                    "available": sorted(engine.providers.keys()),
+                }
+
         try:
-            async with backend.transactional() as tx:
-                consultation_id = str(
-                    await backend.consultations.create_consultation_with_audit(
-                        tx,
-                        prompt=prompt,
-                        task_type=task_type,
-                        consensus_response=consensus_response,
-                        consensus_score=consensus_score,
-                        winning_muse=winning_muse,
-                        cost=engine_cost,
-                        latency_ms=engine_latency_ms,
-                        mode=mode,
-                        owner_id=user.user_id,
-                        namespace=user.namespace,
-                        memory_ids=memory_ids,
-                        genesis_hash=_GENESIS_HASH,
-                    )
-                )
+            result = await engine.consult(
+                prompt=prompt,
+                task_type=task_type,
+                selection=selection,
+                mode=mode,
+            )
+            result = _require_non_empty_consultation_result(result, mode)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
         except HTTPException as e:
             return {"success": False, "error": str(e.detail)}
         except Exception as e:
-            logger.exception("[MCP] graeae_consult persistence failed")
+            logger.exception("[MCP] graeae_consult engine failed")
             return {
                 "success": False,
-                "error": "Consultation persistence failed; audit trail is required.",
+                "error": "Consultation engine error",
                 "error_type": type(e).__name__,
             }
 
-    # Build a caller-friendly response shape:
-    #   synthesis   — the winning consensus response text (if any)
-    #   per_muse    — each provider's result keyed by provider name
-    #   metadata    — winning_muse, consensus_score, cost, latency_ms
-    all_responses = result.get("all_responses", {})
-    per_muse: dict[str, dict[str, Any]] = {}
-    for name, resp in all_responses.items():
-        per_muse[name] = {
-            "status": resp.get("status", "unknown"),
-            "response_text": resp.get("response_text", ""),
-            "model_id": resp.get("model_id", ""),
-            "final_score": resp.get("final_score", 0.0),
-        }
-        if resp.get("error"):
-            per_muse[name]["error"] = resp["error"]
+        consultation_id: str | None = None
+        if result.get("all_responses"):
+            memory_ids = _extract_memory_ids(result)
+            consensus_response = result.get("consensus_response", "") or ""
+            consensus_score = float(result.get("consensus_score", 0.0) or 0.0)
+            winning_muse = result.get("winning_muse")
+            engine_cost = float(result.get("cost", 0.0) or 0.0)
+            engine_latency_ms = int(result.get("latency_ms", 0) or 0)
+            try:
+                async with backend.transactional() as tx:
+                    consultation_id = str(
+                        await backend.consultations.create_consultation_with_audit(
+                            tx,
+                            prompt=prompt,
+                            task_type=task_type,
+                            consensus_response=consensus_response,
+                            consensus_score=consensus_score,
+                            winning_muse=winning_muse,
+                            cost=engine_cost,
+                            latency_ms=engine_latency_ms,
+                            mode=mode,
+                            owner_id=user.user_id,
+                            namespace=user.namespace,
+                            memory_ids=memory_ids,
+                            genesis_hash=_GENESIS_HASH,
+                        )
+                    )
+            except HTTPException as e:
+                return {"success": False, "error": str(e.detail)}
+            except Exception as e:
+                logger.exception("[MCP] graeae_consult persistence failed")
+                return {
+                    "success": False,
+                    "error": "Consultation persistence failed; audit trail is required.",
+                    "error_type": type(e).__name__,
+                }
 
-    return {
-        "success": True,
-        "consultation_id": consultation_id,
-        "synthesis": result.get("consensus_response", ""),
-        "per_muse": per_muse,
-        "winning_muse": result.get("winning_muse"),
-        "consensus_score": result.get("consensus_score", 0.0),
-        "cost": result.get("cost", 0.0),
-        "latency_ms": result.get("latency_ms", 0),
-        "mode": mode,
-        "cache_hit": bool(result.get("cache_hit")),
-        "round_1": result.get("round_1"),
-        "round_2": result.get("round_2"),
-        "quorum_reached": result.get("quorum_reached"),
-        "quorum_threshold": result.get("quorum_threshold"),
-        "similarity_pairs": result.get("similarity_pairs"),
-    }
+        # Build a caller-friendly response shape:
+        #   synthesis   — the winning consensus response text (if any)
+        #   per_muse    — each provider's result keyed by provider name
+        #   metadata    — winning_muse, consensus_score, cost, latency_ms
+        all_responses = result.get("all_responses", {})
+        per_muse: dict[str, dict[str, Any]] = {}
+        for name, resp in all_responses.items():
+            per_muse[name] = {
+                "status": resp.get("status", "unknown"),
+                "response_text": resp.get("response_text", ""),
+                "model_id": resp.get("model_id", ""),
+                "final_score": resp.get("final_score", 0.0),
+            }
+            if resp.get("error"):
+                per_muse[name]["error"] = resp["error"]
+
+        return {
+            "success": True,
+            "consultation_id": consultation_id,
+            "synthesis": result.get("consensus_response", ""),
+            "per_muse": per_muse,
+            "winning_muse": result.get("winning_muse"),
+            "consensus_score": result.get("consensus_score", 0.0),
+            "cost": result.get("cost", 0.0),
+            "latency_ms": result.get("latency_ms", 0),
+            "mode": mode,
+            "cache_hit": bool(result.get("cache_hit")),
+            "round_1": result.get("round_1"),
+            "round_2": result.get("round_2"),
+            "quorum_reached": result.get("quorum_reached"),
+            "quorum_threshold": result.get("quorum_threshold"),
+            "similarity_pairs": result.get("similarity_pairs"),
+        }
+    finally:
+        if context_tokens is not None:
+            reset_mcp_backend_context(context_tokens)
 
 
 TOOLS: dict[str, dict[str, Any]] = {
