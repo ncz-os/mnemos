@@ -16,7 +16,7 @@ import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
@@ -917,10 +917,23 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         source_model: str | None = None,
         source_agent: str | None = None,
         include_archived: bool = False,
-        boost_recency: bool = False,  # noqa: ARG002 - Postgres-only option.
-        recency_weight: float = 0.15,  # noqa: ARG002 - Postgres-only option.
+        boost_recency: bool = False,
+        recency_weight: float = 0.15,
     ) -> list[Row]:
         self._require_dim(embedding, "semantic_search")
+
+        def _updated_date(value: Any, today: date) -> date:
+            if isinstance(value, datetime):
+                return value.date()
+            if isinstance(value, date):
+                return value
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+                except ValueError:
+                    return today
+            return today
+
         embedding_json = json.dumps([float(value) for value in embedding])
         conditions: list[str] = ["me.embedding IS NOT NULL"]
         if not include_archived:
@@ -939,12 +952,13 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         vis_clause = _render_sqlite_visibility(visibility, params, table_alias="m")
         if vis_clause:
             conditions.append(vis_clause)
-        params.append(limit)
+        candidate_limit = max(limit, min(limit * 4, 200)) if boost_recency else limit
+        params.append(candidate_limit)
         # SELECT ``_MEMORY_COLS`` (with the ``m.`` alias) so the row
         # shape matches what the handler's ``row_to_memory`` consumes —
         # parity with PostgresMemoryRepository.semantic_search.
         select_cols = _sqlite_memory_cols("m")
-        return await _fetch_all(
+        rows = await _fetch_all(
             self._conn(tx),
             f"SELECT {select_cols}, "
             "mnemos_cosine_similarity(me.embedding, ?) AS similarity "
@@ -954,6 +968,23 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             "ORDER BY similarity DESC, m.updated DESC LIMIT ?",
             params,
         )
+        if boost_recency and rows:
+            today = datetime.now(timezone.utc).date()
+
+            def _recency_score(row: Row) -> float:
+                try:
+                    similarity = float(row.get("similarity"))
+                except (TypeError, ValueError):
+                    return -math.inf
+                if not math.isfinite(similarity):
+                    return -math.inf
+                updated_date = _updated_date(row.get("updated"), today)
+                age_days = max(0, (today - updated_date).days)
+                return similarity + recency_weight * (1.0 / (1.0 + age_days))
+
+            rows.sort(key=_recency_score, reverse=True)
+            rows = rows[:limit]
+        return rows
 
     async def fts_search(
         self,
