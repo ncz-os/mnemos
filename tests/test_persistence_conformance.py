@@ -89,11 +89,8 @@ KNOWN_UNDECLARED: set[tuple[str, str]] = {
 # as the underlying impl is fixed.
 #   key: "<BackendRepoQualname>.<method>"  value: tracking note
 KNOWN_SIGNATURE_DRIFT: dict[str, str] = {
-    # P4 (DB2 deep pass): Db2SessionsRepository.create_session implements
-    # OAuth/browser-session semantics (session_id/expires_at/metadata) under
-    # the chat-SessionsRepository ABC (user_id/namespace/model/initial_context).
-    # Needs reconciliation + codex review; DB2 is not live-verifiable on STUDIO.
-    "Db2SessionsRepository.create_session": "P4: DB2 chat-vs-oauth create_session conflation",
+    # Keep empty unless a concrete repo signature drift is intentionally
+    # tolerated while a documented repair is pending.
 }
 
 # ── Backend construction (dummy pool; no connection opened) ──────────────────
