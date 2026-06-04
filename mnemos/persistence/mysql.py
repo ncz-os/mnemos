@@ -45,6 +45,7 @@ import hashlib
 import json
 import logging
 import math
+import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
@@ -440,6 +441,127 @@ CREATE TABLE IF NOT EXISTS state (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
+_DDL_MODEL_REGISTRY = """\
+CREATE TABLE IF NOT EXISTS model_registry (
+    id                    VARCHAR(64)  NOT NULL DEFAULT (UUID()),
+    provider              VARCHAR(50)  NOT NULL,
+    model_id              VARCHAR(512) NOT NULL,
+    display_name          TEXT,
+    family                TEXT,
+    context_window        INT,
+    max_output_tokens     INT,
+    capabilities          JSON         NOT NULL DEFAULT (JSON_ARRAY()),
+    input_cost_per_mtok   DECIMAL(12,6) DEFAULT 0,
+    output_cost_per_mtok  DECIMAL(12,6) DEFAULT 0,
+    cache_read_per_mtok   DECIMAL(12,6) DEFAULT 0,
+    cache_write_per_mtok  DECIMAL(12,6) DEFAULT 0,
+    available             BOOLEAN      NOT NULL DEFAULT TRUE,
+    deprecated            BOOLEAN      NOT NULL DEFAULT FALSE,
+    arena_score           DECIMAL(8,2),
+    arena_rank            INT,
+    graeae_weight         DECIMAL(5,4),
+    first_seen            TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    last_seen             TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    last_synced           TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    raw                   JSON         NOT NULL DEFAULT (JSON_OBJECT()),
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_model_registry_provider_model (provider, model_id),
+    INDEX idx_model_registry_provider (provider),
+    INDEX idx_model_registry_available (available),
+    INDEX idx_model_registry_arena_score (arena_score),
+    INDEX idx_model_registry_graeae_weight (graeae_weight),
+    INDEX idx_model_registry_family (family(191)),
+    INDEX idx_model_registry_last_synced (last_synced)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_MODEL_REGISTRY_SYNC_LOG = """\
+CREATE TABLE IF NOT EXISTS model_registry_sync_log (
+    id                VARCHAR(64)  NOT NULL DEFAULT (UUID()),
+    provider          VARCHAR(50)  NOT NULL,
+    synced_at         TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    models_found      INT          NOT NULL DEFAULT 0,
+    models_added      INT          NOT NULL DEFAULT 0,
+    models_updated    INT          NOT NULL DEFAULT 0,
+    models_deprecated INT          NOT NULL DEFAULT 0,
+    error             TEXT,
+    duration_ms       INT,
+    PRIMARY KEY (id),
+    INDEX idx_model_registry_sync_log_provider (provider),
+    INDEX idx_model_registry_sync_log_synced_at (synced_at)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_GRAEAE_CONSULTATIONS = """\
+CREATE TABLE IF NOT EXISTS graeae_consultations (
+    id                 VARCHAR(64)  NOT NULL,
+    prompt             LONGTEXT     NOT NULL,
+    task_type          VARCHAR(100) NOT NULL,
+    consensus_response LONGTEXT,
+    consensus_score    DOUBLE,
+    winning_muse       VARCHAR(100),
+    cost               DOUBLE       DEFAULT 0,
+    latency_ms         INT          DEFAULT 0,
+    mode               VARCHAR(50)  DEFAULT 'single',
+    owner_id           VARCHAR(256) NOT NULL DEFAULT 'default',
+    namespace          VARCHAR(256) NOT NULL DEFAULT 'default',
+    created            TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at         TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    INDEX idx_graeae_consult_task_type (task_type),
+    INDEX idx_graeae_consult_created (created),
+    INDEX idx_graeae_consult_mode (mode),
+    INDEX idx_graeae_consult_winning_muse (winning_muse),
+    INDEX idx_graeae_consultations_owner (owner_id),
+    INDEX idx_graeae_consultations_owner_namespace (owner_id, namespace),
+    INDEX idx_graeae_consultations_deleted (deleted_at)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_GRAEAE_AUDIT_LOG = """\
+CREATE TABLE IF NOT EXISTS graeae_audit_log (
+    id              VARCHAR(64)  NOT NULL DEFAULT (UUID()),
+    sequence_num    BIGINT       NOT NULL AUTO_INCREMENT,
+    consultation_id VARCHAR(64),
+    prompt          LONGTEXT,
+    prompt_hash     VARCHAR(64),
+    provider        VARCHAR(50),
+    model           VARCHAR(100),
+    response_text   LONGTEXT,
+    response_hash   VARCHAR(64),
+    chain_hash      VARCHAR(64),
+    prev_id         VARCHAR(64),
+    prev_chain_hash VARCHAR(64),
+    task_type       VARCHAR(100),
+    quality_score   DOUBLE,
+    latency_ms      INT,
+    cost_usd        DOUBLE,
+    created_at      TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at      TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_graeae_audit_sequence (sequence_num),
+    INDEX idx_audit_sequence (sequence_num),
+    INDEX idx_audit_created (created_at),
+    INDEX idx_graeae_audit_log_consultation (consultation_id),
+    INDEX idx_graeae_audit_log_created_at (created_at),
+    INDEX idx_graeae_audit_log_chain_hash (chain_hash),
+    INDEX idx_graeae_audit_log_deleted (deleted_at)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_CONSULTATION_MEMORY_REFS = """\
+CREATE TABLE IF NOT EXISTS consultation_memory_refs (
+    consultation_id VARCHAR(64) NOT NULL,
+    memory_id       VARCHAR(64) NOT NULL,
+    relevance_score DOUBLE,
+    injected_at     TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (consultation_id, memory_id),
+    INDEX idx_consultation_memory_refs_consultation (consultation_id),
+    INDEX idx_consultation_memory_refs_memory (memory_id),
+    INDEX idx_consultation_memory_refs_injected_at (injected_at)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
 _DDL_MEMORY_VERSIONS = """\
 CREATE TABLE IF NOT EXISTS memory_versions (
     id                VARCHAR(64)   NOT NULL,
@@ -506,6 +628,11 @@ _INIT_DDLS = [
     _DDL_COMPRESSED_VARIANTS,
     _DDL_COMPRESSION_QUEUE,
     _DDL_STATE,
+    _DDL_MODEL_REGISTRY,
+    _DDL_MODEL_REGISTRY_SYNC_LOG,
+    _DDL_GRAEAE_CONSULTATIONS,
+    _DDL_GRAEAE_AUDIT_LOG,
+    _DDL_CONSULTATION_MEMORY_REFS,
 ]
 
 
@@ -2389,16 +2516,436 @@ class MysqlWebhookRepository(WebhookRepository):
 
 
 class MysqlConsultationAuditRepository(ConsultationAuditRepository):
-    fetch_recommended_model = _stub_method("fetch_recommended_model")
-    fetch_model_recommendation = _stub_method("fetch_model_recommendation")
-    lookup_provider_for_model = _stub_method("lookup_provider_for_model")
-    fetch_available_models = _stub_method("fetch_available_models")
-    fetch_model_provider = _stub_method("fetch_model_provider")
-    insert_consultation_audit = _stub_method("insert_consultation_audit")
-    fetch_consultation_audits = _stub_method("fetch_consultation_audits")
-    fetch_consultation_audit = _stub_method("fetch_consultation_audit")
-    fetch_consultation_by_id = _stub_method("fetch_consultation_by_id")
-    fetch_consultations = _stub_method("fetch_consultations")
+    async def fetch_recommended_model(
+        self,
+        tx: Transaction,
+        task_type: str,
+        cost_budget: float,
+        quality_floor: float,
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        from mnemos.core.recommendation import choose_recommended_model
+
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT provider, model_id, display_name, input_cost_per_mtok, output_cost_per_mtok,
+                       capabilities, COALESCE(graeae_weight, 0) AS graeae_weight, context_window
+                  FROM model_registry
+                 WHERE available = TRUE
+                   AND deprecated = FALSE
+                """
+            )
+            rows = await _fetch_all_dicts(cursor)
+        return choose_recommended_model(rows, task_type, cost_budget, quality_floor)
+
+    async def fetch_model_recommendation(
+        self,
+        tx: Transaction,
+        task_type: str,
+        cost_budget: float = 10.0,
+        quality_floor: float = 0.85,
+    ) -> dict[str, Any] | None:
+        model, _required = await self.fetch_recommended_model(tx, task_type, cost_budget, quality_floor)
+        return model
+
+    async def lookup_provider_for_model(self, tx: Transaction, model: str) -> str | None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT provider
+                  FROM model_registry
+                 WHERE model_id = %s
+                   AND available = TRUE
+                   AND deprecated = FALSE
+                """,
+                (model,),
+            )
+            row = await _fetchone_dict(cursor)
+            if row is not None:
+                return row["provider"]
+
+            if "/" not in model:
+                return None
+
+            head, tail = model.split("/", 1)
+            await cursor.execute(
+                """
+                SELECT provider
+                  FROM model_registry
+                 WHERE provider = %s
+                   AND model_id = %s
+                   AND available = TRUE
+                   AND deprecated = FALSE
+                """,
+                (head, tail),
+            )
+            row = await _fetchone_dict(cursor)
+            return row["provider"] if row is not None else None
+
+    async def fetch_available_models(self, tx: Transaction) -> list[Row]:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT provider, model_id, display_name
+                  FROM model_registry
+                 WHERE available = TRUE
+                   AND deprecated = FALSE
+                 ORDER BY graeae_weight IS NULL, graeae_weight DESC, model_id ASC
+                """
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT provider
+                  FROM model_registry
+                 WHERE model_id = %s
+                   AND available = TRUE
+                   AND deprecated = FALSE
+                 LIMIT 1
+                """,
+                (model_id,),
+            )
+            row = await _fetchone_dict(cursor)
+            return row["provider"] if row is not None else None
+
+    async def insert_consultation_audit(self, tx: Transaction, **kwargs: Any) -> str:
+        audit_id = str(kwargs.get("id") or uuid.uuid4().hex)
+        prompt = kwargs.get("prompt") or ""
+        response_text = kwargs.get("response_text") or kwargs.get("response") or ""
+        prompt_hash = kwargs.get("prompt_hash") or hashlib.sha256(prompt.encode()).hexdigest()
+        response_hash = kwargs.get("response_hash") or hashlib.sha256(response_text.encode()).hexdigest()
+        prev_chain_hash = kwargs.get("prev_chain_hash")
+        chain_hash = kwargs.get("chain_hash")
+        if chain_hash is None:
+            chain_basis = (prev_chain_hash or kwargs.get("genesis_hash") or "") + prompt_hash + response_hash
+            chain_hash = hashlib.sha256(chain_basis.encode()).hexdigest()
+
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO graeae_audit_log (
+                    id, consultation_id, prompt, prompt_hash, provider, model, response_text,
+                    response_hash, chain_hash, prev_id, prev_chain_hash, task_type, quality_score,
+                    latency_ms, cost_usd
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s
+                )
+                """,
+                (
+                    audit_id,
+                    kwargs.get("consultation_id"),
+                    prompt,
+                    prompt_hash,
+                    kwargs.get("provider"),
+                    kwargs.get("model"),
+                    response_text,
+                    response_hash,
+                    chain_hash,
+                    kwargs.get("prev_id"),
+                    prev_chain_hash,
+                    kwargs.get("task_type") or "reasoning",
+                    kwargs.get("quality_score"),
+                    kwargs.get("latency_ms"),
+                    kwargs.get("cost_usd"),
+                ),
+            )
+        return audit_id
+
+    async def fetch_consultation_audits(
+        self,
+        tx: Transaction,
+        *,
+        consultation_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Row]:
+        sql = """
+            SELECT id, sequence_num, consultation_id, prompt, prompt_hash, provider, model,
+                   response_text, response_hash, chain_hash, prev_id, prev_chain_hash,
+                   task_type, quality_score, latency_ms, cost_usd, created_at
+              FROM graeae_audit_log
+             WHERE deleted_at IS NULL
+        """
+        params: list[Any] = []
+        if consultation_id is not None:
+            sql += " AND consultation_id = %s"
+            params.append(consultation_id)
+        sql += " ORDER BY sequence_num DESC LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(sql, params)
+            return await _fetch_all_dicts(cursor)
+
+    async def fetch_consultation_audit(self, tx: Transaction, audit_id: str) -> Row | None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT id, sequence_num, consultation_id, prompt, prompt_hash, provider, model,
+                       response_text, response_hash, chain_hash, prev_id, prev_chain_hash,
+                       task_type, quality_score, latency_ms, cost_usd, created_at
+                  FROM graeae_audit_log
+                 WHERE id = %s
+                   AND deleted_at IS NULL
+                """,
+                (audit_id,),
+            )
+            return await _fetchone_dict(cursor)
+
+    async def fetch_consultation_by_id(self, tx: Transaction, consultation_id: str) -> Row | None:
+        return await self.get_consultation(
+            tx,
+            consultation_id=consultation_id,
+            root=True,
+            user_id="",
+            namespace=None,
+        )
+
+    async def fetch_consultations(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str | None = None,
+        namespace: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Row]:
+        sql = """
+            SELECT id, prompt, task_type, consensus_response, consensus_score,
+                   winning_muse, cost, latency_ms, mode, owner_id, namespace, created
+              FROM graeae_consultations
+             WHERE deleted_at IS NULL
+        """
+        params: list[Any] = []
+        if owner_id is not None:
+            sql += " AND owner_id = %s"
+            params.append(owner_id)
+        if namespace is not None:
+            sql += " AND namespace = %s"
+            params.append(namespace)
+        sql += " ORDER BY created DESC LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(sql, params)
+            return await _fetch_all_dicts(cursor)
+
+    async def create_consultation_with_audit(self, tx: Transaction, **kwargs: Any) -> Any:
+        consultation_id = uuid.uuid4().hex
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO graeae_consultations (
+                    id, prompt, task_type, consensus_response, consensus_score, winning_muse,
+                    cost, latency_ms, mode, owner_id, namespace
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    consultation_id,
+                    kwargs["prompt"],
+                    kwargs["task_type"],
+                    kwargs["consensus_response"][:500],
+                    kwargs["consensus_score"],
+                    kwargs["winning_muse"],
+                    kwargs["cost"],
+                    kwargs["latency_ms"],
+                    kwargs["mode"],
+                    kwargs["owner_id"],
+                    kwargs["namespace"],
+                ),
+            )
+
+            prompt_hash = hashlib.sha256(kwargs["prompt"].encode()).hexdigest()
+            response_hash = hashlib.sha256(kwargs["consensus_response"].encode()).hexdigest()
+            await cursor.execute(
+                "SELECT id, chain_hash FROM graeae_audit_log WHERE deleted_at IS NULL ORDER BY sequence_num DESC LIMIT 1"
+            )
+            prev = await _fetchone_dict(cursor)
+            prev_chain = prev["chain_hash"] if prev else kwargs["genesis_hash"]
+            chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
+            await cursor.execute(
+                """
+                INSERT INTO graeae_audit_log (
+                    id, consultation_id, prompt, prompt_hash, provider, response_text,
+                    response_hash, chain_hash, prev_id, prev_chain_hash, task_type, quality_score
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    consultation_id,
+                    kwargs["prompt"],
+                    prompt_hash,
+                    kwargs["winning_muse"],
+                    kwargs["consensus_response"],
+                    response_hash,
+                    chain_hash,
+                    prev["id"] if prev else None,
+                    prev_chain,
+                    kwargs["task_type"] or "reasoning",
+                    kwargs["consensus_score"],
+                ),
+            )
+            for memory_id in kwargs["memory_ids"]:
+                await cursor.execute(
+                    """
+                    INSERT INTO consultation_memory_refs (consultation_id, memory_id, injected_at)
+                    VALUES (%s, %s, CURRENT_TIMESTAMP(6))
+                    ON DUPLICATE KEY UPDATE consultation_id = consultation_id
+                    """,
+                    (consultation_id, memory_id),
+                )
+        return consultation_id
+
+    async def list_audit_log(
+        self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None, limit: int, offset: int
+    ) -> list[Row]:
+        if root and namespace is None:
+            async with tx.conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT id, sequence_num, consultation_id, prompt_hash, response_hash,
+                           chain_hash, prev_id, task_type, provider, quality_score, created_at
+                      FROM graeae_audit_log
+                     WHERE deleted_at IS NULL
+                     ORDER BY sequence_num DESC
+                     LIMIT %s OFFSET %s
+                    """,
+                    (limit, offset),
+                )
+                return await _fetch_all_dicts(cursor)
+
+        if root:
+            sql = """
+                SELECT al.id, al.sequence_num, al.consultation_id, al.prompt_hash,
+                       al.response_hash, al.chain_hash, al.prev_id, al.task_type,
+                       al.provider, al.quality_score, al.created_at
+                  FROM graeae_audit_log al
+                  JOIN graeae_consultations c ON c.id = al.consultation_id
+                 WHERE c.namespace = %s
+                   AND c.deleted_at IS NULL
+                   AND al.deleted_at IS NULL
+                 ORDER BY al.sequence_num DESC
+                 LIMIT %s OFFSET %s
+            """
+            params = (namespace, limit, offset)
+        else:
+            sql = """
+                WITH visible AS (
+                    SELECT al.id, al.sequence_num AS global_sequence_num, al.consultation_id,
+                           al.prompt_hash, al.response_hash, al.task_type, al.provider,
+                           al.quality_score, al.created_at,
+                           ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num,
+                           LAG(al.id) OVER (ORDER BY al.sequence_num ASC) AS scoped_prev_id
+                      FROM graeae_audit_log al
+                      JOIN graeae_consultations c ON c.id = al.consultation_id
+                     WHERE c.owner_id = %s
+                       AND c.namespace = %s
+                       AND c.deleted_at IS NULL
+                       AND al.deleted_at IS NULL
+                )
+                SELECT id, scoped_sequence_num AS sequence_num, consultation_id, prompt_hash,
+                       response_hash, NULL AS chain_hash, scoped_prev_id AS prev_id,
+                       task_type, provider, quality_score, created_at
+                  FROM visible
+                 ORDER BY global_sequence_num DESC
+                 LIMIT %s OFFSET %s
+            """
+            params = (user_id, namespace, limit, offset)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(sql, params)
+            return await _fetch_all_dicts(cursor)
+
+    async def fetch_audit_chain(self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None) -> list[Row]:
+        if root and namespace is None:
+            async with tx.conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id
+                      FROM graeae_audit_log
+                     WHERE deleted_at IS NULL
+                     ORDER BY sequence_num ASC
+                    """
+                )
+                return await _fetch_all_dicts(cursor)
+        owner_sql = "" if root else "c.owner_id = %s AND "
+        params = (namespace,) if root else (user_id, namespace)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT al.sequence_num, ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+                "al.prompt_hash, al.response_hash, al.chain_hash, al.prev_id, al.prev_chain_hash, "
+                "(SELECT prev.chain_hash FROM graeae_audit_log prev WHERE prev.sequence_num < al.sequence_num "
+                "ORDER BY prev.sequence_num DESC LIMIT 1) AS expected_prev_hash "
+                "FROM graeae_audit_log al JOIN graeae_consultations c ON c.id = al.consultation_id "
+                f"WHERE {owner_sql}c.namespace = %s AND c.deleted_at IS NULL AND al.deleted_at IS NULL "
+                "ORDER BY al.sequence_num ASC",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def get_consultation(
+        self, tx: Transaction, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> Row | None:
+        if root and namespace is None:
+            sql = """
+                SELECT id, prompt, task_type, consensus_response, consensus_score,
+                       winning_muse, cost, latency_ms, mode, created
+                  FROM graeae_consultations
+                 WHERE id = %s
+                   AND deleted_at IS NULL
+            """
+            params = (consultation_id,)
+        elif root:
+            sql = """
+                SELECT id, prompt, task_type, consensus_response, consensus_score,
+                       winning_muse, cost, latency_ms, mode, created
+                  FROM graeae_consultations
+                 WHERE id = %s
+                   AND namespace = %s
+                   AND deleted_at IS NULL
+            """
+            params = (consultation_id, namespace)
+        else:
+            sql = """
+                SELECT id, prompt, task_type, consensus_response, consensus_score,
+                       winning_muse, cost, latency_ms, mode, created
+                  FROM graeae_consultations
+                 WHERE id = %s
+                   AND owner_id = %s
+                   AND namespace = %s
+                   AND deleted_at IS NULL
+            """
+            params = (consultation_id, user_id, namespace)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(sql, params)
+            return await _fetchone_dict(cursor)
+
+    async def get_consultation_artifacts(
+        self, tx: Transaction, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> tuple[Row | None, list[Row]]:
+        consultation = await self.get_consultation(
+            tx,
+            consultation_id=consultation_id,
+            root=root,
+            user_id=user_id,
+            namespace=namespace,
+        )
+        if not consultation:
+            return None, []
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT memory_id, injected_at
+                  FROM consultation_memory_refs
+                 WHERE consultation_id = %s
+                 ORDER BY injected_at
+                """,
+                (consultation_id,),
+            )
+            refs = await _fetch_all_dicts(cursor)
+        return consultation, refs
 
 
 class MysqlFederationRepository(FederationRepository):
