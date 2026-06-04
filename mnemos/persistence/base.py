@@ -1518,6 +1518,7 @@ MYSQL_CAPABILITY_DETAILS: frozenset[DetailedCapabilityName] = frozenset(
         FTS_CAPABILITY,
         KG_CAPABILITY,
         VERSIONS_CAPABILITY,
+        BRANCHES_CAPABILITY,
         STATE_DETAIL_CAPABILITY,
     }
 )
