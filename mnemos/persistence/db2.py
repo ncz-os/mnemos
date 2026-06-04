@@ -30,7 +30,7 @@ from functools import lru_cache
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
-from mnemos.core.config import db2_vector_index_override
+from mnemos.core.config import db2_text_search_override, db2_vector_index_override
 from mnemos.persistence.oracle import (
     OracleAuditChainRepository,
     OracleBackend,
@@ -721,6 +721,44 @@ def _resolve_db2_vector_index_mode(settings: Any) -> str:
     return val
 
 
+# ── Db2 full-text-search mode (CONTAINS engagement toggle) ────────────────────
+# ``like``     (default) — ``UPPER(content) LIKE '%term%'``. Full-table scan,
+#                          but works on stock Db2 with no Text Search server.
+# ``contains``           — ``CONTAINS(content, ?) = 1``. Engages a Db2 Text
+#                          Search index; requires the Db2 Text Search server +
+#                          a text index on ``memories.content``. Opt-in only,
+#                          because CONTAINS errors (SQL20424N) when no text
+#                          index exists, so it must not be the default.
+_DB2_TEXT_SEARCH_ENV = "MNEMOS_DB2_TEXT_SEARCH"
+_DB2_TEXT_SEARCH_DEFAULT = "like"
+_DB2_TEXT_SEARCH_VALID = ("like", "contains")
+
+
+def _resolve_db2_text_search_mode(settings: Any) -> str:
+    """Return the effective Db2 FTS mode (``"like"`` or ``"contains"``).
+
+    Env var ``MNEMOS_DB2_TEXT_SEARCH`` wins over the ``settings.db2_text_search``
+    attribute. Defaults to ``"like"`` (safe on stock Db2); ``"contains"`` opts
+    into the native Db2 Text Search index.
+    """
+    raw = db2_text_search_override()
+    if raw is None and settings is not None:
+        raw = getattr(settings, "db2_text_search", None)
+    if raw is None:
+        return _DB2_TEXT_SEARCH_DEFAULT
+    val = str(raw).strip().lower()
+    if val not in _DB2_TEXT_SEARCH_VALID:
+        _LOG.warning(
+            "Invalid %s=%r; expected one of %s. Falling back to %r.",
+            _DB2_TEXT_SEARCH_ENV,
+            raw,
+            _DB2_TEXT_SEARCH_VALID,
+            _DB2_TEXT_SEARCH_DEFAULT,
+        )
+        return _DB2_TEXT_SEARCH_DEFAULT
+    return val
+
+
 class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
     """Memory repository — Db2-native overrides for core write/read paths.
 
@@ -1344,9 +1382,14 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         source_agent: str | None = None,
         include_archived: bool = False,
     ) -> list[Row]:
-        # LIKE-based substring search — works in stock Db2 without the
-        # Db2 Text Search Server installed. Operators with Db2 Text Search
-        # can subclass and replace this with CONTAINS(c, 'pattern').
+        # FTS predicate is mode-gated (MNEMOS_DB2_TEXT_SEARCH):
+        #   like     (default) — UPPER(content) LIKE '%term%'. Full-table scan,
+        #                        works on stock Db2 with no Text Search server.
+        #   contains           — CONTAINS(content, ?) = 1. Engages the Db2 Text
+        #                        Search index. Opt-in: CONTAINS raises SQL20424N
+        #                        when no text index exists, so it is never the
+        #                        default.
+        text_mode = _resolve_db2_text_search_mode(self._settings)
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
@@ -1360,9 +1403,15 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 for m in _BIND_RE.finditer(clause):
                     params_list.append(vis_params[m.group(1)])
                 where.append(pos_clause)
-            search_term = query.strip().strip("%")
-            where.append("UPPER(m.content) LIKE '%' || UPPER(?) || '%'")
-            params_list.append(search_term)
+            if text_mode == "contains":
+                # Native Db2 Text Search index predicate; the search argument is
+                # the raw query term passed to CONTAINS.
+                where.append("CONTAINS(m.content, ?) = 1")
+                params_list.append(query.strip())
+            else:
+                search_term = query.strip().strip("%")
+                where.append("UPPER(m.content) LIKE '%' || UPPER(?) || '%'")
+                params_list.append(search_term)
             for col, val in [
                 ("category", category),
                 ("subcategory", subcategory),

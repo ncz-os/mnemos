@@ -1341,6 +1341,18 @@ def db2_vector_index_override() -> str | None:
     return os.environ.get("MNEMOS_DB2_VECTOR_INDEX")
 
 
+def db2_text_search_override() -> str | None:
+    """Return the raw Db2 full-text-search env override, if present.
+
+    ``MNEMOS_DB2_TEXT_SEARCH=contains`` opts into the Db2 Text Search
+    ``CONTAINS()`` predicate (engages a Db2 text-search index); the default
+    ``like`` keeps the stock substring scan that needs no Text Search server.
+    """
+    if "MNEMOS_DB2_TEXT_SEARCH" not in os.environ:
+        return None
+    return os.environ.get("MNEMOS_DB2_TEXT_SEARCH")
+
+
 def nats_webhooks_queue_group_env() -> str:
     return runtime_env_value_stripped("MNEMOS_NATS_WEBHOOKS_QUEUE_GROUP")
 
