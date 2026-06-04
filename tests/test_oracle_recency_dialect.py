@@ -82,6 +82,11 @@ async def test_oracle_semantic_search_orders_by_bare_vector_distance() -> None:
         assert "SYSDATE - CAST(M.UPDATED AS DATE)" not in sql_upper
         assert "1.0 / (1.0 +" not in sql_upper
         assert "w" not in calls[0]["params"]
+        # The Python recency re-rank's date fallback reads row["created"]; if the
+        # SELECT stops projecting it, the fallback silently dies (corrupt/NULL
+        # updated -> date.min instead of created). Lock the projection here.
+        assert "M.CREATED" in sql_upper
+        assert "M.UPDATED" in sql_upper
 
 
 @pytest.mark.asyncio
