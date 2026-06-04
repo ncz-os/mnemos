@@ -52,6 +52,7 @@ from datetime import date, datetime, timezone
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
+from mnemos.core.auth_context import UserContext
 from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
 from mnemos.persistence.base import (
     BranchRepository,
@@ -59,6 +60,7 @@ from mnemos.persistence.base import (
     CompressionQueueRepository,
     CompressionRepository,
     CORE_CAPABILITY,
+    FEDERATION_CAPABILITY,
     MYSQL_CAPABILITY_DETAILS,
     ConsultationAuditRepository,
     FederationRepository,
@@ -114,6 +116,26 @@ def _env_float(name: str, default: float) -> float:
 def _content_hash(content: Any) -> str:
     normalized = ("" if content is None else str(content)).replace("\r\n", "\n").replace("\r", "\n")
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _json_array_text(value: Sequence[Any] | None) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(list(value))
+
+
+def _json_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8")
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 def _validate_and_format_vector(embedding: Sequence[float]) -> str:
@@ -268,14 +290,21 @@ async def _fetchone_dict(cursor: Any) -> Row | None:
     return dict(zip(cols, row))
 
 
-def _stub_method(method_name: str):
-    """Build a coroutine stub that raises NotImplementedError on call."""
-
-    async def _stub(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError(f"mysql: {method_name} not yet implemented")
-
-    _stub.__name__ = method_name
-    return _stub
+async def _ensure_mysql_columns(conn: Any, table: str, definitions: dict[str, str]) -> None:
+    async with conn.cursor() as cursor:
+        await cursor.execute(
+            """
+            SELECT COLUMN_NAME
+              FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE()
+               AND TABLE_NAME = %s
+            """,
+            (table,),
+        )
+        existing = {str(row[0]).lower() for row in await cursor.fetchall()}
+        for column, definition in definitions.items():
+            if column.lower() not in existing:
+                await cursor.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
 _MYSQL_WEBHOOKS_UNSUPPORTED = (
@@ -306,7 +335,11 @@ CREATE TABLE IF NOT EXISTS memories (
     permission_mode   INT           NOT NULL DEFAULT 0,
     group_id          VARCHAR(256),
     federation_source VARCHAR(512),
+    federation_remote_updated DATETIME(6),
     consolidated_into VARCHAR(64),
+    consolidated_at   DATETIME(6),
+    federation_last_pushed_at DATETIME(6),
+    federation_push_peer VARCHAR(512),
     recall_count      INT           NOT NULL DEFAULT 0,
     last_recalled_at  DATETIME(6),
     archived_at       DATETIME(6),
@@ -318,7 +351,61 @@ CREATE TABLE IF NOT EXISTS memories (
     INDEX idx_memories_ns_cat  (namespace, category),
     INDEX idx_memories_owner   (owner_id, namespace),
     INDEX idx_memories_hash    (content_hash),
+    INDEX idx_memories_federation_remote (federation_source, federation_remote_updated),
+    INDEX idx_memories_push (federation_source, federation_last_pushed_at),
     FULLTEXT INDEX idx_memories_ft (content)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_FEDERATION_PEERS = """\
+CREATE TABLE IF NOT EXISTS federation_peers (
+    id                   VARCHAR(64)  NOT NULL,
+    name                 VARCHAR(256),
+    base_url             TEXT,
+    auth_token           TEXT,
+    api_key              TEXT,
+    namespace_filter     JSON,
+    category_filter      JSON,
+    enabled              BOOLEAN      NOT NULL DEFAULT TRUE,
+    sync_interval_secs   INT          NOT NULL DEFAULT 300,
+    last_sync_at         TIMESTAMP(6) NULL,
+    last_sync_cursor     TEXT,
+    cursor_updated       TEXT,
+    last_error           TEXT,
+    last_error_at        TIMESTAMP(6) NULL,
+    total_pulled         INT          NOT NULL DEFAULT 0,
+    compat_mode          VARCHAR(32)  NOT NULL DEFAULT 'strict',
+    peer_mnemos_version  VARCHAR(128),
+    last_schema_check_at TIMESTAMP(6) NULL,
+    copy_embeddings      BOOLEAN      NOT NULL DEFAULT FALSE,
+    created              TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated              TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_federation_peers_name (name),
+    INDEX idx_federation_peers_enabled (enabled, last_sync_at)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_FEDERATION_SYNC_LOG = """\
+CREATE TABLE IF NOT EXISTS federation_sync_log (
+    id                VARCHAR(64)  NOT NULL,
+    peer_id           VARCHAR(64)  NOT NULL,
+    direction         VARCHAR(16)  NOT NULL DEFAULT 'pull',
+    status            VARCHAR(32)  NOT NULL DEFAULT 'started',
+    started_at        TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    finished_at       TIMESTAMP(6) NULL,
+    memories_pulled   INT          NOT NULL DEFAULT 0,
+    memories_new      INT          NOT NULL DEFAULT 0,
+    memories_updated  INT          NOT NULL DEFAULT 0,
+    records_seen      INT          NOT NULL DEFAULT 0,
+    records_written   INT          NOT NULL DEFAULT 0,
+    error             TEXT,
+    cursor_before     TEXT,
+    cursor_after      TEXT,
+    PRIMARY KEY (id),
+    INDEX idx_federation_sync_log_peer_started (peer_id, started_at),
+    CONSTRAINT fk_federation_sync_log_peer
+        FOREIGN KEY (peer_id) REFERENCES federation_peers(id) ON DELETE CASCADE
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
@@ -621,6 +708,8 @@ CREATE TABLE IF NOT EXISTS memory_branches (
 
 _INIT_DDLS = [
     _DDL_MEMORIES,
+    _DDL_FEDERATION_PEERS,
+    _DDL_FEDERATION_SYNC_LOG,
     _DDL_MEMORY_VERSIONS,
     _DDL_MEMORY_BRANCHES,
     _DDL_KG_TRIPLES,
@@ -1339,17 +1428,81 @@ class MysqlMemoryRepository(MemoryRepository):
         vis = VisibilityFilter.for_read(user, namespace=namespace)
         return await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=vis)
 
-    # --- unimplemented stubs (port forthcoming) ---
+    # --- unimplemented methods (port forthcoming) ---
 
-    fetch_memory_log = _stub_method("fetch_memory_log")
-    fetch_diff_commit_pair = _stub_method("fetch_diff_commit_pair")
-    fetch_checkout_commit = _stub_method("fetch_checkout_commit")
-    fetch_memory_export = _stub_method("fetch_memory_export")
-    fetch_referenced_memory_allowlist = _stub_method("fetch_referenced_memory_allowlist")
-    assert_memory_readable = _stub_method("assert_memory_readable")
-    fetch_duplicate_content_groups = _stub_method("fetch_duplicate_content_groups")
-    consolidate_duplicate_memories = _stub_method("consolidate_duplicate_memories")
-    find_duplicate_content_groups = _stub_method("find_duplicate_content_groups")
+    async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None:
+        raise NotImplementedError("mysql: assert_memory_readable not yet implemented")
+
+    async def fetch_memory_log(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        branch: str,
+        limit: int,
+        user: UserContext,
+    ) -> list[Row]:
+        raise NotImplementedError("mysql: fetch_memory_log not yet implemented")
+
+    async def fetch_diff_commit_pair(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        commit_a: str,
+        commit_b: str,
+        user: UserContext,
+    ) -> tuple[Row | None, Row | None]:
+        raise NotImplementedError("mysql: fetch_diff_commit_pair not yet implemented")
+
+    async def fetch_checkout_commit(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        commit_hash: str,
+        user: UserContext,
+    ) -> Row | None:
+        raise NotImplementedError("mysql: fetch_checkout_commit not yet implemented")
+
+    async def fetch_memory_export(
+        self,
+        tx: Transaction,
+        *,
+        effective_owner: str | None,
+        effective_ns: str | None,
+        category: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[Row]:
+        raise NotImplementedError("mysql: fetch_memory_export not yet implemented")
+
+    async def fetch_referenced_memory_allowlist(
+        self,
+        tx: Transaction,
+        *,
+        referenced_ids: Sequence[str],
+        scope_owner: str | None = None,
+        scope_namespace: str | None = None,
+    ) -> list[Row]:
+        raise NotImplementedError("mysql: fetch_referenced_memory_allowlist not yet implemented")
+
+    async def fetch_duplicate_content_groups(self, *args: Any, **kwargs: Any) -> list[Row]:
+        raise NotImplementedError("mysql: fetch_duplicate_content_groups not yet implemented")
+
+    async def find_duplicate_content_groups(
+        self,
+        tx: Transaction,
+        *,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        raise NotImplementedError("mysql: find_duplicate_content_groups not yet implemented")
+
+    async def consolidate_duplicate_memories(
+        self,
+        tx: Transaction,
+        *,
+        canonical_id: str,
+        duplicate_ids: Sequence[str],
+    ) -> int:
+        raise NotImplementedError("mysql: consolidate_duplicate_memories not yet implemented")
 
 
 # ── KG, Version, Branch, Compression, Webhook, ConsultationAudit,
@@ -2949,35 +3102,865 @@ class MysqlConsultationAuditRepository(ConsultationAuditRepository):
 
 
 class MysqlFederationRepository(FederationRepository):
-    fetch_memory_page = _stub_method("fetch_memory_page")
-    create_peer = _stub_method("create_peer")
-    list_peers = _stub_method("list_peers")
-    get_peer = _stub_method("get_peer")
-    update_peer = _stub_method("update_peer")
-    upsert_peer = _stub_method("upsert_peer")
-    delete_peer = _stub_method("delete_peer")
-    fetch_sync_log = _stub_method("fetch_sync_log")
-    feed_query = _stub_method("feed_query")
-    get_feed_memory = _stub_method("get_feed_memory")
-    get_sync_peer = _stub_method("get_sync_peer")
-    update_peer_schema_check = _stub_method("update_peer_schema_check")
-    record_schema_abort = _stub_method("record_schema_abort")
-    create_sync_log = _stub_method("create_sync_log")
-    finish_sync_log = _stub_method("finish_sync_log")
-    record_sync_error = _stub_method("record_sync_error")
-    record_sync_success = _stub_method("record_sync_success")
-    list_due_peers = _stub_method("list_due_peers")
-    fetch_federated_memory_marker = _stub_method("fetch_federated_memory_marker")
-    insert_federated_memory = _stub_method("insert_federated_memory")
-    update_federated_memory_if_newer = _stub_method("update_federated_memory_if_newer")
-    apply_consolidation_tombstone = _stub_method("apply_consolidation_tombstone")
-    delete_federated_memory = _stub_method("delete_federated_memory")
-    upsert_federated_memory = _stub_method("upsert_federated_memory")
-    fetch_federation_peers = _stub_method("fetch_federation_peers")
-    upsert_federation_peer = _stub_method("upsert_federation_peer")
-    delete_federation_peer = _stub_method("delete_federation_peer")
-    fetch_local_memories_for_push = _stub_method("fetch_local_memories_for_push")
-    mark_memories_pushed = _stub_method("mark_memories_pushed")
+    _ALLOWED_PEER_COLS = {
+        "name",
+        "base_url",
+        "auth_token",
+        "namespace_filter",
+        "category_filter",
+        "enabled",
+        "sync_interval_secs",
+        "compat_mode",
+    }
+
+    @staticmethod
+    def _peer_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["enabled"] = bool(out.get("enabled"))
+        out["copy_embeddings"] = bool(out.get("copy_embeddings", False))
+        out["namespace_filter"] = _json_list(out.get("namespace_filter")) or None
+        out["category_filter"] = _json_list(out.get("category_filter")) or None
+        out["created"] = out.get("created") or out.get("created_at")
+        out["updated"] = out.get("updated") or out.get("updated_at")
+        out["last_sync_cursor"] = out.get("last_sync_cursor") or out.get("cursor_updated")
+        return out
+
+    async def fetch_memory_page(
+        self,
+        tx: Transaction,
+        *,
+        updated_after: Any | None = None,
+        id_after: str | None = None,
+        limit: int = 100,
+    ) -> list[Row]:
+        where = ["deleted_at IS NULL"]
+        params: list[Any] = []
+        if updated_after is not None and id_after is not None:
+            where.append("(updated > %s OR (updated = %s AND id > %s))")
+            params.extend([updated_after, updated_after, id_after])
+        params.append(limit)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT id, content, category, subcategory, metadata,
+                       owner_id, namespace, updated
+                  FROM memories
+                 WHERE {" AND ".join(where)}
+                 ORDER BY updated ASC, id ASC
+                 LIMIT %s
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def create_peer(
+        self,
+        tx: Transaction,
+        *,
+        name: str,
+        base_url: str,
+        auth_token: str,
+        namespace_filter: Sequence[str] | None,
+        category_filter: Sequence[str] | None,
+        enabled: bool,
+        sync_interval_secs: int,
+        compat_mode: str,
+    ) -> Row:
+        peer_id = str(uuid.uuid4())
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO federation_peers
+                  (id, name, base_url, auth_token, api_key, namespace_filter,
+                   category_filter, enabled, sync_interval_secs, compat_mode,
+                   created, updated)
+                VALUES
+                  (%s, %s, %s, %s, %s, CAST(%s AS JSON),
+                   CAST(%s AS JSON), %s, %s, %s,
+                   CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))
+                """,
+                (
+                    peer_id,
+                    name,
+                    base_url,
+                    auth_token,
+                    auth_token,
+                    _json_array_text(namespace_filter),
+                    _json_array_text(category_filter),
+                    bool(enabled),
+                    sync_interval_secs,
+                    compat_mode,
+                ),
+            )
+        row = await self.get_peer(tx, peer_id)
+        assert row is not None
+        return row
+
+    async def list_peers(self, tx: Transaction) -> list[Row]:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute("SELECT * FROM federation_peers ORDER BY name")
+            rows = await _fetch_all_dicts(cursor)
+        return [self._peer_row(row) for row in rows]  # type: ignore[list-item]
+
+    async def get_peer(self, tx: Transaction, peer_id: str) -> Row | None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute("SELECT * FROM federation_peers WHERE id = %s", (peer_id,))
+            return self._peer_row(await _fetchone_dict(cursor))
+
+    async def update_peer(self, tx: Transaction, peer_id: str, updates: dict[str, Any]) -> Row | None:
+        bad = set(updates) - self._ALLOWED_PEER_COLS
+        if bad:
+            raise ValueError(f"unknown federation peer fields: {sorted(bad)}")
+        if not updates:
+            return await self.get_peer(tx, peer_id)
+        assignments: list[str] = []
+        params: list[Any] = []
+        for col, value in updates.items():
+            if col in {"namespace_filter", "category_filter"}:
+                assignments.append(f"{col} = CAST(%s AS JSON)")
+                params.append(_json_array_text(value))
+            elif col == "enabled":
+                assignments.append("enabled = %s")
+                params.append(bool(value))
+            else:
+                assignments.append(f"{col} = %s")
+                params.append(value)
+        assignments.append("updated = CURRENT_TIMESTAMP(6)")
+        params.append(peer_id)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"UPDATE federation_peers SET {', '.join(assignments)} WHERE id = %s",
+                params,
+            )
+            if not cursor.rowcount:
+                return None
+        return await self.get_peer(tx, peer_id)
+
+    async def upsert_peer(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+        base_url: str,
+        name: str | None = None,
+        enabled: bool = True,
+    ) -> None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO federation_peers (id, base_url, name, auth_token, enabled)
+                VALUES (%s, %s, %s, '', %s)
+                ON DUPLICATE KEY UPDATE
+                    base_url = VALUES(base_url),
+                    name = VALUES(name),
+                    enabled = VALUES(enabled),
+                    updated = CURRENT_TIMESTAMP(6)
+                """,
+                (peer_id, base_url, name, bool(enabled)),
+            )
+
+    async def delete_peer(self, tx: Transaction, peer_id: str) -> bool:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute("DELETE FROM federation_peers WHERE id = %s", (peer_id,))
+            return int(cursor.rowcount or 0) > 0
+
+    async def fetch_sync_log(self, tx: Transaction, peer_id: str, limit: int) -> list[Row]:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT id, started_at, finished_at, memories_pulled,
+                       memories_new, memories_updated, error,
+                       cursor_before, cursor_after
+                  FROM federation_sync_log
+                 WHERE peer_id = %s
+                 ORDER BY started_at DESC
+                 LIMIT %s
+                """,
+                (peer_id, limit),
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def feed_query(
+        self,
+        tx: Transaction,
+        *,
+        since_updated: Any | None,
+        since_id: str | None,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+        limit: int,
+        prefer_compressed: bool,
+        include_embedding: bool = False,
+    ) -> list[Row]:
+        memory_where = [
+            "m.federation_source IS NULL",
+            "(m.permission_mode % 10) >= 4",
+            "m.archived_at IS NULL",
+            "m.consolidated_into IS NULL",
+            "m.deleted_at IS NULL",
+        ]
+        tombstone_where = [
+            "m.federation_source IS NULL",
+            "m.consolidated_into IS NOT NULL",
+            "m.consolidated_at IS NOT NULL",
+            "m.deleted_at IS NULL",
+        ]
+        memory_params: list[Any] = []
+        tombstone_params: list[Any] = []
+        if since_updated is not None:
+            memory_where.append("(m.updated > %s OR (m.updated = %s AND m.id > %s))")
+            memory_params.extend([since_updated, since_updated, since_id])
+            tombstone_where.append("(m.consolidated_at > %s OR (m.consolidated_at = %s AND m.id > %s))")
+            tombstone_params.extend([since_updated, since_updated, since_id])
+        if namespaces:
+            placeholders = ", ".join(["%s"] * len(namespaces))
+            memory_where.append(f"m.namespace IN ({placeholders})")
+            tombstone_where.append(f"m.namespace IN ({placeholders})")
+            memory_params.extend(namespaces)
+            tombstone_params.extend(namespaces)
+        if categories:
+            placeholders = ", ".join(["%s"] * len(categories))
+            memory_where.append(f"m.category IN ({placeholders})")
+            tombstone_where.append(f"m.category IN ({placeholders})")
+            memory_params.extend(categories)
+            tombstone_params.extend(categories)
+
+        if prefer_compressed:
+            use_variant = (
+                "m.archived_at IS NULL "
+                "AND v.compressed_content IS NOT NULL "
+                "AND (2 * CHAR_LENGTH(JSON_QUOTE(v.compressed_content))) "
+                "  < (CHAR_LENGTH(JSON_QUOTE(m.content)) "
+                "     + COALESCE(CHAR_LENGTH(JSON_QUOTE(m.verbatim_content)), 0))"
+            )
+            content_select = f"CASE WHEN {use_variant} THEN v.compressed_content ELSE m.content END AS content,"
+            compressed_select = (
+                f"CASE WHEN {use_variant} THEN v.compressed_content ELSE NULL END AS compressed_content,"
+            )
+            verbatim_select = f"CASE WHEN {use_variant} THEN NULL ELSE m.verbatim_content END AS verbatim_content,"
+            join_compressed = "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id"
+        else:
+            content_select = "m.content,"
+            compressed_select = "NULL AS compressed_content,"
+            verbatim_select = "m.verbatim_content,"
+            join_compressed = ""
+
+        if include_embedding:
+            from mnemos.core.config import get_settings as _gs
+            from mnemos.core.config import embed_http_model_override
+
+            try:
+                http_model = embed_http_model_override()
+                embed_model = http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
+            except Exception:
+                embed_model = "unknown"
+            embed_select_memory = "FROM_VECTOR(m.embedding) AS embedding, %s AS embedding_model,"
+            embed_select_tombstone = "NULL AS embedding, NULL AS embedding_model,"
+            memory_params.append(embed_model)
+        else:
+            embed_select_memory = ""
+            embed_select_tombstone = ""
+
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT *
+                FROM (
+                    SELECT NULL AS type,
+                           m.id,
+                           {content_select}
+                           m.category,
+                           m.subcategory,
+                           m.metadata,
+                           m.quality_rating,
+                           {verbatim_select}
+                           m.owner_id,
+                           m.namespace,
+                           m.permission_mode,
+                           m.source_model,
+                           m.source_provider,
+                           m.source_session,
+                           m.source_agent,
+                           m.created,
+                           m.updated,
+                           m.archived_at,
+                           NULL AS consolidated_into,
+                           NULL AS consolidated_at,
+                           {compressed_select}
+                           {embed_select_memory}
+                           NULL AS _trailer
+                    FROM memories m
+                    {join_compressed}
+                    WHERE {" AND ".join(memory_where)}
+
+                    UNION ALL
+
+                    SELECT 'consolidation' AS type,
+                           m.id,
+                           NULL AS content,
+                           NULL AS category,
+                           NULL AS subcategory,
+                           NULL AS metadata,
+                           NULL AS quality_rating,
+                           NULL AS verbatim_content,
+                           NULL AS owner_id,
+                           m.namespace,
+                           NULL AS permission_mode,
+                           NULL AS source_model,
+                           NULL AS source_provider,
+                           NULL AS source_session,
+                           NULL AS source_agent,
+                           m.created,
+                           m.consolidated_at AS updated,
+                           NULL AS archived_at,
+                           m.consolidated_into,
+                           m.consolidated_at,
+                           NULL AS compressed_content,
+                           {embed_select_tombstone}
+                           NULL AS _trailer
+                    FROM memories m
+                    WHERE {" AND ".join(tombstone_where)}
+                ) feed
+                ORDER BY updated ASC, id ASC
+                LIMIT %s
+                """,
+                [*memory_params, *tombstone_params, limit],
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def get_feed_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+    ) -> Row | None:
+        where = [
+            "m.federation_source IS NULL",
+            "(m.permission_mode % 10) >= 4",
+            "m.archived_at IS NULL",
+            "m.consolidated_into IS NULL",
+            "m.deleted_at IS NULL",
+            "m.id = %s",
+        ]
+        params: list[Any] = [memory_id]
+        if namespaces:
+            where.append(f"m.namespace IN ({', '.join(['%s'] * len(namespaces))})")
+            params.extend(namespaces)
+        if categories:
+            where.append(f"m.category IN ({', '.join(['%s'] * len(categories))})")
+            params.extend(categories)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT id, content, category, subcategory, metadata, quality_rating,
+                       verbatim_content, owner_id, namespace, permission_mode,
+                       source_model, source_provider, source_session, source_agent,
+                       created, updated, archived_at
+                  FROM memories m
+                 WHERE {" AND ".join(where)}
+                """,
+                params,
+            )
+            return await _fetchone_dict(cursor)
+
+    async def get_sync_peer(self, tx: Transaction, peer_id: str) -> Row | None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT id, name, base_url, auth_token, namespace_filter,
+                       category_filter, enabled, last_sync_cursor, compat_mode,
+                       COALESCE(copy_embeddings, 0) AS copy_embeddings
+                  FROM federation_peers
+                 WHERE id = %s
+                """,
+                (peer_id,),
+            )
+            return self._peer_row(await _fetchone_dict(cursor))
+
+    async def update_peer_schema_check(self, tx: Transaction, peer_id: str, peer_version: str | None) -> None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE federation_peers
+                   SET peer_mnemos_version = %s,
+                       last_schema_check_at = CURRENT_TIMESTAMP(6)
+                 WHERE id = %s
+                """,
+                (peer_version, peer_id),
+            )
+
+    async def record_schema_abort(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+        peer_version: str | None,
+        cursor_before: Any,
+        error: str,
+        is_transient: bool,
+    ) -> None:
+        await self.update_peer_schema_check(tx, peer_id, peer_version)
+        log_id = await self.create_sync_log(tx, peer_id, cursor_before)
+        await self.finish_sync_log(
+            tx,
+            log_id=log_id,
+            memories_pulled=0,
+            memories_new=0,
+            memories_updated=0,
+            error=error,
+            cursor_after=cursor_before,
+        )
+        async with tx.conn.cursor() as cursor:
+            if is_transient:
+                await cursor.execute(
+                    """
+                    UPDATE federation_peers
+                       SET last_sync_at = DATE_ADD(
+                               DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL sync_interval_secs SECOND),
+                               INTERVAL 60 SECOND
+                           ),
+                           last_error = %s,
+                           last_error_at = CURRENT_TIMESTAMP(6)
+                     WHERE id = %s
+                    """,
+                    (error, peer_id),
+                )
+            else:
+                await cursor.execute(
+                    """
+                    UPDATE federation_peers
+                       SET last_sync_at = CURRENT_TIMESTAMP(6),
+                           last_error = %s,
+                           last_error_at = CURRENT_TIMESTAMP(6)
+                     WHERE id = %s
+                    """,
+                    (error, peer_id),
+                )
+
+    async def create_sync_log(self, tx: Transaction, peer_id: str, cursor_before: Any) -> Any:
+        log_id = str(uuid.uuid4())
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO federation_sync_log
+                  (id, peer_id, direction, status, started_at, cursor_before)
+                VALUES (%s, %s, 'pull', 'started', CURRENT_TIMESTAMP(6), %s)
+                """,
+                (log_id, peer_id, cursor_before),
+            )
+        return log_id
+
+    async def finish_sync_log(
+        self,
+        tx: Transaction,
+        *,
+        log_id: Any,
+        memories_pulled: int,
+        memories_new: int,
+        memories_updated: int,
+        error: str | None,
+        cursor_after: Any,
+    ) -> None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE federation_sync_log
+                   SET finished_at = CURRENT_TIMESTAMP(6),
+                       memories_pulled = %s,
+                       memories_new = %s,
+                       memories_updated = %s,
+                       records_seen = %s,
+                       records_written = %s,
+                       status = %s,
+                       error = %s,
+                       cursor_after = %s
+                 WHERE id = %s
+                """,
+                (
+                    memories_pulled,
+                    memories_new,
+                    memories_updated,
+                    memories_pulled,
+                    memories_new + memories_updated,
+                    "error" if error else "ok",
+                    error,
+                    cursor_after,
+                    str(log_id),
+                ),
+            )
+
+    async def record_sync_error(self, tx: Transaction, peer_id: str, error: str) -> None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE federation_peers
+                   SET last_sync_at = CURRENT_TIMESTAMP(6),
+                       last_error = %s,
+                       last_error_at = CURRENT_TIMESTAMP(6)
+                 WHERE id = %s
+                """,
+                (error, peer_id),
+            )
+
+    async def record_sync_success(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        cursor: Any,
+        total_pulled: int,
+    ) -> None:
+        async with tx.conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE federation_peers
+                   SET last_sync_at = CURRENT_TIMESTAMP(6),
+                       last_sync_cursor = %s,
+                       cursor_updated = %s,
+                       last_error = NULL,
+                       last_error_at = NULL,
+                       total_pulled = total_pulled + %s
+                 WHERE id = %s
+                """,
+                (cursor, cursor, total_pulled, peer_id),
+            )
+
+    async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT id, name, sync_interval_secs, last_sync_at
+                  FROM federation_peers
+                 WHERE enabled = TRUE
+                   AND (
+                        last_sync_at IS NULL
+                        OR DATE_ADD(last_sync_at, INTERVAL sync_interval_secs SECOND) <= CURRENT_TIMESTAMP(6)
+                   )
+                 ORDER BY COALESCE(
+                     DATE_ADD(last_sync_at, INTERVAL sync_interval_secs SECOND),
+                     TIMESTAMP('1970-01-01 00:00:00')
+                 )
+                 LIMIT %s
+                """,
+                (limit,),
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT federation_remote_updated FROM memories WHERE id = %s AND deleted_at IS NULL",
+                (local_id,),
+            )
+            return await _fetchone_dict(cursor)
+
+    async def insert_federated_memory(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        source_model: str | None,
+        source_provider: str | None,
+        source_session: str | None,
+        source_agent: str | None,
+        peer_name: str,
+        remote_updated: Any,
+    ) -> bool:
+        try:
+            async with tx.conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    INSERT INTO memories
+                      (id, content, content_hash, category, subcategory, metadata,
+                       verbatim_content, quality_rating, owner_id, namespace,
+                       permission_mode, source_model, source_provider,
+                       source_session, source_agent, federation_source,
+                       federation_remote_updated, created, updated)
+                    VALUES
+                      (%s, %s, %s, %s, %s, %s,
+                       %s, %s, 'federation', %s,
+                       644, %s, %s,
+                       %s, %s, %s,
+                       %s, CURRENT_TIMESTAMP(6), %s)
+                    """,
+                    (
+                        local_id,
+                        content,
+                        _content_hash(content),
+                        category,
+                        subcategory,
+                        metadata_json,
+                        verbatim_content,
+                        quality_rating,
+                        namespace,
+                        source_model,
+                        source_provider,
+                        source_session,
+                        source_agent,
+                        peer_name,
+                        remote_updated,
+                        remote_updated,
+                    ),
+                )
+            return True
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                return False
+            raise
+
+    async def update_federated_memory_if_newer(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        remote_updated: Any,
+    ) -> bool:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE memories
+                   SET content = %s,
+                       content_hash = %s,
+                       category = %s,
+                       subcategory = %s,
+                       metadata = %s,
+                       verbatim_content = %s,
+                       quality_rating = %s,
+                       namespace = %s,
+                       federation_remote_updated = %s,
+                       updated = %s
+                 WHERE id = %s
+                   AND deleted_at IS NULL
+                   AND (
+                        federation_remote_updated IS NULL
+                        OR federation_remote_updated < %s
+                   )
+                """,
+                (
+                    content,
+                    _content_hash(content),
+                    category,
+                    subcategory,
+                    metadata_json,
+                    verbatim_content,
+                    quality_rating,
+                    namespace,
+                    remote_updated,
+                    remote_updated,
+                    local_id,
+                    remote_updated,
+                ),
+            )
+            return int(cursor.rowcount or 0) > 0
+
+    async def apply_consolidation_tombstone(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        local_canonical_id: str,
+        consolidated_at: Any,
+        remote_id: str,
+        canonical_remote_id: str,
+        peer_name: str,
+    ) -> bool:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE memories
+                   SET consolidated_into = %s,
+                       consolidated_at = COALESCE(%s, CURRENT_TIMESTAMP(6)),
+                       permission_mode = 400,
+                       metadata = JSON_SET(
+                           COALESCE(CAST(NULLIF(metadata, '') AS JSON), JSON_OBJECT()),
+                           '$.federation_consolidation',
+                           JSON_OBJECT(
+                               'remote_id', %s,
+                               'remote_consolidated_into', %s,
+                               'peer', %s
+                           )
+                       )
+                 WHERE id = %s
+                   AND deleted_at IS NULL
+                   AND (consolidated_into IS NULL OR consolidated_into <> %s)
+                   AND EXISTS (
+                       SELECT 1 FROM memories
+                        WHERE id = %s AND deleted_at IS NULL
+                   )
+                """,
+                (
+                    local_canonical_id,
+                    consolidated_at,
+                    remote_id,
+                    canonical_remote_id,
+                    peer_name,
+                    local_id,
+                    local_canonical_id,
+                    local_canonical_id,
+                ),
+            )
+            return int(cursor.rowcount or 0) > 0
+
+    async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int:
+        local_id = f"fed:{peer_name}:{memory_id}"
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE memories
+                   SET deleted_at = CURRENT_TIMESTAMP(6)
+                 WHERE id IN (%s, %s)
+                   AND federation_source = %s
+                   AND deleted_at IS NULL
+                """,
+                (memory_id, local_id, peer_name),
+            )
+            return int(cursor.rowcount or 0)
+
+    async def upsert_federated_memory(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        peer_name: str,
+        remote_updated: Any,
+        source_model: str | None = None,
+        source_provider: str | None = None,
+        source_session: str | None = None,
+        source_agent: str | None = None,
+    ) -> bool:
+        inserted = await self.insert_federated_memory(
+            tx,
+            local_id=local_id,
+            content=content,
+            category=category,
+            subcategory=subcategory,
+            metadata_json=metadata_json,
+            verbatim_content=verbatim_content,
+            quality_rating=quality_rating,
+            namespace=namespace,
+            source_model=source_model,
+            source_provider=source_provider,
+            source_session=source_session,
+            source_agent=source_agent,
+            peer_name=peer_name,
+            remote_updated=remote_updated,
+        )
+        if inserted:
+            return True
+        return await self.update_federated_memory_if_newer(
+            tx,
+            local_id=local_id,
+            content=content,
+            category=category,
+            subcategory=subcategory,
+            metadata_json=metadata_json,
+            verbatim_content=verbatim_content,
+            quality_rating=quality_rating,
+            namespace=namespace,
+            remote_updated=remote_updated,
+        )
+
+    async def fetch_federation_peers(self, tx: Transaction) -> list[Row]:
+        return await self.list_peers(tx)
+
+    async def upsert_federation_peer(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+        base_url: str,
+        name: str | None = None,
+        enabled: bool = True,
+    ) -> None:
+        await self.upsert_peer(tx, peer_id=peer_id, base_url=base_url, name=name, enabled=enabled)
+
+    async def delete_federation_peer(self, tx: Transaction, peer_id: str) -> bool:
+        return await self.delete_peer(tx, peer_id)
+
+    async def fetch_local_memories_for_push(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str | None = None,
+        since_updated: Any | None = None,
+        limit: int = 100,
+    ) -> list[Row]:
+        where = [
+            "federation_source IS NULL",
+            "deleted_at IS NULL",
+            "archived_at IS NULL",
+            "consolidated_into IS NULL",
+            "(permission_mode % 10) >= 4",
+        ]
+        params: list[Any] = []
+        if peer_name is not None:
+            where.append("(federation_push_peer IS NULL OR federation_push_peer = %s)")
+            params.append(peer_name)
+        if since_updated is not None:
+            where.append("updated > %s")
+            params.append(since_updated)
+        params.append(limit)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT id, content, category, subcategory, metadata, owner_id,
+                       namespace, permission_mode, created, updated
+                  FROM memories
+                 WHERE {" AND ".join(where)}
+                 ORDER BY updated ASC, id ASC
+                 LIMIT %s
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def mark_memories_pushed(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        memory_ids: Sequence[str],
+    ) -> int:
+        if not memory_ids:
+            return 0
+        placeholders = ", ".join(["%s"] * len(memory_ids))
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                UPDATE memories
+                   SET federation_last_pushed_at = CURRENT_TIMESTAMP(6),
+                       federation_push_peer = %s
+                 WHERE id IN ({placeholders})
+                   AND federation_source IS NULL
+                   AND deleted_at IS NULL
+                """,
+                [peer_name, *memory_ids],
+            )
+            return int(cursor.rowcount or 0)
 
 
 class MysqlStateRepository(StateRepository):
@@ -3166,7 +4149,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
 
     @property
     def capabilities(self) -> set[str]:
-        return {CORE_CAPABILITY, STATE_CAPABILITY}
+        return {CORE_CAPABILITY, STATE_CAPABILITY, FEDERATION_CAPABILITY}
 
     @property
     def capability_details(self) -> set[str]:
@@ -3296,6 +4279,55 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                     await cursor.execute("SELECT 1")
                     for ddl in _INIT_DDLS:
                         await cursor.execute(ddl)
+                await _ensure_mysql_columns(
+                    conn,
+                    "memories",
+                    {
+                        "federation_remote_updated": "federation_remote_updated DATETIME(6)",
+                        "consolidated_at": "consolidated_at DATETIME(6)",
+                        "federation_last_pushed_at": "federation_last_pushed_at DATETIME(6)",
+                        "federation_push_peer": "federation_push_peer VARCHAR(512)",
+                    },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "federation_peers",
+                    {
+                        "auth_token": "auth_token TEXT",
+                        "api_key": "api_key TEXT",
+                        "namespace_filter": "namespace_filter JSON",
+                        "category_filter": "category_filter JSON",
+                        "sync_interval_secs": "sync_interval_secs INT NOT NULL DEFAULT 300",
+                        "last_sync_cursor": "last_sync_cursor TEXT",
+                        "cursor_updated": "cursor_updated TEXT",
+                        "last_error": "last_error TEXT",
+                        "last_error_at": "last_error_at TIMESTAMP(6) NULL",
+                        "total_pulled": "total_pulled INT NOT NULL DEFAULT 0",
+                        "compat_mode": "compat_mode VARCHAR(32) NOT NULL DEFAULT 'strict'",
+                        "peer_mnemos_version": "peer_mnemos_version VARCHAR(128)",
+                        "last_schema_check_at": "last_schema_check_at TIMESTAMP(6) NULL",
+                        "copy_embeddings": "copy_embeddings BOOLEAN NOT NULL DEFAULT FALSE",
+                        "created": "created TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+                        "updated": "updated TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+                    },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "federation_sync_log",
+                    {
+                        "direction": "direction VARCHAR(16) NOT NULL DEFAULT 'pull'",
+                        "status": "status VARCHAR(32) NOT NULL DEFAULT 'started'",
+                        "started_at": "started_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+                        "finished_at": "finished_at TIMESTAMP(6) NULL",
+                        "memories_pulled": "memories_pulled INT NOT NULL DEFAULT 0",
+                        "memories_new": "memories_new INT NOT NULL DEFAULT 0",
+                        "memories_updated": "memories_updated INT NOT NULL DEFAULT 0",
+                        "records_seen": "records_seen INT NOT NULL DEFAULT 0",
+                        "records_written": "records_written INT NOT NULL DEFAULT 0",
+                        "cursor_before": "cursor_before TEXT",
+                        "cursor_after": "cursor_after TEXT",
+                    },
+                )
                 await conn.commit()
         except Exception as exc:
             _LOG.warning(
