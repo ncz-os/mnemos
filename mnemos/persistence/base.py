@@ -630,9 +630,7 @@ class ConsultationAuditRepository(ABC):
     async def upsert_model(self, tx: Transaction, model: dict[str, Any]) -> bool:
         raise NotImplementedError("upsert_model not implemented for this backend")
 
-    async def mark_models_unavailable(
-        self, tx: Transaction, provider: str, seen_model_ids: Sequence[str]
-    ) -> int:
+    async def mark_models_unavailable(self, tx: Transaction, provider: str, seen_model_ids: Sequence[str]) -> int:
         raise NotImplementedError("mark_models_unavailable not implemented for this backend")
 
     async def write_model_sync_log(
@@ -1518,6 +1516,9 @@ MYSQL_CAPABILITY_DETAILS: frozenset[DetailedCapabilityName] = frozenset(
         MEMORY_CRUD_CAPABILITY,
         VECTOR_SEARCH_CAPABILITY,
         FTS_CAPABILITY,
+        KG_CAPABILITY,
+        VERSIONS_CAPABILITY,
+        STATE_DETAIL_CAPABILITY,
     }
 )
 
