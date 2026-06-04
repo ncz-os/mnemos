@@ -12,20 +12,55 @@ from typing import Any
 
 import httpx
 
+from mnemos.core.config import get_settings
 from mnemos.domain.graeae.api_keys import get_key
 from mnemos.domain.graeae.engine import get_graeae_engine
 from mnemos.domain.openai_compat.content import _content_text, _flatten_messages_for_prompt
 from mnemos.domain.pantheon.router import RouteDecision
+from mnemos.domain.pantheon.cooldown import CooldownManager, InMemoryCooldownStore
+from mnemos.domain.pantheon.fallback import AllDeploymentsFailed
+from mnemos.domain.pantheon.cooldown import DEFAULT_TENANT
+from mnemos.domain.pantheon.http_bridge import classify, retry_after_seconds
+from mnemos.domain.pantheon.runtime import RouterRuntime
 
 logger = logging.getLogger(__name__)
 _IDENTITY_BODY_KEY = "_mnemos_upstream_identity"
 
+# ── Shared pooled HTTP client. Reused across requests so keep-alive
+# connections are recycled instead of paying a fresh TCP+TLS handshake on
+# every call — the main source of added latency when fronting providers.
+_http_client: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """Process-wide pooled httpx client (lazily created, reused)."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(200.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=50,
+                max_connections=200,
+                keepalive_expiry=30.0,
+            ),
+        )
+    return _http_client
+
+
+async def aclose_http_client() -> None:
+    """Close the shared client (call on app shutdown)."""
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
+
 
 class PantheonGatewayError(Exception):
-    def __init__(self, status_code: int, message: str):
+    def __init__(self, status_code: int, message: str, retry_after: float | None = None):
         super().__init__(message)
         self.status_code = status_code
         self.message = message
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -106,8 +141,7 @@ def _chat_payload(decision: RouteDecision, body: dict[str, Any], *, stream: bool
         supplied_user = payload.get("user")
         if supplied_user is not None and supplied_user != identity.opaque_user:
             logger.warning(
-                "[PANTHEON] client-supplied OpenAI user field overridden "
-                "for request_id=%s",
+                "[PANTHEON] client-supplied OpenAI user field overridden for request_id=%s",
                 identity.request_id,
             )
         payload["user"] = identity.opaque_user
@@ -123,6 +157,62 @@ def _embeddings_url(cfg: dict[str, Any]) -> str:
     return url.rstrip("/") + "/embeddings"
 
 
+# ── Resilient routing runtime (retry + cooldown over the single provider call) ──
+_RUNTIME: RouterRuntime | None = None
+
+
+def get_runtime() -> RouterRuntime:
+    """Process-local RouterRuntime singleton (cooldown breaker + retry/fall-over)."""
+    global _RUNTIME
+    if _RUNTIME is None:
+        _RUNTIME = RouterRuntime(CooldownManager(InMemoryCooldownStore()), clock=time.time)
+    return _RUNTIME
+
+
+def set_runtime(runtime: RouterRuntime | None) -> None:
+    """Override the runtime (tests inject a no-sleep runtime)."""
+    global _RUNTIME
+    _RUNTIME = runtime
+
+
+def _is_openai_api(decision: RouteDecision) -> bool:
+    try:
+        return _provider_config(decision).get("api", "openai") == "openai"
+    except Exception:
+        return False
+
+
+async def _forward_chat_once(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
+    """One provider attempt: POST to the resolved provider, raise on >= 400."""
+    cfg = _provider_config(decision)
+    client = get_http_client()
+    payload = _chat_payload(decision, body, stream=False)
+    response = await client.post(
+        str(cfg["url"]),
+        json=payload,
+        headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
+        timeout=cfg.get("timeout", 200),
+    )
+    if response.status_code >= 400:
+        raise PantheonGatewayError(response.status_code, response.text[:500], retry_after_seconds(response))
+    data = response.json()
+    data.setdefault("model", decision.model_id)
+    return data
+
+
+def _decision_cooldown_key(decision: RouteDecision) -> str:
+    """Stable cooldown key for a routed provider (avoids hashing RouteDecision)."""
+    return f"{decision.provider}:{decision.model_id or decision.alias}"
+
+
+def _tenant_of(body: dict[str, Any]) -> str:
+    """Per-tenant cooldown scope from the upstream identity (or the default)."""
+    identity = _pop_upstream_identity(dict(body))
+    if identity is None:
+        return DEFAULT_TENANT
+    return f"{identity.namespace}:{identity.user_id}"
+
+
 async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
     if decision.route_type == "consensus":
         return await consensus_chat_completion(decision, body)
@@ -131,18 +221,34 @@ async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any])
     if cfg.get("api", "openai") != "openai":
         return await _graeae_chat_completion(decision, body)
 
-    async with httpx.AsyncClient(timeout=cfg.get("timeout", 200)) as client:
-        payload = _chat_payload(decision, body, stream=False)
-        response = await client.post(
-            str(cfg["url"]),
-            json=payload,
-            headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
+    # Behavior-preserving resilience: route the single resolved provider through
+    # the runtime so transient failures (5xx / 429 / timeout / connection) are
+    # retried with backoff and every outcome feeds the cooldown breaker. A
+    # single-element chain keeps routing semantics unchanged; a non-retryable
+    # error (e.g. 400) still surfaces as the original PantheonGatewayError.
+    runtime = get_runtime()
+    chain = [decision]
+    if get_settings().pantheon.cross_provider_fallback and decision.route_type == "single":
+        from mnemos.domain.pantheon import catalog, router
+
+        built = router.build_fallback_chain(decision, await catalog.list_models())
+        # only providers served by this openai-compatible path can run in the
+        # chain; drop graeae-only providers (anthropic/gemini) — keep primary.
+        chain = [d for d in built if _is_openai_api(d)] or [decision]
+    try:
+        result = await runtime.route(
+            chain,
+            lambda d: _forward_chat_once(d, body),
+            classify=classify,
+            tenant=_tenant_of(body),
+            key_of=_decision_cooldown_key,
         )
-    if response.status_code >= 400:
-        raise PantheonGatewayError(response.status_code, response.text[:500])
-    data = response.json()
-    data.setdefault("model", decision.model_id)
-    return data
+    except AllDeploymentsFailed as exc:
+        last = exc.last_exception
+        if isinstance(last, PantheonGatewayError):
+            raise last
+        raise PantheonGatewayError(503, str(last) if last else str(exc)) from exc
+    return result.result
 
 
 async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> AsyncIterator[bytes]:
@@ -157,35 +263,34 @@ async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) 
             yield event
         return
 
-    client = httpx.AsyncClient(timeout=None)
-    try:
-        payload = _chat_payload(decision, body, stream=True)
-        async with client.stream(
-            "POST",
-            str(cfg["url"]),
-            json=payload,
-            headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
-        ) as response:
-            if response.status_code >= 400:
-                body_bytes = await response.aread()
-                raise PantheonGatewayError(response.status_code, body_bytes[:500].decode("utf-8", "replace"))
-            async for chunk in response.aiter_bytes():
-                yield chunk
-    finally:
-        await client.aclose()
+    client = get_http_client()
+    payload = _chat_payload(decision, body, stream=True)
+    async with client.stream(
+        "POST",
+        str(cfg["url"]),
+        json=payload,
+        headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
+        timeout=None,
+    ) as response:
+        if response.status_code >= 400:
+            body_bytes = await response.aread()
+            raise PantheonGatewayError(response.status_code, body_bytes[:500].decode("utf-8", "replace"))
+        async for chunk in response.aiter_bytes():
+            yield chunk
 
 
 async def forward_embeddings(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
     if decision.route_type == "consensus":
         raise PantheonGatewayError(400, "consensus aliases are not valid for embeddings")
     cfg = _provider_config(decision)
-    async with httpx.AsyncClient(timeout=cfg.get("timeout", 200)) as client:
-        payload = _chat_payload(decision, body, stream=None)
-        response = await client.post(
-            _embeddings_url(cfg),
-            json=payload,
-            headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
-        )
+    client = get_http_client()
+    payload = _chat_payload(decision, body, stream=None)
+    response = await client.post(
+        _embeddings_url(cfg),
+        json=payload,
+        headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
+        timeout=cfg.get("timeout", 200),
+    )
     if response.status_code >= 400:
         raise PantheonGatewayError(response.status_code, response.text[:500])
     data = response.json()
@@ -210,34 +315,42 @@ async def _graeae_chat_completion(decision: RouteDecision, body: dict[str, Any])
     )
     if result.get("status") != "success":
         raise PantheonGatewayError(503, result.get("error") or "provider unavailable")
-    return _openai_chat_response(decision.model_id or decision.alias, result.get("choices"), result.get("response_text", ""), messages)
+    return _openai_chat_response(
+        decision.model_id or decision.alias, result.get("choices"), result.get("response_text", ""), messages
+    )
 
 
 async def _graeae_chat_completion_stream(decision: RouteDecision, body: dict[str, Any]) -> AsyncIterator[bytes]:
     response = await _graeae_chat_completion(decision, body)
-    yield _stream_event({
-        "id": response["id"],
-        "object": "chat.completion.chunk",
-        "created": response["created"],
-        "model": response["model"],
-        "choices": [{"index": 0, "delta": {"role": "assistant"}}],
-    })
-    content = response["choices"][0]["message"].get("content") or ""
-    if content:
-        yield _stream_event({
+    yield _stream_event(
+        {
             "id": response["id"],
             "object": "chat.completion.chunk",
             "created": response["created"],
             "model": response["model"],
-            "choices": [{"index": 0, "delta": {"content": content}}],
-        })
-    yield _stream_event({
-        "id": response["id"],
-        "object": "chat.completion.chunk",
-        "created": response["created"],
-        "model": response["model"],
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    })
+            "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+        }
+    )
+    content = response["choices"][0]["message"].get("content") or ""
+    if content:
+        yield _stream_event(
+            {
+                "id": response["id"],
+                "object": "chat.completion.chunk",
+                "created": response["created"],
+                "model": response["model"],
+                "choices": [{"index": 0, "delta": {"content": content}}],
+            }
+        )
+    yield _stream_event(
+        {
+            "id": response["id"],
+            "object": "chat.completion.chunk",
+            "created": response["created"],
+            "model": response["model"],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+    )
     yield b"data: [DONE]\n\n"
 
 
@@ -257,29 +370,35 @@ async def consensus_chat_completion(decision: RouteDecision, body: dict[str, Any
 
 async def consensus_chat_completion_stream(decision: RouteDecision, body: dict[str, Any]) -> AsyncIterator[bytes]:
     response = await consensus_chat_completion(decision, body)
-    yield _stream_event({
-        "id": response["id"],
-        "object": "chat.completion.chunk",
-        "created": response["created"],
-        "model": response["model"],
-        "choices": [{"index": 0, "delta": {"role": "assistant"}}],
-    })
-    content = response["choices"][0]["message"].get("content") or ""
-    if content:
-        yield _stream_event({
+    yield _stream_event(
+        {
             "id": response["id"],
             "object": "chat.completion.chunk",
             "created": response["created"],
             "model": response["model"],
-            "choices": [{"index": 0, "delta": {"content": content}}],
-        })
-    yield _stream_event({
-        "id": response["id"],
-        "object": "chat.completion.chunk",
-        "created": response["created"],
-        "model": response["model"],
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    })
+            "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+        }
+    )
+    content = response["choices"][0]["message"].get("content") or ""
+    if content:
+        yield _stream_event(
+            {
+                "id": response["id"],
+                "object": "chat.completion.chunk",
+                "created": response["created"],
+                "model": response["model"],
+                "choices": [{"index": 0, "delta": {"content": content}}],
+            }
+        )
+    yield _stream_event(
+        {
+            "id": response["id"],
+            "object": "chat.completion.chunk",
+            "created": response["created"],
+            "model": response["model"],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+    )
     yield b"data: [DONE]\n\n"
 
 
@@ -289,8 +408,14 @@ def _generation_params(body: dict[str, Any]) -> dict[str, Any]:
 
 def _request_params(body: dict[str, Any]) -> dict[str, Any]:
     fields = (
-        "tools", "tool_choice", "response_format", "stop", "n",
-        "presence_penalty", "frequency_penalty", "user",
+        "tools",
+        "tool_choice",
+        "response_format",
+        "stop",
+        "n",
+        "presence_penalty",
+        "frequency_penalty",
+        "user",
     )
     return {key: body[key] for key in fields if body.get(key) is not None}
 

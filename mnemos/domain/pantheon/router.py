@@ -129,10 +129,67 @@ async def route_model(model_or_alias: str, body: dict[str, Any] | None = None) -
     )
 
 
+def build_fallback_chain(
+    primary: RouteDecision,
+    models: list[dict[str, Any]],
+    *,
+    max_chain: int = 4,
+) -> list[RouteDecision]:
+    """Expand a resolved primary into a cross-provider fallback chain.
+
+    The alias's own ranked candidate pool (``primary.candidates``) is the natural
+    fallback set: ``primary`` first, then each DISTINCT ``(provider, model_id)``
+    candidate resolved against the ``models`` catalog. Pure (the caller supplies
+    the catalog). Consensus/auto-special decisions are returned as a single-
+    element chain (fallback does not apply). Bounded by ``max_chain``.
+    """
+    if primary.route_type != "single":
+        return [primary]
+    by_id: dict[str, dict[str, Any]] = {}
+    ambiguous: set[str] = set()
+    for m in models:
+        mid = m.get("id") if isinstance(m, dict) else None
+        if not mid:
+            continue
+        mid = str(mid)
+        if mid in by_id and by_id[mid].get("provider") != m.get("provider"):
+            ambiguous.add(mid)  # same id across providers -> can't disambiguate from a bare id
+        else:
+            by_id[mid] = m
+    chain = [primary]
+    seen = {(primary.provider, primary.model_id)}
+    for cid in primary.candidates or []:
+        cid = str(cid)
+        if cid in ambiguous:
+            continue
+        m = by_id.get(cid)
+        if not m:
+            continue
+        provider = m.get("provider")
+        key = (provider, cid)
+        if not provider or key in seen:
+            continue
+        seen.add(key)
+        chain.append(
+            RouteDecision(
+                alias=primary.alias,
+                provider=str(provider),
+                model_id=cid,
+                route_type="single",
+                reason="fallback-candidate",
+                model=m,
+                task_type=primary.task_type,
+            )
+        )
+        if len(chain) >= max_chain:
+            break
+    return chain
+
+
 async def explain_route(body: dict[str, Any]) -> dict[str, Any]:
     model = str(body.get("model") or body.get("model_or_alias") or "auto:cheap")
     decision = await route_model(model, body)
     return decision.explain()
 
 
-__all__ = ["PantheonRoutingError", "RouteDecision", "explain_route", "route_model"]
+__all__ = ["PantheonRoutingError", "RouteDecision", "build_fallback_chain", "explain_route", "route_model"]
