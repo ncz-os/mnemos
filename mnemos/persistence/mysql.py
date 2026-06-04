@@ -54,6 +54,7 @@ from urllib.parse import unquote, urlparse
 from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
 from mnemos.persistence.base import (
     BranchRepository,
+    CompressionStatsRow,
     CompressionQueueRepository,
     CompressionRepository,
     CORE_CAPABILITY,
@@ -362,6 +363,68 @@ CREATE TABLE IF NOT EXISTS memory_compression_queue (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
+_DDL_COMPRESSION_CANDIDATES = """\
+CREATE TABLE IF NOT EXISTS memory_compression_candidates (
+    id                  VARCHAR(64)  NOT NULL DEFAULT (UUID()),
+    memory_id           VARCHAR(64)  NOT NULL,
+    owner_id            VARCHAR(256) NOT NULL DEFAULT 'default',
+    contest_id          VARCHAR(64),
+    engine_id           VARCHAR(100) NOT NULL,
+    engine_version      VARCHAR(50),
+    compressed_content  LONGTEXT,
+    original_tokens     INT,
+    compressed_tokens   INT,
+    candidate_content   LONGTEXT,
+    candidate_tokens    INT,
+    compression_ratio   DOUBLE,
+    quality_score       DOUBLE,
+    speed_factor        DOUBLE,
+    composite_score     DOUBLE,
+    scoring_profile     VARCHAR(50)  NOT NULL DEFAULT 'balanced',
+    elapsed_ms          INT,
+    judge_model         VARCHAR(200),
+    gpu_used            BOOLEAN      NOT NULL DEFAULT FALSE,
+    is_winner           BOOLEAN      NOT NULL DEFAULT FALSE,
+    reject_reason       TEXT,
+    manifest            JSON,
+    created             TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    created_at          TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    INDEX idx_mcc_memory (memory_id),
+    INDEX idx_mcc_contest (contest_id),
+    INDEX idx_mcc_memory_winner (memory_id, is_winner),
+    INDEX idx_mcc_owner (owner_id),
+    INDEX idx_mcc_engine (engine_id),
+    CONSTRAINT fk_mcc_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_COMPRESSED_VARIANTS = """\
+CREATE TABLE IF NOT EXISTS memory_compressed_variants (
+    memory_id            VARCHAR(64)  NOT NULL,
+    owner_id             VARCHAR(256) NOT NULL DEFAULT 'default',
+    winner_candidate_id  VARCHAR(64),
+    engine_id            VARCHAR(100) NOT NULL,
+    engine_version       VARCHAR(50),
+    compressed_content   LONGTEXT,
+    compressed_tokens    INT,
+    compression_ratio    DOUBLE,
+    quality_score        DOUBLE,
+    composite_score      DOUBLE,
+    scoring_profile      VARCHAR(50)  NOT NULL DEFAULT 'balanced',
+    judge_model          VARCHAR(200),
+    selected_at          TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (memory_id),
+    INDEX idx_mcv_owner (owner_id),
+    INDEX idx_mcv_engine (engine_id),
+    CONSTRAINT fk_mcv_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+    CONSTRAINT fk_mcv_candidate
+        FOREIGN KEY (winner_candidate_id) REFERENCES memory_compression_candidates(id) ON DELETE SET NULL
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
 _DDL_STATE = """\
 CREATE TABLE IF NOT EXISTS state (
     owner_id   VARCHAR(100) NOT NULL DEFAULT 'default',
@@ -439,6 +502,8 @@ _INIT_DDLS = [
     _DDL_MEMORY_VERSIONS,
     _DDL_MEMORY_BRANCHES,
     _DDL_KG_TRIPLES,
+    _DDL_COMPRESSION_CANDIDATES,
+    _DDL_COMPRESSED_VARIANTS,
     _DDL_COMPRESSION_QUEUE,
     _DDL_STATE,
 ]
@@ -1914,20 +1979,154 @@ class MysqlBranchRepository(BranchRepository):
 
 
 class MysqlCompressionRepository(CompressionRepository):
-    fetch_compressed_variants_for_export = _stub_method("fetch_compressed_variants_for_export")
-    compression_candidate_exists = _stub_method("compression_candidate_exists")
-    insert_compressed_variant = _stub_method("insert_compressed_variant")
-    fetch_compressed_variant_by_memory_id = _stub_method("fetch_compressed_variant_by_memory_id")
-    gather_stats = _stub_method("gather_stats")
-    insert_compression = _stub_method("insert_compression")
-    fetch_compressions = _stub_method("fetch_compressions")
-    fetch_compression_by_id = _stub_method("fetch_compression_by_id")
-    delete_compression = _stub_method("delete_compression")
-    update_compression_review = _stub_method("update_compression_review")
-    fetch_memories_for_compression = _stub_method("fetch_memories_for_compression")
-    fetch_manifests = _stub_method("fetch_manifests")
-    fetch_manifest_by_id = _stub_method("fetch_manifest_by_id")
-    insert_manifest = _stub_method("insert_manifest")
+    async def fetch_compressed_variants_for_export(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        hard_limit: int,
+    ) -> list[Row]:
+        if not memory_ids:
+            return []
+        conn = tx.conn
+        placeholders = ", ".join(["%s"] * len(memory_ids))
+        where = [f"memory_id IN ({placeholders})"]
+        params: list[Any] = list(memory_ids)
+        if effective_owner:
+            where.append("owner_id = %s")
+            params.append(effective_owner)
+        params.append(hard_limit + 1)
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT memory_id, owner_id, winner_candidate_id, engine_id, "
+                "engine_version, compressed_content, compressed_tokens, "
+                "compression_ratio, quality_score, composite_score, "
+                "scoring_profile, judge_model, selected_at "
+                "FROM memory_compressed_variants "
+                f"WHERE {' AND '.join(where)} "
+                "LIMIT %s",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def compression_candidate_exists(
+        self,
+        tx: Transaction,
+        *,
+        candidate_id: str,
+        memory_id: str,
+        owner_id: str,
+    ) -> bool:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT 1
+                  FROM memory_compression_candidates
+                 WHERE id = %s
+                   AND memory_id = %s
+                   AND owner_id = %s
+                """,
+                (candidate_id, memory_id, owner_id),
+            )
+            return await cursor.fetchone() is not None
+
+    async def insert_compressed_variant(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        owner_id: str,
+        winner_candidate_id: str | None,
+        engine_id: str,
+        engine_version: str | None,
+        compressed_content: str | None,
+        compressed_tokens: int | None,
+        compression_ratio: float | None,
+        quality_score: float | None,
+        composite_score: float | None,
+        scoring_profile: str | None,
+        judge_model: str | None,
+        selected_at: Any,
+    ) -> str:
+        conn = tx.conn
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    INSERT INTO memory_compressed_variants (
+                        memory_id, owner_id, winner_candidate_id,
+                        engine_id, engine_version, compressed_content,
+                        compressed_tokens, compression_ratio,
+                        quality_score, composite_score,
+                        scoring_profile, judge_model, selected_at
+                    )
+                    VALUES (
+                        %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s,
+                        %s, %s,
+                        COALESCE(%s, 'balanced'), %s,
+                        COALESCE(%s, CURRENT_TIMESTAMP(6))
+                    )
+                    ON DUPLICATE KEY UPDATE memory_id = memory_id
+                    """,
+                    (
+                        memory_id,
+                        owner_id,
+                        winner_candidate_id,
+                        engine_id,
+                        engine_version,
+                        compressed_content,
+                        compressed_tokens,
+                        compression_ratio,
+                        quality_score,
+                        composite_score,
+                        scoring_profile,
+                        judge_model,
+                        selected_at,
+                    ),
+                )
+                return "INSERT 0 1" if cursor.rowcount else "INSERT 0 0"
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                return "INSERT 0 0"
+            raise
+
+    async def fetch_compressed_variant_by_memory_id(self, tx: Transaction, memory_id: str) -> Row | None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT owner_id, winner_candidate_id, engine_id, engine_version,
+                       compressed_content, compressed_tokens, compression_ratio,
+                       quality_score, composite_score, scoring_profile, judge_model,
+                       selected_at
+                  FROM memory_compressed_variants
+                 WHERE memory_id = %s
+                """,
+                (memory_id,),
+            )
+            return await _fetchone_dict(cursor)
+
+    async def gather_stats(self, tx: Transaction) -> CompressionStatsRow:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT COUNT(*), AVG(compression_ratio),
+                       SUM(CASE WHEN quality_score IS NULL THEN 1 ELSE 0 END)
+                  FROM memory_compressed_variants
+                """,
+            )
+            row = await cursor.fetchone() or (0, None, 0)
+        total, avg_ratio, unreviewed = row
+        return CompressionStatsRow(
+            total_compressions=int(total or 0),
+            average_compression_ratio=float(avg_ratio) if avg_ratio is not None else None,
+            unreviewed_compressions=int(unreviewed or 0),
+        )
 
 
 class MysqlCompressionQueueRepository(CompressionQueueRepository):
