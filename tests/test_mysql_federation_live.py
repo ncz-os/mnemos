@@ -108,3 +108,76 @@ async def test_mysql_federation_live_roundtrip() -> None:
                     await cursor.execute("DELETE FROM federation_peers WHERE name = %s", (peer_name,))
         finally:
             await backend.close()
+
+
+async def test_mysql_federation_feed_include_embedding_preserves_filter_binds() -> None:
+    pytest.importorskip("aiomysql", reason="aiomysql driver not installed")
+
+    from mnemos.persistence.mysql import MysqlBackend, create_mysql_pool
+
+    pool = await create_mysql_pool(MYSQL_DSN)
+    backend = MysqlBackend(pool, SimpleNamespace())
+    await backend.open()
+
+    run_id = uuid.uuid4().hex[:12]
+    owner_id = f"mysql_fed_feed_owner_{run_id}"
+    namespace = f"feed_ns_{run_id}"
+    other_namespace = f"feed_other_ns_{run_id}"
+    wanted_id = f"feed_wanted_{run_id}"
+    other_id = f"feed_other_{run_id}"
+
+    try:
+        async with backend.transactional() as tx:
+            async with tx.conn.cursor() as cursor:
+                for memory_id, memory_namespace, category in (
+                    (wanted_id, namespace, "live"),
+                    (other_id, other_namespace, "private"),
+                ):
+                    await cursor.execute(
+                        """
+                        INSERT INTO memories (
+                            id, content, content_hash, category, subcategory, metadata,
+                            quality_rating, verbatim_content, owner_id, namespace,
+                            permission_mode, created, updated
+                        ) VALUES (
+                            %s, %s, SHA2(%s, 256), %s, NULL, %s,
+                            3, %s, %s, %s,
+                            604, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6)
+                        )
+                        """,
+                        (
+                            memory_id,
+                            f"live feed content {memory_id}",
+                            f"live feed content {memory_id}",
+                            category,
+                            "{}",
+                            f"live feed content {memory_id}",
+                            owner_id,
+                            memory_namespace,
+                        ),
+                    )
+
+            rows = await backend.federation.feed_query(
+                tx,
+                since_updated=datetime(1970, 1, 1, tzinfo=timezone.utc),
+                since_id="",
+                namespaces=[namespace],
+                categories=["live"],
+                limit=10,
+                prefer_compressed=False,
+                include_embedding=True,
+            )
+
+            assert [row["id"] for row in rows] == [wanted_id]
+            assert rows[0]["embedding_model"]
+            assert rows[0]["embedding_model"] not in {namespace, "live", ""}
+    finally:
+        try:
+            async with backend.transactional() as tx:
+                async with tx.conn.cursor() as cursor:
+                    await cursor.execute(
+                        "DELETE FROM memories WHERE id IN (%s, %s) OR owner_id = %s",
+                        (wanted_id, other_id, owner_id),
+                    )
+        finally:
+            await backend.close()
