@@ -119,4 +119,24 @@ in place → re-review until `approve` → commit → push ARGONAS→GitLab→Gi
   boost is strictly weaker and inconsistent across backends. Standardize all
   four on the postgres over-fetch pattern (keeps each engine's native vector
   scan — incl. DB2 `FETCH APPROX FIRST` DiskANN — engaged on the larger
-  candidate set).
+  candidate set). **DB2 shipped** (P4 below); sqlite (recency currently a no-op)
+  and mysql/oracle (SQL-side recency that bypasses ANN index ordering) remain —
+  the mysql/oracle strategy switch is live-unverifiable and changes ordering, so
+  it needs a design decision before changing.
+
+### P4 (DB2 native-feature deep pass)
+- **`semantic_search` recency over-fetch** — shipped (see P3); DB2 now widens the
+  DiskANN candidate fetch under `boost_recency` and re-ranks safely
+  (`_rank_score_sort_key` sorts NULL/invalid/non-finite distances last so a
+  degraded row can never displace a valid candidate). Offline-tested.
+- **`fts_search` native text index** — shipped. DB2 full-text search used a
+  non-indexed `UPPER(content) LIKE '%term%'` full-table scan even where a Db2
+  Text Search index exists (the code comment acknowledged the gap). Added an
+  opt-in `MNEMOS_DB2_TEXT_SEARCH=contains` mode (`config.db2_text_search_override`
+  + `_resolve_db2_text_search_mode`) emitting the native `CONTAINS(content, ?) = 1`
+  predicate that engages the Db2 Text Search index. Default stays `like` (safe on
+  stock Db2; `CONTAINS` raises SQL20424N without a text index, so it must be
+  opt-in). Offline dialect tests assert the predicate per mode + invalid-mode
+  fallback. Live behaviour gated on `DB2_DSN` + a provisioned text index.
+- **`Db2SessionsRepository.create_session` conflation** — still open (see P2);
+  needs the chat-vs-oauth ownership design decision before any code change.

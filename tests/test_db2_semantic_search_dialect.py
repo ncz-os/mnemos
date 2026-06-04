@@ -245,6 +245,92 @@ def test_db2_semantic_search_recency_rerank_sorts_invalid_scores_last() -> None:
     assert len(result) <= 3
 
 
+def _capture_db2_fts_sql(repo, *, text_mode: str | None) -> str:
+    """Drive ``Db2MemoryRepository.fts_search`` through a fake cursor and return
+    the emitted SQL, under the given MNEMOS_DB2_TEXT_SEARCH mode.
+    """
+    from mnemos.persistence.db2 import _Db2AsyncCursor
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    captured: dict[str, str] = {}
+
+    class _FakeSyncCursor:
+        description = (
+            ("id",),
+            ("content",),
+            ("category",),
+            ("subcategory",),
+            ("metadata",),
+            ("quality_rating",),
+            ("owner_id",),
+            ("namespace",),
+            ("created",),
+            ("updated",),
+        )
+        rowcount = 0
+
+        def execute(self, sql, params=None):
+            captured["sql"] = sql
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
+
+        def close(self):
+            return None
+
+    class _FakeConn:
+        def cursor(self):
+            return _Db2AsyncCursor(_FakeSyncCursor())
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    visibility = VisibilityFilter(scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace="default")
+
+    if text_mode is None:
+        os.environ.pop("MNEMOS_DB2_TEXT_SEARCH", None)
+    else:
+        os.environ["MNEMOS_DB2_TEXT_SEARCH"] = text_mode
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(repo.fts_search(tx, query="needle", limit=5, visibility=visibility))
+    finally:
+        loop.close()
+        os.environ.pop("MNEMOS_DB2_TEXT_SEARCH", None)
+    return captured["sql"]
+
+
+def test_db2_fts_defaults_to_like_scan() -> None:
+    """Without the toggle, FTS uses the stock LIKE substring scan (no Text
+    Search server required)."""
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    sql = _capture_db2_fts_sql(Db2MemoryRepository(), text_mode=None).upper()
+    assert "LIKE" in sql
+    assert "CONTAINS(" not in sql
+
+
+def test_db2_fts_contains_mode_engages_text_index() -> None:
+    """MNEMOS_DB2_TEXT_SEARCH=contains emits the native CONTAINS() predicate
+    that engages the Db2 Text Search index."""
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    sql = _capture_db2_fts_sql(Db2MemoryRepository(), text_mode="contains").upper()
+    assert "CONTAINS(M.CONTENT, ?) = 1" in sql
+    assert "LIKE" not in sql
+
+
+def test_db2_fts_invalid_mode_falls_back_to_like() -> None:
+    """An unrecognized mode warns and falls back to the safe LIKE scan."""
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    sql = _capture_db2_fts_sql(Db2MemoryRepository(), text_mode="bogus").upper()
+    assert "LIKE" in sql
+    assert "CONTAINS(" not in sql
+
+
 def test_db2_semantic_search_uses_native_dialect() -> None:
     """Default mode emits EUCLIDEAN + FETCH APPROX FIRST — engages
     the Db2 12.1.5 DiskANN vector index.
