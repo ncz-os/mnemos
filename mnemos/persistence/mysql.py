@@ -46,6 +46,7 @@ import logging
 import math
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timezone
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
@@ -139,12 +140,37 @@ def _cosine_distance_python(a: list[float], b: list[float]) -> float:
     return 1.0 - dot / (norm_a * norm_b)
 
 
+def _rank_score_sort_key(row: Row) -> float:
+    rank = row.get("rank_score") if isinstance(row, dict) else None
+    try:
+        score = float(rank)
+    except (TypeError, ValueError):
+        return math.inf
+    return score if math.isfinite(score) else math.inf
+
+
+def _recency_date(row: Row) -> date:
+    def _coerce_date(value: Any) -> date | None:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+            except ValueError:
+                return None
+        return None
+
+    if not isinstance(row, dict):
+        return date.min
+    return _coerce_date(row.get("updated")) or _coerce_date(row.get("created")) or date.min
+
+
 def _is_vec_distance_unsupported(exc: BaseException) -> bool:
     """True when exc indicates MySQL lacks built-in vector distance functions."""
     msg = str(exc)
-    return "1305" in msg and (
-        "VEC_DISTANCE" in msg or "VEC_COSINE" in msg or "VEC_L2" in msg
-    )
+    return "1305" in msg and ("VEC_DISTANCE" in msg or "VEC_COSINE" in msg or "VEC_L2" in msg)
 
 
 def _is_unique_violation(exc: BaseException) -> bool:
@@ -817,21 +843,16 @@ class MysqlMemoryRepository(MemoryRepository):
                 where.append(f"m.{col} = %s")
                 params.append(val)
 
-        # MySQL 9.0 VECTOR_DISTANCE returns 0 for identical vectors and
-        # grows with dissimilarity — same ordering as pgvector <=> and Oracle
-        # VECTOR_DISTANCE … COSINE.
-        if boost_recency:
-            rank_expr = (
-                "VECTOR_DISTANCE(m.embedding, TO_VECTOR(%s), 'COSINE')"
-                f" - {float(recency_weight)}"
-                " * (1.0 / (1.0 + TIMESTAMPDIFF(SECOND, m.updated, NOW(6)) / 86400.0))"
-            )
-        else:
-            rank_expr = "VECTOR_DISTANCE(m.embedding, TO_VECTOR(%s), 'COSINE')"
+        # MySQL 9.0 VECTOR_DISTANCE returns 0 for identical vectors and grows
+        # with dissimilarity. Keep the SQL rank/order expression as the bare
+        # distance so the native vector index can serve top-K; recency boost is
+        # applied in Python after over-fetching candidates.
+        rank_expr = "VECTOR_DISTANCE(m.embedding, TO_VECTOR(%s), 'COSINE')"
+        candidate_limit = max(limit, min(limit * 4, 200)) if boost_recency else limit
 
         # Bind the TO_VECTOR placeholder before the rest of the params.
         # ORDER BY uses the selected alias so the vector is bound once.
-        vec_params = [vec_literal] + params + [limit]
+        vec_params = [vec_literal] + params + [candidate_limit]
 
         conn = tx.conn
         try:
@@ -852,7 +873,7 @@ class MysqlMemoryRepository(MemoryRepository):
                     """,
                     vec_params,
                 )
-                return await _fetch_all_dicts(cursor)
+                rows = await _fetch_all_dicts(cursor)
         except Exception as exc:
             if _is_vec_distance_unsupported(exc):
                 # MySQL Community Edition lacks VEC_DISTANCE_COSINE; fall back to
@@ -867,6 +888,27 @@ class MysqlMemoryRepository(MemoryRepository):
                     recency_weight=recency_weight,
                 )
             raise
+
+        if boost_recency and rows:
+            w = float(recency_weight)
+            today = datetime.now(timezone.utc).date()
+            for row in rows:
+                rank = row.get("rank_score")
+                if rank is None:
+                    continue
+                try:
+                    rank_f = float(rank)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(rank_f):
+                    continue
+                upd_date = _recency_date(row)
+                age_days = max(0, (today - upd_date).days)
+                row["rank_score"] = rank_f - w * (1.0 / (1.0 + age_days))
+            rows.sort(key=_rank_score_sort_key)
+            rows = rows[:limit]
+
+        return rows
 
     async def _python_cosine_search(
         self,
@@ -1293,7 +1335,9 @@ class MysqlCompressionQueueRepository(CompressionQueueRepository):
             for row in stale_rows:
                 attempts = int(row["attempts"] or 0)
                 error = row.get("error")
-                terminalize = attempts >= max_attempts and error is not None and not str(error).startswith("infra_retry:")
+                terminalize = (
+                    attempts >= max_attempts and error is not None and not str(error).startswith("infra_retry:")
+                )
                 if terminalize:
                     await cursor.execute(
                         """
