@@ -110,6 +110,141 @@ def _capture_db2_translated_sql(repo, *, mode: str | None) -> str:
     return captured["sql"]
 
 
+def _capture_db2_fetch_count(repo, *, boost_recency: bool, limit: int = 5) -> int:
+    """Drive ``Db2MemoryRepository.semantic_search`` through a fake cursor and
+    return the row-count bound to the FETCH clause (the last execute param).
+    """
+    from mnemos.persistence.db2 import _Db2AsyncCursor
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    captured: dict[str, object] = {}
+
+    class _FakeSyncCursor:
+        description = (("id",), ("content",), ("updated",), ("rank_score",))
+        rowcount = 0
+
+        def execute(self, sql, params=None):
+            captured["params"] = params
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
+
+        def close(self):
+            return None
+
+    class _FakeConn:
+        def cursor(self):
+            return _Db2AsyncCursor(_FakeSyncCursor())
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    visibility = VisibilityFilter(scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace="default")
+
+    os.environ["MNEMOS_DB2_VECTOR_INDEX"] = "approx"
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(
+            repo.semantic_search(
+                tx,
+                embedding=[0.1, 0.2, 0.3],
+                limit=limit,
+                visibility=visibility,
+                boost_recency=boost_recency,
+            )
+        )
+    finally:
+        loop.close()
+    params = captured["params"]
+    # Execute binds: (select_vec, *where, order_vec, fetch_count) — the FETCH
+    # row-count is always the final positional parameter.
+    return int(params[-1])
+
+
+def test_db2_semantic_search_overfetches_candidates_for_recency() -> None:
+    """Recency boost must widen the DiskANN candidate fetch beyond ``limit`` so
+    a newer memory just outside the top-``limit`` by distance can be promoted;
+    without boost the fetch is exactly ``limit``. Mirrors PostgresBackend.
+    """
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    repo = Db2MemoryRepository()
+    assert _capture_db2_fetch_count(repo, boost_recency=False, limit=5) == 5
+    # candidate_limit = max(limit, min(limit*4, 200)) = 20 for limit=5
+    assert _capture_db2_fetch_count(repo, boost_recency=True, limit=5) == 20
+    # capped at 200 for large limits
+    assert _capture_db2_fetch_count(repo, boost_recency=True, limit=100) == 200
+
+
+def test_db2_semantic_search_recency_rerank_sorts_invalid_scores_last() -> None:
+    """Recency rerank must never promote unscored rows ahead of finite
+    Db2 vector distances.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from mnemos.persistence.db2 import Db2MemoryRepository, _Db2AsyncCursor
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    today = datetime.now(timezone.utc).date()
+    old = today - timedelta(days=30)
+    fetched_rows = [
+        ("valid-old-best", "a", old, 0.20),
+        ("valid-old-next", "b", old, 0.25),
+        ("valid-fresh", "c", today, 0.31),
+        ("rank-none", "none", today, None),
+        ("rank-invalid", "bad", today, "bad-score"),
+        ("rank-nan", "nan", today, "nan"),
+        ("valid-fresh-late", "d", today, 0.50),
+    ]
+
+    class _FakeSyncCursor:
+        description = (("id",), ("content",), ("updated",), ("rank_score",))
+        rowcount = len(fetched_rows)
+
+        def execute(self, sql, params=None):
+            return None
+
+        def fetchall(self):
+            return fetched_rows
+
+        def fetchone(self):
+            return None
+
+        def close(self):
+            return None
+
+    class _FakeConn:
+        def cursor(self):
+            return _Db2AsyncCursor(_FakeSyncCursor())
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    visibility = VisibilityFilter(scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace="default")
+    repo = Db2MemoryRepository()
+    os.environ["MNEMOS_DB2_VECTOR_INDEX"] = "approx"
+
+    loop = asyncio.new_event_loop()
+    try:
+        result = loop.run_until_complete(
+            repo.semantic_search(
+                tx,
+                embedding=[0.1, 0.2, 0.3],
+                limit=3,
+                visibility=visibility,
+                boost_recency=True,
+                recency_weight=0.1,
+            )
+        )
+    finally:
+        loop.close()
+
+    ids = [row["id"] for row in result]
+    assert ids == ["valid-old-best", "valid-fresh", "valid-old-next"]
+    assert {"rank-none", "rank-invalid", "rank-nan"}.isdisjoint(ids)
+    assert [row["rank_score"] for row in result] == sorted(row["rank_score"] for row in result)
+    assert len(result) <= 3
+
+
 def test_db2_semantic_search_uses_native_dialect() -> None:
     """Default mode emits EUCLIDEAN + FETCH APPROX FIRST — engages
     the Db2 12.1.5 DiskANN vector index.
