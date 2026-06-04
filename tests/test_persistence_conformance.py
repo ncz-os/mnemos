@@ -78,9 +78,8 @@ ACCESSOR_ABC: dict[str, type] = {accessor: abc for pairs in CAP_ACCESSORS.values
 # capability is (currently) undeclared. Seeded with documented drift; phases
 # after P1 retire entries by either declaring the capability (when the repo is
 # real and complete) or making the accessor raise BackendCapabilityMissing.
-KNOWN_UNDECLARED: set[tuple[str, str]] = {
-    ("mysql", "federation"),
-}
+# All real repositories should now declare their governing coarse capability.
+KNOWN_UNDECLARED: set[tuple[str, str]] = set()
 
 # Concrete repo methods whose signature is known to diverge from the ABC.
 # Each entry is documented drift slated for repair in a later phase; the
