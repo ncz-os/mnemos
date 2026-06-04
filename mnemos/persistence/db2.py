@@ -26,6 +26,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from datetime import date, datetime
 from functools import lru_cache
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
@@ -75,6 +76,24 @@ def _rank_score_sort_key(row: Row) -> float:
     except (TypeError, ValueError):
         return math.inf
     return score if math.isfinite(score) else math.inf
+
+
+def _recency_date(row: Row) -> date:
+    def _coerce_date(value: Any) -> date | None:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+            except ValueError:
+                return None
+        return None
+
+    if not isinstance(row, dict):
+        return date.min
+    return _coerce_date(row.get("updated")) or _coerce_date(row.get("created")) or date.min
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -874,18 +893,12 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             # SQL ORDER BY stays index-friendly. ``updated`` may be a
             # datetime (ibm_db_dbi default) or a string fallback — be
             # defensive.
-            from datetime import date, datetime, timezone
+            from datetime import timezone
 
             w = float(recency_weight)
             today = datetime.now(timezone.utc).date()
             for row in rows:
-                updated = row.get("updated") if isinstance(row, dict) else None
-                if isinstance(updated, datetime):
-                    upd_date = updated.date()
-                elif isinstance(updated, date):
-                    upd_date = updated
-                else:
-                    upd_date = today
+                upd_date = _recency_date(row)
                 age_days = max(0, (today - upd_date).days)
                 rank = row.get("rank_score")
                 if rank is None:
