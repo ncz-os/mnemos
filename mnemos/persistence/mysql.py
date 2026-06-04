@@ -3376,7 +3376,7 @@ class MysqlFederationRepository(FederationRepository):
     ) -> list[Row]:
         memory_where = [
             "m.federation_source IS NULL",
-            "(m.permission_mode % 10) >= 4",
+            "(MOD(m.permission_mode, 10)) >= 4",
             "m.archived_at IS NULL",
             "m.consolidated_into IS NULL",
             "m.deleted_at IS NULL",
@@ -3521,7 +3521,7 @@ class MysqlFederationRepository(FederationRepository):
     ) -> Row | None:
         where = [
             "m.federation_source IS NULL",
-            "(m.permission_mode % 10) >= 4",
+            "(MOD(m.permission_mode, 10)) >= 4",
             "m.archived_at IS NULL",
             "m.consolidated_into IS NULL",
             "m.deleted_at IS NULL",
@@ -3995,7 +3995,7 @@ class MysqlFederationRepository(FederationRepository):
             "deleted_at IS NULL",
             "archived_at IS NULL",
             "consolidated_into IS NULL",
-            "(permission_mode % 10) >= 4",
+            "(MOD(permission_mode, 10)) >= 4",
         ]
         params: list[Any] = []
         if peer_name is not None:
