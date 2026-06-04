@@ -68,6 +68,31 @@ async def test_mysql_state_roundtrip_update_list_delete() -> None:
                 tombstone = await cursor.fetchone()
             assert tombstone is not None
             assert tombstone[0] is not None
+
+            revived = await backend.state_kv.set(tx, key, "v3", owner_id=owner_id, namespace=namespace)
+            assert revived is not None
+            assert revived["value"] == "v3"
+            assert int(revived["version"]) == int(second["version"]) + 1
+
+            got_revived = await backend.state_kv.get(tx, key, owner_id=owner_id, namespace=namespace)
+            assert got_revived is not None
+            assert got_revived["value"] == "v3"
+            assert int(got_revived["version"]) == int(revived["version"])
+
+            async with tx.conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT deleted_at
+                      FROM state
+                     WHERE owner_id = %s
+                       AND namespace = %s
+                       AND `key` = %s
+                    """,
+                    (owner_id, namespace, key),
+                )
+                revived_row = await cursor.fetchone()
+            assert revived_row is not None
+            assert revived_row[0] is None
     finally:
         try:
             async with backend.transactional() as tx:
