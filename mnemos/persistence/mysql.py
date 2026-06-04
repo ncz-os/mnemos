@@ -377,7 +377,47 @@ CREATE TABLE IF NOT EXISTS state (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
-_INIT_DDLS = [_DDL_MEMORIES, _DDL_KG_TRIPLES, _DDL_COMPRESSION_QUEUE, _DDL_STATE]
+_DDL_MEMORY_VERSIONS = """\
+CREATE TABLE IF NOT EXISTS memory_versions (
+    id                VARCHAR(64)   NOT NULL,
+    memory_id         VARCHAR(64)   NOT NULL,
+    version_num       INT           NOT NULL,
+    content           LONGTEXT      NOT NULL,
+    category          VARCHAR(128),
+    subcategory       VARCHAR(128),
+    metadata          JSON,
+    verbatim_content  LONGTEXT,
+    owner_id          VARCHAR(256)  NOT NULL DEFAULT 'default',
+    namespace         VARCHAR(256)  NOT NULL DEFAULT 'default',
+    permission_mode   INT           NOT NULL DEFAULT 600,
+    source_model      VARCHAR(256),
+    source_provider   VARCHAR(256),
+    source_session    VARCHAR(512),
+    source_agent      VARCHAR(256),
+    snapshot_at       TIMESTAMP(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    snapshot_by       VARCHAR(256),
+    change_type       VARCHAR(40)   NOT NULL DEFAULT 'create',
+    commit_hash       VARCHAR(128),
+    parent_version_id VARCHAR(64),
+    branch            VARCHAR(128)  NOT NULL DEFAULT 'main',
+    merge_parents     JSON,
+    deleted_at        TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_memory_versions_memory_version (memory_id, branch, version_num),
+    INDEX idx_mv_memory_id (memory_id),
+    INDEX idx_mv_memory_id_vnum (memory_id, version_num DESC),
+    INDEX idx_mv_snapshot_at (snapshot_at),
+    INDEX idx_mv_commit_hash (commit_hash),
+    INDEX idx_mv_branch_head (memory_id, branch, version_num DESC),
+    INDEX idx_mv_owner_namespace (owner_id, namespace),
+    INDEX idx_mv_parent_version (parent_version_id),
+    INDEX idx_mv_deleted (deleted_at),
+    CONSTRAINT fk_mv_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_INIT_DDLS = [_DDL_MEMORIES, _DDL_MEMORY_VERSIONS, _DDL_KG_TRIPLES, _DDL_COMPRESSION_QUEUE, _DDL_STATE]
 
 
 # ── Pool factory ──────────────────────────────────────────────────────────────
@@ -1468,13 +1508,161 @@ class MysqlKGRepository(KGRepository):
 
 
 class MysqlVersionRepository(VersionRepository):
-    fetch_memory_versions_for_export = _stub_method("fetch_memory_versions_for_export")
-    fetch_memory_versions_by_ids = _stub_method("fetch_memory_versions_by_ids")
-    insert_memory_version = _stub_method("insert_memory_version")
-    fetch_memory_version_by_id = _stub_method("fetch_memory_version_by_id")
-    fetch_memory_versions = _stub_method("fetch_memory_versions")
-    fetch_memory_version_snapshot = _stub_method("fetch_memory_version_snapshot")
-    revert_to_version = _stub_method("revert_to_version")
+    async def fetch_memory_versions_for_export(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        effective_ns: str | None,
+        hard_limit: int,
+    ) -> list[Row]:
+        if not memory_ids:
+            return []
+        conditions = ["deleted_at IS NULL"]
+        params: list[Any] = []
+        placeholders = ", ".join(["%s"] * len(memory_ids))
+        conditions.append(f"memory_id IN ({placeholders})")
+        params.extend(memory_ids)
+        if effective_owner:
+            conditions.append("owner_id = %s")
+            params.append(effective_owner)
+        if effective_ns:
+            conditions.append("namespace = %s")
+            params.append(effective_ns)
+        params.append(hard_limit + 1)
+
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT id, memory_id, version_num, content, category, "
+                "subcategory, metadata, verbatim_content, owner_id, "
+                "namespace, permission_mode, source_model, source_provider, "
+                "source_session, source_agent, snapshot_at, snapshot_by, "
+                "change_type, commit_hash, parent_version_id, branch, merge_parents "
+                f"FROM memory_versions WHERE {' AND '.join(conditions)} "
+                "ORDER BY memory_id ASC, branch ASC, version_num ASC "
+                "LIMIT %s",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def fetch_memory_versions_by_ids(self, tx: Transaction, version_ids: Sequence[str]) -> list[Row]:
+        if not version_ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(version_ids))
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT id, memory_id, owner_id, namespace
+                  FROM memory_versions
+                 WHERE id IN ({placeholders})
+                   AND deleted_at IS NULL
+                """,
+                list(version_ids),
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def insert_memory_version(
+        self,
+        tx: Transaction,
+        *,
+        version_id: str,
+        memory_id: str,
+        version_num: int,
+        content: str,
+        category: str | None,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str | None,
+        owner_id: str,
+        namespace: str | None,
+        permission_mode: int | None,
+        source_model: str | None,
+        source_provider: str | None,
+        source_session: str | None,
+        source_agent: str | None,
+        snapshot_at: Any,
+        snapshot_by: str | None,
+        change_type: str | None,
+        commit_hash: str | None,
+        parent_version_id: str | None,
+        branch: str | None,
+        merge_parents: Any,
+    ) -> str:
+        conn = tx.conn
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    INSERT INTO memory_versions (
+                        id, memory_id, version_num, content,
+                        category, subcategory, metadata, verbatim_content,
+                        owner_id, namespace, permission_mode,
+                        source_model, source_provider, source_session, source_agent,
+                        snapshot_at, snapshot_by, change_type,
+                        commit_hash, parent_version_id, branch, merge_parents
+                    )
+                    VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, COALESCE(%s, 'default'), COALESCE(%s, 600),
+                        %s, %s, %s, %s,
+                        COALESCE(%s, CURRENT_TIMESTAMP(6)), %s, COALESCE(%s, 'create'),
+                        %s, %s, COALESCE(%s, 'main'), %s
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        id = id
+                    """,
+                    (
+                        version_id,
+                        memory_id,
+                        version_num,
+                        content,
+                        category,
+                        subcategory,
+                        metadata_json,
+                        verbatim_content,
+                        owner_id,
+                        namespace,
+                        permission_mode,
+                        source_model,
+                        source_provider,
+                        source_session,
+                        source_agent,
+                        snapshot_at,
+                        snapshot_by,
+                        change_type,
+                        commit_hash,
+                        parent_version_id,
+                        branch,
+                        json.dumps(merge_parents if merge_parents is not None else []),
+                    ),
+                )
+                return "INSERT 0 1" if cursor.rowcount else "INSERT 0 0"
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                return "INSERT 0 0"
+            raise
+
+    async def fetch_memory_version_by_id(self, tx: Transaction, version_id: str) -> Row | None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT memory_id, owner_id, namespace, version_num, content, commit_hash,
+                       parent_version_id, branch, merge_parents, category, subcategory,
+                       metadata, verbatim_content, permission_mode, source_model,
+                       source_provider, source_session, source_agent, snapshot_at,
+                       snapshot_by, change_type
+                  FROM memory_versions
+                 WHERE id = %s
+                   AND deleted_at IS NULL
+                """,
+                (version_id,),
+            )
+            return await _fetchone_dict(cursor)
 
 
 class MysqlBranchRepository(BranchRepository):
