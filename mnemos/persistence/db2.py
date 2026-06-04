@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import uuid
 from collections.abc import Sequence
@@ -65,6 +66,15 @@ from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter
 
 _LOG = logging.getLogger(__name__)
+
+
+def _rank_score_sort_key(row: Row) -> float:
+    rank = row.get("rank_score") if isinstance(row, dict) else None
+    try:
+        score = float(rank)
+    except (TypeError, ValueError):
+        return math.inf
+    return score if math.isfinite(score) else math.inf
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -758,6 +768,12 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         # FETCH APPROX FIRST engages the DiskANN index; FETCH FIRST is
         # an exact scan. Both query the same VECTOR_DISTANCE function.
         fetch_clause = "FETCH APPROX FIRST ? ROWS ONLY" if mode == "approx" else "FETCH FIRST ? ROWS ONLY"
+        # Over-fetch a wider candidate set when recency-boosting so the Python
+        # re-rank below can promote a newer memory ranked just outside the
+        # top-`limit` by pure vector distance. Mirrors PostgresBackend's
+        # candidate_limit; the native FETCH APPROX FIRST DiskANN scan stays
+        # engaged on the larger set, and we re-cap to `limit` after re-ranking.
+        fetch_count = max(limit, min(limit * 4, 200)) if boost_recency else limit
 
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -807,7 +823,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 f"ORDER BY {rank_sql} ASC "
                 f"{fetch_clause}"
             )
-            await _call(cursor.execute, sql, (vec_literal, *where_params, vec_literal, limit))
+            await _call(cursor.execute, sql, (vec_literal, *where_params, vec_literal, fetch_count))
             rows = await _fetch_all_dicts(cursor)
         finally:
             await _call(cursor.close)
@@ -842,7 +858,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                     continue
                 row["rank_score"] = rank_f - w * (1.0 / (1.0 + age_days))
             # Re-sort ASC on the adjusted rank_score and re-cap to ``limit``.
-            rows.sort(key=lambda r: float(r.get("rank_score") or 0.0))
+            rows.sort(key=_rank_score_sort_key)
             rows = rows[:limit]
 
         return rows
