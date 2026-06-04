@@ -26,7 +26,7 @@ import math
 import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime, timezone
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
@@ -116,6 +116,33 @@ def _validate_and_format_vector(
             raise ValueError(f"embedding[{idx}] is non-finite ({num!r}); NaN and Inf are rejected.")
         formatted.append(f"{num:.7f}")
     return "[" + ",".join(formatted) + "]"
+
+
+def _rank_score_sort_key(row: Row) -> float:
+    rank = row.get("rank_score") if isinstance(row, dict) else None
+    try:
+        score = float(rank)
+    except (TypeError, ValueError):
+        return math.inf
+    return score if math.isfinite(score) else math.inf
+
+
+def _recency_date(row: Row) -> date:
+    def _coerce_date(value: Any) -> date | None:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+            except ValueError:
+                return None
+        return None
+
+    if not isinstance(row, dict):
+        return date.min
+    return _coerce_date(row.get("updated")) or _coerce_date(row.get("created")) or date.min
 
 
 def _render_visibility(
@@ -1826,20 +1853,13 @@ class OracleMemoryRepository(MemoryRepository):
                     where.append(f"m.{col} = :flt_{col}")
                     params[f"flt_{col}"] = val
             params["q"] = vec_literal
-            params["limit"] = limit
+            params["limit"] = max(limit, min(limit * 4, 200)) if boost_recency else limit
             # Oracle 23ai VECTOR_DISTANCE returns 0 for identical vectors
             # and grows with dissimilarity, so ORDER BY ASC matches the
-            # Postgres pgvector ``<=>`` ordering. Recency boost subtracts
-            # a bounded age penalty so the wider candidate set still
-            # surfaces freshly-touched rows when the caller opts in.
-            if boost_recency:
-                rank = (
-                    "VECTOR_DISTANCE(m.embedding, TO_VECTOR(:q), COSINE) "
-                    "- :w * (1.0 / (1.0 + (SYSDATE - CAST(m.updated AS DATE))))"
-                )
-                params["w"] = float(recency_weight)
-            else:
-                rank = "VECTOR_DISTANCE(m.embedding, TO_VECTOR(:q), COSINE)"
+            # Postgres pgvector ``<=>`` ordering. Keep ORDER BY as the
+            # bare distance so Oracle 23ai can serve top-K from the
+            # native vector index; recency boost is applied after fetch.
+            rank = "VECTOR_DISTANCE(m.embedding, TO_VECTOR(:q), COSINE)"
             sql = (
                 "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
                 "m.quality_rating, m.compressed_content, m.verbatim_content, "
@@ -1853,9 +1873,30 @@ class OracleMemoryRepository(MemoryRepository):
                 "FETCH FIRST :limit ROWS ONLY"
             )
             await _call(cursor.execute, sql, params)
-            return await _fetch_all_dicts(cursor)
+            rows = await _fetch_all_dicts(cursor)
         finally:
             await _call(cursor.close)
+
+        if boost_recency and rows:
+            w = float(recency_weight)
+            today = datetime.now(timezone.utc).date()
+            for row in rows:
+                rank = row.get("rank_score")
+                if rank is None:
+                    continue
+                try:
+                    rank_f = float(rank)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(rank_f):
+                    continue
+                upd_date = _recency_date(row)
+                age_days = max(0, (today - upd_date).days)
+                row["rank_score"] = rank_f - w * (1.0 / (1.0 + age_days))
+            rows.sort(key=_rank_score_sort_key)
+            rows = rows[:limit]
+
+        return rows
 
     async def fetch_memory_context(
         self,
@@ -2576,9 +2617,7 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         finally:
             await _call(cursor.close)
 
-    async def mark_models_unavailable(
-        self, tx: Transaction, provider: str, seen_model_ids: Sequence[str]
-    ) -> int:
+    async def mark_models_unavailable(self, tx: Transaction, provider: str, seen_model_ids: Sequence[str]) -> int:
         """Mark this provider's models NOT seen in the latest sync as unavailable."""
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
