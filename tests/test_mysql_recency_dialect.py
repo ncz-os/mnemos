@@ -11,10 +11,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
-from mnemos.persistence.mysql import MysqlMemoryRepository
+from mnemos.persistence.mysql import MysqlFederationRepository, MysqlMemoryRepository
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
 
@@ -127,3 +128,46 @@ async def test_mysql_semantic_search_recency_rerank_is_conservative() -> None:
     assert [row["rank_score"] for row in result] == sorted(row["rank_score"] for row in result)
     assert len(result) <= 3
     assert calls[0]["params"][-1] == 12
+
+
+@pytest.mark.asyncio
+async def test_mysql_federation_feed_embedding_bind_precedes_filters() -> None:
+    calls: list[dict[str, Any]] = []
+    tx = SimpleNamespace(conn=_FakeMysqlConn([], calls))
+    repo = MysqlFederationRepository()
+    since = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    with (
+        patch("mnemos.core.config.embed_http_model_override", return_value="embed-model"),
+        patch("mnemos.core.config.get_settings"),
+    ):
+        await repo.feed_query(
+            tx,
+            since_updated=since,
+            since_id="cursor-id",
+            namespaces=["tenant-a"],
+            categories=["keep"],
+            limit=25,
+            prefer_compressed=False,
+            include_embedding=True,
+        )
+
+    sql = " ".join(calls[0]["sql"].split()).lower()
+    params = calls[0]["params"]
+
+    assert "%s as embedding_model" in sql
+    assert sql.index("%s as embedding_model") < sql.index("where m.federation_source is null")
+    assert params == (
+        "embed-model",
+        since,
+        since,
+        "cursor-id",
+        "tenant-a",
+        "keep",
+        since,
+        since,
+        "cursor-id",
+        "tenant-a",
+        "keep",
+        25,
+    )

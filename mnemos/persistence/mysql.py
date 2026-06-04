@@ -772,6 +772,7 @@ class _MysqlTransaction:
     def __init__(self, conn: Any) -> None:
         self._conn = conn
         self._closed = False
+        self._named_locks: set[str] = set()
 
     @property
     def closed(self) -> bool:
@@ -781,17 +782,37 @@ class _MysqlTransaction:
     def conn(self) -> Any:
         return self._conn
 
+    def named_lock_held(self, name: str) -> bool:
+        return name in self._named_locks
+
+    def hold_named_lock(self, name: str) -> None:
+        self._named_locks.add(name)
+
+    async def _release_named_locks(self) -> None:
+        if not self._named_locks:
+            return
+        async with self._conn.cursor() as cursor:
+            for name in tuple(self._named_locks):
+                await cursor.execute("SELECT RELEASE_LOCK(%s)", (name,))
+        self._named_locks.clear()
+
     async def commit(self) -> None:
         if self._closed:
             return
-        await self._conn.commit()
-        self._closed = True
+        try:
+            await self._conn.commit()
+        finally:
+            await self._release_named_locks()
+            self._closed = True
 
     async def rollback(self) -> None:
         if self._closed:
             return
-        await self._conn.rollback()
-        self._closed = True
+        try:
+            await self._conn.rollback()
+        finally:
+            await self._release_named_locks()
+            self._closed = True
 
 
 # ── Memory repository ─────────────────────────────────────────────────────────
@@ -2669,6 +2690,97 @@ class MysqlWebhookRepository(WebhookRepository):
 
 
 class MysqlConsultationAuditRepository(ConsultationAuditRepository):
+    _AUDIT_CHAIN_LOCK_NAME = "mnemos_audit_global"
+    _AUDIT_CHAIN_LOCK_TIMEOUT_SECS = 10
+
+    async def _insert_audit_link_locked(
+        self,
+        tx: Transaction,
+        cursor: Any,
+        *,
+        audit_id: str,
+        consultation_id: str | None,
+        prompt: str,
+        prompt_hash: str,
+        provider: str | None,
+        model: str | None = None,
+        response_text: str,
+        response_hash: str,
+        task_type: str | None,
+        quality_score: Any | None,
+        latency_ms: Any | None = None,
+        cost_usd: Any | None = None,
+        genesis_hash: str = "",
+    ) -> str:
+        lock_name = self._AUDIT_CHAIN_LOCK_NAME
+        named_lock_held = getattr(tx, "named_lock_held", None)
+        hold_named_lock = getattr(tx, "hold_named_lock", None)
+        release_immediately = hold_named_lock is None
+
+        if not (callable(named_lock_held) and named_lock_held(lock_name)):
+            await cursor.execute(
+                "SELECT GET_LOCK(%s, %s)",
+                (lock_name, self._AUDIT_CHAIN_LOCK_TIMEOUT_SECS),
+            )
+            lock_row = await cursor.fetchone()
+            if isinstance(lock_row, dict):
+                lock_value = next(iter(lock_row.values()), 0)
+            else:
+                lock_value = lock_row[0] if lock_row else 0
+            if int(lock_value or 0) != 1:
+                raise TimeoutError(f"Timed out acquiring MySQL audit chain lock {lock_name!r}")
+            if callable(hold_named_lock):
+                hold_named_lock(lock_name)
+
+        try:
+            await cursor.execute(
+                """
+                SELECT id, chain_hash
+                  FROM graeae_audit_log
+                 WHERE deleted_at IS NULL
+                 ORDER BY sequence_num DESC
+                 LIMIT 1
+                """
+            )
+            prev = await _fetchone_dict(cursor)
+            prev_id = prev["id"] if prev else None
+            prev_chain_hash = prev["chain_hash"] if prev else genesis_hash
+            chain_hash = hashlib.sha256((prev_chain_hash + prompt_hash + response_hash).encode()).hexdigest()
+            await cursor.execute(
+                """
+                INSERT INTO graeae_audit_log (
+                    id, consultation_id, prompt, prompt_hash, provider, model, response_text,
+                    response_hash, chain_hash, prev_id, prev_chain_hash, task_type, quality_score,
+                    latency_ms, cost_usd
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s
+                )
+                """,
+                (
+                    audit_id,
+                    consultation_id,
+                    prompt,
+                    prompt_hash,
+                    provider,
+                    model,
+                    response_text,
+                    response_hash,
+                    chain_hash,
+                    prev_id,
+                    prev_chain_hash,
+                    task_type or "reasoning",
+                    quality_score,
+                    latency_ms,
+                    cost_usd,
+                ),
+            )
+        finally:
+            if release_immediately:
+                await cursor.execute("SELECT RELEASE_LOCK(%s)", (lock_name,))
+        return audit_id
+
     async def fetch_recommended_model(
         self,
         tx: Transaction,
@@ -2770,42 +2882,24 @@ class MysqlConsultationAuditRepository(ConsultationAuditRepository):
         response_text = kwargs.get("response_text") or kwargs.get("response") or ""
         prompt_hash = kwargs.get("prompt_hash") or hashlib.sha256(prompt.encode()).hexdigest()
         response_hash = kwargs.get("response_hash") or hashlib.sha256(response_text.encode()).hexdigest()
-        prev_chain_hash = kwargs.get("prev_chain_hash")
-        chain_hash = kwargs.get("chain_hash")
-        if chain_hash is None:
-            chain_basis = (prev_chain_hash or kwargs.get("genesis_hash") or "") + prompt_hash + response_hash
-            chain_hash = hashlib.sha256(chain_basis.encode()).hexdigest()
 
         async with tx.conn.cursor() as cursor:
-            await cursor.execute(
-                """
-                INSERT INTO graeae_audit_log (
-                    id, consultation_id, prompt, prompt_hash, provider, model, response_text,
-                    response_hash, chain_hash, prev_id, prev_chain_hash, task_type, quality_score,
-                    latency_ms, cost_usd
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s,
-                    %s, %s
-                )
-                """,
-                (
-                    audit_id,
-                    kwargs.get("consultation_id"),
-                    prompt,
-                    prompt_hash,
-                    kwargs.get("provider"),
-                    kwargs.get("model"),
-                    response_text,
-                    response_hash,
-                    chain_hash,
-                    kwargs.get("prev_id"),
-                    prev_chain_hash,
-                    kwargs.get("task_type") or "reasoning",
-                    kwargs.get("quality_score"),
-                    kwargs.get("latency_ms"),
-                    kwargs.get("cost_usd"),
-                ),
+            await self._insert_audit_link_locked(
+                tx,
+                cursor,
+                audit_id=audit_id,
+                consultation_id=kwargs.get("consultation_id"),
+                prompt=prompt,
+                prompt_hash=prompt_hash,
+                provider=kwargs.get("provider"),
+                model=kwargs.get("model"),
+                response_text=response_text,
+                response_hash=response_hash,
+                task_type=kwargs.get("task_type"),
+                quality_score=kwargs.get("quality_score"),
+                latency_ms=kwargs.get("latency_ms"),
+                cost_usd=kwargs.get("cost_usd"),
+                genesis_hash=kwargs.get("genesis_hash") or "",
             )
         return audit_id
 
@@ -2913,33 +3007,19 @@ class MysqlConsultationAuditRepository(ConsultationAuditRepository):
 
             prompt_hash = hashlib.sha256(kwargs["prompt"].encode()).hexdigest()
             response_hash = hashlib.sha256(kwargs["consensus_response"].encode()).hexdigest()
-            await cursor.execute(
-                "SELECT id, chain_hash FROM graeae_audit_log WHERE deleted_at IS NULL ORDER BY sequence_num DESC LIMIT 1"
-            )
-            prev = await _fetchone_dict(cursor)
-            prev_chain = prev["chain_hash"] if prev else kwargs["genesis_hash"]
-            chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
-            await cursor.execute(
-                """
-                INSERT INTO graeae_audit_log (
-                    id, consultation_id, prompt, prompt_hash, provider, response_text,
-                    response_hash, chain_hash, prev_id, prev_chain_hash, task_type, quality_score
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    uuid.uuid4().hex,
-                    consultation_id,
-                    kwargs["prompt"],
-                    prompt_hash,
-                    kwargs["winning_muse"],
-                    kwargs["consensus_response"],
-                    response_hash,
-                    chain_hash,
-                    prev["id"] if prev else None,
-                    prev_chain,
-                    kwargs["task_type"] or "reasoning",
-                    kwargs["consensus_score"],
-                ),
+            await self._insert_audit_link_locked(
+                tx,
+                cursor,
+                audit_id=uuid.uuid4().hex,
+                consultation_id=consultation_id,
+                prompt=kwargs["prompt"],
+                prompt_hash=prompt_hash,
+                provider=kwargs["winning_muse"],
+                response_text=kwargs["consensus_response"],
+                response_hash=response_hash,
+                task_type=kwargs["task_type"],
+                quality_score=kwargs["consensus_score"],
+                genesis_hash=kwargs["genesis_hash"],
             )
             for memory_id in kwargs["memory_ids"]:
                 await cursor.execute(
@@ -3358,10 +3438,11 @@ class MysqlFederationRepository(FederationRepository):
                 embed_model = "unknown"
             embed_select_memory = "FROM_VECTOR(m.embedding) AS embedding, %s AS embedding_model,"
             embed_select_tombstone = "NULL AS embedding, NULL AS embedding_model,"
-            memory_params.append(embed_model)
+            select_params = [embed_model]
         else:
             embed_select_memory = ""
             embed_select_tombstone = ""
+            select_params = []
 
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
@@ -3426,7 +3507,7 @@ class MysqlFederationRepository(FederationRepository):
                 ORDER BY updated ASC, id ASC
                 LIMIT %s
                 """,
-                [*memory_params, *tombstone_params, limit],
+                [*select_params, *memory_params, *tombstone_params, limit],
             )
             return await _fetch_all_dicts(cursor)
 
@@ -4005,11 +4086,12 @@ class MysqlStateRepository(StateRepository):
                 INSERT INTO state (owner_id, namespace, `key`, value, updated)
                 VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP(6))
                 ON DUPLICATE KEY UPDATE
-                    value = IF(deleted_at IS NULL, %s, value),
-                    updated = IF(deleted_at IS NULL, CURRENT_TIMESTAMP(6), updated),
-                    version = IF(deleted_at IS NULL, version + 1, version)
+                    value = VALUES(value),
+                    updated = CURRENT_TIMESTAMP(6),
+                    version = version + 1,
+                    deleted_at = NULL
                 """,
-                (owner_id, namespace, key, value, value),
+                (owner_id, namespace, key, value),
             )
         return await self.get(tx, key, owner_id=owner_id, namespace=namespace)
 

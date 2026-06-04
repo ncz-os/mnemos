@@ -104,6 +104,14 @@ async def test_mysql_consultation_audit_live_roundtrip() -> None:
             consultation = await backend.consultations_audit.fetch_consultation_by_id(tx, consultation_id)
             assert consultation is not None
             assert consultation["id"] == consultation_id
+            initial_audits = await backend.consultations_audit.fetch_consultation_audits(
+                tx,
+                consultation_id=consultation_id,
+                limit=10,
+                offset=0,
+            )
+            assert len(initial_audits) == 1
+            first_audit = initial_audits[0]
 
             audit_id = await backend.consultations_audit.insert_consultation_audit(
                 tx,
@@ -138,6 +146,11 @@ async def test_mysql_consultation_audit_live_roundtrip() -> None:
             assert audit["provider"] == provider
             assert any(row["id"] == audit_id for row in audits)
             assert any(row["consultation_id"] == consultation_id for row in scoped)
+            assert len(audits) == 2
+            by_id = {row["id"]: row for row in audits}
+            assert by_id[audit_id]["prev_id"] == first_audit["id"]
+            assert by_id[audit_id]["prev_chain_hash"] == first_audit["chain_hash"]
+            assert by_id[first_audit["id"]]["prev_id"] != audit_id
     finally:
         try:
             async with backend.transactional() as tx:
