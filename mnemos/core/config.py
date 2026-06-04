@@ -597,6 +597,10 @@ class PantheonSettings(BaseSettings):
     model_config = _config_model_config()
 
     enabled: bool = Field(False, validation_alias="MNEMOS_PANTHEON_ENABLED")
+    cross_provider_fallback: bool = Field(
+        False,
+        validation_alias="MNEMOS_PANTHEON_CROSS_PROVIDER_FALLBACK",
+    )
     consultation_cap: int = Field(
         50,
         validation_alias="MNEMOS_PANTHEON_CONSULTATION_CAP",
@@ -1412,7 +1416,7 @@ def mcp_mnemos_url_env() -> str:
 def mcp_mnemos_token_env() -> str:
     return runtime_env_value(
         "MNEMOS_TOKEN",
-        "d3a3bc609583005f4a077b6ffd00154b4f03f70104d0cdbfbb019fceb28daca9",
+        "",  # no hardcoded fallback; set MNEMOS_TOKEN in env (leaked token, rotate server-side),
     )
 
 

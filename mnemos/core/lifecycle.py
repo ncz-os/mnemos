@@ -104,6 +104,13 @@ _post_db_startup_hooks: dict = {}
 _lifespan_cleanup_hooks: dict = {}
 
 
+async def _close_graeae_engine_if_loaded() -> None:
+    """Close the singleton GRAEAE engine even when API hook registration is skipped."""
+    from mnemos.domain.graeae.engine import get_graeae_engine
+
+    await get_graeae_engine().close()
+
+
 def register_post_db_startup_hook(name: str, hook) -> None:
     """Register an awaitable startup hook to run AFTER the DB pool is up.
 
@@ -888,6 +895,11 @@ async def lifespan(app):
             await hook()
         except Exception:
             logger.exception("[shutdown] %s cleanup hook failed", hook_name)
+    if "graeae engine" not in _lifespan_cleanup_hooks:
+        try:
+            await _close_graeae_engine_if_loaded()
+        except Exception:
+            logger.exception("[shutdown] graeae engine cleanup failed")
 
     if _persistence_backend is not None:
         await _persistence_backend.close()
