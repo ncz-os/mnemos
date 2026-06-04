@@ -3717,116 +3717,7 @@ class Db2OAuthRepository(OracleOAuthRepository):
 class Db2SessionsRepository(OracleSessionsRepository):
     """Db2-native protocol sessions persistence."""
 
-    async def create_session(
-        self,
-        tx: Any,
-        *,
-        session_id: str | bytes | uuid.UUID | None = None,
-        user_id: str,
-        expires_at: Any,
-        metadata: dict[str, Any] | None = None,
-    ) -> Row:
-        sid = session_id or uuid.uuid4()
-        sid_raw = _uuid_to_raw(sid)
-        assert sid_raw is not None
-        cursor = await _call(_conn_from_tx(tx).cursor)
-        try:
-            await _call(
-                cursor.execute,
-                """
-                INSERT INTO sessions (id, session_id, user_id, started_at, last_active_at, expires_at, metadata)
-                VALUES (?, ?, ?, CURRENT TIMESTAMP, CURRENT TIMESTAMP, ?, ?)
-                """,
-                (str(uuid.UUID(bytes=sid_raw)), sid_raw, user_id, _ts_for_oracle(expires_at), _json_text(metadata, {})),
-            )
-        finally:
-            await _call(cursor.close)
-        row = await self.lookup_session(tx, session_id=sid)
-        assert row is not None
-        return row
-
-    async def lookup_session(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> Row | None:
-        cursor = await _call(_conn_from_tx(tx).cursor)
-        try:
-            await _call(
-                cursor.execute,
-                """
-                SELECT session_id, user_id, started_at, last_active_at, expires_at, metadata
-                FROM sessions
-                WHERE session_id = ? AND expires_at > CURRENT TIMESTAMP
-                """,
-                (_uuid_to_raw(session_id),),
-            )
-            return self._normalize_session_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
-        finally:
-            await _call(cursor.close)
-
-    async def update_session_active(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> bool:
-        cursor = await _call(_conn_from_tx(tx).cursor)
-        try:
-            await _call(
-                cursor.execute,
-                "UPDATE sessions SET last_active_at = CURRENT TIMESTAMP WHERE session_id = ?",
-                (_uuid_to_raw(session_id),),
-            )
-            return int(getattr(cursor, "rowcount", 0) or 0) > 0
-        finally:
-            await _call(cursor.close)
-
-    async def expire_session(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> bool:
-        cursor = await _call(_conn_from_tx(tx).cursor)
-        try:
-            await _call(
-                cursor.execute,
-                "UPDATE sessions SET expires_at = CURRENT TIMESTAMP WHERE session_id = ?",
-                (_uuid_to_raw(session_id),),
-            )
-            return int(getattr(cursor, "rowcount", 0) or 0) > 0
-        finally:
-            await _call(cursor.close)
-
-    async def log_session_event(
-        self,
-        tx: Any,
-        *,
-        session_id: str | bytes | uuid.UUID,
-        event_kind: str,
-        payload: dict[str, Any] | None = None,
-    ) -> Row:
-        cursor = await _call(_conn_from_tx(tx).cursor)
-        try:
-            await _call(
-                cursor.execute,
-                """
-                SELECT id, session_id, event_kind, payload, ts
-                FROM FINAL TABLE (
-                    INSERT INTO session_logs (session_id, event_kind, payload, ts)
-                    VALUES (?, ?, ?, CURRENT TIMESTAMP)
-                )
-                """,
-                (_uuid_to_raw(session_id), event_kind, _json_text(payload, {})),
-            )
-            return self._normalize_session_log_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))  # type: ignore[return-value]
-        finally:
-            await _call(cursor.close)
-
-    @staticmethod
-    def _normalize_session_row(row: Row | None) -> Row | None:
-        if row is None:
-            return None
-        out = dict(row)
-        out["session_id"] = _raw_to_uuid(out.get("session_id"))
-        out["metadata"] = _json_value(out.get("metadata"), {})
-        return out
-
-    @staticmethod
-    def _normalize_session_log_row(row: Row | None) -> Row | None:
-        if row is None:
-            return None
-        out = dict(row)
-        out["session_id"] = _raw_to_uuid(out.get("session_id"))
-        out["payload"] = _json_value(out.get("payload"), {})
-        return out
+    pass
 
 
 class Db2ConsultationsRepository(OracleConsultationsRepository):
@@ -4095,20 +3986,116 @@ class Db2Backend(OracleBackend):
     async def redeem_oauth_state(self, tx: Any, **kwargs: Any) -> Row | None:
         return await self._oauth_repo.redeem_oauth_state(tx, **kwargs)
 
-    async def create_session(self, tx: Any, **kwargs: Any) -> Row:
-        return await self._sessions_repo.create_session(tx, **kwargs)
+    async def create_session(
+        self,
+        tx: Any,
+        *,
+        session_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        expires_at: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> Row:
+        sid = session_id or uuid.uuid4()
+        sid_raw = _uuid_to_raw(sid)
+        assert sid_raw is not None
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO sessions (id, session_id, user_id, started_at, last_active_at, expires_at, metadata)
+                VALUES (?, ?, ?, CURRENT TIMESTAMP, CURRENT TIMESTAMP, ?, ?)
+                """,
+                (str(uuid.UUID(bytes=sid_raw)), sid_raw, user_id, _ts_for_oracle(expires_at), _json_text(metadata, {})),
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.lookup_session(tx, session_id=sid)
+        assert row is not None
+        return row
 
-    async def lookup_session(self, tx: Any, **kwargs: Any) -> Row | None:
-        return await self._sessions_repo.lookup_session(tx, **kwargs)
+    async def lookup_session(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT session_id, user_id, started_at, last_active_at, expires_at, metadata
+                FROM sessions
+                WHERE session_id = ? AND expires_at > CURRENT TIMESTAMP
+                """,
+                (_uuid_to_raw(session_id),),
+            )
+            return self._normalize_session_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+        finally:
+            await _call(cursor.close)
 
-    async def update_session_active(self, tx: Any, **kwargs: Any) -> bool:
-        return await self._sessions_repo.update_session_active(tx, **kwargs)
+    async def update_session_active(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET last_active_at = CURRENT TIMESTAMP WHERE session_id = ?",
+                (_uuid_to_raw(session_id),),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
 
-    async def expire_session(self, tx: Any, **kwargs: Any) -> bool:
-        return await self._sessions_repo.expire_session(tx, **kwargs)
+    async def expire_session(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET expires_at = CURRENT TIMESTAMP WHERE session_id = ?",
+                (_uuid_to_raw(session_id),),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
 
-    async def log_session_event(self, tx: Any, **kwargs: Any) -> Row:
-        return await self._sessions_repo.log_session_event(tx, **kwargs)
+    async def log_session_event(
+        self,
+        tx: Any,
+        *,
+        session_id: str | bytes | uuid.UUID,
+        event_kind: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, session_id, event_kind, payload, ts
+                FROM FINAL TABLE (
+                    INSERT INTO session_logs (session_id, event_kind, payload, ts)
+                    VALUES (?, ?, ?, CURRENT TIMESTAMP)
+                )
+                """,
+                (_uuid_to_raw(session_id), event_kind, _json_text(payload, {})),
+            )
+            return self._normalize_session_log_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))  # type: ignore[return-value]
+        finally:
+            await _call(cursor.close)
+
+    @staticmethod
+    def _normalize_session_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _raw_to_uuid(out.get("session_id"))
+        out["metadata"] = _json_value(out.get("metadata"), {})
+        return out
+
+    @staticmethod
+    def _normalize_session_log_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _raw_to_uuid(out.get("session_id"))
+        out["payload"] = _json_value(out.get("payload"), {})
+        return out
 
     async def create_consultation(self, tx: Any, **kwargs: Any) -> Row:
         return await self._consultations_repo.create_consultation(tx, **kwargs)
