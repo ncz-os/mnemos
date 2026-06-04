@@ -417,7 +417,31 @@ CREATE TABLE IF NOT EXISTS memory_versions (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
-_INIT_DDLS = [_DDL_MEMORIES, _DDL_MEMORY_VERSIONS, _DDL_KG_TRIPLES, _DDL_COMPRESSION_QUEUE, _DDL_STATE]
+_DDL_MEMORY_BRANCHES = """\
+CREATE TABLE IF NOT EXISTS memory_branches (
+    memory_id       VARCHAR(64)  NOT NULL,
+    name            VARCHAR(128) NOT NULL,
+    head_version_id VARCHAR(64),
+    created_by      VARCHAR(256),
+    created_at      TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (memory_id, name),
+    INDEX idx_memory_branches_memory (memory_id),
+    INDEX idx_memory_branches_head (head_version_id),
+    CONSTRAINT fk_memory_branches_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+    CONSTRAINT fk_memory_branches_head
+        FOREIGN KEY (head_version_id) REFERENCES memory_versions(id) ON DELETE SET NULL
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_INIT_DDLS = [
+    _DDL_MEMORIES,
+    _DDL_MEMORY_VERSIONS,
+    _DDL_MEMORY_BRANCHES,
+    _DDL_KG_TRIPLES,
+    _DDL_COMPRESSION_QUEUE,
+    _DDL_STATE,
+]
 
 
 # ── Pool factory ──────────────────────────────────────────────────────────────
@@ -1666,16 +1690,227 @@ class MysqlVersionRepository(VersionRepository):
 
 
 class MysqlBranchRepository(BranchRepository):
-    create_memory_branch = _stub_method("create_memory_branch")
-    delete_memory_branches_for_memories = _stub_method("delete_memory_branches_for_memories")
-    fetch_memory_branch_heads = _stub_method("fetch_memory_branch_heads")
-    upsert_memory_branch_head = _stub_method("upsert_memory_branch_head")
-    list_memory_branches = _stub_method("list_memory_branches")
-    delete_memory_branch = _stub_method("delete_memory_branch")
-    fetch_dag_for_memory = _stub_method("fetch_dag_for_memory")
-    merge_memory_branch = _stub_method("merge_memory_branch")
-    get_branch_head = _stub_method("get_branch_head")
-    set_branch_head = _stub_method("set_branch_head")
+    async def create_memory_branch(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        name: str,
+        from_commit: str | None,
+        user: Any,
+    ) -> dict[str, Any]:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            if self._is_root(user):
+                await cursor.execute(
+                    "SELECT 1 FROM memories WHERE id = %s",
+                    (memory_id,),
+                )
+            else:
+                await cursor.execute(
+                    "SELECT 1 FROM memories WHERE id = %s AND owner_id = %s AND namespace = %s",
+                    (memory_id, user.user_id, user.namespace),
+                )
+            live = await cursor.fetchone()
+            if not live:
+                return {"success": False, "error": f"Memory {memory_id} not found"}
+
+            if from_commit:
+                start = await self._fetch_branch_start_by_commit(cursor, memory_id, from_commit, user)
+                if not start:
+                    return {"success": False, "error": "Commit not found"}
+            else:
+                start = await self._fetch_main_branch_start(cursor, memory_id, user)
+                if not start:
+                    return {"success": False, "error": "main branch not found"}
+
+            await cursor.execute(
+                """
+                INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE memory_id = memory_id
+                """,
+                (memory_id, name, start["id"], user.user_id),
+            )
+            existing = await self._fetch_existing_branch(cursor, memory_id, name, user)
+            if existing is None:
+                return {
+                    "success": False,
+                    "error": (
+                        "branch exists but its head is not visible or points at a foreign memory version; "
+                        "reconciliation required"
+                    ),
+                }
+            if existing["head_version_id"] == start["id"]:
+                return {
+                    "success": True,
+                    "memory_id": memory_id,
+                    "branch": name,
+                    "commit_hash": existing["commit_hash"],
+                    "created_by": user.user_id,
+                    "idempotent": existing["head_version_id"] != start["id"],
+                }
+            return {
+                "success": False,
+                "error": f"branch '{name}' already exists at a different head; refusing to silently move it",
+            }
+
+    @staticmethod
+    def _is_root(user: Any) -> bool:
+        return getattr(user, "role", None) == "root"
+
+    async def _fetch_branch_start_by_commit(
+        self,
+        cursor: Any,
+        memory_id: str,
+        from_commit: str,
+        user: Any,
+    ) -> Row | None:
+        if self._is_root(user):
+            await cursor.execute(
+                "SELECT id, commit_hash FROM memory_versions WHERE memory_id = %s AND commit_hash = %s",
+                (memory_id, from_commit),
+            )
+        else:
+            await cursor.execute(
+                """
+                SELECT id, commit_hash
+                  FROM memory_versions
+                 WHERE memory_id = %s
+                   AND commit_hash = %s
+                   AND (owner_id = %s OR MOD(permission_mode, 10) >= 4)
+                   AND namespace = %s
+                """,
+                (memory_id, from_commit, user.user_id, user.namespace),
+            )
+        return await _fetchone_dict(cursor)
+
+    async def _fetch_main_branch_start(self, cursor: Any, memory_id: str, user: Any) -> Row | None:
+        if self._is_root(user):
+            await cursor.execute(
+                """
+                SELECT mv.id, mv.commit_hash
+                  FROM memory_versions mv
+                  INNER JOIN memory_branches mb
+                          ON mb.memory_id = mv.memory_id
+                         AND mb.head_version_id = mv.id
+                 WHERE mv.memory_id = %s
+                   AND mb.name = 'main'
+                """,
+                (memory_id,),
+            )
+        else:
+            await cursor.execute(
+                """
+                SELECT mv.id, mv.commit_hash
+                  FROM memory_versions mv
+                  INNER JOIN memory_branches mb
+                          ON mb.memory_id = mv.memory_id
+                         AND mb.head_version_id = mv.id
+                 WHERE mv.memory_id = %s
+                   AND mb.name = 'main'
+                   AND (mv.owner_id = %s OR MOD(mv.permission_mode, 10) >= 4)
+                   AND mv.namespace = %s
+                """,
+                (memory_id, user.user_id, user.namespace),
+            )
+        return await _fetchone_dict(cursor)
+
+    async def _fetch_existing_branch(
+        self,
+        cursor: Any,
+        memory_id: str,
+        name: str,
+        user: Any,
+    ) -> Row | None:
+        if self._is_root(user):
+            await cursor.execute(
+                """
+                SELECT mb.head_version_id, mv.commit_hash
+                  FROM memory_branches mb
+                  INNER JOIN memory_versions mv
+                          ON mv.id = mb.head_version_id
+                         AND mv.memory_id = mb.memory_id
+                 WHERE mb.memory_id = %s
+                   AND mb.name = %s
+                """,
+                (memory_id, name),
+            )
+        else:
+            await cursor.execute(
+                """
+                SELECT mb.head_version_id, mv.commit_hash
+                  FROM memory_branches mb
+                  INNER JOIN memory_versions mv
+                          ON mv.id = mb.head_version_id
+                         AND mv.memory_id = mb.memory_id
+                         AND (mv.owner_id = %s OR MOD(mv.permission_mode, 10) >= 4)
+                         AND mv.namespace = %s
+                 WHERE mb.memory_id = %s
+                   AND mb.name = %s
+                """,
+                (user.user_id, user.namespace, memory_id, name),
+            )
+        return await _fetchone_dict(cursor)
+
+    async def delete_memory_branches_for_memories(self, tx: Transaction, memory_ids: Sequence[str]) -> None:
+        if not memory_ids:
+            return
+        placeholders = ", ".join(["%s"] * len(memory_ids))
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"DELETE FROM memory_branches WHERE memory_id IN ({placeholders})",
+                list(memory_ids),
+            )
+
+    async def fetch_memory_branch_heads(
+        self,
+        tx: Transaction,
+        memory_ids: Sequence[str],
+        *,
+        authorized_version_uuids: Sequence[str] | None = None,
+    ) -> list[Row]:
+        if not memory_ids:
+            return []
+        params: list[Any] = list(memory_ids)
+        conditions = [f"memory_id IN ({', '.join(['%s'] * len(memory_ids))})"]
+        if authorized_version_uuids is not None:
+            if not authorized_version_uuids:
+                return []
+            conditions.append(f"id IN ({', '.join(['%s'] * len(authorized_version_uuids))})")
+            params.extend(authorized_version_uuids)
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT memory_id, branch, id AS head_version_id "
+                "FROM ("
+                "  SELECT memory_id, branch, id, version_num, "
+                "         ROW_NUMBER() OVER (PARTITION BY memory_id, branch ORDER BY version_num DESC) AS rn "
+                "  FROM memory_versions "
+                f"  WHERE {' AND '.join(conditions)}"
+                ") ranked WHERE rn = 1",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def upsert_memory_branch_head(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        branch: str,
+        head_version_id: Any,
+    ) -> None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
+                VALUES (%s, %s, %s, NULL)
+                ON DUPLICATE KEY UPDATE head_version_id = VALUES(head_version_id)
+                """,
+                (memory_id, branch, head_version_id),
+            )
 
 
 class MysqlCompressionRepository(CompressionRepository):
