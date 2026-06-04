@@ -27,7 +27,6 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -614,8 +613,7 @@ async def update_arena_scores(
                 )
             else:
                 logger.debug(
-                    f"[SYNC] arena: no rows matched for {prov}/{model_id!r} "
-                    f"— provider models not yet synced?"
+                    f"[SYNC] arena: no rows matched for {prov}/{model_id!r} " f"— provider models not yet synced?"
                 )
 
 
@@ -640,9 +638,7 @@ if __name__ == "__main__":
             from mnemos.core.config import get_settings
 
             settings = get_settings()
-            backend = await _lc._build_oracle_backend(
-                _lc._oracle_dsn_from_settings(settings), settings
-            )
+            backend = await _lc._build_oracle_backend(_lc._oracle_dsn_from_settings(settings), settings)
 
         if args.provider:
             result = await sync_provider(backend, args.provider, dry_run=args.dry_run)
