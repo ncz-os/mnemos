@@ -97,7 +97,9 @@ def user_from_context() -> UserContext | None:
     user_id = _MCP_BACKEND_USER_ID.get()
     role = _MCP_BACKEND_ROLE.get()
     namespace = _MCP_BACKEND_NAMESPACE.get()
-    if not all((api_key, user_id, role, namespace)):
+    if not all((user_id, role, namespace)):
+        return None
+    if not api_key and get_settings().auth.enabled:
         return None
     return UserContext(
         user_id=user_id,
@@ -275,6 +277,23 @@ def _mcp_user_required(user: UserContext | None) -> UserContext:
     if user is None or not user.authenticated:
         raise PermissionError("authenticated user required for version tools")
     return user
+
+
+def _mcp_user_or_system(user: UserContext | None) -> UserContext:
+    """Authenticated caller if present, else a local system context.
+
+    The in-process / LAN MCP path (MNEMOS_AUTH_ENABLED off) has no authenticated
+    caller. Return a system owner so the consultation audit row still persists
+    instead of failing closed (which would reject every consult)."""
+    if user is not None and user.authenticated:
+        return user
+    return UserContext(
+        user_id="mcp-system",
+        group_ids=[],
+        role="root",
+        namespace="default",
+        authenticated=False,
+    )
 
 
 def _mcp_is_root(user: UserContext) -> bool:
