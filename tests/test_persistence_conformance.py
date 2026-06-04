@@ -80,7 +80,6 @@ ACCESSOR_ABC: dict[str, type] = {accessor: abc for pairs in CAP_ACCESSORS.values
 # real and complete) or making the accessor raise BackendCapabilityMissing.
 KNOWN_UNDECLARED: set[tuple[str, str]] = {
     ("mysql", "federation"),
-    ("mysql", "state_kv"),
 }
 
 # Concrete repo methods whose signature is known to diverge from the ABC.
