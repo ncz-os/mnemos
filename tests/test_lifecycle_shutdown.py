@@ -22,8 +22,16 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_p
                 raise RuntimeError("redis unavailable")
 
         class FakeGraeaeEngine:
+            def __init__(self):
+                self.closed = False
+
             async def reload_from_registry(self, _pool):
                 return None
+
+            async def close(self):
+                self.closed = True
+
+        engine = FakeGraeaeEngine()
 
         monkeypatch.setattr(lifecycle, "_background_tasks", set())
         monkeypatch.setattr(lifecycle, "_worker_tasks", set())
@@ -34,7 +42,7 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_p
         monkeypatch.setattr(lifecycle, "_load_config", lambda: {"worker": {"enabled": False}})
         monkeypatch.setattr(lifecycle.asyncpg, "create_pool", create_pool)
         monkeypatch.setattr(lifecycle.aioredis, "from_url", lambda *_args, **_kwargs: RedisUnavailable())
-        monkeypatch.setattr(graeae_engine, "get_graeae_engine", lambda: FakeGraeaeEngine())
+        monkeypatch.setattr(graeae_engine, "get_graeae_engine", lambda: engine)
 
         app = SimpleNamespace(state=SimpleNamespace())
 
@@ -45,5 +53,6 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_p
             assert lifecycle._worker_tasks == set()
 
         assert lifecycle._cache is None
+        assert engine.closed is True
 
     asyncio.run(run())
