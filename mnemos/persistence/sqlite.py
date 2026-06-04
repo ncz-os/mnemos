@@ -2235,7 +2235,7 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
         tx: Transaction,
         task_type: str,
         cost_budget: float = 10.0,
-        quality_floor: float = 0.7,
+        quality_floor: float = 0.85,
     ) -> dict[str, Any] | None:
         model, _required = await self.fetch_recommended_model(tx, task_type, cost_budget, quality_floor)
         return model
