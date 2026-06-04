@@ -138,5 +138,42 @@ in place → re-review until `approve` → commit → push ARGONAS→GitLab→Gi
   stock Db2; `CONTAINS` raises SQL20424N without a text index, so it must be
   opt-in). Offline dialect tests assert the predicate per mode + invalid-mode
   fallback. Live behaviour gated on `DB2_DSN` + a provisioned text index.
-- **`Db2SessionsRepository.create_session` conflation** — still open (see P2);
-  needs the chat-vs-oauth ownership design decision before any code change.
+- **`Db2SessionsRepository.create_session` conflation** — still open; design
+  blessed, mechanics need operator sign-off (auth path, DB2 not live-testable).
+
+  Accurate structure (verified): the browser/OAuth-session helpers
+  (`create_session(session_id, expires_at, metadata)`, `lookup_session`,
+  `update_session_active`, `expire_session`) live as **facade-level methods on
+  `OracleBackend`** (oracle.py:4556-4618) — NOT in `OracleSessionsRepository`
+  (chat, oracle.py:2751) nor `OracleOAuthRepository` (oauth tokens, 2705). DB2
+  regressed this: it put the browser-session methods inside
+  `Db2SessionsRepository` (shadowing the chat `create_session`) and the
+  `Db2Backend` facade delegates `lookup_session`/`update_session_active`/
+  `expire_session` to `self._sessions_repo` (db2.py:4037-4043).
+
+  **GRAEAE verdict (architecture_design, consensus 1.0, winning muse gemini):**
+  browser/OAuth-session ops must live solely on the auth surface; chat
+  `SessionsRepository` must exclusively own conversational state. DB2 should
+  drop the `Db2SessionsRepository.create_session` override (inherit the chat
+  one) and the browser-session helpers should be reached via the facade's
+  Oracle-inherited path, not the chat repo. Migration is static-analysis +
+  conformance + mocked-driver tests only until DB2 12.1.5 is live.
+
+  **Why not auto-applied:** multi-file auth-path refactor on a backend with no
+  live test; the correct relocation target is the `OracleBackend` facade layer
+  (GRAEAE's prompt framing assumed an OAuth repo), so the exact rewire wants
+  operator confirmation. Tracked by `KNOWN_SIGNATURE_DRIFT`.
+
+## Open items for operator / next session
+1. **DB2 session refactor** (above) — apply the GRAEAE-blessed separation, rewire
+   the facade browser-session delegation off `_sessions_repo`, remove the
+   `KNOWN_SIGNATURE_DRIFT` allowlist entry. Auth path — wants sign-off.
+2. **Recency strategy standardization (product decision)** — recency boost is a
+   deliberate per-backend rollout, not a contract bug: postgres + db2 use
+   Python re-rank (now both over-fetch); mysql + oracle use SQL-side recency
+   (bypasses ANN index ordering); sqlite ignores it (`noqa: ARG002`). Decide
+   whether to standardize all backends on the ANN-index-friendly over-fetch
+   pattern (changes ordering on mysql/oracle; live-unverifiable for oracle).
+3. **MySQL stub surfaces** — federation/state/kg/versions/compression are
+   `_stub_method` stubs while `core` is declared; consider finer capability
+   declaration or genuine impls if MySQL is to be a first-class backend.
