@@ -60,6 +60,7 @@ from mnemos.persistence.base import (
     MYSQL_CAPABILITY_DETAILS,
     ConsultationAuditRepository,
     FederationRepository,
+    KG_CAPABILITY,
     KGRepository,
     MemoryRepository,
     STATE_CAPABILITY,
@@ -1100,16 +1101,370 @@ class MysqlMemoryRepository(MemoryRepository):
 
 
 class MysqlKGRepository(KGRepository):
-    insert_kg_triple = _stub_method("insert_kg_triple")
-    fetch_kg_triples_for_export = _stub_method("fetch_kg_triples_for_export")
-    fetch_kg_triple_by_id = _stub_method("fetch_kg_triple_by_id")
-    fetch_kg_triple = _stub_method("fetch_kg_triple")
-    fetch_kg_triples_for_memory = _stub_method("fetch_kg_triples_for_memory")
-    delete_kg_triple = _stub_method("delete_kg_triple")
-    update_kg_triple = _stub_method("update_kg_triple")
-    list_kg_triples = _stub_method("list_kg_triples")
-    assert_memory_ownership_for_kg = _stub_method("assert_memory_ownership_for_kg")
-    fetch_kg_triple_timeline = _stub_method("fetch_kg_triple_timeline")
+    async def fetch_kg_triples_for_export(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        effective_ns: str | None,
+        include_unattached: bool,
+        hard_limit: int,
+    ) -> list[Row]:
+        conditions: list[str] = ["deleted_at IS NULL"]
+        params: list[Any] = []
+        if memory_ids:
+            placeholders = ", ".join(["%s"] * len(memory_ids))
+            if include_unattached:
+                conditions.append(f"(memory_id IS NULL OR memory_id IN ({placeholders}))")
+            else:
+                conditions.append(f"memory_id IN ({placeholders})")
+            params.extend(memory_ids)
+        elif include_unattached:
+            conditions.append("memory_id IS NULL")
+        else:
+            return []
+        if effective_owner:
+            conditions.append("owner_id = %s")
+            params.append(effective_owner)
+        if effective_ns:
+            conditions.append("namespace = %s")
+            params.append(effective_ns)
+        params.append(hard_limit + 1)
+
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT id, subject, predicate, object, subject_type, object_type, "
+                "valid_from, valid_until, memory_id, confidence, created, owner_id, namespace "
+                f"FROM kg_triples WHERE {' AND '.join(conditions)} LIMIT %s",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def insert_kg_triple(
+        self,
+        tx: Transaction,
+        *,
+        triple_id: str,
+        subject: str,
+        predicate: str,
+        obj: str,
+        subject_type: str | None,
+        object_type: str | None,
+        valid_from: Any,
+        valid_until: Any,
+        memory_id: str | None,
+        confidence: float | None,
+        created: Any,
+        owner_id: str,
+        namespace: str | None,
+    ) -> str:
+        conn = tx.conn
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    INSERT INTO kg_triples (
+                        id, subject, predicate, object,
+                        subject_type, object_type,
+                        valid_from, valid_until,
+                        memory_id, confidence, created,
+                        owner_id, namespace
+                    )
+                    VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s,
+                        COALESCE(%s, CURRENT_TIMESTAMP(6)), %s,
+                        %s, COALESCE(%s, 1.0),
+                        COALESCE(%s, CURRENT_TIMESTAMP(6)),
+                        %s, COALESCE(%s, 'default')
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        id = id
+                    """,
+                    (
+                        triple_id,
+                        subject,
+                        predicate,
+                        obj,
+                        subject_type,
+                        object_type,
+                        valid_from,
+                        valid_until,
+                        memory_id,
+                        confidence,
+                        created,
+                        owner_id,
+                        namespace,
+                    ),
+                )
+                return "INSERT 0 1" if cursor.rowcount else "INSERT 0 0"
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                return "INSERT 0 0"
+            raise
+
+    async def fetch_kg_triple_by_id(self, tx: Transaction, triple_id: str) -> Row | None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT subject, predicate, object, subject_type, object_type, memory_id,
+                       confidence, owner_id, namespace, valid_from, valid_until, created
+                  FROM kg_triples
+                 WHERE id = %s AND deleted_at IS NULL
+                """,
+                (triple_id,),
+            )
+            return await _fetchone_dict(cursor)
+
+    async def fetch_kg_triple(
+        self,
+        tx: Transaction,
+        *,
+        subject: str,
+        predicate: str,
+        obj: str,
+        owner_id: str | None = None,
+        namespace: str | None = None,
+    ) -> Row | None:
+        conditions = ["subject = %s", "predicate = %s", "object = %s", "deleted_at IS NULL"]
+        params: list[Any] = [subject, predicate, obj]
+        if owner_id is not None:
+            conditions.append("owner_id = %s")
+            params.append(owner_id)
+        if namespace is not None:
+            conditions.append("namespace = %s")
+            params.append(namespace)
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"SELECT * FROM kg_triples WHERE {' AND '.join(conditions)} "
+                "ORDER BY valid_from ASC, created ASC LIMIT 1",
+                params,
+            )
+            return await _fetchone_dict(cursor)
+
+    async def fetch_kg_triples_for_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        owner_id: str | None = None,
+        namespace: str | None = None,
+        limit: int = 100,
+    ) -> list[Row]:
+        conditions = ["memory_id = %s", "deleted_at IS NULL"]
+        params: list[Any] = [memory_id]
+        if owner_id is not None:
+            conditions.append("owner_id = %s")
+            params.append(owner_id)
+        if namespace is not None:
+            conditions.append("namespace = %s")
+            params.append(namespace)
+        params.append(limit)
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"SELECT * FROM kg_triples WHERE {' AND '.join(conditions)} "
+                "ORDER BY valid_from ASC, created ASC LIMIT %s",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def delete_kg_triple(
+        self,
+        tx: Transaction,
+        triple_id: str,
+        *,
+        owner_id: str | None = None,
+        namespace: str | None = None,
+    ) -> bool:
+        conditions = ["id = %s", "deleted_at IS NULL"]
+        params: list[Any] = [triple_id]
+        if owner_id is not None:
+            conditions.append("owner_id = %s")
+            params.append(owner_id)
+        if namespace is not None:
+            conditions.append("namespace = %s")
+            params.append(namespace)
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"UPDATE kg_triples SET deleted_at = CURRENT_TIMESTAMP(6) WHERE {' AND '.join(conditions)}",
+                params,
+            )
+            return int(cursor.rowcount or 0) > 0
+
+    async def update_kg_triple(
+        self,
+        tx: Transaction,
+        triple_id: str,
+        *,
+        fields: dict[str, Any],
+        owner_id: str | None = None,
+        namespace: str | None = None,
+    ) -> Row | None:
+        allowed = {
+            "subject",
+            "predicate",
+            "object",
+            "subject_type",
+            "object_type",
+            "valid_from",
+            "valid_until",
+            "memory_id",
+            "confidence",
+        }
+        safe_fields = {key: value for key, value in fields.items() if key in allowed}
+        if not safe_fields:
+            return await self.fetch_kg_triple_by_id(tx, triple_id)
+
+        set_sql = ", ".join(f"{column} = %s" for column in safe_fields)
+        conditions = ["id = %s", "deleted_at IS NULL"]
+        params: list[Any] = list(safe_fields.values()) + [triple_id]
+        if owner_id is not None:
+            conditions.append("owner_id = %s")
+            params.append(owner_id)
+        if namespace is not None:
+            conditions.append("namespace = %s")
+            params.append(namespace)
+
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"UPDATE kg_triples SET {set_sql} WHERE {' AND '.join(conditions)}",
+                params,
+            )
+            if not cursor.rowcount:
+                return None
+        return await self.fetch_kg_triple_by_id(tx, triple_id)
+
+    async def list_kg_triples(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str | None = None,
+        namespace: str | None = None,
+        memory_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Row]:
+        conditions = ["deleted_at IS NULL"]
+        params: list[Any] = []
+        if owner_id is not None:
+            conditions.append("owner_id = %s")
+            params.append(owner_id)
+        if namespace is not None:
+            conditions.append("namespace = %s")
+            params.append(namespace)
+        if memory_id is not None:
+            conditions.append("memory_id = %s")
+            params.append(memory_id)
+        params.extend([limit, offset])
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT *
+                  FROM kg_triples
+                 WHERE {" AND ".join(conditions)}
+                 ORDER BY valid_from ASC, created ASC
+                 LIMIT %s OFFSET %s
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def assert_memory_ownership_for_kg(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        owner_id: str,
+        namespace: str | None = None,
+    ) -> Row | None:
+        conditions = ["id = %s", "owner_id = %s", "deleted_at IS NULL"]
+        params: list[Any] = [memory_id, owner_id]
+        if namespace is not None:
+            conditions.append("namespace = %s")
+            params.append(namespace)
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"SELECT id, owner_id, namespace FROM memories WHERE {' AND '.join(conditions)}",
+                params,
+            )
+            return await _fetchone_dict(cursor)
+
+    async def fetch_kg_triple_timeline(
+        self,
+        tx: Transaction,
+        *,
+        subject: str | None = None,
+        predicate: str | None = None,
+        obj: str | None = None,
+        owner_id: str | None = None,
+        namespace: str | None = None,
+        limit: int = 100,
+    ) -> list[Row]:
+        conditions = ["deleted_at IS NULL"]
+        params: list[Any] = []
+        if subject is not None:
+            conditions.append("subject = %s")
+            params.append(subject)
+        if predicate is not None:
+            conditions.append("predicate = %s")
+            params.append(predicate)
+        if obj is not None:
+            conditions.append("object = %s")
+            params.append(obj)
+        if owner_id is not None:
+            conditions.append("owner_id = %s")
+            params.append(owner_id)
+        if namespace is not None:
+            conditions.append("namespace = %s")
+            params.append(namespace)
+        params.append(limit)
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"SELECT * FROM kg_triples WHERE {' AND '.join(conditions)} "
+                "ORDER BY valid_from ASC, created ASC LIMIT %s",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def search_triples(
+        self,
+        tx: Transaction,
+        query: str,
+        *,
+        owner_id: str | None = None,
+        namespace: str | None = None,
+        limit: int = 20,
+    ) -> list[Row]:
+        params: list[Any] = [f"%{query}%", f"%{query}%", f"%{query}%"]
+        conditions = [
+            "(LOWER(subject) LIKE LOWER(%s) OR LOWER(predicate) LIKE LOWER(%s) OR LOWER(object) LIKE LOWER(%s))",
+            "deleted_at IS NULL",
+        ]
+        if owner_id is not None:
+            conditions.append("owner_id = %s")
+            params.append(owner_id)
+        if namespace is not None:
+            conditions.append("namespace = %s")
+            params.append(namespace)
+        params.append(limit)
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"SELECT * FROM kg_triples WHERE {' AND '.join(conditions)} "
+                "ORDER BY valid_from ASC, created ASC LIMIT %s",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
 
 
 class MysqlVersionRepository(VersionRepository):
@@ -1646,7 +2001,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
 
     @property
     def capability_details(self) -> set[str]:
-        return {*MYSQL_CAPABILITY_DETAILS, STATE_DETAIL_CAPABILITY}
+        return {*MYSQL_CAPABILITY_DETAILS, KG_CAPABILITY, STATE_DETAIL_CAPABILITY}
 
     async def record_usage_ledger(self, tx: Transaction, record: Any) -> Any:
         raise NotImplementedError("mysql: usage_ledger is not yet implemented")
