@@ -187,13 +187,39 @@ drop `sessions` from their declared capabilities (chat sessions may be a
 Postgres/SQLite-only feature). Conformance gate stays green either way (signature
 + accessor-type pass); this is a capability-honesty / product-scope call.
 
+### Item 2 SHIPPED — recency standardized across all 5 backends
+All backends now use the ANN-index-friendly pattern (bare distance/similarity
+ORDER BY → over-fetch `candidate_limit = max(limit, min(limit*4, 200))` →
+Python re-rank → cap to limit), with uniform conservative date resolution
+(`updated → created → date.min`) and an invalid-score sort key (missing/non-finite
+sorts last). sqlite (was a no-op), mysql + oracle (were SQL-side, defeating the
+vector index) converted; postgres + db2 already used it (db2 gained the
+over-fetch + a corrupt-date fix). Verified: sqlite offline (aiosqlite); db2 live
+on CERBERUS DB2 EAP; oracle offline + partial-live (CDB read-only blocked writes);
+mysql offline dialect (VECTOR_DISTANCE is HeatWave-only).
+
+### Item 3 SHIPPED — all MySQL stub surfaces implemented + live-verified
+Every `_stub_method` stub in `mnemos/persistence/mysql.py` replaced with a real
+MySQL 9 implementation ported 1:1 from the SQLite reference: **State, KG,
+Versions, Branches, Compression, ConsultationAudit, Federation** (+ inline DDL
+for each table, applied in `open()`). `mysql.py` now has zero `_stub_method`
+references. Capabilities advertise `{core, state, federation}`; the detail set is
+`{memory_crud, vector_search, fts, kg, versions, state, branches, compression,
+federation}`. The conformance gate's `KNOWN_UNDECLARED` allowlist is now **empty**
+— every declared MySQL capability is genuinely served. Each surface has a
+`MYSQL_DSN`-gated live round-trip test; **all 7 verified live (7 passed) against a
+MySQL 9.0.1 container on CERBERUS** (`:3307`). MySQL vector *search* itself
+remains HeatWave-only (Community lacks `VEC_DISTANCE`), so the vector path is
+covered offline at the SQL-shape layer.
+
 ## Open items for operator / next session
-2. **Recency strategy standardization (product decision)** — recency boost is a
-   deliberate per-backend rollout, not a contract bug: postgres + db2 use
-   Python re-rank (now both over-fetch); mysql + oracle use SQL-side recency
-   (bypasses ANN index ordering); sqlite ignores it (`noqa: ARG002`). Decide
-   whether to standardize all backends on the ANN-index-friendly over-fetch
-   pattern (changes ordering on mysql/oracle; live-unverifiable for oracle).
-3. **MySQL stub surfaces** — federation/state/kg/versions/compression are
-   `_stub_method` stubs while `core` is declared; consider finer capability
-   declaration or genuine impls if MySQL is to be a first-class backend.
+1. **Chat-session writes on enterprise backends (Item 1 follow-up)** — `create_session`
+   / `add_message` are `NotImplementedError` in Oracle + DB2 (chat
+   `SessionsRepository`) though both declare `sessions`. Implement chat-session
+   writes on the enterprise backends, or drop the `sessions` capability claim.
+2. **Oracle live-write verification** — blocked by the CERBERUS Oracle container
+   CDB being open READ ONLY (`ORA-65054`); the recency conversion is verified by
+   inspection + offline + partial-live (reads) + db2-parity. Reopen the CDB
+   read-write (operator-owned container) to run the Oracle write suite.
+3. **MySQL vector search** — needs a HeatWave (or Enterprise) MySQL to live-test
+   `VECTOR_DISTANCE`; Community 9.0.1 stores `VECTOR` but lacks the distance fn.
