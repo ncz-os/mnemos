@@ -19,7 +19,8 @@ Key SQL-level differences from Postgres/Oracle:
 - No LISTEN/NOTIFY — ``supports_listen_notify = False``.
 - No pgvector — ``supports_pgvector = False``.
 
-This backend implements the core memory / FTS / vector-search surfaces.
+This backend implements the core memory / FTS / vector-search and state
+key-value surfaces.
 KG triples, compression, versioning, and federation surfaces raise
 ``NotImplementedError`` (same posture as the initial Oracle port) and will be
 filled in across subsequent slices following M4 review. Webhooks are explicitly
@@ -61,6 +62,8 @@ from mnemos.persistence.base import (
     FederationRepository,
     KGRepository,
     MemoryRepository,
+    STATE_CAPABILITY,
+    STATE_DETAIL_CAPABILITY,
     StateRepository,
     Transaction,
     VersionRepository,
@@ -358,7 +361,22 @@ CREATE TABLE IF NOT EXISTS memory_compression_queue (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
-_INIT_DDLS = [_DDL_MEMORIES, _DDL_KG_TRIPLES, _DDL_COMPRESSION_QUEUE]
+_DDL_STATE = """\
+CREATE TABLE IF NOT EXISTS state (
+    owner_id   VARCHAR(100) NOT NULL DEFAULT 'default',
+    namespace  VARCHAR(100) NOT NULL DEFAULT 'default',
+    `key`      VARCHAR(500) NOT NULL,
+    value      LONGTEXT,
+    updated    TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    version    BIGINT       NOT NULL DEFAULT 1,
+    deleted_at TIMESTAMP(6) NULL,
+    UNIQUE KEY uq_state_owner_namespace_key (owner_id, namespace, `key`),
+    INDEX idx_state_owner (owner_id),
+    INDEX idx_state_namespace (namespace)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_INIT_DDLS = [_DDL_MEMORIES, _DDL_KG_TRIPLES, _DDL_COMPRESSION_QUEUE, _DDL_STATE]
 
 
 # ── Pool factory ──────────────────────────────────────────────────────────────
@@ -1439,20 +1457,134 @@ class MysqlFederationRepository(FederationRepository):
 
 
 class MysqlStateRepository(StateRepository):
-    get = _stub_method("get")
-    set = _stub_method("set")
-    delete = _stub_method("delete")
-    list_namespace = _stub_method("list_namespace")
-    delete_namespace = _stub_method("delete_namespace")
-    get_state = _stub_method("get_state")
-    set_state = _stub_method("set_state")
-    delete_state = _stub_method("delete_state")
-    list_state_keys = _stub_method("list_state_keys")
-    get_state_value = _stub_method("get_state_value")
-    set_state_value = _stub_method("set_state_value")
-    delete_state_value = _stub_method("delete_state_value")
-    list_state_namespace = _stub_method("list_state_namespace")
-    delete_state_namespace = _stub_method("delete_state_namespace")
+    async def get(
+        self,
+        tx: Transaction,
+        key: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> Row | None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT `key`, value, updated, version, owner_id, namespace
+                  FROM state
+                 WHERE owner_id = %s
+                   AND namespace = %s
+                   AND `key` = %s
+                   AND deleted_at IS NULL
+                """,
+                (owner_id, namespace, key),
+            )
+            return await _fetchone_dict(cursor)
+
+    async def set(
+        self,
+        tx: Transaction,
+        key: str,
+        value: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+        expires_at: Any | None = None,
+    ) -> Row | None:
+        _ = expires_at
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO state (owner_id, namespace, `key`, value, updated)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP(6))
+                ON DUPLICATE KEY UPDATE
+                    value = IF(deleted_at IS NULL, %s, value),
+                    updated = IF(deleted_at IS NULL, CURRENT_TIMESTAMP(6), updated),
+                    version = IF(deleted_at IS NULL, version + 1, version)
+                """,
+                (owner_id, namespace, key, value, value),
+            )
+        return await self.get(tx, key, owner_id=owner_id, namespace=namespace)
+
+    async def delete(
+        self,
+        tx: Transaction,
+        key: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> bool:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE state
+                   SET deleted_at = CURRENT_TIMESTAMP(6)
+                 WHERE owner_id = %s
+                   AND namespace = %s
+                   AND `key` = %s
+                   AND deleted_at IS NULL
+                """,
+                (owner_id, namespace, key),
+            )
+            return int(cursor.rowcount or 0) > 0
+
+    async def list_namespace(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[Row]:
+        conn = tx.conn
+        params: list[Any] = [owner_id, namespace]
+        sql = """
+            SELECT `key`, updated, version, owner_id, namespace
+              FROM state
+             WHERE owner_id = %s
+               AND namespace = %s
+               AND deleted_at IS NULL
+             ORDER BY `key`
+        """
+        if limit is not None:
+            sql += " LIMIT %s OFFSET %s"
+            params.extend([limit, offset])
+        async with conn.cursor() as cursor:
+            await cursor.execute(sql, params)
+            return await _fetch_all_dicts(cursor)
+
+    async def delete_namespace(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> int:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE state
+                   SET deleted_at = CURRENT_TIMESTAMP(6)
+                 WHERE owner_id = %s
+                   AND namespace = %s
+                   AND deleted_at IS NULL
+                """,
+                (owner_id, namespace),
+            )
+            return int(cursor.rowcount or 0)
+
+    get_state = get
+    set_state = set
+    delete_state = delete
+    list_state_keys = list_namespace
+    get_state_value = get
+    set_state_value = set
+    delete_state_value = delete
+    list_state_namespace = list_namespace
+    delete_state_namespace = delete_namespace
 
 
 # ── Backend facade ────────────────────────────────────────────────────────────
@@ -1461,11 +1593,12 @@ class MysqlStateRepository(StateRepository):
 class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align with SqliteBackend/OracleBackend/Db2Backend/PostgresBackend bare-class pattern
     """MySQL 9.0+ persistence facade backed by an aiomysql connection pool.
 
-    Core memory, FTS, and VECTOR search surfaces are implemented.
+    Core memory, FTS, VECTOR search, and state key-value surfaces are
+    implemented.
     All other repository surfaces (KG triples, versioning, compression,
-    federation, state) are stubbed - ``NotImplementedError`` is raised at call
-    time. Webhooks are currently unsupported; callers should use
-    ``supports_webhooks`` before dispatching.
+    federation) are stubbed - ``NotImplementedError`` is raised at call time.
+    Webhooks are currently unsupported; callers should use ``supports_webhooks``
+    before dispatching.
 
     The pool is managed externally (via ``create_mysql_pool``); callers
     must call ``await backend.close()`` at shutdown to drain the pool.
@@ -1509,11 +1642,11 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
 
     @property
     def capabilities(self) -> set[str]:
-        return {CORE_CAPABILITY}
+        return {CORE_CAPABILITY, STATE_CAPABILITY}
 
     @property
     def capability_details(self) -> set[str]:
-        return set(MYSQL_CAPABILITY_DETAILS)
+        return {*MYSQL_CAPABILITY_DETAILS, STATE_DETAIL_CAPABILITY}
 
     async def record_usage_ledger(self, tx: Transaction, record: Any) -> Any:
         raise NotImplementedError("mysql: usage_ledger is not yet implemented")
@@ -1627,8 +1760,8 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     async def open(self) -> None:
         """Validate pool connectivity and apply UTC + init DDL.
 
-        Runs ``SET time_zone = '+00:00'`` and creates the ``memories``
-        and ``kg_triples`` tables if they do not exist (idempotent).
+        Runs ``SET time_zone = '+00:00'`` and creates the inline schema tables
+        if they do not exist (idempotent).
         """
         if self._closed or self._pool is None:
             return
