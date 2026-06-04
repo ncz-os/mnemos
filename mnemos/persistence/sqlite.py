@@ -922,7 +922,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
     ) -> list[Row]:
         self._require_dim(embedding, "semantic_search")
 
-        def _updated_date(value: Any, today: date) -> date:
+        def _updated_date(row: Row) -> date:
+            value = row.get("updated")
             if isinstance(value, datetime):
                 return value.date()
             if isinstance(value, date):
@@ -931,8 +932,18 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 try:
                     return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
                 except ValueError:
-                    return today
-            return today
+                    pass
+            created = row.get("created")
+            if isinstance(created, datetime):
+                return created.date()
+            if isinstance(created, date):
+                return created
+            if isinstance(created, str):
+                try:
+                    return datetime.fromisoformat(created.replace("Z", "+00:00")).date()
+                except ValueError:
+                    pass
+            return date.min
 
         embedding_json = json.dumps([float(value) for value in embedding])
         conditions: list[str] = ["me.embedding IS NOT NULL"]
@@ -952,6 +963,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         vis_clause = _render_sqlite_visibility(visibility, params, table_alias="m")
         if vis_clause:
             conditions.append(vis_clause)
+        # Bounded approximation matching PostgresMemoryRepository: recency
+        # reranks only within this native similarity candidate window.
         candidate_limit = max(limit, min(limit * 4, 200)) if boost_recency else limit
         params.append(candidate_limit)
         # SELECT ``_MEMORY_COLS`` (with the ``m.`` alias) so the row
@@ -978,7 +991,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                     return -math.inf
                 if not math.isfinite(similarity):
                     return -math.inf
-                updated_date = _updated_date(row.get("updated"), today)
+                updated_date = _updated_date(row)
                 age_days = max(0, (today - updated_date).days)
                 return similarity + recency_weight * (1.0 / (1.0 + age_days))
 
