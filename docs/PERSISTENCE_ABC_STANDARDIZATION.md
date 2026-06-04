@@ -164,10 +164,30 @@ in place → re-review until `approve` → commit → push ARGONAS→GitLab→Gi
   (GRAEAE's prompt framing assumed an OAuth repo), so the exact rewire wants
   operator confirmation. Tracked by `KNOWN_SIGNATURE_DRIFT`.
 
+### Item 1 SHIPPED — DB2 session-ownership refactor (live-verified)
+Applied the GRAEAE separation: the 7 browser/OAuth-session members moved from
+`Db2SessionsRepository` onto the `Db2Backend` facade (mirroring `OracleBackend`);
+`Db2SessionsRepository` is now a pure chat repo; `KNOWN_SIGNATURE_DRIFT` entry
+removed; ownership-boundary regression test added
+(`tests/test_db2_session_ownership.py`). Live-verified on the CERBERUS DB2 EAP
+container (`db2://…@192.168.207.96:50001/MNEMOS`): 179 passed / 7 skipped across
+the db2 live + conformance + dialect suites.
+
+**Newly exposed pre-existing gap (operator decision):** the chat
+`SessionsRepository` write path (`create_session`, `add_message`,
+`add_memory_injections`, `update_metrics`) is `raise NotImplementedError` in
+**both** `OracleSessionsRepository` and (now, by inheritance)
+`Db2SessionsRepository` — only the read methods (`get_session`,
+`fetch_history`) are implemented. Yet Oracle and DB2 both **declare** the
+`sessions` capability. The refactor did not cause this (DB2 previously *masked*
+it with the misplaced browser `create_session`); it surfaced it, and made the
+failure honest (clean `NotImplementedError` instead of wrong browser semantics).
+Decision needed: implement chat-session writes on the enterprise backends, or
+drop `sessions` from their declared capabilities (chat sessions may be a
+Postgres/SQLite-only feature). Conformance gate stays green either way (signature
++ accessor-type pass); this is a capability-honesty / product-scope call.
+
 ## Open items for operator / next session
-1. **DB2 session refactor** (above) — apply the GRAEAE-blessed separation, rewire
-   the facade browser-session delegation off `_sessions_repo`, remove the
-   `KNOWN_SIGNATURE_DRIFT` allowlist entry. Auth path — wants sign-off.
 2. **Recency strategy standardization (product decision)** — recency boost is a
    deliberate per-backend rollout, not a contract bug: postgres + db2 use
    Python re-rank (now both over-fetch); mysql + oracle use SQL-side recency
