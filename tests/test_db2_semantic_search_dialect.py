@@ -245,6 +245,69 @@ def test_db2_semantic_search_recency_rerank_sorts_invalid_scores_last() -> None:
     assert len(result) <= 3
 
 
+def test_db2_semantic_search_recency_rerank_uses_created_for_invalid_updated() -> None:
+    """Malformed ``updated`` values must not receive the max freshness bonus."""
+    from datetime import datetime, timedelta, timezone
+
+    from mnemos.persistence.db2 import Db2MemoryRepository, _Db2AsyncCursor
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    today = datetime.now(timezone.utc).date()
+    old = today - timedelta(days=30)
+    today_iso = f"{today.isoformat()}T00:00:00Z"
+    old_iso = f"{old.isoformat()}T00:00:00Z"
+    fetched_rows = [
+        ("corrupt-updated", "bad timestamp", old_iso, "not-a-date", 0.20),
+        ("valid-old", "old", old_iso, old_iso, 0.21),
+        ("fresh-valid", "fresh", today_iso, today_iso, 0.25),
+    ]
+
+    class _FakeSyncCursor:
+        description = (("id",), ("content",), ("created",), ("updated",), ("rank_score",))
+        rowcount = len(fetched_rows)
+
+        def execute(self, sql, params=None):
+            return None
+
+        def fetchall(self):
+            return fetched_rows
+
+        def fetchone(self):
+            return None
+
+        def close(self):
+            return None
+
+    class _FakeConn:
+        def cursor(self):
+            return _Db2AsyncCursor(_FakeSyncCursor())
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    visibility = VisibilityFilter(scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace="default")
+    repo = Db2MemoryRepository()
+    os.environ["MNEMOS_DB2_VECTOR_INDEX"] = "approx"
+
+    loop = asyncio.new_event_loop()
+    try:
+        result = loop.run_until_complete(
+            repo.semantic_search(
+                tx,
+                embedding=[0.1, 0.2, 0.3],
+                limit=3,
+                visibility=visibility,
+                boost_recency=True,
+                recency_weight=0.1,
+            )
+        )
+    finally:
+        loop.close()
+
+    ids = [row["id"] for row in result]
+    assert ids == ["fresh-valid", "corrupt-updated", "valid-old"]
+    corrupt = next(row for row in result if row["id"] == "corrupt-updated")
+    assert corrupt["rank_score"] > 0.19
+
+
 def _capture_db2_fts_sql(repo, *, text_mode: str | None) -> str:
     """Drive ``Db2MemoryRepository.fts_search`` through a fake cursor and return
     the emitted SQL, under the given MNEMOS_DB2_TEXT_SEARCH mode.
