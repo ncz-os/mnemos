@@ -52,7 +52,7 @@ _TASK_ALIASES = {
 _POLICIES = {
     "coding": RecommendationPolicy(
         task_type="coding",
-        required_caps=("coding",),
+        required_caps=("code",),
         excluded_caps=("embedding",),
         cost_ceiling=10.0,
         allowed_tiers=("A", "B"),
