@@ -17,7 +17,7 @@ from mnemos.api.persistence_helpers import backend_or_503
 
 router = APIRouter(prefix="/v1/knemon", tags=["knemon"])
 
-_CACHE_TTL_SECONDS = 30
+_CACHE_TTL_SECONDS = 30  # 30s incremental refresh per task
 _CACHE: dict[tuple[Any, ...], tuple[float, Any]] = {}
 
 _CAPABILITY_MAP = {
