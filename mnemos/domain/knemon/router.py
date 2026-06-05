@@ -13,6 +13,14 @@ from typing import Any, Optional
 
 from mnemos.core.config import get_settings
 from mnemos.core.plan_windows import compute_plan_window_id
+from mnemos.core.recommendation import (
+    _canonical_cap,
+    _capability_set as _rec_capability_set,
+    _is_special_purpose,
+    _preference_rank,
+    _tier_filter as _rec_tier_filter,
+    recommendation_policy,
+)
 
 # Canonical provider identity — collapses historical/duplicate labels so a
 # single policy entry covers all of them (e.g. "claude" -> "anthropic").
@@ -704,6 +712,47 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
     candidates = _apply_priority_ceiling(candidates, effective_priority, requested_priority=req.priority)
     if not candidates:
         raise NoModelAvailable("no model satisfies priority tier and quality constraints")
+
+    # ── Task-type capability filter (recommendation policy) ──────────────────
+    # Narrow candidates by the task_kind's required/any/excluded capabilities,
+    # strip special-purpose models, apply tier preferences, and rank by
+    # preferred models so that code-fix routes to a coder, narrative to a chat
+    # model, embedding to an embedding model, routing to a small/fast model, etc.
+    rec_policy = recommendation_policy(req.task_kind)
+    _task_required_caps: set[str] = set(rec_policy.required_caps) | {
+        _canonical_cap(cap.strip()) for cap in req.require_capability if cap.strip()
+    }
+    _task_filtered: list[dict[str, Any]] = []
+    for row in candidates:
+        # Use the recommendation module's capability normalizer which
+        # handles aliases (code→coding, coder→coding, embed→embedding, etc.)
+        caps = _rec_capability_set(row.get("capabilities"))
+        # required: ALL must be present
+        if _task_required_caps and not _task_required_caps.issubset(caps):
+            continue
+        # any_caps: at least ONE if policy defines them
+        if rec_policy.any_caps and not any(cap in caps for cap in rec_policy.any_caps):
+            continue
+        # excluded: NONE may be present
+        if any(cap in caps for cap in rec_policy.excluded_caps):
+            continue
+        _task_filtered.append(row)
+    if _task_filtered:
+        # Strip special-purpose models (content-safety, moderation, etc.)
+        _task_filtered = [r for r in _task_filtered if not _is_special_purpose(r)]
+        # Filter by policy-allowed tiers (with fallback)
+        _task_filtered = _rec_tier_filter(_task_filtered, rec_policy)
+        # Sort by preference rank (preferred models first), then cost, then quality
+        _task_filtered.sort(
+            key=lambda row: (
+                _preference_rank(row, rec_policy),
+                _to_float(row.get("estimated_cost_usd")),
+                -_to_float(row.get("graeae_weight") or row.get("quality", 0)),
+            )
+        )
+        candidates = _task_filtered
+    if not candidates:
+        raise NoModelAvailable("no model satisfies task-type capability requirements")
 
     plans = await _plans_by_provider(backend)
     worker_pools = await _worker_pools_for_session(backend, req.caller_session_id)

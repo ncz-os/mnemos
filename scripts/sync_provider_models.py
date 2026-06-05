@@ -153,6 +153,7 @@ async def main() -> int:
                         "groq": "groq",
                         "nvidia": "nvidia",
                         "perplexity": "perplexity",
+                        "deepseek-direct": "deepseek-direct",
                     }
 
                     from mnemos.domain.graeae.model_registry import _PROVIDER_FAMILIES

@@ -165,14 +165,14 @@
     ],
     "B_fanout_high_volume": [
       "groq.llama-3.1-8b-instant",
-      "deepseek_direct.deepseek-v4-flash",
+      "deepseek-direct.deepseek-v4-flash",
       "together.Qwen/Qwen2.5-Coder-32B-Instruct",
       "groq.openai/gpt-oss-20b",
       "gemini.gemini-2.5-flash-lite",
       "xai.grok-4-1-fast"
     ],
     "B_quality_surgical": [
-      "deepseek_direct.deepseek-v4-pro",
+      "deepseek-direct.deepseek-v4-pro",
       "groq.llama-3.3-70b-versatile",
       "siliconflow.Qwen/Qwen3-Coder-30B-A3B-Instruct",
       "groq.openai/gpt-oss-120b",
@@ -180,7 +180,7 @@
     ],
     "B_long_context": [
       "ngc_integrate.minimaxai/minimax-m2.7",
-      "deepseek_direct.deepseek-v4-pro",
+      "deepseek-direct.deepseek-v4-pro",
       "xai.grok-4-3",
       "together.MiniMaxAI/MiniMax-M2.7"
     ],
@@ -199,18 +199,18 @@
     "C_g1_critical": [
       "anthropic.claude-opus-4-7",
       "openai.gpt-5.5",
-      "deepseek_direct.deepseek-v4-pro"
+      "deepseek-direct.deepseek-v4-pro"
     ],
     "C_avoid": [
       "together.deepseek-ai/DeepSeek-V4-Pro"
     ]
   },
   "use_case_routing": {
-    "zeroclaw_fanout_routine": {"primary": "groq.llama-3.1-8b-instant", "secondary": "deepseek_direct.deepseek-v4-flash", "fallback": "ngc_integrate.moonshotai/kimi-k2.6"},
-    "zeroclaw_surgical_review": {"primary": "deepseek_direct.deepseek-v4-pro", "secondary": "ngc_integrate.moonshotai/kimi-k2.6", "consensus": ["deepseek_direct.deepseek-v4-pro","ngc_integrate.moonshotai/kimi-k2.6"]},
-    "code_review_g1": {"primary": "anthropic.claude-opus-4-7", "consensus": ["anthropic.claude-opus-4-7","openai.gpt-5.5","deepseek_direct.deepseek-v4-pro"]},
+    "zeroclaw_fanout_routine": {"primary": "groq.llama-3.1-8b-instant", "secondary": "deepseek-direct.deepseek-v4-flash", "fallback": "ngc_integrate.moonshotai/kimi-k2.6"},
+    "zeroclaw_surgical_review": {"primary": "deepseek-direct.deepseek-v4-pro", "secondary": "ngc_integrate.moonshotai/kimi-k2.6", "consensus": ["deepseek-direct.deepseek-v4-pro","ngc_integrate.moonshotai/kimi-k2.6"]},
+    "code_review_g1": {"primary": "anthropic.claude-opus-4-7", "consensus": ["anthropic.claude-opus-4-7","openai.gpt-5.5","deepseek-direct.deepseek-v4-pro"]},
     "architecture_audit": {"primary": "ngc_integrate.nvidia/nemotron-3-super-120b-a12b", "params": {"thinking": false}},
-    "long_context_500k_plus": {"primary": "ngc_integrate.minimaxai/minimax-m2.7", "secondary": "deepseek_direct.deepseek-v4-pro"},
+    "long_context_500k_plus": {"primary": "ngc_integrate.minimaxai/minimax-m2.7", "secondary": "deepseek-direct.deepseek-v4-pro"},
     "agent_loop_speed": {"primary": "groq.llama-3.3-70b-versatile", "secondary": "groq.llama-3.1-8b-instant"},
     "embeddings": {"primary": "local_medusa.bge-m3-embedding"},
     "rerank": {"primary": "local_medusa.bge-rerank"},
@@ -224,7 +224,6 @@
     "xai": 30,
     "gemini": 20,
     "perplexity": 15,
-    "deepseek_direct": 30,
     "deepseek-direct": 30,
     "groq": 50,
     "siliconflow": 20,
