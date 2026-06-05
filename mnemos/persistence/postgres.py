@@ -667,24 +667,33 @@ class PostgresMemoryRepository(MemoryRepository):
         source_session: str | None,
         source_agent: str | None,
         verbatim_content: str | None,
+        embedding: Sequence[float] | None = None,
         created: Any,
         updated: Any,
     ) -> str:
         pg_tx = _postgres_tx(tx)
         conn = pg_tx.conn
+        # Format embedding as pgvector literal; NULL when not provided so
+        # the column stays NULL and semantic_search filters it out until
+        # backfill.  Inline in the INSERT so the vector commits atomically
+        # with the row — no second round-trip needed.
+        vec_str: str | None = None
+        if embedding:
+            self._require_dim(embedding, "insert_memory")
+            vec_str = "[" + ",".join(str(float(v)) for v in embedding) + "]"
         result = await conn.execute(
             """
             INSERT INTO memories (
                 id, content, category, subcategory, metadata,
                 quality_rating, verbatim_content, owner_id, namespace, permission_mode,
                 source_model, source_provider, source_session, source_agent,
-                created, updated
+                embedding, created, updated
             )
             VALUES (
                 $1, $2, $3, $4, $5::jsonb,
                 $6, $7, $8, $9, $10,
                 $11, $12, $13, $14,
-                COALESCE($15, NOW()), COALESCE($16, NOW())
+                $15::vector, COALESCE($16, NOW()), COALESCE($17, NOW())
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -702,6 +711,7 @@ class PostgresMemoryRepository(MemoryRepository):
             source_provider,
             source_session,
             source_agent,
+            vec_str,
             created,
             updated,
         )
