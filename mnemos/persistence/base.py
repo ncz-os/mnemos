@@ -176,6 +176,7 @@ class MemoryRepository(ABC):
         verbatim_content: str | None,
         created: Any,
         updated: Any,
+        embedding: Sequence[float] | None = None,
     ) -> str: ...
 
     @abstractmethod
@@ -659,6 +660,42 @@ class ConsultationAuditRepository(ABC):
         graeae_weight: float,
     ) -> int:
         raise NotImplementedError("update_arena_score not implemented for this backend")
+
+    # ── model-registry PRICING (KNEMON Step 2: llm_provider_registry.json ingest) ─
+
+    async def upsert_model_pricing(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        price_in: float,
+        price_out: float,
+        price_cached: float,
+    ) -> tuple[int, dict | None]:
+        """Upsert price_in/price_out/price_cached/price_updated_at into model_registry.
+
+        Returns (rows_updated, old_prices_dict_or_None). old_prices_dict is None
+        when the pricing did not change or the model row was not found.
+        """
+        raise NotImplementedError("upsert_model_pricing not implemented for this backend")
+
+    async def write_price_history(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        price_in: float,
+        price_out: float,
+        price_cached: float,
+        prices: dict | None = None,
+    ) -> None:
+        """Write a price_history row for audit trail.
+
+        Called after upsert_model_pricing returns old_prices (prices changed).
+        """
+        raise NotImplementedError("write_price_history not implemented for this backend")
 
 
 class OAuthRepository(ABC):

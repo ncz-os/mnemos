@@ -2711,6 +2711,100 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         finally:
             await _call(cursor.close)
 
+    # ── KNEMON Step 2: pricing ingest from llm_provider_registry.json ──────────
+
+    async def upsert_model_pricing(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        price_in: float,
+        price_out: float,
+        price_cached: float,
+    ) -> tuple[int, dict | None]:
+        """Upsert price columns into model_registry. Returns (rows_updated, old_prices_or_None)."""
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            # Read current prices to detect change
+            await _call(
+                cursor.execute,
+                "SELECT price_in, price_out, price_cached FROM model_registry "
+                "WHERE provider = :p AND model_id = :m",
+                {"p": provider, "m": model_id},
+            )
+            row = await _call(cursor.fetchone)
+            if row is None:
+                return 0, None
+
+            old = {
+                "price_in": float(row[0] or 0),
+                "price_out": float(row[1] or 0),
+                "price_cached": float(row[2] or 0),
+            }
+            # Only update if pricing actually changed
+            if (
+                abs(old["price_in"] - price_in) < 0.000001
+                and abs(old["price_out"] - price_out) < 0.000001
+                and abs(old["price_cached"] - price_cached) < 0.000001
+            ):
+                return 0, None
+
+            await _call(
+                cursor.execute,
+                "UPDATE model_registry SET price_in = :pi, price_out = :po, "
+                "price_cached = :pc, price_updated_at = SYSTIMESTAMP "
+                "WHERE provider = :p AND model_id = :m",
+                {
+                    "pi": price_in,
+                    "po": price_out,
+                    "pc": price_cached,
+                    "p": provider,
+                    "m": model_id,
+                },
+            )
+            n = int(getattr(cursor, "rowcount", 0) or 0)
+            return n, old
+        finally:
+            await _call(cursor.close)
+
+    async def write_price_history(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        price_in: float,
+        price_out: float,
+        price_cached: float,
+        prices: dict | None = None,
+    ) -> None:
+        """Write a price_history row."""
+        import json as _json
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            prices_json = _json.dumps(prices or {})
+            await _call(
+                cursor.execute,
+                "INSERT INTO price_history (id, provider, model_id, price_in, "
+                "price_out, price_cached, prices, recorded_at) "
+                "VALUES (:id, :p, :m, :pi, :po, :pc, :pj, SYSTIMESTAMP)",
+                {
+                    "id": uuid.uuid4().bytes,
+                    "p": provider,
+                    "m": model_id,
+                    "pi": price_in,
+                    "po": price_out,
+                    "pc": price_cached,
+                    "pj": prices_json,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
 
 class OracleOAuthRepository(OAuthRepository):
     async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
