@@ -125,10 +125,10 @@ fn similarity_dot_normalized_f64_impl(query: &[f64], candidates: PyReadonlyArray
     }
 
     let norm_query_sqrt = norm_query.sqrt();
-    let mut scores = Vec::with_capacity(candidates_view.nrows());
-    for row in candidates_view.outer_iter() {
+    let nrows = candidates_view.nrows();
+    let mut scores = vec![0.0f64; nrows];
+    for (i, row) in candidates_view.outer_iter().enumerate() {
         if row.len() != query.len() || row.is_empty() {
-            scores.push(0.0);
             continue;
         }
         let (dot, norm_candidate) = if let Some(row_slice) = row.as_slice() {
@@ -140,7 +140,7 @@ fn similarity_dot_normalized_f64_impl(query: &[f64], candidates: PyReadonlyArray
                     (dot + (left * right), norm + (right * right))
                 })
         };
-        scores.push(normalized_dot_from_parts(dot, norm_query_sqrt, norm_candidate));
+        scores[i] = normalized_dot_from_parts(dot, norm_query_sqrt, norm_candidate);
     }
     scores
 }
@@ -157,10 +157,10 @@ fn similarity_dot_normalized_f32_impl(query: &[f32], candidates: PyReadonlyArray
     }
 
     let norm_query_sqrt = norm_query.sqrt();
-    let mut scores = Vec::with_capacity(candidates_view.nrows());
-    for row in candidates_view.outer_iter() {
+    let nrows = candidates_view.nrows();
+    let mut scores = vec![0.0f64; nrows];
+    for (i, row) in candidates_view.outer_iter().enumerate() {
         if row.len() != query.len() || row.is_empty() {
-            scores.push(0.0);
             continue;
         }
         let (dot, norm_candidate) = if let Some(row_slice) = row.as_slice() {
@@ -174,7 +174,7 @@ fn similarity_dot_normalized_f32_impl(query: &[f32], candidates: PyReadonlyArray
                     (dot + (left * right), norm + (right * right))
                 })
         };
-        scores.push(normalized_dot_from_parts(dot, norm_query_sqrt, norm_candidate));
+        scores[i] = normalized_dot_from_parts(dot, norm_query_sqrt, norm_candidate);
     }
     scores
 }
