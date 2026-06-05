@@ -297,22 +297,39 @@ def _detect_subscription_pools() -> list[str]:
 
     for env_name in ("CLAUDE_SUBSCRIPTION_TIER",):
         if os.environ.get(env_name):
-            _add_plan_aliases(pools, "anthropic", os.environ[env_name])
+            tier = os.environ[env_name]
+            if "max" in tier.lower():
+                pools.add("anthropic.claude_max")
     if os.environ.get("CHATGPT_PLAN"):
-        _add_plan_aliases(pools, "openai", os.environ["CHATGPT_PLAN"], family="chatgpt")
+        plan = os.environ["CHATGPT_PLAN"].lower()
+        if "pro" in plan:
+            pools.add("openai.chatgpt_pro")
+        elif "plus" in plan:
+            pools.add("openai.chatgpt_plus")
     if os.environ.get("CODEX_PLAN"):
-        _add_plan_aliases(pools, "openai", os.environ["CODEX_PLAN"], family="codex")
-    for pool in os.environ.get("OPENAI_SUBSCRIPTION_POOLS", "").split(","):
-        if pool.strip():
-            _add_plan_aliases(
-                pools, "openai", pool, family="openai" if _pool_slug(pool) == "openai_subscription" else None
-            )
+        plan = os.environ["CODEX_PLAN"].lower()
+        if "pro" in plan:
+            pools.add("openai.codex_pro")
+        elif "plus" in plan:
+            pools.add("openai.codex_plus")
 
-    for config_path in (home / ".claude" / "config.toml", home / ".codex" / "config.toml"):
-        _scan_subscription_config(config_path, pools)
+    # scan configs for .claude, .codex, .chatgpt
+    for config_dir in (home / ".claude", home / ".codex", home / ".chatgpt"):
+        for f in config_dir.glob("**/*"):
+            if f.is_file():
+                try:
+                    text = f.read_text(encoding="utf-8", errors="ignore").lower()
+                    if "claude_max" in text:
+                        pools.add("anthropic.claude_max")
+                    if "chatgpt_pro" in text:
+                        pools.add("openai.chatgpt_pro")
+                    if "codex_pro" in text:
+                        pools.add("openai.codex_pro")
+                except:
+                    pass
 
     if (home / ".anthropic" / "auth.json").exists():
-        pools.update({"anthropic_subscription", "claude_subscription"})
+        pools.add("anthropic.claude_max")
 
     return sorted(pools)
 
