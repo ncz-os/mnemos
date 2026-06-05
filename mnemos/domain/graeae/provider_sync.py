@@ -391,6 +391,26 @@ def _fetch_deepseek_direct_static() -> list[dict]:
     ]
 
 
+def _fetch_codex_static() -> list[dict]:
+    """Codex / PANTHEON static seed for gpt-5.3-codex (OAuth subscription model)."""
+    return [
+        {
+            "provider": "codex",
+            "model_id": "gpt-5.3-codex",
+            "display_name": "GPT-5.3 Codex",
+            "family": "gpt-5.3",
+            "context_window": 200000,
+            "max_output_tokens": 100000,
+            "capabilities": ["code", "reasoning"],
+            "input_cost_per_mtok": 0,
+            "output_cost_per_mtok": 0,
+            "usage_tier": "premium",
+            "available": True,
+            "raw": {"source": "static", "capabilities": {"chat": False, "code": True, "reasoning": True}, "note": "OAuth subscription (/bin/zsh)"},
+        },
+    ]
+
+
 # ── Capabilities inference ─────────────────────────────────────────────────────
 
 
@@ -496,6 +516,7 @@ _STATIC_PROVIDERS = {
     "anthropic": _fetch_anthropic_static,
     "deepseek-direct": _fetch_deepseek_direct_static,
     "perplexity": _fetch_perplexity_static,
+    "codex": _fetch_codex_static,
 }
 
 
