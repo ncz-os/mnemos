@@ -1087,12 +1087,16 @@ class OracleMemoryRepository(MemoryRepository):
         source_session: str | None,
         source_agent: str | None,
         verbatim_content: str | None,
+        embedding: Sequence[float] | None = None,
         created: Any,
         updated: Any,
     ) -> str:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         affected = 0
+        vec_literal: str | None = None
+        if embedding:
+            vec_literal = _validate_and_format_vector(embedding)
         try:
             await _call(
                 cursor.execute,
@@ -1101,12 +1105,13 @@ class OracleMemoryRepository(MemoryRepository):
                     id, content, category, subcategory, metadata, content_hash,
                     quality_rating, verbatim_content, owner_id, namespace, permission_mode,
                     source_model, source_provider, source_session, source_agent,
-                    created, updated
+                    embedding, created, updated
                 )
                 SELECT
                     :id, :content, :category, :subcategory, :metadata, :content_hash,
                     :quality_rating, :verbatim_content, :owner_id, :namespace, :permission_mode,
                     :source_model, :source_provider, :source_session, :source_agent,
+                    TO_VECTOR(:embedding),
                     NVL(CAST(:created AS TIMESTAMP WITH TIME ZONE), SYSTIMESTAMP),
                     NVL(CAST(:updated AS TIMESTAMP WITH TIME ZONE), SYSTIMESTAMP)
                 FROM dual
@@ -1128,6 +1133,7 @@ class OracleMemoryRepository(MemoryRepository):
                     "source_provider": source_provider,
                     "source_session": source_session,
                     "source_agent": source_agent,
+                    "embedding": vec_literal,
                     "created": created,
                     "updated": updated,
                 },
@@ -2226,31 +2232,29 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
-            # Ordered SKIP-LOCKED claim. No SQL row cap (FOR UPDATE +
-            # FETCH FIRST is illegal in Oracle); fetch only `limit` rows
-            # — the SKIP-LOCKED cursor locks rows as they are read.
-            #
-            # Bound the locked set to exactly `limit`: python-oracledb /
-            # OCI prefetch + array-fetch would otherwise read (and, under
-            # SKIP LOCKED, LOCK) more pending rows than we update before
-            # the next fetchmany boundary, stranding them locked until the
-            # tx commits and starving peer workers. Disabling prefetch and
-            # sizing the array to `limit` makes the driver fetch+lock only
-            # the rows we claim.
-            try:
-                cursor.prefetchrows = 0
-                cursor.arraysize = int(limit)
-            except Exception:  # pragma: no cover - driver attr differences
-                pass
+            # Ordered SKIP-LOCKED claim bounded to exactly `limit`.
+            # Oracle cannot combine FOR UPDATE with FETCH FIRST
+            # (ORA-02014), so we use a ROWNUM subquery: the inner
+            # ORDER BY runs first, ROWNUM caps the row count, and
+            # the outer FOR UPDATE SKIP LOCKED locks at most `limit`
+            # rows regardless of driver prefetch/arraysize behaviour.
+            # This replaces the prior prefetchrows+arraysize hack
+            # which was fragile across python-oracledb versions and
+            # could over-lock rows, starving peer workers.
             await _call(
                 cursor.execute,
                 "SELECT id, memory_id, owner_id, reason, scoring_profile, attempts "
-                "FROM memory_compression_queue "
-                "WHERE status = 'pending' "
-                "ORDER BY priority DESC, enqueued_at "
+                "FROM ("
+                "  SELECT id, memory_id, owner_id, reason, scoring_profile, attempts "
+                "  FROM memory_compression_queue "
+                "  WHERE status = 'pending' "
+                "  ORDER BY priority DESC, enqueued_at"
+                ") "
+                "WHERE ROWNUM <= :limit "
                 "FOR UPDATE SKIP LOCKED",
+                {"limit": int(limit)},
             )
-            raw = await _call(cursor.fetchmany, int(limit)) or []
+            raw = await _call(cursor.fetchall) or []
             if not raw:
                 return []
             cols = [d[0].lower() for d in cursor.description]
