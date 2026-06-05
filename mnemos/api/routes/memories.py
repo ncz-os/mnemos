@@ -1032,15 +1032,33 @@ async def create_memory(
             # row keeps embedding=NULL; the backfill script picks it up
             # on the next pass. Embed in the same tx so the vector
             # commits atomically with the memory row.
+            #
+            # Codex adversarial-review gate (2026-06-05): the embedding
+            # generation (_get_embedding) is separated from the DB write
+            # (upsert_memory_embedding) so that only embedding-generation
+            # errors are silently degraded to NULL. DB write errors (e.g.
+            # constraint violation, disk-full, connection loss) MUST
+            # propagate and roll back the transaction — no partial-commit
+            # NULL vector.
+            #
+            # Codex adversarial-review gate fix (2026-06-05): the initial
+            # gate edit removed the try/except around _get_embedding
+            # entirely, which meant embedding-model failures (OOM, model
+            # load error, etc.) would abort the entire create_memory tx.
+            # Restore the try/except around embedding generation only —
+            # upsert_memory_embedding remains outside so DB write errors
+            # still propagate.
             try:
                 vec = await _get_embedding(request.content)
-                if vec and hasattr(backend.memories, "upsert_memory_embedding"):
-                    await backend.memories.upsert_memory_embedding(tx, mem_id, vec)
             except Exception:
                 logger.exception(
-                    "[create_memory] inline embed failed for %s; row will be backfilled",
+                    "[create_memory] inline embed generation failed for %s; "
+                    "row will be backfilled with embedding later",
                     mem_id,
                 )
+                vec = None
+            if vec and hasattr(backend.memories, "upsert_memory_embedding"):
+                await backend.memories.upsert_memory_embedding(tx, mem_id, vec)
             # v6.2 M-2.2.1 audit chain entry. Gated by MNEMOS_AUDIT_CHAIN=on
             # via the audit_sealer helper; backend.audit_chain is None on
             # backends pre-implementation (Db2 live-test blocked on 12.1.5
