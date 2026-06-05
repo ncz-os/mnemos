@@ -2116,6 +2116,18 @@ class PostgresCompressionQueueRepository(CompressionQueueRepository):
         for mid in memory_ids:
             if mid not in owner_by_id:
                 continue
+            # Dup-pending dedup: skip if this memory already has a
+            # 'pending' queue row — avoids flooding the queue with
+            # duplicate work for the same memory across multiple
+            # enqueue calls (e.g. rapid on_write triggers).
+            existing = await conn.fetchval(
+                "SELECT 1 FROM memory_compression_queue "
+                "WHERE memory_id = $1 AND status = 'pending' "
+                "LIMIT 1",
+                mid,
+            )
+            if existing:
+                continue
             await conn.execute(
                 "INSERT INTO memory_compression_queue "
                 "(memory_id, owner_id, reason, priority, scoring_profile) "
