@@ -8,6 +8,8 @@ so MNEMOS is always the authoritative model registry.
 
 Then runs Arena.ai ranking sync so arena_score / graeae_weight are current.
 
+# KNEMON subscription-mode: auth_method added to model_registry; classifier honors llm_provider_registry.json
+
 Usage:
   python3 scripts/sync_provider_models.py              # sync all providers
   python3 scripts/sync_provider_models.py --dry-run    # preview only
@@ -151,6 +153,7 @@ async def main() -> int:
                         "groq": "groq",
                         "nvidia": "nvidia",
                         "perplexity": "perplexity",
+                        "deepseek-direct": "deepseek-direct",
                     }
 
                     from mnemos.domain.graeae.model_registry import _PROVIDER_FAMILIES

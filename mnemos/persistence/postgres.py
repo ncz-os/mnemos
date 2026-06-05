@@ -2401,6 +2401,77 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
             return row["provider"]
         return None
 
+    # ── KNEMON Step 2: pricing ingest from llm_provider_registry.json ──────────
+
+    async def upsert_model_pricing(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        price_in: float,
+        price_out: float,
+        price_cached: float,
+    ) -> tuple[int, dict | None]:
+        """Upsert price columns into model_registry. Returns (rows_updated, old_prices_or_None)."""
+        conn = _postgres_tx(tx).conn
+        # Read current prices to detect change
+        row = await conn.fetchrow(
+            "SELECT price_in, price_out, price_cached FROM model_registry "
+            "WHERE provider = $1 AND model_id = $2",
+            provider, model_id,
+        )
+        if row is None:
+            return 0, None
+
+        old = {
+            "price_in": float(row["price_in"] or 0),
+            "price_out": float(row["price_out"] or 0),
+            "price_cached": float(row["price_cached"] or 0),
+        }
+        # Only update if pricing actually changed
+        if (
+            abs(old["price_in"] - price_in) < 0.000001
+            and abs(old["price_out"] - price_out) < 0.000001
+            and abs(old["price_cached"] - price_cached) < 0.000001
+        ):
+            return 0, None
+
+        result = await conn.execute(
+            "UPDATE model_registry SET price_in = $1, price_out = $2, "
+            "price_cached = $3, price_updated_at = NOW() "
+            "WHERE provider = $4 AND model_id = $5",
+            price_in, price_out, price_cached, provider, model_id,
+        )
+        n = _pg_result_count(result)
+        return n, old
+
+    async def write_price_history(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        price_in: float,
+        price_out: float,
+        price_cached: float,
+        prices: dict | None = None,
+    ) -> None:
+        """Write a price_history row for audit trail."""
+        conn = _postgres_tx(tx).conn
+        await conn.execute(
+            "INSERT INTO price_history (id, provider, model_id, price_in, "
+            "price_out, price_cached, prices, recorded_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
+            str(uuid.uuid4()),
+            provider,
+            model_id,
+            price_in,
+            price_out,
+            price_cached,
+            json.dumps(prices or {}),
+        )
+
 
 class PostgresOAuthRepository(OAuthRepository):
     async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
