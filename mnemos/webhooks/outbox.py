@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
 
@@ -10,6 +11,8 @@ import asyncpg
 
 from . import types as webhook_types
 from .nats_events import publish_delivery_queued, publish_webhook_outbox_insert
+
+logger = logging.getLogger(__name__)
 
 
 async def _matching_subscriptions(
@@ -70,23 +73,41 @@ async def _dispatch_on_conn(
             """,
             sub["id"], event_type, body, body_hash, webhook_types.NEW_CODE_WRITER_REVISION,
         )
-        await publish_delivery_queued(
-            delivery_id=str(delivery_id),
-            subscription_id=sub["id"],
-            event_type=event_type,
-            url=sub["url"],
-            payload_hash=body_hash,
-            namespace=sub["namespace"],
-            owner_id=sub["owner_id"],
-        )
-        await publish_webhook_outbox_insert(
-            delivery_id=str(delivery_id),
-            subscription_id=sub["id"],
-            event_type=event_type,
-            url=sub["url"],
-            payload_hash=body_hash,
-            namespace=sub["namespace"],
-            owner_id=sub["owner_id"],
-        )
+        # ── Outbox relay: best-effort NATS notify ──
+        # Adversarial-review CHILD-E gate (2026-06-05): the legacy
+        # _dispatch_on_conn path operates on raw asyncpg without access
+        # to PostgresTransaction.add_after_commit. If NATS is down, the
+        # publish can raise and roll back the delivery row. Wrapping
+        # in try/except ensures the delivery row survives even when
+        # NATS is unreachable — the polling worker picks it up on the
+        # next cycle. (The PostgresWebhookRepository.dispatch_event path
+        # in postgres.py uses proper after_commit for the same guarantee.)
+        try:
+            await publish_delivery_queued(
+                delivery_id=str(delivery_id),
+                subscription_id=sub["id"],
+                event_type=event_type,
+                url=sub["url"],
+                payload_hash=body_hash,
+                namespace=sub["namespace"],
+                owner_id=sub["owner_id"],
+            )
+            await publish_webhook_outbox_insert(
+                delivery_id=str(delivery_id),
+                subscription_id=sub["id"],
+                event_type=event_type,
+                url=sub["url"],
+                payload_hash=body_hash,
+                namespace=sub["namespace"],
+                owner_id=sub["owner_id"],
+            )
+        except Exception:
+            logger.warning(
+                "webhook outbox: NATS publish failed for delivery %s (event=%s); "
+                "delivery row is durable, polling worker will pick it up",
+                delivery_id,
+                event_type,
+                exc_info=True,
+            )
         delivery_ids.append(str(delivery_id))
     return delivery_ids
