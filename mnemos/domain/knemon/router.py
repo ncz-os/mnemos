@@ -719,9 +719,14 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
     # preferred models so that code-fix routes to a coder, narrative to a chat
     # model, embedding to an embedding model, routing to a small/fast model, etc.
     rec_policy = recommendation_policy(req.task_kind)
-    _task_required_caps: set[str] = set(rec_policy.required_caps) | {
+    # Canonicalise policy caps through the same alias table used for model
+    # caps so that "code"→"coding" and CSVs match (router side of the
+    # _caps_match fix in recommendation.py).
+    _task_required_caps: set[str] = {_canonical_cap(c) for c in rec_policy.required_caps} | {
         _canonical_cap(cap.strip()) for cap in req.require_capability if cap.strip()
     }
+    _task_any_caps: set[str] = {_canonical_cap(c) for c in rec_policy.any_caps}
+    _task_excluded_caps: set[str] = {_canonical_cap(c) for c in rec_policy.excluded_caps}
     _task_filtered: list[dict[str, Any]] = []
     for row in candidates:
         # Use the recommendation module's capability normalizer which
@@ -731,10 +736,10 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
         if _task_required_caps and not _task_required_caps.issubset(caps):
             continue
         # any_caps: at least ONE if policy defines them
-        if rec_policy.any_caps and not any(cap in caps for cap in rec_policy.any_caps):
+        if _task_any_caps and not any(cap in caps for cap in _task_any_caps):
             continue
         # excluded: NONE may be present
-        if any(cap in caps for cap in rec_policy.excluded_caps):
+        if any(cap in caps for cap in _task_excluded_caps):
             continue
         _task_filtered.append(row)
     if _task_filtered:

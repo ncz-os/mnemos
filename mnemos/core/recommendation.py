@@ -269,11 +269,17 @@ def _has_name_token(row: Any, tokens: tuple[str, ...]) -> bool:
 
 
 def _caps_match(caps: set[str], policy: RecommendationPolicy) -> bool:
-    if policy.required_caps and not set(policy.required_caps).issubset(caps):
+    # Canonicalise policy caps through the same alias table used for model caps so
+    # that "code" / "coder" / "coding" all land on the same canonical form and
+    # actually match the model rows (which are always canonicalised by _capability_set).
+    required_canon = {_canonical_cap(c) for c in policy.required_caps}
+    any_canon = {_canonical_cap(c) for c in policy.any_caps}
+    excluded_canon = {_canonical_cap(c) for c in policy.excluded_caps}
+    if required_canon and not required_canon.issubset(caps):
         return False
-    if policy.any_caps and not any(cap in caps for cap in policy.any_caps):
+    if any_canon and not any(cap in caps for cap in any_canon):
         return False
-    if any(cap in caps for cap in policy.excluded_caps):
+    if any(cap in caps for cap in excluded_canon):
         return False
     return True
 
@@ -339,7 +345,7 @@ def choose_recommended_model(
                 -_quality(row),
             ),
         )[0]
-        return _format_model(chosen), list(policy.required_caps or policy.any_caps)
+        return _format_model(chosen), sorted({_canonical_cap(c) for c in (policy.required_caps or policy.any_caps)})
 
     degraded = [row for row in capable if _quality(row) >= effective_floor]
     if degraded:
@@ -352,9 +358,9 @@ def choose_recommended_model(
                 -_quality(row),
             ),
         )[0]
-        return _format_model(chosen), list(policy.required_caps or policy.any_caps)
+        return _format_model(chosen), sorted({_canonical_cap(c) for c in (policy.required_caps or policy.any_caps)})
 
-    return None, list(policy.required_caps or policy.any_caps)
+    return None, sorted({_canonical_cap(c) for c in (policy.required_caps or policy.any_caps)})
 
 
 def _format_model(row: Any) -> dict[str, Any]:
