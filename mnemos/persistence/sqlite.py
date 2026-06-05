@@ -2010,6 +2010,19 @@ class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueReposi
         for mid in memory_ids:
             if mid not in owner_by_id:
                 continue
+            # Dup-pending dedup: skip if this memory already has a
+            # 'pending' queue row — avoids flooding the queue with
+            # duplicate work for the same memory across multiple
+            # enqueue calls (e.g. rapid on_write triggers).
+            existing = await _fetch_val(
+                conn,
+                "SELECT 1 FROM memory_compression_queue "
+                "WHERE memory_id = ? AND status = 'pending' "
+                "LIMIT 1",
+                (mid,),
+            )
+            if existing:
+                continue
             await _execute(
                 conn,
                 "INSERT INTO memory_compression_queue "
