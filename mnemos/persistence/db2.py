@@ -3549,7 +3549,7 @@ class Db2StateRepository(_Db2OraCompatMixin, OracleStateRepository):
                        AND deleted_at IS NULL
                      ORDER BY key
                      OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-                    """,
+                     -- Db2: oauth_sessions + fed_audit + codex-exec parity mirrored from Oracle
                     (owner_id, namespace, offset, limit),
                 )
             return await _fetch_all_dicts(cursor)
