@@ -72,21 +72,10 @@ class HiveMindRepository(Protocol):
         now: float,
     ) -> Optional[dict[str, Any]]: ...
 
-    async def claim_job_by_id(
-        self,
-        *,
-        job_id: str,
-        agent_urn: str,
-        agent_kind: str,
-        agent_caps: set[str],
-        agent_runtime: str,
-        agent_model: str,
-        agent_provider: str,
-        agent_tier: str,
-        cost_tier_order: list[str],
-        sub_throttled: bool,
-        now: float,
-    ) -> tuple[str, Optional[dict[str, Any]]]: ...
+    async def requeue_job(self, *, job_id: str) -> bool: ...
+    async def fetch_jobs_metrics(self) -> dict[str, Any]: ...
+    async def fetch_hosts(self) -> list[dict[str, Any]]: ...
+    async def fetch_agents_stats(self) -> dict[str, Any]: ...
 
 
 _SERVICE_JOB_SELECT_COLUMNS = (
