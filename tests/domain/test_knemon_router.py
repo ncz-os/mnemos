@@ -706,3 +706,116 @@ async def test_session_below_burn_threshold_keeps_g1_subscription_escalation():
     decision = await route(_req(14, "not-yet-burned"), backend)
     assert decision.provider == "openai"
     assert decision.auth_method == "subscription"
+
+
+# ── Task-type differentiation fixtures ───────────────────────────────────────
+
+
+def _diverse_task_backend() -> _SqliteKnemonBackend:
+    """Backend with models covering coding / narrative / reasoning / embedding / routing."""
+    backend = _SqliteKnemonBackend(40)
+    # Clear the default 4-model seed so capability assertions are exact.
+    backend.conn.execute("DELETE FROM model_registry")
+    backend.conn.execute("DELETE FROM subscription_plans")
+    now = datetime.now(timezone.utc)
+    models = [
+        # coding
+        ("nvidia", "qwen/qwen3-coder-480b-a35b-instruct", "Qwen3 Coder 480B",
+         '["chat","code","reasoning"]', 1.0, 3.0, 0.86),
+        ("anthropic", "claude-sonnet-4-6", "Claude Sonnet 4.6",
+         '["chat","code","reasoning"]', 3.0, 15.0, 0.94),
+        # narrative (chat)
+        ("anthropic", "claude-opus-4-6", "Claude Opus 4.6",
+         '["chat","code","reasoning"]', 15.0, 75.0, 0.99),
+        ("gemini", "gemini-2.5-flash", "Gemini 2.5 Flash",
+         '["chat"]', 0.15, 0.60, 0.82),
+        # reasoning
+        ("deepseek-direct", "deepseek-v4-pro", "DeepSeek V4 Pro",
+         '["chat","code","reasoning"]', 0.435, 0.87, 0.85),
+        # embedding
+        ("mnemos-local", "bge-m3", "BGE M3",
+         '["embeddings"]', 0.0, 0.0, 0.82),
+        ("voyage", "voyage-3", "Voyage 3",
+         '["embeddings"]', 0.0, 0.0, 0.80),
+        # routing (small/fast)
+        ("groq", "llama-3.1-8b-instant", "Llama 3.1 8B Instant",
+         '["chat","routing"]', 0.05, 0.08, 0.78),
+        ("nvidia", "moonshotai/kimi-k2.6", "Kimi K2.6",
+         '["chat","routing"]', 0.10, 0.15, 0.79),
+        # generic fallback (api-only, cheap)
+        ("xai", "grok-api", "Grok API",
+         '["chat","code"]', 3.0, 15.0, 0.86),
+    ]
+    for provider, model_id, display_name, caps, in_cost, out_cost, weight in models:
+        backend.conn.execute(
+            "INSERT INTO model_registry VALUES (?, ?, ?, ?, ?, ?, 200000, 1200, ?, 1, 0)",
+            (provider, model_id, display_name, caps, in_cost, out_cost, weight),
+        )
+    # Give every provider an api plan so waterfall doesn't skip them.
+    for provider in {"nvidia", "anthropic", "gemini", "deepseek-direct", "mnemos-local",
+                      "voyage", "groq", "xai"}:
+        backend.conn.execute(
+            "INSERT INTO subscription_plans VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL,"
+            " 'monthly', NULL, NULL, '2026-01-01', NULL, NULL)",
+            (provider, f"{provider}_api", "api", "api"),
+        )
+    backend.conn.commit()
+    return backend
+
+
+def _task_req(task_kind: str, priority: int = 14) -> KnemonRouteRequest:
+    """Route request with explicit task_kind and NO caller require_capability
+    so the recommendation policy is the sole capability driver."""
+    return KnemonRouteRequest(
+        task_kind=task_kind,
+        priority=priority,
+        est_tokens_in=10_000,
+        est_tokens_out=2_000,
+        caller_subsystem="pytest",
+        require_capability=[],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_kind", "expected_provider", "expected_model_prefix"),
+    [
+        ("code-fix", "nvidia", "qwen/qwen3-coder"),
+        ("narrative", "anthropic", "claude-sonnet"),          # sonnet not opus
+        ("reasoning", "anthropic", "claude-opus"),            # opus for reasoning
+        ("embedding", "mnemos-local", "bge-m3"),
+        ("routing", "groq", "llama-3.1-8b-instant"),
+    ],
+)
+async def test_task_type_routes_to_different_models(task_kind, expected_provider, expected_model_prefix):
+    """Each task_type MUST return a different model — not all the same Opus."""
+    backend = _diverse_task_backend()
+    decision = await route(_task_req(task_kind), backend)
+    assert decision.provider == expected_provider, (
+        f"{task_kind}: expected {expected_provider}, got {decision.provider}/{decision.model_id}"
+    )
+    assert decision.model_id.startswith(expected_model_prefix), (
+        f"{task_kind}: expected model starting with '{expected_model_prefix}', got {decision.model_id}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_types_return_distinct_models():
+    """All five task types must route to DIFFERENT model_ids."""
+    backend = _diverse_task_backend()
+    task_types = ("code-fix", "narrative", "reasoning", "embedding", "routing")
+    results = {}
+    for tt in task_types:
+        decision = await route(_task_req(tt), backend)
+        results[tt] = (decision.provider, decision.model_id)
+
+    model_ids = {model_id for _, model_id in results.values()}
+    assert len(model_ids) >= 5, (
+        f"Expected 5 distinct models, got {len(model_ids)}: {results}"
+    )
+    # narrative must NOT be opus
+    assert "opus" not in results["narrative"][1].lower()
+    # embedding must be a dedicated embedding model
+    assert results["embedding"][1] == "bge-m3"
+    # routing must be small/fast
+    assert results["routing"][1] == "llama-3.1-8b-instant"
