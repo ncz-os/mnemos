@@ -68,6 +68,18 @@ Stale-running sweep (v3.1.1):
   threshold will simply be abandoned (its work thrown away) and
   retried. That is acceptable by design — the threshold should be
   tuned above expected p99 contest latency.
+
+v3.5 ABC migration (job 019e7049 CHILD A):
+  When ``compression_queue`` (a ``CompressionQueueRepository``) and
+  ``transactional`` (an async context manager yielding
+  ``Transaction``) are both passed, the queue-level operations
+  (dequeue, mark_done, mark_failed, sweep_stale) route through the
+  persistence ABC instead of raw asyncpg SQL. The memory-content
+  fetch and contest-persist paths still use ``pool`` (asyncpg)
+  directly — those move to their own ABC in a follow-up child.
+  When the ABC params are omitted, the function falls back to the
+  pre-ABC raw-SQL path unchanged (backward-compat for standalone
+  workers and unit tests).
 """
 
 from __future__ import annotations
@@ -454,6 +466,9 @@ async def process_contest_queue(
     stale_threshold_secs: int = _DEFAULT_STALE_THRESHOLD_SECS,
     judge_model: Optional[str] = None,
     judge: Optional[Any] = None,
+    # ── ABC path (job 019e7049 CHILD A) ──────────────────────────────────
+    compression_queue: Any | None = None,
+    transactional: Any | None = None,
 ) -> Dict[str, int]:
     """Drain up to `batch_size` pending queue rows via the contest path.
 
@@ -481,6 +496,14 @@ async def process_contest_queue(
     to 0 to disable the sweep entirely (tests, or operators who prefer
     an external reclaim tool).
 
+    ABC path (v3.5 / job 019e7049 CHILD A): when both
+    ``compression_queue`` (a ``CompressionQueueRepository``) and
+    ``transactional`` (an async context manager yielding
+    ``Transaction``) are provided, queue-level operations route through
+    the persistence ABC. The memory-content fetch and contest-persist
+    paths still use ``pool`` directly. When omitted, falls back to the
+    legacy raw-asyncpg path with no behaviour change.
+
     Returns a dict {'dequeued', 'succeeded', 'failed', 'skipped_max_attempts',
     'missing_memory', 'skipped_too_short', 'stranded_reset',
     'stranded_failed', 'race_abandoned'} for the caller to log and for
@@ -488,25 +511,40 @@ async def process_contest_queue(
     no longer matched when the persist transaction started (sweep
     reclaimed, or another worker re-dequeued after sweep reset).
     """
+    _use_abc = compression_queue is not None and transactional is not None
 
     counts: Counter[str] = Counter()
 
     if stale_threshold_secs > 0:
         try:
-            sweep_counts = await _sweep_stale_running(
-                pool,
-                stale_threshold_secs=stale_threshold_secs,
-                max_attempts=max_attempts,
-            )
-            counts.update(sweep_counts)
+            if _use_abc:
+                async with transactional() as tx:
+                    reclaimed = await compression_queue.sweep_stale_compression(
+                        tx,
+                        stale_threshold_secs=stale_threshold_secs,
+                        max_attempts=max_attempts,
+                    )
+                counts["stranded_reset"] = reclaimed
+                counts["stranded_failed"] = 0  # ABC sweep doesn't split counts
+            else:
+                sweep_counts = await _sweep_stale_running(
+                    pool,
+                    stale_threshold_secs=stale_threshold_secs,
+                    max_attempts=max_attempts,
+                )
+                counts.update(sweep_counts)
         except Exception:
             # Sweep failure must not block the rest of the batch —
             # dequeue can still make forward progress on pending rows
             # even if reclaim is temporarily broken.
             logger.exception("contest_queue sweep failed; continuing to dequeue")
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(_DEQUEUE_SQL, batch_size)
+    if _use_abc:
+        async with transactional() as tx:
+            rows = await compression_queue.dequeue_compression(tx, limit=batch_size)
+    else:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(_DEQUEUE_SQL, batch_size)
 
     if not rows:
         return dict(counts)
@@ -535,12 +573,20 @@ async def process_contest_queue(
         # exists to prevent.
         try:
             if attempts > max_attempts:
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        _MARK_FAILED_SQL,
-                        queue_id,
-                        f"max_attempts exceeded ({attempts} > {max_attempts})",
-                    )
+                if _use_abc:
+                    async with transactional() as tx:
+                        await compression_queue.mark_compression_failed(
+                            tx,
+                            queue_id=queue_id,
+                            error=f"max_attempts exceeded ({attempts} > {max_attempts})",
+                        )
+                else:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            _MARK_FAILED_SQL,
+                            queue_id,
+                            f"max_attempts exceeded ({attempts} > {max_attempts})",
+                        )
                 counts["skipped_max_attempts"] += 1
                 counts["failed"] += 1
                 logger.warning(
@@ -564,6 +610,8 @@ async def process_contest_queue(
                     judge=judge,
                     min_content_length=min_content_length,
                     expected_attempts=attempts,
+                    compression_queue=compression_queue if _use_abc else None,
+                    transactional=transactional if _use_abc else None,
                 )
             except Exception as inner_exc:
                 if is_infrastructure_error(inner_exc):
@@ -579,12 +627,20 @@ async def process_contest_queue(
                 # failure, surface it raw — there's no benign
                 # handling left.
                 try:
-                    async with pool.acquire() as conn:
-                        await conn.execute(
-                            _MARK_FAILED_SQL,
-                            queue_id,
-                            f"{type(inner_exc).__name__}: {inner_exc}",
-                        )
+                    if _use_abc:
+                        async with transactional() as tx:
+                            await compression_queue.mark_compression_failed(
+                                tx,
+                                queue_id=queue_id,
+                                error=f"{type(inner_exc).__name__}: {inner_exc}",
+                            )
+                    else:
+                        async with pool.acquire() as conn:
+                            await conn.execute(
+                                _MARK_FAILED_SQL,
+                                queue_id,
+                                f"{type(inner_exc).__name__}: {inner_exc}",
+                            )
                 except Exception as mark_exc:
                     if is_infrastructure_error(mark_exc):
                         logger.warning(
@@ -636,6 +692,9 @@ async def _process_one(
     judge: Optional[Any] = None,
     min_content_length: int = 0,
     expected_attempts: int,
+    # ── ABC path (job 019e7049 CHILD A) ──────────────────────────────────
+    compression_queue: Any | None = None,
+    transactional: Any | None = None,
 ) -> None:
     """Run the contest for a single dequeued queue row + persist + update.
 
@@ -646,17 +705,24 @@ async def _process_one(
     mismatch tells us this worker is stale. See the module docstring
     'Race safety' section.
     """
+    _use_abc = compression_queue is not None and transactional is not None
 
     async with pool.acquire() as conn:
         mem = await conn.fetchrow(_MEMORY_CONTENT_SQL, memory_id)
 
     if mem is None or not mem["content"]:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                _MARK_FAILED_SQL,
-                queue_id,
-                "memory not found or empty content",
-            )
+        if _use_abc:
+            async with transactional() as tx:
+                await compression_queue.mark_compression_failed(
+                    tx, queue_id=queue_id, error="memory not found or empty content",
+                )
+        else:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    _MARK_FAILED_SQL,
+                    queue_id,
+                    "memory not found or empty content",
+                )
         counts["missing_memory"] += 1
         counts["failed"] += 1
         logger.warning(
@@ -667,12 +733,20 @@ async def _process_one(
 
     content_len = len(mem["content"])
     if min_content_length > 0 and content_len < min_content_length:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                _MARK_FAILED_SQL,
-                queue_id,
-                f"too_short: {content_len} chars < threshold {min_content_length}",
-            )
+        if _use_abc:
+            async with transactional() as tx:
+                await compression_queue.mark_compression_failed(
+                    tx,
+                    queue_id=queue_id,
+                    error=f"too_short: {content_len} chars < threshold {min_content_length}",
+                )
+        else:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    _MARK_FAILED_SQL,
+                    queue_id,
+                    f"too_short: {content_len} chars < threshold {min_content_length}",
+                )
         counts["skipped_too_short"] += 1
         counts["failed"] += 1
         logger.info(
@@ -701,12 +775,20 @@ async def _process_one(
             exc,
             exc_info=True,
         )
-        async with pool.acquire() as conn:
-            await conn.execute(
-                _MARK_FAILED_SQL,
-                queue_id,
-                f"{type(exc).__name__}: {exc}",
-            )
+        if _use_abc:
+            async with transactional() as tx:
+                await compression_queue.mark_compression_failed(
+                    tx,
+                    queue_id=queue_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+        else:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    _MARK_FAILED_SQL,
+                    queue_id,
+                    f"{type(exc).__name__}: {exc}",
+                )
         counts["failed"] += 1
         return
 
@@ -785,12 +867,20 @@ async def _process_one(
 
         logger.exception("contest_queue[%s]: contest persistence failed, rolled back", memory_id)
         try:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    _MARK_FAILED_SQL,
-                    queue_id,
-                    f"persist failed: {type(exc).__name__}: {exc}",
-                )
+            if _use_abc:
+                async with transactional() as tx:
+                    await compression_queue.mark_compression_failed(
+                        tx,
+                        queue_id=queue_id,
+                        error=f"persist failed: {type(exc).__name__}: {exc}",
+                    )
+            else:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        _MARK_FAILED_SQL,
+                        queue_id,
+                        f"persist failed: {type(exc).__name__}: {exc}",
+                    )
         except Exception as mark_exc:
             # The fallback mark-failed acquire also failed. If THAT
             # is infrastructure, surface it to the worker loop too —

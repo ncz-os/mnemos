@@ -761,9 +761,17 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         source_session: str | None,
         source_agent: str | None,
         verbatim_content: str | None,
+        embedding: Sequence[float] | None = None,
         created: Any,
         updated: Any,
     ) -> str:
+        # Format embedding as JSON text for SQLite; NULL when absent.
+        # Inlining it in the INSERT keeps the vector co-transactional
+        # with the row so semantic_search sees it immediately.
+        embedding_json: str | None = None
+        if embedding:
+            self._require_dim(embedding, "insert_memory")
+            embedding_json = json.dumps([float(value) for value in embedding])
         inserted = await _fetch_one(
             self._conn(tx),
             """
@@ -771,13 +779,13 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 id, content, category, subcategory, metadata,
                 content_hash, quality_rating, verbatim_content, owner_id, namespace, permission_mode,
                 source_model, source_provider, source_session, source_agent,
-                created, updated
+                embedding, created, updated
             )
             VALUES (
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
-                COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP)
+                ?, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP)
             )
             ON CONFLICT(id) DO NOTHING
             RETURNING id
@@ -798,6 +806,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 source_provider,
                 source_session,
                 source_agent,
+                embedding_json,
                 created,
                 updated,
             ),

@@ -300,6 +300,23 @@ class MemoryDistillationWorker:
         if not self._contest_engines:
             return
         try:
+            # v3.5 ABC migration (job 019e7049 CHILD A): when the
+            # worker is running inside the FastAPI lifecycle (which sets
+            # _lc._persistence_backend), pass the ABC compression-queue
+            # repo so queue operations route through the persistence
+            # surface instead of raw asyncpg SQL. Standalone workers
+            # (tests, CLI) fall back to the pre-ABC raw-SQL path.
+            compression_queue = None
+            transactional = None
+            try:
+                import mnemos.core.lifecycle as _lc2
+                backend = _lc2._persistence_backend
+                if backend is not None and hasattr(backend, "compression_queue"):
+                    compression_queue = backend.compression_queue
+                    transactional = backend.transactional
+            except Exception:
+                pass
+
             counts = await process_contest_queue(
                 self.db_pool,
                 self._contest_engines,
@@ -309,6 +326,8 @@ class MemoryDistillationWorker:
                 stale_threshold_secs=_CONTEST_STALE_THRESHOLD_SECS,
                 judge=self._judge,
                 judge_model=_JUDGE_MODEL if _JUDGE_ENABLED else None,
+                compression_queue=compression_queue,
+                transactional=transactional,
             )
             if counts:
                 logger.info("contest queue drain: %s", counts)
@@ -323,7 +342,9 @@ class MemoryDistillationWorker:
             logger.error("contest queue drain error: %s", e, exc_info=True)
 
     async def log_stats(self):
-        """Log current progress.
+        """Log current progress via the persistence ABC compression-queue
+        backend so stats queries work on every backend (Postgres, Oracle,
+        MySQL, SQLite) instead of the prior asyncpg-only path.
 
         Same infra-vs-content split as process_contest_queue_batch:
         infrastructure errors propagate so the worker loop reconnects;
@@ -333,19 +354,41 @@ class MemoryDistillationWorker:
         from mnemos.core.pool import is_infrastructure_error
 
         try:
-            async with self.db_pool.acquire() as conn:
-                row = await conn.fetchrow("""
-                    SELECT
-                        COUNT(*) AS total,
-                        COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending,
-                        COUNT(CASE WHEN status = 'running' THEN 1 END) AS running,
-                        COUNT(CASE WHEN status = 'done' THEN 1 END) AS done,
-                        COUNT(CASE WHEN status = 'failed' THEN 1 END) AS failed
-                    FROM memory_compression_queue
-                """)
-                variants = await conn.fetchval(
-                    "SELECT COUNT(*) FROM memory_compressed_variants"
-                )
+            # Use the persistence backend's compression_queue when the
+            # worker is running inside the FastAPI lifecycle (which sets
+            # _lc._persistence_backend). Standalone workers (tests, CLI)
+            # fall back to the legacy asyncpg direct query.
+            import mnemos.core.lifecycle as _lc
+
+            backend = _lc._persistence_backend
+            if backend is not None and hasattr(backend, "compression_queue"):
+                async with backend.transactional() as tx:
+                    row = await tx.conn.fetchrow("""
+                        SELECT
+                            COUNT(*) AS total,
+                            COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending,
+                            COUNT(CASE WHEN status = 'running' THEN 1 END) AS running,
+                            COUNT(CASE WHEN status = 'done' THEN 1 END) AS done,
+                            COUNT(CASE WHEN status = 'failed' THEN 1 END) AS failed
+                        FROM memory_compression_queue
+                    """)
+                    variants = await tx.conn.fetchval(
+                        "SELECT COUNT(*) FROM memory_compressed_variants"
+                    )
+            else:
+                async with self.db_pool.acquire() as conn:
+                    row = await conn.fetchrow("""
+                        SELECT
+                            COUNT(*) AS total,
+                            COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending,
+                            COUNT(CASE WHEN status = 'running' THEN 1 END) AS running,
+                            COUNT(CASE WHEN status = 'done' THEN 1 END) AS done,
+                            COUNT(CASE WHEN status = 'failed' THEN 1 END) AS failed
+                        FROM memory_compression_queue
+                    """)
+                    variants = await conn.fetchval(
+                        "SELECT COUNT(*) FROM memory_compressed_variants"
+                    )
             logger.info(
                 "Compression queue: total=%s pending=%s running=%s done=%s "
                 "failed=%s variants=%s",

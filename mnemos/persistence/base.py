@@ -174,6 +174,7 @@ class MemoryRepository(ABC):
         source_session: str | None,
         source_agent: str | None,
         verbatim_content: str | None,
+        embedding: Sequence[float] | None = None,
         created: Any,
         updated: Any,
     ) -> str: ...
@@ -1493,6 +1494,7 @@ FULL_STORAGE_CAPABILITY_DETAILS: frozenset[DetailedCapabilityName] = frozenset(
         VERSIONS_CAPABILITY,
         BRANCHES_CAPABILITY,
         COMPRESSION_CAPABILITY,
+        COMPRESSION_QUEUE_CAPABILITY,
         OAUTH_DETAIL_CAPABILITY,
         SESSIONS_DETAIL_CAPABILITY,
         CONSULTATIONS_DETAIL_CAPABILITY,
@@ -1804,6 +1806,7 @@ def capability_details_for_backend(backend: object) -> set[str]:
                 VERSIONS_CAPABILITY,
                 BRANCHES_CAPABILITY,
                 COMPRESSION_CAPABILITY,
+                COMPRESSION_QUEUE_CAPABILITY,
             }
         )
     if OAUTH_CAPABILITY in legacy:
