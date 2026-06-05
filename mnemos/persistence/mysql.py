@@ -862,10 +862,18 @@ class MysqlMemoryRepository(MemoryRepository):
         source_session: str | None,
         source_agent: str | None,
         verbatim_content: str | None,
+        embedding: Sequence[float] | None = None,
         created: Any,
         updated: Any,
     ) -> str:
         conn = tx.conn
+        # Format embedding as MySQL TO_VECTOR literal; NULL when absent.
+        # Inlining it in the INSERT keeps the vector co-transactional
+        # with the row — semantic_search sees it immediately.
+        vec_literal: str | None = None
+        if embedding:
+            self._require_dim(embedding, "insert_memory")
+            vec_literal = _validate_and_format_vector(embedding)
         try:
             async with conn.cursor() as cursor:
                 await cursor.execute(
@@ -874,12 +882,14 @@ class MysqlMemoryRepository(MemoryRepository):
                         id, content, content_hash, category, subcategory, metadata,
                         quality_rating, verbatim_content, owner_id, namespace,
                         permission_mode, source_model, source_provider,
-                        source_session, source_agent, created, updated
+                        source_session, source_agent,
+                        embedding, created, updated
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s,
+                        TO_VECTOR(%s),
                         COALESCE(%s, NOW(6)), COALESCE(%s, NOW(6))
                     )
                     ON DUPLICATE KEY UPDATE
@@ -901,6 +911,7 @@ class MysqlMemoryRepository(MemoryRepository):
                         source_provider,
                         source_session,
                         source_agent,
+                        vec_literal,
                         created,
                         updated,
                     ),
