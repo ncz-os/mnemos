@@ -446,3 +446,61 @@ async def cost_split(
         item["requests"] += int(row.get("requests") or 0)
         item["cost_usd"] = round(float(item["cost_usd"]) + float(row.get("cost_usd") or 0), 6)
     return [grouped[key] for key in sorted(grouped)]
+
+
+@router.get("/by_plan")
+async def by_plan(
+    provider: str = Query(..., min_length=1),
+    _: UserContext = Depends(require_root),
+) -> list[dict[str, Any]]:
+    """Window utilization % per plan for given provider."""
+    now = datetime.now(timezone.utc)
+    out = []
+    for plan in await _plans():
+        if plan["provider"] != provider:
+            continue
+        start, end = _window_bounds(plan, now)
+        window_id = compute_plan_window_id(
+            str(plan["provider"]),
+            str(plan["plan_name"]),
+            now,
+            reset_anchor=str(plan.get("reset_anchor") or "monthly"),
+            window_seconds=int(plan.get("msg_window_seconds") or plan.get("token_window_seconds") or 0) or None,
+        )
+        usage = await _usage_for_plan(plan, start, end, window_id)
+        requests_used = int(usage.get("requests_used") or 0)
+        tokens_used = int(usage.get("tokens") or 0)
+        cap_unit, used, cap = _cap_basis(plan, usage)
+        util_pct = _pct(used, cap)
+        out.append({
+            "provider": plan["provider"],
+            "plan_name": plan["plan_name"],
+            "window_id": window_id,
+            "utilization_pct": util_pct,
+            "requests_used": requests_used,
+            "tokens_used": tokens_used,
+            "cap": cap,
+            "cap_unit": cap_unit,
+        })
+    return out
+
+
+@router.get("/forecast")
+async def forecast(
+    session_id: str = Query(..., min_length=1),
+    days: int = Query(7, ge=1, le=365),
+    _: UserContext = Depends(require_root),
+) -> dict[str, Any]:
+    """ETA-to-cap projection for a session."""
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    sql = """
+        SELECT provider, tier AS plan_name, COUNT(*) AS calls,
+               COALESCE(SUM(request_count), 0) AS requests,
+               COALESCE(SUM(tokens_in + tokens_out + tokens_reasoning), 0) AS tokens,
+               COALESCE(SUM(est_cost_usd), 0) AS cost_usd
+        FROM usage_ledger
+        WHERE session_id = :session_id AND ts >= :since_ts
+        GROUP BY provider, tier
+    """
+    rows = await _rows(sql, {"session_id": session_id, "since_ts": since})
+    return {"session_id": session_id, "days": days, "plans": rows or []}
