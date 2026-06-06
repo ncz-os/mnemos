@@ -932,9 +932,18 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         source_session: str | None,
         source_agent: str | None,
         verbatim_content: str | None,
+        embedding: Sequence[float] | None = None,
         created: Any,
         updated: Any,
     ) -> str:
+        # Format embedding as Db2 VECTOR literal; NULL when absent.
+        # Inlining it in the MERGE keeps the vector co-transactional
+        # with the row — semantic_search sees it immediately.
+        vec_literal: str | None = None
+        vec_dim: int = 0
+        if embedding:
+            vec_literal = _validate_and_format_vector(embedding)
+            vec_dim = len(embedding)
         conn = _conn_from_tx(tx)
         sync_conn = getattr(conn, "_conn", None)
         if sync_conn is None:
@@ -942,18 +951,20 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             try:
                 await _call(
                     cursor.execute,
-                    """
+                    f"""
                     MERGE INTO memories t USING SYSIBM.SYSDUMMY1
                     ON (t.id = ?)
                     WHEN NOT MATCHED THEN INSERT (
                         id, content, category, subcategory, metadata, content_hash,
                         quality_rating, verbatim_content, owner_id, namespace,
                         permission_mode, source_model, source_provider,
-                        source_session, source_agent, created, updated
+                        source_session, source_agent,
+                        embedding, created, updated
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?,
                         ?, ?, ?, ?,
+                        {f"VECTOR(?, {vec_dim}, FLOAT32)" if vec_literal else "NULL"},
                         COALESCE(?, CURRENT TIMESTAMP),
                         COALESCE(?, CURRENT TIMESTAMP)
                     )
@@ -975,6 +986,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                         source_provider,
                         source_session,
                         source_agent,
+                        *((vec_literal,) if vec_literal else ()),
                         created,
                         updated,
                     ),
@@ -994,9 +1006,10 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             "id, content, category, subcategory, metadata, content_hash, "
             "quality_rating, verbatim_content, owner_id, namespace, permission_mode, "
             "source_model, source_provider, source_session, source_agent, "
-            "created, updated"
+            "embedding, created, updated"
             ") VALUES ("
             "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            f"{f'VECTOR(?, {vec_dim}, FLOAT32)' if vec_literal else 'NULL'}, "
             "COALESCE(?, CURRENT TIMESTAMP), COALESCE(?, CURRENT TIMESTAMP)"
             ")"
         )
@@ -1017,6 +1030,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             source_provider,
             source_session,
             source_agent,
+            *((vec_literal,) if vec_literal else ()),
             created,
             updated,
         )

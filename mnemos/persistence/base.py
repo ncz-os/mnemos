@@ -177,7 +177,6 @@ class MemoryRepository(ABC):
         embedding: Sequence[float] | None = None,
         created: Any,
         updated: Any,
-        embedding: Sequence[float] | None = None,
     ) -> str: ...
 
     @abstractmethod
