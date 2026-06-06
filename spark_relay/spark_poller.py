@@ -377,6 +377,9 @@ class AgenticRepoExecutor:
         elif host == "gitlab.com":
             token = os.environ.get("GITLAB_TOKEN")
             username = "oauth2"
+        elif host == "codeberg.org":
+            token = os.environ.get("CODEBERG_TOKEN")
+            username = os.environ.get("CODEBERG_USER", "jperlow")
         if not token or not username:
             return repo_url
         # SECURITY: only attach a Git token when the repository is owned by a
@@ -391,7 +394,7 @@ class AgenticRepoExecutor:
             o.strip()
             for o in os.environ.get(
                 "SPARK_TOKEN_OWNERS",
-                "perlowja,nclawzero,ncz-os,mnemos-os",
+                "perlowja,jperlow,nclawzero,ncz-os,mnemos-os",
             ).split(",")
             if o.strip()
         }
