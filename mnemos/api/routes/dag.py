@@ -19,6 +19,7 @@ from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.api.routes._postgres_only import _require_postgres_backend
 from mnemos.api.routes.memories import _schedule_outbox_deliveries
+from mnemos.core.visibility import read_visibility_predicate
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
 
@@ -49,7 +50,7 @@ async def _assert_memory_writable(conn, memory_id: str, user: UserContext) -> No
     owner_id AND namespace. We return 404 to avoid leaking existence.
     """
     row = await conn.fetchrow(
-        "SELECT owner_id, namespace FROM memories " "WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT owner_id, namespace FROM memories WHERE id = $1 AND deleted_at IS NULL",
         memory_id,
     )
     if not row:
@@ -76,22 +77,22 @@ async def _assert_memory_readable(conn, memory_id: str, user: UserContext) -> No
             memory_id,
         )
     else:
-        row = await conn.fetchrow(
-            """
-            SELECT 1 FROM memories
-            WHERE id = $1
-              AND deleted_at IS NULL
-              AND namespace = $2
-              AND (
-                    owner_id = $3
-                 OR (permission_mode % 10) >= 4
-                 OR ((permission_mode / 10) % 10) >= 4 AND group_id = ANY($4::text[])
-              )
-            """,
-            memory_id,
-            visibility.namespace,
-            visibility.user_id,
+        # Reuse the shared read predicate so DAG read visibility matches the
+        # main read path exactly — including the memory_acl EXISTS disjunct.
+        # Hand-rolling the predicate here previously dropped that disjunct, so
+        # an ACL-granted reader could read via the main routes but got a 404
+        # from DAG endpoints (a partial-share contract violation).
+        vis_clause, vis_params = read_visibility_predicate(
+            visibility.user_id or "",
             list(visibility.group_ids),
+            start_param_idx=2,
+        )
+        ns_ph = f"${len(vis_params) + 2}"
+        row = await conn.fetchrow(
+            f"SELECT 1 FROM memories WHERE id = $1 AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
+            memory_id,
+            *vis_params,
+            visibility.namespace,
         )
     if not row:
         raise HTTPException(status_code=404, detail="Memory not found")
@@ -413,7 +414,7 @@ async def create_branch(
                 # memory owner or namespace can change between auth and write.
                 if user.role == "root":
                     live = await conn.fetchrow(
-                        "SELECT 1 FROM memories " "WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
+                        "SELECT 1 FROM memories WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
                         memory_id,
                     )
                 else:
