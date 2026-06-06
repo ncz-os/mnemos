@@ -22,7 +22,7 @@ import redis.asyncio as aioredis
 from fastapi import HTTPException
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-from mnemos.core.config import PG_CONFIG, get_settings
+from mnemos.core.config import PG_CONFIG, db2_dsn_env, get_settings, oracle_dsn_env, required_capabilities_env
 from mnemos.core.pool import PoolManager
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,13 @@ def register_lifespan_worker(name: str, factory, *, honor_worker_enabled: bool =
 
 _post_db_startup_hooks: dict = {}
 _lifespan_cleanup_hooks: dict = {}
+
+
+async def _close_graeae_engine_if_loaded() -> None:
+    """Close the singleton GRAEAE engine even when API hook registration is skipped."""
+    from mnemos.domain.graeae.engine import get_graeae_engine
+
+    await get_graeae_engine().close()
 
 
 def register_post_db_startup_hook(name: str, hook) -> None:
@@ -281,9 +288,9 @@ def _select_persistence_backend(settings) -> str:
         return _normalize_backend_name(configured)
     # Per-backend env var shortcuts: ORACLE_DSN / DB2_DSN override
     # explicit postgres connection defaults (host/port/user).
-    if os.environ.get("ORACLE_DSN", "").strip():
+    if oracle_dsn_env():
         return "oracle"
-    if os.environ.get("DB2_DSN", "").strip():
+    if db2_dsn_env():
         return "db2"
 
     if _has_explicit_postgres_connection_config(settings):
@@ -316,7 +323,9 @@ def _normalize_backend_name(configured: str) -> str:
         return "mysql"
     if configured == "auto":
         return "auto"
-    raise ValueError(f"Unsupported persistence backend {configured!r}; expected postgres, sqlite, oracle, db2, mysql, or auto")
+    raise ValueError(
+        f"Unsupported persistence backend {configured!r}; expected postgres, sqlite, oracle, db2, mysql, or auto"
+    )
 
 
 def _backend_from_database_url(database_url: str) -> str | None:
@@ -344,11 +353,11 @@ def _log_and_validate_backend_capabilities(backend_type: str, backend: object) -
         backend_type,
         ", ".join(sorted(capabilities)) if capabilities else "(none)",
     )
-    required = _parse_required_capabilities(os.environ.get("MNEMOS_REQUIRE_CAPABILITIES", ""))
+    required = _parse_required_capabilities(required_capabilities_env())
     missing = required - capabilities
     if missing:
         raise RuntimeError(
-            "Persistence backend " f"{backend_type!r} missing required capabilities: {', '.join(sorted(missing))}"
+            f"Persistence backend {backend_type!r} missing required capabilities: {', '.join(sorted(missing))}"
         )
 
 
@@ -721,6 +730,13 @@ async def lifespan(app):
 
     _log_and_validate_backend_capabilities(backend_type, _persistence_backend)
 
+    # Layered-install fail-fast (GRAEAE de8f4b2b): refuse to start if an enabled
+    # feature layer (graeae/hive) needs a capability this backend lacks. See
+    # docs/LAYERED_INSTALL.md. core is always supported; default flags = all on.
+    from mnemos.persistence.base import assert_backend_supports_layers
+
+    assert_backend_supports_layers(_persistence_backend, settings.layers.active_layers)
+
     # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
     if _auth_configurer is not None:
         _auth_configurer(None)
@@ -879,6 +895,11 @@ async def lifespan(app):
             await hook()
         except Exception:
             logger.exception("[shutdown] %s cleanup hook failed", hook_name)
+    if "graeae engine" not in _lifespan_cleanup_hooks:
+        try:
+            await _close_graeae_engine_if_loaded()
+        except Exception:
+            logger.exception("[shutdown] graeae engine cleanup failed")
 
     if _persistence_backend is not None:
         await _persistence_backend.close()

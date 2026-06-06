@@ -261,6 +261,18 @@ class _FakeMemoryRepo:
         self.calls.append(("insert_memory", kwargs))
         return self._resolve("insert_memory", kwargs.get("memory_id"))
 
+    async def upsert_memory_embedding(self, tx, memory_id, embedding):
+        self.calls.append(
+            (
+                "upsert_memory_embedding",
+                {
+                    "memory_id": memory_id,
+                    "embedding": list(embedding),
+                },
+            )
+        )
+        return self._resolve("upsert_memory_embedding", None)
+
     async def gather_stats(self, tx):
         from mnemos.persistence.base import MemoryStatsRow
 

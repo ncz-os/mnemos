@@ -126,7 +126,16 @@ edge = [
 server = ["mnemos-os[nats,persephone,pantheon]"]
 ml = ["mnemos-os[morpheus,kronos,apollo,artemis,hot]"]
 interop = ["mnemos-os[knossos]"]
-full = ["mnemos-os[morpheus,persephone,pantheon,kronos,knossos,apollo,artemis,nats,hot,edge]"]
+# ── Feature-layer extras (GRAEAE consult de8f4b2b, 2026-06-01) ───────────────
+# Install layers stack: core (base) <- graeae <- hive. `hive` chains `graeae`
+# so the dependency direction is enforced at install time as well as runtime
+# (Settings.enforce_layer_direction). Pair with a storage extra, e.g.
+# `pip install mnemos-os[hive,postgres]`. See docs/LAYERED_INSTALL.md.
+# TODO(codex): move GRAEAE-only / hive-only third-party deps out of base
+# `dependencies` into these extras so a base install pulls neither.
+graeae = ["mnemos-os[pantheon]"]
+hive = ["mnemos-os[graeae]"]
+full = ["mnemos-os[morpheus,persephone,pantheon,kronos,knossos,apollo,artemis,nats,hot,edge,graeae,hive]"]
 # Enterprise backend drivers (feat/oracle-port branch). oracledb uses thin
 # mode by default — no Oracle Instant Client required. ibm_db pulls the
 # DB2 CLI driver as part of its build; on platforms without a pre-built

@@ -789,69 +789,9 @@ async def search_memories(
 
     async with backend.transactional() as tx:
         await _maybe_set_pg_rls(tx, user)
-        if request.semantic:
-            embedding = await _get_embedding(request.query)
-            _log_search_phase(search_trace_id, search_started_at, "embed")
-            if not embedding:
-                logger.warning("[VECTOR] Embedding failed, falling back to FTS")
-                rows = await backend.memories.fts_search(
-                    tx,
-                    query=request.query,
-                    limit=request_limit,
-                    visibility=visibility,
-                    category=request.category,
-                    subcategory=request.subcategory,
-                    source_provider=request.source_provider,
-                    source_model=request.source_model,
-                    source_agent=request.source_agent,
-                    include_archived=bool(request.include_archived),
-                )
-            else:
-                logger.info(f"[VECTOR] Semantic search: {len(embedding)}-dim vector")
-                semantic_trace_kwargs = {}
-                if getattr(backend, "supports_pgvector", False):
-                    semantic_trace_kwargs = {
-                        "search_trace_id": search_trace_id,
-                        "search_started_at": search_started_at,
-                    }
-                rows = await backend.memories.semantic_search(
-                    tx,
-                    embedding=embedding,
-                    limit=request_limit,
-                    visibility=visibility,
-                    category=request.category,
-                    subcategory=request.subcategory,
-                    source_provider=request.source_provider,
-                    source_model=request.source_model,
-                    source_agent=request.source_agent,
-                    include_archived=bool(request.include_archived),
-                    **semantic_trace_kwargs,
-                )
-                # Review #6 fix (2026-05-23): when semantic search returns
-                # zero rows, auto-fall-back to FTS in the same request so
-                # callers don't have to retry with semantic=false. Most
-                # mnemos rows historically had no embedding row in
-                # memory_embeddings (slice 2 backfill incomplete on some
-                # deployments); semantic_search filters embedding IS NOT
-                # NULL, so multi-term queries against partially-embedded
-                # corpora silently returned empty. FTS still hits the
-                # FTS5 index regardless of embedding state.
-                if not rows:
-                    logger.info("[VECTOR] semantic returned 0 rows for " f"'{request.query[:30]}'; falling back to FTS")
-                    rows = await backend.memories.fts_search(
-                        tx,
-                        query=request.query,
-                        limit=request_limit,
-                        visibility=visibility,
-                        category=request.category,
-                        subcategory=request.subcategory,
-                        source_provider=request.source_provider,
-                        source_model=request.source_model,
-                        source_agent=request.source_agent,
-                        include_archived=bool(request.include_archived),
-                    )
-        else:
-            rows = await backend.memories.fts_search(
+
+        async def _fts_fallback() -> list:
+            return await backend.memories.fts_search(
                 tx,
                 query=request.query,
                 limit=request_limit,
@@ -863,6 +803,58 @@ async def search_memories(
                 source_agent=request.source_agent,
                 include_archived=bool(request.include_archived),
             )
+
+        if request.semantic:
+            embedding = await _get_embedding(request.query)
+            _log_search_phase(search_trace_id, search_started_at, "embed")
+            if not embedding:
+                logger.warning("[VECTOR] Embedding failed, falling back to FTS")
+                rows = await _fts_fallback()
+            else:
+                logger.info(f"[VECTOR] Semantic search: {len(embedding)}-dim vector")
+                semantic_trace_kwargs = {}
+                if getattr(backend, "supports_pgvector", False):
+                    semantic_trace_kwargs = {
+                        "search_trace_id": search_trace_id,
+                        "search_started_at": search_started_at,
+                    }
+                semantic_failed = False
+                try:
+                    rows = await backend.memories.semantic_search(
+                        tx,
+                        embedding=embedding,
+                        limit=request_limit,
+                        visibility=visibility,
+                        category=request.category,
+                        subcategory=request.subcategory,
+                        source_provider=request.source_provider,
+                        source_model=request.source_model,
+                        source_agent=request.source_agent,
+                        include_archived=bool(request.include_archived),
+                        **semantic_trace_kwargs,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[VECTOR] semantic search failed for '%s'; falling back to FTS: %s",
+                        request.query[:30],
+                        exc,
+                    )
+                    rows = await _fts_fallback()
+                    semantic_failed = True
+                # Review #6 fix (2026-05-23): when semantic search returns
+                # zero rows, auto-fall-back to FTS in the same request so
+                # callers don't have to retry with semantic=false. Most
+                # mnemos rows historically had no embedding row in
+                # memory_embeddings (slice 2 backfill incomplete on some
+                # deployments); semantic_search filters embedding IS NOT
+                # NULL, so multi-term queries against partially-embedded
+                # corpora silently returned empty. FTS still hits the
+                # FTS5 index regardless of embedding state.
+                if not rows and not semantic_failed:
+                    logger.info("[VECTOR] semantic returned 0 rows for " f"'{request.query[:30]}'; falling back to FTS")
+                    rows = await _fts_fallback()
+        else:
+            rows = await _fts_fallback()
 
     _log_search_phase(search_trace_id, search_started_at, "metadata_fetch")
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
@@ -1011,6 +1003,42 @@ async def create_memory(
             # version 1 + branch automatically; the SQLite path does
             # not have that trigger today (deferred to v4.2 with
             # branch/version surface).
+            # Inline embed via mnemos.runtime.embedder.embed_text — the
+            # in-process embedder (architectural decision
+            # mem_1779334716543_f8ebd4, 2026-05-21) loads the GGUF model
+            # once per worker and returns a 768-dim vector in ~50-100ms
+            # on PYTHIA CPU. Failures (empty vec) are swallowed and the
+            # row keeps embedding=NULL; the backfill script picks it up
+            # on the next pass.
+            #
+            # Codex adversarial-review gate (2026-06-05): the embedding
+            # generation (_get_embedding) is separated from the DB write
+            # (upsert_memory_embedding) so that only embedding-generation
+            # errors are silently degraded to NULL. DB write errors (e.g.
+            # constraint violation, disk-full, connection loss) MUST
+            # propagate and roll back the transaction — no partial-commit
+            # NULL vector.
+            #
+            # Codex adversarial-review gate fix (2026-06-05): the initial
+            # gate edit removed the try/except around _get_embedding
+            # entirely, which meant embedding-model failures (OOM, model
+            # load error, etc.) would abort the entire create_memory tx.
+            # Restore the try/except around embedding generation only —
+            # upsert_memory_embedding remains outside so DB write errors
+            # still propagate.
+            try:
+                vec = await _get_embedding(request.content)
+            except Exception:
+                logger.exception(
+                    "[create_memory] inline embed generation failed for %s; "
+                    "row will be backfilled with embedding later",
+                    mem_id,
+                )
+                vec = None
+            # CHILD C v2 (2026-06-06): Embedding is now co-transactional —
+            # passed inline to insert_memory so the VECTOR column is written
+            # in the same tx. upsert_memory_embedding is kept for backfill
+            # (scripts) and federation copy_embeddings (F-1.4).
             await backend.memories.insert_memory(
                 tx,
                 memory_id=mem_id,
@@ -1029,26 +1057,10 @@ async def create_memory(
                 verbatim_content=(
                     request.verbatim_content if request.verbatim_content is not None else request.content
                 ),
+                embedding=vec,
                 created=None,
                 updated=None,
             )
-            # Inline embed via mnemos.runtime.embedder.embed_text — the
-            # in-process embedder (architectural decision
-            # mem_1779334716543_f8ebd4, 2026-05-21) loads the GGUF model
-            # once per worker and returns a 768-dim vector in ~50-100ms
-            # on PYTHIA CPU. Failures (empty vec) are swallowed and the
-            # row keeps embedding=NULL; the backfill script picks it up
-            # on the next pass. Embed in the same tx so the vector
-            # commits atomically with the memory row.
-            try:
-                vec = await _get_embedding(request.content)
-                if vec and hasattr(backend.memories, "upsert_memory_embedding"):
-                    await backend.memories.upsert_memory_embedding(tx, mem_id, vec)
-            except Exception:
-                logger.exception(
-                    "[create_memory] inline embed failed for %s; row will be backfilled",
-                    mem_id,
-                )
             # v6.2 M-2.2.1 audit chain entry. Gated by MNEMOS_AUDIT_CHAIN=on
             # via the audit_sealer helper; backend.audit_chain is None on
             # backends pre-implementation (Db2 live-test blocked on 12.1.5
@@ -1193,6 +1205,17 @@ async def bulk_create_memories(
                         continue
                     created_ids.append(row["id"])
                     continue
+                # Compute embedding first so it can be passed inline to
+                # insert_memory (co-transactional; CHILD C v2, 2026-06-06).
+                try:
+                    vec = await _get_embedding(mem.content)
+                except Exception:
+                    logger.exception(
+                        "[bulk_create_memories] inline embed generation failed for %s; "
+                        "row will be backfilled with embedding later",
+                        mid,
+                    )
+                    vec = None
                 await backend.memories.insert_memory(
                     tx,
                     memory_id=mid,
@@ -1209,6 +1232,7 @@ async def bulk_create_memories(
                     source_session=mem.source_session,
                     source_agent=mem.source_agent,
                     verbatim_content=verbatim,
+                    embedding=vec,
                     created=None,
                     updated=None,
                 )

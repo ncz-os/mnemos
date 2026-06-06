@@ -5,7 +5,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mnemos.persistence.base import ALL_CAPABILITIES, CORE_CAPABILITY, CorePersistence
+from mnemos.persistence.base import (
+    ALL_CAPABILITIES,
+    CORE_CAPABILITY,
+    FEDERATION_CAPABILITY,
+    STATE_CAPABILITY,
+    CorePersistence,
+)
 from mnemos.persistence.mysql import MysqlBackend, MysqlMemoryRepository
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
@@ -56,7 +62,7 @@ class _FakePool:
         return None
 
 
-async def test_mysql_backend_advertises_core_only_and_pings():
+async def test_mysql_backend_advertises_implemented_capabilities_and_pings():
     cursor = MagicMock()
     cursor.execute = AsyncMock()
     cursor.fetchone = AsyncMock(return_value=(1,))
@@ -64,7 +70,9 @@ async def test_mysql_backend_advertises_core_only_and_pings():
     conn.cursor = MagicMock(return_value=_AsyncCursorContext(cursor))
     backend = MysqlBackend(_FakePool(conn), SimpleNamespace(database=SimpleNamespace(embedding_dim=3)))
 
-    assert backend.capabilities == {CORE_CAPABILITY}
+    # State + Federation persistence are now implemented for MySQL (were stubs);
+    # core + state + federation are served. Still a strict subset of ALL.
+    assert backend.capabilities == {CORE_CAPABILITY, STATE_CAPABILITY, FEDERATION_CAPABILITY}
     assert backend.capabilities != set(ALL_CAPABILITIES)
     assert isinstance(backend, CorePersistence)
     assert await backend.ping() is True

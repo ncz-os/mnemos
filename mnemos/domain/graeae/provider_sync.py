@@ -27,7 +27,6 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -392,6 +391,26 @@ def _fetch_deepseek_direct_static() -> list[dict]:
     ]
 
 
+def _fetch_codex_static() -> list[dict]:
+    """Codex / PANTHEON static seed for gpt-5.3-codex (OAuth subscription model)."""
+    return [
+        {
+            "provider": "codex",
+            "model_id": "gpt-5.3-codex",
+            "display_name": "GPT-5.3 Codex",
+            "family": "gpt-5.3",
+            "context_window": 200000,
+            "max_output_tokens": 100000,
+            "capabilities": ["code", "reasoning"],
+            "input_cost_per_mtok": 0,
+            "output_cost_per_mtok": 0,
+            "usage_tier": "premium",
+            "available": True,
+            "raw": {"source": "static", "capabilities": {"chat": False, "code": True, "reasoning": True}, "note": "OAuth subscription (/bin/zsh)"},
+        },
+    ]
+
+
 # ── Capabilities inference ─────────────────────────────────────────────────────
 
 
@@ -400,7 +419,7 @@ def _infer_capabilities(model_id: str, item: dict) -> list[str]:
     caps = ["chat"]
     mid = model_id.lower()
 
-    if any(x in mid for x in ["vision", "vl", "4o", "gemini", "claude", "grok"]):
+    if any(x in mid for x in ["vision", "vl", "4o", "gemini", "grok"]):
         caps.append("vision")
     if any(x in mid for x in ["code", "coder", "codestral"]):
         caps.append("code")
@@ -421,105 +440,42 @@ def _infer_capabilities(model_id: str, item: dict) -> list[str]:
 # ── DB upsert ──────────────────────────────────────────────────────────────────
 
 
-async def upsert_models(pool, models: list[dict], dry_run: bool = False) -> tuple[int, int, int]:
-    """Upsert model list into model_registry.
+async def upsert_models(backend, models: list[dict], dry_run: bool = False) -> tuple[int, int, int]:
+    """Upsert model list into model_registry via the persistence ABC (Oracle).
 
-    Returns (added, updated, deprecated) counts.
+    `backend` is a PersistenceBackend; all writes go through
+    backend.consultations_audit so the model registry stays Oracle-native (no
+    raw asyncpg / phantom Postgres). Returns (added, updated, deprecated).
     """
     if not models:
         return 0, 0, 0
 
+    if dry_run:
+        for m in models:
+            logger.info(f"[SYNC] DRY-RUN upsert: {m['provider']}/{m['model_id']}")
+        return 0, 0, 0
+
     added = updated = deprecated = 0
-    now = datetime.now(timezone.utc)
-
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            for m in models:
-                if dry_run:
-                    logger.info(f"[SYNC] DRY-RUN upsert: {m['provider']}/{m['model_id']}")
-                    continue
-
-                existing = await conn.fetchrow(
-                    "SELECT id, available FROM model_registry WHERE provider=$1 AND model_id=$2",
-                    m["provider"],
-                    m["model_id"],
-                )
-
-                raw_json = json.dumps(m.get("raw", {}))
-                caps = m.get("capabilities", [])
-
-                if existing is None:
-                    await conn.execute(
-                        """INSERT INTO model_registry
-                            (provider, model_id, display_name, family,
-                             context_window, max_output_tokens, capabilities,
-                             input_cost_per_mtok, output_cost_per_mtok,
-                             cache_read_per_mtok, cache_write_per_mtok,
-                             available, last_seen, last_synced, raw)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,TRUE,$12,$12,$13)
-                           ON CONFLICT (provider, model_id) DO NOTHING""",
-                        m["provider"],
-                        m["model_id"],
-                        m.get("display_name") or m["model_id"],
-                        m.get("family") or _model_family(m["model_id"]),
-                        m.get("context_window"),
-                        m.get("max_output_tokens"),
-                        caps,
-                        m.get("input_cost_per_mtok", 0),
-                        m.get("output_cost_per_mtok", 0),
-                        m.get("cache_read_per_mtok", 0),
-                        m.get("cache_write_per_mtok", 0),
-                        now,
-                        raw_json,
-                    )
-                    added += 1
-                    logger.info(f"[SYNC] ADD {m['provider']}/{m['model_id']}")
-                else:
-                    await conn.execute(
-                        """UPDATE model_registry SET
-                            display_name=$3, family=$4,
-                            context_window=COALESCE($5, context_window),
-                            max_output_tokens=COALESCE($6, max_output_tokens),
-                            capabilities=$7,
-                            available=TRUE, last_seen=$8, last_synced=$8, raw=$9
-                           WHERE provider=$1 AND model_id=$2""",
-                        m["provider"],
-                        m["model_id"],
-                        m.get("display_name") or m["model_id"],
-                        m.get("family") or _model_family(m["model_id"]),
-                        m.get("context_window"),
-                        m.get("max_output_tokens"),
-                        caps,
-                        now,
-                        raw_json,
-                    )
-                    updated += 1
-
-            if not dry_run:
-                # Mark models not seen in this sync as unavailable
-                provider = models[0]["provider"] if models else None
-                if provider:
-                    seen_ids = [m["model_id"] for m in models]
-                    result = await conn.execute(
-                        """UPDATE model_registry SET available=FALSE
-                           WHERE provider=$1 AND model_id != ALL($2::text[])
-                             AND available=TRUE""",
-                        provider,
-                        seen_ids,
-                    )
-                    # asyncpg returns "UPDATE N" string
-                    try:
-                        deprecated = int(result.split()[-1])
-                    except (ValueError, AttributeError):
-                        deprecated = 0
-                    if deprecated:
-                        logger.info(f"[SYNC] DEPRECATED {deprecated} models from {provider}")
+    repo = backend.consultations_audit
+    async with backend.transactional() as tx:
+        for m in models:
+            inserted = await repo.upsert_model(tx, m)
+            if inserted:
+                added += 1
+                logger.info(f"[SYNC] ADD {m['provider']}/{m['model_id']}")
+            else:
+                updated += 1
+        provider = models[0]["provider"]
+        seen_ids = [m["model_id"] for m in models]
+        deprecated = await repo.mark_models_unavailable(tx, provider, seen_ids)
+        if deprecated:
+            logger.info(f"[SYNC] DEPRECATED {deprecated} models from {provider}")
 
     return added, updated, deprecated
 
 
 async def log_sync(
-    pool,
+    backend,
     provider: str,
     models_found: int,
     added: int,
@@ -528,21 +484,18 @@ async def log_sync(
     error: Optional[str],
     duration_ms: int,
 ) -> None:
-    """Write a row to model_registry_sync_log."""
+    """Write a row to model_registry_sync_log via the persistence ABC."""
     try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """INSERT INTO model_registry_sync_log
-                    (provider, models_found, models_added, models_updated,
-                     models_deprecated, error, duration_ms)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7)""",
-                provider,
-                models_found,
-                added,
-                updated,
-                deprecated,
-                error,
-                duration_ms,
+        async with backend.transactional() as tx:
+            await backend.consultations_audit.write_model_sync_log(
+                tx,
+                provider=provider,
+                models_found=models_found,
+                added=added,
+                updated=updated,
+                deprecated=deprecated,
+                error=error,
+                duration_ms=duration_ms,
             )
     except Exception as exc:
         logger.warning(f"[SYNC] failed to write sync log for {provider}: {exc}")
@@ -563,11 +516,12 @@ _STATIC_PROVIDERS = {
     "anthropic": _fetch_anthropic_static,
     "deepseek-direct": _fetch_deepseek_direct_static,
     "perplexity": _fetch_perplexity_static,
+    "codex": _fetch_codex_static,
 }
 
 
 async def sync_provider(
-    pool,
+    backend,
     provider: str,
     dry_run: bool = False,
 ) -> dict:
@@ -587,10 +541,10 @@ async def sync_provider(
         logger.info(f"[SYNC:{provider}] fetched {len(models)} models")
 
         added = updated = deprecated = 0
-        if pool is not None:
-            added, updated, deprecated = await upsert_models(pool, models, dry_run=dry_run)
+        if backend is not None:
+            added, updated, deprecated = await upsert_models(backend, models, dry_run=dry_run)
         else:
-            logger.warning(f"[SYNC:{provider}] no DB pool — skipping upsert (dry-run mode)")
+            logger.warning(f"[SYNC:{provider}] no persistence backend — skipping upsert (dry-run)")
     except Exception as exc:
         error = str(exc)
         logger.error(f"[SYNC:{provider}] error: {exc}", exc_info=True)
@@ -598,8 +552,8 @@ async def sync_provider(
 
     duration_ms = int((time.monotonic() - t0) * 1000)
 
-    if pool is not None and not dry_run:
-        await log_sync(pool, provider, len(models), added, updated, deprecated, error, duration_ms)
+    if backend is not None and not dry_run:
+        await log_sync(backend, provider, len(models), added, updated, deprecated, error, duration_ms)
 
     return {
         "provider": provider,
@@ -614,50 +568,43 @@ async def sync_provider(
 
 
 async def sync_all_providers(
-    pool,
+    backend,
     dry_run: bool = False,
     providers: Optional[list[str]] = None,
 ) -> list[dict]:
-    """Sync all (or specified) providers concurrently. Returns list of summary dicts."""
+    """Sync all (or specified) providers. Returns list of summary dicts.
+
+    Runs sequentially to avoid concurrent transactions sharing one backend pool.
+    """
     all_prov = list(_LIVE_PROVIDERS) + list(_STATIC_PROVIDERS)
     targets = providers if providers else all_prov
     unknown = [p for p in targets if p not in all_prov]
     if unknown:
         raise ValueError(f"Unknown providers: {unknown}")
 
-    results = await asyncio.gather(
-        *[sync_provider(pool, p, dry_run=dry_run) for p in targets],
-        return_exceptions=True,
-    )
-    out = []
-    for r in results:
-        if isinstance(r, Exception):
-            logger.error(f"[SYNC] unexpected exception in gather: {r}")
-        else:
-            out.append(r)
-    return out
+    results: list[dict] = []
+    for p in targets:
+        try:
+            results.append(await sync_provider(backend, p, dry_run=dry_run))
+        except Exception as r:  # noqa: BLE001
+            logger.error(f"[SYNC] unexpected exception for {p}: {r}")
+    return results
 
 
 # ── Arena score update (called by update_model_registry.py) ───────────────────
 
 
 async def update_arena_scores(
-    pool,
+    backend,
     scores: dict[str, tuple[str, float, int]],  # {provider: (model_id, score, rank)}
 ) -> None:
     """Write Arena Elo scores + GRAEAE weights back to model_registry rows.
 
-    scores: {provider: (api_model_id, arena_score, arena_rank)}
-    graeae_weight is derived inline from the score using p10/p90 normalization.
-
-    Matching strategy (in order):
-      1. Exact match on model_id (e.g. openai/gpt-5.4 → gpt-5.4 in DB)
-      2. Family prefix match (e.g. xai/grok-4.2 → family "grok-4" matches
-         grok-4.20-0309-reasoning, grok-4.20-0309-non-reasoning, etc.)
-    This handles providers where the Arena normalizer produces an alias that
-    doesn't appear verbatim in the provider's /models response.
+    All writes go through the persistence ABC (backend.consultations_audit),
+    Oracle-native. graeae_weight is derived from p10/p90 score normalization;
+    matching is exact-model_id first, then family prefix.
     """
-    if not pool or not scores:
+    if not backend or not scores:
         return
 
     raw_scores = {prov: s for prov, (_, s, _) in scores.items()}
@@ -667,53 +614,28 @@ async def update_arena_scores(
     p90 = vals[min(n - 1, int(n * 0.90))]
     span = p90 - p10 or 1.0
 
-    async with pool.acquire() as conn:
+    repo = backend.consultations_audit
+    async with backend.transactional() as tx:
         for prov, (model_id, arena_score, arena_rank) in scores.items():
             weight = round(max(0.50, min(1.00, 0.50 + 0.50 * (arena_score - p10) / span)), 4)
-
-            # 1. Exact match
-            result = await conn.execute(
-                """UPDATE model_registry
-                   SET arena_score=$3, arena_rank=$4, graeae_weight=$5
-                   WHERE provider=$1 AND model_id=$2""",
-                prov,
-                model_id,
-                arena_score,
-                arena_rank,
-                weight,
+            rows_updated = await repo.update_arena_score(
+                tx,
+                provider=prov,
+                model_id=model_id,
+                family=_model_family(model_id),
+                arena_score=arena_score,
+                arena_rank=arena_rank,
+                graeae_weight=weight,
             )
-            rows_updated = int(result.split()[-1]) if result else 0
-
-            # 2. Family prefix match as fallback
-            if rows_updated == 0:
-                family = _model_family(model_id)
-                result = await conn.execute(
-                    """UPDATE model_registry
-                       SET arena_score=$3, arena_rank=$4, graeae_weight=$5
-                       WHERE provider=$1 AND family=$2""",
-                    prov,
-                    family,
-                    arena_score,
-                    arena_rank,
-                    weight,
+            if rows_updated:
+                logger.info(
+                    f"[SYNC] arena scores applied: {prov}/{model_id} "
+                    f"({rows_updated} rows) score={arena_score:.0f} weight={weight}"
                 )
-                rows_updated = int(result.split()[-1]) if result else 0
-                if rows_updated:
-                    logger.info(
-                        f"[SYNC] arena scores applied to family {prov}/{family!r} "
-                        f"({rows_updated} rows) score={arena_score:.0f} weight={weight}"
-                    )
-                else:
-                    logger.debug(
-                        f"[SYNC] arena: no rows matched for {prov}/{model_id!r} "
-                        f"(family={family!r}) — provider models not yet synced?"
-                    )
-                continue
-
-            logger.info(
-                f"[SYNC] arena scores updated: {prov}/{model_id} "
-                f"score={arena_score:.0f} rank={arena_rank} weight={weight}"
-            )
+            else:
+                logger.debug(
+                    f"[SYNC] arena: no rows matched for {prov}/{model_id!r} " f"— provider models not yet synced?"
+                )
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -731,18 +653,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     async def _run() -> None:
-        pool = None
+        backend = None
         if not args.dry_run:
             from mnemos.core import lifecycle as _lc
+            from mnemos.core.config import get_settings
 
-            await _lc.startup()
-            pool = _lc._pool
+            settings = get_settings()
+            backend = await _lc._build_oracle_backend(_lc._oracle_dsn_from_settings(settings), settings)
 
         if args.provider:
-            result = await sync_provider(pool, args.provider, dry_run=args.dry_run)
+            result = await sync_provider(backend, args.provider, dry_run=args.dry_run)
             results = [result]
         else:
-            results = await sync_all_providers(pool, dry_run=args.dry_run)
+            results = await sync_all_providers(backend, dry_run=args.dry_run)
 
         print("\n=== Provider Sync Results ===")
         for r in results:
@@ -758,7 +681,7 @@ if __name__ == "__main__":
             if r.get("error"):
                 print(f"           ERROR: {r['error']}")
 
-        if pool:
-            await _lc.shutdown()
+        if backend is not None:
+            await backend.close()
 
     asyncio.run(_run())

@@ -12,7 +12,7 @@ from httpx import ASGITransport, AsyncClient
 
 import mnemos.core.lifecycle as lifecycle
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.routes.ledger import router as ledger_router
+from mnemos.api.routes.ledger import _PLAN_WINDOWS, router as ledger_router
 from mnemos.persistence.base import UsageLedgerRecord, UsageLedgerResult
 from mnemos.persistence.postgres import PostgresBackend, PostgresTransaction
 
@@ -380,9 +380,45 @@ async def test_ledger_endpoint_requires_root_and_records(monkeypatch):
     assert recorded.model == "gpt-4o"
     assert recorded.session_id is None
     assert recorded.request_count == 1
+    assert recorded.path_kind == "api"
     assert recorded.plan_window_id is not None
     assert recorded.plan_window_id.startswith("openai-standard-")
     assert invalid_response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_ledger_endpoint_infers_known_subscription_path_kind(monkeypatch):
+    backend = _EndpointBackend()
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+
+    app = FastAPI()
+    app.include_router(ledger_router)
+    app.dependency_overrides[get_current_user] = _root
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/ledger",
+            json={
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "task_kind": "code",
+                "tokens_in": 1200,
+                "tokens_out": 340,
+                "tokens_reasoning": 0,
+                "latency_ms": 1240,
+                "outcome": "ok",
+                "caller_subsystem": "pantheon",
+                "tier": "chatgpt_plus",
+            },
+        )
+
+    assert response.status_code == 200
+    assert len(backend.records) == 1
+    recorded = backend.records[0]
+    assert recorded.path_kind == "interactive"
+    assert recorded.plan_window_id is not None
+    assert recorded.plan_window_id.startswith("openai-chatgpt_plus-")
 
 
 def test_usage_ledger_migrations_preserve_constraint_parity():
@@ -397,3 +433,8 @@ def test_usage_ledger_migrations_preserve_constraint_parity():
         assert "est_cost_usd" in normalized and "check (est_cost_usd >= 0)" in normalized
         assert "check (outcome in ('ok','err','timeout'))" in normalized
         assert "check (latency_ms >= 0)" in normalized
+
+
+def test_plan_window_hints_exclude_deleted_claude_future_rows():
+    assert ("anthropic", "claude_max_interactive_post_jun15") not in _PLAN_WINDOWS
+    assert ("anthropic", "agent_sdk_credit_pool_post_jun15") not in _PLAN_WINDOWS

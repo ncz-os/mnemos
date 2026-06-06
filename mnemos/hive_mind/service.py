@@ -24,7 +24,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
+from mnemos.core.config import agent_bus_db_env
+
+DB_PATH = agent_bus_db_env()
 
 # Phase 2 migration cut 1 (2026-05-23): storage abstraction. SQL methods
 # migrate into the repo one at a time; service-level helpers forward.
@@ -80,6 +82,15 @@ CREATE TABLE IF NOT EXISTS agents (
   host TEXT NOT NULL,
   session_id TEXT NOT NULL,
   pid INTEGER,
+  runtime TEXT,
+  model TEXT,
+  provider TEXT,
+  cost_tier TEXT,
+  autonomy_level TEXT,
+  auth_method TEXT,
+  plan_cap_usd REAL,
+  plan_period_used_usd REAL NOT NULL DEFAULT 0,
+  subscription_pools TEXT,
   capabilities TEXT,
   version TEXT,
   started_at REAL NOT NULL,
@@ -101,12 +112,30 @@ CREATE TABLE IF NOT EXISTS jobs (
   required_capabilities TEXT,                   -- json array; worker must have ALL
   eligible_kinds TEXT,                          -- json array; agent kinds eligible (null = any)
   project TEXT,                                 -- #10 FIX: separate project tag from capabilities (riskyeats/investorclaw/etc)
+  max_cost_tier TEXT NOT NULL DEFAULT 'A',
+  preferred_providers TEXT,
+  preferred_models TEXT,
+  mnemos_refs TEXT,
+  depends_on TEXT,
   status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','cancelled')),
   claimed_by TEXT,                              -- worker urn (set on claim/dequeue)
   claimed_at REAL,
+  claimed_runtime TEXT,
+  claimed_model TEXT,
+  claimed_provider TEXT,
+  claimed_cost_tier TEXT,
   started_at REAL NOT NULL,                     -- when job ENTERED queue
+  retry_backoff_until REAL,
+  routed_at REAL,
+  routing_metadata TEXT,
   ended_at REAL,
-  result TEXT
+  result TEXT,
+  result_mnemos_id TEXT,
+  tokens_in INTEGER,
+  tokens_out INTEGER,
+  estimated_cost_usd REAL,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  max_retries INTEGER NOT NULL DEFAULT 2
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_submitter ON jobs(submitter_urn);
@@ -114,6 +143,48 @@ CREATE INDEX IF NOT EXISTS idx_jobs_claimed_by ON jobs(claimed_by);
 CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(status, priority DESC, started_at ASC);
 CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project);  -- #10 FIX
+CREATE INDEX IF NOT EXISTS idx_jobs_retry_backoff ON jobs(retry_backoff_until);
+
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_by_urn TEXT NOT NULL,
+  interval_seconds INTEGER NOT NULL,
+  job_template TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_fired_at REAL,
+  next_fire_at REAL NOT NULL,
+  fire_count INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due ON scheduled_jobs(enabled, next_fire_at);
+
+CREATE TABLE IF NOT EXISTS worker_kind_stats (
+  urn TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  success_count INTEGER NOT NULL DEFAULT 0,
+  fail_count INTEGER NOT NULL DEFAULT 0,
+  cancelled_count INTEGER NOT NULL DEFAULT 0,
+  total_tokens_in INTEGER NOT NULL DEFAULT 0,
+  total_tokens_out INTEGER NOT NULL DEFAULT 0,
+  total_cost_usd REAL NOT NULL DEFAULT 0,
+  total_duration_sec REAL NOT NULL DEFAULT 0,
+  last_run REAL,
+  PRIMARY KEY (urn, kind)
+);
+
+CREATE TABLE IF NOT EXISTS hive_cache (
+  cache_key TEXT PRIMARY KEY,
+  result_json TEXT NOT NULL,
+  source_job_id TEXT,
+  result_mnemos_id TEXT,
+  hit_count INTEGER NOT NULL DEFAULT 0,
+  cost_saved_usd REAL NOT NULL DEFAULT 0,
+  model TEXT,
+  provider TEXT,
+  cached_at REAL NOT NULL,
+  last_hit_at REAL
+);
 
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -405,6 +476,35 @@ async def cache_record_hit(db, cache_key: str, cost_saved: float):
     )
 
 
+async def _claim_agent_context(agent_urn: str) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
+            "auth_method, plan_cap_usd, plan_period_used_usd "
+            "FROM agents WHERE urn=? AND status IN ('online','idle')",
+            (agent_urn,),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"agent not registered or offline: {agent_urn}")
+    agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier, a_auth, a_cap, a_used = row
+    agent_caps = set(json.loads(caps_json)) if caps_json else set()
+    a_tier = a_tier or "C"
+    a_auth = (a_auth or "unknown").lower()
+    # Throttle: subscription agents over 85% MTD usage get refused tier-B/C jobs;
+    # they can still claim tier-A (free) work. Forces API/free fallback as plan cap nears.
+    sub_throttled = a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap
+    return {
+        "agent_kind": agent_kind,
+        "agent_caps": agent_caps,
+        "agent_runtime": a_runtime or "unknown",
+        "agent_model": a_model or "unknown",
+        "agent_provider": a_provider or "unknown",
+        "agent_tier": a_tier,
+        "sub_throttled": bool(sub_throttled),
+    }
+
+
 class AgentRegister(BaseModel):
     # OPEN REGISTRATION + RUNTIME→KIND ENFORCEMENT (per Kimi advisory 2026-05-23).
     # Any agent registers; identity is recorded for transparency. Kind must align
@@ -426,6 +526,7 @@ class AgentRegister(BaseModel):
     autonomy_level: str = Field("unknown", description="autonomous / confirm-risky / interactive / unknown")
     auth_method: str = Field("unknown", description="subscription (Max plan), api (pay-per-token), free, unknown")
     plan_cap_usd: Optional[float] = None  # monthly cap; defaults from DEFAULT_PLAN_CAPS by auth_method
+    subscription_pools: Optional[list[str]] = None
     pid: Optional[int] = None
     capabilities: Optional[list[str]] = None
     version: Optional[str] = None
@@ -468,6 +569,17 @@ class JobUpdate(BaseModel):
     tokens_in: Optional[int] = None  # workers SHOULD report token usage on done/failed for cost audit
     tokens_out: Optional[int] = None
     result_mnemos_id: Optional[str] = None  # mem_XXX id where worker stored the outcome — closes provenance loop
+
+
+class JobRoutingUpdate(BaseModel):
+    required_capabilities: Optional[list[str]] = None
+    eligible_kinds: Optional[list[str]] = None
+    max_cost_tier: Optional[str] = None
+    preferred_providers: Optional[list[str]] = None
+    preferred_models: Optional[list[str]] = None
+    mnemos_refs: Optional[list[str]] = None
+    depends_on: Optional[list[str]] = None
+    routing_metadata: Optional[dict] = None
 
 
 class ScheduleCreate(BaseModel):
@@ -599,15 +711,47 @@ async def lifespan(app: FastAPI):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
         await db.executescript(SCHEMA)
-        # #10 FIX (review 2026-05-23): additive migrations for live DBs (jobs.project).
+        # Additive migrations for live DBs. Keep this list in lockstep with
+        # columns used by endpoints and SqliteHiveMindRepository.
         # Add-only via ALTER TABLE; ignore "duplicate column" errors so reruns are no-ops.
-        for stmt in ("ALTER TABLE jobs ADD COLUMN project TEXT",):
+        migrations = (
+            "ALTER TABLE agents ADD COLUMN runtime TEXT",
+            "ALTER TABLE agents ADD COLUMN model TEXT",
+            "ALTER TABLE agents ADD COLUMN provider TEXT",
+            "ALTER TABLE agents ADD COLUMN cost_tier TEXT",
+            "ALTER TABLE agents ADD COLUMN autonomy_level TEXT",
+            "ALTER TABLE agents ADD COLUMN auth_method TEXT",
+            "ALTER TABLE agents ADD COLUMN plan_cap_usd REAL",
+            "ALTER TABLE agents ADD COLUMN plan_period_used_usd REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE agents ADD COLUMN subscription_pools TEXT",
+            "ALTER TABLE jobs ADD COLUMN project TEXT",
+            "ALTER TABLE jobs ADD COLUMN max_cost_tier TEXT NOT NULL DEFAULT 'A'",
+            "ALTER TABLE jobs ADD COLUMN preferred_providers TEXT",
+            "ALTER TABLE jobs ADD COLUMN preferred_models TEXT",
+            "ALTER TABLE jobs ADD COLUMN mnemos_refs TEXT",
+            "ALTER TABLE jobs ADD COLUMN depends_on TEXT",
+            "ALTER TABLE jobs ADD COLUMN claimed_runtime TEXT",
+            "ALTER TABLE jobs ADD COLUMN claimed_model TEXT",
+            "ALTER TABLE jobs ADD COLUMN claimed_provider TEXT",
+            "ALTER TABLE jobs ADD COLUMN claimed_cost_tier TEXT",
+            "ALTER TABLE jobs ADD COLUMN retry_backoff_until REAL",
+            "ALTER TABLE jobs ADD COLUMN routed_at REAL",
+            "ALTER TABLE jobs ADD COLUMN routing_metadata TEXT",
+            "ALTER TABLE jobs ADD COLUMN result_mnemos_id TEXT",
+            "ALTER TABLE jobs ADD COLUMN tokens_in INTEGER",
+            "ALTER TABLE jobs ADD COLUMN tokens_out INTEGER",
+            "ALTER TABLE jobs ADD COLUMN estimated_cost_usd REAL",
+            "ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 2",
+        )
+        for stmt in migrations:
             try:
                 await db.execute(stmt)
             except Exception as e:
                 if "duplicate column" not in str(e).lower():
                     print(f"migration warn ({stmt!r}): {e}", flush=True)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_retry_backoff ON jobs(retry_backoff_until)")
         await db.commit()
     task = asyncio.create_task(reaper_task(app))
     yield
@@ -652,6 +796,11 @@ async def register(req: AgentRegister):
             "must provide runtime (claude-code/opencode/goose/codex/...) OR explicit kind. "
             "Defaulting to 'unknown' was masking session-bricking misregistrations.",
         )
+    if runtime == "unknown" and kind in WORKER_ONLY_RUNTIMES:
+        raise HTTPException(
+            422,
+            f"worker kind={kind!r} must declare its runtime; runtime='unknown' cannot register as a worker",
+        )
     allowed = RUNTIME_KIND_MAP.get(runtime, {runtime, "unknown"})
     if runtime != "unknown" and kind not in allowed and kind != runtime:
         raise HTTPException(
@@ -688,6 +837,7 @@ async def register(req: AgentRegister):
         autonomy_level=autonomy,
         auth_method=auth_method,
         plan_cap_usd=plan_cap_usd,
+        subscription_pools=req.subscription_pools,
         host=req.host,
         session_id=session_id,
         pid=req.pid,
@@ -710,6 +860,7 @@ async def register(req: AgentRegister):
                 "cost_tier": tier,
                 "host": req.host,
                 "autonomy_level": autonomy,
+                "subscription_pools": req.subscription_pools,
             },
         )
         await db.commit()
@@ -725,6 +876,7 @@ async def register(req: AgentRegister):
         "autonomy_level": autonomy,
         "auth_method": auth_method,
         "plan_cap_usd": plan_cap_usd,
+        "subscription_pools": req.subscription_pools,
     }
 
 
@@ -753,7 +905,7 @@ async def list_agents(
 ):
     sql = (
         "SELECT urn, kind, host, status, last_heartbeat, capabilities, version, metadata, "
-        "pid, runtime, model, provider, cost_tier, autonomy_level "
+        "pid, runtime, model, provider, cost_tier, autonomy_level, subscription_pools "
         "FROM agents WHERE 1=1"
     )
     args: list = []
@@ -805,6 +957,7 @@ async def list_agents(
                         "provider": r[11],
                         "cost_tier": r[12],
                         "autonomy_level": r[13],
+                        "subscription_pools": json.loads(r[14]) if r[14] else None,
                         "display": display,
                     }
                 )
@@ -816,7 +969,7 @@ async def agent_throttle(urn_path: str):
     """Inspect an agent's plan-cap throttle state."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT urn, kind, runtime, auth_method, plan_cap_usd, plan_period_used_usd " "FROM agents WHERE urn=?",
+            "SELECT urn, kind, runtime, auth_method, plan_cap_usd, plan_period_used_usd FROM agents WHERE urn=?",
             (urn_path,),
         ) as cur:
             row = await cur.fetchone()
@@ -995,6 +1148,9 @@ async def create_job(req: JobCreate):
             depends_on=req.depends_on,
             max_retries=req.max_retries,
             started_at=now,
+            routing_metadata={
+                "submitter_max_cost_tier_explicit": "max_cost_tier" in getattr(req, "model_fields_set", set())
+            },
         )
         await emit_event(
             db,
@@ -1027,36 +1183,20 @@ async def dequeue_next_job(agent_urn: str):
     Race-safe via SQLite immediate-mode UPDATE...WHERE rowid=(SELECT...LIMIT 1) under a transaction.
     """
     now = time.time()
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
-            "auth_method, plan_cap_usd, plan_period_used_usd "
-            "FROM agents WHERE urn=? AND status IN ('online','idle')",
-            (agent_urn,),
-        ) as cur:
-            row = await cur.fetchone()
-        if not row:
-            raise HTTPException(404, f"agent not registered or offline: {agent_urn}")
-        agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier, a_auth, a_cap, a_used = row
-        agent_caps = set(json.loads(caps_json)) if caps_json else set()
-        a_tier = a_tier or "C"
-        a_auth = (a_auth or "unknown").lower()
-        # Throttle: subscription agents over 85% MTD usage get refused tier-B/C jobs;
-        # they can still claim tier-A (free) work. Forces API/free fallback as plan cap nears.
-        sub_throttled = a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap
+    agent = await _claim_agent_context(agent_urn)
 
     # Phase 2 cut 4: atomic claim delegated to repo (transaction +
     # filter chain are storage semantics; only event emission stays here).
     claimed = await _REPO.find_and_claim_job(
         agent_urn=agent_urn,
-        agent_kind=agent_kind,
-        agent_caps=agent_caps,
-        agent_runtime=a_runtime or "unknown",
-        agent_model=a_model or "unknown",
-        agent_provider=a_provider or "unknown",
-        agent_tier=a_tier,
+        agent_kind=agent["agent_kind"],
+        agent_caps=agent["agent_caps"],
+        agent_runtime=agent["agent_runtime"],
+        agent_model=agent["agent_model"],
+        agent_provider=agent["agent_provider"],
+        agent_tier=agent["agent_tier"],
         cost_tier_order=list(COST_TIERS),
-        sub_throttled=bool(sub_throttled),
+        sub_throttled=agent["sub_throttled"],
         now=now,
     )
     if claimed:
@@ -1068,10 +1208,10 @@ async def dequeue_next_job(agent_urn: str):
                     "id": claimed["id"],
                     "claimed_by": agent_urn,
                     "kind": claimed["kind"],
-                    "runtime": a_runtime,
-                    "model": a_model,
-                    "provider": a_provider,
-                    "cost_tier": a_tier,
+                    "runtime": agent["agent_runtime"],
+                    "model": agent["agent_model"],
+                    "provider": agent["agent_provider"],
+                    "cost_tier": agent["agent_tier"],
                 },
             )
         return claimed
@@ -1238,6 +1378,39 @@ async def update_job(job_id: str, req: JobUpdate):
             },
         )
     return {"ok": True, "ts": now, "estimated_cost_usd": cost_estimate}
+
+
+@app.patch("/v1/jobs/{job_id}/routing")
+async def route_job(job_id: str, req: JobRoutingUpdate):
+    """Apply KNEMON/Hive triage metadata to a queued job before workers claim it."""
+    now = time.time()
+    updated = await _REPO.update_job_routing(
+        job_id=job_id,
+        routed_at=now,
+        required_capabilities=req.required_capabilities,
+        eligible_kinds=req.eligible_kinds,
+        max_cost_tier=req.max_cost_tier,
+        preferred_providers=req.preferred_providers,
+        preferred_models=req.preferred_models,
+        mnemos_refs=req.mnemos_refs,
+        depends_on=req.depends_on,
+        routing_metadata=req.routing_metadata,
+    )
+    if not updated:
+        raise HTTPException(409, "job not queued, already claimed, or not found")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await emit_event(
+            db,
+            "job.routed",
+            {
+                "id": job_id,
+                "eligible_kinds": req.eligible_kinds,
+                "preferred_providers": req.preferred_providers,
+                "preferred_models": req.preferred_models,
+                "required_capabilities": req.required_capabilities,
+            },
+        )
+    return {"ok": True, "id": job_id, "routed_at": now}
 
 
 @app.post("/v1/schedules")
@@ -1471,18 +1644,40 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
 
 @app.post("/v1/jobs/{job_id}/claim")
 async def claim_job(job_id: str, by: str):
-    """First-write-wins claim: prevents duplicate execution by multiple agents."""
+    """First-write-wins claim after the same eligibility gates as /v1/jobs/next."""
     now = time.time()
+    agent = await _claim_agent_context(by)
+    status, claimed = await _REPO.claim_job_by_id(
+        job_id=job_id,
+        agent_urn=by,
+        agent_kind=agent["agent_kind"],
+        agent_caps=agent["agent_caps"],
+        agent_runtime=agent["agent_runtime"],
+        agent_model=agent["agent_model"],
+        agent_provider=agent["agent_provider"],
+        agent_tier=agent["agent_tier"],
+        cost_tier_order=list(COST_TIERS),
+        sub_throttled=agent["sub_throttled"],
+        now=now,
+    )
+    if status == "ineligible":
+        raise HTTPException(403, "agent is not eligible to claim this job")
+    if status != "claimed" or not claimed:
+        raise HTTPException(409, "job already claimed or not available")
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=? "
-            "WHERE id=? AND status IN ('queued','offered') AND claimed_by IS NULL",
-            (by, now, job_id),
+        await emit_event(
+            db,
+            "job.claimed",
+            {
+                "id": job_id,
+                "claimed_by": by,
+                "kind": claimed["kind"],
+                "runtime": agent["agent_runtime"],
+                "model": agent["agent_model"],
+                "provider": agent["agent_provider"],
+                "cost_tier": agent["agent_tier"],
+            },
         )
-        await db.commit()
-        if cur.rowcount == 0:
-            raise HTTPException(409, "job already claimed or not available")
-        await emit_event(db, "job.claimed", {"id": job_id, "claimed_by": by})
     return {"claimed": True, "ts": now}
 
 
@@ -1493,7 +1688,12 @@ async def list_jobs(
     since: Optional[float] = None,
     limit: int = 100,
 ):
-    sql = "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, claimed_by, started_at, ended_at, result FROM jobs WHERE 1=1"
+    sql = (
+        "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, claimed_by, "
+        "started_at, ended_at, result, required_capabilities, eligible_kinds, max_cost_tier, "
+        "preferred_providers, preferred_models, mnemos_refs, depends_on, routed_at, routing_metadata "
+        "FROM jobs WHERE 1=1"
+    )
     args: list = []
     if status:
         sql += " AND status=?"
@@ -1522,6 +1722,15 @@ async def list_jobs(
                         "started_at": r[8],
                         "ended_at": r[9],
                         "result": json.loads(r[10]) if r[10] else None,
+                        "required_capabilities": json.loads(r[11]) if r[11] else None,
+                        "eligible_kinds": json.loads(r[12]) if r[12] else None,
+                        "max_cost_tier": r[13],
+                        "preferred_providers": json.loads(r[14]) if r[14] else None,
+                        "preferred_models": json.loads(r[15]) if r[15] else None,
+                        "mnemos_refs": json.loads(r[16]) if r[16] else None,
+                        "depends_on": json.loads(r[17]) if r[17] else None,
+                        "routed_at": r[18],
+                        "routing_metadata": json.loads(r[19]) if r[19] else None,
                     }
                 )
     return {"count": len(rows), "jobs": rows}
@@ -1533,8 +1742,7 @@ async def publish_message(req: MessagePublish):
     now = time.time()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO messages (id, from_urn, to_urn, in_reply_to, topic, payload, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (id, from_urn, to_urn, in_reply_to, topic, payload, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (msg_id, req.from_urn, req.to_urn, req.in_reply_to, req.topic, json.dumps(req.payload), now),
         )
         await db.commit()

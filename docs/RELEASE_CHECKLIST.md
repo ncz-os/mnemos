@@ -5,13 +5,13 @@ before announcing a tagged release as GA. Some sections are automated (CI,
 nightly cron) and just need a green-status verification; others are manual
 (chat-UI walkthroughs) and need an operator to drive a real client.
 
-The checklist is split into **server-side** (the `mnemos-os/mnemos` repo
+The checklist is split into **server-side** (the `ncz-os/mnemos` repo
 itself) and **bridge family** (the `mnemos-bridge-*` repos). Run only the
 sections that apply to what's shipping.
 
 ---
 
-## Server-side release (`mnemos-os/mnemos` x.y.z)
+## Server-side release (`ncz-os/mnemos` x.y.z)
 
 ### Pre-merge
 
@@ -135,7 +135,7 @@ crewai offline-only, claude-connector OAuth — those are tier-3 only).
 ### Push to 3 remotes
 
 Same pattern as the server-side push, with the per-bridge gitlab/github
-namespace `mnemos-os/mnemos-bridge-<name>`. The `/tmp/publish-bridge.sh`
+namespace `ncz-os/mnemos-bridge-<name>`. The `/tmp/publish-bridge.sh`
 helper script captures the canonical sequence (init + glab create + push +
 gh create + push + argonas init + push).
 
@@ -253,7 +253,7 @@ For each runner that's part of the operator's stack:
 
 ## Where this lives
 
-- This file: `docs/RELEASE_CHECKLIST.md` in the `mnemos-os/mnemos` repo.
+- This file: `docs/RELEASE_CHECKLIST.md` in the `ncz-os/mnemos` repo.
 - Per-bridge releases follow the same pattern, scoped to that bridge's
   surface — no separate copy needed.
 - The fleet helper script for tier-2 cron lives at

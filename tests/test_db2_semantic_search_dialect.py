@@ -110,6 +110,290 @@ def _capture_db2_translated_sql(repo, *, mode: str | None) -> str:
     return captured["sql"]
 
 
+def _capture_db2_fetch_count(repo, *, boost_recency: bool, limit: int = 5) -> int:
+    """Drive ``Db2MemoryRepository.semantic_search`` through a fake cursor and
+    return the row-count bound to the FETCH clause (the last execute param).
+    """
+    from mnemos.persistence.db2 import _Db2AsyncCursor
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    captured: dict[str, object] = {}
+
+    class _FakeSyncCursor:
+        description = (("id",), ("content",), ("updated",), ("rank_score",))
+        rowcount = 0
+
+        def execute(self, sql, params=None):
+            captured["params"] = params
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
+
+        def close(self):
+            return None
+
+    class _FakeConn:
+        def cursor(self):
+            return _Db2AsyncCursor(_FakeSyncCursor())
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    visibility = VisibilityFilter(scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace="default")
+
+    os.environ["MNEMOS_DB2_VECTOR_INDEX"] = "approx"
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(
+            repo.semantic_search(
+                tx,
+                embedding=[0.1, 0.2, 0.3],
+                limit=limit,
+                visibility=visibility,
+                boost_recency=boost_recency,
+            )
+        )
+    finally:
+        loop.close()
+    params = captured["params"]
+    # Execute binds: (select_vec, *where, order_vec, fetch_count) — the FETCH
+    # row-count is always the final positional parameter.
+    return int(params[-1])
+
+
+def test_db2_semantic_search_overfetches_candidates_for_recency() -> None:
+    """Recency boost must widen the DiskANN candidate fetch beyond ``limit`` so
+    a newer memory just outside the top-``limit`` by distance can be promoted;
+    without boost the fetch is exactly ``limit``. Mirrors PostgresBackend.
+    """
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    repo = Db2MemoryRepository()
+    assert _capture_db2_fetch_count(repo, boost_recency=False, limit=5) == 5
+    # candidate_limit = max(limit, min(limit*4, 200)) = 20 for limit=5
+    assert _capture_db2_fetch_count(repo, boost_recency=True, limit=5) == 20
+    # capped at 200 for large limits
+    assert _capture_db2_fetch_count(repo, boost_recency=True, limit=100) == 200
+
+
+def test_db2_semantic_search_recency_rerank_sorts_invalid_scores_last() -> None:
+    """Recency rerank must never promote unscored rows ahead of finite
+    Db2 vector distances.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from mnemos.persistence.db2 import Db2MemoryRepository, _Db2AsyncCursor
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    today = datetime.now(timezone.utc).date()
+    old = today - timedelta(days=30)
+    fetched_rows = [
+        ("valid-old-best", "a", old, 0.20),
+        ("valid-old-next", "b", old, 0.25),
+        ("valid-fresh", "c", today, 0.31),
+        ("rank-none", "none", today, None),
+        ("rank-invalid", "bad", today, "bad-score"),
+        ("rank-nan", "nan", today, "nan"),
+        ("valid-fresh-late", "d", today, 0.50),
+    ]
+
+    class _FakeSyncCursor:
+        description = (("id",), ("content",), ("updated",), ("rank_score",))
+        rowcount = len(fetched_rows)
+
+        def execute(self, sql, params=None):
+            return None
+
+        def fetchall(self):
+            return fetched_rows
+
+        def fetchone(self):
+            return None
+
+        def close(self):
+            return None
+
+    class _FakeConn:
+        def cursor(self):
+            return _Db2AsyncCursor(_FakeSyncCursor())
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    visibility = VisibilityFilter(scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace="default")
+    repo = Db2MemoryRepository()
+    os.environ["MNEMOS_DB2_VECTOR_INDEX"] = "approx"
+
+    loop = asyncio.new_event_loop()
+    try:
+        result = loop.run_until_complete(
+            repo.semantic_search(
+                tx,
+                embedding=[0.1, 0.2, 0.3],
+                limit=3,
+                visibility=visibility,
+                boost_recency=True,
+                recency_weight=0.1,
+            )
+        )
+    finally:
+        loop.close()
+
+    ids = [row["id"] for row in result]
+    assert ids == ["valid-old-best", "valid-fresh", "valid-old-next"]
+    assert {"rank-none", "rank-invalid", "rank-nan"}.isdisjoint(ids)
+    assert [row["rank_score"] for row in result] == sorted(row["rank_score"] for row in result)
+    assert len(result) <= 3
+
+
+def test_db2_semantic_search_recency_rerank_uses_created_for_invalid_updated() -> None:
+    """Malformed ``updated`` values must not receive the max freshness bonus."""
+    from datetime import datetime, timedelta, timezone
+
+    from mnemos.persistence.db2 import Db2MemoryRepository, _Db2AsyncCursor
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    today = datetime.now(timezone.utc).date()
+    old = today - timedelta(days=30)
+    today_iso = f"{today.isoformat()}T00:00:00Z"
+    old_iso = f"{old.isoformat()}T00:00:00Z"
+    fetched_rows = [
+        ("corrupt-updated", "bad timestamp", old_iso, "not-a-date", 0.20),
+        ("valid-old", "old", old_iso, old_iso, 0.21),
+        ("fresh-valid", "fresh", today_iso, today_iso, 0.25),
+    ]
+
+    class _FakeSyncCursor:
+        description = (("id",), ("content",), ("created",), ("updated",), ("rank_score",))
+        rowcount = len(fetched_rows)
+
+        def execute(self, sql, params=None):
+            return None
+
+        def fetchall(self):
+            return fetched_rows
+
+        def fetchone(self):
+            return None
+
+        def close(self):
+            return None
+
+    class _FakeConn:
+        def cursor(self):
+            return _Db2AsyncCursor(_FakeSyncCursor())
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    visibility = VisibilityFilter(scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace="default")
+    repo = Db2MemoryRepository()
+    os.environ["MNEMOS_DB2_VECTOR_INDEX"] = "approx"
+
+    loop = asyncio.new_event_loop()
+    try:
+        result = loop.run_until_complete(
+            repo.semantic_search(
+                tx,
+                embedding=[0.1, 0.2, 0.3],
+                limit=3,
+                visibility=visibility,
+                boost_recency=True,
+                recency_weight=0.1,
+            )
+        )
+    finally:
+        loop.close()
+
+    ids = [row["id"] for row in result]
+    assert ids == ["fresh-valid", "corrupt-updated", "valid-old"]
+    corrupt = next(row for row in result if row["id"] == "corrupt-updated")
+    assert corrupt["rank_score"] > 0.19
+
+
+def _capture_db2_fts_sql(repo, *, text_mode: str | None) -> str:
+    """Drive ``Db2MemoryRepository.fts_search`` through a fake cursor and return
+    the emitted SQL, under the given MNEMOS_DB2_TEXT_SEARCH mode.
+    """
+    from mnemos.persistence.db2 import _Db2AsyncCursor
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+    captured: dict[str, str] = {}
+
+    class _FakeSyncCursor:
+        description = (
+            ("id",),
+            ("content",),
+            ("category",),
+            ("subcategory",),
+            ("metadata",),
+            ("quality_rating",),
+            ("owner_id",),
+            ("namespace",),
+            ("created",),
+            ("updated",),
+        )
+        rowcount = 0
+
+        def execute(self, sql, params=None):
+            captured["sql"] = sql
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
+
+        def close(self):
+            return None
+
+    class _FakeConn:
+        def cursor(self):
+            return _Db2AsyncCursor(_FakeSyncCursor())
+
+    tx = SimpleNamespace(conn=_FakeConn())
+    visibility = VisibilityFilter(scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace="default")
+
+    if text_mode is None:
+        os.environ.pop("MNEMOS_DB2_TEXT_SEARCH", None)
+    else:
+        os.environ["MNEMOS_DB2_TEXT_SEARCH"] = text_mode
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(repo.fts_search(tx, query="needle", limit=5, visibility=visibility))
+    finally:
+        loop.close()
+        os.environ.pop("MNEMOS_DB2_TEXT_SEARCH", None)
+    return captured["sql"]
+
+
+def test_db2_fts_defaults_to_like_scan() -> None:
+    """Without the toggle, FTS uses the stock LIKE substring scan (no Text
+    Search server required)."""
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    sql = _capture_db2_fts_sql(Db2MemoryRepository(), text_mode=None).upper()
+    assert "LIKE" in sql
+    assert "CONTAINS(" not in sql
+
+
+def test_db2_fts_contains_mode_engages_text_index() -> None:
+    """MNEMOS_DB2_TEXT_SEARCH=contains emits the native CONTAINS() predicate
+    that engages the Db2 Text Search index."""
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    sql = _capture_db2_fts_sql(Db2MemoryRepository(), text_mode="contains").upper()
+    assert "CONTAINS(M.CONTENT, ?) = 1" in sql
+    assert "LIKE" not in sql
+
+
+def test_db2_fts_invalid_mode_falls_back_to_like() -> None:
+    """An unrecognized mode warns and falls back to the safe LIKE scan."""
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    sql = _capture_db2_fts_sql(Db2MemoryRepository(), text_mode="bogus").upper()
+    assert "LIKE" in sql
+    assert "CONTAINS(" not in sql
+
+
 def test_db2_semantic_search_uses_native_dialect() -> None:
     """Default mode emits EUCLIDEAN + FETCH APPROX FIRST — engages
     the Db2 12.1.5 DiskANN vector index.

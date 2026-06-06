@@ -17,6 +17,12 @@ Env:
   ZEROCLAW_TIMEOUT      600 seconds per job
   ORCHESTRATION_TIMEOUT 3600 seconds for orchestration/meta jobs
   AGENT_MODEL           model name reported to hive
+  CLAUDE_SUBSCRIPTION_TIER  claude_max_100 or claude_max_200
+  CHATGPT_PLAN          chatgpt_plus, chatgpt_pro_100, chatgpt_pro_200
+  CODEX_PLAN            codex_plus, codex_pro_100, codex_pro_200
+  OPENAI_SUBSCRIPTION_POOLS comma-sep exact OpenAI pool aliases; include
+                        openai_subscription only when intentionally pooling
+                        ChatGPT and Codex capacity together
 """
 
 from __future__ import annotations
@@ -120,7 +126,25 @@ ZEROCLAW_TIMEOUT = int(os.environ.get("ZEROCLAW_TIMEOUT", "600"))
 PER_ATTEMPT_TIMEOUT = int(os.environ.get("PER_ATTEMPT_TIMEOUT", "1200"))
 ORCHESTRATION_TIMEOUT = int(os.environ.get("ORCHESTRATION_TIMEOUT", "3600"))
 WORKDIR = os.environ.get("HIVE_WORKDIR", os.getcwd())
-AGENT_MODEL = os.environ.get("AGENT_MODEL", "groq/qwen3-32b")
+_AGENT_MODEL_RAW = os.environ.get("AGENT_MODEL", "groq/qwen3-32b")
+AGENT_PROVIDER = os.environ.get(
+    "AGENT_PROVIDER",
+    _AGENT_MODEL_RAW.split("/", 1)[0] if "/" in _AGENT_MODEL_RAW else "groq",
+).lower()
+AGENT_MODEL = os.environ.get(
+    "AGENT_MODEL_ID",
+    _AGENT_MODEL_RAW.split("/", 1)[1] if "/" in _AGENT_MODEL_RAW else _AGENT_MODEL_RAW,
+).lower()
+
+
+def _model_capability(provider: str, model: str) -> str:
+    safe = _re.sub(r"[^a-z0-9]+", "_", f"{provider}_{model}".strip().lower()).strip("_")
+    return f"model:{safe}" if safe else "model:unknown"
+
+
+for _cap in ("coding", _model_capability(AGENT_PROVIDER, AGENT_MODEL)):
+    if _cap not in AGENT_CAPABILITIES:
+        AGENT_CAPABILITIES.append(_cap)
 
 JOB_HEARTBEAT_INTERVAL = int(os.environ.get("JOB_HEARTBEAT_INTERVAL", "300"))
 
@@ -202,7 +226,7 @@ def _pool_slug(value: str) -> str:
     return _re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
 
 
-def _add_plan_aliases(pools: set[str], provider: str, value: str) -> None:
+def _add_plan_aliases(pools: set[str], provider: str, value: str, family: str | None = None) -> None:
     raw = _pool_slug(value)
     if not raw:
         return
@@ -217,13 +241,30 @@ def _add_plan_aliases(pools: set[str], provider: str, value: str) -> None:
         elif "max" in raw:
             pools.add("claude_max_100")
     elif provider == "openai":
-        pools.add("openai_subscription")
-        pools.add("chatgpt_subscription")
-        pools.add("codex_subscription")
-        if "pro" in raw:
-            pools.add("chatgpt_pro")
-        elif "plus" in raw:
-            pools.add("chatgpt_plus")
+        if raw == "openai_subscription" or family == "openai":
+            pools.add("openai_subscription")
+            return
+        is_codex = family == "codex" or raw.startswith("codex") or "_codex" in raw
+        is_chatgpt = family == "chatgpt" or raw.startswith("chatgpt") or "gpt" in raw
+        if is_codex:
+            pools.add("codex_subscription")
+            if "plus" in raw:
+                pools.add("codex_plus")
+            elif "pro" in raw:
+                if "200" in raw:
+                    pools.add("codex_pro_200")
+                elif "100" in raw:
+                    pools.add("codex_pro_100")
+        if is_chatgpt:
+            pools.add("chatgpt_subscription")
+            if "pro" in raw:
+                pools.add("chatgpt_pro")
+                if "100" in raw:
+                    pools.add("chatgpt_pro_100")
+                elif "200" in raw:
+                    pools.add("chatgpt_pro_200")
+            elif "plus" in raw:
+                pools.add("chatgpt_plus")
 
 
 def _scan_subscription_config(path: Path, pools: set[str]) -> None:
@@ -236,8 +277,14 @@ def _scan_subscription_config(path: Path, pools: set[str]) -> None:
         "claude_max_100",
         "chatgpt_plus",
         "chatgpt_pro",
+        "chatgpt_pro_100",
+        "chatgpt_pro_200",
+        "chatgpt_subscription",
         "openai_subscription",
         "anthropic_subscription",
+        "codex_plus",
+        "codex_pro_100",
+        "codex_pro_200",
         "codex_subscription",
     ):
         if pool in text.replace("-", "_"):
@@ -250,18 +297,39 @@ def _detect_subscription_pools() -> list[str]:
 
     for env_name in ("CLAUDE_SUBSCRIPTION_TIER",):
         if os.environ.get(env_name):
-            _add_plan_aliases(pools, "anthropic", os.environ[env_name])
-    for env_name in ("CHATGPT_PLAN", "CODEX_PLAN"):
-        if os.environ.get(env_name):
-            _add_plan_aliases(pools, "openai", os.environ[env_name])
+            tier = os.environ[env_name]
+            if "max" in tier.lower():
+                pools.add("anthropic.claude_max")
+    if os.environ.get("CHATGPT_PLAN"):
+        plan = os.environ["CHATGPT_PLAN"].lower()
+        if "pro" in plan:
+            pools.add("openai.chatgpt_pro")
+        elif "plus" in plan:
+            pools.add("openai.chatgpt_plus")
+    if os.environ.get("CODEX_PLAN"):
+        plan = os.environ["CODEX_PLAN"].lower()
+        if "pro" in plan:
+            pools.add("openai.codex_pro")
+        elif "plus" in plan:
+            pools.add("openai.codex_plus")
 
-    for config_path in (home / ".claude" / "config.toml", home / ".codex" / "config.toml"):
-        _scan_subscription_config(config_path, pools)
+    # scan configs for .claude, .codex, .chatgpt
+    for config_dir in (home / ".claude", home / ".codex", home / ".chatgpt"):
+        for f in config_dir.glob("**/*"):
+            if f.is_file():
+                try:
+                    text = f.read_text(encoding="utf-8", errors="ignore").lower()
+                    if "claude_max" in text:
+                        pools.add("anthropic.claude_max")
+                    if "chatgpt_pro" in text:
+                        pools.add("openai.chatgpt_pro")
+                    if "codex_pro" in text:
+                        pools.add("openai.codex_pro")
+                except:
+                    pass
 
     if (home / ".anthropic" / "auth.json").exists():
-        pools.update({"anthropic_subscription", "claude_subscription"})
-    if (home / ".openai" / "auth.json").exists():
-        pools.update({"openai_subscription", "chatgpt_subscription", "codex_subscription"})
+        pools.add("anthropic.claude_max")
 
     return sorted(pools)
 
@@ -272,10 +340,11 @@ def register() -> str:
     global _urn, _last_heartbeat
     body = {
         "kind": "zeroclaw",
+        "runtime": "zeroclaw",
         "host": AGENT_HOST,
         "pid": os.getpid(),
         "capabilities": AGENT_CAPABILITIES,
-        "provider": "groq",
+        "provider": AGENT_PROVIDER,
         "model": AGENT_MODEL,
         "version": _zeroclaw_version(),
         "subscription_pools": _detect_subscription_pools(),

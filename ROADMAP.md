@@ -50,6 +50,37 @@ alpha line. Major new surfaces in this release:
 PROTEUS barrage (2026-05-02) validated at 2500 concurrent writes,
 2000 reads, 200 searches: 98.5% / 99.7% / 100% success.
 
+## Planned — PINAKES (LLM wiki substrate)
+
+Full design + feature tree in [`docs/PINAKES.md`](./docs/PINAKES.md). PINAKES
+turns a markdown corpus into a self-maintaining, cross-linked wiki with MNEMOS as
+the single backend *and* the single MCP front-end — no separate wiki server, no
+second datastore. It recognizes that "an LLM wiki" is a view over a memory
+system, not a parallel system. Frontends (the reference `llm-wiki` pipeline, and
+any downstream instantiation) inherit the substrate like any other consumer of
+the OSS work; corpus content stays in the frontend, only the capability is here.
+
+- ✅ Derived index over a markdown corpus: page → namespace-isolated memory,
+  slug-keyed upsert gated on `content_hash`, disk-removal reconciliation,
+  transactional commit order (the reference `mnemos_sync` frontend writes these).
+- ✅ Cross-link knowledge graph: `[[slug]]` → outbound `links_to` triple;
+  backlinks derived at query time so editing one page never drifts a neighbour.
+- 📋 **P1 — reachability:** `namespace` param on `search_memory` MCP tool +
+  `read_article(slug)` — smallest change that lets an agent query a corpus
+  end-to-end through the existing MNEMOS MCP. Touches the shared MCP bridge →
+  Codex review gate before merge.
+- 📋 **P2 — wiki verb set:** `list_articles` / `search_articles` /
+  `get_concept` / `trace_lineage` / `list_sources` / `answer_question`, each a
+  thin wrapper over `/v1/memories?namespace=` + `/v1/kg/triples`.
+- 📋 **P3 — review lifecycle:** enforce hand-edit protection via the existing
+  `content_hash`, then `draft → verified → published` + confidence + rejection
+  feedback.
+- 📋 **P4 — concept layer:** synthesized concept pages above source pages with
+  cross-source dedup/merge (the Karpathy "one article per concept") + incremental
+  compile. Largest new build.
+- 📋 **P5 — external-source trust:** prompt-injection hardening, source
+  trust-tiering, publish gate for externally-sourced pages.
+
 ## Historical: v4.0.0 shipped on 2026-04-29
 
 v4.0.0 is shipped. The v4.0 work that used to be forward-looking is now current

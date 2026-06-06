@@ -49,7 +49,7 @@ The port also serves as a strong forcing function for the
 named binds revealed two structural simplifications we'll back-port to
 Postgres.
 
-[1]: https://github.com/mnemos-os/mnemos-production/blob/master/docs/v1_multiuser.md
+[1]: https://github.com/ncz-os/mnemos/blob/master/docs/v1_multiuser.md
 
 ## Repo / target overview
 
@@ -928,9 +928,8 @@ A few small follow-ups also remain:
 
 ```bash
 # Clone the branch
-git clone --branch feat/oracle-port \
-    git@gitlab.com:mnemos-os/mnemos-production.git
-cd mnemos-production
+git clone git@gitlab.com:ncz-os/mnemos.git
+cd mnemos
 
 # Python env
 uv venv && uv pip install oracledb asyncpg fastapi pytest pytest-asyncio

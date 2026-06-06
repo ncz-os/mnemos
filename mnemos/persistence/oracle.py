@@ -23,15 +23,17 @@ import inspect
 import json
 import logging
 import math
-import os
 import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime, timezone
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
+from mnemos.core.config import oracle_pdb_env, runtime_env_value_stripped, vector_dim_max_env
+from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.base import (
+    AclRepository,
     AuditChainRepository,
     BranchRepository,
     CompressionQueueRepository,
@@ -70,16 +72,7 @@ def _vector_dim_max() -> int:
     change. Falls back to :data:`_DEFAULT_VECTOR_DIM_MAX` if the env
     var is missing or unparsable.
     """
-    raw = os.environ.get("MNEMOS_VECTOR_DIM_MAX", "").strip()
-    if not raw:
-        return _DEFAULT_VECTOR_DIM_MAX
-    try:
-        parsed = int(raw)
-    except ValueError:
-        return _DEFAULT_VECTOR_DIM_MAX
-    if parsed <= 0:
-        return _DEFAULT_VECTOR_DIM_MAX
-    return parsed
+    return vector_dim_max_env()
 
 
 def _validate_and_format_vector(
@@ -127,6 +120,33 @@ def _validate_and_format_vector(
     return "[" + ",".join(formatted) + "]"
 
 
+def _rank_score_sort_key(row: Row) -> float:
+    rank = row.get("rank_score") if isinstance(row, dict) else None
+    try:
+        score = float(rank)
+    except (TypeError, ValueError):
+        return math.inf
+    return score if math.isfinite(score) else math.inf
+
+
+def _recency_date(row: Row) -> date:
+    def _coerce_date(value: Any) -> date | None:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+            except ValueError:
+                return None
+        return None
+
+    if not isinstance(row, dict):
+        return date.min
+    return _coerce_date(row.get("updated")) or _coerce_date(row.get("created")) or date.min
+
+
 def _render_visibility(
     visibility: VisibilityFilter,
     *,
@@ -171,6 +191,18 @@ def _render_visibility(
     else:
         group_clause = "0=1"
 
+    acl_clause = ""
+    principals = acl_principals(visibility.user_id or "", group_ids)
+    if principals:
+        acl_placeholders, acl_params = _in_placeholders(principals, f"{param_prefix}_acl")
+        params.update(acl_params)
+        acl_clause = (
+            f" OR EXISTS (SELECT 1 FROM memory_acl macl "
+            f"WHERE macl.memory_id = {p}id "
+            f"AND macl.principal IN ({acl_placeholders}) "
+            f"AND BITAND(macl.perm, {ACL_READ_BIT}) > 0)"
+        )
+
     return (
         "("
         f"{p}owner_id = :{param_prefix}_owner"
@@ -178,6 +210,7 @@ def _render_visibility(
         f" OR MOD(NVL({p}permission_mode, 0), 10) >= 4"
         f" OR (MOD(TRUNC(NVL({p}permission_mode, 0) / 10), 10) >= 4 "
         f"AND {p}group_id IS NOT NULL AND {group_clause})"
+        f"{acl_clause}"
         f") AND {p}namespace = :{param_prefix}_ns",
         params,
     )
@@ -361,7 +394,7 @@ _DEFAULT_ORACLE_POOL_ACQUIRE_TIMEOUT = 60.0
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
+    raw = runtime_env_value_stripped(name)
     if not raw:
         return default
     try:
@@ -372,7 +405,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name, "").strip()
+    raw = runtime_env_value_stripped(name)
     if not raw:
         return default
     try:
@@ -384,7 +417,7 @@ def _env_float(name: str, default: float) -> float:
 
 def _env_flag(name: str) -> bool:
     """Return True if the env var equals ``YES`` / ``1`` / ``TRUE`` (case-insensitive)."""
-    return os.environ.get(name, "").strip().upper() in {"YES", "1", "TRUE", "ON"}
+    return runtime_env_value_stripped(name).upper() in {"YES", "1", "TRUE", "ON"}
 
 
 def _build_oracle_session_callback(settings: Any) -> Any:
@@ -396,7 +429,7 @@ def _build_oracle_session_callback(settings: Any) -> Any:
     continues. This keeps the pool usable in mixed PDB/CDB topologies
     while still giving operators a defensive locale + container pin.
     """
-    pdb_target = os.environ.get("MNEMOS_ORACLE_PDB", "").strip()
+    pdb_target = oracle_pdb_env()
 
     async def _session_callback(conn: Any, requested_tag: Any) -> None:
         cur = None
@@ -1069,12 +1102,16 @@ class OracleMemoryRepository(MemoryRepository):
         source_session: str | None,
         source_agent: str | None,
         verbatim_content: str | None,
+        embedding: Sequence[float] | None = None,
         created: Any,
         updated: Any,
     ) -> str:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         affected = 0
+        vec_literal: str | None = None
+        if embedding:
+            vec_literal = _validate_and_format_vector(embedding)
         try:
             await _call(
                 cursor.execute,
@@ -1083,12 +1120,13 @@ class OracleMemoryRepository(MemoryRepository):
                     id, content, category, subcategory, metadata, content_hash,
                     quality_rating, verbatim_content, owner_id, namespace, permission_mode,
                     source_model, source_provider, source_session, source_agent,
-                    created, updated
+                    embedding, created, updated
                 )
                 SELECT
                     :id, :content, :category, :subcategory, :metadata, :content_hash,
                     :quality_rating, :verbatim_content, :owner_id, :namespace, :permission_mode,
                     :source_model, :source_provider, :source_session, :source_agent,
+                    TO_VECTOR(:embedding),
                     NVL(CAST(:created AS TIMESTAMP WITH TIME ZONE), SYSTIMESTAMP),
                     NVL(CAST(:updated AS TIMESTAMP WITH TIME ZONE), SYSTIMESTAMP)
                 FROM dual
@@ -1110,6 +1148,7 @@ class OracleMemoryRepository(MemoryRepository):
                     "source_provider": source_provider,
                     "source_session": source_session,
                     "source_agent": source_agent,
+                    "embedding": vec_literal,
                     "created": created,
                     "updated": updated,
                 },
@@ -1835,20 +1874,13 @@ class OracleMemoryRepository(MemoryRepository):
                     where.append(f"m.{col} = :flt_{col}")
                     params[f"flt_{col}"] = val
             params["q"] = vec_literal
-            params["limit"] = limit
+            params["limit"] = max(limit, min(limit * 4, 200)) if boost_recency else limit
             # Oracle 23ai VECTOR_DISTANCE returns 0 for identical vectors
             # and grows with dissimilarity, so ORDER BY ASC matches the
-            # Postgres pgvector ``<=>`` ordering. Recency boost subtracts
-            # a bounded age penalty so the wider candidate set still
-            # surfaces freshly-touched rows when the caller opts in.
-            if boost_recency:
-                rank = (
-                    "VECTOR_DISTANCE(m.embedding, TO_VECTOR(:q), COSINE) "
-                    "- :w * (1.0 / (1.0 + (SYSDATE - CAST(m.updated AS DATE))))"
-                )
-                params["w"] = float(recency_weight)
-            else:
-                rank = "VECTOR_DISTANCE(m.embedding, TO_VECTOR(:q), COSINE)"
+            # Postgres pgvector ``<=>`` ordering. Keep ORDER BY as the
+            # bare distance so Oracle 23ai can serve top-K from the
+            # native vector index; recency boost is applied after fetch.
+            rank = "VECTOR_DISTANCE(m.embedding, TO_VECTOR(:q), COSINE)"
             sql = (
                 "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
                 "m.quality_rating, m.compressed_content, m.verbatim_content, "
@@ -1862,9 +1894,30 @@ class OracleMemoryRepository(MemoryRepository):
                 "FETCH FIRST :limit ROWS ONLY"
             )
             await _call(cursor.execute, sql, params)
-            return await _fetch_all_dicts(cursor)
+            rows = await _fetch_all_dicts(cursor)
         finally:
             await _call(cursor.close)
+
+        if boost_recency and rows:
+            w = float(recency_weight)
+            today = datetime.now(timezone.utc).date()
+            for row in rows:
+                rank = row.get("rank_score")
+                if rank is None:
+                    continue
+                try:
+                    rank_f = float(rank)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(rank_f):
+                    continue
+                upd_date = _recency_date(row)
+                age_days = max(0, (today - upd_date).days)
+                row["rank_score"] = rank_f - w * (1.0 / (1.0 + age_days))
+            rows.sort(key=_rank_score_sort_key)
+            rows = rows[:limit]
+
+        return rows
 
     async def fetch_memory_context(
         self,
@@ -2116,7 +2169,7 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
             placeholders = ",".join(f":id{i}" for i in range(len(memory_ids)))
             await _call(
                 cursor.execute,
-                f"SELECT id, owner_id FROM memories " f"WHERE id IN ({placeholders}) AND deleted_at IS NULL",
+                f"SELECT id, owner_id FROM memories WHERE id IN ({placeholders}) AND deleted_at IS NULL",
                 binds,
             )
             rows = await _call(cursor.fetchall) or []
@@ -2124,6 +2177,19 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
             enqueued: list[str] = []
             for mid in memory_ids:
                 if mid not in owner_by_id:
+                    continue
+                # Dup-pending dedup: skip if this memory already has a
+                # 'pending' queue row — avoids flooding the queue with
+                # duplicate work for the same memory across multiple
+                # enqueue calls (e.g. rapid on_write triggers).
+                await _call(
+                    cursor.execute,
+                    "SELECT 1 FROM memory_compression_queue "
+                    "WHERE memory_id = :mid AND status = 'pending' "
+                    "FETCH FIRST 1 ROW ONLY",
+                    {"mid": mid},
+                )
+                if await _call(cursor.fetchone):
                     continue
                 await _call(
                     cursor.execute,
@@ -2165,9 +2231,7 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
                 "row_limit": int(limit),
             }
             if only_uncompressed:
-                where_parts.append(
-                    "NOT EXISTS (SELECT 1 FROM memory_compressed_variants v " "WHERE v.memory_id = m.id)"
-                )
+                where_parts.append("NOT EXISTS (SELECT 1 FROM memory_compressed_variants v WHERE v.memory_id = m.id)")
             if category is not None:
                 where_parts.append("m.category = :category")
                 params["category"] = category
@@ -2196,31 +2260,29 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
-            # Ordered SKIP-LOCKED claim. No SQL row cap (FOR UPDATE +
-            # FETCH FIRST is illegal in Oracle); fetch only `limit` rows
-            # — the SKIP-LOCKED cursor locks rows as they are read.
-            #
-            # Bound the locked set to exactly `limit`: python-oracledb /
-            # OCI prefetch + array-fetch would otherwise read (and, under
-            # SKIP LOCKED, LOCK) more pending rows than we update before
-            # the next fetchmany boundary, stranding them locked until the
-            # tx commits and starving peer workers. Disabling prefetch and
-            # sizing the array to `limit` makes the driver fetch+lock only
-            # the rows we claim.
-            try:
-                cursor.prefetchrows = 0
-                cursor.arraysize = int(limit)
-            except Exception:  # pragma: no cover - driver attr differences
-                pass
+            # Ordered SKIP-LOCKED claim bounded to exactly `limit`.
+            # Oracle cannot combine FOR UPDATE with FETCH FIRST
+            # (ORA-02014), so we use a ROWNUM subquery: the inner
+            # ORDER BY runs first, ROWNUM caps the row count, and
+            # the outer FOR UPDATE SKIP LOCKED locks at most `limit`
+            # rows regardless of driver prefetch/arraysize behaviour.
+            # This replaces the prior prefetchrows+arraysize hack
+            # which was fragile across python-oracledb versions and
+            # could over-lock rows, starving peer workers.
             await _call(
                 cursor.execute,
                 "SELECT id, memory_id, owner_id, reason, scoring_profile, attempts "
-                "FROM memory_compression_queue "
-                "WHERE status = 'pending' "
-                "ORDER BY priority DESC, enqueued_at "
+                "FROM ("
+                "  SELECT id, memory_id, owner_id, reason, scoring_profile, attempts "
+                "  FROM memory_compression_queue "
+                "  WHERE status = 'pending' "
+                "  ORDER BY priority DESC, enqueued_at"
+                ") "
+                "WHERE ROWNUM <= :limit "
                 "FOR UPDATE SKIP LOCKED",
+                {"limit": int(limit)},
             )
-            raw = await _call(cursor.fetchmany, int(limit)) or []
+            raw = await _call(cursor.fetchall) or []
             if not raw:
                 return []
             cols = [d[0].lower() for d in cursor.description]
@@ -2324,7 +2386,7 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
                         "    error = :error WHERE id = :id",
                         {
                             "id": qid,
-                            "error": ("stranded_running: exceeded stale threshold after " f"{attempts} attempts"),
+                            "error": (f"stranded_running: exceeded stale threshold after {attempts} attempts"),
                         },
                     )
                 elif attempts >= max_attempts:
@@ -2530,6 +2592,251 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         _ = (tx, model_id)
         return None
 
+    # ── model-registry WRITES (Oracle MERGE; daily provider sync) ──────────────
+    async def upsert_model(self, tx: Transaction, model: dict[str, Any]) -> bool:
+        """Insert-or-update one model_registry row. Returns True if inserted."""
+        import json as _json
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT id FROM model_registry WHERE provider = :p AND model_id = :m",
+                {"p": model["provider"], "m": model["model_id"]},
+            )
+            existing = await _call(cursor.fetchone)
+            binds = {
+                "p": model["provider"],
+                "m": model["model_id"],
+                "dn": (model.get("display_name") or model["model_id"])[:400],
+                "fam": (model.get("family") or "")[:200] or None,
+                "cw": model.get("context_window"),
+                "mot": model.get("max_output_tokens"),
+                "caps": _json.dumps(model.get("capabilities", [])),
+                "ic": model.get("input_cost_per_mtok", 0) or 0,
+                "oc": model.get("output_cost_per_mtok", 0) or 0,
+                "cr": model.get("cache_read_per_mtok", 0) or 0,
+                "cwr": model.get("cache_write_per_mtok", 0) or 0,
+                "rawp": _json.dumps(model.get("raw", {})),
+            }
+            if existing is None:
+                await _call(
+                    cursor.execute,
+                    "INSERT INTO model_registry (id, provider, model_id, display_name, "
+                    "family, context_window, max_output_tokens, capabilities, "
+                    "input_cost_per_mtok, output_cost_per_mtok, cache_read_per_mtok, "
+                    "cache_write_per_mtok, available, deprecated, first_seen, last_seen, "
+                    "last_synced, raw_payload) VALUES (:id, :p, :m, :dn, :fam, :cw, :mot, "
+                    ":caps, :ic, :oc, :cr, :cwr, 1, 0, SYSTIMESTAMP, SYSTIMESTAMP, "
+                    "SYSTIMESTAMP, :rawp)",
+                    {**binds, "id": f"{model['provider']}:{model['model_id']}"[:100]},
+                )
+                return True
+            await _call(
+                cursor.execute,
+                "UPDATE model_registry SET display_name = :dn, family = :fam, "
+                "context_window = NVL(:cw, context_window), "
+                "max_output_tokens = NVL(:mot, max_output_tokens), "
+                "capabilities = :caps, input_cost_per_mtok = :ic, "
+                "output_cost_per_mtok = :oc, cache_read_per_mtok = :cr, "
+                "cache_write_per_mtok = :cwr, available = 1, deprecated = 0, "
+                "last_seen = SYSTIMESTAMP, last_synced = SYSTIMESTAMP, raw_payload = :rawp "
+                "WHERE provider = :p AND model_id = :m",
+                binds,
+            )
+            return False
+        finally:
+            await _call(cursor.close)
+
+    async def mark_models_unavailable(self, tx: Transaction, provider: str, seen_model_ids: Sequence[str]) -> int:
+        """Mark this provider's models NOT seen in the latest sync as unavailable."""
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            binds: dict[str, Any] = {"p": provider}
+            if seen_model_ids:
+                placeholders = ", ".join(f":s{i}" for i in range(len(seen_model_ids)))
+                for i, mid in enumerate(seen_model_ids):
+                    binds[f"s{i}"] = mid
+                sql = (
+                    "UPDATE model_registry SET available = 0, deprecated = 1, "
+                    "last_synced = SYSTIMESTAMP WHERE provider = :p AND available = 1 "
+                    f"AND model_id NOT IN ({placeholders})"
+                )
+            else:
+                sql = (
+                    "UPDATE model_registry SET available = 0, deprecated = 1, "
+                    "last_synced = SYSTIMESTAMP WHERE provider = :p AND available = 1"
+                )
+            await _call(cursor.execute, sql, binds)
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def write_model_sync_log(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        models_found: int,
+        added: int,
+        updated: int,
+        deprecated: int,
+        error: str | None,
+        duration_ms: int,
+    ) -> None:
+        _ = duration_ms  # Oracle model_registry_sync_log has no duration column
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "INSERT INTO model_registry_sync_log (id, provider, synced_at, "
+                "models_found, models_added, models_updated, models_deprecated, error) "
+                "VALUES (:id, :p, SYSTIMESTAMP, :f, :a, :u, :d, :e)",
+                {
+                    "id": uuid.uuid4().bytes,
+                    "p": provider,
+                    "f": models_found,
+                    "a": added,
+                    "u": updated,
+                    "d": deprecated,
+                    "e": (error or None) and str(error)[:4000],
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def update_arena_score(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        family: str,
+        arena_score: float,
+        arena_rank: int,
+        graeae_weight: float,
+    ) -> int:
+        """Apply arena score by exact model_id, else by family. Returns rows updated."""
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            score_binds = {"sc": arena_score, "rk": arena_rank, "w": graeae_weight}
+            await _call(
+                cursor.execute,
+                "UPDATE model_registry SET arena_score = :sc, arena_rank = :rk, "
+                "graeae_weight = :w WHERE provider = :p AND model_id = :m",
+                {**score_binds, "p": provider, "m": model_id},
+            )
+            n = int(getattr(cursor, "rowcount", 0) or 0)
+            if n == 0:
+                await _call(
+                    cursor.execute,
+                    "UPDATE model_registry SET arena_score = :sc, arena_rank = :rk, "
+                    "graeae_weight = :w WHERE provider = :p AND family = :fam",
+                    {**score_binds, "p": provider, "fam": family},
+                )
+                n = int(getattr(cursor, "rowcount", 0) or 0)
+            return n
+        finally:
+            await _call(cursor.close)
+
+    # ── KNEMON Step 2: pricing ingest from llm_provider_registry.json ──────────
+
+    async def upsert_model_pricing(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        price_in: float,
+        price_out: float,
+        price_cached: float,
+    ) -> tuple[int, dict | None]:
+        """Upsert price columns into model_registry. Returns (rows_updated, old_prices_or_None)."""
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            # Read current prices to detect change
+            await _call(
+                cursor.execute,
+                "SELECT price_in, price_out, price_cached FROM model_registry "
+                "WHERE provider = :p AND model_id = :m",
+                {"p": provider, "m": model_id},
+            )
+            row = await _call(cursor.fetchone)
+            if row is None:
+                return 0, None
+
+            old = {
+                "price_in": float(row[0] or 0),
+                "price_out": float(row[1] or 0),
+                "price_cached": float(row[2] or 0),
+            }
+            # Only update if pricing actually changed
+            if (
+                abs(old["price_in"] - price_in) < 0.000001
+                and abs(old["price_out"] - price_out) < 0.000001
+                and abs(old["price_cached"] - price_cached) < 0.000001
+            ):
+                return 0, None
+
+            await _call(
+                cursor.execute,
+                "UPDATE model_registry SET price_in = :pi, price_out = :po, "
+                "price_cached = :pc, price_updated_at = SYSTIMESTAMP "
+                "WHERE provider = :p AND model_id = :m",
+                {
+                    "pi": price_in,
+                    "po": price_out,
+                    "pc": price_cached,
+                    "p": provider,
+                    "m": model_id,
+                },
+            )
+            n = int(getattr(cursor, "rowcount", 0) or 0)
+            return n, old
+        finally:
+            await _call(cursor.close)
+
+    async def write_price_history(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        price_in: float,
+        price_out: float,
+        price_cached: float,
+        prices: dict | None = None,
+    ) -> None:
+        """Write a price_history row."""
+        import json as _json
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            prices_json = _json.dumps(prices or {})
+            await _call(
+                cursor.execute,
+                "INSERT INTO price_history (id, provider, model_id, price_in, "
+                "price_out, price_cached, prices, recorded_at) "
+                "VALUES (:id, :p, :m, :pi, :po, :pc, :pj, SYSTIMESTAMP)",
+                {
+                    "id": uuid.uuid4().bytes,
+                    "p": provider,
+                    "m": model_id,
+                    "pi": price_in,
+                    "po": price_out,
+                    "pc": price_cached,
+                    "pj": prices_json,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
 
 class OracleOAuthRepository(OAuthRepository):
     async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
@@ -2537,8 +2844,7 @@ class OracleOAuthRepository(OAuthRepository):
         try:
             await _call(
                 cursor.execute,
-                "SELECT name, display_name, kind, enabled FROM oauth_providers "
-                "WHERE enabled = 1 ORDER BY display_name",
+                "SELECT name, display_name, kind, enabled FROM oauth_providers WHERE enabled = 1 ORDER BY display_name",
             )
             return await _fetch_all_dicts(cursor)
         finally:
@@ -2602,6 +2908,106 @@ class OracleOAuthRepository(OAuthRepository):
                 {"session_id": session_id},
             )
             return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+
+class OracleAclRepository(AclRepository):
+    """Oracle per-principal memory ACL grants.
+
+    Upsert via MERGE on the ``(memory_id, principal)`` natural key so a
+    repeated grant updates ``perm``/``granted_by`` rather than violating
+    the unique constraint.
+    """
+
+    async def grant_acl(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        principal: str,
+        perm: int,
+        granted_by: str,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            binds = {
+                "memory_id": memory_id,
+                "principal": principal,
+                "perm": perm,
+                "granted_by": granted_by,
+            }
+            merge_sql = (
+                "MERGE INTO memory_acl t "
+                "USING (SELECT :memory_id AS memory_id, :principal AS principal FROM dual) s "
+                "ON (t.memory_id = s.memory_id AND t.principal = s.principal) "
+                "WHEN MATCHED THEN UPDATE SET t.perm = :perm, t.granted_by = :granted_by "
+                "WHEN NOT MATCHED THEN INSERT (memory_id, principal, perm, granted_by) "
+                "VALUES (:memory_id, :principal, :perm, :granted_by)"
+            )
+            # MERGE is not atomic against a concurrent first INSERT of the
+            # same (memory_id, principal): both sessions can take the
+            # NOT MATCHED branch and one hits ORA-00001. The ABC contract
+            # (mirroring Postgres ON CONFLICT) is that a repeat grant must
+            # never duplicate-key — so on a unique violation we retry once,
+            # where the row now exists and the MATCHED/UPDATE branch wins.
+            try:
+                await _call(cursor.execute, merge_sql, binds)
+            except Exception as exc:  # noqa: BLE001 — re-raised unless it's the dup race
+                if not _is_unique_violation(exc):
+                    raise
+                await _call(cursor.execute, merge_sql, binds)
+            await _call(
+                cursor.execute,
+                "SELECT memory_id, principal, perm, granted_by, created AS created_at "
+                "FROM memory_acl WHERE memory_id = :memory_id AND principal = :principal",
+                {"memory_id": memory_id, "principal": principal},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_acl(self, tx: Transaction, *, memory_id: str, principal: str) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM memory_acl WHERE memory_id = :memory_id AND principal = :principal",
+                {"memory_id": memory_id, "principal": principal},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def list_acl(self, tx: Transaction, memory_id: str) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT memory_id, principal, perm, granted_by, created AS created_at "
+                "FROM memory_acl WHERE memory_id = :memory_id ORDER BY principal",
+                {"memory_id": memory_id},
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def is_group_admin(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT 1 FROM user_groups "
+                "WHERE user_id = :user_id AND group_id = :group_id AND is_admin = 1",
+                {"user_id": user_id, "group_id": group_id},
+            )
+            return await _call(cursor.fetchone) is not None
         finally:
             await _call(cursor.close)
 
@@ -2703,7 +3109,7 @@ class OracleConsultationsRepository(ConsultationsRepository):
             response_hash = hashlib.sha256(kwargs["consensus_response"].encode()).hexdigest()
             await _call(
                 cursor.execute,
-                "SELECT id, chain_hash FROM graeae_audit_log " "ORDER BY sequence_num DESC FETCH FIRST 1 ROWS ONLY",
+                "SELECT id, chain_hash FROM graeae_audit_log ORDER BY sequence_num DESC FETCH FIRST 1 ROWS ONLY",
             )
             prev_row = await _row_to_dict(cursor, await _call(cursor.fetchone))
             prev_chain = prev_row["chain_hash"] if prev_row else kwargs["genesis_hash"]
@@ -3466,12 +3872,10 @@ class OracleFederationRepository(FederationRepository):
             # See docs/v6.1-federation-embeddings-copy.md.
             embed_cols = ""
             if include_embedding:
-                from mnemos.core.config import get_settings as _gs
+                from mnemos.core.config import embed_http_model_override, get_settings as _gs
 
                 try:
-                    import os as _os
-
-                    _http_model = _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                    _http_model = embed_http_model_override()
                     _model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
                 except Exception:
                     _model = "unknown"
@@ -4070,6 +4474,7 @@ class OracleBackend:
     _supports_federation_persistence = True
     _supports_audit_persistence = True
     _supports_state_persistence = True
+    supports_webhooks = True  # Oracle has a real OracleWebhookRepository (see .webhooks)
 
     supports_listen_notify = False
     supports_advisory_locks = False
@@ -4094,6 +4499,7 @@ class OracleBackend:
         self._federation_repo = OracleFederationRepository()
         self._state_kv_repo = OracleStateRepository()
         self._audit_chain_repo = OracleAuditChainRepository()
+        self._acl_repo = OracleAclRepository()
 
     @property
     def settings(self) -> Any:
@@ -4105,7 +4511,7 @@ class OracleBackend:
 
     @property
     def capabilities(self) -> set[str]:
-        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state", "acl"}
 
     @property
     def capability_details(self) -> set[str]:
@@ -4254,8 +4660,7 @@ class OracleBackend:
                     if not _is_missing_table(exc):
                         raise
                     _LOG.warning(
-                        "usage_ledger model_registry table missing for provider=%s model=%s; "
-                        "recording est_cost_usd=0",
+                        "usage_ledger model_registry table missing for provider=%s model=%s; recording est_cost_usd=0",
                         record.provider,
                         record.model,
                     )
@@ -4280,7 +4685,7 @@ class OracleBackend:
                     )
             if auth_method != "subscription" and _scalar(rcost) == 0:
                 _LOG.warning(
-                    "usage_ledger model_registry price missing for provider=%s model=%s; " "recording est_cost_usd=0",
+                    "usage_ledger model_registry price missing for provider=%s model=%s; recording est_cost_usd=0",
                     record.provider,
                     record.model,
                 )
@@ -4794,6 +5199,10 @@ class OracleBackend:
     def audit_chain(self) -> AuditChainRepository:
         return self._audit_chain_repo
 
+    @property
+    def acl(self) -> AclRepository:
+        return self._acl_repo
+
     async def ping(self) -> bool:
         try:
             async with self._pool.acquire() as conn:
@@ -4893,7 +5302,7 @@ class OracleBackend:
                     await _call(cursor.close)
         except Exception as exc:
             _LOG.warning(
-                "OracleBackend.open probe failed (%s); backend remains open " "but first acquire() may also fail.",
+                "OracleBackend.open probe failed (%s); backend remains open but first acquire() may also fail.",
                 exc,
             )
 

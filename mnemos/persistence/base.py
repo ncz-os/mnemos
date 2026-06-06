@@ -174,6 +174,7 @@ class MemoryRepository(ABC):
         source_session: str | None,
         source_agent: str | None,
         verbatim_content: str | None,
+        embedding: Sequence[float] | None = None,
         created: Any,
         updated: Any,
     ) -> str: ...
@@ -623,6 +624,78 @@ class ConsultationAuditRepository(ABC):
 
     @abstractmethod
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None: ...
+
+    # ── model-registry WRITES (daily provider sync; backend-overridable) ───────
+    # Non-abstract so existing backends keep instantiating; backends that own a
+    # live model_registry (Oracle) override these.
+    async def upsert_model(self, tx: Transaction, model: dict[str, Any]) -> bool:
+        raise NotImplementedError("upsert_model not implemented for this backend")
+
+    async def mark_models_unavailable(self, tx: Transaction, provider: str, seen_model_ids: Sequence[str]) -> int:
+        raise NotImplementedError("mark_models_unavailable not implemented for this backend")
+
+    async def write_model_sync_log(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        models_found: int,
+        added: int,
+        updated: int,
+        deprecated: int,
+        error: str | None,
+        duration_ms: int,
+    ) -> None:
+        raise NotImplementedError("write_model_sync_log not implemented for this backend")
+
+    async def update_arena_score(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        family: str,
+        arena_score: float,
+        arena_rank: int,
+        graeae_weight: float,
+    ) -> int:
+        raise NotImplementedError("update_arena_score not implemented for this backend")
+
+    # ── model-registry PRICING (KNEMON Step 2: llm_provider_registry.json ingest) ─
+
+    async def upsert_model_pricing(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        price_in: float,
+        price_out: float,
+        price_cached: float,
+    ) -> tuple[int, dict | None]:
+        """Upsert price_in/price_out/price_cached/price_updated_at into model_registry.
+
+        Returns (rows_updated, old_prices_dict_or_None). old_prices_dict is None
+        when the pricing did not change or the model row was not found.
+        """
+        raise NotImplementedError("upsert_model_pricing not implemented for this backend")
+
+    async def write_price_history(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        price_in: float,
+        price_out: float,
+        price_cached: float,
+        prices: dict | None = None,
+    ) -> None:
+        """Write a price_history row for audit trail.
+
+        Called after upsert_model_pricing returns old_prices (prices changed).
+        """
+        raise NotImplementedError("write_price_history not implemented for this backend")
 
 
 class OAuthRepository(ABC):
@@ -1244,6 +1317,84 @@ class AuditChainRepository(ABC):
         return result
 
 
+class AclRepository(ABC):
+    """Per-principal memory ACL escape hatch — the ``memory_acl`` table.
+
+    A grant widens *read* visibility on top of a memory's own UNIX mode
+    bits: it lets a second group or a named user see a memory they would
+    not otherwise reach. The read predicate (see
+    ``mnemos.core.visibility`` / the per-backend renderers) honors these
+    rows via an EXISTS disjunct on every multi-user backend. This
+    repository is the *management* surface for those rows.
+
+    ``principal`` is a typed string ``'user:<id>'`` or ``'group:<id>'``;
+    ``perm`` is a Unix-style bitmask (read=4, write=2). Only multi-user
+    backends advertise ``ACL_CAPABILITY`` — SQLite (single-user laptop
+    tier) omits it and the route degrades to 503.
+
+    Authorization (who may grant/revoke) is enforced at the route layer,
+    not here: the SQL contract is principal-agnostic so callers stay
+    responsible for the owner/root/group-admin gate.
+    """
+
+    @abstractmethod
+    async def grant_acl(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        principal: str,
+        perm: int,
+        granted_by: str | None,
+    ) -> Row:
+        """Insert or update a grant. Upserts on (memory_id, principal).
+
+        Returns the resulting row. Implementations MUST treat a repeat
+        grant to the same principal as an idempotent update of ``perm``
+        / ``granted_by`` (ON CONFLICT / MERGE), never a duplicate-key
+        error.
+        """
+        ...
+
+    @abstractmethod
+    async def revoke_acl(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        principal: str,
+    ) -> bool:
+        """Delete a grant. Returns True if a row was removed, else False
+        (so the route can 404 a revoke of a non-existent grant)."""
+        ...
+
+    @abstractmethod
+    async def list_acl(self, tx: Transaction, memory_id: str) -> list[Row]:
+        """Return all grants for ``memory_id`` ordered by principal.
+
+        Rows carry ``principal``, ``perm``, ``granted_by``, and the
+        creation timestamp. Returns ``[]`` when the memory has no
+        grants (the common case)."""
+        ...
+
+    @abstractmethod
+    async def is_group_admin(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> bool:
+        """True if ``user_id`` is a delegated admin of ``group_id``.
+
+        Backs the group-admin tier of the ACL-management authz gate:
+        a non-owner who is ``is_admin`` of the memory's ``group_id`` may
+        grant/revoke on memories in that group. Reads
+        ``user_groups.is_admin`` for the (user, group) edge; returns
+        ``False`` when no membership row exists."""
+        ...
+
+
 class CompressionQueueRepository(ABC):
     """v3.1 distillation/compression work queue — backend-agnostic.
 
@@ -1400,6 +1551,7 @@ CapabilityName: TypeAlias = Literal[
     "federation",
     "audit",
     "state",
+    "acl",
 ]
 
 
@@ -1410,6 +1562,7 @@ CONSULTATIONS_CAPABILITY: CapabilityName = "consultations"
 FEDERATION_CAPABILITY: CapabilityName = "federation"
 AUDIT_CAPABILITY: CapabilityName = "audit"
 STATE_CAPABILITY: CapabilityName = "state"
+ACL_CAPABILITY: CapabilityName = "acl"
 ALL_CAPABILITIES: frozenset[CapabilityName] = frozenset(
     {
         CORE_CAPABILITY,
@@ -1419,6 +1572,7 @@ ALL_CAPABILITIES: frozenset[CapabilityName] = frozenset(
         FEDERATION_CAPABILITY,
         AUDIT_CAPABILITY,
         STATE_CAPABILITY,
+        ACL_CAPABILITY,
     }
 )
 
@@ -1457,6 +1611,7 @@ FULL_STORAGE_CAPABILITY_DETAILS: frozenset[DetailedCapabilityName] = frozenset(
         VERSIONS_CAPABILITY,
         BRANCHES_CAPABILITY,
         COMPRESSION_CAPABILITY,
+        COMPRESSION_QUEUE_CAPABILITY,
         OAUTH_DETAIL_CAPABILITY,
         SESSIONS_DETAIL_CAPABILITY,
         CONSULTATIONS_DETAIL_CAPABILITY,
@@ -1480,6 +1635,12 @@ MYSQL_CAPABILITY_DETAILS: frozenset[DetailedCapabilityName] = frozenset(
         MEMORY_CRUD_CAPABILITY,
         VECTOR_SEARCH_CAPABILITY,
         FTS_CAPABILITY,
+        KG_CAPABILITY,
+        VERSIONS_CAPABILITY,
+        BRANCHES_CAPABILITY,
+        COMPRESSION_CAPABILITY,
+        FEDERATION_DETAIL_CAPABILITY,
+        STATE_DETAIL_CAPABILITY,
     }
 )
 
@@ -1681,6 +1842,21 @@ class StatePersistence(PersistenceCapabilityBase, Protocol):
     def state_kv(self) -> StateRepository: ...
 
 
+@runtime_checkable
+class AclPersistence(PersistenceCapabilityBase, Protocol):
+    """Per-principal memory ACL grant/revoke/list persistence.
+
+    Advertised only by multi-user backends (Postgres/Oracle/Db2);
+    single-user SQLite omits ``ACL_CAPABILITY`` so the management
+    routes degrade to 503 there.
+    """
+
+    _supports_acl_persistence: Literal[True]
+
+    @property
+    def acl(self) -> AclRepository: ...
+
+
 PersistenceBackend: TypeAlias = Union[
     CorePersistence,
     OAuthPersistence,
@@ -1689,12 +1865,58 @@ PersistenceBackend: TypeAlias = Union[
     FederationPersistence,
     AuditPersistence,
     StatePersistence,
+    AclPersistence,
 ]
 
 
 def has_capability(backend: object, capability: str) -> bool:
     capabilities = getattr(backend, "capabilities", set())
     return capability in capabilities
+
+
+# ── Feature-layer support matrix (GRAEAE consult de8f4b2b, 2026-06-01) ────────
+# Each install layer needs a set of backend capabilities. A backend "supports" a
+# layer only if it implements all required capabilities — derived from the
+# existing per-backend ``capabilities`` set, so no per-backend edits are needed.
+# core is always supported. See docs/LAYERED_INSTALL.md.
+#   graeae -> "consultations": GRAEAE persists muse consultations; a backend
+#             lacking it (e.g. a Db2 build that NotImplementedErrors consultation
+#             persistence) cannot serve GRAEAE and fails fast at startup.
+#   hive   -> no ADDITIONAL persistence-backend capability: the hive job bus is a
+#             self-contained SQLite store, and KNEMON usage_ledger recording is
+#             best-effort (degrades, never loses the row). The hive layer's real
+#             requirement is GRAEAE (enforced by Settings.enforce_layer_direction
+#             + the graeae gate), so it transitively needs "consultations".
+LAYER_REQUIRED_CAPABILITIES: dict[str, set[str]] = {
+    "core": set(),
+    "graeae": {"consultations"},
+    "hive": set(),
+}
+
+
+def backend_supported_layers(backend: object) -> set[str]:
+    """Return the install layers a backend can fully serve (always incl. core)."""
+    caps = set(getattr(backend, "capabilities", set()))
+    supported = {"core"}
+    for layer, required in LAYER_REQUIRED_CAPABILITIES.items():
+        if layer == "core":
+            continue
+        if required <= caps:
+            supported.add(layer)
+    return supported
+
+
+def assert_backend_supports_layers(backend: object, active_layers: set[str]) -> None:
+    """Fail fast at startup if the backend cannot serve an enabled layer."""
+    unsupported = set(active_layers) - backend_supported_layers(backend)
+    if unsupported:
+        backend_name = type(backend).__name__
+        raise NotImplementedError(
+            f"persistence backend {backend_name!r} does not support enabled "
+            f"layer(s): {sorted(unsupported)}. Disable the layer "
+            f"(MNEMOS_ENABLE_*) or choose a backend that implements it. "
+            f"See docs/LAYERED_INSTALL.md."
+        )
 
 
 def capability_details_for_backend(backend: object) -> set[str]:
@@ -1717,6 +1939,7 @@ def capability_details_for_backend(backend: object) -> set[str]:
                 VERSIONS_CAPABILITY,
                 BRANCHES_CAPABILITY,
                 COMPRESSION_CAPABILITY,
+                COMPRESSION_QUEUE_CAPABILITY,
             }
         )
     if OAUTH_CAPABILITY in legacy:

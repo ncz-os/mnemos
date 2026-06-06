@@ -1,6 +1,6 @@
 # MNEMOS Install Guide
 
-MNEMOS v5 keeps the memory kernel small by default. Subsystems install through
+MNEMOS keeps the memory kernel small by default. Subsystems install through
 pip extras, and common deployment shapes are available as named bundles so an
 operator picks a deployment shape instead of hand-selecting every subsystem.
 
@@ -146,8 +146,8 @@ python -m pip install -e '.[oracle]'    # from source on feat/oracle-port
 # 2. Point MNEMOS at the database
 export MNEMOS_DATABASE_DSN='oracle://MNEMOS:<password>@127.0.0.1:1521/ORCLPDB1'
 
-# 3. Apply the Oracle migration set
-mnemos install --profile server --backend oracle
+# 3. Apply the Oracle migration set (backend is selected by MNEMOS_DATABASE_DSN above)
+mnemos install --profile server
 
 # 4. Verify
 mnemos doctor
@@ -163,8 +163,8 @@ Notes:
   Client fails loud at startup rather than silently falling back).
 - Vector column type is `VECTOR(768, FLOAT32)`; index type is HNSW INMEMORY
   NEIGHBOR GRAPH (Oracle Database 26ai requirement: enable Database In-Memory).
-- Migration file: `db/oracle/migrations/0001_core_schema.sql` (single canonical
-  file in this branch).
+- Migration files: `db/migrations_oracle/` (Oracle migration set, applied in order
+  starting from `0001_core_schema.sql`).
 - **Pool tuning env vars (Oracle eng review, 2026-05-21):**
   - `MNEMOS_ORACLE_POOL_MIN` (default `2`) — minimum pooled sessions.
   - `MNEMOS_ORACLE_POOL_MAX` (default `10`) — maximum pooled sessions.
@@ -223,8 +223,8 @@ db2 force application all && db2stop && db2start
 # 3. Point MNEMOS at the database
 export MNEMOS_DATABASE_DSN='db2://MNEMOS:<password>@127.0.0.1:50000/MNEMOS'
 
-# 4. Apply the Db2 migration set
-mnemos install --profile server --backend db2
+# 4. Apply the Db2 migration set (backend is selected by MNEMOS_DATABASE_DSN above)
+mnemos install --profile server
 
 # 5. Verify
 mnemos doctor
@@ -300,7 +300,7 @@ backend without losing data:
 
 ```bash
 # 1. Export from the current backend via CHARON
-mnemos export --output /tmp/mnemos-backup.mpf.json
+mnemos export --format mpf --out /tmp/mnemos-backup.mpf.json
 
 # 2. Install the new driver
 pip install 'mnemos-os[oracle]'    # or [db2]
@@ -309,11 +309,11 @@ pip install 'mnemos-os[oracle]'    # or [db2]
 export MNEMOS_DATABASE_DSN='oracle://MNEMOS:<password>@host:1521/service_name'
 # or:  MNEMOS_DATABASE_DSN='db2://MNEMOS:<password>@host:50000/dbname'
 
-# 4. Apply migrations on the new backend
-mnemos install --profile server --backend oracle   # or --backend db2
+# 4. Apply migrations on the new backend (backend selected by MNEMOS_DATABASE_DSN above)
+mnemos install --profile server
 
 # 5. Import the snapshot
-mnemos import --input /tmp/mnemos-backup.mpf.json
+mnemos import --from mpf /tmp/mnemos-backup.mpf.json
 ```
 
 The CHARON export format (MPF v0.1) is backend-agnostic and lossless

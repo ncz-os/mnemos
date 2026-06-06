@@ -22,7 +22,7 @@ from typing import Any, Optional
 import asyncpg
 
 from mnemos.core.auth_context import UserContext
-from mnemos.core.config import hot_rs_enabled
+from mnemos.core.config import embed_http_model_override, hot_rs_enabled
 from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.core.recommendation import choose_recommended_model
@@ -33,6 +33,7 @@ from mnemos.core.visibility import (
 from mnemos.core import eligibility as _eligibility
 from mnemos.persistence.base import (
     POSTGRES_CAPABILITY_DETAILS,
+    AclRepository,
     AuditChainRepository,
     BranchRepository,
     CompressionQueueRepository,
@@ -667,24 +668,33 @@ class PostgresMemoryRepository(MemoryRepository):
         source_session: str | None,
         source_agent: str | None,
         verbatim_content: str | None,
+        embedding: Sequence[float] | None = None,
         created: Any,
         updated: Any,
     ) -> str:
         pg_tx = _postgres_tx(tx)
         conn = pg_tx.conn
+        # Format embedding as pgvector literal; NULL when not provided so
+        # the column stays NULL and semantic_search filters it out until
+        # backfill.  Inline in the INSERT so the vector commits atomically
+        # with the row — no second round-trip needed.
+        vec_str: str | None = None
+        if embedding:
+            self._require_dim(embedding, "insert_memory")
+            vec_str = "[" + ",".join(str(float(v)) for v in embedding) + "]"
         result = await conn.execute(
             """
             INSERT INTO memories (
                 id, content, category, subcategory, metadata,
                 quality_rating, verbatim_content, owner_id, namespace, permission_mode,
                 source_model, source_provider, source_session, source_agent,
-                created, updated
+                embedding, created, updated
             )
             VALUES (
                 $1, $2, $3, $4, $5::jsonb,
                 $6, $7, $8, $9, $10,
                 $11, $12, $13, $14,
-                COALESCE($15, NOW()), COALESCE($16, NOW())
+                $15::vector, COALESCE($16, NOW()), COALESCE($17, NOW())
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -702,6 +712,7 @@ class PostgresMemoryRepository(MemoryRepository):
             source_provider,
             source_session,
             source_agent,
+            vec_str,
             created,
             updated,
         )
@@ -1293,11 +1304,8 @@ class PostgresMemoryRepository(MemoryRepository):
             f"WHERE {' AND '.join(conditions)} "
             "ORDER BY rank DESC LIMIT $2"
         )
-        try:
-            return list(await conn.fetch(sql, *params))
-        except Exception:
-            # ILIKE fallback: same predicate shape, $1 becomes the LIKE
-            # pattern, $2 still the limit.
+
+        async def _ilike_search() -> list[Row]:
             like_q = f"%{query}%"
             ilike_params: list[Any] = [like_q, limit]
             ilike_conditions: list[str] = ["content ILIKE $1", "deleted_at IS NULL"]
@@ -1326,6 +1334,18 @@ class PostgresMemoryRepository(MemoryRepository):
                 "ORDER BY created DESC LIMIT $2"
             )
             return list(await conn.fetch(ilike_sql, *ilike_params))
+
+        try:
+            rows = list(await conn.fetch(sql, *params))
+            if rows:
+                return rows
+            return await _ilike_search()
+        except Exception:
+            # ILIKE fallback: same predicate shape, $1 becomes the LIKE
+            # pattern, $2 still the limit. We also use it for zero FTS
+            # results so exact-substring searches survive stale FTS
+            # config or stop-word/tokenization misses.
+            return await _ilike_search()
 
     async def gather_stats(self, tx: Transaction) -> MemoryStatsRow:
         conn = _postgres_tx(tx).conn
@@ -2097,6 +2117,18 @@ class PostgresCompressionQueueRepository(CompressionQueueRepository):
         for mid in memory_ids:
             if mid not in owner_by_id:
                 continue
+            # Dup-pending dedup: skip if this memory already has a
+            # 'pending' queue row — avoids flooding the queue with
+            # duplicate work for the same memory across multiple
+            # enqueue calls (e.g. rapid on_write triggers).
+            existing = await conn.fetchval(
+                "SELECT 1 FROM memory_compression_queue "
+                "WHERE memory_id = $1 AND status = 'pending' "
+                "LIMIT 1",
+                mid,
+            )
+            if existing:
+                continue
             await conn.execute(
                 "INSERT INTO memory_compression_queue "
                 "(memory_id, owner_id, reason, priority, scoring_profile) "
@@ -2392,6 +2424,77 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
             return row["provider"]
         return None
 
+    # ── KNEMON Step 2: pricing ingest from llm_provider_registry.json ──────────
+
+    async def upsert_model_pricing(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        price_in: float,
+        price_out: float,
+        price_cached: float,
+    ) -> tuple[int, dict | None]:
+        """Upsert price columns into model_registry. Returns (rows_updated, old_prices_or_None)."""
+        conn = _postgres_tx(tx).conn
+        # Read current prices to detect change
+        row = await conn.fetchrow(
+            "SELECT price_in, price_out, price_cached FROM model_registry "
+            "WHERE provider = $1 AND model_id = $2",
+            provider, model_id,
+        )
+        if row is None:
+            return 0, None
+
+        old = {
+            "price_in": float(row["price_in"] or 0),
+            "price_out": float(row["price_out"] or 0),
+            "price_cached": float(row["price_cached"] or 0),
+        }
+        # Only update if pricing actually changed
+        if (
+            abs(old["price_in"] - price_in) < 0.000001
+            and abs(old["price_out"] - price_out) < 0.000001
+            and abs(old["price_cached"] - price_cached) < 0.000001
+        ):
+            return 0, None
+
+        result = await conn.execute(
+            "UPDATE model_registry SET price_in = $1, price_out = $2, "
+            "price_cached = $3, price_updated_at = NOW() "
+            "WHERE provider = $4 AND model_id = $5",
+            price_in, price_out, price_cached, provider, model_id,
+        )
+        n = _pg_result_count(result)
+        return n, old
+
+    async def write_price_history(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        price_in: float,
+        price_out: float,
+        price_cached: float,
+        prices: dict | None = None,
+    ) -> None:
+        """Write a price_history row for audit trail."""
+        conn = _postgres_tx(tx).conn
+        await conn.execute(
+            "INSERT INTO price_history (id, provider, model_id, price_in, "
+            "price_out, price_cached, prices, recorded_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
+            str(uuid.uuid4()),
+            provider,
+            model_id,
+            price_in,
+            price_out,
+            price_cached,
+            json.dumps(prices or {}),
+        )
+
 
 class PostgresOAuthRepository(OAuthRepository):
     async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
@@ -2513,6 +2616,66 @@ class PostgresOAuthRepository(OAuthRepository):
             "WHERE s.session_id=$1 AND NOT s.revoked",
             session_id,
         )
+
+
+class PostgresAclRepository(AclRepository):
+    async def grant_acl(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        principal: str,
+        perm: int,
+        granted_by: str | None,
+    ) -> Row:
+        conn = _postgres_tx(tx).conn
+        return await conn.fetchrow(
+            "INSERT INTO memory_acl (memory_id, principal, perm, granted_by) "
+            "VALUES ($1, $2, $3, $4) "
+            "ON CONFLICT (memory_id, principal) DO UPDATE "
+            "SET perm = EXCLUDED.perm, granted_by = EXCLUDED.granted_by "
+            "RETURNING memory_id, principal, perm, granted_by, created_at",
+            memory_id,
+            principal,
+            perm,
+            granted_by,
+        )
+
+    async def revoke_acl(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        principal: str,
+    ) -> bool:
+        status = await _postgres_tx(tx).conn.execute(
+            "DELETE FROM memory_acl WHERE memory_id = $1 AND principal = $2",
+            memory_id,
+            principal,
+        )
+        return status.upper().startswith("DELETE") and not status.endswith(" 0")
+
+    async def list_acl(self, tx: Transaction, memory_id: str) -> list[Row]:
+        return await _postgres_tx(tx).conn.fetch(
+            "SELECT memory_id, principal, perm, granted_by, created_at "
+            "FROM memory_acl WHERE memory_id = $1 ORDER BY principal",
+            memory_id,
+        )
+
+    async def is_group_admin(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> bool:
+        row = await _postgres_tx(tx).conn.fetchrow(
+            "SELECT 1 FROM user_groups "
+            "WHERE user_id = $1 AND group_id = $2 AND is_admin = TRUE",
+            user_id,
+            group_id,
+        )
+        return row is not None
 
 
 class PostgresSessionsRepository(SessionsRepository):
@@ -3079,9 +3242,7 @@ class PostgresFederationRepository(FederationRepository):
             from mnemos.core.config import get_settings as _gs
 
             try:
-                import os as _os
-
-                _http_model = _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                _http_model = embed_http_model_override()
                 _embed_model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
             except Exception:
                 _embed_model = "unknown"
@@ -3907,6 +4068,7 @@ class PostgresBackend:
         self._federation = PostgresFederationRepository()
         self._state_kv = PostgresStateRepository()
         self._audit_chain = PostgresAuditChainRepository()
+        self._acl = PostgresAclRepository()
         self._closed = False
 
     @property
@@ -3915,7 +4077,7 @@ class PostgresBackend:
 
     @property
     def capabilities(self) -> set[str]:
-        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state", "acl"}
 
     @property
     def capability_details(self) -> set[str]:
@@ -4212,6 +4374,10 @@ class PostgresBackend:
     @property
     def sessions(self) -> SessionsRepository:
         return self._sessions
+
+    @property
+    def acl(self) -> AclRepository:
+        return self._acl
 
     @property
     def consultations(self) -> ConsultationsRepository:

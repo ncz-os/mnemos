@@ -165,13 +165,13 @@ development, install the driver extra and set the matching DSN:
 # Oracle 23ai
 python -m pip install -e '.[dev,server,oracle]'
 export MNEMOS_DATABASE_DSN='oracle://MNEMOS:<password>@localhost:1521/ORCLPDB1'
-mnemos install --profile server --backend oracle
+mnemos install --profile server
 mnemos serve --profile server
 
 # IBM Db2 12.1.5
 python -m pip install -e '.[dev,server,db2]'
 export MNEMOS_DATABASE_DSN='db2://MNEMOS:<password>@localhost:50000/MNEMOS'
-mnemos install --profile server --backend db2
+mnemos install --profile server
 mnemos serve --profile server
 ```
 
