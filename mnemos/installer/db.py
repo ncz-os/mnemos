@@ -507,6 +507,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations" / "0038_oauth_sessions_consultations.sql",
         repo_path / "db" / "migrations" / "0039_knemon_dispatch_rule_refresh.sql",
         repo_path / "db" / "migrations" / "0039_subscription_plan_current_limits.sql",
+        repo_path / "db" / "migrations" / "0043_memory_acl.sql",
     ]
 
     print("[db] Running migrations...")
