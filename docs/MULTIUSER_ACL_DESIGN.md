@@ -58,6 +58,28 @@ group-admin (the fail-closed choice).
 Full add/remove-user-to-group CRUD is **deferred** — only the `is_admin`
 column + the authz predicate land in this slice.
 
+### Read-widening scope: live memories only, not version history
+
+A grant widens reads of the **live memory** on every read surface that shares
+the central `read_visibility_predicate` — the main `GET`/search path and the
+DAG read preflight (`_assert_memory_readable`), which this slice updated to use
+that shared predicate so an ACL-granted reader is no longer 404'd at the DAG
+layer.
+
+It does **not** widen reads of **per-version snapshot history**
+(`/log` rows, `/commits/{hash}`, `/versions`). Snapshot tenancy is evaluated by
+`version_visibility_predicate` + the `_snap_visible` post-walk filter, which are
+**owner-or-world-only by design and predate this slice**: `memory_versions`
+does not carry `group_id`/`federation_source`/principal columns, so snapshot
+reads fail closed against group, federation, *and* ACL grants alike. A
+group-reader already sees an empty `/log` for the same reason; an ACL-reader now
+behaves identically (parity, not a regression). No snapshot content leaks — the
+reader gets an empty list / 404, never an unauthorized row, and can already read
+the *live* content via the grant. Widening snapshot history to honor
+group/ACL grants requires backfilling those columns onto `memory_versions` (a
+schema migration the codebase explicitly defers) and is tracked as a follow-up
+— see ncz-os/mnemos#2.
+
 ## Cross-backend notes
 
 - **Postgres** keeps native RLS as defense-in-depth; upsert via `ON CONFLICT`
