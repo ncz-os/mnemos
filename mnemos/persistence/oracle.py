@@ -31,7 +31,9 @@ from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 from mnemos.core.config import oracle_pdb_env, runtime_env_value_stripped, vector_dim_max_env
+from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.base import (
+    AclRepository,
     AuditChainRepository,
     BranchRepository,
     CompressionQueueRepository,
@@ -189,6 +191,18 @@ def _render_visibility(
     else:
         group_clause = "0=1"
 
+    acl_clause = ""
+    principals = acl_principals(visibility.user_id or "", group_ids)
+    if principals:
+        acl_placeholders, acl_params = _in_placeholders(principals, f"{param_prefix}_acl")
+        params.update(acl_params)
+        acl_clause = (
+            f" OR EXISTS (SELECT 1 FROM memory_acl macl "
+            f"WHERE macl.memory_id = {p}id "
+            f"AND macl.principal IN ({acl_placeholders}) "
+            f"AND BITAND(macl.perm, {ACL_READ_BIT}) > 0)"
+        )
+
     return (
         "("
         f"{p}owner_id = :{param_prefix}_owner"
@@ -196,6 +210,7 @@ def _render_visibility(
         f" OR MOD(NVL({p}permission_mode, 0), 10) >= 4"
         f" OR (MOD(TRUNC(NVL({p}permission_mode, 0) / 10), 10) >= 4 "
         f"AND {p}group_id IS NOT NULL AND {group_clause})"
+        f"{acl_clause}"
         f") AND {p}namespace = :{param_prefix}_ns",
         params,
     )
@@ -2897,6 +2912,106 @@ class OracleOAuthRepository(OAuthRepository):
             await _call(cursor.close)
 
 
+class OracleAclRepository(AclRepository):
+    """Oracle per-principal memory ACL grants.
+
+    Upsert via MERGE on the ``(memory_id, principal)`` natural key so a
+    repeated grant updates ``perm``/``granted_by`` rather than violating
+    the unique constraint.
+    """
+
+    async def grant_acl(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        principal: str,
+        perm: int,
+        granted_by: str,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            binds = {
+                "memory_id": memory_id,
+                "principal": principal,
+                "perm": perm,
+                "granted_by": granted_by,
+            }
+            merge_sql = (
+                "MERGE INTO memory_acl t "
+                "USING (SELECT :memory_id AS memory_id, :principal AS principal FROM dual) s "
+                "ON (t.memory_id = s.memory_id AND t.principal = s.principal) "
+                "WHEN MATCHED THEN UPDATE SET t.perm = :perm, t.granted_by = :granted_by "
+                "WHEN NOT MATCHED THEN INSERT (memory_id, principal, perm, granted_by) "
+                "VALUES (:memory_id, :principal, :perm, :granted_by)"
+            )
+            # MERGE is not atomic against a concurrent first INSERT of the
+            # same (memory_id, principal): both sessions can take the
+            # NOT MATCHED branch and one hits ORA-00001. The ABC contract
+            # (mirroring Postgres ON CONFLICT) is that a repeat grant must
+            # never duplicate-key — so on a unique violation we retry once,
+            # where the row now exists and the MATCHED/UPDATE branch wins.
+            try:
+                await _call(cursor.execute, merge_sql, binds)
+            except Exception as exc:  # noqa: BLE001 — re-raised unless it's the dup race
+                if not _is_unique_violation(exc):
+                    raise
+                await _call(cursor.execute, merge_sql, binds)
+            await _call(
+                cursor.execute,
+                "SELECT memory_id, principal, perm, granted_by, created AS created_at "
+                "FROM memory_acl WHERE memory_id = :memory_id AND principal = :principal",
+                {"memory_id": memory_id, "principal": principal},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_acl(self, tx: Transaction, *, memory_id: str, principal: str) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM memory_acl WHERE memory_id = :memory_id AND principal = :principal",
+                {"memory_id": memory_id, "principal": principal},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def list_acl(self, tx: Transaction, memory_id: str) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT memory_id, principal, perm, granted_by, created AS created_at "
+                "FROM memory_acl WHERE memory_id = :memory_id ORDER BY principal",
+                {"memory_id": memory_id},
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def is_group_admin(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT 1 FROM user_groups "
+                "WHERE user_id = :user_id AND group_id = :group_id AND is_admin = 1",
+                {"user_id": user_id, "group_id": group_id},
+            )
+            return await _call(cursor.fetchone) is not None
+        finally:
+            await _call(cursor.close)
+
+
 class OracleSessionsRepository(SessionsRepository):
     async def create_session(self, tx: Transaction, **kwargs: Any) -> Row:
         raise NotImplementedError("Oracle chat sessions repository is not implemented")
@@ -4384,6 +4499,7 @@ class OracleBackend:
         self._federation_repo = OracleFederationRepository()
         self._state_kv_repo = OracleStateRepository()
         self._audit_chain_repo = OracleAuditChainRepository()
+        self._acl_repo = OracleAclRepository()
 
     @property
     def settings(self) -> Any:
@@ -4395,7 +4511,7 @@ class OracleBackend:
 
     @property
     def capabilities(self) -> set[str]:
-        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state", "acl"}
 
     @property
     def capability_details(self) -> set[str]:
@@ -5082,6 +5198,10 @@ class OracleBackend:
     @property
     def audit_chain(self) -> AuditChainRepository:
         return self._audit_chain_repo
+
+    @property
+    def acl(self) -> AclRepository:
+        return self._acl_repo
 
     async def ping(self) -> bool:
         try:
