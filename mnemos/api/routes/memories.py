@@ -1003,35 +1003,13 @@ async def create_memory(
             # version 1 + branch automatically; the SQLite path does
             # not have that trigger today (deferred to v4.2 with
             # branch/version surface).
-            await backend.memories.insert_memory(
-                tx,
-                memory_id=mem_id,
-                content=request.content,
-                category=request.category,
-                subcategory=request.subcategory,
-                metadata_json=metadata_json,
-                quality_rating=75,
-                owner_id=owner_id,
-                namespace=namespace,
-                permission_mode=permission_mode,
-                source_model=request.source_model,
-                source_provider=request.source_provider,
-                source_session=request.source_session,
-                source_agent=request.source_agent,
-                verbatim_content=(
-                    request.verbatim_content if request.verbatim_content is not None else request.content
-                ),
-                created=None,
-                updated=None,
-            )
             # Inline embed via mnemos.runtime.embedder.embed_text — the
             # in-process embedder (architectural decision
             # mem_1779334716543_f8ebd4, 2026-05-21) loads the GGUF model
             # once per worker and returns a 768-dim vector in ~50-100ms
             # on PYTHIA CPU. Failures (empty vec) are swallowed and the
             # row keeps embedding=NULL; the backfill script picks it up
-            # on the next pass. Embed in the same tx so the vector
-            # commits atomically with the memory row.
+            # on the next pass.
             #
             # Codex adversarial-review gate (2026-06-05): the embedding
             # generation (_get_embedding) is separated from the DB write
@@ -1057,8 +1035,32 @@ async def create_memory(
                     mem_id,
                 )
                 vec = None
-            if vec and hasattr(backend.memories, "upsert_memory_embedding"):
-                await backend.memories.upsert_memory_embedding(tx, mem_id, vec)
+            # CHILD C v2 (2026-06-06): Embedding is now co-transactional —
+            # passed inline to insert_memory so the VECTOR column is written
+            # in the same tx. upsert_memory_embedding is kept for backfill
+            # (scripts) and federation copy_embeddings (F-1.4).
+            await backend.memories.insert_memory(
+                tx,
+                memory_id=mem_id,
+                content=request.content,
+                category=request.category,
+                subcategory=request.subcategory,
+                metadata_json=metadata_json,
+                quality_rating=75,
+                owner_id=owner_id,
+                namespace=namespace,
+                permission_mode=permission_mode,
+                source_model=request.source_model,
+                source_provider=request.source_provider,
+                source_session=request.source_session,
+                source_agent=request.source_agent,
+                verbatim_content=(
+                    request.verbatim_content if request.verbatim_content is not None else request.content
+                ),
+                embedding=vec,
+                created=None,
+                updated=None,
+            )
             # v6.2 M-2.2.1 audit chain entry. Gated by MNEMOS_AUDIT_CHAIN=on
             # via the audit_sealer helper; backend.audit_chain is None on
             # backends pre-implementation (Db2 live-test blocked on 12.1.5
@@ -1203,6 +1205,17 @@ async def bulk_create_memories(
                         continue
                     created_ids.append(row["id"])
                     continue
+                # Compute embedding first so it can be passed inline to
+                # insert_memory (co-transactional; CHILD C v2, 2026-06-06).
+                try:
+                    vec = await _get_embedding(mem.content)
+                except Exception:
+                    logger.exception(
+                        "[bulk_create_memories] inline embed generation failed for %s; "
+                        "row will be backfilled with embedding later",
+                        mid,
+                    )
+                    vec = None
                 await backend.memories.insert_memory(
                     tx,
                     memory_id=mid,
@@ -1219,18 +1232,10 @@ async def bulk_create_memories(
                     source_session=mem.source_session,
                     source_agent=mem.source_agent,
                     verbatim_content=verbatim,
+                    embedding=vec,
                     created=None,
                     updated=None,
                 )
-                try:
-                    vec = await _get_embedding(mem.content)
-                    if vec and hasattr(backend.memories, "upsert_memory_embedding"):
-                        await backend.memories.upsert_memory_embedding(tx, mid, vec)
-                except Exception:
-                    logger.exception(
-                        "[bulk_create_memories] inline embed failed for %s; row will be backfilled",
-                        mid,
-                    )
                 if getattr(backend, "supports_webhooks", True):
                     item_delivery_ids = await backend.webhooks.dispatch_event(
                         tx,
