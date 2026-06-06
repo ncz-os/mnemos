@@ -125,7 +125,10 @@ def _normalize_gemini_finish_reason(raw: str | None) -> str:
 _BUILTIN_PROVIDERS: dict[str, dict] = {
     "together": {
         "url": "https://api.together.xyz/v1/chat/completions",
-        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "weight": 0.80, "api": "openai", "key_name": "together_ai",
+        # iter 56 registry-align: MiniMax-M2.7 FP4 is the current Together
+        # default per llm-usage-policy-2026-05-22.md ($0.40/$1.20, 4M ctx,
+        # weight=0.78 in model_registry).
+        "model": "MiniMaxAI/MiniMax-M2.7", "weight": 0.78, "api": "openai", "key_name": "together_ai",
     },
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
@@ -133,11 +136,17 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
     },
     "openai": {
         "url": "https://api.openai.com/v1/chat/completions",
-        "model": "gpt-5.2-chat-latest", "weight": 0.88, "api": "openai", "key_name": "openai",
+        # iter 56 registry-align: gpt-5.5 is arena rank 8 (score 1481) per
+        # 2026-05-28 snapshot; supersedes 5.2-chat-latest.
+        "model": "gpt-5.5", "weight": 0.88, "api": "openai", "key_name": "openai",
     },
     "claude": {
         "url": "https://api.anthropic.com/v1/messages",
-        "model": "claude-opus-4-6", "weight": 0.90, "api": "anthropic", "key_name": "claude",
+        # iter 56 operator override: keep opus-4-6 for quality. Early-return
+        # short-circuit (consult() gather block) handles the latency by
+        # cancelling whichever muse is slowest once quorum reached, so opus
+        # being slow on arch-design prompts is no longer a blocker.
+        "model": "claude-opus-4-8", "weight": 0.90, "api": "anthropic", "key_name": "claude",
     },
     "perplexity": {
         "url": "https://api.perplexity.ai/chat/completions",
@@ -145,15 +154,20 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
     },
     "xai": {
         "url": "https://api.x.ai/v1/chat/completions",
-        "model": "grok-4-1-fast", "weight": 0.86, "api": "openai", "key_name": "xai",
+        # iter 56 registry-align: grok-4.20-0309-reasoning is arena rank 21
+        # (score 1453) per 2026-05-28 snapshot; supersedes 4-1-fast.
+        "model": "grok-4.20-0309-reasoning", "weight": 0.86, "api": "openai", "key_name": "xai",
     },
     "nvidia": {
         "url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "model": "meta/llama-3.3-70b-instruct", "weight": 0.80, "api": "openai", "key_name": "nvidia",
+        # iter 56 registry-align: NGC Kimi K2.6 is arena rank 19 (score
+        # 1457) + 80.2% SWE-bench Verified, free Tier-A per
+        # llm-usage-policy-2026-05-22.md.
+        "model": "moonshotai/kimi-k2.6", "weight": 0.80, "api": "openai", "key_name": "nvidia",
     },
     "gemini": {
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent",
-        "model": "gemini-3-pro-preview", "weight": 0.88, "api": "gemini", "key_name": "gemini",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent",
+        "model": "gemini-3.1-pro-preview", "weight": 0.88, "api": "gemini", "key_name": "gemini",
     },
 }
 
@@ -474,7 +488,17 @@ class GraeaeEngine:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=200)
+            # Pool sized for fan-out consults (mode=all queries ~8 muses
+            # concurrently); default httpx keepalive=20 would cap reuse and
+            # force re-handshakes under fan-out.
+            self._client = httpx.AsyncClient(
+                timeout=200,
+                limits=httpx.Limits(
+                    max_keepalive_connections=50,
+                    max_connections=200,
+                    keepalive_expiry=30.0,
+                ),
+            )
         return self._client
 
     async def close(self) -> None:
@@ -693,8 +717,102 @@ class GraeaeEngine:
             ))
             for name in active
         ]
+
+        # iter 56 — early-return on quorum reached.
+        # Old behaviour gathered ALL tasks before returning, so the slowest
+        # muse (often claude-opus on long-thinking prompts) blocked
+        # consensus even when 2/3 had already succeeded. Now: race the
+        # tasks via asyncio.wait(FIRST_COMPLETED); once `early_return_after`
+        # successful tasks are in, cancel the rest and proceed.
+        #
+        # Trigger only when mode is one of the quorum-style modes (auto,
+        # all, external, local). `single`/`debate`/`majority` route to
+        # specialised methods that wrap this call and want full results
+        # — for those, early_return_after stays None and the loop drains
+        # all tasks.
+        early_return_after: Optional[int] = None
+        early_return_grace_seconds: float = 30.0  # iter56 widen — see below
+        if mode in {"auto", "all", "external", "local"} and len(tasks) >= 3:
+            # 2/3 = 0.66 quorum threshold (matches route_majority default).
+            # Was max(2,...) — bumped to max(3,...) so 3-of-5 lineup must
+            # complete before any cancellation. Pairs with the wider
+            # route_majority lineup (limit=5) so slow high-weight muses
+            # like claude-opus + gpt-5.5 get to land.
+            early_return_after = max(3, (len(tasks) * 2) // 3)
+
+        results: list = [None] * len(tasks)
         try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            if early_return_after is None:
+                gathered = await asyncio.gather(*tasks, return_exceptions=True)
+                for i, r in enumerate(gathered):
+                    results[i] = r
+            else:
+                import time as _time
+                successes = 0
+                remaining = set(tasks)
+                task_to_idx = {t: i for i, t in enumerate(tasks)}
+                quorum_met_at: Optional[float] = None
+                while remaining:
+                    # iter56 grace: shrink wait timeout once quorum met
+                    # so we exit promptly after the grace window expires.
+                    if quorum_met_at is not None:
+                        grace_left = max(
+                            0.1,
+                            early_return_grace_seconds
+                            - (_time.monotonic() - quorum_met_at),
+                        )
+                    else:
+                        grace_left = None
+                    done, remaining = await asyncio.wait(
+                        remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=grace_left,
+                    )
+                    if not done and grace_left is not None:
+                        # grace expired — cancel remaining + exit loop
+                        break
+                    for t in done:
+                        idx = task_to_idx[t]
+                        try:
+                            r = t.result()
+                        except BaseException as exc:
+                            results[idx] = exc
+                            continue
+                        results[idx] = r
+                        if isinstance(r, dict) and r.get("status") == "success":
+                            successes += 1
+                    if successes >= early_return_after and quorum_met_at is None:
+                        quorum_met_at = _time.monotonic()
+                        # do NOT break — keep waiting until grace expires
+                        # or all tasks finish, whichever comes first.
+                # Cancel any still-pending tasks. They may have partial work
+                # which we drop on the floor — the cost of fastness over
+                # completeness.
+                for t in remaining:
+                    if not t.done():
+                        t.cancel()
+                if remaining:
+                    cancelled = await asyncio.gather(
+                        *remaining, return_exceptions=True,
+                    )
+                    for t, r in zip(remaining, cancelled):
+                        idx = task_to_idx[t]
+                        if results[idx] is None:
+                            results[idx] = r if not isinstance(
+                                r, asyncio.CancelledError
+                            ) else {
+                                "status": "cancelled",
+                                "response_text": "",
+                                "error": (
+                                    "cancelled: quorum reached before this "
+                                    "muse responded"
+                                ),
+                                "latency_ms": 0,
+                                "final_score": 0.0,
+                                "model_id": self.providers.get(
+                                    active[idx], {}
+                                ).get("model", ""),
+                            }
         except asyncio.CancelledError:
             for task in tasks:
                 if not task.done():
@@ -832,9 +950,16 @@ class GraeaeEngine:
         quorum: float = 0.66,
         selection: Optional[Dict[str, Optional[str]]] = None,
     ) -> Dict:
-        """Run up to three muses and report quorum agreement."""
+        """Run up to five muses and report quorum agreement.
+
+        iter56 widen: was limit=3 which cut off Grok-4.20 (0.86) +
+        Together MiniMax-M2.7 (0.78) + NGC Kimi (0.50) before they
+        could participate. limit=5 includes the next two highest-
+        weight muses for wider editorial coverage. Caller can still
+        force a smaller lineup via selection=.
+        """
         lineup = await self._ranked_lineup(
-            task_type=task_type, limit=3, selection=selection,
+            task_type=task_type, limit=5, selection=selection,
         )
         result = await self.consult(
             prompt, task_type, timeout=timeout, selection=lineup or selection, mode="all",

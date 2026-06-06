@@ -50,7 +50,7 @@ python3 -m mnemos.tools.mpf_validate --file /tmp/source-export.json
 ```
 
 Output should include `OK`. A failed validation means either the source
-emitted a non-conformant envelope (file a bug on `mnemos-os/mnemos`) or
+emitted a non-conformant envelope (file a bug on `ncz-os/mnemos`) or
 the file was corrupted in transit.
 
 ### 3. Import into target
@@ -198,5 +198,5 @@ flip its `compat_mode` to `permissive` (operator decision; see
 `docs/FEDERATION.md` for the trade-off).
 
 **Orphan `memory_versions` rows after delete** — known footgun until
-[mnemos-os/mnemos#1](https://github.com/ncz-os/mnemos/issues/1)
+[ncz-os/mnemos#1](https://github.com/ncz-os/mnemos/issues/1)
 lands. Sweep with the orphan-cleanup query above.

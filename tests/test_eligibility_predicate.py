@@ -5,6 +5,7 @@ from mnemos.core.eligibility import (
     eligible_for_compression,
     eligible_for_federation,
     eligible_for_morpheus,
+    qualify_memory_predicate,
 )
 
 
@@ -43,6 +44,13 @@ def test_canonical_memory_eligibility_predicate_filters_universal_exclusions():
     assert eligible_for_morpheus("m") == (
         "m.deleted_at IS NULL AND m.archived_at IS NULL AND m.consolidated_into IS NULL"
     )
+
+
+def test_qualify_memory_predicate_applies_alias_to_all_canonical_columns():
+    assert qualify_memory_predicate(MEMORY_ELIGIBILITY_PREDICATE, "row") == (
+        "row.deleted_at IS NULL AND row.archived_at IS NULL AND row.consolidated_into IS NULL"
+    )
+    assert qualify_memory_predicate(MEMORY_ELIGIBILITY_PREDICATE, "") == MEMORY_ELIGIBILITY_PREDICATE
 
 
 def test_compression_eligibility_rejects_private_consolidation_parent():

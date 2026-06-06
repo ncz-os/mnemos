@@ -21,16 +21,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
+import math
 import re
 import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from datetime import date, datetime
 from functools import lru_cache
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
+from mnemos.core.config import db2_text_search_override, db2_vector_index_override
 from mnemos.persistence.oracle import (
+    OracleAclRepository,
     OracleAuditChainRepository,
     OracleBackend,
     OracleBranchRepository,
@@ -65,6 +68,33 @@ from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter
 
 _LOG = logging.getLogger(__name__)
+
+
+def _rank_score_sort_key(row: Row) -> float:
+    rank = row.get("rank_score") if isinstance(row, dict) else None
+    try:
+        score = float(rank)
+    except (TypeError, ValueError):
+        return math.inf
+    return score if math.isfinite(score) else math.inf
+
+
+def _recency_date(row: Row) -> date:
+    def _coerce_date(value: Any) -> date | None:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+            except ValueError:
+                return None
+        return None
+
+    if not isinstance(row, dict):
+        return date.min
+    return _coerce_date(row.get("updated")) or _coerce_date(row.get("created")) or date.min
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -362,7 +392,7 @@ class _Db2AsyncConnectionPool:
                 continue
             if ";" in v or "=" in v and k != "PORT":
                 raise ValueError(
-                    f"DSN attribute {k} contains forbidden char (; or =); " "would allow CLI attribute injection."
+                    f"DSN attribute {k} contains forbidden char (; or =); would allow CLI attribute injection."
                 )
         dsn_string = ";".join(f"{k}={v}" for k, v in self._dsn_kwargs.items()) + ";"
         raw = await asyncio.to_thread(ibm_db_dbi.connect, dsn_string, "", "")
@@ -540,7 +570,7 @@ class _Db2NativeAsyncConnectionPool(_Db2AsyncConnectionPool):
                 continue
             if ";" in v or "=" in v and k != "PORT":
                 raise ValueError(
-                    f"DSN attribute {k} contains forbidden char (; or =); " "would allow CLI attribute injection."
+                    f"DSN attribute {k} contains forbidden char (; or =); would allow CLI attribute injection."
                 )
         dsn_string = ";".join(f"{k}={v}" for k, v in self._dsn_kwargs.items()) + ";"
         raw = await asyncio.to_thread(ibm_db_dbi.connect, dsn_string, "", "")
@@ -693,7 +723,7 @@ def _resolve_db2_vector_index_mode(settings: Any) -> str:
     ``settings.db2_vector_index`` attribute; both default to
     ``"approx"`` so a fresh deployment engages the DiskANN index.
     """
-    raw = os.environ.get(_DB2_VEC_INDEX_ENV)
+    raw = db2_vector_index_override()
     if raw is None and settings is not None:
         raw = getattr(settings, "db2_vector_index", None)
     if raw is None:
@@ -708,6 +738,44 @@ def _resolve_db2_vector_index_mode(settings: Any) -> str:
             _DB2_VEC_INDEX_DEFAULT,
         )
         return _DB2_VEC_INDEX_DEFAULT
+    return val
+
+
+# ── Db2 full-text-search mode (CONTAINS engagement toggle) ────────────────────
+# ``like``     (default) — ``UPPER(content) LIKE '%term%'``. Full-table scan,
+#                          but works on stock Db2 with no Text Search server.
+# ``contains``           — ``CONTAINS(content, ?) = 1``. Engages a Db2 Text
+#                          Search index; requires the Db2 Text Search server +
+#                          a text index on ``memories.content``. Opt-in only,
+#                          because CONTAINS errors (SQL20424N) when no text
+#                          index exists, so it must not be the default.
+_DB2_TEXT_SEARCH_ENV = "MNEMOS_DB2_TEXT_SEARCH"
+_DB2_TEXT_SEARCH_DEFAULT = "like"
+_DB2_TEXT_SEARCH_VALID = ("like", "contains")
+
+
+def _resolve_db2_text_search_mode(settings: Any) -> str:
+    """Return the effective Db2 FTS mode (``"like"`` or ``"contains"``).
+
+    Env var ``MNEMOS_DB2_TEXT_SEARCH`` wins over the ``settings.db2_text_search``
+    attribute. Defaults to ``"like"`` (safe on stock Db2); ``"contains"`` opts
+    into the native Db2 Text Search index.
+    """
+    raw = db2_text_search_override()
+    if raw is None and settings is not None:
+        raw = getattr(settings, "db2_text_search", None)
+    if raw is None:
+        return _DB2_TEXT_SEARCH_DEFAULT
+    val = str(raw).strip().lower()
+    if val not in _DB2_TEXT_SEARCH_VALID:
+        _LOG.warning(
+            "Invalid %s=%r; expected one of %s. Falling back to %r.",
+            _DB2_TEXT_SEARCH_ENV,
+            raw,
+            _DB2_TEXT_SEARCH_VALID,
+            _DB2_TEXT_SEARCH_DEFAULT,
+        )
+        return _DB2_TEXT_SEARCH_DEFAULT
     return val
 
 
@@ -758,6 +826,12 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         # FETCH APPROX FIRST engages the DiskANN index; FETCH FIRST is
         # an exact scan. Both query the same VECTOR_DISTANCE function.
         fetch_clause = "FETCH APPROX FIRST ? ROWS ONLY" if mode == "approx" else "FETCH FIRST ? ROWS ONLY"
+        # Over-fetch a wider candidate set when recency-boosting so the Python
+        # re-rank below can promote a newer memory ranked just outside the
+        # top-`limit` by pure vector distance. Mirrors PostgresBackend's
+        # candidate_limit; the native FETCH APPROX FIRST DiskANN scan stays
+        # engaged on the larger set, and we re-cap to `limit` after re-ranking.
+        fetch_count = max(limit, min(limit * 4, 200)) if boost_recency else limit
 
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -807,7 +881,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 f"ORDER BY {rank_sql} ASC "
                 f"{fetch_clause}"
             )
-            await _call(cursor.execute, sql, (vec_literal, *where_params, vec_literal, limit))
+            await _call(cursor.execute, sql, (vec_literal, *where_params, vec_literal, fetch_count))
             rows = await _fetch_all_dicts(cursor)
         finally:
             await _call(cursor.close)
@@ -820,18 +894,12 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             # SQL ORDER BY stays index-friendly. ``updated`` may be a
             # datetime (ibm_db_dbi default) or a string fallback — be
             # defensive.
-            from datetime import date, datetime, timezone
+            from datetime import timezone
 
             w = float(recency_weight)
             today = datetime.now(timezone.utc).date()
             for row in rows:
-                updated = row.get("updated") if isinstance(row, dict) else None
-                if isinstance(updated, datetime):
-                    upd_date = updated.date()
-                elif isinstance(updated, date):
-                    upd_date = updated
-                else:
-                    upd_date = today
+                upd_date = _recency_date(row)
                 age_days = max(0, (today - upd_date).days)
                 rank = row.get("rank_score")
                 if rank is None:
@@ -842,7 +910,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                     continue
                 row["rank_score"] = rank_f - w * (1.0 / (1.0 + age_days))
             # Re-sort ASC on the adjusted rank_score and re-cap to ``limit``.
-            rows.sort(key=lambda r: float(r.get("rank_score") or 0.0))
+            rows.sort(key=_rank_score_sort_key)
             rows = rows[:limit]
 
         return rows
@@ -865,9 +933,18 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         source_session: str | None,
         source_agent: str | None,
         verbatim_content: str | None,
+        embedding: Sequence[float] | None = None,
         created: Any,
         updated: Any,
     ) -> str:
+        # Format embedding as Db2 VECTOR literal; NULL when absent.
+        # Inlining it in the MERGE keeps the vector co-transactional
+        # with the row — semantic_search sees it immediately.
+        vec_literal: str | None = None
+        vec_dim: int = 0
+        if embedding:
+            vec_literal = _validate_and_format_vector(embedding)
+            vec_dim = len(embedding)
         conn = _conn_from_tx(tx)
         sync_conn = getattr(conn, "_conn", None)
         if sync_conn is None:
@@ -875,18 +952,20 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             try:
                 await _call(
                     cursor.execute,
-                    """
+                    f"""
                     MERGE INTO memories t USING SYSIBM.SYSDUMMY1
                     ON (t.id = ?)
                     WHEN NOT MATCHED THEN INSERT (
                         id, content, category, subcategory, metadata, content_hash,
                         quality_rating, verbatim_content, owner_id, namespace,
                         permission_mode, source_model, source_provider,
-                        source_session, source_agent, created, updated
+                        source_session, source_agent,
+                        embedding, created, updated
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?,
                         ?, ?, ?, ?,
+                        {f"VECTOR(?, {vec_dim}, FLOAT32)" if vec_literal else "NULL"},
                         COALESCE(?, CURRENT TIMESTAMP),
                         COALESCE(?, CURRENT TIMESTAMP)
                     )
@@ -908,6 +987,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                         source_provider,
                         source_session,
                         source_agent,
+                        *((vec_literal,) if vec_literal else ()),
                         created,
                         updated,
                     ),
@@ -927,9 +1007,10 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             "id, content, category, subcategory, metadata, content_hash, "
             "quality_rating, verbatim_content, owner_id, namespace, permission_mode, "
             "source_model, source_provider, source_session, source_agent, "
-            "created, updated"
+            "embedding, created, updated"
             ") VALUES ("
             "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            f"{f'VECTOR(?, {vec_dim}, FLOAT32)' if vec_literal else 'NULL'}, "
             "COALESCE(?, CURRENT TIMESTAMP), COALESCE(?, CURRENT TIMESTAMP)"
             ")"
         )
@@ -950,6 +1031,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             source_provider,
             source_session,
             source_agent,
+            *((vec_literal,) if vec_literal else ()),
             created,
             updated,
         )
@@ -1328,9 +1410,14 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         source_agent: str | None = None,
         include_archived: bool = False,
     ) -> list[Row]:
-        # LIKE-based substring search — works in stock Db2 without the
-        # Db2 Text Search Server installed. Operators with Db2 Text Search
-        # can subclass and replace this with CONTAINS(c, 'pattern').
+        # FTS predicate is mode-gated (MNEMOS_DB2_TEXT_SEARCH):
+        #   like     (default) — UPPER(content) LIKE '%term%'. Full-table scan,
+        #                        works on stock Db2 with no Text Search server.
+        #   contains           — CONTAINS(content, ?) = 1. Engages the Db2 Text
+        #                        Search index. Opt-in: CONTAINS raises SQL20424N
+        #                        when no text index exists, so it is never the
+        #                        default.
+        text_mode = _resolve_db2_text_search_mode(self._settings)
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
@@ -1344,9 +1431,15 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 for m in _BIND_RE.finditer(clause):
                     params_list.append(vis_params[m.group(1)])
                 where.append(pos_clause)
-            search_term = query.strip().strip("%")
-            where.append("UPPER(m.content) LIKE '%' || UPPER(?) || '%'")
-            params_list.append(search_term)
+            if text_mode == "contains":
+                # Native Db2 Text Search index predicate; the search argument is
+                # the raw query term passed to CONTAINS.
+                where.append("CONTAINS(m.content, ?) = 1")
+                params_list.append(query.strip())
+            else:
+                search_term = query.strip().strip("%")
+                where.append("UPPER(m.content) LIKE '%' || UPPER(?) || '%'")
+                params_list.append(search_term)
             for col, val in [
                 ("category", category),
                 ("subcategory", subcategory),
@@ -2537,7 +2630,7 @@ class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAudit
         tx: Any,
         task_type: str,
         cost_budget: float = 10.0,
-        quality_floor: float = 0.7,
+        quality_floor: float = 0.85,
     ) -> dict[str, Any] | None:
         model, _ = await self.fetch_recommended_model(tx, task_type, cost_budget, quality_floor)
         return model
@@ -2548,7 +2641,7 @@ class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAudit
         try:
             await _call(
                 cursor.execute,
-                "SELECT provider FROM model_registry WHERE model_id = ? " "AND available = 1 AND deprecated = 0",
+                "SELECT provider FROM model_registry WHERE model_id = ? AND available = 1 AND deprecated = 0",
                 (model,),
             )
             rows = await _fetch_all_dicts(cursor)
@@ -2578,8 +2671,7 @@ class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAudit
         try:
             await _call(
                 cursor.execute,
-                "SELECT provider FROM model_registry WHERE model_id = ? "
-                "AND available = 1 AND deprecated = 0 LIMIT 1",
+                "SELECT provider FROM model_registry WHERE model_id = ? AND available = 1 AND deprecated = 0 LIMIT 1",
                 (model_id,),
             )
             row = await _fetch_all_dicts(cursor)
@@ -3266,12 +3358,10 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
             # See docs/v6.1-federation-embeddings-copy.md.
             embed_cols = ""
             if include_embedding:
-                from mnemos.core.config import get_settings as _gs
+                from mnemos.core.config import embed_http_model_override, get_settings as _gs
 
                 try:
-                    import os as _os
-
-                    _http_model = _os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "").strip()
+                    _http_model = embed_http_model_override()
                     _model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
                 except Exception:
                     _model = "unknown"
@@ -3655,116 +3745,7 @@ class Db2OAuthRepository(OracleOAuthRepository):
 class Db2SessionsRepository(OracleSessionsRepository):
     """Db2-native protocol sessions persistence."""
 
-    async def create_session(
-        self,
-        tx: Any,
-        *,
-        session_id: str | bytes | uuid.UUID | None = None,
-        user_id: str,
-        expires_at: Any,
-        metadata: dict[str, Any] | None = None,
-    ) -> Row:
-        sid = session_id or uuid.uuid4()
-        sid_raw = _uuid_to_raw(sid)
-        assert sid_raw is not None
-        cursor = await _call(_conn_from_tx(tx).cursor)
-        try:
-            await _call(
-                cursor.execute,
-                """
-                INSERT INTO sessions (id, session_id, user_id, started_at, last_active_at, expires_at, metadata)
-                VALUES (?, ?, ?, CURRENT TIMESTAMP, CURRENT TIMESTAMP, ?, ?)
-                """,
-                (str(uuid.UUID(bytes=sid_raw)), sid_raw, user_id, _ts_for_oracle(expires_at), _json_text(metadata, {})),
-            )
-        finally:
-            await _call(cursor.close)
-        row = await self.lookup_session(tx, session_id=sid)
-        assert row is not None
-        return row
-
-    async def lookup_session(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> Row | None:
-        cursor = await _call(_conn_from_tx(tx).cursor)
-        try:
-            await _call(
-                cursor.execute,
-                """
-                SELECT session_id, user_id, started_at, last_active_at, expires_at, metadata
-                FROM sessions
-                WHERE session_id = ? AND expires_at > CURRENT TIMESTAMP
-                """,
-                (_uuid_to_raw(session_id),),
-            )
-            return self._normalize_session_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
-        finally:
-            await _call(cursor.close)
-
-    async def update_session_active(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> bool:
-        cursor = await _call(_conn_from_tx(tx).cursor)
-        try:
-            await _call(
-                cursor.execute,
-                "UPDATE sessions SET last_active_at = CURRENT TIMESTAMP WHERE session_id = ?",
-                (_uuid_to_raw(session_id),),
-            )
-            return int(getattr(cursor, "rowcount", 0) or 0) > 0
-        finally:
-            await _call(cursor.close)
-
-    async def expire_session(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> bool:
-        cursor = await _call(_conn_from_tx(tx).cursor)
-        try:
-            await _call(
-                cursor.execute,
-                "UPDATE sessions SET expires_at = CURRENT TIMESTAMP WHERE session_id = ?",
-                (_uuid_to_raw(session_id),),
-            )
-            return int(getattr(cursor, "rowcount", 0) or 0) > 0
-        finally:
-            await _call(cursor.close)
-
-    async def log_session_event(
-        self,
-        tx: Any,
-        *,
-        session_id: str | bytes | uuid.UUID,
-        event_kind: str,
-        payload: dict[str, Any] | None = None,
-    ) -> Row:
-        cursor = await _call(_conn_from_tx(tx).cursor)
-        try:
-            await _call(
-                cursor.execute,
-                """
-                SELECT id, session_id, event_kind, payload, ts
-                FROM FINAL TABLE (
-                    INSERT INTO session_logs (session_id, event_kind, payload, ts)
-                    VALUES (?, ?, ?, CURRENT TIMESTAMP)
-                )
-                """,
-                (_uuid_to_raw(session_id), event_kind, _json_text(payload, {})),
-            )
-            return self._normalize_session_log_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))  # type: ignore[return-value]
-        finally:
-            await _call(cursor.close)
-
-    @staticmethod
-    def _normalize_session_row(row: Row | None) -> Row | None:
-        if row is None:
-            return None
-        out = dict(row)
-        out["session_id"] = _raw_to_uuid(out.get("session_id"))
-        out["metadata"] = _json_value(out.get("metadata"), {})
-        return out
-
-    @staticmethod
-    def _normalize_session_log_row(row: Row | None) -> Row | None:
-        if row is None:
-            return None
-        out = dict(row)
-        out["session_id"] = _raw_to_uuid(out.get("session_id"))
-        out["payload"] = _json_value(out.get("payload"), {})
-        return out
+    pass
 
 
 class Db2ConsultationsRepository(OracleConsultationsRepository):
@@ -3939,6 +3920,106 @@ class Db2AuditChainRepository(OracleAuditChainRepository):
     """
 
 
+class Db2AclRepository(OracleAclRepository):
+    """Db2-native per-principal memory ACL grants.
+
+    Native MERGE on ``SYSIBM.SYSDUMMY1`` (no ``DUAL``) with ``?``
+    positional binds so the grant upsert works under both
+    :class:`Db2Backend` (compat cursor) and :class:`Db2BackendNative`
+    (which forbids ``FROM DUAL``). ``created_at`` is rendered with
+    ``TO_CHAR`` to match the other Db2-native repos.
+    """
+
+    async def grant_acl(
+        self,
+        tx: Any,
+        *,
+        memory_id: str,
+        principal: str,
+        perm: int,
+        granted_by: str,
+    ) -> Row:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        merge_sql = """
+                MERGE INTO memory_acl t
+                USING (SELECT ? AS memory_id, ? AS principal,
+                              ? AS perm, ? AS granted_by FROM SYSIBM.SYSDUMMY1) src
+                   ON (t.memory_id = src.memory_id AND t.principal = src.principal)
+                WHEN MATCHED THEN UPDATE SET
+                    perm = src.perm,
+                    granted_by = src.granted_by
+                WHEN NOT MATCHED THEN INSERT (memory_id, principal, perm, granted_by)
+                VALUES (src.memory_id, src.principal, src.perm, src.granted_by)
+                """
+        binds = (memory_id, principal, perm, granted_by)
+        try:
+            try:
+                await _call(cursor.execute, merge_sql, binds)
+            except Exception as exc:  # noqa: BLE001 — dialect-specific dup-key retry
+                if not _is_unique_violation(exc):
+                    raise
+                # Concurrent first-grant race: the NOT MATCHED INSERT lost to a
+                # peer. Re-run the MERGE so it takes the MATCHED UPDATE branch.
+                await _call(cursor.execute, merge_sql, binds)
+        finally:
+            await _call(cursor.close)
+        rows = await self.list_acl(tx, memory_id)
+        for row in rows:
+            if row.get("principal") == principal or row.get("PRINCIPAL") == principal:
+                return row
+        return None
+
+    async def revoke_acl(self, tx: Any, *, memory_id: str, principal: str) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM memory_acl WHERE memory_id = ? AND principal = ?",
+                (memory_id, principal),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def list_acl(self, tx: Any, memory_id: str) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT memory_id, principal, perm, granted_by, "
+                "TO_CHAR(created) AS created_at "
+                "FROM memory_acl WHERE memory_id = ? ORDER BY principal",
+                (memory_id,),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def is_group_admin(
+        self,
+        tx: Any,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT 1 FROM user_groups "
+                "WHERE user_id = ? AND group_id = ? AND is_admin = 1 "
+                "FETCH FIRST 1 ROW ONLY",
+                (user_id, group_id),
+            )
+            return await _call(cursor.fetchone) is not None
+        finally:
+            await _call(cursor.close)
+
+
 class Db2Backend(OracleBackend):
     """IBM Db2 12.1.x backend via Oracle Compatibility Mode.
 
@@ -4003,6 +4084,7 @@ class Db2Backend(OracleBackend):
         self._sessions_repo = Db2SessionsRepository()
         self._consultations_repo = Db2ConsultationsRepository()
         self._audit_chain_repo = Db2AuditChainRepository()
+        self._acl_repo = Db2AclRepository()
         # Startup registry-probe state, populated lazily by ``open()``.
         # ``None`` means "not yet probed"; otherwise stores the raw
         # registry value (``"YES"``, ``"NO"``, ``""``...) for the
@@ -4016,7 +4098,7 @@ class Db2Backend(OracleBackend):
 
     @property
     def capabilities(self) -> set[str]:
-        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state", "acl"}
 
     async def register_oauth_token(self, tx: Any, **kwargs: Any) -> Row:
         return await self._oauth_repo.register_oauth_token(tx, **kwargs)
@@ -4033,20 +4115,116 @@ class Db2Backend(OracleBackend):
     async def redeem_oauth_state(self, tx: Any, **kwargs: Any) -> Row | None:
         return await self._oauth_repo.redeem_oauth_state(tx, **kwargs)
 
-    async def create_session(self, tx: Any, **kwargs: Any) -> Row:
-        return await self._sessions_repo.create_session(tx, **kwargs)
+    async def create_session(
+        self,
+        tx: Any,
+        *,
+        session_id: str | bytes | uuid.UUID | None = None,
+        user_id: str,
+        expires_at: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> Row:
+        sid = session_id or uuid.uuid4()
+        sid_raw = _uuid_to_raw(sid)
+        assert sid_raw is not None
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO sessions (id, session_id, user_id, started_at, last_active_at, expires_at, metadata)
+                VALUES (?, ?, ?, CURRENT TIMESTAMP, CURRENT TIMESTAMP, ?, ?)
+                """,
+                (str(uuid.UUID(bytes=sid_raw)), sid_raw, user_id, _ts_for_oracle(expires_at), _json_text(metadata, {})),
+            )
+        finally:
+            await _call(cursor.close)
+        row = await self.lookup_session(tx, session_id=sid)
+        assert row is not None
+        return row
 
-    async def lookup_session(self, tx: Any, **kwargs: Any) -> Row | None:
-        return await self._sessions_repo.lookup_session(tx, **kwargs)
+    async def lookup_session(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT session_id, user_id, started_at, last_active_at, expires_at, metadata
+                FROM sessions
+                WHERE session_id = ? AND expires_at > CURRENT TIMESTAMP
+                """,
+                (_uuid_to_raw(session_id),),
+            )
+            return self._normalize_session_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))
+        finally:
+            await _call(cursor.close)
 
-    async def update_session_active(self, tx: Any, **kwargs: Any) -> bool:
-        return await self._sessions_repo.update_session_active(tx, **kwargs)
+    async def update_session_active(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET last_active_at = CURRENT TIMESTAMP WHERE session_id = ?",
+                (_uuid_to_raw(session_id),),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
 
-    async def expire_session(self, tx: Any, **kwargs: Any) -> bool:
-        return await self._sessions_repo.expire_session(tx, **kwargs)
+    async def expire_session(self, tx: Any, *, session_id: str | bytes | uuid.UUID) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET expires_at = CURRENT TIMESTAMP WHERE session_id = ?",
+                (_uuid_to_raw(session_id),),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
 
-    async def log_session_event(self, tx: Any, **kwargs: Any) -> Row:
-        return await self._sessions_repo.log_session_event(tx, **kwargs)
+    async def log_session_event(
+        self,
+        tx: Any,
+        *,
+        session_id: str | bytes | uuid.UUID,
+        event_kind: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, session_id, event_kind, payload, ts
+                FROM FINAL TABLE (
+                    INSERT INTO session_logs (session_id, event_kind, payload, ts)
+                    VALUES (?, ?, ?, CURRENT TIMESTAMP)
+                )
+                """,
+                (_uuid_to_raw(session_id), event_kind, _json_text(payload, {})),
+            )
+            return self._normalize_session_log_row(await _row_to_dict(cursor, await _call(cursor.fetchone)))  # type: ignore[return-value]
+        finally:
+            await _call(cursor.close)
+
+    @staticmethod
+    def _normalize_session_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _raw_to_uuid(out.get("session_id"))
+        out["metadata"] = _json_value(out.get("metadata"), {})
+        return out
+
+    @staticmethod
+    def _normalize_session_log_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["session_id"] = _raw_to_uuid(out.get("session_id"))
+        out["payload"] = _json_value(out.get("payload"), {})
+        return out
 
     async def create_consultation(self, tx: Any, **kwargs: Any) -> Row:
         return await self._consultations_repo.create_consultation(tx, **kwargs)
@@ -4200,8 +4378,7 @@ class Db2Backend(OracleBackend):
                     if not _is_missing_model_registry(exc):
                         raise
                     _LOG.warning(
-                        "usage_ledger model_registry table missing for provider=%s model=%s; "
-                        "recording est_cost_usd=0",
+                        "usage_ledger model_registry table missing for provider=%s model=%s; recording est_cost_usd=0",
                         record.provider,
                         record.model,
                     )
@@ -4309,7 +4486,7 @@ class Db2Backend(OracleBackend):
         """
         if self._pool is None:
             return
-        sql = "SELECT REG_VAR_VALUE FROM SYSIBMADM.REG_VARIABLES " "WHERE REG_VAR_NAME = 'DB2_VECTOR_INDEXING'"
+        sql = "SELECT REG_VAR_VALUE FROM SYSIBMADM.REG_VARIABLES WHERE REG_VAR_NAME = 'DB2_VECTOR_INDEXING'"
         value: str | None = None
         try:
             async with self._pool.acquire() as conn:

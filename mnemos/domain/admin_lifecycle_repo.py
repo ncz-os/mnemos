@@ -11,8 +11,6 @@ import hashlib
 from datetime import datetime
 from typing import Any
 
-import asyncpg
-
 from mnemos.db.deletion_log import fetch_deletion_log
 from mnemos.persistence.base import PersistenceBackend, Transaction
 
@@ -22,13 +20,6 @@ def _conn(tx: Transaction) -> Any:
     if conn is None:
         raise TypeError(f"{type(tx).__name__} does not expose a repository connection")
     return conn
-
-
-def _result_count(result: Any) -> int:
-    try:
-        return int(str(result).rsplit(" ", 1)[-1])
-    except (IndexError, ValueError):
-        return 0
 
 
 class DeletionRequestOverlapError(ValueError):
@@ -42,75 +33,6 @@ class DeletionRequestActiveDuplicateError(ValueError):
 
 
 class AdminLifecycleRepository:
-    async def enqueue_compression(
-        self,
-        tx: Transaction,
-        *,
-        memory_ids: list[str],
-        reason: str,
-        priority: int,
-        scoring_profile: str,
-    ) -> list[str]:
-        conn = _conn(tx)
-        known = await conn.fetch(
-            "SELECT id, owner_id FROM memories WHERE id = ANY($1::text[]) AND deleted_at IS NULL",
-            memory_ids,
-        )
-        owner_by_id = {r["id"]: r["owner_id"] for r in known}
-        enqueued_ids: list[str] = []
-        for mid in memory_ids:
-            if mid not in owner_by_id:
-                continue
-            await conn.execute(
-                "INSERT INTO memory_compression_queue "
-                "(memory_id, owner_id, reason, priority, scoring_profile) "
-                "VALUES ($1, $2, $3, $4, $5)",
-                mid,
-                owner_by_id[mid],
-                reason,
-                priority,
-                scoring_profile,
-            )
-            enqueued_ids.append(mid)
-        return enqueued_ids
-
-    async def enqueue_all_compression(
-        self,
-        tx: Transaction,
-        *,
-        reason: str,
-        priority: int,
-        scoring_profile: str,
-        category: str | None,
-        only_uncompressed: bool,
-        limit: int,
-    ) -> int:
-        where_parts: list[str] = ["m.deleted_at IS NULL"]
-        params: list[Any] = []
-        if only_uncompressed:
-            where_parts.append("NOT EXISTS (SELECT 1 FROM memory_compressed_variants v WHERE v.memory_id = m.id)")
-        if category is not None:
-            params.append(category)
-            where_parts.append(f"m.category = ${len(params)}")
-        where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
-
-        params.extend([reason, priority, scoring_profile, limit])
-        reason_idx = len(params) - 3
-        priority_idx = len(params) - 2
-        profile_idx = len(params) - 1
-        limit_idx = len(params)
-
-        sql = (
-            "INSERT INTO memory_compression_queue "
-            "(memory_id, owner_id, reason, priority, scoring_profile) "
-            "SELECT m.id, m.owner_id, "
-            f"${reason_idx}, ${priority_idx}, ${profile_idx} "
-            f"FROM memories m{where_sql} "
-            "ORDER BY LENGTH(m.content) DESC "
-            f"LIMIT ${limit_idx}"
-        )
-        return _result_count(await _conn(tx).execute(sql, *params))
-
     async def sweep_for_archival(
         self,
         tx: Transaction,
@@ -275,8 +197,16 @@ class AdminLifecycleRepository:
                 requested_by,
                 notes,
             )
-        except asyncpg.UniqueViolationError as exc:
-            raise DeletionRequestActiveDuplicateError from exc
+        except Exception as exc:
+            # Backend-agnostic duplicate-key guard. Postgres raises
+            # asyncpg.UniqueViolationError; Oracle raises
+            # oracledb.IntegrityError (ORA-00001); SQLite raises
+            # sqlite3.IntegrityError. The advisory-lock + SELECT check
+            # above makes the race window narrow — any duplicate-key
+            # error that escapes is an active duplicate.
+            if "UniqueViolation" in type(exc).__name__ or "IntegrityError" in type(exc).__name__ or "UNIQUE constraint" in str(exc):
+                raise DeletionRequestActiveDuplicateError from exc
+            raise
 
     async def list_deletion_requests(
         self,

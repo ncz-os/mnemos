@@ -16,7 +16,6 @@ from dataclasses import dataclass, replace
 import json
 import logging
 import math
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Tuple
 from uuid import UUID, uuid4
@@ -26,7 +25,7 @@ import asyncpg
 from mnemos.db.deletion_log import log_morpheus_run_memory_deletions
 import numpy as np
 
-from mnemos.core.config import get_settings, hot_rs_enabled
+from mnemos.core.config import get_settings, hot_rs_enabled, morpheus_orphan_timeout_hours_env
 from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.ids import new_memory_id
 from mnemos.core.eligibility import eligible_for_morpheus
@@ -166,7 +165,7 @@ def _orphan_timeout_hours(max_age_hours: Optional[float] = None) -> float:
             hours = _DEFAULT_ORPHAN_TIMEOUT_HOURS
         return hours if hours > 0 else _DEFAULT_ORPHAN_TIMEOUT_HOURS
 
-    raw = os.environ.get(_ORPHAN_TIMEOUT_ENV)
+    raw = morpheus_orphan_timeout_hours_env()
     if raw is None or not raw.strip():
         return _DEFAULT_ORPHAN_TIMEOUT_HOURS
     try:

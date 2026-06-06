@@ -23,15 +23,20 @@ def _alice() -> UserContext:
 
 
 @pytest.fixture
-def current_user_override():
+def current_user_override(monkeypatch: pytest.MonkeyPatch):
     from mnemos.api.main import app
+    from mnemos.api.routes import memories
 
     current = {"user": _alice()}
 
     async def override_user():
         return current["user"]
 
+    async def fake_embedding(_text: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
     app.dependency_overrides[get_current_user] = override_user
+    monkeypatch.setattr(memories, "_get_embedding", fake_embedding)
     try:
         yield current
     finally:
@@ -70,8 +75,11 @@ async def test_bulk_create_emits_memory_created_for_each_success(
     memory_ids = data["memory_ids"]
     assert data == {"created": 3, "memory_ids": memory_ids, "errors": []}
     insert_calls = [payload for name, payload in backend.memories.calls if name == "insert_memory"]
+    embedding_calls = [payload for name, payload in backend.memories.calls if name == "upsert_memory_embedding"]
     webhook_calls = [payload for name, payload in backend.webhooks.calls if name == "dispatch_event"]
     assert [call["memory_id"] for call in insert_calls] == memory_ids
+    assert [call["memory_id"] for call in embedding_calls] == memory_ids
+    assert {tuple(call["embedding"]) for call in embedding_calls} == {(0.1, 0.2, 0.3)}
     assert [call["payload"]["memory_id"] for call in webhook_calls] == memory_ids
     assert [call["event_type"] for call in webhook_calls] == ["memory.created"] * 3
     assert {call["owner_id"] for call in webhook_calls} == {"alice"}
@@ -108,8 +116,10 @@ async def test_bulk_create_dispatches_only_successful_items(
     assert len(data["memory_ids"]) == 2
     assert data["errors"] == ["[1] content is empty"]
     insert_calls = [payload for name, payload in backend.memories.calls if name == "insert_memory"]
+    embedding_calls = [payload for name, payload in backend.memories.calls if name == "upsert_memory_embedding"]
     webhook_calls = [payload for name, payload in backend.webhooks.calls if name == "dispatch_event"]
     assert [call["memory_id"] for call in insert_calls] == data["memory_ids"]
+    assert [call["memory_id"] for call in embedding_calls] == data["memory_ids"]
     assert [call["payload"]["memory_id"] for call in webhook_calls] == data["memory_ids"]
     assert [call["payload"]["content"] for call in webhook_calls] == ["valid one", "valid two"]
     assert {call["owner_id"] for call in webhook_calls} == {"alice"}

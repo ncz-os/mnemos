@@ -12,6 +12,7 @@ Allowed exceptions to the ban are:
 from __future__ import annotations
 
 import os
+import socket
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -91,7 +92,7 @@ class _DatabaseSettings(BaseSettings):
         validation_alias=AliasChoices("MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL"),
     )
     sqlite_path: Path = Field(
-        default_factory=lambda: (Path.home() / ".mnemos" / "mnemos.db"),
+        default_factory=lambda: Path.home() / ".mnemos" / "mnemos.db",
         validation_alias=AliasChoices("MNEMOS_SQLITE_PATH", "SQLITE_DB_PATH", "PG_SQLITE_PATH"),
     )
     host: str = "localhost"
@@ -127,6 +128,71 @@ class _DatabaseSettings(BaseSettings):
     @classmethod
     def _expand_sqlite_path(cls, raw: Any) -> Path:
         return Path(raw).expanduser()
+
+    @property
+    def oracle_dsn(self) -> str:
+        return oracle_dsn_env()
+
+    @property
+    def db2_dsn(self) -> str:
+        return db2_dsn_env()
+
+    @property
+    def required_capabilities(self) -> str:
+        return required_capabilities_env()
+
+    @property
+    def vector_dim_max(self) -> int:
+        return vector_dim_max_env()
+
+    @property
+    def db2_vector_index(self) -> str:
+        raw = db2_vector_index_override()
+        return raw if raw is not None else "approx"
+
+    @property
+    def oracle_pdb(self) -> str:
+        return oracle_pdb_env()
+
+    @property
+    def oracle_thick(self) -> str:
+        return runtime_env_value_stripped("MNEMOS_ORACLE_THICK")
+
+    @property
+    def oracle_drcp(self) -> str:
+        return runtime_env_value_stripped("MNEMOS_ORACLE_DRCP")
+
+    @property
+    def oracle_pool_min(self) -> int:
+        return runtime_env_int("MNEMOS_ORACLE_POOL_MIN", 2)
+
+    @property
+    def oracle_pool_max(self) -> int:
+        return runtime_env_int("MNEMOS_ORACLE_POOL_MAX", 10)
+
+    @property
+    def oracle_pool_increment(self) -> int:
+        return runtime_env_int("MNEMOS_ORACLE_POOL_INCREMENT", 1)
+
+    @property
+    def oracle_stmt_cache_size(self) -> int:
+        return runtime_env_int("MNEMOS_ORACLE_STMT_CACHE_SIZE", 20)
+
+    @property
+    def oracle_pool_acquire_timeout(self) -> float:
+        return runtime_env_float("MNEMOS_ORACLE_POOL_ACQUIRE_TIMEOUT", 60.0)
+
+    @property
+    def mysql_pool_min(self) -> int:
+        return runtime_env_int("MNEMOS_MYSQL_POOL_MIN", 2)
+
+    @property
+    def mysql_pool_max(self) -> int:
+        return runtime_env_int("MNEMOS_MYSQL_POOL_MAX", 10)
+
+    @property
+    def mysql_connect_timeout(self) -> float:
+        return runtime_env_float("MNEMOS_MYSQL_CONNECT_TIMEOUT", 10.0)
 
 
 class _GraeaeSettings(BaseSettings):
@@ -215,6 +281,16 @@ class _ProviderSettings(BaseSettings):
     xai_api_key: str = Field("", validation_alias="XAI_API_KEY")
     groq_api_key: str = Field("", validation_alias="GROQ_API_KEY")
     perplexity_api_key: str = Field("", validation_alias="PERPLEXITY_API_KEY")
+    # KNEMON routing policy (deployment-configurable; no-op defaults).
+    # Comma-separated provider ids/aliases excluded from KNEMON route
+    # selection by default (merged with any per-request exclude_providers).
+    # The Anthropic ban is THIS deployment's policy, not a universal rule —
+    # other deployments leave this empty or choose differently.
+    knemon_exclude_providers: str = Field("", validation_alias="KNEMON_DEFAULT_EXCLUDE_PROVIDERS")
+    # Comma-separated ordered provider preference; candidates are bucketed by
+    # this order first, then by graeae_weight within each bucket. Empty
+    # preserves pure graeae_weight ordering.
+    knemon_provider_preference: str = Field("", validation_alias="KNEMON_PROVIDER_PREFERENCE")
     together_api_key: str = Field("", validation_alias="TOGETHER_API_KEY")
     nvidia_api_key: str = Field("", validation_alias="NVIDIA_API_KEY")
     keys_path: Path | None = Field(None, validation_alias="MNEMOS_KEYS_PATH")
@@ -240,6 +316,70 @@ class _ProviderSettings(BaseSettings):
     embed_n_ctx: int = Field(8192, validation_alias="MNEMOS_EMBED_N_CTX")
     embed_threads: int = Field(0, validation_alias="MNEMOS_EMBED_THREADS")  # 0 = auto
     embed_gpu_layers: int = Field(0, validation_alias="MNEMOS_EMBED_GPU_LAYERS")
+
+    @property
+    def embed_backend(self) -> str:
+        return embed_backend_env()
+
+    @property
+    def embed_ov_model_id(self) -> str:
+        return embed_ov_model_id_env()
+
+    @property
+    def embed_ov_device(self) -> str:
+        return embed_ov_device_env()
+
+    @property
+    def embed_cix_model_path(self) -> str:
+        return embed_cix_model_path_env()
+
+    @property
+    def embed_cix_tokenizer_id(self) -> str:
+        return embed_cix_tokenizer_id_env()
+
+    @property
+    def embed_cix_max_seq_len(self) -> int:
+        return embed_cix_max_seq_len_env()
+
+    @property
+    def embed_hybrid(self) -> str:
+        return embed_hybrid_env()
+
+    @property
+    def embed_npu_threshold_chars(self) -> int:
+        return embed_npu_threshold_chars_env()
+
+    @property
+    def embed_http_url(self) -> str:
+        return embed_http_url_env()
+
+    @property
+    def embed_http_url_fallback(self) -> str:
+        return embed_http_url_fallback_env()
+
+    @property
+    def embed_http_model(self) -> str:
+        return embed_http_model_env()
+
+    @property
+    def embed_http_timeout(self) -> float:
+        return embed_http_timeout_env()
+
+    @property
+    def embed_max_chars(self) -> int:
+        return embed_max_chars_env()
+
+    @property
+    def reranker_url(self) -> str:
+        return reranker_url_env()
+
+    @property
+    def reranker_model(self) -> str:
+        return reranker_model_env()
+
+    @property
+    def reranker_timeout_secs(self) -> str:
+        return reranker_timeout_secs_env() or ""
 
     def api_key_for(self, provider: str) -> str:
         keys = {
@@ -386,6 +526,10 @@ class _MorpheusSettings(BaseSettings):
     extract_muse: str = Field("qwen3-7b", validation_alias="MNEMOS_MORPHEUS_EXTRACT_MUSE")
     extract_verifier: str = Field("openai", validation_alias="MNEMOS_MORPHEUS_EXTRACT_VERIFIER")
 
+    @property
+    def orphan_timeout_hours(self) -> str | None:
+        return morpheus_orphan_timeout_hours_env()
+
 
 class _PersephoneSettings(BaseSettings):
     model_config = _config_model_config()
@@ -426,6 +570,10 @@ class KronosSettings(BaseSettings):
     default_lookback_hours: int = Field(168, validation_alias="MNEMOS_KRONOS_LOOKBACK_HOURS")
     default_baseline_days: int = Field(30, validation_alias="MNEMOS_KRONOS_BASELINE_DAYS")
 
+    @property
+    def backend(self) -> str:
+        return kronos_backend_env()
+
     @field_validator("default_sensitivity", mode="before")
     @classmethod
     def _positive_sensitivity(cls, raw: Any) -> float:
@@ -449,6 +597,10 @@ class PantheonSettings(BaseSettings):
     model_config = _config_model_config()
 
     enabled: bool = Field(False, validation_alias="MNEMOS_PANTHEON_ENABLED")
+    cross_provider_fallback: bool = Field(
+        False,
+        validation_alias="MNEMOS_PANTHEON_CROSS_PROVIDER_FALLBACK",
+    )
     consultation_cap: int = Field(
         50,
         validation_alias="MNEMOS_PANTHEON_CONSULTATION_CAP",
@@ -514,6 +666,54 @@ class PantheonSettings(BaseSettings):
         return value if value >= 0.0 else 0.0
 
 
+class KnemonSettings(BaseSettings):
+    model_config = _config_model_config(env_prefix="MNEMOS_KNEMON_")
+
+    session_burn_requests_per_hour: int = 10
+    session_burn_window_seconds: int = 3600
+    subscription_preferred_utilization_pct: float = 70.0
+    subscription_near_cap_pct: float = 90.0
+    low_priority_api_cost_ceiling_usd: float = 0.50
+    g1_quality_floor: float = 0.85
+    g2_quality_floor: float = 0.75
+
+    @field_validator("session_burn_requests_per_hour", "session_burn_window_seconds", mode="before")
+    @classmethod
+    def _positive_int(cls, raw: Any) -> int:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 1
+        return value if value >= 1 else 1
+
+    @field_validator("subscription_preferred_utilization_pct", "subscription_near_cap_pct", mode="before")
+    @classmethod
+    def _bounded_pct(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(100.0, value))
+
+    @field_validator("g1_quality_floor", "g2_quality_floor", mode="before")
+    @classmethod
+    def _bounded_quality_floor(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(1.0, value))
+
+    @field_validator("low_priority_api_cost_ceiling_usd", mode="before")
+    @classmethod
+    def _non_negative_cost(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if value >= 0.0 else 0.0
+
+
 class _FederationNatsPeerSettings(BaseModel):
     name: str
     nats_url: str
@@ -568,6 +768,10 @@ class _RuntimeSettings(BaseSettings):
     pool_acquire_timeout: float = Field(10.0, validation_alias="MNEMOS_POOL_ACQUIRE_TIMEOUT")
     loose_timeouts: bool = Field(False, validation_alias="MNEMOS_LOOSE_TIMEOUTS")
     task_classifier_factory: str = Field("", validation_alias="MNEMOS_TASK_CLASSIFIER_FACTORY")
+    knemon_session_burn_requests_per_hour: int = Field(
+        10,
+        validation_alias="MNEMOS_KNEMON_SESSION_BURN_REQUESTS_PER_HOUR",
+    )
 
 
 class _ToolSettings(BaseSettings):
@@ -618,6 +822,22 @@ class _NatsSettings(BaseSettings):
     # replicas understand it. (Audit Finding 5.)
     webhook_queue_group: str = Field("", validation_alias="MNEMOS_WEBHOOK_NATS_QUEUE_GROUP")
 
+    @property
+    def webhooks_enabled(self) -> str:
+        return runtime_env_value_stripped("MNEMOS_NATS_WEBHOOKS_ENABLED")
+
+    @property
+    def federation_enabled(self) -> str:
+        return runtime_env_value_stripped("MNEMOS_NATS_FEDERATION_ENABLED")
+
+    @property
+    def webhooks_queue_group(self) -> str:
+        return nats_webhooks_queue_group_env()
+
+    @property
+    def federation_queue_group(self) -> str:
+        return nats_federation_queue_group_env()
+
     @field_validator("publish_timeout_seconds", mode="before")
     @classmethod
     def _positive_timeout(cls, raw: Any) -> float:
@@ -628,11 +848,63 @@ class _NatsSettings(BaseSettings):
         return value if value > 0 else 1.0
 
 
+class _AuditSettings(BaseModel):
+    require_session_secret: str = Field(
+        default_factory=lambda: runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET")
+    )
+    chain: str = Field(default_factory=lambda: runtime_env_value("MNEMOS_AUDIT_CHAIN", ""))
+    root_private_key: str = Field(default_factory=lambda: runtime_env_value_stripped("MNEMOS_AUDIT_ROOT_PRIVKEY"))
+
+
+class _HiveMindSettings(BaseModel):
+    system_hive_url: str = Field(default_factory=lambda: system_hive_url_env())
+    mcp_hive_url: str = Field(default_factory=lambda: mcp_hive_url_env())
+    agent_host: str = Field(default_factory=lambda: agent_host_env())
+    heartbeat_interval: float = Field(default_factory=lambda: heartbeat_interval_env())
+    claim_jobs: str = Field(default_factory=lambda: claim_jobs_env())
+    mcp_mnemos_url: str = Field(default_factory=lambda: mcp_mnemos_url_env())
+    mcp_mnemos_token: str = Field(default_factory=lambda: mcp_mnemos_token_env())
+    mcp_port: int = Field(default_factory=lambda: mcp_port_env())
+    agent_bus_db: str = Field(default_factory=lambda: agent_bus_db_env())
+
+
+class _LayerSettings(BaseSettings):
+    """Feature-layer enable flags (GRAEAE consult de8f4b2b layering, 2026-06-01).
+
+    Three install layers stack: core (memory/persistence, always on) <- graeae
+    (reasoning) <- hive (job coordination + KNEMON routing). Flags default ON so
+    an existing full deployment is byte-for-byte unchanged; slim/base installs
+    opt OUT via env. Direction enforced by Settings.enforce_layer_direction:
+    hive requires graeae. See docs/LAYERED_INSTALL.md.
+    """
+
+    model_config = _config_model_config()
+
+    enable_graeae: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("MNEMOS_ENABLE_GRAEAE", "ENABLE_GRAEAE"),
+    )
+    enable_hive: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("MNEMOS_ENABLE_HIVE", "ENABLE_HIVE"),
+    )
+
+    @property
+    def active_layers(self) -> set[str]:
+        active = {"core"}
+        if self.enable_graeae:
+            active.add("graeae")
+        if self.enable_hive:
+            active.add("hive")
+        return active
+
+
 class Settings(BaseSettings):
     model_config = _config_model_config()
 
     _explicit_fields: dict[str, set[str]] = PrivateAttr(default_factory=dict)
 
+    layers: _LayerSettings
     database: _DatabaseSettings
     graeae: _GraeaeSettings
     server: _ServerSettings
@@ -648,6 +920,7 @@ class Settings(BaseSettings):
     persephone: _PersephoneSettings
     kronos: KronosSettings
     pantheon: PantheonSettings
+    knemon: KnemonSettings
     federation: _FederationSettings
     oauth: _OAuthSettings
     auth: _AuthSettings
@@ -655,6 +928,20 @@ class Settings(BaseSettings):
     tools: _ToolSettings
     logging: _LoggingSettings
     nats: _NatsSettings
+    audit: _AuditSettings
+    hive_mind: _HiveMindSettings
+
+    @model_validator(mode="after")
+    def enforce_layer_direction(self) -> "Settings":
+        # Layer dependency direction: core <- graeae <- hive. Hive (job
+        # coordination + KNEMON routing) requires GRAEAE (reasoning). See
+        # docs/LAYERED_INSTALL.md (GRAEAE consult de8f4b2b, 2026-06-01).
+        if self.layers.enable_hive and not self.layers.enable_graeae:
+            raise ValueError(
+                "MNEMOS_ENABLE_HIVE requires MNEMOS_ENABLE_GRAEAE: the hive/KNEMON "
+                "layer depends on the GRAEAE reasoning layer."
+            )
+        return self
 
     @property
     def profile(self) -> str:
@@ -739,6 +1026,7 @@ def _build_settings() -> Settings:
         if env_filled_field in db_section and db_section[env_filled_field] == "":
             db_section.pop(env_filled_field)
     groups = {
+        "layers": _LayerSettings(**_toml_section(toml_config, "layers")),
         "database": _DatabaseSettings(**db_section),
         "graeae": _GraeaeSettings(**_toml_section(toml_config, "graeae")),
         "server": server,
@@ -754,6 +1042,7 @@ def _build_settings() -> Settings:
         "persephone": _PersephoneSettings(**_toml_section(toml_config, "persephone")),
         "kronos": KronosSettings(**_toml_section(toml_config, "kronos")),
         "pantheon": PantheonSettings(**_toml_section(toml_config, "pantheon")),
+        "knemon": KnemonSettings(**_toml_section(toml_config, "knemon")),
         "federation": _FederationSettings(**_toml_section(toml_config, "federation")),
         "oauth": _OAuthSettings(**_toml_section(toml_config, "oauth")),
         "auth": _AuthSettings(**_toml_section(toml_config, "auth")),
@@ -761,8 +1050,11 @@ def _build_settings() -> Settings:
         "tools": _ToolSettings(**_toml_section(toml_config, "tools")),
         "logging": _LoggingSettings(**_toml_section(toml_config, "logging")),
         "nats": _NatsSettings(**_toml_section(toml_config, "nats")),
+        "audit": _AuditSettings(**_toml_section(toml_config, "audit")),
+        "hive_mind": _HiveMindSettings(**_toml_section(toml_config, "hive_mind")),
     }
     settings = Settings(
+        layers=groups["layers"],
         database=groups["database"],
         graeae=groups["graeae"],
         server=groups["server"],
@@ -778,6 +1070,7 @@ def _build_settings() -> Settings:
         persephone=groups["persephone"],
         kronos=groups["kronos"],
         pantheon=groups["pantheon"],
+        knemon=groups["knemon"],
         federation=groups["federation"],
         oauth=groups["oauth"],
         auth=groups["auth"],
@@ -785,6 +1078,8 @@ def _build_settings() -> Settings:
         tools=groups["tools"],
         logging=groups["logging"],
         nats=groups["nats"],
+        audit=groups["audit"],
+        hive_mind=groups["hive_mind"],
     )
     settings._explicit_fields = {
         group_name: set(group.model_fields_set)
@@ -887,6 +1182,250 @@ def set_profile_override(profile_value: str) -> Settings:
     os.environ["MNEMOS_PROFILE_OVERRIDE"] = profile_value
     os.environ["MNEMOS_PROFILE"] = profile_value
     return reload_settings()
+
+
+def runtime_env_value(name: str, default: str = "") -> str:
+    """Return a raw environment value for dynamic-name runtime accessors."""
+    return os.environ.get(name, default)
+
+
+def runtime_env_value_stripped(name: str, default: str = "") -> str:
+    """Return a stripped environment value for dynamic-name runtime accessors."""
+    return runtime_env_value(name, default).strip()
+
+
+def runtime_env_int(name: str, default: int) -> int:
+    raw = runtime_env_value_stripped(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def runtime_env_float(name: str, default: float) -> float:
+    raw = runtime_env_value_stripped(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def embedding_dim_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBEDDING_DIM", "768"))
+
+
+def oracle_dsn_env() -> str:
+    return runtime_env_value_stripped("ORACLE_DSN")
+
+
+def db2_dsn_env() -> str:
+    return runtime_env_value_stripped("DB2_DSN")
+
+
+def required_capabilities_env() -> str:
+    return runtime_env_value("MNEMOS_REQUIRE_CAPABILITIES", "")
+
+
+def vector_dim_max_env() -> int:
+    raw = runtime_env_value_stripped("MNEMOS_VECTOR_DIM_MAX")
+    if not raw:
+        return 4096
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return 4096
+    return parsed if parsed > 0 else 4096
+
+
+def embed_http_model_override() -> str:
+    """Return the explicit MNEMOS_EMBED_HTTP_MODEL env override, if set."""
+    return runtime_env_value_stripped("MNEMOS_EMBED_HTTP_MODEL")
+
+
+def embed_backend_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_BACKEND", "auto")
+
+
+def embed_ov_model_id_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_OV_MODEL_ID", "BAAI/bge-base-en-v1.5")
+
+
+def embed_ov_device_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_OV_DEVICE", "AUTO")
+
+
+def embed_model_path_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_MODEL_PATH", "/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf")
+
+
+def embed_n_ctx_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBED_N_CTX", "8192"))
+
+
+def embed_threads_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBED_THREADS", str(max(1, os.cpu_count() or 4))))
+
+
+def embed_gpu_layers_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBED_GPU_LAYERS", "0"))
+
+
+def embed_cix_model_path_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_CIX_MODEL_PATH", "/opt/mnemos/models/bge-small-zh-v1.5_256.cix")
+
+
+def embed_cix_tokenizer_id_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_CIX_TOKENIZER_ID", "BAAI/bge-small-zh-v1.5")
+
+
+def embed_cix_max_seq_len_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBED_CIX_MAX_SEQ_LEN", "256"))
+
+
+def embed_hybrid_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_HYBRID", "False")
+
+
+def embed_npu_threshold_chars_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBED_NPU_THRESHOLD_CHARS", "1000"))
+
+
+def embed_http_url_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_HTTP_URL", "http://192.168.207.61:8090/v1/embeddings")
+
+
+def embed_http_url_fallback_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_HTTP_URL_FALLBACK", "http://192.168.207.64:8090/v1/embeddings")
+
+
+def embed_http_model_env() -> str:
+    return runtime_env_value("MNEMOS_EMBED_HTTP_MODEL", "bge-m3")
+
+
+def embed_http_timeout_env() -> float:
+    return float(runtime_env_value("MNEMOS_EMBED_HTTP_TIMEOUT", "30.0"))
+
+
+def embed_max_chars_env() -> int:
+    return int(runtime_env_value("MNEMOS_EMBED_MAX_CHARS", "8000"))
+
+
+def reranker_url_env() -> str:
+    return runtime_env_value("MNEMOS_RERANKER_URL", "http://192.168.207.64:8091/v1/rerank")
+
+
+def reranker_model_env() -> str:
+    return runtime_env_value("MNEMOS_RERANKER_MODEL", "bge-reranker-v2-m3")
+
+
+def reranker_timeout_secs_env() -> str | None:
+    return os.environ.get("MNEMOS_RERANKER_TIMEOUT_SECS")
+
+
+def morpheus_orphan_timeout_hours_env() -> str | None:
+    return os.environ.get("MNEMOS_MORPHEUS_ORPHAN_TIMEOUT_HOURS")
+
+
+def kronos_backend_env() -> str:
+    return runtime_env_value("MNEMOS_KRONOS_BACKEND", "auto").strip().lower()
+
+
+def oracle_pdb_env() -> str:
+    return runtime_env_value_stripped("MNEMOS_ORACLE_PDB")
+
+
+def db2_vector_index_override() -> str | None:
+    """Return the raw Db2 vector-index env override, if present."""
+    if "MNEMOS_DB2_VECTOR_INDEX" not in os.environ:
+        return None
+    return os.environ.get("MNEMOS_DB2_VECTOR_INDEX")
+
+
+def db2_text_search_override() -> str | None:
+    """Return the raw Db2 full-text-search env override, if present.
+
+    ``MNEMOS_DB2_TEXT_SEARCH=contains`` opts into the Db2 Text Search
+    ``CONTAINS()`` predicate (engages a Db2 text-search index); the default
+    ``like`` keeps the stock substring scan that needs no Text Search server.
+    """
+    if "MNEMOS_DB2_TEXT_SEARCH" not in os.environ:
+        return None
+    return os.environ.get("MNEMOS_DB2_TEXT_SEARCH")
+
+
+def nats_webhooks_queue_group_env() -> str:
+    return runtime_env_value_stripped("MNEMOS_NATS_WEBHOOKS_QUEUE_GROUP")
+
+
+def nats_federation_queue_group_env() -> str:
+    return runtime_env_value_stripped("MNEMOS_NATS_FEDERATION_QUEUE_GROUP")
+
+
+def nats_webhooks_enabled() -> bool:
+    """Return whether webhook outbox NATS publishing/consuming is enabled."""
+    return runtime_env_value_stripped("MNEMOS_NATS_WEBHOOKS_ENABLED").lower() in {"1", "true", "yes", "on"}
+
+
+def nats_federation_enabled() -> bool:
+    """Return whether federation memory NATS publishing/consuming is enabled."""
+    return runtime_env_value_stripped("MNEMOS_NATS_FEDERATION_ENABLED").lower() in {"1", "true", "yes", "on"}
+
+
+def session_secret_required() -> bool:
+    """Return whether startup must fail when MNEMOS_SESSION_SECRET is unset."""
+    return runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET").lower() in {"yes", "1", "true"}
+
+
+def audit_chain_enabled_flag() -> bool:
+    """Return whether MNEMOS_AUDIT_CHAIN enables audit-chain writes."""
+    return runtime_env_value("MNEMOS_AUDIT_CHAIN", "").lower() == "on"
+
+
+def system_hive_url_env() -> str:
+    return runtime_env_value("HIVE_URL", "http://192.168.207.8:5005")
+
+
+def mcp_hive_url_env() -> str:
+    return runtime_env_value("HIVE_URL", "http://127.0.0.1:5005")
+
+
+def agent_host_env() -> str:
+    return runtime_env_value("AGENT_HOST", socket.gethostname().split(".")[0])
+
+
+def heartbeat_interval_env() -> float:
+    return float(runtime_env_value("HEARTBEAT_INTERVAL", "15"))
+
+
+def claim_jobs_env() -> str:
+    return runtime_env_value("CLAIM_JOBS", "0")
+
+
+def claim_jobs_enabled_env() -> bool:
+    return claim_jobs_env() == "1"
+
+
+def mcp_mnemos_url_env() -> str:
+    return runtime_env_value("MNEMOS_URL", "http://192.168.207.67:5002")
+
+
+def mcp_mnemos_token_env() -> str:
+    return runtime_env_value(
+        "MNEMOS_TOKEN",
+        "",  # no hardcoded fallback; set MNEMOS_TOKEN in env (leaked token, rotate server-side),
+    )
+
+
+def mcp_port_env() -> int:
+    return int(runtime_env_value("PORT", "5006"))
+
+
+def agent_bus_db_env() -> str:
+    return runtime_env_value("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
 
 
 def connector_default_namespace() -> str | None:

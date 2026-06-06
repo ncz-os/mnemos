@@ -15,10 +15,11 @@ Circuit-breaker semantics mirror `mnemos/runtime/embedder.py::_HttpBackend`:
 from __future__ import annotations
 
 import logging
-import os
 import time as _t
 from threading import Lock
 from typing import Any
+
+from mnemos.core.config import reranker_model_env, reranker_timeout_secs_env, reranker_url_env
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +46,9 @@ class Reranker:
         cb_threshold: int = DEFAULT_CB_THRESHOLD,
         cb_cooldown: float = DEFAULT_CB_COOLDOWN,
     ) -> None:
-        self.url = url or os.environ.get("MNEMOS_RERANKER_URL", DEFAULT_RERANKER_URL)
-        self.model = model or os.environ.get("MNEMOS_RERANKER_MODEL", DEFAULT_RERANKER_MODEL)
-        env_timeout = os.environ.get("MNEMOS_RERANKER_TIMEOUT_SECS")
+        self.url = url or reranker_url_env()
+        self.model = model or reranker_model_env()
+        env_timeout = reranker_timeout_secs_env()
         if timeout is not None:
             self.timeout = timeout
         elif env_timeout:
@@ -95,7 +96,7 @@ class Reranker:
         if self._consecutive_failures >= self._cb_threshold and self._breaker_opened_at is None:
             self._breaker_opened_at = _t.monotonic()
             logger.warning(
-                "[RERANK] breaker OPEN after %d consecutive failures; " "cooling down %.1fs url=%s",
+                "[RERANK] breaker OPEN after %d consecutive failures; cooling down %.1fs url=%s",
                 self._consecutive_failures,
                 self._cb_cooldown,
                 self.url,

@@ -5,12 +5,35 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
+from mnemos.core.config import get_settings
 from mnemos.core.plan_windows import compute_plan_window_id
+from mnemos.core.recommendation import (
+    _canonical_cap,
+    _capability_set as _rec_capability_set,
+    _is_special_purpose,
+    _preference_rank,
+    _tier_filter as _rec_tier_filter,
+    recommendation_policy,
+)
+
+# Canonical provider identity — collapses historical/duplicate labels so a
+# single policy entry covers all of them (e.g. "claude" -> "anthropic").
+_PROVIDER_ALIASES = {"claude": "anthropic"}
+
+
+def _canon_provider(name: str) -> str:
+    canon = (name or "").strip().lower()
+    return _PROVIDER_ALIASES.get(canon, canon)
+
+
+def _csv_providers(raw: str) -> list[str]:
+    return [_canon_provider(part) for part in (raw or "").split(",") if part.strip()]
 
 
 class NoModelAvailable(RuntimeError):
@@ -21,12 +44,18 @@ class NoModelAvailable(RuntimeError):
 class KnemonRouteRequest:
     task_kind: str
     priority: int
-    est_tokens_in: int
-    est_tokens_out: int
-    caller_session_id: Optional[str]
-    caller_subsystem: str
+    est_tokens_in: int = 0
+    est_tokens_out: int = 0
+    caller_session_id: Optional[str] = None
+    caller_subsystem: str = "api"
     exclude_providers: list[str] = field(default_factory=list)
     require_capability: list[str] = field(default_factory=list)
+    max_cost_tier: Optional[str] = None
+    est_tokens: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.est_tokens is not None and self.est_tokens_in == 0 and self.est_tokens_out == 0:
+            self.est_tokens_in = max(0, int(self.est_tokens))
 
 
 @dataclass
@@ -39,11 +68,58 @@ class KnemonRouteDecision:
     sub_window_utilization_pct: float
     fallback_chain: list[tuple]
     reasoning: str
+    # Model-affinity dispatch (GRAEAE de8f4b2b layering / zeroclaw triage bridge):
+    # for zeroclaw callers the decision pins the job to a specific provider/model
+    # worker via a model:<provider_model> capability. Empty for non-dispatch
+    # callers (api/internal) so existing consumers are unaffected.
+    dispatch_kind: str = ""
+    dispatch_required_capabilities: list[str] = field(default_factory=list)
+    dispatch_cost_tier: str = ""
+    dispatch_subscription_pools: list[str] = field(default_factory=list)
 
 
 _SESSION_LOCKS: dict[str, asyncio.Lock] = {}
-_SESSION_BURN_REQUESTS_PER_HOUR = 10
-_LOW_PRIORITY_API_COST_CEILING_USD = 0.50
+_NAMED_PARAM_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
+
+# Caller-subsystem -> dispatchable provider allowlist (GRAEAE consult de8f4b2b 2026-05-28:
+# Option A centralized allowlist, config-driven/version-controlled, NoModelAvailable -> caller blocks).
+# A dispatch worker can only EXECUTE providers that have a gateway agent alias; KNEMON must never
+# route it to a provider it cannot run (e.g. anthropic/claude, which is also policy-forbidden in the
+# zeroclaw stack per CLAUDE.md directive 5). openai is intentionally absent: it is reserved for the
+# explicit codex scarce path (kind=codex/review:/doctor:codex-fix), not the general dispatch route.
+CALLER_DISPATCHABLE_PROVIDERS: dict[str, frozenset[str]] = {
+    "zeroclaw": frozenset({"groq", "xai", "deepseek", "deepseek-direct", "nvidia", "together", "gemini"}),
+}
+
+# Zeroclaw-family provider aliases — providers a zeroclaw worker can execute.
+_ZEROCLAW_PROVIDER_ALIASES = {"zeroclaw", "openclaw", "local", "local-llamacpp", "local-vllm"}
+
+
+def _model_capability(provider: str, model_id: str) -> str:
+    """Stable model:<provider_model> capability used to pin a job to one worker."""
+    safe = _normalize_pool(f"{provider}_{model_id}")
+    return f"model:{safe}" if safe else "model:unknown"
+
+
+def _dispatch_kind(provider: str, caller_subsystem: str = "") -> str:
+    """Worker kind that should execute this job (zeroclaw for dispatch callers)."""
+    if (caller_subsystem or "").strip().lower() == "zeroclaw":
+        return "zeroclaw"
+    provider_key = _canon_provider(provider)
+    if provider_key in _ZEROCLAW_PROVIDER_ALIASES:
+        return "zeroclaw"
+    return provider_key or "provider-worker"
+
+
+def _dispatch_required_capabilities(
+    selected: dict[str, Any], required_caps: list[str], caller_subsystem: str = ""
+) -> list[str]:
+    """Append the model-affinity capability for zeroclaw dispatch callers."""
+    out = list(required_caps)
+    model_cap = _model_capability(str(selected.get("provider") or ""), str(selected.get("model_id") or ""))
+    if _dispatch_kind(str(selected.get("provider") or ""), caller_subsystem) == "zeroclaw" and model_cap not in out:
+        out.append(model_cap)
+    return out
 
 
 async def _call(value: Any, *args: Any, **kwargs: Any) -> Any:
@@ -70,9 +146,44 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
     return getattr(row, key, getattr(row, lower, default))
 
 
+def _asyncpg_sql(sql: str, params: dict[str, Any]) -> tuple[str, list[Any]]:
+    values: list[Any] = []
+    positions: dict[str, int] = {}
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in params:
+            return match.group(0)
+        if name not in positions:
+            positions[name] = len(values) + 1
+            values.append(params[name])
+        return f"${positions[name]}"
+
+    return _NAMED_PARAM_RE.sub(replace, sql), values
+
+
+def _dict_rows(rows: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        if isinstance(row, dict):
+            out.append({str(key).lower(): value for key, value in row.items()})
+            continue
+        try:
+            items = dict(row).items()
+        except (TypeError, ValueError):
+            continue
+        out.append({str(key).lower(): value for key, value in items})
+    return out
+
+
 async def _rows(backend: Any, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     async with backend.transactional() as tx:
         conn = _conn_from_tx(tx)
+        fetch = getattr(conn, "fetch", None)
+        if callable(fetch):
+            pg_sql, pg_params = _asyncpg_sql(sql, params or {})
+            return _dict_rows(await _call(fetch, pg_sql, *pg_params))
+
         cursor = await _call(conn.cursor)
         try:
             await _call(cursor.execute, sql, params or {})
@@ -104,6 +215,39 @@ def _to_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _to_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        pass
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+
+
+def _plan_is_effective(row: dict[str, Any], today: date | None = None) -> bool:
+    if "effective_from" not in row and "effective_until" not in row:
+        return True
+    today = today or datetime.now(timezone.utc).date()
+    effective_from = _to_date(row.get("effective_from"))
+    effective_until = _to_date(row.get("effective_until"))
+    if effective_from is not None and effective_from > today:
+        return False
+    if effective_until is not None and effective_until < today:
+        return False
+    return True
 
 
 def _truthy(value: Any) -> bool:
@@ -151,19 +295,52 @@ def _subscription_pool_aliases(plan: dict[str, Any]) -> set[str]:
     if provider == "anthropic":
         aliases.add("claude_subscription")
     if provider == "openai":
-        aliases.update({"chatgpt_subscription", "codex_subscription"})
+        if "chatgpt" in plan_name:
+            aliases.add("chatgpt_subscription")
+        if "codex" in plan_name:
+            aliases.add("codex_subscription")
     return aliases
+
+
+def _plan_family_alias(plan: dict[str, Any]) -> str | None:
+    aliases = _subscription_pool_aliases(plan)
+    for family in ("chatgpt_subscription", "codex_subscription", "claude_subscription"):
+        if family in aliases:
+            return family
+    return None
+
+
+def _candidate_plan_family(candidate: dict[str, Any] | None) -> str | None:
+    if not candidate:
+        return None
+    provider = _normalize_pool(candidate.get("provider"))
+    if provider == "anthropic":
+        return "claude_subscription"
+    if provider != "openai":
+        return None
+    raw = " ".join(
+        str(part or "")
+        for part in (
+            candidate.get("model_id"),
+            candidate.get("display_name"),
+            " ".join(candidate.get("capabilities") or []),
+        )
+    ).lower()
+    if "codex" in raw:
+        return "codex_subscription"
+    return "chatgpt_subscription"
 
 
 async def _worker_pools_for_session(backend: Any, session_id: str | None) -> set[str] | None:
     if not session_id:
         return None
+    rows: list[dict[str, Any]]
     try:
         rows = await _rows(
             backend,
             """
             SELECT subscription_pools
-            FROM hive_agents
+            FROM agents
             WHERE session_id = :session_id
               AND status IN ('online', 'idle')
             ORDER BY last_heartbeat DESC
@@ -174,7 +351,7 @@ async def _worker_pools_for_session(backend: Any, session_id: str | None) -> set
     except Exception as exc:
         msg = str(exc).lower()
         if "fetch" not in msg:
-            if "hive_agents" in msg or "subscription_pools" in msg or "no such table" in msg or "no such column" in msg:
+            if "agents" in msg or "subscription_pools" in msg or "no such table" in msg or "no such column" in msg:
                 return None
             raise
         try:
@@ -182,7 +359,7 @@ async def _worker_pools_for_session(backend: Any, session_id: str | None) -> set
                 backend,
                 """
                 SELECT subscription_pools
-                FROM hive_agents
+                FROM agents
                 WHERE session_id = :session_id
                   AND status IN ('online', 'idle')
                 ORDER BY last_heartbeat DESC
@@ -193,16 +370,16 @@ async def _worker_pools_for_session(backend: Any, session_id: str | None) -> set
         except Exception as fallback_exc:
             fallback_msg = str(fallback_exc).lower()
             if (
-                "hive_agents" in fallback_msg
+                "agents" in fallback_msg
                 or "subscription_pools" in fallback_msg
                 or "no such table" in fallback_msg
                 or "no such column" in fallback_msg
             ):
                 return None
             raise
-    if not rows:
-        return None
-    return _normalize_pools(rows[0].get("subscription_pools"))
+    if rows:
+        return _normalize_pools(rows[0].get("subscription_pools"))
+    return None
 
 
 def _worker_has_pool(worker_pools: set[str] | None, plan: dict[str, Any]) -> bool:
@@ -234,6 +411,16 @@ def _tier(row: dict[str, Any]) -> str:
     return "C"
 
 
+def _tier_allowed(tier: str, max_cost_tier: str | None) -> bool:
+    if not max_cost_tier:
+        return True
+    order = ["A", "B", "C"]
+    try:
+        return order.index((tier or "C").upper()) <= order.index(max_cost_tier.upper())
+    except ValueError:
+        return False
+
+
 def _price(row: dict[str, Any], tokens_in: int, tokens_out: int) -> float:
     return round(
         (
@@ -257,13 +444,21 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
         ORDER BY graeae_weight DESC
         """,
     )
-    excluded = {provider.strip().lower() for provider in req.exclude_providers if provider.strip()}
+    providers_cfg = get_settings().providers
+    # Deployment-default excludes (canonicalised) merged with per-request set.
+    excluded = set(_csv_providers(providers_cfg.knemon_exclude_providers))
+    excluded |= {_canon_provider(p) for p in req.exclude_providers if p.strip()}
+    allowed = CALLER_DISPATCHABLE_PROVIDERS.get((req.caller_subsystem or "").strip().lower())
     required = {cap.strip() for cap in req.require_capability if cap.strip()}
     min_context = int(max(0, req.est_tokens_in) * 1.2)
     candidates: list[dict[str, Any]] = []
     for row in rows:
         provider = str(row.get("provider") or "").strip()
-        if not provider or provider.lower() in excluded:
+        if not provider or _canon_provider(provider) in excluded:
+            continue
+        # Caller-eligibility allowlist: dispatch workers (e.g. zeroclaw) can only execute providers
+        # backed by a gateway alias. Callers absent from the map (api, internal) are unrestricted.
+        if allowed is not None and provider.lower() not in allowed:
             continue
         if not _truthy(row.get("available", True)) or _truthy(row.get("deprecated", False)):
             continue
@@ -276,22 +471,41 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
         enriched["capabilities"] = sorted(caps)
         enriched["quality"] = _quality(enriched)
         enriched["tier"] = _tier(enriched)
+        if not _tier_allowed(enriched["tier"], req.max_cost_tier):
+            continue
         enriched["estimated_cost_usd"] = _price(enriched, req.est_tokens_in, req.est_tokens_out)
         candidates.append(enriched)
-    candidates.sort(key=lambda row: _to_float(row.get("graeae_weight")), reverse=True)
+    preference = _csv_providers(providers_cfg.knemon_provider_preference)
+    if preference:
+        rank = {name: idx for idx, name in enumerate(preference)}
+        candidates.sort(
+            key=lambda row: (
+                rank.get(_canon_provider(str(row.get("provider") or "")), len(preference)),
+                -_to_float(row.get("graeae_weight")),
+            )
+        )
+    else:
+        candidates.sort(key=lambda row: _to_float(row.get("graeae_weight")), reverse=True)
     return candidates
 
 
-def _apply_priority_ceiling(candidates: list[dict[str, Any]], priority: int) -> list[dict[str, Any]]:
-    if priority >= 14:
-        return [row for row in candidates if row["quality"] >= 0.85]
+def _apply_priority_ceiling(
+    candidates: list[dict[str, Any]],
+    priority: int,
+    *,
+    requested_priority: int | None = None,
+) -> list[dict[str, Any]]:
+    policy = get_settings().knemon
+    quality_priority = max(priority, requested_priority if requested_priority is not None else priority)
+    if quality_priority >= 14:
+        return [row for row in candidates if row["quality"] >= policy.g1_quality_floor]
     if priority >= 10:
-        return [row for row in candidates if row["tier"] in {"A", "B"} and row["quality"] >= 0.75]
+        return [row for row in candidates if row["tier"] in {"A", "B"} and row["quality"] >= policy.g2_quality_floor]
     eligible = [row for row in candidates if row["tier"] in {"A", "B"}]
     return sorted(eligible, key=lambda row: (row["tier"] != "A", -_to_float(row.get("graeae_weight"))))
 
 
-async def _plans_by_provider(backend: Any) -> dict[str, list[dict[str, Any]]]:
+async def _plans_by_provider(backend: Any, as_of: date | None = None) -> dict[str, list[dict[str, Any]]]:
     sql = """
         SELECT provider, plan_name, auth_method, path_kind, monthly_usd, msg_cap,
                msg_window_seconds, token_cap, token_window_seconds,
@@ -299,15 +513,20 @@ async def _plans_by_provider(backend: Any) -> dict[str, list[dict[str, Any]]]:
                overage_pricing_per_mtok_out, effective_from, effective_until,
                parent_plan_id
         FROM subscription_plans
-        WHERE effective_from <= TRUNC(SYSTIMESTAMP)
-          AND (effective_until IS NULL OR effective_until >= TRUNC(SYSTIMESTAMP))
-        ORDER BY provider, monthly_usd DESC, msg_cap DESC
+        ORDER BY provider, COALESCE(monthly_usd, 0) DESC, COALESCE(msg_cap, 0) DESC, plan_name
         """
     try:
         rows = await _rows(backend, sql)
+        today = as_of or datetime.now(timezone.utc).date()
+        rows = [row for row in rows if _plan_is_effective(row, today)]
     except Exception as exc:
         msg = str(exc).lower()
-        if "trunc" not in msg and "effective_from" not in msg and "path_kind" not in msg:
+        if (
+            "coalesce" not in msg
+            and "effective_from" not in msg
+            and "path_kind" not in msg
+            and "parent_plan_id" not in msg
+        ):
             raise
         rows = await _rows(
             backend,
@@ -317,18 +536,35 @@ async def _plans_by_provider(backend: Any) -> dict[str, list[dict[str, Any]]]:
                    reset_anchor, overage_pricing_per_mtok_in,
                    overage_pricing_per_mtok_out
             FROM subscription_plans
-            ORDER BY provider, monthly_usd DESC, msg_cap DESC
+            ORDER BY provider, monthly_usd DESC, msg_cap DESC, plan_name
             """,
         )
     out: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
+        if not _plan_is_effective(row, as_of):
+            continue
         out.setdefault(str(row.get("provider") or "").lower(), []).append(row)
     return out
 
 
-def _best_plan(plans: dict[str, list[dict[str, Any]]], provider: str) -> dict[str, Any]:
+def _best_plan(
+    plans: dict[str, list[dict[str, Any]]],
+    provider: str,
+    worker_pools: set[str] | None = None,
+    candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     provider_plans = plans.get(provider.lower()) or []
+    if worker_pools is not None:
+        for plan in provider_plans:
+            if _worker_has_pool(worker_pools, plan):
+                return plan
     if provider_plans:
+        if worker_pools is None:
+            family = _candidate_plan_family(candidate)
+            if family is not None:
+                for plan in provider_plans:
+                    if family in _subscription_pool_aliases(plan):
+                        return plan
         return provider_plans[0]
     return {"provider": provider, "plan_name": "api", "auth_method": "api", "path_kind": "api"}
 
@@ -337,7 +573,7 @@ async def _usage_for_plan(backend: Any, plan: dict[str, Any]) -> tuple[int, int]
     now = datetime.now(timezone.utc)
     plan_name = str(plan.get("plan_name") or "api")
     provider = str(plan.get("provider") or "")
-    path_kind = str(plan.get("path_kind") or "api")
+    path_kind, legacy_path_kind = _usage_path_kinds(plan)
     window_id = compute_plan_window_id(
         provider,
         plan_name,
@@ -351,10 +587,16 @@ async def _usage_for_plan(backend: Any, plan: dict[str, Any]) -> tuple[int, int]
         FROM usage_ledger
         WHERE provider = :provider
           AND tier = :plan_name
-          AND path_kind = :path_kind
+          AND (path_kind = :path_kind OR (:legacy_path_kind IS NOT NULL AND path_kind = :legacy_path_kind))
           AND plan_window_id LIKE :window_pattern
         """
-    params = {"provider": provider, "plan_name": plan_name, "path_kind": path_kind, "window_pattern": f"{window_id}%"}
+    params = {
+        "provider": provider,
+        "plan_name": plan_name,
+        "path_kind": path_kind,
+        "legacy_path_kind": legacy_path_kind,
+        "window_pattern": f"{window_id}%",
+    }
     try:
         rows = await _rows(backend, sql, params)
     except Exception as exc:
@@ -386,10 +628,21 @@ def _utilization(plan: dict[str, Any], requests_used: int, tokens_used: int) -> 
     return 0.0
 
 
+def _usage_path_kinds(plan: dict[str, Any]) -> tuple[str, str | None]:
+    path_kind = str(plan.get("path_kind") or "api").lower()
+    auth_method = str(plan.get("auth_method") or "api").lower()
+    legacy_path_kind = "api" if auth_method == "subscription" and path_kind != "api" else None
+    return path_kind, legacy_path_kind
+
+
 async def _session_burned(backend: Any, session_id: str | None) -> bool:
     if not session_id:
         return False
-    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    policy = get_settings().knemon
+    threshold = policy.session_burn_requests_per_hour
+    if threshold <= 0:
+        return False
+    since = datetime.now(timezone.utc) - timedelta(seconds=policy.session_burn_window_seconds)
     rows = await _rows(
         backend,
         """
@@ -399,7 +652,7 @@ async def _session_burned(backend: Any, session_id: str | None) -> bool:
         """,
         {"session_id": session_id, "since_ts": since},
     )
-    return _to_int((rows[0] if rows else {}).get("requests_used")) > _SESSION_BURN_REQUESTS_PER_HOUR
+    return _to_int((rows[0] if rows else {}).get("requests_used")) >= threshold
 
 
 def _downgrade_priority(priority: int) -> int:
@@ -411,14 +664,15 @@ def _downgrade_priority(priority: int) -> int:
 
 
 def _fallback_bucket(item: dict[str, Any]) -> int:
+    policy = get_settings().knemon
     auth = str(item.get("auth_method") or "api").lower()
     util = _to_float(item.get("sub_window_utilization_pct"))
     cost = _to_float(item.get("estimated_cost_usd"))
     if auth == "free":
         return 0
-    if auth == "subscription" and util < 70:
+    if auth == "subscription" and util < policy.subscription_preferred_utilization_pct:
         return 1
-    if auth in {"api", "token"} and cost <= _LOW_PRIORITY_API_COST_CEILING_USD:
+    if auth in {"api", "token"} and cost < policy.low_priority_api_cost_ceiling_usd:
         return 2
     if auth in {"api", "token"}:
         return 3
@@ -453,21 +707,67 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
     if not candidates:
         raise NoModelAvailable("no model satisfies required capabilities, provider exclusions, and context window")
 
-    effective_priority = (
-        _downgrade_priority(req.priority) if await _session_burned(backend, req.caller_session_id) else req.priority
-    )
-    candidates = _apply_priority_ceiling(candidates, effective_priority)
+    session_burned = await _session_burned(backend, req.caller_session_id)
+    effective_priority = _downgrade_priority(req.priority) if session_burned else req.priority
+    candidates = _apply_priority_ceiling(candidates, effective_priority, requested_priority=req.priority)
     if not candidates:
         raise NoModelAvailable("no model satisfies priority tier and quality constraints")
 
+    # ── Task-type capability filter (recommendation policy) ──────────────────
+    # Narrow candidates by the task_kind's required/any/excluded capabilities,
+    # strip special-purpose models, apply tier preferences, and rank by
+    # preferred models so that code-fix routes to a coder, narrative to a chat
+    # model, embedding to an embedding model, routing to a small/fast model, etc.
+    rec_policy = recommendation_policy(req.task_kind)
+    # Canonicalise policy caps through the same alias table used for model
+    # caps so that "code"→"coding" and CSVs match (router side of the
+    # _caps_match fix in recommendation.py).
+    _task_required_caps: set[str] = {_canonical_cap(c) for c in rec_policy.required_caps} | {
+        _canonical_cap(cap.strip()) for cap in req.require_capability if cap.strip()
+    }
+    _task_any_caps: set[str] = {_canonical_cap(c) for c in rec_policy.any_caps}
+    _task_excluded_caps: set[str] = {_canonical_cap(c) for c in rec_policy.excluded_caps}
+    _task_filtered: list[dict[str, Any]] = []
+    for row in candidates:
+        # Use the recommendation module's capability normalizer which
+        # handles aliases (code→coding, coder→coding, embed→embedding, etc.)
+        caps = _rec_capability_set(row.get("capabilities"))
+        # required: ALL must be present
+        if _task_required_caps and not _task_required_caps.issubset(caps):
+            continue
+        # any_caps: at least ONE if policy defines them
+        if _task_any_caps and not any(cap in caps for cap in _task_any_caps):
+            continue
+        # excluded: NONE may be present
+        if any(cap in caps for cap in _task_excluded_caps):
+            continue
+        _task_filtered.append(row)
+    if _task_filtered:
+        # Strip special-purpose models (content-safety, moderation, etc.)
+        _task_filtered = [r for r in _task_filtered if not _is_special_purpose(r)]
+        # Filter by policy-allowed tiers (with fallback)
+        _task_filtered = _rec_tier_filter(_task_filtered, rec_policy)
+        # Sort by preference rank (preferred models first), then cost, then quality
+        _task_filtered.sort(
+            key=lambda row: (
+                _preference_rank(row, rec_policy),
+                _to_float(row.get("estimated_cost_usd")),
+                -_to_float(row.get("graeae_weight") or row.get("quality", 0)),
+            )
+        )
+        candidates = _task_filtered
+    if not candidates:
+        raise NoModelAvailable("no model satisfies task-type capability requirements")
+
     plans = await _plans_by_provider(backend)
     worker_pools = await _worker_pools_for_session(backend, req.caller_session_id)
+    policy = get_settings().knemon
     enriched: list[dict[str, Any]] = []
     selected: dict[str, Any] | None = None
     reasons: list[str] = []
     blocked_subscription_keys: set[tuple[str, str]] = set()
     for index, row in enumerate(candidates):
-        plan = _best_plan(plans, row["provider"])
+        plan = _best_plan(plans, row["provider"], worker_pools, row)
         auth_method = str(plan.get("auth_method") or "api").lower()
         path_kind = str(plan.get("path_kind") or auth_method).lower()
         requests_used, tokens_used = await _usage_for_plan(backend, plan) if auth_method == "subscription" else (0, 0)
@@ -489,22 +789,33 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
                     f"{required[0] if required else item['plan_name']}"
                 )
                 continue
-            if util < 70:
+            if util < policy.subscription_preferred_utilization_pct:
                 selected = item
-                reasons.append(f"selected subscription under 70% utilization ({util:.2f}%)")
+                reasons.append(
+                    "selected subscription under "
+                    f"{policy.subscription_preferred_utilization_pct:.0f}% utilization ({util:.2f}%)"
+                )
                 break
-            if util <= 90 and effective_priority >= 12:
+            if not session_burned and util <= policy.subscription_near_cap_pct and effective_priority >= 12:
                 selected = item
                 reasons.append(f"selected subscription near cap for priority {effective_priority} ({util:.2f}%)")
                 break
             no_other_candidate = index == len(candidates) - 1
-            if util > 90 and util < 100 and effective_priority >= 14:
+            if util > policy.subscription_near_cap_pct and util < 100 and effective_priority >= 14:
                 selected = item
-                reasons.append(f"selected over-90% subscription for G1 priority {effective_priority} ({util:.2f}%)")
+                reasons.append(
+                    "selected over-"
+                    f"{policy.subscription_near_cap_pct:.0f}% subscription for G1 priority "
+                    f"{effective_priority} ({util:.2f}%)"
+                )
                 break
-            if util > 90 and no_other_candidate:
+            if util > policy.subscription_near_cap_pct and no_other_candidate:
                 selected = item
-                reasons.append(f"selected over-90% subscription because no alternate remained ({util:.2f}%)")
+                reasons.append(
+                    "selected over-"
+                    f"{policy.subscription_near_cap_pct:.0f}% subscription because no alternate remained "
+                    f"({util:.2f}%)"
+                )
                 break
             reasons.append(f"skipped subscription at {util:.2f}% utilization")
             continue
@@ -513,16 +824,13 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
             reasons.append("selected free plan for low-priority request")
             break
         if auth_method in {"api", "token"}:
-            if effective_priority < 10 and item["estimated_cost_usd"] > _LOW_PRIORITY_API_COST_CEILING_USD:
+            if effective_priority < 10 and item["estimated_cost_usd"] >= policy.low_priority_api_cost_ceiling_usd:
                 reasons.append(f"skipped API cost ${item['estimated_cost_usd']:.4f} for low-priority request")
                 continue
             selected = item
             reasons.append(f"selected {auth_method} candidate")
             break
 
-    if selected is None and enriched:
-        selected = enriched[0]
-        reasons.append("selected first remaining candidate because no lower-cost rule matched")
     if selected is None:
         raise NoModelAvailable("no model survived subscription, free, and API waterfall rules")
 
@@ -531,17 +839,23 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
     for row in candidates:
         if (row["provider"], row["model_id"]) in seen:
             continue
-        plan = _best_plan(plans, row["provider"])
-        if str(plan.get("auth_method") or "api").lower() == "subscription" and not _worker_has_pool(worker_pools, plan):
+        plan = _best_plan(plans, row["provider"], worker_pools, row)
+        auth_method = str(plan.get("auth_method") or "api").lower()
+        path_kind = str(plan.get("path_kind") or auth_method).lower()
+        util = 0.0
+        if auth_method == "subscription" and not _worker_has_pool(worker_pools, plan):
             blocked_subscription_keys.add((row["provider"], row["model_id"]))
             continue
+        if auth_method == "subscription":
+            requests_used, tokens_used = await _usage_for_plan(backend, plan)
+            util = _utilization(plan, requests_used, tokens_used)
         fallback_candidates.append(
             {
                 **row,
-                "auth_method": str(plan.get("auth_method") or "api").lower(),
-                "path_kind": str(plan.get("path_kind") or plan.get("auth_method") or "api").lower(),
+                "auth_method": auth_method,
+                "path_kind": path_kind,
                 "plan_name": plan.get("plan_name", "api"),
-                "sub_window_utilization_pct": 0.0,
+                "sub_window_utilization_pct": util,
             }
         )
     if blocked_subscription_keys:
@@ -557,6 +871,20 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
         sub_window_utilization_pct=float(selected["sub_window_utilization_pct"]),
         fallback_chain=_fallback_chain(fallback_candidates, selected),
         reasoning="; ".join(reasons),
+        dispatch_kind=_dispatch_kind(str(selected["provider"]), req.caller_subsystem),
+        dispatch_required_capabilities=_dispatch_required_capabilities(
+            selected,
+            [c.strip() for c in req.require_capability if c.strip()],
+            req.caller_subsystem,
+        ),
+        dispatch_cost_tier=str(selected.get("tier") or ""),
+        dispatch_subscription_pools=(
+            sorted(
+                _subscription_pool_aliases({"provider": selected["provider"], "plan_name": selected.get("plan_name")})
+            )
+            if selected.get("auth_method") == "subscription"
+            else []
+        ),
     )
 
 
