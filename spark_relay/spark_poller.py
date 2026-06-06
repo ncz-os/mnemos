@@ -335,14 +335,13 @@ class AgenticRepoExecutor:
         return None
 
     def _repo_hint_to_url(self, repo: str) -> str | None:
+        # Spark scope: open source + NVIDIA-internal only. Commercial
+        # argonautsystems projects (ic-engine, riskyeats, florida-licenses) are
+        # intentionally excluded and must not be cloned/committed from Spark.
         aliases = {
-            "ic-engine": "https://gitlab.com/argonautsystems/ic-engine.git",
-            "investorclaw": "https://gitlab.com/argonautsystems/ic-engine.git",
-            "riskyeats": "https://gitlab.com/perlowja/riskyeats.git",
             "mnemos": "https://gitlab.com/mnemos-os/mnemos.git",
             "zeroclaw": "https://gitlab.com/nclawzero/zeroclaw.git",
             "ncz-installer": "https://gitlab.com/nclawzero/ncz-installer.git",
-            "florida-licenses": None,
             "fleet-ops": None,
         }
         # Optional operator-managed extra allowlist:
@@ -392,7 +391,7 @@ class AgenticRepoExecutor:
             o.strip()
             for o in os.environ.get(
                 "SPARK_TOKEN_OWNERS",
-                "argonautsystems,perlowja,nclawzero,ncz-os,mnemos-os",
+                "perlowja,nclawzero,ncz-os,mnemos-os",
             ).split(",")
             if o.strip()
         }
