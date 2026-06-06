@@ -33,6 +33,7 @@ from urllib.parse import unquote, urlparse
 
 from mnemos.core.config import db2_text_search_override, db2_vector_index_override
 from mnemos.persistence.oracle import (
+    OracleAclRepository,
     OracleAuditChainRepository,
     OracleBackend,
     OracleBranchRepository,
@@ -3563,7 +3564,7 @@ class Db2StateRepository(_Db2OraCompatMixin, OracleStateRepository):
                        AND deleted_at IS NULL
                      ORDER BY key
                      OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-                     -- Db2: oauth_sessions + fed_audit + codex-exec parity mirrored from Oracle
+                    """,
                     (owner_id, namespace, offset, limit),
                 )
             return await _fetch_all_dicts(cursor)
@@ -3919,6 +3920,106 @@ class Db2AuditChainRepository(OracleAuditChainRepository):
     """
 
 
+class Db2AclRepository(OracleAclRepository):
+    """Db2-native per-principal memory ACL grants.
+
+    Native MERGE on ``SYSIBM.SYSDUMMY1`` (no ``DUAL``) with ``?``
+    positional binds so the grant upsert works under both
+    :class:`Db2Backend` (compat cursor) and :class:`Db2BackendNative`
+    (which forbids ``FROM DUAL``). ``created_at`` is rendered with
+    ``TO_CHAR`` to match the other Db2-native repos.
+    """
+
+    async def grant_acl(
+        self,
+        tx: Any,
+        *,
+        memory_id: str,
+        principal: str,
+        perm: int,
+        granted_by: str,
+    ) -> Row:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        merge_sql = """
+                MERGE INTO memory_acl t
+                USING (SELECT ? AS memory_id, ? AS principal,
+                              ? AS perm, ? AS granted_by FROM SYSIBM.SYSDUMMY1) src
+                   ON (t.memory_id = src.memory_id AND t.principal = src.principal)
+                WHEN MATCHED THEN UPDATE SET
+                    perm = src.perm,
+                    granted_by = src.granted_by
+                WHEN NOT MATCHED THEN INSERT (memory_id, principal, perm, granted_by)
+                VALUES (src.memory_id, src.principal, src.perm, src.granted_by)
+                """
+        binds = (memory_id, principal, perm, granted_by)
+        try:
+            try:
+                await _call(cursor.execute, merge_sql, binds)
+            except Exception as exc:  # noqa: BLE001 — dialect-specific dup-key retry
+                if not _is_unique_violation(exc):
+                    raise
+                # Concurrent first-grant race: the NOT MATCHED INSERT lost to a
+                # peer. Re-run the MERGE so it takes the MATCHED UPDATE branch.
+                await _call(cursor.execute, merge_sql, binds)
+        finally:
+            await _call(cursor.close)
+        rows = await self.list_acl(tx, memory_id)
+        for row in rows:
+            if row.get("principal") == principal or row.get("PRINCIPAL") == principal:
+                return row
+        return None
+
+    async def revoke_acl(self, tx: Any, *, memory_id: str, principal: str) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM memory_acl WHERE memory_id = ? AND principal = ?",
+                (memory_id, principal),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def list_acl(self, tx: Any, memory_id: str) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT memory_id, principal, perm, granted_by, "
+                "TO_CHAR(created) AS created_at "
+                "FROM memory_acl WHERE memory_id = ? ORDER BY principal",
+                (memory_id,),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def is_group_admin(
+        self,
+        tx: Any,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT 1 FROM user_groups "
+                "WHERE user_id = ? AND group_id = ? AND is_admin = 1 "
+                "FETCH FIRST 1 ROW ONLY",
+                (user_id, group_id),
+            )
+            return await _call(cursor.fetchone) is not None
+        finally:
+            await _call(cursor.close)
+
+
 class Db2Backend(OracleBackend):
     """IBM Db2 12.1.x backend via Oracle Compatibility Mode.
 
@@ -3983,6 +4084,7 @@ class Db2Backend(OracleBackend):
         self._sessions_repo = Db2SessionsRepository()
         self._consultations_repo = Db2ConsultationsRepository()
         self._audit_chain_repo = Db2AuditChainRepository()
+        self._acl_repo = Db2AclRepository()
         # Startup registry-probe state, populated lazily by ``open()``.
         # ``None`` means "not yet probed"; otherwise stores the raw
         # registry value (``"YES"``, ``"NO"``, ``""``...) for the
@@ -3996,7 +4098,7 @@ class Db2Backend(OracleBackend):
 
     @property
     def capabilities(self) -> set[str]:
-        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state", "acl"}
 
     async def register_oauth_token(self, tx: Any, **kwargs: Any) -> Row:
         return await self._oauth_repo.register_oauth_token(tx, **kwargs)

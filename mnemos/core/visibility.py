@@ -20,6 +20,27 @@ from typing import List, NoReturn, Tuple
 
 from fastapi import HTTPException
 
+# Unix-style permission bits reused by the per-principal ACL escape hatch
+# (memory_acl.perm). read=4, write=2 — execute/1 is unused for memories.
+ACL_READ_BIT = 4
+ACL_WRITE_BIT = 2
+
+
+def acl_principals(user_id: str, group_ids: List[str]) -> list[str]:
+    """Typed principal set for a caller: 'user:<id>' plus 'group:<id>' each.
+
+    This is the set matched against ``memory_acl.principal`` in the read
+    predicate's EXISTS disjunct. Empty ids are dropped so an
+    unauthenticated caller (user_id == "") can never match a malformed
+    ``'user:'`` grant — grant validation forbids creating one, and this
+    is the matching-side backstop.
+    """
+    principals: list[str] = []
+    if user_id:
+        principals.append(f"user:{user_id}")
+    principals.extend(f"group:{g}" for g in group_ids if g)
+    return principals
+
 
 def handle_trigger_pgerror(exc: Exception) -> NoReturn:
     """Translate trigger-raised Postgres errors into API conflicts."""
@@ -63,6 +84,11 @@ def read_visibility_predicate(
       (extract Unix-style group bits via tens-digit; permission_mode
       = 700 has group bits = 0, so the row is owner-only even though
       the owner bit is readable).
+    - ``mnemos_acl_select``    → ``EXISTS (SELECT 1 FROM memory_acl …)``
+      the per-principal escape hatch: a row is also readable if it has
+      an ACL grant to any of the caller's principals
+      (``user:<id>``/``group:<id>``) carrying the read bit. This only
+      ever widens visibility on top of the mode bits.
 
     ``group_ids`` is sourced from ``UserContext.group_ids`` (resolved
     at auth time) rather than re-querying ``user_groups`` via EXISTS;
@@ -84,9 +110,13 @@ def read_visibility_predicate(
         f" OR ((({p}permission_mode / 10) % 10) >= 4 "
         f"AND {p}group_id IS NOT NULL "
         f"AND {p}group_id = ANY(${n + 1}::text[]))"
+        f" OR EXISTS (SELECT 1 FROM memory_acl macl "
+        f"WHERE macl.memory_id = {p}id "
+        f"AND macl.principal = ANY(${n + 2}::text[]) "
+        f"AND (macl.perm & {ACL_READ_BIT}) <> 0)"
         ")"
     )
-    return clause, [user_id, list(group_ids)]
+    return clause, [user_id, list(group_ids), acl_principals(user_id, group_ids)]
 
 
 def version_visibility_predicate(

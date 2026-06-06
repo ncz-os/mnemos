@@ -53,6 +53,7 @@ from mnemos.persistence.base import (
     WebhookRepository,
 )
 from mnemos.persistence.types import MEMORY_COLS as _MEMORY_COLS, Row
+from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core import webhook_constants
 
@@ -116,6 +117,7 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v6_2_category_decay_sqlite.sql",
     "0038_oauth_sessions_consultations.sql",
     "0039_subscription_plan_current_limits.sql",
+    "0043_memory_acl.sql",
 ]
 
 
@@ -240,6 +242,9 @@ def _read_visibility_clause(
         params.extend(group_ids)
     else:
         group_clause = "0"
+    acl_clause = _acl_exists_clause(
+        acl_principals(user.user_id, group_ids), params, table_alias=table_alias
+    )
     return (
         "("
         f"{p}owner_id = ?"
@@ -247,7 +252,33 @@ def _read_visibility_clause(
         f" OR ({p}permission_mode % 10) >= 4"
         f" OR ((({p}permission_mode / 10) % 10) >= 4 "
         f"AND {p}group_id IS NOT NULL AND {group_clause})"
+        f"{acl_clause}"
         ")"
+    )
+
+
+def _acl_exists_clause(
+    principals: Sequence[str],
+    params: list[Any],
+    *,
+    table_alias: str = "",
+) -> str:
+    """SQLite per-principal ACL read disjunct (qmark style).
+
+    Returns a leading-``" OR EXISTS (…)"`` fragment when ``principals``
+    is non-empty (appending the principal binds to ``params`` in
+    placeholder order), or ``""`` when there is nothing to match — an
+    unauthenticated caller with no groups can never satisfy an ACL.
+    """
+    if not principals:
+        return ""
+    p = f"{table_alias}." if table_alias else ""
+    params.extend(principals)
+    return (
+        f" OR EXISTS (SELECT 1 FROM memory_acl macl "
+        f"WHERE macl.memory_id = {p}id "
+        f"AND macl.principal IN ({_placeholders(principals)}) "
+        f"AND (macl.perm & {ACL_READ_BIT}) <> 0)"
     )
 
 
@@ -332,6 +363,9 @@ def _render_sqlite_visibility(
         params.extend(group_ids)
     else:
         group_clause = "0"
+    acl_clause = _acl_exists_clause(
+        acl_principals(user_id, group_ids), params, table_alias=table_alias
+    )
     clause = (
         "("
         f"{p}owner_id = ?"
@@ -339,6 +373,7 @@ def _render_sqlite_visibility(
         f" OR ({p}permission_mode % 10) >= 4"
         f" OR ((({p}permission_mode / 10) % 10) >= 4 "
         f"AND {p}group_id IS NOT NULL AND {group_clause})"
+        f"{acl_clause}"
         ")"
     )
     clause = f"{clause} AND {p}namespace = ?"

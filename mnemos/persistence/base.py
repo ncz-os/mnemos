@@ -1317,6 +1317,84 @@ class AuditChainRepository(ABC):
         return result
 
 
+class AclRepository(ABC):
+    """Per-principal memory ACL escape hatch — the ``memory_acl`` table.
+
+    A grant widens *read* visibility on top of a memory's own UNIX mode
+    bits: it lets a second group or a named user see a memory they would
+    not otherwise reach. The read predicate (see
+    ``mnemos.core.visibility`` / the per-backend renderers) honors these
+    rows via an EXISTS disjunct on every multi-user backend. This
+    repository is the *management* surface for those rows.
+
+    ``principal`` is a typed string ``'user:<id>'`` or ``'group:<id>'``;
+    ``perm`` is a Unix-style bitmask (read=4, write=2). Only multi-user
+    backends advertise ``ACL_CAPABILITY`` — SQLite (single-user laptop
+    tier) omits it and the route degrades to 503.
+
+    Authorization (who may grant/revoke) is enforced at the route layer,
+    not here: the SQL contract is principal-agnostic so callers stay
+    responsible for the owner/root/group-admin gate.
+    """
+
+    @abstractmethod
+    async def grant_acl(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        principal: str,
+        perm: int,
+        granted_by: str | None,
+    ) -> Row:
+        """Insert or update a grant. Upserts on (memory_id, principal).
+
+        Returns the resulting row. Implementations MUST treat a repeat
+        grant to the same principal as an idempotent update of ``perm``
+        / ``granted_by`` (ON CONFLICT / MERGE), never a duplicate-key
+        error.
+        """
+        ...
+
+    @abstractmethod
+    async def revoke_acl(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        principal: str,
+    ) -> bool:
+        """Delete a grant. Returns True if a row was removed, else False
+        (so the route can 404 a revoke of a non-existent grant)."""
+        ...
+
+    @abstractmethod
+    async def list_acl(self, tx: Transaction, memory_id: str) -> list[Row]:
+        """Return all grants for ``memory_id`` ordered by principal.
+
+        Rows carry ``principal``, ``perm``, ``granted_by``, and the
+        creation timestamp. Returns ``[]`` when the memory has no
+        grants (the common case)."""
+        ...
+
+    @abstractmethod
+    async def is_group_admin(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> bool:
+        """True if ``user_id`` is a delegated admin of ``group_id``.
+
+        Backs the group-admin tier of the ACL-management authz gate:
+        a non-owner who is ``is_admin`` of the memory's ``group_id`` may
+        grant/revoke on memories in that group. Reads
+        ``user_groups.is_admin`` for the (user, group) edge; returns
+        ``False`` when no membership row exists."""
+        ...
+
+
 class CompressionQueueRepository(ABC):
     """v3.1 distillation/compression work queue — backend-agnostic.
 
@@ -1473,6 +1551,7 @@ CapabilityName: TypeAlias = Literal[
     "federation",
     "audit",
     "state",
+    "acl",
 ]
 
 
@@ -1483,6 +1562,7 @@ CONSULTATIONS_CAPABILITY: CapabilityName = "consultations"
 FEDERATION_CAPABILITY: CapabilityName = "federation"
 AUDIT_CAPABILITY: CapabilityName = "audit"
 STATE_CAPABILITY: CapabilityName = "state"
+ACL_CAPABILITY: CapabilityName = "acl"
 ALL_CAPABILITIES: frozenset[CapabilityName] = frozenset(
     {
         CORE_CAPABILITY,
@@ -1492,6 +1572,7 @@ ALL_CAPABILITIES: frozenset[CapabilityName] = frozenset(
         FEDERATION_CAPABILITY,
         AUDIT_CAPABILITY,
         STATE_CAPABILITY,
+        ACL_CAPABILITY,
     }
 )
 
@@ -1761,6 +1842,21 @@ class StatePersistence(PersistenceCapabilityBase, Protocol):
     def state_kv(self) -> StateRepository: ...
 
 
+@runtime_checkable
+class AclPersistence(PersistenceCapabilityBase, Protocol):
+    """Per-principal memory ACL grant/revoke/list persistence.
+
+    Advertised only by multi-user backends (Postgres/Oracle/Db2);
+    single-user SQLite omits ``ACL_CAPABILITY`` so the management
+    routes degrade to 503 there.
+    """
+
+    _supports_acl_persistence: Literal[True]
+
+    @property
+    def acl(self) -> AclRepository: ...
+
+
 PersistenceBackend: TypeAlias = Union[
     CorePersistence,
     OAuthPersistence,
@@ -1769,6 +1865,7 @@ PersistenceBackend: TypeAlias = Union[
     FederationPersistence,
     AuditPersistence,
     StatePersistence,
+    AclPersistence,
 ]
 
 
