@@ -83,6 +83,7 @@ EXPECTED_MIGRATIONS = [
     "0038_oauth_sessions_consultations.sql",
     "0039_knemon_dispatch_rule_refresh.sql",
     "0039_subscription_plan_current_limits.sql",
+    "0043_memory_acl.sql",
 ]
 
 EXPECTED_SQLITE_MIGRATIONS = [
@@ -140,6 +141,7 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "migrations_v6_2_category_decay_sqlite.sql",
     "0038_oauth_sessions_consultations.sql",
     "0039_subscription_plan_current_limits.sql",
+    "0043_memory_acl.sql",
 ]
 
 
