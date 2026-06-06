@@ -16,12 +16,14 @@ from fastapi import HTTPException
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext
 from mnemos.persistence.base import (
+    ACL_CAPABILITY,
     AUDIT_CAPABILITY,
     CONSULTATIONS_CAPABILITY,
     FEDERATION_CAPABILITY,
     OAUTH_CAPABILITY,
     SESSIONS_CAPABILITY,
     STATE_CAPABILITY,
+    AclPersistence,
     AuditPersistence,
     BackendCapabilityMissing,
     ConsultationsPersistence,
@@ -97,6 +99,13 @@ def require_state_backend():
     backend = require_backend_capability(backend_or_503(), STATE_CAPABILITY)
     if not isinstance(backend, StatePersistence) and not hasattr(backend, "state_kv"):
         raise _capability_503(STATE_CAPABILITY, backend)
+    return backend
+
+
+def require_acl_backend():
+    backend = require_backend_capability(backend_or_503(), ACL_CAPABILITY)
+    if not isinstance(backend, AclPersistence) and not hasattr(backend, "acl"):
+        raise _capability_503(ACL_CAPABILITY, backend)
     return backend
 
 
@@ -192,6 +201,7 @@ __all__ = [
     "backend_or_503",
     "capability_exception_to_503",
     "maybe_set_pg_rls",
+    "require_acl_backend",
     "require_audit_backend",
     "require_backend_capability",
     "require_consultations_backend",
