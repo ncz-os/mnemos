@@ -33,6 +33,7 @@ from mnemos.core.visibility import (
 from mnemos.core import eligibility as _eligibility
 from mnemos.persistence.base import (
     POSTGRES_CAPABILITY_DETAILS,
+    AclRepository,
     AuditChainRepository,
     BranchRepository,
     CompressionQueueRepository,
@@ -2617,6 +2618,66 @@ class PostgresOAuthRepository(OAuthRepository):
         )
 
 
+class PostgresAclRepository(AclRepository):
+    async def grant_acl(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        principal: str,
+        perm: int,
+        granted_by: str | None,
+    ) -> Row:
+        conn = _postgres_tx(tx).conn
+        return await conn.fetchrow(
+            "INSERT INTO memory_acl (memory_id, principal, perm, granted_by) "
+            "VALUES ($1, $2, $3, $4) "
+            "ON CONFLICT (memory_id, principal) DO UPDATE "
+            "SET perm = EXCLUDED.perm, granted_by = EXCLUDED.granted_by "
+            "RETURNING memory_id, principal, perm, granted_by, created_at",
+            memory_id,
+            principal,
+            perm,
+            granted_by,
+        )
+
+    async def revoke_acl(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        principal: str,
+    ) -> bool:
+        status = await _postgres_tx(tx).conn.execute(
+            "DELETE FROM memory_acl WHERE memory_id = $1 AND principal = $2",
+            memory_id,
+            principal,
+        )
+        return status.upper().startswith("DELETE") and not status.endswith(" 0")
+
+    async def list_acl(self, tx: Transaction, memory_id: str) -> list[Row]:
+        return await _postgres_tx(tx).conn.fetch(
+            "SELECT memory_id, principal, perm, granted_by, created_at "
+            "FROM memory_acl WHERE memory_id = $1 ORDER BY principal",
+            memory_id,
+        )
+
+    async def is_group_admin(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        group_id: str,
+    ) -> bool:
+        row = await _postgres_tx(tx).conn.fetchrow(
+            "SELECT 1 FROM user_groups "
+            "WHERE user_id = $1 AND group_id = $2 AND is_admin = TRUE",
+            user_id,
+            group_id,
+        )
+        return row is not None
+
+
 class PostgresSessionsRepository(SessionsRepository):
     async def create_session(
         self,
@@ -4007,6 +4068,7 @@ class PostgresBackend:
         self._federation = PostgresFederationRepository()
         self._state_kv = PostgresStateRepository()
         self._audit_chain = PostgresAuditChainRepository()
+        self._acl = PostgresAclRepository()
         self._closed = False
 
     @property
@@ -4015,7 +4077,7 @@ class PostgresBackend:
 
     @property
     def capabilities(self) -> set[str]:
-        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state"}
+        return {"core", "oauth", "sessions", "consultations", "federation", "audit", "state", "acl"}
 
     @property
     def capability_details(self) -> set[str]:
@@ -4312,6 +4374,10 @@ class PostgresBackend:
     @property
     def sessions(self) -> SessionsRepository:
         return self._sessions
+
+    @property
+    def acl(self) -> AclRepository:
+        return self._acl
 
     @property
     def consultations(self) -> ConsultationsRepository:
