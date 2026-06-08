@@ -1,4 +1,4 @@
--- 0041_model_registry_pricing.sql
+-- 0044_model_registry_pricing.sql
 -- Extend model_registry with price_in/price_out/price_cached columns sourced
 -- from llm_provider_registry.json (cost_in_per_m, cost_out_per_m, cache_hit_in_per_m).
 -- Adds price_history table for audit trail of pricing changes.
