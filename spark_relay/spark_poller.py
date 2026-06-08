@@ -174,6 +174,15 @@ class OpenAIChatExecutor:
         import requests
 
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        # Request a LARGE output budget. The agentic flow asks the model to
+        # return the COMPLETE new content of each changed file; with no
+        # max_tokens the provider default (often ~4k) truncates big files
+        # before the closing ===END=== marker, so _extract_file_blocks finds
+        # nothing and the job fails "no applicable file changes" — even though
+        # the model produced correct output (observed 2026-06-08: claude-opus
+        # truncated mid-_entity_match.py on 3 riskyeats jobs). 32k covers any
+        # single source file; cap it under the model's context window.
+        max_out = int(os.environ.get("SPARK_MAX_OUTPUT_TOKENS", "32000"))
         resp = requests.post(
             f"{self.base}/chat/completions",
             headers=headers,
@@ -183,6 +192,7 @@ class OpenAIChatExecutor:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
+                "max_tokens": max_out,
             },
             timeout=timeout or self.timeout,
         )
