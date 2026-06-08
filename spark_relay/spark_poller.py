@@ -250,29 +250,88 @@ class AgenticRepoExecutor:
             clone_url = self._credentialed_url(repo_url)
             self._git(["clone", "--depth", "1", clone_url, str(clone_dir)], cwd=Path(workdir))
             tree = self._repo_tree(clone_dir)
-            named_files = self._named_file_context(clone_dir, self._job_text(job))
-            model_text = self._request_diff(job, tree, named_files)
-            diff = self._extract_diff(model_text)
-            if not diff:
+            # Full-file replacement flow (2026-06-06). The previous unified-diff
+            # flow was diff-blind: the model only ever saw the repo tree plus a
+            # few excerpts, then had to emit byte-exact context hunks — every
+            # relayed job failed `git apply --check` (fabricated index hashes,
+            # corrupt patches), retries included. Instead: (1) the model picks
+            # the files it needs, (2) we feed it their FULL content, (3) it
+            # returns complete replacement files, (4) git computes the real
+            # diff from the written tree.
+            wanted = self._request_file_list(job, tree)
+            file_ctx = self._full_files_context(clone_dir, wanted)
+            retries = int(os.environ.get("SPARK_DIFF_RETRIES", "2"))
+            model_text = ""
+            feedback = ""
+            changes: dict[str, str | None] = {}
+            for _attempt in range(retries + 1):
+                model_text = self._request_changes(job, tree, file_ctx, feedback=feedback)
+                changes = self._extract_file_blocks(model_text)
+                if not changes:
+                    feedback = (
+                        "your previous reply contained no valid ===FILE: path=== ... ===END=== "
+                        "blocks; output the COMPLETE new content of every file you change"
+                    )
+                    continue
+                # Reset any prior attempt's writes FIRST — the guards below
+                # must compare against pristine HEAD, not a previous attempt's
+                # already-mangled tree (reset used to run after the truncation
+                # check, so attempt 2 measured against attempt 1's output).
+                self._git(["checkout", "--", "."], cwd=clone_dir, check=False)
+                self._git(["clean", "-fdq"], cwd=clone_dir, check=False)
+                # Truncation guard (2026-06-06): a "replacement" much smaller
+                # than the original is an output-budget overflow, not an edit —
+                # stonkmode.py went 679 -> 133 lines and lost 546 lines of
+                # working code. Reject before writing anything.
+                trunc = self._truncation_violations(clone_dir, changes)
+                if trunc:
+                    feedback = (
+                        "you TRUNCATED these files (returned far less than the original "
+                        f"content): {'; '.join(trunc)}. Output the COMPLETE new file "
+                        "content for every file you change — every original line that "
+                        "you are not deliberately changing must be preserved verbatim."
+                    )
+                    continue
+                # Interface guard (2026-06-06): replacements must not silently
+                # drop top-level def/class names — one patch deleted
+                # bad_actors.load(), the module's import entrypoint, while
+                # passing the size ratio.
+                dropped = self._dropped_symbols(clone_dir, changes)
+                if dropped:
+                    feedback = (
+                        "your replacement files REMOVED these top-level functions/classes "
+                        f"that other code may import: {'; '.join(dropped)}. Keep every "
+                        "existing top-level def/class (you may modify their bodies) and "
+                        "output the COMPLETE corrected files."
+                    )
+                    continue
+                bad = self._write_file_changes(clone_dir, changes)
+                if bad:
+                    return {
+                        "status": "needs-review",
+                        "error": f"unsafe paths rejected: {bad}",
+                        "suggestion": model_text,
+                        "repo": repo_url,
+                    }
+                # Compile gate (2026-06-06): replaced .py files must at least
+                # parse — the same incident shipped two syntax errors.
+                pyerr = self._compile_failures(clone_dir, changes)
+                if pyerr:
+                    feedback = (
+                        "your replacement files have Python syntax errors: "
+                        f"{'; '.join(pyerr)}. Output corrected COMPLETE file content."
+                    )
+                    continue
+                break
+            else:
                 return {
                     "status": "needs-review",
-                    "error": "model diff did not apply cleanly",
+                    "error": "model produced no applicable file changes",
+                    "attempts": retries + 1,
+                    "last_feedback": feedback[:500],
                     "suggestion": model_text,
                     "repo": repo_url,
                 }
-
-            diff_path = Path(workdir) / "spark.diff"
-            diff_path.write_text(diff, encoding="utf-8")
-            check = self._git(["apply", "--check", str(diff_path)], cwd=clone_dir, check=False)
-            if check.returncode != 0:
-                return {
-                    "status": "needs-review",
-                    "error": "model diff did not apply cleanly",
-                    "suggestion": model_text,
-                    "repo": repo_url,
-                }
-
-            self._git(["apply", str(diff_path)], cwd=clone_dir)
             self._git(["config", "user.name", os.environ.get("SPARK_GIT_USER_NAME", "Spark Nemotron")], cwd=clone_dir)
             self._git(
                 ["config", "user.email", os.environ.get("SPARK_GIT_USER_EMAIL", "spark-nemotron@localhost")],
@@ -285,7 +344,7 @@ class AgenticRepoExecutor:
             if not changed:
                 return {
                     "status": "needs-review",
-                    "error": "model diff did not apply cleanly",
+                    "error": "model file replacements were identical to existing content",
                     "suggestion": model_text,
                     "repo": repo_url,
                 }
@@ -310,24 +369,185 @@ class AgenticRepoExecutor:
         except Exception as exc:  # noqa: BLE001
             return f"chat suggestion failed: {exc}"
 
-    def _request_diff(self, job: dict, tree: str, named_files: str) -> str:
-        task = self._job_text(job)
+    def _agentic_model(self) -> str | None:
+        return os.environ.get("SPARK_AGENTIC_MODEL") or None
+
+    def _request_file_list(self, job: dict, tree: str) -> list[str]:
+        """Phase 1: the model names the files it needs to read/change."""
+        max_files = int(os.environ.get("SPARK_MAX_CONTEXT_FILES", "8"))
         system = (
-            "You are a repository editing agent. Output ONLY a single unified git diff "
-            "that is compatible with git apply -p1. Do not include prose or markdown fences."
+            "You are a repository editing agent planning a change. Reply with ONLY "
+            "the repo-relative paths of the files you need to read or modify, one "
+            f"per line, at most {max_files}. No prose, no fences."
+        )
+        user = f"Repo tree:\n{tree}\n\nTask:\n{self._job_text(job)}"
+        out = self.chat.complete(
+            system=system, user=user, model=self._agentic_model(), timeout=self.model_timeout
+        )
+        paths = []
+        for line in out.splitlines():
+            line = line.strip().strip("`").lstrip("-* ").strip()
+            if line and "/" in line or (line and "." in line):
+                paths.append(line)
+        return paths[:max_files]
+
+    def _full_files_context(self, clone_dir: Path, paths: list[str]) -> str:
+        """Phase 2 input: FULL content of the requested files (size-capped)."""
+        cap = int(os.environ.get("SPARK_FILE_CAP", "40000"))
+        parts = []
+        for rel in paths:
+            p = (clone_dir / rel).resolve()
+            try:
+                p.relative_to(clone_dir.resolve())
+            except ValueError:
+                continue  # traversal attempt — skip
+            if not p.is_file():
+                parts.append(f"===FILE: {rel}===\n(does not exist — you may create it)\n===END===")
+                continue
+            try:
+                body = p.read_text(encoding="utf-8", errors="replace")[:cap]
+            except Exception:  # noqa: BLE001
+                continue
+            parts.append(f"===FILE: {rel}===\n{body}\n===END===")
+        return "\n\n".join(parts)
+
+    def _request_changes(self, job: dict, tree: str, file_ctx: str, *, feedback: str = "") -> str:
+        """Phase 2: the model returns COMPLETE replacement files."""
+        system = (
+            "You are a repository editing agent. You are given the full current "
+            "content of the relevant files. Implement the task by outputting the "
+            "COMPLETE new content of every file you change or create, using exactly "
+            "this framing for each file:\n"
+            "===FILE: relative/path===\n<entire new file content>\n===END===\n"
+            "To delete a file output: ===DELETE: relative/path===\n"
+            "Output ONLY these blocks. No prose, no markdown fences, no diffs."
         )
         user = (
             f"Repo tree:\n{tree}\n\n"
-            f"Relevant file excerpts:\n{named_files or '(none)'}\n\n"
-            f"Task:\n{task}\n\n"
-            "Output ONLY the unified git diff."
+            f"Current file contents:\n{file_ctx or '(no files selected)'}\n\n"
+            f"Task:\n{self._job_text(job)}"
         )
-        return self.chat.complete(system=system, user=user, timeout=self.model_timeout)
+        if feedback:
+            user += f"\n\nCorrection: {feedback}"
+        return self.chat.complete(
+            system=system, user=user, model=self._agentic_model(), timeout=self.model_timeout
+        )
+
+    # Tolerant framing (2026-06-06): models drop the trailing === on the FILE
+    # header (an 8KB perfectly-good module was discarded as "no applicable
+    # file changes"). Accept optional leading whitespace, optional trailing
+    # ===, and whitespace around markers.
+    _FILE_BLOCK_RE = re.compile(
+        r"^[ \t]*===[ \t]*FILE:[ \t]*(?P<path>[^\n=]+?)[ \t]*(?:===)?[ \t]*\n"
+        r"(?P<body>.*?)\n?[ \t]*===[ \t]*END[ \t]*===",
+        re.S | re.M,
+    )
+    _DELETE_BLOCK_RE = re.compile(
+        r"^[ \t]*===[ \t]*DELETE:[ \t]*(?P<path>[^\n=]+?)[ \t]*(?:===)?[ \t]*$", re.M
+    )
+
+    def _extract_file_blocks(self, text: str) -> dict[str, str | None]:
+        """Parse model output into {relpath: new_content | None-to-delete}."""
+        changes: dict[str, str | None] = {}
+        for m in self._FILE_BLOCK_RE.finditer(text or ""):
+            changes[m.group("path").strip()] = m.group("body")
+        for m in self._DELETE_BLOCK_RE.finditer(text or ""):
+            changes[m.group("path").strip()] = None
+        return changes
+
+    def _truncation_violations(self, clone_dir: Path, changes: dict[str, str | None]) -> list[str]:
+        """Replacements for EXISTING files must keep >= SPARK_MIN_REPLACEMENT_RATIO
+        of the original line count (default 0.6). Deletions and new files pass."""
+        ratio = float(os.environ.get("SPARK_MIN_REPLACEMENT_RATIO", "0.6"))
+        out = []
+        for rel, body in changes.items():
+            if body is None:
+                continue  # explicit delete
+            p = clone_dir / rel
+            if not p.is_file():
+                continue  # new file
+            try:
+                orig_lines = p.read_text(encoding="utf-8", errors="replace").count("\n") or 1
+            except Exception:  # noqa: BLE001
+                continue
+            new_lines = body.count("\n") or 1
+            if orig_lines >= 40 and new_lines < orig_lines * ratio:
+                out.append(f"{rel} (original {orig_lines} lines, you returned {new_lines})")
+        return out
+
+    _TOPLEVEL_DEF_RE = re.compile(r"^(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
+
+    def _dropped_symbols(self, clone_dir: Path, changes: dict[str, str | None]) -> list[str]:
+        """Top-level def/class names present in the original .py but absent
+        from its replacement. Deletions and new files pass."""
+        out = []
+        for rel, body in changes.items():
+            if body is None or not rel.endswith(".py"):
+                continue
+            p = clone_dir / rel
+            if not p.is_file():
+                continue
+            try:
+                orig = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:  # noqa: BLE001
+                continue
+            old_syms = set(self._TOPLEVEL_DEF_RE.findall(orig))
+            new_syms = set(self._TOPLEVEL_DEF_RE.findall(body))
+            missing = sorted(old_syms - new_syms)
+            if missing:
+                out.append(f"{rel}: {', '.join(missing[:6])}")
+        return out
+
+    def _compile_failures(self, clone_dir: Path, changes: dict[str, str | None]) -> list[str]:
+        """py_compile every replaced/created .py file; return error summaries."""
+        out = []
+        for rel, body in changes.items():
+            if body is None or not rel.endswith(".py"):
+                continue
+            p = clone_dir / rel
+            if not p.is_file():
+                continue
+            proc = subprocess.run(
+                ["python3", "-m", "py_compile", str(p)],
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout).strip().splitlines()
+                out.append(f"{rel}: {err[-1][:200] if err else 'compile failed'}")
+        return out
+
+    def _write_file_changes(self, clone_dir: Path, changes: dict[str, str | None]) -> list[str]:
+        """Write replacements into the clone. Returns rejected (unsafe) paths."""
+        bad = []
+        root = clone_dir.resolve()
+        for rel, body in changes.items():
+            if rel.startswith(("/", "~")) or ".." in Path(rel).parts or rel.startswith(".git/"):
+                bad.append(rel)
+                continue
+            p = (clone_dir / rel).resolve()
+            try:
+                p.relative_to(root)
+            except ValueError:
+                bad.append(rel)
+                continue
+            if body is None:
+                p.unlink(missing_ok=True)
+            else:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                if not body.endswith("\n"):
+                    body += "\n"
+                p.write_text(body, encoding="utf-8")
+        return bad
 
     def _resolve_repo_url(self, job: dict) -> str | None:
+        # A repo: hint that doesn't resolve falls THROUGH to the kind map —
+        # the old early-return turned an unknown hint into "no repo mapping"
+        # even when the kind was mapped (2026-06-06).
         hint = REPO_HINT_RE.search(self._job_text(job))
         if hint:
-            return self._repo_hint_to_url(hint.group("repo"))
+            url = self._repo_hint_to_url(hint.group("repo"))
+            if url:
+                return url
         kind = str(job.get("kind") or "")
         for prefixes, url in KIND_WORKSPACE_MAP:
             if kind.startswith(prefixes):
@@ -335,13 +555,18 @@ class AgenticRepoExecutor:
         return None
 
     def _repo_hint_to_url(self, repo: str) -> str | None:
-        # Spark scope: open source + NVIDIA-internal only. Commercial
-        # argonautsystems projects (ic-engine, riskyeats, florida-licenses) are
-        # intentionally excluded and must not be cloned/committed from Spark.
+        # Spark scope (operator override 2026-06-06): Spark may work ANY fleet
+        # project — its NGC pool is large and non-metered. The previous
+        # "open source + NVIDIA-internal only" exclusion of argonautsystems
+        # projects is lifted.
         aliases = {
             "mnemos": "https://gitlab.com/mnemos-os/mnemos.git",
             "zeroclaw": "https://gitlab.com/nclawzero/zeroclaw.git",
             "ncz-installer": "https://gitlab.com/nclawzero/ncz-installer.git",
+            "riskyeats": "https://gitlab.com/perlowja/riskyeats.git",
+            "ic-engine": "https://gitlab.com/argonautsystems/ic-engine.git",
+            "investorclaw-enterprise": "https://gitlab.com/argonautsystems/InvestorClaw.git",
+            "florida-licenses": "https://gitlab.com/argonautsystems/florida-licenses.git",
             "fleet-ops": None,
         }
         # Optional operator-managed extra allowlist:
@@ -394,7 +619,7 @@ class AgenticRepoExecutor:
             o.strip()
             for o in os.environ.get(
                 "SPARK_TOKEN_OWNERS",
-                "perlowja,jperlow,nclawzero,ncz-os,mnemos-os",
+                "perlowja,jperlow,nclawzero,ncz-os,mnemos-os,argonautsystems",
             ).split(",")
             if o.strip()
         }
@@ -541,8 +766,16 @@ def run_once(relay: RelayClient, key: bytes, executor: Executor, *, owner: str |
         if not relay.claim(uuid, owner):
             continue  # another live worker owns it (or lease not yet expired)
         try:
+            raw = relay.get_pending(uuid)
+        except Exception as exc:  # noqa: BLE001 — stale claim marker for a
+            # pending object that was already consumed/deleted (GCS 404).
+            # Previously this propagated and KILLED the poller process
+            # (2026-06-06); skip and keep sweeping.
+            log.warning("pending object for %s unreadable (%s) — skipping", uuid, exc)
+            continue
+        try:
             job = relay_crypto.open_blob(
-                relay.get_pending(uuid), key, aad=relay_crypto.aad_for("pending", uuid)
+                raw, key, aad=relay_crypto.aad_for("pending", uuid)
             )
         except relay_crypto.RelayCryptoError as exc:
             # Don't strand the claim: record a durable terminal failure so the
