@@ -28,6 +28,9 @@ _CLAIMED = "claimed/"
 # states for the same uuid. The done-vs-failed distinction lives in the sealed
 # payload's "status" field.
 _TERMINAL = "terminal/"
+# Out-of-band status objects (e.g. GPU telemetry). Overwrite-allowed (latest
+# wins), unlike the create-only terminal/claimed objects.
+_STATUS = "status/"
 _SUFFIX = ".json.enc"
 
 # A claim older than this (seconds) is considered abandoned (worker died
@@ -152,6 +155,20 @@ class RelayClient:
 
     def get_terminal(self, uuid: str) -> bytes:
         return self._bucket.blob(f"{_TERMINAL}{uuid}{_SUFFIX}").download_as_bytes()
+
+    # ---- out-of-band status (GPU telemetry etc.) ------------------------
+    def put_status(self, name: str, sealed: bytes) -> None:
+        """Write/overwrite a status object (latest wins)."""
+        self._bucket.blob(f"{_STATUS}{name}{_SUFFIX}").upload_from_string(
+            sealed, content_type="application/octet-stream"
+        )
+
+    def get_status(self, name: str) -> bytes | None:
+        """Read a status object, or None if absent."""
+        try:
+            return self._bucket.blob(f"{_STATUS}{name}{_SUFFIX}").download_as_bytes()
+        except self._NotFound:
+            return None
 
     def purge(self, uuid: str) -> None:
         """Delete every object for a job across all prefixes. Idempotent."""
