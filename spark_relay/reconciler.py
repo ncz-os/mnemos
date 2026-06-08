@@ -1,10 +1,12 @@
-"""PYTHIA-side reconciler: terminal/ -> open -> hive terminal status + purge.
+"""PYTHIA-side reconciler: terminal/ -> open -> land patch -> hive status + purge.
 
 Polls the relay bucket's single ``terminal/`` prefix, decrypts each sealed
-object with the shared E2EE key, branches on its ``status`` (done/failed),
-reports terminal status back to the hive (with ``commit_sha`` so ARGONAS can fan
-out by sha), then purges the job's objects. Decoupled from the Spark; runs
-whenever.
+object with the shared E2EE key, branches on its ``status`` (done/failed/
+needs-review), LANDS any needs-review patch as a ``hive/spark-<jobid>`` review
+branch on the canonical repository (the 2026-06-07 orphan incident: 73 patches
+were trapped inside done-marked job results because no landing step existed),
+reports the job's terminal status back to the hive, then purges the job's
+objects. Decoupled from the Spark; runs whenever.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import time
 
 from . import relay_crypto
 from .bridge_common import HiveClient, backoff_sleep
+from .lander import PatchLander, PermanentLandingError, TransientLandingError
 from .relay_client import RelayClient
 
 log = logging.getLogger("spark_relay.reconciler")
@@ -28,7 +31,29 @@ def _json_size_bytes(value: object) -> int:
     return len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
 
 
-def _reconcile_one(hive: HiveClient, relay: RelayClient, key: bytes, uuid: str) -> bool:
+def _shrink_result(result: dict) -> dict:
+    """Drop the largest payload fields until the result fits MAX_RESULT_BYTES.
+
+    Pre-lander this path replaced the WHOLE result with ``payload_too_large``,
+    destroying the patch. Now the patch (a) usually already landed as a branch
+    and (b) is dropped field-by-field, keeping the routing/review metadata.
+    """
+    for field in ("patch", "suggestion", "metrics", "files_changed"):
+        if _json_size_bytes(result) <= MAX_RESULT_BYTES:
+            return result
+        if field in result:
+            result[f"{field}_dropped"] = "payload_too_large"
+            del result[field]
+    if _json_size_bytes(result) > MAX_RESULT_BYTES:
+        keep = {k: result.get(k) for k in ("needs_review", "commit_sha", "branch", "landed_branch", "landed_repo", "landed_sha", "landing", "landing_error") if k in result}
+        keep["error"] = "payload_too_large"
+        return keep
+    return result
+
+
+def _reconcile_one(
+    hive: HiveClient, relay: RelayClient, key: bytes, uuid: str, lander: PatchLander
+) -> bool:
     """Report one terminal job to the hive and purge ONLY on a durable PATCH.
 
     Returns True if reconciled (and purged); False if the hive PATCH did not
@@ -56,20 +81,39 @@ def _reconcile_one(hive: HiveClient, relay: RelayClient, key: bytes, uuid: str) 
     else:
         # Pass the FULL Spark terminal payload through to the hive result so the
         # agentic executor's patch / suggestion / needs_review / files_changed
-        # survive the round-trip (the hive has no needs-review status, so flag it
-        # in the result). Strip only the routing field.
+        # survive the round-trip. Strip only the routing field.
         result = {k: v for k, v in payload.items() if k != "claimant_urn"}
         result["needs_review"] = (status == "needs-review") or bool(payload.get("needs_review"))
-        if _json_size_bytes(result) > MAX_RESULT_BYTES:
-            result = {"error": "payload_too_large"}
-            ok = hive.patch_status(uuid, "failed", result=result, claimed_by=claimant)
+
+        # LANDER (2026-06-08): a needs-review payload with a patch must land as
+        # a review branch BEFORE the job is closed out — a patch that exists
+        # only inside a job result is an orphan (the 2026-06-07 incident).
+        if result["needs_review"] and payload.get("patch"):
+            try:
+                result.update(lander.land(payload, uuid))
+                # Surface the landed commit where the bus work-contract guard
+                # looks, so commit-mandatory jobs read as truthfully committed.
+                if payload.get("commit_sha"):
+                    result.setdefault("commits", [payload["commit_sha"]])
+            except TransientLandingError as exc:
+                log.warning("transient landing failure for %s — will retry: %s", uuid, exc)
+                return False
+            except PermanentLandingError as exc:
+                # Patch preserved in the result for manual landing; close out.
+                result["landing"] = "failed"
+                result["landing_error"] = str(exc)[:500]
+                log.error("permanent landing failure for %s: %s", uuid, exc)
+
+        result = _shrink_result(result)
+        # Prefer the hive's first-class needs-review status (reviewer timer
+        # watches it); older buses without it reject the PATCH — fall back to
+        # done + the needs_review flag in the result.
+        if result["needs_review"]:
+            ok = hive.patch_status(uuid, "needs-review", result=result, claimed_by=claimant)
+            if not ok:
+                ok = hive.patch_status(uuid, "done", result=result, claimed_by=claimant)
         else:
-            ok = hive.patch_status(
-                uuid,
-                "done",
-                result=result,
-                claimed_by=claimant,
-            )
+            ok = hive.patch_status(uuid, "done", result=result, claimed_by=claimant)
     if not ok:
         log.error("hive PATCH for %s failed — leaving bucket objects for retry", uuid)
         return False
@@ -78,11 +122,11 @@ def _reconcile_one(hive: HiveClient, relay: RelayClient, key: bytes, uuid: str) 
     return True
 
 
-def run_once(hive: HiveClient, relay: RelayClient, key: bytes) -> int:
+def run_once(hive: HiveClient, relay: RelayClient, key: bytes, lander: PatchLander) -> int:
     count = 0
     for uuid in relay.list_terminal():
         try:
-            if _reconcile_one(hive, relay, key, uuid):
+            if _reconcile_one(hive, relay, key, uuid, lander):
                 count += 1
         except relay_crypto.RelayCryptoError:
             log.exception("undecryptable %s — leaving for inspection", uuid)
@@ -107,17 +151,18 @@ def main() -> None:
         capabilities=["*"],
     )
     relay = RelayClient()
+    lander = PatchLander()
     hive.register()
 
     if args.once:
-        run_once(hive, relay, key)
+        run_once(hive, relay, key, lander)
         return
 
     attempt = 0
     while True:
         try:
             hive.heartbeat()  # stay 'online'
-            run_once(hive, relay, key)
+            run_once(hive, relay, key, lander)
             attempt = 0
             time.sleep(args.interval)
         except KeyboardInterrupt:
