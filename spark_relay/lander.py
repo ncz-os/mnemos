@@ -258,8 +258,10 @@ class PatchLander:
             )
             default = self._default_branch(clone)
             # Restore a pristine HEAD no matter what a previous (crashed/timed
-            # out) landing left behind: stale am state, dirty tracked files,
-            # stray untracked files.
+            # out) landing left behind: stale index.lock (safe to remove — the
+            # per-repo flock means no other LOCAL process is inside this clone),
+            # stale am state, dirty tracked files, stray untracked files.
+            (clone / ".git" / "index.lock").unlink(missing_ok=True)
             self._git(clone, ["am", "--abort"], check=False)
             self._git(clone, ["checkout", "-q", "--detach", f"origin/{default}"])
             self._git(clone, ["reset", "--hard", f"origin/{default}"], check=False)
@@ -450,7 +452,8 @@ class PatchLander:
                 f"git {args[0]} timed out after {self.git_timeout:.0f}s"
             )
         if check and proc.returncode != 0:
-            raise PermanentLandingError(
-                _redact_secrets(f"git {' '.join(args)} failed: {(proc.stderr or proc.stdout).strip()[-400:]}")
-            )
+            err = _redact_secrets((proc.stderr or proc.stdout).strip()[-400:])
+            # Classify even local-command failures: e.g. a stale index.lock or
+            # an interrupted transfer is retryable, not a permanent close-out.
+            raise _classify_git_failure(err)(f"git {' '.join(args)} failed: {err}")
         return proc

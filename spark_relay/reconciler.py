@@ -119,6 +119,15 @@ def _reconcile_one(
                 saved = lander.save_orphan_patch(payload, uuid)
                 if saved:
                     result["patch_saved"] = saved
+                elif _json_size_bytes(result) > MAX_RESULT_BYTES:
+                    # The patch won't fit in the hive result AND the disk copy
+                    # failed: purging the bucket now would destroy the only
+                    # remaining copy. Keep the bucket object and retry.
+                    log.error(
+                        "orphan save failed for %s and patch exceeds result cap — retaining bucket object",
+                        uuid,
+                    )
+                    return False
                 log.error("permanent landing failure for %s: %s", uuid, exc)
 
         result = _shrink_result(result)
