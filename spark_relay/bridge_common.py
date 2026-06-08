@@ -55,10 +55,12 @@ class HiveClient:
         self.model = model
         self._session = requests.Session()
 
-    def register(self) -> None:
+    def register(self, metadata: dict[str, Any] | None = None) -> None:
         """Register and ADOPT the server-assigned URN. The hive replaces the
         session segment with its own uuid; subsequent claim/patch must use the
-        returned URN or the agent reads as 'not registered'."""
+        returned URN or the agent reads as 'not registered'. ``metadata`` is
+        merged into the role tag (e.g. specs.gpus so /v1/hosts surfaces it)."""
+        meta = {"role": "spark-relay-bridge", **(metadata or {})}
         try:
             resp = self._session.post(
                 f"{self.base}/v1/agents/register",
@@ -71,7 +73,7 @@ class HiveClient:
                     "model": self.model,
                     "capabilities": self.capabilities,
                     "autonomy_level": "autonomous",
-                    "metadata": {"role": "spark-relay-bridge"},
+                    "metadata": meta,
                 },
                 timeout=_TIMEOUT,
             )
@@ -82,14 +84,19 @@ class HiveClient:
         except (requests.RequestException, ValueError) as exc:
             log.warning("hive register failed (non-fatal): %s", exc)
 
-    def heartbeat(self, status: str = "online") -> None:
+    def heartbeat(self, status: str = "online", metadata: dict[str, Any] | None = None) -> None:
         """Keep the agent active. The hive reaps agents to 'stale' after ~90s
         without a heartbeat, after which dequeue stops offering work — so the
-        loops must call this every iteration (interval < the stale window)."""
+        loops must call this every iteration (interval < the stale window).
+        ``metadata`` (e.g. {"load": {"gpus_runtime": [...]}}) is merged
+        server-side so /v1/hosts shows fresh GPU telemetry."""
+        body: dict[str, Any] = {"urn": self.urn, "status": status}
+        if metadata:
+            body["metadata"] = metadata
         try:
             self._session.post(
                 f"{self.base}/v1/agents/heartbeat",
-                json={"urn": self.urn, "status": status},
+                json=body,
                 timeout=_TIMEOUT,
             ).raise_for_status()
         except requests.RequestException as exc:
@@ -136,16 +143,35 @@ class HiveClient:
         403. The reconciler (a different agent than the enqueuer that claimed the
         job) passes the job's actual claimant; the enqueuer omits it and defaults
         to its own URN (it is the claimant)."""
+        code = self.patch_status_code(job_id, status, result=result, claimed_by=claimed_by)
+        return code is not None and 200 <= code < 300
+
+    def patch_status_code(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        result: dict[str, Any] | None = None,
+        claimed_by: str | None = None,
+    ) -> int | None:
+        """Like :meth:`patch_status` but returns the HTTP status code (or None
+        on a network-level failure) so callers can distinguish validation
+        rejections (4xx — e.g. a bus that doesn't know a status enum) from
+        transient transport errors that should be retried, not worked around."""
         body: dict[str, Any] = {"status": status, "claimed_by": claimed_by or self.urn}
         if result is not None:
             body["result"] = result
         try:
             resp = self._session.patch(f"{self.base}/v1/jobs/{job_id}", json=body, timeout=_TIMEOUT)
-            resp.raise_for_status()
-            return True
+            if resp.status_code >= 400:
+                log.error(
+                    "patch_status %s -> %s rejected %s: %s",
+                    job_id, status, resp.status_code, resp.text[:200],
+                )
+            return resp.status_code
         except requests.RequestException as exc:
             log.error("patch_status %s -> %s failed: %s", job_id, status, exc)
-            return False
+            return None
 
 
 def mnemos_search(query: str, limit: int = 6) -> list[dict[str, Any]]:

@@ -35,6 +35,7 @@ def build_payload(job: dict) -> dict:
     context = mnemos_search(prompt, limit=CONTEXT_LIMIT)
     return {
         "job_id": job["id"],
+        "kind": job.get("kind"),  # poller KIND_WORKSPACE_MAP needs it (was missing -> no repo mapping, 2026-06-06)
         "prompt": prompt,
         # No hardcoded model: the Spark executor picks (local GB10 coder primary,
         # NGC fallback). A submitter MAY pin one via the job's model field.
@@ -71,6 +72,30 @@ def run_once(hive: HiveClient, relay: RelayClient, key: bytes) -> int:
     return enqueued
 
 
+GPU_STATUS_NAME = SPARK_HOST + "-gpu"
+
+
+def read_gpu(relay: RelayClient, key: bytes) -> dict:
+    """Read the remote worker's GPU snapshot off the bucket (fail-soft)."""
+    try:
+        raw = relay.get_status(GPU_STATUS_NAME)
+        if not raw:
+            return {}
+        return relay_crypto.open_blob(raw, key, aad=relay_crypto.aad_for("status", GPU_STATUS_NAME))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("read_gpu failed: %s", exc)
+        return {}
+
+
+def gpu_metadata(relay: RelayClient, key: bytes) -> dict:
+    """Build agent metadata so /v1/hosts surfaces the remote GPU in the dashboard."""
+    snap = read_gpu(relay, key)
+    return {
+        "specs": {"gpus": snap.get("specs_gpus", []), "arch": "aarch64", "has_npu": False},
+        "load": {"gpus_runtime": snap.get("gpus_runtime", [])},
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Spark relay enqueuer (PYTHIA side)")
     ap.add_argument("--interval", type=float, default=15.0, help="poll seconds")
@@ -89,7 +114,7 @@ def main() -> None:
         model="qwen/qwen3-coder-480b-a35b-instruct",
     )
     relay = RelayClient()
-    hive.register()
+    hive.register(metadata=gpu_metadata(relay, key))
 
     if args.once:
         run_once(hive, relay, key)
@@ -98,7 +123,8 @@ def main() -> None:
     attempt = 0
     while True:
         try:
-            hive.heartbeat()  # stay 'online' so the hive keeps offering work
+            # heartbeat carries fresh remote GPU telemetry -> dashboard GPU panel
+            hive.heartbeat(metadata=gpu_metadata(relay, key))
             run_once(hive, relay, key)
             attempt = 0
             time.sleep(args.interval)
