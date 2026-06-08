@@ -90,28 +90,42 @@ def _reconcile_one(
         # only inside a job result is an orphan (the 2026-06-07 incident).
         if result["needs_review"] and payload.get("patch"):
             try:
-                result.update(lander.land(payload, uuid))
-                # Surface the landed commit where the bus work-contract guard
-                # looks, so commit-mandatory jobs read as truthfully committed.
-                if payload.get("commit_sha"):
-                    result.setdefault("commits", [payload["commit_sha"]])
+                landed = lander.land(payload, uuid)
+                result.update(landed)
+                # Surface the LANDED commit (git am re-hashes; the Spark-side
+                # sha never exists on the canonical remote) where the bus
+                # work-contract guard looks, so commit-mandatory jobs read as
+                # truthfully committed. Keep the Spark sha for traceability.
+                result["spark_commit_sha"] = payload.get("commit_sha")
+                result["commit_sha"] = landed["landed_sha"]
+                result["commits"] = [landed["landed_sha"]]
             except TransientLandingError as exc:
                 log.warning("transient landing failure for %s — will retry: %s", uuid, exc)
                 return False
             except PermanentLandingError as exc:
-                # Patch preserved in the result for manual landing; close out.
+                # Close out, but never lose the patch: keep it in the result
+                # AND save it durably on disk (the result copy may be dropped
+                # by the size cap below).
                 result["landing"] = "failed"
                 result["landing_error"] = str(exc)[:500]
+                saved = lander.save_orphan_patch(payload, uuid)
+                if saved:
+                    result["patch_saved"] = saved
                 log.error("permanent landing failure for %s: %s", uuid, exc)
 
         result = _shrink_result(result)
         # Prefer the hive's first-class needs-review status (reviewer timer
-        # watches it); older buses without it reject the PATCH — fall back to
-        # done + the needs_review flag in the result.
+        # watches it). Fall back to done + the needs_review result flag ONLY
+        # on an explicit validation rejection (4xx = bus doesn't know the
+        # enum); transient transport failures must retry, not double-PATCH.
         if result["needs_review"]:
-            ok = hive.patch_status(uuid, "needs-review", result=result, claimed_by=claimant)
-            if not ok:
+            code = hive.patch_status_code(uuid, "needs-review", result=result, claimed_by=claimant)
+            if code is not None and 200 <= code < 300:
+                ok = True
+            elif code is not None and 400 <= code < 500 and code != 403:
                 ok = hive.patch_status(uuid, "done", result=result, claimed_by=claimant)
+            else:
+                ok = False
         else:
             ok = hive.patch_status(uuid, "done", result=result, claimed_by=claimant)
     if not ok:
