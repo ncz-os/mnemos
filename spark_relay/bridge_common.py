@@ -55,10 +55,12 @@ class HiveClient:
         self.model = model
         self._session = requests.Session()
 
-    def register(self) -> None:
+    def register(self, metadata: dict[str, Any] | None = None) -> None:
         """Register and ADOPT the server-assigned URN. The hive replaces the
         session segment with its own uuid; subsequent claim/patch must use the
-        returned URN or the agent reads as 'not registered'."""
+        returned URN or the agent reads as 'not registered'. ``metadata`` is
+        merged into the role tag (e.g. specs.gpus so /v1/hosts surfaces it)."""
+        meta = {"role": "spark-relay-bridge", **(metadata or {})}
         try:
             resp = self._session.post(
                 f"{self.base}/v1/agents/register",
@@ -71,7 +73,7 @@ class HiveClient:
                     "model": self.model,
                     "capabilities": self.capabilities,
                     "autonomy_level": "autonomous",
-                    "metadata": {"role": "spark-relay-bridge"},
+                    "metadata": meta,
                 },
                 timeout=_TIMEOUT,
             )
@@ -82,14 +84,19 @@ class HiveClient:
         except (requests.RequestException, ValueError) as exc:
             log.warning("hive register failed (non-fatal): %s", exc)
 
-    def heartbeat(self, status: str = "online") -> None:
+    def heartbeat(self, status: str = "online", metadata: dict[str, Any] | None = None) -> None:
         """Keep the agent active. The hive reaps agents to 'stale' after ~90s
         without a heartbeat, after which dequeue stops offering work — so the
-        loops must call this every iteration (interval < the stale window)."""
+        loops must call this every iteration (interval < the stale window).
+        ``metadata`` (e.g. {"load": {"gpus_runtime": [...]}}) is merged
+        server-side so /v1/hosts shows fresh GPU telemetry."""
+        body: dict[str, Any] = {"urn": self.urn, "status": status}
+        if metadata:
+            body["metadata"] = metadata
         try:
             self._session.post(
                 f"{self.base}/v1/agents/heartbeat",
-                json={"urn": self.urn, "status": status},
+                json=body,
                 timeout=_TIMEOUT,
             ).raise_for_status()
         except requests.RequestException as exc:
