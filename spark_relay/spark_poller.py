@@ -699,7 +699,12 @@ class AgenticRepoExecutor:
     def _commit_message(self, job: dict) -> str:
         task = " ".join(self._job_text(job).split())
         summary = task[:72].rstrip() or str(job.get("kind") or "Spark repo task")
-        return f"{summary} (spark/nemotron, needs review)"
+        # Label with the ACTUAL model, not a hardcoded "nemotron" (misleading —
+        # nemotron is retired from spark code-gen; the agentic model is frontier
+        # claude/gpt or the local Qwen3-Coder-Next per SPARK_AGENTIC_MODEL/NGC_MODEL).
+        model = self._agentic_model() or os.environ.get("NGC_MODEL") or "spark"
+        model_tag = re.sub(r"^.*/", "", str(model))[:40]
+        return f"{summary} (spark/{model_tag}, needs review)"
 
 
 class DispatchingExecutor:
