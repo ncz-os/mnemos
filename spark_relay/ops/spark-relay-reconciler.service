@@ -1,0 +1,16 @@
+[Unit]
+Description=Spark relay reconciler (PYTHIA side) — GCS results -> hive done
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jasonperlow
+WorkingDirectory=/home/jasonperlow/mnemos
+EnvironmentFile=/home/jasonperlow/.config/spark-relay/relay.env
+ExecStart=/home/jasonperlow/mnemos/.venv/bin/python -m spark_relay.reconciler --interval 15
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
