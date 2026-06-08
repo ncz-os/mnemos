@@ -1,5 +1,5 @@
--- 0041_model_registry_pricing.sql — IBM Db2 12.1 (Oracle Compat mode)
--- Mirrors db/migrations/0041_model_registry_pricing.sql (canonical PG).
+-- 0044_model_registry_pricing.sql — IBM Db2 12.1 (Oracle Compat mode)
+-- Mirrors db/migrations/0044_model_registry_pricing.sql (canonical PG).
 -- Db2 Oracle-compat: ADD COLUMN is idempotent via continue handler.
 
 -- ── model_registry: add pricing columns ──────────────────────────────────────
