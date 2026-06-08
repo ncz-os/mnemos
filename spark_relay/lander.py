@@ -172,8 +172,10 @@ class PatchLander:
             or Path.home() / ".cache" / "spark-relay-lander"
         )
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.chmod(0o700)  # clones + orphan patches are private code
         self.orphan_dir = self.cache_dir / "orphans"
         self.orphan_dir.mkdir(exist_ok=True)
+        self.orphan_dir.chmod(0o700)
         self.git_timeout = float(os.environ.get("SPARK_LANDER_GIT_TIMEOUT", "300"))
         self._askpass = self.cache_dir / "askpass.sh"
         self._askpass.write_text(_ASKPASS_SCRIPT)
@@ -188,8 +190,10 @@ class PatchLander:
         Raises :class:`PermanentLandingError` / :class:`TransientLandingError`.
         """
         patch = payload.get("patch")
-        if not patch or not str(patch).strip():
-            raise PermanentLandingError("payload has no patch text")
+        if not isinstance(patch, str) or not patch.strip():
+            # Non-string truthy values would AttributeError past the typed
+            # error paths and wedge the bucket object in an eternal retry.
+            raise PermanentLandingError("payload has no usable patch text")
         repo_url = str(payload.get("repo") or "").strip()
         if not repo_url:
             raise PermanentLandingError("payload has no repo url")
@@ -223,6 +227,15 @@ class PatchLander:
                 return {"landed_branch": branch, "landed_repo": repo_url, "landed_sha": existing}
 
             clone = self._ensure_clone(repo_url, env)
+            # Identity is required by `git am` ("Committer identity unknown").
+            # Set it unconditionally: a crash between a fresh clone's rename
+            # and its config calls would otherwise leave a clone that fails
+            # permanently on every retry.
+            self._git(clone, ["config", "user.name", os.environ.get("SPARK_GIT_USER_NAME", "Spark Lander")])
+            self._git(
+                clone,
+                ["config", "user.email", os.environ.get("SPARK_GIT_USER_EMAIL", "jperlow@gmail.com")],
+            )
             default = self._default_branch(clone)
             # Restore a pristine HEAD no matter what a previous (crashed/timed
             # out) landing left behind: stale am state, dirty tracked files,
@@ -271,9 +284,14 @@ class PatchLander:
             return None
         safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(job_id)).strip("-") or "unknown"
         path = self.orphan_dir / f"{safe}.patch"
+        body = str(patch)
+        if not body.endswith("\n"):
+            body += "\n"
         try:
-            path.write_text(patch if str(patch).endswith("\n") else str(patch) + "\n")
-            path.chmod(0o600)  # patches can contain private code
+            # 0600 from creation (no chmod-after-write exposure window).
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(body)
             return str(path)
         except OSError as exc:
             log.error("could not save orphan patch for %s: %s", job_id, exc)
@@ -351,11 +369,6 @@ class PatchLander:
             err = _redact_secrets((proc.stderr or proc.stdout).strip()[-400:])
             raise _classify_git_failure(err)(f"clone failed: {err}")
         tmp.rename(clone)
-        self._git(clone, ["config", "user.name", os.environ.get("SPARK_GIT_USER_NAME", "Spark Lander")])
-        self._git(
-            clone,
-            ["config", "user.email", os.environ.get("SPARK_GIT_USER_EMAIL", "jperlow@gmail.com")],
-        )
         return clone
 
     def _default_branch(self, clone: Path) -> str:
