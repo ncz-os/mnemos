@@ -306,6 +306,15 @@ class PatchLander:
             GIT_TERMINAL_PROMPT="0",
             LANDER_GIT_USERNAME=username,
             LANDER_GIT_PASSWORD=token,
+            # Disable credential helpers for every command holding lander
+            # credentials: a configured helper could (a) answer auth with a
+            # DIFFERENT cached credential, bypassing the owner/token policy,
+            # and (b) on success PERSIST the lander token into
+            # ~/.git-credentials / keychain / cache daemon. An empty
+            # credential.helper value clears the helper list.
+            GIT_CONFIG_COUNT="1",
+            GIT_CONFIG_KEY_0="credential.helper",
+            GIT_CONFIG_VALUE_0="",
         )
         return env
 
