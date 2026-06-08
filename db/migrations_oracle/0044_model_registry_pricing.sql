@@ -1,5 +1,5 @@
--- 0041_model_registry_pricing.sql — Oracle 23ai
--- Mirrors db/migrations/0041_model_registry_pricing.sql (canonical PG).
+-- 0044_model_registry_pricing.sql — Oracle 23ai
+-- Mirrors db/migrations/0044_model_registry_pricing.sql (canonical PG).
 -- Oracle ALTER TABLE ADD without IF NOT EXISTS — idempotent via PL/SQL block.
 
 -- ── model_registry: add pricing columns ──────────────────────────────────────
