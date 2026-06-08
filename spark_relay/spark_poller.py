@@ -90,6 +90,36 @@ def worker_id() -> str:
     return os.environ.get("SPARK_WORKER_ID") or socket.gethostname()
 
 
+# Anchored to a STANDALONE final verdict line (the reviewer is told "End with
+# exactly one line: VERDICT: …"). Matching only the last non-empty line means a
+# VERDICT-like string quoted from the diff/task body cannot flip the result.
+# End-anchored: the final line must be ONLY the verdict — "VERDICT: APPROVE but
+# I have concerns" must NOT count as a clean approval (fail closed to 'error').
+_VERDICT_LINE_RE = re.compile(r"^VERDICT:\s*(NEEDS[- ]ATTENTION|APPROVE)\s*$", re.I)
+
+
+def _classify_review_verdict(txt: str) -> dict:
+    """Parse a reviewer reply into a verdict, fail-CLOSED on ambiguity.
+
+    Only the FINAL non-empty line is considered, and it must be a clean
+    ``VERDICT: APPROVE`` / ``VERDICT: NEEDS-ATTENTION`` line. A verdict-like
+    string quoted in the body (e.g. the reviewer citing the diff, which may
+    contain the literal instruction text) is ignored. Empty / verdict-less /
+    trailing-prose output → ``error``, NOT a silent approve, so a broken or
+    evasive reviewer never green-lights a patch. The reconciler lands 'error'
+    (flagged unreviewed — still a review branch a human must merge) but BLOCKS
+    'needs-attention'."""
+    lines = [ln.strip() for ln in (txt or "").splitlines() if ln.strip()]
+    if not lines:
+        return {"verdict": "error", "text": "empty reviewer output"}
+    m = _VERDICT_LINE_RE.match(lines[-1])
+    if not m:
+        return {"verdict": "error", "text": (txt or "").strip()[:1500]}
+    last = m.group(1).upper().replace(" ", "-")
+    verdict = "needs-attention" if last == "NEEDS-ATTENTION" else "approve"
+    return {"verdict": verdict, "text": (txt or "").strip()[:1500]}
+
+
 def _nvidia_smi(query: str) -> list[list[str]]:
     try:
         r = subprocess.run(
@@ -358,6 +388,15 @@ class AgenticRepoExecutor:
                     "suggestion": model_text,
                     "repo": repo_url,
                 }
+            # MANDATORY cross-family adversarial review (operator 2026-06-08):
+            # the authoring model must NOT review its own output. Claude-authored
+            # code is reviewed by codex on EIH (and vice-versa). Catches the
+            # failure class that slipped through before max_tokens was enough to
+            # land: reverting unrelated merged work + dead/unwired code (e.g. a
+            # haversine helper added but never called). The verdict rides in the
+            # result; the PYTHIA lander refuses to land a needs-attention patch.
+            staged_diff = self._git(["diff", "--cached"], cwd=clone_dir).stdout
+            review = self._adversarial_review(job, staged_diff)
             self._git(["commit", "-m", self._commit_message(job)], cwd=clone_dir)
             sha = self._git(["rev-parse", "HEAD"], cwd=clone_dir).stdout.strip()
             patch = self._git(["format-patch", "-1", "--stdout"], cwd=clone_dir).stdout
@@ -368,7 +407,8 @@ class AgenticRepoExecutor:
                 "branch": branch,
                 "repo": repo_url,
                 "files_changed": changed,
-                "metrics": {"backend": "ngc-agentic", "model": self.chat.default_model},
+                "adversarial_review": review,
+                "metrics": {"backend": "ngc-agentic", "model": self._agentic_model() or self.chat.default_model},
             }
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -695,6 +735,74 @@ class AgenticRepoExecutor:
     def _job_id_short(self, job: dict) -> str:
         raw = str(job.get("job_id") or job.get("id") or "manual")
         return re.sub(r"[^A-Za-z0-9._-]+", "-", raw)[:12] or "manual"
+
+    def _adversarial_reviewer_model(self) -> str:
+        """Cross-family reviewer: a model never reviews its own family's output.
+        Author=claude -> reviewer=codex (default). Author=gpt/codex -> reviewer=claude."""
+        author = (self._agentic_model() or self.chat.default_model or "").lower()
+        # OpenAI family incl. o-series (o3/o4-mini/...) → review with a non-OpenAI
+        # model so a family never reviews its own output.
+        openai_family = bool(
+            "codex" in author or "gpt" in author or "openai" in author
+            or re.search(r"(^|[/_-])o[0-9]", author)
+        )
+        if openai_family:
+            return os.environ.get("SPARK_REVIEW_MODEL_ALT", "azure/anthropic/claude-opus-4-8")
+        return os.environ.get("SPARK_REVIEW_MODEL", "azure/openai/gpt-5.3-codex")
+
+    def _adversarial_review(self, job: dict, diff: str) -> dict:
+        """Adversarial review of the staged diff via a cross-family model on EIH.
+
+        Returns ``{verdict: 'approve'|'needs-attention'|'error', model, text}``.
+        verdict='needs-attention' tells the PYTHIA lander to REFUSE to land
+        (the patch is preserved for human review). A reviewer infra error fails
+        OPEN to verdict='error' (lands, but flagged unreviewed) so a codex
+        outage does not strand all spark work — only a CLEAR rejection blocks."""
+        model = self._adversarial_reviewer_model()
+        # A diff the reviewer cannot see in FULL cannot be approved — a patch
+        # could hide a revert / dead code past a truncation point and still get
+        # APPROVE on the visible prefix. Frontier reviewers take large context;
+        # if the diff still exceeds the budget, BLOCK (needs-attention) so a
+        # human reviews it, rather than reviewing a truncated view.
+        review_cap = int(os.environ.get("SPARK_REVIEW_DIFF_CHARS", "200000"))
+        if len(diff or "") > review_cap:
+            return {
+                "verdict": "needs-attention",
+                "model": model,
+                "text": f"diff {len(diff)} chars exceeds review budget {review_cap} — blocked for human review",
+            }
+        system = (
+            "You are an adversarial code reviewer. The diff must implement EXACTLY the task and "
+            "nothing more. Reply NEEDS-ATTENTION if it: reverts or removes unrelated existing code, "
+            "adds dead/unwired code (a function/method never called), changes constants/thresholds "
+            "outside the task scope, or is incorrect. Otherwise APPROVE. End with exactly one line: "
+            "VERDICT: APPROVE or VERDICT: NEEDS-ATTENTION."
+        )
+        # Full diff (size already gated above) so the reviewer sees every change.
+        user = f"TASK:\n{self._job_text(job)[:4000]}\n\nDIFF:\n{diff or ''}"
+        try:
+            import requests  # import inside try: an import failure must not break execute()
+            headers = {"Authorization": f"Bearer {self.chat.api_key}"} if self.chat.api_key else {}
+            if "codex" in model.lower():
+                resp = requests.post(
+                    f"{self.chat.base}/responses",
+                    headers=headers,
+                    json={"model": model, "max_output_tokens": 1500,
+                          "instructions": system, "input": user},
+                    timeout=self.model_timeout,
+                )
+                resp.raise_for_status()
+                txt = ""
+                for o in resp.json().get("output", []):
+                    if o.get("type") == "message":
+                        for c in o.get("content", []):
+                            if c.get("type") == "output_text":
+                                txt += c.get("text", "")
+            else:
+                txt = self.chat.complete(system=system, user=user, model=model, timeout=self.model_timeout)
+            return {"model": model, **_classify_review_verdict(txt)}
+        except Exception as exc:  # noqa: BLE001 — infra error fails OPEN (flagged), never breaks execute()
+            return {"verdict": "error", "model": model, "text": f"reviewer error (fail-open): {exc}"[:300]}
 
     def _commit_message(self, job: dict) -> str:
         task = " ".join(self._job_text(job).split())

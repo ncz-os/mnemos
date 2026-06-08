@@ -93,10 +93,31 @@ def _reconcile_one(
         result = {k: v for k, v in payload.items() if k != "claimant_urn"}
         result["needs_review"] = (status == "needs-review") or bool(payload.get("needs_review"))
 
-        # LANDER (2026-06-08): a needs-review payload with a patch must land as
-        # a review branch BEFORE the job is closed out — a patch that exists
-        # only inside a job result is an orphan (the 2026-06-07 incident).
-        if result["needs_review"] and payload.get("patch"):
+        # ADVERSARIAL-REVIEW GATE (operator 2026-06-08): a cross-family reviewer
+        # (codex on EIH for claude-authored code, and vice-versa) runs on the
+        # spark side. A NEEDS-ATTENTION verdict must BLOCK the landing — the
+        # patch that reverted merged work + added dead code (2026-06-08 incident)
+        # is exactly what this stops. The patch is preserved (result + orphan
+        # file) for human review; only a CLEAR rejection blocks (reviewer infra
+        # errors fail open to verdict='error' and still land, flagged).
+        _review = payload.get("adversarial_review")
+        if not isinstance(_review, dict):  # malformed/serialization-mangled review metadata
+            _review = {}
+        _review_blocked = str(_review.get("verdict") or "").strip().lower() == "needs-attention"
+
+        if result["needs_review"] and payload.get("patch") and _review_blocked:
+            result["landing"] = "blocked_by_adversarial_review"
+            try:
+                saved = lander.save_orphan_patch(payload, uuid)
+                if saved:
+                    result["patch_saved"] = saved
+            except Exception as exc:  # noqa: BLE001 — preserving the result must not crash on a save error
+                log.error("orphan save failed for review-blocked %s: %s", uuid, exc)
+            log.warning(
+                "review-blocked %s (%s): %s", uuid, _review.get("model"),
+                str(_review.get("text", ""))[:160],
+            )
+        elif result["needs_review"] and payload.get("patch"):
             try:
                 landed = lander.land(payload, uuid)
                 result.update(landed)
