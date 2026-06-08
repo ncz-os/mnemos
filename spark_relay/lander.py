@@ -102,6 +102,25 @@ def _credentials_for(repo_url: str) -> tuple[str | None, str | None]:
     return username, token
 
 
+# Checked FIRST: auth/permission/missing-repo failures are permanent even
+# though git wraps them in "unable to access ... returned error: 403" — a
+# transient match there would retry a rejected credential forever.
+_PERMANENT_GIT_MARKERS = (
+    "authentication failed",
+    "permission denied",
+    "permission to",
+    "repository not found",
+    "could not read username",
+    "could not read password",
+    "invalid credentials",
+    "error: 401",
+    "returned error: 401",
+    "error: 403",
+    "returned error: 403",
+    "error: 404",
+    "returned error: 404",
+)
+
 _TRANSIENT_GIT_MARKERS = (
     "could not resolve host",
     "couldn't connect",
@@ -115,13 +134,14 @@ _TRANSIENT_GIT_MARKERS = (
     "502",
     "500",
     "the remote end hung up",
-    "unable to access",
     "index.lock",
 )
 
 
 def _classify_git_failure(stderr: str) -> type[LandingError]:
     low = stderr.lower()
+    if any(m in low for m in _PERMANENT_GIT_MARKERS):
+        return PermanentLandingError
     if any(m in low for m in _TRANSIENT_GIT_MARKERS):
         return TransientLandingError
     return PermanentLandingError
