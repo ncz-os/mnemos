@@ -31,6 +31,7 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -142,10 +143,15 @@ def _branch_for_job(job_id: str) -> str:
     Job ids are UUIDv7 whose first 12 chars are a millisecond timestamp —
     burst-submitted jobs share that prefix (the 2026-06-05 session-collision
     incident), so a truncated prefix would alias different jobs' branches.
+    The sanitizer is not injective ("a/b" and "a b" both collapse to "a-b"),
+    so any id the sanitizer had to alter gets a hash suffix of the RAW id.
     """
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(job_id)).strip("-")
+    raw = str(job_id)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-")
     if not safe:
-        raise PermanentLandingError(f"unusable job id {job_id!r}")
+        raise PermanentLandingError("unusable job id")
+    if safe != raw:
+        safe = f"{safe}-{hashlib.sha256(raw.encode()).hexdigest()[:8]}"
     return f"hive/spark-{safe}"
 
 
@@ -187,14 +193,22 @@ class PatchLander:
         repo_url = str(payload.get("repo") or "").strip()
         if not repo_url:
             raise PermanentLandingError("payload has no repo url")
-        if urlparse(repo_url).scheme != "https":
-            raise PermanentLandingError(f"non-https repo url: {repo_url!r}")
+        parsed = urlparse(repo_url)
+        if parsed.scheme != "https":
+            raise PermanentLandingError(f"non-https repo url: {_redact_secrets(repo_url)!r}")
+        if parsed.username or parsed.password:
+            # Embedded credentials in a relayed payload are never acceptable —
+            # and must never be echoed into results/logs.
+            raise PermanentLandingError(
+                f"repo url carries embedded credentials, refusing: {_redact_secrets(repo_url)}"
+            )
         username, token = _credentials_for(repo_url)
         if not token:
             # A push would fail with auth prompts; permanent so the patch is
             # preserved (result + orphan file) for manual landing.
             raise PermanentLandingError(
-                f"no push credentials for {repo_url} (owner not allowlisted or token unset)"
+                f"no push credentials for {_redact_secrets(repo_url)} "
+                "(owner not allowlisted or token unset)"
             )
         env = self._git_env(username, token)
         branch = _branch_for_job(job_id)
@@ -210,8 +224,12 @@ class PatchLander:
 
             clone = self._ensure_clone(repo_url, env)
             default = self._default_branch(clone)
-            self._git(clone, ["am", "--abort"], check=False)  # clear stale state
+            # Restore a pristine HEAD no matter what a previous (crashed/timed
+            # out) landing left behind: stale am state, dirty tracked files,
+            # stray untracked files.
+            self._git(clone, ["am", "--abort"], check=False)
             self._git(clone, ["checkout", "-q", "--detach", f"origin/{default}"])
+            self._git(clone, ["reset", "--hard", f"origin/{default}"], check=False)
             self._git(clone, ["clean", "-fdq"], check=False)
 
             with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as fh:
@@ -233,6 +251,13 @@ class PatchLander:
                 clone, ["push", "origin", f"HEAD:refs/heads/{branch}"], env=env, check=False
             )
             if push.returncode != 0:
+                # Another reconciler may have raced us past the ls-remote check
+                # (the flock is per-host only). If the branch now exists, the
+                # landing IS durable — report the winner's sha.
+                raced = self._ls_remote_branch(repo_url, branch, env)
+                if raced:
+                    log.info("lost push race for %s — branch exists at %s", branch, raced[:12])
+                    return {"landed_branch": branch, "landed_repo": repo_url, "landed_sha": raced}
                 err = _redact_secrets((push.stderr or push.stdout).strip()[-400:])
                 raise _classify_git_failure(err)(f"push of {branch} failed: {err}")
         log.info("landed %s -> %s %s (%s)", job_id, repo_url, branch, sha[:12])
@@ -248,6 +273,7 @@ class PatchLander:
         path = self.orphan_dir / f"{safe}.patch"
         try:
             path.write_text(patch if str(patch).endswith("\n") else str(patch) + "\n")
+            path.chmod(0o600)  # patches can contain private code
             return str(path)
         except OSError as exc:
             log.error("could not save orphan patch for %s: %s", job_id, exc)
@@ -298,19 +324,33 @@ class PatchLander:
                 err = _redact_secrets((proc.stderr or proc.stdout).strip()[-400:])
                 raise _classify_git_failure(err)(f"fetch failed: {err}")
             return clone
-        # Clone with the CLEAN url; the askpass env supplies credentials, so
-        # nothing secret ever reaches argv or .git/config — there is no
-        # "rewrite origin afterwards" window to crash inside.
-        proc = subprocess.run(
-            ["git", "clone", "--quiet", repo_url, str(clone)],
-            capture_output=True,
-            text=True,
-            timeout=self.git_timeout * 4,  # first clone of a big repo is slow
-            env=env,
-        )
+        if clone.exists():
+            # Leftover of a clone that crashed/timed out before completing —
+            # without a .git dir it can only be garbage; clear it so the fresh
+            # clone below does not fail on "destination path already exists".
+            shutil.rmtree(clone, ignore_errors=True)
+        # Clone with the CLEAN url into a temp dir and rename into place
+        # atomically, so a half-written clone can never be mistaken for a
+        # cache hit. The askpass env supplies credentials, so nothing secret
+        # ever reaches argv or .git/config.
+        tmp = clone.with_name(clone.name + ".tmp")
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            proc = subprocess.run(
+                ["git", "clone", "--quiet", repo_url, str(tmp)],
+                capture_output=True,
+                text=True,
+                timeout=self.git_timeout * 4,  # first clone of a big repo is slow
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise TransientLandingError(f"clone timed out after {self.git_timeout * 4:.0f}s")
         if proc.returncode != 0:
+            shutil.rmtree(tmp, ignore_errors=True)
             err = _redact_secrets((proc.stderr or proc.stdout).strip()[-400:])
             raise _classify_git_failure(err)(f"clone failed: {err}")
+        tmp.rename(clone)
         self._git(clone, ["config", "user.name", os.environ.get("SPARK_GIT_USER_NAME", "Spark Lander")])
         self._git(
             clone,
@@ -328,13 +368,16 @@ class PatchLander:
         raise PermanentLandingError("cannot determine default branch")
 
     def _ls_remote_branch(self, repo_url: str, branch: str, env: dict[str, str]) -> str | None:
-        proc = subprocess.run(
-            ["git", "ls-remote", repo_url, f"refs/heads/{branch}"],
-            capture_output=True,
-            text=True,
-            timeout=self.git_timeout,
-            env=env,
-        )
+        try:
+            proc = subprocess.run(
+                ["git", "ls-remote", repo_url, f"refs/heads/{branch}"],
+                capture_output=True,
+                text=True,
+                timeout=self.git_timeout,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            raise TransientLandingError(f"ls-remote timed out after {self.git_timeout:.0f}s")
         if proc.returncode != 0:
             err = _redact_secrets((proc.stderr or proc.stdout).strip()[-400:])
             raise _classify_git_failure(err)(f"ls-remote failed: {err}")
@@ -349,14 +392,21 @@ class PatchLander:
         env: dict[str, str] | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        proc = subprocess.run(
-            ["git", *args],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=self.git_timeout,
-            env=env,
-        )
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=self.git_timeout,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            # A hung network operation must NOT close the job out permanently;
+            # the next sweep starts from a pristine reset of the cached clone.
+            raise TransientLandingError(
+                f"git {args[0]} timed out after {self.git_timeout:.0f}s"
+            )
         if check and proc.returncode != 0:
             raise PermanentLandingError(
                 _redact_secrets(f"git {' '.join(args)} failed: {(proc.stderr or proc.stdout).strip()[-400:]}")

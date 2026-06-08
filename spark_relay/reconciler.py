@@ -45,7 +45,15 @@ def _shrink_result(result: dict) -> dict:
             result[f"{field}_dropped"] = "payload_too_large"
             del result[field]
     if _json_size_bytes(result) > MAX_RESULT_BYTES:
-        keep = {k: result.get(k) for k in ("needs_review", "commit_sha", "branch", "landed_branch", "landed_repo", "landed_sha", "landing", "landing_error") if k in result}
+        keep = {
+            k: result.get(k)
+            for k in (
+                "needs_review", "commit_sha", "spark_commit_sha", "commits", "branch",
+                "landed_branch", "landed_repo", "landed_sha",
+                "landing", "landing_error", "patch_saved",
+            )
+            if k in result
+        }
         keep["error"] = "payload_too_large"
         return keep
     return result
@@ -116,13 +124,15 @@ def _reconcile_one(
         result = _shrink_result(result)
         # Prefer the hive's first-class needs-review status (reviewer timer
         # watches it). Fall back to done + the needs_review result flag ONLY
-        # on an explicit validation rejection (4xx = bus doesn't know the
-        # enum); transient transport failures must retry, not double-PATCH.
+        # on an explicit schema-validation rejection (400/422 = a bus that
+        # doesn't know the enum). Everything else — 401/403 (auth/claimant),
+        # 408/409/423/429 (transient or state conflicts), 5xx, network — must
+        # retry on the next sweep, never double-PATCH a review job to done.
         if result["needs_review"]:
             code = hive.patch_status_code(uuid, "needs-review", result=result, claimed_by=claimant)
             if code is not None and 200 <= code < 300:
                 ok = True
-            elif code is not None and 400 <= code < 500 and code != 403:
+            elif code in (400, 422):
                 ok = hive.patch_status(uuid, "done", result=result, claimed_by=claimant)
             else:
                 ok = False
