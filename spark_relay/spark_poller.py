@@ -319,6 +319,17 @@ class AgenticRepoExecutor:
                 # check, so attempt 2 measured against attempt 1's output).
                 self._git(["checkout", "--", "."], cwd=clone_dir, check=False)
                 self._git(["clean", "-fdq"], cwd=clone_dir, check=False)
+                # Off-task confabulation guard (2026-06-11): reject NEW files the
+                # task never asked for, before anything is written.
+                offtask = self._offtask_new_files(clone_dir, changes, self._job_text(job))
+                if offtask:
+                    feedback = (
+                        "you created NEW files the task did not ask for: "
+                        f"{'; '.join(offtask)}. Do NOT create new files unless the task "
+                        "explicitly names them — implement the task by editing only the "
+                        "existing file(s) it refers to."
+                    )
+                    continue
                 # Truncation guard (2026-06-06): a "replacement" much smaller
                 # than the original is an output-budget overflow, not an edit —
                 # stonkmode.py went 679 -> 133 lines and lost 546 lines of
@@ -428,7 +439,10 @@ class AgenticRepoExecutor:
         system = (
             "You are a repository editing agent planning a change. Reply with ONLY "
             "the repo-relative paths of the files you need to read or modify, one "
-            f"per line, at most {max_files}. No prose, no fences."
+            f"per line, at most {max_files}. No prose, no fences. Name ONLY files "
+            "that already exist and are directly relevant to the task; if the task "
+            "names a specific file, that file MUST be in your list. Do NOT invent or "
+            "scaffold new files unless the task explicitly asks you to create one."
         )
         user = f"Repo tree:\n{tree}\n\nTask:\n{self._job_text(job)}"
         out = self.chat.complete(
@@ -465,7 +479,11 @@ class AgenticRepoExecutor:
         """Phase 2: the model returns COMPLETE replacement files."""
         system = (
             "You are a repository editing agent. You are given the full current "
-            "content of the relevant files. Implement the task by outputting the "
+            "content of the relevant files. Make ONLY the change the task describes: "
+            "edit only files that already exist and are named or clearly implied by the "
+            "task, and change as little as possible. Do NOT create new files, modules, "
+            "or scaffolding unless the task EXPLICITLY asks for a new file; if the task "
+            "names a file, change that file and no other. Implement the task by outputting the "
             "COMPLETE new content of every file you change or create, using exactly "
             "this framing for each file:\n"
             "===FILE: relative/path===\n<entire new file content>\n===END===\n"
@@ -731,6 +749,29 @@ class AgenticRepoExecutor:
             if job.get(key):
                 parts.append(str(job[key]))
         return "\n\n".join(parts)
+
+    def _offtask_new_files(self, clone_dir: Path, changes: dict, task: str) -> list[str]:
+        """Off-task confabulation guard (2026-06-11): reject NEW files the task
+        never asked for. A file that does not already exist in the cloned repo is
+        only allowed if the task text explicitly names it. Kills the class where a
+        trivial task ("add a comment to scripts/foo.sh") yields an unrelated
+        scaffolded module (e.g. agents/skill.py): the review gate caught those,
+        but nothing useful ever landed. Editing existing files is always in-scope."""
+        named = set(re.findall(r"`([^`]+\.[A-Za-z0-9_./-]+)`", task))
+        named.update(re.findall(r"\b[A-Za-z0-9_./-]+/[A-Za-z0-9_./-]+\.[A-Za-z0-9_./-]+\b", task))
+        named_norm = {n.strip().lower() for n in named}
+        named_base = {Path(n).name.lower() for n in named}
+        bad = []
+        for rel, body in changes.items():
+            if body is None:
+                continue  # deletion handled by its own framing
+            if (clone_dir / rel).is_file():
+                continue  # editing an existing file is in-scope
+            rl = rel.strip().lower()
+            if rl in named_norm or Path(rel).name.lower() in named_base:
+                continue  # explicitly requested new file
+            bad.append(rel)
+        return bad
 
     def _job_id_short(self, job: dict) -> str:
         raw = str(job.get("job_id") or job.get("id") or "manual")
