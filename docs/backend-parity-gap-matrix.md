@@ -71,7 +71,7 @@
 | fetch_model_recommendation | IMPL | IMPL | IMPL | IMPL | IMPL |
 | lookup_provider_for_model | IMPL | IMPL | IMPL | IMPL | IMPL |
 | fetch_available_models | IMPL | IMPL | IMPL | IMPL | IMPL |
-| fetch_model_provider | STUB | IMPL | IMPL | IMPL | IMPL |
+| fetch_model_provider | IMPL | IMPL | IMPL | IMPL | IMPL |
 
 ## OAuthRepository (7 methods)
 | method | oracle | postgres | db2 | mysql | sqlite |
@@ -170,7 +170,7 @@
 ## TOTALS (across all ABC repo methods)
 | backend | IMPL | STUB | RAISE | absent(--) |
 |---|---|---|---|---|
-| oracle | 99 | 8 | 4 | 0 |
+| oracle | 100 | 7 | 4 | 0 |
 | postgres | 111 | 0 | 0 | 0 |
 | db2 | 94 | 1 | 0 | 16 |
 | mysql | 110 | 1 | 0 | 0 |
