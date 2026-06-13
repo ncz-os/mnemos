@@ -35,6 +35,7 @@ from mnemos.domain.artemis_dedup import (
     evaluate_memory_create_dedup,
 )
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.base import DuplicateMemoryError
 from mnemos.domain.models import (
     BulkCreateRequest,
@@ -1037,7 +1038,26 @@ async def create_memory(
             _meta["secret_redact_spans"] = _finding.spans
             _meta["secret_reasons"] = _finding.reasons
     except Exception:
-        logger.exception("[secret-vault] ingest classification failed for %s", mem_id)
+        # FAIL CLOSED (release-blocking 2026-06-13): if classification
+        # cannot complete (import error, classifier bug, etc.) we MUST
+        # NOT store potentially-credential content on the default path.
+        # Quarantine into the vault namespace so an unclassifiable write
+        # never silently reintroduces the vault bypass. A false-positive
+        # (non-secret prose vaulted on a transient classifier error) is
+        # recoverable by a root re-file; a false-negative (a real secret
+        # left searchable) is not.
+        logger.exception(
+            "[secret-vault] ingest classification FAILED for %s — failing "
+            "closed, quarantining into vault namespace",
+            mem_id,
+        )
+        if namespace != VAULT_NAMESPACE:
+            _meta["secret_vaulted"] = True
+            _meta["secret_reasons"] = ["classification_failed_fail_closed"]
+            _meta["secret_original_namespace"] = namespace
+            _meta["secret_classified_at"] = "ingest"
+            _meta["secret_classification_error"] = True
+            namespace = VAULT_NAMESPACE
 
     metadata_json = json.dumps(_meta or {"source": request.source})
     delivery_ids: list[str] = []
