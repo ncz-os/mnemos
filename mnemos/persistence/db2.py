@@ -20,6 +20,7 @@ References:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import uuid
@@ -3772,23 +3773,289 @@ class Db2ConsultationsRepository(OracleConsultationsRepository):
     """Db2-native user-facing consultations persistence."""
 
     async def create_consultation_with_audit(self, tx: Any, **kwargs: Any) -> Any:
-        """Not supported on the Db2 backend (severance slice 8 / decision D).
+        """Insert a GRAEAE consultation + audit-chain link + memory refs in one tx.
 
-        Writes the GRAEAE consultation + audit-chain + memory-refs to
-        ``graeae_consultations`` / ``graeae_audit_log`` /
-        ``consultation_memory_refs`` -- Oracle-only tables that are NOT in
-        ``db/migrations_db2``. Rather than silently fall through to Oracle SQL
-        (named binds against missing tables) in native mode, fail loud. Port
-        those three tables to migrations_db2 + add a native override here if
-        Db2-backed GRAEAE consultations are ever required.
+        Db2-native port of PostgresConsultationsRepository.create_consultation_with_audit
+        (the complete reference). Targets graeae_consultations / graeae_audit_log /
+        consultation_memory_refs (db/migrations_db2/0002b_graeae.sql + the ownership
+        / soft-delete columns in 0002c_graeae_parity_cols.sql). App-side UUID hex PKs
+        (Oracle/SQLite parity); ``?`` positional binds; ``CURRENT TIMESTAMP``;
+        ``FETCH FIRST 1 ROWS ONLY`` for the chain tip; duplicate memory_refs are
+        swallowed via ``_is_unique_violation`` (Db2 SQLSTATE 23505). ``"mode"`` is a
+        reserved word -> quoted on the column list.
         """
-        raise NotImplementedError(
-            "create_consultation_with_audit is not implemented on the Db2 "
-            "backend: the GRAEAE graeae_consultations / graeae_audit_log / "
-            "consultation_memory_refs tables are not in db/migrations_db2. "
-            "Port them and add a native override to enable Db2-backed GRAEAE "
-            "consultations."
+        conn = _conn_from_tx(tx)
+        consultation_id = uuid.uuid4().hex
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "INSERT INTO graeae_consultations "
+                "(id, prompt, task_type, consensus_response, consensus_score, winning_muse, "
+                'cost, latency_ms, "mode", owner_id, namespace) '
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    consultation_id,
+                    kwargs["prompt"],
+                    kwargs["task_type"],
+                    kwargs["consensus_response"][:500],
+                    kwargs["consensus_score"],
+                    kwargs["winning_muse"],
+                    kwargs["cost"],
+                    kwargs["latency_ms"],
+                    kwargs["mode"],
+                    kwargs["owner_id"],
+                    kwargs["namespace"],
+                ),
+            )
+
+            prompt_hash = hashlib.sha256(kwargs["prompt"].encode()).hexdigest()
+            response_hash = hashlib.sha256(kwargs["consensus_response"].encode()).hexdigest()
+            # Serialize the audit-chain tip read + append so concurrent
+            # consultations cannot hash off the same previous link and fork
+            # the chain (postgres uses pg_advisory_xact_lock; Db2 holds an
+            # EXCLUSIVE table lock to end-of-tx).
+            await _call(cursor.execute, "LOCK TABLE graeae_audit_log IN EXCLUSIVE MODE")
+            await _call(
+                cursor.execute,
+                "SELECT id, chain_hash FROM graeae_audit_log "
+                "ORDER BY sequence_num DESC FETCH FIRST 1 ROWS ONLY",
+            )
+            prev = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            prev_chain = prev["chain_hash"] if prev else kwargs["genesis_hash"]
+            prev_id = prev["id"] if prev else None
+            chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
+            # provider is NOT NULL on the Db2 audit_log; winning_muse can be None on
+            # the all-muses-failed consensus path -> sentinel "[none]".
+            await _call(
+                cursor.execute,
+                "INSERT INTO graeae_audit_log "
+                "(id, consultation_id, prompt, prompt_hash, provider, response_text, response_hash, "
+                "chain_hash, prev_id, prev_chain_hash, task_type, quality_score) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    uuid.uuid4().hex,
+                    consultation_id,
+                    kwargs["prompt"],
+                    prompt_hash,
+                    kwargs["winning_muse"] or "[none]",
+                    kwargs["consensus_response"],
+                    response_hash,
+                    chain_hash,
+                    prev_id,
+                    prev_chain,
+                    kwargs["task_type"] or "reasoning",
+                    kwargs["consensus_score"],
+                ),
+            )
+
+            # Memory refs -- Db2 has no INSERT ... ON CONFLICT; swallow the unique
+            # violation on (consultation_id, memory_id) only.
+            for memory_id in kwargs["memory_ids"]:
+                try:
+                    await _call(
+                        cursor.execute,
+                        "INSERT INTO consultation_memory_refs "
+                        "(id, consultation_id, memory_id, injected_at) "
+                        "VALUES (?, ?, ?, CURRENT TIMESTAMP)",
+                        (uuid.uuid4().hex, consultation_id, memory_id),
+                    )
+                except Exception as exc:
+                    if not _is_unique_violation(exc):
+                        raise
+        finally:
+            await _call(cursor.close)
+        return consultation_id
+
+    async def resolve_tier_lineup(self, tx: Any, tier: str) -> list[Row]:
+        """Db2-native port of PostgresConsultationsRepository.resolve_tier_lineup.
+
+        Postgres ``DISTINCT ON (provider)`` -> ``ROW_NUMBER() OVER (PARTITION BY
+        provider ORDER BY ...) = 1``. ``available``/``deprecated`` are SMALLINT
+        (1/0). NULLS LAST keeps unranked/unweighted models behind ranked ones.
+        """
+        if tier == "frontier":
+            inner = (
+                "SELECT provider, model_id, "
+                "ROW_NUMBER() OVER (PARTITION BY provider "
+                "ORDER BY graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST) AS rn "
+                "FROM model_registry WHERE available=1 AND deprecated=0 "
+                "AND ((arena_rank IS NOT NULL AND arena_rank <= 5) OR graeae_weight >= 0.95)"
+            )
+        elif tier == "premium":
+            inner = (
+                "SELECT provider, model_id, "
+                "ROW_NUMBER() OVER (PARTITION BY provider "
+                "ORDER BY graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST) AS rn "
+                "FROM model_registry WHERE available=1 AND deprecated=0 "
+                "AND ((arena_rank IS NOT NULL AND arena_rank BETWEEN 6 AND 15) "
+                "OR (graeae_weight >= 0.85 AND graeae_weight < 0.95))"
+            )
+        else:
+            inner = (
+                "SELECT provider, model_id, "
+                "ROW_NUMBER() OVER (PARTITION BY provider "
+                "ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC) AS rn "
+                "FROM model_registry WHERE available=1 AND deprecated=0 AND graeae_weight >= 0.75 "
+                "AND input_cost_per_mtok IS NOT NULL AND output_cost_per_mtok IS NOT NULL"
+            )
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute, f"SELECT provider, model_id FROM ({inner}) t WHERE rn = 1")
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def resolve_models(self, tx: Any, model_ids: Sequence[str]) -> list[Row]:
+        ids = list(model_ids)
+        if not ids:
+            return []
+        placeholders = ", ".join("?" for _ in ids)
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"SELECT provider, model_id FROM model_registry "
+                f"WHERE model_id IN ({placeholders}) AND available=1 AND deprecated=0",
+                tuple(ids),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def list_audit_log(
+        self, tx: Any, *, root: bool, user_id: str, namespace: str | None, limit: int, offset: int
+    ) -> list[Row]:
+        """Db2-native port of PostgresConsultationsRepository.list_audit_log.
+
+        ``LIMIT/OFFSET`` -> ``OFFSET ? ROWS FETCH NEXT ? ROWS ONLY`` (offset bind
+        first). ``NULL::text`` -> ``CAST(NULL AS VARCHAR(64))``. Non-root path
+        re-numbers + re-links within the owner+namespace scope (chain_hash hidden).
+        """
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            if root and namespace is None:
+                await _call(
+                    cursor.execute,
+                    "SELECT id, sequence_num, consultation_id, prompt_hash, response_hash, chain_hash, "
+                    "prev_id, task_type, provider, quality_score, created_at FROM graeae_audit_log "
+                    "WHERE deleted_at IS NULL ORDER BY sequence_num DESC "
+                    "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+                    (offset, limit),
+                )
+            elif root:
+                await _call(
+                    cursor.execute,
+                    "SELECT al.id, al.sequence_num, al.consultation_id, al.prompt_hash, al.response_hash, "
+                    "al.chain_hash, al.prev_id, al.task_type, al.provider, al.quality_score, al.created_at "
+                    "FROM graeae_audit_log al JOIN graeae_consultations c ON c.id=al.consultation_id "
+                    "WHERE c.namespace=? AND c.deleted_at IS NULL AND al.deleted_at IS NULL "
+                    "ORDER BY al.sequence_num DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+                    (namespace, offset, limit),
+                )
+            else:
+                await _call(
+                    cursor.execute,
+                    "WITH visible AS (SELECT al.id, al.sequence_num AS global_sequence_num, al.consultation_id, "
+                    "al.prompt_hash, al.response_hash, al.task_type, al.provider, al.quality_score, al.created_at, "
+                    "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+                    "LAG(al.id) OVER (ORDER BY al.sequence_num ASC) AS scoped_prev_id "
+                    "FROM graeae_audit_log al JOIN graeae_consultations c ON c.id=al.consultation_id "
+                    "WHERE c.owner_id=? AND c.namespace=? AND c.deleted_at IS NULL AND al.deleted_at IS NULL) "
+                    "SELECT id, scoped_sequence_num AS sequence_num, consultation_id, prompt_hash, response_hash, "
+                    "CAST(NULL AS VARCHAR(64)) AS chain_hash, scoped_prev_id AS prev_id, task_type, provider, "
+                    "quality_score, created_at FROM visible "
+                    "ORDER BY global_sequence_num DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+                    (user_id, namespace, offset, limit),
+                )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_audit_chain(
+        self, tx: Any, *, root: bool, user_id: str, namespace: str | None
+    ) -> list[Row]:
+        """Db2-native port of PostgresConsultationsRepository.fetch_audit_chain.
+
+        Postgres ``LEFT JOIN LATERAL`` for the previous link -> correlated scalar
+        subquery (``... WHERE p.sequence_num < al.sequence_num ORDER BY ... DESC
+        FETCH FIRST 1 ROWS ONLY``). Positional binds: owner_id (when scoped) then
+        namespace.
+        """
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            if root and namespace is None:
+                await _call(
+                    cursor.execute,
+                    "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
+                    "FROM graeae_audit_log ORDER BY sequence_num ASC",
+                )
+                return await _fetch_all_dicts(cursor)
+            owner_clause = "" if root else "c.owner_id = ? AND "
+            params = (namespace,) if root else (user_id, namespace)
+            await _call(
+                cursor.execute,
+                "SELECT al.sequence_num, "
+                "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+                "al.prompt_hash, al.response_hash, al.chain_hash, al.prev_id, al.prev_chain_hash, "
+                "(SELECT p.chain_hash FROM graeae_audit_log p WHERE p.sequence_num < al.sequence_num "
+                "ORDER BY p.sequence_num DESC FETCH FIRST 1 ROWS ONLY) AS expected_prev_hash "
+                "FROM graeae_audit_log al JOIN graeae_consultations c ON c.id=al.consultation_id "
+                f"WHERE {owner_clause}c.namespace=? AND c.deleted_at IS NULL AND al.deleted_at IS NULL "
+                "ORDER BY al.sequence_num ASC",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_consultation(
+        self, tx: Any, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> Row | None:
+        cols = (
+            'SELECT id, prompt, task_type, consensus_response, consensus_score, winning_muse, '
+            'cost, latency_ms, "mode", created FROM graeae_consultations '
         )
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            if root and namespace is None:
+                await _call(cursor.execute, cols + "WHERE id=? AND deleted_at IS NULL", (consultation_id,))
+            elif root:
+                await _call(
+                    cursor.execute,
+                    cols + "WHERE id=? AND namespace=? AND deleted_at IS NULL",
+                    (consultation_id, namespace),
+                )
+            else:
+                await _call(
+                    cursor.execute,
+                    cols + "WHERE id=? AND owner_id=? AND namespace=? AND deleted_at IS NULL",
+                    (consultation_id, user_id, namespace),
+                )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def get_consultation_artifacts(
+        self, tx: Any, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> tuple[Row | None, list[Row]]:
+        consultation = await self.get_consultation(
+            tx, consultation_id=consultation_id, root=root, user_id=user_id, namespace=namespace
+        )
+        if not consultation:
+            return None, []
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT memory_id, injected_at FROM consultation_memory_refs "
+                "WHERE consultation_id=? ORDER BY injected_at",
+                (consultation_id,),
+            )
+            refs = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        return consultation, refs
 
     async def create_consultation(
         self,
