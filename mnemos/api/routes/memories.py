@@ -37,6 +37,7 @@ from mnemos.domain.artemis_dedup import (
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.persistence.base import DuplicateMemoryError
 from mnemos.domain.models import (
+    DEFAULT_SEMANTIC_FLOOR,
     BulkCreateRequest,
     BulkCreateResponse,
     MemoryCreateRequest,
@@ -46,6 +47,7 @@ from mnemos.domain.models import (
     MemoryUpdateRequest,
     RehydrationRequest,
     RehydrationResponse,
+    normalize_similarity,
     row_to_memory as _row_to_memory,
 )
 
@@ -793,6 +795,7 @@ async def search_memories(
         request.boost_recency,
         request.recency_weight,
         search_profile.value,  # v6.2 M-2.2.3: distinct cache per profile
+        request.min_score,  # UAT 2026-06-13: floor changes the result set
     )
 
     if _lc._cache and not request.include_compressed:
@@ -892,6 +895,39 @@ async def search_memories(
                 if not rows and not semantic_failed:
                     logger.info(f"[VECTOR] semantic returned 0 rows for '{request.query[:30]}'; falling back to FTS")
                     rows = await _fts_fallback()
+                elif rows and not semantic_failed:
+                    # Relevance floor (UAT 2026-06-13): drop semantic hits
+                    # whose normalized cosine similarity is below the
+                    # requested floor (or DEFAULT_SEMANTIC_FLOOR when the
+                    # caller didn't specify). This cuts the irrelevant
+                    # nearest-neighbour tail on good queries and returns
+                    # EMPTY for nonsense queries. min_score=0.0 opts out
+                    # (legacy top-k-nearest). FTS rows (semantic_failed or
+                    # the 0-row fallback above) carry no score and are
+                    # never filtered here. Floor is clamped to [0, 1].
+                    floor = request.min_score
+                    if floor is None:
+                        floor = DEFAULT_SEMANTIC_FLOOR
+                    floor = max(0.0, min(1.0, float(floor)))
+                    if floor > 0.0:
+                        before = len(rows)
+                        kept = []
+                        for r in rows:
+                            sim = normalize_similarity(r)
+                            # Keep rows we can't score (defensive: a
+                            # backend that omitted the score column should
+                            # not silently vanish) — they pass the floor.
+                            if sim is None or sim >= floor:
+                                kept.append(r)
+                        rows = kept
+                        if len(rows) != before:
+                            logger.info(
+                                "[VECTOR] min_score floor=%.3f dropped %d/%d for '%s'",
+                                floor,
+                                before - len(rows),
+                                before,
+                                request.query[:30],
+                            )
         else:
             rows = await _fts_fallback()
 

@@ -1,6 +1,7 @@
 """Pydantic models for MNEMOS API."""
 
 import json
+import math
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, StrictInt
@@ -109,6 +110,13 @@ class MemoryItem(BaseModel):
     # enabled MNEMOS_AUDIT_CHAIN.
     audit_latest_entry_id: Optional[str] = None  # hex(16-byte entry_id)
     audit_latest_entry_hash: Optional[str] = None  # hex(32-byte sha256)
+    # Semantic relevance score (UAT 2026-06-13). Normalized cosine
+    # similarity in [0, 1], higher = more relevant. Present only on
+    # semantic (vector) search hits; None for FTS/exact/get/rehydrate
+    # results which carry no vector distance. Lets callers see WHY a
+    # row ranked where it did and apply their own cutoff on top of the
+    # server-side min_score floor.
+    score: Optional[float] = None
 
 
 class FederationConsolidationEvent(BaseModel):
@@ -124,6 +132,60 @@ def _isoformat_value(value: Any) -> str | None:
     if isinstance(value, str):
         return value
     return value.isoformat()
+
+
+# Default semantic-relevance floor (UAT 2026-06-13). Empirically tuned
+# against the production bge-m3 (1024-d) cosine distribution: known-good
+# natural-language queries land ~0.60-0.80; nonsense/gibberish nearest
+# neighbours land ~0.30-0.52. A 0.55 floor keeps good hits while cutting
+# the irrelevant-nearest tail. Callers override per-request via
+# MemorySearchRequest.min_score (0.0 = opt out).
+DEFAULT_SEMANTIC_FLOOR = 0.55
+
+
+def normalize_similarity(row) -> Optional[float]:
+    """Extract a normalized cosine similarity in [0, 1] (higher = better)
+    from a semantic-search row, regardless of backend.
+
+    Backends expose the raw vector score under different keys/conventions:
+      * ``similarity``  — sqlite / postgres: already cosine similarity
+        in roughly [0, 1] (1 - cosine_distance), higher is better.
+      * ``rank_score``  — oracle / mysql: COSINE *distance* (0 = identical,
+        grows with dissimilarity); similarity = 1 - distance.
+      * ``rank_score``  — db2: EUCLIDEAN distance on normalized vectors;
+        for unit-norm embeddings cos = 1 - (d^2 / 2), so we map it back.
+
+    Returns None when no score column is present (FTS/exact rows) so the
+    caller leaves MemoryItem.score unset for non-vector results.
+    """
+    if not isinstance(row, dict):
+        return None
+    if row.get("similarity") is not None:
+        try:
+            sim = float(row["similarity"])
+        except (TypeError, ValueError):
+            return None
+    elif row.get("rank_score") is not None:
+        try:
+            dist = float(row["rank_score"])
+        except (TypeError, ValueError):
+            return None
+        # COSINE distance -> similarity (oracle/mysql). db2 uses
+        # EUCLIDEAN; for unit-norm vectors d^2 = 2(1-cos) so the same
+        # 1-d linear map keeps it monotonic and in-range for the common
+        # case. Either way ordering is preserved; only the absolute
+        # floor calibration is backend-specific (we tune for COSINE).
+        sim = 1.0 - dist
+    else:
+        return None
+    if not math.isfinite(sim):
+        return None
+    # Clamp tiny FP overshoot / negative cosine into [0, 1].
+    if sim < 0.0:
+        return 0.0
+    if sim > 1.0:
+        return 1.0
+    return sim
 
 
 def row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
@@ -156,6 +218,7 @@ def row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
         source_agent=row.get("source_agent"),
         archived_at=_isoformat_value(row.get("archived_at")),
         archived=row.get("archived_at") is not None,
+        score=normalize_similarity(row),
     )
 
 
@@ -199,6 +262,14 @@ class MemorySearchRequest(BaseModel):
     # table defaults; `synthesize`/`narrate` may set {"*": 1.0} to
     # disable decay entirely for deep recall.
     decay_overrides: Optional[Dict[str, float]] = None
+    # Semantic relevance floor (UAT 2026-06-13). Normalized cosine
+    # similarity in [0, 1]; semantic hits scoring BELOW this are
+    # dropped. Default None -> the server applies DEFAULT_SEMANTIC_FLOOR
+    # so nonsense queries return empty and the low-score noise tail is
+    # cut from good queries. Pass 0.0 to opt OUT of the floor (legacy
+    # top-k-nearest behavior). Has NO effect on FTS/exact search, which
+    # carry no vector score. Out-of-range values are clamped to [0, 1].
+    min_score: Optional[float] = None
 
 
 class MemoryCreateRequest(BaseModel):
