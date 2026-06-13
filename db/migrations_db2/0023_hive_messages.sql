@@ -10,8 +10,7 @@ BEGIN
       to_urn       VARCHAR(256),
       in_reply_to  VARCHAR(64),
       topic        VARCHAR(128)  NOT NULL,
-      payload      CLOB(2M) INLINE LENGTH 4096
-        CHECK (payload IS JSON FORMAT JSON STRICT) NOT NULL,
+      payload      CLOB(2M) INLINE LENGTH 4096 NOT NULL,
       ts           DOUBLE NOT NULL,
       CONSTRAINT pk_hive_messages PRIMARY KEY (id)
     )';

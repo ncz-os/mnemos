@@ -8,8 +8,7 @@ CREATE TABLE hive_scheduled_jobs (
   name              VARCHAR(256) NOT NULL,
   created_by_urn    VARCHAR(256) NOT NULL,
   interval_seconds  BIGINT       NOT NULL,
-  job_template      CLOB(2M) INLINE LENGTH 4096
-                                 CHECK (job_template IS JSON) NOT NULL,
+  job_template      CLOB(2M) INLINE LENGTH 4096 NOT NULL,
   enabled           SMALLINT     NOT NULL WITH DEFAULT 1,
   last_fired_at     DOUBLE,
   next_fire_at      DOUBLE       NOT NULL,

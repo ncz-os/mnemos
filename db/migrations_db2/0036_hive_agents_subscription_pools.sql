@@ -13,7 +13,6 @@ BEGIN
     EXECUTE IMMEDIATE '
       ALTER TABLE hive_agents
       ADD COLUMN subscription_pools CLOB(1M) INLINE LENGTH 4096
-        CHECK (subscription_pools IS JSON FORMAT JSON STRICT)
     ';
   END IF;
 END%

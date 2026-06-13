@@ -2,15 +2,15 @@
 -- Adapted from Oracle 23ai version with Db2 timestamp / CLOB handling.
 
 CREATE TABLE api_keys (
-    id VARCHAR(36) PRIMARY KEY,
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
     name VARCHAR(100) NOT NULL,
     provider VARCHAR(50) NOT NULL,
     key_hash VARCHAR(128) NOT NULL,
     scopes CLOB(1M),
     rate_limit_per_min INTEGER,
-    created TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    last_used_at TIMESTAMP(6) WITH TIME ZONE,
-    revoked_at TIMESTAMP(6) WITH TIME ZONE,
+    created TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_used_at TIMESTAMP WITH TIME ZONE,
+    revoked_at TIMESTAMP WITH TIME ZONE,
     owner_id VARCHAR(36),
     namespace VARCHAR(100)
 );

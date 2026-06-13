@@ -11,8 +11,7 @@
 
 CREATE TABLE hive_cache (
   cache_key        VARCHAR(128)  NOT NULL,
-  result_json      CLOB(2M) INLINE LENGTH 4096
-                                CHECK (result_json IS JSON) NOT NULL,
+  result_json      CLOB(2M) INLINE LENGTH 4096 NOT NULL,
   source_job_id    VARCHAR(64),
   result_mnemos_id VARCHAR(64),
   hit_count        BIGINT        NOT NULL WITH DEFAULT 0,

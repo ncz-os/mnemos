@@ -18,14 +18,12 @@ BEGIN
       host                  VARCHAR(128)  NOT NULL,
       session_id            VARCHAR(128)  NOT NULL,
       pid                   INTEGER,
-      capabilities          CLOB(1M) INLINE LENGTH 4096
-        CHECK (capabilities IS JSON FORMAT JSON STRICT),
+      capabilities          CLOB(1M) INLINE LENGTH 4096,
       version               VARCHAR(64),
       started_at            DOUBLE NOT NULL,
       last_heartbeat        DOUBLE NOT NULL,
       status                VARCHAR(16)   NOT NULL,
-      metadata              CLOB(1M) INLINE LENGTH 4096
-        CHECK (metadata IS JSON FORMAT JSON STRICT),
+      metadata              CLOB(1M) INLINE LENGTH 4096,
       runtime               VARCHAR(64),
       model                 VARCHAR(128),
       provider              VARCHAR(64),
