@@ -3185,6 +3185,28 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         finally:
             await _call(cursor.close)
 
+    async def record_schema_abort(
+        self,
+        tx: Any,
+        *,
+        peer_id: str,
+        peer_version: str | None,
+        cursor_before: Any,
+        error: str,
+        is_transient: bool,
+    ) -> None:
+        """Explicit Db2 surface for the inherited pure-delegation method (it calls
+        the Db2-native create_sync_log / finish_sync_log / record_sync_error via
+        the MRO, so it already works on Db2; this makes the surface explicit)."""
+        return await super().record_schema_abort(
+            tx,
+            peer_id=peer_id,
+            peer_version=peer_version,
+            cursor_before=cursor_before,
+            error=error,
+            is_transient=is_transient,
+        )
+
     async def record_sync_success(
         self,
         tx: Any,

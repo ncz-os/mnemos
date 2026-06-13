@@ -123,7 +123,7 @@
 | get_feed_memory | IMPL | IMPL | IMPL | IMPL | IMPL |
 | get_sync_peer | IMPL | IMPL | IMPL | IMPL | IMPL |
 | update_peer_schema_check | IMPL | IMPL | IMPL | IMPL | IMPL |
-| record_schema_abort | IMPL | IMPL | -- | IMPL | IMPL |
+| record_schema_abort | IMPL | IMPL | IMPL | IMPL | IMPL |
 | create_sync_log | IMPL | IMPL | IMPL | IMPL | IMPL |
 | finish_sync_log | IMPL | IMPL | IMPL | IMPL | IMPL |
 | record_sync_error | IMPL | IMPL | IMPL | IMPL | IMPL |
@@ -172,6 +172,6 @@
 |---|---|---|---|---|
 | oracle | 110 | 1 | 0 | 0 |
 | postgres | 111 | 0 | 0 | 0 |
-| db2 | 107 | 1 | 0 | 3 |
+| db2 | 108 | 1 | 0 | 2 |
 | mysql | 110 | 1 | 0 | 0 |
 | sqlite | 110 | 0 | 1 | 0 |
