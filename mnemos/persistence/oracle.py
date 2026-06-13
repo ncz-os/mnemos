@@ -21,6 +21,8 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import secrets
+import re
 import logging
 import math
 import uuid
@@ -51,6 +53,15 @@ from mnemos.persistence.base import (
 )
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+_USER_ID_SAFE = re.compile(r"[^a-zA-Z0-9._:-]+")
+
+
+def _mint_user_id(provider: str, external_id: str) -> str:
+    """Deterministic user id from an OAuth identity (mirrors core.oauth)."""
+    slug = _USER_ID_SAFE.sub("", f"{provider}:{external_id}")
+    return slug[:64] or f"{provider}:{secrets.token_hex(6)}"
+
 
 _LOG = logging.getLogger(__name__)
 
@@ -2558,11 +2569,103 @@ class OracleOAuthRepository(OAuthRepository):
         finally:
             await _call(cursor.close)
 
-    async def provision_or_link_user(self, tx: Transaction, **kwargs: Any) -> tuple[str, str]:
-        raise NotImplementedError("Oracle OAuth identity provisioning repository is not implemented")
+    async def provision_or_link_user(
+        self, tx: Transaction, *, provider: str, external_id: str, claims: dict[str, Any]
+    ) -> tuple[str, str]:
+        """Oracle port of PostgresOAuthRepository.provision_or_link_user.
 
-    async def create_session(self, tx: Transaction, **kwargs: Any) -> str:
-        raise NotImplementedError("Oracle OAuth session creation repository is not implemented")
+        Targets the OIDC columns added in 0044 (provider/email/display_name/
+        raw_claims on oauth_identities). provider_id is NOT NULL on the legacy
+        token-hash schema, so it is set to the provider name alongside the new
+        provider column. ON CONFLICT DO NOTHING -> swallow the users unique
+        violation; :userid avoids the Oracle UID builtin.
+        """
+        raw_claims = json.dumps(claims)
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT id, user_id FROM oauth_identities WHERE provider=:prov AND external_id=:ext",
+                {"prov": provider, "ext": external_id},
+            )
+            existing = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            if existing:
+                await _call(
+                    cursor.execute,
+                    "UPDATE oauth_identities SET last_login_at=SYSTIMESTAMP, raw_claims=:rc WHERE id=:id",
+                    {"rc": raw_claims, "id": existing["id"]},
+                )
+                return existing["user_id"], str(existing["id"])
+
+            email = claims.get("email")
+            display_name = claims.get("name") or claims.get("preferred_username")
+            ev = claims.get("email_verified")
+            if isinstance(ev, bool):
+                email_verified = ev
+            elif isinstance(ev, str):
+                email_verified = ev.strip().lower() == "true"
+            else:
+                email_verified = False
+
+            user_id = None
+            if email and email_verified:
+                await _call(cursor.execute, "SELECT id FROM users WHERE email=:em", {"em": email})
+                lt = await _row_to_dict(cursor, await _call(cursor.fetchone))
+                if lt:
+                    user_id = lt["id"]
+            if user_id is None:
+                user_id = _mint_user_id(provider, external_id)
+                try:
+                    await _call(
+                        cursor.execute,
+                        "INSERT INTO users (id, display_name, email, role) VALUES (:id, :dn, :em, 'user')",
+                        {"id": user_id, "dn": display_name, "em": email},
+                    )
+                except Exception as exc:
+                    if not _is_unique_violation(exc):
+                        raise
+
+            identity_id = uuid.uuid4().hex
+            await _call(
+                cursor.execute,
+                "INSERT INTO oauth_identities "
+                "(id, user_id, provider_id, provider, external_id, email, display_name, raw_claims, last_login_at) "
+                "VALUES (:iid, :userid, :prov, :prov, :ext, :em, :dn, :rc, SYSTIMESTAMP)",
+                {"iid": identity_id, "userid": user_id, "prov": provider, "ext": external_id,
+                 "em": email, "dn": display_name, "rc": raw_claims},
+            )
+            return user_id, identity_id
+        finally:
+            await _call(cursor.close)
+
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        user_id: str,
+        identity_id: str | None,
+        expires_at: Any,
+        user_agent: str,
+        ip_address: str | None,
+    ) -> str:
+        """Oracle port of PostgresOAuthRepository.create_session — writes an OIDC
+        auth session row to oauth_sessions (OIDC columns added in 0044). id is the
+        PK (app-side uuid); session_id is the lookup key used by
+        get_identity_for_session / revoke_session."""
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "INSERT INTO oauth_sessions "
+                "(id, session_id, user_id, identity_id, expires_at, user_agent, ip_address, revoked) "
+                "VALUES (:id, :sid, :userid, :iid, :exp, :ua, :ip, 0)",
+                {"id": uuid.uuid4().hex, "sid": session_id, "userid": user_id, "iid": identity_id,
+                 "exp": _ts_for_oracle(expires_at), "ua": user_agent, "ip": ip_address},
+            )
+            return session_id
+        finally:
+            await _call(cursor.close)
 
     async def revoke_session(self, tx: Transaction, session_id: str) -> bool:
         cursor = await _call(_conn_from_tx(tx).cursor)
