@@ -178,3 +178,47 @@ REMAINING (not bugs):
   (store provider client secrets in plaintext + migrate existing token-hash rows),
   not something to change autonomously. Oracle's provider methods have the same
   latent dependency.
+
+## GRAEAE vendor-best-practice doctrine (2026-06-13)
+
+GRAEAE consultation (multi-model consensus) on the remaining design questions,
+deferring to Oracle / IBM DB2 / MySQL vendor best practice. Verdicts:
+
+1. **OAuth client_secret storage -> APP-LEVEL ENCRYPTION (never plaintext).**
+   Vendor transparent encryption (Oracle TDE, DB2 native, MySQL keyring) only
+   encrypts files on disk and stays transparent to any DB user / SQL-injection
+   path, so it still yields plaintext. Encrypt at the application layer (Fernet/
+   AES) and decrypt transiently for build_client; or store a reference and inject
+   from a secrets manager. **IMPLEMENTED** (mnemos/core/secret_box.py + oracle
+   0045 / db2 0043 client_secret_enc + decrypting get_provider). Follow-ups:
+   migrate postgres oauth_providers (currently documented plaintext) to the same
+   scheme; optionally move the key to a secrets manager (Vault / OCI / KMS).
+
+2. **Dual-purpose `sessions` table -> SEPARATE TABLES (auth_sessions vs
+   chat_sessions).** Overloaded tables violate 3NF, waste block/buffer space on
+   NULL columns, cause auth-vs-chat lock contention + index fragmentation, and
+   force filtered indexes. CURRENT: additive dual-purpose `sessions` (auth rows
+   NULL namespace, chat rows set namespace — separable, validated, auth path
+   unwired). TARGET: split into dedicated tables. (Deferred — refactor of
+   validated working code with a prod migration; not done autonomously.)
+
+3. **Delete semantics -> HARD DELETE via DB-native FK ON DELETE CASCADE +
+   TEMPORAL TABLES for audit** (Oracle Flashback Data Archive, DB2 ADD
+   VERSIONING / system-period temporal, MySQL system-versioned), NOT `deleted_at`
+   soft-delete columns (which bloat active indexes + force WHERE deleted_at IS
+   NULL everywhere) and NOT app-level child cascade (round-trip/txn overhead).
+   CURRENT: hard delete + explicit in-tx child cleanup (no FK CASCADE exists on
+   oracle/db2) + deleted_at-filtered reads (postgres parity). TARGET: add FK
+   ON DELETE CASCADE + temporal versioning; drop deleted_at. (Deferred.)
+
+4. **Schema evolution -> DROP vestigial columns; backfill new constraints with
+   the 3-step rollout** (add NULL -> UPDATE backfill in batches -> ALTER NOT NULL
+   + UNIQUE). Oracle: SET UNUSED then DROP UNUSED COLUMNS in a window. DB2: DROP
+   COLUMN then REORG (NOT NULL puts the table in reorg-pending). CURRENT: OIDC
+   columns added additively with token-hash columns retained (unused). TARGET:
+   drop the vestigial token-hash columns in a maintenance migration. (Deferred.)
+
+Verdicts #2-#4 are recorded as the vendor-aligned target architecture; they
+refactor already-validated working code with prod-migration cost, so they are
+flagged for a planned migration rather than changed autonomously. Verdict #1 was
+the only one blocking functionality (the oauth_providers gate) and is implemented.
