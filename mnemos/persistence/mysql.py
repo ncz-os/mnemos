@@ -60,6 +60,7 @@ from mnemos.persistence.base import (
     BranchRepository,
     CompressionStatsRow,
     CompressionQueueRepository,
+    AuditChainRepository,
     CompressionRepository,
     CONSULTATIONS_CAPABILITY,
     CONSULTATIONS_DETAIL_CAPABILITY,
@@ -4591,6 +4592,209 @@ class MysqlStateRepository(StateRepository):
 # ── Backend facade ────────────────────────────────────────────────────────────
 
 
+class MysqlAuditChainRepository(AuditChainRepository):
+    """MySQL implementation of the v6.2 per-memory audit chain."""
+
+    async def get_latest_audit_entry(self, tx: Transaction, memory_id: bytes) -> Row | None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                       op, payload_hash, writer_id, writer_pubkey,
+                       signature, signed_at, global_root, global_seq
+                  FROM memory_audit_chain
+                 WHERE memory_id = %s
+                 ORDER BY signed_at DESC
+                 LIMIT 1
+                """,
+                (memory_id,),
+            )
+            return await _fetchone_dict(cursor)
+
+    async def insert_audit_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: bytes,
+        memory_id: bytes,
+        prev_entry_id: bytes | None,
+        prev_entry_hash: bytes | None,
+        op: str,
+        payload_hash: bytes,
+        writer_id: str,
+        writer_pubkey: bytes,
+        signature: bytes,
+        signed_at: Any,
+    ) -> None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO memory_audit_chain (
+                    entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                    op, payload_hash, writer_id, writer_pubkey,
+                    signature, signed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    entry_id,
+                    memory_id,
+                    prev_entry_id,
+                    prev_entry_hash,
+                    op,
+                    payload_hash,
+                    writer_id,
+                    writer_pubkey,
+                    signature,
+                    signed_at,
+                ),
+            )
+
+    async def claim_unsealed_window(
+        self,
+        tx: Transaction,
+        *,
+        max_window_seconds: int,
+        limit: int,
+    ) -> list[Row]:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT entry_id, signature, signed_at
+                  FROM memory_audit_chain
+                 WHERE global_root IS NULL
+                   AND signed_at <= DATE_SUB(NOW(6), INTERVAL %s SECOND)
+                 ORDER BY signed_at ASC, entry_id ASC
+                 LIMIT %s
+                 FOR UPDATE SKIP LOCKED
+                """,
+                (max_window_seconds, limit),
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def stamp_window_with_root(
+        self,
+        tx: Transaction,
+        *,
+        entry_ids: list[bytes],
+        global_root: bytes,
+        starting_seq: int,
+    ) -> None:
+        if not entry_ids:
+            return
+        async with tx.conn.cursor() as cursor:
+            for offset, entry_id in enumerate(entry_ids):
+                await cursor.execute(
+                    """
+                    UPDATE memory_audit_chain
+                       SET global_root = %s,
+                           global_seq = %s
+                     WHERE entry_id = %s
+                    """,
+                    (global_root, starting_seq + offset, entry_id),
+                )
+
+    async def insert_audit_root(
+        self,
+        tx: Transaction,
+        *,
+        global_root: bytes,
+        window_start: Any,
+        window_end: Any,
+        entry_count: int,
+        root_signature: bytes,
+        signer_pubkey: bytes,
+        sealed_at: Any,
+    ) -> None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO memory_audit_roots (
+                    global_root, window_start, window_end, entry_count,
+                    root_signature, signer_pubkey, sealed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (global_root, window_start, window_end, entry_count, root_signature, signer_pubkey, sealed_at),
+            )
+
+    async def list_window_entries(self, tx: Transaction, global_root: bytes) -> list[Row]:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT entry_id, memory_id, signature, signed_at,
+                       global_seq, payload_hash, op
+                  FROM memory_audit_chain
+                 WHERE global_root = %s
+                 ORDER BY signed_at ASC, entry_id ASC
+                """,
+                (global_root,),
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def get_audit_entry_by_id(self, tx: Transaction, entry_id: bytes) -> Row | None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                       op, payload_hash, writer_id, writer_pubkey,
+                       signature, signed_at, global_root, global_seq
+                  FROM memory_audit_chain
+                 WHERE entry_id = %s
+                """,
+                (entry_id,),
+            )
+            return await _fetchone_dict(cursor)
+
+    async def get_chain_stats(self, tx: Transaction) -> dict:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT COUNT(*) AS total_entries,
+                       SUM(CASE WHEN global_root IS NULL THEN 1 ELSE 0 END) AS unsealed_count,
+                       MIN(CASE WHEN global_root IS NULL THEN signed_at ELSE NULL END) AS oldest_unsealed_signed_at
+                  FROM memory_audit_chain
+                """
+            )
+            chain_stats = await _fetchone_dict(cursor) or {}
+            await cursor.execute(
+                """
+                SELECT COUNT(*) AS sealed_root_count,
+                       MAX(sealed_at) AS last_sealed_at
+                  FROM memory_audit_roots
+                """
+            )
+            root_stats = await _fetchone_dict(cursor) or {}
+        return {
+            "total_entries": int(chain_stats.get("total_entries") or 0),
+            "unsealed_count": int(chain_stats.get("unsealed_count") or 0),
+            "oldest_unsealed_signed_at": _iso_or_none(chain_stats.get("oldest_unsealed_signed_at")),
+            "sealed_root_count": int(root_stats.get("sealed_root_count") or 0),
+            "last_sealed_at": _iso_or_none(root_stats.get("last_sealed_at")),
+        }
+
+    async def get_latest_audit_entries_batch(self, tx: Transaction, memory_ids: list[bytes]) -> dict[bytes, Row]:
+        if not memory_ids:
+            return {}
+        placeholders = ", ".join(["%s"] * len(memory_ids))
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                       op, payload_hash, writer_id, writer_pubkey,
+                       signature, signed_at, global_root, global_seq
+                  FROM (
+                        SELECT mac.*,
+                               ROW_NUMBER() OVER (PARTITION BY memory_id ORDER BY signed_at DESC) AS rn
+                          FROM memory_audit_chain mac
+                         WHERE memory_id IN ({placeholders})
+                       ) ranked
+                 WHERE rn = 1
+                """,
+                list(memory_ids),
+            )
+            rows = await _fetch_all_dicts(cursor)
+        return {row["memory_id"]: row for row in rows}
+
+
 class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align with SqliteBackend/OracleBackend/Db2Backend/PostgresBackend bare-class pattern
     """MySQL 9.0+ persistence facade backed by an aiomysql connection pool.
 
@@ -4638,6 +4842,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         self._consultations_repo = MysqlConsultationsRepository()
         self._federation_repo = MysqlFederationRepository()
         self._state_kv_repo = MysqlStateRepository()
+        self._audit_chain_repo = MysqlAuditChainRepository()
 
     @property
     def settings(self) -> Any:
@@ -4789,6 +4994,10 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv_repo
+
+    @property
+    def audit_chain(self) -> AuditChainRepository:
+        return self._audit_chain_repo
 
     async def open(self) -> None:
         """Validate pool connectivity and apply UTC + init DDL.
