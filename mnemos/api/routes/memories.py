@@ -35,7 +35,6 @@ from mnemos.domain.artemis_dedup import (
     evaluate_memory_create_dedup,
 )
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
-from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.base import DuplicateMemoryError
 from mnemos.domain.models import (
     BulkCreateRequest,
@@ -581,9 +580,7 @@ async def get_compression_manifests(
                 )
             else:
                 exists = await conn.fetchval(
-                    "SELECT 1 FROM memories "
-                    "WHERE id = $1 AND owner_id = $2 AND namespace = $3 "
-                    "AND deleted_at IS NULL",
+                    "SELECT 1 FROM memories WHERE id = $1 AND owner_id = $2 AND namespace = $3 AND deleted_at IS NULL",
                     memory_id,
                     user.user_id,
                     user.namespace,
@@ -893,7 +890,7 @@ async def search_memories(
                 # corpora silently returned empty. FTS still hits the
                 # FTS5 index regardless of embedding state.
                 if not rows and not semantic_failed:
-                    logger.info("[VECTOR] semantic returned 0 rows for " f"'{request.query[:30]}'; falling back to FTS")
+                    logger.info(f"[VECTOR] semantic returned 0 rows for '{request.query[:30]}'; falling back to FTS")
                     rows = await _fts_fallback()
         else:
             rows = await _fts_fallback()
@@ -1023,6 +1020,7 @@ async def create_memory(
         _meta.setdefault("source", request.source)
     try:
         from mnemos.core.secret_detection import classify as _classify, SecretClass, VAULT_NAMESPACE
+
         _finding = _classify(request.content)
         if _finding.cls is SecretClass.VAULT and namespace != VAULT_NAMESPACE:
             _meta["secret_vaulted"] = True
@@ -1032,7 +1030,8 @@ async def create_memory(
             namespace = VAULT_NAMESPACE
             logger.warning(
                 "[secret-vault] ingest auto-vaulted memory %s (reasons=%s)",
-                mem_id, _finding.reasons,
+                mem_id,
+                _finding.reasons,
             )
         elif _finding.cls is SecretClass.REDACT:
             _meta["secret_redact_spans"] = _finding.spans
@@ -1047,8 +1046,7 @@ async def create_memory(
         # recoverable by a root re-file; a false-negative (a real secret
         # left searchable) is not.
         logger.exception(
-            "[secret-vault] ingest classification FAILED for %s — failing "
-            "closed, quarantining into vault namespace",
+            "[secret-vault] ingest classification FAILED for %s — failing closed, quarantining into vault namespace",
             mem_id,
         )
         if namespace != VAULT_NAMESPACE:
@@ -1180,7 +1178,7 @@ async def create_memory(
                     )
                 else:
                     logger.warning(
-                        "[create_memory] MNEMOS_AUDIT_CHAIN=on but " "session_secret is empty; skipping audit write"
+                        "[create_memory] MNEMOS_AUDIT_CHAIN=on but session_secret is empty; skipping audit write"
                     )
             # Same-tx outbox enqueue — preserves the v4.0 contract
             # that webhook_deliveries rows commit atomically with
