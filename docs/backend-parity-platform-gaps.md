@@ -82,3 +82,23 @@ stub NOT on the ABC — not a parity requirement, leave or delete.
 - **db2 sessions drift** — db2 inherits Oracle session stubs; needs the same
   treatment as oracle sessions (gated on the oracle work + an Oracle/DB2 session
   schema decision).
+
+### UPDATE 2026-06-13 — 4 of the 8 mysql RAISE ported
+
+Done (commit 784bb20, validated MySQL 9.0): fetch_referenced_memory_allowlist,
+fetch_memory_export, find_duplicate_content_groups, consolidate_duplicate_memories.
+mysql is now 106 IMPL / 4 RAISE.
+
+Remaining 4 = the version-ACL cluster: assert_memory_readable, fetch_memory_log,
+fetch_diff_commit_pair, fetch_checkout_commit. These need a **MySQL-dialect
+visibility predicate** first. Postgres uses `mnemos.core.visibility.
+read_visibility_predicate` / `version_visibility_predicate`, which emit `$n`
+placeholders AND a `group_id = ANY($groups)` array param. A naive `$n -> %s`
+rewrite breaks on the array param (MySQL needs `group_id IN (%s, ...)` expansion).
+So the slice must author a `%s`/list-expanding MySQL variant that mirrors the RLS
+branch logic EXACTLY (owner_id / federation_source IS NOT NULL / world bits
+`permission_mode % 10 >= 4` / group bits `(permission_mode/10)%10 >= 4 AND
+group_id IN (...)`), then port the 4 methods (fetch_memory_log is a RECURSIVE CTE
+over memory_versions+memory_branches; root paths skip the predicate). This is
+security-sensitive (RLS read policy) — do it as a focused, heavily-reviewed slice,
+not a quick port. mysql8 OR mysql9 both validate it (no VECTOR dep).
