@@ -2516,8 +2516,20 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         return await self._registry_rows(tx)
 
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
-        _ = (tx, model_id)
-        return None
+        """Oracle port of PostgresConsultations... fetch_model_provider — looks up the
+        provider for an available, non-deprecated model in model_registry."""
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider FROM model_registry WHERE model_id = :m "
+                "AND available = 1 AND deprecated = 0 FETCH FIRST 1 ROWS ONLY",
+                {"m": model_id},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            return row["provider"] if row else None
+        finally:
+            await _call(cursor.close)
 
 
 class OracleOAuthRepository(OAuthRepository):
