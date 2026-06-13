@@ -100,13 +100,13 @@
 ## ConsultationsRepository (7 methods)
 | method | oracle | postgres | db2 | mysql | sqlite |
 |---|---|---|---|---|---|
-| resolve_tier_lineup | STUB | IMPL | IMPL | IMPL | IMPL |
-| resolve_models | STUB | IMPL | IMPL | IMPL | IMPL |
+| resolve_tier_lineup | IMPL | IMPL | IMPL | IMPL | IMPL |
+| resolve_models | IMPL | IMPL | IMPL | IMPL | IMPL |
 | create_consultation_with_audit | IMPL | IMPL | IMPL | IMPL | IMPL |
-| list_audit_log | STUB | IMPL | IMPL | IMPL | IMPL |
-| fetch_audit_chain | STUB | IMPL | IMPL | IMPL | IMPL |
-| get_consultation | STUB | IMPL | IMPL | IMPL | IMPL |
-| get_consultation_artifacts | STUB | IMPL | IMPL | IMPL | IMPL |
+| list_audit_log | IMPL | IMPL | IMPL | IMPL | IMPL |
+| fetch_audit_chain | IMPL | IMPL | IMPL | IMPL | IMPL |
+| get_consultation | IMPL | IMPL | IMPL | IMPL | IMPL |
+| get_consultation_artifacts | IMPL | IMPL | IMPL | IMPL | IMPL |
 
 ## FederationRepository (23 methods)
 | method | oracle | postgres | db2 | mysql | sqlite |
@@ -170,7 +170,7 @@
 ## TOTALS (across all ABC repo methods)
 | backend | IMPL | STUB | RAISE | absent(--) |
 |---|---|---|---|---|
-| oracle | 93 | 14 | 4 | 0 |
+| oracle | 99 | 8 | 4 | 0 |
 | postgres | 111 | 0 | 0 | 0 |
 | db2 | 94 | 1 | 0 | 16 |
 | mysql | 110 | 1 | 0 | 0 |
