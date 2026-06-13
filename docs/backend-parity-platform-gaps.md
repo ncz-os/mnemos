@@ -120,3 +120,30 @@ Everything still open is GATED and must NOT be blind-built: oracle Sessions +
 Consultations (live Oracle XE), the oauth token-hash -> OIDC schema split (data
 migration + plaintext-secret decision, mem_1781325370745), db2 sessions drift +
 db2 oauth (the oracle parent must resolve the session/oauth design first).
+
+### UPDATE 2026-06-13 (ext) — oracle Consultations un-gated; sessions gate proven real
+
+Stood up Oracle 23ai Free (gvenzl/oracle-free:23-slim) — the oracle "needs a live
+DB" gate was only that. Oracle XE 21c does NOT work (the oracle migrations use
+`CREATE TABLE IF NOT EXISTS`, a 23c+ feature). With 23ai up:
+- oracle GRAEAE Consultations implemented natively (6 read methods + the
+  create_consultation_with_audit that 0041 unblocked) + migrations
+  0041_graeae_parity_cols + 0042_model_registry. oracle 93 -> 99 -> 100 IMPL
+  (incl. fetch_model_provider). Validated on 23ai.
+
+Final coverage: postgres 111, sqlite 110, mysql 110, db2 94, oracle 100 — all
+non-gated parity reached.
+
+The chat-Sessions gate is NOT a DB-availability gate — it is a genuine SCHEMA
+CONFLICT, now proven against the live DB: the oracle `sessions` table is an
+AUTH/token schema (`session_id RAW`, `started_at`, `expires_at`,
+`last_active_at`, `metadata`) used by the auth `get_session`, NOT the
+chat-session schema the `SessionsRepository` ABC expects (model, message_count,
+total_tokens, last_activity + `session_messages` with model/tokens_used/
+memories_injected + `session_memory_injections` with message_id/relevance_score).
+Same table name, two different purposes across backends. Implementing chat
+sessions on oracle/db2 needs a human decision: new chat-session tables, or rename
+the auth table, or extend it. db2 inherits the same conflict.
+
+OAuth stays gated for the same reasons as before (token-hash vs OIDC, breaking
+schema + plaintext client_secret + prod-data migration).
