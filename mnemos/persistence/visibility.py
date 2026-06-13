@@ -94,22 +94,39 @@ class VisibilityFilter:
         the full ``READABLE`` envelope pinned to ``namespace``.
 
         ``include_secrets`` / explicit vault targeting controls the
-        secret-vault subtraction:
+        secret-vault subtraction. Access control is enforced HERE in the
+        factory (correct-by-construction), not merely by a route check:
+        the vault escape hatches (``include_secrets`` and explicit
+        ``namespace == VAULT_NAMESPACE`` targeting) are ROOT-ONLY.
 
-        * Default (``include_secrets=False``) AND not already pinned to
-          the vault namespace -> the vault namespace is subtracted from
-          the result set even for root. Credential-class memories never
+        * Default (``include_secrets=False``) AND not pinned to the
+          vault namespace -> the vault namespace is subtracted from the
+          result set even for root. Credential-class memories never
           surface on the default FTS/semantic path.
-        * ``include_secrets=True`` OR ``namespace == VAULT_NAMESPACE`` ->
-          no subtraction; fleet agents fetch credentials explicitly.
+        * ROOT caller with ``include_secrets=True`` OR
+          ``namespace == VAULT_NAMESPACE`` -> no subtraction; fleet
+          agents fetch credentials explicitly.
+        * NON-ROOT caller -> the vault is ALWAYS subtracted, regardless
+          of ``include_secrets`` or an explicit ``namespace="vault"``
+          request. A non-root caller cannot enumerate or target the
+          vault even by naming it. (Routes additionally reject these
+          requests up front, but the factory does not depend on that.)
+
+        Release-blocking hardening 2026-06-13: previously the vault
+        exclusion was cleared whenever the caller targeted
+        ``namespace="vault"`` for ANY user, letting a non-root caller
+        enumerate the vault by explicitly requesting it. The escape
+        hatches are now gated on ``is_root`` inside the factory.
         """
-        targeting_vault = namespace == VAULT_NAMESPACE
-        exclude = (
-            ()
-            if (include_secrets or targeting_vault)
-            else DEFAULT_EXCLUDED_NAMESPACES
+        caller_is_root = is_root(user)
+        # Vault escape hatches are root-only: a non-root caller never
+        # clears the vault subtraction, even when targeting the vault
+        # namespace or passing include_secrets.
+        unmask_vault = caller_is_root and (
+            include_secrets or namespace == VAULT_NAMESPACE
         )
-        if is_root(user):
+        exclude = () if unmask_vault else DEFAULT_EXCLUDED_NAMESPACES
+        if caller_is_root:
             return cls(
                 scope=VisibilityScope.ROOT_BYPASS,
                 user_id=None,

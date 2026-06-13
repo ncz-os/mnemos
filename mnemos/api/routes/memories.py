@@ -402,12 +402,18 @@ async def get_memory(
     visibility = VisibilityFilter.for_read(
         user,
         namespace=None if is_root(user) else user.namespace,
-        # GET-by-id is an EXPLICIT fetch: knowing the exact memory id
-        # is itself the opt-in, so the vault namespace is NOT excluded
-        # here. (Search/list/rehydrate DO exclude it because those
-        # enumerate.) This lets fleet agents fetch a credential they
-        # hold the id for without an include_secrets flag.
-        include_secrets=True,
+        # GET-by-id is an EXPLICIT fetch: for ROOT callers, knowing the
+        # exact memory id is itself the opt-in, so the vault namespace
+        # is NOT excluded — fleet agents fetch a credential they hold
+        # the id for without an include_secrets flag. (Search/list/
+        # rehydrate DO exclude it for everyone because those enumerate.)
+        # Secret vault (release-blocking 2026-06-13): for NON-ROOT
+        # callers the vault MUST stay excluded so a non-root user who
+        # knows/guesses a vault memory id cannot fetch it — the row is
+        # filtered out and the handler returns 404 (not-found), keeping
+        # vault-row existence invisible. Vault GET-by-id is therefore
+        # root-only by construction.
+        include_secrets=is_root(user),
     )
     body: Optional[str] = None
     row = None
@@ -698,6 +704,20 @@ async def search_memories(
     user: UserContext = Depends(get_current_user),
 ):
     """Search memories with optional 5-minute response caching."""
+    # Secret vault (release-blocking 2026-06-13): include_secrets is
+    # root-only and MUST be enforced BEFORE any cache-key construction,
+    # cache read, or cache write. The cache key encodes
+    # include_secrets into a distinct (secret-inclusive) bucket; if a
+    # non-root caller were allowed past this point they could read — or
+    # populate — the root-only secret bucket via that key. Rejecting up
+    # front guarantees the secret-inclusive cache bucket is reachable
+    # only by root. (Duplicated visibility-factory call below stays
+    # defense-in-depth.)
+    if request.include_secrets and not is_root(user):
+        raise HTTPException(
+            status_code=403,
+            detail="include_secrets requires root",
+        )
     search_trace_id = uuid4().hex[:8]
     search_started_at = time.monotonic()
     # v6.2 M-2.2.3: validate retrieval profile (unknown → 400). Default
@@ -797,14 +817,11 @@ async def search_memories(
     # subtracts the vault namespace even for root, so credential-class
     # memories never surface in normal/public/phone search. Fleet
     # agents opt in with include_secrets=true OR by targeting
-    # namespace="vault" explicitly. include_secrets is root-only:
-    # a non-root caller asking for it is rejected rather than silently
-    # downgraded.
-    if request.include_secrets and not is_root(user):
-        raise HTTPException(
-            status_code=403,
-            detail="include_secrets requires root",
-        )
+    # namespace="vault" explicitly. include_secrets is root-only and is
+    # rejected at the TOP of this handler (before cache-key build) so a
+    # non-root caller can never touch the secret-inclusive cache bucket.
+    # The visibility factory below independently clears the vault
+    # exclusion only for root callers (defense-in-depth).
     visibility = VisibilityFilter.for_read(
         user,
         namespace=search_namespace,
