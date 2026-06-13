@@ -23,6 +23,14 @@ from enum import Enum
 from mnemos.core.auth_context import UserContext
 from mnemos.core.security import is_root
 
+from mnemos.core.secret_detection import VAULT_NAMESPACE
+
+# Namespaces hidden from the DEFAULT read path (FTS + semantic). The
+# secret vault is excluded so credential-class memories never surface
+# in normal/public/phone search. Fleet agents opt in explicitly (see
+# VisibilityFilter.for_read include_secrets / namespace=vault).
+DEFAULT_EXCLUDED_NAMESPACES: tuple[str, ...] = (VAULT_NAMESPACE,)
+
 
 class VisibilityScope(Enum):
     """Read/write visibility envelope for a repository call.
@@ -66,20 +74,65 @@ class VisibilityFilter:
     user_id: str | None
     group_ids: tuple[str, ...]
     namespace: str | None
+    # Namespaces to subtract from the result set REGARDLESS of scope --
+    # applied even for ROOT_BYPASS. This is how the secret vault stays
+    # hidden from the default read path: root callers search with
+    # namespace=None (no pin) but still must not see vault rows.
+    exclude_namespaces: tuple[str, ...] = ()
 
     @classmethod
-    def for_read(cls, user: UserContext, *, namespace: str | None) -> "VisibilityFilter":
+    def for_read(
+        cls,
+        user: UserContext,
+        *,
+        namespace: str | None,
+        include_secrets: bool = False,
+    ) -> "VisibilityFilter":
         """Build the read-path filter for a user.
 
         Root callers bypass the predicate entirely. Non-root callers get
         the full ``READABLE`` envelope pinned to ``namespace``.
+
+        ``include_secrets`` / explicit vault targeting controls the
+        secret-vault subtraction. Access control is enforced HERE in the
+        factory (correct-by-construction), not merely by a route check:
+        the vault escape hatches (``include_secrets`` and explicit
+        ``namespace == VAULT_NAMESPACE`` targeting) are ROOT-ONLY.
+
+        * Default (``include_secrets=False``) AND not pinned to the
+          vault namespace -> the vault namespace is subtracted from the
+          result set even for root. Credential-class memories never
+          surface on the default FTS/semantic path.
+        * ROOT caller with ``include_secrets=True`` OR
+          ``namespace == VAULT_NAMESPACE`` -> no subtraction; fleet
+          agents fetch credentials explicitly.
+        * NON-ROOT caller -> the vault is ALWAYS subtracted, regardless
+          of ``include_secrets`` or an explicit ``namespace="vault"``
+          request. A non-root caller cannot enumerate or target the
+          vault even by naming it. (Routes additionally reject these
+          requests up front, but the factory does not depend on that.)
+
+        Release-blocking hardening 2026-06-13: previously the vault
+        exclusion was cleared whenever the caller targeted
+        ``namespace="vault"`` for ANY user, letting a non-root caller
+        enumerate the vault by explicitly requesting it. The escape
+        hatches are now gated on ``is_root`` inside the factory.
         """
-        if is_root(user):
+        caller_is_root = is_root(user)
+        # Vault escape hatches are root-only: a non-root caller never
+        # clears the vault subtraction, even when targeting the vault
+        # namespace or passing include_secrets.
+        unmask_vault = caller_is_root and (
+            include_secrets or namespace == VAULT_NAMESPACE
+        )
+        exclude = () if unmask_vault else DEFAULT_EXCLUDED_NAMESPACES
+        if caller_is_root:
             return cls(
                 scope=VisibilityScope.ROOT_BYPASS,
                 user_id=None,
                 group_ids=(),
                 namespace=namespace,
+                exclude_namespaces=exclude,
             )
         if namespace is None:
             raise ValueError("non-root read visibility requires a namespace")
@@ -88,6 +141,7 @@ class VisibilityFilter:
             user_id=user.user_id,
             group_ids=tuple(user.group_ids),
             namespace=namespace,
+            exclude_namespaces=exclude,
         )
 
     @classmethod
