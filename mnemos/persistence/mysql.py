@@ -1524,7 +1524,37 @@ class MysqlMemoryRepository(MemoryRepository):
         limit: int,
         offset: int,
     ) -> list[Row]:
-        raise NotImplementedError("mysql: fetch_memory_export not yet implemented")
+        """MySQL port of PostgresMemoryRepository.fetch_memory_export.
+
+        Provenance columns (provenance->prov_kind, morpheus_run_id,
+        source_memories, federation_source) feed MPF v0.2 emission, same as
+        postgres. morpheus_run_id is CHAR(36) on MySQL so no ::text cast.
+        """
+        conditions: list[str] = ["deleted_at IS NULL"]
+        params: list[Any] = []
+        if effective_owner:
+            conditions.append("owner_id = %s")
+            params.append(effective_owner)
+        if effective_ns:
+            conditions.append("namespace = %s")
+            params.append(effective_ns)
+        if category:
+            conditions.append("category = %s")
+            params.append(category)
+        where = "WHERE " + " AND ".join(conditions)
+        sql = (
+            "SELECT id, content, category, subcategory, created, updated, "
+            "owner_id, namespace, permission_mode, quality_rating, "
+            "source_model, source_provider, source_session, source_agent, metadata, "
+            "provenance AS prov_kind, morpheus_run_id AS morpheus_run_id, "
+            "source_memories, federation_source "
+            "FROM memories "
+            f"{where} ORDER BY created ASC LIMIT %s OFFSET %s"
+        )
+        params.extend([limit, offset])
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
 
     async def fetch_referenced_memory_allowlist(
         self,
@@ -1534,7 +1564,28 @@ class MysqlMemoryRepository(MemoryRepository):
         scope_owner: str | None = None,
         scope_namespace: str | None = None,
     ) -> list[Row]:
-        raise NotImplementedError("mysql: fetch_referenced_memory_allowlist not yet implemented")
+        """MySQL port of PostgresMemoryRepository.fetch_referenced_memory_allowlist.
+
+        Postgres ``id = ANY($1::text[])`` -> ``id IN (%s, ...)``.
+        """
+        ids = list(referenced_ids)
+        if not ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(ids))
+        sql = f"SELECT id, owner_id, namespace FROM memories WHERE id IN ({placeholders}) AND deleted_at IS NULL"
+        params: list[Any] = list(ids)
+        if scope_owner is not None:
+            sql += " AND owner_id = %s"
+            params.append(scope_owner)
+            if scope_namespace is not None:
+                sql += " AND namespace = %s"
+                params.append(scope_namespace)
+        elif scope_namespace is not None:
+            sql += " AND namespace = %s"
+            params.append(scope_namespace)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
 
     async def fetch_duplicate_content_groups(self, *args: Any, **kwargs: Any) -> list[Row]:
         raise NotImplementedError("mysql: fetch_duplicate_content_groups not yet implemented")
@@ -1545,7 +1596,41 @@ class MysqlMemoryRepository(MemoryRepository):
         *,
         namespace: str | None = None,
     ) -> list[Row]:
-        raise NotImplementedError("mysql: find_duplicate_content_groups not yet implemented")
+        """MySQL port of PostgresMemoryRepository.find_duplicate_content_groups.
+
+        postgres ``ARRAY_AGG(id ORDER BY created, id)`` + ``[1]`` canonical ->
+        ``GROUP_CONCAT(... ORDER BY created, id)`` split to a list, canonical via
+        ``SUBSTRING_INDEX(...,',',1)``. GROUP_CONCAT defaults to a 1024-char cap
+        that would silently truncate large duplicate groups, so raise
+        ``group_concat_max_len`` first. Row shape matches postgres: owner_id,
+        namespace, content_hash, duplicate_count (int), memory_ids (list),
+        canonical_id.
+        """
+        # Memory IDs are ``mem_<ts>_<hash6>`` (alphanumeric + underscore, never a
+        # comma), so the comma-joined GROUP_CONCAT splits back cleanly. The
+        # SET_VAR optimizer hint raises group_concat_max_len for THIS statement
+        # only (no pooled-connection session-state leak); 1M chars covers
+        # ~25k ids, far beyond any realistic identical-content group.
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT /*+ SET_VAR(group_concat_max_len=1000000) */ "
+                "owner_id, namespace, content_hash, "
+                "COUNT(*) AS duplicate_count, "
+                "GROUP_CONCAT(id ORDER BY created ASC, id ASC) AS memory_ids_csv, "
+                "SUBSTRING_INDEX(GROUP_CONCAT(id ORDER BY created ASC, id ASC), ',', 1) AS canonical_id "
+                "FROM memories "
+                "WHERE deleted_at IS NULL AND archived_at IS NULL AND consolidated_into IS NULL "
+                "AND content_hash IS NOT NULL AND (%s IS NULL OR namespace = %s) "
+                "GROUP BY owner_id, namespace, content_hash HAVING COUNT(*) > 1 "
+                "ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC",
+                (namespace, namespace),
+            )
+            rows = await _fetch_all_dicts(cursor)
+        for r in rows:
+            csv = r.pop("memory_ids_csv", "") or ""
+            r["memory_ids"] = csv.split(",") if csv else []
+            r["duplicate_count"] = int(r["duplicate_count"])
+        return rows
 
     async def consolidate_duplicate_memories(
         self,
@@ -1554,7 +1639,30 @@ class MysqlMemoryRepository(MemoryRepository):
         canonical_id: str,
         duplicate_ids: Sequence[str],
     ) -> int:
-        raise NotImplementedError("mysql: consolidate_duplicate_memories not yet implemented")
+        """MySQL port of PostgresMemoryRepository.consolidate_duplicate_memories.
+
+        postgres ``id = ANY($2::text[])`` -> ``id IN (%s, ...)``; ``NOW()`` ->
+        ``NOW(6)``. The canonical-still-live guard wraps the self-referential
+        EXISTS subquery in a derived table so MySQL does not raise error 1093
+        (can't SELECT a table being UPDATEd in a bare subquery).
+        """
+        ids = list(duplicate_ids)
+        if not ids:
+            return 0
+        placeholders = ", ".join(["%s"] * len(ids))
+        sql = (
+            "UPDATE memories "
+            "SET consolidated_into = %s, consolidated_at = NOW(6), "
+            "deleted_at = COALESCE(deleted_at, NOW(6)), updated = NOW(6) "
+            f"WHERE id IN ({placeholders}) AND id <> %s "
+            "AND deleted_at IS NULL AND archived_at IS NULL AND consolidated_into IS NULL "
+            "AND EXISTS (SELECT 1 FROM (SELECT id FROM memories WHERE id = %s "
+            "AND deleted_at IS NULL AND archived_at IS NULL AND consolidated_into IS NULL) AS canon)"
+        )
+        params = [canonical_id, *ids, canonical_id, canonical_id]
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(params))
+            return int(getattr(cursor, "rowcount", 0) or 0)
 
 
 # ── KG, Version, Branch, Compression, Webhook, ConsultationAudit,
