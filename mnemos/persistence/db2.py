@@ -91,6 +91,9 @@ _NATIVE_FORBIDDEN_ORACLE_TOKENS: tuple[tuple[str, str], ...] = (
     ("SYSDATE", "Oracle SYSDATE token"),
     ("FROM DUAL", "Oracle DUAL table"),
     ("TO_VECTOR(", "Oracle TO_VECTOR call"),
+    ("ROWNUM", "Oracle ROWNUM pseudocolumn"),
+    ("TO_TIMESTAMP_TZ", "Oracle TO_TIMESTAMP_TZ call"),
+    ("NUMTODSINTERVAL", "Oracle NUMTODSINTERVAL call"),
 )
 # Db2's ``NVL(?, 'literal')`` infers the result column type from the
 # literal width (e.g. VARCHAR(7) from 'default'), then truncates any
