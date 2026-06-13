@@ -7,8 +7,8 @@
 | fetch_memory_log | IMPL | IMPL | IMPL | RAISE | IMPL |
 | fetch_diff_commit_pair | IMPL | IMPL | IMPL | RAISE | IMPL |
 | fetch_checkout_commit | IMPL | IMPL | IMPL | RAISE | IMPL |
-| fetch_memory_export | IMPL | IMPL | IMPL | RAISE | IMPL |
-| fetch_referenced_memory_allowlist | IMPL | IMPL | IMPL | RAISE | IMPL |
+| fetch_memory_export | IMPL | IMPL | IMPL | IMPL | IMPL |
+| fetch_referenced_memory_allowlist | IMPL | IMPL | IMPL | IMPL | IMPL |
 | insert_memory | IMPL | IMPL | IMPL | IMPL | IMPL |
 | fetch_memory_by_id | IMPL | IMPL | IMPL | IMPL | IMPL |
 | set_suppress_version_snapshot | STUB | IMPL | STUB | STUB | IMPL |
@@ -20,8 +20,8 @@
 | update_memory | IMPL | IMPL | IMPL | IMPL | IMPL |
 | find_active_duplicate_by_content_hash | IMPL | IMPL | IMPL | IMPL | IMPL |
 | bump_recall_and_get_memory | IMPL | IMPL | IMPL | IMPL | IMPL |
-| find_duplicate_content_groups | IMPL | IMPL | IMPL | RAISE | IMPL |
-| consolidate_duplicate_memories | IMPL | IMPL | IMPL | RAISE | IMPL |
+| find_duplicate_content_groups | IMPL | IMPL | IMPL | IMPL | IMPL |
+| consolidate_duplicate_memories | IMPL | IMPL | IMPL | IMPL | IMPL |
 | delete_memory | IMPL | IMPL | IMPL | IMPL | IMPL |
 | semantic_search | IMPL | IMPL | IMPL | IMPL | IMPL |
 | fts_search | IMPL | IMPL | IMPL | IMPL | IMPL |
@@ -173,5 +173,5 @@
 | oracle | 93 | 14 | 4 | 0 |
 | postgres | 111 | 0 | 0 | 0 |
 | db2 | 94 | 1 | 0 | 16 |
-| mysql | 102 | 1 | 8 | 0 |
+| mysql | 106 | 1 | 4 | 0 |
 | sqlite | 110 | 0 | 1 | 0 |
