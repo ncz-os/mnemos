@@ -122,9 +122,7 @@ class VisibilityFilter:
         # Vault escape hatches are root-only: a non-root caller never
         # clears the vault subtraction, even when targeting the vault
         # namespace or passing include_secrets.
-        unmask_vault = caller_is_root and (
-            include_secrets or namespace == VAULT_NAMESPACE
-        )
+        unmask_vault = caller_is_root and (include_secrets or namespace == VAULT_NAMESPACE)
         exclude = () if unmask_vault else DEFAULT_EXCLUDED_NAMESPACES
         if caller_is_root:
             return cls(

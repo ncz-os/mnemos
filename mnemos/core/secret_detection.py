@@ -37,8 +37,8 @@ VAULT_NAMESPACE = "vault"
 
 class SecretClass(str, Enum):
     CLEAN = "clean"
-    REDACT = "redact"   # incidental span — keep memory, mask span on default read
-    VAULT = "vault"     # credential carrier — isolate whole memory
+    REDACT = "redact"  # incidental span — keep memory, mask span on default read
+    VAULT = "vault"  # credential carrier — isolate whole memory
 
 
 # ── High-confidence provider/credential shapes ─────────────────────────
@@ -94,10 +94,7 @@ def _value_is_secret_grade(value: str) -> bool:
     if len(value) < 12:
         return False
     # require some entropy: at least two of {lower, upper, digit, symbol}
-    classes = sum(
-        bool(re.search(p, value))
-        for p in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^0-9A-Za-z]")
-    )
+    classes = sum(bool(re.search(p, value)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^0-9A-Za-z]"))
     return classes >= 2
 
 
@@ -139,7 +136,7 @@ def classify(content: str | None) -> SecretFinding:
 
     # 3. Long hex blobs (64+) without SHA/commit context → REDACT span only.
     for mo in _HEX_BLOB_RE.finditer(text):
-        window = text[max(0, mo.start() - 30):mo.start()]
+        window = text[max(0, mo.start() - 30) : mo.start()]
         if _SHA_CONTEXT_RE.search(window):
             continue  # explicitly a SHA/commit/digest — leave clean
         if finding.cls is SecretClass.CLEAN:

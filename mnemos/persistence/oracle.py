@@ -167,9 +167,7 @@ def _render_visibility(
     it applies even to ROOT_BYPASS (which otherwise yields no tenancy
     filter and would expose vault rows to the root token).
     """
-    clause, params = _render_visibility_core(
-        visibility, table_alias=table_alias, param_prefix=param_prefix
-    )
+    clause, params = _render_visibility_core(visibility, table_alias=table_alias, param_prefix=param_prefix)
     excl = tuple(visibility.exclude_namespaces or ())
     if excl:
         p = f"{table_alias}." if table_alias else ""
@@ -184,9 +182,7 @@ def _render_visibility(
         # memories from default/root search. Vault rows always carry a
         # non-NULL namespace ("vault"), so NULL is never a secret —
         # preserve it explicitly. (release-blocking 2026-06-13)
-        excl_clause = (
-            f"({p}namespace IS NULL OR {p}namespace NOT IN ({', '.join(names)}))"
-        )
+        excl_clause = f"({p}namespace IS NULL OR {p}namespace NOT IN ({', '.join(names)}))"
         clause = f"({clause}) AND {excl_clause}" if clause else excl_clause
     return clause, params
 
@@ -2800,8 +2796,7 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
             # Read current prices to detect change
             await _call(
                 cursor.execute,
-                "SELECT price_in, price_out, price_cached FROM model_registry "
-                "WHERE provider = :p AND model_id = :m",
+                "SELECT price_in, price_out, price_cached FROM model_registry WHERE provider = :p AND model_id = :m",
                 {"p": provider, "m": model_id},
             )
             row = await _call(cursor.fetchone)
@@ -3041,8 +3036,7 @@ class OracleAclRepository(AclRepository):
         try:
             await _call(
                 cursor.execute,
-                "SELECT 1 FROM user_groups "
-                "WHERE user_id = :user_id AND group_id = :group_id AND is_admin = 1",
+                "SELECT 1 FROM user_groups WHERE user_id = :user_id AND group_id = :group_id AND is_admin = 1",
                 {"user_id": user_id, "group_id": group_id},
             )
             return await _call(cursor.fetchone) is not None
