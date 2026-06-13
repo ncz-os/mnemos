@@ -101,6 +101,15 @@ class Transaction(Protocol):
 class MemoryRepository(ABC):
     """Memory row, memory export, and memory DAG read operations."""
 
+    # Declarative description of the raw vector-score column that this
+    # backend's semantic_search() emits, so the route can convert it to a
+    # normalized cosine similarity (0..1) without backend-specific code or
+    # brittle class-name sniffing. (semantic_score_column, metric) where
+    # metric is one of mnemos.domain.models.METRIC_*. Subclasses override.
+    # Default = oracle/mysql convention (COSINE distance under rank_score).
+    SEMANTIC_SCORE_COLUMN: str = "rank_score"
+    SEMANTIC_SCORE_METRIC: str = "cosine_distance"
+
     @abstractmethod
     async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None: ...
 

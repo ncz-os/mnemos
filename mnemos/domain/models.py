@@ -143,44 +143,72 @@ def _isoformat_value(value: Any) -> str | None:
 DEFAULT_SEMANTIC_FLOOR = 0.55
 
 
+# Canonical key under which the route stamps a normalized cosine
+# similarity (0..1, higher = better) onto a semantic-search row, AFTER
+# converting the backend's raw distance/score via score_to_similarity().
+# row_to_memory() reads ONLY this key — never a backend-specific column —
+# so an FTS row's ``rank``/``rank_score`` relevance column can NEVER be
+# mistaken for a vector score (ngc-review BLOCK finding 2026-06-13).
+SEMANTIC_SCORE_KEY = "_semantic_score"
+
+# Backend vector-distance metrics. The raw value in the backend's score
+# column means different things per metric; score_to_similarity() maps
+# each to a cosine similarity in [0, 1].
+METRIC_COSINE_SIMILARITY = "cosine_similarity"  # value already = similarity (sqlite/postgres)
+METRIC_COSINE_DISTANCE = "cosine_distance"  # value = 1 - cos (oracle/mysql)
+METRIC_EUCLIDEAN_UNIT = "euclidean_unit"  # value = L2 dist on unit vecs (db2)
+
+
+def score_to_similarity(raw, metric: str) -> Optional[float]:
+    """Map a backend's raw vector score to cosine similarity in [0, 1]
+    (higher = better), using the backend's distance metric.
+
+    Returns None for non-finite / unparseable input so the caller can
+    decide how to treat an unscoreable semantic row.
+    """
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    if metric == METRIC_COSINE_DISTANCE:
+        sim = 1.0 - v
+    elif metric == METRIC_EUCLIDEAN_UNIT:
+        # L2-normalized embeddings: d^2 = 2(1 - cos) -> cos = 1 - d^2/2.
+        sim = 1.0 - (v * v) / 2.0
+    else:  # METRIC_COSINE_SIMILARITY (default)
+        sim = v
+    # Clamp FP overshoot / negative cosine into [0, 1].
+    if sim < 0.0:
+        return 0.0
+    if sim > 1.0:
+        return 1.0
+    return sim
+
+
 def normalize_similarity(row) -> Optional[float]:
-    """Extract a normalized cosine similarity in [0, 1] (higher = better)
-    from a semantic-search row, regardless of backend.
+    """Read the canonical normalized cosine similarity (0..1) that the
+    route stamped onto a semantic row under SEMANTIC_SCORE_KEY.
 
-    Backends expose the raw vector score under different keys/conventions:
-      * ``similarity``  — sqlite / postgres: already cosine similarity
-        in roughly [0, 1] (1 - cosine_distance), higher is better.
-      * ``rank_score``  — oracle / mysql: COSINE *distance* (0 = identical,
-        grows with dissimilarity); similarity = 1 - distance.
-      * ``rank_score``  — db2: EUCLIDEAN distance on normalized vectors;
-        for unit-norm embeddings cos = 1 - (d^2 / 2), so we map it back.
-
-    Returns None when no score column is present (FTS/exact rows) so the
-    caller leaves MemoryItem.score unset for non-vector results.
+    Returns None for FTS/exact/get rows (which never carry the canonical
+    key), so MemoryItem.score stays unset for non-vector results. This
+    deliberately does NOT inspect backend-specific columns
+    (``similarity``/``rank``/``rank_score``) — those collide with FTS
+    relevance columns and have backend-dependent meaning; the route owns
+    that conversion via score_to_similarity().
     """
     if not isinstance(row, dict):
         return None
-    if row.get("similarity") is not None:
-        try:
-            sim = float(row["similarity"])
-        except (TypeError, ValueError):
-            return None
-    elif row.get("rank_score") is not None:
-        try:
-            dist = float(row["rank_score"])
-        except (TypeError, ValueError):
-            return None
-        # COSINE distance -> similarity (oracle/mysql). db2 uses
-        # EUCLIDEAN; for unit-norm vectors d^2 = 2(1-cos) so the same
-        # 1-d linear map keeps it monotonic and in-range for the common
-        # case. Either way ordering is preserved; only the absolute
-        # floor calibration is backend-specific (we tune for COSINE).
-        sim = 1.0 - dist
-    else:
+    val = row.get(SEMANTIC_SCORE_KEY)
+    if val is None:
+        return None
+    try:
+        sim = float(val)
+    except (TypeError, ValueError):
         return None
     if not math.isfinite(sim):
         return None
-    # Clamp tiny FP overshoot / negative cosine into [0, 1].
     if sim < 0.0:
         return 0.0
     if sim > 1.0:

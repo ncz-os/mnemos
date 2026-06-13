@@ -363,6 +363,11 @@ def _queue_federation_nats_upsert(tx: PostgresTransaction, row: Row | None) -> N
 
 
 class PostgresMemoryRepository(MemoryRepository):
+    # semantic_search emits ``similarity`` = 1 - (embedding <=> q) (pgvector
+    # cosine similarity in [0,1], higher = better).
+    SEMANTIC_SCORE_COLUMN = "similarity"
+    SEMANTIC_SCORE_METRIC = "cosine_similarity"
+
     # Set by PostgresBackend on construction so search paths can fail
     # loudly on dim mismatches. None disables the check (e.g. tests
     # that bypass the backend). Mirrors SqliteMemoryRepository's
@@ -2122,9 +2127,7 @@ class PostgresCompressionQueueRepository(CompressionQueueRepository):
             # duplicate work for the same memory across multiple
             # enqueue calls (e.g. rapid on_write triggers).
             existing = await conn.fetchval(
-                "SELECT 1 FROM memory_compression_queue "
-                "WHERE memory_id = $1 AND status = 'pending' "
-                "LIMIT 1",
+                "SELECT 1 FROM memory_compression_queue WHERE memory_id = $1 AND status = 'pending' LIMIT 1",
                 mid,
             )
             if existing:
@@ -2440,9 +2443,9 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
         conn = _postgres_tx(tx).conn
         # Read current prices to detect change
         row = await conn.fetchrow(
-            "SELECT price_in, price_out, price_cached FROM model_registry "
-            "WHERE provider = $1 AND model_id = $2",
-            provider, model_id,
+            "SELECT price_in, price_out, price_cached FROM model_registry WHERE provider = $1 AND model_id = $2",
+            provider,
+            model_id,
         )
         if row is None:
             return 0, None
@@ -2464,7 +2467,11 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
             "UPDATE model_registry SET price_in = $1, price_out = $2, "
             "price_cached = $3, price_updated_at = NOW() "
             "WHERE provider = $4 AND model_id = $5",
-            price_in, price_out, price_cached, provider, model_id,
+            price_in,
+            price_out,
+            price_cached,
+            provider,
+            model_id,
         )
         n = _pg_result_count(result)
         return n, old
@@ -2670,8 +2677,7 @@ class PostgresAclRepository(AclRepository):
         group_id: str,
     ) -> bool:
         row = await _postgres_tx(tx).conn.fetchrow(
-            "SELECT 1 FROM user_groups "
-            "WHERE user_id = $1 AND group_id = $2 AND is_admin = TRUE",
+            "SELECT 1 FROM user_groups WHERE user_id = $1 AND group_id = $2 AND is_admin = TRUE",
             user_id,
             group_id,
         )

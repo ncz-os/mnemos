@@ -799,6 +799,13 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
     module-level docstring.
     """
 
+    # semantic_search emits ``rank_score`` = VECTOR_DISTANCE(..., EUCLIDEAN)
+    # on L2-normalized embeddings. NOT a cosine distance — override the
+    # Oracle-inherited cosine_distance metric so the route converts it via
+    # cos = 1 - d^2/2 (ngc-review BLOCK finding 2026-06-13).
+    SEMANTIC_SCORE_COLUMN = "rank_score"
+    SEMANTIC_SCORE_METRIC = "euclidean_unit"
+
     # Settings reference, populated by ``Db2Backend.__init__`` so the
     # override can read ``settings.db2_vector_index`` without changing
     # the inherited ``OracleMemoryRepository`` constructor signature.
@@ -4010,9 +4017,7 @@ class Db2AclRepository(OracleAclRepository):
         try:
             await _call(
                 cursor.execute,
-                "SELECT 1 FROM user_groups "
-                "WHERE user_id = ? AND group_id = ? AND is_admin = 1 "
-                "FETCH FIRST 1 ROW ONLY",
+                "SELECT 1 FROM user_groups WHERE user_id = ? AND group_id = ? AND is_admin = 1 FETCH FIRST 1 ROW ONLY",
                 (user_id, group_id),
             )
             return await _call(cursor.fetchone) is not None
