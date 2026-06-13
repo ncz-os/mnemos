@@ -4280,6 +4280,69 @@ class Db2Backend(OracleBackend):
             est_cost_usd=Decimal(str(row[1])) if row[1] is not None else Decimal("0"),
         )
 
+    async def ping(self) -> bool:
+        """Db2-native liveness probe (native severance slice 1).
+
+        Replaces the inherited ``OracleBackend.ping`` ``SELECT 1 FROM DUAL``
+        with the Db2 ``SELECT 1 FROM SYSIBM.SYSDUMMY1`` equivalent so the
+        native cursor guard is not tripped (and silently swallowed into a
+        ``False`` result) in ``MNEMOS_DB2_DIALECT=native`` mode.
+        """
+        if self._pool is None:
+            return False
+        try:
+            async with self._pool.acquire() as conn:
+                cursor = await _call(conn.cursor)
+                try:
+                    await _call(cursor.execute, "SELECT 1 FROM SYSIBM.SYSDUMMY1", None)
+                    row = await _call(cursor.fetchone)
+                finally:
+                    await _call(cursor.close)
+            return row is not None and row[0] == 1
+        except Exception:
+            return False
+
+    async def upsert_category_decay(
+        self,
+        tx: Any,
+        *,
+        category: str,
+        half_life_days: float,
+        decay_kind: str,
+        floor: float,
+    ) -> None:
+        """Db2-native MERGE upsert (native severance slice 1).
+
+        Replaces the inherited Oracle ``MERGE ... USING (SELECT :category
+        FROM dual)`` (DUAL + named binds) with a Db2 ``MERGE`` whose source
+        is a ``(VALUES (?, ?, ?, ?))`` row and whose binds are positional.
+        """
+        from decimal import Decimal
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO memory_category_decay AS tgt
+                USING (VALUES (CAST(? AS VARCHAR(64)), CAST(? AS DECIMAL(10,2)),
+                               CAST(? AS VARCHAR(16)), CAST(? AS DECIMAL(5,4))))
+                    AS src(category, half_life_days, decay_kind, floor)
+                ON tgt.category = src.category
+                WHEN MATCHED THEN UPDATE SET
+                    half_life_days = src.half_life_days,
+                    decay_kind = src.decay_kind,
+                    floor = src.floor
+                WHEN NOT MATCHED THEN
+                    INSERT (category, half_life_days, decay_kind, floor)
+                    VALUES (src.category, src.half_life_days, src.decay_kind, src.floor)
+                """,
+                (category, Decimal(str(half_life_days)), decay_kind, Decimal(str(floor))),
+            )
+        finally:
+            await _call(cursor.close)
+
     async def open(self) -> None:
         """Open hook — probes ``DB2_VECTOR_INDEXING`` registry var.
 
@@ -4292,11 +4355,24 @@ class Db2Backend(OracleBackend):
         WARNINGs rather than raising so a transiently-unreachable Db2
         instance still opens the backend cleanly.
         """
-        parent_open = getattr(super(), "open", None)
-        if callable(parent_open):
-            result = parent_open()
-            if hasattr(result, "__await__"):
-                await result
+        # Native severance slice 1: do NOT delegate to OracleBackend.open
+        # (its ``SELECT 1 FROM DUAL`` smoke trips the native cursor Oracle-ism
+        # guard and degrades to a swallowed warning). Run a Db2-native
+        # SYSIBM.SYSDUMMY1 pool-checkout smoke, then the registry probe. Both
+        # are best-effort (log, never raise).
+        if self._pool is not None:
+            try:
+                async with self._pool.acquire() as conn:
+                    cursor = await _call(conn.cursor)
+                    try:
+                        await _call(cursor.execute, "SELECT 1 FROM SYSIBM.SYSDUMMY1", None)
+                        row = await _call(cursor.fetchone)
+                    finally:
+                        await _call(cursor.close)
+                if not (row is not None and row[0] == 1):
+                    _LOG.warning("Db2 open() smoke returned unexpected row %r.", row)
+            except Exception as exc:  # pragma: no cover - smoke is best-effort
+                _LOG.warning("Db2 open() pool-checkout smoke failed (%s); backend remains open.", exc)
         await self._probe_vector_indexing_registry()
 
     async def _probe_vector_indexing_registry(self) -> None:

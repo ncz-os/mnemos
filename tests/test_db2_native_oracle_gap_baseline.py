@@ -116,6 +116,9 @@ async def test_native_oracle_gap_baseline():
     for lbl, why in sorted(inconclusive):
         print(f"  ?     {lbl:55s} {why}")
 
-    # Baseline assertion: the known Oracle fall-throughs MUST be detected.
-    # This is the RED baseline — it documents the gap surface to be sealed.
-    assert oracle_gaps or ping_latent, "expected at least one Oracle fall-through to be detected"
+    # Regression invariant (post-slice-1): NO tx-only repo method may emit
+    # Oracle SQL in native mode. As fall-through slices land, this stays green
+    # and fences regressions. (Keyword-only methods need kwarg synthesis — a
+    # later iteration extends coverage beyond tx-only signatures.)
+    gap_labels = [g[0] for g in oracle_gaps] + (["backend.ping"] if ping_latent else [])
+    assert not gap_labels, f"Oracle fall-through detected in native mode: {gap_labels}"
