@@ -141,3 +141,55 @@ async def test_db2_native_audit_chain_hash_equivalence():
     await be.close()
     print("SLICE7_VALIDATE_OK")
 
+
+
+async def test_db2_native_audit_chain_tamper_detection():
+    """GRAEAE-C tamper-detection: a mutation to a stored audit field must change
+    the recomputed entry_hash (so the chain link no longer verifies). Proves the
+    Db2-native round-trip preserves tamper-evidence, not just equivalence."""
+    settings = SimpleNamespace(database=SimpleNamespace(embedding_dim=768, db2_dialect="native"))
+    pool = await m.create_db2_native_pool(DB2_DSN, min_size=1, max_size=2)
+    be = m.Db2BackendNative(pool, settings)
+    await be.open()
+    ac = be._audit_chain_repo
+    iso = datetime.now(tz=timezone.utc).isoformat()
+    e = mk_entry(b"T", iso)
+    sig = b"ST".ljust(64, b"\x00")[:64]
+    h_clean = entry_hash(e, sig)
+    async with be.transactional() as tx:
+        conn = m._conn_from_tx(tx); cur = await m._call(conn.cursor)
+        await m._call(cur.execute, "DELETE FROM memory_audit_chain WHERE writer_id='tester'")
+        await m._call(cur.close)
+    try:
+        async with be.transactional() as tx:
+            await ac.insert_audit_entry(
+                tx, entry_id=e.entry_id, memory_id=e.memory_id, prev_entry_id=None,
+                prev_entry_hash=None, op=e.op, payload_hash=e.payload_hash,
+                writer_id=e.writer_id, writer_pubkey=e.writer_pubkey, signature=sig, signed_at=iso)
+        # untampered read -> hash matches
+        async with be.transactional() as tx:
+            row = await ac.get_audit_entry_by_id(tx, e.entry_id)
+        e_clean = mk_entry(b"T", _to_iso(row["signed_at"]))
+        assert entry_hash(e_clean, bytes(row["signature"])) == h_clean
+        # TAMPER: mutate the stored payload_hash directly
+        async with be.transactional() as tx:
+            conn = m._conn_from_tx(tx); cur = await m._call(conn.cursor)
+            await m._call(cur.execute,
+                "UPDATE memory_audit_chain SET payload_hash = ? WHERE entry_id = ?",
+                (b"X".ljust(32, b"\x00"), e.entry_id))
+            await m._call(cur.close)
+        async with be.transactional() as tx:
+            trow = await ac.get_audit_entry_by_id(tx, e.entry_id)
+        e_tampered = AuditEntry(
+            entry_id=bytes(trow["entry_id"]), memory_id=bytes(trow["memory_id"]),
+            prev_entry_id=None, prev_entry_hash=None, op=trow["op"],
+            payload_hash=bytes(trow["payload_hash"]), writer_id=trow["writer_id"],
+            writer_pubkey=bytes(trow["writer_pubkey"]), signed_at=_to_iso(trow["signed_at"]))
+        h_tampered = entry_hash(e_tampered, bytes(trow["signature"]))
+        assert h_tampered != h_clean, "tamper NOT detected — recomputed hash unchanged after mutation"
+    finally:
+        async with be.transactional() as tx:
+            conn = m._conn_from_tx(tx); cur = await m._call(conn.cursor)
+            await m._call(cur.execute, "DELETE FROM memory_audit_chain WHERE writer_id='tester'")
+            await m._call(cur.close)
+        await be.close()
