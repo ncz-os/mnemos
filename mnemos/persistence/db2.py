@@ -20,6 +20,7 @@ References:
 from __future__ import annotations
 
 import asyncio
+import json
 import hashlib
 import logging
 import re
@@ -52,6 +53,7 @@ from mnemos.persistence.oracle import (
     _content_hash,
     _fetch_all_dicts,
     _is_unique_violation,
+    _mint_user_id,
     _json_text,
     _json_value,
     _raw_to_uuid,
@@ -3652,6 +3654,142 @@ class Db2OAuthRepository(OracleOAuthRepository):
         out = dict(row)
         out["state"] = _raw_token_text(out.get("state"))
         return out
+
+
+    # --- OIDC OAuth identity/session methods (port OracleOAuthRepository to Db2:
+    # ? binds, CURRENT TIMESTAMP). Target the OIDC columns added in 0042. NOTE:
+    # get_provider / list_enabled_providers are intentionally NOT overridden here
+    # -- they require the oauth_providers OIDC schema (plaintext client_secret),
+    # which is a separate operator security decision. ---
+
+    async def provision_or_link_user(
+        self, tx: Any, *, provider: str, external_id: str, claims: dict[str, Any]
+    ) -> tuple[str, str]:
+        """Db2 port of PostgresOAuthRepository.provision_or_link_user. provider_id is
+        NOT NULL with a UNIQUE(external_id, provider_id) that enforces identity
+        dedup, so it is set to the provider name alongside the new provider column."""
+        raw_claims = json.dumps(claims)
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT id, user_id FROM oauth_identities WHERE provider=? AND external_id=?",
+                (provider, external_id),
+            )
+            existing = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            if existing:
+                await _call(
+                    cursor.execute,
+                    "UPDATE oauth_identities SET last_login_at=CURRENT TIMESTAMP, raw_claims=? WHERE id=?",
+                    (raw_claims, existing["id"]),
+                )
+                return existing["user_id"], str(existing["id"])
+
+            email = claims.get("email")
+            display_name = claims.get("name") or claims.get("preferred_username")
+            ev = claims.get("email_verified")
+            if isinstance(ev, bool):
+                email_verified = ev
+            elif isinstance(ev, str):
+                email_verified = ev.strip().lower() == "true"
+            else:
+                email_verified = False
+
+            user_id = None
+            if email and email_verified:
+                await _call(cursor.execute, "SELECT id FROM users WHERE email=?", (email,))
+                lt = await _row_to_dict(cursor, await _call(cursor.fetchone))
+                if lt:
+                    user_id = lt["id"]
+            if user_id is None:
+                user_id = _mint_user_id(provider, external_id)
+                try:
+                    await _call(
+                        cursor.execute,
+                        "INSERT INTO users (id, display_name, email, role) VALUES (?, ?, ?, 'user')",
+                        (user_id, display_name, email),
+                    )
+                except Exception as exc:
+                    if not _is_unique_violation(exc):
+                        raise
+
+            identity_id = uuid.uuid4().hex
+            await _call(
+                cursor.execute,
+                "INSERT INTO oauth_identities "
+                "(id, user_id, provider_id, provider, external_id, email, display_name, raw_claims, last_login_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT TIMESTAMP)",
+                (identity_id, user_id, provider, provider, external_id, email, display_name, raw_claims),
+            )
+            return user_id, identity_id
+        finally:
+            await _call(cursor.close)
+
+    async def create_session(
+        self,
+        tx: Any,
+        *,
+        session_id: str,
+        user_id: str,
+        identity_id: str | None,
+        expires_at: Any,
+        user_agent: str,
+        ip_address: str | None,
+    ) -> str:
+        """Db2 port of PostgresOAuthRepository.create_session (OIDC auth session)."""
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "INSERT INTO oauth_sessions "
+                "(id, session_id, user_id, identity_id, expires_at, user_agent, ip_address, revoked) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                (uuid.uuid4().hex, session_id, user_id, identity_id, _ts_for_oracle(expires_at), user_agent, ip_address),
+            )
+            return session_id
+        finally:
+            await _call(cursor.close)
+
+    async def get_identity_for_session(self, tx: Any, session_id: str) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT i.id, i.user_id, i.provider, i.external_id, i.email, i.display_name, "
+                "i.last_login_at, i.created FROM oauth_sessions s "
+                "JOIN oauth_identities i ON i.id = s.identity_id "
+                "WHERE s.session_id = ? AND s.revoked = 0",
+                (session_id,),
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_session(self, tx: Any, session_id: str) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE oauth_sessions SET revoked = 1, revoked_at = CURRENT TIMESTAMP "
+                "WHERE session_id = ? AND revoked = 0",
+                (session_id,),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_all_sessions(self, tx: Any, user_id: str) -> int:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE oauth_sessions SET revoked = 1, revoked_at = CURRENT TIMESTAMP "
+                "WHERE user_id = ? AND revoked = 0",
+                (user_id,),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
 
 
 class Db2SessionsRepository(OracleSessionsRepository):
