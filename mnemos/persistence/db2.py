@@ -3925,19 +3925,264 @@ class Db2ConsultationsRepository(OracleConsultationsRepository):
         return out
 
 
+def _db2_audit_naive_utc(value: Any) -> Any:
+    """ISO-8601 string or datetime -> naive UTC datetime for binding to a Db2
+    ``TIMESTAMP`` column. The audit writer stamps ``signed_at`` as
+    ``datetime.now(tz=utc).isoformat()`` (always UTC); Db2 timestamps carry no
+    zone, so we normalise to naive UTC on write and re-attach UTC on read
+    (:func:`_db2_audit_reattach_utc`) so the reconstructed ISO string is
+    byte-identical to the one in the audit hash."""
+    from datetime import datetime, timezone
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        dt = datetime.fromisoformat(value)
+        naive = dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo is not None else dt
+        # Hash-equivalence guard: the stored naive value, re-tagged UTC on read,
+        # MUST reproduce the exact ISO string the audit hash already signed. The
+        # writer emits datetime.now(tz=utc).isoformat() (+00:00); anything else
+        # (naive, 'Z', or a non-UTC offset) would silently break verification,
+        # so fail loud instead.
+        if naive.replace(tzinfo=timezone.utc).isoformat() != value:
+            raise ValueError(
+                "db2 audit chain requires canonical UTC isoformat signed_at "
+                f"(offset +00:00); {value!r} would not round-trip and would "
+                "break cross-dialect hash verification"
+            )
+        return naive
+    dt = value
+    if getattr(dt, "tzinfo", None) is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=None) if hasattr(dt, "replace") else dt
+
+
+def _db2_audit_reattach_utc(row: dict) -> dict:
+    """Re-attach UTC tzinfo to a naive ``signed_at`` so the shared audit-chain
+    reconstruction (``_to_iso`` -> ``value.isoformat()``) reproduces the exact
+    ISO-8601 UTC string that was hashed. ibm_db returns naive datetimes even
+    for WITH TIME ZONE columns, so without this the ``+00:00`` offset is lost
+    and cross-dialect hash verification fails."""
+    from datetime import timezone
+
+    v = row.get("signed_at")
+    if v is not None and hasattr(v, "tzinfo") and v.tzinfo is None:
+        row["signed_at"] = v.replace(tzinfo=timezone.utc)
+    return row
+
+
 class Db2AuditChainRepository(OracleAuditChainRepository):
-    """Db2 12.1.x impl of v6.2 M-2.2.1 audit chain.
+    """Db2-native audit chain (severance slice 7) — v6.2 M-2.2.1.
 
-    Inherits the Oracle implementation verbatim — Db2's Oracle
-    Compatibility Mode supports `TO_TIMESTAMP_TZ`, `NUMTODSINTERVAL`,
-    `ROWNUM`, `SYSTIMESTAMP`, and `FOR UPDATE SKIP LOCKED` (Db2 11.5+).
-    Cursor-level Ora→Db2 translation (`_ORA_TO_DB2_PAIRS` +
-    `_BIND_RE`) handles `SYSTIMESTAMP`→`CURRENT TIMESTAMP` and
-    `:name` → `?` bind conversion.
-
-    No override needed unless Db2 diverges on a specific call;
-    file a follow-up commit if/when that happens.
+    The native cursor does NOT translate Oracle SQL, so every method emits
+    Db2-native SQL: ``?`` positional binds, ``CURRENT TIMESTAMP``,
+    ``FETCH FIRST n ROWS ONLY`` (Oracle ``ROWNUM``), ``ROW_NUMBER() OVER``,
+    ``FOR UPDATE SKIP LOCKED DATA``, and ``CURRENT TIMESTAMP - n SECONDS``
+    (Oracle ``NUMTODSINTERVAL``). Timestamps are bound as naive UTC datetimes
+    (Oracle used ``TO_TIMESTAMP_TZ``) and re-tagged UTC on read so the
+    ``signed_at`` ISO string in the audit hash round-trips byte-identically
+    (cross-dialect hash equivalence — verified on the live 12.1.5 EAP).
     """
+
+    _SKIP_LOCKED = "FOR UPDATE SKIP LOCKED DATA"
+    _ENTRY_COLS = (
+        "entry_id, memory_id, prev_entry_id, prev_entry_hash, op, payload_hash, "
+        "writer_id, writer_pubkey, signature, signed_at, global_root, global_seq"
+    )
+
+    async def get_latest_audit_entry(self, tx: Any, memory_id: bytes) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"SELECT {self._ENTRY_COLS} FROM memory_audit_chain "
+                "WHERE memory_id = ? ORDER BY signed_at DESC, entry_id DESC FETCH FIRST 1 ROW ONLY",
+                (memory_id,),
+            )
+            row = await _call(cursor.fetchone)
+            if row is None:
+                return None
+            cols = [d[0].lower() for d in cursor.description]
+            return _db2_audit_reattach_utc(dict(zip(cols, row)))
+        finally:
+            await _call(cursor.close)
+
+    async def insert_audit_entry(
+        self, tx: Any, *, entry_id: bytes, memory_id: bytes,
+        prev_entry_id: bytes | None, prev_entry_hash: bytes | None, op: str,
+        payload_hash: bytes, writer_id: str, writer_pubkey: bytes,
+        signature: bytes, signed_at: Any,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "INSERT INTO memory_audit_chain (entry_id, memory_id, prev_entry_id, "
+                "prev_entry_hash, op, payload_hash, writer_id, writer_pubkey, "
+                "signature, signed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (entry_id, memory_id, prev_entry_id, prev_entry_hash, op, payload_hash,
+                 writer_id, writer_pubkey, signature, _db2_audit_naive_utc(signed_at)),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def claim_unsealed_window(self, tx: Any, *, max_window_seconds: int, limit: int) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT entry_id, signature, signed_at FROM memory_audit_chain "
+                "WHERE global_root IS NULL "
+                f"  AND signed_at <= CURRENT TIMESTAMP - {max(0, int(max_window_seconds))} SECONDS "
+                "ORDER BY signed_at ASC, entry_id ASC "
+                "FETCH FIRST ? ROWS ONLY " + self._SKIP_LOCKED,
+                (int(limit),),
+            )
+            rows = await _call(cursor.fetchall)
+            if not rows:
+                return []
+            cols = [d[0].lower() for d in cursor.description]
+            return [_db2_audit_reattach_utc(dict(zip(cols, r))) for r in rows]
+        finally:
+            await _call(cursor.close)
+
+    async def stamp_window_with_root(
+        self, tx: Any, *, entry_ids: list[bytes], global_root: bytes, starting_seq: int
+    ) -> None:
+        if not entry_ids:
+            return
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            for offset, eid in enumerate(entry_ids):
+                await _call(
+                    cursor.execute,
+                    "UPDATE memory_audit_chain SET global_root = ?, global_seq = ? "
+                    "WHERE entry_id = ? AND global_root IS NULL",
+                    (global_root, starting_seq + offset, eid),
+                )
+        finally:
+            await _call(cursor.close)
+
+    async def insert_audit_root(
+        self, tx: Any, *, global_root: bytes, window_start: Any, window_end: Any,
+        entry_count: int, root_signature: bytes, signer_pubkey: bytes, sealed_at: Any,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "INSERT INTO memory_audit_roots (global_root, window_start, window_end, "
+                "entry_count, root_signature, signer_pubkey, sealed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (global_root, _db2_audit_naive_utc(window_start), _db2_audit_naive_utc(window_end),
+                 int(entry_count), root_signature, signer_pubkey, _db2_audit_naive_utc(sealed_at)),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def list_window_entries(self, tx: Any, global_root: bytes) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT entry_id, memory_id, signature, signed_at, global_seq, payload_hash, op "
+                "FROM memory_audit_chain WHERE global_root = ? ORDER BY global_seq ASC",
+                (global_root,),
+            )
+            rows = await _call(cursor.fetchall)
+            if not rows:
+                return []
+            cols = [d[0].lower() for d in cursor.description]
+            return [_db2_audit_reattach_utc(dict(zip(cols, r))) for r in rows]
+        finally:
+            await _call(cursor.close)
+
+    async def get_audit_entry_by_id(self, tx: Any, entry_id: bytes) -> Row | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"SELECT {self._ENTRY_COLS} FROM memory_audit_chain WHERE entry_id = ?",
+                (entry_id,),
+            )
+            row = await _call(cursor.fetchone)
+            if row is None:
+                return None
+            cols = [d[0].lower() for d in cursor.description]
+            return _db2_audit_reattach_utc(dict(zip(cols, row)))
+        finally:
+            await _call(cursor.close)
+
+    async def get_chain_stats(self, tx: Any) -> dict:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT COUNT(*), COUNT(CASE WHEN global_root IS NULL THEN 1 END), "
+                "MIN(CASE WHEN global_root IS NULL THEN signed_at END) FROM memory_audit_chain",
+            )
+            crow = await _call(cursor.fetchone)
+            total = int(crow[0] or 0)
+            unsealed = int(crow[1] or 0)
+            oldest = crow[2]
+            await _call(cursor.execute, "SELECT COUNT(*), MAX(sealed_at) FROM memory_audit_roots")
+            rrow = await _call(cursor.fetchone)
+            root_count = int(rrow[0] or 0)
+            last_sealed = rrow[1]
+        finally:
+            await _call(cursor.close)
+        from datetime import timezone
+
+        def _iso_utc(v: Any) -> Any:
+            if v is None:
+                return None
+            if hasattr(v, "tzinfo") and v.tzinfo is None:
+                v = v.replace(tzinfo=timezone.utc)
+            return v.isoformat() if hasattr(v, "isoformat") else str(v)
+
+        return {
+            "total_entries": total,
+            "unsealed_count": unsealed,
+            "oldest_unsealed_signed_at": _iso_utc(oldest),
+            "sealed_root_count": root_count,
+            "last_sealed_at": _iso_utc(last_sealed),
+        }
+
+    async def get_latest_audit_entries_batch(self, tx: Any, memory_ids: list[bytes]) -> dict:
+        if not memory_ids:
+            return {}
+        ph = ",".join("?" for _ in memory_ids)
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"SELECT {self._ENTRY_COLS} FROM ("
+                "  SELECT m.*, ROW_NUMBER() OVER ("
+                "    PARTITION BY memory_id ORDER BY signed_at DESC, entry_id DESC) AS rn "
+                f"  FROM memory_audit_chain m WHERE memory_id IN ({ph})"
+                ") WHERE rn = 1",
+                tuple(memory_ids),
+            )
+            rows = await _call(cursor.fetchall)
+            if not rows:
+                return {}
+            cols = [d[0].lower() for d in cursor.description]
+            out: dict = {}
+            for r in rows:
+                d = _db2_audit_reattach_utc(dict(zip(cols, r)))
+                out[d["memory_id"]] = d
+            return out
+        finally:
+            await _call(cursor.close)
 
 
 class Db2CompressionQueueRepository(OracleCompressionQueueRepository):
