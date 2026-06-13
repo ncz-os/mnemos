@@ -149,7 +149,15 @@ def _render_visibility(
             key = f"{param_prefix}_xns_{i}"
             names.append(f":{key}")
             params[key] = ns
-        excl_clause = f"{p}namespace NOT IN ({', '.join(names)})"
+        # SQL NULL semantics: `namespace NOT IN (...)` evaluates to
+        # UNKNOWN (not TRUE) for rows where namespace IS NULL, which
+        # would silently DROP legitimate non-vault NULL-namespace
+        # memories from default/root search. Vault rows always carry a
+        # non-NULL namespace ("vault"), so NULL is never a secret —
+        # preserve it explicitly. (release-blocking 2026-06-13)
+        excl_clause = (
+            f"({p}namespace IS NULL OR {p}namespace NOT IN ({', '.join(names)}))"
+        )
         clause = f"({clause}) AND {excl_clause}" if clause else excl_clause
     return clause, params
 
