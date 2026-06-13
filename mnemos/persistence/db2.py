@@ -3771,6 +3771,25 @@ class Db2SessionsRepository(OracleSessionsRepository):
 class Db2ConsultationsRepository(OracleConsultationsRepository):
     """Db2-native user-facing consultations persistence."""
 
+    async def create_consultation_with_audit(self, tx: Any, **kwargs: Any) -> Any:
+        """Not supported on the Db2 backend (severance slice 8 / decision D).
+
+        Writes the GRAEAE consultation + audit-chain + memory-refs to
+        ``graeae_consultations`` / ``graeae_audit_log`` /
+        ``consultation_memory_refs`` -- Oracle-only tables that are NOT in
+        ``db/migrations_db2``. Rather than silently fall through to Oracle SQL
+        (named binds against missing tables) in native mode, fail loud. Port
+        those three tables to migrations_db2 + add a native override here if
+        Db2-backed GRAEAE consultations are ever required.
+        """
+        raise NotImplementedError(
+            "create_consultation_with_audit is not implemented on the Db2 "
+            "backend: the GRAEAE graeae_consultations / graeae_audit_log / "
+            "consultation_memory_refs tables are not in db/migrations_db2. "
+            "Port them and add a native override to enable Db2-backed GRAEAE "
+            "consultations."
+        )
+
     async def create_consultation(
         self,
         tx: Any,
