@@ -3,10 +3,10 @@
 ## MemoryRepository (23 methods)
 | method | oracle | postgres | db2 | mysql | sqlite |
 |---|---|---|---|---|---|
-| assert_memory_readable | IMPL | IMPL | IMPL | RAISE | IMPL |
-| fetch_memory_log | IMPL | IMPL | IMPL | RAISE | IMPL |
-| fetch_diff_commit_pair | IMPL | IMPL | IMPL | RAISE | IMPL |
-| fetch_checkout_commit | IMPL | IMPL | IMPL | RAISE | IMPL |
+| assert_memory_readable | IMPL | IMPL | IMPL | IMPL | IMPL |
+| fetch_memory_log | IMPL | IMPL | IMPL | IMPL | IMPL |
+| fetch_diff_commit_pair | IMPL | IMPL | IMPL | IMPL | IMPL |
+| fetch_checkout_commit | IMPL | IMPL | IMPL | IMPL | IMPL |
 | fetch_memory_export | IMPL | IMPL | IMPL | IMPL | IMPL |
 | fetch_referenced_memory_allowlist | IMPL | IMPL | IMPL | IMPL | IMPL |
 | insert_memory | IMPL | IMPL | IMPL | IMPL | IMPL |
@@ -173,5 +173,5 @@
 | oracle | 93 | 14 | 4 | 0 |
 | postgres | 111 | 0 | 0 | 0 |
 | db2 | 94 | 1 | 0 | 16 |
-| mysql | 106 | 1 | 4 | 0 |
+| mysql | 110 | 1 | 0 | 0 |
 | sqlite | 110 | 0 | 1 | 0 |
