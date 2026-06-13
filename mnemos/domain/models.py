@@ -134,13 +134,35 @@ def _isoformat_value(value: Any) -> str | None:
     return value.isoformat()
 
 
-# Default semantic-relevance floor (UAT 2026-06-13). Empirically tuned
-# against the production bge-m3 (1024-d) cosine distribution: known-good
-# natural-language queries land ~0.60-0.80; nonsense/gibberish nearest
-# neighbours land ~0.30-0.52. A 0.55 floor keeps good hits while cutting
-# the irrelevant-nearest tail. Callers override per-request via
-# MemorySearchRequest.min_score (0.0 = opt out).
-DEFAULT_SEMANTIC_FLOOR = 0.55
+# Default semantic-relevance floor (UAT 2026-06-13). EMPIRICALLY tuned
+# against the LIVE production corpus (PYTHIA Oracle 23ai, ~8k rows,
+# bge-m3 1024-d, COSINE) — NOT the 0.55-0.65 guessed a priori.
+#
+# Measured top-score distribution (min_score=0.0 opt-out):
+#   GOOD   "restaurant inspections"            top 0.772  tail ~0.65
+#          "eateries that flunked food safety" top 0.777
+#          "Florida health inspection website" top 0.749
+#          "syncing data between phone+server" top 0.731
+#          "personal AI secretary"             top 0.685  (weakest good)
+#   NEG    "asdfqwer zxcv nonsense token"      top 0.720
+#          "quantum gardening ... nonsense"    top 0.695
+#          pure keyboard-mash "qwertyuiop..."  top 0.695
+#
+# KEY FINDING: bge-m3 has a HIGH, COMPRESSED cosine baseline — even pure
+# gibberish lands ~0.68-0.72 against *something* in a corpus this size.
+# The GOOD and NEGATIVE top-score ranges OVERLAP, so NO scalar floor can
+# both (a) empty nonsense and (b) keep weak-but-valid queries: a floor
+# high enough to empty "asdfqwer..." (>0.72) also empties the legitimate
+# "personal AI secretary" (0.685). Fully separating real-word nonsense
+# needs a relative/margin gate or cross-encoder rerank (future work),
+# not an absolute threshold.
+#
+# 0.65 is the best achievable flat default: it preserves 100% recall on
+# all known-good queries (each keeps >=19/20 hits) while trimming the
+# genuine low-relevance tail (rows below 0.65 are reliably off-topic).
+# Operators raise it fleet-wide via MNEMOS_SEMANTIC_FLOOR or per-request
+# via min_score; min_score=0.0 restores legacy top-k-nearest.
+DEFAULT_SEMANTIC_FLOOR = 0.65
 
 
 # Canonical key under which the route stamps a normalized cosine
