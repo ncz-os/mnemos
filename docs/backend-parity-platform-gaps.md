@@ -102,3 +102,21 @@ group_id IN (...)`), then port the 4 methods (fetch_memory_log is a RECURSIVE CT
 over memory_versions+memory_branches; root paths skip the predicate). This is
 security-sensitive (RLS read policy) — do it as a focused, heavily-reviewed slice,
 not a quick port. mysql8 OR mysql9 both validate it (no VECTOR dep).
+
+### FINAL 2026-06-13 — all non-gated parity reached
+
+mysql is now 110 IMPL / 1 STUB / 0 RAISE / 0 absent — the version-ACL cluster
+(assert_memory_readable, fetch_memory_log, fetch_diff_commit_pair,
+fetch_checkout_commit) landed in commit 311cea5, security-validated on MySQL 9.0
+(deny paths + the fail-closed version-vs-live group behavior). The remaining 1
+STUB is set_suppress_version_snapshot (correct-by-design no-op).
+
+Cross-backend status: postgres 111 (reference), sqlite 110 (1 raise = a
+postgres-only path; edge backend, expected partial), mysql 110 (COMPLETE for all
+non-gated work), db2 94 (consultations native; the 16 absent + 1 stub are
+oracle-inherited sessions/oauth — GATED), oracle 93 (GATED, needs live Oracle XE).
+
+Everything still open is GATED and must NOT be blind-built: oracle Sessions +
+Consultations (live Oracle XE), the oauth token-hash -> OIDC schema split (data
+migration + plaintext-secret decision, mem_1781325370745), db2 sessions drift +
+db2 oauth (the oracle parent must resolve the session/oauth design first).
