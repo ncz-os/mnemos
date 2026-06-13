@@ -53,6 +53,7 @@ from mnemos.persistence.base import (
 )
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 
 _LOG = logging.getLogger(__name__)
 
@@ -3880,8 +3881,13 @@ class OracleFederationRepository(FederationRepository):
                 "m.deleted_at IS NULL",
                 "m.federation_source IS NULL",
                 "m.archived_at IS NULL",
+                # Secret vault (release-blocking 2026-06-13): credential-class
+                # memories MUST NOT cross the federation feed to remote peers.
+                # Excluded unconditionally — even an explicit namespace=vault
+                # filter cannot pull them.
+                "(m.namespace IS NULL OR m.namespace <> :vault_ns)",
             ]
-            params: dict[str, Any] = {"limit": limit}
+            params: dict[str, Any] = {"limit": limit, "vault_ns": VAULT_NAMESPACE}
             if since_updated is not None and since_id is not None:
                 where.append("(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))")
                 # Explicit TIMESTAMP_TZ bind to avoid thin-mode coercion to VARCHAR
@@ -3943,8 +3949,10 @@ class OracleFederationRepository(FederationRepository):
                 "m.id = :id",
                 "m.deleted_at IS NULL",
                 "m.federation_source IS NULL",
+                # Secret vault: never serve a vaulted memory over federation.
+                "(m.namespace IS NULL OR m.namespace <> :vault_ns)",
             ]
-            params: dict[str, Any] = {"id": memory_id}
+            params: dict[str, Any] = {"id": memory_id, "vault_ns": VAULT_NAMESPACE}
             if namespaces:
                 ns_ph, ns_params = _in_placeholders(namespaces, "ns")
                 where.append(f"m.namespace IN ({ns_ph})")

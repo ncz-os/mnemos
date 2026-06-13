@@ -37,6 +37,7 @@ from mnemos.domain.artemis_dedup import (
     evaluate_memory_create_dedup,
 )
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.base import DuplicateMemoryError
 from mnemos.domain.models import (
     DEFAULT_SEMANTIC_FLOOR,
@@ -201,6 +202,37 @@ def _validate_permission_mode(value: int | None, *, default: int | None = None) 
     if value < 0 or value > 777 or any(digit not in "01234567" for digit in str(value)):
         raise HTTPException(status_code=422, detail="permission_mode must be octal-style 0-777")
     return value
+
+
+def _should_redact_secrets(user: UserContext, *, include_secrets: bool = False, namespace: str | None = None) -> bool:
+    """Whether to mask credential spans for this read (redact-at-retrieval).
+
+    Privileged (full content, no masking) ONLY when the caller is root
+    AND explicitly opted in (include_secrets=True) or targeted the vault
+    namespace. Everything else — every non-root caller, and root on the
+    default path — gets credential spans masked ``[REDACTED]`` before the
+    content leaves the server. This is the redact-at-retrieval gate that
+    backstops a vaulted-miss and masks incidental spans (release-blocking
+    2026-06-13).
+    """
+    if not is_root(user):
+        return True
+    privileged = bool(include_secrets) or namespace == VAULT_NAMESPACE
+    return not privileged
+
+
+def _should_redact_secrets_for_row(user: UserContext, row) -> bool:
+    """Row-aware redact gate for the GET-by-id explicit-fetch escape hatch.
+
+    Root fetching the exact id of a VAULT-namespace row gets full content
+    (the deliberate credential-fetch path); root fetching a NON-vault row by
+    id is still redacted so an ordinary root read can't leak an incidental
+    credential span (ngc-review 2026-06-13). Non-root always redacts.
+    """
+    if not is_root(user):
+        return True
+    row_ns = row.get("namespace") if hasattr(row, "get") else None
+    return row_ns != VAULT_NAMESPACE
 
 
 def _read_visibility_for(user: UserContext, *, namespace: str) -> VisibilityFilter:
@@ -463,9 +495,10 @@ async def list_memories(
             offset=offset,
             include_archived=include_archived,
         )
+    redact = _should_redact_secrets(user, namespace=effective_namespace)
     return MemoryListResponse(
         count=total,
-        memories=[_row_to_memory(r) for r in rows],
+        memories=[_row_to_memory(r, redact_secrets=redact) for r in rows],
     )
 
 
@@ -544,7 +577,13 @@ async def get_memory(
                 from fastapi.encoders import jsonable_encoder
 
                 return JSONResponse(
-                    content=jsonable_encoder(_row_to_memory(row, include_compressed=True)),
+                    content=jsonable_encoder(
+                        _row_to_memory(
+                            row,
+                            include_compressed=True,
+                            redact_secrets=_should_redact_secrets_for_row(user, row),
+                        )
+                    ),
                     headers={"Vary": "Accept"},
                 )
             else:
@@ -617,15 +656,36 @@ async def get_memory(
     # bypass our header injection.
     if narrate_format is not None:
         media_type = "text/plain" if narrate_format == "prose" else "application/x-apollo-dense"
+        narrated_body = body or ""
+        # GET-by-id narrate escape hatch, narrowed to VAULT rows: root
+        # narrating the exact id of a vault memory gets full content; root
+        # narrating a non-vault memory still has incidental spans masked;
+        # non-root always redacts (ngc-review 2026-06-13).
+        if _should_redact_secrets_for_row(user, row):
+            from mnemos.core.secret_detection import redact_content
+
+            narrated_body = redact_content(narrated_body)
         return PlainTextResponse(
-            body or "",
+            narrated_body,
             media_type=media_type,
             headers={"Vary": "Accept"},
         )
 
     from fastapi.encoders import jsonable_encoder
 
-    memory_item = _row_to_memory(row, include_compressed=True)
+    # GET-by-id is the ROOT explicit-fetch escape hatch, but narrowed to
+    # VAULT rows only (ngc-review 2026-06-13): root fetching the exact id of
+    # a VAULT memory gets full content (fleet agents fetch a credential they
+    # hold the id for — task contract "Fleet/root explicit … GET-by-id still
+    # gets full content"). Root fetching a NON-vault memory by id still has
+    # any incidental credential span masked — an ordinary root read must not
+    # leak an accidental span. Non-root never reaches a vault row (-> 404)
+    # and is always redacted.
+    memory_item = _row_to_memory(
+        row,
+        include_compressed=True,
+        redact_secrets=_should_redact_secrets_for_row(user, row),
+    )
     return JSONResponse(
         content=jsonable_encoder(memory_item),
         headers={"Vary": "Accept"},
@@ -1094,7 +1154,15 @@ async def search_memories(
             rows = await _fts_fallback()
 
     _log_search_phase(search_trace_id, search_started_at, "metadata_fetch")
-    memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
+    # Redact-at-retrieval: mask credential spans unless this is a root
+    # include_secrets / vault-targeted search. Backstops a vaulted-miss and
+    # masks incidental spans before the result set is serialized OR cached.
+    _redact = _should_redact_secrets(
+        user, include_secrets=bool(request.include_secrets), namespace=search_namespace
+    )
+    memories = [
+        _row_to_memory(r, include_compressed=request.include_compressed, redact_secrets=_redact) for r in rows
+    ]
 
     # v6.2 M-2.2.3: cross-encoder rerank for deep profile.
     # Reranker returns [] on breaker-open / error — we keep original
@@ -1844,6 +1912,17 @@ async def rehydrate_memories(
         sql_conditions.append(f"m.category=${idx}")
         sql_params.append(request.category)
         idx += 1
+    # Secret vault (release-blocking 2026-06-13): rehydrate enumerates the
+    # corpus into a Claude context window — it has NO include_secrets opt-in,
+    # so the vault namespace is excluded for EVERYONE (incl. root, whose
+    # rehydrate_namespace is None / unpinned). Parameterized to avoid any
+    # SQL-interpolation precedent (ngc-review 2026-06-13). NULL-safe so
+    # legitimate NULL-namespace rows (never secret — vault rows always carry
+    # the non-NULL "vault" namespace) are preserved, not dropped by SQL
+    # three-valued logic (ngc-review 2026-06-13 round 4).
+    sql_conditions.append(f"(m.namespace IS NULL OR m.namespace <> ${idx})")
+    sql_params.append(VAULT_NAMESPACE)
+    idx += 1
 
     where_sql = " AND ".join(sql_conditions)
     sql = (
@@ -1877,12 +1956,18 @@ async def rehydrate_memories(
     context_parts = []
     raw_size = 0
     variant_hits = 0
+    from mnemos.core.secret_detection import redact_content as _redact_content
+
     for row in rows:
         # Prefer contest winner (variant_used=True), else raw.
         effective = row["compressed_content"] or row["raw_content"]
         raw_size += len(row["raw_content"] or "")
         if row["variant_used"]:
             variant_hits += 1
+        # Redact-at-retrieval: rehydrate has no include_secrets opt-in, so
+        # any credential span (vaulted-miss or incidental) is masked before
+        # it enters the Claude context blob.
+        effective = _redact_content(effective)
         created_str = row["created"].strftime("%Y-%m-%d") if row["created"] else "unknown"
         context_parts.append(f"[{row['category']} / {created_str}]\n{effective[:2000]}")
     combined_context = "\n\n---\n\n".join(context_parts)

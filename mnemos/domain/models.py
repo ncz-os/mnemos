@@ -427,7 +427,23 @@ def normalize_similarity(row) -> Optional[float]:
     return sim
 
 
-def row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
+def row_to_memory(row, include_compressed: bool = False, redact_secrets: bool = False) -> MemoryItem:
+    """Build a MemoryItem from a backend row.
+
+    ``redact_secrets`` (release-blocking 2026-06-13) is the
+    redact-at-retrieval gate. The parameter DEFAULTS to ``False``
+    (full content / privileged) so a forgotten caller fails toward
+    correctness of content, not silent masking; EVERY default-scope read
+    handler passes ``redact_secrets=True`` explicitly via the route gate
+    ``_should_redact_secrets``. When True, every credential span in
+    ``content``, ``compressed_content`` and ``verbatim_content`` is masked
+    ``[REDACTED]`` before the item leaves the server — so a vaulted-miss or
+    an incidental credential span never escapes the default path. Root /
+    include_secrets / vault-targeted reads pass ``redact_secrets=False`` and
+    receive full content (fleet agents need real credentials). The vault
+    itself is excluded from default reads at the repository layer; this gate
+    is the second line of defense for incidental spans and vaulted-misses.
+    """
     raw_meta = row.get("metadata")
     if isinstance(raw_meta, str):
         try:
@@ -436,17 +452,28 @@ def row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
             raw_meta = None
     elif not isinstance(raw_meta, dict):
         raw_meta = None
+
+    content = row["content"]
+    compressed = row.get("compressed_content") if include_compressed else None
+    verbatim = row.get("verbatim_content")
+    if redact_secrets:
+        from mnemos.core.secret_detection import redact_content
+
+        content = redact_content(content)
+        compressed = redact_content(compressed) if compressed else compressed
+        verbatim = redact_content(verbatim) if verbatim else verbatim
+
     return MemoryItem(
         id=row["id"],
-        content=row["content"],
+        content=content,
         category=row["category"],
         subcategory=row.get("subcategory"),
         created=_isoformat_value(row["created"]) or "",
         updated=_isoformat_value(row.get("updated")),
         metadata=raw_meta if raw_meta else None,
         quality_rating=row.get("quality_rating"),
-        compressed_content=row.get("compressed_content") if include_compressed else None,
-        verbatim_content=row.get("verbatim_content"),
+        compressed_content=compressed,
+        verbatim_content=verbatim,
         owner_id=row.get("owner_id"),
         group_id=row.get("group_id"),
         namespace=row.get("namespace"),

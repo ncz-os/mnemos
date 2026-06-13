@@ -490,6 +490,14 @@ class _PoolBackedMemoryRepo:
 
         if visibility.namespace is not None and row.get("namespace") != visibility.namespace:
             return False
+        # Mirror the real Oracle backend: exclude_namespaces (the secret
+        # vault on the default path) is subtracted for ALL scopes incl.
+        # ROOT_BYPASS. A non-NULL namespace in the exclude set is hidden;
+        # NULL namespace is never a secret and is preserved. (Faithful to
+        # _render_visibility, release-blocking 2026-06-13.)
+        excl = tuple(getattr(visibility, "exclude_namespaces", ()) or ())
+        if excl and row.get("namespace") in excl:
+            return False
         if visibility.scope == VisibilityScope.ROOT_BYPASS:
             return True
         if row.get("owner_id") == visibility.user_id:
