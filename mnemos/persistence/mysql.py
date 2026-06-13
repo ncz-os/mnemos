@@ -293,6 +293,20 @@ def _render_visibility(
     )
 
 
+
+def _mysql_version_visibility_predicate(user_id: str, table_alias: str = "") -> tuple[str, list[Any]]:
+    """MySQL port of mnemos.core.visibility.version_visibility_predicate.
+
+    Per-snapshot tenancy on memory_versions, which has NO group_id /
+    federation_source columns -> fail-closed to owner + world bits only
+    (deliberately narrower than the live-memory READABLE predicate). MOD()
+    avoids the pymysql ``%s``/``%%`` escaping trap; the world bit is the
+    ones-digit of permission_mode. Mirrors the core helper's two branches
+    exactly. The namespace pin is added by the caller alongside this clause.
+    """
+    pre = f"{table_alias}." if table_alias else ""
+    return f"({pre}owner_id = %s OR MOD({pre}permission_mode, 10) >= 4)", [user_id]
+
 async def _fetch_all_dicts(cursor: Any) -> list[Row]:
     """Fetch all rows as a list of column-name-keyed dicts."""
     rows = await cursor.fetchall()
@@ -1480,10 +1494,35 @@ class MysqlMemoryRepository(MemoryRepository):
         vis = VisibilityFilter.for_read(user, namespace=namespace)
         return await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=vis)
 
-    # --- unimplemented methods (port forthcoming) ---
+    # --- version / ACL read methods (ported from PostgresMemoryRepository) ---
 
     async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None:
-        raise NotImplementedError("mysql: assert_memory_readable not yet implemented")
+        """MySQL port of PostgresMemoryRepository.assert_memory_readable.
+
+        Root path is an existence check against memory_versions (matches
+        postgres). Non-root path applies the full READABLE predicate on
+        memories via _render_visibility (owner/federation/world/group bits +
+        namespace) -- the same predicate the rest of the mysql read paths use.
+        Raises PermissionError('Memory not found') when the row is invisible,
+        identical to the other backends.
+        """
+        async with tx.conn.cursor() as cursor:
+            if user.role == "root":
+                await cursor.execute(
+                    "SELECT 1 FROM memory_versions WHERE memory_id = %s AND deleted_at IS NULL LIMIT 1",
+                    (memory_id,),
+                )
+                if await cursor.fetchone() is None:
+                    raise PermissionError("Memory not found")
+                return
+            vis = VisibilityFilter.for_read(user, namespace=user.namespace)
+            vis_clause, vis_params = _render_visibility(vis)
+            await cursor.execute(
+                f"SELECT 1 FROM memories WHERE id = %s AND deleted_at IS NULL AND {vis_clause} LIMIT 1",
+                (memory_id, *vis_params),
+            )
+            if await cursor.fetchone() is None:
+                raise PermissionError("Memory not found")
 
     async def fetch_memory_log(
         self,
@@ -1493,7 +1532,63 @@ class MysqlMemoryRepository(MemoryRepository):
         limit: int,
         user: UserContext,
     ) -> list[Row]:
-        raise NotImplementedError("mysql: fetch_memory_log not yet implemented")
+        """MySQL port of PostgresMemoryRepository.fetch_memory_log.
+
+        RECURSIVE CTE walking parent_version_id within a single memory+branch
+        (the mv.memory_id = cw.memory_id join guard stops a corrupt parent
+        pointer from pulling in another memory's versions). Per-snapshot
+        visibility uses _mysql_version_visibility_predicate (owner+world only;
+        memory_versions has no group/federation columns). Param order is
+        textual (%s is positional): postgres reuses $3/$4, so MySQL repeats
+        the limit + (vis_params, namespace) where they appear twice.
+        """
+        if user.role == "root":
+            anchor_scope = ""
+            recursive_scope = ""
+            params: tuple[Any, ...] = (branch, memory_id, limit, limit)
+        else:
+            vis_clause, vis_params = _mysql_version_visibility_predicate(user.user_id, table_alias="mv")
+            scope = f"AND {vis_clause} AND mv.namespace = %s"
+            anchor_scope = scope
+            recursive_scope = scope
+            params = (
+                branch, memory_id, *vis_params, user.namespace, limit,
+                *vis_params, user.namespace, limit,
+            )
+        sql = f"""
+            WITH RECURSIVE commit_walk AS (
+                SELECT
+                    mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
+                    mv.version_num, mv.branch, mv.content, mv.category,
+                    mv.change_type, mv.snapshot_at, mv.snapshot_by,
+                    mv.owner_id, mv.namespace, mv.permission_mode, 1 AS depth
+                FROM memory_versions mv
+                INNER JOIN memory_branches mb ON (
+                    mb.memory_id = mv.memory_id AND mb.name = %s AND mb.head_version_id = mv.id)
+                WHERE mv.memory_id = %s AND mv.deleted_at IS NULL AND mb.deleted_at IS NULL
+                  {anchor_scope}
+                UNION ALL
+                SELECT
+                    mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
+                    mv.version_num, mv.branch, mv.content, mv.category,
+                    mv.change_type, mv.snapshot_at, mv.snapshot_by,
+                    mv.owner_id, mv.namespace, mv.permission_mode, cw.depth + 1
+                FROM memory_versions mv
+                INNER JOIN commit_walk cw
+                    ON mv.id = cw.parent_version_id AND mv.memory_id = cw.memory_id
+                WHERE cw.depth < %s AND mv.deleted_at IS NULL
+                  {recursive_scope}
+            )
+            SELECT
+                commit_hash, version_num, branch, category, change_type,
+                snapshot_at, snapshot_by, owner_id, namespace, permission_mode
+            FROM commit_walk
+            ORDER BY depth ASC
+            LIMIT %s
+        """
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(sql, params)
+            return await _fetch_all_dicts(cursor)
 
     async def fetch_diff_commit_pair(
         self,
@@ -1503,7 +1598,35 @@ class MysqlMemoryRepository(MemoryRepository):
         commit_b: str,
         user: UserContext,
     ) -> tuple[Row | None, Row | None]:
-        raise NotImplementedError("mysql: fetch_diff_commit_pair not yet implemented")
+        """MySQL port of PostgresMemoryRepository.fetch_diff_commit_pair.
+
+        Fetches two snapshots by commit_hash; non-root scopes each by the
+        per-snapshot version predicate + namespace so a reader cannot diff a
+        snapshot that was private at the time it was taken.
+        """
+        if user.role == "root":
+            sql = (
+                "SELECT content, version_num FROM memory_versions "
+                "WHERE memory_id = %s AND commit_hash = %s AND deleted_at IS NULL"
+            )
+            async with tx.conn.cursor() as cursor:
+                await cursor.execute(sql, (memory_id, commit_a))
+                a = await _fetchone_dict(cursor)
+                await cursor.execute(sql, (memory_id, commit_b))
+                b = await _fetchone_dict(cursor)
+            return a, b
+        vis_clause, vis_params = _mysql_version_visibility_predicate(user.user_id)
+        sql = (
+            "SELECT content, version_num FROM memory_versions "
+            "WHERE memory_id = %s AND commit_hash = %s AND deleted_at IS NULL "
+            f"AND {vis_clause} AND namespace = %s"
+        )
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(sql, (memory_id, commit_a, *vis_params, user.namespace))
+            a = await _fetchone_dict(cursor)
+            await cursor.execute(sql, (memory_id, commit_b, *vis_params, user.namespace))
+            b = await _fetchone_dict(cursor)
+        return a, b
 
     async def fetch_checkout_commit(
         self,
@@ -1512,7 +1635,27 @@ class MysqlMemoryRepository(MemoryRepository):
         commit_hash: str,
         user: UserContext,
     ) -> Row | None:
-        raise NotImplementedError("mysql: fetch_checkout_commit not yet implemented")
+        """MySQL port of PostgresMemoryRepository.fetch_checkout_commit."""
+        cols = (
+            "commit_hash, version_num, branch, category, subcategory, "
+            "content, change_type, snapshot_at, snapshot_by"
+        )
+        async with tx.conn.cursor() as cursor:
+            if user.role == "root":
+                await cursor.execute(
+                    f"SELECT {cols} FROM memory_versions "
+                    "WHERE memory_id = %s AND commit_hash = %s AND deleted_at IS NULL",
+                    (memory_id, commit_hash),
+                )
+            else:
+                vis_clause, vis_params = _mysql_version_visibility_predicate(user.user_id)
+                await cursor.execute(
+                    f"SELECT {cols} FROM memory_versions "
+                    "WHERE memory_id = %s AND commit_hash = %s AND deleted_at IS NULL "
+                    f"AND {vis_clause} AND namespace = %s",
+                    (memory_id, commit_hash, *vis_params, user.namespace),
+                )
+            return await _fetchone_dict(cursor)
 
     async def fetch_memory_export(
         self,
