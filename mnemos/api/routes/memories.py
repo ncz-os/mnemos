@@ -40,8 +40,10 @@ from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.persistence.base import DuplicateMemoryError
 from mnemos.domain.models import (
     DEFAULT_SEMANTIC_FLOOR,
+    DEFAULT_SEMANTIC_MARGIN_FLOOR,
     METRIC_COSINE_DISTANCE,
     SEMANTIC_SCORE_KEY,
+    is_ood_result_set,
     BulkCreateRequest,
     BulkCreateResponse,
     MemoryCreateRequest,
@@ -81,6 +83,77 @@ def effective_semantic_floor() -> float:
         logger.warning("[VECTOR] non-finite MNEMOS_SEMANTIC_FLOOR=%r; using default %.2f", raw, DEFAULT_SEMANTIC_FLOOR)
         return DEFAULT_SEMANTIC_FLOOR
     return max(0.0, min(1.0, val))
+
+
+def effective_semantic_margin_floor() -> float:
+    """Default MARGIN floor for the OOD (nonsense-query) gate, applied when a
+    caller does not pass min_margin. Operator-overridable fleet-wide via
+    MNEMOS_SEMANTIC_MARGIN_FLOOR (set 0.0 to DISABLE the margin/anchor gate
+    and keep the absolute-floor behavior only). Invalid / non-finite values
+    fall back to DEFAULT_SEMANTIC_MARGIN_FLOOR. Negative clamps to 0 (disabled).
+    """
+    raw = os.environ.get("MNEMOS_SEMANTIC_MARGIN_FLOOR")
+    if raw is None or raw == "":
+        return DEFAULT_SEMANTIC_MARGIN_FLOOR
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[VECTOR] invalid MNEMOS_SEMANTIC_MARGIN_FLOOR=%r; using default %.3f",
+            raw, DEFAULT_SEMANTIC_MARGIN_FLOOR,
+        )
+        return DEFAULT_SEMANTIC_MARGIN_FLOOR
+    if not math.isfinite(val):
+        logger.warning(
+            "[VECTOR] non-finite MNEMOS_SEMANTIC_MARGIN_FLOOR=%r; using default %.3f",
+            raw, DEFAULT_SEMANTIC_MARGIN_FLOOR,
+        )
+        return DEFAULT_SEMANTIC_MARGIN_FLOOR
+    # Clamp to [0, 1] to match the request field's bounds; a stray large
+    # env value would otherwise empty nearly every unanchored semantic set
+    # (ngc-review 2026-06-13). 0.0 = gate disabled.
+    return max(0.0, min(1.0, val))
+
+
+def _resolve_margin_floor(request_min_margin) -> float:
+    """Single source of truth for the OOD margin floor actually applied to a
+    request: a per-request override if finite & in range, else the env/default.
+    Returned value is finite and clamped to [0, 1]. Used for BOTH the cache key
+    and the gate execution so a cached result and a fresh recompute always gate
+    identically, even if an internal caller passes an out-of-range/non-finite
+    min_margin that bypasses request-field validation (ngc-review 2026-06-13).
+    """
+    if request_min_margin is not None:
+        try:
+            v = float(request_min_margin)
+        except (TypeError, ValueError):
+            v = None
+        if v is not None and math.isfinite(v):
+            return max(0.0, min(1.0, v))
+    return effective_semantic_margin_floor()
+
+
+def ood_gate_enabled() -> bool:
+    """Master on/off for the OOD (nonsense-query) margin+anchor gate. Defaults
+    ON (UAT-mandated, recall-first: empirically 0 false-negatives). Operators
+    flip it OFF fleet-wide with MNEMOS_SEMANTIC_OOD_GATE in
+    {0,false,no,off} (case-insensitive). Independent of, and ANDed with, the
+    per-request/min_margin opt-out (min_margin=0.0 also disables it for one
+    call). Exposed as a named flag so the behavior change is explicit and
+    reversible without a code change (ngc-review 2026-06-13).
+
+    ROLLOUT DECISION: default ON is UAT-mandated and empirically safe (0
+    false-negatives over 15 genuine queries incl. paraphrases; the gate only
+    drops a result set that is BOTH unanchored — after morphological stemming
+    — AND flat-scored). The named flag + per-request min_margin=0.0 are the
+    rollback levers; set MNEMOS_SEMANTIC_OOD_GATE=0 to restore pre-gate recall
+    instantly. Residual risk: a genuine zero-lexical-overlap paraphrase with a
+    flat distribution; none was observed in tuning.
+    """
+    raw = os.environ.get("MNEMOS_SEMANTIC_OOD_GATE")
+    if raw is None or raw == "":
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 NatsPublishIntent = tuple[str, dict, str]
@@ -830,6 +903,11 @@ async def search_memories(
         # BEFORE keying so equivalent floors (e.g. 2.0 and 1.0, or -1.0
         # and 0.0) share one cache entry instead of fragmenting it.
         (max(0.0, min(1.0, float(request.min_score))) if request.min_score is not None else effective_semantic_floor()),
+        _resolve_margin_floor(request.min_margin),
+        # Master OOD-gate flag participates in the key: toggling
+        # MNEMOS_SEMANTIC_OOD_GATE must NOT serve a stale gated/ungated
+        # result from before the flip (ngc-review 2026-06-13).
+        ood_gate_enabled(),
     )
 
     if _lc._cache and not request.include_compressed:
@@ -975,6 +1053,43 @@ async def search_memories(
                                 before,
                                 request.query[:30],
                             )
+                    # GRAEAE OOD / nonsense-query gate (UAT 2026-06-13 cycle 2).
+                    # A scalar floor cannot separate gibberish from weak-valid
+                    # queries (bge-m3 cosine baseline overlap). After the
+                    # absolute floor, apply a relative margin + lexical-anchor
+                    # gate: an ANCHORABLE query whose top hits share NO
+                    # significant token AND whose score distribution is FLAT
+                    # (low top1-mean margin) is treated as out-of-distribution
+                    # and returned EMPTY. Anchored or skewed sets pass
+                    # (recall-favoring). min_margin=0.0 (or the env override
+                    # set to 0) DISABLES the gate. Runs on the already-floored
+                    # `rows`, so it can only shrink an already-precision-cut set.
+                    # OOD gate is ON BY DEFAULT (UAT-mandated, recall-first):
+                    # empirically 0 false-negatives across 15 genuine queries
+                    # (incl. paraphrases) because a lexical anchor OR a skewed
+                    # score distribution always keeps the set — only an
+                    # UNANCHORED *and* FLAT result set is dropped. Operators
+                    # disable it fleet-wide with MNEMOS_SEMANTIC_MARGIN_FLOOR=0
+                    # and callers per-request with min_margin=0.0. Resolve via
+                    # the SAME sanitizer used for the cache key so a cached
+                    # entry and its live recompute can never gate differently
+                    # (ngc-review 2026-06-13).
+                    margin_floor = _resolve_margin_floor(request.min_margin)
+                    if rows and ood_gate_enabled() and margin_floor and margin_floor > 0.0:
+                        if is_ood_result_set(request.query, rows, margin_floor=margin_floor):
+                            # Do NOT log any query-derived value — even a
+                            # truncated hash of a short/low-entropy query is
+                            # brute-forceable and linkable (ngc-review
+                            # 2026-06-13). Counts + floor are enough to reason
+                            # about gate behavior; the trace_id correlates the
+                            # request.
+                            logger.info(
+                                "[VECTOR] OOD gate (margin<%.3f, no anchor) emptied %d rows trace=%s",
+                                margin_floor,
+                                len(rows),
+                                search_trace_id,
+                            )
+                            rows = []
         else:
             rows = await _fts_fallback()
 

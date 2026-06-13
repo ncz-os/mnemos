@@ -259,3 +259,145 @@ def test_effective_floor_env_override(monkeypatch):
         assert memories_handler.effective_semantic_floor() == DEFAULT_SEMANTIC_FLOOR
     monkeypatch.delenv("MNEMOS_SEMANTIC_FLOOR", raising=False)
     assert memories_handler.effective_semantic_floor() == DEFAULT_SEMANTIC_FLOOR
+
+
+
+# --- OOD / nonsense-query margin + lexical-anchor gate (UAT 2026-06-13 c2) ----
+
+from mnemos.domain.models import (  # noqa: E402
+    DEFAULT_SEMANTIC_MARGIN_FLOOR,
+    _significant_tokens,
+    is_ood_result_set,
+)
+
+
+def _srow(score, content):
+    return {SEMANTIC_SCORE_KEY: score, "content": content}
+
+
+def test_significant_tokens_drops_stopwords_and_short_and_stems():
+    toks = _significant_tokens("The a AI on-device embedder x")
+    # tokens are stemmed: "embedder" -> "embedd", "device" unchanged.
+    assert "embedd" in toks
+    assert "device" in toks
+    # stopwords + sub-3-char dropped
+    assert "the" not in toks and "a" not in toks and "on" not in toks and "x" not in toks
+
+
+def test_significant_tokens_stems_morphological_variants():
+    # plural / -ing / -ed collapse to a shared stem so a paraphrase anchors.
+    assert _significant_tokens("inspections") == _significant_tokens("inspection")
+    assert _significant_tokens("syncing") & _significant_tokens("sync data")
+    assert _significant_tokens("deployments") == _significant_tokens("deployment")
+
+
+def test_ood_anchor_matches_across_morphology():
+    # query "restaurant inspections" anchors to a hit saying "inspection" even
+    # with a flat distribution (stemming, ngc-review 2026-06-13).
+    rows = [_srow(0.66 - 0.0005 * i, "florida restaurant inspection record") for i in range(10)]
+    assert is_ood_result_set("restaurant inspections", rows) is False
+
+
+def test_ood_unanchored_flat_distribution_rejected():
+    # nonsense query: no shared token with the (flat-scored) hits -> OOD True.
+    rows = [_srow(0.72 - 0.0008 * i, "florida restaurant inspection records") for i in range(10)]
+    assert is_ood_result_set("asdfqwer zxcv blorf", rows) is True
+
+
+def test_ood_lexical_anchor_keeps_weak_query():
+    # weak-but-valid: flat distribution BUT shares a token -> keep (recall).
+    rows = [_srow(0.66 - 0.0005 * i, "florida restaurant inspection records") for i in range(10)]
+    assert is_ood_result_set("restaurant inspections", rows) is False
+
+
+def test_ood_skewed_distribution_keeps_even_unanchored():
+    # top-1 stands out (skewed) -> genuine even without a lexical anchor.
+    rows = [_srow(0.85, "alpha beta gamma delta")] + [
+        _srow(0.60, "alpha beta gamma delta") for _ in range(9)
+    ]
+    assert is_ood_result_set("zzz qqq www", rows) is False
+
+
+def test_ood_disabled_with_zero_floor():
+    rows = [_srow(0.72 - 0.0008 * i, "florida restaurant inspection records") for i in range(10)]
+    assert is_ood_result_set("asdfqwer zxcv blorf", rows, margin_floor=0.0) is False
+
+
+def test_ood_unanchorable_query_keeps():
+    # all-stopword / sub-threshold query: nothing to anchor on -> keep (fail open).
+    rows = [_srow(0.72 - 0.0008 * i, "florida restaurant inspection records") for i in range(10)]
+    assert is_ood_result_set("a an the", rows) is False
+
+
+def test_ood_empty_and_singleton_never_rejected():
+    assert is_ood_result_set("anything", []) is False
+    assert is_ood_result_set("zzz qqq", [_srow(0.70, "florida data")]) is False
+
+
+def test_ood_nonfinite_floor_disables_gate():
+    rows = [_srow(0.72 - 0.0008 * i, "florida restaurant inspection records") for i in range(10)]
+    for bad in (float("nan"), float("inf"), -0.5):
+        assert is_ood_result_set("asdfqwer zxcv blorf", rows, margin_floor=bad) is False
+
+
+def test_effective_margin_floor_env_override(monkeypatch):
+    monkeypatch.setenv("MNEMOS_SEMANTIC_MARGIN_FLOOR", "0.0")
+    assert memories_handler.effective_semantic_margin_floor() == 0.0
+    monkeypatch.setenv("MNEMOS_SEMANTIC_MARGIN_FLOOR", "0.030")
+    assert memories_handler.effective_semantic_margin_floor() == pytest.approx(0.030)
+    monkeypatch.setenv("MNEMOS_SEMANTIC_MARGIN_FLOOR", "garbage")
+    assert memories_handler.effective_semantic_margin_floor() == DEFAULT_SEMANTIC_MARGIN_FLOOR
+    for bad in ("nan", "inf", "-inf"):
+        monkeypatch.setenv("MNEMOS_SEMANTIC_MARGIN_FLOOR", bad)
+        assert memories_handler.effective_semantic_margin_floor() == DEFAULT_SEMANTIC_MARGIN_FLOOR
+    monkeypatch.delenv("MNEMOS_SEMANTIC_MARGIN_FLOOR", raising=False)
+    assert memories_handler.effective_semantic_margin_floor() == DEFAULT_SEMANTIC_MARGIN_FLOOR
+
+
+def test_min_margin_request_field_rejects_negative():
+    with pytest.raises(Exception):
+        MemorySearchRequest(query="x", min_margin=-0.1)
+    # zero (disable) and positive accepted
+    assert MemorySearchRequest(query="x", min_margin=0.0).min_margin == 0.0
+    assert MemorySearchRequest(query="x", min_margin=0.05).min_margin == pytest.approx(0.05)
+
+
+
+def test_stem_conservative_no_short_word_collisions():
+    from mnemos.domain.models import _stem
+    # short words must NOT be over-stripped into colliding stems.
+    assert _stem("law") == "law"
+    assert _stem("laws") == "laws"  # 'law' would be < _MIN_STEM_LEN -> not stripped
+    assert _stem("bus") == "bus"
+    # but real long-word morphology still collapses.
+    assert _stem("inspections") == _stem("inspection") == "inspection"
+    assert _stem("deployments") == _stem("deployment") == "deployment"
+
+
+def test_min_margin_request_rejects_non_finite():
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(Exception):
+            MemorySearchRequest(query="x", min_margin=bad)
+
+
+def test_min_score_request_rejects_non_finite():
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(Exception):
+            MemorySearchRequest(query="x", min_score=bad)
+
+
+def test_ood_refuses_generator_fails_open():
+    # a one-shot generator must NOT be consumed -> fail open (keep / False).
+    gen = (_srow(0.72 - 0.001 * i, "florida data") for i in range(10))
+    assert is_ood_result_set("asdfqwer zxcv blorf", gen) is False
+
+
+def test_ood_gate_enabled_env(monkeypatch):
+    for off in ("0", "false", "FALSE", "no", "off"):
+        monkeypatch.setenv("MNEMOS_SEMANTIC_OOD_GATE", off)
+        assert memories_handler.ood_gate_enabled() is False
+    for on in ("1", "true", "yes", "on", "anything"):
+        monkeypatch.setenv("MNEMOS_SEMANTIC_OOD_GATE", on)
+        assert memories_handler.ood_gate_enabled() is True
+    monkeypatch.delenv("MNEMOS_SEMANTIC_OOD_GATE", raising=False)
+    assert memories_handler.ood_gate_enabled() is True
