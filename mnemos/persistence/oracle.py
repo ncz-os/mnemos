@@ -2607,46 +2607,226 @@ class OracleOAuthRepository(OAuthRepository):
 
 
 class OracleSessionsRepository(SessionsRepository):
-    async def create_session(self, tx: Transaction, **kwargs: Any) -> Row:
-        raise NotImplementedError("Oracle chat sessions repository is not implemented")
+    """Oracle-native chat-session persistence (ports PostgresSessionsRepository).
+
+    Backed by the chat columns added to sessions / session_messages /
+    session_memory_injections in 0043_chat_sessions_parity_cols.sql. These rows
+    are separable from the auth-session rows on the same `sessions` table: chat
+    rows carry a namespace + NULL session_id; auth rows carry a session_id +
+    NULL namespace, and every query here filters on namespace, so the auth path
+    (OracleBackend.create_session) is never touched. session_messages.created_at
+    is the message timestamp (aliased "timestamp"); session_memory_injections
+    uses injected_at as the injection timestamp.
+    """
+
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        namespace: str,
+        model: str,
+        initial_context: str | None,
+    ) -> Row:
+        sid = uuid.uuid4().hex
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "INSERT INTO sessions (id, user_id, namespace, model) VALUES (:id, :userid, :ns, :model)",
+                {"id": sid, "userid": user_id, "ns": namespace, "model": model},
+            )
+            if initial_context:
+                await _call(
+                    cursor.execute,
+                    "INSERT INTO session_messages (session_id, role, content) VALUES (:sid, 'system', :c)",
+                    {"sid": sid, "c": initial_context},
+                )
+            await _call(
+                cursor.execute,
+                "SELECT id, created_at, model FROM sessions "
+                "WHERE id=:id AND user_id=:userid AND namespace=:ns AND deleted_at IS NULL",
+                {"id": sid, "userid": user_id, "ns": namespace},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            assert row is not None
+            return row
+        finally:
+            await _call(cursor.close)
 
     async def get_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> Row | None:
         cursor = await _call(_conn_from_tx(tx).cursor)
         try:
             await _call(
                 cursor.execute,
-                "SELECT * FROM sessions WHERE id = :id AND user_id = :user_id "
-                "AND namespace = :namespace AND deleted_at IS NULL",
-                {"id": session_id, "user_id": user_id, "namespace": namespace},
+                "SELECT id, user_id, namespace, model, created_at, last_activity, message_count, total_tokens "
+                "FROM sessions WHERE id=:id AND user_id=:userid AND namespace=:ns AND deleted_at IS NULL",
+                {"id": session_id, "userid": user_id, "ns": namespace},
             )
             return await _row_to_dict(cursor, await _call(cursor.fetchone))
         finally:
             await _call(cursor.close)
 
     async def list_injected_memory_ids(self, tx: Transaction, session_id: str, limit: int = 10) -> list[str]:
-        _ = (tx, session_id, limit)
-        return []
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT memory_id FROM session_memory_injections WHERE session_id=:s AND deleted_at IS NULL "
+                "GROUP BY memory_id ORDER BY MAX(injected_at) DESC FETCH FIRST :lim ROWS ONLY",
+                {"s": session_id, "lim": limit},
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return [r["memory_id"] for r in rows]
+        finally:
+            await _call(cursor.close)
 
-    async def add_message(self, tx: Transaction, **kwargs: Any) -> Any:
-        raise NotImplementedError("Oracle chat session messages repository is not implemented")
+    async def add_message(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        model: str | None = None,
+        tokens_used: int | None = None,
+        memories_injected: int | None = None,
+    ) -> Any:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            out = cursor.var(int)
+            await _call(
+                cursor.execute,
+                "INSERT INTO session_messages (session_id, role, content, model, tokens_used, memories_injected) "
+                "VALUES (:s, :r, :c, :m, :t, :mi) RETURNING id INTO :retid",
+                {"s": session_id, "r": role, "c": content, "m": model,
+                 "t": tokens_used, "mi": memories_injected, "retid": out},
+            )
+            val = out.getvalue()
+            # oracledb returns a list for DML RETURNING INTO.
+            return val[0] if isinstance(val, (list, tuple)) else val
+        finally:
+            await _call(cursor.close)
 
     async def fetch_provider_history(self, tx: Transaction, session_id: str) -> list[Row]:
-        _ = (tx, session_id)
-        return []
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "WITH first_system AS ("
+                "  SELECT id, role, content, created_at FROM session_messages "
+                "  WHERE session_id=:s AND role='system' AND deleted_at IS NULL "
+                "  ORDER BY created_at ASC, id ASC FETCH FIRST 1 ROWS ONLY"
+                "), later_system AS ("
+                "  SELECT sm.id, sm.role, sm.content, sm.created_at FROM session_messages sm "
+                "  WHERE sm.session_id=:s AND sm.role='system' AND sm.deleted_at IS NULL "
+                "  AND sm.id <> (SELECT id FROM first_system) "
+                "  ORDER BY sm.created_at DESC, sm.id DESC FETCH FIRST 4 ROWS ONLY"
+                "), pinned AS ("
+                "  SELECT id, role, content, created_at, 0 AS k FROM first_system "
+                "  UNION ALL SELECT id, role, content, created_at, 0 AS k FROM later_system"
+                "), recent AS ("
+                "  SELECT id, role, content, created_at, 1 AS k FROM session_messages "
+                "  WHERE session_id=:s AND role <> 'system' AND deleted_at IS NULL "
+                "  ORDER BY created_at DESC, id DESC FETCH FIRST 10 ROWS ONLY"
+                ") SELECT role, content FROM ("
+                "  SELECT id, role, content, created_at, k FROM pinned "
+                "  UNION ALL SELECT id, role, content, created_at, k FROM recent"
+                ") ORDER BY k, created_at ASC, id ASC",
+                {"s": session_id},
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
-    async def add_memory_injections(self, tx: Transaction, **kwargs: Any) -> None:
-        _ = (tx, kwargs)
+    async def add_memory_injections(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        message_id: Any,
+        memory_ids: Sequence[str],
+    ) -> None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            for i, memory_id in enumerate(memory_ids):
+                await _call(
+                    cursor.execute,
+                    "INSERT INTO session_memory_injections (id, session_id, message_id, memory_id, relevance_score) "
+                    "VALUES (:id, :s, :msg, :mem, :rel)",
+                    {"id": uuid.uuid4().hex, "s": session_id, "msg": message_id,
+                     "mem": memory_id, "rel": 0.9 - (i * 0.1)},
+                )
+        finally:
+            await _call(cursor.close)
 
-    async def update_metrics(self, tx: Transaction, **kwargs: Any) -> None:
-        _ = (tx, kwargs)
+    async def update_metrics(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        user_id: str,
+        namespace: str,
+        tokens_used: int,
+    ) -> None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE sessions SET message_count=message_count+2, total_tokens=total_tokens+:t, "
+                "last_activity=SYSTIMESTAMP WHERE id=:s AND user_id=:u AND namespace=:n AND deleted_at IS NULL",
+                {"t": tokens_used, "s": session_id, "u": user_id, "n": namespace},
+            )
+        finally:
+            await _call(cursor.close)
 
     async def fetch_history(self, tx: Transaction, session_id: str, limit: int, offset: int) -> tuple[list[Row], int]:
-        _ = (tx, session_id, limit, offset)
-        return [], 0
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                'SELECT role, content, created_at AS "timestamp", model FROM session_messages '
+                "WHERE session_id=:s AND deleted_at IS NULL ORDER BY created_at ASC "
+                "OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY",
+                {"s": session_id, "off": offset, "lim": limit},
+            )
+            rows = await _fetch_all_dicts(cursor)
+            await _call(
+                cursor.execute,
+                "SELECT COUNT(*) AS cnt FROM session_messages WHERE session_id=:s AND deleted_at IS NULL",
+                {"s": session_id},
+            )
+            crow = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            total = int(crow["cnt"]) if crow and crow.get("cnt") is not None else 0
+            return rows, total
+        finally:
+            await _call(cursor.close)
 
     async def delete_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> bool:
-        _ = (tx, session_id, user_id, namespace)
-        return False
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            # Confirm the chat session is owned + visible in this namespace before
+            # touching anything (also stops an auth row, NULL namespace, matching).
+            await _call(
+                cursor.execute,
+                "SELECT id FROM sessions WHERE id=:s AND user_id=:u AND namespace=:n AND deleted_at IS NULL",
+                {"s": session_id, "u": user_id, "n": namespace},
+            )
+            if await _call(cursor.fetchone) is None:
+                return False
+            # Postgres relies on ON DELETE CASCADE; Oracle's session_messages /
+            # session_memory_injections carry no FK to sessions, so a bare session
+            # delete would orphan them. Remove children explicitly in-tx first.
+            await _call(cursor.execute, "DELETE FROM session_memory_injections WHERE session_id=:s", {"s": session_id})
+            await _call(cursor.execute, "DELETE FROM session_messages WHERE session_id=:s", {"s": session_id})
+            await _call(
+                cursor.execute,
+                "DELETE FROM sessions WHERE id=:s AND user_id=:u AND namespace=:n AND deleted_at IS NULL",
+                {"s": session_id, "u": user_id, "n": namespace},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
 
 
 class OracleConsultationsRepository(ConsultationsRepository):
