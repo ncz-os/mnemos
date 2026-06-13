@@ -78,24 +78,24 @@
 |---|---|---|---|---|---|
 | list_enabled_providers | IMPL | IMPL | -- | IMPL | IMPL |
 | get_provider | IMPL | IMPL | -- | IMPL | IMPL |
-| provision_or_link_user | RAISE | IMPL | -- | IMPL | IMPL |
-| create_session | RAISE | IMPL | -- | IMPL | IMPL |
-| revoke_session | IMPL | IMPL | -- | IMPL | IMPL |
-| revoke_all_sessions | IMPL | IMPL | -- | IMPL | IMPL |
-| get_identity_for_session | IMPL | IMPL | -- | IMPL | IMPL |
+| provision_or_link_user | IMPL | IMPL | IMPL | IMPL | IMPL |
+| create_session | IMPL | IMPL | IMPL | IMPL | IMPL |
+| revoke_session | IMPL | IMPL | IMPL | IMPL | IMPL |
+| revoke_all_sessions | IMPL | IMPL | IMPL | IMPL | IMPL |
+| get_identity_for_session | IMPL | IMPL | IMPL | IMPL | IMPL |
 
 ## SessionsRepository (9 methods)
 | method | oracle | postgres | db2 | mysql | sqlite |
 |---|---|---|---|---|---|
 | create_session | IMPL | IMPL | IMPL | IMPL | IMPL |
-| get_session | IMPL | IMPL | -- | IMPL | IMPL |
-| list_injected_memory_ids | IMPL | IMPL | -- | IMPL | IMPL |
-| add_message | IMPL | IMPL | -- | IMPL | IMPL |
-| fetch_provider_history | IMPL | IMPL | -- | IMPL | IMPL |
-| add_memory_injections | IMPL | IMPL | -- | IMPL | IMPL |
-| update_metrics | IMPL | IMPL | -- | IMPL | IMPL |
-| fetch_history | IMPL | IMPL | -- | IMPL | IMPL |
-| delete_session | IMPL | IMPL | -- | IMPL | IMPL |
+| get_session | IMPL | IMPL | IMPL | IMPL | IMPL |
+| list_injected_memory_ids | IMPL | IMPL | IMPL | IMPL | IMPL |
+| add_message | IMPL | IMPL | IMPL | IMPL | IMPL |
+| fetch_provider_history | IMPL | IMPL | IMPL | IMPL | IMPL |
+| add_memory_injections | IMPL | IMPL | IMPL | IMPL | IMPL |
+| update_metrics | IMPL | IMPL | IMPL | IMPL | IMPL |
+| fetch_history | IMPL | IMPL | IMPL | IMPL | IMPL |
+| delete_session | IMPL | IMPL | IMPL | IMPL | IMPL |
 
 ## ConsultationsRepository (7 methods)
 | method | oracle | postgres | db2 | mysql | sqlite |
@@ -170,8 +170,8 @@
 ## TOTALS (across all ABC repo methods)
 | backend | IMPL | STUB | RAISE | absent(--) |
 |---|---|---|---|---|
-| oracle | 108 | 1 | 2 | 0 |
+| oracle | 110 | 1 | 0 | 0 |
 | postgres | 111 | 0 | 0 | 0 |
-| db2 | 94 | 1 | 0 | 16 |
+| db2 | 107 | 1 | 0 | 3 |
 | mysql | 110 | 1 | 0 | 0 |
 | sqlite | 110 | 0 | 1 | 0 |
