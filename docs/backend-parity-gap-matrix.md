@@ -87,15 +87,15 @@
 ## SessionsRepository (9 methods)
 | method | oracle | postgres | db2 | mysql | sqlite |
 |---|---|---|---|---|---|
-| create_session | RAISE | IMPL | IMPL | IMPL | IMPL |
+| create_session | IMPL | IMPL | IMPL | IMPL | IMPL |
 | get_session | IMPL | IMPL | -- | IMPL | IMPL |
-| list_injected_memory_ids | STUB | IMPL | -- | IMPL | IMPL |
-| add_message | RAISE | IMPL | -- | IMPL | IMPL |
-| fetch_provider_history | STUB | IMPL | -- | IMPL | IMPL |
-| add_memory_injections | STUB | IMPL | -- | IMPL | IMPL |
-| update_metrics | STUB | IMPL | -- | IMPL | IMPL |
-| fetch_history | STUB | IMPL | -- | IMPL | IMPL |
-| delete_session | STUB | IMPL | -- | IMPL | IMPL |
+| list_injected_memory_ids | IMPL | IMPL | -- | IMPL | IMPL |
+| add_message | IMPL | IMPL | -- | IMPL | IMPL |
+| fetch_provider_history | IMPL | IMPL | -- | IMPL | IMPL |
+| add_memory_injections | IMPL | IMPL | -- | IMPL | IMPL |
+| update_metrics | IMPL | IMPL | -- | IMPL | IMPL |
+| fetch_history | IMPL | IMPL | -- | IMPL | IMPL |
+| delete_session | IMPL | IMPL | -- | IMPL | IMPL |
 
 ## ConsultationsRepository (7 methods)
 | method | oracle | postgres | db2 | mysql | sqlite |
@@ -170,7 +170,7 @@
 ## TOTALS (across all ABC repo methods)
 | backend | IMPL | STUB | RAISE | absent(--) |
 |---|---|---|---|---|
-| oracle | 100 | 7 | 4 | 0 |
+| oracle | 108 | 1 | 2 | 0 |
 | postgres | 111 | 0 | 0 | 0 |
 | db2 | 94 | 1 | 0 | 16 |
 | mysql | 110 | 1 | 0 | 0 |
