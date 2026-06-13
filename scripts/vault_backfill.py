@@ -33,26 +33,48 @@ def _read(v):
 
 
 def scan(conn):
+    """Return (vault_rows, redact_rows).
+
+    ``vault_rows``  — credential-RECORD memories (classify VAULT): moved to
+                      namespace='vault' so the default read path excludes
+                      them entirely.
+    ``redact_rows`` — memories with an INCIDENTAL credential span (classify
+                      REDACT): stay in their namespace but get tagged with
+                      ``secret_redact_spans`` so the span is masked at
+                      retrieval. (redact-at-retrieval also masks them live
+                      regardless of the tag; the tag is for auditability.)
+    Both are reversible via the same ledger.
+    """
     cur = conn.cursor()
     cur.execute("SELECT id, namespace, content, metadata FROM memories WHERE deleted_at IS NULL")
-    vault = []
+    vault, redact = [], []
     for mid, ns, content, meta in cur:
         if ns == VAULT_NAMESPACE:
             continue
         f = classify(_read(content))
+        rec = {"id": mid, "orig_namespace": ns, "orig_metadata": _read(meta), "reasons": f.reasons}
         if f.cls is SecretClass.VAULT:
-            vault.append({"id": mid, "orig_namespace": ns, "orig_metadata": _read(meta), "reasons": f.reasons})
-    return vault
+            vault.append(rec)
+        elif f.cls is SecretClass.REDACT:
+            rec["spans"] = f.spans
+            redact.append(rec)
+    return vault, redact
 
 
-def apply(conn, rows, ledger_path):
+def apply(conn, vault_rows, redact_rows, ledger_path):
     json.dump(
-        {"created": datetime.datetime.utcnow().isoformat() + "Z", "action": "vault-backfill", "rows": rows},
+        {
+            "created": datetime.datetime.utcnow().isoformat() + "Z",
+            "action": "vault-backfill",
+            "rows": vault_rows,  # ledger key kept as "rows" for revert compat
+            "redact_rows": redact_rows,
+        },
         open(ledger_path, "w"),
         indent=2,
     )
     cur = conn.cursor()
-    for r in rows:
+    # 1) VAULT moves
+    for r in vault_rows:
         try:
             orig = json.loads(r["orig_metadata"]) if r["orig_metadata"] else {}
         except Exception:
@@ -65,18 +87,39 @@ def apply(conn, rows, ledger_path):
             "UPDATE memories SET namespace=:ns, metadata=:md, updated=SYSTIMESTAMP WHERE id=:id AND deleted_at IS NULL",
             {"ns": VAULT_NAMESPACE, "md": json.dumps(orig), "id": r["id"]},
         )
+    # 2) REDACT tags (namespace UNCHANGED — just metadata)
+    for r in redact_rows:
+        try:
+            orig = json.loads(r["orig_metadata"]) if r["orig_metadata"] else {}
+        except Exception:
+            orig = {}
+        orig["secret_redact_spans"] = r.get("spans")
+        orig["secret_reasons"] = r["reasons"]
+        orig["secret_classified_at"] = "backfill"
+        cur.execute(
+            "UPDATE memories SET metadata=:md, updated=SYSTIMESTAMP WHERE id=:id AND deleted_at IS NULL",
+            {"md": json.dumps(orig), "id": r["id"]},
+        )
     conn.commit()
-    return len(rows)
+    return len(vault_rows), len(redact_rows)
 
 
 def revert(conn, ledger_path):
     led = json.load(open(ledger_path))
     cur = conn.cursor()
     n = 0
-    for r in led["rows"]:
+    # VAULT moves: restore original namespace + metadata.
+    for r in led.get("rows", []):
         cur.execute(
             "UPDATE memories SET namespace=:ns, metadata=:md, updated=SYSTIMESTAMP WHERE id=:id",
             {"ns": r["orig_namespace"], "md": r["orig_metadata"], "id": r["id"]},
+        )
+        n += cur.rowcount
+    # REDACT tags: restore original metadata (namespace was never changed).
+    for r in led.get("redact_rows", []):
+        cur.execute(
+            "UPDATE memories SET metadata=:md, updated=SYSTIMESTAMP WHERE id=:id",
+            {"md": r["orig_metadata"], "id": r["id"]},
         )
         n += cur.rowcount
     conn.commit()
@@ -93,12 +136,13 @@ if __name__ == "__main__":
     if a.revert:
         print("reverted rows:", revert(conn, a.revert))
         sys.exit(0)
-    rows = scan(conn)
-    print(f"VAULT candidates: {len(rows)}")
-    for r in rows[:50]:
-        print(" ", r["id"], r["orig_namespace"], r["reasons"])
+    vault_rows, redact_rows = scan(conn)
+    print(f"VAULT candidates (move to vault): {len(vault_rows)}")
+    print(f"REDACT-tag candidates (incidental span, stay in place): {len(redact_rows)}")
+    for r in vault_rows[:30]:
+        print("  [VAULT] ", r["id"], r["orig_namespace"], r["reasons"])
     if a.apply:
-        n = apply(conn, rows, a.ledger)
-        print(f"APPLIED: vaulted {n} memories; ledger -> {a.ledger}")
+        nv, nr = apply(conn, vault_rows, redact_rows, a.ledger)
+        print(f"APPLIED: vaulted {nv} memories, redact-tagged {nr}; ledger -> {a.ledger}")
     else:
         print("(dry-run; pass --apply to write)")

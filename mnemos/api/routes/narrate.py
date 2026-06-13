@@ -119,14 +119,26 @@ def _build_narrate_response(
     memory_row: dict,
     variant_row: dict | None,
     format: str,
+    *,
+    redact: bool = False,
 ) -> NarrateResponse:
     """Compose the rich NarrateResponse model.
 
     Same dispatch as ``_render_narration`` but emits the structured
     response object that ``/v1/memories/{id}/narrate`` returns
     (``source`` discriminator + engine metadata included).
+
+    ``redact`` (redact-at-retrieval, 2026-06-13): when True the chosen
+    body is masked at CONSTRUCTION time — the only text field on
+    NarrateResponse is ``content``, so masking here keeps the model fully
+    consistent (no post-hoc attribute mutation; ngc-review 2026-06-13).
     """
-    raw_content = memory_row.get("content") or ""
+    from mnemos.core.secret_detection import redact_content
+
+    def _maybe(text: str) -> str:
+        return redact_content(text) if redact else text
+
+    raw_content = _maybe(memory_row.get("content") or "")
 
     if format == "dense":
         if variant_row is None:
@@ -139,7 +151,7 @@ def _build_narrate_response(
         return NarrateResponse(
             memory_id=memory_id,
             format="dense",
-            content=variant_row["compressed_content"] or "",
+            content=_maybe(variant_row["compressed_content"] or ""),
             source="variant_dense",
             engine_id=variant_row["engine_id"],
             engine_version=variant_row["engine_version"],
@@ -158,7 +170,7 @@ def _build_narrate_response(
         return NarrateResponse(
             memory_id=memory_id,
             format="prose",
-            content=variant_row["compressed_content"] or "",
+            content=_maybe(variant_row["compressed_content"] or ""),
             source="variant_passthrough",
             engine_id=engine_id,
             engine_version=variant_row["engine_version"],
@@ -167,7 +179,7 @@ def _build_narrate_response(
     return NarrateResponse(
         memory_id=memory_id,
         format="prose",
-        content=_narrate_apollo(variant_row["compressed_content"]),
+        content=_maybe(_narrate_apollo(variant_row["compressed_content"])),
         source="narrated",
         engine_id=engine_id,
         engine_version=variant_row["engine_version"],
@@ -202,8 +214,15 @@ async def compute_narrate(
     in-depth as ``GET /v1/memories/{id}``.
     """
     backend = backend_or_503()
+    # GET-by-id narrate is an explicit exact-id fetch, so it mirrors
+    # GET /v1/memories/{id}: root may reach a VAULT row by id
+    # (include_secrets=is_root), and the row-aware redact gate below then
+    # serves a vault row full but masks incidental spans on a non-vault row
+    # (ngc-review 2026-06-13). Non-root never reaches a vault row (-> 404).
     visibility = VisibilityFilter.for_read(
-        user, namespace=None if is_root(user) else user.namespace,
+        user,
+        namespace=None if is_root(user) else user.namespace,
+        include_secrets=is_root(user),
     )
     async with backend.transactional() as tx:
         await maybe_set_pg_rls(tx, user)
@@ -216,7 +235,15 @@ async def compute_narrate(
             tx, memory_id,
         )
 
-    return _build_narrate_response(memory_id, memory_row, variant_row, format)
+    # Redact-at-retrieval (release-blocking 2026-06-13): masked at response
+    # CONSTRUCTION (no post-hoc mutation). Row-aware gate -- root narrating
+    # a VAULT row by exact id gets full content (fleet credential fetch);
+    # root narrating a non-vault row, and every non-root caller, has any
+    # credential span masked.
+    from mnemos.api.routes.memories import _should_redact_secrets_for_row
+
+    redact = _should_redact_secrets_for_row(user, memory_row)
+    return _build_narrate_response(memory_id, memory_row, variant_row, format, redact=redact)
 
 
 @router.get("/{memory_id}/narrate", response_model=NarrateResponse)

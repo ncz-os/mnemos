@@ -231,9 +231,20 @@ def _memory_item_from_row(
             embedding_model = row["embedding_model"]
         except (KeyError, IndexError):
             embedding_model = None
+    # Redact-at-retrieval over the federation feed (release-blocking
+    # 2026-06-13): vaulted memories are already excluded at the SQL level
+    # (feed_query namespace <> 'vault'), but an incidental credential span
+    # in a world-readable CLEAN/REDACT memory must NOT cross to a remote
+    # peer. Federation has no fleet/root "full content" scope — a peer is a
+    # separate cluster — so every feed item is masked.
+    from mnemos.core.secret_detection import redact_content
+
+    fed_content = redact_content(row["content"])
+    fed_compressed = redact_content(compressed) if compressed else compressed
+    fed_verbatim = redact_content(row["verbatim_content"]) if row["verbatim_content"] else row["verbatim_content"]
     return MemoryItem(
         id=row["id"],
-        content=row["content"],
+        content=fed_content,
         category=row["category"],
         subcategory=row["subcategory"],
         created=_iso_value(row["created"]) or "",
@@ -244,8 +255,8 @@ def _memory_item_from_row(
             else (dict(row["metadata"]) if row["metadata"] else None)
         ),
         quality_rating=row["quality_rating"],
-        compressed_content=compressed,
-        verbatim_content=row["verbatim_content"],
+        compressed_content=fed_compressed,
+        verbatim_content=fed_verbatim,
         owner_id=row["owner_id"],
         namespace=row["namespace"],
         permission_mode=row["permission_mode"],
