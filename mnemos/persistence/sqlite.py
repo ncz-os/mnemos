@@ -55,6 +55,7 @@ from mnemos.persistence.base import (
 from mnemos.persistence.types import MEMORY_COLS as _MEMORY_COLS, Row
 from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.core import webhook_constants
 
 logger = logging.getLogger(__name__)
@@ -335,11 +336,27 @@ def _render_sqlite_visibility(
     """
     p = f"{table_alias}." if table_alias else ""
 
+    # Secret vault (release-blocking 2026-06-13): exclude_namespaces is
+    # subtracted for EVERY scope, incl. ROOT_BYPASS with namespace=None —
+    # mirrors the Oracle _render_visibility contract. NULL namespace is
+    # never a secret (vault rows always carry a non-NULL "vault"), so it is
+    # preserved. Without this a root default search on SQLite returned the
+    # whole vault (the same bug already fixed in the Oracle backend).
+    def _excl_clause() -> str:
+        excl = tuple(visibility.exclude_namespaces or ())
+        if not excl:
+            return ""
+        ph = _placeholders(excl)
+        params.extend(excl)
+        return f"({p}namespace IS NULL OR {p}namespace NOT IN ({ph}))"
+
     if visibility.scope == VisibilityScope.ROOT_BYPASS:
         if visibility.namespace is None:
-            return ""
+            return _excl_clause()
         params.append(visibility.namespace)
-        return f"{p}namespace = ?"
+        base = f"{p}namespace = ?"
+        excl = _excl_clause()
+        return f"{base} AND {excl}" if excl else base
 
     if visibility.namespace is None:
         return "1=0"
@@ -374,6 +391,9 @@ def _render_sqlite_visibility(
     )
     clause = f"{clause} AND {p}namespace = ?"
     params.append(visibility.namespace)
+    excl = _excl_clause()
+    if excl:
+        clause = f"{clause} AND {excl}"
     return clause
 
 
@@ -3008,13 +3028,17 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             "(m.permission_mode % 10) >= 4",
             "m.archived_at IS NULL",
             "m.consolidated_into IS NULL",
+            # Secret vault (release-blocking 2026-06-13): never federate a
+            # credential-class memory to a remote peer, even if it were
+            # somehow flagged world-readable.
+            "(m.namespace IS NULL OR m.namespace <> ?)",
         ]
         tombstone_query_parts = [
             "m.federation_source IS NULL",
             "m.consolidated_into IS NOT NULL",
             "m.consolidated_at IS NOT NULL",
         ]
-        memory_params: list[Any] = []
+        memory_params: list[Any] = [VAULT_NAMESPACE]
         tombstone_params: list[Any] = []
         if since_updated is not None:
             memory_query_parts.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
@@ -3135,8 +3159,10 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             "m.archived_at IS NULL",
             "m.consolidated_into IS NULL",
             "m.id = ?",
+            # Secret vault: never serve a vaulted memory over federation.
+            "(m.namespace IS NULL OR m.namespace <> ?)",
         ]
-        params: list[Any] = [memory_id]
+        params: list[Any] = [memory_id, VAULT_NAMESPACE]
         if namespaces:
             query_parts.append(f"m.namespace IN ({_placeholders(namespaces)})")
             params.extend(namespaces)
