@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from contextlib import asynccontextmanager
@@ -73,6 +74,11 @@ def effective_semantic_floor() -> float:
         val = float(raw)
     except (TypeError, ValueError):
         logger.warning("[VECTOR] invalid MNEMOS_SEMANTIC_FLOOR=%r; using default %.2f", raw, DEFAULT_SEMANTIC_FLOOR)
+        return DEFAULT_SEMANTIC_FLOOR
+    # Reject NaN/inf — float() accepts them but the clamp would silently
+    # turn them into 1.0/0.0, contradicting "invalid -> default".
+    if not math.isfinite(val):
+        logger.warning("[VECTOR] non-finite MNEMOS_SEMANTIC_FLOOR=%r; using default %.2f", raw, DEFAULT_SEMANTIC_FLOOR)
         return DEFAULT_SEMANTIC_FLOOR
     return max(0.0, min(1.0, val))
 

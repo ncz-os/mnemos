@@ -177,8 +177,13 @@ def score_to_similarity(raw, metric: str) -> Optional[float]:
     elif metric == METRIC_EUCLIDEAN_UNIT:
         # L2-normalized embeddings: d^2 = 2(1 - cos) -> cos = 1 - d^2/2.
         sim = 1.0 - (v * v) / 2.0
-    else:  # METRIC_COSINE_SIMILARITY (default)
+    elif metric == METRIC_COSINE_SIMILARITY:
         sim = v
+    else:
+        # Unknown/misconfigured metric: fail CLOSED (None) rather than
+        # treating a raw distance as a similarity, which would bypass the
+        # relevance floor. Caller treats None as below-floor.
+        return None
     # Clamp FP overshoot / negative cosine into [0, 1].
     if sim < 0.0:
         return 0.0
