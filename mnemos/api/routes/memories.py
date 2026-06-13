@@ -402,6 +402,12 @@ async def get_memory(
     visibility = VisibilityFilter.for_read(
         user,
         namespace=None if is_root(user) else user.namespace,
+        # GET-by-id is an EXPLICIT fetch: knowing the exact memory id
+        # is itself the opt-in, so the vault namespace is NOT excluded
+        # here. (Search/list/rehydrate DO exclude it because those
+        # enumerate.) This lets fleet agents fetch a credential they
+        # hold the id for without an include_secrets flag.
+        include_secrets=True,
     )
     body: Optional[str] = None
     row = None
@@ -763,6 +769,7 @@ async def search_memories(
         request.source_agent,
         search_namespace,
         search_owner_id,
+        bool(request.include_secrets),  # vault opt-in -> distinct cache bucket
         sorted(user.group_ids),  # list, not pre-serialized string
         request.include_archived,
         request.boost_recency,
@@ -785,7 +792,24 @@ async def search_memories(
     # None); non-root callers are pinned. The visibility factory
     # rejects namespace=None for non-root, which the namespace 403
     # check above already prevents reaching.
-    visibility = VisibilityFilter.for_read(user, namespace=search_namespace)
+    #
+    # Secret vault (release-blocking 2026-06-13): the DEFAULT path
+    # subtracts the vault namespace even for root, so credential-class
+    # memories never surface in normal/public/phone search. Fleet
+    # agents opt in with include_secrets=true OR by targeting
+    # namespace="vault" explicitly. include_secrets is root-only:
+    # a non-root caller asking for it is rejected rather than silently
+    # downgraded.
+    if request.include_secrets and not is_root(user):
+        raise HTTPException(
+            status_code=403,
+            detail="include_secrets requires root",
+        )
+    visibility = VisibilityFilter.for_read(
+        user,
+        namespace=search_namespace,
+        include_secrets=bool(request.include_secrets),
+    )
 
     async with backend.transactional() as tx:
         await _maybe_set_pg_rls(tx, user)
@@ -968,7 +992,37 @@ async def create_memory(
     namespace = request.namespace or user.namespace
     permission_mode = _validate_permission_mode(request.permission_mode, default=600)
 
-    metadata_json = json.dumps(request.metadata or {"source": request.source})
+    # Secret-vault ingest classification (release-blocking 2026-06-13).
+    # Credential-class content (PATs, provider keys, PEM blocks, secret-
+    # grade key=value assignments) is auto-isolated into the vault
+    # namespace so it can never surface on the default FTS/semantic path.
+    # Incidental secret spans (REDACT) are left in place but flagged in
+    # metadata for the redact-on-read follow-up. Already-vaulted writes
+    # are left untouched. The classifier is conservative -> a 40-hex git
+    # SHA in prose is NOT vaulted.
+    _meta = dict(request.metadata or {})
+    if request.metadata is None and request.source is not None:
+        _meta.setdefault("source", request.source)
+    try:
+        from mnemos.core.secret_detection import classify as _classify, SecretClass, VAULT_NAMESPACE
+        _finding = _classify(request.content)
+        if _finding.cls is SecretClass.VAULT and namespace != VAULT_NAMESPACE:
+            _meta["secret_vaulted"] = True
+            _meta["secret_reasons"] = _finding.reasons
+            _meta["secret_original_namespace"] = namespace
+            _meta["secret_classified_at"] = "ingest"
+            namespace = VAULT_NAMESPACE
+            logger.warning(
+                "[secret-vault] ingest auto-vaulted memory %s (reasons=%s)",
+                mem_id, _finding.reasons,
+            )
+        elif _finding.cls is SecretClass.REDACT:
+            _meta["secret_redact_spans"] = _finding.spans
+            _meta["secret_reasons"] = _finding.reasons
+    except Exception:
+        logger.exception("[secret-vault] ingest classification failed for %s", mem_id)
+
+    metadata_json = json.dumps(_meta or {"source": request.source})
     delivery_ids: list[str] = []
     try:
         async with backend.transactional() as tx:

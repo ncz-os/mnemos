@@ -23,6 +23,14 @@ from enum import Enum
 from mnemos.core.auth_context import UserContext
 from mnemos.core.security import is_root
 
+from mnemos.core.secret_detection import VAULT_NAMESPACE
+
+# Namespaces hidden from the DEFAULT read path (FTS + semantic). The
+# secret vault is excluded so credential-class memories never surface
+# in normal/public/phone search. Fleet agents opt in explicitly (see
+# VisibilityFilter.for_read include_secrets / namespace=vault).
+DEFAULT_EXCLUDED_NAMESPACES: tuple[str, ...] = (VAULT_NAMESPACE,)
+
 
 class VisibilityScope(Enum):
     """Read/write visibility envelope for a repository call.
@@ -66,20 +74,48 @@ class VisibilityFilter:
     user_id: str | None
     group_ids: tuple[str, ...]
     namespace: str | None
+    # Namespaces to subtract from the result set REGARDLESS of scope --
+    # applied even for ROOT_BYPASS. This is how the secret vault stays
+    # hidden from the default read path: root callers search with
+    # namespace=None (no pin) but still must not see vault rows.
+    exclude_namespaces: tuple[str, ...] = ()
 
     @classmethod
-    def for_read(cls, user: UserContext, *, namespace: str | None) -> "VisibilityFilter":
+    def for_read(
+        cls,
+        user: UserContext,
+        *,
+        namespace: str | None,
+        include_secrets: bool = False,
+    ) -> "VisibilityFilter":
         """Build the read-path filter for a user.
 
         Root callers bypass the predicate entirely. Non-root callers get
         the full ``READABLE`` envelope pinned to ``namespace``.
+
+        ``include_secrets`` / explicit vault targeting controls the
+        secret-vault subtraction:
+
+        * Default (``include_secrets=False``) AND not already pinned to
+          the vault namespace -> the vault namespace is subtracted from
+          the result set even for root. Credential-class memories never
+          surface on the default FTS/semantic path.
+        * ``include_secrets=True`` OR ``namespace == VAULT_NAMESPACE`` ->
+          no subtraction; fleet agents fetch credentials explicitly.
         """
+        targeting_vault = namespace == VAULT_NAMESPACE
+        exclude = (
+            ()
+            if (include_secrets or targeting_vault)
+            else DEFAULT_EXCLUDED_NAMESPACES
+        )
         if is_root(user):
             return cls(
                 scope=VisibilityScope.ROOT_BYPASS,
                 user_id=None,
                 group_ids=(),
                 namespace=namespace,
+                exclude_namespaces=exclude,
             )
         if namespace is None:
             raise ValueError("non-root read visibility requires a namespace")
@@ -88,6 +124,7 @@ class VisibilityFilter:
             user_id=user.user_id,
             group_ids=tuple(user.group_ids),
             namespace=namespace,
+            exclude_namespaces=exclude,
         )
 
     @classmethod

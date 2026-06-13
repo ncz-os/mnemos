@@ -130,7 +130,37 @@ def _render_visibility(
     READABLE mirrors the v1_multiuser policy used by Postgres and
     SQLite: own rows, federation rows, world-readable rows, and
     group-readable rows, all namespace-pinned.
+
+    On top of the tenancy predicate this also subtracts any namespaces
+    in ``visibility.exclude_namespaces`` (the secret vault on the
+    default path). The subtraction is rendered as a separate
+    ``namespace NOT IN (...)`` term ANDed with the scope predicate, so
+    it applies even to ROOT_BYPASS (which otherwise yields no tenancy
+    filter and would expose vault rows to the root token).
     """
+    clause, params = _render_visibility_core(
+        visibility, table_alias=table_alias, param_prefix=param_prefix
+    )
+    excl = tuple(visibility.exclude_namespaces or ())
+    if excl:
+        p = f"{table_alias}." if table_alias else ""
+        names = []
+        for i, ns in enumerate(excl):
+            key = f"{param_prefix}_xns_{i}"
+            names.append(f":{key}")
+            params[key] = ns
+        excl_clause = f"{p}namespace NOT IN ({', '.join(names)})"
+        clause = f"({clause}) AND {excl_clause}" if clause else excl_clause
+    return clause, params
+
+
+def _render_visibility_core(
+    visibility: VisibilityFilter,
+    *,
+    table_alias: str = "",
+    param_prefix: str = "vis",
+) -> tuple[str, dict[str, Any]]:
+    """Tenancy-only render (no vault subtraction); see _render_visibility."""
     p = f"{table_alias}." if table_alias else ""
 
     if visibility.scope == VisibilityScope.ROOT_BYPASS:
