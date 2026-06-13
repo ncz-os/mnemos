@@ -26,6 +26,7 @@ from mnemos.core.config import embed_http_model_override, hot_rs_enabled
 from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.core.recommendation import choose_recommended_model
+from mnemos.core.secret_box import decrypt_provider_secret
 from mnemos.core.visibility import (
     read_visibility_predicate as _core_read_visibility_predicate,
     version_visibility_predicate as _core_version_visibility_predicate,
@@ -2400,12 +2401,23 @@ class PostgresOAuthRepository(OAuthRepository):
         )
 
     async def get_provider(self, tx: Transaction, name: str) -> Row | None:
-        return await _postgres_tx(tx).conn.fetchrow(
-            "SELECT name, kind, issuer_url, client_id, client_secret, scope, "
+        """Backward-compatible at-rest encryption (GRAEAE + vendor best practice):
+        prefer the decrypted client_secret_enc; fall back to the legacy plaintext
+        client_secret for rows not yet backfilled. Operator backfills + drops
+        the plaintext column (Phase 2.3-2.5)."""
+        row = await _postgres_tx(tx).conn.fetchrow(
+            "SELECT name, kind, issuer_url, client_id, client_secret, client_secret_enc, scope, "
             "authorize_url, token_url, userinfo_url, enabled "
             "FROM oauth_providers WHERE name=$1",
             name,
         )
+        if row is None:
+            return None
+        d = dict(row)
+        enc = d.pop("client_secret_enc", None)
+        if enc:
+            d["client_secret"] = decrypt_provider_secret(enc)
+        return d
 
     async def provision_or_link_user(
         self,
