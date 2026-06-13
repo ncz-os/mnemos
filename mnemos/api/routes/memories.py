@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -38,6 +39,8 @@ from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.persistence.base import DuplicateMemoryError
 from mnemos.domain.models import (
     DEFAULT_SEMANTIC_FLOOR,
+    METRIC_COSINE_DISTANCE,
+    SEMANTIC_SCORE_KEY,
     BulkCreateRequest,
     BulkCreateResponse,
     MemoryCreateRequest,
@@ -49,10 +52,31 @@ from mnemos.domain.models import (
     RehydrationResponse,
     normalize_similarity,
     row_to_memory as _row_to_memory,
+    score_to_similarity,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["memories"])
+
+
+def effective_semantic_floor() -> float:
+    """Default semantic relevance floor applied when a caller does not
+    pass min_score. Operator-overridable fleet-wide via
+    MNEMOS_SEMANTIC_FLOOR (set 0.0 to restore legacy top-k-nearest
+    behavior for clients that pre-date the floor). Clamped to [0, 1].
+    Invalid values fall back to DEFAULT_SEMANTIC_FLOOR.
+    """
+    raw = os.environ.get("MNEMOS_SEMANTIC_FLOOR")
+    if raw is None or raw == "":
+        return DEFAULT_SEMANTIC_FLOOR
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("[VECTOR] invalid MNEMOS_SEMANTIC_FLOOR=%r; using default %.2f", raw, DEFAULT_SEMANTIC_FLOOR)
+        return DEFAULT_SEMANTIC_FLOOR
+    return max(0.0, min(1.0, val))
+
+
 NatsPublishIntent = tuple[str, dict, str]
 
 
@@ -795,7 +819,11 @@ async def search_memories(
         request.boost_recency,
         request.recency_weight,
         search_profile.value,  # v6.2 M-2.2.3: distinct cache per profile
-        request.min_score,  # UAT 2026-06-13: floor changes the result set
+        # UAT 2026-06-13: floor changes the result set. Resolve to the
+        # EFFECTIVE clamped floor (caller min_score or the env/default)
+        # BEFORE keying so equivalent floors (e.g. 2.0 and 1.0, or -1.0
+        # and 0.0) share one cache entry instead of fragmenting it.
+        (max(0.0, min(1.0, float(request.min_score))) if request.min_score is not None else effective_semantic_floor()),
     )
 
     if _lc._cache and not request.include_compressed:
@@ -896,28 +924,41 @@ async def search_memories(
                     logger.info(f"[VECTOR] semantic returned 0 rows for '{request.query[:30]}'; falling back to FTS")
                     rows = await _fts_fallback()
                 elif rows and not semantic_failed:
-                    # Relevance floor (UAT 2026-06-13): drop semantic hits
-                    # whose normalized cosine similarity is below the
-                    # requested floor (or DEFAULT_SEMANTIC_FLOOR when the
-                    # caller didn't specify). This cuts the irrelevant
-                    # nearest-neighbour tail on good queries and returns
-                    # EMPTY for nonsense queries. min_score=0.0 opts out
-                    # (legacy top-k-nearest). FTS rows (semantic_failed or
-                    # the 0-row fallback above) carry no score and are
-                    # never filtered here. Floor is clamped to [0, 1].
+                    # Relevance floor (UAT 2026-06-13). These are genuine
+                    # vector rows (not the semantic_failed / 0-row->FTS
+                    # fallback paths above, which carry no vector score and
+                    # are never filtered). Two steps:
+                    #
+                    # 1) Stamp each row with a canonical normalized cosine
+                    #    similarity (0..1, higher=better) under
+                    #    SEMANTIC_SCORE_KEY, converting the backend's raw
+                    #    score column via its declared metric. Done HERE —
+                    #    not in row_to_memory — so an FTS row's rank/
+                    #    rank_score relevance column can never be mistaken
+                    #    for a vector score.
+                    # 2) Drop hits below the floor. Default floor =
+                    #    effective_semantic_floor() unless the caller set
+                    #    min_score; min_score=0.0 opts out (legacy top-k).
+                    score_col = getattr(backend.memories, "SEMANTIC_SCORE_COLUMN", "rank_score")
+                    score_metric = getattr(backend.memories, "SEMANTIC_SCORE_METRIC", METRIC_COSINE_DISTANCE)
+                    for r in rows:
+                        if isinstance(r, dict):
+                            r[SEMANTIC_SCORE_KEY] = score_to_similarity(r.get(score_col), score_metric)
                     floor = request.min_score
                     if floor is None:
-                        floor = DEFAULT_SEMANTIC_FLOOR
+                        floor = effective_semantic_floor()
                     floor = max(0.0, min(1.0, float(floor)))
                     if floor > 0.0:
                         before = len(rows)
                         kept = []
                         for r in rows:
                             sim = normalize_similarity(r)
-                            # Keep rows we can't score (defensive: a
-                            # backend that omitted the score column should
-                            # not silently vanish) — they pass the floor.
-                            if sim is None or sim >= floor:
+                            # A genuine semantic row whose score is
+                            # missing/non-finite is treated as BELOW the
+                            # floor — failing closed protects precision
+                            # exactly when scoring is broken (ngc-review
+                            # finding 2026-06-13).
+                            if sim is not None and sim >= floor:
                                 kept.append(r)
                         rows = kept
                         if len(rows) != before:

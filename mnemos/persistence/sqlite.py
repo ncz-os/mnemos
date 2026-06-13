@@ -242,9 +242,7 @@ def _read_visibility_clause(
         params.extend(group_ids)
     else:
         group_clause = "0"
-    acl_clause = _acl_exists_clause(
-        acl_principals(user.user_id, group_ids), params, table_alias=table_alias
-    )
+    acl_clause = _acl_exists_clause(acl_principals(user.user_id, group_ids), params, table_alias=table_alias)
     return (
         "("
         f"{p}owner_id = ?"
@@ -363,9 +361,7 @@ def _render_sqlite_visibility(
         params.extend(group_ids)
     else:
         group_clause = "0"
-    acl_clause = _acl_exists_clause(
-        acl_principals(user_id, group_ids), params, table_alias=table_alias
-    )
+    acl_clause = _acl_exists_clause(acl_principals(user_id, group_ids), params, table_alias=table_alias)
     clause = (
         "("
         f"{p}owner_id = ?"
@@ -557,6 +553,11 @@ class _SqliteRepository:
 
 
 class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
+    # semantic_search emits ``similarity`` = mnemos_cosine_similarity (already
+    # cosine similarity in [0,1], higher = better).
+    SEMANTIC_SCORE_COLUMN = "similarity"
+    SEMANTIC_SCORE_METRIC = "cosine_similarity"
+
     # Set by SqliteBackend on construction so search/upsert paths can
     # enforce the configured embedding dim end-to-end. None disables the
     # check (e.g. tests that bypass the backend).
@@ -2051,9 +2052,7 @@ class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueReposi
             # enqueue calls (e.g. rapid on_write triggers).
             existing = await _fetch_val(
                 conn,
-                "SELECT 1 FROM memory_compression_queue "
-                "WHERE memory_id = ? AND status = 'pending' "
-                "LIMIT 1",
+                "SELECT 1 FROM memory_compression_queue WHERE memory_id = ? AND status = 'pending' LIMIT 1",
                 (mid,),
             )
             if existing:
