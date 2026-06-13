@@ -2,9 +2,10 @@
 
 import json
 import math
+import re
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import BaseModel, Field, StrictInt, field_validator
 
 
 ConsultationMode = Literal["auto", "local", "external", "all", "single", "debate", "majority"]
@@ -163,6 +164,189 @@ def _isoformat_value(value: Any) -> str | None:
 # Operators raise it fleet-wide via MNEMOS_SEMANTIC_FLOOR or per-request
 # via min_score; min_score=0.0 restores legacy top-k-nearest.
 DEFAULT_SEMANTIC_FLOOR = 0.65
+
+
+# --- OOD / nonsense-query rejection (margin + lexical-anchor gate) -------------
+# UAT 2026-06-13 cycle 2: a scalar cosine floor provably CANNOT separate
+# gibberish from weak-but-valid queries — bge-m3 has a high, compressed
+# cosine baseline so pure keyboard-mash scores 0.69-0.72 against *something*
+# in an ~8k-row corpus, overlapping the legitimate range (e.g. "personal AI
+# secretary" 0.685). GRAEAE prescribed a relative MARGIN / score-distribution
+# gate (genuine queries are SKEWED — top-1 stands out; gibberish is FLAT/
+# high-variance), with a LEXICAL-ANCHOR overlay for the borderline cases.
+#
+# EMPIRICAL (live PYTHIA Oracle corpus, top-10, min_score=0.0):
+#   margin = top1 - mean(top-k):
+#     GOOD  range 0.0099 .. 0.0846   (median ~0.026)
+#     NONS  range 0.0041 .. 0.0173
+#   -> the ranges OVERLAP (GOOD "secret vault" 0.0099, "hive job dispatch"
+#      0.0137 < NONS "the moon eats spaghetti" 0.0173) so margin ALONE is
+#      insufficient (FN on weak-valid). The lexical-anchor signal is far
+#      cleaner: 14/15 GOOD share >=1 significant query token with a top-3
+#      hit; 7/8 NONS share NONE.
+#
+# COMBINED GATE (the rule that works, 0 false-neg / 7-of-8 nonsense rejected):
+#   A semantic result set is OOD (-> return EMPTY) when ALL hold:
+#     (a) the query is ANCHORABLE (has >=1 significant, non-stopword token), AND
+#     (b) NO top-N hit shares a significant token with the query (no anchor), AND
+#     (c) the score distribution is FLAT: margin = top1 - mean(top-k) < MARGIN_FLOOR.
+#   Otherwise the set passes (favor RECALL — a lexical anchor OR a skewed
+#   distribution is enough to treat the query as genuine). The residual FP
+#   ("quantum gardening ... nonsense" — a real corpus token + low margin)
+#   is unreachable without a cross-encoder rerank (future work); we accept
+#   it rather than raise the floor and start emptying valid queries.
+#
+# This runs AFTER and IN ADDITION TO the absolute min_score floor (0.65) on
+# the same already-floored row set; it never lowers recall on anchored or
+# skewed queries. Conservative by design: only an unanchored, FLAT set is
+# rejected.
+DEFAULT_SEMANTIC_MARGIN_FLOOR = 0.020
+# Number of top hits inspected for a shared (lexical-anchor) query token.
+SEMANTIC_ANCHOR_TOPN = 3
+# Window over which the margin (top1 - mean) is computed. The floor was
+# calibrated on the top-10 distribution; computing the mean over a larger
+# result set (big `limit` + long low-score tail) would inflate the margin
+# and silently weaken the gate, so we fix the window regardless of `limit`
+# (ngc-review 2026-06-13).
+SEMANTIC_MARGIN_TOPK = 10
+# Hard cap on rows materialized from the (possibly unbounded) input iterable.
+# Only the top anchor/margin windows matter, but we read a small superset so a
+# caller that passes an over-large or generator `rows` cannot blow up the
+# request path (ngc-review 2026-06-13).
+SEMANTIC_GATE_MAX_ROWS = 50
+# Canonical text-bearing fields on a semantic row, in priority order. This is
+# the full set every backend's semantic_search returns (verified against the
+# production Oracle backend: SELECT ... content, compressed_content,
+# verbatim_content ...; sqlite/postgres/mysql/db2 mirror these names). The
+# anchor test unions tokens across all of them so a valid hit is never
+# mis-classified as unanchored because its text lives in a sibling field
+# (ngc-review 2026-06-13).
+SEMANTIC_ANCHOR_TEXT_FIELDS = ("content", "verbatim_content", "compressed_content")
+# Min token length to count as "significant" for anchoring (drops 1-2 char
+# noise; combined with the stopword set below).
+SEMANTIC_ANCHOR_MIN_TOKEN_LEN = 3
+# Max chars of each hit's text scanned for an anchor token. The anchor only
+# needs to find ONE shared significant token, which for a genuine hit appears
+# early; capping bounds CPU on large memory bodies in the request path
+# (ngc-review 2026-06-13).
+SEMANTIC_ANCHOR_SCAN_CHARS = 1000
+# Stopwords excluded from anchor/significance tests. Small, high-frequency
+# function words only — keeping it tiny avoids accidentally making a short
+# valid query (e.g. "secret vault") unanchorable.
+SEMANTIC_ANCHOR_STOPWORDS = frozenset(
+    "the a an of to in on for and or is are was were with how do does did "
+    "i my me you your we our by at from as that this it be can will would "
+    "what when where who whom which than then so if not no yes".split()
+)
+
+
+_MIN_STEM_LEN = 4
+
+
+def _stem(word):
+    """Crude, dependency-free suffix stripper so morphological variants anchor
+    (inspection/inspections, embed/embedder/embedding, sync/syncing). Not a
+    real stemmer — just collapses the common English inflections that would
+    otherwise make a valid paraphrase look unanchored (ngc-review 2026-06-13).
+    """
+    # Conservative: only strip a suffix when the REMAINING stem is still
+    # substantial (>= _MIN_STEM_LEN). Blind trailing-"s"/"er" stripping on
+    # short words manufactures false anchors between unrelated tokens, and any
+    # anchor bypasses the OOD gate — so we trade a little recall on very short
+    # words for fewer false-positive anchors (ngc-review 2026-06-13).
+    if word.endswith("ies") and len(word) - 3 >= _MIN_STEM_LEN:
+        return word[:-3] + "y"
+    for suf in ("ing", "ers", "er", "ed", "es", "s"):
+        if word.endswith(suf) and len(word) - len(suf) >= _MIN_STEM_LEN:
+            return word[: -len(suf)]
+    return word
+
+
+def _significant_tokens(text):
+    """Lowercased alphanumeric tokens >= SEMANTIC_ANCHOR_MIN_TOKEN_LEN that
+    are not stopwords. Backend-agnostic, pure-Python, no deps. Returns a set.
+    """
+    if not text:
+        return set()
+    out = set()
+    for w in re.findall(r"[a-z0-9]+", str(text).lower()):
+        if len(w) >= SEMANTIC_ANCHOR_MIN_TOKEN_LEN and w not in SEMANTIC_ANCHOR_STOPWORDS:
+            out.add(_stem(w))
+    return out
+
+
+def is_ood_result_set(query, rows, margin_floor=DEFAULT_SEMANTIC_MARGIN_FLOOR,
+                      anchor_topn=SEMANTIC_ANCHOR_TOPN):
+    """GRAEAE margin + lexical-anchor gate. Given the ALREADY-FLOORED semantic
+    rows (each carrying a normalized cosine score under SEMANTIC_SCORE_KEY),
+    decide whether the result set is out-of-distribution (nonsense / no real
+    match) and should be returned EMPTY.
+
+    Returns True (== reject -> empty) ONLY when the query is anchorable, has
+    no lexical anchor in the top-N hits, AND the score distribution is flat
+    (margin below margin_floor). Favors recall: any lexical anchor OR a skewed
+    distribution keeps the set. Returns False on empty input, an unanchorable
+    query (can't judge -> keep), or a non-finite/zero floor (gate disabled).
+
+    CONTRACT: ``rows`` must be a re-readable Sequence (list/tuple) of dicts;
+    a one-shot iterator/generator is REFUSED (fail open) rather than partially
+    consumed, so a caller's result set is never silently truncated.
+    """
+    # Do NOT consume a one-shot iterator: only accept an already-materialized
+    # Sequence (the production call site passes the result list). Anything else
+    # fails OPEN (keep) so a generator caller's rows are never partially
+    # drained (ngc-review 2026-06-13).
+    if not isinstance(rows, (list, tuple)):
+        return False
+    # Bound work on a pathologically large list.
+    if len(rows) > SEMANTIC_GATE_MAX_ROWS:
+        rows = rows[:SEMANTIC_GATE_MAX_ROWS]
+    if not rows:
+        return False
+    try:
+        mf = float(margin_floor)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(mf) or mf <= 0.0:
+        return False  # gate disabled / opted out
+    qtok = _significant_tokens(query)
+    if not qtok:
+        # All-stopword / sub-threshold query: nothing to anchor on, and the
+        # margin signal alone is too weak — fail OPEN (keep) to protect recall.
+        return False
+    # (b) lexical anchor: does any top-N hit share a significant query token?
+    for r in rows[:anchor_topn]:
+        if not isinstance(r, dict):
+            continue
+        # Check every text-bearing field the row may carry (a semantic row
+        # may expose the searchable text under content and/or the verbatim/
+        # compressed variants) so a valid hit is never wrongly "unanchored"
+        # because its text lives in a sibling field (ngc-review 2026-06-13).
+        hit_tokens = set()
+        for field in SEMANTIC_ANCHOR_TEXT_FIELDS:
+            v = r.get(field)
+            if v:
+                hit_tokens |= _significant_tokens(str(v)[:SEMANTIC_ANCHOR_SCAN_CHARS])
+        if qtok & hit_tokens:
+            return False  # anchored -> genuine, keep
+    # (c) distribution: margin = top1 - mean(top-k) over the scored rows.
+    scores = []
+    for r in rows:
+        if isinstance(r, dict):
+            sc = normalize_similarity(r)
+            if sc is not None:
+                scores.append(sc)
+    if len(scores) < 2:
+        return False  # single hit -> not "flat"; keep
+    # Compute the margin over a FIXED top-k window (highest scores), sorted
+    # descending and independent of the caller's `limit`, to match the
+    # calibrated top-10 rule (ngc-review 2026-06-13). max()==window[0] after
+    # sort, so order of the input rows does not matter.
+    window = sorted(scores, reverse=True)[:SEMANTIC_MARGIN_TOPK]
+    top1 = window[0]
+    margin = top1 - (sum(window) / len(window))
+    # Unanchored AND flat distribution -> OOD.
+    return margin < mf
 
 
 # Canonical key under which the route stamps a normalized cosine
@@ -327,6 +511,25 @@ class MemorySearchRequest(BaseModel):
     # non-finite (NaN/inf) values at parse time -> clean 422, so the
     # route never has to defensively clamp a hostile float.
     min_score: Optional[float] = Field(None, ge=0.0, le=1.0)
+    # OOD / nonsense-query margin gate override (UAT 2026-06-13 cycle 2).
+    # The relative top1-mean(top-k) margin below which an UNANCHORED semantic
+    # result set is treated as out-of-distribution and returned empty. Default
+    # None -> the server applies effective_semantic_margin_floor()
+    # (MNEMOS_SEMANTIC_MARGIN_FLOOR env, default 0.020). Pass 0.0 to DISABLE the
+    # margin/anchor gate (keep absolute-floor behavior only). Only affects
+    # semantic search; capped non-negative. Recall-favoring: a lexical anchor
+    # or a skewed distribution always keeps the set regardless of this value.
+    min_margin: Optional[float] = Field(None, ge=0.0, le=1.0, allow_inf_nan=False)
+
+    @field_validator("min_score", "min_margin")
+    @classmethod
+    def _reject_non_finite_score(cls, v):
+        # Belt-and-suspenders over allow_inf_nan=False: guarantee NaN/inf are
+        # rejected at parse time regardless of pydantic version/config, so the
+        # gate + cache key never see a non-finite float (ngc-review 2026-06-13).
+        if v is not None and not math.isfinite(v):
+            raise ValueError("must be a finite number")
+        return v
 
 
 class MemoryCreateRequest(BaseModel):
