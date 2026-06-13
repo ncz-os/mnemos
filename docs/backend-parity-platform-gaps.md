@@ -42,13 +42,31 @@ explicit super()-delegators so the surface is visible + counted.
 
 ## Genuine platform gaps (need a newer engine / are inherently partial)
 
-- **mysql 8 RAISE** — VECTOR/embedding methods (semantic_search and the embedding
-  write/duplicate-content paths). MySQL `VECTOR` / `TO_VECTOR` / `VECTOR_DISTANCE`
-  are MySQL **9.0** features; MySQL 8.0 cannot host them. These are gated on a
-  MySQL 9.0 target (the prod engine) — implement + validate there, not on 8.0.
-  The 8.0 `MysqlBackend.open()` probe intentionally fails the VECTOR DDL.
 - **sqlite 1 RAISE** — a postgres-specific path with no sqlite equivalent;
   sqlite is the edge backend and is expected to be partial.
+
+## mysql 8 RAISE — NOT VECTOR; portable MemoryRepository methods (NEXT SLICE)
+
+Correction (2026-06-13): the mysql RAISE set is **not** VECTOR/embedding — those
+already degrade to a python-cosine `semantic_search` impl. The 8 ABC-counted
+RAISEs are all `MysqlMemoryRepository` versioning / ACL / dedup methods that were
+simply never ported. They ARE portable from the postgres reference and
+validatable on a live MySQL container (mysql9 used for the next slice; mysql8
+also works — none of these need VECTOR). All schema deps exist in
+`db/migrations_mysql` (memory_versions, memory_branches; memories.content_hash /
+provenance / morpheus_run_id / source_memories / federation_source). Split by risk:
+
+Low-risk (ACL-free, port + validate straightforwardly):
+- `fetch_referenced_memory_allowlist` — `id = ANY($1::text[])` -> `IN (%s,…)` + optional owner/ns scope.
+- `fetch_memory_export` — memories SELECT w/ optional owner/ns/category filters + the provenance columns; `$idx`/`$idx+1` LIMIT/OFFSET -> `%s`.
+- `find_duplicate_content_groups` — GROUP BY owner/ns/content_hash HAVING COUNT>1. GOTCHA: postgres `ARRAY_AGG(id ORDER BY created,id)` + `[1]` canonical -> MySQL `GROUP_CONCAT(id ORDER BY created,id)` (MUST raise `group_concat_max_len`, default 1024 truncates large groups) split to a list, canonical via `SUBSTRING_INDEX(...,',',1)`; or `JSON_ARRAYAGG` (ordering not guaranteed — prefer GROUP_CONCAT + explicit max_len).
+- `consolidate_duplicate_memories` — UPDATE … SET consolidated_into/consolidated_at/deleted_at WHERE `id = ANY($2::text[])` -> `IN (%s,…)`; `NOW()` -> `NOW(6)`; return rowcount.
+
+Version-ACL cluster (do together — share the version-visibility predicate):
+- `assert_memory_readable`, `fetch_memory_log` (RECURSIVE CTE over memory_versions+memory_branches), `fetch_diff_commit_pair`, `fetch_checkout_commit`. Postgres uses `_core_read_visibility_predicate` / `_core_version_visibility_predicate` (emit `$n`); mysql has `_render_visibility(VisibilityFilter, table_alias)` (emit `%s`) — needs a version-table (`mv` alias) visibility rendering path. Build the VisibilityFilter from UserContext the way the existing mysql get_memory/list_memories do; root path is a simple existence check (no predicate).
+
+NOTE: `fetch_duplicate_content_groups` (mysql L1539) is a vestigial mysql-only
+stub NOT on the ABC — not a parity requirement, leave or delete.
 
 ## Gated work (needs live infra or an architectural decision — DO NOT blind-build)
 
