@@ -34,6 +34,7 @@ from mnemos.persistence.oracle import (
     OracleAuditChainRepository,
     OracleBackend,
     OracleBranchRepository,
+    OracleCompressionQueueRepository,
     OracleCompressionRepository,
     OracleConsultationAuditRepository,
     OracleConsultationsRepository,
@@ -3939,6 +3940,203 @@ class Db2AuditChainRepository(OracleAuditChainRepository):
     """
 
 
+class Db2CompressionQueueRepository(OracleCompressionQueueRepository):
+    """Compression-queue repository — Db2-native overrides (severance slice 6).
+
+    All six methods emit explicit Db2-native SQL: ``?`` positional binds,
+    ``CURRENT TIMESTAMP``, ``CASE`` for Oracle ``GREATEST``, and Db2 ordered
+    SKIP-LOCKED claiming via ``FETCH FIRST ? ROWS ONLY FOR UPDATE SKIP LOCKED
+    DATA``, which caps the fetched/locked set to ``limit`` rows so peer
+    workers are never starved by an over-locked prefetch (the problem the
+    Oracle path works around with prefetchrows/arraysize tuning). Validated
+    on the live 12.1.5 EAP: two concurrent dequeues claim disjoint sets with
+    no double-claim; unclaimed pending rows are released at commit and picked
+    up on the next poll. The id column is filled by the
+    ``mcq_bi_id`` BEFORE INSERT trigger, so inserts omit it.
+    """
+
+    _SKIP_LOCKED = "FOR UPDATE SKIP LOCKED DATA"
+
+    async def enqueue_compression(
+        self, tx: Any, *, memory_ids: list[str], reason: str, priority: int, scoring_profile: str
+    ) -> list[str]:
+        if not memory_ids:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            ph = ",".join("?" for _ in memory_ids)
+            await _call(
+                cursor.execute,
+                f"SELECT id, owner_id FROM memories WHERE id IN ({ph}) AND deleted_at IS NULL",
+                tuple(memory_ids),
+            )
+            rows = await _call(cursor.fetchall) or []
+            owner_by_id = {r[0]: r[1] for r in rows}
+            enqueued: list[str] = []
+            for mid in memory_ids:
+                if mid not in owner_by_id:
+                    continue
+                await _call(
+                    cursor.execute,
+                    "INSERT INTO memory_compression_queue "
+                    "(memory_id, owner_id, reason, priority, scoring_profile) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (mid, owner_by_id[mid], reason, priority, scoring_profile),
+                )
+                enqueued.append(mid)
+            return enqueued
+        finally:
+            await _call(cursor.close)
+
+    async def enqueue_all_compression(
+        self, tx: Any, *, reason: str, priority: int, scoring_profile: str,
+        category: str | None, only_uncompressed: bool, limit: int,
+    ) -> int:
+        if int(limit) <= 0:
+            return 0
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where_parts = ["m.deleted_at IS NULL"]
+            params: list[Any] = [reason, priority, scoring_profile]
+            if only_uncompressed:
+                where_parts.append(
+                    "NOT EXISTS (SELECT 1 FROM memory_compressed_variants v WHERE v.memory_id = m.id)"
+                )
+            if category is not None:
+                where_parts.append("m.category = ?")
+                params.append(category)
+            params.append(int(limit))
+            where_sql = " AND ".join(where_parts)
+            sql = (
+                "INSERT INTO memory_compression_queue "
+                "(memory_id, owner_id, reason, priority, scoring_profile) "
+                "SELECT m.id, m.owner_id, ?, ?, ? "
+                f"FROM memories m WHERE {where_sql} "
+                "ORDER BY LENGTH(m.content) DESC "
+                "FETCH FIRST ? ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, tuple(params))
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def dequeue_compression(self, tx: Any, *, limit: int) -> list[Row]:
+        if limit <= 0:
+            return []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT id, memory_id, owner_id, reason, scoring_profile, attempts "
+                "FROM memory_compression_queue "
+                "WHERE status = 'pending' "
+                "ORDER BY priority DESC, enqueued_at "
+                "FETCH FIRST ? ROWS ONLY " + self._SKIP_LOCKED,
+                (int(limit),),
+            )
+            claimed = await _fetch_all_dicts(cursor)
+            if not claimed:
+                return []
+            ids = [row["id"] for row in claimed]
+            ph = ",".join("?" for _ in ids)
+            await _call(
+                cursor.execute,
+                "UPDATE memory_compression_queue "
+                "SET status = 'running', started_at = CURRENT TIMESTAMP, "
+                "    attempts = attempts + 1 "
+                f"WHERE id IN ({ph})",
+                tuple(ids),
+            )
+            for row in claimed:
+                row["attempts"] = int(row.get("attempts") or 0) + 1
+            return claimed
+        finally:
+            await _call(cursor.close)
+
+    async def mark_compression_done(self, tx: Any, *, queue_id: str) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memory_compression_queue "
+                "SET status = 'done', finished_at = CURRENT TIMESTAMP, error = NULL "
+                "WHERE id = ?",
+                (queue_id,),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def mark_compression_failed(self, tx: Any, *, queue_id: str, error: str) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memory_compression_queue "
+                "SET status = 'failed', finished_at = CURRENT TIMESTAMP, error = ? "
+                "WHERE id = ?",
+                (error, queue_id),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def sweep_stale_compression(self, tx: Any, *, stale_threshold_secs: int, max_attempts: int) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT id, attempts, error FROM memory_compression_queue "
+                "WHERE status = 'running' "
+                "  AND (started_at IS NULL "
+                f"       OR started_at < CURRENT TIMESTAMP - {max(0, int(stale_threshold_secs))} SECONDS) "
+                + self._SKIP_LOCKED,
+            )
+            stale = await _fetch_all_dicts(cursor)
+            swept = 0
+            for row in stale:
+                qid = row["id"]
+                attempts = int(row.get("attempts") or 0)
+                err = row.get("error")
+                terminalize = (
+                    attempts >= max_attempts and err is not None and not str(err).startswith("infra_retry:")
+                )
+                if terminalize:
+                    await _call(
+                        cursor.execute,
+                        "UPDATE memory_compression_queue "
+                        "SET status = 'failed', finished_at = CURRENT TIMESTAMP, error = ? "
+                        "WHERE id = ?",
+                        (f"stranded_running: exceeded stale threshold after {attempts} attempts", qid),
+                    )
+                elif attempts >= max_attempts:
+                    await _call(
+                        cursor.execute,
+                        "UPDATE memory_compression_queue "
+                        "SET status = 'pending', started_at = NULL, finished_at = NULL, "
+                        "    attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END, "
+                        "    error = 'infra_retry: stale-recovered without content-failure breadcrumb' "
+                        "WHERE id = ?",
+                        (qid,),
+                    )
+                else:
+                    await _call(
+                        cursor.execute,
+                        "UPDATE memory_compression_queue "
+                        "SET status = 'pending', started_at = NULL, finished_at = NULL, error = NULL "
+                        "WHERE id = ?",
+                        (qid,),
+                    )
+                swept += 1
+            return swept
+        finally:
+            await _call(cursor.close)
+
+
 class Db2Backend(OracleBackend):
     """IBM Db2 12.1.x backend via Oracle Compatibility Mode.
 
@@ -3992,6 +4190,7 @@ class Db2Backend(OracleBackend):
         self._memory_versions_repo = Db2VersionRepository()
         self._memory_branches_repo = Db2BranchRepository()
         self._compression_repo = Db2CompressionRepository()
+        self._compression_queue_repo = Db2CompressionQueueRepository()
         self._webhooks_repo = Db2WebhookRepository()
         self._consultations_audit_repo = Db2ConsultationAuditRepository()
         self._federation_repo = Db2FederationRepository()
