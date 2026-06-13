@@ -65,6 +65,7 @@ from mnemos.persistence.oracle import (
     _uuid_to_raw,
     _validate_and_format_vector,
 )
+from mnemos.core.secret_box import decrypt_provider_secret
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter
 
@@ -3683,6 +3684,39 @@ class Db2OAuthRepository(OracleOAuthRepository):
     # get_provider / list_enabled_providers are intentionally NOT overridden here
     # -- they require the oauth_providers OIDC schema (plaintext client_secret),
     # which is a separate operator security decision. ---
+
+    async def list_enabled_providers(self, tx: Any) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT name, display_name, kind, enabled FROM oauth_providers "
+                "WHERE enabled = 1 ORDER BY display_name",
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_provider(self, tx: Any, name: str) -> Row | None:
+        """OIDC provider row with client_secret decrypted from client_secret_enc
+        (encrypted at rest; see core.secret_box)."""
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT name, kind, issuer_url, client_id, client_secret_enc, scope, "
+                "authorize_url, token_url, userinfo_url, enabled "
+                "FROM oauth_providers WHERE name = ?",
+                (name,),
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            if row is None:
+                return None
+            enc = row.pop("client_secret_enc", None)
+            row["client_secret"] = decrypt_provider_secret(enc) if enc else None
+            return row
+        finally:
+            await _call(cursor.close)
 
     async def provision_or_link_user(
         self, tx: Any, *, provider: str, external_id: str, claims: dict[str, Any]

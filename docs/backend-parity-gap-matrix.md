@@ -76,8 +76,8 @@
 ## OAuthRepository (7 methods)
 | method | oracle | postgres | db2 | mysql | sqlite |
 |---|---|---|---|---|---|
-| list_enabled_providers | IMPL | IMPL | -- | IMPL | IMPL |
-| get_provider | IMPL | IMPL | -- | IMPL | IMPL |
+| list_enabled_providers | IMPL | IMPL | IMPL | IMPL | IMPL |
+| get_provider | IMPL | IMPL | IMPL | IMPL | IMPL |
 | provision_or_link_user | IMPL | IMPL | IMPL | IMPL | IMPL |
 | create_session | IMPL | IMPL | IMPL | IMPL | IMPL |
 | revoke_session | IMPL | IMPL | IMPL | IMPL | IMPL |
@@ -172,6 +172,6 @@
 |---|---|---|---|---|
 | oracle | 110 | 1 | 0 | 0 |
 | postgres | 111 | 0 | 0 | 0 |
-| db2 | 108 | 1 | 0 | 2 |
+| db2 | 110 | 1 | 0 | 0 |
 | mysql | 110 | 1 | 0 | 0 |
 | sqlite | 110 | 0 | 1 | 0 |

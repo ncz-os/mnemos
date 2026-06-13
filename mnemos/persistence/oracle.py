@@ -51,6 +51,7 @@ from mnemos.persistence.base import (
     VersionRepository,
     WebhookRepository,
 )
+from mnemos.core.secret_box import decrypt_provider_secret
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
@@ -2556,16 +2557,24 @@ class OracleOAuthRepository(OAuthRepository):
             await _call(cursor.close)
 
     async def get_provider(self, tx: Transaction, name: str) -> Row | None:
+        """Returns the OIDC provider row with client_secret decrypted from
+        client_secret_enc (encrypted at rest; see core.secret_box). build_client
+        consumes the decrypted secret transiently."""
         cursor = await _call(_conn_from_tx(tx).cursor)
         try:
             await _call(
                 cursor.execute,
-                "SELECT name, kind, issuer_url, client_id, client_secret, scope, "
+                'SELECT name, kind, issuer_url, client_id, client_secret_enc, "scope" AS scope, '
                 "authorize_url, token_url, userinfo_url, enabled "
                 "FROM oauth_providers WHERE name = :name",
                 {"name": name},
             )
-            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            if row is None:
+                return None
+            enc = row.pop("client_secret_enc", None)
+            row["client_secret"] = decrypt_provider_secret(enc) if enc else None
+            return row
         finally:
             await _call(cursor.close)
 
