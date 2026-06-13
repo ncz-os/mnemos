@@ -102,6 +102,20 @@ def test_score_unknown_metric_fails_closed():
     assert score_to_similarity(0.1, "bogus_metric") is None
 
 
+def test_min_score_request_validation():
+    import math as _math
+
+    from pydantic import ValidationError
+
+    # in-range + None accepted
+    for ok in (0.0, 0.5, 1.0, None):
+        MemorySearchRequest(query="q", min_score=ok)
+    # non-finite + out-of-range rejected at parse time (clean 422)
+    for bad in (_math.nan, _math.inf, -_math.inf, 1.5, -0.1):
+        with pytest.raises(ValidationError):
+            MemorySearchRequest(query="q", min_score=bad)
+
+
 # ---- normalize_similarity reads only the canonical key -----------------
 
 

@@ -297,12 +297,14 @@ class MemorySearchRequest(BaseModel):
     decay_overrides: Optional[Dict[str, float]] = None
     # Semantic relevance floor (UAT 2026-06-13). Normalized cosine
     # similarity in [0, 1]; semantic hits scoring BELOW this are
-    # dropped. Default None -> the server applies DEFAULT_SEMANTIC_FLOOR
+    # dropped. Default None -> the server applies effective_semantic_floor()
     # so nonsense queries return empty and the low-score noise tail is
     # cut from good queries. Pass 0.0 to opt OUT of the floor (legacy
     # top-k-nearest behavior). Has NO effect on FTS/exact search, which
-    # carry no vector score. Out-of-range values are clamped to [0, 1].
-    min_score: Optional[float] = None
+    # carry no vector score. ``ge``/``le`` reject out-of-range AND
+    # non-finite (NaN/inf) values at parse time -> clean 422, so the
+    # route never has to defensively clamp a hostile float.
+    min_score: Optional[float] = Field(None, ge=0.0, le=1.0)
 
 
 class MemoryCreateRequest(BaseModel):
