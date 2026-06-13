@@ -56,6 +56,8 @@ from urllib.parse import unquote, urlparse
 
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
+from mnemos.core import webhook_constants
+from mnemos.persistence import nats_events as persistence_nats_events
 from mnemos.persistence.base import (
     BranchRepository,
     CompressionStatsRow,
@@ -2715,7 +2717,74 @@ class MysqlWebhookRepository(WebhookRepository):
         owner_id: str | None = None,
         namespace: str | None = None,
     ) -> list[str]:
-        raise NotImplementedError(_MYSQL_WEBHOOKS_UNSUPPORTED)
+        """MySQL port of PostgresWebhookRepository.dispatch_event.
+
+        Fans an event out to matching webhook_subscriptions and enqueues a
+        ``pending`` row per subscription in webhook_deliveries (the delivery
+        worker drains them). Dialect: ``$1 = ANY(events)`` -> ``JSON_CONTAINS(
+        events, JSON_QUOTE(%s))`` (events is a JSON array of event-type
+        strings); ``NOT revoked`` -> ``revoked = 0`` (TINYINT). NATS outbox
+        publishes mirror postgres so the delivery pipeline behaves identically.
+        """
+        query = (
+            "SELECT id, url, owner_id, namespace FROM webhook_subscriptions "
+            "WHERE revoked = 0 AND JSON_CONTAINS(events, JSON_QUOTE(%s))"
+        )
+        args: list[Any] = [event_type]
+        if owner_id is not None:
+            query += " AND owner_id = %s"
+            args.append(owner_id)
+        if namespace is not None:
+            query += " AND namespace = %s"
+            args.append(namespace)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(query, tuple(args))
+            subscriptions = await _fetch_all_dicts(cursor)
+        body = json.dumps(
+            {"event": event_type, "timestamp": datetime.now(timezone.utc).isoformat(), "data": payload},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        delivery_ids: list[str] = []
+        for sub in subscriptions:
+            delivery_id = str(uuid.uuid4())
+            async with tx.conn.cursor() as cursor:
+                await cursor.execute(
+                    "INSERT INTO webhook_deliveries "
+                    "(id, subscription_id, event_type, payload, payload_hash, status, writer_revision) "
+                    "VALUES (%s, %s, %s, %s, %s, 'pending', %s)",
+                    (
+                        delivery_id,
+                        sub["id"],
+                        event_type,
+                        body,
+                        body_hash,
+                        webhook_constants.NEW_CODE_WRITER_REVISION,
+                    ),
+                )
+            from mnemos.nats.webhook_events import publish_delivery_queued
+
+            await publish_delivery_queued(
+                delivery_id=delivery_id,
+                subscription_id=sub["id"],
+                event_type=event_type,
+                url=sub["url"],
+                payload_hash=body_hash,
+                namespace=sub["namespace"],
+                owner_id=sub["owner_id"],
+            )
+            await persistence_nats_events.publish_webhook_outbox_insert(
+                delivery_id=delivery_id,
+                subscription_id=sub["id"],
+                event_type=event_type,
+                url=sub["url"],
+                payload_hash=body_hash,
+                namespace=sub["namespace"],
+                owner_id=sub["owner_id"],
+            )
+            delivery_ids.append(delivery_id)
+        return delivery_ids
 
 
 class MysqlConsultationAuditRepository(ConsultationAuditRepository):
@@ -3591,6 +3660,32 @@ class MysqlConsultationsRepository(MysqlConsultationAuditRepository, Consultatio
             namespace=namespace,
             memory_ids=memory_ids,
             genesis_hash=genesis_hash,
+        )
+
+    async def list_audit_log(
+        self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None, limit: int, offset: int
+    ) -> list[Row]:
+        return await super().list_audit_log(
+            tx, root=root, user_id=user_id, namespace=namespace, limit=limit, offset=offset
+        )
+
+    async def fetch_audit_chain(
+        self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None
+    ) -> list[Row]:
+        return await super().fetch_audit_chain(tx, root=root, user_id=user_id, namespace=namespace)
+
+    async def get_consultation(
+        self, tx: Transaction, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> Row | None:
+        return await super().get_consultation(
+            tx, consultation_id=consultation_id, root=root, user_id=user_id, namespace=namespace
+        )
+
+    async def get_consultation_artifacts(
+        self, tx: Transaction, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> tuple[Row | None, list[Row]]:
+        return await super().get_consultation_artifacts(
+            tx, consultation_id=consultation_id, root=root, user_id=user_id, namespace=namespace
         )
 
 
