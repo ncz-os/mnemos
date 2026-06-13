@@ -147,3 +147,34 @@ the auth table, or extend it. db2 inherits the same conflict.
 
 OAuth stays gated for the same reasons as before (token-hash vs OIDC, breaking
 schema + plaintext client_secret + prod-data migration).
+
+### FINAL 2026-06-13 (ext-2) — stubs/raises/absent resolved; only the providers-secret decision remains
+
+Standing up live Oracle 23ai Free + the live DB2 12.1.5 EAP un-gated almost
+everything. Implemented this pass (all codex+ngc gated, validated against a live
+instance of each backend, pushed ARGONAS+gitlab+github):
+- oracle: chat Sessions (8) + OAuth provision/create_session (OIDC alignment) -> oracle 110/1/0/0.
+- db2: chat Sessions (9) + OAuth identity/session methods (5) + record_schema_abort delegator -> db2 108/1/0/2.
+
+Final coverage: postgres 111, oracle 110, mysql 110, sqlite 110, db2 108.
+
+RESOLVED understanding of the former "gates":
+- The chat-Sessions "schema conflict" was real but fixable: the oracle/db2 sessions
+  table held an AUTH shape; the auth create_session is UNWIRED (no callers), so the
+  chat columns were added additively (namespace nullable -> auth/chat separable) and
+  the chat repo implemented. Auth path untouched.
+- The OAuth raises were a code/schema mismatch: the OAuth code targets the OIDC
+  shape but the migrations created token-hash columns. Added the OIDC columns
+  additively (identities/sessions) -> implemented + repaired the previously-broken
+  IMPL methods (get_identity_for_session etc.).
+
+REMAINING (not bugs):
+- set_suppress_version_snapshot STUB on oracle/db2/mysql -- correct-by-design (no-op).
+- sqlite 1 RAISE -- a postgres-only path; edge backend, expected partial.
+- db2 list_enabled_providers + get_provider (2 absent) -- the ONLY genuinely
+  operator-gated item: they need the oauth_providers OIDC schema, and get_provider /
+  core.oauth.build_client require the OAuth client_secret stored in PLAINTEXT
+  (vs the current client_secret_hash). That is a security decision for the operator
+  (store provider client secrets in plaintext + migrate existing token-hash rows),
+  not something to change autonomously. Oracle's provider methods have the same
+  latent dependency.
