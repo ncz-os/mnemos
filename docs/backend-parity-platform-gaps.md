@@ -222,3 +222,22 @@ Verdicts #2-#4 are recorded as the vendor-aligned target architecture; they
 refactor already-validated working code with prod-migration cost, so they are
 flagged for a planned migration rather than changed autonomously. Verdict #1 was
 the only one blocking functionality (the oauth_providers gate) and is implemented.
+
+## GRAEAE phased execution plan (2026-06-13, score 1.0) — "address all"
+
+Constraint-aware revisions to the raw verdicts: (#3) KEEP deleted_at + add indexes
+(temporal tables across 5 dialects breaks portability; sqlite has none); (#2) DROP
+the dead auth columns from `sessions` (oauth_sessions already IS the auth table — no
+new table); (#4) keep the LIVE token-hash cols (oauth_sessions.access_token_hash/
+refresh_token_hash used by the token-flow); (#1) postgres encryption via dual-write,
+backfill operator-gated. Plan (lowest risk first; each phase ship+review+validate):
+- Phase 1: prune the dead/unwired auth-session cluster; drop sessions.session_id/
+  started_at/last_active_at (oracle/db2/sqlite; NOT expires_at/metadata which are
+  postgres chat cols). sqlite needs >= 3.35 for DROP COLUMN.
+- Phase 2: postgres oauth_providers client_secret -> encrypted (add client_secret_enc,
+  dual-write, [OPERATOR backfill], cutover, drop plaintext). Backfill NOT automated.
+- Phase 3: index harmonization on deleted_at (partial indexes pg/sqlite; composite
+  oracle/db2/mysql) across the 7 heavy tables.
+- Phase 4: FK ON DELETE CASCADE on the core tables (hard-delete orphan safety net).
+OPERATOR WARNINGS: 2.3 backfill = human runs + verifies Fernet key; verify sqlite
+>= 3.35 before DROP COLUMN.
