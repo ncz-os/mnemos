@@ -2639,12 +2639,61 @@ class OracleSessionsRepository(SessionsRepository):
 
 class OracleConsultationsRepository(ConsultationsRepository):
     async def resolve_tier_lineup(self, tx: Transaction, tier: str) -> list[Row]:
-        _ = (tx, tier)
-        return []
+        """Oracle port of PostgresConsultationsRepository.resolve_tier_lineup.
+
+        DISTINCT ON (provider) -> ROW_NUMBER() OVER (PARTITION BY provider ...) = 1.
+        available/deprecated are NUMBER(1) (1/0). NULLS LAST keeps unranked models last.
+        """
+        if tier == "frontier":
+            inner = (
+                "SELECT provider, model_id, ROW_NUMBER() OVER (PARTITION BY provider "
+                "ORDER BY graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST) AS rn "
+                "FROM model_registry WHERE available=1 AND deprecated=0 "
+                "AND ((arena_rank IS NOT NULL AND arena_rank <= 5) OR graeae_weight >= 0.95)"
+            )
+        elif tier == "premium":
+            inner = (
+                "SELECT provider, model_id, ROW_NUMBER() OVER (PARTITION BY provider "
+                "ORDER BY graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST) AS rn "
+                "FROM model_registry WHERE available=1 AND deprecated=0 "
+                "AND ((arena_rank IS NOT NULL AND arena_rank BETWEEN 6 AND 15) "
+                "OR (graeae_weight >= 0.85 AND graeae_weight < 0.95))"
+            )
+        else:
+            inner = (
+                "SELECT provider, model_id, ROW_NUMBER() OVER (PARTITION BY provider "
+                "ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC) AS rn "
+                "FROM model_registry WHERE available=1 AND deprecated=0 AND graeae_weight >= 0.75 "
+                "AND input_cost_per_mtok IS NOT NULL AND output_cost_per_mtok IS NOT NULL"
+            )
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute, f"SELECT provider, model_id FROM ({inner}) WHERE rn = 1")
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
     async def resolve_models(self, tx: Transaction, model_ids: Sequence[str]) -> list[Row]:
-        _ = (tx, model_ids)
-        return []
+        """Oracle port of PostgresConsultationsRepository.resolve_models.
+
+        ANY($1::text[]) -> IN (:m0, :m1, ...) with expanded named binds.
+        """
+        ids = list(model_ids)
+        if not ids:
+            return []
+        binds = {f"m{i}": v for i, v in enumerate(ids)}
+        placeholders = ", ".join(f":m{i}" for i in range(len(ids)))
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"SELECT provider, model_id FROM model_registry WHERE model_id IN ({placeholders}) "
+                "AND available=1 AND deprecated=0",
+                binds,
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
     async def create_consultation_with_audit(self, tx: Transaction, **kwargs: Any) -> Any:
         """Insert a consultation + audit-chain link + memory refs in one tx.
@@ -2758,21 +2807,139 @@ class OracleConsultationsRepository(ConsultationsRepository):
             await _call(cursor.close)
         return consultation_id
 
-    async def list_audit_log(self, tx: Transaction, **kwargs: Any) -> list[Row]:
-        _ = (tx, kwargs)
-        return []
+    async def list_audit_log(
+        self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None, limit: int, offset: int
+    ) -> list[Row]:
+        """Oracle port of PostgresConsultationsRepository.list_audit_log.
 
-    async def fetch_audit_chain(self, tx: Transaction, **kwargs: Any) -> list[Row]:
-        _ = (tx, kwargs)
-        return []
+        LIMIT/OFFSET -> OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY. NULL::text ->
+        CAST(NULL AS VARCHAR2(64)). Non-root path re-numbers + re-links within the
+        owner+namespace scope (chain_hash hidden), mirroring postgres.
+        """
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            if root and namespace is None:
+                await _call(
+                    cursor.execute,
+                    "SELECT id, sequence_num, consultation_id, prompt_hash, response_hash, chain_hash, "
+                    "prev_id, task_type, provider, quality_score, created_at FROM graeae_audit_log "
+                    "WHERE deleted_at IS NULL ORDER BY sequence_num DESC "
+                    "OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY",
+                    {"off": offset, "lim": limit},
+                )
+            elif root:
+                await _call(
+                    cursor.execute,
+                    "SELECT al.id, al.sequence_num, al.consultation_id, al.prompt_hash, al.response_hash, "
+                    "al.chain_hash, al.prev_id, al.task_type, al.provider, al.quality_score, al.created_at "
+                    "FROM graeae_audit_log al JOIN graeae_consultations c ON c.id=al.consultation_id "
+                    "WHERE c.namespace=:ns AND c.deleted_at IS NULL AND al.deleted_at IS NULL "
+                    "ORDER BY al.sequence_num DESC OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY",
+                    {"ns": namespace, "off": offset, "lim": limit},
+                )
+            else:
+                await _call(
+                    cursor.execute,
+                    "WITH visible AS (SELECT al.id, al.sequence_num AS global_sequence_num, al.consultation_id, "
+                    "al.prompt_hash, al.response_hash, al.task_type, al.provider, al.quality_score, al.created_at, "
+                    "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+                    "LAG(al.id) OVER (ORDER BY al.sequence_num ASC) AS scoped_prev_id "
+                    "FROM graeae_audit_log al JOIN graeae_consultations c ON c.id=al.consultation_id "
+                    "WHERE c.owner_id=:owner AND c.namespace=:ns AND c.deleted_at IS NULL AND al.deleted_at IS NULL) "
+                    "SELECT id, scoped_sequence_num AS sequence_num, consultation_id, prompt_hash, response_hash, "
+                    "CAST(NULL AS VARCHAR2(64)) AS chain_hash, scoped_prev_id AS prev_id, task_type, provider, "
+                    "quality_score, created_at FROM visible "
+                    "ORDER BY global_sequence_num DESC OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY",
+                    {"owner": user_id, "ns": namespace, "off": offset, "lim": limit},
+                )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
-    async def get_consultation(self, tx: Transaction, **kwargs: Any) -> Row | None:
-        _ = (tx, kwargs)
-        return None
+    async def fetch_audit_chain(
+        self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None
+    ) -> list[Row]:
+        """Oracle port of PostgresConsultationsRepository.fetch_audit_chain.
 
-    async def get_consultation_artifacts(self, tx: Transaction, **kwargs: Any) -> tuple[Row | None, list[Row]]:
-        _ = (tx, kwargs)
-        return None, []
+        LEFT JOIN LATERAL (previous link) -> correlated scalar subquery
+        (... WHERE p.sequence_num < al.sequence_num ORDER BY ... DESC FETCH FIRST
+        1 ROWS ONLY). Bind order: owner_id (when scoped) then namespace.
+        """
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            if root and namespace is None:
+                await _call(
+                    cursor.execute,
+                    "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
+                    "FROM graeae_audit_log ORDER BY sequence_num ASC",
+                )
+                return await _fetch_all_dicts(cursor)
+            owner_clause = "" if root else "c.owner_id = :owner AND "
+            binds = {"ns": namespace} if root else {"owner": user_id, "ns": namespace}
+            await _call(
+                cursor.execute,
+                "SELECT al.sequence_num, ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+                "al.prompt_hash, al.response_hash, al.chain_hash, al.prev_id, al.prev_chain_hash, "
+                "(SELECT p.chain_hash FROM graeae_audit_log p WHERE p.sequence_num < al.sequence_num "
+                "ORDER BY p.sequence_num DESC FETCH FIRST 1 ROWS ONLY) AS expected_prev_hash "
+                "FROM graeae_audit_log al JOIN graeae_consultations c ON c.id=al.consultation_id "
+                f"WHERE {owner_clause}c.namespace=:ns AND c.deleted_at IS NULL AND al.deleted_at IS NULL "
+                "ORDER BY al.sequence_num ASC",
+                binds,
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_consultation(
+        self, tx: Transaction, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> Row | None:
+        """Oracle port of PostgresConsultationsRepository.get_consultation."""
+        cols = (
+            'SELECT id, prompt, task_type, consensus_response, consensus_score, winning_muse, '
+            'cost, latency_ms, "mode", created FROM graeae_consultations '
+        )
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            if root and namespace is None:
+                await _call(cursor.execute, cols + "WHERE id=:id AND deleted_at IS NULL", {"id": consultation_id})
+            elif root:
+                await _call(
+                    cursor.execute,
+                    cols + "WHERE id=:id AND namespace=:ns AND deleted_at IS NULL",
+                    {"id": consultation_id, "ns": namespace},
+                )
+            else:
+                await _call(
+                    cursor.execute,
+                    cols + "WHERE id=:id AND owner_id=:owner AND namespace=:ns AND deleted_at IS NULL",
+                    {"id": consultation_id, "owner": user_id, "ns": namespace},
+                )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def get_consultation_artifacts(
+        self, tx: Transaction, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> tuple[Row | None, list[Row]]:
+        """Oracle port of PostgresConsultationsRepository.get_consultation_artifacts."""
+        consultation = await self.get_consultation(
+            tx, consultation_id=consultation_id, root=root, user_id=user_id, namespace=namespace
+        )
+        if not consultation:
+            return None, []
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT memory_id, injected_at FROM consultation_memory_refs "
+                "WHERE consultation_id=:id ORDER BY injected_at",
+                {"id": consultation_id},
+            )
+            refs = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        return consultation, refs
 
 
 class OracleFederationRepository(FederationRepository):
