@@ -32,40 +32,20 @@ for node in btree.body:
 
 
 def classify(fn):
-    body = [s for s in fn.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]  # drop docstring
-    if not body:
-        return "STUB"
-    # raises NotImplementedError anywhere at top level
-    for s in body:
-        if isinstance(s, ast.Raise) and s.exc is not None:
-            name = ""
-            e = s.exc
-            if isinstance(e, ast.Call):
-                e = e.func
-            if isinstance(e, ast.Name):
-                name = e.id
-            if "NotImplemented" in name:
+    """Classify a method body: RAISE (raises NotImplementedError), IMPL (does
+    real async work — any ``await``, i.e. a DB call or delegate), or STUB
+    (returns a constant / ``pass`` / ``_ = ...`` with no await). The await
+    heuristic is reliable: a real persistence method always awaits a cursor or
+    connection; a stub just returns ``[]`` / ``None`` or raises."""
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Raise) and node.exc is not None:
+            e = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+            if isinstance(e, ast.Name) and "NotImplemented" in e.id:
                 return "RAISE"
-    # trivial stub: single return of a literal/empty, or just `_ = ...`, or pass
-    if len(body) == 1:
-        s = body[0]
-        if isinstance(s, ast.Pass):
-            return "STUB"
-        if isinstance(s, ast.Return):
-            v = s.value
-            if v is None or (isinstance(v, ast.Constant) and v.value in (None, 0, False, "")):
-                return "STUB"
-            if isinstance(v, (ast.List, ast.Dict, ast.Tuple)) and not getattr(v, "elts", getattr(v, "keys", [1])):
-                return "STUB"
-            if isinstance(v, ast.Tuple) and all(isinstance(x, (ast.List, ast.Dict, ast.Constant)) for x in v.elts):
-                return "STUB"
-        if isinstance(s, ast.Assign):  # `_ = (tx, ...)`
-            return "STUB"
-    if len(body) == 2 and isinstance(body[0], ast.Assign) and isinstance(body[1], ast.Return):
-        v = body[1].value
-        if isinstance(v, (ast.List, ast.Dict)) or v is None:
-            return "STUB"
-    return "IMPL"
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Await):
+            return "IMPL"
+    return "STUB"
 
 
 def backend_methods(path, prefix):
