@@ -178,6 +178,12 @@ class MemorySearchRequest(BaseModel):
     source_model: Optional[str] = None
     source_agent: Optional[str] = None
     namespace: Optional[str] = None
+    # Secret-vault opt-in. Default search EXCLUDES the vault
+    # namespace so credential-class memories never surface on the
+    # normal/public/phone path. Fleet agents that legitimately need
+    # a credential set include_secrets=true (or query
+    # namespace="vault" directly, root only).
+    include_secrets: Optional[bool] = False
     include_archived: Optional[bool] = False
     boost_recency: Optional[bool] = False
     recency_weight: float = Field(0.15, ge=0.0, le=1.0)

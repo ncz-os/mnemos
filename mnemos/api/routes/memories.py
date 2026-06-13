@@ -35,6 +35,7 @@ from mnemos.domain.artemis_dedup import (
     evaluate_memory_create_dedup,
 )
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.base import DuplicateMemoryError
 from mnemos.domain.models import (
     BulkCreateRequest,
@@ -402,6 +403,18 @@ async def get_memory(
     visibility = VisibilityFilter.for_read(
         user,
         namespace=None if is_root(user) else user.namespace,
+        # GET-by-id is an EXPLICIT fetch: for ROOT callers, knowing the
+        # exact memory id is itself the opt-in, so the vault namespace
+        # is NOT excluded — fleet agents fetch a credential they hold
+        # the id for without an include_secrets flag. (Search/list/
+        # rehydrate DO exclude it for everyone because those enumerate.)
+        # Secret vault (release-blocking 2026-06-13): for NON-ROOT
+        # callers the vault MUST stay excluded so a non-root user who
+        # knows/guesses a vault memory id cannot fetch it — the row is
+        # filtered out and the handler returns 404 (not-found), keeping
+        # vault-row existence invisible. Vault GET-by-id is therefore
+        # root-only by construction.
+        include_secrets=is_root(user),
     )
     body: Optional[str] = None
     row = None
@@ -692,6 +705,20 @@ async def search_memories(
     user: UserContext = Depends(get_current_user),
 ):
     """Search memories with optional 5-minute response caching."""
+    # Secret vault (release-blocking 2026-06-13): include_secrets is
+    # root-only and MUST be enforced BEFORE any cache-key construction,
+    # cache read, or cache write. The cache key encodes
+    # include_secrets into a distinct (secret-inclusive) bucket; if a
+    # non-root caller were allowed past this point they could read — or
+    # populate — the root-only secret bucket via that key. Rejecting up
+    # front guarantees the secret-inclusive cache bucket is reachable
+    # only by root. (Duplicated visibility-factory call below stays
+    # defense-in-depth.)
+    if request.include_secrets and not is_root(user):
+        raise HTTPException(
+            status_code=403,
+            detail="include_secrets requires root",
+        )
     search_trace_id = uuid4().hex[:8]
     search_started_at = time.monotonic()
     # v6.2 M-2.2.3: validate retrieval profile (unknown → 400). Default
@@ -763,6 +790,7 @@ async def search_memories(
         request.source_agent,
         search_namespace,
         search_owner_id,
+        bool(request.include_secrets),  # vault opt-in -> distinct cache bucket
         sorted(user.group_ids),  # list, not pre-serialized string
         request.include_archived,
         request.boost_recency,
@@ -785,7 +813,21 @@ async def search_memories(
     # None); non-root callers are pinned. The visibility factory
     # rejects namespace=None for non-root, which the namespace 403
     # check above already prevents reaching.
-    visibility = VisibilityFilter.for_read(user, namespace=search_namespace)
+    #
+    # Secret vault (release-blocking 2026-06-13): the DEFAULT path
+    # subtracts the vault namespace even for root, so credential-class
+    # memories never surface in normal/public/phone search. Fleet
+    # agents opt in with include_secrets=true OR by targeting
+    # namespace="vault" explicitly. include_secrets is root-only and is
+    # rejected at the TOP of this handler (before cache-key build) so a
+    # non-root caller can never touch the secret-inclusive cache bucket.
+    # The visibility factory below independently clears the vault
+    # exclusion only for root callers (defense-in-depth).
+    visibility = VisibilityFilter.for_read(
+        user,
+        namespace=search_namespace,
+        include_secrets=bool(request.include_secrets),
+    )
 
     async with backend.transactional() as tx:
         await _maybe_set_pg_rls(tx, user)
@@ -968,7 +1010,56 @@ async def create_memory(
     namespace = request.namespace or user.namespace
     permission_mode = _validate_permission_mode(request.permission_mode, default=600)
 
-    metadata_json = json.dumps(request.metadata or {"source": request.source})
+    # Secret-vault ingest classification (release-blocking 2026-06-13).
+    # Credential-class content (PATs, provider keys, PEM blocks, secret-
+    # grade key=value assignments) is auto-isolated into the vault
+    # namespace so it can never surface on the default FTS/semantic path.
+    # Incidental secret spans (REDACT) are left in place but flagged in
+    # metadata for the redact-on-read follow-up. Already-vaulted writes
+    # are left untouched. The classifier is conservative -> a 40-hex git
+    # SHA in prose is NOT vaulted.
+    _meta = dict(request.metadata or {})
+    if request.metadata is None and request.source is not None:
+        _meta.setdefault("source", request.source)
+    try:
+        from mnemos.core.secret_detection import classify as _classify, SecretClass, VAULT_NAMESPACE
+        _finding = _classify(request.content)
+        if _finding.cls is SecretClass.VAULT and namespace != VAULT_NAMESPACE:
+            _meta["secret_vaulted"] = True
+            _meta["secret_reasons"] = _finding.reasons
+            _meta["secret_original_namespace"] = namespace
+            _meta["secret_classified_at"] = "ingest"
+            namespace = VAULT_NAMESPACE
+            logger.warning(
+                "[secret-vault] ingest auto-vaulted memory %s (reasons=%s)",
+                mem_id, _finding.reasons,
+            )
+        elif _finding.cls is SecretClass.REDACT:
+            _meta["secret_redact_spans"] = _finding.spans
+            _meta["secret_reasons"] = _finding.reasons
+    except Exception:
+        # FAIL CLOSED (release-blocking 2026-06-13): if classification
+        # cannot complete (import error, classifier bug, etc.) we MUST
+        # NOT store potentially-credential content on the default path.
+        # Quarantine into the vault namespace so an unclassifiable write
+        # never silently reintroduces the vault bypass. A false-positive
+        # (non-secret prose vaulted on a transient classifier error) is
+        # recoverable by a root re-file; a false-negative (a real secret
+        # left searchable) is not.
+        logger.exception(
+            "[secret-vault] ingest classification FAILED for %s — failing "
+            "closed, quarantining into vault namespace",
+            mem_id,
+        )
+        if namespace != VAULT_NAMESPACE:
+            _meta["secret_vaulted"] = True
+            _meta["secret_reasons"] = ["classification_failed_fail_closed"]
+            _meta["secret_original_namespace"] = namespace
+            _meta["secret_classified_at"] = "ingest"
+            _meta["secret_classification_error"] = True
+            namespace = VAULT_NAMESPACE
+
+    metadata_json = json.dumps(_meta or {"source": request.source})
     delivery_ids: list[str] = []
     try:
         async with backend.transactional() as tx:
