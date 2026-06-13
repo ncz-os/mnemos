@@ -21,9 +21,10 @@ Key SQL-level differences from Postgres/Oracle:
 
 This backend implements the core memory / FTS / vector-search and state
 key-value surfaces.
-KG triples, versioning, branches, compression, federation, state, and audit
-surfaces are implemented in MySQL dialect. Webhooks are explicitly declared
-unsupported and gated before callers can reach the outbox methods.
+KG triples, compression, versioning, and federation surfaces raise
+``NotImplementedError`` (same posture as the initial Oracle port) and will be
+filled in across subsequent slices following M4 review. Webhooks are explicitly
+declared unsupported and gated before callers can reach the outbox methods.
 
 Configuration example::
 
@@ -44,6 +45,8 @@ import hashlib
 import json
 import logging
 import math
+import re
+import secrets
 import uuid
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
@@ -54,14 +57,12 @@ from urllib.parse import unquote, urlparse
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
 from mnemos.persistence.base import (
-    AUDIT_CAPABILITY,
-    AUDIT_DETAIL_CAPABILITY,
-    AuditChainRepository,
     BranchRepository,
     CompressionStatsRow,
-    COMPRESSION_QUEUE_CAPABILITY,
     CompressionQueueRepository,
     CompressionRepository,
+    CONSULTATIONS_CAPABILITY,
+    CONSULTATIONS_DETAIL_CAPABILITY,
     CORE_CAPABILITY,
     FEDERATION_CAPABILITY,
     MYSQL_CAPABILITY_DETAILS,
@@ -70,10 +71,17 @@ from mnemos.persistence.base import (
     KG_CAPABILITY,
     KGRepository,
     MemoryRepository,
+    OAUTH_CAPABILITY,
+    OAUTH_DETAIL_CAPABILITY,
+    OAuthRepository,
+    SESSIONS_CAPABILITY,
+    SESSIONS_DETAIL_CAPABILITY,
+    SessionsRepository,
     STATE_CAPABILITY,
     STATE_DETAIL_CAPABILITY,
     StateRepository,
     Transaction,
+    ConsultationsRepository,
     VersionRepository,
     WebhookRepository,
 )
@@ -86,6 +94,7 @@ _DEFAULT_EMBEDDING_DIM = embedding_dim_env()
 _DEFAULT_MYSQL_POOL_MIN = 2
 _DEFAULT_MYSQL_POOL_MAX = 10
 _DEFAULT_MYSQL_ACQUIRE_TIMEOUT = 60.0
+_USER_ID_SAFE = re.compile(r"[^a-zA-Z0-9._:-]+")
 
 # MySQL 9.0 native vector column declaration
 _VECTOR_COLUMN = f"VECTOR({_DEFAULT_EMBEDDING_DIM})"
@@ -114,6 +123,11 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         _LOG.warning("Ignoring unparsable %s=%r; using default %.1f", name, raw, default)
         return default
+
+
+def _mint_user_id(provider: str, external_id: str) -> str:
+    slug = _USER_ID_SAFE.sub("", f"{provider}:{external_id}")
+    return slug[:64] or f"{provider}:{secrets.token_hex(6)}"
 
 
 def _content_hash(content: Any) -> str:
@@ -692,42 +706,6 @@ CREATE TABLE IF NOT EXISTS memory_versions (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
-_DDL_MEMORY_AUDIT_CHAIN = """\
-CREATE TABLE IF NOT EXISTS memory_audit_chain (
-    entry_id        VARBINARY(32)  NOT NULL,
-    memory_id       VARBINARY(32)  NOT NULL,
-    prev_entry_id   VARBINARY(32),
-    prev_entry_hash VARBINARY(32),
-    op              VARCHAR(32)    NOT NULL,
-    payload_hash    VARBINARY(32)  NOT NULL,
-    writer_id       VARCHAR(256)   NOT NULL,
-    writer_pubkey   VARBINARY(512) NOT NULL,
-    signature       VARBINARY(512) NOT NULL,
-    signed_at       TIMESTAMP(6)   NOT NULL,
-    global_root     VARBINARY(32),
-    global_seq      BIGINT,
-    PRIMARY KEY (entry_id),
-    INDEX ix_memory_audit_by_memory (memory_id, signed_at DESC),
-    INDEX ix_memory_audit_by_root (global_root),
-    INDEX ix_memory_audit_unsigned (signed_at),
-    INDEX ix_memory_audit_by_writer (writer_id, signed_at DESC)
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-"""
-
-_DDL_MEMORY_AUDIT_ROOTS = """\
-CREATE TABLE IF NOT EXISTS memory_audit_roots (
-    global_root    VARBINARY(32)  NOT NULL,
-    window_start   TIMESTAMP(6)   NOT NULL,
-    window_end     TIMESTAMP(6)   NOT NULL,
-    entry_count    INT            NOT NULL,
-    root_signature VARBINARY(512) NOT NULL,
-    signer_pubkey  VARBINARY(512) NOT NULL,
-    sealed_at      TIMESTAMP(6)   NOT NULL,
-    PRIMARY KEY (global_root),
-    INDEX ix_memory_audit_roots_window (window_end DESC)
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-"""
-
 _DDL_MEMORY_BRANCHES = """\
 CREATE TABLE IF NOT EXISTS memory_branches (
     memory_id       VARCHAR(64)  NOT NULL,
@@ -751,8 +729,6 @@ _INIT_DDLS = [
     _DDL_FEDERATION_SYNC_LOG,
     _DDL_MEMORY_VERSIONS,
     _DDL_MEMORY_BRANCHES,
-    _DDL_MEMORY_AUDIT_CHAIN,
-    _DDL_MEMORY_AUDIT_ROOTS,
     _DDL_KG_TRIPLES,
     _DDL_COMPRESSION_CANDIDATES,
     _DDL_COMPRESSED_VARIANTS,
@@ -990,12 +966,7 @@ class MysqlMemoryRepository(MemoryRepository):
         async with conn.cursor() as cursor:
             placeholders = ", ".join(["%s"] * len(memory_ids))
             await cursor.execute(
-                f"""
-                SELECT DISTINCT memory_id
-                  FROM memory_versions
-                 WHERE memory_id IN ({placeholders})
-                   AND deleted_at IS NULL
-                """,
+                f"SELECT id FROM memories WHERE id IN ({placeholders}) AND deleted_at IS NULL",
                 list(memory_ids),
             )
             return await _fetch_all_dicts(cursor)
@@ -1007,18 +978,7 @@ class MysqlMemoryRepository(MemoryRepository):
         async with conn.cursor() as cursor:
             placeholders = ", ".join(["%s"] * len(memory_ids))
             await cursor.execute(
-                f"""
-                SELECT m.id, m.content AS memory_content,
-                       mv.content AS head_content
-                  FROM memories m
-                  LEFT JOIN memory_branches b
-                    ON b.memory_id = m.id AND b.name = 'main'
-                  LEFT JOIN memory_versions mv
-                    ON mv.id = b.head_version_id
-                   AND mv.deleted_at IS NULL
-                 WHERE m.id IN ({placeholders})
-                   AND m.deleted_at IS NULL
-                """,
+                f"SELECT id FROM memories WHERE id IN ({placeholders}) AND deleted_at IS NULL",
                 list(memory_ids),
             )
             return await _fetch_all_dicts(cursor)
@@ -1487,51 +1447,14 @@ class MysqlMemoryRepository(MemoryRepository):
                 WHERE deleted_at IS NULL
                 """
             )
-            row = await _fetchone_dict(cursor) or {}
-            await cursor.execute(
-                """
-                SELECT federation_source, COUNT(*) AS cnt
-                  FROM memories
-                 WHERE federation_source IS NOT NULL AND deleted_at IS NULL
-                 GROUP BY federation_source
-                 ORDER BY cnt DESC
-                """
-            )
-            peer_rows = await _fetch_all_dicts(cursor)
-            await cursor.execute(
-                """
-                SELECT category, COUNT(*) AS cnt
-                  FROM memories
-                 WHERE deleted_at IS NULL
-                 GROUP BY category
-                """
-            )
-            cat_rows = await _fetch_all_dicts(cursor)
-            await cursor.execute(
-                """
-                SELECT category, subcategory, COUNT(*) AS cnt
-                  FROM memories
-                 WHERE subcategory IS NOT NULL AND deleted_at IS NULL
-                 GROUP BY category, subcategory
-                 ORDER BY cnt DESC
-                """
-            )
-            sub_rows = await _fetch_all_dicts(cursor)
+            row = await _fetchone_dict(cursor)
 
         from mnemos.persistence.base import MemoryStatsRow
 
-        memories_by_subcategory: dict[str, dict[str, int]] = {}
-        for sub_row in sub_rows:
-            memories_by_subcategory.setdefault(str(sub_row["category"]), {})[str(sub_row["subcategory"])] = int(
-                sub_row["cnt"] or 0
-            )
         return MemoryStatsRow(
-            total_memories=int(row.get("total_memories") or 0),
-            native_memories=int(row.get("native_memories") or 0),
-            federated_memories=int(row.get("federated_memories") or 0),
-            memories_by_peer={str(r["federation_source"]): int(r["cnt"] or 0) for r in peer_rows},
-            memories_by_category={str(r["category"]): int(r["cnt"] or 0) for r in cat_rows},
-            memories_by_subcategory=memories_by_subcategory,
+            total_memories=int(row["total_memories"] or 0),
+            native_memories=int(row["native_memories"] or 0),
+            federated_memories=int(row["federated_memories"] or 0),
             avg_quality_rating=float(row["avg_quality_rating"]) if row.get("avg_quality_rating") is not None else None,
         )
 
@@ -1554,34 +1477,10 @@ class MysqlMemoryRepository(MemoryRepository):
         vis = VisibilityFilter.for_read(user, namespace=namespace)
         return await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=vis)
 
-    # --- DAG/export/dedup parity methods ---
+    # --- unimplemented methods (port forthcoming) ---
 
     async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None:
-        conn = tx.conn
-        async with conn.cursor() as cursor:
-            if user.role == "root":
-                await cursor.execute(
-                    "SELECT 1 FROM memory_versions WHERE memory_id = %s AND deleted_at IS NULL LIMIT 1",
-                    (memory_id,),
-                )
-            else:
-                vis_clause, vis_params = _render_visibility(
-                    VisibilityFilter.for_read(user, namespace=user.namespace),
-                    table_alias="m",
-                )
-                await cursor.execute(
-                    f"""
-                    SELECT 1
-                      FROM memories m
-                     WHERE m.id = %s
-                       AND m.deleted_at IS NULL
-                       AND {vis_clause}
-                     LIMIT 1
-                    """,
-                    [memory_id, *vis_params],
-                )
-            if await cursor.fetchone() is None:
-                raise PermissionError("Memory not found")
+        raise NotImplementedError("mysql: assert_memory_readable not yet implemented")
 
     async def fetch_memory_log(
         self,
@@ -1591,50 +1490,7 @@ class MysqlMemoryRepository(MemoryRepository):
         limit: int,
         user: UserContext,
     ) -> list[Row]:
-        conn = tx.conn
-        scope_sql = ""
-        scope_params: list[Any] = []
-        if user.role != "root":
-            scope_sql = "AND (mv.owner_id = %s OR MOD(mv.permission_mode, 10) >= 4) AND mv.namespace = %s"
-            scope_params = [user.user_id, user.namespace]
-        async with conn.cursor() as cursor:
-            await cursor.execute(
-                f"""
-                WITH RECURSIVE commit_walk AS (
-                    SELECT mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
-                           mv.version_num, mv.branch, mv.content, mv.category,
-                           mv.change_type, mv.snapshot_at, mv.snapshot_by,
-                           mv.owner_id, mv.namespace, mv.permission_mode, 1 AS depth
-                      FROM memory_versions mv
-                      INNER JOIN memory_branches mb
-                              ON mb.memory_id = mv.memory_id
-                             AND mb.name = %s
-                             AND mb.head_version_id = mv.id
-                     WHERE mv.memory_id = %s
-                       AND mv.deleted_at IS NULL
-                       {scope_sql}
-                    UNION ALL
-                    SELECT mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
-                           mv.version_num, mv.branch, mv.content, mv.category,
-                           mv.change_type, mv.snapshot_at, mv.snapshot_by,
-                           mv.owner_id, mv.namespace, mv.permission_mode, cw.depth + 1
-                      FROM memory_versions mv
-                      INNER JOIN commit_walk cw
-                              ON mv.id = cw.parent_version_id
-                             AND mv.memory_id = cw.memory_id
-                     WHERE cw.depth < %s
-                       AND mv.deleted_at IS NULL
-                       {scope_sql}
-                )
-                SELECT commit_hash, version_num, branch, category, change_type,
-                       snapshot_at, snapshot_by, owner_id, namespace, permission_mode
-                  FROM commit_walk
-                 ORDER BY depth ASC
-                 LIMIT %s
-                """,
-                [branch, memory_id, *scope_params, limit, *scope_params, limit],
-            )
-            return await _fetch_all_dicts(cursor)
+        raise NotImplementedError("mysql: fetch_memory_log not yet implemented")
 
     async def fetch_diff_commit_pair(
         self,
@@ -1644,25 +1500,7 @@ class MysqlMemoryRepository(MemoryRepository):
         commit_b: str,
         user: UserContext,
     ) -> tuple[Row | None, Row | None]:
-        conn = tx.conn
-        sql = """
-            SELECT content, version_num
-              FROM memory_versions
-             WHERE memory_id = %s AND commit_hash = %s AND deleted_at IS NULL
-        """
-        async with conn.cursor() as cursor:
-            if user.role == "root":
-                await cursor.execute(sql, (memory_id, commit_a))
-                row_a = await _fetchone_dict(cursor)
-                await cursor.execute(sql, (memory_id, commit_b))
-                row_b = await _fetchone_dict(cursor)
-            else:
-                gated = sql + " AND (owner_id = %s OR MOD(permission_mode, 10) >= 4) AND namespace = %s"
-                await cursor.execute(gated, (memory_id, commit_a, user.user_id, user.namespace))
-                row_a = await _fetchone_dict(cursor)
-                await cursor.execute(gated, (memory_id, commit_b, user.user_id, user.namespace))
-                row_b = await _fetchone_dict(cursor)
-        return row_a, row_b
+        raise NotImplementedError("mysql: fetch_diff_commit_pair not yet implemented")
 
     async def fetch_checkout_commit(
         self,
@@ -1671,20 +1509,7 @@ class MysqlMemoryRepository(MemoryRepository):
         commit_hash: str,
         user: UserContext,
     ) -> Row | None:
-        conn = tx.conn
-        sql = """
-            SELECT commit_hash, version_num, branch, category, subcategory,
-                   content, change_type, snapshot_at, snapshot_by
-              FROM memory_versions
-             WHERE memory_id = %s AND commit_hash = %s AND deleted_at IS NULL
-        """
-        params: list[Any] = [memory_id, commit_hash]
-        if user.role != "root":
-            sql += " AND (owner_id = %s OR MOD(permission_mode, 10) >= 4) AND namespace = %s"
-            params.extend([user.user_id, user.namespace])
-        async with conn.cursor() as cursor:
-            await cursor.execute(sql, params)
-            return await _fetchone_dict(cursor)
+        raise NotImplementedError("mysql: fetch_checkout_commit not yet implemented")
 
     async def fetch_memory_export(
         self,
@@ -1696,34 +1521,7 @@ class MysqlMemoryRepository(MemoryRepository):
         limit: int,
         offset: int,
     ) -> list[Row]:
-        conditions = ["deleted_at IS NULL"]
-        params: list[Any] = []
-        if effective_owner:
-            conditions.append("owner_id = %s")
-            params.append(effective_owner)
-        if effective_ns:
-            conditions.append("namespace = %s")
-            params.append(effective_ns)
-        if category:
-            conditions.append("category = %s")
-            params.append(category)
-        conn = tx.conn
-        async with conn.cursor() as cursor:
-            await cursor.execute(
-                f"""
-                SELECT id, content, category, subcategory, created, updated,
-                       owner_id, namespace, permission_mode, quality_rating,
-                       source_model, source_provider, source_session, source_agent,
-                       metadata, NULL AS prov_kind, NULL AS morpheus_run_id,
-                       NULL AS source_memories, federation_source
-                  FROM memories
-                 WHERE {" AND ".join(conditions)}
-                 ORDER BY created ASC
-                 LIMIT %s OFFSET %s
-                """,
-                params + [limit, offset],
-            )
-            return await _fetch_all_dicts(cursor)
+        raise NotImplementedError("mysql: fetch_memory_export not yet implemented")
 
     async def fetch_referenced_memory_allowlist(
         self,
@@ -1733,23 +1531,10 @@ class MysqlMemoryRepository(MemoryRepository):
         scope_owner: str | None = None,
         scope_namespace: str | None = None,
     ) -> list[Row]:
-        if not referenced_ids:
-            return []
-        placeholders = ", ".join(["%s"] * len(referenced_ids))
-        sql = f"SELECT id, owner_id, namespace FROM memories WHERE id IN ({placeholders}) AND deleted_at IS NULL"
-        params: list[Any] = list(referenced_ids)
-        if scope_owner is not None:
-            sql += " AND owner_id = %s"
-            params.append(scope_owner)
-        if scope_namespace is not None:
-            sql += " AND namespace = %s"
-            params.append(scope_namespace)
-        async with tx.conn.cursor() as cursor:
-            await cursor.execute(sql, params)
-            return await _fetch_all_dicts(cursor)
+        raise NotImplementedError("mysql: fetch_referenced_memory_allowlist not yet implemented")
 
     async def fetch_duplicate_content_groups(self, *args: Any, **kwargs: Any) -> list[Row]:
-        return await self.find_duplicate_content_groups(*args, **kwargs)
+        raise NotImplementedError("mysql: fetch_duplicate_content_groups not yet implemented")
 
     async def find_duplicate_content_groups(
         self,
@@ -1757,34 +1542,7 @@ class MysqlMemoryRepository(MemoryRepository):
         *,
         namespace: str | None = None,
     ) -> list[Row]:
-        params: list[Any] = []
-        namespace_sql = ""
-        if namespace is not None:
-            namespace_sql = "AND namespace = %s"
-            params.append(namespace)
-        async with tx.conn.cursor() as cursor:
-            await cursor.execute(
-                f"""
-                SELECT owner_id, namespace, content_hash,
-                       COUNT(*) AS duplicate_count,
-                       JSON_ARRAYAGG(id) AS memory_ids,
-                       SUBSTRING_INDEX(GROUP_CONCAT(id ORDER BY created ASC, id ASC), ',', 1) AS canonical_id
-                  FROM memories
-                 WHERE deleted_at IS NULL
-                   AND archived_at IS NULL
-                   AND consolidated_into IS NULL
-                   AND content_hash IS NOT NULL
-                   {namespace_sql}
-                 GROUP BY owner_id, namespace, content_hash
-                HAVING COUNT(*) > 1
-                 ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC
-                """,
-                params,
-            )
-            rows = await _fetch_all_dicts(cursor)
-        for row in rows:
-            row["memory_ids"] = _json_list(row.get("memory_ids"))
-        return rows
+        raise NotImplementedError("mysql: find_duplicate_content_groups not yet implemented")
 
     async def consolidate_duplicate_memories(
         self,
@@ -1793,36 +1551,11 @@ class MysqlMemoryRepository(MemoryRepository):
         canonical_id: str,
         duplicate_ids: Sequence[str],
     ) -> int:
-        if not duplicate_ids:
-            return 0
-        placeholders = ", ".join(["%s"] * len(duplicate_ids))
-        async with tx.conn.cursor() as cursor:
-            await cursor.execute(
-                f"""
-                UPDATE memories
-                   SET consolidated_into = %s,
-                       consolidated_at = NOW(6),
-                       deleted_at = COALESCE(deleted_at, NOW(6)),
-                       updated = NOW(6)
-                 WHERE id IN ({placeholders})
-                   AND id <> %s
-                   AND deleted_at IS NULL
-                   AND archived_at IS NULL
-                   AND consolidated_into IS NULL
-                   AND EXISTS (
-                       SELECT 1 FROM (SELECT id FROM memories
-                                       WHERE id = %s AND deleted_at IS NULL
-                                         AND archived_at IS NULL
-                                         AND consolidated_into IS NULL) c
-                   )
-                """,
-                [canonical_id, *duplicate_ids, canonical_id, canonical_id],
-            )
-            return int(cursor.rowcount or 0)
+        raise NotImplementedError("mysql: consolidate_duplicate_memories not yet implemented")
 
 
 # ── KG, Version, Branch, Compression, Webhook, ConsultationAudit,
-#    Federation, State, AuditChain repositories ───────────────────────────────
+#    Federation, State — all stubbed; implementation follows M4 cadence.
 
 
 class MysqlKGRepository(KGRepository):
@@ -3476,6 +3209,390 @@ class MysqlConsultationAuditRepository(ConsultationAuditRepository):
         return consultation, refs
 
 
+class MysqlOAuthRepository(OAuthRepository):
+    async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT name, display_name, kind, enabled FROM oauth_providers WHERE enabled=TRUE ORDER BY display_name"
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def get_provider(self, tx: Transaction, name: str) -> Row | None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT name, kind, issuer_url, client_id, client_secret, scope, "
+                "authorize_url, token_url, userinfo_url, enabled "
+                "FROM oauth_providers WHERE name=%s",
+                (name,),
+            )
+            return await _fetchone_dict(cursor)
+
+    async def provision_or_link_user(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        external_id: str,
+        claims: dict[str, Any],
+    ) -> tuple[str, str]:
+        raw_claims = json.dumps(claims)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT id, user_id FROM oauth_identities WHERE provider=%s AND external_id=%s",
+                (provider, external_id),
+            )
+            existing = await _fetchone_dict(cursor)
+            if existing:
+                await cursor.execute(
+                    "UPDATE oauth_identities SET last_login_at=NOW(6), raw_claims=%s WHERE id=%s",
+                    (raw_claims, existing["id"]),
+                )
+                return existing["user_id"], str(existing["id"])
+
+            email = claims.get("email")
+            display_name = claims.get("name") or claims.get("preferred_username")
+            email_verified_claim = claims.get("email_verified")
+            if isinstance(email_verified_claim, bool):
+                email_verified = email_verified_claim
+            elif isinstance(email_verified_claim, str):
+                email_verified = email_verified_claim.strip().lower() == "true"
+            else:
+                email_verified = False
+
+            user_id = None
+            if email and email_verified:
+                await cursor.execute("SELECT id FROM users WHERE email=%s", (email,))
+                link_target = await _fetchone_dict(cursor)
+                if link_target:
+                    user_id = link_target["id"]
+            if user_id is None:
+                user_id = _mint_user_id(provider, external_id)
+                await cursor.execute(
+                    "INSERT INTO users (id, display_name, email, role) "
+                    "VALUES (%s, %s, %s, 'user') "
+                    "ON DUPLICATE KEY UPDATE id = id",
+                    (user_id, display_name, email),
+                )
+            identity_id = str(uuid.uuid4())
+            await cursor.execute(
+                "INSERT INTO oauth_identities "
+                "(id, user_id, provider, external_id, email, display_name, raw_claims, last_login_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(6))",
+                (identity_id, user_id, provider, external_id, email, display_name, raw_claims),
+            )
+            return user_id, identity_id
+
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        user_id: str,
+        identity_id: str | None,
+        expires_at: Any,
+        user_agent: str,
+        ip_address: str | None,
+    ) -> str:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "INSERT INTO oauth_sessions "
+                "(session_id, user_id, identity_id, expires_at, user_agent, ip_address) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (session_id, user_id, identity_id, expires_at, user_agent, ip_address),
+            )
+        return session_id
+
+    async def revoke_session(self, tx: Transaction, session_id: str) -> bool:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE oauth_sessions SET revoked=TRUE, revoked_at=NOW(6) WHERE session_id=%s AND NOT revoked",
+                (session_id,),
+            )
+            return int(cursor.rowcount or 0) > 0
+
+    async def revoke_all_sessions(self, tx: Transaction, user_id: str) -> int:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE oauth_sessions SET revoked=TRUE, revoked_at=NOW(6) WHERE user_id=%s AND NOT revoked",
+                (user_id,),
+            )
+            return int(cursor.rowcount or 0)
+
+    async def get_identity_for_session(self, tx: Transaction, session_id: str) -> Row | None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT i.id AS id, i.user_id, i.provider, i.external_id, i.email, "
+                "i.display_name, i.last_login_at, i.created "
+                "FROM oauth_sessions s JOIN oauth_identities i ON i.id = s.identity_id "
+                "WHERE s.session_id=%s AND NOT s.revoked",
+                (session_id,),
+            )
+            return await _fetchone_dict(cursor)
+
+
+class MysqlSessionsRepository(SessionsRepository):
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        namespace: str,
+        model: str,
+        initial_context: str | None,
+    ) -> Row:
+        session_id = uuid.uuid4().hex
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "INSERT INTO sessions (id, user_id, namespace, model) VALUES (%s, %s, %s, %s)",
+                (session_id, user_id, namespace, model),
+            )
+            if initial_context:
+                await cursor.execute(
+                    "INSERT INTO session_messages (session_id, role, content) VALUES (%s, 'system', %s)",
+                    (session_id, initial_context),
+                )
+            await cursor.execute(
+                "SELECT id, created_at, model FROM sessions "
+                "WHERE id=%s AND user_id=%s AND namespace=%s AND deleted_at IS NULL",
+                (session_id, user_id, namespace),
+            )
+            row = await _fetchone_dict(cursor)
+        if row is None:
+            raise RuntimeError("mysql: session insert returned no row")
+        return row
+
+    async def get_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> Row | None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT * FROM sessions WHERE id=%s AND user_id=%s AND namespace=%s AND deleted_at IS NULL",
+                (session_id, user_id, namespace),
+            )
+            return await _fetchone_dict(cursor)
+
+    async def list_injected_memory_ids(self, tx: Transaction, session_id: str, limit: int = 10) -> list[str]:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT memory_id FROM session_memory_injections WHERE session_id=%s AND deleted_at IS NULL "
+                "GROUP BY memory_id ORDER BY MAX(injection_timestamp) DESC LIMIT %s",
+                (session_id, limit),
+            )
+            rows = await _fetch_all_dicts(cursor)
+        return [row["memory_id"] for row in rows]
+
+    async def add_message(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        model: str | None = None,
+        tokens_used: int | None = None,
+        memories_injected: int | None = None,
+    ) -> Any:
+        message_id = uuid.uuid4().hex
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "INSERT INTO session_messages "
+                "(id, session_id, role, content, model, tokens_used, memories_injected) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (message_id, session_id, role, content, model, tokens_used, memories_injected),
+            )
+        return message_id
+
+    async def fetch_provider_history(self, tx: Transaction, session_id: str) -> list[Row]:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                WITH first_system AS (
+                    SELECT id, role, content, timestamp FROM session_messages
+                    WHERE session_id=%s AND role='system' AND deleted_at IS NULL
+                    ORDER BY timestamp ASC, id ASC LIMIT 1
+                ), later_system AS (
+                    SELECT s.id, s.role, s.content, s.timestamp FROM session_messages s
+                    WHERE s.session_id=%s AND s.role='system' AND s.deleted_at IS NULL
+                    AND s.id <> (SELECT id FROM first_system)
+                    ORDER BY s.timestamp DESC, s.id DESC LIMIT 4
+                ), pinned AS (
+                    SELECT id, role, content, timestamp, 0 AS k FROM first_system
+                    UNION ALL SELECT id, role, content, timestamp, 0 AS k FROM later_system
+                ), recent AS (
+                    SELECT id, role, content, timestamp, 1 AS k FROM session_messages
+                    WHERE session_id=%s AND role <> 'system' AND deleted_at IS NULL
+                    ORDER BY timestamp DESC, id DESC LIMIT 10
+                )
+                SELECT role, content FROM (
+                    SELECT * FROM pinned UNION ALL SELECT * FROM recent
+                ) all_msgs ORDER BY k, timestamp ASC, id ASC
+                """,
+                (session_id, session_id, session_id),
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def add_memory_injections(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        message_id: Any,
+        memory_ids: Sequence[str],
+    ) -> None:
+        async with tx.conn.cursor() as cursor:
+            for i, memory_id in enumerate(memory_ids):
+                await cursor.execute(
+                    "INSERT INTO session_memory_injections "
+                    "(id, session_id, message_id, memory_id, relevance_score) VALUES (%s, %s, %s, %s, %s)",
+                    (uuid.uuid4().hex, session_id, message_id, memory_id, 0.9 - (i * 0.1)),
+                )
+
+    async def update_metrics(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        user_id: str,
+        namespace: str,
+        tokens_used: int,
+    ) -> None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE sessions SET message_count=message_count+2, total_tokens=total_tokens+%s, "
+                "last_activity=NOW(6) WHERE id=%s AND user_id=%s AND namespace=%s AND deleted_at IS NULL",
+                (tokens_used, session_id, user_id, namespace),
+            )
+
+    async def fetch_history(self, tx: Transaction, session_id: str, limit: int, offset: int) -> tuple[list[Row], int]:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT role, content, timestamp, model FROM session_messages "
+                "WHERE session_id=%s AND deleted_at IS NULL ORDER BY timestamp ASC LIMIT %s OFFSET %s",
+                (session_id, limit, offset),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            await cursor.execute(
+                "SELECT COUNT(*) AS count FROM session_messages WHERE session_id=%s AND deleted_at IS NULL",
+                (session_id,),
+            )
+            total_row = await _fetchone_dict(cursor)
+        return rows, int((total_row or {}).get("count") or 0)
+
+    async def delete_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> bool:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM sessions WHERE id=%s AND user_id=%s AND namespace=%s AND deleted_at IS NULL",
+                (session_id, user_id, namespace),
+            )
+            return int(cursor.rowcount or 0) > 0
+
+
+class MysqlConsultationsRepository(MysqlConsultationAuditRepository, ConsultationsRepository):
+    async def resolve_tier_lineup(self, tx: Transaction, tier: str) -> list[Row]:
+        if tier == "frontier":
+            sql = """
+                SELECT provider, model_id
+                  FROM (
+                    SELECT provider, model_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY provider
+                               ORDER BY graeae_weight IS NULL, graeae_weight DESC,
+                                        arena_rank IS NULL, arena_rank ASC
+                           ) AS rn
+                      FROM model_registry
+                     WHERE available = TRUE
+                       AND deprecated = FALSE
+                       AND ((arena_rank IS NOT NULL AND arena_rank <= 5) OR graeae_weight >= 0.95)
+                  ) ranked
+                 WHERE rn = 1
+                 ORDER BY provider
+            """
+        elif tier == "premium":
+            sql = """
+                SELECT provider, model_id
+                  FROM (
+                    SELECT provider, model_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY provider
+                               ORDER BY graeae_weight IS NULL, graeae_weight DESC,
+                                        arena_rank IS NULL, arena_rank ASC
+                           ) AS rn
+                      FROM model_registry
+                     WHERE available = TRUE
+                       AND deprecated = FALSE
+                       AND ((arena_rank IS NOT NULL AND arena_rank BETWEEN 6 AND 15)
+                            OR (graeae_weight >= 0.85 AND graeae_weight < 0.95))
+                  ) ranked
+                 WHERE rn = 1
+                 ORDER BY provider
+            """
+        else:
+            sql = """
+                SELECT provider, model_id
+                  FROM (
+                    SELECT provider, model_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY provider
+                               ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC
+                           ) AS rn
+                      FROM model_registry
+                     WHERE available = TRUE
+                       AND deprecated = FALSE
+                       AND graeae_weight >= 0.75
+                       AND input_cost_per_mtok IS NOT NULL
+                       AND output_cost_per_mtok IS NOT NULL
+                  ) ranked
+                 WHERE rn = 1
+                 ORDER BY provider
+            """
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(sql)
+            return await _fetch_all_dicts(cursor)
+
+    async def resolve_models(self, tx: Transaction, model_ids: Sequence[str]) -> list[Row]:
+        if not model_ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(model_ids))
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT provider, model_id FROM model_registry "
+                f"WHERE model_id IN ({placeholders}) AND available=TRUE AND deprecated=FALSE",
+                tuple(model_ids),
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def create_consultation_with_audit(
+        self,
+        tx: Transaction,
+        *,
+        prompt: str,
+        task_type: str,
+        consensus_response: str,
+        consensus_score: float,
+        winning_muse: str | None,
+        cost: float,
+        latency_ms: int,
+        mode: str,
+        owner_id: str,
+        namespace: str,
+        memory_ids: Sequence[str],
+        genesis_hash: str,
+    ) -> Any:
+        return await super().create_consultation_with_audit(
+            tx,
+            prompt=prompt,
+            task_type=task_type,
+            consensus_response=consensus_response,
+            consensus_score=consensus_score,
+            winning_muse=winning_muse,
+            cost=cost,
+            latency_ms=latency_ms,
+            mode=mode,
+            owner_id=owner_id,
+            namespace=namespace,
+            memory_ids=memory_ids,
+            genesis_hash=genesis_hash,
+        )
+
+
 class MysqlFederationRepository(FederationRepository):
     _ALLOWED_PEER_COLS = {
         "name",
@@ -4471,228 +4588,18 @@ class MysqlStateRepository(StateRepository):
     delete_state_namespace = delete_namespace
 
 
-def _iso_or_none(value: Any) -> str | None:
-    if value is None:
-        return None
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    return str(value)
-
-
-class MysqlAuditChainRepository(AuditChainRepository):
-    """MySQL implementation of the v6.2 per-memory audit chain."""
-
-    async def get_latest_audit_entry(self, tx: Transaction, memory_id: bytes) -> Row | None:
-        async with tx.conn.cursor() as cursor:
-            await cursor.execute(
-                """
-                SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
-                       op, payload_hash, writer_id, writer_pubkey,
-                       signature, signed_at, global_root, global_seq
-                  FROM memory_audit_chain
-                 WHERE memory_id = %s
-                 ORDER BY signed_at DESC
-                 LIMIT 1
-                """,
-                (memory_id,),
-            )
-            return await _fetchone_dict(cursor)
-
-    async def insert_audit_entry(
-        self,
-        tx: Transaction,
-        *,
-        entry_id: bytes,
-        memory_id: bytes,
-        prev_entry_id: bytes | None,
-        prev_entry_hash: bytes | None,
-        op: str,
-        payload_hash: bytes,
-        writer_id: str,
-        writer_pubkey: bytes,
-        signature: bytes,
-        signed_at: Any,
-    ) -> None:
-        async with tx.conn.cursor() as cursor:
-            await cursor.execute(
-                """
-                INSERT INTO memory_audit_chain (
-                    entry_id, memory_id, prev_entry_id, prev_entry_hash,
-                    op, payload_hash, writer_id, writer_pubkey,
-                    signature, signed_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    entry_id,
-                    memory_id,
-                    prev_entry_id,
-                    prev_entry_hash,
-                    op,
-                    payload_hash,
-                    writer_id,
-                    writer_pubkey,
-                    signature,
-                    signed_at,
-                ),
-            )
-
-    async def claim_unsealed_window(
-        self,
-        tx: Transaction,
-        *,
-        max_window_seconds: int,
-        limit: int,
-    ) -> list[Row]:
-        async with tx.conn.cursor() as cursor:
-            await cursor.execute(
-                """
-                SELECT entry_id, signature, signed_at
-                  FROM memory_audit_chain
-                 WHERE global_root IS NULL
-                   AND signed_at <= DATE_SUB(NOW(6), INTERVAL %s SECOND)
-                 ORDER BY signed_at ASC, entry_id ASC
-                 LIMIT %s
-                 FOR UPDATE SKIP LOCKED
-                """,
-                (max_window_seconds, limit),
-            )
-            return await _fetch_all_dicts(cursor)
-
-    async def stamp_window_with_root(
-        self,
-        tx: Transaction,
-        *,
-        entry_ids: list[bytes],
-        global_root: bytes,
-        starting_seq: int,
-    ) -> None:
-        if not entry_ids:
-            return
-        async with tx.conn.cursor() as cursor:
-            for offset, entry_id in enumerate(entry_ids):
-                await cursor.execute(
-                    """
-                    UPDATE memory_audit_chain
-                       SET global_root = %s,
-                           global_seq = %s
-                     WHERE entry_id = %s
-                    """,
-                    (global_root, starting_seq + offset, entry_id),
-                )
-
-    async def insert_audit_root(
-        self,
-        tx: Transaction,
-        *,
-        global_root: bytes,
-        window_start: Any,
-        window_end: Any,
-        entry_count: int,
-        root_signature: bytes,
-        signer_pubkey: bytes,
-        sealed_at: Any,
-    ) -> None:
-        async with tx.conn.cursor() as cursor:
-            await cursor.execute(
-                """
-                INSERT INTO memory_audit_roots (
-                    global_root, window_start, window_end, entry_count,
-                    root_signature, signer_pubkey, sealed_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (global_root, window_start, window_end, entry_count, root_signature, signer_pubkey, sealed_at),
-            )
-
-    async def list_window_entries(self, tx: Transaction, global_root: bytes) -> list[Row]:
-        async with tx.conn.cursor() as cursor:
-            await cursor.execute(
-                """
-                SELECT entry_id, memory_id, signature, signed_at,
-                       global_seq, payload_hash, op
-                  FROM memory_audit_chain
-                 WHERE global_root = %s
-                 ORDER BY signed_at ASC, entry_id ASC
-                """,
-                (global_root,),
-            )
-            return await _fetch_all_dicts(cursor)
-
-    async def get_audit_entry_by_id(self, tx: Transaction, entry_id: bytes) -> Row | None:
-        async with tx.conn.cursor() as cursor:
-            await cursor.execute(
-                """
-                SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
-                       op, payload_hash, writer_id, writer_pubkey,
-                       signature, signed_at, global_root, global_seq
-                  FROM memory_audit_chain
-                 WHERE entry_id = %s
-                """,
-                (entry_id,),
-            )
-            return await _fetchone_dict(cursor)
-
-    async def get_chain_stats(self, tx: Transaction) -> dict:
-        async with tx.conn.cursor() as cursor:
-            await cursor.execute(
-                """
-                SELECT COUNT(*) AS total_entries,
-                       SUM(CASE WHEN global_root IS NULL THEN 1 ELSE 0 END) AS unsealed_count,
-                       MIN(CASE WHEN global_root IS NULL THEN signed_at ELSE NULL END) AS oldest_unsealed_signed_at
-                  FROM memory_audit_chain
-                """
-            )
-            chain_stats = await _fetchone_dict(cursor) or {}
-            await cursor.execute(
-                """
-                SELECT COUNT(*) AS sealed_root_count,
-                       MAX(sealed_at) AS last_sealed_at
-                  FROM memory_audit_roots
-                """
-            )
-            root_stats = await _fetchone_dict(cursor) or {}
-        return {
-            "total_entries": int(chain_stats.get("total_entries") or 0),
-            "unsealed_count": int(chain_stats.get("unsealed_count") or 0),
-            "oldest_unsealed_signed_at": _iso_or_none(chain_stats.get("oldest_unsealed_signed_at")),
-            "sealed_root_count": int(root_stats.get("sealed_root_count") or 0),
-            "last_sealed_at": _iso_or_none(root_stats.get("last_sealed_at")),
-        }
-
-    async def get_latest_audit_entries_batch(self, tx: Transaction, memory_ids: list[bytes]) -> dict[bytes, Row]:
-        if not memory_ids:
-            return {}
-        placeholders = ", ".join(["%s"] * len(memory_ids))
-        async with tx.conn.cursor() as cursor:
-            await cursor.execute(
-                f"""
-                SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
-                       op, payload_hash, writer_id, writer_pubkey,
-                       signature, signed_at, global_root, global_seq
-                  FROM (
-                        SELECT mac.*,
-                               ROW_NUMBER() OVER (PARTITION BY memory_id ORDER BY signed_at DESC) AS rn
-                          FROM memory_audit_chain mac
-                         WHERE memory_id IN ({placeholders})
-                       ) ranked
-                 WHERE rn = 1
-                """,
-                list(memory_ids),
-            )
-            rows = await _fetch_all_dicts(cursor)
-        return {row["memory_id"]: row for row in rows}
-
-
 # ── Backend facade ────────────────────────────────────────────────────────────
 
 
 class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align with SqliteBackend/OracleBackend/Db2Backend/PostgresBackend bare-class pattern
     """MySQL 9.0+ persistence facade backed by an aiomysql connection pool.
 
-    Core memory, FTS, VECTOR search, KG, versioning, branches, compression,
-    federation, state key-value, and audit-chain surfaces are implemented.
-    OAuth, Sessions, and Consultations repositories remain intentionally
-    unwired pending schema-unification work. Webhooks are currently unsupported;
-    callers should use ``supports_webhooks`` before dispatching.
+    Core memory, FTS, VECTOR search, and state key-value surfaces are
+    implemented.
+    All other repository surfaces (KG triples, versioning, compression,
+    federation) are stubbed - ``NotImplementedError`` is raised at call time.
+    Webhooks are currently unsupported; callers should use ``supports_webhooks``
+    before dispatching.
 
     The pool is managed externally (via ``create_mysql_pool``); callers
     must call ``await backend.close()`` at shutdown to drain the pool.
@@ -4705,6 +4612,9 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     supports_mysql_vector = True  # MySQL 9.0 native VECTOR
     supports_webhooks = False
     _supports_core_persistence = True
+    _supports_oauth_persistence = True
+    _supports_sessions_persistence = True
+    _supports_consultations_persistence = True
 
     def __init__(self, pool: Any, settings: Any) -> None:
         self._pool = pool
@@ -4723,9 +4633,11 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         self._compression_repo = MysqlCompressionRepository()
         self._compression_queue_repo = MysqlCompressionQueueRepository()
         self._consultations_audit_repo = MysqlConsultationAuditRepository()
+        self._oauth_repo = MysqlOAuthRepository()
+        self._sessions_repo = MysqlSessionsRepository()
+        self._consultations_repo = MysqlConsultationsRepository()
         self._federation_repo = MysqlFederationRepository()
         self._state_kv_repo = MysqlStateRepository()
-        self._audit_chain_repo = MysqlAuditChainRepository()
 
     @property
     def settings(self) -> Any:
@@ -4737,16 +4649,24 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
 
     @property
     def capabilities(self) -> set[str]:
-        return {CORE_CAPABILITY, STATE_CAPABILITY, FEDERATION_CAPABILITY, AUDIT_CAPABILITY}
+        return {
+            CORE_CAPABILITY,
+            OAUTH_CAPABILITY,
+            SESSIONS_CAPABILITY,
+            CONSULTATIONS_CAPABILITY,
+            FEDERATION_CAPABILITY,
+            STATE_CAPABILITY,
+        }
 
     @property
     def capability_details(self) -> set[str]:
         return {
             *MYSQL_CAPABILITY_DETAILS,
             KG_CAPABILITY,
-            COMPRESSION_QUEUE_CAPABILITY,
+            OAUTH_DETAIL_CAPABILITY,
+            SESSIONS_DETAIL_CAPABILITY,
+            CONSULTATIONS_DETAIL_CAPABILITY,
             STATE_DETAIL_CAPABILITY,
-            AUDIT_DETAIL_CAPABILITY,
         }
 
     async def record_usage_ledger(self, tx: Transaction, record: Any) -> Any:
@@ -4851,16 +4771,24 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         return self._consultations_audit_repo
 
     @property
+    def oauth(self) -> OAuthRepository:
+        return self._oauth_repo
+
+    @property
+    def sessions(self) -> SessionsRepository:
+        return self._sessions_repo
+
+    @property
+    def consultations(self) -> ConsultationsRepository:
+        return self._consultations_repo
+
+    @property
     def federation(self) -> FederationRepository:
         return self._federation_repo
 
     @property
     def state_kv(self) -> StateRepository:
         return self._state_kv_repo
-
-    @property
-    def audit_chain(self) -> AuditChainRepository:
-        return self._audit_chain_repo
 
     async def open(self) -> None:
         """Validate pool connectivity and apply UTC + init DDL.
@@ -4960,11 +4888,13 @@ __all__ = [
     "MysqlCompressionQueueRepository",
     "MysqlCompressionRepository",
     "MysqlConsultationAuditRepository",
+    "MysqlConsultationsRepository",
     "MysqlFederationRepository",
     "MysqlKGRepository",
     "MysqlMemoryRepository",
+    "MysqlOAuthRepository",
+    "MysqlSessionsRepository",
     "MysqlStateRepository",
-    "MysqlAuditChainRepository",
     "MysqlVersionRepository",
     "MysqlWebhookRepository",
     "create_mysql_pool",
