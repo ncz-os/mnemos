@@ -96,6 +96,12 @@ def test_score_clamps_and_handles_bad():
     assert score_to_similarity(None, METRIC_COSINE_SIMILARITY) is None
 
 
+def test_score_unknown_metric_fails_closed():
+    # A typo'd/misconfigured metric must NOT treat a distance as a
+    # similarity (which would bypass the floor) -> None.
+    assert score_to_similarity(0.1, "bogus_metric") is None
+
+
 # ---- normalize_similarity reads only the canonical key -----------------
 
 
@@ -233,5 +239,9 @@ def test_effective_floor_env_override(monkeypatch):
     assert memories_handler.effective_semantic_floor() == pytest.approx(0.62)
     monkeypatch.setenv("MNEMOS_SEMANTIC_FLOOR", "garbage")
     assert memories_handler.effective_semantic_floor() == DEFAULT_SEMANTIC_FLOOR
+    # non-finite must fall back to default, not clamp to 1.0/0.0
+    for bad in ("nan", "inf", "-inf"):
+        monkeypatch.setenv("MNEMOS_SEMANTIC_FLOOR", bad)
+        assert memories_handler.effective_semantic_floor() == DEFAULT_SEMANTIC_FLOOR
     monkeypatch.delenv("MNEMOS_SEMANTIC_FLOOR", raising=False)
     assert memories_handler.effective_semantic_floor() == DEFAULT_SEMANTIC_FLOOR
