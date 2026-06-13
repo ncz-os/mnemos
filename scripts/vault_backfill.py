@@ -9,18 +9,28 @@ dry-run.
 
 Reverse: feed the ledger to --revert.
 """
-import argparse, json, os, re, sys, datetime
+
+import argparse
+import json
+import os
+import re
+import sys
+import datetime
 import oracledb
 from mnemos.core.secret_detection import classify, SecretClass, VAULT_NAMESPACE
+
 
 def connect():
     dsn = os.environ["MNEMOS_DATABASE_DSN"]
     m = re.match(r"oracle://([^:]+):([^@]+)@([^:/]+):?([0-9]+)?/?(.*)", dsn)
-    u, pw, h, p, s = m.groups(); p = p or "1521"
+    u, pw, h, p, s = m.groups()
+    p = p or "1521"
     return oracledb.connect(user=u, password=pw, dsn=f"{h}:{p}/{s}")
+
 
 def _read(v):
     return v.read() if hasattr(v, "read") else v
+
 
 def scan(conn):
     cur = conn.cursor()
@@ -31,14 +41,16 @@ def scan(conn):
             continue
         f = classify(_read(content))
         if f.cls is SecretClass.VAULT:
-            vault.append({"id": mid, "orig_namespace": ns,
-                          "orig_metadata": _read(meta), "reasons": f.reasons})
+            vault.append({"id": mid, "orig_namespace": ns, "orig_metadata": _read(meta), "reasons": f.reasons})
     return vault
 
+
 def apply(conn, rows, ledger_path):
-    json.dump({"created": datetime.datetime.utcnow().isoformat()+"Z",
-               "action": "vault-backfill", "rows": rows},
-              open(ledger_path, "w"), indent=2)
+    json.dump(
+        {"created": datetime.datetime.utcnow().isoformat() + "Z", "action": "vault-backfill", "rows": rows},
+        open(ledger_path, "w"),
+        indent=2,
+    )
     cur = conn.cursor()
     for r in rows:
         try:
@@ -50,12 +62,12 @@ def apply(conn, rows, ledger_path):
         orig["secret_original_namespace"] = r["orig_namespace"]
         orig["secret_classified_at"] = "backfill"
         cur.execute(
-            "UPDATE memories SET namespace=:ns, metadata=:md, updated=SYSTIMESTAMP "
-            "WHERE id=:id AND deleted_at IS NULL",
+            "UPDATE memories SET namespace=:ns, metadata=:md, updated=SYSTIMESTAMP WHERE id=:id AND deleted_at IS NULL",
             {"ns": VAULT_NAMESPACE, "md": json.dumps(orig), "id": r["id"]},
         )
     conn.commit()
     return len(rows)
+
 
 def revert(conn, ledger_path):
     led = json.load(open(ledger_path))
@@ -63,13 +75,13 @@ def revert(conn, ledger_path):
     n = 0
     for r in led["rows"]:
         cur.execute(
-            "UPDATE memories SET namespace=:ns, metadata=:md, updated=SYSTIMESTAMP "
-            "WHERE id=:id",
+            "UPDATE memories SET namespace=:ns, metadata=:md, updated=SYSTIMESTAMP WHERE id=:id",
             {"ns": r["orig_namespace"], "md": r["orig_metadata"], "id": r["id"]},
         )
         n += cur.rowcount
     conn.commit()
     return n
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -79,7 +91,8 @@ if __name__ == "__main__":
     a = ap.parse_args()
     conn = connect()
     if a.revert:
-        print("reverted rows:", revert(conn, a.revert)); sys.exit(0)
+        print("reverted rows:", revert(conn, a.revert))
+        sys.exit(0)
     rows = scan(conn)
     print(f"VAULT candidates: {len(rows)}")
     for r in rows[:50]:
