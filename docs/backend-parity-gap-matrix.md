@@ -62,7 +62,7 @@
 ## WebhookRepository (1 methods)
 | method | oracle | postgres | db2 | mysql | sqlite |
 |---|---|---|---|---|---|
-| dispatch_event | IMPL | IMPL | IMPL | RAISE | IMPL |
+| dispatch_event | IMPL | IMPL | IMPL | IMPL | IMPL |
 
 ## ConsultationAuditRepository (5 methods)
 | method | oracle | postgres | db2 | mysql | sqlite |
@@ -103,10 +103,10 @@
 | resolve_tier_lineup | STUB | IMPL | IMPL | IMPL | IMPL |
 | resolve_models | STUB | IMPL | IMPL | IMPL | IMPL |
 | create_consultation_with_audit | IMPL | IMPL | IMPL | IMPL | IMPL |
-| list_audit_log | STUB | IMPL | IMPL | -- | IMPL |
-| fetch_audit_chain | STUB | IMPL | IMPL | -- | IMPL |
-| get_consultation | STUB | IMPL | IMPL | -- | IMPL |
-| get_consultation_artifacts | STUB | IMPL | IMPL | -- | IMPL |
+| list_audit_log | STUB | IMPL | IMPL | IMPL | IMPL |
+| fetch_audit_chain | STUB | IMPL | IMPL | IMPL | IMPL |
+| get_consultation | STUB | IMPL | IMPL | IMPL | IMPL |
+| get_consultation_artifacts | STUB | IMPL | IMPL | IMPL | IMPL |
 
 ## FederationRepository (23 methods)
 | method | oracle | postgres | db2 | mysql | sqlite |
@@ -173,5 +173,5 @@
 | oracle | 93 | 14 | 4 | 0 |
 | postgres | 111 | 0 | 0 | 0 |
 | db2 | 94 | 1 | 0 | 16 |
-| mysql | 97 | 1 | 9 | 4 |
+| mysql | 102 | 1 | 8 | 0 |
 | sqlite | 110 | 0 | 1 | 0 |
