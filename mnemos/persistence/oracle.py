@@ -3879,13 +3879,11 @@ class OracleFederationRepository(FederationRepository):
         cursor = await _call(conn.cursor)
         try:
             where = [
-                "m.deleted_at IS NULL",
                 "m.federation_source IS NULL",
+                "MOD(m.permission_mode, 10) >= 4",
+                "m.deleted_at IS NULL",
                 "m.archived_at IS NULL",
-                # Secret vault (release-blocking 2026-06-13): credential-class
-                # memories MUST NOT cross the federation feed to remote peers.
-                # Excluded unconditionally — even an explicit namespace=vault
-                # filter cannot pull them.
+                "m.consolidated_into IS NULL",
                 "(m.namespace IS NULL OR m.namespace <> :vault_ns)",
             ]
             params: dict[str, Any] = {"limit": limit, "vault_ns": VAULT_NAMESPACE}
@@ -3948,9 +3946,11 @@ class OracleFederationRepository(FederationRepository):
         try:
             where = [
                 "m.id = :id",
-                "m.deleted_at IS NULL",
                 "m.federation_source IS NULL",
-                # Secret vault: never serve a vaulted memory over federation.
+                "MOD(m.permission_mode, 10) >= 4",
+                "m.deleted_at IS NULL",
+                "m.archived_at IS NULL",
+                "m.consolidated_into IS NULL",
                 "(m.namespace IS NULL OR m.namespace <> :vault_ns)",
             ]
             params: dict[str, Any] = {"id": memory_id, "vault_ns": VAULT_NAMESPACE}
