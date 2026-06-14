@@ -238,16 +238,25 @@ def _render_visibility(
     """Render a VisibilityFilter into a MySQL WHERE fragment and positional params."""
     p = f"{table_alias}." if table_alias else ""
 
+    def _with_exclusions(clause: str, params: list[Any]) -> tuple[str, list[Any]]:
+        excl = tuple(visibility.exclude_namespaces or ())
+        if not excl:
+            return clause, params
+        placeholders = ", ".join(["%s"] * len(excl))
+        excl_clause = f"({p}namespace IS NULL OR {p}namespace NOT IN ({placeholders}))"
+        clause = f"({clause}) AND {excl_clause}" if clause else excl_clause
+        return clause, params + list(excl)
+
     if visibility.scope == VisibilityScope.ROOT_BYPASS:
         if visibility.namespace is None:
-            return "", []
-        return f"{p}namespace = %s", [visibility.namespace]
+            return _with_exclusions("", [])
+        return _with_exclusions(f"{p}namespace = %s", [visibility.namespace])
 
     if visibility.namespace is None:
         return "1=0", []
 
     if visibility.scope == VisibilityScope.OWN_ONLY:
-        return (
+        return _with_exclusions(
             f"{p}owner_id = %s AND {p}namespace = %s",
             [visibility.user_id, visibility.namespace],
         )
@@ -261,7 +270,7 @@ def _render_visibility(
     else:
         group_clause = "0=1"
 
-    return (
+    return _with_exclusions(
         "("
         f"{p}owner_id = %s"
         f" OR {p}federation_source IS NOT NULL"
