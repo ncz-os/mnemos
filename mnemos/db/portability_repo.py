@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Optional, Sequence
 
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 
 
 async def fetch_memory_export(
@@ -19,10 +20,15 @@ async def fetch_memory_export(
     category: Optional[str],
     limit: int,
     offset: int,
+    include_secrets: bool = False,
 ):
     conditions: list[str] = ["deleted_at IS NULL"]
     params: list[Any] = []
     idx = 1
+    if not include_secrets:
+        conditions.append(f"(namespace IS NULL OR namespace <> ${idx})")
+        params.append(VAULT_NAMESPACE)
+        idx += 1
     if effective_owner:
         conditions.append(f"owner_id = ${idx}")
         params.append(effective_owner)
@@ -73,6 +79,7 @@ async def _fetch_sidecar(
     hard_limit: int,
     null_ok: bool = False,
     order_by: Optional[str] = None,
+    include_secrets: bool = False,
 ):
     if bound_to_memories and not memory_ids and not null_ok:
         return []
@@ -82,6 +89,10 @@ async def _fetch_sidecar(
     idx = 1
     if table in {"kg_triples", "memory_versions"}:
         conditions.append("deleted_at IS NULL")
+    if not include_secrets and table in {"kg_triples", "memory_versions"}:
+        conditions.append(f"(namespace IS NULL OR namespace <> ${idx})")
+        params.append(VAULT_NAMESPACE)
+        idx += 1
     if bound_to_memories:
         if null_ok and memory_ids:
             conditions.append(f"({memory_id_column} IS NULL OR {memory_id_column} = ANY(${idx}::text[]))")
@@ -116,6 +127,7 @@ async def fetch_kg_triples_for_export(
     effective_ns: Optional[str],
     include_unattached: bool,
     hard_limit: int,
+    include_secrets: bool = False,
 ):
     return await _fetch_sidecar(
         conn,
@@ -132,6 +144,7 @@ async def fetch_kg_triples_for_export(
         bound_to_memories=True,
         hard_limit=hard_limit,
         null_ok=include_unattached,
+        include_secrets=include_secrets,
     )
 
 
@@ -146,6 +159,7 @@ async def fetch_deletion_log_for_export(
     cursor_executed_at: Optional[str] = None,
     cursor_id: Optional[str] = None,
     export_as_of: Optional[str] = None,
+    include_secrets: bool = False,
 ):
     """Fetch deletion_log rows for an MPF v0.2 export.
 
@@ -168,6 +182,10 @@ async def fetch_deletion_log_for_export(
     conditions: list[str] = []
     params: list[Any] = []
     idx = 1
+    if not include_secrets:
+        conditions.append(f"(namespace IS NULL OR namespace <> ${idx})")
+        params.append(VAULT_NAMESPACE)
+        idx += 1
     if effective_owner:
         conditions.append(f"owner_id = ${idx}")
         params.append(effective_owner)
@@ -219,6 +237,7 @@ async def fetch_memory_versions_for_export(
     effective_owner: Optional[str],
     effective_ns: Optional[str],
     hard_limit: int,
+    include_secrets: bool = False,
 ):
     # ``id`` and ``parent_version_id`` are PG UUID columns; cast to
     # text so callers (and the persistence-parity tests) see the
@@ -244,6 +263,7 @@ async def fetch_memory_versions_for_export(
         bound_to_memories=True,
         hard_limit=hard_limit,
         order_by="memory_id ASC, branch ASC, version_num ASC",
+        include_secrets=include_secrets,
     )
 
 

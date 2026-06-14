@@ -78,6 +78,17 @@ async def export_memories(
     ] = None,
     include_sidecars: Annotated[bool, Query()] = False,
     include_unattached_kg: Annotated[bool, Query()] = False,
+    include_secrets: Annotated[
+        bool,
+        Query(
+            description=(
+                "Root-only backup escape hatch. Defaults false: vault namespace "
+                "rows are excluded and credential-shaped content is redacted. "
+                "When true, root exports may include vault/secret plaintext and "
+                "the MPF envelope is marked includes_secrets=true."
+            ),
+        ),
+    ] = False,
     mpf_version: Annotated[
         Optional[str],
         Query(
@@ -128,6 +139,8 @@ async def export_memories(
     user: UserContext = Depends(get_current_user),
 ):
     require_postgres_pool_or_503(route_label="GET /v1/export")
+    if include_secrets and user.role != "root":
+        raise HTTPException(status_code=403, detail="include_secrets requires root")
 
     # Reject naive datetimes — timestamptz comparison would otherwise
     # be interpreted in DB session tz and silently shift the export
@@ -252,6 +265,7 @@ async def export_memories(
             namespace=namespace,
             include_sidecars=include_sidecars,
             include_unattached_kg=include_unattached_kg,
+            include_secrets=include_secrets,
             mpf_version=mpf_version,
             deletion_log_from=(
                 deletion_log_from.isoformat() if deletion_log_from else None
