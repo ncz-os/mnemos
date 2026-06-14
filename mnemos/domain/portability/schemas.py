@@ -72,6 +72,10 @@ class MPFEnvelope(BaseModel):
     # this back as `deletion_log_cursor` to fetch the next chunk. Opaque
     # base64-JSON (executed_at, id). v0.1 envelopes never carry this.
     deletion_log_next_cursor: Optional[str] = None
+    # Present only for explicit root-authorized secret-inclusive exports.
+    # This makes the trust-boundary crossing machine-visible in the MPF
+    # envelope without changing the default export shape.
+    includes_secrets: Optional[bool] = None
 
 
 class ImportStats(BaseModel):
