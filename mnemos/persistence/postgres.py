@@ -200,21 +200,37 @@ def _render_postgres_visibility(
     """
     p = f"{table_alias}." if table_alias else ""
 
+    def _excl_clause(idx: int) -> tuple[str, list[Any], int]:
+        excl = tuple(visibility.exclude_namespaces or ())
+        if not excl:
+            return "", [], idx
+        placeholders = [f"${idx + i}" for i in range(len(excl))]
+        return (
+            f"({p}namespace IS NULL OR {p}namespace NOT IN ({', '.join(placeholders)}))",
+            list(excl),
+            idx + len(excl),
+        )
+
     if visibility.scope == VisibilityScope.ROOT_BYPASS:
         if visibility.namespace is None:
-            return "", [], start_idx
-        return f"{p}namespace=${start_idx}", [visibility.namespace], start_idx + 1
+            return _excl_clause(start_idx)
+        clause = f"{p}namespace=${start_idx}"
+        excl_clause, excl_params, next_idx = _excl_clause(start_idx + 1)
+        if excl_clause:
+            clause = f"{clause} AND {excl_clause}"
+        return clause, [visibility.namespace] + excl_params, next_idx
 
     if visibility.namespace is None:
         return "1=0", [], start_idx
 
     if visibility.scope == VisibilityScope.OWN_ONLY:
-        # Mutation path: strict owner_id + namespace match.
-        return (
-            f"{p}owner_id=${start_idx} AND {p}namespace=${start_idx + 1}",
-            [visibility.user_id, visibility.namespace],
-            start_idx + 2,
-        )
+        # Mutation path: strict owner_id + namespace match, with the
+        # same namespace subtraction applied to every visibility scope.
+        clause = f"{p}owner_id=${start_idx} AND {p}namespace=${start_idx + 1}"
+        excl_clause, excl_params, next_idx = _excl_clause(start_idx + 2)
+        if excl_clause:
+            clause = f"{clause} AND {excl_clause}"
+        return clause, [visibility.user_id, visibility.namespace] + excl_params, next_idx
 
     # READABLE: full v1_multiuser read predicate via core helper, plus
     # namespace pin appended after.
@@ -228,6 +244,10 @@ def _render_postgres_visibility(
     clause = f"{clause} AND {p}namespace=${next_idx}"
     vis_params = vis_params + [visibility.namespace]
     next_idx += 1
+    excl_clause, excl_params, next_idx = _excl_clause(next_idx)
+    if excl_clause:
+        clause = f"{clause} AND {excl_clause}"
+        vis_params += excl_params
     return clause, vis_params, next_idx
 
 
