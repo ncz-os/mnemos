@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from mnemos.persistence import SqliteBackend
+from mnemos.persistence.sqlite import _execute
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
 
@@ -111,8 +112,7 @@ async def test_sqlite_semantic_search_boosts_recent_candidates(tmp_path):
     assert len(unboosted) <= 2
     assert len(boosted) <= 2
     assert unboosted[0]["id"] == old
-    assert boosted[0]["id"] == newer
-    assert [row["id"] for row in boosted].index(newer) < [row["id"] for row in boosted].index(old)
+    assert [row["id"] for row in boosted] == [newer, old]
 
 
 @pytest.mark.asyncio
@@ -146,7 +146,8 @@ async def test_sqlite_semantic_search_invalid_updated_falls_back_to_created(tmp_
                 content="fresh valid boosted winner",
                 updated=now,
             )
-            await tx.conn.execute(
+            await _execute(
+                tx.conn,
                 "UPDATE memories SET updated = ? WHERE id = ?",
                 ("not-a-date", corrupt),
             )

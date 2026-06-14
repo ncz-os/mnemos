@@ -1087,6 +1087,8 @@ async def search_memories(
                         source_model=request.source_model,
                         source_agent=request.source_agent,
                         include_archived=bool(request.include_archived),
+                        boost_recency=bool(request.boost_recency),
+                        recency_weight=request.recency_weight,
                         **semantic_trace_kwargs,
                     )
                 except Exception as exc:
@@ -1251,7 +1253,7 @@ async def search_memories(
     if memories:
         try:
             decay_table = await load_decay_table(backend)
-            if decay_table or request.decay_overrides:
+            if decay_table or request.decay_overrides or any(getattr(m, "superseded_by", None) for m in memories):
                 memories = apply_decay(
                     memories,
                     decay_table,
