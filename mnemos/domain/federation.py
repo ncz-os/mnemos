@@ -24,6 +24,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 import httpx
 
 from mnemos.core import eligibility as _eligibility
+from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.persistence.base import AuditPersistence, FederationPersistence, FederationRepository, Transaction
 
 FederationBackend = Union[FederationPersistence, AuditPersistence]
@@ -680,9 +681,10 @@ async def _store_memories(
             mem.get("verbatim_content") or mem.get("content", ""),
             FEDERATION_MAX_CONTENT,
         )
+        compressed = _cap(mem.get("compressed_content"), FEDERATION_MAX_CONTENT)
         category = _cap(mem.get("category", "federation"), FEDERATION_MAX_NAME)
         subcategory = _cap(mem.get("subcategory"), FEDERATION_MAX_NAME)
-        namespace = _cap(mem.get("namespace", "default"), FEDERATION_MAX_NAME)
+        namespace = _cap(mem.get("namespace") or "default", FEDERATION_MAX_NAME)
         local_id = f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}"
         remote_updated = _coerce_datetime(mem.get("updated") or mem.get("created"))
 
@@ -697,7 +699,25 @@ async def _store_memories(
         meta_json = json.dumps(meta_raw)
         if len(meta_json) > FEDERATION_MAX_METADATA:
             # Drop metadata if it's absurdly large; keep the remote_id pointer.
-            meta_json = json.dumps({"federation_remote_id": remote_id, "_metadata_truncated": True})
+            meta_raw = {"federation_remote_id": remote_id, "_metadata_truncated": True}
+
+        classified = classify_persisted_text_fields(
+            content=content,
+            verbatim_content=verbatim,
+            compressed_content=compressed,
+            metadata=meta_raw,
+            namespace=namespace,
+            classified_at="federation_pull",
+            memory_id=local_id,
+        )
+        namespace = classified.namespace
+        meta_json = json.dumps(classified.metadata)
+        if len(meta_json) > FEDERATION_MAX_METADATA:
+            truncated_meta = {"federation_remote_id": remote_id, "_metadata_truncated": True}
+            for key, value in classified.metadata.items():
+                if str(key).startswith("secret_"):
+                    truncated_meta[key] = value
+            meta_json = json.dumps(truncated_meta)
 
         if existing is None:
             inserted = await repo.insert_federated_memory(

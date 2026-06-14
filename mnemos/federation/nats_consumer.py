@@ -146,10 +146,7 @@ async def consumer_loop(
                 ",".join(peer.subjects),
                 queue_group or "(single-replica)",
             )
-            subscriptions = [
-                await _subscribe(js, peer, subject, queue_group=queue_group)
-                for subject in peer.subjects
-            ]
+            subscriptions = [await _subscribe(js, peer, subject, queue_group=queue_group) for subject in peer.subjects]
             # Reset AFTER all subscriptions succeed. A broker that
             # accepts the connection but fails JetStream subscribe
             # (stream drift, consumer-group recovery) would otherwise
@@ -381,8 +378,7 @@ class _SubscriptionGroup:
 
     async def __aenter__(self):
         self.tasks = [
-            asyncio.create_task(_consume_subscription(self.pool, self.peer, sub))
-            for sub in self.subscriptions
+            asyncio.create_task(_consume_subscription(self.pool, self.peer, sub)) for sub in self.subscriptions
         ]
         return self
 
@@ -535,19 +531,32 @@ def _memory_id(payload: Mapping[str, Any]) -> str | None:
 
 
 def _memory_from_event(payload: Mapping[str, Any], peer_name: str, memory_id: str) -> dict[str, Any]:
+    from mnemos.core.persisted_text_classification import classify_persisted_text_fields
+
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
     metadata = {**metadata, "fed_origin": peer_name}
+    content = payload.get("content") or ""
+    verbatim = payload.get("verbatim_content") or content
+    classified = classify_persisted_text_fields(
+        content=content,
+        verbatim_content=verbatim,
+        compressed_content=payload.get("compressed_content"),
+        metadata=metadata,
+        namespace=payload.get("namespace") or "default",
+        classified_at="federation_nats",
+        memory_id=memory_id,
+    )
     return {
         "id": memory_id,
-        "content": payload.get("content") or "",
-        "verbatim_content": payload.get("verbatim_content") or payload.get("content") or "",
+        "content": content,
+        "verbatim_content": verbatim,
         "category": payload.get("category") or "federation",
         "subcategory": payload.get("subcategory"),
-        "namespace": payload.get("namespace") or "default",
+        "namespace": classified.namespace,
         "quality_rating": payload.get("quality_rating") or 75,
-        "metadata": metadata,
+        "metadata": classified.metadata,
         "source_model": payload.get("source_model"),
         "source_provider": payload.get("source_provider"),
         "source_session": payload.get("source_session"),
@@ -580,9 +589,7 @@ def _queue_durable_name(queue_group: str, peer_name: str, subject: str) -> str:
 
     group_safe = re.sub(r"[^A-Za-z0-9_-]+", "_", queue_group).strip("_")[:32]
     rest = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{peer_name}_{subject}").strip("_")[:48]
-    digest = hashlib.sha256(
-        f"{queue_group}|{peer_name}|{subject}".encode("utf-8")
-    ).hexdigest()[:12]
+    digest = hashlib.sha256(f"{queue_group}|{peer_name}|{subject}".encode("utf-8")).hexdigest()[:12]
     name = f"mnemos_federation_q_{group_safe}_{rest}_{digest}"
     if len(name) > 128:
         # Worst case: somebody passes pathological input. Always
