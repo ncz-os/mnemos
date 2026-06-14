@@ -1398,6 +1398,7 @@ class OracleMemoryRepository(MemoryRepository):
         limit: int = 20,
         offset: int = 0,
         include_archived: bool = False,
+        exclude_superseded: bool = False,
     ) -> tuple[list[Row], int]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -1406,6 +1407,8 @@ class OracleMemoryRepository(MemoryRepository):
             where = ["m.deleted_at IS NULL"]
             if not include_archived:
                 where.append("m.archived_at IS NULL")
+            if exclude_superseded:
+                where.append("m.consolidated_into IS NULL")
             if clause:
                 where.append(clause)
             if category is not None:
@@ -1589,6 +1592,7 @@ class OracleMemoryRepository(MemoryRepository):
         source_model: str | None = None,
         source_agent: str | None = None,
         include_archived: bool = False,
+        exclude_superseded: bool = False,
     ) -> list[Row]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -1597,6 +1601,8 @@ class OracleMemoryRepository(MemoryRepository):
             where = ["m.deleted_at IS NULL"]
             if not include_archived:
                 where.append("m.archived_at IS NULL")
+            if exclude_superseded:
+                where.append("m.consolidated_into IS NULL")
             if clause:
                 where.append(clause)
             # DBMS_LOB.INSTR is a substring locator, not a LIKE pattern —
@@ -1987,6 +1993,7 @@ class OracleMemoryRepository(MemoryRepository):
         include_archived: bool = False,
         boost_recency: bool = False,
         recency_weight: float = 0.15,
+        exclude_superseded: bool = False,
     ) -> list[Row]:
         if not embedding:
             return []
@@ -1999,6 +2006,8 @@ class OracleMemoryRepository(MemoryRepository):
             where = ["m.deleted_at IS NULL", "m.embedding IS NOT NULL"]
             if not include_archived:
                 where.append("m.archived_at IS NULL")
+            if exclude_superseded:
+                where.append("m.consolidated_into IS NULL")
             if clause:
                 where.append(clause)
             for col, val in (
