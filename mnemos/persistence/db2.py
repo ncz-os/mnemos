@@ -95,7 +95,25 @@ def _recency_date(row: Row) -> date:
 
     if not isinstance(row, dict):
         return date.min
-    return _coerce_date(row.get("updated")) or _coerce_date(row.get("created")) or date.min
+    return (
+        _coerce_date(row.get("last_recalled_at"))
+        or _coerce_date(row.get("updated"))
+        or _coerce_date(row.get("created"))
+        or date.min
+    )
+
+
+def _boosted_rank_score_sort_key(row: Row, *, today: date, recency_weight: float) -> float:
+    rank = _rank_score_sort_key(row)
+    if not math.isfinite(rank):
+        return math.inf
+    age_days = max(0, (today - _recency_date(row)).days)
+    return rank - recency_weight * (1.0 / (1.0 + age_days))
+
+
+def _boosted_rank_supersession_sort_key(row: Row, *, today: date, recency_weight: float) -> tuple[bool, float]:
+    superseded = isinstance(row, dict) and bool(row.get("superseded_by") or row.get("consolidated_into"))
+    return superseded, _boosted_rank_score_sort_key(row, today=today, recency_weight=recency_weight)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -883,7 +901,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 "m.owner_id, m.namespace, m.permission_mode, m.source_model, "
                 "m.source_provider, m.source_session, m.source_agent, "
                 "m.group_id, m.created, m.updated, m.archived_at, "
-                "m.recall_count, m.last_recalled_at, "
+                "m.recall_count, m.last_recalled_at, m.consolidated_into, "
                 f"({rank_sql}) AS rank_score "
                 "FROM memories m WHERE " + " AND ".join(where) + " "
                 f"ORDER BY {rank_sql} ASC "
@@ -897,28 +915,15 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         if boost_recency and rows:
             # Match Oracle's recency formula:
             #   adjusted = distance - w * (1.0 / (1.0 + age_days))
-            # where age_days = CURRENT DATE - CAST(updated AS DATE).
-            # We compute age_days in Python from ``updated`` so the
-            # SQL ORDER BY stays index-friendly. ``updated`` may be a
-            # datetime (ibm_db_dbi default) or a string fallback — be
-            # defensive.
+            # using COALESCE(last_recalled_at, updated, created). We compute
+            # age_days in Python so the SQL ORDER BY stays index-friendly.
             from datetime import timezone
 
             w = float(recency_weight)
             today = datetime.now(timezone.utc).date()
-            for row in rows:
-                upd_date = _recency_date(row)
-                age_days = max(0, (today - upd_date).days)
-                rank = row.get("rank_score")
-                if rank is None:
-                    continue
-                try:
-                    rank_f = float(rank)
-                except (TypeError, ValueError):
-                    continue
-                row["rank_score"] = rank_f - w * (1.0 / (1.0 + age_days))
-            # Re-sort ASC on the adjusted rank_score and re-cap to ``limit``.
-            rows.sort(key=_rank_score_sort_key)
+            # Re-sort ASC on an adjusted ordering key and re-cap to ``limit``.
+            # Keep ``rank_score`` as the raw vector distance for route gates.
+            rows.sort(key=lambda row: _boosted_rank_supersession_sort_key(row, today=today, recency_weight=w))
             rows = rows[:limit]
 
         return rows

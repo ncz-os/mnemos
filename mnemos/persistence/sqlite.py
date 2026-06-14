@@ -61,6 +61,7 @@ from mnemos.core import webhook_constants
 logger = logging.getLogger(__name__)
 
 MIN_SQLITE_VERSION = (3, 35, 0)
+_RECENCY_E_FOLD_SECONDS = 7 * 24 * 60 * 60
 
 
 SQLITE_MIGRATION_FILES = [
@@ -991,28 +992,25 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
     ) -> list[Row]:
         self._require_dim(embedding, "semantic_search")
 
-        def _updated_date(row: Row) -> date:
-            value = row.get("updated")
-            if isinstance(value, datetime):
-                return value.date()
-            if isinstance(value, date):
-                return value
-            if isinstance(value, str):
-                try:
-                    return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
-                except ValueError:
-                    pass
-            created = row.get("created")
-            if isinstance(created, datetime):
-                return created.date()
-            if isinstance(created, date):
-                return created
-            if isinstance(created, str):
-                try:
-                    return datetime.fromisoformat(created.replace("Z", "+00:00")).date()
-                except ValueError:
-                    pass
-            return date.min
+        def _recency_date(row: Row) -> date:
+            def _coerce_date(value: Any) -> date | None:
+                if isinstance(value, datetime):
+                    return value.date()
+                if isinstance(value, date):
+                    return value
+                if isinstance(value, str):
+                    try:
+                        return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+                    except ValueError:
+                        return None
+                return None
+
+            return (
+                _coerce_date(row.get("last_recalled_at"))
+                or _coerce_date(row.get("updated"))
+                or _coerce_date(row.get("created"))
+                or date.min
+            )
 
         embedding_json = json.dumps([float(value) for value in embedding])
         conditions: list[str] = ["me.embedding IS NOT NULL"]
@@ -1043,6 +1041,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         rows = await _fetch_all(
             self._conn(tx),
             f"SELECT {select_cols}, "
+            "replace(datetime(m.last_recalled_at), ' ', 'T') AS last_recalled_at, "
             "mnemos_cosine_similarity(me.embedding, ?) AS similarity "
             "FROM memory_embeddings me "
             "JOIN memories m ON m.id = me.memory_id "
@@ -1060,11 +1059,22 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                     return -math.inf
                 if not math.isfinite(similarity):
                     return -math.inf
-                updated_date = _updated_date(row)
-                age_days = max(0, (today - updated_date).days)
-                return similarity + recency_weight * (1.0 / (1.0 + age_days))
+                recency_date = _recency_date(row)
+                age_days = max(0, (today - recency_date).days)
+                # Align with Postgres' exponential recency signal. This is
+                # an ordering key only; the raw ``similarity`` column remains
+                # untouched for route-level min_score/OOD gates.
+                recency = math.exp(-age_days * 86400.0 / float(_RECENCY_E_FOLD_SECONDS))
+                if row.get("superseded_by") or row.get("consolidated_into"):
+                    recency = 0.0
+                return similarity + recency_weight * recency
 
-            rows.sort(key=_recency_score, reverse=True)
+            rows.sort(
+                key=lambda row: (
+                    bool(row.get("superseded_by") or row.get("consolidated_into")),
+                    -_recency_score(row),
+                )
+            )
             rows = rows[:limit]
         return rows
 
