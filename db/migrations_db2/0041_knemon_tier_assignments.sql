@@ -1,4 +1,4 @@
---#SET TERMINATOR %
+--#SET TERMINATOR @
 -- migration: 0041_knemon_tier_assignments
 -- target:    IBM Db2 12.1.5
 -- purpose:   KNEMON Phase 3 tier-split table. Db2 parity port of Oracle 0041.
@@ -21,6 +21,6 @@ BEGIN
       CONSTRAINT uq_knemon_tier_task_kind UNIQUE (task_kind),
       CONSTRAINT ck_knemon_tier_valid CHECK (tier IN (''B1'',''B2'',''C1'',''C2''))
     )';
-END%
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_tier_tier ON knemon_tier_assignments(tier)'; END%
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_tier_iter ON knemon_tier_assignments(iteration)'; END%
+END@
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_tier_tier ON knemon_tier_assignments(tier)'; END@
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_tier_iter ON knemon_tier_assignments(iteration)'; END@
