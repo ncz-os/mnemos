@@ -4,15 +4,21 @@ from types import SimpleNamespace
 
 import pytest
 
+from mnemos.api.dependencies import UserContext
 import mnemos.api.routes.memories as memories_handler
 from mnemos.domain.models import MemoryListRequest, MemorySearchRequest
 from mnemos.domain.search.decay import apply_decay
-from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from tests._fake_backend import _FakeBackend
 
 
-def _root():
-    return SimpleNamespace(user_id="root", namespace="default", group_ids=[], roles=["root"], permissions=["root"])
+def _root() -> UserContext:
+    return UserContext(
+        user_id="admin",
+        group_ids=[],
+        role="root",
+        namespace="default",
+        authenticated=True,
+    )
 
 
 def _row(memory_id: str, *, consolidated_into: str | None = None):
@@ -87,20 +93,23 @@ async def test_list_route_passes_exclude_superseded_to_backend(monkeypatch):
     backend.memories.configure_return("list_memories", ([_row("current")], 1))
     monkeypatch.setattr(memories_handler, "_backend_or_503", lambda: backend)
 
-    response = await memories_handler.list_memories(exclude_superseded=True, user=_root())
+    response = await memories_handler.list_memories(exclude_superseded=True, limit=20, offset=0, user=_root())
 
     assert [m.id for m in response.memories] == ["current"]
     assert backend.memories.calls[-1][0] == "list_memories"
     assert backend.memories.calls[-1][1]["exclude_superseded"] is True
 
 
-@pytest.mark.parametrize("repo_path, expected", [
-    ("mnemos.persistence.postgres.PostgresMemoryRepository", "consolidated_into IS NULL"),
-    ("mnemos.persistence.sqlite.SqliteMemoryRepository", "consolidated_into IS NULL"),
-    ("mnemos.persistence.mysql.MysqlMemoryRepository", "m.consolidated_into IS NULL"),
-    ("mnemos.persistence.db2.Db2MemoryRepository", "m.consolidated_into IS NULL"),
-    ("mnemos.persistence.oracle.OracleMemoryRepository", "m.consolidated_into IS NULL"),
-])
+@pytest.mark.parametrize(
+    "repo_path, expected",
+    [
+        ("mnemos.persistence.postgres.PostgresMemoryRepository", "consolidated_into IS NULL"),
+        ("mnemos.persistence.sqlite.SqliteMemoryRepository", "consolidated_into IS NULL"),
+        ("mnemos.persistence.mysql.MysqlMemoryRepository", "m.consolidated_into IS NULL"),
+        ("mnemos.persistence.db2.Db2MemoryRepository", "m.consolidated_into IS NULL"),
+        ("mnemos.persistence.oracle.OracleMemoryRepository", "m.consolidated_into IS NULL"),
+    ],
+)
 def test_backend_current_only_predicates_are_wired(repo_path, expected):
     import inspect
 

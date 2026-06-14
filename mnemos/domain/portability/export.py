@@ -52,8 +52,7 @@ def _encode_deletion_log_cursor(
     # an empty string), and packing one would round-trip to a 400 from
     # the decoder on the next page. Catch it at the source so the bug
     # can't propagate into a cursor in the first place.
-    for name, val in (("effective_owner", effective_owner),
-                      ("effective_ns", effective_ns)):
+    for name, val in (("effective_owner", effective_owner), ("effective_ns", effective_ns)):
         if val == "":
             raise ValueError(
                 f"_encode_deletion_log_cursor: {name} must be a non-empty "
@@ -98,10 +97,7 @@ def _validate_cursor_iso_datetime(value: str) -> str:
         candidate = candidate[:-1] + "+00:00"
     parsed = datetime.fromisoformat(candidate)
     if parsed.tzinfo is None:
-        raise ValueError(
-            "cursor timestamp must be timezone-aware "
-            "(e.g. ...Z or ...+00:00)"
-        )
+        raise ValueError("cursor timestamp must be timezone-aware " "(e.g. ...Z or ...+00:00)")
     return value
 
 
@@ -129,9 +125,7 @@ def _decode_deletion_log_cursor(token: str) -> Dict[str, Any]:
         row_id_raw = data.get("id")
         export_as_of_raw = data.get("export_as_of")
         if executed_at_raw is None or row_id_raw is None or export_as_of_raw is None:
-            raise ValueError(
-                "cursor must contain executed_at, id, and export_as_of"
-            )
+            raise ValueError("cursor must contain executed_at, id, and export_as_of")
         # Window-preservation fields are always present on cursors
         # produced by this server. Tolerate missing keys for older
         # cursors (forward-compat), but a present key with a value MUST
@@ -154,23 +148,14 @@ def _decode_deletion_log_cursor(token: str) -> Dict[str, Any]:
                 raise ValueError(f"cursor {name} must be a string or null")
             if isinstance(val, str) and val == "":
                 raise ValueError(
-                    f"cursor {name} must be a non-empty string or null; "
-                    f"empty string is not a valid scope value"
+                    f"cursor {name} must be a non-empty string or null; " f"empty string is not a valid scope value"
                 )
         result: Dict[str, Any] = {
             "executed_at": _validate_cursor_iso_datetime(executed_at_raw),
             "id": _validate_cursor_uuid(row_id_raw),
             "export_as_of": _validate_cursor_iso_datetime(export_as_of_raw),
-            "deletion_log_from": (
-                _validate_cursor_iso_datetime(dl_from_raw)
-                if dl_from_raw is not None
-                else None
-            ),
-            "deletion_log_to": (
-                _validate_cursor_iso_datetime(dl_to_raw)
-                if dl_to_raw is not None
-                else None
-            ),
+            "deletion_log_from": (_validate_cursor_iso_datetime(dl_from_raw) if dl_from_raw is not None else None),
+            "deletion_log_to": (_validate_cursor_iso_datetime(dl_to_raw) if dl_to_raw is not None else None),
             "effective_owner": owner_raw,
             "effective_ns": ns_raw,
             # Sentinel for forward-compat: distinguishes a legacy cursor
@@ -191,6 +176,7 @@ def _decode_deletion_log_cursor(token: str) -> Dict[str, Any]:
                 "verbatim, do not edit."
             ),
         )
+
 
 from .schemas import (
     MPF_VERSION,
@@ -394,10 +380,7 @@ async def export_memories(
         if not emit_version.startswith("0.2"):
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "deletion_log_cursor is a v0.2-only field; pass "
-                    "mpf_version=0.2 to use cursor pagination."
-                ),
+                detail=("deletion_log_cursor is a v0.2-only field; pass " "mpf_version=0.2 to use cursor pagination."),
             )
         cursor_data = _decode_deletion_log_cursor(deletion_log_cursor)
         # Reject legacy scope-less cursors with a clear 400 — operators
@@ -483,10 +466,7 @@ async def export_memories(
                     filtered = [
                         infl
                         for infl in rec.provenance["wasInfluencedBy"]
-                        if not (
-                            infl.get("type") == "memory"
-                            and infl.get("id") not in in_scope_ids
-                        )
+                        if not (infl.get("type") == "memory" and infl.get("id") not in in_scope_ids)
                     ]
                     if filtered:
                         rec.provenance["wasInfluencedBy"] = filtered
@@ -565,12 +545,8 @@ async def export_memories(
             # already cursor-bound when a cursor is present.
             if emit_version.startswith("0.2"):
                 # Window from cursor (page 2+) or request (page 1).
-                effective_dl_from = (
-                    cursor_dl_from if cursor_data is not None else deletion_log_from
-                )
-                effective_dl_to = (
-                    cursor_dl_to if cursor_data is not None else deletion_log_to
-                )
+                effective_dl_from = cursor_dl_from if cursor_data is not None else deletion_log_from
+                effective_dl_to = cursor_dl_to if cursor_data is not None else deletion_log_to
                 # Snapshot anchor: cursor wins on page 2+; page 1 derives
                 # from the DB (not the app clock — clock skew between app
                 # and DB would otherwise let rows leak across the boundary).
@@ -632,7 +608,11 @@ async def export_memories(
                 deletion_log_out = [
                     entry
                     for entry in (
-                        _deletion_log_to_entry(dict(r), mpf_version=emit_version)
+                        _deletion_log_to_entry(
+                            dict(r),
+                            mpf_version=emit_version,
+                            redact_secrets=redact_secrets,
+                        )
                         for r in dl_rows
                     )
                     if entry and entry.get("deleted_at")

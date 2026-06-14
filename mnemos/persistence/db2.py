@@ -1196,7 +1196,8 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 where.append(pos_clause)
             await _call(
                 cursor.execute,
-                "UPDATE memories SET deleted_at = CURRENT TIMESTAMP, updated = CURRENT TIMESTAMP WHERE " + " AND ".join(where),
+                "UPDATE memories SET deleted_at = CURRENT TIMESTAMP, updated = CURRENT TIMESTAMP WHERE "
+                + " AND ".join(where),
                 tuple(params_list),
             )
             if int(getattr(cursor, "rowcount", 0) or 0) == 0:
@@ -1293,7 +1294,8 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                        m.quality_rating, m.compressed_content, m.verbatim_content,
                        m.owner_id, m.namespace, m.permission_mode, m.source_model,
                        m.source_provider, m.source_session, m.source_agent,
-                       m.group_id, m.created, m.updated, m.archived_at, m.deleted_at
+                       m.group_id, m.created, m.updated, m.archived_at,
+                       m.consolidated_into, m.deleted_at
                   FROM memories m
                  WHERE {where_sql}
                  ORDER BY m.created DESC, m.id ASC
@@ -1513,7 +1515,8 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             params_list.append(limit)
             sql = (
                 "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
-                "m.quality_rating, m.owner_id, m.namespace, m.created, m.updated "
+                "m.quality_rating, m.owner_id, m.namespace, m.created, m.updated, "
+                "m.consolidated_into "
                 "FROM memories m WHERE " + " AND ".join(where) + " "
                 "ORDER BY m.updated DESC FETCH FIRST ? ROWS ONLY"
             )

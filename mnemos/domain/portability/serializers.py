@@ -30,6 +30,15 @@ _ACTIVITY_TYPE_HINTS = (
     ("ingest", "etl_job"),
 )
 
+_REDACTABLE_MEMORY_TEXT_FIELDS = (
+    "category",
+    "subcategory",
+    "source_model",
+    "source_provider",
+    "source_session",
+    "source_agent",
+)
+
 
 def _redact_secret_strings(value: Any) -> Any:
     """Recursively redact credential-shaped spans from JSON-ish export data."""
@@ -51,8 +60,7 @@ def _derive_prov_activity_type(row) -> str:
     MNEMOS-stored memories (operator-driven Claude/openclaw chat).
     """
     haystack = " ".join(
-        str(row.get(field) or "")
-        for field in ("source_provider", "source_agent", "source_session")
+        str(row.get(field) or "") for field in ("source_provider", "source_agent", "source_session")
     ).lower()
     for hint, activity_type in _ACTIVITY_TYPE_HINTS:
         if hint in haystack:
@@ -96,9 +104,7 @@ def _record_provenance_v0_2(row) -> Dict[str, Any]:
                 "type": "federation_pull",
                 "id": f"federation:{federation_source}",
             },
-            "generatedAtTime": (
-                _iso(row.get("created")) or _iso(row.get("updated")) or ""
-            ),
+            "generatedAtTime": (_iso(row.get("created")) or _iso(row.get("updated")) or ""),
         }
         return prov
 
@@ -120,11 +126,7 @@ def _record_provenance_v0_2(row) -> Dict[str, Any]:
         # - SQLite:   `source_memory_ids` (TEXT, JSON-encoded array)
         # Read both keys with explicit fallback so neither backend's
         # naming silently drops the lineage.
-        source_memories = (
-            row.get("source_memories")
-            or row.get("source_memory_ids")
-            or []
-        )
+        source_memories = row.get("source_memories") or row.get("source_memory_ids") or []
         if isinstance(source_memories, str):
             try:
                 parsed = json.loads(source_memories)
@@ -140,22 +142,15 @@ def _record_provenance_v0_2(row) -> Dict[str, Any]:
                 "type": "distillation",
                 "id": f"morpheus:{activity_id}",
             },
-            "generatedAtTime": (
-                _iso(row.get("created")) or _iso(row.get("updated")) or ""
-            ),
+            "generatedAtTime": (_iso(row.get("created")) or _iso(row.get("updated")) or ""),
         }
         if source_memories:
-            prov["wasInfluencedBy"] = [
-                {"type": "memory", "id": str(mid)} for mid in source_memories
-            ]
+            prov["wasInfluencedBy"] = [{"type": "memory", "id": str(mid)} for mid in source_memories]
         return prov
 
     # 3) Default heuristic path (chat / graeae / etl / etc).
     activity_id = (
-        row.get("source_session")
-        or row.get("source_agent")
-        or row.get("source_provider")
-        or f"mem:{row['id']}"
+        row.get("source_session") or row.get("source_agent") or row.get("source_provider") or f"mem:{row['id']}"
     )
 
     prov = {
@@ -195,24 +190,32 @@ def _memory_to_record(
     content = row.get("content")
     if redact_secrets:
         content = redact_content(content)
+    text_fields = {
+        field: _redact_secret_strings(row.get(field)) if redact_secrets else row.get(field)
+        for field in _REDACTABLE_MEMORY_TEXT_FIELDS
+    }
 
     payload: Dict[str, Any] = {
         "content": content,
-        "category": row.get("category"),
-        "subcategory": row.get("subcategory"),
+        "category": text_fields["category"],
+        "subcategory": text_fields["subcategory"],
         "created": _iso(row.get("created")),
         "updated": _iso(row.get("updated")),
         "owner_id": row.get("owner_id"),
         "namespace": row.get("namespace"),
         "permission_mode": row.get("permission_mode"),
         "quality_rating": row.get("quality_rating"),
-        "source_model": row.get("source_model"),
-        "source_provider": row.get("source_provider"),
-        "source_session": row.get("source_session"),
-        "source_agent": row.get("source_agent"),
+        "source_model": text_fields["source_model"],
+        "source_provider": text_fields["source_provider"],
+        "source_session": text_fields["source_session"],
+        "source_agent": text_fields["source_agent"],
         "metadata": metadata,
     }
     payload = {k: v for k, v in payload.items() if v is not None}
+
+    provenance_row = row
+    if redact_secrets:
+        provenance_row = {**row, **text_fields}
 
     record_kwargs: Dict[str, Any] = dict(
         id=row["id"],
@@ -226,11 +229,9 @@ def _memory_to_record(
     # null per the spec's "MNEMOS importers default valid_time_start to
     # transaction_time" guidance.
     if mpf_version.startswith(MPF_VERSION_PREFIX_V0_2):
-        record_kwargs["provenance"] = _record_provenance_v0_2(row)
+        record_kwargs["provenance"] = _record_provenance_v0_2(provenance_row)
         record_kwargs["transaction_time"] = _iso(row.get("created"))
-        valid_time_meta = (
-            metadata.get("valid_time") if isinstance(metadata, dict) else None
-        )
+        valid_time_meta = metadata.get("valid_time") if isinstance(metadata, dict) else None
         if isinstance(valid_time_meta, dict):
             vt_start = _iso(valid_time_meta.get("start"))
             vt_end = _iso(valid_time_meta.get("end"))
@@ -295,8 +296,9 @@ def _kg_triple_to_entry(
     is_v0_2 = mpf_version.startswith(MPF_VERSION_PREFIX_V0_2)
     if is_v0_2:
         norm_conf, raw_conf = _normalize_confidence_for_mpf(row.get("confidence"))
-        if raw_conf is not None and (not isinstance(metadata, dict) or
-                                     metadata.get("_mnemos_raw_confidence") != raw_conf):
+        if raw_conf is not None and (
+            not isinstance(metadata, dict) or metadata.get("_mnemos_raw_confidence") != raw_conf
+        ):
             if not isinstance(metadata, dict):
                 metadata = {}
             metadata = {**metadata, "_mnemos_raw_confidence": raw_conf}
@@ -330,9 +332,7 @@ def _kg_triple_to_entry(
     return {k: v for k, v in entry.items() if v is not None}
 
 
-_MPF_V0_2_CHANGE_TYPES = frozenset(
-    {"create", "update", "delete", "revert", "merge", "branch"}
-)
+_MPF_V0_2_CHANGE_TYPES = frozenset({"create", "update", "delete", "revert", "merge", "branch"})
 
 
 def _normalize_change_type_for_mpf(raw: Any) -> Any:
@@ -384,10 +384,7 @@ def _memory_version_to_entry(
     is_v0_2 = mpf_version.startswith(MPF_VERSION_PREFIX_V0_2)
     if is_v0_2:
         change_type_out = _normalize_change_type_for_mpf(raw_change_type)
-        if (
-            raw_change_type is not None
-            and raw_change_type != change_type_out
-        ):
+        if raw_change_type is not None and raw_change_type != change_type_out:
             if not isinstance(metadata, dict):
                 metadata = {}
             metadata = {**metadata, "_mnemos_change_type": raw_change_type}
@@ -399,6 +396,10 @@ def _memory_version_to_entry(
         content = redact_content(content)
         if verbatim_content is not None:
             verbatim_content = redact_content(verbatim_content)
+    text_fields = {
+        field: _redact_secret_strings(row.get(field)) if redact_secrets else row.get(field)
+        for field in _REDACTABLE_MEMORY_TEXT_FIELDS
+    }
     entry: Dict[str, Any] = {
         "id": str(row["id"]),
         "record_id": row["memory_id"],
@@ -408,17 +409,17 @@ def _memory_version_to_entry(
         "parent_version_id": parent_version_id,
         "merge_parents": merge_parents,
         "content": content,
-        "category": row.get("category"),
-        "subcategory": row.get("subcategory"),
+        "category": text_fields["category"],
+        "subcategory": text_fields["subcategory"],
         "metadata": metadata or None,
         "verbatim_content": verbatim_content,
         "owner_id": row.get("owner_id"),
         "namespace": row.get("namespace"),
         "permission_mode": row.get("permission_mode"),
-        "source_model": row.get("source_model"),
-        "source_provider": row.get("source_provider"),
-        "source_session": row.get("source_session"),
-        "source_agent": row.get("source_agent"),
+        "source_model": text_fields["source_model"],
+        "source_provider": text_fields["source_provider"],
+        "source_session": text_fields["source_session"],
+        "source_agent": text_fields["source_agent"],
         "snapshot_at": _iso(row.get("snapshot_at")),
         "snapshot_by": row.get("snapshot_by"),
         "change_type": change_type_out,
@@ -443,7 +444,12 @@ def _clamp_non_negative_int(raw: Any) -> Any:
     return n if n >= 0 else None
 
 
-def _deletion_log_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[str, Any]:
+def _deletion_log_to_entry(
+    row,
+    *,
+    mpf_version: str = "0.1.1",
+    redact_secrets: bool = False,
+) -> Dict[str, Any]:
     """Serialize a deletion_log row for the MPF v0.2 deletion_log sidecar.
 
     Spec required fields (per mnemos-os/mpf v0.2.0 schema): id, record_id,
@@ -470,12 +476,15 @@ def _deletion_log_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[str, Any]
         # somehow missing. If both are missing, skip the row entirely
         # (caller should drop the entry).
         deleted_at = _iso(row.get("requested_at"))
+    reason = row.get("reason")
+    if redact_secrets:
+        reason = redact_content(reason)
     entry: Dict[str, Any] = {
         "id": str(row["id"]),
         "record_id": row["memory_id"],
         "deleted_at": deleted_at,
         "deleted_by": row.get("requested_by"),
-        "reason": row.get("reason"),
+        "reason": reason,
         "tombstone_hash": row.get("content_hash"),
     }
     # Extra context for round-trip / audit replay.
@@ -485,7 +494,10 @@ def _deletion_log_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[str, Any]
     if row.get("requested_at"):
         extra_metadata["_mnemos_requested_at"] = _iso(row.get("requested_at"))
     if row.get("source"):
-        extra_metadata["_mnemos_source"] = list(row["source"])
+        source = list(row["source"])
+        if redact_secrets:
+            source = _redact_secret_strings(source)
+        extra_metadata["_mnemos_source"] = source
     if extra_metadata:
         entry["metadata"] = extra_metadata
     return {k: v for k, v in entry.items() if v is not None}
