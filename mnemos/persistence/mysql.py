@@ -54,6 +54,7 @@ from urllib.parse import unquote, urlparse
 
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.base import (
     BranchRepository,
     CompressionStatsRow,
@@ -3391,15 +3392,19 @@ class MysqlFederationRepository(FederationRepository):
             "m.archived_at IS NULL",
             "m.consolidated_into IS NULL",
             "m.deleted_at IS NULL",
+            # Secret vault: never federate credential-class memories, even
+            # when a peer explicitly filters to that namespace.
+            "(m.namespace IS NULL OR m.namespace <> %s)",
         ]
         tombstone_where = [
             "m.federation_source IS NULL",
             "m.consolidated_into IS NOT NULL",
             "m.consolidated_at IS NOT NULL",
             "m.deleted_at IS NULL",
+            "(m.namespace IS NULL OR m.namespace <> %s)",
         ]
-        memory_params: list[Any] = []
-        tombstone_params: list[Any] = []
+        memory_params: list[Any] = [VAULT_NAMESPACE]
+        tombstone_params: list[Any] = [VAULT_NAMESPACE]
         if since_updated is not None:
             memory_where.append("(m.updated > %s OR (m.updated = %s AND m.id > %s))")
             memory_params.extend([since_updated, since_updated, since_id])
@@ -3537,8 +3542,10 @@ class MysqlFederationRepository(FederationRepository):
             "m.consolidated_into IS NULL",
             "m.deleted_at IS NULL",
             "m.id = %s",
+            # Secret vault: never serve a vaulted memory over federation.
+            "(m.namespace IS NULL OR m.namespace <> %s)",
         ]
-        params: list[Any] = [memory_id]
+        params: list[Any] = [memory_id, VAULT_NAMESPACE]
         if namespaces:
             where.append(f"m.namespace IN ({', '.join(['%s'] * len(namespaces))})")
             params.extend(namespaces)

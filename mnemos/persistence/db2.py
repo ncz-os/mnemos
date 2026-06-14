@@ -32,6 +32,7 @@ from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 from mnemos.core.config import db2_text_search_override, db2_vector_index_override
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.oracle import (
     OracleAclRepository,
     OracleAuditChainRepository,
@@ -3340,30 +3341,71 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         prefer_compressed: bool,
         include_embedding: bool = False,
     ) -> list[Row]:
-        _ = prefer_compressed
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
-            where = [
+            memory_where = [
                 "m.deleted_at IS NULL",
                 "m.federation_source IS NULL",
+                "MOD(m.permission_mode, 10) >= 4",
                 "m.archived_at IS NULL",
+                "m.consolidated_into IS NULL",
+                # Secret vault: Db2 must match Postgres/Oracle/SQLite and
+                # never federate credential-class memories even when a peer
+                # explicitly filters to the vault namespace.
+                "(m.namespace IS NULL OR m.namespace <> ?)",
             ]
-            params_list: list[Any] = []
+            tombstone_where = [
+                "m.deleted_at IS NULL",
+                "m.federation_source IS NULL",
+                "m.consolidated_into IS NOT NULL",
+                "m.consolidated_at IS NOT NULL",
+                "(m.namespace IS NULL OR m.namespace <> ?)",
+            ]
+            memory_params: list[Any] = [VAULT_NAMESPACE]
+            tombstone_params: list[Any] = [VAULT_NAMESPACE]
             if since_updated is not None and since_id is not None:
-                where.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
-                params_list.extend([since_updated, since_updated, since_id])
+                memory_where.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
+                memory_params.extend([since_updated, since_updated, since_id])
+                tombstone_where.append("(m.consolidated_at > ? OR (m.consolidated_at = ? AND m.id > ?))")
+                tombstone_params.extend([since_updated, since_updated, since_id])
             if namespaces:
                 ns_ph = ",".join("?" for _ in namespaces)
-                where.append(f"m.namespace IN ({ns_ph})")
-                params_list.extend(namespaces)
+                memory_where.append(f"m.namespace IN ({ns_ph})")
+                tombstone_where.append(f"m.namespace IN ({ns_ph})")
+                memory_params.extend(namespaces)
+                tombstone_params.extend(namespaces)
             if categories:
                 cat_ph = ",".join("?" for _ in categories)
-                where.append(f"m.category IN ({cat_ph})")
-                params_list.extend(categories)
+                memory_where.append(f"m.category IN ({cat_ph})")
+                tombstone_where.append(f"m.category IN ({cat_ph})")
+                memory_params.extend(categories)
+                tombstone_params.extend(categories)
+            if prefer_compressed:
+                use_variant = (
+                    "m.archived_at IS NULL "
+                    "AND v.compressed_content IS NOT NULL "
+                    "AND (2 * LENGTH(v.compressed_content)) "
+                    "  < (LENGTH(m.content) + COALESCE(LENGTH(m.verbatim_content), 0))"
+                )
+                content_select = f"CASE WHEN {use_variant} THEN v.compressed_content ELSE m.content END AS content"
+                compressed_select = (
+                    f"CASE WHEN {use_variant} THEN v.compressed_content ELSE CAST(NULL AS CLOB) END AS compressed_content"
+                )
+                verbatim_select = (
+                    f"CASE WHEN {use_variant} THEN CAST(NULL AS CLOB) ELSE m.verbatim_content END AS verbatim_content"
+                )
+                join_compressed = "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id"
+            else:
+                content_select = "m.content AS content"
+                compressed_select = "CAST(NULL AS CLOB) AS compressed_content"
+                verbatim_select = "m.verbatim_content AS verbatim_content"
+                join_compressed = ""
+
             # v6.1 F-1.2: optional embedding + embedding_model literal columns.
             # See docs/v6.1-federation-embeddings-copy.md.
-            embed_cols = ""
+            embed_memory = ""
+            embed_tombstone = ""
             if include_embedding:
                 from mnemos.core.config import embed_http_model_override, get_settings as _gs
 
@@ -3373,18 +3415,39 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 except Exception:
                     _model = "unknown"
                 _model_escaped = _model.replace("'", "''")
-                embed_cols = f", m.embedding AS embedding, '{_model_escaped}' AS embedding_model"
-            params_list.append(limit)
+                embed_memory = f", m.embedding AS embedding, '{_model_escaped}' AS embedding_model"
+                embed_tombstone = ", NULL AS embedding, CAST(NULL AS VARCHAR(200)) AS embedding_model"
             sql = (
-                "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
-                "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
+                "SELECT * FROM ("
+                "SELECT CAST(NULL AS VARCHAR(32)) AS type, "
+                "m.id, " + content_select + ", m.category, m.subcategory, m.metadata, "
+                "m.quality_rating, " + verbatim_select + ", m.owner_id, m.namespace, "
                 "m.permission_mode, m.source_model, m.source_provider, "
                 "m.source_session, m.source_agent, m.created, m.updated, "
-                "m.archived_at" + embed_cols + " FROM memories m WHERE " + " AND ".join(where) + " "
-                "ORDER BY m.updated ASC, m.id ASC "
-                "FETCH FIRST ? ROWS ONLY"
+                "m.archived_at, CAST(NULL AS VARCHAR(100)) AS consolidated_into, "
+                "CAST(NULL AS TIMESTAMP) AS consolidated_at, "
+                + compressed_select
+                + embed_memory
+                + " FROM memories m "
+                + join_compressed
+                + " WHERE "
+                + " AND ".join(memory_where)
+                + " UNION ALL "
+                "SELECT 'consolidation' AS type, m.id, CAST(NULL AS CLOB) AS content, "
+                "CAST(NULL AS VARCHAR(100)) AS category, CAST(NULL AS VARCHAR(100)) AS subcategory, "
+                "CAST(NULL AS CLOB) AS metadata, CAST(NULL AS INTEGER) AS quality_rating, "
+                "CAST(NULL AS CLOB) AS verbatim_content, CAST(NULL AS VARCHAR(100)) AS owner_id, "
+                "m.namespace, CAST(NULL AS SMALLINT) AS permission_mode, "
+                "CAST(NULL AS VARCHAR(200)) AS source_model, CAST(NULL AS VARCHAR(100)) AS source_provider, "
+                "CAST(NULL AS VARCHAR(200)) AS source_session, CAST(NULL AS VARCHAR(200)) AS source_agent, "
+                "m.created, m.consolidated_at AS updated, CAST(NULL AS TIMESTAMP) AS archived_at, "
+                "m.consolidated_into, m.consolidated_at, CAST(NULL AS CLOB) AS compressed_content"
+                + embed_tombstone
+                + " FROM memories m WHERE "
+                + " AND ".join(tombstone_where)
+                + ") feed ORDER BY updated ASC, id ASC FETCH FIRST ? ROWS ONLY"
             )
-            await _call(cursor.execute, sql, tuple(params_list))
+            await _call(cursor.execute, sql, tuple([*memory_params, *tombstone_params, limit]))
             return await _fetch_all_dicts(cursor)
         finally:
             await _call(cursor.close)
@@ -3404,8 +3467,13 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 "m.id = ?",
                 "m.deleted_at IS NULL",
                 "m.federation_source IS NULL",
+                "MOD(m.permission_mode, 10) >= 4",
+                "m.archived_at IS NULL",
+                "m.consolidated_into IS NULL",
+                # Secret vault: never serve a vaulted memory over federation.
+                "(m.namespace IS NULL OR m.namespace <> ?)",
             ]
-            params_list: list[Any] = [memory_id]
+            params_list: list[Any] = [memory_id, VAULT_NAMESPACE]
             if namespaces:
                 ns_ph = ",".join("?" for _ in namespaces)
                 where.append(f"m.namespace IN ({ns_ph})")

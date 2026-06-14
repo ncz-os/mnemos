@@ -23,6 +23,7 @@ import asyncpg
 
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import embed_http_model_override, hot_rs_enabled
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.core.recommendation import choose_recommended_model
@@ -3189,14 +3190,20 @@ class PostgresFederationRepository(FederationRepository):
         prefer_compressed: bool,
         include_embedding: bool = False,
     ) -> list[Row]:
-        memory_query_parts = [_eligibility.eligible_for_federation("m")]
+        memory_query_parts = [
+            _eligibility.eligible_for_federation("m"),
+            # Secret vault: never federate credential-class memories, even
+            # when a peer explicitly filters to that namespace.
+            "(m.namespace IS NULL OR m.namespace <> $1)",
+        ]
         tombstone_query_parts = [
             "m.federation_source IS NULL",
             "m.deleted_at IS NULL",
             "m.consolidated_into IS NOT NULL",
             "m.consolidated_at IS NOT NULL",
+            "(m.namespace IS NULL OR m.namespace <> $1)",
         ]
-        args: list[Any] = []
+        args: list[Any] = [VAULT_NAMESPACE]
         if since_updated is not None:
             args.append(since_updated)
             since_updated_arg = len(args)
@@ -3328,8 +3335,13 @@ class PostgresFederationRepository(FederationRepository):
         namespaces: Sequence[str],
         categories: Sequence[str],
     ) -> Row | None:
-        query_parts = [_eligibility.eligible_for_federation("m"), "m.id = $1"]
-        args: list[Any] = [memory_id]
+        query_parts = [
+            _eligibility.eligible_for_federation("m"),
+            "m.id = $1",
+            # Secret vault: never serve a vaulted memory over federation.
+            "(m.namespace IS NULL OR m.namespace <> $2)",
+        ]
+        args: list[Any] = [memory_id, VAULT_NAMESPACE]
         if namespaces:
             args.append(list(namespaces))
             query_parts.append(f"m.namespace = ANY(${len(args)})")

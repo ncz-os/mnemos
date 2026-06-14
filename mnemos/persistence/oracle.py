@@ -6,12 +6,11 @@ ABC-conformant subclasses for every repository surface
 ``compression``, ``webhooks``, ``consultations_audit``, ``federation``,
 ``state_kv``) plus :class:`OracleBackend` and a transactional context.
 
-Each repo instantiates with full :class:`~abc.ABC` coverage. Methods
-that have real implementations against the Oracle schema land in this
-module; method bodies awaiting the Oracle 23ai VECTOR / Text rollout
-or the namespace-policy visibility predicate raise
-:class:`NotImplementedError` at call time (not attribute access), so
-attribute lookups remain safe across the whole backend graph.
+Each repo instantiates with full :class:`~abc.ABC` coverage. The
+federation/read-side surfaces now use concrete SQL across the supported
+Oracle-family backends instead of call-time parity stubs; remaining
+abstract-domain bases (compression engines, import helpers) stay outside
+this persistence module.
 
 See ``docs/oracle-port-status.md`` for the running M7 plan.
 """
@@ -3227,7 +3226,7 @@ class OracleConsultationsRepository(ConsultationsRepository):
 
 
 class OracleFederationRepository(FederationRepository):
-    """Oracle federation repo — peer CRUD wired, sync paths stubbed."""
+    """Oracle federation repo with peer CRUD, sync state, and feed parity."""
 
     async def list_peers(self, tx: Transaction) -> list[Row]:
         conn = _conn_from_tx(tx)
@@ -3873,23 +3872,34 @@ class OracleFederationRepository(FederationRepository):
         prefer_compressed: bool,
         include_embedding: bool = False,
     ) -> list[Row]:
-        _ = prefer_compressed
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
-            where = [
+            memory_where = [
                 "m.deleted_at IS NULL",
                 "m.federation_source IS NULL",
+                "MOD(m.permission_mode, 10) >= 4",
                 "m.archived_at IS NULL",
+                "m.consolidated_into IS NULL",
                 # Secret vault (release-blocking 2026-06-13): credential-class
                 # memories MUST NOT cross the federation feed to remote peers.
                 # Excluded unconditionally — even an explicit namespace=vault
                 # filter cannot pull them.
                 "(m.namespace IS NULL OR m.namespace <> :vault_ns)",
             ]
+            tombstone_where = [
+                "m.deleted_at IS NULL",
+                "m.federation_source IS NULL",
+                "m.consolidated_into IS NOT NULL",
+                "m.consolidated_at IS NOT NULL",
+                "(m.namespace IS NULL OR m.namespace <> :vault_ns)",
+            ]
             params: dict[str, Any] = {"limit": limit, "vault_ns": VAULT_NAMESPACE}
             if since_updated is not None and since_id is not None:
-                where.append("(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))")
+                memory_where.append("(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))")
+                tombstone_where.append(
+                    "(m.consolidated_at > :upd OR (m.consolidated_at = :upd AND m.id > :since_id))"
+                )
                 # Explicit TIMESTAMP_TZ bind to avoid thin-mode coercion to VARCHAR
                 # which was causing infinite-loop pulls on ACHILLES (id < since_id).
                 import oracledb
@@ -3900,15 +3910,40 @@ class OracleFederationRepository(FederationRepository):
                 params["since_id"] = since_id
             if namespaces:
                 ns_ph, ns_params = _in_placeholders(namespaces, "ns")
-                where.append(f"m.namespace IN ({ns_ph})")
+                memory_where.append(f"m.namespace IN ({ns_ph})")
+                tombstone_where.append(f"m.namespace IN ({ns_ph})")
                 params.update(ns_params)
             if categories:
                 cat_ph, cat_params = _in_placeholders(categories, "cat")
-                where.append(f"m.category IN ({cat_ph})")
+                memory_where.append(f"m.category IN ({cat_ph})")
+                tombstone_where.append(f"m.category IN ({cat_ph})")
                 params.update(cat_params)
+
+            if prefer_compressed:
+                use_variant = (
+                    "m.archived_at IS NULL "
+                    "AND v.compressed_content IS NOT NULL "
+                    "AND (2 * LENGTH(v.compressed_content)) "
+                    "  < (LENGTH(m.content) + COALESCE(LENGTH(m.verbatim_content), 0))"
+                )
+                content_select = f"CASE WHEN {use_variant} THEN v.compressed_content ELSE m.content END AS content"
+                compressed_select = (
+                    f"CASE WHEN {use_variant} THEN v.compressed_content ELSE CAST(NULL AS CLOB) END AS compressed_content"
+                )
+                verbatim_select = (
+                    f"CASE WHEN {use_variant} THEN CAST(NULL AS CLOB) ELSE m.verbatim_content END AS verbatim_content"
+                )
+                join_compressed = "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id"
+            else:
+                content_select = "m.content AS content"
+                compressed_select = "CAST(NULL AS CLOB) AS compressed_content"
+                verbatim_select = "m.verbatim_content AS verbatim_content"
+                join_compressed = ""
+
             # v6.1 F-1.2: optional embedding + embedding_model literal columns.
             # See docs/v6.1-federation-embeddings-copy.md.
-            embed_cols = ""
+            embed_memory = ""
+            embed_tombstone = ""
             if include_embedding:
                 from mnemos.core.config import embed_http_model_override, get_settings as _gs
 
@@ -3917,17 +3952,39 @@ class OracleFederationRepository(FederationRepository):
                     _model = _http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
                 except Exception:
                     _model = "unknown"
-                # Single-quote escape for embedded literal.
                 _model_escaped = _model.replace("'", "''")
-                embed_cols = f", m.embedding AS embedding, '{_model_escaped}' AS embedding_model"
+                embed_memory = f", m.embedding AS embedding, '{_model_escaped}' AS embedding_model"
+                embed_tombstone = ", NULL AS embedding, CAST(NULL AS VARCHAR2(200)) AS embedding_model"
+
             sql = (
-                "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
-                "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
+                "SELECT * FROM ("
+                "SELECT CAST(NULL AS VARCHAR2(32)) AS type, "
+                "m.id, " + content_select + ", m.category, m.subcategory, m.metadata, "
+                "m.quality_rating, " + verbatim_select + ", m.owner_id, m.namespace, "
                 "m.permission_mode, m.source_model, m.source_provider, "
                 "m.source_session, m.source_agent, m.created, m.updated, "
-                "m.archived_at" + embed_cols + " FROM memories m WHERE " + " AND ".join(where) + " "
-                "ORDER BY m.updated ASC, m.id ASC "
-                "FETCH FIRST :limit ROWS ONLY"
+                "m.archived_at, CAST(NULL AS VARCHAR2(100)) AS consolidated_into, "
+                "CAST(NULL AS TIMESTAMP WITH TIME ZONE) AS consolidated_at, "
+                + compressed_select
+                + embed_memory
+                + " FROM memories m "
+                + join_compressed
+                + " WHERE "
+                + " AND ".join(memory_where)
+                + " UNION ALL "
+                "SELECT 'consolidation' AS type, m.id, CAST(NULL AS CLOB) AS content, "
+                "CAST(NULL AS VARCHAR2(100)) AS category, CAST(NULL AS VARCHAR2(100)) AS subcategory, "
+                "CAST(NULL AS CLOB) AS metadata, CAST(NULL AS NUMBER) AS quality_rating, "
+                "CAST(NULL AS CLOB) AS verbatim_content, CAST(NULL AS VARCHAR2(100)) AS owner_id, "
+                "m.namespace, CAST(NULL AS NUMBER(4)) AS permission_mode, "
+                "CAST(NULL AS VARCHAR2(200)) AS source_model, CAST(NULL AS VARCHAR2(100)) AS source_provider, "
+                "CAST(NULL AS VARCHAR2(200)) AS source_session, CAST(NULL AS VARCHAR2(200)) AS source_agent, "
+                "m.created, m.consolidated_at AS updated, CAST(NULL AS TIMESTAMP WITH TIME ZONE) AS archived_at, "
+                "m.consolidated_into, m.consolidated_at, CAST(NULL AS CLOB) AS compressed_content"
+                + embed_tombstone
+                + " FROM memories m WHERE "
+                + " AND ".join(tombstone_where)
+                + ") feed ORDER BY updated ASC, id ASC FETCH FIRST :limit ROWS ONLY"
             )
             await _call(cursor.execute, sql, params)
             return await _fetch_all_dicts(cursor)
@@ -3949,6 +4006,9 @@ class OracleFederationRepository(FederationRepository):
                 "m.id = :id",
                 "m.deleted_at IS NULL",
                 "m.federation_source IS NULL",
+                "MOD(m.permission_mode, 10) >= 4",
+                "m.archived_at IS NULL",
+                "m.consolidated_into IS NULL",
                 # Secret vault: never serve a vaulted memory over federation.
                 "(m.namespace IS NULL OR m.namespace <> :vault_ns)",
             ]

@@ -3019,10 +3019,24 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         include_embedding: bool = False,
     ) -> list[Row]:
         if prefer_compressed:
-            raise NotImplementedError(
-                "SQLite federation feed does not support prefer_compressed; "
-                "use the Postgres server profile for compressed federation feeds."
+            use_variant = (
+                "m.archived_at IS NULL "
+                "AND v.compressed_content IS NOT NULL "
+                "AND (2 * length(json_quote(v.compressed_content))) "
+                "  < (length(json_quote(m.content)) "
+                "     + COALESCE(length(json_quote(m.verbatim_content)), 0))"
             )
+            content_select = f"CASE WHEN {use_variant} THEN v.compressed_content ELSE m.content END AS content"
+            compressed_select = (
+                f"CASE WHEN {use_variant} THEN v.compressed_content ELSE NULL END AS compressed_content"
+            )
+            verbatim_select = f"CASE WHEN {use_variant} THEN NULL ELSE m.verbatim_content END AS verbatim_content"
+            join_compressed = "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id"
+        else:
+            content_select = "m.content"
+            compressed_select = "NULL AS compressed_content"
+            verbatim_select = "m.verbatim_content"
+            join_compressed = ""
         memory_query_parts = [
             "m.federation_source IS NULL",
             "(m.permission_mode % 10) >= 4",
@@ -3037,9 +3051,10 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             "m.federation_source IS NULL",
             "m.consolidated_into IS NOT NULL",
             "m.consolidated_at IS NOT NULL",
+            "(m.namespace IS NULL OR m.namespace <> ?)",
         ]
         memory_params: list[Any] = [VAULT_NAMESPACE]
-        tombstone_params: list[Any] = []
+        tombstone_params: list[Any] = [VAULT_NAMESPACE]
         if since_updated is not None:
             memory_query_parts.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
             memory_params.extend([since_updated, since_updated, since_id])
@@ -3088,12 +3103,12 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             FROM (
                 SELECT NULL AS type,
                        m.id,
-                       m.content,
+                       {content_select},
                        m.category,
                        m.subcategory,
                        m.metadata,
                        m.quality_rating,
-                       m.verbatim_content,
+                       {verbatim_select},
                        m.owner_id,
                        m.namespace,
                        m.permission_mode,
@@ -3106,11 +3121,12 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                        m.archived_at,
                        NULL AS consolidated_into,
                        NULL AS consolidated_at,
-                       NULL AS compressed_content
+                       {compressed_select}
                        {mem_embed}
-                FROM memories m
-                {mem_embed_join}
-                WHERE {memory_where_clause}
+                 FROM memories m
+                 {join_compressed}
+                 {mem_embed_join}
+                 WHERE {memory_where_clause}
 
                 UNION ALL
 

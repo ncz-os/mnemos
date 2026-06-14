@@ -99,7 +99,7 @@ async def test_federation_repository_peer_crud_and_sync_log(backend_case: Backen
 
 
 @pytest.mark.asyncio
-async def test_federation_repository_feed_cursor_and_sqlite_compressed_stub(backend_case: BackendCase):
+async def test_federation_repository_feed_cursor_and_sqlite_compressed_parity(backend_case: BackendCase):
     now = datetime(2026, 5, 3, 12, 0, tzinfo=timezone.utc)
     ids = [f"{backend_case.prefix}-fed-a", f"{backend_case.prefix}-fed-b"]
     namespace = f"{backend_case.prefix}-ns"
@@ -142,16 +142,16 @@ async def test_federation_repository_feed_cursor_and_sqlite_compressed_stub(back
             limit=10,
             prefer_compressed=False,
         )
-        if backend_case.name == "sqlite":
-            with pytest.raises(NotImplementedError):
-                await backend_case.backend.federation.feed_query(
-                    tx,
-                    since_updated=None,
-                    since_id=None,
-                    namespaces=[namespace],
-                    categories=[],
-                    limit=10,
-                    prefer_compressed=True,
-                )
+        compressed_page = await backend_case.backend.federation.feed_query(
+            tx,
+            since_updated=None,
+            since_id=None,
+            namespaces=[namespace],
+            categories=[],
+            limit=10,
+            prefer_compressed=True,
+        )
 
     assert [row["id"] for row in [*page1, *page2]] == ids
+    assert [row["id"] for row in compressed_page] == ids
+    assert all("compressed_content" in row for row in compressed_page)
