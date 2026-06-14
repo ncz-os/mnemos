@@ -855,62 +855,51 @@ async def _store_memories(
                             exc_info=True,
                         )
 
-        # v6.2 M-2.2.1 federation audit write. Replica records the
-        # inbound write under op="replicate" with writer_id="fed:<peer>"
-        # so its local audit chain reflects what was federated in.
-        # Spec § Federation interaction: audit chain becomes a federated
-        # Merkle DAG. Replica chains to its own prior entry for this
-        # local_id (NOT the primary's prev_entry_id) — the primary's
-        # chain is its own concern; we attest our local write.
+        # v6.2 M-2.2.1 federation audit write. Replica records each
+        # applied inbound write under op="replicate" with writer_id="fed:<peer>"
+        # so its local audit chain is universal across local API writes and
+        # federation mutations. When the peer supplies a primary chain head,
+        # enforce that the replica entry chains to it. Malformed/partial heads
+        # or audit insert failures abort the transaction and halt the peer sync
+        # instead of remaining log-only.
         if backend is not None and backend.audit_chain is not None:
-            try:
-                from mnemos.workers.audit_sealer import audit_chain_enabled
+            from mnemos.workers.audit_sealer import audit_chain_enabled
 
-                if audit_chain_enabled():
-                    from mnemos.core.config import get_settings as _gs2
+            if audit_chain_enabled():
+                from mnemos.core.config import get_settings as _gs2
 
-                    _s = _gs2()
-                    _ss = (getattr(_s.server, "session_secret", "") or "").encode("utf-8")
-                    if _ss:
-                        # v6.2 chain-head continuity check (best-effort).
-                        # If the primary sent its audit_latest_entry_hash
-                        # for this memory, we record a metadata-side
-                        # hint so post-hoc divergence audits can flag
-                        # any future mismatch. Active rejection of
-                        # mismatched feeds is a future hardening once
-                        # we've fielded the chain at scale.
-                        primary_eid = mem.get("audit_latest_entry_id")
-                        primary_hash = mem.get("audit_latest_entry_hash")
-                        if primary_eid and primary_hash:
-                            logger.info(
-                                "[federation/audit] peer=%s memory=%s primary_chain_head eid=%s hash=%s",
-                                peer_name,
-                                local_id,
-                                primary_eid[:16],
-                                primary_hash[:16],
-                            )
-
-                        from mnemos.audit import write_audit_entry
-
-                        await write_audit_entry(
-                            backend,
-                            tx,
-                            op="replicate",
-                            memory_id_str=local_id,
-                            content=content,
-                            category=category,
-                            subcategory=subcategory,
-                            metadata=meta_raw if isinstance(meta_raw, dict) else None,
-                            embedding=None,
-                            writer_id=f"fed:{peer_name}",
-                            session_secret=_ss,
+                _s = _gs2()
+                _ss = (getattr(_s.server, "session_secret", "") or "").encode("utf-8")
+                if _ss:
+                    primary_eid = mem.get("audit_latest_entry_id")
+                    primary_hash = mem.get("audit_latest_entry_hash")
+                    if primary_eid or primary_hash:
+                        logger.info(
+                            "[federation/audit] peer=%s memory=%s enforcing primary_chain_head eid=%s hash=%s",
+                            peer_name,
+                            local_id,
+                            str(primary_eid or "")[:16],
+                            str(primary_hash or "")[:16],
                         )
-            except Exception:
-                logger.warning(
-                    "[federation/audit] replicate-op audit write failed for %s",
-                    local_id,
-                    exc_info=True,
-                )
+
+                    from mnemos.audit import write_audit_entry
+
+                    await write_audit_entry(
+                        backend,
+                        tx,
+                        op="replicate",
+                        memory_id_str=local_id,
+                        content=content,
+                        category=category,
+                        subcategory=subcategory,
+                        metadata=meta_raw if isinstance(meta_raw, dict) else None,
+                        embedding=None,
+                        writer_id=f"fed:{peer_name}",
+                        session_secret=_ss,
+                        expected_prev_entry_id_hex=primary_eid,
+                        expected_prev_entry_hash_hex=primary_hash,
+                        enforce_continuity=bool(primary_eid or primary_hash),
+                    )
 
     return new_n, upd_n
 

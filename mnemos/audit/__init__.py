@@ -30,10 +30,11 @@ from .crypto import (
     sign_entry,
     verify_entry,
 )
-from .route_helper import memory_id_to_audit_bytes, write_audit_entry
+from .route_helper import AuditChainContinuityError, memory_id_to_audit_bytes, write_audit_entry
 from .writer import build_entry, latest_hash
 
 __all__ = [
+    "AuditChainContinuityError",
     "AuditEntry",
     "build_entry",
     "canonical_entry_bytes",
