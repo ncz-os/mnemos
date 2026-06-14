@@ -53,6 +53,7 @@ from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 from mnemos.core.auth_context import UserContext
+from mnemos.core import eligibility as _eligibility
 from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
 from mnemos.persistence.base import (
     BranchRepository,
@@ -3395,18 +3396,10 @@ class MysqlFederationRepository(FederationRepository):
         prefer_compressed: bool,
         include_embedding: bool = False,
     ) -> list[Row]:
-        memory_where = [
-            "m.federation_source IS NULL",
-            "(MOD(m.permission_mode, 10)) >= 4",
-            "m.archived_at IS NULL",
-            "m.consolidated_into IS NULL",
-            "m.deleted_at IS NULL",
-        ]
+        memory_where = [_eligibility.eligible_for_federation("m")]
         tombstone_where = [
-            "m.federation_source IS NULL",
-            "m.consolidated_into IS NOT NULL",
+            _eligibility.eligible_for_federation_tombstone("m"),
             "m.consolidated_at IS NOT NULL",
-            "m.deleted_at IS NULL",
         ]
         memory_params: list[Any] = []
         tombstone_params: list[Any] = []
@@ -3540,14 +3533,7 @@ class MysqlFederationRepository(FederationRepository):
         namespaces: Sequence[str],
         categories: Sequence[str],
     ) -> Row | None:
-        where = [
-            "m.federation_source IS NULL",
-            "(MOD(m.permission_mode, 10)) >= 4",
-            "m.archived_at IS NULL",
-            "m.consolidated_into IS NULL",
-            "m.deleted_at IS NULL",
-            "m.id = %s",
-        ]
+        where = [_eligibility.eligible_for_federation("m"), "m.id = %s"]
         params: list[Any] = [memory_id]
         if namespaces:
             where.append(f"m.namespace IN ({', '.join(['%s'] * len(namespaces))})")
