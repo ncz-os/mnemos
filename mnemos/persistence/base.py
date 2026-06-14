@@ -295,6 +295,51 @@ class MemoryRepository(ABC):
         """Increment recall counters for one memory and return it."""
         ...
 
+    async def backfill_missing_content_hashes(
+        self,
+        tx: Transaction,
+        *,
+        batch_size: int = 500,
+        apply: bool = False,
+    ) -> int:
+        """Count or backfill NULL content_hash values.
+
+        Dry-run (``apply=False``) returns the count of currently NULL hashes
+        without mutating rows. Apply mode updates at most ``batch_size`` rows,
+        computing the same newline-normalized SHA-256 digest used on creation.
+        The operation is idempotent and only updates rows whose hash is still
+        NULL.
+        """
+        raise NotImplementedError("content_hash backfill is not implemented for this backend")
+
+    async def soft_delete_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        requested_by: str | None = None,
+        requested_at: Any = None,
+        request_kind: str = "admin_purge",
+        reason: str | None = None,
+        source: Sequence[str] | None = None,
+    ) -> Row | None:
+        """Reversibly mark a memory deleted by setting deleted_at.
+
+        Backends may override for efficient atomic UPDATE..RETURNING. The
+        default delegates to delete_memory for legacy soft-delete backends.
+        """
+        return await self.delete_memory(
+            tx,
+            memory_id,
+            visibility=visibility,
+            requested_by=requested_by,
+            requested_at=requested_at,
+            request_kind=request_kind,
+            reason=reason,
+            source=source,
+        )
+
     @abstractmethod
     async def find_duplicate_content_groups(
         self,
