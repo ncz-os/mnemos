@@ -690,16 +690,29 @@ async def _store_memories(
 
         # Check existing
         existing = await repo.fetch_federated_memory_marker(tx, local_id)
+        mutation_applied = False
+        source_audit_provenance: dict[str, Any] = {}
+        primary_eid = mem.get("audit_latest_entry_id")
+        primary_hash = mem.get("audit_latest_entry_hash")
+        if isinstance(primary_eid, str) and primary_eid:
+            source_audit_provenance["federation_source_audit_latest_entry_id"] = primary_eid
+        if isinstance(primary_hash, str) and primary_hash:
+            source_audit_provenance["federation_source_audit_latest_entry_hash"] = primary_hash
 
         meta_raw = mem.get("metadata") or {}
         if isinstance(meta_raw, dict):
             meta_raw = {**meta_raw, "federation_remote_id": remote_id}
         else:
             meta_raw = {"federation_remote_id": remote_id}
+        meta_raw.update(source_audit_provenance)
         meta_json = json.dumps(meta_raw)
         if len(meta_json) > FEDERATION_MAX_METADATA:
             # Drop metadata if it's absurdly large; keep the remote_id pointer.
-            meta_raw = {"federation_remote_id": remote_id, "_metadata_truncated": True}
+            meta_raw = {
+                "federation_remote_id": remote_id,
+                "_metadata_truncated": True,
+                **source_audit_provenance,
+            }
 
         classified = classify_persisted_text_fields(
             content=content,
@@ -711,13 +724,16 @@ async def _store_memories(
             memory_id=local_id,
         )
         namespace = classified.namespace
-        meta_json = json.dumps(classified.metadata)
+        persisted_metadata = dict(classified.metadata)
+        meta_json = json.dumps(persisted_metadata)
         if len(meta_json) > FEDERATION_MAX_METADATA:
             truncated_meta = {"federation_remote_id": remote_id, "_metadata_truncated": True}
+            truncated_meta.update(source_audit_provenance)
             for key, value in classified.metadata.items():
                 if str(key).startswith("secret_"):
                     truncated_meta[key] = value
             meta_json = json.dumps(truncated_meta)
+            persisted_metadata = truncated_meta
 
         if existing is None:
             inserted = await repo.insert_federated_memory(
@@ -739,6 +755,7 @@ async def _store_memories(
             )
             if inserted:
                 new_n += 1
+                mutation_applied = True
                 # NOTE: deliberately NOT 'continue' here — fall through to
                 # the F-1.4 embedding-copy block at the bottom of the loop
                 # so newly inserted rows get their embedding written same
@@ -787,6 +804,7 @@ async def _store_memories(
                 # idempotency means this is a successful no-op.
                 if updated:
                     upd_n += 1
+                    mutation_applied = True
 
         # v6.1 F-1.4: optional embedding copy. Only attempt when:
         #   1. backend was passed in (caller opted in)
@@ -858,11 +876,12 @@ async def _store_memories(
         # v6.2 M-2.2.1 federation audit write. Replica records each
         # applied inbound write under op="replicate" with writer_id="fed:<peer>"
         # so its local audit chain is universal across local API writes and
-        # federation mutations. When the peer supplies a primary chain head,
-        # enforce that the replica entry chains to it. Malformed/partial heads
-        # or audit insert failures abort the transaction and halt the peer sync
-        # instead of remaining log-only.
-        if backend is not None and backend.audit_chain is not None:
+        # federation mutations. Source peers may publish their own audit head;
+        # the receiver stores that as row provenance but never treats it as the
+        # predecessor for this local `fed:<peer>:<remote>` replica chain.
+        # Enforced audit writes make the first pull seed a local replica chain
+        # and make later pulls fail closed if the local predecessor is corrupt.
+        if mutation_applied and backend is not None and backend.audit_chain is not None:
             from mnemos.workers.audit_sealer import audit_chain_enabled
 
             if audit_chain_enabled():
@@ -871,11 +890,9 @@ async def _store_memories(
                 _s = _gs2()
                 _ss = (getattr(_s.server, "session_secret", "") or "").encode("utf-8")
                 if _ss:
-                    primary_eid = mem.get("audit_latest_entry_id")
-                    primary_hash = mem.get("audit_latest_entry_hash")
                     if primary_eid or primary_hash:
                         logger.info(
-                            "[federation/audit] peer=%s memory=%s enforcing primary_chain_head eid=%s hash=%s",
+                            "[federation/audit] peer=%s memory=%s carrying source_chain_head eid=%s hash=%s",
                             peer_name,
                             local_id,
                             str(primary_eid or "")[:16],
@@ -892,13 +909,11 @@ async def _store_memories(
                         content=content,
                         category=category,
                         subcategory=subcategory,
-                        metadata=meta_raw if isinstance(meta_raw, dict) else None,
+                        metadata=persisted_metadata,
                         embedding=None,
                         writer_id=f"fed:{peer_name}",
                         session_secret=_ss,
-                        expected_prev_entry_id_hex=primary_eid,
-                        expected_prev_entry_hash_hex=primary_hash,
-                        enforce_continuity=bool(primary_eid or primary_hash),
+                        enforce_continuity=True,
                     )
 
     return new_n, upd_n

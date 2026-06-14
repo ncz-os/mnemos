@@ -103,12 +103,10 @@ class MemoryItem(BaseModel):
     embedding: Optional[str] = None  # base64(float32 little-endian)
     embedding_model: Optional[str] = None
     embedding_dim: Optional[int] = None
-    # v6.2 M-2.2.1 chain head piggyback — primary publishes its chain
-    # head so replicas can validate continuity on inbound writes.
-    # Replicas require a well-formed audit_latest_entry_id/hash pair
-    # and chain their local replicate entry to it; malformed claims reject
-    # payload + log + halt peer. None/empty on peers that haven't
-    # enabled MNEMOS_AUDIT_CHAIN.
+    # v6.2 M-2.2.1 chain-head piggyback: the source publishes its own
+    # latest local audit head as provenance. Receivers must not treat this
+    # as their local predecessor because replicas write under
+    # `fed:<peer>:<remote_id>` chains.
     audit_latest_entry_id: Optional[str] = None  # hex(16-byte entry_id)
     audit_latest_entry_hash: Optional[str] = None  # hex(32-byte sha256)
     # Semantic relevance score (UAT 2026-06-13). Normalized cosine
