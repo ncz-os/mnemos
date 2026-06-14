@@ -121,6 +121,10 @@ async def test_oracle_semantic_search_recency_rerank_is_conservative() -> None:
     ids = [row["id"] for row in result]
     assert ids == ["valid-old-best", "valid-fresh", "valid-old-next"]
     assert {"corrupt-updated", "rank-none"}.isdisjoint(ids)
-    assert [row["rank_score"] for row in result] == sorted(row["rank_score"] for row in result)
+    assert {row["id"]: row["rank_score"] for row in result} == {
+        "valid-old-best": 0.20,
+        "valid-fresh": 0.31,
+        "valid-old-next": 0.25,
+    }
     assert len(result) <= 3
     assert calls[0]["params"]["limit"] == 12

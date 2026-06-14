@@ -173,6 +173,68 @@ async def test_sqlite_semantic_search_invalid_updated_falls_back_to_created(tmp_
 
 
 @pytest.mark.asyncio
+async def test_sqlite_semantic_search_recency_prefers_last_recalled_at(tmp_path):
+    settings = SimpleNamespace(database=SimpleNamespace(embedding_dim=3))
+    backend = SqliteBackend(tmp_path / "recency-last-recalled.sqlite3", settings)
+    await backend.open()
+    visibility = VisibilityFilter(
+        scope=VisibilityScope.ROOT_BYPASS,
+        user_id=None,
+        group_ids=(),
+        namespace=None,
+    )
+    now = datetime.now(timezone.utc)
+    updated_winner = "sqlite-recency-updated-winner"
+    recalled_winner = "sqlite-recency-recalled-winner"
+
+    try:
+        async with backend.transactional() as tx:
+            await _insert_memory(
+                backend,
+                tx,
+                memory_id=updated_winner,
+                content="fresh by updated only",
+                updated=now,
+            )
+            await _insert_memory(
+                backend,
+                tx,
+                memory_id=recalled_winner,
+                content="fresh by recall",
+                updated=now - timedelta(days=90),
+            )
+            await _execute(
+                tx.conn,
+                "UPDATE memories SET last_recalled_at = ? WHERE id = ?",
+                ((now - timedelta(days=90)).isoformat(), updated_winner),
+            )
+            await _execute(
+                tx.conn,
+                "UPDATE memories SET last_recalled_at = ? WHERE id = ?",
+                (now.isoformat(), recalled_winner),
+            )
+            await backend.memories.upsert_memory_embedding(tx, updated_winner, [1.0, 0.0, 0.0])
+            await backend.memories.upsert_memory_embedding(
+                tx,
+                recalled_winner,
+                _embedding_with_similarity(0.99),
+            )
+
+            boosted = await backend.memories.semantic_search(
+                tx,
+                embedding=[1.0, 0.0, 0.0],
+                limit=2,
+                visibility=visibility,
+                boost_recency=True,
+                recency_weight=0.2,
+            )
+    finally:
+        await backend.close()
+
+    assert [row["id"] for row in boosted] == [recalled_winner, updated_winner]
+
+
+@pytest.mark.asyncio
 async def test_sqlite_semantic_search_recency_reranks_only_candidate_window(tmp_path):
     settings = SimpleNamespace(database=SimpleNamespace(embedding_dim=3))
     backend = SqliteBackend(tmp_path / "recency-candidate-window.sqlite3", settings)
