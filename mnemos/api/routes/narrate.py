@@ -5,7 +5,8 @@ GET /v1/memories/{memory_id}/narrate[?format=prose|dense]
 For memories whose winning compression variant is APOLLO's dense
 form, expand back to prose. Non-APOLLO winners pass through
 unchanged (ARTEMIS output is already prose-shaped). When no
-winning variant exists, return the raw memory content.
+winning variant exists, return the raw memory content. The selected
+body is framed as untrusted retrieved DATA before it leaves the API.
 
 v3.3 S-II ships the rule-based narrator dispatcher (see
 ``mnemos.domain.compression.apollo.narrate_encoded``). S-III replaces with a
@@ -23,6 +24,7 @@ import mnemos.core.lifecycle as _lc  # noqa: F401  (kept for symmetry; helpers c
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import backend_or_503, maybe_set_pg_rls
 from mnemos.core.extras import is_extra_installed, missing_extra_detail
+from mnemos.core.injection_defense import defend as _defend_untrusted
 from mnemos.core.security import is_root
 from mnemos.persistence.visibility import VisibilityFilter
 
@@ -39,8 +41,8 @@ class NarrateResponse(BaseModel):
       * ``narrated``            — APOLLO dense form expanded to prose
       * ``variant_passthrough`` — non-APOLLO winning variant
                                   (e.g. ARTEMIS output, already prose)
-      * ``variant_dense``       — raw dense form when format=dense
-      * ``raw``                 — no winning variant; raw memories.content
+      * ``variant_dense``       — dense form when format=dense, framed as DATA
+      * ``raw``                 — no winning variant; raw memories.content, framed as DATA
     """
 
     memory_id: str
@@ -136,7 +138,10 @@ def _build_narrate_response(
     from mnemos.core.secret_detection import redact_content
 
     def _maybe(text: str) -> str:
-        return redact_content(text) if redact else text
+        # Agent-facing narration is retrieved memory DATA, not instructions.
+        # Redact first, then quarantine/framing so both prose and dense
+        # variants carry the same prompt-injection boundary as JSON reads.
+        return _defend_untrusted(redact_content(text) if redact else text)
 
     raw_content = _maybe(memory_row.get("content") or "")
 
@@ -255,8 +260,8 @@ async def narrate(
         description=(
             "prose → expand APOLLO dense forms to human-readable text; "
             "non-APOLLO variants passed through unchanged. "
-            "dense → return the raw winning-variant content verbatim; "
-            "falls back to raw memory content when no variant exists."
+            "dense → return the winning-variant content framed as DATA; "
+            "falls back to framed raw memory content when no variant exists."
         ),
     ),
     user: UserContext = Depends(get_current_user),
@@ -265,7 +270,7 @@ async def narrate(
 
     Always safe to call — missing variants degrade gracefully to the
     raw memory content, non-APOLLO variants pass through unchanged,
-    unknown dense shapes fall through verbatim rather than raising.
+    unknown dense shapes fall through to the untrusted-data framing step rather than raising.
 
     Tenancy: non-root callers filtered by ``owner_id + namespace``.
     404 when the memory does not exist under the caller's tenancy
