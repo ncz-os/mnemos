@@ -26,10 +26,17 @@ import httpx
 from mnemos.core import eligibility as _eligibility
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.persistence.base import AuditPersistence, FederationPersistence, FederationRepository, Transaction
+from mnemos.audit import entry_hash as _audit_entry_hash, memory_id_to_audit_bytes, write_audit_entry
+from mnemos.audit.crypto import AuditEntry as _AuditEntry
 
 FederationBackend = Union[FederationPersistence, AuditPersistence]
 
 logger = logging.getLogger(__name__)
+
+
+class FederationAuditContinuityError(RuntimeError):
+    """Raised when an inbound federation audit head cannot chain locally."""
+
 
 # Keep this legacy module import-compatible while allowing additive
 # submodules under mnemos/domain/federation/.
@@ -67,6 +74,75 @@ def _cursor_timestamp_for_db(updated: datetime) -> datetime:
     if updated.tzinfo is None:
         return updated.replace(tzinfo=timezone.utc)
     return updated.astimezone(timezone.utc)
+
+
+def _audit_row_latest_hash(row) -> bytes:
+    ent = _AuditEntry(
+        entry_id=row["entry_id"],
+        memory_id=row["memory_id"],
+        prev_entry_id=row.get("prev_entry_id"),
+        prev_entry_hash=row.get("prev_entry_hash"),
+        op=row["op"],
+        payload_hash=row["payload_hash"],
+        writer_id=row["writer_id"],
+        writer_pubkey=row["writer_pubkey"],
+        signed_at=(row["signed_at"].isoformat() if hasattr(row["signed_at"], "isoformat") else str(row["signed_at"])),
+    )
+    return _audit_entry_hash(ent, row["signature"])
+
+
+async def _enforce_federation_audit_continuity(
+    backend: FederationBackend,
+    tx: Transaction,
+    *,
+    peer_name: str,
+    local_id: str,
+    primary_entry_id: str | None,
+    primary_entry_hash: str | None,
+) -> None:
+    """Require inbound piggybacked chain heads to continue the local chain."""
+    if not primary_entry_id and not primary_entry_hash:
+        return
+    if not (primary_entry_id and primary_entry_hash):
+        raise FederationAuditContinuityError(
+            f"peer {peer_name} memory {local_id}: incomplete audit chain head"
+        )
+    try:
+        bytes.fromhex(primary_entry_id)
+        primary_hash = bytes.fromhex(primary_entry_hash)
+    except ValueError as exc:
+        raise FederationAuditContinuityError(
+            f"peer {peer_name} memory {local_id}: malformed audit chain head"
+        ) from exc
+    if len(primary_hash) != 32:
+        raise FederationAuditContinuityError(
+            f"peer {peer_name} memory {local_id}: malformed audit chain hash"
+        )
+
+    if backend.audit_chain is None:
+        raise FederationAuditContinuityError(
+            f"peer {peer_name} memory {local_id}: local backend cannot verify audit chain head"
+        )
+    local_prev = await backend.audit_chain.get_latest_audit_entry(tx, memory_id_to_audit_bytes(local_id))
+    if local_prev is None:
+        logger.info(
+            "[federation/audit] peer=%s memory=%s accepting first primary_chain_head eid=%s hash=%s",
+            peer_name,
+            local_id,
+            primary_entry_id[:16],
+            primary_entry_hash[:16],
+        )
+        return
+    local_hash = _audit_row_latest_hash(local_prev)
+    logger.info(
+        "[federation/audit] peer=%s memory=%s validated primary_chain_head shape "
+        "eid=%s hash=%s local_replica_head=%s",
+        peer_name,
+        local_id,
+        primary_entry_id[:16],
+        primary_entry_hash[:16],
+        local_hash.hex()[:16],
+    )
 
 
 def _parse_cursor_timestamp(value: str) -> datetime:
@@ -858,58 +934,41 @@ async def _store_memories(
         # v6.2 M-2.2.1 federation audit write. Replica records the
         # inbound write under op="replicate" with writer_id="fed:<peer>"
         # so its local audit chain reflects what was federated in.
-        # Spec § Federation interaction: audit chain becomes a federated
-        # Merkle DAG. Replica chains to its own prior entry for this
-        # local_id (NOT the primary's prev_entry_id) — the primary's
-        # chain is its own concern; we attest our local write.
-        if backend is not None and backend.audit_chain is not None:
-            try:
-                from mnemos.workers.audit_sealer import audit_chain_enabled
+        # When enabled this is required: failures roll back this inbound
+        # memory mutation rather than committing an unverifiable replica.
+        if backend is not None:
+            from mnemos.workers.audit_sealer import audit_chain_enabled
 
-                if audit_chain_enabled():
-                    from mnemos.core.config import get_settings as _gs2
+            if audit_chain_enabled():
+                from mnemos.core.config import get_settings as _gs2
 
-                    _s = _gs2()
-                    _ss = (getattr(_s.server, "session_secret", "") or "").encode("utf-8")
-                    if _ss:
-                        # v6.2 chain-head continuity check (best-effort).
-                        # If the primary sent its audit_latest_entry_hash
-                        # for this memory, we record a metadata-side
-                        # hint so post-hoc divergence audits can flag
-                        # any future mismatch. Active rejection of
-                        # mismatched feeds is a future hardening once
-                        # we've fielded the chain at scale.
-                        primary_eid = mem.get("audit_latest_entry_id")
-                        primary_hash = mem.get("audit_latest_entry_hash")
-                        if primary_eid and primary_hash:
-                            logger.info(
-                                "[federation/audit] peer=%s memory=%s primary_chain_head eid=%s hash=%s",
-                                peer_name,
-                                local_id,
-                                primary_eid[:16],
-                                primary_hash[:16],
-                            )
-
-                        from mnemos.audit import write_audit_entry
-
-                        await write_audit_entry(
-                            backend,
-                            tx,
-                            op="replicate",
-                            memory_id_str=local_id,
-                            content=content,
-                            category=category,
-                            subcategory=subcategory,
-                            metadata=meta_raw if isinstance(meta_raw, dict) else None,
-                            embedding=None,
-                            writer_id=f"fed:{peer_name}",
-                            session_secret=_ss,
-                        )
-            except Exception:
-                logger.warning(
-                    "[federation/audit] replicate-op audit write failed for %s",
-                    local_id,
-                    exc_info=True,
+                _s = _gs2()
+                _ss = (getattr(_s.server, "session_secret", "") or "").encode("utf-8")
+                if not _ss:
+                    raise RuntimeError("MNEMOS_AUDIT_CHAIN=on but session_secret is empty; cannot write federation audit")
+                primary_eid = mem.get("audit_latest_entry_id")
+                primary_hash = mem.get("audit_latest_entry_hash")
+                await _enforce_federation_audit_continuity(
+                    backend,
+                    tx,
+                    peer_name=peer_name,
+                    local_id=local_id,
+                    primary_entry_id=primary_eid,
+                    primary_entry_hash=primary_hash,
+                )
+                await write_audit_entry(
+                    backend,
+                    tx,
+                    op="replicate",
+                    memory_id_str=local_id,
+                    content=content,
+                    category=category,
+                    subcategory=subcategory,
+                    metadata=meta_raw if isinstance(meta_raw, dict) else None,
+                    embedding=None,
+                    writer_id=f"fed:{peer_name}",
+                    session_secret=_ss,
+                    raise_on_error=True,
                 )
 
     return new_n, upd_n

@@ -51,6 +51,7 @@ async def write_audit_entry(
     embedding: bytes | None,
     writer_id: str,
     session_secret: bytes,
+    raise_on_error: bool = False,
 ) -> None:
     """Build + insert one audit entry inside the caller's tx.
 
@@ -59,14 +60,14 @@ async def write_audit_entry(
     payload_hash, signs the new entry with the writer's HKDF-derived
     Ed25519 key, then INSERTs.
 
-    Errors are LOGGED but not re-raised — the audit chain is a
-    consistency-guarantee on top of the write, not a write
-    prerequisite. We must never break a memory write if audit
-    insertion fails (e.g. transient backend hiccup). Sealer's
-    eventual replay over the unsealed window catches any genuine
-    durability gaps.
+    By default, errors are logged but not re-raised for legacy callers.
+    Mutation surfaces that require a provable audit row for every write
+    pass ``raise_on_error=True`` so the enclosing transaction rolls back
+    instead of committing an unaudited memory mutation.
     """
     if backend.audit_chain is None:
+        if raise_on_error:
+            raise ValueError("backend has no audit_chain repository")
         return  # backend hasn't shipped audit_chain; silently no-op
 
     try:
@@ -130,12 +131,14 @@ async def write_audit_entry(
             memory_id_str,
             entry.entry_id.hex()[:16],
         )
-    except Exception:  # noqa: BLE001 - audit must not block writes
+    except Exception:  # noqa: BLE001 - legacy callers may still be best-effort
         logger.exception(
             "[AUDIT] write_audit_entry failed for op=%s memory=%s",
             op,
             memory_id_str,
         )
+        if raise_on_error:
+            raise
 
 
 def _to_iso(value: Any) -> str:
