@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from datetime import timezone
 from typing import Any, Literal
 
-from .crypto import AuditEntry, canonical_payload_hash
+from .crypto import AuditEntry, canonical_payload_hash, verify_entry
 from .writer import build_entry, latest_hash
 from mnemos.persistence.base import AuditPersistence
 
@@ -70,7 +71,7 @@ async def write_audit_entry(
     is a consistency-guarantee on top of the write, not a write
     prerequisite. Callers that pass ``enforce_continuity=True`` opt
     into hard failure for continuity/insert errors (federation uses
-    this when a peer supplies a signed chain-head claim).
+    this for replica-chain audit writes).
     """
     if backend.audit_chain is None:
         return  # backend hasn't shipped audit_chain; silently no-op
@@ -84,11 +85,17 @@ async def write_audit_entry(
             expected_prev_entry_hash_hex=expected_prev_entry_hash_hex,
         )
         if override_prev is not None:
-            # Federation peers publish their source chain head. When supplied,
-            # make that head the predecessor of this replica entry so the local
-            # chain is a verifiable Merkle DAG edge to the primary, rather than
-            # merely logging the remote claim out-of-band.
-            prev_entry_id, prev_entry_hash = override_prev
+            # Federation continuity is a claim about the predecessor this
+            # replica is extending. Do not install a nonzero peer-supplied head
+            # unless it exactly matches the local chain head for this memory.
+            if prev_entry_id is None or prev_entry_hash is None:
+                raise AuditChainContinuityError(
+                    "expected prev head supplied but local audit chain has no predecessor"
+                )
+            if override_prev != (prev_entry_id, prev_entry_hash):
+                raise AuditChainContinuityError(
+                    "expected prev head does not match local audit chain head"
+                )
 
         payload_hash = canonical_payload_hash(
             memory_id=memory_id_str,
@@ -139,7 +146,16 @@ async def write_audit_entry(
 def _audit_prev_head(prev_row: Any | None) -> tuple[bytes | None, bytes | None]:
     if prev_row is None:
         return None, None
-    prev_ae = AuditEntry(
+    signature = prev_row["signature"]
+    for signed_at in _signed_at_candidates(prev_row["signed_at"]):
+        prev_ae = _audit_entry_from_row(prev_row, signed_at=signed_at)
+        if verify_entry(prev_ae, signature):
+            return prev_row["entry_id"], latest_hash(prev_ae, signature)
+    raise AuditChainContinuityError("local audit chain latest entry signature is invalid")
+
+
+def _audit_entry_from_row(prev_row: Any, *, signed_at: str) -> AuditEntry:
+    return AuditEntry(
         entry_id=prev_row["entry_id"],
         memory_id=prev_row["memory_id"],
         prev_entry_id=prev_row.get("prev_entry_id"),
@@ -148,9 +164,35 @@ def _audit_prev_head(prev_row: Any | None) -> tuple[bytes | None, bytes | None]:
         payload_hash=prev_row["payload_hash"],
         writer_id=prev_row["writer_id"],
         writer_pubkey=prev_row["writer_pubkey"],
-        signed_at=_to_iso(prev_row["signed_at"]),
+        signed_at=signed_at,
     )
-    return prev_row["entry_id"], latest_hash(prev_ae, prev_row["signature"])
+
+
+def _signed_at_candidates(value: Any) -> tuple[str, ...]:
+    candidates: list[str] = []
+
+    def add(candidate: str | None) -> None:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add(_to_iso(value))
+    if hasattr(value, "isoformat"):
+        try:
+            if getattr(value, "tzinfo", None) is None:
+                add(value.replace(tzinfo=timezone.utc).isoformat())
+            else:
+                add(value.astimezone(timezone.utc).isoformat())
+        except Exception:
+            pass
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z"):
+            add(text[:-1] + "+00:00")
+        if " " in text:
+            add(text.replace(" ", "T"))
+        if "+" not in text and not text.endswith("Z"):
+            add(text + "+00:00")
+    return tuple(candidates)
 
 
 def _decode_expected_hex(value: str | None, *, label: str, length: int) -> bytes | None:
