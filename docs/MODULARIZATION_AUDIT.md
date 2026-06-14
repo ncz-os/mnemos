@@ -57,7 +57,7 @@ MNEMOS_INSTALL_INTERACTIVE_COMPONENTS=1 bash install.sh --wizard
 
 - pip extras (via `pip install .[extras]` in the managed venv);
 - persisted runtime service flags (`MNEMOS_PROFILE_SERVICES_ENABLED`, `MNEMOS_SELECTED_COMPONENTS`, and existing per-service env names);
-- a migration selector hook (`selected_migration_groups`) that records the needed groups and preserves the current full-chain migration behavior for compatibility.
+- a migration selector hook (`selected_migration_groups`) that scopes the ordered Postgres migration list for explicit component selections while preserving full-chain behavior when no components are selected.
 
 ### Gap C: PANTHEON default-on risk in server bundle
 
@@ -71,7 +71,7 @@ Recommendation: make full backend migration parity a CI and pre-install gate:
 python scripts/check_migration_parity.py --mode full
 ```
 
-This catches schema drift such as historically missing `consolidated_into` or `pantheon_routing_audit` columns on Oracle/Db2 before an installer attempts a backend-specific deployment. The installer’s new `selected_migration_groups()` is an explicit boundary for future component-addressable migration skipping, but the current runner intentionally applies the complete ordered chain to preserve schema expectations across runtime modules.
+This catches schema drift such as historically missing `consolidated_into` or `pantheon_routing_audit` columns on Oracle/Db2 before an installer attempts a backend-specific deployment. The installer’s `selected_migration_groups()` is the explicit component boundary for Postgres migration filtering; omitted component selection still applies the complete ordered chain for legacy compatibility.
 
 ## Profile -> services mapping
 
@@ -140,11 +140,11 @@ MNEMOS_INSTALL_INTERACTIVE_COMPONENTS=1 bash install.sh --wizard
 - Lifecycle hooks now consult `service_enabled(...)` before launching federation, webhook NATS, PERSEPHONE, and PANTHEON audit services.
 - PANTHEON routes now use the resolved service state, preserving explicit `MNEMOS_PANTHEON_ENABLED=true` behavior.
 - Installer config persists selected components in `config.toml` and service env files.
-- `mnemos/installer/db.py:selected_migration_groups()` records the intended migration scope. Full-chain migrations remain active until every optional schema slice is proven independently skippable by parity CI.
+- `mnemos/installer/db.py:selected_migration_groups()` scopes optional Postgres migration slices for explicit selections and leaves no-selection installs on the legacy full chain.
 
 ## CI / pre-install gates
 
-Required before making migrations actually skippable:
+Required before broadening migration scoping across every backend:
 
 1. `python scripts/check_migration_parity.py --mode full` across Postgres, SQLite, Oracle, Db2, and MySQL where supported.
 2. Unit tests for `resolve_profile_services` and installer component normalization.

@@ -298,7 +298,7 @@ main() {
 
     step "Launching Python installer"
     cd "$INSTALL_DIR"
-    exec "$PYTHON" -m installer "${py_args[@]}"
+    exec "$PYTHON" -m mnemos.installer "${py_args[@]}"
 }
 
 main "$@"
