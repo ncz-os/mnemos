@@ -12,6 +12,7 @@ from typing import Any
 
 import asyncpg
 
+from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.persistence.base import PersistenceBackend, Transaction
 
 
@@ -55,6 +56,23 @@ class DocumentRepository:
             from mnemos.persistence.postgres import PostgresTransaction
         except ImportError:  # pragma: no cover - defensive for stripped builds.
             PostgresTransaction = None  # type: ignore[assignment]
+
+        import json
+
+        try:
+            metadata_obj = json.loads(metadata_json) if metadata_json else {}
+        except Exception:
+            metadata_obj = {}
+        classified = classify_persisted_text_fields(
+            content=content,
+            verbatim_content=content,
+            metadata=metadata_obj,
+            namespace=namespace,
+            classified_at="document_import",
+            memory_id=memory_id,
+        )
+        metadata_json = json.dumps(classified.metadata)
+        namespace = classified.namespace
 
         if PostgresTransaction is not None and isinstance(tx, PostgresTransaction):
             return await self._import_postgres_chunk(

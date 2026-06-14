@@ -112,6 +112,19 @@ _SSHPASS_RE = re.compile(r"(?i)\bsshpass\s+-p\s*(['\"]?)([^\s'\"]{1,})\1")
 # (ngc-review 2026-06-13).
 _PW_KV_RE = re.compile(r"(?i)\b(?:root[ \t]+pw|pw|sudo[ \t]+pw)\b[ \t]*[:=]?[ \t]*(['\"]?)([^\s'\"]{3,})\1")
 
+# Credential-record shorthand: "<user>/<password>" or "<user>:<password>".
+# This is intentionally narrower than a generic path/key-value parser:
+#   * the left side must start at a non-path/non-URL boundary
+#   * the password segment cannot contain path/URL separators
+#   * the password is validated by _record_password_is_credential()
+_CRED_RECORD_TOKEN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9._%+/:@-])"
+    r"([A-Za-z][A-Za-z0-9._-]{0,31})"
+    r"([/:])"
+    r"([^\s'\"`,;/:<>()\[\]{}]{6,})"
+    r"(?![A-Za-z0-9._%+/:@-])"
+)
+
 # PasswordAuthentication directive (sshd_config). Whole token is sensitive
 # as a security-posture disclosure; mask the keyword+value.
 _PWAUTH_RE = re.compile(r"(?i)\bPasswordAuthentication\s+(?:yes|no|[^\s]+)")
@@ -152,9 +165,7 @@ _FLEET_LITERALS: tuple[str, ...] = (
     "***REMOVED-CREDENTIAL***",
     "***REMOVED-CREDENTIAL***",
 )
-_FLEET_LITERAL_RE = re.compile(
-    "|".join(re.escape(lit) for lit in _FLEET_LITERALS)
-)
+_FLEET_LITERAL_RE = re.compile("|".join(re.escape(lit) for lit in _FLEET_LITERALS))
 
 # Headers/markers that declare a memory to be a CREDENTIAL RECORD (the
 # whole thing exists to store secrets) -> VAULT the entire memory.
@@ -181,15 +192,69 @@ _PLACEHOLDER_RE = re.compile(
 # required", "password auth enabled", "credential management", etc.
 _PROSE_STOPWORDS: frozenset[str] = frozenset(
     {
-        "is", "was", "are", "the", "a", "an", "to", "for", "of", "and", "or",
-        "set", "reset", "rotation", "rotate", "rotated", "required", "enabled",
-        "disabled", "auth", "authentication", "management", "manager", "policy",
-        "store", "vault", "field", "value", "prompt", "needed", "missing",
-        "empty", "blank", "default", "strength", "complexity", "expiry",
-        "expires", "expired", "hash", "hashed", "salted", "must", "should",
-        "will", "here", "above", "below", "via", "with", "without", "per",
-        "this", "that", "credentials", "credential", "secrets", "secret",
-        "manager.", "less", "based", "protected", "stored",
+        "is",
+        "was",
+        "are",
+        "the",
+        "a",
+        "an",
+        "to",
+        "for",
+        "of",
+        "and",
+        "or",
+        "set",
+        "reset",
+        "rotation",
+        "rotate",
+        "rotated",
+        "required",
+        "enabled",
+        "disabled",
+        "auth",
+        "authentication",
+        "management",
+        "manager",
+        "policy",
+        "store",
+        "vault",
+        "field",
+        "value",
+        "prompt",
+        "needed",
+        "missing",
+        "empty",
+        "blank",
+        "default",
+        "strength",
+        "complexity",
+        "expiry",
+        "expires",
+        "expired",
+        "hash",
+        "hashed",
+        "salted",
+        "must",
+        "should",
+        "will",
+        "here",
+        "above",
+        "below",
+        "via",
+        "with",
+        "without",
+        "per",
+        "this",
+        "that",
+        "credentials",
+        "credential",
+        "secrets",
+        "secret",
+        "manager.",
+        "less",
+        "based",
+        "protected",
+        "stored",
     }
 )
 
@@ -210,11 +275,43 @@ def _value_is_secret_grade(value: str) -> bool:
 # assignment with one of these values is NOT redacted.
 _NONSECRET_ASSIGN_VALUES: frozenset[str] = frozenset(
     {
-        "true", "false", "yes", "no", "on", "off", "enabled", "disabled",
-        "none", "null", "nil", "user", "users", "admin", "root", "guest",
-        "required", "optional", "default", "auto", "manual", "ok", "set",
-        "unset", "empty", "blank", "valid", "invalid", "active", "inactive",
-        "public", "private", "value", "string", "int", "bool", "type",
+        "true",
+        "false",
+        "yes",
+        "no",
+        "on",
+        "off",
+        "enabled",
+        "disabled",
+        "none",
+        "null",
+        "nil",
+        "user",
+        "users",
+        "admin",
+        "root",
+        "guest",
+        "required",
+        "optional",
+        "default",
+        "auto",
+        "manual",
+        "ok",
+        "set",
+        "unset",
+        "empty",
+        "blank",
+        "valid",
+        "invalid",
+        "active",
+        "inactive",
+        "public",
+        "private",
+        "value",
+        "string",
+        "int",
+        "bool",
+        "type",
     }
 )
 # High-signal assignment heads: a value here is password-grade by intent
@@ -274,6 +371,51 @@ def _prose_value_is_credential(value: str) -> bool:
     # when the memory is a CREDENTIAL RECORD (the record escalation VAULTs
     # the whole memory). A bare all-lowercase word is NOT a credential here.
     return False
+
+
+def _record_password_is_credential(value: str) -> bool:
+    """True for password-looking RHS in a bare user/password record token.
+
+    This must be stricter than prose/assignment values because the token
+    shape also resembles ordinary relative paths (``src/AliceBeta``).
+    """
+    v = value.strip()
+    if not v or len(v) < 6 or _PLACEHOLDER_RE.match(v):
+        return False
+    if _FLEET_LITERAL_RE.fullmatch(v):
+        return True
+    # Dates and version-ish path segments are common in notes and paths.
+    if re.fullmatch(r"\d{1,4}[-/]\d{1,2}[-/]\d{1,4}", v):
+        return False
+    if re.fullmatch(r"v?\d+(?:\.\d+){1,}(?:[-+][0-9A-Za-z.]+)?", v, re.IGNORECASE):
+        return False
+    # Do not treat email/host-looking tokens as passwords.
+    if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", v):
+        return False
+    if re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", v):
+        return False
+    has_lower = bool(re.search(r"[a-z]", v))
+    has_upper = bool(re.search(r"[A-Z]", v))
+    has_digit = bool(re.search(r"[0-9]", v))
+    has_symbol = bool(re.search(r"[^0-9A-Za-z]", v))
+    has_alpha = has_lower or has_upper
+    if not has_alpha:
+        return False
+    # Pure-alpha path/name/release segments are not password-grade, even when
+    # mixed case (e.g. AliceBeta, JulyRelease).
+    if not (has_digit or has_symbol):
+        return False
+    # Ordinary password complexity for this shorthand requires both a digit
+    # and a symbol. This catches values like Tr0ub4dor&3 without accepting
+    # relative path segments that are merely mixed-case words.
+    if has_digit and has_symbol:
+        return True
+    # Fallback for clearly random-looking non-dictionary values that may omit
+    # either digits or symbols. Keep it narrow so release labels and names with
+    # numbers do not become credential spans.
+    classes = sum((has_lower, has_upper, has_digit, has_symbol))
+    longest_alpha_run = max((len(m.group(0)) for m in re.finditer(r"[A-Za-z]+", v)), default=0)
+    return len(v) >= 12 and classes >= 3 and longest_alpha_run <= 4
 
 
 @dataclass
@@ -336,6 +478,8 @@ def _prefilter_hits(text: str) -> bool:
     # Hex blobs (64+) have no keyword anchor; check them cheaply too.
     if _PREFILTER_RE.search(text):
         return True
+    if _CRED_RECORD_TOKEN_RE.search(text):
+        return True
     return bool(_HEX_BLOB_RE.search(text))
 
 
@@ -373,6 +517,7 @@ PREFILTER_SAMPLES: dict[str, str] = {
     "password_auth": "PasswordAuthentication yes",
     "hex64": "a" * 64,
     "fleet_literal": "***REMOVED-CREDENTIAL***",
+    "cred_record_token": "alice/Tr0ub4dor&3",
 }
 
 
@@ -493,7 +638,19 @@ def classify(content: str | None) -> SecretFinding:
             finding.reasons.append(name)
             finding.spans.append((mo.start(vgroup), mo.end(vgroup)))
 
-    # 6. .env-style ALLCAPS secret assignment with a long value → VAULT.
+    # 6. Bare credential-record token: "alice/Tr0ub4dor&3" or
+    # "alice:Tr0ub4dor&3". On its own this is a redactable credential span;
+    # when paired with a credential-record header it escalates below.
+    for mo in _CRED_RECORD_TOKEN_RE.finditer(text):
+        value = mo.group(3)
+        if not _record_password_is_credential(value):
+            continue
+        _escalate(finding, SecretClass.REDACT)
+        finding.reasons.append("cred_record_token")
+        finding.spans.append((mo.start(3), mo.end(3)))
+        cred_span_count += 1
+
+    # 7. .env-style ALLCAPS secret assignment with a long value → VAULT.
     for mo in _ENV_SECRET_RE.finditer(text):
         value = mo.group(3)
         if _PLACEHOLDER_RE.match(value):
@@ -503,13 +660,13 @@ def classify(content: str | None) -> SecretFinding:
         finding.spans.append((mo.start(3), mo.end(3)))
         cred_span_count += 1
 
-    # 7. PasswordAuthentication directive → REDACT (security-posture span).
+    # 8. PasswordAuthentication directive → REDACT (security-posture span).
     for mo in _PWAUTH_RE.finditer(text):
         _escalate(finding, SecretClass.REDACT)
         finding.reasons.append("password_auth")
         finding.spans.append((mo.start(), mo.end()))
 
-    # 8. Long hex blobs (64+) without SHA/commit context → REDACT span only.
+    # 9. Long hex blobs (64+) without SHA/commit context → REDACT span only.
     for mo in _HEX_BLOB_RE.finditer(text):
         window = text[max(0, mo.start() - 30) : mo.start()]
         if _SHA_CONTEXT_RE.search(window):
@@ -518,7 +675,7 @@ def classify(content: str | None) -> SecretFinding:
         finding.reasons.append("hex64")
         finding.spans.append((mo.start(), mo.end()))
 
-    # 9. Credential-RECORD escalation. A memory headed by a credential
+    # 10. Credential-RECORD escalation. A memory headed by a credential
     # marker ("INFRASTRUCTURE CREDENTIALS", "🔑 Credential", "SSH ACCESS
     # PATTERNS", "root login password") that ALSO carries >=1 credential
     # span is PREDOMINANTLY a credential record → VAULT the whole memory,

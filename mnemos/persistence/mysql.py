@@ -1091,6 +1091,7 @@ class MysqlMemoryRepository(MemoryRepository):
             "source_agent",
             "group_id",
             "archived_at",
+            "namespace",
         }
     )
 

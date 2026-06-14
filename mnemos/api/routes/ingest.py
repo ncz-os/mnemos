@@ -1,4 +1,5 @@
 """Session ingestion endpoint."""
+
 import logging
 
 import asyncpg
@@ -13,6 +14,7 @@ from mnemos.api.routes.memories import (
     _validate_permission_mode,
 )
 from mnemos.core.ids import new_memory_id
+from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.domain.models import SessionIngestRequest, SessionIngestResponse
 
 logger = logging.getLogger(__name__)
@@ -39,8 +41,6 @@ def _extract_readable(items: list, max_items: int = 20) -> str:
     return "\n".join(parts) if parts else "(no readable content)"
 
 
-
-
 @router.post("/ingest/session", response_model=SessionIngestResponse)
 async def ingest_session(request: SessionIngestRequest, user: UserContext = Depends(get_current_user)):
     """Ingest Claude Code session data into MNEMOS."""
@@ -64,10 +64,7 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
                         if not items:
                             continue
 
-                        content = (
-                            f"Session {request.session_id} — {len(items)} {label}\n"
-                            f"{_extract_readable(items)}"
-                        )
+                        content = f"Session {request.session_id} — {len(items)} {label}\n" f"{_extract_readable(items)}"
                         mem_id = new_memory_id()
                         metadata = {
                             "source": request.source,
@@ -78,25 +75,36 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
                             "item_count": len(items),
                             "item_type": item_type,
                         }
-                        nats_intents.extend(await _insert_memory_with_created_webhook(
-                            conn=conn,
-                            mem_id=mem_id,
+                        classified = classify_persisted_text_fields(
                             content=content,
-                            category=category,
-                            subcategory=None,
-                            metadata=metadata,
-                            owner_id=user.user_id,
-                            namespace=user.namespace,
-                            permission_mode=permission_mode,
                             verbatim_content=content,
-                            source_model=None,
-                            source_provider=request.source,
-                            source_session=request.session_id,
-                            source_agent=request.agent_id,
-                        ))
+                            metadata=metadata,
+                            namespace=user.namespace,
+                            classified_at="session_ingest",
+                            memory_id=mem_id,
+                        )
+                        nats_intents.extend(
+                            await _insert_memory_with_created_webhook(
+                                conn=conn,
+                                mem_id=mem_id,
+                                content=content,
+                                category=category,
+                                subcategory=None,
+                                metadata=classified.metadata,
+                                owner_id=user.user_id,
+                                namespace=classified.namespace,
+                                permission_mode=permission_mode,
+                                verbatim_content=content,
+                                source_model=None,
+                                source_provider=request.source,
+                                source_session=request.session_id,
+                                source_agent=request.agent_id,
+                            )
+                        )
                         stored_ids.append(mem_id)
 
         from mnemos.nats import publish_event as _nats_publish_event
+
         for subject, payload, msg_id in nats_intents:
             await _nats_publish_event(subject, payload, msg_id=msg_id)
 
@@ -108,8 +116,10 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
 
         logger.info(f"Session {request.session_id} ingested: {len(stored_ids)} records")
         return SessionIngestResponse(
-            success=True, session_id=request.session_id,
-            stored_count=len(stored_ids), memory_ids=stored_ids,
+            success=True,
+            session_id=request.session_id,
+            stored_count=len(stored_ids),
+            memory_ids=stored_ids,
         )
     except asyncpg.PostgresError as e:
         logger.error(f"Session ingestion DB error: {e}", exc_info=True)

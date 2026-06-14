@@ -8,6 +8,7 @@ from typing import Dict, Optional
 
 from fastapi import HTTPException
 
+from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.core.security import is_root
 from mnemos.db import portability_repo as repo
 
@@ -47,10 +48,7 @@ def _validate_import_request(envelope: MPFEnvelope, preserve_owner: bool, user) 
     if not envelope.mpf_version.startswith(MPF_VERSION_PREFIX):
         raise HTTPException(
             status_code=415,
-            detail=(
-                f"Unsupported MPF version {envelope.mpf_version!r}; "
-                f"expected {MPF_VERSION_PREFIX}x"
-            ),
+            detail=(f"Unsupported MPF version {envelope.mpf_version!r}; " f"expected {MPF_VERSION_PREFIX}x"),
         )
 
     if preserve_owner and not is_root(user):
@@ -75,9 +73,7 @@ def _validate_import_request(envelope: MPFEnvelope, preserve_owner: bool, user) 
 
     if envelope.memory_versions:
         memory_record_ids = {r.id for r in envelope.records if r.kind == "memory"}
-        sidecar_versioned_ids = {
-            e.get("record_id") for e in envelope.memory_versions if e.get("record_id")
-        }
+        sidecar_versioned_ids = {e.get("record_id") for e in envelope.memory_versions if e.get("record_id")}
         uncovered = memory_record_ids - sidecar_versioned_ids
         if uncovered:
             raise HTTPException(
@@ -114,9 +110,7 @@ async def import_memories(
 
         for record in envelope.records:
             if record.kind != "memory":
-                stats.unsupported_kinds[record.kind] = (
-                    stats.unsupported_kinds.get(record.kind, 0) + 1
-                )
+                stats.unsupported_kinds[record.kind] = stats.unsupported_kinds.get(record.kind, 0) + 1
                 continue
 
             if record.payload_version != MEMORY_PAYLOAD_VERSION:
@@ -148,6 +142,18 @@ async def import_memories(
             permission_mode = p.get("permission_mode") or 600
             metadata = p.get("metadata") or {}
             quality_rating = p.get("quality_rating") or 75
+            verbatim_content = p.get("verbatim_content") or content
+
+            classified = classify_persisted_text_fields(
+                content=content,
+                verbatim_content=verbatim_content,
+                metadata=metadata,
+                namespace=imported_ns,
+                classified_at="mpf_record_import",
+                memory_id=record.id,
+            )
+            metadata = classified.metadata
+            imported_ns = classified.namespace
 
             if non_root_id_rewrite:
                 persisted_id = _derive_caller_scoped_id(
@@ -177,7 +183,7 @@ async def import_memories(
                         source_provider=p.get("source_provider"),
                         source_session=p.get("source_session"),
                         source_agent=p.get("source_agent"),
-                        verbatim_content=p.get("verbatim_content") or content,
+                        verbatim_content=verbatim_content,
                         created=_parse_iso_naive(p.get("created")),
                         updated=_parse_iso_naive(p.get("updated")),
                     )
@@ -200,6 +206,10 @@ async def import_memories(
                     if existing_mem is None:
                         mismatched_fields.append("row missing")
                     else:
+                        try:
+                            existing_verbatim = existing_mem["verbatim_content"]
+                        except (KeyError, IndexError):
+                            existing_verbatim = existing_mem["content"]
                         checks = [
                             ("content", existing_mem["content"], content),
                             ("category", existing_mem["category"], category),
@@ -221,6 +231,7 @@ async def import_memories(
                                 p.get("source_session"),
                             ),
                             ("source_agent", existing_mem["source_agent"], p.get("source_agent")),
+                            ("verbatim_content", existing_verbatim, verbatim_content),
                         ]
                         for col, db_val, env_val in checks:
                             if db_val != env_val:

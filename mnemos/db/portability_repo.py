@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any, Optional, Sequence
 
+from mnemos.core.persisted_text_classification import classify_persisted_text_fields
+
 
 async def fetch_memory_export(
     conn,
@@ -82,9 +84,7 @@ async def _fetch_sidecar(
         conditions.append("deleted_at IS NULL")
     if bound_to_memories:
         if null_ok and memory_ids:
-            conditions.append(
-                f"({memory_id_column} IS NULL OR {memory_id_column} = ANY(${idx}::text[]))"
-            )
+            conditions.append(f"({memory_id_column} IS NULL OR {memory_id_column} = ANY(${idx}::text[]))")
             params.append(list(memory_ids))
             idx += 1
         elif null_ok:
@@ -189,9 +189,7 @@ async def fetch_deletion_log_for_export(
     # lexicographically and we have a matching composite index from
     # migrations_v5_3_3_deletion_log_export_index.sql.
     if cursor_executed_at and cursor_id:
-        conditions.append(
-            f"(executed_at, id) > (${idx}::timestamptz, ${idx + 1}::uuid)"
-        )
+        conditions.append(f"(executed_at, id) > (${idx}::timestamptz, ${idx + 1}::uuid)")
         params.append(cursor_executed_at)
         params.append(cursor_id)
         idx += 2
@@ -281,10 +279,7 @@ async def fetch_referenced_memory_allowlist(
     scope_owner: Optional[str] = None,
     scope_namespace: Optional[str] = None,
 ):
-    sql = (
-        "SELECT id, owner_id, namespace FROM memories "
-        "WHERE id = ANY($1::text[]) AND deleted_at IS NULL"
-    )
+    sql = "SELECT id, owner_id, namespace FROM memories " "WHERE id = ANY($1::text[]) AND deleted_at IS NULL"
     params: list[Any] = [list(referenced_ids)]
     if scope_owner is not None:
         sql += " AND owner_id = $2"
@@ -318,6 +313,22 @@ async def insert_memory(
     created,
     updated,
 ) -> str:
+    import json
+
+    try:
+        metadata_obj = json.loads(metadata_json) if metadata_json else {}
+    except Exception:
+        metadata_obj = {}
+    classified = classify_persisted_text_fields(
+        content=content,
+        verbatim_content=verbatim_content or content,
+        metadata=metadata_obj,
+        namespace=namespace,
+        classified_at="mpf_record_import",
+        memory_id=memory_id,
+    )
+    metadata_json = json.dumps(classified.metadata)
+    namespace = classified.namespace
     return await conn.execute(
         """
         INSERT INTO memories (
@@ -379,8 +390,7 @@ async def delete_memory_branches_for_memories(conn, memory_ids: Sequence[str]) -
 
 async def fetch_versioned_memory_ids(conn, memory_ids: Sequence[str]):
     return await conn.fetch(
-        "SELECT DISTINCT memory_id FROM memory_versions "
-        "WHERE memory_id = ANY($1::text[]) AND deleted_at IS NULL",
+        "SELECT DISTINCT memory_id FROM memory_versions " "WHERE memory_id = ANY($1::text[]) AND deleted_at IS NULL",
         list(memory_ids),
     )
 
@@ -622,9 +632,7 @@ async def compression_candidate_exists(
     owner_id: str,
 ) -> bool:
     exists = await conn.fetchval(
-        "SELECT 1 FROM memory_compression_candidates "
-        "WHERE id = $1::uuid AND memory_id = $2 "
-        "AND owner_id = $3",
+        "SELECT 1 FROM memory_compression_candidates " "WHERE id = $1::uuid AND memory_id = $2 " "AND owner_id = $3",
         candidate_id,
         memory_id,
         owner_id,
@@ -649,6 +657,15 @@ async def insert_compressed_variant(
     judge_model: Optional[str],
     selected_at,
 ) -> str:
+    classified = classify_persisted_text_fields(
+        compressed_content=compressed_content,
+        metadata={},
+        namespace="default",
+        classified_at="mpf_compression_import",
+        memory_id=memory_id,
+    )
+    if classified.vaulted:
+        compressed_content = "[REDACTED]"
     return await conn.execute(
         """
         INSERT INTO memory_compressed_variants (

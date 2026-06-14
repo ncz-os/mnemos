@@ -1227,7 +1227,30 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         if not fields:
             return None
         conn = self._conn(tx)
-        keys = list(fields.keys())
+        keys = [
+            k
+            for k in fields.keys()
+            if k
+            in {
+                "content",
+                "category",
+                "subcategory",
+                "metadata",
+                "quality_rating",
+                "compressed_content",
+                "verbatim_content",
+                "permission_mode",
+                "source_model",
+                "source_provider",
+                "source_session",
+                "source_agent",
+                "group_id",
+                "archived_at",
+                "namespace",
+            }
+        ]
+        if not keys:
+            return await self.get_memory(tx, memory_id, visibility=visibility)
         set_clauses = [f"{col} = ?" for col in keys]
         values: list[Any] = [fields[k] for k in keys]
         if "content" in fields:
