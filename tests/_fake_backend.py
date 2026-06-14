@@ -138,6 +138,10 @@ class _FakeMemoryRepo:
         )
         return self._resolve("bump_recall_and_get_memory", None)
 
+    async def backfill_missing_content_hashes(self, tx, *, batch_size=500, apply=False):
+        self.calls.append(("backfill_missing_content_hashes", {"batch_size": batch_size, "apply": apply}))
+        return self._resolve("backfill_missing_content_hashes", 0)
+
     async def find_duplicate_content_groups(self, tx, *, namespace=None):
         self.calls.append(("find_duplicate_content_groups", {"namespace": namespace}))
         return self._resolve("find_duplicate_content_groups", [])
@@ -679,6 +683,25 @@ class _PoolBackedMemoryRepo:
         row["last_recalled_at"] = datetime(2026, 5, 3, 12, 0, 0)
         return row
 
+    async def backfill_missing_content_hashes(self, tx, *, batch_size=500, apply=False):
+        from mnemos.domain.artemis_dedup import content_sha256
+
+        if not apply:
+            return sum(1 for row in self._pool.state["memories"].values() if row.get("content_hash") is None)
+        changed = 0
+        for row in sorted(
+            self._pool.state["memories"].values(),
+            key=lambda item: (item.get("created") or "", item.get("id") or ""),
+        ):
+            if changed >= batch_size:
+                break
+            if row.get("content_hash") is not None:
+                continue
+            row["content_hash"] = content_sha256(row.get("content") or "")
+            row["updated"] = datetime(2026, 5, 3, 12, 0, 0)
+            changed += 1
+        return changed
+
     async def find_duplicate_content_groups(self, tx, *, namespace=None):
         grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for row in self._pool.state["memories"].values():
@@ -688,13 +711,21 @@ class _PoolBackedMemoryRepo:
                 continue
             if row.get("consolidated_into") is not None or not row.get("content_hash"):
                 continue
-            key = (row.get("owner_id"), row.get("namespace"), row.get("content_hash"))
+            normalized_content = (row.get("content") or "").replace("\r\n", "\n").replace("\r", "\n")
+            key = (row.get("owner_id"), row.get("namespace"), row.get("content_hash"), normalized_content)
             grouped.setdefault(key, []).append(row)
         result = []
-        for (owner_id, ns, content_hash), rows in grouped.items():
+        for (owner_id, ns, content_hash, _normalized_content), rows in grouped.items():
             if len(rows) < 2:
                 continue
-            rows.sort(key=lambda row: (row.get("created") or "", row.get("id") or ""))
+            rows.sort(
+                key=lambda row: (
+                    row.get("created") or "",
+                    row.get("quality_rating") if row.get("quality_rating") is not None else -1,
+                    row.get("id") or "",
+                ),
+                reverse=True,
+            )
             memory_ids = [row["id"] for row in rows]
             result.append(
                 {
@@ -703,10 +734,30 @@ class _PoolBackedMemoryRepo:
                     "content_hash": content_hash,
                     "duplicate_count": len(memory_ids),
                     "memory_ids": memory_ids,
+                    "keep_id": memory_ids[0],
                     "canonical_id": memory_ids[0],
                 }
             )
         return result
+
+    async def soft_delete_memory(
+        self,
+        tx,
+        memory_id,
+        *,
+        visibility,
+        requested_by=None,
+        requested_at=None,
+        request_kind="admin_purge",
+        reason=None,
+        source=None,
+    ):
+        row = self._pool.state["memories"].get(memory_id)
+        if row is None or row.get("deleted_at") is not None:
+            return None
+        row["deleted_at"] = datetime(2026, 5, 3, 12, 0, 0)
+        row["updated"] = datetime(2026, 5, 3, 12, 0, 0)
+        return row
 
     async def consolidate_duplicate_memories(self, tx, *, canonical_id, duplicate_ids):
         changed = 0

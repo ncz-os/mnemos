@@ -1061,6 +1061,44 @@ class PostgresMemoryRepository(MemoryRepository):
             memory_id,
         )
 
+    async def backfill_missing_content_hashes(
+        self,
+        tx: Transaction,
+        *,
+        batch_size: int = 500,
+        apply: bool = False,
+    ) -> int:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        conn = _postgres_tx(tx).conn
+        if not apply:
+            return int(await conn.fetchval("SELECT COUNT(*) FROM memories WHERE content_hash IS NULL") or 0)
+        result = await conn.execute(
+            """
+            WITH candidates AS (
+                SELECT id
+                FROM memories
+                WHERE content_hash IS NULL
+                ORDER BY created ASC, id ASC
+                LIMIT $1
+            )
+            UPDATE memories m
+               SET content_hash = encode(
+                       digest(
+                           replace(replace(COALESCE(m.content, ''), E'\r\n', E'\n'), E'\r', E'\n'),
+                           'sha256'
+                       ),
+                       'hex'
+                   ),
+                   updated = NOW()
+              FROM candidates
+             WHERE m.id = candidates.id
+               AND m.content_hash IS NULL
+            """,
+            int(batch_size),
+        )
+        return _pg_result_count(result)
+
     async def find_duplicate_content_groups(
         self,
         tx: Transaction,
@@ -1076,15 +1114,20 @@ class PostgresMemoryRepository(MemoryRepository):
                 namespace,
                 content_hash,
                 COUNT(*)::int AS duplicate_count,
-                ARRAY_AGG(id ORDER BY created ASC, id ASC) AS memory_ids,
-                (ARRAY_AGG(id ORDER BY created ASC, id ASC))[1] AS canonical_id
-            FROM memories
-            WHERE deleted_at IS NULL
-              AND archived_at IS NULL
-              AND consolidated_into IS NULL
-              AND content_hash IS NOT NULL
-              AND ($1::text IS NULL OR namespace=$1)
-            GROUP BY owner_id, namespace, content_hash
+                ARRAY_AGG(id ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) AS memory_ids,
+                (ARRAY_AGG(id ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC))[1] AS keep_id,
+                (ARRAY_AGG(id ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC))[1] AS canonical_id
+            FROM (
+                SELECT id, owner_id, namespace, content_hash, created, quality_rating,
+                       replace(replace(COALESCE(content, ''), E'\r\n', E'\n'), E'\r', E'\n') AS normalized_content
+                FROM memories
+                WHERE deleted_at IS NULL
+                  AND archived_at IS NULL
+                  AND consolidated_into IS NULL
+                  AND content_hash IS NOT NULL
+                  AND ($1::text IS NULL OR namespace=$1)
+            ) candidates
+            GROUP BY owner_id, namespace, content_hash, normalized_content
             HAVING COUNT(*) > 1
             ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC
             """,
@@ -1125,6 +1168,35 @@ class PostgresMemoryRepository(MemoryRepository):
             list(duplicate_ids),
         )
         return _pg_result_count(result)
+
+    async def soft_delete_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        requested_by: str | None = None,
+        requested_at: Any = None,
+        request_kind: str = "admin_purge",
+        reason: str | None = None,
+        source: Sequence[str] | None = None,
+    ) -> Row | None:
+        _ = (requested_by, requested_at, request_kind, reason, source)
+        conn = _postgres_tx(tx).conn
+        vis_clause, vis_params, _include = _render_postgres_visibility(visibility, start_idx=2)
+        if vis_clause:
+            sql = (
+                "UPDATE memories SET deleted_at = COALESCE(deleted_at, NOW()), updated = NOW() "
+                f"WHERE id=$1 AND deleted_at IS NULL AND {vis_clause} "
+                "RETURNING owner_id, namespace, id, content, category, subcategory"
+            )
+            return await conn.fetchrow(sql, memory_id, *vis_params)
+        return await conn.fetchrow(
+            "UPDATE memories SET deleted_at = COALESCE(deleted_at, NOW()), updated = NOW() "
+            "WHERE id=$1 AND deleted_at IS NULL "
+            "RETURNING owner_id, namespace, id, content, category, subcategory",
+            memory_id,
+        )
 
     async def delete_memory(
         self,
