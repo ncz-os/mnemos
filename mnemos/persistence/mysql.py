@@ -1200,6 +1200,36 @@ class MysqlMemoryRepository(MemoryRepository):
                 return None
         return await self.get_memory(tx, memory_id, visibility=visibility)
 
+    async def soft_delete_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        requested_by: str | None = None,
+        requested_at: Any = None,
+        request_kind: str = "admin_purge",
+        reason: str | None = None,
+        source: Sequence[str] | None = None,
+    ) -> Row | None:
+        _ = (requested_by, requested_at, request_kind, reason, source)
+        row = await self.get_memory(tx, memory_id, visibility=visibility)
+        if row is None:
+            return None
+        conn = tx.conn
+        vis_clause, vis_params = _render_visibility(visibility, table_alias="m")
+        where = ["m.id = %s", "m.deleted_at IS NULL"]
+        params: list[Any] = [memory_id]
+        if vis_clause:
+            where.append(vis_clause)
+            params += vis_params
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"UPDATE memories m SET deleted_at = COALESCE(deleted_at, NOW(6)), updated = NOW(6) WHERE {' AND '.join(where)}",
+                params,
+            )
+            return row if cursor.rowcount else None
+
     async def delete_memory(
         self,
         tx: Transaction,
@@ -1527,8 +1557,44 @@ class MysqlMemoryRepository(MemoryRepository):
     ) -> list[Row]:
         raise NotImplementedError("mysql: fetch_referenced_memory_allowlist not yet implemented")
 
+    async def backfill_missing_content_hashes(
+        self,
+        tx: Transaction,
+        *,
+        batch_size: int = 500,
+        apply: bool = False,
+    ) -> int:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            if not apply:
+                await cursor.execute("SELECT COUNT(*) AS cnt FROM memories WHERE content_hash IS NULL")
+                row = await _fetchone_dict(cursor)
+                return int((row or {}).get("cnt") or 0)
+            await cursor.execute(
+                """
+                UPDATE memories m
+                JOIN (
+                    SELECT id
+                      FROM memories
+                     WHERE content_hash IS NULL
+                     ORDER BY created ASC, id ASC
+                     LIMIT %s
+                ) candidates ON candidates.id = m.id
+                   SET m.content_hash = SHA2(
+                           REPLACE(REPLACE(COALESCE(m.content, ''), '\\r\\n', '\\n'), '\\r', '\\n'),
+                           256
+                       ),
+                       m.updated = NOW(6)
+                 WHERE m.content_hash IS NULL
+                """,
+                (int(batch_size),),
+            )
+            return int(cursor.rowcount or 0)
+
     async def fetch_duplicate_content_groups(self, *args: Any, **kwargs: Any) -> list[Row]:
-        raise NotImplementedError("mysql: fetch_duplicate_content_groups not yet implemented")
+        return await self.find_duplicate_content_groups(*args, **kwargs)
 
     async def find_duplicate_content_groups(
         self,
@@ -1536,7 +1602,43 @@ class MysqlMemoryRepository(MemoryRepository):
         *,
         namespace: str | None = None,
     ) -> list[Row]:
-        raise NotImplementedError("mysql: find_duplicate_content_groups not yet implemented")
+        conn = tx.conn
+        where = [
+            "deleted_at IS NULL",
+            "archived_at IS NULL",
+            "consolidated_into IS NULL",
+            "content_hash IS NOT NULL",
+        ]
+        params: list[Any] = []
+        if namespace is not None:
+            where.append("namespace = %s")
+            params.append(namespace)
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT owner_id, namespace, content_hash,
+                       COUNT(*) AS duplicate_count,
+                       GROUP_CONCAT(id ORDER BY created DESC, quality_rating DESC, id DESC SEPARATOR CHAR(31)) AS memory_ids,
+                       SUBSTRING_INDEX(GROUP_CONCAT(id ORDER BY created DESC, quality_rating DESC, id DESC SEPARATOR CHAR(31)), CHAR(31), 1) AS keep_id,
+                       SUBSTRING_INDEX(GROUP_CONCAT(id ORDER BY created DESC, quality_rating DESC, id DESC SEPARATOR CHAR(31)), CHAR(31), 1) AS canonical_id
+                  FROM (
+                    SELECT id, owner_id, namespace, content_hash, created, quality_rating,
+                           REPLACE(REPLACE(COALESCE(content, ''), '\\r\\n', '\\n'), '\\r', '\\n') AS normalized_content
+                      FROM memories
+                     WHERE {" AND ".join(where)}
+                  ) candidates
+                 GROUP BY owner_id, namespace, content_hash, normalized_content
+                HAVING COUNT(*) > 1
+                 ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC
+                """,
+                params,
+            )
+            rows = await _fetch_all_dicts(cursor)
+        for row in rows:
+            raw = row.get("memory_ids") or ""
+            row["memory_ids"] = [part for part in str(raw).split("\x1f") if part]
+            row["duplicate_count"] = int(row.get("duplicate_count") or 0)
+        return rows
 
     async def consolidate_duplicate_memories(
         self,
