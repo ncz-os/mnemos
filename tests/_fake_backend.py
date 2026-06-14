@@ -469,6 +469,9 @@ class FakeBackend:
         return None
 
 
+_FakeBackend = FakeBackend
+
+
 class _PoolBackedTx(PostgresTransaction):
     """PostgresTransaction subclass backed by a FakeConnection.
 

@@ -58,9 +58,7 @@ def _patch_typer_click_compat() -> None:
         if not getattr(TyperOption.__init__, "_mnemos_click_compat", False):
             sig = inspect.signature(original_option_init)
             params = sig.parameters
-            accepts_var_kwargs = any(
-                param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
-            )
+            accepts_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
             accepted_names = set(params.keys())
 
             def option_init(self: Any, **kwargs: Any) -> None:
@@ -385,8 +383,6 @@ def _print_dedup_markdown(payload: dict[str, Any]) -> None:
 
 async def _open_cli_persistence_backend():
     """Open a backend for one-shot CLI maintenance commands."""
-    import asyncpg
-
     import mnemos.core.lifecycle as lifecycle
 
     try:
@@ -402,6 +398,40 @@ async def _open_cli_persistence_backend():
             settings,
         )
         return backend, True
+
+    if backend_type == "oracle":
+        oracle_dsn = lifecycle._oracle_dsn_from_settings(settings) or lifecycle.oracle_dsn_env()
+        if not oracle_dsn:
+            raise RuntimeError(
+                "Oracle backend selected but no oracle:// DSN configured. "
+                "Set MNEMOS_DATABASE_DSN=oracle://user:pass@host:port/service "
+                "or ORACLE_DSN."
+            )
+        return await lifecycle._build_oracle_backend(oracle_dsn, settings), True
+
+    if backend_type == "db2":
+        db2_dsn = lifecycle._db2_dsn_from_settings(settings) or lifecycle.db2_dsn_env()
+        if not db2_dsn:
+            raise RuntimeError(
+                "Db2 backend selected but no db2:// DSN configured. "
+                "Set MNEMOS_DATABASE_DSN=db2://user:pass@host:port/database "
+                "or DB2_DSN."
+            )
+        return await lifecycle._build_db2_backend(db2_dsn, settings), True
+
+    if backend_type == "mysql":
+        mysql_dsn = lifecycle._mysql_dsn_from_settings(settings)
+        if not mysql_dsn:
+            raise RuntimeError(
+                "MySQL backend selected but no mysql:// DSN configured. "
+                "Set MNEMOS_DATABASE_DSN=mysql://user:pass@host:3306/mnemos."
+            )
+        return await lifecycle._build_mysql_backend(mysql_dsn, settings), True
+
+    if backend_type != "postgres":
+        raise RuntimeError(f"Backend {backend_type!r} is not supported by CLI maintenance commands.")
+
+    import asyncpg
 
     database_dsn = lifecycle._database_dsn_from_settings(settings)
     if database_dsn:
@@ -489,7 +519,9 @@ async def _memory_dedup_async(*, namespace: str | None, apply: bool) -> dict[str
 
     backend, close_backend = await _open_cli_persistence_backend()
     try:
-        return await dedup_exact_content(backend, namespace=namespace, apply=apply)
+        payload = await dedup_exact_content(backend, namespace=namespace, apply=apply)
+        _schedule_dedup_side_effects(payload)
+        return payload
     finally:
         if close_backend:
             await backend.close()
@@ -720,7 +752,6 @@ def artemis_memory_dedup(
 ) -> None:
     """Deduplicate exact active memory-content duplicates with reversible soft-deletes."""
     payload = asyncio.run(_memory_dedup_async(namespace=namespace, apply=apply))
-    _schedule_dedup_side_effects(payload)
     if json_output:
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     else:
@@ -738,9 +769,7 @@ def artemis_dedup_sweep(
     if dry_run and auto_merge:
         typer.echo("ERROR: choose either --dry-run or --auto-merge.", err=True)
         raise typer.Exit(2)
-    payload = asyncio.run(
-        _dedup_sweep_async(namespace=namespace, auto_merge=auto_merge)
-    )
+    payload = asyncio.run(_dedup_sweep_async(namespace=namespace, auto_merge=auto_merge))
     if json_output:
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     else:
@@ -774,7 +803,9 @@ def import_doc(
     tag: str = typer.Option(..., "--tag", help="Active project tag.", is_flag=False),
     category: str = typer.Option("documents", "--category", help="Memory category.", is_flag=False),
     subcategory: Optional[str] = typer.Option(None, "--subcategory", help="Memory subcategory.", is_flag=False),
-    permission_mode: Optional[int] = typer.Option(None, "--permission-mode", help="Unix-style permission mode.", is_flag=False),
+    permission_mode: Optional[int] = typer.Option(
+        None, "--permission-mode", help="Unix-style permission mode.", is_flag=False
+    ),
     allow_archive_snapshot: bool = typer.Option(
         False,
         "--allow-archive-snapshot",
@@ -802,7 +833,9 @@ def import_project(
     repo_path: Path = typer.Argument(..., help="Repository path to scan for docs."),
     tag: str = typer.Option(..., "--tag", help="Active project tag.", is_flag=False),
     category: str = typer.Option("documents", "--category", help="Memory category.", is_flag=False),
-    permission_mode: Optional[int] = typer.Option(None, "--permission-mode", help="Unix-style permission mode.", is_flag=False),
+    permission_mode: Optional[int] = typer.Option(
+        None, "--permission-mode", help="Unix-style permission mode.", is_flag=False
+    ),
     allow_archive_snapshot: bool = typer.Option(
         False,
         "--allow-archive-snapshot",
@@ -1025,11 +1058,9 @@ def doctor() -> None:
 def dump_openapi(
     output: Optional[str] = typer.Option(
         None,
-        "--output", "-o",
-        help=(
-            "Write the OpenAPI spec to this path instead of stdout. "
-            "Use ``-`` or omit to print to stdout."
-        ),
+        "--output",
+        "-o",
+        help=("Write the OpenAPI spec to this path instead of stdout. " "Use ``-`` or omit to print to stdout."),
     ),
     indent: int = typer.Option(
         2,
