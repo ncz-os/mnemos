@@ -1,4 +1,4 @@
---#SET TERMINATOR %
+--#SET TERMINATOR @
 -- migration: 0042_knemon_baseline_tables
 -- target:    IBM Db2 12.1.5
 -- purpose:   KNEMON Phase 1 baseline snapshot + registry. Db2 parity port of Oracle 0042.
@@ -19,12 +19,12 @@ BEGIN
       ts_utc          TIMESTAMP(6) WITH TIME ZONE NOT NULL,
       CONSTRAINT pk_knemon_phase1_20260528 PRIMARY KEY (event_id)
     )';
-END%
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_p1b_task_kind ON knemon_phase1_baseline_2026_05_28(task_kind)'; END%
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_p1b_provider ON knemon_phase1_baseline_2026_05_28(provider)'; END%
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_p1b_model ON knemon_phase1_baseline_2026_05_28(provider, model)'; END%
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_p1b_session ON knemon_phase1_baseline_2026_05_28(session_urn)'; END%
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_p1b_ts ON knemon_phase1_baseline_2026_05_28(ts_utc)'; END%
+END@
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_p1b_task_kind ON knemon_phase1_baseline_2026_05_28(task_kind)'; END@
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_p1b_provider ON knemon_phase1_baseline_2026_05_28(provider)'; END@
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_p1b_model ON knemon_phase1_baseline_2026_05_28(provider, model)'; END@
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_p1b_session ON knemon_phase1_baseline_2026_05_28(session_urn)'; END@
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX ix_knemon_p1b_ts ON knemon_phase1_baseline_2026_05_28(ts_utc)'; END@
 
 BEGIN
   DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
@@ -44,4 +44,4 @@ BEGIN
       CONSTRAINT pk_knemon_baselines PRIMARY KEY (id),
       CONSTRAINT uq_knemon_baseline_name UNIQUE (baseline_name)
     )';
-END%
+END@
