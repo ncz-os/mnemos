@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from mnemos.persistence import SqliteBackend
+from mnemos.persistence.sqlite import _execute
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
 
@@ -111,8 +112,7 @@ async def test_sqlite_semantic_search_boosts_recent_candidates(tmp_path):
     assert len(unboosted) <= 2
     assert len(boosted) <= 2
     assert unboosted[0]["id"] == old
-    assert boosted[0]["id"] == newer
-    assert [row["id"] for row in boosted].index(newer) < [row["id"] for row in boosted].index(old)
+    assert [row["id"] for row in boosted] == [newer, old]
 
 
 @pytest.mark.asyncio
@@ -146,7 +146,8 @@ async def test_sqlite_semantic_search_invalid_updated_falls_back_to_created(tmp_
                 content="fresh valid boosted winner",
                 updated=now,
             )
-            await tx.conn.execute(
+            await _execute(
+                tx.conn,
                 "UPDATE memories SET updated = ? WHERE id = ?",
                 ("not-a-date", corrupt),
             )
@@ -169,6 +170,68 @@ async def test_sqlite_semantic_search_invalid_updated_falls_back_to_created(tmp_
         await backend.close()
 
     assert [row["id"] for row in boosted] == [fresh, corrupt]
+
+
+@pytest.mark.asyncio
+async def test_sqlite_semantic_search_recency_prefers_last_recalled_at(tmp_path):
+    settings = SimpleNamespace(database=SimpleNamespace(embedding_dim=3))
+    backend = SqliteBackend(tmp_path / "recency-last-recalled.sqlite3", settings)
+    await backend.open()
+    visibility = VisibilityFilter(
+        scope=VisibilityScope.ROOT_BYPASS,
+        user_id=None,
+        group_ids=(),
+        namespace=None,
+    )
+    now = datetime.now(timezone.utc)
+    updated_winner = "sqlite-recency-updated-winner"
+    recalled_winner = "sqlite-recency-recalled-winner"
+
+    try:
+        async with backend.transactional() as tx:
+            await _insert_memory(
+                backend,
+                tx,
+                memory_id=updated_winner,
+                content="fresh by updated only",
+                updated=now,
+            )
+            await _insert_memory(
+                backend,
+                tx,
+                memory_id=recalled_winner,
+                content="fresh by recall",
+                updated=now - timedelta(days=90),
+            )
+            await _execute(
+                tx.conn,
+                "UPDATE memories SET last_recalled_at = ? WHERE id = ?",
+                ((now - timedelta(days=90)).isoformat(), updated_winner),
+            )
+            await _execute(
+                tx.conn,
+                "UPDATE memories SET last_recalled_at = ? WHERE id = ?",
+                (now.isoformat(), recalled_winner),
+            )
+            await backend.memories.upsert_memory_embedding(tx, updated_winner, [1.0, 0.0, 0.0])
+            await backend.memories.upsert_memory_embedding(
+                tx,
+                recalled_winner,
+                _embedding_with_similarity(0.99),
+            )
+
+            boosted = await backend.memories.semantic_search(
+                tx,
+                embedding=[1.0, 0.0, 0.0],
+                limit=2,
+                visibility=visibility,
+                boost_recency=True,
+                recency_weight=0.2,
+            )
+    finally:
+        await backend.close()
+
+    assert [row["id"] for row in boosted] == [recalled_winner, updated_winner]
 
 
 @pytest.mark.asyncio

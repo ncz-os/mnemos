@@ -241,7 +241,11 @@ def test_db2_semantic_search_recency_rerank_sorts_invalid_scores_last() -> None:
     ids = [row["id"] for row in result]
     assert ids == ["valid-old-best", "valid-fresh", "valid-old-next"]
     assert {"rank-none", "rank-invalid", "rank-nan"}.isdisjoint(ids)
-    assert [row["rank_score"] for row in result] == sorted(row["rank_score"] for row in result)
+    assert {row["id"]: row["rank_score"] for row in result} == {
+        "valid-old-best": 0.20,
+        "valid-fresh": 0.31,
+        "valid-old-next": 0.25,
+    }
     assert len(result) <= 3
 
 
