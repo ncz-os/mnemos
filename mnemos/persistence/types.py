@@ -15,7 +15,7 @@ MEMORY_COLS = (
     "metadata, quality_rating, compressed_content, verbatim_content, "
     "owner_id, group_id, namespace, permission_mode, "
     "source_model, source_provider, source_session, source_agent, "
-    "archived_at"
+    "archived_at, consolidated_into"
 )
 
 # Backward-compatible persistence-layer alias for modules that still use the

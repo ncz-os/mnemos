@@ -118,6 +118,10 @@ class MemoryItem(BaseModel):
     # row ranked where it did and apply their own cutoff on top of the
     # server-side min_score floor.
     score: Optional[float] = None
+    # Non-null when this row has been superseded/consolidated into a
+    # current memory. Search keeps the stale row visible but ranks it
+    # behind current rows when recency/decay ordering is applied.
+    superseded_by: Optional[str] = None
 
 
 class FederationConsolidationEvent(BaseModel):
@@ -512,6 +516,7 @@ def row_to_memory(row, include_compressed: bool = False, redact_secrets: bool = 
         archived_at=_isoformat_value(row.get("archived_at")),
         archived=row.get("archived_at") is not None,
         score=normalize_similarity(row),
+        superseded_by=row.get("superseded_by") or row.get("consolidated_into"),
     )
 
 
