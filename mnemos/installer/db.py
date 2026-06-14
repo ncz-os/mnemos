@@ -367,6 +367,26 @@ def _is_local_postgres_host(host: str) -> bool:
     return h == "localhost"
 
 
+def selected_migration_groups(config: Config) -> set[str]:
+    """Return migration component groups needed for an installer selection.
+
+    The current Postgres runner still applies all migrations for compatibility;
+    this selector documents the concrete gating boundary and lets tests/CI catch
+    drift as migrations become component-addressable.
+    """
+    components = set(getattr(config, "selected_components", ()) or ())
+    if not components:
+        return {"core", "webhooks", "federation", "compression", "pantheon"}
+    groups = {"core"}
+    if components & {"server", "nats", "full"}:
+        groups.update({"webhooks", "federation"})
+    if components & {"ml", "morpheus", "persephone", "apollo", "artemis", "full"}:
+        groups.add("compression")
+    if components & {"pantheon", "full"}:
+        groups.add("pantheon")
+    return groups
+
+
 def run_migrations(config: Config) -> bool:
     """Run SQL migration files in order. Idempotent.
 
@@ -436,6 +456,11 @@ def run_migrations(config: Config) -> bool:
         return False
 
     repo_path = Path(__file__).resolve().parents[2]
+    migration_groups = selected_migration_groups(config)
+    if getattr(config, "selected_components", ()):
+        print(f"[db] Selected migration groups: {', '.join(sorted(migration_groups))}")
+        print("[db] Compatibility mode: applying full ordered migration chain; selector is recorded for parity gating.")
+
     migration_files = [
         repo_path / "db" / "migrations.sql",
         repo_path / "db" / "migrations_v1_multiuser.sql",
