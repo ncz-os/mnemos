@@ -151,6 +151,8 @@ async def publish_routing_event(payload: dict[str, Any], metadata: dict[str, Any
 
 async def write_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
     """Write one routing decision as a memory, swallowing all failures."""
+    # Keep this memory telemetry path as-is. Redirecting PANTHEON telemetry to
+    # pantheon_routing_audit is a separate follow-up.
     try:
         content = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         metadata_json = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
