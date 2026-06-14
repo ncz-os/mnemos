@@ -33,6 +33,9 @@ jobs:
       - name: Lint (ruff)
         run: .venv/bin/ruff check .
 
+      - name: Migration parity
+        run: .venv/bin/python scripts/check_migration_parity.py --mode full
+
       - name: Lint env discipline
         run: |
           # Runtime environment reads must route through mnemos/core/config.py.
