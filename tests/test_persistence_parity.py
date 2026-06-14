@@ -573,7 +573,9 @@ def test_edge_sqlite_list_memories_serializes_timestamp_text(tmp_path, monkeypat
     assert body["count"] == 1
     assert body["memories"][0]["id"] == memory_id
     assert body["memories"][0]["created"] == "2026-04-29T12:34:56"
-    assert body["memories"][0]["verbatim_content"] == "edge sqlite timestamp content"
+    # Prompt-injection hardening (release-gate 2026-06-13): default-path
+    # verbatim_content is framed as untrusted DATA (marker survives inside).
+    assert "edge sqlite timestamp content" in body["memories"][0]["verbatim_content"]
     assert create_response.status_code == 201
     assert create_response.json()["verbatim_content"] == "created memory defaults verbatim"
     assert "stats:global:v2" in fake_cache.deleted
@@ -651,7 +653,9 @@ def test_edge_sqlite_search_memories_serializes_timestamp_text(tmp_path, monkeyp
     assert body["count"] == 1
     assert body["memories"][0]["id"] == memory_id
     assert body["memories"][0]["created"] == "2026-04-29T12:34:56"
-    assert body["memories"][0]["verbatim_content"] == "edge sqlite search timestamp content"
+    # Prompt-injection hardening (release-gate 2026-06-13): default search
+    # verbatim_content is framed as untrusted DATA (marker survives inside).
+    assert "edge sqlite search timestamp content" in body["memories"][0]["verbatim_content"]
 
 
 @pytest.mark.asyncio
