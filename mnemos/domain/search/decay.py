@@ -162,10 +162,14 @@ def apply_decay(
     now: datetime | None = None,
     overrides: Mapping[str, float] | None = None,
     recency_weight: float = 1.0,
+    preserve_current_order: bool = False,
 ) -> list[Any]:
     """Apply per-category decay to a list of memory items.
 
-    Sorts in-place by descending (base_score * decay_multiplier).
+    Sorts by descending (base_score * decay_multiplier), unless
+    ``preserve_current_order`` is set for a backend-boosted result set.
+    In that mode, current rows keep their incoming order and only
+    superseded/consolidated rows are moved behind them.
     ``base_score`` is the existing ``quality_rating`` or the recency
     weight from the search route — we read either field defensively.
 
@@ -178,11 +182,12 @@ def apply_decay(
     """
     if not memories:
         return memories
-    if not table and not overrides:
+    has_superseded = any(_safe_get(m, "superseded_by") or _safe_get(m, "consolidated_into") for m in memories)
+    if not table and not overrides and not has_superseded:
         return memories
 
     now_ts = now or datetime.now(tz=timezone.utc)
-    decorated: list[tuple[float, Any]] = []
+    decorated: list[tuple[bool, float, Any]] = []
     universal_override = overrides.get("*") if overrides else None
 
     for m in memories:
@@ -219,12 +224,22 @@ def apply_decay(
             setattr(m, "decay_final_score", round(final, 4))
         except Exception:
             pass
-        decorated.append((final, m))
+        # Superseded/consolidated rows are still returned for history, but
+        # never ahead of current rows when route-level decay/recency ordering
+        # is active. Treat superseded_by/consolidated_into as a separate sort
+        # key, not a score mutation, so diagnostics retain the raw score.
+        superseded = bool(_safe_get(m, "superseded_by") or _safe_get(m, "consolidated_into"))
+        if superseded:
+            final = -math.inf
+        decorated.append((superseded, final, m))
 
-    # Stable sort by final score descending; preserves original order
-    # among ties.
-    decorated.sort(key=lambda kv: kv[0], reverse=True)
-    return [m for _, m in decorated]
+    # Stable sort. When a backend already applied recency boost, keep the
+    # incoming order of current rows and only push stale/superseded rows back.
+    if preserve_current_order:
+        decorated.sort(key=lambda kv: kv[0])
+    else:
+        decorated.sort(key=lambda kv: (kv[0], -kv[1]))
+    return [m for _, _, m in decorated]
 
 
 def _safe_get(obj: Any, key: str) -> Any:
