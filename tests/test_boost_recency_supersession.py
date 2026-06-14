@@ -11,6 +11,8 @@ from mnemos.api.routes import memories as memories_handler
 from mnemos.domain.models import METRIC_COSINE_SIMILARITY, MemorySearchRequest
 from mnemos.domain.search.decay import DecayParams, apply_decay
 from mnemos.persistence import SqliteBackend
+from mnemos.persistence.db2 import Db2MemoryRepository, _Db2AsyncCursor
+from mnemos.persistence.mysql import MysqlMemoryRepository
 from mnemos.persistence.postgres import PostgresMemoryRepository, PostgresTransaction
 from mnemos.persistence.sqlite import _execute
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
@@ -67,6 +69,126 @@ async def _empty_decay(_backend):
 
 async def _fake_embed(_query):
     return [1.0, 0.0, 0.0]
+
+
+_SEMANTIC_RERANK_COLUMNS = (
+    "id",
+    "content",
+    "category",
+    "subcategory",
+    "metadata",
+    "quality_rating",
+    "compressed_content",
+    "verbatim_content",
+    "owner_id",
+    "namespace",
+    "permission_mode",
+    "source_model",
+    "source_provider",
+    "source_session",
+    "source_agent",
+    "group_id",
+    "created",
+    "updated",
+    "archived_at",
+    "recall_count",
+    "last_recalled_at",
+    "consolidated_into",
+    "rank_score",
+)
+
+_MYSQL_FALLBACK_COLUMNS = (*_SEMANTIC_RERANK_COLUMNS[:-1], "embedding_json")
+
+
+def _semantic_tuple(
+    memory_id: str,
+    *,
+    updated: datetime,
+    consolidated_into: str | None,
+    rank_score: float | None = None,
+    embedding_json: str | None = None,
+) -> tuple:
+    return (
+        memory_id,
+        memory_id,
+        "facts",
+        None,
+        "{}",
+        80,
+        None,
+        memory_id,
+        "alice",
+        "alice-ns",
+        600,
+        None,
+        None,
+        None,
+        None,
+        None,
+        updated,
+        updated,
+        None,
+        0,
+        None,
+        consolidated_into,
+        embedding_json if embedding_json is not None else rank_score,
+    )
+
+
+class _MysqlCursor:
+    rowcount = 0
+
+    def __init__(self, rows: list[tuple], columns: tuple[str, ...]) -> None:
+        self._rows = rows
+        self.description = tuple((column,) for column in columns)
+
+    async def __aenter__(self) -> "_MysqlCursor":
+        return self
+
+    async def __aexit__(self, *_exc_info) -> None:
+        return None
+
+    async def execute(self, _sql: str, _params) -> None:
+        return None
+
+    async def fetchall(self) -> list[tuple]:
+        return self._rows
+
+
+class _MysqlConn:
+    def __init__(self, rows: list[tuple], columns: tuple[str, ...]) -> None:
+        self._rows = rows
+        self._columns = columns
+
+    def cursor(self) -> _MysqlCursor:
+        return _MysqlCursor(self._rows, self._columns)
+
+
+class _Db2SyncCursor:
+    def __init__(self, rows: list[tuple]) -> None:
+        self._rows = rows
+        self.description = tuple((column,) for column in _SEMANTIC_RERANK_COLUMNS)
+        self.rowcount = len(rows)
+
+    def execute(self, _sql: str, _params=None) -> None:
+        return None
+
+    def fetchall(self) -> list[tuple]:
+        return self._rows
+
+    def fetchone(self):
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class _Db2Conn:
+    def __init__(self, rows: list[tuple]) -> None:
+        self._rows = rows
+
+    def cursor(self) -> _Db2AsyncCursor:
+        return _Db2AsyncCursor(_Db2SyncCursor(self._rows))
 
 
 @pytest.mark.asyncio
@@ -140,6 +262,75 @@ async def test_recency_min_score_still_uses_raw_similarity(monkeypatch):
 
     assert resp.count == 0
     assert resp.memories == []
+
+
+@pytest.mark.asyncio
+async def test_boosted_route_ood_gate_still_rejects_flat_unanchored_results(monkeypatch):
+    backend = install_fake_backend(monkeypatch)
+    backend.memories.SEMANTIC_SCORE_COLUMN = "similarity"
+    backend.memories.SEMANTIC_SCORE_METRIC = METRIC_COSINE_SIMILARITY
+    backend.memories.configure_return(
+        "semantic_search",
+        [
+            _row(
+                f"flat_{idx}",
+                "florida restaurant inspection records",
+                similarity=0.72 - 0.0005 * idx,
+                _composite_score=0.99,
+            )
+            for idx in range(10)
+        ],
+    )
+    monkeypatch.setattr(memories_handler, "_get_embedding", _fake_embed)
+    monkeypatch.setattr(memories_handler, "_bump_recall_counters", _noop_bump)
+    monkeypatch.setattr(memories_handler, "load_decay_table", _empty_decay)
+
+    resp = await memories_handler.search_memories(
+        MemorySearchRequest(
+            query="asdfqwer zxcv blorf",
+            semantic=True,
+            boost_recency=True,
+            recency_weight=1.0,
+        ),
+        user=_alice(),
+    )
+    await asyncio.sleep(0)
+
+    assert resp.count == 0
+    assert resp.memories == []
+
+
+@pytest.mark.asyncio
+async def test_boosted_route_keeps_current_order_when_superseded_row_triggers_decay(monkeypatch):
+    backend = install_fake_backend(monkeypatch)
+    backend.memories.SEMANTIC_SCORE_COLUMN = "similarity"
+    backend.memories.SEMANTIC_SCORE_METRIC = METRIC_COSINE_SIMILARITY
+    backend.memories.configure_return(
+        "semantic_search",
+        [
+            _row("fresh", "restaurant inspections recent", similarity=0.90),
+            _row("old", "restaurant inspections relevant", similarity=0.91),
+            _row("stale", "restaurant inspections stale", similarity=0.99, consolidated_into="fresh"),
+        ],
+    )
+    monkeypatch.setattr(memories_handler, "_get_embedding", _fake_embed)
+    monkeypatch.setattr(memories_handler, "_bump_recall_counters", _noop_bump)
+    monkeypatch.setattr(memories_handler, "load_decay_table", _empty_decay)
+
+    resp = await memories_handler.search_memories(
+        MemorySearchRequest(
+            query="restaurant inspections",
+            semantic=True,
+            min_score=0.0,
+            boost_recency=True,
+            recency_weight=1.0,
+        ),
+        user=_alice(),
+    )
+    await asyncio.sleep(0)
+
+    assert [m.id for m in resp.memories] == ["fresh", "old", "stale"]
+    assert resp.memories[-1].superseded_by == "fresh"
 
 
 def test_apply_decay_keeps_superseded_rows_behind_current():
@@ -250,6 +441,81 @@ async def test_sqlite_boosted_recency_keeps_superseded_behind_current(tmp_path):
         await backend.close()
 
     assert [row["id"] for row in rows] == ["current"]
+
+
+@pytest.mark.asyncio
+async def test_mysql_boosted_rerank_keeps_superseded_behind_current():
+    repo = MysqlMemoryRepository()
+    repo._expected_embedding_dim = 2
+    visibility = VisibilityFilter(scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace=None)
+    now = datetime.now(timezone.utc)
+    rows = [
+        _semantic_tuple("stale", updated=now, consolidated_into="current", rank_score=0.0),
+        _semantic_tuple("current", updated=now - timedelta(days=30), consolidated_into=None, rank_score=0.5),
+    ]
+    tx = SimpleNamespace(conn=_MysqlConn(rows, _SEMANTIC_RERANK_COLUMNS))
+
+    out = await repo.semantic_search(
+        tx,
+        embedding=[1.0, 0.0],
+        limit=1,
+        visibility=visibility,
+        boost_recency=True,
+        recency_weight=1.0,
+    )
+
+    assert [row["id"] for row in out] == ["current"]
+
+
+@pytest.mark.asyncio
+async def test_mysql_python_cosine_boosted_rerank_keeps_superseded_behind_current():
+    repo = MysqlMemoryRepository()
+    now = datetime.now(timezone.utc)
+    rows = [
+        _semantic_tuple("stale", updated=now, consolidated_into="current", embedding_json="[1.0,0.0]"),
+        _semantic_tuple(
+            "current",
+            updated=now - timedelta(days=30),
+            consolidated_into=None,
+            embedding_json="[0.5,0.8660254038]",
+        ),
+    ]
+    tx = SimpleNamespace(conn=_MysqlConn(rows, _MYSQL_FALLBACK_COLUMNS))
+
+    out = await repo._python_cosine_search(
+        tx,
+        vec_literal="[1.0,0.0]",
+        where=["1 = 1"],
+        params=[],
+        limit=1,
+        boost_recency=True,
+        recency_weight=1.0,
+    )
+
+    assert [row["id"] for row in out] == ["current"]
+
+
+@pytest.mark.asyncio
+async def test_db2_boosted_rerank_keeps_superseded_behind_current():
+    repo = Db2MemoryRepository()
+    visibility = VisibilityFilter(scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace=None)
+    now = datetime.now(timezone.utc)
+    rows = [
+        _semantic_tuple("stale", updated=now, consolidated_into="current", rank_score=0.0),
+        _semantic_tuple("current", updated=now - timedelta(days=30), consolidated_into=None, rank_score=0.5),
+    ]
+    tx = SimpleNamespace(conn=_Db2Conn(rows))
+
+    out = await repo.semantic_search(
+        tx,
+        embedding=[1.0, 0.0],
+        limit=1,
+        visibility=visibility,
+        boost_recency=True,
+        recency_weight=1.0,
+    )
+
+    assert [row["id"] for row in out] == ["current"]
 
 
 class _PgRow(dict):
