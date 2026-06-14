@@ -2360,3 +2360,71 @@ def test_import_branch_restore_skips_rejected_record_ids(monkeypatch):
         f"expected no memory_branches UPSERT for rejected entry; "
         f"got {len(branch_inserts)}: {[e[0][:60] for e in branch_inserts]}"
     )
+
+
+def test_export_default_excludes_vault_and_redacts_credential_content(monkeypatch):
+    """Default /v1/export is not a secret backup surface.
+
+    Even for root, include_secrets defaults false: the SQL excludes the vault
+    namespace and any credential-shaped incidental content is redacted before
+    it leaves in the MPF payload.
+    """
+    row = _memory_row(
+        owner_id="admin",
+        namespace="ops",
+        content="rotate API_TOKEN=abcdefgh1234 before deploy",
+    )
+    conn = _Conn(rows=[row])
+    _install(monkeypatch, conn)
+
+    env = asyncio.run(portability.export_memories(
+        category=None, limit=1000, offset=0,
+        owner_id=None, namespace=None, include_sidecars=False, user=_root(),
+    ))
+
+    sql, args = conn.fetch_calls[-1]
+    assert "namespace <>" in sql
+    assert "vault" in args
+    assert env.includes_secrets is None
+    assert env.records[0].payload["content"] == "rotate API_TOKEN=[REDACTED] before deploy"
+
+
+def test_export_non_root_include_secrets_rejected_before_db(monkeypatch):
+    conn = _Conn(rows=[])
+    _install(monkeypatch, conn)
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(portability.export_memories(
+            category=None, limit=1000, offset=0,
+            owner_id=None, namespace=None, include_sidecars=False,
+            include_secrets=True, user=_alice(),
+        ))
+
+    assert exc.value.status_code == 403
+    assert "include_secrets requires root" in exc.value.detail
+    assert not conn.fetch_calls
+
+
+def test_export_root_include_secrets_includes_vault_plaintext_and_marks(monkeypatch):
+    vault_row = _memory_row(
+        id="vault_1",
+        owner_id="alice",
+        namespace="vault",
+        content="API_TOKEN=abcdefgh1234",
+    )
+    conn = _Conn(rows=[vault_row])
+    _install(monkeypatch, conn)
+
+    env = asyncio.run(portability.export_memories(
+        category=None, limit=1000, offset=0,
+        owner_id="alice", namespace="vault", include_sidecars=False,
+        include_secrets=True, user=_root(),
+    ))
+
+    sql, args = conn.fetch_calls[-1]
+    assert "namespace <>" not in sql
+    assert "vault" in args  # explicit target namespace, not exclusion param
+    assert env.includes_secrets is True
+    assert env.records[0].payload["namespace"] == "vault"
+    assert env.records[0].payload["content"] == "API_TOKEN=abcdefgh1234"
