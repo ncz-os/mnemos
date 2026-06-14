@@ -133,6 +133,12 @@ def service_flags_for_selection(profile: str, selected_components: tuple[str, ..
     return flags
 
 
+def apply_component_selection(cfg: Config, selected_components: tuple[str, ...]) -> None:
+    cfg.selected_components = selected_components
+    cfg.profile_services_enabled = bool(selected_components)
+    cfg.service_flags = service_flags_for_selection(cfg.profile, selected_components) if selected_components else {}
+
+
 def env_flags_for_services(flags: dict[str, bool]) -> dict[str, bool]:
     env_flags: dict[str, bool] = {
         "MNEMOS_PROFILE_SERVICES_ENABLED": True,
@@ -250,20 +256,20 @@ def run_wizard(
     # 1b. Component / service bundle selection
     # ------------------------------------------------------------------ #
     if selected_components is not None:
-        cfg.selected_components = selected_components
+        apply_component_selection(cfg, selected_components)
     else:
-        defaults = ",".join(default_components_for_profile(cfg.profile))
+        suggested = ",".join(default_components_for_profile(cfg.profile))
         raw = _prompt(
-            "Install component bundles/extras (comma-separated; add pantheon to opt into model proxy)",
-            default=defaults,
+            "Install component bundles/extras "
+            f"(comma-separated; suggested for {cfg.profile}: {suggested}; "
+            "blank preserves legacy startup)",
+            default="",
         )
         try:
-            cfg.selected_components = normalize_component_selection(raw)
+            apply_component_selection(cfg, normalize_component_selection(raw))
         except ValueError as exc:
             print(f"  {exc}")
-            cfg.selected_components = default_components_for_profile(cfg.profile)
-    cfg.profile_services_enabled = bool(cfg.selected_components)
-    cfg.service_flags = service_flags_for_selection(cfg.profile, cfg.selected_components)
+            apply_component_selection(cfg, ())
 
     # ------------------------------------------------------------------ #
     # 2. Database

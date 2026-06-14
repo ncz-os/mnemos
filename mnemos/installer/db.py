@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .wizard import Config
+from .wizard import Config, default_components_for_profile
 
 
 def _validate_identifier(value: str, name: str = "identifier") -> str:
@@ -367,23 +367,97 @@ def _is_local_postgres_host(host: str) -> bool:
     return h == "localhost"
 
 
-def selected_migration_groups(config: Config) -> set[str]:
-    """Return migration component groups needed for an installer selection.
+_MIGRATION_GROUP_BY_NAME: dict[str, str] = {
+    "migrations_v3_webhooks.sql": "webhooks",
+    "migrations_v3_5_webhook_retry_terminal_state.sql": "webhooks",
+    "migrations_v3_5_webhook_attempt_lease.sql": "webhooks",
+    "migrations_v3_5_webhook_writer_revision.sql": "webhooks",
+    "migrations_v3_5_webhook_status_updated_at.sql": "webhooks",
+    "migrations_v3_5_webhook_superseded_marker.sql": "webhooks",
+    "migrations_v3_5_webhook_attempt_unique.sql": "webhooks",
+    "migrations_v3_5_webhook_succeeded_unique.sql": "webhooks",
+    "migrations_v3_5_webhook_succeeded_terminal_trigger.sql": "webhooks",
+    "migrations_v3_federation.sql": "federation",
+    "migrations_v3_4_federation_compat.sql": "federation",
+    "migrations_v5_2_0_nats_outbox_idempotency.sql": "nats",
+    "migrations_v3_1_compression.sql": "compression",
+    "migrations_v3_5_session_compression_ratio_drop.sql": "compression",
+    "migrations_v3_5_session_compression_legacy_drop.sql": "compression",
+    "migrations_v4_2_compression_candidates_nullable_tokens.sql": "compression",
+    "migrations_v4_2_compression_dag.sql": "compression",
+    "migrations_v3_3_morpheus.sql": "morpheus",
+    "migrations_v3_3_morpheus_namespace.sql": "morpheus",
+    "migrations_v4_2_morpheus_consolidate.sql": "morpheus",
+    "migrations_v4_2_morpheus_extract.sql": "morpheus",
+    "migrations_v5_0_consolidated_at.sql": "morpheus",
+    "migrations_v5_0_morpheus_extract_run_memories.sql": "morpheus",
+    "migrations_v4_2_persephone.sql": "persephone",
+    "migrations_v5_0_2_artemis_dedup.sql": "artemis",
+    "migrations_v4_2_pantheon_routing_audit.sql": "pantheon",
+    "0036_hive_agents_subscription_pools.sql": "hive",
+}
 
-    The current Postgres runner still applies all migrations for compatibility;
-    this selector documents the concrete gating boundary and lets tests/CI catch
-    drift as migrations become component-addressable.
+
+def migration_group_for_file(mig_path: Path) -> str:
+    return _MIGRATION_GROUP_BY_NAME.get(mig_path.name, "core")
+
+
+def scoped_migration_files(migration_files: list[Path], migration_groups: set[str]) -> list[Path]:
+    return [mig_path for mig_path in migration_files if migration_group_for_file(mig_path) in migration_groups]
+
+
+def _component_set(raw_components) -> set[str]:
+    if isinstance(raw_components, str):
+        values = raw_components.split(",")
+    else:
+        values = raw_components or ()
+    return {str(component).strip().lower() for component in values if str(component).strip()}
+
+
+def selected_migration_components(config: Config) -> set[str]:
+    """Return active components that should scope Postgres migrations.
+
+    No component selection preserves the historical full-chain behavior unless
+    the profile-service manifest is explicitly managed. In that managed-profile
+    case, use the profile's default component bundle as the migration boundary.
     """
-    components = set(getattr(config, "selected_components", ()) or ())
+    components = _component_set(getattr(config, "selected_components", ()))
+    if components:
+        return components
+    if getattr(config, "profile_services_enabled", False):
+        return _component_set(default_components_for_profile(getattr(config, "profile", "")))
+    return set()
+
+
+def selected_migration_groups(config: Config) -> set[str]:
+    """Return migration component groups needed for an installer selection."""
+    components = selected_migration_components(config)
     if not components:
-        return {"core", "webhooks", "federation", "compression", "pantheon"}
+        return {
+            "core",
+            "webhooks",
+            "federation",
+            "nats",
+            "compression",
+            "morpheus",
+            "persephone",
+            "artemis",
+            "pantheon",
+            "hive",
+        }
     groups = {"core"}
     if components & {"server", "nats", "full"}:
-        groups.update({"webhooks", "federation"})
-    if components & {"ml", "morpheus", "persephone", "apollo", "artemis", "full"}:
-        groups.add("compression")
+        groups.update({"webhooks", "federation", "nats"})
+    if components & {"server", "persephone", "ml", "full"}:
+        groups.add("persephone")
+    if components & {"ml", "morpheus", "apollo", "artemis", "full"}:
+        groups.update({"compression", "morpheus"})
+    if components & {"ml", "artemis", "full"}:
+        groups.update({"artemis", "persephone"})
     if components & {"pantheon", "full"}:
         groups.add("pantheon")
+    if components & {"hive", "full"}:
+        groups.add("hive")
     return groups
 
 
@@ -457,9 +531,7 @@ def run_migrations(config: Config) -> bool:
 
     repo_path = Path(__file__).resolve().parents[2]
     migration_groups = selected_migration_groups(config)
-    if getattr(config, "selected_components", ()):
-        print(f"[db] Selected migration groups: {', '.join(sorted(migration_groups))}")
-        print("[db] Compatibility mode: applying full ordered migration chain; selector is recorded for parity gating.")
+    selected_components = selected_migration_components(config)
 
     migration_files = [
         repo_path / "db" / "migrations.sql",
@@ -534,6 +606,15 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations" / "0039_subscription_plan_current_limits.sql",
         repo_path / "db" / "migrations" / "0043_memory_acl.sql",
     ]
+
+    if selected_components:
+        unscoped_count = len(migration_files)
+        migration_files = scoped_migration_files(migration_files, migration_groups)
+        print(f"[db] Selected migration groups: {', '.join(sorted(migration_groups))}")
+        print(
+            f"[db] Applying {len(migration_files)} of {unscoped_count} "
+            "ordered migrations for selected components/profile."
+        )
 
     print("[db] Running migrations...")
 
