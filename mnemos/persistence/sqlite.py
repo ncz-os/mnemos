@@ -61,6 +61,7 @@ from mnemos.core import webhook_constants
 logger = logging.getLogger(__name__)
 
 MIN_SQLITE_VERSION = (3, 35, 0)
+_RECENCY_E_FOLD_SECONDS = 7 * 24 * 60 * 60
 
 
 SQLITE_MIGRATION_FILES = [
@@ -1062,9 +1063,20 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                     return -math.inf
                 updated_date = _updated_date(row)
                 age_days = max(0, (today - updated_date).days)
-                return similarity + recency_weight * (1.0 / (1.0 + age_days))
+                # Align with Postgres' exponential recency signal. This is
+                # an ordering key only; the raw ``similarity`` column remains
+                # untouched for route-level min_score/OOD gates.
+                recency = math.exp(-age_days * 86400.0 / float(_RECENCY_E_FOLD_SECONDS))
+                if row.get("superseded_by") or row.get("consolidated_into"):
+                    recency = 0.0
+                return similarity + recency_weight * recency
 
-            rows.sort(key=_recency_score, reverse=True)
+            rows.sort(
+                key=lambda row: (
+                    bool(row.get("superseded_by") or row.get("consolidated_into")),
+                    -_recency_score(row),
+                )
+            )
             rows = rows[:limit]
         return rows
 
