@@ -92,13 +92,18 @@ ALTER TABLE graeae_consultations ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL
 CREATE INDEX IF NOT EXISTS idx_graeae_consultations_owner ON graeae_consultations(owner_id);
 
 -- federation_peers ------------------------------------------------------------
--- Document the plaintext-token caveat directly in the schema. The column is
--- readable by anyone with database access; encrypt at rest via a
--- KMS-backed envelope key or pgcrypto if that matters for your threat model.
-COMMENT ON COLUMN federation_peers.auth_token IS
-    'Bearer token sent to remote peers. Stored in plaintext — protect with '
-    'filesystem-level encryption or a wrapper view if your threat model '
-    'requires at-rest encryption.';
+-- Document the plaintext-token caveat when the federation slice is installed.
+DO $$
+BEGIN
+    IF to_regclass('federation_peers') IS NOT NULL THEN
+        EXECUTE $comment$
+            COMMENT ON COLUMN federation_peers.auth_token IS
+                'Bearer token sent to remote peers. Stored in plaintext - protect with '
+                'filesystem-level encryption or a wrapper view if your threat model '
+                'requires at-rest encryption.'
+        $comment$;
+    END IF;
+END$$;
 
 -- memories.permission_mode convention -----------------------------------------
 -- Decimal digits that read like octal Unix mode bits:
