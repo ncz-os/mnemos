@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.core.config import get_settings
+from mnemos.core.services import service_enabled
 from mnemos.core.extras import is_extra_installed, missing_extra_detail
 from mnemos.core.rate_limit import limiter
 
@@ -48,7 +49,8 @@ def _require_enabled() -> None:
             status_code=503,
             detail=missing_extra_detail("pantheon", label="PANTHEON"),
         )
-    if not get_settings().pantheon.enabled:
+    settings = get_settings()
+    if not service_enabled(settings, "pantheon"):
         raise HTTPException(status_code=503, detail="PANTHEON disabled in this profile")
 
 

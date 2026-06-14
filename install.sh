@@ -255,15 +255,30 @@ main() {
     echo -e "\n${BOLD}${CYAN}MNEMOS ${MNEMOS_VERSION} — Bootstrap Installer${RESET}"
     echo -e "${CYAN}$(printf '─%.0s' {1..50})${RESET}\n"
 
-    # Parse args early — --check and --upgrade don't need system packages
+    # Parse args early — --check and --upgrade don't need system packages.
+    # Preserve argument boundaries (notably --with a,b,c) instead of rebuilding
+    # a whitespace-split string.
     local skip_pkgs=false
-    local py_args=""
-    for arg in $INSTALLER_ARGS; do
-        py_args="$py_args $arg"
+    local py_args=("$@")
+    local _interactive_components=""
+    local _saw_with=false
+    for arg in "$@"; do
         case "$arg" in
             --check|--upgrade) skip_pkgs=true ;;
+            --with|--with=*) _saw_with=true ;;
         esac
     done
+    if [[ "${MNEMOS_INSTALL_INTERACTIVE_COMPONENTS:-}" == "1" && "$_saw_with" == "false" ]]; then
+        echo
+        echo "Select optional MNEMOS components/bundles (comma-separated)."
+        echo "  Bundles: edge, server, ml, interop, full"
+        echo "  Components: nats, morpheus, persephone, pantheon, kronos, knossos, apollo, artemis, hot"
+        echo "  Note: pantheon is opt-in; server defaults to nats+federation+distillation without pantheon."
+        read -r -p "Components [leave blank for profile/default behavior]: " _interactive_components || true
+        if [[ -n "$_interactive_components" ]]; then
+            py_args+=("--with" "$_interactive_components")
+        fi
+    fi
 
     detect_os
     check_disk_space
@@ -283,7 +298,7 @@ main() {
 
     step "Launching Python installer"
     cd "$INSTALL_DIR"
-    exec "$PYTHON" -m installer $py_args
+    exec "$PYTHON" -m mnemos.installer "${py_args[@]}"
 }
 
 main "$@"
