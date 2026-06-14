@@ -104,6 +104,116 @@ def _decode_feed_cursor(raw: str) -> FederationFeedCursor:
         raise ValueError("invalid federation cursor")
 
 
+def _looks_hex(value: Any, expected_bytes: int) -> bool:
+    if not isinstance(value, str) or len(value) != expected_bytes * 2:
+        return False
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _extract_federation_chain_head(meta: Any) -> tuple[str | None, str | None]:
+    if not isinstance(meta, dict):
+        return None, None
+    head = meta.get("federation_audit_head")
+    if isinstance(head, dict):
+        eid = head.get("entry_id")
+        h = head.get("entry_hash")
+    else:
+        eid = meta.get("federation_audit_head_entry_id")
+        h = meta.get("federation_audit_head_hash")
+    return (eid if isinstance(eid, str) else None, h if isinstance(h, str) else None)
+
+
+def _store_federation_chain_head(meta: dict[str, Any], entry_id: str, entry_hash: str) -> dict[str, Any]:
+    out = dict(meta)
+    out["federation_audit_head"] = {"entry_id": entry_id, "entry_hash": entry_hash}
+    return out
+
+
+async def _enforce_federation_chain_head_continuity(
+    backend: Optional[FederationBackend],
+    tx: Transaction,
+    *,
+    peer_name: str,
+    local_id: str,
+    remote_id: str,
+    existing_metadata: Any,
+    existing_remote_updated: Any,
+    inbound_remote_updated: Any,
+    primary_entry_id: str | None,
+    primary_entry_hash: str | None,
+) -> None:
+    """Reject discontinuous inbound federation audit heads when checkable.
+
+    Peers currently piggyback only their latest head, not a full remote proof.
+    We therefore enforce what the receiver can prove locally: once a federated
+    row has adopted a peer head, later same/stale payloads must repeat it and
+    may not omit/mangle it; strictly newer payloads may advance the stored peer
+    head and are captured by a new local ``op=replicate`` audit entry.
+    """
+    if existing_metadata is None:
+        if primary_entry_id or primary_entry_hash:
+            if not (_looks_hex(primary_entry_id, 16) and _looks_hex(primary_entry_hash, 32)):
+                raise RuntimeError(f"federation audit head from {peer_name}/{remote_id} is malformed")
+        return
+
+    prev_entry_id, prev_entry_hash = _extract_federation_chain_head(existing_metadata)
+    if prev_entry_id is None and prev_entry_hash is None and backend is not None and getattr(backend, "audit_chain", None) is not None:
+        try:
+            from mnemos.audit import memory_id_to_audit_bytes
+
+            row = await backend.audit_chain.get_latest_audit_entry(tx, memory_id_to_audit_bytes(local_id))
+            if row is not None:
+                logger.warning(
+                    "[federation/audit] memory=%s has local replicate audit entries but no stored peer head; accepting bootstrap head from peer=%s remote=%s",
+                    local_id,
+                    peer_name,
+                    remote_id,
+                )
+        except Exception:
+            logger.warning(
+                "[federation/audit] could not inspect local chain for %s during continuity check",
+                local_id,
+                exc_info=True,
+            )
+    if prev_entry_id is None and prev_entry_hash is None:
+        if primary_entry_id or primary_entry_hash:
+            if not (_looks_hex(primary_entry_id, 16) and _looks_hex(primary_entry_hash, 32)):
+                raise RuntimeError(f"federation audit head from {peer_name}/{remote_id} is malformed")
+        return
+    if not (primary_entry_id and primary_entry_hash):
+        raise RuntimeError(
+            f"federation audit head missing after adoption peer={peer_name} remote={remote_id} local={local_id}"
+        )
+    if not (_looks_hex(primary_entry_id, 16) and _looks_hex(primary_entry_hash, 32)):
+        raise RuntimeError(f"federation audit head from {peer_name}/{remote_id} is malformed")
+    if prev_entry_id == primary_entry_id and prev_entry_hash == primary_entry_hash:
+        return
+    prev_updated = _coerce_datetime(existing_remote_updated)
+    next_updated = _coerce_datetime(inbound_remote_updated)
+    if prev_updated is not None and next_updated is not None and next_updated > prev_updated:
+        logger.info(
+            "[federation/audit] advancing peer head peer=%s remote=%s local=%s stored=%s/%s inbound=%s/%s",
+            peer_name,
+            remote_id,
+            local_id,
+            str(prev_entry_id)[:16],
+            str(prev_entry_hash)[:16],
+            primary_entry_id[:16],
+            primary_entry_hash[:16],
+        )
+        return
+    raise RuntimeError(
+        "federation audit head discontinuity "
+        f"peer={peer_name} remote={remote_id} local={local_id} "
+        f"stored={str(prev_entry_id)[:16]}/{str(prev_entry_hash)[:16]} "
+        f"inbound={primary_entry_id[:16]}/{primary_entry_hash[:16]}"
+    )
+
+
 def _cap(value, limit: int):
     """Truncate strings above `limit`. Pass-through for None/non-string."""
     if isinstance(value, str) and len(value) > limit:
@@ -690,16 +800,48 @@ async def _store_memories(
 
         # Check existing
         existing = await repo.fetch_federated_memory_marker(tx, local_id)
+        primary_eid = mem.get("audit_latest_entry_id")
+        primary_hash = mem.get("audit_latest_entry_hash")
+        existing_meta_raw: Any = None
+        if existing is not None:
+            existing_meta_raw = existing.get("metadata") if hasattr(existing, "get") else None
+            if isinstance(existing_meta_raw, str):
+                try:
+                    existing_meta_raw = json.loads(existing_meta_raw)
+                except Exception:
+                    existing_meta_raw = None
+        if existing is not None or primary_eid or primary_hash:
+            await _enforce_federation_chain_head_continuity(
+                backend,
+                tx,
+                peer_name=peer_name,
+                local_id=local_id,
+                remote_id=remote_id,
+                existing_metadata=existing_meta_raw,
+                existing_remote_updated=(
+                    existing.get("federation_remote_updated")
+                    if existing is not None and hasattr(existing, "get")
+                    else None
+                ),
+                inbound_remote_updated=remote_updated,
+                primary_entry_id=primary_eid if isinstance(primary_eid, str) else None,
+                primary_entry_hash=primary_hash if isinstance(primary_hash, str) else None,
+            )
 
         meta_raw = mem.get("metadata") or {}
         if isinstance(meta_raw, dict):
             meta_raw = {**meta_raw, "federation_remote_id": remote_id}
         else:
             meta_raw = {"federation_remote_id": remote_id}
+        if isinstance(primary_eid, str) and isinstance(primary_hash, str):
+            meta_raw = _store_federation_chain_head(meta_raw, primary_eid, primary_hash)
         meta_json = json.dumps(meta_raw)
         if len(meta_json) > FEDERATION_MAX_METADATA:
-            # Drop metadata if it's absurdly large; keep the remote_id pointer.
+            # Drop metadata if it's absurdly large; keep the remote_id pointer
+            # and the federation audit head needed for continuity enforcement.
             meta_raw = {"federation_remote_id": remote_id, "_metadata_truncated": True}
+            if isinstance(primary_eid, str) and isinstance(primary_hash, str):
+                meta_raw = _store_federation_chain_head(meta_raw, primary_eid, primary_hash)
 
         classified = classify_persisted_text_fields(
             content=content,
@@ -715,7 +857,7 @@ async def _store_memories(
         if len(meta_json) > FEDERATION_MAX_METADATA:
             truncated_meta = {"federation_remote_id": remote_id, "_metadata_truncated": True}
             for key, value in classified.metadata.items():
-                if str(key).startswith("secret_"):
+                if str(key).startswith("secret_") or key == "federation_audit_head":
                     truncated_meta[key] = value
             meta_json = json.dumps(truncated_meta)
 
@@ -752,6 +894,29 @@ async def _store_memories(
                 # update-when-newer branch so the losing path still applies
                 # a delta if its remote_updated is the freshest.
                 existing = await repo.fetch_federated_memory_marker(tx, local_id)
+                if existing is not None:
+                    conflict_meta = existing.get("metadata") if hasattr(existing, "get") else None
+                    if isinstance(conflict_meta, str):
+                        try:
+                            conflict_meta = json.loads(conflict_meta)
+                        except Exception:
+                            conflict_meta = None
+                    await _enforce_federation_chain_head_continuity(
+                        backend,
+                        tx,
+                        peer_name=peer_name,
+                        local_id=local_id,
+                        remote_id=remote_id,
+                        existing_metadata=conflict_meta,
+                        existing_remote_updated=(
+                            existing.get("federation_remote_updated")
+                            if hasattr(existing, "get")
+                            else None
+                        ),
+                        inbound_remote_updated=remote_updated,
+                        primary_entry_id=primary_eid if isinstance(primary_eid, str) else None,
+                        primary_entry_hash=primary_hash if isinstance(primary_hash, str) else None,
+                    )
 
         if existing is not None:
             # Update only if the inbound remote_updated beats the
@@ -872,22 +1037,13 @@ async def _store_memories(
                     _s = _gs2()
                     _ss = (getattr(_s.server, "session_secret", "") or "").encode("utf-8")
                     if _ss:
-                        # v6.2 chain-head continuity check (best-effort).
-                        # If the primary sent its audit_latest_entry_hash
-                        # for this memory, we record a metadata-side
-                        # hint so post-hoc divergence audits can flag
-                        # any future mismatch. Active rejection of
-                        # mismatched feeds is a future hardening once
-                        # we've fielded the chain at scale.
-                        primary_eid = mem.get("audit_latest_entry_id")
-                        primary_hash = mem.get("audit_latest_entry_hash")
                         if primary_eid and primary_hash:
                             logger.info(
-                                "[federation/audit] peer=%s memory=%s primary_chain_head eid=%s hash=%s",
+                                "[federation/audit] peer=%s memory=%s accepted_primary_chain_head eid=%s hash=%s",
                                 peer_name,
                                 local_id,
-                                primary_eid[:16],
-                                primary_hash[:16],
+                                str(primary_eid)[:16],
+                                str(primary_hash)[:16],
                             )
 
                         from mnemos.audit import write_audit_entry

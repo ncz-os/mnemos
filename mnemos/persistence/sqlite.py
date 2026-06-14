@@ -3455,7 +3455,7 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
         return await _fetch_one(
             self._conn(tx),
-            "SELECT federation_remote_updated FROM memories WHERE id = ?",
+            "SELECT federation_remote_updated, metadata FROM memories WHERE id = ?",
             (local_id,),
         )
 

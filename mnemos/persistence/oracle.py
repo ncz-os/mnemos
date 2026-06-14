@@ -3748,7 +3748,7 @@ class OracleFederationRepository(FederationRepository):
             await _call(
                 cursor.execute,
                 """
-                SELECT federation_remote_updated
+                SELECT federation_remote_updated, metadata
                   FROM memories
                  WHERE id = :id AND deleted_at IS NULL
                 """,
