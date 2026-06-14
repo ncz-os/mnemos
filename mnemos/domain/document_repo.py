@@ -6,6 +6,8 @@ backend-specific chunk write so routes do not reach for raw driver pools.
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -14,6 +16,8 @@ import asyncpg
 
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.persistence.base import PersistenceBackend, Transaction
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentChunkSoftDeletedConflictError(ValueError):
@@ -57,8 +61,6 @@ class DocumentRepository:
         except ImportError:  # pragma: no cover - defensive for stripped builds.
             PostgresTransaction = None  # type: ignore[assignment]
 
-        import json
-
         try:
             metadata_obj = json.loads(metadata_json) if metadata_json else {}
         except Exception:
@@ -75,7 +77,7 @@ class DocumentRepository:
         namespace = classified.namespace
 
         if PostgresTransaction is not None and isinstance(tx, PostgresTransaction):
-            return await self._import_postgres_chunk(
+            imported = await self._import_postgres_chunk(
                 tx.conn,
                 memory_id=memory_id,
                 content=content,
@@ -88,6 +90,18 @@ class DocumentRepository:
                 chunk_key=chunk_key,
                 legacy_chunk_key=legacy_chunk_key,
             )
+            if imported.emit_created_event and imported.memory_id == memory_id:
+                await _write_document_import_audit_entry(
+                    backend,
+                    tx,
+                    memory_id=imported.memory_id,
+                    content=content,
+                    category=category,
+                    subcategory=subcategory,
+                    metadata=classified.metadata,
+                    writer_id=owner_id,
+                )
+            return imported
 
         now = datetime.now(timezone.utc)
         await backend.memories.insert_memory(
@@ -108,6 +122,16 @@ class DocumentRepository:
             verbatim_content=content,
             created=now,
             updated=now,
+        )
+        await _write_document_import_audit_entry(
+            backend,
+            tx,
+            memory_id=memory_id,
+            content=content,
+            category=category,
+            subcategory=subcategory,
+            metadata=classified.metadata,
+            writer_id=owner_id,
         )
         return ImportedDocumentChunk(memory_id=memory_id)
 
@@ -187,3 +211,43 @@ class DocumentRepository:
                 "Document chunk matches a soft-deleted memory; restore it before retrying this import"
             )
         return ImportedDocumentChunk(memory_id=str(canonical_id))
+
+
+async def _write_document_import_audit_entry(
+    backend: PersistenceBackend,
+    tx: Transaction,
+    *,
+    memory_id: str,
+    content: str,
+    category: str,
+    subcategory: str | None,
+    metadata: dict[str, Any] | None,
+    writer_id: str,
+) -> None:
+    if getattr(backend, "audit_chain", None) is None:
+        return
+    from mnemos.audit import write_audit_entry
+    from mnemos.core.config import get_settings
+    from mnemos.workers.audit_sealer import audit_chain_enabled
+
+    if not audit_chain_enabled():
+        return
+    session_secret = (getattr(get_settings().server, "session_secret", "") or "").encode("utf-8")
+    if not session_secret:
+        logger.warning(
+            "[document_import] MNEMOS_AUDIT_CHAIN=on but session_secret is empty; skipping audit write"
+        )
+        return
+    await write_audit_entry(
+        backend,
+        tx,
+        op="create",
+        memory_id_str=memory_id,
+        content=content,
+        category=category,
+        subcategory=subcategory,
+        metadata=metadata,
+        embedding=None,
+        writer_id=writer_id,
+        session_secret=session_secret,
+    )
