@@ -32,6 +32,7 @@ from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 from mnemos.core.config import db2_text_search_override, db2_vector_index_override
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.oracle import (
     OracleAclRepository,
     OracleAuditChainRepository,
@@ -3345,11 +3346,16 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         cursor = await _call(conn.cursor)
         try:
             where = [
-                "m.deleted_at IS NULL",
                 "m.federation_source IS NULL",
+                "MOD(m.permission_mode, 10) >= 4",
+                "m.deleted_at IS NULL",
                 "m.archived_at IS NULL",
+                "m.consolidated_into IS NULL",
+                # Secret vault: never federate credential-class memories,
+                # even when a caller supplies an explicit namespace filter.
+                "(m.namespace IS NULL OR m.namespace <> ?)",
             ]
-            params_list: list[Any] = []
+            params_list: list[Any] = [VAULT_NAMESPACE]
             if since_updated is not None and since_id is not None:
                 where.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
                 params_list.extend([since_updated, since_updated, since_id])
@@ -3402,10 +3408,15 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         try:
             where = [
                 "m.id = ?",
-                "m.deleted_at IS NULL",
                 "m.federation_source IS NULL",
+                "MOD(m.permission_mode, 10) >= 4",
+                "m.deleted_at IS NULL",
+                "m.archived_at IS NULL",
+                "m.consolidated_into IS NULL",
+                # Secret vault: never serve a vaulted memory over federation.
+                "(m.namespace IS NULL OR m.namespace <> ?)",
             ]
-            params_list: list[Any] = [memory_id]
+            params_list: list[Any] = [memory_id, VAULT_NAMESPACE]
             if namespaces:
                 ns_ph = ",".join("?" for _ in namespaces)
                 where.append(f"m.namespace IN ({ns_ph})")

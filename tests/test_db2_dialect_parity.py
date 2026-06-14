@@ -3122,9 +3122,12 @@ async def test_db2_federation_feed_query_native_tokens() -> None:
     sql = calls[0]["sql"].upper() if calls else ""
     params_tuple = calls[0]["params"] if calls else ()
     assert "FROM MEMORIES M" in sql
-    assert "WHERE M.DELETED_AT IS NULL" in sql
-    assert "M.FEDERATION_SOURCE IS NULL" in sql
+    assert "WHERE M.FEDERATION_SOURCE IS NULL" in sql
+    assert "MOD(M.PERMISSION_MODE, 10) >= 4" in sql
+    assert "M.DELETED_AT IS NULL" in sql
     assert "M.ARCHIVED_AT IS NULL" in sql
+    assert "M.CONSOLIDATED_INTO IS NULL" in sql
+    assert "M.NAMESPACE IS NULL OR M.NAMESPACE <> ?" in sql
     assert "M.UPDATED > ? OR (M.UPDATED = ? AND M.ID > ?)" in sql
     assert "M.NAMESPACE IN (?,?)" in sql or "M.NAMESPACE IN (?, ?)" in sql
     assert "M.CATEGORY IN (?)" in sql
@@ -3134,7 +3137,7 @@ async def test_db2_federation_feed_query_native_tokens() -> None:
     assert ":LIMIT" not in sql
     assert ":NS" not in sql
     assert ":CAT" not in sql
-    assert len(params_tuple) == 7  # updated x2, since_id, ns-a, ns-b, cat, limit
+    assert len(params_tuple) == 8  # vault, updated x2, since_id, ns-a, ns-b, cat, limit
 
 
 @pytest.mark.asyncio
@@ -3177,7 +3180,10 @@ async def test_db2_federation_feed_query_no_filters_native_tokens() -> None:
     assert "FETCH FIRST ? ROWS ONLY" in sql
     assert "M.NAMESPACE IN" not in sql
     assert "M.CATEGORY IN" not in sql
-    assert len(params_tuple) == 1  # just limit
+    assert "MOD(M.PERMISSION_MODE, 10) >= 4" in sql
+    assert "M.CONSOLIDATED_INTO IS NULL" in sql
+    assert "M.NAMESPACE IS NULL OR M.NAMESPACE <> ?" in sql
+    assert len(params_tuple) == 2  # vault, limit
 
 
 @pytest.mark.asyncio
@@ -3216,13 +3222,17 @@ async def test_db2_federation_get_feed_memory_native_tokens() -> None:
     params_tuple = calls[0]["params"] if calls else ()
     assert "FROM MEMORIES M" in sql
     assert "M.ID = ?" in sql
+    assert "MOD(M.PERMISSION_MODE, 10) >= 4" in sql
     assert "M.DELETED_AT IS NULL" in sql
+    assert "M.ARCHIVED_AT IS NULL" in sql
+    assert "M.CONSOLIDATED_INTO IS NULL" in sql
+    assert "M.NAMESPACE IS NULL OR M.NAMESPACE <> ?" in sql
     assert "M.NAMESPACE IN (?)" in sql
     assert "M.CATEGORY IN (?,?)" in sql or "M.CATEGORY IN (?, ?)" in sql
     assert ":ID" not in sql
     assert ":NS" not in sql
     assert ":CAT" not in sql
-    assert len(params_tuple) == 4  # memory_id, ns-a, facts, logs
+    assert len(params_tuple) == 5  # memory_id, vault, ns-a, facts, logs
 
 
 @pytest.mark.asyncio
@@ -3255,6 +3265,10 @@ async def test_db2_federation_get_feed_memory_no_filters_native_tokens() -> None
     sql = calls[0]["sql"].upper() if calls else ""
     params_tuple = calls[0]["params"] if calls else ()
     assert "M.ID = ?" in sql
+    assert "MOD(M.PERMISSION_MODE, 10) >= 4" in sql
+    assert "M.ARCHIVED_AT IS NULL" in sql
+    assert "M.CONSOLIDATED_INTO IS NULL" in sql
+    assert "M.NAMESPACE IS NULL OR M.NAMESPACE <> ?" in sql
     assert "M.NAMESPACE IN" not in sql
     assert "M.CATEGORY IN" not in sql
-    assert len(params_tuple) == 1  # just memory_id
+    assert len(params_tuple) == 2  # memory_id, vault
