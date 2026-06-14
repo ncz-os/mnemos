@@ -825,8 +825,16 @@ async def lifespan(app):
                 if worker_name == "deletion_request_worker":
                     _worker_status["deletion_request_worker"] = "disabled"
                 continue
+            worker_coro = factory(_pool)
+            if worker_coro is None:
+                logger.info("%s disabled", worker_name)
+                if worker_name == "distillation_worker":
+                    _worker_status["distillation_worker"] = "disabled"
+                if worker_name == "deletion_request_worker":
+                    _worker_status["deletion_request_worker"] = "disabled"
+                continue
             logger.info("Launching %s", worker_name)
-            _schedule_worker(factory(_pool))
+            _schedule_worker(worker_coro)
             scheduled_workers += 1
     if scheduled_workers:
         import asyncio as _asyncio

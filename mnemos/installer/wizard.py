@@ -9,6 +9,9 @@ import string
 import sys
 from dataclasses import dataclass, field
 
+from mnemos.core.extras import FEATURE_BUNDLES, EXTRA_PROBES
+from mnemos.core.services import COMPONENT_SERVICE_ENABLES, PROFILE_SERVICE_MANIFEST, SERVICE_ENV_OVERRIDES
+
 from .detect import SystemInfo, check_port_free
 
 
@@ -28,6 +31,9 @@ class Config:
     graeae_providers: dict = field(default_factory=dict)
     inference_embed_host: str = "http://localhost:11434"
     install_docling: bool = True
+    selected_components: tuple[str, ...] = field(default_factory=tuple)
+    profile_services_enabled: bool = False
+    service_flags: dict[str, bool] = field(default_factory=dict)
     create_service: bool = True
     create_new_db: bool = True       # True = create DB, False = use existing
     embedding_dim: int = 768         # vec0/embedding dimension; honors MNEMOS_EMBEDDING_DIM
@@ -43,6 +49,99 @@ _PROVIDERS = [
     "nvidia",
     "together",
 ]
+
+_SELECTABLE_COMPONENTS = tuple(
+    dict.fromkeys(
+        [
+            "edge",
+            "server",
+            "ml",
+            "interop",
+            "full",
+            "morpheus",
+            "persephone",
+            "pantheon",
+            "kronos",
+            "kronos-gpu",
+            "knossos",
+            "apollo",
+            "artemis",
+            "nats",
+            "hot",
+            "sqlite",
+            "tracing",
+            "structlog",
+            "docling",
+        ]
+    )
+)
+
+
+_COMPONENT_ALIASES = {"compression": "ml"}
+
+
+def normalize_component_selection(raw: str | None) -> tuple[str, ...]:
+    if not raw:
+        return ()
+    selected: dict[str, None] = {}
+    valid = set(_SELECTABLE_COMPONENTS) | set(FEATURE_BUNDLES) | set(EXTRA_PROBES) | {"sqlite"}
+    for item in raw.split(","):
+        component = _COMPONENT_ALIASES.get(item.strip().lower(), item.strip().lower())
+        if not component:
+            continue
+        if component not in valid:
+            raise ValueError(f"Unknown MNEMOS component/bundle {component!r}; choose one of: {', '.join(_SELECTABLE_COMPONENTS)}")
+        selected.setdefault(component, None)
+    return tuple(selected)
+
+
+def default_components_for_profile(profile: str) -> tuple[str, ...]:
+    if profile == "server":
+        return ("server",)
+    if profile == "edge":
+        return ("edge",)
+    if profile == "dev":
+        return ("edge", "tracing", "structlog")
+    return ("edge",)
+
+
+def pip_extra_spec(selected_components: tuple[str, ...]) -> str:
+    # PANTHEON is intentionally not pulled by the managed server default. The
+    # pyproject server extra remains unchanged for backward compatibility; the
+    # installer expands server into its runtime-required extras instead of using
+    # mnemos-os[server].
+    extras: set[str] = set()
+    for component in selected_components:
+        if component == "server":
+            extras.update({"nats", "persephone"})
+        elif component == "ml":
+            extras.update({"morpheus", "kronos", "apollo", "artemis", "hot", "persephone"})
+        elif component == "interop":
+            extras.add("knossos")
+        elif component == "full":
+            extras.update({"edge", "nats", "persephone", "pantheon", "morpheus", "kronos", "knossos", "apollo", "artemis", "hot", "graeae", "hive"})
+        else:
+            extras.add(component)
+    return f".[{','.join(sorted(extras))}]" if extras else "."
+
+
+def service_flags_for_selection(profile: str, selected_components: tuple[str, ...]) -> dict[str, bool]:
+    flags = dict(PROFILE_SERVICE_MANIFEST.get(profile, PROFILE_SERVICE_MANIFEST["edge"]))
+    for component in selected_components:
+        for service, enabled in COMPONENT_SERVICE_ENABLES.get(component, {}).items():
+            flags[service] = enabled
+    return flags
+
+
+def env_flags_for_services(flags: dict[str, bool]) -> dict[str, bool]:
+    env_flags: dict[str, bool] = {
+        "MNEMOS_PROFILE_SERVICES_ENABLED": True,
+    }
+    for service, enabled in flags.items():
+        env_names = SERVICE_ENV_OVERRIDES.get(service, ())
+        if env_names:
+            env_flags[env_names[0]] = enabled
+    return env_flags
 
 
 def _generate_password(length: int = 24) -> str:
@@ -102,7 +201,12 @@ def _profile_uses_sqlite(profile: str) -> bool:
     return profile in {"edge", "dev"}
 
 
-def run_wizard(info: SystemInfo, existing_config: dict = None, selected_profile: str | None = None) -> Config:
+def run_wizard(
+    info: SystemInfo,
+    existing_config: dict = None,
+    selected_profile: str | None = None,
+    selected_components: tuple[str, ...] | None = None,
+) -> Config:
     """Run the interactive installation wizard and return a Config."""
     cfg = Config()
 
@@ -141,6 +245,25 @@ def run_wizard(info: SystemInfo, existing_config: dict = None, selected_profile:
 
     cfg.auth_enabled = False
     cfg.rls_enabled = False
+
+    # ------------------------------------------------------------------ #
+    # 1b. Component / service bundle selection
+    # ------------------------------------------------------------------ #
+    if selected_components is not None:
+        cfg.selected_components = selected_components
+    else:
+        defaults = ",".join(default_components_for_profile(cfg.profile))
+        raw = _prompt(
+            "Install component bundles/extras (comma-separated; add pantheon to opt into model proxy)",
+            default=defaults,
+        )
+        try:
+            cfg.selected_components = normalize_component_selection(raw)
+        except ValueError as exc:
+            print(f"  {exc}")
+            cfg.selected_components = default_components_for_profile(cfg.profile)
+    cfg.profile_services_enabled = bool(cfg.selected_components)
+    cfg.service_flags = service_flags_for_selection(cfg.profile, cfg.selected_components)
 
     # ------------------------------------------------------------------ #
     # 2. Database
