@@ -1046,6 +1046,7 @@ async def search_memories(
             logger.warning(f"[CACHE] search read error: {e}")
 
     backend = _backend_or_503()
+    semantic_boosted_order = False
     # Root callers can search across namespaces (search_owner_id is
     # None); non-root callers are pinned. The visibility factory
     # rejects namespace=None for non-root, which the namespace 403
@@ -1114,6 +1115,7 @@ async def search_memories(
                         recency_weight=request.recency_weight,
                         **semantic_trace_kwargs,
                     )
+                    semantic_boosted_order = bool(request.boost_recency)
                 except Exception as exc:
                     logger.warning(
                         "[VECTOR] semantic search failed for '%s'; falling back to FTS: %s",
@@ -1122,6 +1124,7 @@ async def search_memories(
                     )
                     rows = await _fts_fallback()
                     semantic_failed = True
+                    semantic_boosted_order = False
                 # Review #6 fix (2026-05-23): when semantic search returns
                 # zero rows, auto-fall-back to FTS in the same request so
                 # callers don't have to retry with semantic=false. Most
@@ -1134,6 +1137,7 @@ async def search_memories(
                 if not rows and not semantic_failed:
                     logger.info(f"[VECTOR] semantic returned 0 rows for '{request.query[:30]}'; falling back to FTS")
                     rows = await _fts_fallback()
+                    semantic_boosted_order = False
                 elif rows and not semantic_failed:
                     # Relevance floor (UAT 2026-06-13). These are genuine
                     # vector rows (not the semantic_failed / 0-row->FTS
@@ -1280,6 +1284,7 @@ async def search_memories(
                     decay_table,
                     overrides=request.decay_overrides,
                     recency_weight=request.recency_weight,
+                    preserve_current_order=semantic_boosted_order,
                 )
         except Exception:
             logger.exception(

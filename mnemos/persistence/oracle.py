@@ -145,7 +145,20 @@ def _recency_date(row: Row) -> date:
 
     if not isinstance(row, dict):
         return date.min
-    return _coerce_date(row.get("updated")) or _coerce_date(row.get("created")) or date.min
+    return (
+        _coerce_date(row.get("last_recalled_at"))
+        or _coerce_date(row.get("updated"))
+        or _coerce_date(row.get("created"))
+        or date.min
+    )
+
+
+def _boosted_rank_score_sort_key(row: Row, *, today: date, recency_weight: float) -> float:
+    rank = _rank_score_sort_key(row)
+    if not math.isfinite(rank):
+        return math.inf
+    age_days = max(0, (today - _recency_date(row)).days)
+    return rank - recency_weight * (1.0 / (1.0 + age_days))
 
 
 def _render_visibility(
@@ -1937,20 +1950,7 @@ class OracleMemoryRepository(MemoryRepository):
         if boost_recency and rows:
             w = float(recency_weight)
             today = datetime.now(timezone.utc).date()
-            for row in rows:
-                rank = row.get("rank_score")
-                if rank is None:
-                    continue
-                try:
-                    rank_f = float(rank)
-                except (TypeError, ValueError):
-                    continue
-                if not math.isfinite(rank_f):
-                    continue
-                upd_date = _recency_date(row)
-                age_days = max(0, (today - upd_date).days)
-                row["rank_score"] = rank_f - w * (1.0 / (1.0 + age_days))
-            rows.sort(key=_rank_score_sort_key)
+            rows.sort(key=lambda row: _boosted_rank_score_sort_key(row, today=today, recency_weight=w))
             rows = rows[:limit]
 
         return rows
