@@ -486,6 +486,15 @@ def _parse_args() -> argparse.Namespace:
         choices=sorted(_VALID_PROFILES),
         help="Deployment profile: server, edge, or dev. Legacy personal maps to edge.",
     )
+    parser.add_argument(
+        "--with",
+        dest="with_components",
+        help=(
+            "Comma-separated optional extras/bundles to install and enable "
+            "(for example: server,ml,nats,pantheon). Implies managed "
+            "profile->service composition; omitted preserves legacy defaults."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1250,7 +1259,12 @@ def _config_from_env() -> "Config":
     path uses _config_from_env_runtime_parity() instead, which is
     PG_*-strict to match what the running service reads.
     """
-    from .wizard import Config
+    from .wizard import (
+        Config,
+        env_flags_for_services,
+        normalize_component_selection,
+        service_flags_for_selection,
+    )
 
     cfg = Config()
     # Profile inference: if MNEMOS_PROFILE isn't set explicitly but the
@@ -1293,6 +1307,13 @@ def _config_from_env() -> "Config":
     cfg.auth_enabled = False
     cfg.rls_enabled = False
     cfg.create_new_db = os.environ.get("MNEMOS_CREATE_DB", "true").lower() == "true"
+    selected_raw = os.environ.get("MNEMOS_SELECTED_COMPONENTS", "")
+    if selected_raw:
+        cfg.selected_components = normalize_component_selection(selected_raw)
+        cfg.profile_services_enabled = True
+        cfg.service_flags = service_flags_for_selection(cfg.profile, cfg.selected_components)
+        for key, value in env_flags_for_services(cfg.service_flags).items():
+            os.environ.setdefault(key, "true" if value else "false")
     cfg.install_docling = os.environ.get("MNEMOS_INSTALL_DOCLING", "true").lower() == "true"
     cfg.create_service = os.environ.get("MNEMOS_CREATE_SERVICE", "true").lower() == "true"
     cfg.inference_embed_host = os.environ.get(
@@ -1516,6 +1537,9 @@ def _write_config_toml(cfg, repo_path: str) -> None:
     _set("graeae", "mode_default", profile_defaults["graeae_mode_default"])
     _set("logging", "level", profile_defaults["log_level"])
     _set("compression", "workers", profile_defaults["compression_workers"])
+    if getattr(cfg, "selected_components", ()):
+        _set("services", "managed", True)
+        _set("services", "selected_components", ",".join(cfg.selected_components))
     if cfg.profile == "dev":
         _set("runtime", "loose_timeouts", True)
 
@@ -1619,6 +1643,15 @@ def _render_minimal_config(cfg, profile_defaults: dict) -> str:
             f"workers = {profile_defaults['compression_workers']}",
         ]
     )
+    if getattr(cfg, "selected_components", ()):
+        lines.extend(
+            [
+                "",
+                "[services]",
+                "managed = true",
+                f'selected_components = "{','.join(cfg.selected_components)}"',
+            ]
+        )
     if cfg.profile == "dev":
         lines.extend(["", "[runtime]", "loose_timeouts = true"])
     return "\n".join(lines) + "\n"
@@ -1938,15 +1971,28 @@ def main() -> int:
     # ------------------------------------------------------------------ #
     cfg = None
 
+    selected_components = None
+    if args.with_components:
+        from .wizard import env_flags_for_services, normalize_component_selection, service_flags_for_selection
+
+        selected_components = normalize_component_selection(args.with_components)
+
     if args.unattended:
         print("Running in unattended mode (reading config from environment)...")
         cfg = _config_from_env()
         if args.profile:
             cfg.profile = args.profile
+        if selected_components is not None:
+            cfg.selected_components = selected_components
+            cfg.profile_services_enabled = True
+            cfg.service_flags = service_flags_for_selection(cfg.profile, cfg.selected_components)
+            os.environ["MNEMOS_SELECTED_COMPONENTS"] = ",".join(cfg.selected_components)
+            for key, value in env_flags_for_services(cfg.service_flags).items():
+                os.environ[key] = "true" if value else "false"
 
     elif args.wizard:
         from .wizard import run_wizard
-        cfg = run_wizard(info, selected_profile=args.profile)
+        cfg = run_wizard(info, selected_profile=args.profile, selected_components=selected_components)
         _apply_embedding_dim_from_env(cfg)
 
     else:
@@ -1956,16 +2002,25 @@ def main() -> int:
             cfg = run_agent(info)
             if args.profile:
                 cfg.profile = args.profile
+            if selected_components is not None:
+                from .wizard import env_flags_for_services, service_flags_for_selection
+
+                cfg.selected_components = selected_components
+                cfg.profile_services_enabled = True
+                cfg.service_flags = service_flags_for_selection(cfg.profile, cfg.selected_components)
+                os.environ["MNEMOS_SELECTED_COMPONENTS"] = ",".join(cfg.selected_components)
+                for key, value in env_flags_for_services(cfg.service_flags).items():
+                    os.environ[key] = "true" if value else "false"
             _apply_embedding_dim_from_env(cfg)
         except (ImportError, ModuleNotFoundError):
             print("[installer] agent module not available — falling back to wizard.")
             from .wizard import run_wizard
-            cfg = run_wizard(info, selected_profile=args.profile)
+            cfg = run_wizard(info, selected_profile=args.profile, selected_components=selected_components)
             _apply_embedding_dim_from_env(cfg)
         except Exception as exc:
             print(f"[installer] Agent error ({exc}) — falling back to wizard.")
             from .wizard import run_wizard
-            cfg = run_wizard(info, selected_profile=args.profile)
+            cfg = run_wizard(info, selected_profile=args.profile, selected_components=selected_components)
             _apply_embedding_dim_from_env(cfg)
 
     if cfg is None:
@@ -1988,7 +2043,12 @@ def main() -> int:
     # Step 7: Install requirements
     # ------------------------------------------------------------------ #
     print("\n[installer] Installing Python dependencies...")
-    ok = install_requirements(venv_path)
+    extras_to_install = []
+    if getattr(cfg, "selected_components", ()):
+        from .wizard import pip_extra_spec
+
+        extras_to_install.append(pip_extra_spec(cfg.selected_components))
+    ok = install_requirements(venv_path, extra=extras_to_install)
     if not ok:
         print("WARNING: Some dependencies failed to install.", file=sys.stderr)
 
