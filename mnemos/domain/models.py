@@ -527,6 +527,19 @@ class MemoryListResponse(BaseModel):
     compression_metadata: Optional[Dict[str, Any]] = None
 
 
+class MemoryListRequest(BaseModel):
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    namespace: Optional[str] = None
+    include_archived: Optional[bool] = False
+    limit: int = Field(20, ge=1, le=500)
+    offset: int = Field(0, ge=0)
+    operational: Optional[bool] = False
+    # Supersession current-state mode. Default OFF for back-compat.
+    exclude_superseded: Optional[bool] = False
+    current_only: Optional[bool] = False
+
+
 class MemorySearchRequest(BaseModel):
     query: str
     limit: int = 10
@@ -552,6 +565,10 @@ class MemorySearchRequest(BaseModel):
     # content for legitimate operational/runbook recall by a trusted caller.
     operational: Optional[bool] = False
     include_archived: Optional[bool] = False
+    # Supersession current-state mode. Default OFF for back-compat: historical
+    # superseded/consolidated rows remain visible unless callers opt in.
+    exclude_superseded: Optional[bool] = False
+    current_only: Optional[bool] = False
     boost_recency: Optional[bool] = False
     recency_weight: float = Field(0.15, ge=0.0, le=1.0)
     # v6.2 M-2.2.3: retrieval profile dispatcher.
