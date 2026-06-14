@@ -4411,6 +4411,34 @@ class OracleAuditChainRepository(AuditChainRepository):
         finally:
             await _call(cursor.close)
 
+    async def list_memory_entries(
+        self,
+        tx: Transaction,
+        memory_id: bytes,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                       op, payload_hash, writer_id, writer_pubkey,
+                       signature, signed_at, global_root, global_seq
+                FROM memory_audit_chain
+                WHERE memory_id = :memory_id
+                ORDER BY signed_at ASC, entry_id ASC
+                """,
+                {"memory_id": memory_id},
+            )
+            rows = await _call(cursor.fetchall)
+            if not rows:
+                return []
+            cols = [d[0].lower() for d in cursor.description]
+            return [dict(zip(cols, r)) for r in rows]
+        finally:
+            await _call(cursor.close)
+
     async def get_chain_stats(self, tx: Transaction) -> dict:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)

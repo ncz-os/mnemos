@@ -25,10 +25,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import AUDIT_CAPABILITY, backend_or_503 as _backend_or_503
-from mnemos.api.persistence_helpers import _capability_503
+from mnemos.api.persistence_helpers import _capability_503, maybe_set_pg_rls
 from mnemos.audit import derive_writer_keypair, load_root_keypair
 from mnemos.audit.crypto import merkle_leaf, merkle_proof, merkle_root
 from mnemos.audit.route_helper import memory_id_to_audit_bytes
+from mnemos.audit.verify import verify_memory_audit_chain
+from mnemos.core.config import get_settings
+from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.workers.audit_sealer import audit_chain_enabled
 
 logger = logging.getLogger(__name__)
@@ -270,6 +273,96 @@ async def audit_inclusion_proof(
         "global_seq": target_row.get("global_seq"),
         "proof": [{"sibling": sib.hex(), "position": pos} for sib, pos in proof],
     }
+
+
+@router.get("/verify")
+async def audit_verify_memory(
+    memory_id_str: str = Query(
+        ...,
+        description="Memory ID (string form, e.g. 'mem_1779637500000_abc123')",
+    ),
+    include_current: bool = Query(
+        True,
+        description="Also compare the latest signed payload hash with the current readable memory row.",
+    ),
+    user: UserContext = Depends(get_current_user),
+) -> dict:
+    """Verify one memory's Ed25519 + hash-linked audit chain.
+
+    This endpoint is the operator-facing tamper-evidence proof: it
+    retrieves the per-memory chain through ``backend.audit_chain`` and
+    verifies signatures, prev-entry hash links, and (by default) that the
+    chain head still commits to the current readable memory row. A silent
+    modification to either the audit table or memory row turns ``valid``
+    false with machine-readable ``issues``.
+    """
+    if not audit_chain_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="audit chain disabled (MNEMOS_AUDIT_CHAIN not 'on')",
+        )
+    backend = _require_audit_backend()
+    if backend.audit_chain is None:
+        raise HTTPException(
+            status_code=503,
+            detail="backend has no audit_chain repository",
+        )
+
+    try:
+        memory_id_bytes = memory_id_to_audit_bytes(memory_id_str)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    current_memory = None
+    async with backend.transactional() as tx:
+        await maybe_set_pg_rls(tx, user)
+        rows = await backend.audit_chain.list_memory_entries(tx, memory_id_bytes)
+        if include_current:
+            if user.role == "root":
+                visibility = VisibilityFilter(
+                    scope=VisibilityScope.ROOT_BYPASS,
+                    user_id=None,
+                    group_ids=(),
+                    namespace=user.namespace,
+                )
+            else:
+                visibility = VisibilityFilter.for_read(user, namespace=user.namespace)
+            current_memory = await backend.memories.get_memory(
+                tx,
+                memory_id_str,
+                visibility=visibility,
+                include_archived=True,
+            )
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no audit entries for memory_id={memory_id_str}",
+        )
+
+    settings = get_settings()
+    session_secret = (getattr(settings.server, "session_secret", "") or "").encode("utf-8") or None
+    result = verify_memory_audit_chain(
+        rows,
+        current_memory=current_memory,
+        session_secret=session_secret,
+    )
+    result.update(
+        {
+            "memory_id": memory_id_str,
+            "memory_id_audit_key": memory_id_bytes.hex(),
+            "current_memory_checked": current_memory is not None,
+        }
+    )
+    if include_current and current_memory is None and result.get("head_op") != "delete":
+        result["issues"].append(
+            {
+                "code": "current_memory_unavailable",
+                "detail": "memory row is absent or not readable; signature/link verification still ran",
+            }
+        )
+        result["valid"] = False
+    return result
 
 
 @router.get("/health")
