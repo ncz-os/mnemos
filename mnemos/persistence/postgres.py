@@ -1256,26 +1256,37 @@ class PostgresMemoryRepository(MemoryRepository):
             return rows[:limit]
 
         candidates = [_parse_pgvector_text(row.get("_embedding_text")) for row in rows]
-        recency_boost = [float(row.get("_recency_boost") or 0.0) for row in rows]
+        recency_boost = [
+            0.0 if (row.get("superseded_by") or row.get("consolidated_into")) else float(row.get("_recency_boost") or 0.0)
+            for row in rows
+        ]
         weight_recency = max(0.0, min(1.0, float(recency_weight)))
-        weight_cos = 1.0 - weight_recency
+        # Recency is an additive ordering boost, not a replacement for raw
+        # semantic similarity. Keep cosine at full strength so old but very
+        # strong semantic hits stay in the candidate window while recent near
+        # ties can still move ahead.
+        weight_cos = 1.0
         ranking = _rerank_composite(
             embedding,
             candidates,
             recency_boost,
             weight_cos,
             weight_recency,
-            limit,
+            0,
         )
         reranked: list[Row] = []
         for idx, composite_score in ranking:
             row = rows[idx]
             enriched = dict(row.items()) if hasattr(row, "items") else dict(row)
-            enriched["similarity"] = composite_score
+            # Preserve the raw semantic similarity for min_score/OOD gates.
+            # Recency is an ordering-only key; overwriting ``similarity``
+            # would make a recent but semantically weak row bypass floors.
             enriched["_composite_score"] = composite_score
+            enriched["superseded_by"] = enriched.get("superseded_by") or enriched.get("consolidated_into")
             reranked.append(enriched)
+        reranked.sort(key=lambda r: bool(r.get("superseded_by") or r.get("consolidated_into")))
         _log_search_phase(search_trace_id, search_started_at, "rerank")
-        return reranked
+        return reranked[:limit]
 
     async def fts_search(
         self,
