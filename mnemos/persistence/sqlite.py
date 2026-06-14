@@ -362,10 +362,14 @@ def _render_sqlite_visibility(
         return "1=0"
 
     if visibility.scope == VisibilityScope.OWN_ONLY:
-        # Mutation path: strict owner_id + namespace.
+        # Mutation path: strict owner_id + namespace, with the same
+        # namespace subtraction applied to every visibility scope.
         clauses: list[str] = [f"{p}owner_id = ?", f"{p}namespace = ?"]
         params.append(visibility.user_id)
         params.append(visibility.namespace)
+        excl = _excl_clause()
+        if excl:
+            clauses.append(excl)
         return " AND ".join(clauses)
 
     # READABLE: full v1_multiuser predicate (own / federation / world /
