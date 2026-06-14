@@ -1,0 +1,12 @@
+[Unit]
+Description=MNEMOS PANTHEON — External Pricing Catalog Sync Timer
+Requires=pantheon-catalog-sync.service
+
+[Timer]
+# Run shortly after the GRAEAE model-registry sync so the base catalog is fresh.
+OnCalendar=*-*-* 03:45:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

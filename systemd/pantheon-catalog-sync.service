@@ -1,0 +1,24 @@
+[Unit]
+Description=MNEMOS PANTHEON — External Pricing Catalog Sync
+Documentation=https://github.com/perlowja/mnemos
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mnemos
+Group=mnemos
+WorkingDirectory=/opt/mnemos
+ExecStart=/opt/mnemos/venv/bin/python3 scripts/refresh_pantheon_catalog.py
+Environment=DATABASE_URL=postgresql://mnemos_user@localhost/mnemos
+Environment=MNEMOS_CONFIG=/opt/mnemos/config.toml
+Environment=PANTHEON_CATALOG_CACHE=/var/lib/mnemos/pantheon-catalog.json
+Environment=PANTHEON_CATALOG_SQLITE=/var/lib/mnemos/pantheon-catalog.sqlite3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pantheon-catalog-sync
+
+# Keep last-good catalog on external feed outages; fetcher-level failures are
+# tolerated by the sync process and reported in the cached source metadata.
+SuccessExitStatus=0

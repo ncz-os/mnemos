@@ -178,6 +178,7 @@ dev = [
 # filesystem.
 mnemos = "mnemos.cli.main:app"
 mnemos-install = "mnemos.installer.__main__:main"
+refresh-pantheon-catalog = "mnemos.domain.pantheon.pricing:main"
 
 [tool.setuptools]
 # Ship every file listed in MANIFEST.in (SQL migrations, config example,
