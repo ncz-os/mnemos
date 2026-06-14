@@ -2,7 +2,9 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import mnemos.core.lifecycle as _lc
+from mnemos.core.injection_defense import defend
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
+from mnemos.core.secret_detection import redact_content
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,17 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
         return default
 
 
+def _secure_agent_context(content: Any) -> str:
+    """Return DB memory content as redacted, framed untrusted data.
+
+    This path consumes raw database rows, so apparent MNEMOS frame delimiters in
+    content are attacker-controlled data.  Never trust is_framed() here: always
+    redact first, then defend() so embedded delimiters/instructions are escaped
+    and the entire value is wrapped as untrusted DATA.
+    """
+    return defend(redact_content("" if content is None else str(content)))
+
+
 async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Dict[str, Any]]:
     if not _lc._pool:
         logger.debug("[MNEMOS] No DB pool available")
@@ -30,7 +43,7 @@ async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Di
             if user.role == "root":
                 memories = await conn.fetch(
                     """
-                    SELECT m.id, m.category,
+                    SELECT m.id, m.category, m.namespace,
                            COALESCE(v.compressed_content, m.content) AS content
                     FROM memories m
                     LEFT JOIN memory_compressed_variants v
@@ -38,6 +51,7 @@ async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Di
                     WHERE
                         m.deleted_at IS NULL
                         AND m.archived_at IS NULL
+                        AND m.namespace <> 'vault'
                         AND (
                             to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)
                             OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
@@ -62,7 +76,7 @@ async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Di
                 lim_ph = f"${len(vis_params) + 3}"
                 memories = await conn.fetch(
                     f"""
-                    SELECT m.id, m.category,
+                    SELECT m.id, m.category, m.namespace,
                            COALESCE(v.compressed_content, m.content) AS content
                     FROM memories m
                     LEFT JOIN memory_compressed_variants v
@@ -71,6 +85,7 @@ async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Di
                       AND m.archived_at IS NULL
                       AND {vis_clause}
                       AND m.namespace = {ns_ph}
+                      AND m.namespace <> 'vault'
                       AND (
                           to_tsvector('english', m.content) @@ plainto_tsquery('english', {q_ph})
                           OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
@@ -84,7 +99,15 @@ async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Di
                     limit,
                 )
             logger.info("[MNEMOS] Found %s memories for query '%s...'", len(memories), query[:30])
-            return [{"id": m["id"], "content": m["content"]} for m in memories]
+            return [
+                {
+                    "id": m["id"],
+                    "content": _secure_agent_context(m["content"]),
+                    "namespace": _row_get(m, "namespace"),
+                }
+                for m in memories
+                if _row_get(m, "namespace") != "vault"
+            ]
     except Exception as e:
         logger.warning("[MNEMOS] Search failed for '%s...': %s", query[:50], e)
         return []
@@ -173,6 +196,7 @@ async def fetch_model_recommendation(
             # unknown cost honestly rather than fabricate 0.0 which
             # would silently lie about pricing semantics.
             from mnemos.core.numeric import safe_float
+
             in_cost = _row_get(model, "input_cost_per_mtok")
             out_cost = _row_get(model, "output_cost_per_mtok")
             if in_cost is None or out_cost is None:
@@ -220,9 +244,7 @@ async def lookup_provider_for_model(model: str) -> Optional[str]:
 
             if "/" in model:
                 head, tail = model.split("/", 1)
-                head_registry = GRAEAE_REGISTRY_MAP.get(head, {"registry_provider": head})[
-                    "registry_provider"
-                ]
+                head_registry = GRAEAE_REGISTRY_MAP.get(head, {"registry_provider": head})["registry_provider"]
                 row = await conn.fetchrow(
                     "SELECT provider FROM model_registry "
                     "WHERE provider = $1 AND model_id = $2 "
@@ -252,8 +274,7 @@ async def fetch_available_models() -> list[Any]:
                 )
         except Exception as exc:
             logger.warning(
-                "[/v1/models] model_registry query failed, "
-                "returning an empty discovery list: %s",
+                "[/v1/models] model_registry query failed, " "returning an empty discovery list: %s",
                 exc,
             )
             rows = []

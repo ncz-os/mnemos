@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Protocol
 
 from mnemos.core.config import get_registered_task_classifier, get_settings
+from mnemos.core.injection_defense import defend
+from mnemos.core.secret_detection import redact_content
 from mnemos.db import openai_compat_repo
 
 from .content import _content_text, _message_to_dict
@@ -45,8 +47,7 @@ _FACTORY_CLASSIFIER_PATH: str | None = None
 
 
 class TaskClassifier(Protocol):
-    def classify(self, messages: List[ChatMessage]) -> str:
-        ...
+    def classify(self, messages: List[ChatMessage]) -> str: ...
 
 
 class KeywordTaskClassifier:
@@ -94,10 +95,7 @@ def _response_message_data(message: Dict[str, Any]) -> Dict[str, Any]:
         if key not in _RESPONSE_MESSAGE_FIELDS:
             raise OpenAICompatError(
                 status_code=502,
-                detail=(
-                    f"provider returned unsupported response field {key}; "
-                    "gateway cannot faithfully represent"
-                ),
+                detail=(f"provider returned unsupported response field {key}; " "gateway cannot faithfully represent"),
             )
     return dict(message)
 
@@ -159,10 +157,7 @@ def _import_from_path(path: str) -> Any:
     if not sep:
         module_path, _, attr = path.rpartition(".")
     if not module_path or not attr:
-        raise ValueError(
-            "MNEMOS_TASK_CLASSIFIER_FACTORY must be an import path like "
-            "'package.module:factory'"
-        )
+        raise ValueError("MNEMOS_TASK_CLASSIFIER_FACTORY must be an import path like " "'package.module:factory'")
     module = importlib.import_module(module_path)
     return getattr(module, attr)
 
@@ -207,11 +202,7 @@ def _is_openai_error_detail(detail: Any) -> bool:
     if not isinstance(detail, dict):
         return False
     error = detail.get("error")
-    return (
-        isinstance(error, dict)
-        and isinstance(error.get("type"), str)
-        and isinstance(error.get("code"), str)
-    )
+    return isinstance(error, dict) and isinstance(error.get("type"), str) and isinstance(error.get("code"), str)
 
 
 _PROVIDER_DISPLAY = {
@@ -243,10 +234,7 @@ def _row_provider(row: Any) -> Optional[str]:
 
 async def list_models(user: Any) -> ModelsResponse:
     rows = await openai_compat_repo.fetch_available_models()
-    models = [
-        ModelInfo(id=_row_model_id(row), owned_by=_owned_by(_row_provider(row)))
-        for row in rows
-    ]
+    models = [ModelInfo(id=_row_model_id(row), owned_by=_owned_by(_row_provider(row))) for row in rows]
     return ModelsResponse(data=models)
 
 
@@ -266,6 +254,18 @@ async def get_model(model_id: str, user: Any) -> ModelInfo:
 
 async def search_memory_context(*args: Any, **kwargs: Any) -> Any:
     return await openai_compat_repo.fetch_memory_context(*args, **kwargs)
+
+
+def format_memory_for_system_prompt(content: Any) -> str:
+    """Return one memory as redacted, framed untrusted data.
+
+    Memory rows are untrusted even if they appear to begin with MNEMOS frame
+    delimiters: stored content may forge FRAME_OPEN/FRAME_CLOSE and append live
+    instructions after the close marker.  Always redact first, then let
+    defend() defang any embedded delimiters/injections and wrap the whole value
+    as DATA.
+    """
+    return defend(redact_content("" if content is None else str(content)))
 
 
 async def get_model_recommendation(*args: Any, **kwargs: Any) -> Any:
@@ -327,9 +327,15 @@ async def chat_completion(
             break
 
     if mnemos_docs:
-        context_str = "\n\n".join([f"[Memory]\n{doc['content'][:500]}" for doc in mnemos_docs])
-        system_prompt += f"\n\n[MNEMOS Context - {len(mnemos_docs)} memories]\n{context_str}"
-        logger.info("[MNEMOS] Injected %s memories into context", len(mnemos_docs))
+        safe_memories = [
+            format_memory_for_system_prompt(str(doc.get("content", ""))[:500])
+            for doc in mnemos_docs
+            if doc.get("namespace") != "vault"
+        ]
+        if safe_memories:
+            context_str = "\n\n".join([f"[Memory]\n{memory}" for memory in safe_memories])
+            system_prompt += f"\n\n[MNEMOS Context - {len(safe_memories)} memories]\n{context_str}"
+            logger.info("[MNEMOS] Injected %s memories into context", len(safe_memories))
 
     messages: list[dict[str, Any]] = []
     system_added = False
