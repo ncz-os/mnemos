@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.core.security import is_root
 from mnemos.db import portability_repo as repo
+from mnemos.persistence.base import AuditPersistence, Transaction
 
 from .allowlist import _build_referenced_memory_allowlist
 from .ids import _derive_caller_scoped_id
@@ -95,6 +96,8 @@ async def import_memories(
     envelope: MPFEnvelope,
     preserve_owner: bool,
     user,
+    backend: AuditPersistence | None = None,
+    tx: Transaction | None = None,
 ) -> ImportStats:
     _validate_import_request(envelope, preserve_owner, user)
     stats = _new_stats()
@@ -255,6 +258,17 @@ async def import_memories(
                 else:
                     stats.imported += 1
                     inserted_record_ids.add(persisted_id)
+                    if backend is not None and tx is not None:
+                        await _write_mpf_import_audit_entry(
+                            backend,
+                            tx,
+                            memory_id=persisted_id,
+                            content=content,
+                            category=category,
+                            subcategory=subcategory,
+                            metadata=metadata,
+                            writer_id=user.user_id,
+                        )
             except Exception as exc:
                 stats.failed += 1
                 stats.errors.append(f"{record.id}: {type(exc).__name__}: {exc}")
@@ -430,3 +444,41 @@ async def import_memories(
         stats.sidecars_imported,
     )
     return stats
+
+
+async def _write_mpf_import_audit_entry(
+    backend: AuditPersistence,
+    tx: Transaction,
+    *,
+    memory_id: str,
+    content: str,
+    category: str,
+    subcategory: str | None,
+    metadata: dict[str, Any] | None,
+    writer_id: str,
+) -> None:
+    if getattr(backend, "audit_chain", None) is None:
+        return
+    from mnemos.audit import write_audit_entry
+    from mnemos.core.config import get_settings
+    from mnemos.workers.audit_sealer import audit_chain_enabled
+
+    if not audit_chain_enabled():
+        return
+    session_secret = (getattr(get_settings().server, "session_secret", "") or "").encode("utf-8")
+    if not session_secret:
+        logger.warning("[mpf_import] MNEMOS_AUDIT_CHAIN=on but session_secret is empty; skipping audit write")
+        return
+    await write_audit_entry(
+        backend,
+        tx,
+        op="create",
+        memory_id_str=memory_id,
+        content=content,
+        category=category,
+        subcategory=subcategory,
+        metadata=metadata,
+        embedding=None,
+        writer_id=writer_id,
+        session_secret=session_secret,
+    )
