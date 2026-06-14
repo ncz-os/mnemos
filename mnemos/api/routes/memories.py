@@ -538,11 +538,10 @@ async def get_memory(
     Content-negotiation surface (Accept header):
       * default / ``application/json`` / ``*/*`` — returns the JSON
         ``MemoryItem`` (existing behaviour, unchanged).
-      * ``text/plain`` — returns the prose narration body, identical
-        to ``GET /v1/memories/{id}/narrate?format=prose``.
-      * ``application/x-apollo-dense`` — returns the raw winning-
-        variant content (APOLLO dense form), identical to
-        ``?format=dense`` on the narrate endpoint.
+      * ``text/plain`` — returns the prose narration body, framed as
+        untrusted retrieved DATA.
+      * ``application/x-apollo-dense`` — returns the winning variant
+        content (APOLLO dense form) framed as untrusted retrieved DATA.
 
     All representations honour the same ``VisibilityFilter.for_read``
     read contract — owner, federated, world-readable, and group-
@@ -693,6 +692,13 @@ async def get_memory(
             from mnemos.core.secret_detection import redact_content
 
             narrated_body = redact_content(narrated_body)
+        # Content-negotiated prose/dense is an agent-facing retrieval path
+        # just like JSON get/list/search. Frame it as untrusted DATA unless
+        # root explicitly requested operational verbatim recall.
+        if _should_frame_data(user, operational=operational):
+            from mnemos.core.injection_defense import defend as _defend_untrusted
+
+            narrated_body = _defend_untrusted(narrated_body)
         return PlainTextResponse(
             narrated_body,
             media_type=media_type,
