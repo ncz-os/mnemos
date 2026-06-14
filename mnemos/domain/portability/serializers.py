@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict
 
+from mnemos.core.secret_detection import redact_content
+
 from .schemas import (
     MEMORY_PAYLOAD_VERSION,
     MPF_VERSION_PREFIX_V0_2,
@@ -27,6 +29,19 @@ _ACTIVITY_TYPE_HINTS = (
     ("docling", "etl_job"),
     ("ingest", "etl_job"),
 )
+
+
+def _redact_secret_strings(value: Any) -> Any:
+    """Recursively redact credential-shaped spans from JSON-ish export data."""
+    if isinstance(value, str):
+        return redact_content(value)
+    if isinstance(value, dict):
+        return {k: _redact_secret_strings(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_secret_strings(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_secret_strings(v) for v in value)
+    return value
 
 
 def _derive_prov_activity_type(row) -> str:
@@ -154,7 +169,12 @@ def _record_provenance_v0_2(row) -> Dict[str, Any]:
     return prov
 
 
-def _memory_to_record(row, *, mpf_version: str = "0.1.1") -> MPFRecord:
+def _memory_to_record(
+    row,
+    *,
+    mpf_version: str = "0.1.1",
+    redact_secrets: bool = False,
+) -> MPFRecord:
     """Serialize a memories row to an MPF record.
 
     ``mpf_version`` selects the emission shape. v0.1.x: legacy payload
@@ -170,8 +190,14 @@ def _memory_to_record(row, *, mpf_version: str = "0.1.1") -> MPFRecord:
         except Exception:
             metadata = {"_raw": metadata}
 
+    if redact_secrets:
+        metadata = _redact_secret_strings(metadata)
+    content = row.get("content")
+    if redact_secrets:
+        content = redact_content(content)
+
     payload: Dict[str, Any] = {
-        "content": row.get("content"),
+        "content": content,
         "category": row.get("category"),
         "subcategory": row.get("subcategory"),
         "created": _iso(row.get("created")),
@@ -245,7 +271,12 @@ def _normalize_confidence_for_mpf(raw: Any) -> tuple[Any, Any]:
     return (clamped, raw)
 
 
-def _kg_triple_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[str, Any]:
+def _kg_triple_to_entry(
+    row,
+    *,
+    mpf_version: str = "0.1.1",
+    redact_secrets: bool = False,
+) -> Dict[str, Any]:
     """Serialize a kg_triples row for MPF.
 
     v0.1.x emits raw DB values verbatim (backward-compat). v0.2.x clamps
@@ -258,6 +289,8 @@ def _kg_triple_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[str, Any]:
             metadata = json.loads(metadata)
         except Exception:
             metadata = {"_raw": metadata}
+    if redact_secrets:
+        metadata = _redact_secret_strings(metadata)
 
     is_v0_2 = mpf_version.startswith(MPF_VERSION_PREFIX_V0_2)
     if is_v0_2:
@@ -271,11 +304,17 @@ def _kg_triple_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[str, Any]:
     else:
         confidence_value = row.get("confidence")
 
+    subject_literal = row.get("subject")
+    object_literal = row.get("object")
+    if redact_secrets:
+        subject_literal = redact_content(subject_literal)
+        object_literal = redact_content(object_literal)
+
     entry: Dict[str, Any] = {
         "id": row["id"],
         "predicate": row["predicate"],
-        "subject_literal": row.get("subject"),
-        "object_literal": row.get("object"),
+        "subject_literal": subject_literal,
+        "object_literal": object_literal,
         "subject_type": row.get("subject_type"),
         "object_type": row.get("object_type"),
         "memory_id": row.get("memory_id"),
@@ -314,7 +353,12 @@ def _normalize_change_type_for_mpf(raw: Any) -> Any:
     return "update"
 
 
-def _memory_version_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[str, Any]:
+def _memory_version_to_entry(
+    row,
+    *,
+    mpf_version: str = "0.1.1",
+    redact_secrets: bool = False,
+) -> Dict[str, Any]:
     """Serialize a memory_versions row for MPF.
 
     v0.1.x emits change_type verbatim (backward-compat — the v0.1 schema
@@ -328,6 +372,8 @@ def _memory_version_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[str, An
             metadata = json.loads(metadata)
         except Exception:
             metadata = {"_raw": metadata}
+    if redact_secrets:
+        metadata = _redact_secret_strings(metadata)
     merge_parents = row.get("merge_parents") or None
     if merge_parents is not None:
         merge_parents = [str(p) for p in merge_parents]
@@ -347,6 +393,12 @@ def _memory_version_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[str, An
             metadata = {**metadata, "_mnemos_change_type": raw_change_type}
     else:
         change_type_out = raw_change_type
+    content = row["content"]
+    verbatim_content = row.get("verbatim_content")
+    if redact_secrets:
+        content = redact_content(content)
+        if verbatim_content is not None:
+            verbatim_content = redact_content(verbatim_content)
     entry: Dict[str, Any] = {
         "id": str(row["id"]),
         "record_id": row["memory_id"],
@@ -355,11 +407,11 @@ def _memory_version_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[str, An
         "branch": row.get("branch"),
         "parent_version_id": parent_version_id,
         "merge_parents": merge_parents,
-        "content": row["content"],
+        "content": content,
         "category": row.get("category"),
         "subcategory": row.get("subcategory"),
         "metadata": metadata or None,
-        "verbatim_content": row.get("verbatim_content"),
+        "verbatim_content": verbatim_content,
         "owner_id": row.get("owner_id"),
         "namespace": row.get("namespace"),
         "permission_mode": row.get("permission_mode"),
@@ -439,7 +491,12 @@ def _deletion_log_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[str, Any]
     return {k: v for k, v in entry.items() if v is not None}
 
 
-def _compression_variant_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[str, Any]:
+def _compression_variant_to_entry(
+    row,
+    *,
+    mpf_version: str = "0.1.1",
+    redact_secrets: bool = False,
+) -> Dict[str, Any]:
     """Serialize a memory_compressed_variants row for MPF.
 
     v0.1.x emits compressed_tokens verbatim (backward-compat — legacy
@@ -454,11 +511,14 @@ def _compression_variant_to_entry(row, *, mpf_version: str = "0.1.1") -> Dict[st
         compressed_tokens_out = _clamp_non_negative_int(row.get("compressed_tokens"))
     else:
         compressed_tokens_out = row.get("compressed_tokens")
+    compressed_content = row.get("compressed_content")
+    if redact_secrets:
+        compressed_content = redact_content(compressed_content)
     entry: Dict[str, Any] = {
         "record_id": row["memory_id"],
         "engine_id": row["engine_id"],
         "engine_version": row.get("engine_version"),
-        "compressed_content": row.get("compressed_content"),
+        "compressed_content": compressed_content,
         "compressed_tokens": compressed_tokens_out,
         "compression_ratio": row.get("compression_ratio"),
         "quality_score": row.get("quality_score"),
