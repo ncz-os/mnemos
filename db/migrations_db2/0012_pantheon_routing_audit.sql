@@ -1,4 +1,4 @@
---#SET TERMINATOR %
+--#SET TERMINATOR @
 -- 0012_pantheon_routing_audit.sql — Db2 12.1.5 parity backfill.
 -- Mirrors db/migrations_v4_2_pantheon_routing_audit.sql. Idempotent via
 -- duplicate-object handlers and column-existence guards.
@@ -23,7 +23,7 @@ BEGIN
       created        TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
       CONSTRAINT pk_pantheon_routing_audit PRIMARY KEY (id)
     )';
-END%
+END@
 
 -- Backfill columns if an earlier stub table exists. Existing rows may lack a
 -- full routing payload, so payload is nullable on the ALTER path; fresh creates
@@ -65,7 +65,7 @@ BEGIN
   IF (SELECT COUNT(*) FROM syscat.columns WHERE tabschema = CURRENT SCHEMA AND tabname = 'PANTHEON_ROUTING_AUDIT' AND colname = 'CREATED') = 0 THEN
     EXECUTE IMMEDIATE 'ALTER TABLE pantheon_routing_audit ADD COLUMN created TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP';
   END IF;
-END%
+END@
 
 BEGIN
   DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
@@ -74,12 +74,12 @@ BEGIN
     REFERENCING NEW AS n FOR EACH ROW
     WHEN (n.id IS NULL)
       SET n.id = LOWER(HEX(GENERATE_UNIQUE()))';
-END%
+END@
 
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX idx_pantheon_routing_audit_created_desc ON pantheon_routing_audit (created DESC)';
-END%
+END@
 
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX idx_pantheon_routing_audit_tenant_created_desc ON pantheon_routing_audit (tenant_user_id, created DESC)';
-END%
+END@

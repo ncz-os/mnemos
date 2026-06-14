@@ -1,4 +1,4 @@
---#SET TERMINATOR %
+--#SET TERMINATOR @
 -- 0002_graeae.sql — Db2 12.1.5 parity backfill for GRAEAE tables.
 -- App-side generates UUIDs; duplicate objects are ignored for replay safety.
 
@@ -27,7 +27,7 @@ BEGIN
       CONSTRAINT valid_quality CHECK (context_quality_rating IS NULL OR (context_quality_rating >= 0 AND context_quality_rating <= 100)),
       CONSTRAINT valid_consensus_score CHECK (consensus_score IS NULL OR (consensus_score >= 0 AND consensus_score <= 1.0))
     )';
-END%
+END@
 
 BEGIN
   DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
@@ -56,11 +56,11 @@ BEGIN
       CONSTRAINT valid_chain_hash CHECK (length(chain_hash) = 64),
       CONSTRAINT valid_response_hash CHECK (length(response_hash) = 64)
     )';
-END%
+END@
 
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_graeae_audit_log_consultation ON graeae_audit_log(consultation_id)'; END%
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_graeae_audit_log_created_at ON graeae_audit_log(created_at DESC)'; END%
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_graeae_audit_log_chain_hash ON graeae_audit_log(chain_hash)'; END%
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_graeae_audit_log_consultation ON graeae_audit_log(consultation_id)'; END@
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_graeae_audit_log_created_at ON graeae_audit_log(created_at DESC)'; END@
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_graeae_audit_log_chain_hash ON graeae_audit_log(chain_hash)'; END@
 
 BEGIN
   DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
@@ -76,8 +76,8 @@ BEGIN
       CONSTRAINT fk_cmr_memory FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE SET NULL,
       CONSTRAINT unique_consultation_memory UNIQUE (consultation_id, memory_id)
     )';
-END%
+END@
 
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_consultation_memory_refs_consultation ON consultation_memory_refs(consultation_id)'; END%
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_consultation_memory_refs_memory ON consultation_memory_refs(memory_id)'; END%
-BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_consultation_memory_refs_injected_at ON consultation_memory_refs(injected_at DESC)'; END%
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_consultation_memory_refs_consultation ON consultation_memory_refs(consultation_id)'; END@
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_consultation_memory_refs_memory ON consultation_memory_refs(memory_id)'; END@
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_consultation_memory_refs_injected_at ON consultation_memory_refs(injected_at DESC)'; END@
