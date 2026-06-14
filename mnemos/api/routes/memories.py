@@ -113,6 +113,25 @@ async def _write_memory_mutation_audit_entry(
     )
 
 
+def _metadata_for_audit(value) -> dict | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        if not value:
+            return None
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {"_raw": value}
+        return parsed if isinstance(parsed, dict) else {"_value": parsed}
+    try:
+        return dict(value)
+    except Exception:
+        return None
+
+
 def effective_semantic_floor() -> float:
     """Default semantic relevance floor applied when a caller does not
     pass min_score. Operator-overridable fleet-wide via
@@ -1478,7 +1497,8 @@ async def create_memory(
     _meta = _classified.metadata
     namespace = _classified.namespace
 
-    metadata_json = json.dumps(_meta or {"source": request.source})
+    persisted_metadata = _meta or {"source": request.source}
+    metadata_json = json.dumps(persisted_metadata)
     delivery_ids: list[str] = []
     try:
         async with backend.transactional() as tx:
@@ -1579,7 +1599,7 @@ async def create_memory(
                 content=request.content,
                 category=request.category,
                 subcategory=request.subcategory,
-                metadata=request.metadata,
+                metadata=persisted_metadata,
                 writer_id=user.user_id,
             )
             # Same-tx outbox enqueue — preserves the v4.0 contract
@@ -1881,7 +1901,7 @@ async def update_memory(
                 content=row["content"],
                 category=row["category"],
                 subcategory=row["subcategory"],
-                metadata=request.metadata,
+                metadata=_metadata_for_audit(row["metadata"]),
                 writer_id=user.user_id,
             )
             if getattr(backend, "supports_webhooks", True):
