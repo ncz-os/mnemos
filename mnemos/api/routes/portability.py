@@ -285,6 +285,18 @@ async def import_memories(
 ):
     require_postgres_pool_or_503(route_label="POST /v1/import")
 
+    backend = getattr(_lc, "_persistence_backend", None)
+    if backend is not None:
+        async with backend.transactional() as tx:
+            return await _import_memories(
+                tx.conn,
+                envelope=envelope,
+                preserve_owner=preserve_owner,
+                user=user,
+                backend=backend,
+                tx=tx,
+            )
+
     async with _lc.get_pool_manager().acquire() as conn:
         return await _import_memories(
             conn,
