@@ -1280,7 +1280,9 @@ class PostgresMemoryRepository(MemoryRepository):
 
         candidates = [_parse_pgvector_text(row.get("_embedding_text")) for row in rows]
         recency_boost = [
-            0.0 if (row.get("superseded_by") or row.get("consolidated_into")) else float(row.get("_recency_boost") or 0.0)
+            0.0
+            if (row.get("superseded_by") or row.get("consolidated_into"))
+            else float(row.get("_recency_boost") or 0.0)
             for row in rows
         ]
         weight_recency = max(0.0, min(1.0, float(recency_weight)))
@@ -3245,9 +3247,7 @@ class PostgresFederationRepository(FederationRepository):
     ) -> list[Row]:
         memory_query_parts = [_eligibility.eligible_for_federation("m")]
         tombstone_query_parts = [
-            "m.federation_source IS NULL",
-            "m.deleted_at IS NULL",
-            "m.consolidated_into IS NOT NULL",
+            _eligibility.eligible_for_federation_tombstone("m"),
             "m.consolidated_at IS NOT NULL",
         ]
         args: list[Any] = []

@@ -58,39 +58,6 @@ def _feed_payload(row: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _redact_field(value: Any) -> Any:
-    if value is None:
-        return None
-    from mnemos.core.secret_detection import redact_content
-
-    return redact_content(str(value))
-
-
-def _is_vault_row(row: Mapping[str, Any]) -> bool:
-    from mnemos.core.secret_detection import VAULT_NAMESPACE
-
-    return str(row.get("namespace") or "") == VAULT_NAMESPACE
-
-
-def _redacted_row(row: Mapping[str, Any]) -> dict[str, Any]:
-    # Native serializers receive raw DB rows and bypass the Pydantic
-    # _memory_item_from_row redaction path.  Apply the same federation
-    # retrieval policy here before either the Rust extension or pure-Python
-    # serializer can emit bytes: vault rows never leave the node, and every
-    # content-bearing field is span-redacted for credentials.
-    out = dict(row)
-    if out.get("type") == "consolidation":
-        return out
-    for key in ("content", "compressed_content", "verbatim_content"):
-        if key in out:
-            out[key] = _redact_field(out.get(key))
-    return out
-
-
-def _redacted_non_vault_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    return [_redacted_row(row) for row in rows if not _is_vault_row(row)]
-
-
 def _memory_item_payload(row: Mapping[str, Any]) -> dict[str, Any]:
     archived_at = _first_optional(row, "archived_at")
     metadata = row.get("metadata")
@@ -153,26 +120,21 @@ def serialize_memory_for_feed(rows: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def pure_python_serialize_memory_rows(rows: Sequence[Mapping[str, Any]]) -> bytes:
-    dict_rows = _redacted_non_vault_rows(rows)
     return json.dumps(
-        [_wire_payload(row) for row in dict_rows],
+        [_wire_payload(row) for row in rows],
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
 
 
 def serialize_memory_rows(rows: Sequence[Mapping[str, Any]]) -> bytes:
-    dict_rows = _redacted_non_vault_rows(rows)
+    dict_rows = [dict(row) for row in rows]
     if _NATIVE_FEDERATION is not None:
         try:
             return bytes(_NATIVE_FEDERATION.serialize_memory_rows(dict_rows))
         except Exception:
             pass
-    return json.dumps(
-        [_wire_payload(row) for row in dict_rows],
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
+    return pure_python_serialize_memory_rows(dict_rows)
 
 
 def serialize_feed_response(rows: Sequence[Mapping[str, Any]], *, next_cursor: str | None, has_more: bool) -> bytes:

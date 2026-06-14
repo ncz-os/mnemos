@@ -55,7 +55,7 @@ from mnemos.persistence.base import (
 from mnemos.persistence.types import MEMORY_COLS as _MEMORY_COLS, Row
 from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
-from mnemos.core.secret_detection import VAULT_NAMESPACE
+from mnemos.core import eligibility as _eligibility
 from mnemos.core import webhook_constants
 
 logger = logging.getLogger(__name__)
@@ -3060,22 +3060,12 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                 "SQLite federation feed does not support prefer_compressed; "
                 "use the Postgres server profile for compressed federation feeds."
             )
-        memory_query_parts = [
-            "m.federation_source IS NULL",
-            "(m.permission_mode % 10) >= 4",
-            "m.archived_at IS NULL",
-            "m.consolidated_into IS NULL",
-            # Secret vault (release-blocking 2026-06-13): never federate a
-            # credential-class memory to a remote peer, even if it were
-            # somehow flagged world-readable.
-            "(m.namespace IS NULL OR m.namespace <> ?)",
-        ]
+        memory_query_parts = [_eligibility.eligible_for_federation("m")]
         tombstone_query_parts = [
-            "m.federation_source IS NULL",
-            "m.consolidated_into IS NOT NULL",
+            _eligibility.eligible_for_federation_tombstone("m"),
             "m.consolidated_at IS NOT NULL",
         ]
-        memory_params: list[Any] = [VAULT_NAMESPACE]
+        memory_params: list[Any] = []
         tombstone_params: list[Any] = []
         if since_updated is not None:
             memory_query_parts.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
@@ -3190,16 +3180,8 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         namespaces: Sequence[str],
         categories: Sequence[str],
     ) -> Row | None:
-        query_parts = [
-            "m.federation_source IS NULL",
-            "(m.permission_mode % 10) >= 4",
-            "m.archived_at IS NULL",
-            "m.consolidated_into IS NULL",
-            "m.id = ?",
-            # Secret vault: never serve a vaulted memory over federation.
-            "(m.namespace IS NULL OR m.namespace <> ?)",
-        ]
-        params: list[Any] = [memory_id, VAULT_NAMESPACE]
+        query_parts = [_eligibility.eligible_for_federation("m"), "m.id = ?"]
+        params: list[Any] = [memory_id]
         if namespaces:
             query_parts.append(f"m.namespace IN ({_placeholders(namespaces)})")
             params.extend(namespaces)

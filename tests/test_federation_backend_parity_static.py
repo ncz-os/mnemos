@@ -137,3 +137,238 @@ async def test_db2_feed_queries_require_public_readable_and_exclude_vault() -> N
 
     assert feed_params == (VAULT_NAMESPACE, 25)
     assert get_params == ("mem-1", VAULT_NAMESPACE)
+
+
+class _FakeModule:
+    DB_TYPE_TIMESTAMP_TZ = object()
+
+
+class _FakeAsyncpgModule:
+    Connection = object
+    Pool = object
+    UniqueViolationError = Exception
+
+
+class _AsyncContextCursor:
+    description = None
+
+    def __init__(self, calls: list[dict[str, Any]]) -> None:
+        self._calls = calls
+
+    async def __aenter__(self) -> "_AsyncContextCursor":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        pass
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        self._calls.append({"sql": sql, "params": params})
+
+    async def close(self) -> None:
+        pass
+
+    async def fetchall(self) -> list[Any]:
+        return []
+
+    async def fetchone(self) -> Any:
+        return None
+
+
+class _SqlCaptureCursor:
+    description = None
+
+    def __init__(self, calls: list[dict[str, Any]], sql: str, params: Any = None) -> None:
+        self._calls = calls
+        self._sql = sql
+        self._params = params
+
+    async def close(self) -> None:
+        pass
+
+    async def fetchall(self) -> list[Any]:
+        self._calls.append({"sql": self._sql, "params": self._params})
+        return []
+
+    async def fetchone(self) -> Any:
+        self._calls.append({"sql": self._sql, "params": self._params})
+        return None
+
+
+class _AwaitableCursor:
+    description = None
+
+    def __init__(self, calls: list[dict[str, Any]]) -> None:
+        self._calls = calls
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        self._calls.append({"sql": sql, "params": params})
+
+    async def fetchall(self) -> list[Any]:
+        return []
+
+    async def fetchone(self) -> Any:
+        return None
+
+    async def close(self) -> None:
+        pass
+
+
+class _PostgresConn:
+    def __init__(self, calls: list[dict[str, Any]]) -> None:
+        self._calls = calls
+
+    async def fetch(self, sql: str, *args: Any) -> list[Any]:
+        self._calls.append({"sql": sql, "params": args})
+        return []
+
+    async def fetchrow(self, sql: str, *args: Any) -> None:
+        self._calls.append({"sql": sql, "params": args})
+        return None
+
+
+class _SqliteConn:
+    def __init__(self, calls: list[dict[str, Any]]) -> None:
+        self._calls = calls
+
+    async def execute(self, sql: str, params: Any = None) -> _SqlCaptureCursor:
+        return _SqlCaptureCursor(self._calls, sql, params)
+
+
+class _MySqlConn:
+    def __init__(self, calls: list[dict[str, Any]]) -> None:
+        self._calls = calls
+
+    def cursor(self) -> _AsyncContextCursor:
+        return _AsyncContextCursor(self._calls)
+
+
+class _AwaitableCursorConn:
+    def __init__(self, calls: list[dict[str, Any]]) -> None:
+        self._calls = calls
+
+    def cursor(self) -> _AwaitableCursor:
+        return _AwaitableCursor(self._calls)
+
+
+FEDERATION_GATE_CASES = (
+    pytest.param(
+        "sqlite",
+        "mnemos.persistence.sqlite",
+        "SqliteFederationRepository",
+        lambda calls: __import__("mnemos.persistence.sqlite", fromlist=["SqliteTransaction"]).SqliteTransaction(
+            _SqliteConn(calls)
+        ),
+        ("(M.PERMISSION_MODE % 10) >= 4", "M.NAMESPACE IS NULL OR M.NAMESPACE <> 'VAULT'"),
+        id="sqlite",
+    ),
+    pytest.param(
+        "postgres",
+        "mnemos.persistence.postgres",
+        "PostgresFederationRepository",
+        lambda calls: __import__("mnemos.persistence.postgres", fromlist=["PostgresTransaction"]).PostgresTransaction(
+            _PostgresConn(calls), None
+        ),
+        ("(M.PERMISSION_MODE % 10) >= 4", "M.NAMESPACE IS NULL OR M.NAMESPACE <> 'VAULT'"),
+        id="postgres",
+    ),
+    pytest.param(
+        "mysql",
+        "mnemos.persistence.mysql",
+        "MysqlFederationRepository",
+        lambda calls: __import__("mnemos.persistence.mysql", fromlist=["_MysqlTransaction"])._MysqlTransaction(
+            _MySqlConn(calls)
+        ),
+        ("(M.PERMISSION_MODE % 10) >= 4", "M.NAMESPACE IS NULL OR M.NAMESPACE <> 'VAULT'"),
+        id="mysql",
+    ),
+    pytest.param(
+        "oracle",
+        "mnemos.persistence.oracle",
+        "OracleFederationRepository",
+        lambda calls: SimpleNamespace(conn=_AwaitableCursorConn(calls)),
+        ("MOD(M.PERMISSION_MODE, 10) >= 4", "M.NAMESPACE IS NULL OR M.NAMESPACE <> :VAULT_NS"),
+        id="oracle",
+    ),
+    pytest.param(
+        "db2",
+        "mnemos.persistence.db2",
+        "Db2FederationRepository",
+        lambda calls: SimpleNamespace(conn=_AwaitableCursorConn(calls)),
+        ("MOD(M.PERMISSION_MODE, 10) >= 4", "M.NAMESPACE IS NULL OR M.NAMESPACE <> ?"),
+        id="db2",
+    ),
+)
+
+
+def _normalized_sql(sql: str) -> str:
+    return " ".join(sql.upper().split())
+
+
+def _split_feed_branches(sql: str) -> tuple[str, str | None]:
+    normalized = _normalized_sql(sql)
+    if " UNION ALL " not in normalized:
+        return normalized, None
+    live_branch, tombstone_branch = normalized.split(" UNION ALL ", 1)
+    return live_branch, tombstone_branch
+
+
+def _assert_live_federation_gates(sql: str, public_token: str, vault_token: str) -> None:
+    assert "M.FEDERATION_SOURCE IS NULL" in sql
+    assert public_token in sql
+    assert "M.DELETED_AT IS NULL" in sql
+    assert "M.ARCHIVED_AT IS NULL" in sql
+    assert "M.CONSOLIDATED_INTO IS NULL" in sql
+    assert vault_token in sql
+
+
+def _assert_tombstone_federation_gates(sql: str, public_token: str, vault_token: str) -> None:
+    assert "M.FEDERATION_SOURCE IS NULL" in sql
+    assert public_token in sql
+    assert "M.DELETED_AT IS NULL" in sql
+    assert "M.ARCHIVED_AT IS NULL" in sql
+    assert "M.CONSOLIDATED_INTO IS NOT NULL" in sql
+    assert "M.CONSOLIDATED_AT IS NOT NULL" in sql
+    assert vault_token in sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend,module_name,repo_name,tx_factory,dialect_tokens", FEDERATION_GATE_CASES)
+async def test_every_backend_feed_and_by_id_apply_canonical_federation_gates(
+    backend: str,
+    module_name: str,
+    repo_name: str,
+    tx_factory: Any,
+    dialect_tokens: tuple[str, str],
+) -> None:
+    """Federation feed branches and by-id paths must apply visibility gates."""
+    import sys
+
+    sys.modules.setdefault("oracledb", _FakeModule())
+    sys.modules.setdefault("asyncpg", _FakeAsyncpgModule())
+    module = __import__(module_name, fromlist=[repo_name])
+    repo = getattr(module, repo_name)()
+    calls: list[dict[str, Any]] = []
+    tx = tx_factory(calls)
+
+    await repo.feed_query(
+        tx,
+        since_updated=None,
+        since_id=None,
+        namespaces=[],
+        categories=[],
+        limit=25,
+        prefer_compressed=False,
+    )
+    await repo.get_feed_memory(tx, "mem-1", namespaces=[], categories=[])
+
+    assert len(calls) >= 2, backend
+    live_feed_sql, tombstone_feed_sql = _split_feed_branches(calls[0]["sql"])
+    by_id_sql = _normalized_sql(calls[1]["sql"])
+    public_token, vault_token = dialect_tokens
+
+    _assert_live_federation_gates(live_feed_sql, public_token, vault_token)
+    _assert_live_federation_gates(by_id_sql, public_token, vault_token)
+    if tombstone_feed_sql is not None:
+        _assert_tombstone_federation_gates(tombstone_feed_sql, public_token, vault_token)
+    else:
+        assert backend in {"oracle", "db2"}
