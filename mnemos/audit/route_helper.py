@@ -22,13 +22,17 @@ import hashlib
 import logging
 from typing import Any, Literal
 
-from .crypto import canonical_payload_hash
+from .crypto import AuditEntry, canonical_payload_hash
 from .writer import build_entry, latest_hash
 from mnemos.persistence.base import AuditPersistence
 
 logger = logging.getLogger(__name__)
 
 AuditOp = Literal["create", "update", "delete", "archive", "replicate"]
+
+
+class AuditChainContinuityError(ValueError):
+    """Raised when a caller requires a specific prior chain head."""
 
 
 def memory_id_to_audit_bytes(memory_id_str: str) -> bytes:
@@ -51,6 +55,9 @@ async def write_audit_entry(
     embedding: bytes | None,
     writer_id: str,
     session_secret: bytes,
+    expected_prev_entry_id_hex: str | None = None,
+    expected_prev_entry_hash_hex: str | None = None,
+    enforce_continuity: bool = False,
 ) -> None:
     """Build + insert one audit entry inside the caller's tx.
 
@@ -59,12 +66,11 @@ async def write_audit_entry(
     payload_hash, signs the new entry with the writer's HKDF-derived
     Ed25519 key, then INSERTs.
 
-    Errors are LOGGED but not re-raised — the audit chain is a
-    consistency-guarantee on top of the write, not a write
-    prerequisite. We must never break a memory write if audit
-    insertion fails (e.g. transient backend hiccup). Sealer's
-    eventual replay over the unsealed window catches any genuine
-    durability gaps.
+    Errors are LOGGED but not re-raised by default — the audit chain
+    is a consistency-guarantee on top of the write, not a write
+    prerequisite. Callers that pass ``enforce_continuity=True`` opt
+    into hard failure for continuity/insert errors (federation uses
+    this when a peer supplies a signed chain-head claim).
     """
     if backend.audit_chain is None:
         return  # backend hasn't shipped audit_chain; silently no-op
@@ -72,27 +78,17 @@ async def write_audit_entry(
     try:
         memory_id_bytes = memory_id_to_audit_bytes(memory_id_str)
         prev_row = await backend.audit_chain.get_latest_audit_entry(tx, memory_id_bytes)
-        prev_entry_id: bytes | None = None
-        prev_entry_hash: bytes | None = None
-        if prev_row is not None:
-            prev_entry_id = prev_row["entry_id"]
-            # Reconstruct prev_entry_hash from the prior row's canonical
-            # bytes + signature. We don't persist latest_hash as a
-            # separate column today; recompute from the row.
-            from .crypto import AuditEntry as _AE
-
-            prev_ae = _AE(
-                entry_id=prev_row["entry_id"],
-                memory_id=prev_row["memory_id"],
-                prev_entry_id=prev_row.get("prev_entry_id"),
-                prev_entry_hash=prev_row.get("prev_entry_hash"),
-                op=prev_row["op"],
-                payload_hash=prev_row["payload_hash"],
-                writer_id=prev_row["writer_id"],
-                writer_pubkey=prev_row["writer_pubkey"],
-                signed_at=_to_iso(prev_row["signed_at"]),
-            )
-            prev_entry_hash = latest_hash(prev_ae, prev_row["signature"])
+        prev_entry_id, prev_entry_hash = _audit_prev_head(prev_row)
+        override_prev = _decode_expected_prev_head(
+            expected_prev_entry_id_hex=expected_prev_entry_id_hex,
+            expected_prev_entry_hash_hex=expected_prev_entry_hash_hex,
+        )
+        if override_prev is not None:
+            # Federation peers publish their source chain head. When supplied,
+            # make that head the predecessor of this replica entry so the local
+            # chain is a verifiable Merkle DAG edge to the primary, rather than
+            # merely logging the remote claim out-of-band.
+            prev_entry_id, prev_entry_hash = override_prev
 
         payload_hash = canonical_payload_hash(
             memory_id=memory_id_str,
@@ -130,12 +126,69 @@ async def write_audit_entry(
             memory_id_str,
             entry.entry_id.hex()[:16],
         )
-    except Exception:  # noqa: BLE001 - audit must not block writes
+    except Exception:  # noqa: BLE001 - audit must not block writes unless requested
         logger.exception(
             "[AUDIT] write_audit_entry failed for op=%s memory=%s",
             op,
             memory_id_str,
         )
+        if enforce_continuity:
+            raise
+
+
+def _audit_prev_head(prev_row: Any | None) -> tuple[bytes | None, bytes | None]:
+    if prev_row is None:
+        return None, None
+    prev_ae = AuditEntry(
+        entry_id=prev_row["entry_id"],
+        memory_id=prev_row["memory_id"],
+        prev_entry_id=prev_row.get("prev_entry_id"),
+        prev_entry_hash=prev_row.get("prev_entry_hash"),
+        op=prev_row["op"],
+        payload_hash=prev_row["payload_hash"],
+        writer_id=prev_row["writer_id"],
+        writer_pubkey=prev_row["writer_pubkey"],
+        signed_at=_to_iso(prev_row["signed_at"]),
+    )
+    return prev_row["entry_id"], latest_hash(prev_ae, prev_row["signature"])
+
+
+def _decode_expected_hex(value: str | None, *, label: str, length: int) -> bytes | None:
+    if value in (None, ""):
+        return None
+    try:
+        out = bytes.fromhex(value)
+    except ValueError as exc:
+        raise AuditChainContinuityError(f"{label} is not valid hex") from exc
+    if len(out) != length:
+        raise AuditChainContinuityError(f"{label} must decode to {length} bytes")
+    if not any(out):
+        raise AuditChainContinuityError(f"{label} must not be all-zero bytes")
+    return out
+
+
+def _decode_expected_prev_head(
+    *,
+    expected_prev_entry_id_hex: str | None,
+    expected_prev_entry_hash_hex: str | None,
+) -> tuple[bytes, bytes] | None:
+    expected_entry_id = _decode_expected_hex(
+        expected_prev_entry_id_hex,
+        label="expected_prev_entry_id_hex",
+        length=16,
+    )
+    expected_entry_hash = _decode_expected_hex(
+        expected_prev_entry_hash_hex,
+        label="expected_prev_entry_hash_hex",
+        length=32,
+    )
+    if expected_entry_id is None and expected_entry_hash is None:
+        return None
+    if expected_entry_id is None or expected_entry_hash is None:
+        raise AuditChainContinuityError(
+            "expected prev entry id/hash must both be supplied or both be empty"
+        )
+    return expected_entry_id, expected_entry_hash
 
 
 def _to_iso(value: Any) -> str:
