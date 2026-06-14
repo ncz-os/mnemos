@@ -181,3 +181,66 @@ async def test_write_audit_entry_errors_dont_propagate(sqlite_backend, monkeypat
             writer_id="alice",
             session_secret=b"x" * 32,
         )
+
+
+@pytest.mark.asyncio
+async def test_bulk_create_writes_verifiable_audit_entries(sqlite_backend, monkeypatch):
+    from types import SimpleNamespace
+
+    import mnemos.api.routes.memories as memories
+    from mnemos.audit import AuditEntry, memory_id_to_audit_bytes, verify_entry
+    from mnemos.domain.models import BulkCreateRequest, MemoryCreateRequest
+
+    monkeypatch.setenv("MNEMOS_AUDIT_CHAIN", "on")
+    monkeypatch.setenv("MNEMOS_SESSION_SECRET", "bulk-secret")
+    monkeypatch.setattr(
+        "mnemos.core.config.get_settings",
+        lambda: SimpleNamespace(server=SimpleNamespace(session_secret="bulk-secret")),
+    )
+    monkeypatch.setattr(memories, "_backend_or_503", lambda: sqlite_backend)
+    monkeypatch.setattr(memories, "_get_embedding", lambda _text: None)
+    monkeypatch.setattr(memories, "_publish_nats_with_timeout", _noop_async)
+    monkeypatch.setattr(memories, "_invalidate_caches_after_mutation", _noop_async)
+    monkeypatch.setattr(memories, "_schedule_outbox_deliveries", lambda _ids: None)
+
+    user = SimpleNamespace(
+        user_id="alice",
+        namespace="default",
+        role="user",
+        group_ids=[],
+        authenticated=True,
+    )
+    resp = await memories.bulk_create_memories(
+        BulkCreateRequest(
+            memories=[
+                MemoryCreateRequest(content="bulk audit one", category="facts"),
+                MemoryCreateRequest(content="bulk audit two", category="facts"),
+            ]
+        ),
+        user=user,
+    )
+    assert resp.errors == []
+    assert resp.created == 2
+
+    async with sqlite_backend.transactional() as tx:
+        for mid in resp.memory_ids:
+            row = await sqlite_backend.audit_chain.get_latest_audit_entry(tx, memory_id_to_audit_bytes(mid))
+            assert row is not None
+            assert row["op"] == "create"
+            assert row["writer_id"] == "alice"
+            ent = AuditEntry(
+                entry_id=row["entry_id"],
+                memory_id=row["memory_id"],
+                prev_entry_id=row.get("prev_entry_id"),
+                prev_entry_hash=row.get("prev_entry_hash"),
+                op=row["op"],
+                payload_hash=row["payload_hash"],
+                writer_id=row["writer_id"],
+                writer_pubkey=row["writer_pubkey"],
+                signed_at=row["signed_at"],
+            )
+            assert verify_entry(ent, row["signature"]) is True
+
+
+async def _noop_async(*args, **kwargs):
+    return None

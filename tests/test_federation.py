@@ -11,8 +11,23 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+@pytest_asyncio.fixture
+async def sqlite_backend(tmp_path):
+    from types import SimpleNamespace
+
+    from mnemos.persistence import SqliteBackend
+
+    backend = SqliteBackend(tmp_path / "federation_audit.sqlite3", SimpleNamespace())
+    await backend.open()
+    try:
+        yield backend
+    finally:
+        await backend.close()
 
 
 def _feed_row(memory_id: str, updated: datetime) -> dict:
@@ -885,3 +900,106 @@ class TestFederationFeedPreferCompressed:
         assert "COALESCE(v.compressed_content" not in seen
         m = resp.memories[0]
         assert m.compressed_content is None
+
+
+@pytest.mark.asyncio
+async def test_federation_inbound_writes_verifiable_replicate_audit(sqlite_backend, monkeypatch):
+    import base64
+    from types import SimpleNamespace
+
+    from mnemos.audit import AuditEntry, memory_id_to_audit_bytes, verify_entry
+    from mnemos.domain.federation import _store_memories
+
+    monkeypatch.setenv("MNEMOS_AUDIT_CHAIN", "on")
+    monkeypatch.setenv("MNEMOS_SESSION_SECRET", "federation-secret")
+    monkeypatch.setattr(
+        "mnemos.core.config.get_settings",
+        lambda: SimpleNamespace(server=SimpleNamespace(session_secret="federation-secret")),
+    )
+    monkeypatch.setenv("MNEMOS_AUDIT_ROOT_PRIVKEY", base64.b64encode(b"\x42" * 32).decode())
+
+    feed = [{
+        "id": "mem_remote_audit",
+        "content": "replicated content",
+        "category": "facts",
+        "verbatim_content": "replicated content",
+        "namespace": "default",
+        "metadata": {"source": "peer"},
+        "quality_rating": 75,
+        "updated": "2026-06-14T20:00:00Z",
+        "created": "2026-06-14T20:00:00Z",
+        "audit_latest_entry_id": "11" * 16,
+        "audit_latest_entry_hash": "22" * 32,
+    }]
+
+    async with sqlite_backend.transactional() as tx:
+        new_n, upd_n = await _store_memories(sqlite_backend.federation, tx, "pythia", feed, backend=sqlite_backend)
+    assert (new_n, upd_n) == (1, 0)
+
+    local_id = "fed:pythia:mem_remote_audit"
+    async with sqlite_backend.transactional() as tx:
+        row = await sqlite_backend.audit_chain.get_latest_audit_entry(tx, memory_id_to_audit_bytes(local_id))
+        assert row is not None
+        assert row["op"] == "replicate"
+        assert row["writer_id"] == "fed:pythia"
+        ent = AuditEntry(
+            entry_id=row["entry_id"],
+            memory_id=row["memory_id"],
+            prev_entry_id=row.get("prev_entry_id"),
+            prev_entry_hash=row.get("prev_entry_hash"),
+            op=row["op"],
+            payload_hash=row["payload_hash"],
+            writer_id=row["writer_id"],
+            writer_pubkey=row["writer_pubkey"],
+            signed_at=row["signed_at"],
+        )
+        assert verify_entry(ent, row["signature"]) is True
+        import json
+
+        marker = await sqlite_backend.federation.fetch_federated_memory_marker(tx, local_id)
+        marker_meta = marker["metadata"]
+        if isinstance(marker_meta, str):
+            marker_meta = json.loads(marker_meta)
+        assert marker_meta["federation_audit_head"] == {
+            "entry_id": "11" * 16,
+            "entry_hash": "22" * 32,
+        }
+
+
+@pytest.mark.asyncio
+async def test_federation_rejects_discontinuous_inbound_audit_head(sqlite_backend, monkeypatch):
+    import base64
+    from types import SimpleNamespace
+
+    from mnemos.domain.federation import _store_memories
+
+    monkeypatch.setenv("MNEMOS_AUDIT_CHAIN", "on")
+    monkeypatch.setenv("MNEMOS_SESSION_SECRET", "federation-secret")
+    monkeypatch.setattr(
+        "mnemos.core.config.get_settings",
+        lambda: SimpleNamespace(server=SimpleNamespace(session_secret="federation-secret")),
+    )
+    monkeypatch.setenv("MNEMOS_AUDIT_ROOT_PRIVKEY", base64.b64encode(b"\x42" * 32).decode())
+
+    base = {
+        "id": "mem_remote_discontinuous",
+        "content": "replicated content v1",
+        "category": "facts",
+        "verbatim_content": "replicated content v1",
+        "namespace": "default",
+        "metadata": {"source": "peer"},
+        "quality_rating": 75,
+        "updated": "2026-06-14T20:00:00Z",
+        "created": "2026-06-14T20:00:00Z",
+        "audit_latest_entry_id": "aa" * 16,
+        "audit_latest_entry_hash": "bb" * 32,
+    }
+    async with sqlite_backend.transactional() as tx:
+        await _store_memories(sqlite_backend.federation, tx, "pythia", [base], backend=sqlite_backend)
+
+    tampered = {**base, "content": "replicated content replay", "updated": "2026-06-14T20:00:00Z"}
+    tampered["audit_latest_entry_id"] = "cc" * 16
+    tampered["audit_latest_entry_hash"] = "dd" * 32
+    async with sqlite_backend.transactional() as tx:
+        with pytest.raises(RuntimeError, match="audit head discontinuity"):
+            await _store_memories(sqlite_backend.federation, tx, "pythia", [tampered], backend=sqlite_backend)
