@@ -68,14 +68,15 @@ def _write_env_file(config: Config, env_path: str) -> bool:
         ]
         if getattr(config, "selected_components", ()):
             lines.append(f"MNEMOS_SELECTED_COMPONENTS={','.join(config.selected_components)}")
-        if getattr(config, "profile_services_enabled", False):
+        managed_services = getattr(config, "profile_services_enabled", False)
+        if managed_services:
             lines.append("MNEMOS_PROFILE_SERVICES_ENABLED=true")
-        for key, enabled in getattr(config, "service_flags", {}).items():
-            from mnemos.core.services import SERVICE_ENV_OVERRIDES
+            for key, enabled in getattr(config, "service_flags", {}).items():
+                from mnemos.core.services import SERVICE_ENV_OVERRIDES
 
-            env_names = SERVICE_ENV_OVERRIDES.get(key, ())
-            if env_names:
-                lines.append(f"{env_names[0]}={'true' if enabled else 'false'}")
+                env_names = SERVICE_ENV_OVERRIDES.get(key, ())
+                if env_names:
+                    lines.append(f"{env_names[0]}={'true' if enabled else 'false'}")
         lines.extend([
             f"PG_HOST={config.db_host}",
             f"PG_PORT={config.db_port}",
@@ -234,14 +235,15 @@ def install_launchd(config: Config, repo_path: str) -> bool:
     }
     if getattr(config, "selected_components", ()):
         env_vars["MNEMOS_SELECTED_COMPONENTS"] = ",".join(config.selected_components)
-    if getattr(config, "profile_services_enabled", False):
+    managed_services = getattr(config, "profile_services_enabled", False)
+    if managed_services:
         env_vars["MNEMOS_PROFILE_SERVICES_ENABLED"] = "true"
-    for service, enabled in getattr(config, "service_flags", {}).items():
-        from mnemos.core.services import SERVICE_ENV_OVERRIDES
+        for service, enabled in getattr(config, "service_flags", {}).items():
+            from mnemos.core.services import SERVICE_ENV_OVERRIDES
 
-        env_names = SERVICE_ENV_OVERRIDES.get(service, ())
-        if env_names:
-            env_vars[env_names[0]] = "true" if enabled else "false"
+            env_names = SERVICE_ENV_OVERRIDES.get(service, ())
+            if env_names:
+                env_vars[env_names[0]] = "true" if enabled else "false"
     for provider, key in config.graeae_providers.items():
         env_vars[f"{provider.upper()}_API_KEY"] = key
 

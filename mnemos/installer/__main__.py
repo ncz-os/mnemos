@@ -1261,9 +1261,9 @@ def _config_from_env() -> "Config":
     """
     from .wizard import (
         Config,
+        apply_component_selection,
         env_flags_for_services,
         normalize_component_selection,
-        service_flags_for_selection,
     )
 
     cfg = Config()
@@ -1309,11 +1309,10 @@ def _config_from_env() -> "Config":
     cfg.create_new_db = os.environ.get("MNEMOS_CREATE_DB", "true").lower() == "true"
     selected_raw = os.environ.get("MNEMOS_SELECTED_COMPONENTS", "")
     if selected_raw:
-        cfg.selected_components = normalize_component_selection(selected_raw)
-        cfg.profile_services_enabled = True
-        cfg.service_flags = service_flags_for_selection(cfg.profile, cfg.selected_components)
-        for key, value in env_flags_for_services(cfg.service_flags).items():
-            os.environ.setdefault(key, "true" if value else "false")
+        apply_component_selection(cfg, normalize_component_selection(selected_raw))
+        if cfg.profile_services_enabled:
+            for key, value in env_flags_for_services(cfg.service_flags).items():
+                os.environ.setdefault(key, "true" if value else "false")
     cfg.install_docling = os.environ.get("MNEMOS_INSTALL_DOCLING", "true").lower() == "true"
     cfg.create_service = os.environ.get("MNEMOS_CREATE_SERVICE", "true").lower() == "true"
     cfg.inference_embed_host = os.environ.get(
@@ -1644,12 +1643,13 @@ def _render_minimal_config(cfg, profile_defaults: dict) -> str:
         ]
     )
     if getattr(cfg, "selected_components", ()):
+        selected_components = ",".join(cfg.selected_components)
         lines.extend(
             [
                 "",
                 "[services]",
                 "managed = true",
-                f'selected_components = "{','.join(cfg.selected_components)}"',
+                f'selected_components = "{selected_components}"',
             ]
         )
     if cfg.profile == "dev":
@@ -1973,7 +1973,7 @@ def main() -> int:
 
     selected_components = None
     if args.with_components:
-        from .wizard import env_flags_for_services, normalize_component_selection, service_flags_for_selection
+        from .wizard import normalize_component_selection
 
         selected_components = normalize_component_selection(args.with_components)
 
@@ -1983,12 +1983,13 @@ def main() -> int:
         if args.profile:
             cfg.profile = args.profile
         if selected_components is not None:
-            cfg.selected_components = selected_components
-            cfg.profile_services_enabled = True
-            cfg.service_flags = service_flags_for_selection(cfg.profile, cfg.selected_components)
-            os.environ["MNEMOS_SELECTED_COMPONENTS"] = ",".join(cfg.selected_components)
-            for key, value in env_flags_for_services(cfg.service_flags).items():
-                os.environ[key] = "true" if value else "false"
+            from .wizard import apply_component_selection, env_flags_for_services
+
+            apply_component_selection(cfg, selected_components)
+            if cfg.profile_services_enabled:
+                os.environ["MNEMOS_SELECTED_COMPONENTS"] = ",".join(cfg.selected_components)
+                for key, value in env_flags_for_services(cfg.service_flags).items():
+                    os.environ[key] = "true" if value else "false"
 
     elif args.wizard:
         from .wizard import run_wizard
@@ -2003,14 +2004,13 @@ def main() -> int:
             if args.profile:
                 cfg.profile = args.profile
             if selected_components is not None:
-                from .wizard import env_flags_for_services, service_flags_for_selection
+                from .wizard import apply_component_selection, env_flags_for_services
 
-                cfg.selected_components = selected_components
-                cfg.profile_services_enabled = True
-                cfg.service_flags = service_flags_for_selection(cfg.profile, cfg.selected_components)
-                os.environ["MNEMOS_SELECTED_COMPONENTS"] = ",".join(cfg.selected_components)
-                for key, value in env_flags_for_services(cfg.service_flags).items():
-                    os.environ[key] = "true" if value else "false"
+                apply_component_selection(cfg, selected_components)
+                if cfg.profile_services_enabled:
+                    os.environ["MNEMOS_SELECTED_COMPONENTS"] = ",".join(cfg.selected_components)
+                    for key, value in env_flags_for_services(cfg.service_flags).items():
+                        os.environ[key] = "true" if value else "false"
             _apply_embedding_dim_from_env(cfg)
         except (ImportError, ModuleNotFoundError):
             print("[installer] agent module not available — falling back to wizard.")
