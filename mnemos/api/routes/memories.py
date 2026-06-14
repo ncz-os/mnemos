@@ -65,6 +65,73 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["memories"])
 
 
+async def _write_memory_mutation_audit_entry(
+    backend,
+    tx,
+    *,
+    op: str,
+    memory_id: str,
+    content: str,
+    category: str,
+    subcategory: str | None,
+    metadata: dict | None,
+    writer_id: str,
+) -> None:
+    """Append a route-side audit-chain entry for one memory mutation.
+
+    This keeps the single create/update/delete and bulk-create paths on the
+    same helper so new write paths do not accidentally bypass the Ed25519
+    per-memory chain. The helper intentionally preserves the legacy API
+    behavior: when audit is disabled, unsupported by the backend, or missing
+    a session secret, the data write still commits.
+    """
+    from mnemos.core.config import get_settings as _get_settings
+    from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
+
+    if not _ace():
+        return
+    _settings = _get_settings()
+    _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
+    if not _session_secret:
+        logger.warning(
+            "[%s] MNEMOS_AUDIT_CHAIN=on but session_secret is empty; skipping audit write",
+            op,
+        )
+        return
+    await write_audit_entry(
+        backend,
+        tx,
+        op=op,
+        memory_id_str=memory_id,
+        content=content,
+        category=category,
+        subcategory=subcategory,
+        metadata=metadata,
+        embedding=None,
+        writer_id=writer_id,
+        session_secret=_session_secret,
+    )
+
+
+def _metadata_for_audit(value) -> dict | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        if not value:
+            return None
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {"_raw": value}
+        return parsed if isinstance(parsed, dict) else {"_value": parsed}
+    try:
+        return dict(value)
+    except Exception:
+        return None
+
+
 def effective_semantic_floor() -> float:
     """Default semantic relevance floor applied when a caller does not
     pass min_score. Operator-overridable fleet-wide via
@@ -407,6 +474,7 @@ async def _insert_memory_with_created_webhook(
     source_provider: Optional[str] = None,
     source_session: Optional[str] = None,
     source_agent: Optional[str] = None,
+    audit_writer_id: Optional[str] = None,
 ):
     """Insert a canonical memory row and enqueue memory.created in the same txn."""
     verbatim = verbatim_content if verbatim_content is not None else content
@@ -430,6 +498,27 @@ async def _insert_memory_with_created_webhook(
         source_session,
         source_agent,
     )
+    if audit_writer_id:
+        try:
+            backend = _lc.get_persistence_backend()
+            tx = getattr(conn, "_mnemos_transaction", None)
+            if tx is None:
+                from mnemos.persistence.postgres import PostgresTransaction
+
+                tx = PostgresTransaction(conn)
+            await _write_memory_mutation_audit_entry(
+                backend,
+                tx,
+                op="create",
+                memory_id=mem_id,
+                content=content,
+                category=category,
+                subcategory=subcategory,
+                metadata=metadata,
+                writer_id=audit_writer_id,
+            )
+        except Exception:
+            logger.exception("[ingest/create] audit-chain write failed for memory %s", mem_id)
 
     event_payload = {
         "memory_id": mem_id,
@@ -1408,7 +1497,8 @@ async def create_memory(
     _meta = _classified.metadata
     namespace = _classified.namespace
 
-    metadata_json = json.dumps(_meta or {"source": request.source})
+    persisted_metadata = _meta or {"source": request.source}
+    metadata_json = json.dumps(persisted_metadata)
     delivery_ids: list[str] = []
     try:
         async with backend.transactional() as tx:
@@ -1501,36 +1591,17 @@ async def create_memory(
                 created=None,
                 updated=None,
             )
-            # v6.2 M-2.2.1 audit chain entry. Gated by MNEMOS_AUDIT_CHAIN=on
-            # via the audit_sealer helper; backend.audit_chain is None on
-            # backends pre-implementation (Db2 live-test blocked on 12.1.5
-            # GA), so write_audit_entry no-ops there. Errors are logged
-            # but never re-raised — audit is a consistency layer, not a
-            # write prerequisite.
-            from mnemos.core.config import get_settings as _get_settings
-            from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
-
-            if _ace():
-                _settings = _get_settings()
-                _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
-                if _session_secret:
-                    await write_audit_entry(
-                        backend,
-                        tx,
-                        op="create",
-                        memory_id_str=mem_id,
-                        content=request.content,
-                        category=request.category,
-                        subcategory=request.subcategory,
-                        metadata=request.metadata,
-                        embedding=None,  # raw bytes for embedding hash; omitted for now
-                        writer_id=user.user_id,
-                        session_secret=_session_secret,
-                    )
-                else:
-                    logger.warning(
-                        "[create_memory] MNEMOS_AUDIT_CHAIN=on but session_secret is empty; skipping audit write"
-                    )
+            await _write_memory_mutation_audit_entry(
+                backend,
+                tx,
+                op="create",
+                memory_id=mem_id,
+                content=request.content,
+                category=request.category,
+                subcategory=request.subcategory,
+                metadata=persisted_metadata,
+                writer_id=user.user_id,
+            )
             # Same-tx outbox enqueue — preserves the v4.0 contract
             # that webhook_deliveries rows commit atomically with
             # the data write.
@@ -1688,6 +1759,17 @@ async def bulk_create_memories(
                     created=None,
                     updated=None,
                 )
+                await _write_memory_mutation_audit_entry(
+                    backend,
+                    tx,
+                    op="create",
+                    memory_id=mid,
+                    content=mem.content,
+                    category=mem.category,
+                    subcategory=mem.subcategory,
+                    metadata=item_metadata,
+                    writer_id=user.user_id,
+                )
                 if getattr(backend, "supports_webhooks", True):
                     item_delivery_ids = await backend.webhooks.dispatch_event(
                         tx,
@@ -1811,28 +1893,17 @@ async def update_memory(
                 )
                 if row is None:
                     raise RuntimeError(f"post-write re-fetch missed just-vaulted memory {memory_id}")
-            # v6.2 M-2.2.1 audit-chain entry. Same gate + same-tx
-            # commit as create_memory above (see commit e6d0677).
-            from mnemos.core.config import get_settings as _get_settings
-            from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
-
-            if _ace():
-                _settings = _get_settings()
-                _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
-                if _session_secret:
-                    await write_audit_entry(
-                        backend,
-                        tx,
-                        op="update",
-                        memory_id_str=memory_id,
-                        content=row["content"],
-                        category=row["category"],
-                        subcategory=row["subcategory"],
-                        metadata=request.metadata,
-                        embedding=None,
-                        writer_id=user.user_id,
-                        session_secret=_session_secret,
-                    )
+            await _write_memory_mutation_audit_entry(
+                backend,
+                tx,
+                op="update",
+                memory_id=memory_id,
+                content=row["content"],
+                category=row["category"],
+                subcategory=row["subcategory"],
+                metadata=_metadata_for_audit(row["metadata"]),
+                writer_id=user.user_id,
+            )
             if getattr(backend, "supports_webhooks", True):
                 delivery_ids = await backend.webhooks.dispatch_event(
                     tx,
@@ -1917,29 +1988,17 @@ async def delete_memory(
                     status_code=404,
                     detail=f"Memory {memory_id} not found",
                 )
-            # v6.2 M-2.2.1 audit-chain delete entry. Same gate as
-            # create/update; captures the final state of the row at
-            # the delete point so the chain still verifies post-purge.
-            from mnemos.core.config import get_settings as _get_settings
-            from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
-
-            if _ace():
-                _settings = _get_settings()
-                _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
-                if _session_secret:
-                    await write_audit_entry(
-                        backend,
-                        tx,
-                        op="delete",
-                        memory_id_str=memory_id,
-                        content=row["content"],
-                        category=row["category"],
-                        subcategory=row["subcategory"],
-                        metadata=None,
-                        embedding=None,
-                        writer_id=user.user_id,
-                        session_secret=_session_secret,
-                    )
+            await _write_memory_mutation_audit_entry(
+                backend,
+                tx,
+                op="delete",
+                memory_id=memory_id,
+                content=row["content"],
+                category=row["category"],
+                subcategory=row["subcategory"],
+                metadata=None,
+                writer_id=user.user_id,
+            )
             if getattr(backend, "supports_webhooks", True):
                 delivery_ids = await backend.webhooks.dispatch_event(
                     tx,

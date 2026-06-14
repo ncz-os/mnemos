@@ -18,6 +18,45 @@ from mnemos.nats import publisher as nats_publisher
 logger = logging.getLogger(__name__)
 
 PANTHEON_ROUTING_SUBJECT = "mnemos.pantheon.routing"
+
+
+async def _maybe_write_create_audit(
+    backend: Any,
+    tx: Any,
+    *,
+    memory_id: str,
+    content: str,
+    category: str,
+    subcategory: str | None,
+    metadata: dict[str, Any] | None,
+    writer_id: str,
+) -> None:
+    try:
+        from mnemos.audit import write_audit_entry
+        from mnemos.core.config import get_settings
+        from mnemos.workers.audit_sealer import audit_chain_enabled
+
+        if not audit_chain_enabled() or getattr(backend, "audit_chain", None) is None:
+            return
+        session_secret = (getattr(get_settings().server, "session_secret", "") or "").encode("utf-8")
+        if not session_secret:
+            logger.warning("[PANTHEON] audit-chain enabled but session_secret empty; skipping routing audit entry")
+            return
+        await write_audit_entry(
+            backend,
+            tx,
+            op="create",
+            memory_id_str=memory_id,
+            content=content,
+            category=category,
+            subcategory=subcategory,
+            metadata=metadata,
+            embedding=None,
+            writer_id=writer_id,
+            session_secret=session_secret,
+        )
+    except Exception:
+        logger.exception("[PANTHEON] audit-chain write failed for routing memory %s", memory_id)
 PANTHEON_ROUTING_SCHEMA_VERSION = "1"
 
 
@@ -178,6 +217,16 @@ async def write_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]
                     verbatim_content=content,
                     created=None,
                     updated=None,
+                )
+                await _maybe_write_create_audit(
+                    backend,
+                    tx,
+                    memory_id=memory_id,
+                    content=content,
+                    category="pantheon_routing",
+                    subcategory=None,
+                    metadata=metadata,
+                    writer_id="system:pantheon",
                 )
             return
 

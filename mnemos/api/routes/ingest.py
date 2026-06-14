@@ -99,6 +99,7 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
                                 source_provider=request.source,
                                 source_session=request.session_id,
                                 source_agent=request.agent_id,
+                                audit_writer_id=user.user_id,
                             )
                         )
                         stored_ids.append(mem_id)
