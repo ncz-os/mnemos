@@ -7,6 +7,7 @@ from typing import Any
 
 from mnemos.api.dependencies import configure_auth
 from mnemos.core import lifecycle
+from mnemos.core.services import service_enabled
 
 logger = logging.getLogger(__name__)
 _registered = False
@@ -25,6 +26,11 @@ async def _close_graeae_engine() -> None:
 
 
 async def _close_pantheon_http_client() -> None:
+    from mnemos.core.config import get_settings
+
+    if not service_enabled(get_settings(), "pantheon"):
+        return
+
     from mnemos.domain.pantheon.gateway import aclose_http_client
 
     await aclose_http_client()
@@ -32,6 +38,13 @@ async def _close_pantheon_http_client() -> None:
 
 async def _run_distillation_worker(_pool: Any) -> None:
     """Supervise the distillation worker loop with bounded restart backoff."""
+    from mnemos.core.config import get_settings
+
+    if not service_enabled(get_settings(), "distillation_worker"):
+        logger.info("Distillation worker disabled by profile service manifest")
+        lifecycle._worker_status["distillation_worker"] = "disabled"
+        return
+
     try:
         from mnemos.workers.distillation import MemoryDistillationWorker
     except ImportError as e:
@@ -81,6 +94,12 @@ def _webhook_delivery_worker(pool: Any):
 
 
 def _federation_sync_worker(pool: Any):
+    from mnemos.core.config import get_settings
+
+    if not service_enabled(get_settings(), "federation_sync_worker"):
+        logger.info("federation sync worker disabled by profile service manifest")
+        return None
+
     from mnemos.domain.federation import federation_worker_loop
 
     backend = lifecycle._persistence_backend
@@ -90,12 +109,24 @@ def _federation_sync_worker(pool: Any):
 
 
 def _deletion_request_worker(pool: Any):
+    from mnemos.core.config import get_settings
+
+    if not service_enabled(get_settings(), "deletion_request_worker"):
+        logger.info("deletion request worker disabled by profile service manifest")
+        return None
+
     from mnemos.workers.deletion_request_worker import deletion_request_worker_loop
 
     return deletion_request_worker_loop(pool)
 
 
 def _persephone_archival_worker(pool: Any):
+    from mnemos.core.config import get_settings
+
+    if not service_enabled(get_settings(), "persephone_archival_worker"):
+        logger.info("PERSEPHONE archival worker disabled by profile service manifest")
+        return None
+
     from mnemos.workers.persephone_archival_worker import persephone_archival_worker_loop
 
     return persephone_archival_worker_loop(pool)
@@ -115,6 +146,10 @@ async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
     and cause loop-back filtering to mis-fire. Operators with peers
     really want a stable, unique node name.
     """
+    if not service_enabled(settings, "federation_nats_consumers"):
+        logger.info("federation nats consumers disabled by profile service manifest")
+        return
+
     from mnemos.federation.nats_consumer import (
         configured_nats_peers,
         consumer_loop,
@@ -149,6 +184,10 @@ async def _webhook_nats_post_db_hook(pool: Any, settings: Any) -> None:
     Optional and additive: the polling recovery worker remains the
     durable fallback path regardless of NATS availability.
     """
+    if not service_enabled(settings, "webhook_nats_trigger"):
+        logger.info("webhook nats trigger disabled by profile service manifest")
+        return
+
     from mnemos.webhooks.nats_trigger import consumer_loop as webhook_nats_trigger_loop
 
     logger.info("Launching webhook nats trigger consumer")
@@ -157,7 +196,7 @@ async def _webhook_nats_post_db_hook(pool: Any, settings: Any) -> None:
 
 async def _pantheon_routing_audit_post_db_hook(pool: Any, settings: Any) -> None:
     """Launch the optional PANTHEON routing audit NATS consumer."""
-    if not settings.nats.audit_consumer_enabled:
+    if not service_enabled(settings, "pantheon_routing_audit_consumer"):
         return
 
     from mnemos.workers.pantheon_routing_audit_consumer import consumer_loop

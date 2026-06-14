@@ -20,6 +20,8 @@ from typing import Any
 from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from mnemos.core.services import ServiceResolution, parse_component_selection, resolve_profile_services
+
 
 PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "server": {
@@ -241,6 +243,22 @@ class _ServerSettings(BaseSettings):
         "redis://localhost:6379",
         validation_alias=AliasChoices("MNEMOS_REDIS_URL", "REDIS_URL"),
     )
+
+
+class _ProfileServiceSettings(BaseSettings):
+    model_config = _config_model_config()
+
+    managed: bool = Field(False, validation_alias="MNEMOS_PROFILE_SERVICES_ENABLED")
+    selected_components: str = Field("", validation_alias="MNEMOS_SELECTED_COMPONENTS")
+    resolution: ServiceResolution = Field(
+        default_factory=lambda: resolve_profile_services(
+            profile=None,
+            managed=False,
+            selected_components=(),
+            env=os.environ,
+        )
+    )
+
 
 
 class _WebhookSettings(BaseSettings):
@@ -908,6 +926,7 @@ class Settings(BaseSettings):
     database: _DatabaseSettings
     graeae: _GraeaeSettings
     server: _ServerSettings
+    services: _ProfileServiceSettings
     webhook: _WebhookSettings
     providers: _ProviderSettings
     mcp: _MCPSettings
@@ -1030,6 +1049,7 @@ def _build_settings() -> Settings:
         "database": _DatabaseSettings(**db_section),
         "graeae": _GraeaeSettings(**_toml_section(toml_config, "graeae")),
         "server": server,
+        "services": _ProfileServiceSettings(**_toml_section(toml_config, "services")),
         "webhook": _WebhookSettings(**_toml_section(toml_config, "webhook")),
         "providers": _ProviderSettings(**_toml_section(toml_config, "providers")),
         "mcp": _MCPSettings(**_toml_section(toml_config, "mcp")),
@@ -1058,6 +1078,7 @@ def _build_settings() -> Settings:
         database=groups["database"],
         graeae=groups["graeae"],
         server=groups["server"],
+        services=groups["services"],
         webhook=groups["webhook"],
         providers=groups["providers"],
         mcp=groups["mcp"],
@@ -1087,6 +1108,12 @@ def _build_settings() -> Settings:
         if isinstance(group, BaseSettings)
     }
     _apply_profile_defaults(settings)
+    settings.services.resolution = resolve_profile_services(
+        profile=settings.profile,
+        managed=settings.services.managed,
+        selected_components=parse_component_selection(settings.services.selected_components),
+        env=os.environ,
+    )
     return settings
 
 
@@ -1367,12 +1394,12 @@ def nats_federation_queue_group_env() -> str:
 
 def nats_webhooks_enabled() -> bool:
     """Return whether webhook outbox NATS publishing/consuming is enabled."""
-    return runtime_env_value_stripped("MNEMOS_NATS_WEBHOOKS_ENABLED").lower() in {"1", "true", "yes", "on"}
+    return get_settings().services.resolution.enabled("nats_webhooks")
 
 
 def nats_federation_enabled() -> bool:
     """Return whether federation memory NATS publishing/consuming is enabled."""
-    return runtime_env_value_stripped("MNEMOS_NATS_FEDERATION_ENABLED").lower() in {"1", "true", "yes", "on"}
+    return get_settings().services.resolution.enabled("nats_federation")
 
 
 def session_secret_required() -> bool:
