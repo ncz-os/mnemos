@@ -888,11 +888,14 @@ class PostgresMemoryRepository(MemoryRepository):
         limit: int = 20,
         offset: int = 0,
         include_archived: bool = False,
+        exclude_superseded: bool = False,
     ) -> tuple[list[Row], int]:
         conn = _postgres_tx(tx).conn
         where_parts: list[str] = ["deleted_at IS NULL"]
         if not include_archived:
             where_parts.append("archived_at IS NULL")
+        if exclude_superseded:
+            where_parts.append("consolidated_into IS NULL")
         params: list[Any] = []
         if category is not None:
             params.append(category)
@@ -1220,6 +1223,7 @@ class PostgresMemoryRepository(MemoryRepository):
         include_archived: bool = False,
         boost_recency: bool = False,
         recency_weight: float = 0.15,
+        exclude_superseded: bool = False,
         search_trace_id: str | None = None,
         search_started_at: float | None = None,
     ) -> list[Row]:
@@ -1236,6 +1240,8 @@ class PostgresMemoryRepository(MemoryRepository):
         conditions: list[str] = ["embedding IS NOT NULL", "deleted_at IS NULL"]
         if not include_archived:
             conditions.append("archived_at IS NULL")
+        if exclude_superseded:
+            conditions.append("consolidated_into IS NULL")
         for col, val in (
             ("category", category),
             ("subcategory", subcategory),
@@ -1326,6 +1332,7 @@ class PostgresMemoryRepository(MemoryRepository):
         source_model: str | None = None,
         source_agent: str | None = None,
         include_archived: bool = False,
+        exclude_superseded: bool = False,
     ) -> list[Row]:
         # plainto_tsquery treats user input as plain text — tsquery
         # operators like |, !, & are not interpreted. Prevents tsquery
@@ -1340,6 +1347,8 @@ class PostgresMemoryRepository(MemoryRepository):
         ]
         if not include_archived:
             conditions.append("archived_at IS NULL")
+        if exclude_superseded:
+            conditions.append("consolidated_into IS NULL")
         for col, val in (
             ("category", category),
             ("subcategory", subcategory),
@@ -1372,6 +1381,8 @@ class PostgresMemoryRepository(MemoryRepository):
             ilike_conditions: list[str] = ["content ILIKE $1", "deleted_at IS NULL"]
             if not include_archived:
                 ilike_conditions.append("archived_at IS NULL")
+            if exclude_superseded:
+                ilike_conditions.append("consolidated_into IS NULL")
             for col, val in (
                 ("category", category),
                 ("subcategory", subcategory),
