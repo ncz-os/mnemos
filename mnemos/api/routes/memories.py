@@ -609,6 +609,7 @@ async def get_memory(
                             row,
                             include_compressed=True,
                             redact_secrets=_should_redact_secrets_for_row(user, row),
+                            frame_data=_should_frame_data(user, operational=operational),
                         )
                     ),
                     headers={"Vary": "Accept"},
