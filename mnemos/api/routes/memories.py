@@ -38,6 +38,7 @@ from mnemos.domain.artemis_dedup import (
 )
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core.secret_detection import VAULT_NAMESPACE
+from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.persistence.base import DuplicateMemoryError
 from mnemos.domain.models import (
     DEFAULT_SEMANTIC_FLOOR,
@@ -101,13 +102,15 @@ def effective_semantic_margin_floor() -> float:
     except (TypeError, ValueError):
         logger.warning(
             "[VECTOR] invalid MNEMOS_SEMANTIC_MARGIN_FLOOR=%r; using default %.3f",
-            raw, DEFAULT_SEMANTIC_MARGIN_FLOOR,
+            raw,
+            DEFAULT_SEMANTIC_MARGIN_FLOOR,
         )
         return DEFAULT_SEMANTIC_MARGIN_FLOOR
     if not math.isfinite(val):
         logger.warning(
             "[VECTOR] non-finite MNEMOS_SEMANTIC_MARGIN_FLOOR=%r; using default %.3f",
-            raw, DEFAULT_SEMANTIC_MARGIN_FLOOR,
+            raw,
+            DEFAULT_SEMANTIC_MARGIN_FLOOR,
         )
         return DEFAULT_SEMANTIC_MARGIN_FLOOR
     # Clamp to [0, 1] to match the request field's bounds; a stray large
@@ -234,6 +237,7 @@ def _should_redact_secrets_for_row(user: UserContext, row) -> bool:
     row_ns = row.get("namespace") if hasattr(row, "get") else None
     return row_ns != VAULT_NAMESPACE
 
+
 def _should_frame_data(user, *, operational: bool = False) -> bool:
     """Whether to apply untrusted-data framing + injection quarantine.
 
@@ -265,6 +269,25 @@ def _read_visibility_for(user: UserContext, *, namespace: str) -> VisibilityFilt
             namespace=namespace,
         )
     return VisibilityFilter.for_read(user, namespace=namespace)
+
+
+def _vault_inclusive_read_visibility_for(user: UserContext, *, namespace: str | None = None) -> VisibilityFilter:
+    """Root/vault-inclusive visibility for post-write response re-fetches.
+
+    Auto-vaulting moves a just-written row from the caller namespace to
+    ``vault``. The normal default read filter intentionally subtracts the
+    vault, so a same-transaction response re-fetch would return None and crash
+    or roll back. Post-write re-fetches are not enumeration; they target the
+    exact id that was just authorized and written, so use root-bypass without
+    the default vault subtraction to return the row reliably on every backend.
+    """
+    return VisibilityFilter(
+        scope=VisibilityScope.ROOT_BYPASS,
+        user_id=None,
+        group_ids=(),
+        namespace=namespace,
+        exclude_namespaces=(),
+    )
 
 
 def _mutation_visibility_for(user: UserContext, *, namespace: str | None) -> VisibilityFilter:
@@ -1199,9 +1222,7 @@ async def search_memories(
     # Redact-at-retrieval: mask credential spans unless this is a root
     # include_secrets / vault-targeted search. Backstops a vaulted-miss and
     # masks incidental spans before the result set is serialized OR cached.
-    _redact = _should_redact_secrets(
-        user, include_secrets=bool(request.include_secrets), namespace=search_namespace
-    )
+    _redact = _should_redact_secrets(user, include_secrets=bool(request.include_secrets), namespace=search_namespace)
     # Framing is applied as the FINAL pass below (after rerank/decay) so the
     # cross-encoder reranker scores RAW content, not the data-boundary
     # wrapper. ``_row_to_memory`` here only redacts; injection-defense
@@ -1341,55 +1362,23 @@ async def create_memory(
     namespace = request.namespace or user.namespace
     permission_mode = _validate_permission_mode(request.permission_mode, default=600)
 
-    # Secret-vault ingest classification (release-blocking 2026-06-13).
-    # Credential-class content (PATs, provider keys, PEM blocks, secret-
-    # grade key=value assignments) is auto-isolated into the vault
-    # namespace so it can never surface on the default FTS/semantic path.
-    # Incidental secret spans (REDACT) are left in place but flagged in
-    # metadata for the redact-on-read follow-up. Already-vaulted writes
-    # are left untouched. The classifier is conservative -> a 40-hex git
-    # SHA in prose is NOT vaulted.
+    # Secret-vault persisted-text classification (release-blocking 2026-06-14).
+    # Classify every text field that will be stored. Any VAULT-class finding in
+    # content or verbatim_content moves the row to the vault namespace;
+    # incidental spans are recorded for redact-at-retrieval.
     _meta = dict(request.metadata or {})
     if request.metadata is None and request.source is not None:
         _meta.setdefault("source", request.source)
-    try:
-        from mnemos.core.secret_detection import classify as _classify, SecretClass, VAULT_NAMESPACE
-
-        _finding = _classify(request.content)
-        if _finding.cls is SecretClass.VAULT and namespace != VAULT_NAMESPACE:
-            _meta["secret_vaulted"] = True
-            _meta["secret_reasons"] = _finding.reasons
-            _meta["secret_original_namespace"] = namespace
-            _meta["secret_classified_at"] = "ingest"
-            namespace = VAULT_NAMESPACE
-            logger.warning(
-                "[secret-vault] ingest auto-vaulted memory %s (reasons=%s)",
-                mem_id,
-                _finding.reasons,
-            )
-        elif _finding.cls is SecretClass.REDACT:
-            _meta["secret_redact_spans"] = _finding.spans
-            _meta["secret_reasons"] = _finding.reasons
-    except Exception:
-        # FAIL CLOSED (release-blocking 2026-06-13): if classification
-        # cannot complete (import error, classifier bug, etc.) we MUST
-        # NOT store potentially-credential content on the default path.
-        # Quarantine into the vault namespace so an unclassifiable write
-        # never silently reintroduces the vault bypass. A false-positive
-        # (non-secret prose vaulted on a transient classifier error) is
-        # recoverable by a root re-file; a false-negative (a real secret
-        # left searchable) is not.
-        logger.exception(
-            "[secret-vault] ingest classification FAILED for %s — failing closed, quarantining into vault namespace",
-            mem_id,
-        )
-        if namespace != VAULT_NAMESPACE:
-            _meta["secret_vaulted"] = True
-            _meta["secret_reasons"] = ["classification_failed_fail_closed"]
-            _meta["secret_original_namespace"] = namespace
-            _meta["secret_classified_at"] = "ingest"
-            _meta["secret_classification_error"] = True
-            namespace = VAULT_NAMESPACE
+    _classified = classify_persisted_text_fields(
+        content=request.content,
+        verbatim_content=(request.verbatim_content if request.verbatim_content is not None else request.content),
+        metadata=_meta,
+        namespace=namespace,
+        classified_at="ingest",
+        memory_id=mem_id,
+    )
+    _meta = _classified.metadata
+    namespace = _classified.namespace
 
     metadata_json = json.dumps(_meta or {"source": request.source})
     delivery_ids: list[str] = []
@@ -1539,8 +1528,10 @@ async def create_memory(
             row = await backend.memories.get_memory(
                 tx,
                 mem_id,
-                visibility=_read_visibility_for(user, namespace=namespace),
+                visibility=_vault_inclusive_read_visibility_for(user, namespace=namespace),
             )
+            if row is None:
+                raise RuntimeError(f"post-write re-fetch missed just-created memory {mem_id}")
     except DuplicateMemoryError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except HTTPException:
@@ -1603,6 +1594,16 @@ async def bulk_create_memories(
         verbatim = mem.verbatim_content if mem.verbatim_content is not None else mem.content
         owner_id = mem.owner_id or user.user_id
         namespace = mem.namespace or user.namespace
+        _classified = classify_persisted_text_fields(
+            content=mem.content,
+            verbatim_content=verbatim,
+            metadata=mem.metadata or {},
+            namespace=namespace,
+            classified_at="bulk_ingest",
+            memory_id=mid,
+        )
+        item_metadata = _classified.metadata
+        namespace = _classified.namespace
         try:
             async with backend.transactional() as tx:
                 await _maybe_set_pg_rls(tx, user)
@@ -1645,7 +1646,7 @@ async def bulk_create_memories(
                     content=mem.content,
                     category=mem.category,
                     subcategory=mem.subcategory,
-                    metadata_json=json.dumps(mem.metadata or {}),
+                    metadata_json=json.dumps(item_metadata),
                     quality_rating=75,
                     owner_id=owner_id,
                     namespace=namespace,
@@ -1729,6 +1730,24 @@ async def update_memory(
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update")
 
+    # Classify PATCH text variants before persistence. If the PATCH turns an
+    # ordinary row into a credential record, move it to the vault in the same
+    # atomic UPDATE.
+    if request.content is not None or request.verbatim_content is not None:
+        base_meta = request.metadata or {}
+        _classified = classify_persisted_text_fields(
+            content=request.content,
+            verbatim_content=request.verbatim_content,
+            metadata=base_meta,
+            namespace=user.namespace,
+            classified_at="patch",
+            memory_id=memory_id,
+        )
+        if _classified.metadata:
+            updates["metadata"] = json.dumps(_classified.metadata)
+        if _classified.vaulted:
+            updates["namespace"] = _classified.namespace
+
     # Authorization + mutation in a single repository call: the
     # visibility predicate folds into the UPDATE … RETURNING, so a
     # concurrent admin/repair changing ownership between auth check
@@ -1756,6 +1775,14 @@ async def update_memory(
                     status_code=404,
                     detail=f"Memory {memory_id} not found",
                 )
+            if updates.get("namespace") == VAULT_NAMESPACE:
+                row = await backend.memories.get_memory(
+                    tx,
+                    memory_id,
+                    visibility=_vault_inclusive_read_visibility_for(user, namespace=VAULT_NAMESPACE),
+                )
+                if row is None:
+                    raise RuntimeError(f"post-write re-fetch missed just-vaulted memory {memory_id}")
             # v6.2 M-2.2.1 audit-chain entry. Same gate + same-tx
             # commit as create_memory above (see commit e6d0677).
             from mnemos.core.config import get_settings as _get_settings

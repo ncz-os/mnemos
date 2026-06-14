@@ -955,7 +955,30 @@ class PostgresMemoryRepository(MemoryRepository):
         # $1 = memory_id, $2.. = field values, then visibility params,
         # so update_memory writes are atomic with their authorization
         # check (folded into the WHERE on the same UPDATE).
-        keys = list(fields.keys())
+        keys = [
+            k
+            for k in fields.keys()
+            if k
+            in {
+                "content",
+                "category",
+                "subcategory",
+                "metadata",
+                "quality_rating",
+                "compressed_content",
+                "verbatim_content",
+                "permission_mode",
+                "source_model",
+                "source_provider",
+                "source_session",
+                "source_agent",
+                "group_id",
+                "archived_at",
+                "namespace",
+            }
+        ]
+        if not keys:
+            return await self.get_memory(tx, memory_id, visibility=visibility)
         set_clauses = [f"{col}=${i + 2}" for i, col in enumerate(keys)]
         set_clauses.append("updated=NOW()")
         set_sql = ", ".join(set_clauses)

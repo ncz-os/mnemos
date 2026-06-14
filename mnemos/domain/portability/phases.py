@@ -8,6 +8,8 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional
 
+from mnemos.core.persisted_text_classification import classify_persisted_text_fields
+from mnemos.core.secret_detection import redact
 from mnemos.db import portability_repo as repo
 
 from .allowlist import _is_allowed_reference
@@ -55,9 +57,7 @@ async def _import_kg_triples(
         obj = entry.get("object_literal") or entry.get("object_id")
         if not subject:
             _bump(stats.sidecars_failed, surface)
-            stats.errors.append(
-                f"[{surface}] {entry['id']}: missing subject_literal/subject_id; skipped"
-            )
+            stats.errors.append(f"[{surface}] {entry['id']}: missing subject_literal/subject_id; skipped")
             continue
         if not obj:
             obj = ""
@@ -115,8 +115,7 @@ async def _import_kg_triples(
                     or existing["subject_type"] != entry.get("subject_type")
                     or existing["object_type"] != entry.get("object_type")
                     or existing["memory_id"] != entry.get("memory_id")
-                    or existing["confidence"]
-                    != (entry["confidence"] if entry.get("confidence") is not None else 1.0)
+                    or existing["confidence"] != (entry["confidence"] if entry.get("confidence") is not None else 1.0)
                     or existing["owner_id"] != row_owner
                     or existing["namespace"] != row_ns
                     or (not tolerate_valid_from and existing["valid_from"] != expected_valid_from)
@@ -199,9 +198,7 @@ async def _import_memory_versions(
                 entry["parent_version_id"] = version_id_remap[str(pv)]
             mp_list = entry.get("merge_parents")
             if mp_list:
-                entry["merge_parents"] = [
-                    version_id_remap.get(str(mp), str(mp)) for mp in mp_list
-                ]
+                entry["merge_parents"] = [version_id_remap.get(str(mp), str(mp)) for mp in mp_list]
             ch = entry.get("commit_hash")
             if ch:
                 entry["commit_hash"] = hashlib.sha256(
@@ -251,10 +248,7 @@ async def _import_memory_versions(
                 if mp:
                     parent_uuids.append(str(mp))
             if parent_uuids:
-                require_in_envelope = (
-                    inserted_record_ids is not None
-                    and entry["record_id"] in inserted_record_ids
-                )
+                require_in_envelope = inserted_record_ids is not None and entry["record_id"] in inserted_record_ids
                 ok, bad = await _validate_version_parents(
                     conn,
                     parent_uuids,
@@ -306,11 +300,7 @@ async def _import_memory_versions(
                     )
                 if row == "INSERT 0 0":
                     existing = await repo.fetch_memory_version_by_id(conn, entry["id"])
-                    expected_parent = (
-                        str(entry["parent_version_id"])
-                        if entry.get("parent_version_id")
-                        else None
-                    )
+                    expected_parent = str(entry["parent_version_id"]) if entry.get("parent_version_id") else None
                     expected_branch = entry.get("branch") or "main"
                     expected_merge_parents = entry.get("merge_parents") or None
                     expected_change_type = entry.get("change_type") or "create"
@@ -336,23 +326,15 @@ async def _import_memory_versions(
                     actual_metadata = _norm_jsonb(existing["metadata"]) if existing else None
                     expected_snapshot_at = _parse_iso(entry.get("snapshot_at"))
                     actual_snapshot_at = existing["snapshot_at"] if existing else None
-                    fresh_memory = (
-                        inserted_record_ids is not None
-                        and entry.get("record_id") in inserted_record_ids
-                    )
-                    tolerate_snapshot_at = (
-                        not fresh_memory and entry.get("snapshot_at") is None
-                    )
+                    fresh_memory = inserted_record_ids is not None and entry.get("record_id") in inserted_record_ids
+                    tolerate_snapshot_at = not fresh_memory and entry.get("snapshot_at") is None
                     if existing is None or (
                         existing["memory_id"] != entry["record_id"]
                         or existing["owner_id"] != row_owner
                         or existing["namespace"] != row_ns
                         or existing["version_num"] != entry["version_num"]
                         or existing["content"] != entry["content"]
-                        or (
-                            not entry.get("commit_hash")
-                            or existing["commit_hash"] != entry["commit_hash"]
-                        )
+                        or (not entry.get("commit_hash") or existing["commit_hash"] != entry["commit_hash"])
                         or existing["parent_version_id"] != expected_parent
                         or existing["branch"] != expected_branch
                         or _norm_mp(actual_merge_parents) != _norm_mp(expected_merge_parents)
@@ -434,6 +416,22 @@ async def _import_compression_manifest(
                 stats.errors.append(f"[{surface}] {entry.get('record_id')}: {reason}")
                 continue
 
+            compressed_content = entry.get("compressed_content")
+            classified = classify_persisted_text_fields(
+                compressed_content=compressed_content,
+                metadata={},
+                namespace=caller_namespace,
+                classified_at="mpf_compression_manifest",
+                memory_id=entry.get("record_id"),
+            )
+            if compressed_content and classified.vaulted:
+                compressed_content = "[REDACTED]"
+            elif compressed_content and classified.redact_fields.get("compressed_content"):
+                compressed_content = redact(
+                    str(compressed_content),
+                    classified.redact_fields["compressed_content"],
+                )
+
             winner_id_raw = entry.get("winner_contest_id")
             winner_id: Optional[str] = None
             if winner_id_raw:
@@ -459,7 +457,7 @@ async def _import_compression_manifest(
                         winner_candidate_id=winner_id,
                         engine_id=entry["engine_id"],
                         engine_version=entry.get("engine_version"),
-                        compressed_content=entry.get("compressed_content"),
+                        compressed_content=compressed_content,
                         compressed_tokens=entry.get("compressed_tokens"),
                         compression_ratio=entry.get("compression_ratio"),
                         quality_score=entry.get("quality_score"),
@@ -476,19 +474,14 @@ async def _import_compression_manifest(
                     expected_winner = str(winner_id) if winner_id else None
                     expected_scoring = entry.get("scoring_profile") or "balanced"
                     expected_selected_at = _parse_iso(entry.get("selected_at"))
-                    fresh_memory = (
-                        inserted_record_ids is not None
-                        and entry.get("record_id") in inserted_record_ids
-                    )
-                    tolerate_selected_at = (
-                        not fresh_memory and entry.get("selected_at") is None
-                    )
+                    fresh_memory = inserted_record_ids is not None and entry.get("record_id") in inserted_record_ids
+                    tolerate_selected_at = not fresh_memory and entry.get("selected_at") is None
                     if existing is None or (
                         existing["owner_id"] != row_owner
                         or existing["winner_candidate_id"] != expected_winner
                         or existing["engine_id"] != entry["engine_id"]
                         or existing["engine_version"] != entry.get("engine_version")
-                        or existing["compressed_content"] != entry.get("compressed_content")
+                        or existing["compressed_content"] != compressed_content
                         or existing["compressed_tokens"] != entry.get("compressed_tokens")
                         or existing["compression_ratio"] != entry.get("compression_ratio")
                         or existing["quality_score"] != entry.get("quality_score")
@@ -509,9 +502,7 @@ async def _import_compression_manifest(
                     _bump(stats.sidecars_imported, surface)
             except Exception as exc:
                 _bump(stats.sidecars_failed, surface)
-                stats.errors.append(
-                    f"[{surface}] {entry.get('record_id')}: {type(exc).__name__}: {exc}"
-                )
+                stats.errors.append(f"[{surface}] {entry.get('record_id')}: {type(exc).__name__}: {exc}")
                 logger.exception(
                     "MPF compression_manifest import failed for record_id %s",
                     entry.get("record_id"),
