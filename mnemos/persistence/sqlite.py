@@ -1333,6 +1333,36 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             )
         return await _fetch_one(conn, sql, params)
 
+    async def backfill_missing_content_hashes(
+        self,
+        tx: Transaction,
+        *,
+        batch_size: int = 500,
+        apply: bool = False,
+    ) -> int:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        conn = self._conn(tx)
+        if not apply:
+            return int(await _fetch_val(conn, "SELECT COUNT(*) FROM memories WHERE content_hash IS NULL") or 0)
+        return await _execute_count(
+            conn,
+            """
+            UPDATE memories
+               SET content_hash = mnemos_content_sha256(content),
+                   updated = CURRENT_TIMESTAMP
+             WHERE id IN (
+                SELECT id
+                  FROM memories
+                 WHERE content_hash IS NULL
+                 ORDER BY created ASC, id ASC
+                 LIMIT ?
+             )
+               AND content_hash IS NULL
+            """,
+            [int(batch_size)],
+        )
+
     async def find_duplicate_content_groups(
         self,
         tx: Transaction,
@@ -1354,18 +1384,23 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 COUNT(*) AS duplicate_count,
                 GROUP_CONCAT(id, char(31)) AS memory_ids,
                 substr(GROUP_CONCAT(id, char(31)), 1, instr(GROUP_CONCAT(id, char(31)) || char(31), char(31)) - 1)
+                    AS keep_id,
+                substr(GROUP_CONCAT(id, char(31)), 1, instr(GROUP_CONCAT(id, char(31)) || char(31), char(31)) - 1)
                     AS canonical_id
             FROM (
-                SELECT id, owner_id, namespace, content_hash, created
+                SELECT id, owner_id, namespace, content_hash, created, quality_rating,
+                       replace(replace(COALESCE(content, ''), char(13) || char(10), char(10)), char(13), char(10))
+                           AS normalized_content
                 FROM memories
                 WHERE deleted_at IS NULL
                   AND archived_at IS NULL
                   AND consolidated_into IS NULL
                   AND content_hash IS NOT NULL
                   {namespace_clause}
-                ORDER BY owner_id ASC, namespace ASC, content_hash ASC, created ASC, id ASC
+                ORDER BY owner_id ASC, namespace ASC, content_hash ASC,
+                         created DESC, quality_rating DESC, id DESC
             )
-            GROUP BY owner_id, namespace, content_hash
+            GROUP BY owner_id, namespace, content_hash, normalized_content
             HAVING COUNT(*) > 1
             ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC
             """.format(namespace_clause=namespace_clause),
@@ -1414,6 +1449,35 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             """,
             params,
         )
+
+    async def soft_delete_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        requested_by: str | None = None,
+        requested_at: Any = None,
+        request_kind: str = "admin_purge",
+        reason: str | None = None,
+        source: Sequence[str] | None = None,
+    ) -> Row | None:
+        _ = (requested_by, requested_at, request_kind, reason, source)
+        conn = self._conn(tx)
+        params: list[Any] = [memory_id]
+        vis_clause = _render_sqlite_visibility(visibility, params)
+        if vis_clause:
+            sql = (
+                "UPDATE memories SET deleted_at = COALESCE(deleted_at, CURRENT_TIMESTAMP), updated = CURRENT_TIMESTAMP "
+                f"WHERE id = ? AND deleted_at IS NULL AND {vis_clause} "
+                "RETURNING owner_id, namespace, id, content, category, subcategory"
+            )
+        else:
+            sql = (
+                "UPDATE memories SET deleted_at = COALESCE(deleted_at, CURRENT_TIMESTAMP), updated = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND deleted_at IS NULL RETURNING owner_id, namespace, id, content, category, subcategory"
+            )
+        return await _fetch_one(conn, sql, params)
 
     async def delete_memory(
         self,
