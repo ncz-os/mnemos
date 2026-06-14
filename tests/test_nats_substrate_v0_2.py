@@ -256,16 +256,66 @@ class _AuditPool:
         return _AcquireContext(self.conn)
 
 
+class _CursorAuditCursor:
+    def __init__(self) -> None:
+        self.calls = []
+        self.closed = False
+
+    async def execute(self, sql: str, params):
+        self.calls.append({"sql": sql, "params": params})
+
+    async def close(self):
+        self.closed = True
+
+
+class _CursorAuditConnection:
+    def __init__(self) -> None:
+        self.cursor_obj = _CursorAuditCursor()
+        self.commits = 0
+
+    def cursor(self):
+        return self.cursor_obj
+
+    async def commit(self):
+        self.commits += 1
+
+
+class _CursorAuditPool:
+    def __init__(self, backend) -> None:
+        self.persistence_backend = backend
+        self.conn = _CursorAuditConnection()
+
+    def acquire(self):
+        return _AcquireContext(self.conn)
+
+
+class Db2Backend:
+    pass
+
+
+class OracleBackend:
+    pass
+
+
+class MysqlBackend:
+    pass
+
+
+class _UnsupportedAuditPool:
+    persistence_backend = MysqlBackend()
+
+    def acquire(self):
+        raise AssertionError("unsupported audit backend should not acquire a connection")
+
+
 class _FakeMsg:
     def __init__(self, payload: dict[str, Any]):
         self.subject = PANTHEON_ROUTING_SUBJECT
         self.data = json.dumps(payload).encode("utf-8")
 
 
-@pytest.mark.asyncio
-async def test_pantheon_routing_audit_consumer_inserts_expected_columns():
-    pool = _AuditPool()
-    payload = {
+def _audit_payload() -> dict[str, Any]:
+    return {
         "request_id": "req-audit",
         "tenant_user_id": "alice",
         "alias_or_model": "auto:cheap",
@@ -279,11 +329,18 @@ async def test_pantheon_routing_audit_consumer_inserts_expected_columns():
         "metadata": {"schema_version": PANTHEON_ROUTING_SCHEMA_VERSION},
     }
 
+
+@pytest.mark.asyncio
+async def test_pantheon_routing_audit_consumer_inserts_expected_columns():
+    pool = _AuditPool()
+    payload = _audit_payload()
+
     await audit_consumer.handle_message(pool, _FakeMsg(payload))
 
     assert len(pool.conn.rows) == 1
     row = pool.conn.rows[0]
     assert "INSERT INTO pantheon_routing_audit" in row["sql"]
+    assert "$11::jsonb" in row["sql"]
     assert row["request_id"] == "req-audit"
     assert row["tenant_user_id"] == "alice"
     assert row["alias_or_model"] == "auto:cheap"
@@ -294,6 +351,41 @@ async def test_pantheon_routing_audit_consumer_inserts_expected_columns():
     assert row["tokens_out"] == 5
     assert row["cost_usd"] == Decimal("0.0123")
     assert row["payload"] == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend", "dialect"),
+    [(Db2Backend(), "db2"), (OracleBackend(), "oracle")],
+)
+async def test_pantheon_routing_audit_consumer_uses_backend_sql_dialect(backend, dialect):
+    pool = _CursorAuditPool(backend)
+    payload = _audit_payload()
+
+    await audit_consumer.handle_message(pool, _FakeMsg(payload))
+
+    assert pool.conn.commits == 1
+    assert pool.conn.cursor_obj.closed is True
+    assert len(pool.conn.cursor_obj.calls) == 1
+    call = pool.conn.cursor_obj.calls[0]
+    assert "INSERT INTO pantheon_routing_audit" in call["sql"]
+    assert "::jsonb" not in call["sql"]
+
+    if dialect == "db2":
+        assert "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" in " ".join(call["sql"].split())
+        assert isinstance(call["params"], tuple)
+        assert call["params"][8] == Decimal("0.0123")
+        assert json.loads(call["params"][10]) == payload
+    else:
+        assert ":payload" in call["sql"]
+        assert isinstance(call["params"], dict)
+        assert call["params"]["cost_usd"] == Decimal("0.0123")
+        assert json.loads(call["params"]["payload"]) == payload
+
+
+@pytest.mark.asyncio
+async def test_pantheon_routing_audit_consumer_skips_unsupported_backend():
+    await audit_consumer.handle_message(_UnsupportedAuditPool(), _FakeMsg(_audit_payload()))
 
 
 @pytest.mark.skip(
