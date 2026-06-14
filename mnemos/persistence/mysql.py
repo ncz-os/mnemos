@@ -1053,7 +1053,7 @@ class MysqlMemoryRepository(MemoryRepository):
                        m.owner_id, m.namespace, m.permission_mode, m.source_model,
                        m.source_provider, m.source_session, m.source_agent,
                        m.group_id, m.created, m.updated, m.archived_at,
-                       m.recall_count, m.last_recalled_at
+                       m.recall_count, m.last_recalled_at, m.consolidated_into
                   FROM memories m
                  WHERE {where_sql}
                  ORDER BY m.created DESC
@@ -1455,7 +1455,7 @@ class MysqlMemoryRepository(MemoryRepository):
                        m.owner_id, m.namespace, m.permission_mode, m.source_model,
                        m.source_provider, m.source_session, m.source_agent,
                        m.group_id, m.created, m.updated, m.archived_at,
-                       m.recall_count, m.last_recalled_at,
+                       m.recall_count, m.last_recalled_at, m.consolidated_into,
                        MATCH (m.content) AGAINST (%s IN BOOLEAN MODE) AS rank_score
                   FROM memories m
                  WHERE {" AND ".join(where)}

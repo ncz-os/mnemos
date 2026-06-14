@@ -2108,14 +2108,16 @@ async def test_db2_memory_find_duplicate_content_groups_native() -> None:
     assert len(result) == 2
     sql = calls[0]["sql"].upper() if calls else ""
     params = calls[0]["params"] if calls else ()
-    assert "GROUP BY CONTENT_HASH" in sql
+    assert "GROUP BY OWNER_ID, NAMESPACE, CONTENT_HASH, NORMALIZED_CONTENT" in sql
     assert "HAVING COUNT(*) > 1" in sql
-    assert "WITH DUP_GROUPS" in sql.upper()  # CTE
-    assert "FIRST_VALUE" in sql.upper()  # KEEP→FIRST_VALUE
-    assert "ORDER BY D.CNT DESC" in sql or "ORDER BY D.CNT DESC" in calls[0]["sql"]
-    assert "KEEP" not in sql.upper()  # no Oracle-ism
+    assert "WITH ORDERED AS" in sql  # CTE
+    assert "LISTAGG" in sql
+    assert "ORDER BY DUPLICATE_COUNT DESC" in sql
+    assert "KEEP (" not in sql  # no Oracle KEEP(DENSE_RANK ...) aggregate
+    assert "DENSE_RANK" not in sql
+    assert "FIRST_VALUE" not in sql.upper()
     assert ":NS" not in sql
-    assert len(params) == 2  # namespace param duplicated for CTEs
+    assert len(params) == 1
 
 
 @pytest.mark.asyncio
@@ -2146,10 +2148,13 @@ async def test_db2_memory_find_duplicate_content_groups_no_namespace_native() ->
     await repo.find_duplicate_content_groups(tx)
     sql = calls[0]["sql"].upper() if calls else ""
     params = calls[0]["params"] if calls else ()
-    assert "GROUP BY CONTENT_HASH" in sql
+    assert "GROUP BY OWNER_ID, NAMESPACE, CONTENT_HASH, NORMALIZED_CONTENT" in sql
     assert "HAVING COUNT(*) > 1" in sql
-    assert "FIRST_VALUE" in sql.upper()
-    assert "KEEP" not in sql.upper()
+    assert "WITH ORDERED AS" in sql
+    assert "LISTAGG" in sql
+    assert "KEEP (" not in sql
+    assert "DENSE_RANK" not in sql
+    assert "FIRST_VALUE" not in sql.upper()
     assert len(params) == 0
 
 

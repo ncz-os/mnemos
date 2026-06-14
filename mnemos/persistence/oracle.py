@@ -161,6 +161,11 @@ def _boosted_rank_score_sort_key(row: Row, *, today: date, recency_weight: float
     return rank - recency_weight * (1.0 / (1.0 + age_days))
 
 
+def _boosted_rank_supersession_sort_key(row: Row, *, today: date, recency_weight: float) -> tuple[bool, float]:
+    superseded = isinstance(row, dict) and bool(row.get("superseded_by") or row.get("consolidated_into"))
+    return superseded, _boosted_rank_score_sort_key(row, today=today, recency_weight=recency_weight)
+
+
 def _render_visibility(
     visibility: VisibilityFilter,
     *,
@@ -1434,7 +1439,8 @@ class OracleMemoryRepository(MemoryRepository):
                        m.quality_rating, m.compressed_content, m.verbatim_content,
                        m.owner_id, m.namespace, m.permission_mode, m.source_model,
                        m.source_provider, m.source_session, m.source_agent,
-                       m.group_id, m.created, m.updated, m.archived_at, m.deleted_at
+                       m.group_id, m.created, m.updated, m.archived_at,
+                       m.consolidated_into, m.deleted_at
                   FROM memories m
                  WHERE {where_sql}
                  ORDER BY m.created DESC, m.id ASC
@@ -1623,7 +1629,8 @@ class OracleMemoryRepository(MemoryRepository):
             params["limit"] = limit
             sql = (
                 "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
-                "m.quality_rating, m.owner_id, m.namespace, m.created, m.updated "
+                "m.quality_rating, m.owner_id, m.namespace, m.created, m.updated, "
+                "m.consolidated_into "
                 "FROM memories m WHERE " + " AND ".join(where) + " "
                 "ORDER BY m.updated DESC FETCH FIRST :limit ROWS ONLY"
             )
@@ -1889,10 +1896,10 @@ class OracleMemoryRepository(MemoryRepository):
                 cursor.execute,
                 """
                 UPDATE memories
-                   SET content_hash = STANDARD_HASH(
+                   SET content_hash = LOWER(RAWTOHEX(STANDARD_HASH(
                            REPLACE(REPLACE(NVL(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)),
                            'SHA256'
-                       ),
+                       ))),
                        updated = SYSTIMESTAMP
                  WHERE id IN (
                     SELECT id
@@ -2034,7 +2041,7 @@ class OracleMemoryRepository(MemoryRepository):
                 "m.owner_id, m.namespace, m.permission_mode, m.source_model, "
                 "m.source_provider, m.source_session, m.source_agent, "
                 "m.group_id, m.created, m.updated, m.archived_at, "
-                "m.recall_count, m.last_recalled_at, "
+                "m.consolidated_into, m.recall_count, m.last_recalled_at, "
                 f"({rank}) AS rank_score "
                 "FROM memories m WHERE " + " AND ".join(where) + " "
                 f"ORDER BY {rank} ASC "
@@ -2048,7 +2055,7 @@ class OracleMemoryRepository(MemoryRepository):
         if boost_recency and rows:
             w = float(recency_weight)
             today = datetime.now(timezone.utc).date()
-            rows.sort(key=lambda row: _boosted_rank_score_sort_key(row, today=today, recency_weight=w))
+            rows.sort(key=lambda row: _boosted_rank_supersession_sort_key(row, today=today, recency_weight=w))
             rows = rows[:limit]
 
         return rows
