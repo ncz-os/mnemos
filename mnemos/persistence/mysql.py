@@ -192,7 +192,25 @@ def _recency_date(row: Row) -> date:
 
     if not isinstance(row, dict):
         return date.min
-    return _coerce_date(row.get("updated")) or _coerce_date(row.get("created")) or date.min
+    return (
+        _coerce_date(row.get("last_recalled_at"))
+        or _coerce_date(row.get("updated"))
+        or _coerce_date(row.get("created"))
+        or date.min
+    )
+
+
+def _boosted_rank_score_sort_key(row: Row, *, today: date, recency_weight: float) -> float:
+    rank = _rank_score_sort_key(row)
+    if not math.isfinite(rank):
+        return math.inf
+    age_days = max(0, (today - _recency_date(row)).days)
+    return rank - recency_weight * (1.0 / (1.0 + age_days))
+
+
+def _boosted_rank_supersession_sort_key(row: Row, *, today: date, recency_weight: float) -> tuple[bool, float]:
+    superseded = isinstance(row, dict) and bool(row.get("superseded_by") or row.get("consolidated_into"))
+    return superseded, _boosted_rank_score_sort_key(row, today=today, recency_weight=recency_weight)
 
 
 def _is_vec_distance_unsupported(exc: BaseException) -> bool:
@@ -1269,7 +1287,7 @@ class MysqlMemoryRepository(MemoryRepository):
                            m.owner_id, m.namespace, m.permission_mode, m.source_model,
                            m.source_provider, m.source_session, m.source_agent,
                            m.group_id, m.created, m.updated, m.archived_at,
-                           m.recall_count, m.last_recalled_at,
+                           m.recall_count, m.last_recalled_at, m.consolidated_into,
                            {rank_expr} AS rank_score
                       FROM memories m
                      WHERE {" AND ".join(where)}
@@ -1297,20 +1315,7 @@ class MysqlMemoryRepository(MemoryRepository):
         if boost_recency and rows:
             w = float(recency_weight)
             today = datetime.now(timezone.utc).date()
-            for row in rows:
-                rank = row.get("rank_score")
-                if rank is None:
-                    continue
-                try:
-                    rank_f = float(rank)
-                except (TypeError, ValueError):
-                    continue
-                if not math.isfinite(rank_f):
-                    continue
-                upd_date = _recency_date(row)
-                age_days = max(0, (today - upd_date).days)
-                row["rank_score"] = rank_f - w * (1.0 / (1.0 + age_days))
-            rows.sort(key=_rank_score_sort_key)
+            rows.sort(key=lambda row: _boosted_rank_supersession_sort_key(row, today=today, recency_weight=w))
             rows = rows[:limit]
 
         return rows
@@ -1328,8 +1333,6 @@ class MysqlMemoryRepository(MemoryRepository):
     ) -> list[Row]:
         """Fallback semantic search using Python-side cosine when MySQL lacks
         built-in VEC_DISTANCE functions (Community Edition)."""
-        import time as _time
-
         query_vec = json.loads(vec_literal)
         conn = tx.conn
         async with conn.cursor() as cursor:
@@ -1340,7 +1343,7 @@ class MysqlMemoryRepository(MemoryRepository):
                        m.owner_id, m.namespace, m.permission_mode, m.source_model,
                        m.source_provider, m.source_session, m.source_agent,
                        m.group_id, m.created, m.updated, m.archived_at,
-                       m.recall_count, m.last_recalled_at,
+                       m.recall_count, m.last_recalled_at, m.consolidated_into,
                        FROM_VECTOR(m.embedding) AS embedding_json
                   FROM memories m
                  WHERE {" AND ".join(where)}
@@ -1349,7 +1352,8 @@ class MysqlMemoryRepository(MemoryRepository):
             )
             raw_rows = await _fetch_all_dicts(cursor)
 
-        now_ts = _time.time()
+        today = datetime.now(timezone.utc).date()
+        w = float(recency_weight)
         for row in raw_rows:
             emb_json = row.pop("embedding_json", None)
             try:
@@ -1357,16 +1361,12 @@ class MysqlMemoryRepository(MemoryRepository):
                 dist = _cosine_distance_python(query_vec, emb) if emb else 1.0
             except (json.JSONDecodeError, ValueError, TypeError):
                 dist = 1.0
-            if boost_recency and row.get("updated") is not None:
-                try:
-                    updated = row["updated"]
-                    age_days = (now_ts - updated.timestamp()) / 86400.0
-                    dist -= recency_weight * (1.0 / (1.0 + age_days))
-                except (AttributeError, OSError):
-                    pass
             row["rank_score"] = dist
 
-        raw_rows.sort(key=lambda r: r.get("rank_score", 1.0))
+        if boost_recency:
+            raw_rows.sort(key=lambda row: _boosted_rank_supersession_sort_key(row, today=today, recency_weight=w))
+        else:
+            raw_rows.sort(key=_rank_score_sort_key)
         return raw_rows[:limit]
 
     async def fts_search(
