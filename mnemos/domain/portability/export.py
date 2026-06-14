@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -210,6 +211,8 @@ from .version_topology import _topo_sort_versions
 _EXPORT_HARD_LIMIT = 10_000
 _EXPORT_SIDECAR_HARD_LIMIT = 50_000
 
+logger = logging.getLogger(__name__)
+
 
 def _enforce_sidecar_cap(rows, surface: str) -> None:
     if len(rows) > _EXPORT_SIDECAR_HARD_LIMIT:
@@ -278,6 +281,7 @@ async def export_memories(
     namespace: Optional[str],
     include_sidecars: bool,
     include_unattached_kg: bool = False,
+    include_secrets: bool = False,
     mpf_version: Optional[str] = None,
     deletion_log_from: Optional[str] = None,
     deletion_log_to: Optional[str] = None,
@@ -335,6 +339,19 @@ async def export_memories(
     review.
     """
     emit_version = _resolve_export_version(mpf_version)
+    if include_secrets and not is_root(user):
+        raise HTTPException(status_code=403, detail="include_secrets requires root")
+    redact_secrets = not include_secrets
+    if include_secrets:
+        logger.warning(
+            "[portability-export] root secret-inclusive MPF export requested "
+            "by user=%s owner_id=%s namespace=%s category=%s sidecars=%s",
+            getattr(user, "user_id", None),
+            owner_id,
+            namespace,
+            category,
+            include_sidecars,
+        )
     if is_root(user):
         effective_owner = owner_id
         effective_ns = namespace
@@ -442,8 +459,16 @@ async def export_memories(
             category=category,
             limit=limit,
             offset=offset,
+            include_secrets=include_secrets,
         )
-        records = [_memory_to_record(dict(r), mpf_version=emit_version) for r in rows]
+        records = [
+            _memory_to_record(
+                dict(r),
+                mpf_version=emit_version,
+                redact_secrets=redact_secrets,
+            )
+            for r in rows
+        ]
         # Cross-tenant ID leak guard for v0.2 exports: Morpheus synthesis
         # builds source_memories from cluster members across namespaces,
         # then assigns the summary to the majority-owner. A non-root
@@ -483,10 +508,15 @@ async def export_memories(
                 effective_ns=effective_ns,
                 include_unattached=include_unattached_kg,
                 hard_limit=_EXPORT_SIDECAR_HARD_LIMIT,
+                include_secrets=include_secrets,
             )
             _enforce_sidecar_cap(kg_rows, "kg_triples")
             kg_triples_out = [
-                _kg_triple_to_entry(dict(r), mpf_version=emit_version)
+                _kg_triple_to_entry(
+                    dict(r),
+                    mpf_version=emit_version,
+                    redact_secrets=redact_secrets,
+                )
                 for r in kg_rows
             ]
 
@@ -496,11 +526,16 @@ async def export_memories(
                 effective_owner=effective_owner,
                 effective_ns=effective_ns,
                 hard_limit=_EXPORT_SIDECAR_HARD_LIMIT,
+                include_secrets=include_secrets,
             )
             _enforce_sidecar_cap(mv_rows, "memory_versions")
             memory_versions_out = _topo_sort_versions(
                 [
-                    _memory_version_to_entry(dict(r), mpf_version=emit_version)
+                    _memory_version_to_entry(
+                        dict(r),
+                        mpf_version=emit_version,
+                        redact_secrets=redact_secrets,
+                    )
                     for r in mv_rows
                 ]
             )
@@ -513,7 +548,11 @@ async def export_memories(
             )
             _enforce_sidecar_cap(cv_rows, "compression_manifest")
             compression_manifest_out = [
-                _compression_variant_to_entry(dict(r), mpf_version=emit_version)
+                _compression_variant_to_entry(
+                    dict(r),
+                    mpf_version=emit_version,
+                    redact_secrets=redact_secrets,
+                )
                 for r in cv_rows
             ]
 
@@ -554,6 +593,7 @@ async def export_memories(
                     cursor_executed_at=cursor_executed_at,
                     cursor_id=cursor_row_id,
                     export_as_of=export_as_of,
+                    include_secrets=include_secrets,
                 )
                 # Page-aware overflow handling: if we got cap+1 rows, the
                 # cap-th row is the cursor for the NEXT page. Slice it
@@ -610,4 +650,5 @@ async def export_memories(
         compression_manifest=compression_manifest_out,
         deletion_log=deletion_log_out,
         deletion_log_next_cursor=deletion_log_next_cursor,
+        includes_secrets=True if include_secrets else None,
     )
