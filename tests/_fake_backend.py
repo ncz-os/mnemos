@@ -65,6 +65,7 @@ class _FakeMemoryRepo:
         limit=20,
         offset=0,
         include_archived=False,
+        exclude_superseded=False,
     ):
         self.calls.append(
             (
@@ -76,6 +77,7 @@ class _FakeMemoryRepo:
                     "limit": limit,
                     "offset": offset,
                     "include_archived": include_archived,
+                    "exclude_superseded": exclude_superseded,
                 },
             )
         )
@@ -204,6 +206,7 @@ class _FakeMemoryRepo:
         include_archived=False,
         boost_recency=False,
         recency_weight=0.15,
+        exclude_superseded=False,
     ):
         self.calls.append(
             (
@@ -220,6 +223,7 @@ class _FakeMemoryRepo:
                     "include_archived": include_archived,
                     "boost_recency": boost_recency,
                     "recency_weight": recency_weight,
+                    "exclude_superseded": exclude_superseded,
                 },
             )
         )
@@ -238,6 +242,7 @@ class _FakeMemoryRepo:
         source_model=None,
         source_agent=None,
         include_archived=False,
+        exclude_superseded=False,
     ):
         self.calls.append(
             (
@@ -252,6 +257,7 @@ class _FakeMemoryRepo:
                     "source_model": source_model,
                     "source_agent": source_agent,
                     "include_archived": include_archived,
+                    "exclude_superseded": exclude_superseded,
                 },
             )
         )
@@ -516,11 +522,14 @@ class _PoolBackedMemoryRepo:
         category=None,
         subcategory=None,
         include_archived=False,
+        exclude_superseded=False,
     ) -> list[dict[str, Any]]:
         rows = [row for row in self._pool.state["memories"].values() if self._visible(row, visibility)]
         rows = [row for row in rows if row.get("deleted_at") is None]
         if not include_archived:
             rows = [row for row in rows if row.get("archived_at") is None]
+        if exclude_superseded:
+            rows = [row for row in rows if row.get("consolidated_into") is None and row.get("superseded_by") is None]
         if category is not None:
             rows = [row for row in rows if row.get("category") == category]
         if subcategory is not None:
@@ -537,12 +546,14 @@ class _PoolBackedMemoryRepo:
         limit=20,
         offset=0,
         include_archived=False,
+        exclude_superseded=False,
     ):
         rows = self._rows(
             visibility,
             category=category,
             subcategory=subcategory,
             include_archived=include_archived,
+            exclude_superseded=exclude_superseded,
         )
         return rows[offset : offset + limit], len(rows)
 
@@ -569,6 +580,7 @@ class _PoolBackedMemoryRepo:
         source_model=None,
         source_agent=None,
         include_archived=False,
+        exclude_superseded=False,
     ):
         needle = query.lower()
         rows = [
@@ -578,6 +590,7 @@ class _PoolBackedMemoryRepo:
                 category=category,
                 subcategory=subcategory,
                 include_archived=include_archived,
+                exclude_superseded=exclude_superseded,
             )
             if needle in row.get("content", "").lower()
         ]
@@ -598,12 +611,14 @@ class _PoolBackedMemoryRepo:
         include_archived=False,
         boost_recency=False,
         recency_weight=0.15,
+        exclude_superseded=False,
     ):
         rows = self._rows(
             visibility,
             category=category,
             subcategory=subcategory,
             include_archived=include_archived,
+            exclude_superseded=exclude_superseded,
         )
         return [{**row, "similarity": 0.99} for row in rows[:limit]]
 

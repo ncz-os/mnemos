@@ -989,6 +989,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         include_archived: bool = False,
         boost_recency: bool = False,
         recency_weight: float = 0.15,
+        exclude_superseded: bool = False,
     ) -> list[Row]:
         self._require_dim(embedding, "semantic_search")
 
@@ -1016,6 +1017,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         conditions: list[str] = ["me.embedding IS NOT NULL"]
         if not include_archived:
             conditions.append("m.archived_at IS NULL")
+        if exclude_superseded:
+            conditions.append("m.consolidated_into IS NULL")
         params: list[Any] = [embedding_json]
         for col, val in (
             ("category", category),
@@ -1091,6 +1094,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         source_model: str | None = None,
         source_agent: str | None = None,
         include_archived: bool = False,
+        exclude_superseded: bool = False,
     ) -> list[Row]:
         conn = self._conn(tx)
         # FTS path: $1=query (MATCH), filter+visibility params in the
@@ -1101,6 +1105,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         conditions: list[str] = []
         if not include_archived:
             conditions.append("m.archived_at IS NULL")
+        if exclude_superseded:
+            conditions.append("m.consolidated_into IS NULL")
         for col, val in (
             ("category", category),
             ("subcategory", subcategory),
@@ -1123,6 +1129,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             like_conditions: list[str] = ["lower(m.content) LIKE lower(?)"]
             if not include_archived:
                 like_conditions.append("m.archived_at IS NULL")
+            if exclude_superseded:
+                like_conditions.append("m.consolidated_into IS NULL")
             for col, val in (
                 ("category", category),
                 ("subcategory", subcategory),
@@ -1181,11 +1189,14 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         limit: int = 20,
         offset: int = 0,
         include_archived: bool = False,
+        exclude_superseded: bool = False,
     ) -> tuple[list[Row], int]:
         conn = self._conn(tx)
         where_parts: list[str] = []
         if not include_archived:
             where_parts.append("archived_at IS NULL")
+        if exclude_superseded:
+            where_parts.append("consolidated_into IS NULL")
         params: list[Any] = []
         if category is not None:
             where_parts.append("category = ?")
