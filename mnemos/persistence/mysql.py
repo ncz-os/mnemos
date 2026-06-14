@@ -1016,6 +1016,7 @@ class MysqlMemoryRepository(MemoryRepository):
         limit: int = 20,
         offset: int = 0,
         include_archived: bool = False,
+        exclude_superseded: bool = False,
     ) -> tuple[list[Row], int]:
         conn = tx.conn
         vis_clause, vis_params = _render_visibility(visibility, table_alias="m")
@@ -1023,6 +1024,8 @@ class MysqlMemoryRepository(MemoryRepository):
         params: list[Any] = []
         if not include_archived:
             where.append("m.archived_at IS NULL")
+        if exclude_superseded:
+            where.append("m.consolidated_into IS NULL")
         if vis_clause:
             where.append(vis_clause)
             params += vis_params
@@ -1274,6 +1277,7 @@ class MysqlMemoryRepository(MemoryRepository):
         include_archived: bool = False,
         boost_recency: bool = False,
         recency_weight: float = 0.15,
+        exclude_superseded: bool = False,
     ) -> list[Row]:
         if not embedding:
             return []
@@ -1284,6 +1288,8 @@ class MysqlMemoryRepository(MemoryRepository):
         params: list[Any] = []
         if not include_archived:
             where.append("m.archived_at IS NULL")
+        if exclude_superseded:
+            where.append("m.consolidated_into IS NULL")
         if vis_clause:
             where.append(vis_clause)
             params += vis_params
@@ -1414,6 +1420,7 @@ class MysqlMemoryRepository(MemoryRepository):
         source_model: str | None = None,
         source_agent: str | None = None,
         include_archived: bool = False,
+        exclude_superseded: bool = False,
     ) -> list[Row]:
         vis_clause, vis_params = _render_visibility(visibility, table_alias="m")
         where = [
@@ -1423,6 +1430,8 @@ class MysqlMemoryRepository(MemoryRepository):
         params: list[Any] = [query]
         if not include_archived:
             where.append("m.archived_at IS NULL")
+        if exclude_superseded:
+            where.append("m.consolidated_into IS NULL")
         if vis_clause:
             where.append(vis_clause)
             params += vis_params

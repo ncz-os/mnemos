@@ -50,6 +50,7 @@ from mnemos.domain.models import (
     BulkCreateResponse,
     MemoryCreateRequest,
     MemoryItem,
+    MemoryListRequest,
     MemoryListResponse,
     MemorySearchRequest,
     MemoryUpdateRequest,
@@ -500,6 +501,8 @@ async def list_memories(
     subcategory: Optional[str] = None,
     namespace: Optional[str] = None,
     include_archived: bool = False,
+    exclude_superseded: bool = False,
+    current_only: bool = False,
     limit: int = Query(20, ge=1, le=500),
     offset: int = Query(0, ge=0),
     operational: bool = False,
@@ -527,6 +530,18 @@ async def list_memories(
         )
     effective_namespace = namespace if root else user.namespace
     visibility = VisibilityFilter.for_read(user, namespace=effective_namespace)
+    list_request = MemoryListRequest(
+        category=category,
+        subcategory=subcategory,
+        namespace=namespace,
+        include_archived=include_archived,
+        exclude_superseded=exclude_superseded,
+        current_only=current_only,
+        limit=limit,
+        offset=offset,
+        operational=operational,
+    )
+    exclude_superseded_effective = bool(list_request.exclude_superseded or list_request.current_only)
 
     async with backend.transactional() as tx:
         await _maybe_set_pg_rls(tx, user)
@@ -538,6 +553,7 @@ async def list_memories(
             limit=limit,
             offset=offset,
             include_archived=include_archived,
+            exclude_superseded=exclude_superseded_effective,
         )
     redact = _should_redact_secrets(user, namespace=effective_namespace)
     frame = _should_frame_data(user, operational=operational)
@@ -1020,6 +1036,8 @@ async def search_memories(
         bool(request.operational),  # framing opt-in -> distinct (unframed) cache bucket
         sorted(user.group_ids),  # list, not pre-serialized string
         request.include_archived,
+        bool(request.exclude_superseded),
+        bool(request.current_only),
         request.boost_recency,
         request.recency_weight,
         search_profile.value,  # v6.2 M-2.2.3: distinct cache per profile
@@ -1082,6 +1100,7 @@ async def search_memories(
                 source_model=request.source_model,
                 source_agent=request.source_agent,
                 include_archived=bool(request.include_archived),
+                exclude_superseded=bool(request.exclude_superseded or request.current_only),
             )
 
         if request.semantic:
@@ -1113,6 +1132,7 @@ async def search_memories(
                         include_archived=bool(request.include_archived),
                         boost_recency=bool(request.boost_recency),
                         recency_weight=request.recency_weight,
+                        exclude_superseded=bool(request.exclude_superseded or request.current_only),
                         **semantic_trace_kwargs,
                     )
                     semantic_boosted_order = bool(request.boost_recency)
@@ -1285,6 +1305,7 @@ async def search_memories(
                     overrides=request.decay_overrides,
                     recency_weight=request.recency_weight,
                     preserve_current_order=semantic_boosted_order,
+                    exclude_superseded=bool(request.exclude_superseded or request.current_only),
                 )
         except Exception:
             logger.exception(
