@@ -1164,6 +1164,44 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             await _call(cursor.close)
         return await self.get_memory(tx, memory_id, visibility=visibility)
 
+    async def soft_delete_memory(
+        self,
+        tx: Any,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        requested_by: str | None = None,
+        requested_at: Any = None,
+        request_kind: str = "admin_purge",
+        reason: str | None = None,
+        source: Sequence[str] | None = None,
+    ) -> Row | None:
+        _ = (requested_by, requested_at, request_kind, reason, source)
+        row = await self.get_memory(tx, memory_id, visibility=visibility, include_archived=True)
+        if row is None:
+            return None
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility)
+            where = ["id = ?", "deleted_at IS NULL"]
+            params_list: list[Any] = [memory_id]
+            if clause:
+                pos_clause = _BIND_RE.sub("?", clause)
+                for m in _BIND_RE.finditer(clause):
+                    params_list.append(vis_params[m.group(1)])
+                where.append(pos_clause)
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET deleted_at = CURRENT TIMESTAMP, updated = CURRENT TIMESTAMP WHERE " + " AND ".join(where),
+                tuple(params_list),
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return None
+        finally:
+            await _call(cursor.close)
+        return row
+
     async def delete_memory(
         self,
         tx: Any,
@@ -1754,6 +1792,45 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         finally:
             await _call(cursor.close)
 
+    async def backfill_missing_content_hashes(
+        self,
+        tx: Any,
+        *,
+        batch_size: int = 500,
+        apply: bool = False,
+    ) -> int:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if not apply:
+                await _call(cursor.execute, "SELECT COUNT(*) AS cnt FROM memories WHERE content_hash IS NULL")
+                row = await _fetchone_dict(cursor)
+                return int((row or {}).get("cnt") or 0)
+            await _call(
+                cursor.execute,
+                """
+                UPDATE memories
+                   SET content_hash = LOWER(HEX(HASH_SHA256(
+                           REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10))
+                       ))),
+                       updated = CURRENT TIMESTAMP
+                 WHERE id IN (
+                    SELECT id
+                      FROM memories
+                     WHERE content_hash IS NULL
+                     ORDER BY created ASC, id ASC
+                     FETCH FIRST ? ROWS ONLY
+                 )
+                   AND content_hash IS NULL
+                """,
+                (int(batch_size),),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
     async def find_duplicate_content_groups(
         self,
         tx: Any,
@@ -1763,40 +1840,44 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
-            where = ["deleted_at IS NULL", "content_hash IS NOT NULL"]
+            where = [
+                "deleted_at IS NULL",
+                "archived_at IS NULL",
+                "consolidated_into IS NULL",
+                "content_hash IS NOT NULL",
+            ]
             params_list: list[Any] = []
             if namespace is not None:
                 where.append("namespace = ?")
                 params_list.append(namespace)
-            ns_clause = "AND namespace = ?" if namespace is not None else ""
             sql = (
-                "WITH dup_groups AS ("
-                "SELECT content_hash, COUNT(*) AS cnt "
-                "FROM memories "
-                "WHERE " + " AND ".join(where) + " "
-                "GROUP BY content_hash "
-                "HAVING COUNT(*) > 1"
-                "), "
-                "earliest AS ("
-                "SELECT m.content_hash, "
-                "FIRST_VALUE(m.id) OVER ("
-                "PARTITION BY m.content_hash ORDER BY m.created ASC, m.id ASC"
-                ") AS canonical_id, "
+                "WITH ordered AS ("
+                "SELECT id, owner_id, namespace, content_hash, created, quality_rating, "
+                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)) AS normalized_content, "
                 "ROW_NUMBER() OVER ("
-                "PARTITION BY m.content_hash ORDER BY m.content_hash"
+                "PARTITION BY owner_id, namespace, content_hash, "
+                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)) "
+                "ORDER BY created DESC, quality_rating DESC, id DESC"
                 ") AS rn "
-                "FROM memories m "
-                "WHERE m.deleted_at IS NULL AND m.content_hash IS NOT NULL " + ns_clause + ") "
-                "SELECT d.content_hash, d.cnt, e.canonical_id "
-                "FROM dup_groups d "
-                "JOIN (SELECT content_hash, canonical_id FROM earliest WHERE rn = 1) e "
-                "ON d.content_hash = e.content_hash "
-                "ORDER BY d.cnt DESC, d.content_hash ASC"
+                "FROM memories WHERE " + " AND ".join(where) + " "
+                "), grouped AS ("
+                "SELECT owner_id, namespace, content_hash, COUNT(*) AS duplicate_count, "
+                "LISTAGG(id, CHR(31)) WITHIN GROUP (ORDER BY rn ASC) AS memory_ids "
+                "FROM ordered GROUP BY owner_id, namespace, content_hash, normalized_content HAVING COUNT(*) > 1"
+                ") "
+                "SELECT owner_id, namespace, content_hash, duplicate_count, memory_ids, "
+                "SUBSTR(memory_ids, 1, LOCATE(CHR(31), memory_ids || CHR(31)) - 1) AS keep_id, "
+                "SUBSTR(memory_ids, 1, LOCATE(CHR(31), memory_ids || CHR(31)) - 1) AS canonical_id "
+                "FROM grouped "
+                "ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC"
             )
-            # Use the same params as where clause, but duplicate for CTE scan if namespace present
-            all_params = tuple(params_list + params_list) if namespace is not None else tuple(params_list)
-            await _call(cursor.execute, sql, all_params)
-            return await _fetch_all_dicts(cursor)
+            await _call(cursor.execute, sql, tuple(params_list))
+            rows = await _fetch_all_dicts(cursor)
+            for row in rows:
+                raw = row.get("memory_ids") or ""
+                row["memory_ids"] = [part for part in str(raw).split("\x1f") if part]
+                row["duplicate_count"] = int(row.get("duplicate_count") or 0)
+            return rows
         finally:
             await _call(cursor.close)
 

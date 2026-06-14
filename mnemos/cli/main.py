@@ -317,6 +317,46 @@ def _echo_json_response(response: httpx.Response) -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def _schedule_dedup_side_effects(payload: dict[str, Any]) -> None:
+    delivery_ids = [str(item) for item in payload.pop("delivery_ids", [])]
+    nats_intents = payload.pop("nats_intents", [])
+    if delivery_ids:
+        from mnemos.api.routes.memories import _schedule_outbox_deliveries
+
+        _schedule_outbox_deliveries(delivery_ids)
+    if nats_intents:
+        import mnemos.core.lifecycle as _lc
+        from mnemos.nats import publish_event as _nats_publish_event
+
+        for subject, event_payload, msg_id in nats_intents:
+            _lc._schedule_background(_nats_publish_event(subject, event_payload, msg_id=msg_id))
+
+
+def _print_memory_dedup_markdown(payload: dict[str, Any]) -> None:
+    typer.echo("# MNEMOS exact memory-content dedup")
+    typer.echo("")
+    typer.echo(f"- Namespace: {payload.get('namespace') or '*'}")
+    typer.echo(f"- Mode: {'apply' if payload.get('apply') else 'dry-run'}")
+    typer.echo(f"- Groups: {payload['group_count']}")
+    typer.echo(f"- Duplicate rows: {payload['duplicate_count']}")
+    typer.echo(f"- Rows soft-deleted: {payload.get('deleted_count', 0)}")
+    if not payload["groups"]:
+        return
+    typer.echo("")
+    typer.echo("| owner_id | namespace | keep_id | duplicates | content_hash |")
+    typer.echo("| --- | --- | --- | ---: | --- |")
+    for group in payload["groups"]:
+        typer.echo(
+            "| {owner_id} | {namespace} | {keep_id} | {count} | `{hash}` |".format(
+                owner_id=group["owner_id"],
+                namespace=group["namespace"],
+                keep_id=group["keep_id"],
+                count=len(group["duplicate_ids"]),
+                hash=group["content_hash"][:16],
+            )
+        )
+
+
 def _print_dedup_markdown(payload: dict[str, Any]) -> None:
     typer.echo("# ARTEMIS duplicate-content sweep")
     typer.echo("")
@@ -428,6 +468,28 @@ async def _dedup_sweep_async(
             namespace=namespace,
             auto_merge=auto_merge,
         )
+    finally:
+        if close_backend:
+            await backend.close()
+
+
+async def _memory_hash_backfill_async(*, batch_size: int, apply: bool) -> dict[str, Any]:
+    from mnemos.domain.memory_dedup import backfill_content_hashes
+
+    backend, close_backend = await _open_cli_persistence_backend()
+    try:
+        return await backfill_content_hashes(backend, batch_size=batch_size, apply=apply)
+    finally:
+        if close_backend:
+            await backend.close()
+
+
+async def _memory_dedup_async(*, namespace: str | None, apply: bool) -> dict[str, Any]:
+    from mnemos.domain.memory_dedup import dedup_exact_content
+
+    backend, close_backend = await _open_cli_persistence_backend()
+    try:
+        return await dedup_exact_content(backend, namespace=namespace, apply=apply)
     finally:
         if close_backend:
             await backend.close()
@@ -629,6 +691,40 @@ def worker_deletion_requests(
 def worker_persephone() -> None:
     """Run the PERSEPHONE archival worker."""
     _run_async_module_main("mnemos.workers.persephone_archival_worker")
+
+
+@artemis_app.command("hash-backfill")
+def artemis_hash_backfill(
+    batch_size: int = typer.Option(500, "--batch-size", help="Rows to inspect/update per batch.", is_flag=False),
+    apply: bool = typer.Option(False, "--apply", help="Actually backfill hashes. Default is dry-run count only."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON instead of markdown."),
+) -> None:
+    """Backfill NULL memory content_hash values safely and idempotently."""
+    if batch_size <= 0:
+        typer.echo("ERROR: --batch-size must be positive.", err=True)
+        raise typer.Exit(2)
+    payload = asyncio.run(_memory_hash_backfill_async(batch_size=batch_size, apply=apply))
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    elif apply:
+        typer.echo(f"Backfilled {payload['updated_count']} content_hash value(s).")
+    else:
+        typer.echo(f"Dry-run: {payload['null_count']} memory row(s) have NULL content_hash.")
+
+
+@artemis_app.command("memory-dedup")
+def artemis_memory_dedup(
+    namespace: Optional[str] = typer.Option(None, "--namespace", help="Limit dedup to one namespace.", is_flag=False),
+    apply: bool = typer.Option(False, "--apply", help="Soft-delete duplicate rows. Default is dry-run count only."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON instead of markdown."),
+) -> None:
+    """Deduplicate exact active memory-content duplicates with reversible soft-deletes."""
+    payload = asyncio.run(_memory_dedup_async(namespace=namespace, apply=apply))
+    _schedule_dedup_side_effects(payload)
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        _print_memory_dedup_markdown(payload)
 
 
 @artemis_app.command("dedup-sweep")
