@@ -90,6 +90,95 @@ def test_audit_pubkey_disabled_when_chain_off(monkeypatch, fake_user):
     assert exc.value.status_code == 503
 
 
+def test_audit_verify_reports_valid_chain(monkeypatch, fake_user):
+    from mnemos.api.routes import audit as audit_route
+    from mnemos.audit import build_entry, canonical_payload_hash
+    from mnemos.audit.route_helper import memory_id_to_audit_bytes
+
+    monkeypatch.setattr(audit_route, "audit_chain_enabled", lambda: True)
+    memory_id_str = "mem_verify_endpoint"
+    memory_id = memory_id_to_audit_bytes(memory_id_str)
+    payload_hash = canonical_payload_hash(
+        memory_id=memory_id_str,
+        content="ok",
+        category="facts",
+        subcategory=None,
+        metadata={},
+        embedding=None,
+    )
+    entry, sig = build_entry(
+        op="create",
+        memory_id=memory_id,
+        prev_entry_id=None,
+        prev_entry_hash=None,
+        payload_hash=payload_hash,
+        writer_id="user-1",
+        session_secret=b"x" * 32,
+    )
+    row = {
+        "entry_id": entry.entry_id,
+        "memory_id": entry.memory_id,
+        "prev_entry_id": entry.prev_entry_id,
+        "prev_entry_hash": entry.prev_entry_hash,
+        "op": entry.op,
+        "payload_hash": entry.payload_hash,
+        "writer_id": entry.writer_id,
+        "writer_pubkey": entry.writer_pubkey,
+        "signature": sig,
+        "signed_at": entry.signed_at,
+        "global_root": None,
+        "global_seq": None,
+    }
+
+    class _AuditChain:
+        async def list_memory_entries(self, tx, mid):
+            assert mid == memory_id
+            return [row]
+
+    class _Memories:
+        async def get_memory(self, tx, memory_id, *, visibility, include_archived=False):
+            return {
+                "id": memory_id,
+                "content": "ok",
+                "category": "facts",
+                "subcategory": None,
+                "metadata": {},
+            }
+
+    class _TxCtx:
+        async def __aenter__(self):
+            return MagicMock()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Backend:
+        audit_chain = _AuditChain()
+        memories = _Memories()
+
+        def transactional(self):
+            return _TxCtx()
+
+    monkeypatch.setattr("mnemos.api.routes.audit._backend_or_503", lambda: _Backend())
+
+    class _Server:
+        session_secret = "x" * 32
+
+    class _Settings:
+        server = _Server()
+
+    monkeypatch.setattr(audit_route, "get_settings", lambda: _Settings())
+
+    import asyncio
+
+    result = asyncio.get_event_loop().run_until_complete(
+        audit_route.audit_verify_memory(memory_id_str=memory_id_str, include_current=True, user=fake_user)
+    )
+    assert result["valid"] is True
+    assert result["entry_count"] == 1
+    assert result["current_memory_checked"] is True
+
+
 def test_audit_proof_head_404_when_no_entry(monkeypatch, fake_user):
     from fastapi import HTTPException
 

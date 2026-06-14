@@ -1285,6 +1285,23 @@ class AuditChainRepository(ABC):
         ...
 
     @abstractmethod
+    async def list_memory_entries(
+        self,
+        tx: Transaction,
+        memory_id: bytes,
+    ) -> list[Row]:
+        """Return the full per-memory audit chain ordered oldest-first.
+
+        Verification walks these rows to prove Ed25519 signatures,
+        prev_entry_id / prev_entry_hash linkage, and (for the head
+        entry) that the signed payload hash still matches the current
+        memory row. The method deliberately lives in the repository
+        abstraction so `/v1/audit/verify` is backend-agnostic and never
+        reaches through to raw SQL.
+        """
+        ...
+
+    @abstractmethod
     async def get_chain_stats(self, tx: Transaction) -> dict:
         """Return per-backend audit-chain health snapshot.
 

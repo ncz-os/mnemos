@@ -3976,6 +3976,24 @@ class PostgresAuditChainRepository(AuditChainRepository):
         )
         return dict(row) if row is not None else None
 
+    async def list_memory_entries(
+        self,
+        tx: Transaction,
+        memory_id: bytes,
+    ) -> list[Row]:
+        rows = await _postgres_tx(tx).conn.fetch(
+            """
+            SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                   op, payload_hash, writer_id, writer_pubkey,
+                   signature, signed_at, global_root, global_seq
+            FROM memory_audit_chain
+            WHERE memory_id = $1
+            ORDER BY signed_at ASC, entry_id ASC
+            """,
+            memory_id,
+        )
+        return [dict(r) for r in rows]
+
     async def get_chain_stats(self, tx: Transaction) -> dict:
         conn = _postgres_tx(tx).conn
         chain_stats = await conn.fetchrow(

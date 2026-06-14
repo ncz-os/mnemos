@@ -31,10 +31,12 @@ from .crypto import (
     verify_entry,
 )
 from .route_helper import memory_id_to_audit_bytes, write_audit_entry
+from .verify import audit_entry_from_row, verify_memory_audit_chain
 from .writer import build_entry, latest_hash
 
 __all__ = [
     "AuditEntry",
+    "audit_entry_from_row",
     "build_entry",
     "canonical_entry_bytes",
     "canonical_payload_hash",
@@ -47,5 +49,6 @@ __all__ = [
     "merkle_root",
     "sign_entry",
     "verify_entry",
+    "verify_memory_audit_chain",
     "write_audit_entry",
 ]

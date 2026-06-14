@@ -3798,6 +3798,24 @@ class SqliteAuditChainRepository(_SqliteRepository, AuditChainRepository):
             (entry_id,),
         )
 
+    async def list_memory_entries(
+        self,
+        tx: Transaction,
+        memory_id: bytes,
+    ) -> list[Row]:
+        return await _fetch_all(
+            self._conn(tx),
+            """
+            SELECT entry_id, memory_id, prev_entry_id, prev_entry_hash,
+                   op, payload_hash, writer_id, writer_pubkey,
+                   signature, signed_at, global_root, global_seq
+            FROM memory_audit_chain
+            WHERE memory_id = ?
+            ORDER BY datetime(signed_at) ASC, entry_id ASC
+            """,
+            (memory_id,),
+        )
+
     async def get_chain_stats(self, tx: Transaction) -> dict:
         conn = self._conn(tx)
         chain = await _fetch_one(
