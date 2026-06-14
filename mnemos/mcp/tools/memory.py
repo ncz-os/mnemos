@@ -6,6 +6,7 @@ from typing import Any
 
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import connector_default_namespace
+from mnemos.core.injection_defense import defend as _defend_untrusted
 
 from ._runtime import (
     MCP_BULK_CREATE_MAX_ITEMS,
@@ -127,8 +128,8 @@ async def tool_get_memory(
     that ``GET /v1/memories/{id}`` exposes via Accept-header
     content negotiation:
 
-      * ``"prose"``  → prose narration body (Accept: text/plain)
-      * ``"dense"``  → raw winning-variant content (Accept:
+      * ``"prose"``  → prose narration body framed as DATA (Accept: text/plain)
+      * ``"dense"``  → winning-variant content framed as DATA (Accept:
                        application/x-apollo-dense)
       * ``None``     → existing JSON ``MemoryItem`` (default,
                        backwards-compatible)
@@ -153,7 +154,12 @@ async def tool_get_memory(
     return {
         "memory_id": memory_id,
         "format": format,
-        "content": body,
+        # Defense-in-depth for MCP's prose/dense shortcut: the REST API now
+        # frames negotiated bodies, but MCP is itself an agent-facing surface
+        # and must never expose unframed retrieved prose/dense text if routed
+        # through a legacy or mocked REST seam. ``defend`` is idempotent for
+        # genuine frames, so this does not double-wrap current servers.
+        "content": _defend_untrusted(body),
     }
 
 
@@ -290,8 +296,8 @@ TOOLS: dict[str, dict[str, Any]] = {
         (
             "Retrieve a single memory by its ID (mem_xxxxxxxxxxxx). "
             "Default response is the JSON memory object. Optional "
-            "``format='prose'`` returns the prose-narrated body "
-            "(human-readable), ``format='dense'`` returns the raw "
+            "``format='prose'`` returns the framed prose-narrated body "
+            "(human-readable), ``format='dense'`` returns the framed "
             "APOLLO compressed variant — both intended for clients "
             "that want to feed the compressed form straight to a "
             "downstream LLM without round-tripping through JSON."
