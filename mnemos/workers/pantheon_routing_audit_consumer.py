@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from decimal import Decimal, InvalidOperation
@@ -18,11 +19,40 @@ logger = logging.getLogger("mnemos.workers.pantheon_routing_audit_consumer")
 STREAM = "MNEMOS_PANTHEON"
 DURABLE = "mnemos_pantheon_routing_audit"
 
-_INSERT_SQL = """
+_AUDIT_FIELDS = (
+    "request_id",
+    "tenant_user_id",
+    "alias_or_model",
+    "resolved_to",
+    "outcome",
+    "latency_ms",
+    "tokens_in",
+    "tokens_out",
+    "cost_usd",
+    "error_class",
+    "payload",
+)
+
+_INSERT_SQL_POSTGRES = """
 INSERT INTO pantheon_routing_audit
        (request_id, tenant_user_id, alias_or_model, resolved_to, outcome,
         latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+"""
+
+_INSERT_SQL_ORACLE = """
+INSERT INTO pantheon_routing_audit
+       (request_id, tenant_user_id, alias_or_model, resolved_to, outcome,
+        latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload)
+VALUES (:request_id, :tenant_user_id, :alias_or_model, :resolved_to, :outcome,
+        :latency_ms, :tokens_in, :tokens_out, :cost_usd, :error_class, :payload)
+"""
+
+_INSERT_SQL_DB2 = """
+INSERT INTO pantheon_routing_audit
+       (request_id, tenant_user_id, alias_or_model, resolved_to, outcome,
+        latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -97,21 +127,71 @@ async def handle_message(pool: Any, msg: Any) -> None:
 async def insert_audit_event(pool: Any, event: Mapping[str, Any]) -> None:
     """Insert a decoded routing event into ``pantheon_routing_audit``."""
     payload_json = json.dumps(event, sort_keys=True, default=str, separators=(",", ":"))
+    values = (
+        _text_field(event, "request_id"),
+        _text_field(event, "tenant_user_id"),
+        _text_field(event, "alias_or_model"),
+        _text_field(event, "resolved_to"),
+        _text_field(event, "outcome"),
+        _int_field(event, "latency_ms"),
+        _int_field(event, "tokens_in"),
+        _int_field(event, "tokens_out"),
+        _decimal_field(event, "cost_usd"),
+        _text_field(event, "error_class"),
+        payload_json,
+    )
+    dialect = _audit_insert_dialect(pool)
+    if dialect == "unsupported":
+        logger.debug("PANTHEON routing audit insert skipped for non-Postgres-compatible backend")
+        return
+
     async with pool.acquire() as conn:
-        await conn.execute(
-            _INSERT_SQL,
-            _text_field(event, "request_id"),
-            _text_field(event, "tenant_user_id"),
-            _text_field(event, "alias_or_model"),
-            _text_field(event, "resolved_to"),
-            _text_field(event, "outcome"),
-            _int_field(event, "latency_ms"),
-            _int_field(event, "tokens_in"),
-            _int_field(event, "tokens_out"),
-            _decimal_field(event, "cost_usd"),
-            _text_field(event, "error_class"),
-            payload_json,
-        )
+        if dialect == "oracle":
+            await _execute_cursor_insert(conn, _INSERT_SQL_ORACLE, dict(zip(_AUDIT_FIELDS, values)))
+        elif dialect == "db2":
+            await _execute_cursor_insert(conn, _INSERT_SQL_DB2, values)
+        else:
+            await conn.execute(_INSERT_SQL_POSTGRES, *values)
+
+
+def _audit_insert_dialect(pool: Any) -> str:
+    candidates = (
+        getattr(pool, "persistence_backend", None),
+        getattr(pool, "_pool", None),
+        pool,
+    )
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        marker = f"{type(candidate).__module__}.{type(candidate).__name__}".lower()
+        if "db2" in marker:
+            return "db2"
+        if "oracle" in marker or "oracledb" in marker:
+            return "oracle"
+        if "mysql" in marker or "sqlite" in marker:
+            return "unsupported"
+        if "asyncpg" in marker or "postgres" in marker:
+            return "postgres"
+    return "postgres"
+
+
+async def _execute_cursor_insert(conn: Any, sql: str, params: Any) -> None:
+    cursor = conn.cursor()
+    try:
+        await _maybe_await(cursor.execute(sql, params))
+    finally:
+        close = getattr(cursor, "close", None)
+        if close is not None:
+            await _maybe_await(close())
+
+    commit = getattr(conn, "commit", None)
+    if commit is not None:
+        await _maybe_await(commit())
+
+
+async def _maybe_await(result: Any) -> None:
+    if inspect.isawaitable(result):
+        await result
 
 
 async def _consume_subscription(pool: Any, sub: Any) -> None:
