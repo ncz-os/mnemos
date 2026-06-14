@@ -201,6 +201,7 @@ DEFAULT_SEMANTIC_FLOOR = 0.65
 # skewed queries. Conservative by design: only an unanchored, FLAT set is
 # rejected.
 DEFAULT_SEMANTIC_MARGIN_FLOOR = 0.020
+DEFAULT_RECENCY_WEIGHT = 0.15
 # Number of top hits inspected for a shared (lexical-anchor) query token.
 SEMANTIC_ANCHOR_TOPN = 3
 # Window over which the margin (top1 - mean) is computed. The floor was
@@ -548,7 +549,7 @@ class MemorySearchRequest(BaseModel):
     operational: Optional[bool] = False
     include_archived: Optional[bool] = False
     boost_recency: Optional[bool] = False
-    recency_weight: float = Field(0.15, ge=0.0, le=1.0)
+    recency_weight: float = Field(DEFAULT_RECENCY_WEIGHT, ge=0.0, le=1.0)
     # v6.2 M-2.2.3: retrieval profile dispatcher.
     # fast = semantic-only no rerank; balanced = current behavior (default);
     # deep = semantic + cross-encoder rerank via MEDUSA :8091.

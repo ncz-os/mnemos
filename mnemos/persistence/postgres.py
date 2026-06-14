@@ -10,6 +10,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import re
 import secrets
 import time
@@ -55,6 +56,7 @@ from mnemos.persistence.base import (
     VersionRepository,
     WebhookRepository,
 )
+from mnemos.domain.models import DEFAULT_RECENCY_WEIGHT
 from mnemos.persistence.types import MEMORY_COLS as _MEMORY_COLS, Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core import webhook_constants
@@ -1238,7 +1240,13 @@ class PostgresMemoryRepository(MemoryRepository):
 
         candidates = [_parse_pgvector_text(row.get("_embedding_text")) for row in rows]
         recency_boost = [float(row.get("_recency_boost") or 0.0) for row in rows]
-        weight_recency = max(0.0, min(1.0, float(recency_weight)))
+        try:
+            weight_recency = float(recency_weight)
+        except (TypeError, ValueError):
+            weight_recency = DEFAULT_RECENCY_WEIGHT
+        if not math.isfinite(weight_recency):
+            weight_recency = DEFAULT_RECENCY_WEIGHT
+        weight_recency = max(0.0, min(1.0, weight_recency))
         weight_cos = 1.0 - weight_recency
         ranking = _rerank_composite(
             embedding,
@@ -1252,11 +1260,14 @@ class PostgresMemoryRepository(MemoryRepository):
         for idx, composite_score in ranking:
             row = rows[idx]
             enriched = dict(row.items()) if hasattr(row, "items") else dict(row)
-            enriched["similarity"] = composite_score
+            # Preserve the raw semantic similarity for route-level min_score
+            # and OOD gating.  Recency is a separate ordering key exposed only
+            # for diagnostics; clobbering ``similarity`` would let a boosted
+            # but semantically weak row bypass relevance gates.
             enriched["_composite_score"] = composite_score
             reranked.append(enriched)
         _log_search_phase(search_trace_id, search_started_at, "rerank")
-        return reranked
+        return reranked[:limit]
 
     async def fts_search(
         self,

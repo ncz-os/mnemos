@@ -42,6 +42,7 @@ from mnemos.persistence.base import DuplicateMemoryError
 from mnemos.domain.models import (
     DEFAULT_SEMANTIC_FLOOR,
     DEFAULT_SEMANTIC_MARGIN_FLOOR,
+    DEFAULT_RECENCY_WEIGHT,
     METRIC_COSINE_DISTANCE,
     SEMANTIC_SCORE_KEY,
     is_ood_result_set,
@@ -1075,6 +1076,19 @@ async def search_memories(
                         "search_started_at": search_started_at,
                     }
                 semantic_failed = False
+                # MemoryRepository.semantic_search's backend-neutral contract
+                # (mnemos.persistence.base plus sqlite/postgres/mysql/oracle/db2)
+                # includes recency controls. Normalize defensively anyway so a
+                # legacy/deserialized request that lacks the field cannot pass
+                # None into repository scoring math.
+                try:
+                    recency_weight = float(getattr(request, "recency_weight", DEFAULT_RECENCY_WEIGHT))
+                except (TypeError, ValueError):
+                    recency_weight = DEFAULT_RECENCY_WEIGHT
+                if recency_weight != recency_weight or recency_weight in (float("inf"), float("-inf")):
+                    recency_weight = DEFAULT_RECENCY_WEIGHT
+                recency_weight = max(0.0, min(1.0, recency_weight))
+                boost_recency = bool(getattr(request, "boost_recency", False))
                 try:
                     rows = await backend.memories.semantic_search(
                         tx,
@@ -1087,6 +1101,8 @@ async def search_memories(
                         source_model=request.source_model,
                         source_agent=request.source_agent,
                         include_archived=bool(request.include_archived),
+                        boost_recency=boost_recency,
+                        recency_weight=recency_weight,
                         **semantic_trace_kwargs,
                     )
                 except Exception as exc:
