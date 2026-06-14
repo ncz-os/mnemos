@@ -427,7 +427,8 @@ def normalize_similarity(row) -> Optional[float]:
     return sim
 
 
-def row_to_memory(row, include_compressed: bool = False, redact_secrets: bool = False) -> MemoryItem:
+def row_to_memory(row, include_compressed: bool = False, redact_secrets: bool = False,
+                  frame_data: bool = False) -> MemoryItem:
     """Build a MemoryItem from a backend row.
 
     ``redact_secrets`` (release-blocking 2026-06-13) is the
@@ -443,6 +444,21 @@ def row_to_memory(row, include_compressed: bool = False, redact_secrets: bool = 
     receive full content (fleet agents need real credentials). The vault
     itself is excluded from default reads at the repository layer; this gate
     is the second line of defense for incidental spans and vaulted-misses.
+
+    ``frame_data`` (release-gate 2026-06-13) is the prompt-injection
+    defense. DEFAULTS to ``False`` (verbatim, like ``redact_secrets``);
+    every default-scope read handler passes ``frame_data=True`` via the
+    route gate ``_should_frame_data``. When True, ``content`` is run
+    through ``injection_defense.defend`` -- AI-targeting injection
+    meta-instructions are quarantined and the whole body is wrapped in
+    an untrusted-data boundary so a consuming agent treats it as
+    reference DATA, never executable instructions. Legitimate
+    operational prose (runbooks, ``run``/``use`` imperatives, shell
+    commands) passes through unharmed. Trusted callers needing verbatim
+    operational recall pass ``frame_data=False`` (operational opt-in).
+    Applied AFTER redaction so credential spans are masked first, then
+    framed. ``compressed`` and ``verbatim`` (returned by get_memory) are
+    framed too, so no alternate text field escapes the defense.
     """
     raw_meta = row.get("metadata")
     if isinstance(raw_meta, str):
@@ -462,6 +478,17 @@ def row_to_memory(row, include_compressed: bool = False, redact_secrets: bool = 
         content = redact_content(content)
         compressed = redact_content(compressed) if compressed else compressed
         verbatim = redact_content(verbatim) if verbatim else verbatim
+
+    if frame_data:
+        from mnemos.core.injection_defense import defend
+
+        # Defend EVERY agent-consumable text field, not just ``content``
+        # (ngc-review HIGH 2026-06-13): get_memory returns compressed +
+        # verbatim too, and a malicious memory could steer a consumer via
+        # an unframed alternate field.
+        content = defend(content)
+        compressed = defend(compressed) if compressed else compressed
+        verbatim = defend(verbatim) if verbatim else verbatim
 
     return MemoryItem(
         id=row["id"],
@@ -513,6 +540,12 @@ class MemorySearchRequest(BaseModel):
     # a credential set include_secrets=true (or query
     # namespace="vault" directly, root only).
     include_secrets: Optional[bool] = False
+    # Operational opt-in (release-gate 2026-06-13). Default False ->
+    # retrieved content is framed as untrusted DATA + injection-quarantined
+    # so a malicious stored memory cannot steer the consuming agent. Set
+    # True (root-only, like include_secrets) to receive VERBATIM unframed
+    # content for legitimate operational/runbook recall by a trusted caller.
+    operational: Optional[bool] = False
     include_archived: Optional[bool] = False
     boost_recency: Optional[bool] = False
     recency_weight: float = Field(0.15, ge=0.0, le=1.0)
