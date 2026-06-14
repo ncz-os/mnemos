@@ -845,6 +845,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         include_archived: bool = False,
         boost_recency: bool = False,
         recency_weight: float = 0.15,
+        exclude_superseded: bool = False,
     ) -> list[Row]:
         if not embedding:
             return []
@@ -868,6 +869,8 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             where = ["m.deleted_at IS NULL", "m.embedding IS NOT NULL"]
             if not include_archived:
                 where.append("m.archived_at IS NULL")
+            if exclude_superseded:
+                where.append("m.consolidated_into IS NULL")
             if clause:
                 where.append(_BIND_RE.sub("?", clause))
             where_params = [params[m.group(1)] for m in _BIND_RE.finditer(clause)] if clause else []
@@ -1212,6 +1215,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         limit: int = 20,
         offset: int = 0,
         include_archived: bool = False,
+        exclude_superseded: bool = False,
     ) -> tuple[list[Row], int]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -1220,6 +1224,8 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             where = ["m.deleted_at IS NULL"]
             if not include_archived:
                 where.append("m.archived_at IS NULL")
+            if exclude_superseded:
+                where.append("m.consolidated_into IS NULL")
             params_list: list[Any] = []
             if clause:
                 pos_clause = _BIND_RE.sub("?", clause)
@@ -1422,6 +1428,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         source_model: str | None = None,
         source_agent: str | None = None,
         include_archived: bool = False,
+        exclude_superseded: bool = False,
     ) -> list[Row]:
         # FTS predicate is mode-gated (MNEMOS_DB2_TEXT_SEARCH):
         #   like     (default) — UPPER(content) LIKE '%term%'. Full-table scan,
@@ -1439,6 +1446,8 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             params_list: list[Any] = []
             if not include_archived:
                 where.append("m.archived_at IS NULL")
+            if exclude_superseded:
+                where.append("m.consolidated_into IS NULL")
             if clause:
                 pos_clause = _BIND_RE.sub("?", clause)
                 for m in _BIND_RE.finditer(clause):

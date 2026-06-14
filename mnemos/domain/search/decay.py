@@ -163,6 +163,7 @@ def apply_decay(
     overrides: Mapping[str, float] | None = None,
     recency_weight: float = 1.0,
     preserve_current_order: bool = False,
+    exclude_superseded: bool = False,
 ) -> list[Any]:
     """Apply per-category decay to a list of memory items.
 
@@ -182,6 +183,10 @@ def apply_decay(
     """
     if not memories:
         return memories
+    if exclude_superseded:
+        memories = [m for m in memories if not (_safe_get(m, "superseded_by") or _safe_get(m, "consolidated_into"))]
+        if not memories:
+            return memories
     has_superseded = any(_safe_get(m, "superseded_by") or _safe_get(m, "consolidated_into") for m in memories)
     if not table and not overrides and not has_superseded:
         return memories
