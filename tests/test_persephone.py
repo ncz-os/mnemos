@@ -295,7 +295,13 @@ async def test_include_archived_returns_archived_markers(monkeypatch):
 
     assert listed.memories[0].id == "m_arch"
     assert listed.memories[0].archived is True
-    assert searched.memories[0].content == "ARCHIVED:m_arch"
+    # Prompt-injection hardening (release-gate 2026-06-13): default search
+    # content is now framed as untrusted DATA even for root (verbatim only
+    # via the operational opt-in). The archived marker survives inside the
+    # frame; the boundary is added around it.
+    from mnemos.core.injection_defense import is_framed
+    assert is_framed(searched.memories[0].content)
+    assert "ARCHIVED:m_arch" in searched.memories[0].content
     assert searched.memories[0].archived is True
 
 

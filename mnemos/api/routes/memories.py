@@ -234,6 +234,21 @@ def _should_redact_secrets_for_row(user: UserContext, row) -> bool:
     row_ns = row.get("namespace") if hasattr(row, "get") else None
     return row_ns != VAULT_NAMESPACE
 
+def _should_frame_data(user, *, operational: bool = False) -> bool:
+    """Whether to apply untrusted-data framing + injection quarantine.
+
+    Prompt-injection defense (release-gate 2026-06-13). Retrieved memories
+    are framed as untrusted reference DATA and AI-targeting injection
+    meta-instructions are quarantined on EVERY read path by default, so a
+    malicious stored memory cannot steer a consuming agent. The ONLY way to
+    get verbatim, unframed content is the explicit operational opt-in --
+    and, like ``include_secrets``, that opt-in is root-only. A non-root
+    caller is ALWAYS framed regardless of the flag.
+    """
+    if not is_root(user):
+        return True
+    return not bool(operational)
+
 
 def _read_visibility_for(user: UserContext, *, namespace: str) -> VisibilityFilter:
     """Read-path visibility for an already-resolved namespace.
@@ -464,6 +479,7 @@ async def list_memories(
     include_archived: bool = False,
     limit: int = Query(20, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    operational: bool = False,
     user: UserContext = Depends(get_current_user),
 ):
     backend = _backend_or_503()
@@ -475,6 +491,11 @@ async def list_memories(
         raise HTTPException(
             status_code=403,
             detail="cross-namespace list requires root",
+        )
+    if operational and not root:
+        raise HTTPException(
+            status_code=403,
+            detail="operational (verbatim, unframed) recall requires root",
         )
     if include_archived and not root:
         raise HTTPException(
@@ -496,9 +517,10 @@ async def list_memories(
             include_archived=include_archived,
         )
     redact = _should_redact_secrets(user, namespace=effective_namespace)
+    frame = _should_frame_data(user, operational=operational)
     return MemoryListResponse(
         count=total,
-        memories=[_row_to_memory(r, redact_secrets=redact) for r in rows],
+        memories=[_row_to_memory(r, redact_secrets=redact, frame_data=frame) for r in rows],
     )
 
 
@@ -508,6 +530,7 @@ async def get_memory(
     request: Request,
     include_archived: bool = False,
     restore: bool = False,
+    operational: bool = False,
     user: UserContext = Depends(get_current_user),
 ):
     """Fetch a memory by id.
@@ -533,6 +556,11 @@ async def get_memory(
     narrate_format = negotiate_narrate_format(accept)
 
     backend = _backend_or_503()
+    if operational and not is_root(user):
+        raise HTTPException(
+            status_code=403,
+            detail="operational (verbatim, unframed) recall requires root",
+        )
     # Root callers see everything (namespace=None); non-root callers
     # are pinned to their namespace by the visibility factory. 404
     # (not 403) keeps other-tenant memory existence invisible — same
@@ -685,6 +713,7 @@ async def get_memory(
         row,
         include_compressed=True,
         redact_secrets=_should_redact_secrets_for_row(user, row),
+        frame_data=_should_frame_data(user, operational=operational),
     )
     return JSONResponse(
         content=jsonable_encoder(memory_item),
@@ -876,6 +905,11 @@ async def search_memories(
     # front guarantees the secret-inclusive cache bucket is reachable
     # only by root. (Duplicated visibility-factory call below stays
     # defense-in-depth.)
+    if request.operational and not is_root(user):
+        raise HTTPException(
+            status_code=403,
+            detail="operational (verbatim, unframed) recall requires root",
+        )
     if request.include_secrets and not is_root(user):
         raise HTTPException(
             status_code=403,
@@ -953,6 +987,7 @@ async def search_memories(
         search_namespace,
         search_owner_id,
         bool(request.include_secrets),  # vault opt-in -> distinct cache bucket
+        bool(request.operational),  # framing opt-in -> distinct (unframed) cache bucket
         sorted(user.group_ids),  # list, not pre-serialized string
         request.include_archived,
         request.boost_recency,
@@ -1160,8 +1195,18 @@ async def search_memories(
     _redact = _should_redact_secrets(
         user, include_secrets=bool(request.include_secrets), namespace=search_namespace
     )
+    # Framing is applied as the FINAL pass below (after rerank/decay) so the
+    # cross-encoder reranker scores RAW content, not the data-boundary
+    # wrapper. ``_row_to_memory`` here only redacts; injection-defense
+    # framing is layered on at serialize time.
+    _frame = _should_frame_data(user, operational=bool(request.operational))
     memories = [
-        _row_to_memory(r, include_compressed=request.include_compressed, redact_secrets=_redact) for r in rows
+        _row_to_memory(
+            r,
+            include_compressed=request.include_compressed,
+            redact_secrets=_redact,
+        )
+        for r in rows
     ]
 
     # v6.2 M-2.2.3: cross-encoder rerank for deep profile.
@@ -1221,6 +1266,22 @@ async def search_memories(
 
     compression_applied = False
     compression_metadata = {}
+
+    # Prompt-injection defense (release-gate 2026-06-13): frame each hit's
+    # content as untrusted DATA + quarantine AI-targeting injection
+    # meta-instructions, as the LAST transform before serialize/cache so a
+    # malicious stored memory cannot steer a consuming agent. Skipped only
+    # for the root operational opt-in (verbatim recall). Reranker/decay ran
+    # on raw content above; framing here keeps their scoring intact.
+    if _frame and memories:
+        from mnemos.core.injection_defense import defend as _defend
+
+        for _m in memories:
+            _m.content = _defend(_m.content)
+            if _m.compressed_content:
+                _m.compressed_content = _defend(_m.compressed_content)
+            if _m.verbatim_content:
+                _m.verbatim_content = _defend(_m.verbatim_content)
 
     response = MemoryListResponse(
         count=len(memories),
@@ -1860,7 +1921,17 @@ async def rehydrate_memories(
     request: RehydrationRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    """Return memories optimized for Claude context injection (Phase 5)."""
+    """Return memories optimized for Claude context injection (Phase 5).
+
+    Prompt-injection defense (release-gate 2026-06-13): rehydrate is THE
+    canonical "inject memories into an agent's context" path, so it is
+    ALWAYS defended -- there is deliberately NO operational/verbatim opt-in
+    here (unlike search/list/get): handing an agent unframed, un-quarantined
+    recall as context is exactly the steer-the-agent risk this gate exists
+    to close. Each memory is injection-quarantined and the whole blob is
+    framed as untrusted DATA. Trusted callers needing verbatim operational
+    recall use search/get with operational=true instead.
+    """
     require_postgres_pool_or_503(route_label="POST /v1/memories/rehydrate")
     # Same v3.1.2 Tier 3 pinning as /memories/search — rehydrate is a
     # read path for the caller's own corpus.
@@ -1957,6 +2028,7 @@ async def rehydrate_memories(
     raw_size = 0
     variant_hits = 0
     from mnemos.core.secret_detection import redact_content as _redact_content
+    from mnemos.core.injection_defense import quarantine_injections as _quarantine, frame_untrusted as _frame
 
     for row in rows:
         # Prefer contest winner (variant_used=True), else raw.
@@ -1968,9 +2040,17 @@ async def rehydrate_memories(
         # any credential span (vaulted-miss or incidental) is masked before
         # it enters the Claude context blob.
         effective = _redact_content(effective)
+        # Prompt-injection defense (release-gate 2026-06-13): rehydrate is
+        # THE canonical inject-into-agent-context path, so neutralize any
+        # AI-targeting injection meta-instruction in each memory before it
+        # enters the context blob. Legit operational prose passes through.
+        effective = _quarantine(effective)
         created_str = row["created"].strftime("%Y-%m-%d") if row["created"] else "unknown"
         context_parts.append(f"[{row['category']} / {created_str}]\n{effective[:2000]}")
     combined_context = "\n\n---\n\n".join(context_parts)
+    # Wrap the whole rehydrated blob in an untrusted-data boundary so the
+    # consuming agent treats injected memories as reference DATA.
+    combined_context = _frame(combined_context)
     original_tokens = int(len(combined_context) / 4)
 
     tokens_used = min(original_tokens, request.budget_tokens) if request.budget_tokens else original_tokens
