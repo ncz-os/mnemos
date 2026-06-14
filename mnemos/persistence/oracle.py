@@ -1506,6 +1506,41 @@ class OracleMemoryRepository(MemoryRepository):
             await _call(cursor.close)
         return await self.get_memory(tx, memory_id, visibility=visibility)
 
+    async def soft_delete_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        requested_by: str | None = None,
+        requested_at: Any = None,
+        request_kind: str = "admin_purge",
+        reason: str | None = None,
+        source: Sequence[str] | None = None,
+    ) -> Row | None:
+        _ = (requested_by, requested_at, request_kind, reason, source)
+        row = await self.get_memory(tx, memory_id, visibility=visibility, include_archived=True)
+        if row is None:
+            return None
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            clause, vis_params = _render_visibility(visibility)
+            where = ["id = :id", "deleted_at IS NULL"]
+            if clause:
+                where.append(clause)
+            vis_params["id"] = memory_id
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET deleted_at = SYSTIMESTAMP, updated = SYSTIMESTAMP WHERE " + " AND ".join(where),
+                vis_params,
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return None
+        finally:
+            await _call(cursor.close)
+        return row
+
     async def delete_memory(
         self,
         tx: Transaction,
@@ -1828,6 +1863,46 @@ class OracleMemoryRepository(MemoryRepository):
             await _call(cursor.close)
         return await self.get_memory(tx, memory_id, visibility=visibility)
 
+    async def backfill_missing_content_hashes(
+        self,
+        tx: Transaction,
+        *,
+        batch_size: int = 500,
+        apply: bool = False,
+    ) -> int:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if not apply:
+                await _call(cursor.execute, "SELECT COUNT(*) AS cnt FROM memories WHERE content_hash IS NULL")
+                row = await _fetchone_dict(cursor)
+                return int((row or {}).get("cnt") or 0)
+            await _call(
+                cursor.execute,
+                """
+                UPDATE memories
+                   SET content_hash = STANDARD_HASH(
+                           REPLACE(REPLACE(NVL(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)),
+                           'SHA256'
+                       ),
+                       updated = SYSTIMESTAMP
+                 WHERE id IN (
+                    SELECT id
+                      FROM memories
+                     WHERE content_hash IS NULL
+                     ORDER BY created ASC, id ASC
+                     FETCH FIRST :batch_size ROWS ONLY
+                 )
+                   AND content_hash IS NULL
+                """,
+                {"batch_size": int(batch_size)},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
     async def find_duplicate_content_groups(
         self,
         tx: Transaction,
@@ -1837,20 +1912,34 @@ class OracleMemoryRepository(MemoryRepository):
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
-            where = ["deleted_at IS NULL", "content_hash IS NOT NULL"]
+            where = [
+                "deleted_at IS NULL",
+                "archived_at IS NULL",
+                "consolidated_into IS NULL",
+                "content_hash IS NOT NULL",
+            ]
             params: dict[str, Any] = {}
             if namespace is not None:
                 where.append("namespace = :ns")
                 params["ns"] = namespace
             sql = (
-                "SELECT content_hash, COUNT(*) AS cnt, "
-                "MIN(id) KEEP (DENSE_RANK FIRST ORDER BY created ASC) AS canonical_id "
-                "FROM memories WHERE " + " AND ".join(where) + " "
-                "GROUP BY content_hash HAVING COUNT(*) > 1 "
-                "ORDER BY cnt DESC, content_hash ASC"
+                "SELECT owner_id, namespace, content_hash, COUNT(*) AS duplicate_count, "
+                "LISTAGG(id, CHR(31)) WITHIN GROUP (ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) AS memory_ids, "
+                "MIN(id) KEEP (DENSE_RANK FIRST ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) AS keep_id, "
+                "MIN(id) KEEP (DENSE_RANK FIRST ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) AS canonical_id "
+                "FROM (SELECT id, owner_id, namespace, content_hash, created, quality_rating, "
+                "REPLACE(REPLACE(NVL(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)) AS normalized_content "
+                "FROM memories WHERE " + " AND ".join(where) + ") candidates "
+                "GROUP BY owner_id, namespace, content_hash, normalized_content HAVING COUNT(*) > 1 "
+                "ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC"
             )
             await _call(cursor.execute, sql, params)
-            return await _fetch_all_dicts(cursor)
+            rows = await _fetch_all_dicts(cursor)
+            for row in rows:
+                raw = row.get("memory_ids") or ""
+                row["memory_ids"] = [part for part in str(raw).split("\x1f") if part]
+                row["duplicate_count"] = int(row.get("duplicate_count") or 0)
+            return rows
         finally:
             await _call(cursor.close)
 
