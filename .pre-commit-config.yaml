@@ -22,7 +22,7 @@ repos:
   # Any new .sql under db/migrations/ OR db/migrations_oracle/ OR
   # db/migrations_db2/ must have parallel files in all three dirs
   # or the commit is rejected. Pre-commit uses --mode staged (only
-  # blocks new additions); CI runs --mode diff against MR base.
+  # blocks new additions); CI runs --mode full as a clean inventory gate.
   - repo: local
     hooks:
       - id: migration-parity-check

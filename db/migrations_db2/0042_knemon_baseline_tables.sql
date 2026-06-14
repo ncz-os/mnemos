@@ -1,0 +1,4 @@
+-- 0042_knemon_baseline_tables.sql — Db2 migration-parity shim.
+-- Db2 carries the active schema through the canonical numbered migrations and
+-- this basename is retained to match the historical Oracle rollout name.
+-- Idempotent no-op for full parity gating.

@@ -78,6 +78,9 @@ jobs:
               sys.exit(1)
           PY
 
+      - name: Migration parity
+        run: .venv/bin/python scripts/check_migration_parity.py --mode full
+
       - name: Lint imports
         run: |
           set +e

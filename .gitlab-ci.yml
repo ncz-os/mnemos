@@ -91,6 +91,17 @@ lint:env-discipline:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
 
+lint:migration-parity:
+  stage: lint
+  tags: [argos, ncz-os]
+  script:
+    # Full inventory is now a hard gate: every basename under the PostgreSQL,
+    # Oracle, and Db2 migration directories must exist in all three places.
+    - python3 scripts/check_migration_parity.py --mode full
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
 # ---- test --------------------------------------------------------------
 
 test:unit:

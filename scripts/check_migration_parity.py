@@ -23,9 +23,8 @@ Modes:
                   added .sql in any of the 3 dirs lacks parity.
 
   --mode full     CI safety net: walk all 3 dirs, fail if any file has
-                  no matching basename in the others. (Current state has
-                  20 grandfathered violations — full mode is informational
-                  only until cleanup lands.)
+                  no matching basename in the others. This is a hard gate:
+                  historical drift has been backfilled.
 
 Defaults to --mode staged (env override: MIGRATION_PARITY_MODE).
 
