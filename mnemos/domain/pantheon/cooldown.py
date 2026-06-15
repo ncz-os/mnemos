@@ -25,9 +25,9 @@ bad BYOK key) never cool another tenant's separate key on the same provider.
 Trip rules (LiteLLM ``_is_cooldown_required`` + ``_should_cooldown_deployment``):
 the error type must be cooldownable (``NormalizedError.cooldownable`` — never a
 plain 400 or an APIConnection fault); a SINGLE-deployment group is never cooled
-(removing the only model helps nobody); otherwise trip on a 429, on a permanent
-auth/not-found error, or when the failure rate exceeds 50% over >= 5 requests
-this minute (or 100% over a high-traffic single-deployment burst).
+(removing the only model helps nobody); otherwise trip on a timeout, on a 429,
+on a permanent auth/not-found error, or when the failure rate exceeds 50% over
+>= 5 requests this minute (or 100% over a high-traffic single-deployment burst).
 """
 
 from __future__ import annotations
@@ -79,6 +79,8 @@ def evaluate_cooldown(
         return no
 
     # Stage 2: rate / permanence thresholds.
+    if err.error_class is ErrorClass.TIMEOUT:
+        return CooldownDecision(True, cooldown_seconds, "timeout")
     if err.error_class is ErrorClass.RATE_LIMIT or err.status_code == 429:
         return CooldownDecision(True, cooldown_seconds, "rate_limit")
     if err.error_class in _PERMANENT_CLASSES:
