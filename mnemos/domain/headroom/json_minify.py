@@ -43,8 +43,16 @@ def _validate_json(text: str) -> None:
         parse_float=str,
         parse_constant=lambda token: (_ for _ in ()).throw(JSONMinifyError(f"invalid JSON constant {token!r}")),
     )
+    # raw_decode does not skip leading whitespace; advance past it so documents
+    # with leading JSON whitespace (e.g. "  {...}  ") validate and can minify.
+    start = 0
+    n = len(text)
+    while start < n and text[start] in _JSON_WS:
+        start += 1
+    if start >= n:
+        raise JSONMinifyError("empty JSON document")
     try:
-        _, end = decoder.raw_decode(text)
+        _, end = decoder.raw_decode(text, start)
     except JSONMinifyError:
         raise
     except json.JSONDecodeError as exc:

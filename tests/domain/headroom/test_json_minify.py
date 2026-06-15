@@ -213,3 +213,18 @@ def test_json_container_content_still_minifies() -> None:
     assert result.compressed[0]["content"] == "[1,2,3.0]"
     assert result.changed is True
     assert result.lossless is True
+
+
+def test_leading_whitespace_container_minifies_losslessly() -> None:
+    """A JSON container with leading whitespace still minifies (raw_decode skip).
+
+    Digits and identifiers are preserved exactly; only insignificant container
+    whitespace is dropped.
+    """
+    text = '  { "amount" : 123.4500, "id" : "LIC-001" }  '
+    result = compress([{"role": "user", "content": text}])
+    out = result.compressed[0]["content"]
+    assert out == '{"amount":123.4500,"id":"LIC-001"}'
+    assert json.loads(out) == json.loads(text)
+    assert result.changed is True
+    assert result.lossless is True
