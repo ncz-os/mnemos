@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 
 import httpx
@@ -45,6 +46,20 @@ def _assert_echo_tool_call(response_data: dict) -> list[dict]:
 
 def _client_timeout() -> httpx.Timeout:
     return httpx.Timeout(connect=10.0, read=SMOKE_READ_TIMEOUT_SECONDS, write=30.0, pool=10.0)
+
+
+def _codex_host_skip_reason(status_code: int, body: str) -> str | None:
+    if status_code in (401, 403):
+        return f"upstream_{status_code}_credential"
+    if status_code != 503:
+        return None
+
+    text = body.lower().replace('\\"', '"')
+    if re.search(r"provider\s+['\"]?[^'\"\s]+['\"]?\s+(?:is\s+)?not\s+registered", text):
+        return "provider_not_registered"
+    if "missing api_key" in text or ("missing" in text and "api key" in text):
+        return "missing_api_key"
+    return None
 
 
 def main() -> int:
@@ -109,10 +124,15 @@ def main() -> int:
         # The /v1/responses route + codex-model resolution is what we assert here.
         # A 404 means the route is missing or the codex model is not cataloged
         # (real gateway gap). A 401/403 means the route resolved + dispatched but
-        # this host has no credential for the codex/openai provider — expected on
-        # hosts that only carry NGC/GROQ keys; treat as a host-skip, not a failure.
-        if codex.status_code in (401, 403):
-            print(f"codex /v1/responses route OK (upstream {codex.status_code}: no codex cred on this host — skipped)")
+        # this host has no credential/registered provider for the codex/openai
+        # provider — expected on hosts that only carry NGC/GROQ keys; treat as a
+        # host-skip, not a failure. 404 stays a hard failure.
+        skip_reason = _codex_host_skip_reason(codex.status_code, codex.text)
+        if skip_reason:
+            print(
+                "codex /v1/responses route OK "
+                f"(host-skip {skip_reason}; upstream {codex.status_code})"
+            )
         else:
             codex.raise_for_status()
     print("pantheon shadow smoke ok")

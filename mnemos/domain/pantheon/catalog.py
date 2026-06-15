@@ -103,6 +103,14 @@ def _fleet_model(model_id: Any) -> dict[str, Any] | None:
     return _FLEET_MODELS_BY_ID.get(str(model_id or "").strip().lower())
 
 
+def _fleet_provider_registered(model_id: Any, provider_cfgs: dict[str, dict[str, Any]]) -> bool:
+    fleet = _fleet_model(model_id)
+    if not fleet:
+        return True
+    provider = str(fleet.get("provider") or "").strip()
+    return bool(provider and provider in provider_cfgs)
+
+
 def _catalog_key(model: dict[str, Any]) -> tuple[str, str] | None:
     provider = str(model.get("provider") or "").strip()
     model_id = str(model.get("id") or model.get("model_id") or "").strip()
@@ -617,6 +625,8 @@ async def list_models(*, use_synced_cache: bool = True) -> list[dict[str, Any]]:
         fleet = _fleet_model(model_id)
         if fleet:
             provider = str(fleet.get("provider") or provider)
+            if not _fleet_provider_registered(model_id, provider_cfgs):
+                continue
         provider_cfg = provider_cfgs.get(provider, {"model": model_id})
         model_source = {
             "model_id": model_id,
@@ -660,6 +670,8 @@ async def list_models(*, use_synced_cache: bool = True) -> list[dict[str, Any]]:
             add_model(normalized, overwrite=False)
 
     for cached_model in synced_cached_models or legacy_cached_models:
+        if not _fleet_provider_registered(cached_model.get("id") or cached_model.get("model_id"), provider_cfgs):
+            continue
         key = _catalog_key(cached_model)
         if key is not None and key not in models:
             models[key] = cached_model

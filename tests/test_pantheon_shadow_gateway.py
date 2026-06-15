@@ -135,6 +135,87 @@ def test_shadow_app_serves_openai_chat_without_auth_startup(monkeypatch):
     assert response.json()["model"] == "shadow-model"
 
 
+def test_shadow_app_openai_responses_dispatches_codex_model(monkeypatch):
+    from mnemos.api.pantheon_shadow import app
+    from mnemos.api.routes import pantheon as pantheon_routes
+    from mnemos.core.config import _reset_settings_for_tests
+
+    decision = _decision(
+        alias="gpt-5.3-codex",
+        provider="openai",
+        model_id="gpt-5.3-codex",
+        route_type="literal",
+        model={"id": "gpt-5.3-codex", "usage_tier": "frontier"},
+    )
+    seen = {}
+
+    class _PantheonRouter:
+        async def route_model(self, model, body):
+            seen["routed_model"] = model
+            seen["route_body"] = body
+            return decision
+
+    class _CapBucket:
+        def check_and_increment(self, **_kwargs):
+            raise AssertionError("frontier model should not consume consultation cap")
+
+    async def _forward_chat_completion(actual_decision, body):
+        seen["forward_decision"] = actual_decision
+        seen["forward_body"] = body
+        assert actual_decision.model_id == "gpt-5.3-codex"
+        assert body["messages"] == [{"role": "user", "content": "Return the word ok."}]
+        assert body["_mnemos_upstream_identity"]["user_id"] == "default"
+        return {
+            "id": "chatcmpl-codex",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-5.3-codex",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    def _routing_payload(**_kwargs):
+        return {}, {}
+
+    with monkeypatch.context() as m:
+        m.setenv("MNEMOS_PROFILE", "server")
+        m.setenv("MNEMOS_PANTHEON_ENABLED", "true")
+        m.setattr(dependencies, "PERSONAL_SINGLETON", None)
+        m.setattr(dependencies, "_auth_enabled", False)
+        m.setattr(gateway, "forward_chat_completion", _forward_chat_completion)
+        m.setattr(
+            pantheon_routes,
+            "_pantheon_imports",
+            lambda: (
+                None,
+                gateway,
+                _PantheonRouter(),
+                Exception,
+                _CapBucket(),
+                _routing_payload,
+                lambda _payload, _metadata: None,
+            ),
+        )
+        _reset_settings_for_tests()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                json={"model": "gpt-5.3-codex", "input": "Return the word ok."},
+            )
+
+    _reset_settings_for_tests()
+
+    assert response.status_code != 404, response.text
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["object"] == "response"
+    assert data["model"] == "gpt-5.3-codex"
+    assert data["output"][0]["content"][0]["text"] == "ok"
+    assert seen["routed_model"] == "gpt-5.3-codex"
+    assert seen["forward_decision"].model_id == "gpt-5.3-codex"
+
+
 def test_endpoint_routing_by_codex_model_uses_responses_url(monkeypatch):
     posted = {}
 
@@ -201,6 +282,46 @@ def test_codex_fleet_model_is_cataloged_and_resolvable(monkeypatch):
     assert decision.provider == "openai"
     assert decision.model_id == "gpt-5.3-codex"
     assert model_uses_responses_api(decision.model_id) is True
+
+
+def test_codex_fleet_model_skipped_without_registered_openai_provider(monkeypatch):
+    from mnemos.domain.pantheon import catalog, pricing
+
+    class _Engine:
+        providers = {
+            "ngc": {
+                "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+                "model": "nvidia/llama-3.3-70b-instruct",
+                "weight": 0.72,
+                "api": "openai",
+                "key_name": "ngc",
+            }
+        }
+
+        def provider_status(self):
+            return {}
+
+    cached = {
+        "schema": "mnemos.pantheon.catalog.v1",
+        "models": [
+            {
+                "id": "gpt-5.3-codex",
+                "provider": "openai",
+                "registry_provider": "openai",
+                "display_name": "GPT-5.3 Codex",
+            }
+        ],
+    }
+
+    monkeypatch.setattr(catalog, "get_graeae_engine", lambda: _Engine())
+    monkeypatch.setattr(catalog._lc, "_pool", None)
+    monkeypatch.setattr(pricing, "read_json_cache", lambda *_args, **_kwargs: cached)
+
+    models = asyncio.run(catalog.list_models())
+    ids = {model["id"] for model in models}
+
+    assert "nvidia/llama-3.3-70b-instruct" in ids
+    assert "gpt-5.3-codex" not in ids
 
 
 def test_tool_call_passthrough_payload_and_response_arguments(monkeypatch):
@@ -562,7 +683,7 @@ def test_streaming_telemetry_logs_after_stream_with_real_wire_model(monkeypatch)
 
 
 def test_shadow_smoke_tool_call_check_is_assertive():
-    from scripts.pantheon_shadow_smoke import _assert_echo_tool_call, _client_timeout
+    from scripts.pantheon_shadow_smoke import _assert_echo_tool_call, _client_timeout, _codex_host_skip_reason
 
     with pytest.raises(AssertionError, match="expected at least one tool_call"):
         _assert_echo_tool_call({"choices": [{"message": {"content": "no tool"}}]})
@@ -590,3 +711,10 @@ def test_shadow_smoke_tool_call_check_is_assertive():
         _assert_echo_tool_call(response_data)
 
     assert _client_timeout().read >= 90.0
+    assert _codex_host_skip_reason(503, '{"detail":"provider \\"openai\\" is not registered"}') == (
+        "provider_not_registered"
+    )
+    assert _codex_host_skip_reason(503, '{"detail":"missing api_key for provider key_name=\\"openai\\""}') == (
+        "missing_api_key"
+    )
+    assert _codex_host_skip_reason(404, '{"detail":"not found"}') is None
