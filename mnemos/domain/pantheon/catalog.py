@@ -252,6 +252,9 @@ def _synced_cache_models() -> list[dict[str, Any]] | None:
 
 def _catalog_cache_paths() -> list[Path]:
     paths: list[str] = []
+    pricing_cache_path = os.environ.get("PANTHEON_CATALOG_CACHE")
+    if pricing_cache_path:
+        paths.append(pricing_cache_path)
     try:
         configured = get_settings().pantheon.catalog_cache_path
         if configured:
@@ -263,7 +266,15 @@ def _catalog_cache_paths() -> list[Path]:
         paths.append(env_path)
     paths.extend(_DEFAULT_CACHE_PATHS)
     cwd = Path.cwd()
-    return [Path(p) if Path(p).is_absolute() else cwd / p for p in paths]
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for raw in paths:
+        path = Path(raw).expanduser()
+        path = path if path.is_absolute() else cwd / path
+        if path not in seen:
+            out.append(path)
+            seen.add(path)
+    return out
 
 
 def _cache_payload_models(payload: Any) -> list[dict[str, Any]]:

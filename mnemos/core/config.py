@@ -668,9 +668,21 @@ class PantheonSettings(BaseSettings):
         8000,
         validation_alias="MNEMOS_PANTHEON_REASONING_OUTPUT_TOKEN_BUDGET",
     )
+    upstream_timeout_seconds: float = Field(
+        60.0,
+        validation_alias=AliasChoices(
+            "MNEMOS_PANTHEON_UPSTREAM_TIMEOUT_SECONDS",
+            "PANTHEON_UPSTREAM_TIMEOUT_SECONDS",
+            "PANTHEON_UPSTREAM_TIMEOUT",
+        ),
+    )
     shadow_port: int = Field(
         4101,
         validation_alias="MNEMOS_PANTHEON_SHADOW_PORT",
+    )
+    shadow_no_auth: bool = Field(
+        True,
+        validation_alias="MNEMOS_PANTHEON_SHADOW_NO_AUTH",
     )
     catalog_cache_path: str | None = Field(
         None,
@@ -702,6 +714,15 @@ class PantheonSettings(BaseSettings):
         except (TypeError, ValueError):
             return 0.0
         return value if value >= 0.0 else 0.0
+
+    @field_validator("upstream_timeout_seconds", mode="before")
+    @classmethod
+    def _positive_timeout(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 60.0
+        return value if value > 0.0 else 60.0
 
 
 class KnemonSettings(BaseSettings):

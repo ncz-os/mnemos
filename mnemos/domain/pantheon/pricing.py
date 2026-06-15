@@ -31,6 +31,39 @@ DEFAULT_JSON_CACHE = Path(os.environ.get("PANTHEON_CATALOG_CACHE", "/var/lib/mne
 DEFAULT_SQLITE_CACHE = Path(os.environ.get("PANTHEON_CATALOG_SQLITE", "/var/lib/mnemos/pantheon-catalog.sqlite3"))
 DEFAULT_SEED_CACHE = Path(__file__).with_name("pricing_seed.json")
 
+
+def _user_cache_dir() -> Path:
+    root = os.environ.get("XDG_CACHE_HOME")
+    base = Path(root).expanduser() if root else Path.home() / ".cache"
+    return base / "mnemos"
+
+
+def _fallback_cache_path(path: Path) -> Path:
+    return _user_cache_dir() / path.name
+
+
+def _default_json_cache_path(path: Path = DEFAULT_JSON_CACHE) -> Path:
+    primary = Path(path).expanduser()
+    if primary == DEFAULT_JSON_CACHE.expanduser():
+        return Path(os.environ.get("PANTHEON_CATALOG_CACHE", str(DEFAULT_JSON_CACHE))).expanduser()
+    return primary
+
+
+def _default_sqlite_cache_path(path: Path = DEFAULT_SQLITE_CACHE) -> Path:
+    primary = Path(path).expanduser()
+    if primary == DEFAULT_SQLITE_CACHE.expanduser():
+        return Path(os.environ.get("PANTHEON_CATALOG_SQLITE", str(DEFAULT_SQLITE_CACHE))).expanduser()
+    return primary
+
+
+def _cache_candidate_paths(path: Path) -> list[Path]:
+    primary = Path(path).expanduser()
+    fallback = _fallback_cache_path(primary)
+    paths = [primary]
+    if fallback != primary:
+        paths.append(fallback)
+    return paths
+
 # External feeds use their own naming. Normalize the provider half into the
 # names PANTHEON/GRAEAE already understands. "NGC-EIH" is represented by the
 # local nvidia provider key in existing code paths.
@@ -441,13 +474,14 @@ def cache_payload(models: list[dict[str, Any]], source_status: list[dict[str, An
 
 
 def read_json_cache(path: Path = DEFAULT_JSON_CACHE) -> dict[str, Any] | None:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[PANTHEON] could not read pricing cache %s: %s", path, exc)
-        return None
+    for candidate in _cache_candidate_paths(_default_json_cache_path(path)):
+        try:
+            return json.loads(candidate.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[PANTHEON] could not read pricing cache %s: %s", candidate, exc)
+    return None
 
 
 def read_seed_cache(path: Path = DEFAULT_SEED_CACHE) -> dict[str, Any] | None:
@@ -478,10 +512,28 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def write_json_cache(payload: dict[str, Any], path: Path = DEFAULT_JSON_CACHE) -> None:
-    _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    errors: list[str] = []
+    primary = _default_json_cache_path(path)
+    for candidate in _cache_candidate_paths(primary):
+        try:
+            _atomic_write_text(candidate, text)
+            if candidate != primary:
+                logger.warning(
+                    "[PANTHEON] pricing cache %s unwritable; wrote fallback %s",
+                    primary,
+                    candidate,
+                )
+            return
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
+    logger.warning(
+        "[PANTHEON] could not write pricing cache; refresh will continue without cache update (%s)",
+        "; ".join(errors),
+    )
 
 
-def write_sqlite_cache(payload: dict[str, Any], path: Path = DEFAULT_SQLITE_CACHE) -> None:
+def _write_sqlite_cache_at(payload: dict[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     try:
@@ -513,6 +565,27 @@ def write_sqlite_cache(payload: dict[str, Any], path: Path = DEFAULT_SQLITE_CACH
         conn.commit()
     finally:
         conn.close()
+
+
+def write_sqlite_cache(payload: dict[str, Any], path: Path = DEFAULT_SQLITE_CACHE) -> None:
+    errors: list[str] = []
+    primary = _default_sqlite_cache_path(path)
+    for candidate in _cache_candidate_paths(primary):
+        try:
+            _write_sqlite_cache_at(payload, candidate)
+            if candidate != primary:
+                logger.warning(
+                    "[PANTHEON] pricing SQLite cache %s unwritable; wrote fallback %s",
+                    primary,
+                    candidate,
+                )
+            return
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{candidate}: {exc}")
+    logger.warning(
+        "[PANTHEON] could not write pricing SQLite cache; refresh will continue without cache update (%s)",
+        "; ".join(errors),
+    )
 
 
 async def regenerate_catalog_cache(

@@ -12,6 +12,8 @@ import sys
 
 import httpx
 
+SMOKE_READ_TIMEOUT_SECONDS = 120.0
+
 
 def _assert_echo_tool_call(response_data: dict) -> list[dict]:
     first_tool_calls = ((response_data.get("choices") or [{}])[0].get("message") or {}).get("tool_calls") or []
@@ -41,6 +43,10 @@ def _assert_echo_tool_call(response_data: dict) -> list[dict]:
     return first_tool_calls
 
 
+def _client_timeout() -> httpx.Timeout:
+    return httpx.Timeout(connect=10.0, read=SMOKE_READ_TIMEOUT_SECONDS, write=30.0, pool=10.0)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:4101")
@@ -49,7 +55,7 @@ def main() -> int:
     parser.add_argument("--codex-model", default="gpt-5.3-codex")
     args = parser.parse_args()
     headers = {"Authorization": f"Bearer {args.api_key}"}
-    with httpx.Client(base_url=args.base_url, headers=headers, timeout=120) as client:
+    with httpx.Client(base_url=args.base_url, headers=headers, timeout=_client_timeout()) as client:
         r = client.get("/health")
         r.raise_for_status()
         chat = client.post(
