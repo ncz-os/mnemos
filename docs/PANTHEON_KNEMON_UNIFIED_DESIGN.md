@@ -91,6 +91,20 @@ capabilities, quality — keyed provider+model with alias mapping to our provide
    as the prior litellm→caddy cutover was). Keep caddy hot as instant rollback.
 4. **Rollback** — flip VIP back to caddy; pantheon is additive until flip.
 
+**PRE-FLIP CHECKLIST (load-test gate):**
+
+- `MNEMOS_PANTHEON_GATEWAY_RATE_LIMIT` is fleet-scale, or disabled when testing caddy
+  parity; a process-local/single-worker default is not a valid cutover limit.
+- Gateway runs as a worker pool behind caddy (`gunicorn -w N ...`), not one process;
+  single-worker testing ceilings around ~350 req/s are capacity findings, not the target
+  topology.
+- Cooldown, breaker, and request-limit state is shared through NATS/JetStream before any
+  multi-worker run; process-local state is incorrect once caddy fans out.
+- caddy remains the stable `:4100` VIP and load-balances across the PANTHEON worker pool;
+  rollback is repointing the caddy upstream back to `inference-api`.
+- Concurrent load test passes at fleet concurrency before flip: record p50/p95/p99 and
+  require **0 spurious 429s** from the gateway rate limiter.
+
 The flip is **operator/Claude-orchestrated, not a blind hive job** (fleet critical path).
 
 ## Phased build (hive jobs)
