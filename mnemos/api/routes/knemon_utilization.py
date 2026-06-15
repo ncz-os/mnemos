@@ -10,10 +10,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 
 from mnemos.api.dependencies import UserContext, require_root
+from mnemos.api.extra_guards import require_extra
 from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.core.plan_windows import compute_plan_window_id
 
-router = APIRouter(prefix="/v1/knemon", tags=["knemon"])
+router = APIRouter(prefix="/v1/knemon", tags=["knemon"], dependencies=[require_extra("knemon", label="KNEMON")])
 
 
 async def _call(value: Any, *args: Any, **kwargs: Any) -> Any:
