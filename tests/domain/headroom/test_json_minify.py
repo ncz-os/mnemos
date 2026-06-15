@@ -182,3 +182,34 @@ def test_compress_messages_recursively_minifies_json_string_leaves_only() -> Non
     assert result.compressed[1]["tool_calls"][0]["function"]["arguments"] == (
         '{"amount":1234567890.000000000000000001,"exp":1E+000}'
     )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "1.230000000000000000000000000001\t",  # bare number w/ trailing tab (financial)
+        '"LIC-001"  ',  # bare quoted-string identifier w/ trailing spaces
+        "  true  ",  # bare boolean literal
+        "  null ",  # bare null literal
+        "42",  # bare integer with no whitespace
+    ],
+)
+def test_bare_json_scalar_content_is_passthrough_not_minified(content) -> None:
+    """A lone JSON scalar as message content is text, not a JSON document.
+
+    Trailing/leading whitespace around a bare scalar is significant literal text,
+    yet it is JSON-insignificant — minifying it would silently mutate the value
+    while the JSON-semantic lossless proof still passed. Such content must pass
+    through byte-for-byte (regression for the messages-API over-broad minify).
+    """
+    result = compress([{"role": "user", "content": content}])
+    assert result.compressed[0]["content"] == content
+    assert result.lossless is True
+
+
+def test_json_container_content_still_minifies() -> None:
+    """The intended win — JSON object/array tool payloads — is preserved."""
+    result = compress([{"role": "user", "content": '[1, 2,  3.0]'}])
+    assert result.compressed[0]["content"] == "[1,2,3.0]"
+    assert result.changed is True
+    assert result.lossless is True

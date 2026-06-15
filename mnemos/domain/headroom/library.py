@@ -65,7 +65,35 @@ def _byte_len(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
+def _is_json_container(text: str) -> bool:
+    """True only when the payload is a JSON object/array document.
+
+    A bare JSON scalar (lone number, quoted string, true/false/null) that makes
+    up the entire payload is ambiguous with free text: e.g. a message content of
+    ``"1.2300\t"`` or ``'"LIC-001"  '`` is literal text whose trailing whitespace
+    is significant, yet it parses as a complete JSON scalar where that whitespace
+    is JSON-insignificant. Minifying it would silently mutate the literal value
+    while the JSON-semantic proof still passes. Whitespace is only safely
+    droppable inside a JSON container, so restrict minification to ``{``/``[``.
+    """
+    for ch in text:
+        if ch in (" ", "\t", "\r", "\n"):
+            continue
+        return ch in ("{", "[")
+    return False
+
+
 def _compress_json_string(text: str, *, path: str) -> tuple[str, TransformRecord]:
+    if not _is_json_container(text):
+        return text, TransformRecord(
+            name="json-minify",
+            supported=False,
+            changed=False,
+            path=path,
+            reason="not a JSON object/array document; passthrough (bare scalar/text)",
+            original_bytes=_byte_len(text),
+            compressed_bytes=_byte_len(text),
+        )
     try:
         compressed = minify_json_text(text)
     except JSONMinifyError as exc:
