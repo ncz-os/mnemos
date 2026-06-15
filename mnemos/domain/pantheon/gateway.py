@@ -28,6 +28,27 @@ logger = logging.getLogger(__name__)
 _IDENTITY_BODY_KEY = "_mnemos_upstream_identity"
 _REASONING_MODEL_RE = re.compile(r"(reason|thinking|r1\b|\bo[134]\b|gpt-5|grok-4|deepseek)", re.I)
 _RESPONSES_MODEL_RE = re.compile(r"(?:^|/)(?:gpt-[0-9.]+.*codex|.*codex.*gpt-[0-9.]|o[134].*-codex|codex)", re.I)
+_TOKEN_BUDGET_FIELDS = ("max_output_tokens", "max_completion_tokens", "max_tokens")
+_PANTHEON_PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
+    "eih": {
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "api": "openai",
+        "key_name": "eih",
+        "enabled": True,
+    },
+    "ngc": {
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "api": "openai",
+        "key_name": "ngc",
+        "enabled": True,
+    },
+    "deepseek-direct": {
+        "url": "https://api.deepseek.com/v1/chat/completions",
+        "api": "openai",
+        "key_name": "deepseek-direct",
+        "enabled": True,
+    },
+}
 
 
 # ── Shared pooled HTTP client. Reused across requests so keep-alive
@@ -114,7 +135,8 @@ def _identity_headers(identity: UpstreamIdentity | None) -> dict[str, str]:
 
 def _provider_config(decision: RouteDecision) -> dict[str, Any]:
     engine = get_graeae_engine()
-    cfg = dict(engine.providers.get(decision.provider, {}))
+    defaults = _PANTHEON_PROVIDER_DEFAULTS.get(decision.provider, {})
+    cfg = {**defaults, **dict(engine.providers.get(decision.provider, {}))}
     if not cfg:
         raise PantheonGatewayError(503, f"provider {decision.provider!r} is not registered")
     if decision.model_id:
@@ -203,18 +225,29 @@ def _reasoning_budget() -> int:
     return max(8000, configured)
 
 
-def _apply_reasoning_budget(payload: dict[str, Any], model_id: str | None) -> dict[str, Any]:
+def _apply_reasoning_budget(
+    payload: dict[str, Any],
+    model_id: str | None,
+    *,
+    budget_field: str = "max_completion_tokens",
+) -> dict[str, Any]:
     if not model_needs_reasoning_budget(model_id):
         return payload
     budget = _reasoning_budget()
-    raw = payload.get("max_completion_tokens", payload.get("max_tokens"))
+    raw = None
+    for field in _TOKEN_BUDGET_FIELDS:
+        if field in payload:
+            raw = payload.get(field)
+            break
     try:
         current = int(raw) if raw is not None else None
     except (TypeError, ValueError):
         current = None
     if current is None or current < budget:
-        payload["max_completion_tokens"] = budget
-        payload.pop("max_tokens", None)
+        payload[budget_field] = budget
+        for field in _TOKEN_BUDGET_FIELDS:
+            if field != budget_field:
+                payload.pop(field, None)
     return payload
 
 
@@ -245,12 +278,14 @@ def _responses_payload(decision: RouteDecision, body: dict[str, Any], *, stream:
     payload.pop("stream", None)
     if stream is not None:
         payload["stream"] = stream
-    payload = _apply_reasoning_budget(payload, decision.model_id)
-    if "max_tokens" in payload and "max_output_tokens" not in payload:
+    if "max_output_tokens" in payload:
+        payload.pop("max_tokens", None)
+        payload.pop("max_completion_tokens", None)
+    elif "max_tokens" in payload:
         payload["max_output_tokens"] = payload.pop("max_tokens")
-    if "max_completion_tokens" in payload and "max_output_tokens" not in payload:
+    elif "max_completion_tokens" in payload:
         payload["max_output_tokens"] = payload.pop("max_completion_tokens")
-    return payload
+    return _apply_reasoning_budget(payload, decision.model_id, budget_field="max_output_tokens")
 
 
 def _provider_payload(decision: RouteDecision, body: dict[str, Any], *, stream: bool | None = None) -> dict[str, Any]:
@@ -394,7 +429,7 @@ async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any])
     # error (e.g. 400) still surfaces as the original PantheonGatewayError.
     runtime = get_runtime()
     chain = [decision]
-    if get_settings().pantheon.cross_provider_fallback and decision.route_type == "single":
+    if get_settings().pantheon.cross_provider_fallback:
         from mnemos.domain.pantheon import catalog, router
 
         built = router.build_fallback_chain(decision, await catalog.list_models())

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -204,6 +205,24 @@ def _log_route_outcome(
     schedule_routing_memory(payload, metadata)
 
 
+def _stream_event_wire_model(event: str) -> str | None:
+    wire_model: str | None = None
+    for line in event.splitlines():
+        if not line.startswith("data:"):
+            continue
+        raw = line[5:].strip()
+        if not raw or raw == "[DONE]":
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        model = payload.get("model") if isinstance(payload, dict) else None
+        if isinstance(model, str) and model:
+            wire_model = model
+    return wire_model
+
+
 async def _list_models_impl() -> dict[str, Any]:
     catalog, *_ = _pantheon_imports()
     return await catalog.models_response()
@@ -253,21 +272,58 @@ async def _chat_completions_impl(
         started_at = time.perf_counter()
         forward_body = gateway.attach_upstream_identity(body, identity)
         if body.get("stream") is True:
-            _log_route_outcome(
-                routing_payload=routing_payload,
-                schedule_routing_memory=schedule_routing_memory,
-                request_id=request_id,
-                tenant_user_id=user.user_id,
-                session_id=session_id,
-                decision=decision,
-                outcome="success",
-                started_at=started_at,
-                namespace=user.namespace,
-                forwarded_user=identity.opaque_user,
-                resolved_wire_model=decision.model_id or decision.alias,
-            )
+            async def audited_stream():
+                stream_buffer = ""
+                wire_model: str | None = None
+                try:
+                    async for chunk in gateway.stream_chat_completion(decision, forward_body):
+                        try:
+                            stream_buffer += chunk.decode("utf-8", "ignore")
+                        except AttributeError:
+                            stream_buffer += str(chunk)
+                        events = stream_buffer.split("\n\n")
+                        stream_buffer = events.pop()
+                        for event in events:
+                            event_model = _stream_event_wire_model(event)
+                            if event_model:
+                                wire_model = event_model
+                        yield chunk
+                except Exception as exc:
+                    _log_route_outcome(
+                        routing_payload=routing_payload,
+                        schedule_routing_memory=schedule_routing_memory,
+                        request_id=request_id,
+                        tenant_user_id=user.user_id,
+                        session_id=session_id,
+                        decision=decision,
+                        outcome="error",
+                        started_at=started_at,
+                        error_class=exc.__class__.__name__,
+                        namespace=user.namespace,
+                        forwarded_user=identity.opaque_user,
+                        resolved_wire_model=wire_model or decision.model_id or decision.alias,
+                    )
+                    raise
+                if stream_buffer:
+                    event_model = _stream_event_wire_model(stream_buffer)
+                    if event_model:
+                        wire_model = event_model
+                _log_route_outcome(
+                    routing_payload=routing_payload,
+                    schedule_routing_memory=schedule_routing_memory,
+                    request_id=request_id,
+                    tenant_user_id=user.user_id,
+                    session_id=session_id,
+                    decision=decision,
+                    outcome="success",
+                    started_at=started_at,
+                    namespace=user.namespace,
+                    forwarded_user=identity.opaque_user,
+                    resolved_wire_model=wire_model or decision.model_id or decision.alias,
+                )
+
             return StreamingResponse(
-                gateway.stream_chat_completion(decision, forward_body),
+                audited_stream(),
                 media_type="text/event-stream",
             )
         response_data = await gateway.forward_chat_completion(decision, forward_body)
@@ -332,9 +388,7 @@ async def _responses_impl(
     result = await _chat_completions_impl(request, body, user)
     if not isinstance(result, JSONResponse):
         return result
-    import json as _json
-
-    chat = _json.loads(result.body.decode("utf-8"))
+    chat = json.loads(result.body.decode("utf-8"))
     choice = (chat.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     output: list[dict[str, Any]] = []

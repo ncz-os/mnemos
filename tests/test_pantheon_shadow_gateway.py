@@ -4,6 +4,8 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from mnemos.domain.pantheon import gateway
 from mnemos.domain.pantheon.gateway import (
     _provider_payload,
@@ -122,6 +124,114 @@ def test_reasoning_budget_default_at_least_8000(monkeypatch):
     assert "max_tokens" not in payload
 
 
+def test_responses_max_output_tokens_floor_applies_to_direct_responses(monkeypatch):
+    monkeypatch.setattr(
+        gateway,
+        "get_settings",
+        lambda: SimpleNamespace(pantheon=SimpleNamespace(reasoning_output_token_budget=4000)),
+    )
+    payload = _provider_payload(
+        _decision(model_id="gpt-5.3-codex"),
+        {"messages": [{"role": "user", "content": "think"}], "max_output_tokens": 512},
+    )
+    assert payload["max_output_tokens"] == 8000
+    assert "max_completion_tokens" not in payload
+    assert "max_tokens" not in payload
+
+
+def test_cross_provider_fallback_runs_for_auto_routes(monkeypatch):
+    monkeypatch.setattr(
+        gateway,
+        "get_settings",
+        lambda: SimpleNamespace(pantheon=SimpleNamespace(cross_provider_fallback=True)),
+    )
+    monkeypatch.setattr(gateway, "_provider_config", lambda d: {"api": "openai", "url": "http://provider.test"})
+
+    async def _models():
+        return [
+            {"id": "gpt-5.4", "provider": "openai"},
+            {"id": "deepseek-v4-flash", "provider": "deepseek-direct"},
+        ]
+
+    from mnemos.domain.pantheon import catalog
+
+    monkeypatch.setattr(catalog, "list_models", _models)
+    captured: dict[str, list[RouteDecision]] = {}
+
+    class _Runtime:
+        async def route(self, chain, call, **kwargs):
+            captured["chain"] = list(chain)
+            return SimpleNamespace(result={"ok": True})
+
+    monkeypatch.setattr(gateway, "get_runtime", lambda: _Runtime())
+    out = asyncio.run(
+        gateway.forward_chat_completion(
+            _decision(
+                alias="auto:code",
+                provider="openai",
+                model_id="gpt-5.4",
+                route_type="auto",
+                candidates=["gpt-5.4", "deepseek-v4-flash"],
+            ),
+            {"messages": [{"role": "user", "content": "hi"}]},
+        )
+    )
+
+    assert out == {"ok": True}
+    assert [(d.provider, d.model_id) for d in captured["chain"]] == [
+        ("openai", "gpt-5.4"),
+        ("deepseek-direct", "deepseek-v4-flash"),
+    ]
+
+
+def test_eih_and_deepseek_direct_defaults_forward(monkeypatch):
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    posted: list[tuple[str, dict]] = []
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def __init__(self, model: str):
+            self._model = model
+
+        def json(self):
+            return {
+                "id": "chatcmpl-provider",
+                "model": self._model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+                "usage": {},
+            }
+
+    class _Client:
+        async def post(self, url, **kwargs):
+            posted.append((url, kwargs["json"]))
+            return _Resp(kwargs["json"]["model"])
+
+    monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
+    monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
+
+    eih = asyncio.run(
+        gateway._forward_chat_once(
+            _decision(provider="eih", model_id="nvidia/llama-3.3-70b-instruct", route_type="literal"),
+            {"messages": [{"role": "user", "content": "hi"}]},
+        )
+    )
+    deepseek = asyncio.run(
+        gateway._forward_chat_once(
+            _decision(provider="deepseek-direct", model_id="deepseek-v4-flash", route_type="literal"),
+            {"messages": [{"role": "user", "content": "hi"}]},
+        )
+    )
+
+    assert eih["model"] == "nvidia/llama-3.3-70b-instruct"
+    assert deepseek["model"] == "deepseek-v4-flash"
+    assert posted[0][0] == "https://integrate.api.nvidia.com/v1/chat/completions"
+    assert posted[0][1]["model"] == "nvidia/llama-3.3-70b-instruct"
+    assert posted[1][0] == "https://api.deepseek.com/v1/chat/completions"
+    assert posted[1][1]["model"] == "deepseek-v4-flash"
+
+
 def test_model_label_correctness_uses_response_wire_model():
     dec = _decision(model_id="gpt-5.3-codex")
     response = {"model": "gpt-5.3-codex-2026-06-01", "usage": {}}
@@ -138,3 +248,97 @@ def test_model_label_correctness_uses_response_wire_model():
     )
     assert payload["resolved_to"] == "gpt-5.3-codex-2026-06-01"
     assert metadata["resolved_to"] == "gpt-5.3-codex-2026-06-01"
+
+
+def test_streaming_telemetry_logs_after_stream_with_real_wire_model(monkeypatch):
+    from mnemos.api.routes import pantheon as pantheon_routes
+
+    decision = _decision(alias="auto:cheap", provider="openai", model_id="cheap-chat", route_type="auto")
+    logs: list[dict] = []
+    scheduled: list[tuple[dict, dict]] = []
+
+    class _PantheonRouter:
+        async def route_model(self, model, body):
+            return decision
+
+    async def _stream(_decision, _body):
+        yield (
+            b'data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1,'
+            b'"model":"cheap-chat-2026-06-14","choices":[]}\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+    def _routing_payload(**kwargs):
+        logs.append(kwargs)
+        resolved = kwargs.get("resolved_wire_model")
+        return {"resolved_to": resolved}, {"resolved_to": resolved}
+
+    def _schedule(payload, metadata):
+        scheduled.append((payload, metadata))
+
+    monkeypatch.setattr(gateway, "stream_chat_completion", _stream)
+    monkeypatch.setattr(
+        pantheon_routes,
+        "_pantheon_imports",
+        lambda: (
+            None,
+            gateway,
+            _PantheonRouter(),
+            Exception,
+            SimpleNamespace(),
+            _routing_payload,
+            _schedule,
+        ),
+    )
+
+    request = SimpleNamespace(headers={}, query_params={}, state=SimpleNamespace(), client=SimpleNamespace(host="test"))
+    user = SimpleNamespace(user_id="u1", namespace="ns1")
+    response = asyncio.run(
+        pantheon_routes._chat_completions_impl(
+            request,
+            {"model": "auto:cheap", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+            user,
+        )
+    )
+    assert logs == []
+
+    async def _consume():
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(_consume())
+    assert chunks[-1] == b"data: [DONE]\n\n"
+    assert logs[0]["outcome"] == "success"
+    assert logs[0]["resolved_wire_model"] == "cheap-chat-2026-06-14"
+    assert scheduled[0][0]["resolved_to"] == "cheap-chat-2026-06-14"
+
+
+def test_shadow_smoke_tool_call_check_is_assertive():
+    from scripts.pantheon_shadow_smoke import _assert_echo_tool_call
+
+    with pytest.raises(AssertionError, match="expected at least one tool_call"):
+        _assert_echo_tool_call({"choices": [{"message": {"content": "no tool"}}]})
+
+    response_data = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "echo", "arguments": '{"x":1}'},
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    calls = _assert_echo_tool_call(response_data)
+    assert calls[0]["function"]["arguments"] == '{"x":1}'
+
+    response_data["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = '{"x":2}'
+    with pytest.raises(AssertionError, match="expected echo arguments"):
+        _assert_echo_tool_call(response_data)
