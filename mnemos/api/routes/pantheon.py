@@ -32,6 +32,10 @@ async def _pantheon_user(
     return user
 
 
+def _pantheon_gateway_rate_limit() -> str:
+    return get_settings().rate_limit.pantheon_gateway
+
+
 def _pantheon_rate_key(request: Request) -> str:
     user_id = getattr(request.state, "mnemos_pantheon_user_id", None)
     session_id = (
@@ -258,7 +262,6 @@ async def _record_pantheon_ledger(payload: dict[str, Any], metadata: dict[str, A
     recorder = getattr(backend, "record_usage_ledger", None) if backend is not None else None
     if recorder is None:
         return
-    model = decision.model or {}
     record = UsageLedgerRecord(
         provider=str(decision.provider or "pantheon"),
         model=str(decision.model_id or decision.alias),
@@ -343,7 +346,7 @@ async def _list_models_impl() -> dict[str, Any]:
 
 
 @router.get("/models")
-@limiter.limit("60/minute", key_func=_pantheon_rate_key)
+@limiter.limit(_pantheon_gateway_rate_limit, key_func=_pantheon_rate_key)
 async def list_models(
     request: Request,
     authorization: str | None = Header(None),
@@ -484,7 +487,7 @@ async def _chat_completions_impl(
 
 
 @router.post("/chat/completions")
-@limiter.limit("60/minute", key_func=_pantheon_rate_key)
+@limiter.limit(_pantheon_gateway_rate_limit, key_func=_pantheon_rate_key)
 async def chat_completions(
     request: Request,
     body: dict[str, Any] = Body(...),
@@ -550,7 +553,7 @@ async def _responses_impl(
 
 
 @router.post("/embeddings")
-@limiter.limit("60/minute", key_func=_pantheon_rate_key)
+@limiter.limit(_pantheon_gateway_rate_limit, key_func=_pantheon_rate_key)
 async def embeddings(
     request: Request,
     body: dict[str, Any] = Body(...),
@@ -618,7 +621,7 @@ async def embeddings(
 
 
 @openai_router.get("/models")
-@limiter.limit("60/minute", key_func=_pantheon_rate_key)
+@limiter.limit(_pantheon_gateway_rate_limit, key_func=_pantheon_rate_key)
 async def openai_list_models(
     request: Request,
     authorization: str | None = Header(None),
@@ -628,7 +631,7 @@ async def openai_list_models(
 
 
 @openai_router.post("/chat/completions")
-@limiter.limit("60/minute", key_func=_pantheon_rate_key)
+@limiter.limit(_pantheon_gateway_rate_limit, key_func=_pantheon_rate_key)
 async def openai_chat_completions(
     request: Request,
     body: dict[str, Any] = Body(...),
@@ -639,7 +642,7 @@ async def openai_chat_completions(
 
 
 @openai_router.post("/responses")
-@limiter.limit("60/minute", key_func=_pantheon_rate_key)
+@limiter.limit(_pantheon_gateway_rate_limit, key_func=_pantheon_rate_key)
 async def openai_responses(
     request: Request,
     body: dict[str, Any] = Body(...),
@@ -650,7 +653,7 @@ async def openai_responses(
 
 
 @router.get("/route/explain")
-@limiter.limit("60/minute", key_func=_pantheon_rate_key)
+@limiter.limit(_pantheon_gateway_rate_limit, key_func=_pantheon_rate_key)
 async def route_explain(
     request: Request,
     body: dict[str, Any] | None = Body(default=None),
