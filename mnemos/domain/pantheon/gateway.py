@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass
@@ -25,6 +26,9 @@ from mnemos.domain.pantheon.runtime import RouterRuntime
 
 logger = logging.getLogger(__name__)
 _IDENTITY_BODY_KEY = "_mnemos_upstream_identity"
+_REASONING_MODEL_RE = re.compile(r"(reason|thinking|r1\b|\bo[134]\b|gpt-5|grok-4|deepseek)", re.I)
+_RESPONSES_MODEL_RE = re.compile(r"(?:^|/)(?:gpt-[0-9.]+.*codex|.*codex.*gpt-[0-9.]|o[134].*-codex|codex)", re.I)
+
 
 # ── Shared pooled HTTP client. Reused across requests so keep-alive
 # connections are recycled instead of paying a fresh TCP+TLS handshake on
@@ -126,6 +130,7 @@ def _auth_headers(cfg: dict[str, Any], identity: UpstreamIdentity | None = None)
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "Accept": "text/event-stream" if cfg.get("stream") else "application/json",
         **_identity_headers(identity),
     }
 
@@ -148,13 +153,171 @@ def _chat_payload(decision: RouteDecision, body: dict[str, Any], *, stream: bool
     return payload
 
 
+def model_uses_responses_api(model_id: str | None) -> bool:
+    """Return True for Codex/Responses-only OpenAI models.
+
+    gpt-5.x-codex models reject /v1/chat/completions with 400; the gateway
+    routes those wire model IDs to /v1/responses instead and converts the OpenAI
+    Responses object back into chat-completion shape for downstream clients.
+    """
+    return bool(model_id and _RESPONSES_MODEL_RE.search(model_id))
+
+
+def model_needs_reasoning_budget(model_id: str | None) -> bool:
+    return bool(model_id and _REASONING_MODEL_RE.search(model_id))
+
+
+def _base_v1_url(url: str) -> str:
+    for suffix in ("/chat/completions", "/responses", "/embeddings"):
+        if url.endswith(suffix):
+            return url[: -len(suffix)]
+    return url.rstrip("/")
+
+
+def _chat_url(cfg: dict[str, Any], decision: RouteDecision) -> str:
+    if model_uses_responses_api(decision.model_id):
+        return _responses_url(cfg)
+    url = str(cfg.get("chat_url") or cfg.get("url") or "")
+    if url.endswith("/responses"):
+        return _base_v1_url(url) + "/chat/completions"
+    return url
+
+
+def _responses_url(cfg: dict[str, Any]) -> str:
+    if cfg.get("responses_url"):
+        return str(cfg["responses_url"])
+    return _base_v1_url(str(cfg.get("url") or "")) + "/responses"
+
+
 def _embeddings_url(cfg: dict[str, Any]) -> str:
     if cfg.get("embeddings_url"):
         return str(cfg["embeddings_url"])
-    url = str(cfg.get("url") or "")
-    if "/chat/completions" in url:
-        return url.replace("/chat/completions", "/embeddings")
-    return url.rstrip("/") + "/embeddings"
+    return _base_v1_url(str(cfg.get("url") or "")) + "/embeddings"
+
+
+def _reasoning_budget() -> int:
+    try:
+        configured = int(get_settings().pantheon.reasoning_output_token_budget)
+    except Exception:
+        configured = 8000
+    return max(8000, configured)
+
+
+def _apply_reasoning_budget(payload: dict[str, Any], model_id: str | None) -> dict[str, Any]:
+    if not model_needs_reasoning_budget(model_id):
+        return payload
+    budget = _reasoning_budget()
+    raw = payload.get("max_completion_tokens", payload.get("max_tokens"))
+    try:
+        current = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        current = None
+    if current is None or current < budget:
+        payload["max_completion_tokens"] = budget
+        payload.pop("max_tokens", None)
+    return payload
+
+
+def _responses_input_from_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        item = dict(message)
+        # Responses API accepts tool_call outputs as function_call_output items;
+        # retain IDs/content without flattening function-call arguments.
+        if item.get("role") == "tool":
+            out.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": item.get("tool_call_id") or item.get("call_id") or "",
+                    "output": item.get("content") if item.get("content") is not None else "",
+                }
+            )
+        else:
+            out.append(item)
+    return out
+
+
+def _responses_payload(decision: RouteDecision, body: dict[str, Any], *, stream: bool | None = None) -> dict[str, Any]:
+    payload = _chat_payload(decision, body, stream=None)
+    messages = payload.pop("messages", [])
+    if isinstance(messages, list):
+        payload["input"] = _responses_input_from_messages(messages)
+    payload.pop("stream", None)
+    if stream is not None:
+        payload["stream"] = stream
+    payload = _apply_reasoning_budget(payload, decision.model_id)
+    if "max_tokens" in payload and "max_output_tokens" not in payload:
+        payload["max_output_tokens"] = payload.pop("max_tokens")
+    if "max_completion_tokens" in payload and "max_output_tokens" not in payload:
+        payload["max_output_tokens"] = payload.pop("max_completion_tokens")
+    return payload
+
+
+def _provider_payload(decision: RouteDecision, body: dict[str, Any], *, stream: bool | None = None) -> dict[str, Any]:
+    if model_uses_responses_api(decision.model_id):
+        return _responses_payload(decision, body, stream=stream)
+    payload = _chat_payload(decision, body, stream=stream)
+    return _apply_reasoning_budget(payload, decision.model_id)
+
+
+def _message_from_responses_output(data: dict[str, Any]) -> dict[str, Any]:
+    content_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "message":
+            for part in item.get("content") or []:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text") or part.get("output_text")
+                if text is not None:
+                    content_parts.append(str(text))
+        elif item_type in {"function_call", "tool_call"}:
+            function = item.get("function") if isinstance(item.get("function"), dict) else {}
+            name = item.get("name") or function.get("name")
+            arguments = item.get("arguments") if "arguments" in item else function.get("arguments")
+            if isinstance(arguments, (dict, list)):
+                arguments = json.dumps(arguments, separators=(",", ":"))
+            tool_calls.append(
+                {
+                    "id": item.get("call_id") or item.get("id") or f"call_{len(tool_calls)}",
+                    "type": "function",
+                    "function": {"name": name or "", "arguments": arguments or ""},
+                }
+            )
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts) or None}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message
+
+
+def _responses_to_chat_completion(data: dict[str, Any], decision: RouteDecision) -> dict[str, Any]:
+    created = int(data.get("created_at") or time.time())
+    message = _message_from_responses_output(data)
+    finish_reason = "tool_calls" if message.get("tool_calls") else "stop"
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    prompt_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0))
+    completion_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0))
+    return {
+        "id": data.get("id") or f"chatcmpl-pantheon-{created}",
+        "object": "chat.completion",
+        "created": created,
+        "model": data.get("model") or decision.model_id or decision.alias,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": int(prompt_tokens or 0),
+            "completion_tokens": int(completion_tokens or 0),
+            "total_tokens": int((prompt_tokens or 0) + (completion_tokens or 0)),
+        },
+    }
+
+
+def resolved_wire_model(response: dict[str, Any] | None, decision: RouteDecision) -> str:
+    if isinstance(response, dict) and response.get("model"):
+        return str(response["model"])
+    return str(decision.model_id or decision.alias)
 
 
 # ── Resilient routing runtime (retry + cooldown over the single provider call) ──
@@ -186,9 +349,10 @@ async def _forward_chat_once(decision: RouteDecision, body: dict[str, Any]) -> d
     """One provider attempt: POST to the resolved provider, raise on >= 400."""
     cfg = _provider_config(decision)
     client = get_http_client()
-    payload = _chat_payload(decision, body, stream=False)
+    payload = _provider_payload(decision, body, stream=False)
+    url = _responses_url(cfg) if model_uses_responses_api(decision.model_id) else _chat_url(cfg, decision)
     response = await client.post(
-        str(cfg["url"]),
+        url,
         json=payload,
         headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
         timeout=cfg.get("timeout", 200),
@@ -196,6 +360,8 @@ async def _forward_chat_once(decision: RouteDecision, body: dict[str, Any]) -> d
     if response.status_code >= 400:
         raise PantheonGatewayError(response.status_code, response.text[:500], retry_after_seconds(response))
     data = response.json()
+    if model_uses_responses_api(decision.model_id):
+        data = _responses_to_chat_completion(data, decision)
     data.setdefault("model", decision.model_id)
     return data
 
@@ -264,10 +430,11 @@ async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) 
         return
 
     client = get_http_client()
-    payload = _chat_payload(decision, body, stream=True)
+    payload = _provider_payload(decision, body, stream=True)
+    url = _responses_url(cfg) if model_uses_responses_api(decision.model_id) else _chat_url(cfg, decision)
     async with client.stream(
         "POST",
-        str(cfg["url"]),
+        url,
         json=payload,
         headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
         timeout=None,
@@ -275,6 +442,41 @@ async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) 
         if response.status_code >= 400:
             body_bytes = await response.aread()
             raise PantheonGatewayError(response.status_code, body_bytes[:500].decode("utf-8", "replace"))
+        if model_uses_responses_api(decision.model_id):
+            stream_id = f"chatcmpl-pantheon-{int(time.time())}"
+            created = int(time.time())
+            model = decision.model_id or decision.alias
+            state: dict[str, Any] = {}
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if not raw:
+                    continue
+                if raw == "[DONE]":
+                    break
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    yield (line + "\n\n").encode("utf-8")
+                    continue
+                response_obj = data.get("response") if isinstance(data.get("response"), dict) else None
+                if response_obj and response_obj.get("model"):
+                    model = str(response_obj["model"])
+                for event in _responses_stream_events(data, stream_id=stream_id, created=created, model=model, state=state):
+                    yield event
+            if not state.get("finished"):
+                yield _stream_event(
+                    {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                )
+            yield b"data: [DONE]\n\n"
+            return
         async for chunk in response.aiter_bytes():
             yield chunk
 
@@ -284,7 +486,7 @@ async def forward_embeddings(decision: RouteDecision, body: dict[str, Any]) -> d
         raise PantheonGatewayError(400, "consensus aliases are not valid for embeddings")
     cfg = _provider_config(decision)
     client = get_http_client()
-    payload = _chat_payload(decision, body, stream=None)
+    payload = _provider_payload(decision, body, stream=None)
     response = await client.post(
         _embeddings_url(cfg),
         json=payload,
@@ -299,8 +501,8 @@ async def forward_embeddings(decision: RouteDecision, body: dict[str, Any]) -> d
 
 
 async def _graeae_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
-    payload = _chat_payload(decision, body, stream=None)
-    messages = payload.get("messages") or []
+    payload = _provider_payload(decision, body, stream=None)
+    messages = payload.get("messages") or body.get("messages") or []
     prompt = _flatten_messages_for_prompt(messages)
     engine = get_graeae_engine()
     result = await engine.route(
@@ -410,6 +612,7 @@ def _request_params(body: dict[str, Any]) -> dict[str, Any]:
     fields = (
         "tools",
         "tool_choice",
+        "parallel_tool_calls",
         "response_format",
         "stop",
         "n",
@@ -448,6 +651,113 @@ def _openai_chat_response(
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
+
+
+def _responses_stream_events(data: dict[str, Any], *, stream_id: str, created: int, model: str, state: dict[str, Any]) -> list[bytes]:
+    """Translate Responses API SSE objects into chat.completion.chunk frames."""
+    events: list[bytes] = []
+    if not state.get("started"):
+        state["started"] = True
+        events.append(
+            _stream_event(
+                {
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+                }
+            )
+        )
+    event_type = str(data.get("type") or data.get("event") or "")
+    if event_type in {"response.output_text.delta", "response.refusal.delta"}:
+        delta = data.get("delta")
+        if delta is not None:
+            events.append(
+                _stream_event(
+                    {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": str(delta)}}],
+                    }
+                )
+            )
+    elif event_type == "response.function_call_arguments.delta":
+        call_id = data.get("call_id") or data.get("item_id") or "call_0"
+        events.append(
+            _stream_event(
+                {
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": int(data.get("output_index") or 0),
+                                        "id": call_id,
+                                        "type": "function",
+                                        "function": {"arguments": data.get("delta") or ""},
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+    elif event_type == "response.output_item.done":
+        item = data.get("item") if isinstance(data.get("item"), dict) else {}
+        if item.get("type") in {"function_call", "tool_call"}:
+            arguments = item.get("arguments") or ""
+            if isinstance(arguments, (dict, list)):
+                arguments = json.dumps(arguments, separators=(",", ":"))
+            events.append(
+                _stream_event(
+                    {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": int(data.get("output_index") or 0),
+                                            "id": item.get("call_id") or item.get("id") or "call_0",
+                                            "type": "function",
+                                            "function": {"name": item.get("name") or "", "arguments": arguments},
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                    }
+                )
+            )
+    elif event_type in {"response.completed", "response.failed", "response.incomplete"}:
+        if not state.get("finished"):
+            state["finished"] = True
+            reason = "stop" if event_type == "response.completed" else "length"
+            events.append(
+                _stream_event(
+                    {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
+                    }
+                )
+            )
+    return events
 
 
 def _stream_event(data: dict[str, Any]) -> bytes:

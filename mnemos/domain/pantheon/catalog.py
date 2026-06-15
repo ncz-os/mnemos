@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 import mnemos.core.lifecycle as _lc
@@ -12,6 +15,12 @@ from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.domain.graeae.engine import get_graeae_engine
 
 logger = logging.getLogger(__name__)
+_DEFAULT_CACHE_PATHS = (
+    "data/pantheon_catalog.json",
+    "data/pantheon/catalog.json",
+    "data/llm_provider_registry.json",
+    "llm_provider_registry.json",
+)
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
@@ -208,6 +217,62 @@ async def _registry_rows() -> list[Any]:
         return []
 
 
+def _catalog_cache_paths() -> list[Path]:
+    paths: list[str] = []
+    try:
+        configured = get_settings().pantheon.catalog_cache_path
+        if configured:
+            paths.append(str(configured))
+    except Exception:
+        pass
+    env_path = os.environ.get("MNEMOS_PANTHEON_CATALOG_CACHE_PATH")
+    if env_path:
+        paths.append(env_path)
+    paths.extend(_DEFAULT_CACHE_PATHS)
+    cwd = Path.cwd()
+    return [Path(p) if Path(p).is_absolute() else cwd / p for p in paths]
+
+
+def _cache_payload_models(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        raw = payload.get("data") or payload.get("models") or payload.get("catalog") or []
+    else:
+        raw = payload
+    if not isinstance(raw, list):
+        return []
+    models: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or item.get("owned_by") or "").strip()
+        model_id = str(item.get("id") or item.get("model_id") or "").strip()
+        if not provider or not model_id:
+            continue
+        cfg = {"model": model_id, "api": "openai", "weight": item.get("quality_score") or item.get("weight") or 0.0}
+        normalized = _normalize_model(
+            provider=provider,
+            provider_cfg=cfg,
+            model_source={**item, "model_id": model_id},
+            health={"state": "cached"},
+        )
+        models.append(normalized)
+    return models
+
+
+def _cached_catalog_models() -> list[dict[str, Any]]:
+    for path in _catalog_cache_paths():
+        try:
+            if not path.exists():
+                continue
+            models = _cache_payload_models(json.loads(path.read_text()))
+            if models:
+                logger.info("[PANTHEON] loaded cached phase-A catalog from %s", path)
+                return models
+        except Exception as exc:
+            logger.debug("[PANTHEON] cached catalog %s unavailable: %s", path, exc)
+    return []
+
+
 def _model_sources(provider_cfg: dict[str, Any]) -> list[dict[str, Any]]:
     raw_models = provider_cfg.get("models")
     if isinstance(raw_models, list) and raw_models:
@@ -222,7 +287,24 @@ def _model_sources(provider_cfg: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 async def list_models() -> list[dict[str, Any]]:
-    """Return the extended PANTHEON model catalog."""
+    """Return the extended PANTHEON model catalog.
+
+    Prefer the phase-A cached provider catalog when present; fall back to the
+    live GRAEAE registry/provider config otherwise.
+    """
+    cached = _cached_catalog_models()
+    if cached:
+        return sorted(
+            cached,
+            key=lambda item: (
+                not item["available"],
+                item["deprecated"],
+                item["cost_per_mtok"] is None,
+                item["cost_per_mtok"] if item["cost_per_mtok"] is not None else float("inf"),
+                -float(item["quality_score"] or 0.0),
+                item["id"],
+            ),
+        )
     engine = get_graeae_engine()
     try:
         provider_status = engine.provider_status()
