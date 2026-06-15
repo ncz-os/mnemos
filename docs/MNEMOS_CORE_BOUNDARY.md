@@ -85,4 +85,19 @@ These define `mnemos-core`. Rules for the extracted packages:
 - ✅ `EXTRA_PROBES` registers `knemon`/`graeae`/`hive` (`5a8ce3f`).
 - ✅ Import boundary verified clean (core hard-imports zero add-ons).
 - ✅ KNEMON routes gated via `extra_guards.require_extra` → 503-when-disabled (`3a2a879`, codex-approved).
-- ⏳ Step-2 dependency-inversion: pending `Embedder`/`BudgetTracker` Protocol placement in this surface.
+- ✅ Step-2 audit done. The dependency-inversion is **almost entirely moot**: core has
+  **one-way** dependence already (add-ons import core, not vice versa). Embedding is
+  `mnemos.runtime.embedder` (core-adjacent, in-process — not an extracted add-on), so no
+  `Embedder` injection needed. Budget (KNEMON) is never imported by core. **Sole remaining
+  coupling:** `mnemos/core/lifecycle.py::_close_graeae_engine_if_loaded()` lazy-imports
+  `mnemos.domain.graeae.engine.get_graeae_engine` to close the engine at shutdown.
+  - Fix (deferred, **bundle with Phase-3 extraction**): invert via the existing
+    `_lifespan_cleanup_hooks` — GRAEAE registers its own engine-close hook; core stops
+    importing graeae. Delicate (handles the "API-hook-registration-skipped" shutdown path)
+    + harmless today (lazy import, doesn't break core import-time), so it is intentionally
+    NOT changed unattended; it breaks only when graeae physically leaves the tree (Phase 3,
+    operator-gated) and is fixed there.
+
+Net: **Phase-1 is functionally complete.** Phase-2 (carve `mnemos-core` package) and
+Phase-3 (move add-ons to `ncz-os`, incl. the one cleanup-hook inversion) are operator-gated
+structural moves; `ncz-os` code-move stays operator-gated (confirmed with the hive-build track).
