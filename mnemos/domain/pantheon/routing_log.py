@@ -1,16 +1,16 @@
-"""Best-effort MNEMOS routing-log writes for PANTHEON."""
+"""Best-effort PANTHEON routing-audit writes."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import asyncio
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import mnemos.core.lifecycle as _lc
 from mnemos.core.config import get_settings
-from mnemos.core.ids import new_memory_id
 from mnemos.core.numeric import safe_float
 from mnemos.domain.pantheon.router import RouteDecision
 from mnemos.nats import publisher as nats_publisher
@@ -18,46 +18,20 @@ from mnemos.nats import publisher as nats_publisher
 logger = logging.getLogger(__name__)
 
 PANTHEON_ROUTING_SUBJECT = "mnemos.pantheon.routing"
-
-
-async def _maybe_write_create_audit(
-    backend: Any,
-    tx: Any,
-    *,
-    memory_id: str,
-    content: str,
-    category: str,
-    subcategory: str | None,
-    metadata: dict[str, Any] | None,
-    writer_id: str,
-) -> None:
-    try:
-        from mnemos.audit import write_audit_entry
-        from mnemos.core.config import get_settings
-        from mnemos.workers.audit_sealer import audit_chain_enabled
-
-        if not audit_chain_enabled() or getattr(backend, "audit_chain", None) is None:
-            return
-        session_secret = (getattr(get_settings().server, "session_secret", "") or "").encode("utf-8")
-        if not session_secret:
-            logger.warning("[PANTHEON] audit-chain enabled but session_secret empty; skipping routing audit entry")
-            return
-        await write_audit_entry(
-            backend,
-            tx,
-            op="create",
-            memory_id_str=memory_id,
-            content=content,
-            category=category,
-            subcategory=subcategory,
-            metadata=metadata,
-            embedding=None,
-            writer_id=writer_id,
-            session_secret=session_secret,
-        )
-    except Exception:
-        logger.exception("[PANTHEON] audit-chain write failed for routing memory %s", memory_id)
 PANTHEON_ROUTING_SCHEMA_VERSION = "1"
+_AUDIT_RECORD_FIELDS = (
+    "request_id",
+    "tenant_user_id",
+    "alias_or_model",
+    "resolved_to",
+    "outcome",
+    "latency_ms",
+    "tokens_in",
+    "tokens_out",
+    "cost_usd",
+    "error_class",
+    "payload_json",
+)
 
 
 @dataclass(frozen=True)
@@ -180,56 +154,57 @@ async def publish_routing_event(payload: dict[str, Any], metadata: dict[str, Any
     if not get_settings().nats.publish_pantheon_routing:
         return
     try:
-        event = routing_event_payload(payload, metadata)
         await nats_publisher.publish_event(
             PANTHEON_ROUTING_SUBJECT,
-            event,
+            routing_event_payload(payload, metadata),
             msg_id=_routing_msg_id(payload),
         )
     except Exception as exc:
         logger.warning("[PANTHEON] routing NATS publish failed: %s", exc)
 
 
-async def write_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
-    """Write one routing decision as a memory, swallowing all failures."""
-    # Keep this memory telemetry path as-is. Redirecting PANTHEON telemetry to
-    # pantheon_routing_audit is a separate follow-up.
+def _audit_values(payload: dict[str, Any], metadata: dict[str, Any]) -> tuple[Any, ...]:
+    event = routing_event_payload(payload, metadata)
+    cost = payload.get("cost_usd")
+    return (
+        str(payload.get("request_id") or ""),
+        str(payload.get("tenant_user_id") or ""),
+        str(payload.get("alias_or_model") or ""),
+        str(payload.get("resolved_to") or ""),
+        str(payload.get("outcome") or ""),
+        int(round(safe_float(payload.get("latency_ms")))),
+        payload.get("tokens_in"),
+        payload.get("tokens_out"),
+        Decimal(str(cost)) if cost is not None else None,
+        payload.get("error_class"),
+        json.dumps(event, sort_keys=True, default=str, separators=(",", ":")),
+    )
+
+
+def routing_audit_record(payload: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    return dict(zip(_AUDIT_RECORD_FIELDS, _audit_values(payload, metadata), strict=True))
+
+
+async def insert_routing_audit_record(backend: Any, record: dict[str, Any]) -> bool:
+    insert = getattr(backend, "insert_pantheon_routing_audit", None)
+    transactional = getattr(backend, "transactional", None)
+    if not callable(insert) or not callable(transactional):
+        return False
+    async with transactional() as tx:
+        await insert(tx, record)
+    return True
+
+
+async def write_routing_audit(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
+    """Write one routing decision to ``pantheon_routing_audit``.
+
+    The table is the canonical PANTHEON telemetry sink; MEMORY rows are no
+    longer used for routing audit events.
+    """
     try:
-        content = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        metadata_json = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+        record = routing_audit_record(payload, metadata)
         backend = _lc._persistence_backend
-        memory_id = new_memory_id()
-        if backend is not None:
-            async with backend.transactional() as tx:
-                await backend.memories.insert_memory(
-                    tx,
-                    memory_id=memory_id,
-                    content=content,
-                    category="pantheon_routing",
-                    subcategory=None,
-                    metadata_json=metadata_json,
-                    quality_rating=75,
-                    owner_id="system:pantheon",
-                    namespace="pantheon",
-                    permission_mode=600,
-                    source_model=str(payload.get("resolved_to") or "") or None,
-                    source_provider=None,
-                    source_session=str(metadata.get("session_id") or "") or None,
-                    source_agent="pantheon",
-                    verbatim_content=content,
-                    created=None,
-                    updated=None,
-                )
-                await _maybe_write_create_audit(
-                    backend,
-                    tx,
-                    memory_id=memory_id,
-                    content=content,
-                    category="pantheon_routing",
-                    subcategory=None,
-                    metadata=metadata,
-                    writer_id="system:pantheon",
-                )
+        if backend is not None and await insert_routing_audit_record(backend, record):
             return
 
         pool = _lc._pool
@@ -238,28 +213,30 @@ async def write_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]
         async with pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO memories
-                (id, content, category, subcategory, metadata, quality_rating, verbatim_content,
-                 owner_id, namespace, permission_mode, source_model, source_provider,
-                 source_session, source_agent)
-                VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10, $11, $12, $13)
+                INSERT INTO pantheon_routing_audit
+                       (request_id, tenant_user_id, alias_or_model, resolved_to, outcome,
+                        latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
                 """,
-                memory_id,
-                content,
-                "pantheon_routing",
-                None,
-                metadata_json,
-                content,
-                "system:pantheon",
-                "pantheon",
-                600,
-                str(payload.get("resolved_to") or "") or None,
-                None,
-                str(metadata.get("session_id") or "") or None,
-                "pantheon",
+                record["request_id"],
+                record["tenant_user_id"],
+                record["alias_or_model"],
+                record["resolved_to"],
+                record["outcome"],
+                record["latency_ms"],
+                record["tokens_in"],
+                record["tokens_out"],
+                record["cost_usd"],
+                record["error_class"],
+                record["payload_json"],
             )
     except Exception as exc:
-        logger.debug("[PANTHEON] routing-log write failed: %s", exc)
+        logger.debug("[PANTHEON] routing-audit write failed: %s", exc)
+
+
+async def write_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
+    """Compatibility alias for the routing audit table writer."""
+    await write_routing_audit(payload, metadata)
 
 
 def _routing_log_settings() -> tuple[int, int]:
@@ -288,7 +265,7 @@ async def _drain_routing_log_queue() -> None:
             except asyncio.QueueEmpty:
                 return
             try:
-                await write_routing_memory(item.payload, item.metadata)
+                await write_routing_audit(item.payload, item.metadata)
                 await publish_routing_event(item.payload, item.metadata)
             finally:
                 queue.task_done()
@@ -309,7 +286,7 @@ def _ensure_routing_log_drainers() -> None:
         _routing_log_drainers += 1
 
 
-def schedule_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
+def schedule_routing_audit(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
     queue = _get_routing_log_queue()
     item = _RoutingLogItem(dict(payload), dict(metadata))
     if queue.full():
@@ -327,6 +304,11 @@ def schedule_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]) -
     _ensure_routing_log_drainers()
 
 
+def schedule_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
+    """Compatibility alias for scheduling routing audit writes."""
+    schedule_routing_audit(payload, metadata)
+
+
 # #192: removed `drain_routing_log_queue_for_tests` — exported in
 # `__all__` but no test or script ever called it. The drainers
 # spawned by `_ensure_routing_log_drainers` are background tasks
@@ -341,6 +323,8 @@ __all__ = [
     "publish_routing_event",
     "routing_event_payload",
     "routing_payload",
+    "schedule_routing_audit",
     "schedule_routing_memory",
+    "write_routing_audit",
     "write_routing_memory",
 ]

@@ -69,6 +69,10 @@ def _routing_memories(db_pool) -> list[dict[str, Any]]:
     ]
 
 
+def _routing_audits(db_pool) -> list[dict[str, Any]]:
+    return list(db_pool.state.get("pantheon_routing_audit", []))
+
+
 @asynccontextmanager
 async def _pantheon_client(monkeypatch: pytest.MonkeyPatch, db_pool, *, publish_nats: bool):
     from mnemos.api.main import app
@@ -138,7 +142,7 @@ def nats_publish_calls(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
-async def test_pantheon_gateway_publish_enabled_writes_memory_and_nats(
+async def test_pantheon_gateway_publish_enabled_writes_audit_and_nats(
     monkeypatch: pytest.MonkeyPatch,
     db_pool,
     nats_publish_calls,
@@ -152,27 +156,21 @@ async def test_pantheon_gateway_publish_enabled_writes_memory_and_nats(
         await _drain_background_tasks()
 
     assert response.status_code == 200
-    memories = _routing_memories(pool)
-    assert len(memories) == 1
-    memory_payload = json.loads(memories[0]["content"])
-    uuid.UUID(memory_payload["request_id"])
+    assert _routing_memories(pool) == []
+    [audit] = _routing_audits(pool)
+    audit_payload = audit["payload"]
+    uuid.UUID(audit_payload["request_id"])
     assert nats_publish_calls == [
         {
             "subject": PANTHEON_ROUTING_SUBJECT,
-            "payload": {
-                **memory_payload,
-                "metadata": {
-                    **memories[0]["metadata"],
-                    "schema_version": PANTHEON_ROUTING_SCHEMA_VERSION,
-                },
-            },
-            "msg_id": f"pantheon.routing.{memory_payload['request_id']}",
+            "payload": audit_payload,
+            "msg_id": f"pantheon.routing.{audit_payload['request_id']}",
         }
     ]
 
 
 @pytest.mark.asyncio
-async def test_pantheon_gateway_publish_disabled_writes_only_memory(
+async def test_pantheon_gateway_publish_disabled_writes_only_audit(
     monkeypatch: pytest.MonkeyPatch,
     db_pool,
     nats_publish_calls,
@@ -186,7 +184,8 @@ async def test_pantheon_gateway_publish_disabled_writes_only_memory(
         await _drain_background_tasks()
 
     assert response.status_code == 200
-    assert len(_routing_memories(pool)) == 1
+    assert _routing_memories(pool) == []
+    assert len(_routing_audits(pool)) == 1
     assert nats_publish_calls == []
 
 
@@ -211,7 +210,8 @@ async def test_pantheon_gateway_nats_publish_failure_does_not_fail_request(
         await _drain_background_tasks()
 
     assert response.status_code == 200
-    assert len(_routing_memories(pool)) == 1
+    assert _routing_memories(pool) == []
+    assert len(_routing_audits(pool)) == 1
     assert "routing NATS publish failed" in caplog.text
 
 
