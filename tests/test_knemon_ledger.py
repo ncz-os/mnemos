@@ -12,7 +12,8 @@ from httpx import ASGITransport, AsyncClient
 
 import mnemos.core.lifecycle as lifecycle
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.routes.ledger import _PLAN_WINDOWS, router as ledger_router
+from mnemos.api.routes.ledger import router as ledger_router
+from mnemos.core.plan_windows import _PLAN_WINDOWS
 from mnemos.persistence.base import UsageLedgerRecord, UsageLedgerResult
 from mnemos.persistence.postgres import PostgresBackend, PostgresTransaction
 
