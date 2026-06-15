@@ -19,6 +19,19 @@ logger = logging.getLogger(__name__)
 
 PANTHEON_ROUTING_SUBJECT = "mnemos.pantheon.routing"
 PANTHEON_ROUTING_SCHEMA_VERSION = "1"
+_AUDIT_RECORD_FIELDS = (
+    "request_id",
+    "tenant_user_id",
+    "alias_or_model",
+    "resolved_to",
+    "outcome",
+    "latency_ms",
+    "tokens_in",
+    "tokens_out",
+    "cost_usd",
+    "error_class",
+    "payload_json",
+)
 
 
 @dataclass(frozen=True)
@@ -166,6 +179,20 @@ def _audit_values(payload: dict[str, Any], metadata: dict[str, Any]) -> tuple[An
     )
 
 
+def routing_audit_record(payload: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    return dict(zip(_AUDIT_RECORD_FIELDS, _audit_values(payload, metadata), strict=True))
+
+
+async def insert_routing_audit_record(backend: Any, record: dict[str, Any]) -> bool:
+    insert = getattr(backend, "insert_pantheon_routing_audit", None)
+    transactional = getattr(backend, "transactional", None)
+    if not callable(insert) or not callable(transactional):
+        return False
+    async with transactional() as tx:
+        await insert(tx, record)
+    return True
+
+
 async def write_routing_audit(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
     """Write one routing decision to ``pantheon_routing_audit``.
 
@@ -173,23 +200,9 @@ async def write_routing_audit(payload: dict[str, Any], metadata: dict[str, Any])
     longer used for routing audit events.
     """
     try:
-        values = _audit_values(payload, metadata)
+        record = routing_audit_record(payload, metadata)
         backend = _lc._persistence_backend
-        if backend is not None:
-            async with backend.transactional() as tx:
-                conn = getattr(tx, "conn", tx)
-                execute = getattr(conn, "execute", None)
-                if execute is None:
-                    return
-                await execute(
-                    """
-                    INSERT INTO pantheon_routing_audit
-                           (request_id, tenant_user_id, alias_or_model, resolved_to, outcome,
-                            latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
-                    """,
-                    *values,
-                )
+        if backend is not None and await insert_routing_audit_record(backend, record):
             return
 
         pool = _lc._pool
@@ -203,7 +216,17 @@ async def write_routing_audit(payload: dict[str, Any], metadata: dict[str, Any])
                         latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
                 """,
-                *values,
+                record["request_id"],
+                record["tenant_user_id"],
+                record["alias_or_model"],
+                record["resolved_to"],
+                record["outcome"],
+                record["latency_ms"],
+                record["tokens_in"],
+                record["tokens_out"],
+                record["cost_usd"],
+                record["error_class"],
+                record["payload_json"],
             )
     except Exception as exc:
         logger.debug("[PANTHEON] routing-audit write failed: %s", exc)

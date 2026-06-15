@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -292,6 +293,116 @@ async def test_routing_log_success_writes_pantheon_audit_not_memory(pantheon_v02
     assert payload["metadata"]["session_id"] == "log-success"
     assert payload["metadata"]["usage_tier"] == "agentic_ok"
     assert db_pool.state["usage_ledger"][-1]["caller_subsystem"] == "pantheon"
+
+
+@pytest.mark.asyncio
+async def test_routing_audit_writer_lands_on_sqlite_backend(monkeypatch, tmp_path):
+    pytest.importorskip("aiosqlite")
+
+    import mnemos.core.lifecycle as lc
+    from mnemos.core.config import get_settings
+    from mnemos.domain.pantheon.routing_log import write_routing_audit
+    from mnemos.persistence.sqlite import SqliteBackend
+
+    backend = SqliteBackend(tmp_path / "pantheon-audit.sqlite", get_settings())
+    await backend.open()
+    monkeypatch.setattr(lc, "_pool", None)
+    monkeypatch.setattr(lc, "_persistence_backend", backend)
+
+    payload = {
+        "request_id": "req-sqlite-audit",
+        "tenant_user_id": "alice",
+        "alias_or_model": "cheap-chat",
+        "resolved_to": "cheap-chat",
+        "outcome": "success",
+        "latency_ms": 12.7,
+        "tokens_in": 10,
+        "tokens_out": 5,
+        "cost_usd": 0.0123,
+        "error_class": None,
+    }
+    metadata = {
+        "schema_version": "1",
+        "pantheon_version": "0.2",
+        "session_id": "sqlite-session",
+        **payload,
+    }
+
+    try:
+        await write_routing_audit(payload, metadata)
+
+        async with backend.transactional() as tx:
+            cursor = await tx.conn.execute(
+                """
+                SELECT request_id, tenant_user_id, alias_or_model, resolved_to, outcome,
+                       latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload
+                FROM pantheon_routing_audit
+                WHERE request_id = ?
+                """,
+                ("req-sqlite-audit",),
+            )
+            try:
+                row = await cursor.fetchone()
+            finally:
+                await cursor.close()
+    finally:
+        await backend.close()
+
+    assert row is not None
+    assert row["tenant_user_id"] == "alice"
+    assert row["alias_or_model"] == "cheap-chat"
+    assert row["resolved_to"] == "cheap-chat"
+    assert row["outcome"] == "success"
+    assert row["latency_ms"] == 13
+    assert row["tokens_in"] == 10
+    assert row["tokens_out"] == 5
+    assert row["error_class"] is None
+    payload_json = json.loads(row["payload"])
+    assert payload_json["request_id"] == "req-sqlite-audit"
+    assert payload_json["metadata"]["session_id"] == "sqlite-session"
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_schedules_pantheon_audit_consumer_for_non_pg_backend(monkeypatch):
+    from mnemos.api import lifecycle_hooks
+    from mnemos.core import lifecycle
+    from mnemos.core.config import _reset_settings_for_tests, get_settings
+    from mnemos.workers import pantheon_routing_audit_consumer as audit_consumer
+
+    scheduled: list[dict[str, Any]] = []
+    backend = SimpleNamespace(name="sqlite-backend")
+
+    def fake_consumer_loop(handle, *, settings):
+        scheduled.append({"handle": handle, "settings": settings})
+
+        async def _noop():
+            return None
+
+        return _noop()
+
+    def fake_schedule_worker(coro):
+        coro.close()
+        return SimpleNamespace(cancel=lambda: None)
+
+    monkeypatch.setenv("MNEMOS_NATS_AUDIT_CONSUMER_ENABLED", "true")
+    _reset_settings_for_tests()
+    settings = get_settings()
+    monkeypatch.setattr(lifecycle, "_pool", None)
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+    monkeypatch.setattr(lifecycle, "schedule_worker", fake_schedule_worker)
+    monkeypatch.setattr(audit_consumer, "consumer_loop", fake_consumer_loop)
+    monkeypatch.setattr(
+        lifecycle,
+        "_post_db_startup_hooks",
+        {"PANTHEON routing audit NATS consumer": lifecycle_hooks._pantheon_routing_audit_post_db_hook},
+    )
+    try:
+        await lifecycle._run_post_db_startup_hooks(backend, settings)
+    finally:
+        monkeypatch.delenv("MNEMOS_NATS_AUDIT_CONSUMER_ENABLED", raising=False)
+        _reset_settings_for_tests()
+
+    assert scheduled == [{"handle": backend, "settings": settings}]
 
 
 @pytest.mark.asyncio
