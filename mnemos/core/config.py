@@ -311,6 +311,8 @@ class _ProviderSettings(BaseSettings):
     knemon_provider_preference: str = Field("", validation_alias="KNEMON_PROVIDER_PREFERENCE")
     together_api_key: str = Field("", validation_alias="TOGETHER_API_KEY")
     nvidia_api_key: str = Field("", validation_alias="NVIDIA_API_KEY")
+    eih_api_key: str = Field("", validation_alias="EIH_API_KEY")
+    deepseek_api_key: str = Field("", validation_alias="DEEPSEEK_API_KEY")
     keys_path: Path | None = Field(None, validation_alias="MNEMOS_KEYS_PATH")
     api_keys_file: Path = Field(
         default_factory=lambda: Path.home() / ".config" / "mnemos" / "api_keys.json",
@@ -411,6 +413,10 @@ class _ProviderSettings(BaseSettings):
             "together_ai": self.together_api_key,
             "together": self.together_api_key,
             "nvidia": self.nvidia_api_key,
+            "ngc": self.nvidia_api_key,
+            "eih": self.eih_api_key,
+            "deepseek": self.deepseek_api_key,
+            "deepseek-direct": self.deepseek_api_key,
         }
         return keys.get(provider, "")
 
@@ -658,12 +664,26 @@ class PantheonSettings(BaseSettings):
         1,
         validation_alias="MNEMOS_PANTHEON_ROUTING_LOG_DRAIN_WORKERS",
     )
+    reasoning_output_token_budget: int = Field(
+        8000,
+        validation_alias="MNEMOS_PANTHEON_REASONING_OUTPUT_TOKEN_BUDGET",
+    )
+    shadow_port: int = Field(
+        4101,
+        validation_alias="MNEMOS_PANTHEON_SHADOW_PORT",
+    )
+    catalog_cache_path: str | None = Field(
+        None,
+        validation_alias="MNEMOS_PANTHEON_CATALOG_CACHE_PATH",
+    )
 
     @field_validator(
         "consultation_cap",
         "routing_window_minutes",
         "routing_log_queue_size",
         "routing_log_drain_workers",
+        "reasoning_output_token_budget",
+        "shadow_port",
         mode="before",
     )
     @classmethod
