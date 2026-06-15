@@ -40,6 +40,25 @@ def _clear_slowapi_limiter(limiter: Any) -> None:
 
 
 @pytest.fixture(autouse=True)
+def isolate_pantheon_catalog_cache(monkeypatch, tmp_path):
+    """Keep a developer's / CI's ambient catalog-cache env out of the tests.
+
+    The PANTHEON pricing/catalog code honors PANTHEON_CATALOG_CACHE and
+    MNEMOS_PANTHEON_CATALOG_CACHE_PATH. If either points at a real on-disk
+    cache (e.g. one regenerated while running the shadow gateway), catalog
+    resolution reads that instead of the test fixtures and resolution-order
+    assertions break nondeterministically. Point them at a guaranteed-absent
+    per-test path: delenv alone is insufficient because pricing.DEFAULT_JSON_CACHE
+    is import-time-bound, so a call-time fallback can still hit a real cache;
+    setting a nonexistent path makes the call-time env win deterministically.
+    A test that needs its own cache can still monkeypatch.setenv over this.
+    """
+    isolated = tmp_path / "pantheon-catalog-isolated.json"
+    monkeypatch.setenv("PANTHEON_CATALOG_CACHE", str(isolated))
+    monkeypatch.delenv("MNEMOS_PANTHEON_CATALOG_CACHE_PATH", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def reset_rate_limiter_state():
     """Prevent SlowAPI's in-memory buckets from leaking across tests."""
     from mnemos.core.rate_limit import limiter
