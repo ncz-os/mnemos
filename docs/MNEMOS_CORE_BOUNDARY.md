@@ -54,3 +54,35 @@ Operator ratifies before code physically moves; Phase 1 stays in-tree and revers
 
 Joint open item: agree the exact `mnemos-core` public API surface that
 hive/graeae/knemon/pantheon all depend on before the dependency-inversion lands.
+
+## `mnemos-core` public surface (proposed, derived from actual add-on imports)
+
+The de-facto surface the add-ons import today (audit of `mnemos/domain/{pantheon,knemon,graeae}`):
+
+| Module | Used for |
+|---|---|
+| `mnemos.core.config` (`get_settings`, `GRAEAE_CONFIG`) | settings/config access |
+| `mnemos.core.extras` (`is_extra_installed`, `require_extra`, `missing_extra_detail`) | optional-extra gating |
+| `mnemos.core.numeric` (`safe_float`) | numeric helpers |
+| `mnemos.core.lifecycle` (cache helpers, `_lc`) | shared cache / lifecycle |
+| `mnemos.core.provider_registry` (`GRAEAE_REGISTRY_MAP`) | provider/model registry |
+| `mnemos.core.plan_windows` (`compute_plan_window_id`) | plan-window math |
+| `mnemos.core.resilience` (`CircuitBreakerPool`, NATS breaker) | resilience primitives |
+| `mnemos.core.rate_limit` (`limiter`) | HTTP rate limiting |
+| `mnemos.persistence.base` (backend `Protocol`, `UsageLedgerRecord`) | persistence interface |
+
+These define `mnemos-core`. Rules for the extracted packages:
+- Add-ons import **only** from this surface (no reach into private core internals).
+- **Core never imports add-ons** (verified clean today). Phase-1 ✅.
+- **Phase-1 step-2 (dependency-inversion):** the few places core *would* need an add-on
+  (embedding generation, budget tracking) take an injected `Embedder` / `BudgetTracker`
+  Protocol at runtime instead — defined in `mnemos-core`, implemented by morpheus/KNEMON.
+- HIVE build-fabric (bus/executor/worker/control-plane) depends on the same surface; its
+  extra registers like the others (`hive` for control-plane; optional separate `build`
+  for executor/worker — TBD with the hive-build track).
+
+### Phase-1 status (this track)
+- ✅ `EXTRA_PROBES` registers `knemon`/`graeae`/`hive` (`5a8ce3f`).
+- ✅ Import boundary verified clean (core hard-imports zero add-ons).
+- ✅ KNEMON routes gated via `extra_guards.require_extra` → 503-when-disabled (`3a2a879`, codex-approved).
+- ⏳ Step-2 dependency-inversion: pending `Embedder`/`BudgetTracker` Protocol placement in this surface.
