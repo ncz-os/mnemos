@@ -4,9 +4,9 @@ Resolution order (first hit wins per provider):
 
   1. Standard per-provider environment variables — the widely-accepted
      convention every LLM SDK uses:
-        OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY,
-        XAI_API_KEY, GROQ_API_KEY, PERPLEXITY_API_KEY,
-        TOGETHER_API_KEY, NVIDIA_API_KEY
+       OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY,
+       XAI_API_KEY, GROQ_API_KEY, PERPLEXITY_API_KEY,
+       TOGETHER_API_KEY, NVIDIA_API_KEY, EIH_API_KEY, DEEPSEEK_API_KEY
   2. Canonical MNEMOS key file (first readable path below):
        $MNEMOS_KEYS_PATH                   — explicit override
        ~/.config/mnemos/api_keys.json      — preferred standard location
@@ -59,6 +59,10 @@ _PROVIDER_ENV_VARS: dict[str, str] = {
     "perplexity":    "PERPLEXITY_API_KEY",
     "together_ai":   "TOGETHER_API_KEY",
     "nvidia":        "NVIDIA_API_KEY",
+    "ngc":           "NVIDIA_API_KEY",
+    "eih":           "EIH_API_KEY",
+    "deepseek":      "DEEPSEEK_API_KEY",
+    "deepseek-direct": "DEEPSEEK_API_KEY",
 }
 
 

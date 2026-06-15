@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 import mnemos.core.lifecycle as _lc
+from mnemos.core.config import get_settings
 from mnemos.core.numeric import safe_float
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.domain.graeae.engine import get_graeae_engine
 
 logger = logging.getLogger(__name__)
 CATALOG_CACHE_SCHEMA = "mnemos.pantheon.catalog.v1"
+_DEFAULT_CACHE_PATHS = (
+    "data/pantheon_catalog.json",
+    "data/pantheon/catalog.json",
+    "data/llm_provider_registry.json",
+    "llm_provider_registry.json",
+)
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
@@ -236,7 +246,64 @@ def _synced_cache_models() -> list[dict[str, Any]] | None:
     models = payload.get("models")
     if not isinstance(models, list) or not models:
         return None
-    return [dict(model) for model in models if isinstance(model, dict)]
+    cached = [dict(model) for model in models if isinstance(model, dict)]
+    return cached or None
+
+
+def _catalog_cache_paths() -> list[Path]:
+    paths: list[str] = []
+    try:
+        configured = get_settings().pantheon.catalog_cache_path
+        if configured:
+            paths.append(str(configured))
+    except Exception:
+        pass
+    env_path = os.environ.get("MNEMOS_PANTHEON_CATALOG_CACHE_PATH")
+    if env_path:
+        paths.append(env_path)
+    paths.extend(_DEFAULT_CACHE_PATHS)
+    cwd = Path.cwd()
+    return [Path(p) if Path(p).is_absolute() else cwd / p for p in paths]
+
+
+def _cache_payload_models(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        raw = payload.get("data") or payload.get("models") or payload.get("catalog") or []
+    else:
+        raw = payload
+    if not isinstance(raw, list):
+        return []
+    models: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or item.get("owned_by") or "").strip()
+        model_id = str(item.get("id") or item.get("model_id") or "").strip()
+        if not provider or not model_id:
+            continue
+        cfg = {"model": model_id, "api": "openai", "weight": item.get("quality_score") or item.get("weight") or 0.0}
+        normalized = _normalize_model(
+            provider=provider,
+            provider_cfg=cfg,
+            model_source={**item, "model_id": model_id},
+            health={"state": "cached"},
+        )
+        models.append(normalized)
+    return models
+
+
+def _cached_catalog_models() -> list[dict[str, Any]]:
+    for path in _catalog_cache_paths():
+        try:
+            if not path.exists():
+                continue
+            models = _cache_payload_models(json.loads(path.read_text()))
+            if models:
+                logger.info("[PANTHEON] loaded cached phase-A catalog from %s", path)
+                return models
+        except Exception as exc:
+            logger.debug("[PANTHEON] cached catalog %s unavailable: %s", path, exc)
+    return []
 
 
 def _model_sources(provider_cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -258,6 +325,10 @@ async def list_models(*, use_synced_cache: bool = True) -> list[dict[str, Any]]:
         cached_models = _synced_cache_models()
         if cached_models is not None:
             return _sort_models(cached_models)
+
+    cached = _cached_catalog_models()
+    if cached:
+        return _sort_models(cached)
 
     engine = get_graeae_engine()
     try:
