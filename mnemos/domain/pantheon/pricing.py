@@ -1,10 +1,8 @@
 """External pricing ingest for the PANTHEON catalog data layer.
 
-The live gateway still builds its model list from the local GRAEAE/model
-registry path. This module is intentionally a side-car: it periodically
-fetches public price feeds, normalizes them to PANTHEON's catalog shape,
-merges them onto a supplied base catalog, and writes a last-good cache that
-can be consumed later when the gateway is wired to it.
+The refresh job fetches public machine-readable price feeds, normalizes them
+to PANTHEON's catalog shape, merges them onto the local base catalog, and
+writes a last-good cache consumed by the live catalog/gateway path.
 """
 
 from __future__ import annotations
@@ -31,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_JSON_CACHE = Path(os.environ.get("PANTHEON_CATALOG_CACHE", "/var/lib/mnemos/pantheon-catalog.json"))
 DEFAULT_SQLITE_CACHE = Path(os.environ.get("PANTHEON_CATALOG_SQLITE", "/var/lib/mnemos/pantheon-catalog.sqlite3"))
+DEFAULT_SEED_CACHE = Path(__file__).with_name("pricing_seed.json")
 
 # External feeds use their own naming. Normalize the provider half into the
 # names PANTHEON/GRAEAE already understands. "NGC-EIH" is represented by the
@@ -75,7 +74,14 @@ MODEL_PREFIX_ALIASES: dict[str, str] = {
     "ngc-eih": "nvidia",
 }
 
-SOURCE_PRIORITY: dict[str, int] = {"models.dev": 40, "litellm": 35, "openrouter": 30}
+SOURCE_PRIORITY: dict[str, int] = {
+    "tokencost": 60,
+    "litellm": 55,
+    "models.dev": 35,
+    "openrouter": 30,
+    "artificialanalysis": 20,
+    "benchlm": 20,
+}
 
 
 @dataclass(frozen=True)
@@ -322,7 +328,7 @@ async def fetch_pricing_records(
     """Fetch all configured feeds, tolerating per-source failures."""
     records: list[PricingRecord] = []
     source_status: list[dict[str, Any]] = []
-    fetchers = fetchers or [ModelsDevPricingFetcher(), LiteLLMPricingFetcher(), OpenRouterPricingFetcher()]
+    fetchers = fetchers or default_pricing_fetchers()
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         for fetcher in fetchers:
             started = time.monotonic()
@@ -351,6 +357,17 @@ async def fetch_pricing_records(
                     }
                 )
     return records, source_status
+
+
+def default_pricing_fetchers() -> list[PricingFetcher]:
+    """Return pricing feeds in authority order.
+
+    LiteLLM's model_prices_and_context_window.json is the primary bundled
+    machine-readable source. models.dev and OpenRouter stay secondary, while
+    quality-only feeds are represented in SOURCE_PRIORITY but do not currently
+    provide pricing records here.
+    """
+    return [LiteLLMPricingFetcher(), ModelsDevPricingFetcher(), OpenRouterPricingFetcher()]
 
 
 def _record_score(record: PricingRecord) -> tuple[int, int]:
@@ -433,6 +450,16 @@ def read_json_cache(path: Path = DEFAULT_JSON_CACHE) -> dict[str, Any] | None:
         return None
 
 
+def read_seed_cache(path: Path = DEFAULT_SEED_CACHE) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[PANTHEON] could not read pricing seed cache %s: %s", path, exc)
+        return None
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
@@ -492,6 +519,7 @@ async def regenerate_catalog_cache(
     *,
     json_path: Path = DEFAULT_JSON_CACHE,
     sqlite_path: Path | None = DEFAULT_SQLITE_CACHE,
+    seed_path: Path = DEFAULT_SEED_CACHE,
     dry_run: bool = False,
     fetchers: list[PricingFetcher] | None = None,
 ) -> dict[str, Any]:
@@ -503,17 +531,37 @@ async def regenerate_catalog_cache(
     """
     from mnemos.domain.pantheon.catalog import list_models
 
-    base_models = await list_models()
+    base_models = await list_models(use_synced_cache=False)
     records, source_status = await fetch_pricing_records(fetchers=fetchers)
     success_count = sum(1 for status in source_status if status.get("ok"))
     if not records:
+        failure_message = "no external pricing records fetched"
         last_good = read_json_cache(json_path)
         if last_good is not None:
             last_good.setdefault("stale", True)
-            last_good["last_refresh_error"] = "no external pricing records fetched"
+            last_good["last_refresh_error"] = failure_message
             last_good["last_refresh_sources"] = source_status
             return last_good
-        raise RuntimeError("no external pricing records fetched and no last-good PANTHEON catalog cache exists")
+        seed = read_seed_cache(seed_path)
+        if seed is not None:
+            payload = dict(seed)
+            payload.setdefault("schema", "mnemos.pantheon.catalog.v1")
+            payload.setdefault("generated_at", utc_now_iso())
+            payload.setdefault(
+                "sources",
+                [{"source": "bundled-seed", "ok": True, "records": len(payload.get("models") or [])}],
+            )
+            payload["stale"] = True
+            payload["seed_fallback"] = True
+            payload["refresh_ok"] = False
+            payload["last_refresh_error"] = failure_message
+            payload["last_refresh_sources"] = source_status
+            if not dry_run:
+                write_json_cache(payload, json_path)
+                if sqlite_path is not None:
+                    write_sqlite_cache(payload, sqlite_path)
+            return payload
+        raise RuntimeError("no external pricing records fetched and no last-good or seed PANTHEON catalog cache exists")
 
     merged = merge_pricing_into_catalog(base_models, records)
     payload = cache_payload(merged, source_status)
