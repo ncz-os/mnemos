@@ -13,6 +13,34 @@ import sys
 import httpx
 
 
+def _assert_echo_tool_call(response_data: dict) -> list[dict]:
+    first_tool_calls = ((response_data.get("choices") or [{}])[0].get("message") or {}).get("tool_calls") or []
+    if not first_tool_calls:
+        raise AssertionError("expected at least one tool_call for echo(x=1)")
+
+    first = first_tool_calls[0]
+    if not first.get("id"):
+        raise AssertionError("first tool_call is missing id")
+    function = first.get("function") or {}
+    if function.get("name") != "echo":
+        raise AssertionError(f"expected echo tool_call, got {function.get('name')!r}")
+
+    arguments = function.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            parsed_arguments = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"tool_call arguments are not valid JSON: {arguments!r}") from exc
+    elif isinstance(arguments, dict):
+        parsed_arguments = arguments
+    else:
+        raise AssertionError(f"tool_call arguments have unexpected shape: {arguments!r}")
+
+    if parsed_arguments != {"x": 1}:
+        raise AssertionError(f"expected echo arguments {{'x': 1}}, got {parsed_arguments!r}")
+    return first_tool_calls
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:4101")
@@ -52,20 +80,19 @@ def main() -> int:
             },
         )
         tool.raise_for_status()
-        first_tool_calls = ((tool.json().get("choices") or [{}])[0].get("message") or {}).get("tool_calls") or []
-        if first_tool_calls:
-            tool_result = client.post(
-                "/v1/chat/completions",
-                json={
-                    "model": args.model,
-                    "messages": [
-                        {"role": "user", "content": "call the echo tool with x=1"},
-                        {"role": "assistant", "content": None, "tool_calls": first_tool_calls},
-                        {"role": "tool", "tool_call_id": first_tool_calls[0]["id"], "content": json.dumps({"x": 1})},
-                    ],
-                },
-            )
-            tool_result.raise_for_status()
+        first_tool_calls = _assert_echo_tool_call(tool.json())
+        tool_result = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": args.model,
+                "messages": [
+                    {"role": "user", "content": "call the echo tool with x=1"},
+                    {"role": "assistant", "content": None, "tool_calls": first_tool_calls},
+                    {"role": "tool", "tool_call_id": first_tool_calls[0]["id"], "content": json.dumps({"x": 1})},
+                ],
+            },
+        )
+        tool_result.raise_for_status()
         codex = client.post(
             "/v1/responses",
             json={"model": args.codex_model, "input": "Return the word ok."},
