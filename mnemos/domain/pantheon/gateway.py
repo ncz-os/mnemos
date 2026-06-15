@@ -18,9 +18,8 @@ from mnemos.domain.graeae.api_keys import get_key
 from mnemos.domain.graeae.engine import get_graeae_engine
 from mnemos.domain.openai_compat.content import _content_text, _flatten_messages_for_prompt
 from mnemos.domain.pantheon.router import RouteDecision
-from mnemos.domain.pantheon.cooldown import CooldownManager, InMemoryCooldownStore
+from mnemos.domain.pantheon.cooldown import DEFAULT_TENANT, CooldownManager, InMemoryCooldownStore
 from mnemos.domain.pantheon.fallback import AllDeploymentsFailed
-from mnemos.domain.pantheon.cooldown import DEFAULT_TENANT
 from mnemos.domain.pantheon.http_bridge import classify, retry_after_seconds
 from mnemos.domain.pantheon.runtime import RouterRuntime
 
@@ -79,6 +78,23 @@ async def aclose_http_client() -> None:
     if _http_client is not None and not _http_client.is_closed:
         await _http_client.aclose()
     _http_client = None
+
+
+async def aclose_runtime() -> None:
+    """Close PANTHEON runtime-owned durable resources."""
+    global _RUNTIME
+    if _RUNTIME is None:
+        return
+    store = getattr(getattr(_RUNTIME, "cooldown", None), "_store", None)
+    close = getattr(store, "close", None)
+    if close is not None:
+        try:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+        except Exception:
+            logger.exception("PANTHEON runtime close failed")
+    _RUNTIME = None
 
 
 class PantheonGatewayError(Exception):
@@ -374,11 +390,23 @@ def resolved_wire_model(response: dict[str, Any] | None, decision: RouteDecision
 _RUNTIME: RouterRuntime | None = None
 
 
+def _make_cooldown_store() -> InMemoryCooldownStore:
+    settings = get_settings()
+    if getattr(getattr(settings, "nats", None), "url", None):
+        try:
+            from mnemos.domain.pantheon.cooldown_nats import NatsJetStreamCooldownStore
+
+            return NatsJetStreamCooldownStore()  # type: ignore[return-value]
+        except Exception:
+            logger.exception("PANTHEON NATS cooldown store unavailable; using in-process fallback")
+    return InMemoryCooldownStore()
+
+
 def get_runtime() -> RouterRuntime:
     """Process-local RouterRuntime singleton (cooldown breaker + retry/fall-over)."""
     global _RUNTIME
     if _RUNTIME is None:
-        _RUNTIME = RouterRuntime(CooldownManager(InMemoryCooldownStore()), clock=time.time)
+        _RUNTIME = RouterRuntime(CooldownManager(_make_cooldown_store()), clock=time.time)
     return _RUNTIME
 
 

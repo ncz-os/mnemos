@@ -3,12 +3,16 @@ from __future__ import annotations
 """GRAEAE resilience primitives with in-process and Redis-backed backends."""
 
 import asyncio
+import hashlib
+import hmac
 import inspect
+import json
 import logging
 import threading
 import time
 import uuid
 from collections import defaultdict, deque
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from enum import Enum
@@ -321,6 +325,482 @@ class RedisCircuitBreakerPool:
 
     def status(self) -> dict[str, dict[str, Any]]:
         return {provider: self._breaker.status(provider) for provider in sorted(self._providers)}
+
+
+_NATS_CB_BUCKET = "MNEMOS_PANTHEON_DISPATCH"
+_NATS_CB_PREFIX = "circuit."
+_NATS_CB_DECAY_SECONDS = 300
+_NATS_SYNC_TIMEOUT_SECONDS = 0.25
+_NATS_CAS_ATTEMPTS = 16
+_NATS_STABLE_FALLBACK_SECRET = b"mnemos-nats-circuit-breaker-key-v1"
+
+
+def _nats_missing_key(exc: BaseException) -> bool:
+    name = exc.__class__.__name__.lower()
+    msg = str(exc).lower()
+    return "notfound" in name or "not found" in msg or "no keys" in msg
+
+
+def _nats_wrong_revision(exc: BaseException) -> bool:
+    name = exc.__class__.__name__.lower()
+    msg = str(exc).lower()
+    return "wronglast" in name or "wrong last" in msg or "wrong last sequence" in msg
+
+
+def _nats_entry_value(entry: Any) -> bytes:
+    value = getattr(entry, "value", entry)
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    return str(value).encode("utf-8")
+
+
+def _nats_entry_revision(entry: Any) -> int | None:
+    revision = getattr(entry, "revision", None)
+    if revision is None:
+        revision = getattr(entry, "rev", None)
+    return int(revision) if revision is not None else None
+
+
+def _nats_json(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+async def _nats_maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _nats_kv_put(kv: Any, key: str, value: bytes) -> Any:
+    # nats-py KV operations do not accept per-key TTL. Expiry is configured
+    # on the bucket via KeyValueConfig(ttl=...).
+    return await _nats_maybe_await(kv.put(key, value))
+
+
+async def _nats_kv_create(kv: Any, key: str, value: bytes) -> Any:
+    return await _nats_maybe_await(kv.create(key, value))
+
+
+async def _nats_kv_update(kv: Any, key: str, value: bytes, revision: int) -> Any:
+    return await _nats_maybe_await(kv.update(key, value, last=revision))
+
+
+class _NatsLoopThread:
+    """Owns the asyncio loop and any NATS connections created by NATS resilience."""
+
+    def __init__(self, *, name: str = "mnemos-nats-resilience") -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._owned_connections: list[Any] = []
+        self._lock = threading.Lock()
+        self._closed = False
+        self._thread.start()
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def submit(self, coro: Any) -> Future:
+        with self._lock:
+            if self._closed:
+                close = getattr(coro, "close", None)
+                if close is not None:
+                    close()
+                raise RuntimeError("NATS resilience loop is closed")
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    def add_connection(self, nc: Any) -> None:
+        with self._lock:
+            self._owned_connections.append(nc)
+
+    async def _shutdown(self) -> None:
+        tasks = [task for task in asyncio.all_tasks(self._loop) if task is not asyncio.current_task(self._loop)]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        with self._lock:
+            connections = list(self._owned_connections)
+            self._owned_connections.clear()
+        for nc in connections:
+            try:
+                drain = getattr(nc, "drain", None)
+                if drain is not None:
+                    await _nats_maybe_await(drain())
+                close = getattr(nc, "close", None)
+                if close is not None:
+                    await _nats_maybe_await(close())
+            except Exception:
+                logger.exception("NATS resilience connection close failed")
+
+    def close(self, timeout: float = 2.0) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop).result(timeout=timeout)
+        except Exception as exc:
+            logger.debug("NATS resilience loop shutdown did not finish cleanly: %s", exc)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            logger.warning("NATS resilience loop did not stop within %.1fs", timeout)
+            return
+        self._loop.close()
+
+
+class NatsCircuitBreaker:
+    """JetStream KV-backed circuit breaker shared across gateway workers."""
+
+    def __init__(
+        self,
+        kv_or_js: Any | None,
+        key_prefix: str,
+        failure_threshold: int,
+        cooldown_seconds: int,
+        *,
+        bucket: str = _NATS_CB_BUCKET,
+        settings: Any | None = None,
+        sync_timeout: float = _NATS_SYNC_TIMEOUT_SECONDS,
+    ):
+        self.key_prefix = key_prefix
+        self.failure_threshold = failure_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self.bucket = bucket
+        self._settings = settings
+        self._sync_timeout = sync_timeout
+        self._loop = _NatsLoopThread()
+        self._kv_future = self._loop.submit(self._ensure_kv(kv_or_js))
+        self._open_cache: dict[str, float] = {}
+        self._last_status: dict[str, dict[str, Any]] = {}
+        self._local_failures: dict[str, int] = defaultdict(int)
+        self._local_fallback = InProcessCircuitBreakerPool(
+            failure_threshold=failure_threshold,
+            cooldown_seconds=cooldown_seconds,
+        )
+        self._state_lock = threading.Lock()
+
+    async def _ensure_kv(self, source: Any | None) -> Any | None:
+        if source is None:
+            source = await self._connect_jetstream()
+        if source is None:
+            return None
+        if all(hasattr(source, name) for name in ("get", "put")):
+            return source
+        try:
+            return await _nats_maybe_await(source.key_value(self.bucket))
+        except Exception as exc:
+            if not _nats_missing_key(exc):
+                logger.debug("NATS KV lookup for %s failed; attempting create: %s", self.bucket, exc)
+        bucket_ttl = max(int(self.cooldown_seconds), _NATS_CB_DECAY_SECONDS)
+        try:
+            from nats.js.api import KeyValueConfig  # type: ignore[import-not-found]
+
+            return await _nats_maybe_await(
+                source.create_key_value(config=KeyValueConfig(bucket=self.bucket, history=1, ttl=bucket_ttl))
+            )
+        except ImportError:
+            return await _nats_maybe_await(source.create_key_value(bucket=self.bucket, ttl=bucket_ttl))
+        except TypeError:
+            return await _nats_maybe_await(source.create_key_value(self.bucket))
+        except Exception as exc:
+            if _nats_missing_key(exc):
+                raise
+            return await _nats_maybe_await(source.key_value(self.bucket))
+
+    async def _connect_jetstream(self) -> Any | None:
+        if self._settings is not None:
+            settings = self._settings
+        else:
+            from mnemos.core.config import get_settings
+
+            settings = get_settings()
+        nats_settings = getattr(settings, "nats", None)
+        url = getattr(nats_settings, "url", None)
+        if not url:
+            return None
+        try:
+            import nats  # type: ignore[import-not-found]
+        except ImportError:
+            logger.warning("nats-py not installed; NATS resilience backend unavailable")
+            return None
+        try:
+            kwargs: dict[str, Any] = {"servers": [url]}
+            token = getattr(nats_settings, "token", None)
+            if token:
+                kwargs["token"] = token
+            nc = await nats.connect(**kwargs)
+            self._loop.add_connection(nc)
+            return nc.jetstream()
+        except Exception as exc:
+            logger.warning("NATS resilience backend connect failed: %s", exc)
+            return None
+
+    async def _kv(self) -> Any | None:
+        return await asyncio.wrap_future(self._kv_future)
+
+    def _key_secret(self) -> bytes:
+        if self._settings is not None:
+            settings = self._settings
+        else:
+            try:
+                from mnemos.core.config import get_settings
+
+                settings = get_settings()
+            except Exception:
+                settings = None
+        configured = getattr(getattr(settings, "pantheon", None), "nats_key_secret", "") if settings else ""
+        if configured:
+            return str(configured).encode("utf-8")
+        token = getattr(getattr(settings, "nats", None), "token", None) if settings else None
+        if token:
+            return str(token).encode("utf-8")
+        return _NATS_STABLE_FALLBACK_SECRET
+
+    def _key(self, provider: str) -> str:
+        digest = hmac.new(self._key_secret(), provider.encode("utf-8"), hashlib.sha256).hexdigest()
+        return f"{self.key_prefix}{_NATS_CB_PREFIX}{digest}"
+
+    def _cache_open(self, provider: str) -> None:
+        with self._state_lock:
+            self._open_cache[provider] = time.monotonic() + min(_OPEN_CACHE_SECONDS, float(self.cooldown_seconds))
+
+    def _clear_cache(self, provider: str) -> None:
+        with self._state_lock:
+            self._open_cache.pop(provider, None)
+
+    def _set_status(self, provider: str, status: dict[str, Any]) -> None:
+        with self._state_lock:
+            self._last_status[provider] = status
+
+    def cached_open(self, provider: str) -> bool:
+        with self._state_lock:
+            expires_at = self._open_cache.get(provider)
+            if expires_at is None:
+                return False
+            if expires_at <= time.monotonic():
+                self._open_cache.pop(provider, None)
+                return False
+            return True
+
+    async def _read(self, provider: str) -> tuple[dict[str, Any] | None, int | None]:
+        kv = await self._kv()
+        if kv is None:
+            return None, None
+        try:
+            entry = await _nats_maybe_await(kv.get(self._key(provider)))
+        except Exception as exc:
+            if _nats_missing_key(exc):
+                return None, None
+            raise
+        return json.loads(_nats_entry_value(entry).decode("utf-8")), _nats_entry_revision(entry)
+
+    async def _run_on_loop(self, coro: Any) -> Any:
+        return await asyncio.wrap_future(self._loop.submit(coro))
+
+    async def _run_bounded(self, coro: Any, fallback: Any = None) -> Any:
+        fut = self._loop.submit(coro)
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=self._sync_timeout)
+        except (TimeoutError, asyncio.TimeoutError):
+            fut.cancel()
+            logger.warning("NATS circuit breaker operation timed out; using local fallback")
+            return fallback
+
+    async def check_open(self, provider: str) -> bool:
+        if self.cached_open(provider):
+            self._set_status(provider, {"state": CircuitState.OPEN.value, "failures": None})
+            return True
+        result = await self._run_bounded(self._check_open(provider), fallback=None)
+        if result is None:
+            return not self._local_fallback.is_allowed(provider)
+        return bool(result)
+
+    async def _check_open(self, provider: str) -> bool:
+        kv = await self._kv()
+        if kv is None:
+            return None
+        payload, _revision = await self._read(provider)
+        now = time.time()
+        if payload and payload.get("state") == CircuitState.OPEN.value:
+            opened_at = float(payload.get("opened_at_epoch", 0.0))
+            if opened_at + self.cooldown_seconds > now:
+                self._cache_open(provider)
+                self._set_status(
+                    provider,
+                    {"state": CircuitState.OPEN.value, "failures": int(payload.get("failures", 0))},
+                )
+                return True
+            self._set_status(
+                provider,
+                {"state": CircuitState.HALF_OPEN.value, "failures": int(payload.get("failures", 0))},
+            )
+            self._clear_cache(provider)
+            return False
+        self._set_status(
+            provider,
+            {"state": CircuitState.CLOSED.value, "failures": int(payload.get("failures", 0)) if payload else 0},
+        )
+        self._clear_cache(provider)
+        return False
+
+    async def record_failure(self, provider: str) -> None:
+        with self._state_lock:
+            self._local_failures[provider] += 1
+        self._local_fallback.record_failure(provider)
+        await self._run_bounded(self._record_failure(provider), fallback=None)
+
+    async def _record_failure(self, provider: str) -> None:
+        key = self._key(provider)
+        kv = await self._kv()
+        if kv is None:
+            return
+        now = time.time()
+        for _attempt in range(_NATS_CAS_ATTEMPTS):
+            payload, revision = await self._read(provider)
+            if payload and payload.get("state") == CircuitState.OPEN.value:
+                opened_at = float(payload.get("opened_at_epoch", 0.0))
+                if opened_at + self.cooldown_seconds > now:
+                    self._cache_open(provider)
+                    self._set_status(
+                        provider,
+                        {"state": CircuitState.OPEN.value, "failures": int(payload.get("failures", 0))},
+                    )
+                    return
+            failures = int(payload.get("failures", 0)) + 1 if payload else 1
+            opened = failures >= self.failure_threshold
+            new_payload: dict[str, Any] = {
+                "state": CircuitState.OPEN.value if opened else CircuitState.CLOSED.value,
+                "failures": failures,
+                "updated_at_epoch": now,
+            }
+            if opened:
+                new_payload["opened_at_epoch"] = now
+                new_payload["opened_at"] = datetime.now(timezone.utc).isoformat()
+            try:
+                if revision is None:
+                    try:
+                        await _nats_kv_create(kv, key, _nats_json(new_payload))
+                    except AttributeError:
+                        await _nats_kv_put(kv, key, _nats_json(new_payload))
+                else:
+                    await _nats_kv_update(kv, key, _nats_json(new_payload), revision)
+                self._set_status(provider, {"state": new_payload["state"], "failures": failures})
+                if opened:
+                    self._cache_open(provider)
+                    logger.warning("[CB] %s: TRIPPED in NATS", provider)
+                else:
+                    self._clear_cache(provider)
+                return
+            except Exception as exc:
+                if not _nats_wrong_revision(exc):
+                    raise
+        raise RuntimeError(f"NATS circuit breaker CAS failed for {provider}")
+
+    async def record_success(self, provider: str) -> None:
+        await self._run_bounded(self._record_success(provider), fallback=None)
+        self._local_fallback.record_success(provider)
+
+    async def _record_success(self, provider: str) -> None:
+        key = self._key(provider)
+        kv = await self._kv()
+        if kv is None:
+            return
+        now = time.time()
+        for _attempt in range(_NATS_CAS_ATTEMPTS):
+            payload, revision = await self._read(provider)
+            if payload and payload.get("state") == CircuitState.OPEN.value:
+                opened_at = float(payload.get("opened_at_epoch", 0.0))
+                if opened_at + self.cooldown_seconds > now:
+                    self._cache_open(provider)
+                    self._set_status(
+                        provider,
+                        {"state": CircuitState.OPEN.value, "failures": int(payload.get("failures", 0))},
+                    )
+                    return
+            failures = max(0, int(payload.get("failures", 0)) - 1) if payload else 0
+            new_payload = {"state": CircuitState.CLOSED.value, "failures": failures, "updated_at_epoch": now}
+            try:
+                if revision is None:
+                    try:
+                        await _nats_kv_create(kv, key, _nats_json(new_payload))
+                    except AttributeError:
+                        await _nats_kv_put(kv, key, _nats_json(new_payload))
+                else:
+                    await _nats_kv_update(kv, key, _nats_json(new_payload), revision)
+                self._clear_cache(provider)
+                self._set_status(provider, {"state": CircuitState.CLOSED.value, "failures": failures})
+                return
+            except Exception as exc:
+                if not _nats_wrong_revision(exc):
+                    raise
+        raise RuntimeError(f"NATS circuit breaker success CAS failed for {provider}")
+
+    def status(self, provider: str) -> dict[str, Any]:
+        with self._state_lock:
+            status = self._last_status.get(provider)
+            failures = self._local_failures.get(provider)
+        if status is not None:
+            return dict(status)
+        return {
+            "state": CircuitState.OPEN.value if self.cached_open(provider) else CircuitState.CLOSED.value,
+            "failures": failures,
+        }
+
+    def close(self) -> None:
+        self._loop.close()
+
+
+class NatsCircuitBreakerPool:
+    """Circuit breaker pool backed by NATS JetStream KV state."""
+
+    def __init__(
+        self,
+        kv_or_js: Any | None,
+        key_prefix: str = "cb.",
+        failure_threshold: int = 5,
+        cooldown_seconds: int = 300,
+        *,
+        bucket: str = _NATS_CB_BUCKET,
+        settings: Any | None = None,
+    ):
+        self._breaker = NatsCircuitBreaker(
+            kv_or_js,
+            key_prefix,
+            failure_threshold,
+            cooldown_seconds,
+            bucket=bucket,
+            settings=settings,
+        )
+        self._providers: set[str] = set()
+        self._providers_lock = threading.Lock()
+
+    def _remember(self, provider: str) -> None:
+        with self._providers_lock:
+            self._providers.add(provider)
+
+    async def is_allowed(self, provider: str) -> bool:
+        self._remember(provider)
+        return not await self._breaker.check_open(provider)
+
+    async def record_success(self, provider: str) -> None:
+        self._remember(provider)
+        await self._breaker.record_success(provider)
+
+    async def record_failure(self, provider: str) -> None:
+        self._remember(provider)
+        await self._breaker.record_failure(provider)
+
+    def status(self) -> dict[str, dict[str, Any]]:
+        with self._providers_lock:
+            providers = sorted(self._providers)
+        return {provider: self._breaker.status(provider) for provider in providers}
+
+    def close(self) -> None:
+        self._breaker.close()
 
 
 class InProcessRateLimiter:
@@ -638,6 +1118,10 @@ def _redis_requested(settings: Any) -> bool:
     return _storage_uri(settings).startswith(("redis://", "rediss://"))
 
 
+def _nats_configured(settings: Any) -> bool:
+    return bool(getattr(getattr(settings, "nats", None), "url", None))
+
+
 def _fallback_warning_enabled(settings: Any) -> bool:
     resilience = getattr(settings, "resilience", None)
     return bool(getattr(resilience, "fallback_warning", True))
@@ -667,7 +1151,11 @@ def make_circuit_breaker_pool(
     failure_threshold: int = 5,
     cooldown_seconds: int = 300,
     redis_client: Any | None = None,
-) -> InProcessCircuitBreakerPool | RedisCircuitBreakerPool:
+    nats_kv: Any | None = None,
+) -> InProcessCircuitBreakerPool | RedisCircuitBreakerPool | NatsCircuitBreakerPool:
+    # Backend precedence is explicit and stable: Redis remains authoritative when
+    # RATE_LIMIT_STORAGE_URI requests it. NATS is selected only for deployments
+    # without Redis that deliberately set MNEMOS_NATS_URL.
     if _redis_requested(settings):
         client = redis_client if redis_client is not None else _get_lifecycle_redis_client()
         if client is not None:
@@ -678,8 +1166,16 @@ def make_circuit_breaker_pool(
                 cooldown_seconds=cooldown_seconds,
             )
         _warn_fallback(settings, "Redis resilience backend requested but unavailable")
+    elif _nats_configured(settings):
+        return NatsCircuitBreakerPool(
+            nats_kv,
+            getattr(settings.resilience, "circuit_breaker_nats_prefix", "cb."),
+            failure_threshold=failure_threshold,
+            cooldown_seconds=cooldown_seconds,
+            settings=settings,
+        )
     else:
-        _warn_fallback(settings, "Redis not configured")
+        _warn_fallback(settings, "Redis/NATS not configured")
     return InProcessCircuitBreakerPool(
         failure_threshold=failure_threshold,
         cooldown_seconds=cooldown_seconds,
