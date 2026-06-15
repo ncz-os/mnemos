@@ -14,7 +14,7 @@ import math
 import re
 import sqlite3
 import uuid
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -4907,6 +4907,37 @@ class SqliteBackend:
             else:
                 if not tx.closed:
                     await tx.commit()
+
+    async def insert_pantheon_routing_audit(
+        self,
+        tx: Transaction,
+        record: Mapping[str, Any],
+    ) -> None:
+        cost_usd = record.get("cost_usd")
+        if isinstance(cost_usd, Decimal):
+            cost_usd = float(cost_usd)
+        await _execute(
+            _sqlite_tx(tx).conn,
+            """
+            INSERT INTO pantheon_routing_audit
+                   (request_id, tenant_user_id, alias_or_model, resolved_to, outcome,
+                    latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.get("request_id"),
+                record.get("tenant_user_id"),
+                record.get("alias_or_model"),
+                record.get("resolved_to"),
+                record.get("outcome"),
+                record.get("latency_ms"),
+                record.get("tokens_in"),
+                record.get("tokens_out"),
+                cost_usd,
+                record.get("error_class"),
+                record.get("payload_json"),
+            ),
+        )
 
     @property
     def memories(self) -> MemoryRepository:

@@ -136,6 +136,17 @@ def register_post_db_startup_hook(name: str, hook) -> None:
     _post_db_startup_hooks[name] = hook
 
 
+async def _run_post_db_startup_hooks(db_handle: Any, settings: Any) -> None:
+    """Run registered post-DB hooks with the active backend handle."""
+    if db_handle is None:
+        return
+    for hook_name, hook in _post_db_startup_hooks.items():
+        try:
+            await hook(db_handle, settings)
+        except Exception:
+            logger.exception("[startup] %s hook failed", hook_name)
+
+
 def register_lifespan_cleanup_hook(name: str, hook) -> None:
     """Register an awaitable shutdown hook by name.
 
@@ -492,6 +503,58 @@ async def _build_mysql_backend(dsn: str, settings: Any):
     backend = mysql_module.MysqlBackend(pool, settings)
     await backend.open()
     return backend
+
+
+async def build_configured_persistence_backend(settings: Any | None = None) -> tuple[str, Any]:
+    """Open the configured persistence backend without starting the API lifespan."""
+    settings = settings or get_settings()
+    backend_type = _select_persistence_backend(settings)
+    if backend_type == "sqlite":
+        return backend_type, await _build_sqlite_backend(_sqlite_path_from_settings(settings), settings)
+    if backend_type == "oracle":
+        oracle_dsn = _oracle_dsn_from_settings(settings)
+        if not oracle_dsn:
+            raise RuntimeError(
+                "Oracle backend selected but no oracle:// DSN configured. "
+                "Set MNEMOS_DATABASE_DSN=oracle://user:pass@host:port/service"
+            )
+        return backend_type, await _build_oracle_backend(oracle_dsn, settings)
+    if backend_type == "db2":
+        db2_dsn = _db2_dsn_from_settings(settings)
+        if not db2_dsn:
+            raise RuntimeError(
+                "Db2 backend selected but no db2:// DSN configured. "
+                "Set MNEMOS_DATABASE_DSN=db2://user:pass@host:port/database"
+            )
+        return backend_type, await _build_db2_backend(db2_dsn, settings)
+    if backend_type == "mysql":
+        mysql_dsn = _mysql_dsn_from_settings(settings)
+        if not mysql_dsn:
+            raise RuntimeError(
+                "MySQL backend selected but no mysql:// DSN configured. "
+                "Set MNEMOS_DATABASE_DSN=mysql://user:pass@host:3306/mnemos"
+            )
+        return backend_type, await _build_mysql_backend(mysql_dsn, settings)
+
+    database_dsn = _database_dsn_from_settings(settings)
+    pool_kwargs = {
+        "min_size": PG_CONFIG["pool_min_size"],
+        "max_size": PG_CONFIG["pool_max_size"],
+    }
+    if database_dsn:
+        raw_pool = await asyncpg.create_pool(database_dsn, **pool_kwargs)
+    else:
+        raw_pool = await asyncpg.create_pool(
+            user=PG_CONFIG["user"],
+            password=PG_CONFIG["password"],
+            database=PG_CONFIG["database"],
+            host=PG_CONFIG["host"],
+            port=PG_CONFIG["port"],
+            **pool_kwargs,
+        )
+    from mnemos.core.pool import wrap_pool_with_timeout
+
+    return backend_type, _build_postgres_backend(wrap_pool_with_timeout(raw_pool), settings)
 
 
 def _sqlite_path_from_settings(settings):
@@ -877,13 +940,10 @@ async def lifespan(app):
     # Post-DB startup hooks (federation NATS consumers, webhook NATS
     # triggers, etc.). Hooks register at API-layer boot time via
     # register_post_db_startup_hook so core/lifecycle does not need
-    # to import federation / webhook modules at runtime.
-    if _pool:
-        for hook_name, hook in _post_db_startup_hooks.items():
-            try:
-                await hook(_pool, settings)
-            except Exception:
-                logger.exception("[startup] %s hook failed", hook_name)
+    # to import federation / webhook modules at runtime. Postgres-era
+    # hooks still receive the asyncpg pool; non-Postgres hooks receive
+    # the active persistence backend.
+    await _run_post_db_startup_hooks(_pool if _pool is not None else _persistence_backend, settings)
 
     yield
 

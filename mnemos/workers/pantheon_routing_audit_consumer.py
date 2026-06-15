@@ -11,7 +11,10 @@ from typing import Any, Awaitable, Callable, Mapping
 
 from mnemos.core.config import Settings, get_settings
 from mnemos.core.extras import is_extra_installed
-from mnemos.domain.pantheon.routing_log import PANTHEON_ROUTING_SUBJECT
+from mnemos.domain.pantheon.routing_log import (
+    PANTHEON_ROUTING_SUBJECT,
+    insert_routing_audit_record,
+)
 from mnemos.nats.backoff import ReconnectBackoff
 
 logger = logging.getLogger("mnemos.workers.pantheon_routing_audit_consumer")
@@ -126,20 +129,62 @@ async def handle_message(pool: Any, msg: Any) -> None:
 
 async def insert_audit_event(pool: Any, event: Mapping[str, Any]) -> None:
     """Insert a decoded routing event into ``pantheon_routing_audit``."""
+    record = _audit_record(event)
+    backend = _audit_persistence_backend(pool)
+    if backend is not None and await insert_routing_audit_record(backend, record):
+        return
+
+    await _insert_audit_record_via_pool(pool, record)
+
+
+def _audit_record(event: Mapping[str, Any]) -> dict[str, Any]:
     payload_json = json.dumps(event, sort_keys=True, default=str, separators=(",", ":"))
-    values = (
-        _text_field(event, "request_id"),
-        _text_field(event, "tenant_user_id"),
-        _text_field(event, "alias_or_model"),
-        _text_field(event, "resolved_to"),
-        _text_field(event, "outcome"),
-        _int_field(event, "latency_ms"),
-        _int_field(event, "tokens_in"),
-        _int_field(event, "tokens_out"),
-        _decimal_field(event, "cost_usd"),
-        _text_field(event, "error_class"),
-        payload_json,
+    return {
+        "request_id": _text_field(event, "request_id"),
+        "tenant_user_id": _text_field(event, "tenant_user_id"),
+        "alias_or_model": _text_field(event, "alias_or_model"),
+        "resolved_to": _text_field(event, "resolved_to"),
+        "outcome": _text_field(event, "outcome"),
+        "latency_ms": _int_field(event, "latency_ms"),
+        "tokens_in": _int_field(event, "tokens_in"),
+        "tokens_out": _int_field(event, "tokens_out"),
+        "cost_usd": _decimal_field(event, "cost_usd"),
+        "error_class": _text_field(event, "error_class"),
+        "payload_json": payload_json,
+    }
+
+
+def _audit_persistence_backend(target: Any) -> Any | None:
+    for candidate in (target, getattr(target, "persistence_backend", None)):
+        if _supports_audit_repository(candidate):
+            return candidate
+    return None
+
+
+def _supports_audit_repository(candidate: Any) -> bool:
+    return callable(getattr(candidate, "transactional", None)) and callable(
+        getattr(candidate, "insert_pantheon_routing_audit", None)
     )
+
+
+def _record_values(record: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        record.get("request_id"),
+        record.get("tenant_user_id"),
+        record.get("alias_or_model"),
+        record.get("resolved_to"),
+        record.get("outcome"),
+        record.get("latency_ms"),
+        record.get("tokens_in"),
+        record.get("tokens_out"),
+        record.get("cost_usd"),
+        record.get("error_class"),
+        record.get("payload_json"),
+    )
+
+
+async def _insert_audit_record_via_pool(pool: Any, record: Mapping[str, Any]) -> None:
+    values = _record_values(record)
     dialect = _audit_insert_dialect(pool)
     if dialect == "unsupported":
         logger.debug("PANTHEON routing audit insert skipped for non-Postgres-compatible backend")
@@ -352,26 +397,14 @@ async def _ack_safely(msg: Any) -> None:
 
 
 async def main() -> None:
-    import asyncpg
+    from mnemos.core import lifecycle
 
-    from mnemos.core.config import PG_CONFIG as _PG_CONFIG
-    from mnemos.core.pool import wrap_pool_with_timeout
-
-    raw_pool = await asyncpg.create_pool(
-        min_size=1,
-        max_size=3,
-        command_timeout=60,
-        user=_PG_CONFIG["user"],
-        password=_PG_CONFIG["password"],
-        database=_PG_CONFIG["database"],
-        host=_PG_CONFIG["host"],
-        port=_PG_CONFIG["port"],
-    )
-    pool = wrap_pool_with_timeout(raw_pool)
+    settings = get_settings()
+    _backend_type, backend = await lifecycle.build_configured_persistence_backend(settings)
     try:
-        await consumer_loop(pool)
+        await consumer_loop(backend, settings=settings)
     finally:
-        await pool.close()
+        await backend.close()
 
 
 if __name__ == "__main__":
