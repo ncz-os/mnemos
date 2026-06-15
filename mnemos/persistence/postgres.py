@@ -14,7 +14,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -4241,6 +4241,31 @@ class PostgresBackend:
             else:
                 if not tx.closed:
                     await tx.commit()
+
+    async def insert_pantheon_routing_audit(
+        self,
+        tx: Transaction,
+        record: Mapping[str, Any],
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            INSERT INTO pantheon_routing_audit
+                   (request_id, tenant_user_id, alias_or_model, resolved_to, outcome,
+                    latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+            """,
+            record.get("request_id"),
+            record.get("tenant_user_id"),
+            record.get("alias_or_model"),
+            record.get("resolved_to"),
+            record.get("outcome"),
+            record.get("latency_ms"),
+            record.get("tokens_in"),
+            record.get("tokens_out"),
+            record.get("cost_usd"),
+            record.get("error_class"),
+            record.get("payload_json"),
+        )
 
     async def record_usage_ledger(
         self,

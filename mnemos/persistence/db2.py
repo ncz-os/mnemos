@@ -24,7 +24,7 @@ import logging
 import math
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from functools import lru_cache
@@ -4172,6 +4172,38 @@ class Db2Backend(OracleBackend):
     supports_db2_vector = True
 
     _UNSUPPORTED_CAPABILITY_MARKERS = frozenset({})
+
+    async def insert_pantheon_routing_audit(
+        self,
+        tx: Any,
+        record: Mapping[str, Any],
+    ) -> None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO pantheon_routing_audit
+                       (request_id, tenant_user_id, alias_or_model, resolved_to, outcome,
+                        latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.get("request_id"),
+                    record.get("tenant_user_id"),
+                    record.get("alias_or_model"),
+                    record.get("resolved_to"),
+                    record.get("outcome"),
+                    record.get("latency_ms"),
+                    record.get("tokens_in"),
+                    record.get("tokens_out"),
+                    record.get("cost_usd"),
+                    record.get("error_class"),
+                    record.get("payload_json"),
+                ),
+            )
+        finally:
+            await _call(cursor.close)
 
     def __init__(self, pool: Any, settings: Any):
         # Call OracleBackend.__init__ so any new ``_X_repo`` attribute

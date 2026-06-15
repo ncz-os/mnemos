@@ -8,7 +8,7 @@ code should depend on this facade instead of driver-specific SQL.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -1748,6 +1748,14 @@ class CorePersistence(PersistenceCapabilityBase, Protocol):
         Only the Postgres backend implements KNEMON MVP Step 1.
         """
         raise NotImplementedError("usage_ledger is Postgres-only")
+
+    async def insert_pantheon_routing_audit(
+        self,
+        tx: Transaction,
+        record: Mapping[str, Any],
+    ) -> None:
+        """Insert one PANTHEON routing audit row using this backend's SQL dialect."""
+        raise NotImplementedError("pantheon routing audit is not implemented")
 
     async def fetch_category_decay_rows(self, tx: Transaction) -> list[Row]:
         """Return rows from the per-category decay table."""
