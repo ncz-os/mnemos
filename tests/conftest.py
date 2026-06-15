@@ -130,6 +130,28 @@ class FakeConnection:
             )
             return "INSERT 0 1"
 
+        if compact.startswith("INSERT INTO pantheon_routing_audit"):
+            payload = args[10]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            self.state.setdefault("pantheon_routing_audit", []).append(
+                {
+                    "request_id": args[0],
+                    "tenant_user_id": args[1],
+                    "alias_or_model": args[2],
+                    "resolved_to": args[3],
+                    "outcome": args[4],
+                    "latency_ms": args[5],
+                    "tokens_in": args[6],
+                    "tokens_out": args[7],
+                    "cost_usd": args[8],
+                    "error_class": args[9],
+                    "payload": payload,
+                    "created": _utcnow(),
+                }
+            )
+            return "INSERT 0 1"
+
         if compact.startswith("INSERT INTO memory_versions "):
             return "INSERT 0 1"
 
@@ -207,6 +229,41 @@ class FakeConnection:
 
     async def fetchrow(self, query: str, *args):
         compact = " ".join(query.split())
+
+        if compact.startswith("INSERT INTO usage_ledger") or "INSERT INTO usage_ledger" in compact:
+            ledger_id = len(self.state.setdefault("usage_ledger", [])) + 1
+            record = {
+                "id": ledger_id,
+                "provider": args[0],
+                "model": args[1],
+                "task_kind": args[2],
+                "tokens_in": args[3],
+                "tokens_out": args[4],
+                "tokens_reasoning": args[5],
+                "est_cost_usd": 0,
+                "latency_ms": args[6],
+                "outcome": args[7],
+                "caller_subsystem": args[8],
+                "tier": args[9],
+                "session_id": args[10],
+                "request_count": args[11],
+                "plan_window_id": args[12],
+                "path_kind": args[13],
+                "ts": _utcnow(),
+            }
+            for model in self.state.get("model_registry", []):
+                if model.get("provider") == args[0] and model.get("model_id") == args[1]:
+                    record["est_cost_usd"] = (
+                        float(args[3] or 0) * float(model.get("input_cost_per_mtok") or 0)
+                        + float(args[4] or 0) * float(model.get("output_cost_per_mtok") or 0)
+                    ) / 1000000.0
+                    break
+            if not record["est_cost_usd"]:
+                from decimal import Decimal
+
+                record["est_cost_usd"] = Decimal(str(getattr(self, "_next_ledger_cost", 0)))
+            self.state["usage_ledger"].append(record)
+            return {"id": ledger_id, "est_cost_usd": record["est_cost_usd"], "registry_match": True, "auth_method": "api"}
 
         if compact.startswith("INSERT INTO webhook_subscriptions"):
             webhook_id = str(uuid4())
@@ -460,6 +517,12 @@ class FakeConnection:
                 {"column_name": "chain_hash"},
             ]
 
+        if "FROM usage_ledger" in compact and "SUM(est_cost_usd)" in compact:
+            return [{"spent_usd": sum(float(row.get("est_cost_usd") or 0) for row in self.state.get("usage_ledger", []))}]
+
+        if "FROM pantheon_routing_audit" in compact:
+            return list(self.state.get("pantheon_routing_audit", []))
+
         if "FROM model_registry" in compact:
             return list(self.state["model_registry"])
 
@@ -526,6 +589,8 @@ class FakePool:
             "memory_refs": [],
             "entities": {},
             "webhook_subscriptions": {},
+            "pantheon_routing_audit": [],
+            "usage_ledger": [],
             "model_registry": [
                 {
                     "provider": "openai",
@@ -536,6 +601,7 @@ class FakePool:
                     "capabilities": ["reasoning", "logic"],
                     "graeae_weight": 0.92,
                     "context_window": 128000,
+                    "raw": {},
                 }
             ],
         }
