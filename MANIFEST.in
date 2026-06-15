@@ -25,6 +25,9 @@ include .env.example
 # SQL migrations for source distributions and repo-based installs
 recursive-include db *.sql
 
+# Bundled last-good seed data for offline PANTHEON pricing refreshes
+recursive-include mnemos/domain/pantheon *.json
+
 # Integrations bundle (claude-code / openclaw / zeroclaw / hermes) —
 # include every file. These directories carry mixed extensions (*.md /
 # *.json / *.sh / *.yaml / *.snippet / hooks.config.example / dotfile-

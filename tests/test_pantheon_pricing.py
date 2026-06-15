@@ -80,6 +80,39 @@ def test_parse_litellm_and_models_dev_adapters():
     assert models_dev_records[0].output_cost_per_mtok == 10.0
 
 
+def test_primary_pricing_sources_prefer_litellm_and_reserve_tokencost():
+    assert [fetcher.name for fetcher in pricing.default_pricing_fetchers()] == [
+        "litellm",
+        "models.dev",
+        "openrouter",
+    ]
+    assert pricing.SOURCE_PRIORITY["tokencost"] > pricing.SOURCE_PRIORITY["litellm"]
+    assert pricing.SOURCE_PRIORITY["litellm"] > pricing.SOURCE_PRIORITY["models.dev"]
+    assert pricing.SOURCE_PRIORITY["models.dev"] > pricing.SOURCE_PRIORITY["openrouter"]
+
+    chosen = pricing.pricing_index(
+        [
+            PricingRecord(
+                provider="openai",
+                model="gpt-4o-mini",
+                input_cost_per_mtok=99.0,
+                output_cost_per_mtok=99.0,
+                source="models.dev",
+            ),
+            PricingRecord(
+                provider="openai",
+                model="gpt-4o-mini",
+                input_cost_per_mtok=0.15,
+                output_cost_per_mtok=0.6,
+                source="litellm",
+            ),
+        ]
+    )[("openai", "gpt-4o-mini")]
+
+    assert chosen.source == "litellm"
+    assert chosen.input_cost_per_mtok == 0.15
+
+
 def test_merge_pricing_into_catalog_aliases_and_marks_source():
     merged = pricing.merge_pricing_into_catalog(
         [
@@ -147,7 +180,7 @@ async def test_regenerate_catalog_cache_keeps_last_good_on_total_refresh_failure
     last_good = {"schema": "mnemos.pantheon.catalog.v1", "generated_at": "old", "models": [{"id": "old"}]}
     cache_path.write_text(json.dumps(last_good), encoding="utf-8")
 
-    async def fake_list_models():
+    async def fake_list_models(**_kwargs):
         return [{"id": "gpt-4o", "provider": "openai", "registry_provider": "openai"}]
 
     async def fake_fetch(fetchers=None):
@@ -162,3 +195,76 @@ async def test_regenerate_catalog_cache_keeps_last_good_on_total_refresh_failure
     assert payload["stale"] is True
     assert payload["last_refresh_error"] == "no external pricing records fetched"
     assert json.loads(cache_path.read_text(encoding="utf-8")) == last_good
+
+
+@pytest.mark.asyncio
+async def test_regenerate_catalog_cache_uses_seed_when_feeds_and_cache_missing(monkeypatch, tmp_path: Path):
+    cache_path = tmp_path / "pantheon-catalog.json"
+    seed_path = tmp_path / "seed.json"
+    seed = {
+        "schema": "mnemos.pantheon.catalog.v1",
+        "generated_at": "seed",
+        "sources": [{"source": "seed", "ok": True, "records": 1}],
+        "models": [{"id": "seed-model", "provider": "openai", "registry_provider": "openai"}],
+    }
+    seed_path.write_text(json.dumps(seed), encoding="utf-8")
+
+    async def fake_list_models(**_kwargs):
+        return [{"id": "gpt-4o", "provider": "openai", "registry_provider": "openai"}]
+
+    async def fake_fetch(fetchers=None):
+        return [], [{"source": "litellm", "ok": False, "error": "offline", "records": 0}]
+
+    monkeypatch.setattr("mnemos.domain.pantheon.catalog.list_models", fake_list_models)
+    monkeypatch.setattr(pricing, "fetch_pricing_records", fake_fetch)
+
+    payload = await pricing.regenerate_catalog_cache(json_path=cache_path, sqlite_path=None, seed_path=seed_path)
+
+    assert payload["models"] == seed["models"]
+    assert payload["stale"] is True
+    assert payload["seed_fallback"] is True
+    assert payload["refresh_ok"] is False
+    assert payload["last_refresh_error"] == "no external pricing records fetched"
+    assert json.loads(cache_path.read_text(encoding="utf-8"))["models"] == seed["models"]
+
+
+@pytest.mark.asyncio
+async def test_live_catalog_reads_synced_json_cache(monkeypatch):
+    from mnemos.domain.pantheon import catalog
+
+    cached = {
+        "schema": "mnemos.pantheon.catalog.v1",
+        "generated_at": "now",
+        "sources": [{"source": "litellm", "ok": True, "records": 1}],
+        "models": [
+            {
+                "id": "cached-gpt",
+                "object": "model",
+                "created": 1,
+                "owned_by": "openai",
+                "provider": "openai",
+                "registry_provider": "openai",
+                "display_name": "Cached GPT",
+                "capabilities": ["chat"],
+                "usage_tier": "budget",
+                "cost_per_mtok": 0.3,
+                "price_in": 0.1,
+                "price_out": 0.5,
+                "input_cost_per_mtok": 0.1,
+                "output_cost_per_mtok": 0.5,
+                "quality_score": 0.9,
+                "available": True,
+                "deprecated": False,
+                "pricing_source": "litellm",
+                "health": {},
+            }
+        ],
+    }
+
+    monkeypatch.setattr(pricing, "read_json_cache", lambda *_args, **_kwargs: cached)
+
+    models = await catalog.list_models()
+    response = await catalog.models_response()
+
+    assert [model["id"] for model in models] == ["cached-gpt"]
+    assert response["data"][0]["pricing_source"] == "litellm"
