@@ -15,6 +15,9 @@ EXTRA_PROBES: dict[str, tuple[str, ...]] = {
     "morpheus": ("numpy",),
     "persephone": ("zstandard",),
     "pantheon": (),
+    "knemon": (),
+    "graeae": (),
+    "hive": (),
     "kronos": ("numpy",),
     "knossos": (),
     "apollo": (),
@@ -25,13 +28,16 @@ EXTRA_PROBES: dict[str, tuple[str, ...]] = {
 
 FEATURE_BUNDLES: dict[str, tuple[str, ...]] = {
     "edge": ("edge",),
-    "server": ("nats", "persephone", "pantheon"),
+    "server": ("nats", "persephone", "pantheon", "knemon", "graeae", "hive"),
     "ml": ("morpheus", "kronos", "apollo", "artemis", "hot"),
     "interop": ("knossos",),
     "full": (
         "morpheus",
         "persephone",
         "pantheon",
+        "knemon",
+        "graeae",
+        "hive",
         "kronos",
         "knossos",
         "apollo",
