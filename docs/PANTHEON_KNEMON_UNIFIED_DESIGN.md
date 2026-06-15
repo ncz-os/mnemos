@@ -109,3 +109,24 @@ The flip is **operator/Claude-orchestrated, not a blind hive job** (fleet critic
 - pantheon currently DISABLED — re-enable only behind the validated gateway.
 - catalog scrape fragility — mitigated by tokencost/LiteLLM-JSON primary (machine-readable).
 - decouple cost — pantheon stays in-tree (mnemos); KNEMON in-tree; no extraction needed for v1.
+
+## Phase E — HEADROOM token-compression library (operator-greenlit 2026-06-14)
+
+Decision: build HEADROOM as a lossless token-compression **library** the gateway calls
+**pre-dispatch** — fewer input tokens → lower per-request cost → feeds KNEMON affordability.
+(Supersedes the prior default-SKIP; `mem_1781485342861_3d44b5`.)
+
+- Clean-room (Option-D): discard ML/CCR/proxy/telemetry/hf-hub; reimplement only the
+  lossless transforms. `mnemos/domain/headroom/`, library-mode, importable.
+- **Piece 1 (primary): JSON-minify** — collapse insignificant whitespace in JSON
+  payloads/tool-args. **Financial correctness: numbers round-trip EXACTLY** (serde_json
+  `arbitrary_precision` via pyo3, or Python `Decimal`/precision-preserving JSON) — digit
+  mutation is a hard fail; numeric property tests (big ints, high-precision decimals,
+  sci-notation, zeros).
+- **Piece 2 (secondary, deferrable): AST code-strip** — strip comments/whitespace from
+  fenced code blocks losslessly (reimpl of `code_compressor.py`/`astgrep.py`).
+- API: `compress(text|messages) -> lossless result`; passthrough no-op for unsupported
+  content (never corrupt). Job E builds the pure library; a follow-on (E2) wires it into
+  the pantheon gateway pre-dispatch path.
+- Default-skip override: pursue because it's a library asset of the unified system, not a
+  caveman replacement; latency-vs-benefit evaluated live in the KNEMON cost-model.
