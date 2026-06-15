@@ -12,6 +12,7 @@ from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.domain.graeae.engine import get_graeae_engine
 
 logger = logging.getLogger(__name__)
+CATALOG_CACHE_SCHEMA = "mnemos.pantheon.catalog.v1"
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
@@ -208,6 +209,36 @@ async def _registry_rows() -> list[Any]:
         return []
 
 
+def _sort_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        models,
+        key=lambda item: (
+            not item.get("available", True),
+            bool(item.get("deprecated", False)),
+            item.get("cost_per_mtok") is None,
+            item.get("cost_per_mtok") if item.get("cost_per_mtok") is not None else float("inf"),
+            -float(item.get("quality_score") or 0.0),
+            str(item.get("id") or ""),
+        ),
+    )
+
+
+def _synced_cache_models() -> list[dict[str, Any]] | None:
+    try:
+        from mnemos.domain.pantheon.pricing import read_json_cache
+
+        payload = read_json_cache()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[PANTHEON] synced catalog cache unavailable: %s", exc)
+        return None
+    if not isinstance(payload, dict) or payload.get("schema") != CATALOG_CACHE_SCHEMA:
+        return None
+    models = payload.get("models")
+    if not isinstance(models, list) or not models:
+        return None
+    return [dict(model) for model in models if isinstance(model, dict)]
+
+
 def _model_sources(provider_cfg: dict[str, Any]) -> list[dict[str, Any]]:
     raw_models = provider_cfg.get("models")
     if isinstance(raw_models, list) and raw_models:
@@ -221,8 +252,13 @@ def _model_sources(provider_cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"model_id": provider_cfg.get("model")}]
 
 
-async def list_models() -> list[dict[str, Any]]:
+async def list_models(*, use_synced_cache: bool = True) -> list[dict[str, Any]]:
     """Return the extended PANTHEON model catalog."""
+    if use_synced_cache:
+        cached_models = _synced_cache_models()
+        if cached_models is not None:
+            return _sort_models(cached_models)
+
     engine = get_graeae_engine()
     try:
         provider_status = engine.provider_status()
@@ -277,17 +313,7 @@ async def list_models() -> list[dict[str, Any]]:
         )
         models[(normalized["provider"], normalized["id"])] = normalized
 
-    return sorted(
-        models.values(),
-        key=lambda item: (
-            not item["available"],
-            item["deprecated"],
-            item["cost_per_mtok"] is None,
-            item["cost_per_mtok"] if item["cost_per_mtok"] is not None else float("inf"),
-            -float(item["quality_score"] or 0.0),
-            item["id"],
-        ),
-    )
+    return _sort_models(list(models.values()))
 
 
 async def models_response(
