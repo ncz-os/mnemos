@@ -1,0 +1,30 @@
+# PANTHEON VIP-stable cutover snippet.
+# NEW FILE ONLY: do not paste automatically over the live :4100 site. Review,
+# stage, and apply during the cutover window.
+#
+# Rollback one-liner: change the reverse_proxy upstream below back to
+# inference-api:4100 (or the pre-cutover inference-api upstream) and reload Caddy.
+
+:4100 {
+    encode zstd gzip
+
+    @pantheon_health path /health
+    reverse_proxy @pantheon_health 127.0.0.1:4110 {
+        health_uri /health
+        health_interval 10s
+        health_timeout 2s
+        fail_duration 30s
+    }
+
+    reverse_proxy 127.0.0.1:4110 {
+        lb_policy first
+        health_uri /health
+        health_interval 10s
+        health_timeout 2s
+        fail_duration 30s
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}

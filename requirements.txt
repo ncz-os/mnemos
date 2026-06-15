@@ -4,6 +4,7 @@
 # API framework
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
+gunicorn>=22.0.0
 starlette>=0.40.0
 pydantic>=2.8.0
 # Pinned <2.12: see pyproject.toml for the precedence rationale (#199).

@@ -440,6 +440,13 @@ class _RateLimitSettings(BaseSettings):
     )
     trust_proxy: bool = Field(False, validation_alias="RATE_LIMIT_TRUST_PROXY")
     per_minute: int = Field(60, validation_alias=AliasChoices("MNEMOS_RATE_LIMIT_PER_MINUTE", "RATE_LIMIT_PER_MINUTE"))
+    pantheon_gateway: str = Field(
+        "60/minute",
+        validation_alias=AliasChoices(
+            "MNEMOS_PANTHEON_GATEWAY_RATE_LIMIT",
+            "PANTHEON_GATEWAY_RATE_LIMIT",
+        ),
+    )
 
     @property
     def storage(self) -> str:
