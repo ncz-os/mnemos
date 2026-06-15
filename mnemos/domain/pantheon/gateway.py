@@ -29,6 +29,7 @@ _IDENTITY_BODY_KEY = "_mnemos_upstream_identity"
 _REASONING_MODEL_RE = re.compile(r"(reason|thinking|r1\b|\bo[134]\b|gpt-5|grok-4|deepseek)", re.I)
 _RESPONSES_MODEL_RE = re.compile(r"(?:^|/)(?:gpt-[0-9.]+.*codex|.*codex.*gpt-[0-9.]|o[134].*-codex|codex)", re.I)
 _TOKEN_BUDGET_FIELDS = ("max_output_tokens", "max_completion_tokens", "max_tokens")
+DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 60.0
 _PANTHEON_PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
     "eih": {
         "url": "https://integrate.api.nvidia.com/v1/chat/completions",
@@ -155,6 +156,20 @@ def _auth_headers(cfg: dict[str, Any], identity: UpstreamIdentity | None = None)
         "Accept": "text/event-stream" if cfg.get("stream") else "application/json",
         **_identity_headers(identity),
     }
+
+
+def _upstream_timeout(cfg: dict[str, Any]) -> float:
+    raw = cfg.get("timeout")
+    if raw is None:
+        try:
+            raw = get_settings().pantheon.upstream_timeout_seconds
+        except Exception:
+            raw = DEFAULT_UPSTREAM_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_UPSTREAM_TIMEOUT_SECONDS
+    return timeout if timeout > 0.0 else DEFAULT_UPSTREAM_TIMEOUT_SECONDS
 
 
 def _chat_payload(decision: RouteDecision, body: dict[str, Any], *, stream: bool | None = None) -> dict[str, Any]:
@@ -390,7 +405,7 @@ async def _forward_chat_once(decision: RouteDecision, body: dict[str, Any]) -> d
         url,
         json=payload,
         headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
-        timeout=cfg.get("timeout", 200),
+        timeout=_upstream_timeout(cfg),
     )
     if response.status_code >= 400:
         raise PantheonGatewayError(response.status_code, response.text[:500], retry_after_seconds(response))
@@ -526,7 +541,7 @@ async def forward_embeddings(decision: RouteDecision, body: dict[str, Any]) -> d
         _embeddings_url(cfg),
         json=payload,
         headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
-        timeout=cfg.get("timeout", 200),
+        timeout=_upstream_timeout(cfg),
     )
     if response.status_code >= 400:
         raise PantheonGatewayError(response.status_code, response.text[:500])

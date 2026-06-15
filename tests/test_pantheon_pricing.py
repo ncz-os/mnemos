@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -172,6 +173,46 @@ def test_fetch_pricing_records_tolerates_per_source_failure():
     assert "boom" in status[0]["error"]
     assert status[1]["source"] == "good"
     assert status[1]["ok"] is True
+
+
+def test_write_json_cache_falls_back_to_user_cache_when_primary_unwritable(monkeypatch, tmp_path: Path):
+    primary = tmp_path / "blocked" / "pantheon-catalog.json"
+    xdg_home = tmp_path / "xdg"
+    fallback = xdg_home / "mnemos" / "pantheon-catalog.json"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_home))
+
+    real_atomic_write = pricing._atomic_write_text
+
+    def fake_atomic_write(path, text):
+        if Path(path) == primary:
+            raise PermissionError("denied")
+        real_atomic_write(path, text)
+
+    monkeypatch.setattr(pricing, "_atomic_write_text", fake_atomic_write)
+
+    pricing.write_json_cache({"schema": "mnemos.pantheon.catalog.v1", "models": [{"id": "cached"}]}, primary)
+
+    assert json.loads(fallback.read_text(encoding="utf-8"))["models"] == [{"id": "cached"}]
+    assert pricing.read_json_cache(primary)["models"] == [{"id": "cached"}]
+
+
+def test_catalog_cache_paths_prefer_pricing_cache_env(monkeypatch, tmp_path: Path):
+    from mnemos.domain.pantheon import catalog
+
+    pricing_cache = tmp_path / "pricing-writes-here.json"
+    legacy_cache = tmp_path / "legacy-reader.json"
+    monkeypatch.setenv("PANTHEON_CATALOG_CACHE", str(pricing_cache))
+    monkeypatch.setenv("MNEMOS_PANTHEON_CATALOG_CACHE_PATH", str(legacy_cache))
+    monkeypatch.setattr(
+        catalog,
+        "get_settings",
+        lambda: SimpleNamespace(pantheon=SimpleNamespace(catalog_cache_path=None)),
+    )
+
+    paths = catalog._catalog_cache_paths()  # noqa: SLF001
+
+    assert paths[0] == pricing_cache
+    assert legacy_cache in paths
 
 
 @pytest.mark.asyncio
