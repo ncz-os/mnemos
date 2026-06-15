@@ -9,11 +9,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from mnemos.api.dependencies import UserContext, require_root
+from mnemos.api.extra_guards import require_extra
 from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.core.plan_windows import compute_plan_window_id, plan_path_kind
 from mnemos.persistence.base import UsageLedgerRecord
 
-router = APIRouter(prefix="/v1", tags=["ledger"])
+router = APIRouter(prefix="/v1", tags=["ledger"], dependencies=[require_extra("knemon", label="KNEMON")])
 
 
 class LedgerRecordRequest(BaseModel):

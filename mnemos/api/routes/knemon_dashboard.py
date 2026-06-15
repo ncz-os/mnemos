@@ -13,9 +13,10 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import HTMLResponse
 
 from mnemos.api.dependencies import UserContext, require_root
+from mnemos.api.extra_guards import require_extra
 from mnemos.api.persistence_helpers import backend_or_503
 
-router = APIRouter(prefix="/v1/knemon", tags=["knemon"])
+router = APIRouter(prefix="/v1/knemon", tags=["knemon"], dependencies=[require_extra("knemon", label="KNEMON")])
 
 _CACHE_TTL_SECONDS = 30  # 30s incremental refresh per task
 _CACHE: dict[tuple[Any, ...], tuple[float, Any]] = {}
