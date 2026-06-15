@@ -52,6 +52,9 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://127.0.0.1:4101")
     parser.add_argument("--api-key", default="shadow-smoke")
     parser.add_argument("--model", default="auto:cheap")
+    # Tool-call assertions need a model that reliably emits tool_calls; auto:cheap
+    # may resolve to a model that answers in prose. Pin a tool-native default.
+    parser.add_argument("--tool-model", default="llama-3.3-70b-versatile")
     parser.add_argument("--codex-model", default="gpt-5.3-codex")
     args = parser.parse_args()
     headers = {"Authorization": f"Bearer {args.api_key}"}
@@ -66,7 +69,7 @@ def main() -> int:
         tool = client.post(
             "/v1/chat/completions",
             json={
-                "model": args.model,
+                "model": args.tool_model,
                 "messages": [{"role": "user", "content": "call the echo tool with x=1"}],
                 "tools": [
                     {
@@ -90,7 +93,7 @@ def main() -> int:
         tool_result = client.post(
             "/v1/chat/completions",
             json={
-                "model": args.model,
+                "model": args.tool_model,
                 "messages": [
                     {"role": "user", "content": "call the echo tool with x=1"},
                     {"role": "assistant", "content": None, "tool_calls": first_tool_calls},
