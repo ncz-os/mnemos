@@ -658,12 +658,26 @@ class PantheonSettings(BaseSettings):
         1,
         validation_alias="MNEMOS_PANTHEON_ROUTING_LOG_DRAIN_WORKERS",
     )
+    reasoning_output_token_budget: int = Field(
+        8000,
+        validation_alias="MNEMOS_PANTHEON_REASONING_OUTPUT_TOKEN_BUDGET",
+    )
+    shadow_port: int = Field(
+        4101,
+        validation_alias="MNEMOS_PANTHEON_SHADOW_PORT",
+    )
+    catalog_cache_path: str | None = Field(
+        None,
+        validation_alias="MNEMOS_PANTHEON_CATALOG_CACHE_PATH",
+    )
 
     @field_validator(
         "consultation_cap",
         "routing_window_minutes",
         "routing_log_queue_size",
         "routing_log_drain_workers",
+        "reasoning_output_token_budget",
+        "shadow_port",
         mode="before",
     )
     @classmethod

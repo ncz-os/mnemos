@@ -32,7 +32,14 @@ def _cost_sort_value(candidate: dict[str, Any] | str) -> tuple[bool, float, str]
     if isinstance(candidate, str):
         return (True, float("inf"), candidate)
     cost = candidate.get("cost_per_mtok")
-    return (cost is None, safe_float(cost) if cost is not None else float("inf"), _candidate_backend(candidate))
+    if cost is None:
+        in_cost = candidate.get("input_cost_per_mtok", candidate.get("price_in"))
+        out_cost = candidate.get("output_cost_per_mtok", candidate.get("price_out"))
+        if in_cost is not None and out_cost is not None:
+            cost = (safe_float(in_cost) + safe_float(out_cost)) / 2.0
+    quality = -safe_float(candidate.get("quality_score") or candidate.get("graeae_weight") or 0.0)
+    latency = safe_float(candidate.get("p50_latency_ms") or candidate.get("latency_ms") or 0.0)
+    return (cost is None, safe_float(cost) if cost is not None else float("inf"), quality, latency, _candidate_backend(candidate))
 
 
 def _fallback_cheapest(candidates: list[dict[str, Any] | str]) -> dict[str, Any] | str:
