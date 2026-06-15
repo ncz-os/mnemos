@@ -12,6 +12,7 @@ include DOCUMENT_IMPORT_GUIDE.md
 include install.sh
 include deploy.sh
 include Makefile
+recursive-include deploy/pantheon *
 include Dockerfile
 include docker-compose.yml
 include docker-gpu-setup.sh

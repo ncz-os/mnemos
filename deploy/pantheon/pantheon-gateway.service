@@ -1,0 +1,28 @@
+[Unit]
+Description=MNEMOS PANTHEON OpenAI-compatible gateway worker pool
+Documentation=file:/opt/mnemos/deploy/pantheon/README.md
+After=network-online.target nats-server.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=mnemos
+Group=mnemos
+WorkingDirectory=/opt/mnemos
+EnvironmentFile=-/etc/mnemos/pantheon-gateway.env
+Environment=MNEMOS_PANTHEON_ENABLED=true
+Environment=PANTHEON_BIND=127.0.0.1:4110
+Environment=WEB_CONCURRENCY=4
+ExecStart=/opt/mnemos/deploy/pantheon/pantheon-gunicorn.sh
+Restart=always
+RestartSec=5s
+KillSignal=SIGQUIT
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/mnemos /var/log/mnemos /tmp
+
+[Install]
+WantedBy=multi-user.target
