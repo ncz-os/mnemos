@@ -4250,7 +4250,7 @@ class PostgresBackend:
         row = await _postgres_tx(tx).conn.fetchrow(
             """
             WITH resolved_prices AS (
-                SELECT input_cost_per_mtok, output_cost_per_mtok, raw
+                SELECT input_cost_per_mtok, output_cost_per_mtok
                 FROM model_registry
                 WHERE provider=$1 AND model_id=$2
             ),
@@ -4273,11 +4273,7 @@ class PostgresBackend:
                     CASE WHEN COALESCE(pl.auth_method, 'api') = 'subscription' THEN 0
                          ELSE (($4::NUMERIC * COALESCE(rp.input_cost_per_mtok, 0)::NUMERIC)
                               + ($5::NUMERIC * COALESCE(rp.output_cost_per_mtok, 0)::NUMERIC)
-                              + ($6::NUMERIC * COALESCE(
-                                  NULLIF(rp.raw->>'reasoning_cost_per_mtok', '')::NUMERIC,
-                                  rp.output_cost_per_mtok,
-                                  0
-                                )::NUMERIC)) / 1000000
+                              + ($6::NUMERIC * COALESCE(rp.output_cost_per_mtok, 0)::NUMERIC)) / 1000000
                     END,
                     $7, $8, $9, $10, $11, $12, $13, $14,
                     COALESCE(pl.auth_method, 'api') = 'subscription'

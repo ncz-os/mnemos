@@ -92,7 +92,7 @@ class _PolicyConnection:
         compact = " ".join(query.split())
         if "FROM model_registry" in compact:
             return []
-        if "category='pantheon_routing'" not in compact:
+        if "FROM pantheon_routing_audit" not in compact:
             return []
         window_minutes = int(args[0])
         candidates = set(args[1])
@@ -155,6 +155,10 @@ def _routing_memories(db_pool) -> list[dict[str, Any]]:
         memory for memory in db_pool.state["memories"].values()
         if memory.get("category") == "pantheon_routing"
     ]
+
+
+def _routing_audits(db_pool) -> list[dict[str, Any]]:
+    return list(db_pool.state.get("pantheon_routing_audit", []))
 
 
 @pytest_asyncio.fixture
@@ -263,7 +267,7 @@ async def test_agentic_cap_is_independent_by_session(pantheon_v02_client):
 
 
 @pytest.mark.asyncio
-async def test_routing_log_success_writes_pantheon_memory(pantheon_v02_client):
+async def test_routing_log_success_writes_pantheon_audit_not_memory(pantheon_v02_client):
     client, db_pool = pantheon_v02_client
 
     response = await client.post(
@@ -274,8 +278,9 @@ async def test_routing_log_success_writes_pantheon_memory(pantheon_v02_client):
     await _drain_background_tasks()
 
     assert response.status_code == 200
-    [memory] = _routing_memories(db_pool)
-    payload = json.loads(memory["content"])
+    assert _routing_memories(db_pool) == []
+    [audit] = _routing_audits(db_pool)
+    payload = audit["payload"]
     assert payload["tenant_user_id"] == "alice"
     assert payload["alias_or_model"] == "cheap-chat"
     assert payload["resolved_to"] == "cheap-chat"
@@ -283,11 +288,33 @@ async def test_routing_log_success_writes_pantheon_memory(pantheon_v02_client):
     assert payload["tokens_in"] == 10
     assert payload["tokens_out"] == 5
     assert payload["cost_usd"] is not None
-    assert memory["owner_id"] == "system:pantheon"
-    assert memory["namespace"] == "pantheon"
-    assert memory["metadata"]["pantheon_version"] == "0.2"
-    assert memory["metadata"]["session_id"] == "log-success"
-    assert memory["metadata"]["usage_tier"] == "agentic_ok"
+    assert payload["metadata"]["pantheon_version"] == "0.2"
+    assert payload["metadata"]["session_id"] == "log-success"
+    assert payload["metadata"]["usage_tier"] == "agentic_ok"
+    assert db_pool.state["usage_ledger"][-1]["caller_subsystem"] == "pantheon"
+
+
+@pytest.mark.asyncio
+async def test_pantheon_budget_denies_when_knemon_over_cap(monkeypatch, pantheon_v02_client):
+    from mnemos.core.config import _reset_settings_for_tests
+
+    client, db_pool = pantheon_v02_client
+    db_pool.state["usage_ledger"].append({"caller_subsystem": "pantheon", "est_cost_usd": 201})
+    monkeypatch.setenv("MNEMOS_KNEMON_WEEKLY_BUDGET_CAP_USD", "200")
+    _reset_settings_for_tests()
+    try:
+        response = await client.post(
+            "/pantheon/v1/chat/completions",
+            json={"model": "cheap-chat", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Pantheon-Session": "over-budget"},
+        )
+    finally:
+        monkeypatch.delenv("MNEMOS_KNEMON_WEEKLY_BUDGET_CAP_USD", raising=False)
+        _reset_settings_for_tests()
+
+    assert response.status_code == 402
+    assert response.json()["error"]["type"] == "pantheon_budget_exceeded"
+    assert _routing_audits(db_pool) == []
 
 
 @pytest.mark.asyncio
@@ -309,12 +336,13 @@ async def test_routing_log_error_writes_error_outcome(monkeypatch, pantheon_v02_
     await _drain_background_tasks()
 
     assert response.status_code == 502
-    [memory] = _routing_memories(db_pool)
-    payload = json.loads(memory["content"])
+    assert _routing_memories(db_pool) == []
+    [audit] = _routing_audits(db_pool)
+    payload = audit["payload"]
     assert payload["outcome"] == "error"
     assert payload["error_class"] == "PantheonGatewayError"
-    assert memory["metadata"]["outcome"] == "error"
-    assert memory["metadata"]["error_class"] == "PantheonGatewayError"
+    assert payload["metadata"]["outcome"] == "error"
+    assert payload["metadata"]["error_class"] == "PantheonGatewayError"
 
 
 @pytest.mark.asyncio
