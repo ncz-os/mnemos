@@ -140,10 +140,10 @@ def build_fallback_chain(
     The alias's own ranked candidate pool (``primary.candidates``) is the natural
     fallback set: ``primary`` first, then each DISTINCT ``(provider, model_id)``
     candidate resolved against the ``models`` catalog. Pure (the caller supplies
-    the catalog). Consensus/auto-special decisions are returned as a single-
-    element chain (fallback does not apply). Bounded by ``max_chain``.
+    the catalog). Consensus decisions are returned as a single-element chain
+    because they are handled by the consultation path. Bounded by ``max_chain``.
     """
-    if primary.route_type != "single":
+    if primary.route_type == "consensus":
         return [primary]
     by_id: dict[str, dict[str, Any]] = {}
     ambiguous: set[str] = set()
