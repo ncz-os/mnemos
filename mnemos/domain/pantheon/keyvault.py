@@ -32,6 +32,9 @@ _DEFAULT_ENV_MAP: dict[str, str] = {
     "deepseek": "DEEPSEEK_API_KEY",
     "deepseek-direct": "DEEPSEEK_API_KEY",
     "nvidia": "NVIDIA_API_KEY",
+    "ngc": "NVIDIA_API_KEY",
+    "eih": "EIH_API_KEY",
+    "openai": "OPENAI_API_KEY",
 }
 
 
