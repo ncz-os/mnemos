@@ -10,6 +10,7 @@ from mnemos.core.resilience import (
     InProcessConcurrencyLimiterPool,
     InProcessRateLimiter,
     InProcessRateLimiterPool,
+    NatsCircuitBreakerPool,
     RedisCircuitBreakerPool,
     RedisConcurrencyLimiterPool,
     RedisRateLimiterPool,
@@ -18,6 +19,55 @@ from mnemos.core.resilience import (
     make_concurrency_limiter,
     make_rate_limiter_pool,
 )
+
+
+class _WrongLastError(Exception):
+    pass
+
+
+class _NotFoundError(Exception):
+    pass
+
+
+class _FakeKvEntry:
+    def __init__(self, value: bytes, revision: int):
+        self.value = value
+        self.revision = revision
+
+
+class _FakeNatsKv:
+    def __init__(self):
+        self._values: dict[str, tuple[bytes, int]] = {}
+        self._rev = 0
+
+    async def get(self, key: str):
+        try:
+            value, revision = self._values[key]
+        except KeyError:
+            raise _NotFoundError("not found")
+        return _FakeKvEntry(value, revision)
+
+    async def create(self, key: str, value: bytes, **kwargs):
+        if key in self._values:
+            raise _WrongLastError("wrong last sequence")
+        if kwargs:
+            raise AssertionError(f"per-key KV kwargs are not supported: {kwargs}")
+        return await self.put(key, value)
+
+    async def put(self, key: str, value: bytes):
+        self._rev += 1
+        self._values[key] = (value, self._rev)
+        return self._rev
+
+    async def update(self, key: str, value: bytes, *, last: int, **kwargs):
+        if key not in self._values:
+            raise _WrongLastError("wrong last sequence")
+        _old, revision = self._values[key]
+        if revision != last:
+            raise _WrongLastError("wrong last sequence")
+        if kwargs:
+            raise AssertionError(f"per-key KV kwargs are not supported: {kwargs}")
+        return await self.put(key, value)
 
 
 class _FakeAsyncRedis:
@@ -138,6 +188,8 @@ def _settings(storage_uri: str = "memory://", *, fallback_warning: bool = False)
         ),
         server=SimpleNamespace(redis_url="redis://cache:6379/0"),
         federation=SimpleNamespace(peers="", enabled=False),
+        layers=SimpleNamespace(active_layers=[]),
+        nats=SimpleNamespace(url=None, token=None),
     )
 
 
@@ -290,7 +342,7 @@ def test_factory_memory_uri_returns_in_process_and_warns(caplog):
     pool = make_circuit_breaker_pool(settings)
 
     assert isinstance(pool, InProcessCircuitBreakerPool)
-    assert "Redis not configured" in caplog.text
+    assert "Redis/NATS not configured" in caplog.text
     assert "Multi-worker deployments require Redis" in caplog.text
 
 
@@ -348,3 +400,44 @@ def test_lifecycle_redis_unreachable_degrades_to_no_resilience_client(monkeypatc
     asyncio.run(run())
 
     assert "Redis resilience backend unavailable" in caplog.text
+
+
+def test_nats_circuit_breaker_cross_instance_and_success_preserves_peer_trip():
+    async def run():
+        kv = _FakeNatsKv()
+        first = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=2, cooldown_seconds=60)
+        second = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=2, cooldown_seconds=60)
+        try:
+            await first.record_failure("openai")
+            assert await second.is_allowed("openai")
+            await second.record_failure("openai")
+            assert not await first.is_allowed("openai")
+            await first.record_success("openai")
+            assert not await second.is_allowed("openai")
+        finally:
+            first.close()
+            second.close()
+
+    asyncio.run(run())
+
+
+def test_make_circuit_breaker_pool_preserves_redis_precedence_when_nats_set():
+    from mnemos.core.resilience import RedisCircuitBreakerPool
+
+    settings = _settings("redis://cache:6379/0")
+    settings.nats = SimpleNamespace(url="nats://localhost:4222", token=None)
+    pool = make_circuit_breaker_pool(settings, redis_client=_FakeAsyncRedis(), nats_kv=_FakeNatsKv())
+    assert isinstance(pool, RedisCircuitBreakerPool)
+
+
+def test_nats_circuit_breaker_keys_are_opaque():
+    from mnemos.core.resilience import NatsCircuitBreaker
+
+    breaker = NatsCircuitBreaker(_FakeNatsKv(), "cb.", failure_threshold=2, cooldown_seconds=60)
+    try:
+        key = breaker._key("provider/model:identity")
+        assert key.startswith("cb.circuit.")
+        for plaintext in ("provider", "model", "identity"):
+            assert plaintext not in key
+    finally:
+        breaker.close()
