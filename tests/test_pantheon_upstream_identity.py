@@ -57,6 +57,8 @@ def test_upstream_forward_attaches_identity_headers(monkeypatch):
             return {"id": "chatcmpl-test", "choices": [], "usage": {}}
 
     class _Client:
+        is_closed = False
+
         def __init__(self, **_kwargs):
             pass
 
@@ -66,7 +68,7 @@ def test_upstream_forward_attaches_identity_headers(monkeypatch):
         async def __aexit__(self, *_exc):
             return False
 
-        async def post(self, url, *, json, headers):
+        async def post(self, url, *, json, headers, **_kwargs):
             recorded["url"] = url
             recorded["json"] = json
             recorded["headers"] = headers
@@ -88,6 +90,9 @@ def test_upstream_forward_attaches_identity_headers(monkeypatch):
         session_id="session-1",
         request_id="request-1",
     )
+    # forward_chat_completion uses a cached module-level client; reset it so the
+    # monkeypatched fake AsyncClient is the one actually instantiated.
+    monkeypatch.setattr(gateway, "_http_client", None)
     monkeypatch.setattr(gateway.httpx, "AsyncClient", _Client)
     monkeypatch.setattr(gateway, "get_graeae_engine", lambda: _Engine())
     monkeypatch.setattr(gateway, "get_key", lambda _key_name: "provider-key")
