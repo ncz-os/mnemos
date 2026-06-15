@@ -14,7 +14,9 @@ from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.core.config import get_settings
 from mnemos.core.services import service_enabled
 from mnemos.core.extras import is_extra_installed, missing_extra_detail
+from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.core.rate_limit import limiter
+from mnemos.persistence.base import UsageLedgerRecord
 
 router = APIRouter(prefix="/pantheon/v1", tags=["pantheon"])
 logger = logging.getLogger(__name__)
@@ -54,12 +56,12 @@ def _require_enabled() -> None:
         raise HTTPException(status_code=503, detail="PANTHEON disabled in this profile")
 
 
-def _pantheon_imports() -> tuple[Any, Any, Any, Any, Any, Any, Any]:
+def _pantheon_imports() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
     _require_enabled()
-    from mnemos.domain.pantheon import catalog, gateway, router as pantheon_router
+    from mnemos.domain.pantheon import budget, catalog, gateway, router as pantheon_router
     from mnemos.domain.pantheon.aliases import PantheonRoutingError
     from mnemos.domain.pantheon.caps import consultation_cap_bucket
-    from mnemos.domain.pantheon.routing_log import routing_payload, schedule_routing_memory
+    from mnemos.domain.pantheon.routing_log import routing_payload, schedule_routing_audit
 
     return (
         catalog,
@@ -68,7 +70,8 @@ def _pantheon_imports() -> tuple[Any, Any, Any, Any, Any, Any, Any]:
         PantheonRoutingError,
         consultation_cap_bucket,
         routing_payload,
-        schedule_routing_memory,
+        schedule_routing_audit,
+        budget,
     )
 
 
@@ -171,10 +174,9 @@ def _check_consultation_cap(
     )
 
 
-def _log_route_outcome(
+def _audit_payload_for_response(
     *,
     routing_payload: Any,
-    schedule_routing_memory: Any,
     request_id: str,
     tenant_user_id: str,
     session_id: str,
@@ -185,8 +187,8 @@ def _log_route_outcome(
     error_class: str | None = None,
     namespace: str | None = None,
     forwarded_user: str | None = None,
-) -> None:
-    payload, metadata = routing_payload(
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return routing_payload(
         request_id=request_id,
         tenant_user_id=tenant_user_id,
         session_id=session_id,
@@ -198,7 +200,117 @@ def _log_route_outcome(
         namespace=namespace,
         forwarded_user=forwarded_user,
     )
-    schedule_routing_memory(payload, metadata)
+
+
+def _estimate_cost_usd(decision: Any, body: dict[str, Any]) -> float:
+    pantheon = body.get("pantheon") if isinstance(body.get("pantheon"), dict) else {}
+    raw = body.get("estimated_cost_usd", pantheon.get("estimated_cost_usd"))
+    if raw is not None:
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.0
+    model = decision.model or {}
+    max_tokens = body.get("max_tokens", pantheon.get("max_tokens", 0))
+    try:
+        out_tokens = max(0, int(max_tokens or 0))
+    except (TypeError, ValueError):
+        out_tokens = 0
+    in_cost = float(model.get("input_cost_per_mtok") or model.get("cost_per_mtok") or 0.0)
+    out_cost = float(model.get("output_cost_per_mtok") or model.get("cost_per_mtok") or 0.0)
+    return (out_tokens * out_cost) / 1_000_000.0 if out_tokens else (in_cost + out_cost) / 1_000_000.0
+
+
+def _budget_denied_response(decision: Any) -> JSONResponse:
+    return JSONResponse(
+        status_code=402,
+        content={
+            "error": {
+                "type": "pantheon_budget_exceeded",
+                "message": decision.reason,
+                "remaining_usd": decision.remaining_usd,
+                "limit_usd": decision.limit_usd,
+                "spent_usd": decision.spent_usd,
+            }
+        },
+    )
+
+
+async def _check_budget_or_deny(budget_module: Any, decision: Any, body: dict[str, Any]) -> JSONResponse | None:
+    import mnemos.core.lifecycle as lc
+
+    budget_decision = await budget_module.evaluate_budget(
+        backend=lc._persistence_backend,
+        estimated_cost_usd=_estimate_cost_usd(decision, body),
+        caller_subsystem="pantheon",
+    )
+    return None if budget_decision.allowed else _budget_denied_response(budget_decision)
+
+
+async def _record_pantheon_ledger(payload: dict[str, Any], metadata: dict[str, Any], decision: Any) -> None:
+    import mnemos.core.lifecycle as lc
+
+    backend = lc._persistence_backend
+    recorder = getattr(backend, "record_usage_ledger", None) if backend is not None else None
+    if recorder is None:
+        return
+    model = decision.model or {}
+    record = UsageLedgerRecord(
+        provider=str(decision.provider or "pantheon"),
+        model=str(decision.model_id or decision.alias),
+        task_kind=str(decision.task_type or payload.get("alias_or_model") or "pantheon"),
+        tokens_in=int(payload.get("tokens_in") or 0),
+        tokens_out=int(payload.get("tokens_out") or 0),
+        tokens_reasoning=0,
+        latency_ms=int(round(float(payload.get("latency_ms") or 0))),
+        outcome="ok" if payload.get("outcome") == "success" else "err",
+        caller_subsystem="pantheon",
+        tier="api",
+        session_id=str(metadata.get("session_id") or "") or None,
+        request_count=1,
+        plan_window_id=compute_plan_window_id(str(decision.provider or "pantheon"), "api"),
+        path_kind="api",
+    )
+    try:
+        async with backend.transactional() as tx:
+            result = await recorder(tx, record)
+        if payload.get("cost_usd") is None:
+            payload["cost_usd"] = float(result.est_cost_usd)
+            metadata["cost_usd"] = payload["cost_usd"]
+    except Exception as exc:
+        logger.debug("[PANTHEON] usage_ledger record failed: %s", exc)
+
+
+async def _log_route_outcome(
+    *,
+    routing_payload: Any,
+    schedule_routing_audit: Any,
+    request_id: str,
+    tenant_user_id: str,
+    session_id: str,
+    decision: Any,
+    outcome: str,
+    started_at: float,
+    response: dict[str, Any] | None = None,
+    error_class: str | None = None,
+    namespace: str | None = None,
+    forwarded_user: str | None = None,
+) -> None:
+    payload, metadata = _audit_payload_for_response(
+        routing_payload=routing_payload,
+        request_id=request_id,
+        tenant_user_id=tenant_user_id,
+        session_id=session_id,
+        decision=decision,
+        outcome=outcome,
+        started_at=started_at,
+        response=response,
+        error_class=error_class,
+        namespace=namespace,
+        forwarded_user=forwarded_user,
+    )
+    await _record_pantheon_ledger(payload, metadata, decision)
+    schedule_routing_audit(payload, metadata)
 
 
 @router.get("/models")
@@ -227,7 +339,8 @@ async def chat_completions(
         PantheonRoutingError,
         consultation_cap_bucket,
         routing_payload,
-        schedule_routing_memory,
+        schedule_routing_audit,
+        budget,
     ) = _pantheon_imports()
     if not isinstance(body.get("messages"), list) or not body["messages"]:
         raise HTTPException(status_code=400, detail="messages required")
@@ -246,12 +359,15 @@ async def chat_completions(
         )
         if cap_result is not None and not cap_result.allowed:
             return _consultation_cap_exceeded(cap_result)
+        budget_response = await _check_budget_or_deny(budget, decision, body)
+        if budget_response is not None:
+            return budget_response
         started_at = time.perf_counter()
         if body.get("stream") is True:
             forward_body = gateway.attach_upstream_identity(body, identity)
-            _log_route_outcome(
+            await _log_route_outcome(
                 routing_payload=routing_payload,
-                schedule_routing_memory=schedule_routing_memory,
+                schedule_routing_audit=schedule_routing_audit,
                 request_id=request_id,
                 tenant_user_id=user.user_id,
                 session_id=session_id,
@@ -267,9 +383,9 @@ async def chat_completions(
             )
         forward_body = gateway.attach_upstream_identity(body, identity)
         response_data = await gateway.forward_chat_completion(decision, forward_body)
-        _log_route_outcome(
+        await _log_route_outcome(
             routing_payload=routing_payload,
-            schedule_routing_memory=schedule_routing_memory,
+            schedule_routing_audit=schedule_routing_audit,
             request_id=request_id,
             tenant_user_id=user.user_id,
             session_id=session_id,
@@ -285,9 +401,9 @@ async def chat_completions(
         raise _to_http_exception(exc) from exc
     except gateway.PantheonGatewayError as exc:
         if decision is not None:
-            _log_route_outcome(
+            await _log_route_outcome(
                 routing_payload=routing_payload,
-                schedule_routing_memory=schedule_routing_memory,
+                schedule_routing_audit=schedule_routing_audit,
                 request_id=request_id,
                 tenant_user_id=user.user_id,
                 session_id=session_id,
@@ -316,7 +432,8 @@ async def embeddings(
         PantheonRoutingError,
         _consultation_cap_bucket,
         routing_payload,
-        schedule_routing_memory,
+        schedule_routing_audit,
+        budget,
     ) = _pantheon_imports()
     if "input" not in body:
         raise HTTPException(status_code=400, detail="input is required")
@@ -327,12 +444,15 @@ async def embeddings(
     identity = _upstream_identity(gateway, request, user, session_id=session_id, request_id=request_id)
     try:
         decision = await pantheon_router.route_model(model, body)
+        budget_response = await _check_budget_or_deny(budget, decision, body)
+        if budget_response is not None:
+            return budget_response
         started_at = time.perf_counter()
         forward_body = gateway.attach_upstream_identity(body, identity)
         response_data = await gateway.forward_embeddings(decision, forward_body)
-        _log_route_outcome(
+        await _log_route_outcome(
             routing_payload=routing_payload,
-            schedule_routing_memory=schedule_routing_memory,
+            schedule_routing_audit=schedule_routing_audit,
             request_id=request_id,
             tenant_user_id=user.user_id,
             session_id=session_id,
@@ -348,9 +468,9 @@ async def embeddings(
         raise _to_http_exception(exc) from exc
     except gateway.PantheonGatewayError as exc:
         if decision is not None:
-            _log_route_outcome(
+            await _log_route_outcome(
                 routing_payload=routing_payload,
-                schedule_routing_memory=schedule_routing_memory,
+                schedule_routing_audit=schedule_routing_audit,
                 request_id=request_id,
                 tenant_user_id=user.user_id,
                 session_id=session_id,
@@ -381,7 +501,8 @@ async def route_explain(
         PantheonRoutingError,
         _consultation_cap_bucket,
         _routing_payload,
-        _schedule_routing_memory,
+        _schedule_routing_audit,
+        _budget,
     ) = _pantheon_imports()
     request_body: dict[str, Any] = dict(body or {})
     if model_or_alias is not None:
