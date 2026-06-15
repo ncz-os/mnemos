@@ -7,10 +7,11 @@ from dataclasses import asdict
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from mnemos.api.dependencies import UserContext, require_root
+from mnemos.api.extra_guards import require_extra
 from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.domain.knemon.router import KnemonRouteRequest, NoModelAvailable, route
 
-router = APIRouter(prefix="/v1/knemon", tags=["knemon"])
+router = APIRouter(prefix="/v1/knemon", tags=["knemon"], dependencies=[require_extra("knemon", label="KNEMON")])
 
 
 def _csv(value: str | None) -> list[str]:
