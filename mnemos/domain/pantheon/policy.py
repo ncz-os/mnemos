@@ -67,15 +67,14 @@ async def _fetch_window(pool: Any, candidate_list: list[str], window_minutes: in
         return list(
             await conn.fetch(
                 """
-                SELECT metadata->>'resolved_to' AS backend,
-                       AVG((metadata->>'latency_ms')::FLOAT) AS avg_latency_ms,
-                       SUM(CASE WHEN metadata->>'outcome' = 'error' THEN 1 ELSE 0 END)::FLOAT
+                SELECT resolved_to AS backend,
+                       AVG(latency_ms::FLOAT) AS avg_latency_ms,
+                       SUM(CASE WHEN outcome = 'error' THEN 1 ELSE 0 END)::FLOAT
                          / COUNT(*)::FLOAT AS error_rate,
-                       AVG((metadata->>'cost_usd')::FLOAT) AS avg_cost
-                FROM memories
-                WHERE category='pantheon_routing'
-                  AND created > NOW() - ($1::int * INTERVAL '1 minute')
-                  AND metadata->>'resolved_to' = ANY($2::text[])
+                       AVG(cost_usd::FLOAT) AS avg_cost
+                FROM pantheon_routing_audit
+                WHERE created > NOW() - ($1::int * INTERVAL '1 minute')
+                  AND resolved_to = ANY($2::text[])
                 GROUP BY backend
                 """,
                 int(window_minutes),
