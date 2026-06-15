@@ -1349,7 +1349,7 @@ class GraeaeEngine:
         if "top_p" in generation_params:
             payload["top_p"] = generation_params["top_p"]
         for field in (
-            "tools", "tool_choice", "response_format", "stop", "n",
+            "tools", "tool_choice", "parallel_tool_calls", "response_format", "stop", "n",
             "presence_penalty", "frequency_penalty", "user",
         ):
             if field in request_params:
