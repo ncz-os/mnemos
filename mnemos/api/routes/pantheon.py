@@ -17,6 +17,7 @@ from mnemos.core.extras import is_extra_installed, missing_extra_detail
 from mnemos.core.rate_limit import limiter
 
 router = APIRouter(prefix="/pantheon/v1", tags=["pantheon"])
+openai_router = APIRouter(prefix="/v1", tags=["pantheon-openai-shadow"])
 logger = logging.getLogger(__name__)
 
 
@@ -185,6 +186,7 @@ def _log_route_outcome(
     error_class: str | None = None,
     namespace: str | None = None,
     forwarded_user: str | None = None,
+    resolved_wire_model: str | None = None,
 ) -> None:
     payload, metadata = routing_payload(
         request_id=request_id,
@@ -197,8 +199,14 @@ def _log_route_outcome(
         error_class=error_class,
         namespace=namespace,
         forwarded_user=forwarded_user,
+        resolved_wire_model=resolved_wire_model,
     )
     schedule_routing_memory(payload, metadata)
+
+
+async def _list_models_impl() -> dict[str, Any]:
+    catalog, *_ = _pantheon_imports()
+    return await catalog.models_response()
 
 
 @router.get("/models")
@@ -208,18 +216,14 @@ async def list_models(
     authorization: str | None = Header(None),
     user: UserContext = Depends(_pantheon_user),
 ) -> dict[str, Any]:
-    catalog, *_ = _pantheon_imports()
-    return await catalog.models_response()
+    return await _list_models_impl()
 
 
-@router.post("/chat/completions")
-@limiter.limit("60/minute", key_func=_pantheon_rate_key)
-async def chat_completions(
+async def _chat_completions_impl(
     request: Request,
-    body: dict[str, Any] = Body(...),
-    authorization: str | None = Header(None),
-    user: UserContext = Depends(_pantheon_user),
-):
+    body: dict[str, Any],
+    user: UserContext,
+) -> Any:
     (
         _catalog,
         gateway,
@@ -247,8 +251,8 @@ async def chat_completions(
         if cap_result is not None and not cap_result.allowed:
             return _consultation_cap_exceeded(cap_result)
         started_at = time.perf_counter()
+        forward_body = gateway.attach_upstream_identity(body, identity)
         if body.get("stream") is True:
-            forward_body = gateway.attach_upstream_identity(body, identity)
             _log_route_outcome(
                 routing_payload=routing_payload,
                 schedule_routing_memory=schedule_routing_memory,
@@ -260,12 +264,12 @@ async def chat_completions(
                 started_at=started_at,
                 namespace=user.namespace,
                 forwarded_user=identity.opaque_user,
+                resolved_wire_model=decision.model_id or decision.alias,
             )
             return StreamingResponse(
                 gateway.stream_chat_completion(decision, forward_body),
                 media_type="text/event-stream",
             )
-        forward_body = gateway.attach_upstream_identity(body, identity)
         response_data = await gateway.forward_chat_completion(decision, forward_body)
         _log_route_outcome(
             routing_payload=routing_payload,
@@ -279,6 +283,7 @@ async def chat_completions(
             response=response_data,
             namespace=user.namespace,
             forwarded_user=identity.opaque_user,
+            resolved_wire_model=gateway.resolved_wire_model(response_data, decision),
         )
         return JSONResponse(response_data)
     except PantheonRoutingError as exc:
@@ -299,6 +304,74 @@ async def chat_completions(
                 forwarded_user=identity.opaque_user,
             )
         raise _to_http_exception(exc) from exc
+
+
+@router.post("/chat/completions")
+@limiter.limit("60/minute", key_func=_pantheon_rate_key)
+async def chat_completions(
+    request: Request,
+    body: dict[str, Any] = Body(...),
+    authorization: str | None = Header(None),
+    user: UserContext = Depends(_pantheon_user),
+):
+    return await _chat_completions_impl(request, body, user)
+
+
+async def _responses_impl(
+    request: Request,
+    body: dict[str, Any],
+    user: UserContext,
+) -> Any:
+    # OpenAI Responses compatibility for clients that call /v1/responses
+    # directly. Internally route through the same policy/cooldown gateway and
+    # return an OpenAI-compatible response object.
+    if "messages" not in body:
+        input_value = body.get("input", "")
+        content = input_value if isinstance(input_value, str) else str(input_value)
+        body = {**body, "messages": [{"role": "user", "content": content}]}
+    result = await _chat_completions_impl(request, body, user)
+    if not isinstance(result, JSONResponse):
+        return result
+    import json as _json
+
+    chat = _json.loads(result.body.decode("utf-8"))
+    choice = (chat.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    output: list[dict[str, Any]] = []
+    if message.get("content") is not None:
+        output.append(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": message.get("content") or ""}],
+            }
+        )
+    for call in message.get("tool_calls") or []:
+        fn = call.get("function") or {}
+        output.append(
+            {
+                "type": "function_call",
+                "id": call.get("id"),
+                "call_id": call.get("id"),
+                "name": fn.get("name"),
+                "arguments": fn.get("arguments") or "",
+            }
+        )
+    return JSONResponse(
+        status_code=result.status_code,
+        content={
+            "id": chat.get("id"),
+            "object": "response",
+            "created_at": chat.get("created"),
+            "model": chat.get("model"),
+            "output": output,
+            "usage": {
+                "input_tokens": (chat.get("usage") or {}).get("prompt_tokens", 0),
+                "output_tokens": (chat.get("usage") or {}).get("completion_tokens", 0),
+                "total_tokens": (chat.get("usage") or {}).get("total_tokens", 0),
+            },
+        },
+    )
 
 
 @router.post("/embeddings")
@@ -342,6 +415,7 @@ async def embeddings(
             response=response_data,
             namespace=user.namespace,
             forwarded_user=identity.opaque_user,
+            resolved_wire_model=gateway.resolved_wire_model(response_data, decision),
         )
         return JSONResponse(response_data)
     except PantheonRoutingError as exc:
@@ -362,6 +436,38 @@ async def embeddings(
                 forwarded_user=identity.opaque_user,
             )
         raise _to_http_exception(exc) from exc
+
+
+@openai_router.get("/models")
+@limiter.limit("60/minute", key_func=_pantheon_rate_key)
+async def openai_list_models(
+    request: Request,
+    authorization: str | None = Header(None),
+    user: UserContext = Depends(_pantheon_user),
+) -> dict[str, Any]:
+    return await _list_models_impl()
+
+
+@openai_router.post("/chat/completions")
+@limiter.limit("60/minute", key_func=_pantheon_rate_key)
+async def openai_chat_completions(
+    request: Request,
+    body: dict[str, Any] = Body(...),
+    authorization: str | None = Header(None),
+    user: UserContext = Depends(_pantheon_user),
+):
+    return await _chat_completions_impl(request, body, user)
+
+
+@openai_router.post("/responses")
+@limiter.limit("60/minute", key_func=_pantheon_rate_key)
+async def openai_responses(
+    request: Request,
+    body: dict[str, Any] = Body(...),
+    authorization: str | None = Header(None),
+    user: UserContext = Depends(_pantheon_user),
+):
+    return await _responses_impl(request, body, user)
 
 
 @router.get("/route/explain")

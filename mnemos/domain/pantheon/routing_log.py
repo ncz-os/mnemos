@@ -128,12 +128,14 @@ def routing_payload(
     error_class: str | None = None,
     namespace: str | None = None,
     forwarded_user: str | None = None,
+    resolved_wire_model: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    wire_model = resolved_wire_model or decision.model_id or decision.alias
     payload = {
         "request_id": request_id,
         "tenant_user_id": tenant_user_id,
         "alias_or_model": decision.alias,
-        "resolved_to": decision.model_id or decision.alias,
+        "resolved_to": wire_model,
         "outcome": outcome,
         "latency_ms": latency_ms,
         "tokens_in": _usage_value(response, "prompt_tokens"),
