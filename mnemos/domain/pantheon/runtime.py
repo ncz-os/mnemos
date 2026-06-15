@@ -57,6 +57,11 @@ class RouterRuntime:
         self._sleep = sleep
         self._rng = rng
 
+    @property
+    def cooldown(self) -> CooldownManager:
+        """Public accessor so lifecycle hooks can reach the cooldown store."""
+        return self._cooldown
+
     async def route(
         self,
         deployments: Sequence[Any],
