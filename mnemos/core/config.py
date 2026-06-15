@@ -707,6 +707,7 @@ class PantheonSettings(BaseSettings):
 class KnemonSettings(BaseSettings):
     model_config = _config_model_config(env_prefix="MNEMOS_KNEMON_")
 
+    weekly_budget_cap_usd: float = 200.0
     session_burn_requests_per_hour: int = 10
     session_burn_window_seconds: int = 3600
     subscription_preferred_utilization_pct: float = 70.0
@@ -732,6 +733,15 @@ class KnemonSettings(BaseSettings):
         except (TypeError, ValueError):
             return 0.0
         return max(0.0, min(100.0, value))
+
+    @field_validator("weekly_budget_cap_usd", mode="before")
+    @classmethod
+    def _non_negative_budget(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 200.0
+        return max(0.0, value)
 
     @field_validator("g1_quality_floor", "g2_quality_floor", mode="before")
     @classmethod

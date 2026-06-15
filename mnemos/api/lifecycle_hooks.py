@@ -201,8 +201,9 @@ async def _pantheon_routing_audit_post_db_hook(pool: Any, settings: Any) -> None
 
     from mnemos.workers.pantheon_routing_audit_consumer import consumer_loop
 
+    audit_handle = lifecycle._persistence_backend or pool
     logger.info("Launching PANTHEON routing audit NATS consumer")
-    lifecycle.schedule_worker(consumer_loop(pool, settings=settings))
+    lifecycle.schedule_worker(consumer_loop(audit_handle, settings=settings))
 
 
 def register_lifespan_hooks() -> None:

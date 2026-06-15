@@ -46,7 +46,7 @@ import json
 import logging
 import math
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from typing import Any, AsyncIterator
@@ -841,6 +841,12 @@ class _MysqlTransaction:
         finally:
             await self._release_named_locks()
             self._closed = True
+
+
+def _mysql_tx(tx: Transaction) -> _MysqlTransaction:
+    if not isinstance(tx, _MysqlTransaction):
+        raise TypeError("MySQL repositories require a _MysqlTransaction")
+    return tx
 
 
 # ── Memory repository ─────────────────────────────────────────────────────────
@@ -4423,6 +4429,35 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
             else:
                 if not tx.closed:
                     await tx.commit()
+
+    async def insert_pantheon_routing_audit(
+        self,
+        tx: Transaction,
+        record: Mapping[str, Any],
+    ) -> None:
+        cost_usd = record.get("cost_usd")
+        async with _mysql_tx(tx).conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO pantheon_routing_audit
+                       (request_id, tenant_user_id, alias_or_model, resolved_to, outcome,
+                        latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    record.get("request_id"),
+                    record.get("tenant_user_id"),
+                    record.get("alias_or_model"),
+                    record.get("resolved_to"),
+                    record.get("outcome"),
+                    record.get("latency_ms"),
+                    record.get("tokens_in"),
+                    record.get("tokens_out"),
+                    cost_usd,
+                    record.get("error_class"),
+                    record.get("payload_json"),
+                ),
+            )
 
     @property
     def memories(self) -> MemoryRepository:

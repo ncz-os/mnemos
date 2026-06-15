@@ -24,7 +24,7 @@ import json
 import logging
 import math
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from typing import Any, AsyncIterator
@@ -4676,6 +4676,40 @@ class OracleBackend:
             else:
                 if not tx.closed:
                     await tx.commit()
+
+    async def insert_pantheon_routing_audit(
+        self,
+        tx: Transaction,
+        record: Mapping[str, Any],
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = conn.cursor()
+        try:
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO pantheon_routing_audit
+                       (request_id, tenant_user_id, alias_or_model, resolved_to, outcome,
+                        latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload)
+                VALUES (:request_id, :tenant_user_id, :alias_or_model, :resolved_to, :outcome,
+                        :latency_ms, :tokens_in, :tokens_out, :cost_usd, :error_class, :payload)
+                """,
+                {
+                    "request_id": record.get("request_id"),
+                    "tenant_user_id": record.get("tenant_user_id"),
+                    "alias_or_model": record.get("alias_or_model"),
+                    "resolved_to": record.get("resolved_to"),
+                    "outcome": record.get("outcome"),
+                    "latency_ms": record.get("latency_ms"),
+                    "tokens_in": record.get("tokens_in"),
+                    "tokens_out": record.get("tokens_out"),
+                    "cost_usd": record.get("cost_usd"),
+                    "error_class": record.get("error_class"),
+                    "payload": record.get("payload_json"),
+                },
+            )
+        finally:
+            await _call(cursor.close)
 
     async def record_usage_ledger(
         self,
