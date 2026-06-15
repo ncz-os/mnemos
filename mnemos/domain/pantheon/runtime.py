@@ -27,7 +27,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
-from mnemos.domain.pantheon.cooldown import DEFAULT_TENANT, CooldownManager
+from mnemos.domain.pantheon.cooldown import DEFAULT_TENANT, CooldownDecision, CooldownManager, evaluate_cooldown
 from mnemos.domain.pantheon.errors import NormalizedError
 from mnemos.domain.pantheon.fallback import (
     DEFAULT_MAX_FALLBACKS,
@@ -74,11 +74,63 @@ class RouterRuntime:
 
         is_single = len(group) == 1
 
-        def cooled(deployment: Any) -> bool:
-            return self._cooldown.is_cooled(key_of(deployment), self._clock(), tenant=tenant)
+        async def cooled(deployment: Any) -> bool:
+            store = getattr(self._cooldown, "_store", None)
+            aget = getattr(store, "aget_cooled_until", None)
+            now = self._clock()
+            if aget is not None:
+                cooled_until = await aget(tenant, key_of(deployment))
+                return cooled_until is not None and cooled_until > now
+            return self._cooldown.is_cooled(key_of(deployment), now, tenant=tenant)
 
-        available = [d for d in group if not cooled(d)]
+        cooled_state: dict[str, bool] = {}
+        available = []
+        for deployment in group:
+            deployment_key = key_of(deployment)
+            is_cooled = await cooled(deployment)
+            cooled_state[deployment_key] = is_cooled
+            if not is_cooled:
+                available.append(deployment)
         chain = available or group  # all cooled -> try the full chain anyway
+
+        async def record_success(deployment: Any, now: float) -> None:
+            store = getattr(self._cooldown, "_store", None)
+            aincr = getattr(store, "aincr", None)
+            if aincr is not None:
+                await aincr(tenant, key_of(deployment), self._cooldown._minute(now), success=True)
+                return
+            self._cooldown.record_success(key_of(deployment), now, tenant=tenant)
+
+        async def record_failure(deployment: Any, err: NormalizedError, now: float) -> CooldownDecision:
+            store = getattr(self._cooldown, "_store", None)
+            aincr = getattr(store, "aincr", None)
+            aget_counts = getattr(store, "aget_counts", None)
+            if aincr is not None and aget_counts is not None:
+                minute = self._cooldown._minute(now)
+                deployment_key = key_of(deployment)
+                await aincr(tenant, deployment_key, minute, success=False)
+                successes, failures = await aget_counts(tenant, deployment_key, minute)
+                decision = evaluate_cooldown(
+                    err,
+                    successes=successes,
+                    failures=failures,
+                    is_single_deployment_group=is_single,
+                    cooldown_seconds=self._cooldown._default_cooldown,
+                )
+                if decision.should_cooldown:
+                    aset_cooldown = getattr(store, "aset_cooldown", None)
+                    if aset_cooldown is not None:
+                        await aset_cooldown(tenant, deployment_key, now + decision.cooldown_seconds)
+                    else:
+                        store.set_cooldown(tenant, deployment_key, now + decision.cooldown_seconds)
+                    cooled_state[deployment_key] = True
+                return decision
+            decision = self._cooldown.record_failure(
+                key_of(deployment), err, now, is_single_deployment_group=is_single, tenant=tenant
+            )
+            if decision.should_cooldown:
+                cooled_state[key_of(deployment)] = True
+            return decision
 
         async def instrumented(deployment: Any) -> Any:
             try:
@@ -86,11 +138,9 @@ class RouterRuntime:
             except Exception as exc:  # noqa: BLE001 — record then re-raise for the fallback loop
                 now = self._clock()  # observation time, not request start
                 err = classify(exc)
-                self._cooldown.record_failure(
-                    key_of(deployment), err, now, is_single_deployment_group=is_single, tenant=tenant
-                )
+                await record_failure(deployment, err, now)
                 raise
-            self._cooldown.record_success(key_of(deployment), self._clock(), tenant=tenant)
+            await record_success(deployment, self._clock())
             return result
 
         return await execute_with_fallbacks(
@@ -101,5 +151,5 @@ class RouterRuntime:
             max_fallbacks=self._max_fallbacks,
             sleep=self._sleep,
             rng=self._rng,
-            can_retry=lambda d: not cooled(d),
+            can_retry=lambda d: not cooled_state.get(key_of(d), False),
         )

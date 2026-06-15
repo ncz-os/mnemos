@@ -142,3 +142,165 @@ def test_store_prunes_stale_minute_buckets():
     assert s.get_counts("t", "d", 100) == (0, 0)  # pruned
     assert s.get_counts("t", "d", 101) == (0, 1)  # previous minute kept
     assert s.get_counts("t", "d", 102) == (0, 1)
+
+
+class _WrongLastError(Exception):
+    pass
+
+
+class _NotFoundError(Exception):
+    pass
+
+
+class _FakeKvEntry:
+    def __init__(self, value: bytes, revision: int):
+        self.value = value
+        self.revision = revision
+
+
+class _FakeNatsKv:
+    def __init__(self):
+        self._values: dict[str, tuple[bytes, int]] = {}
+        self._rev = 0
+
+    async def get(self, key: str):
+        try:
+            value, revision = self._values[key]
+        except KeyError:
+            raise _NotFoundError("not found")
+        return _FakeKvEntry(value, revision)
+
+    async def create(self, key: str, value: bytes, **kwargs):
+        if key in self._values:
+            raise _WrongLastError("wrong last sequence")
+        if kwargs:
+            raise AssertionError(f"per-key KV kwargs are not supported: {kwargs}")
+        return await self.put(key, value)
+
+    async def put(self, key: str, value: bytes):
+        self._rev += 1
+        self._values[key] = (value, self._rev)
+        return self._rev
+
+    async def update(self, key: str, value: bytes, *, last: int, **kwargs):
+        if key not in self._values:
+            raise _WrongLastError("wrong last sequence")
+        _old, revision = self._values[key]
+        if revision != last:
+            raise _WrongLastError("wrong last sequence")
+        if kwargs:
+            raise AssertionError(f"per-key KV kwargs are not supported: {kwargs}")
+        return await self.put(key, value)
+
+
+def test_nats_cooldown_cross_instance_failure_accumulation_trips():
+    from mnemos.domain.pantheon.cooldown_nats import NatsJetStreamCooldownStore
+
+    kv = _FakeNatsKv()
+    first = CooldownManager(NatsJetStreamCooldownStore(js=kv))
+    second = CooldownManager(NatsJetStreamCooldownStore(js=kv))
+    try:
+        first.record_success("dep", NOW, tenant="tenant")
+        first.record_success("dep", NOW, tenant="tenant")
+        for _ in range(2):
+            decision = first.record_failure("dep", _err(503), NOW, is_single_deployment_group=False, tenant="tenant")
+            assert not decision.should_cooldown
+        decision = second.record_failure("dep", _err(503), NOW, is_single_deployment_group=False, tenant="tenant")
+        assert decision.should_cooldown
+        assert second.is_cooled("dep", NOW, tenant="tenant")
+    finally:
+        first._store.close()
+        second._store.close()
+
+
+def test_nats_cooldown_peer_seen_on_first_request_and_monotonic():
+    from mnemos.domain.pantheon.cooldown_nats import NatsJetStreamCooldownStore
+
+    kv = _FakeNatsKv()
+    first = NatsJetStreamCooldownStore(js=kv)
+    second = NatsJetStreamCooldownStore(js=kv)
+    try:
+        first.set_cooldown("tenant", "dep", NOW + 100)
+        first.flush()
+        assert second.get_cooled_until("tenant", "dep") == NOW + 100
+        second.set_cooldown("tenant", "dep", NOW + 5)
+        second.flush()
+        assert first.get_cooled_until("tenant", "dep") == NOW + 100
+    finally:
+        first.close()
+        second.close()
+
+
+def test_nats_counter_load_is_idempotent_and_uses_bucket_ttl_only():
+    from mnemos.domain.pantheon.cooldown_nats import NatsJetStreamCooldownStore, _counter_key
+
+    kv = _FakeNatsKv()
+    store = NatsJetStreamCooldownStore(js=kv)
+    try:
+        store.incr("tenant", "dep", 16, success=False)
+        assert store.refresh_counts("tenant", "dep", 16) == (0, 1)
+        assert store.refresh_counts("tenant", "dep", 16) == (0, 1)
+        _counter_key("tenant", "dep", 16)  # key construction remains opaque and deterministic
+    finally:
+        store.close()
+
+
+def test_nats_cooldown_keys_are_opaque():
+    from mnemos.domain.pantheon.cooldown_nats import _cooldown_key, _counter_key
+
+    key = _cooldown_key("namespace:user@example.com", "provider/model")
+    counter = _counter_key("namespace:user@example.com", "provider/model", 16)
+    for plaintext in ("namespace", "user", "example", "provider", "model"):
+        assert plaintext not in key
+        assert plaintext not in counter
+
+
+def test_nats_bucket_created_with_ttl_and_no_per_key_ttl():
+    from mnemos.domain.pantheon.cooldown_nats import NatsJetStreamCooldownStore
+
+    class Missing(Exception):
+        pass
+
+    class FakeJs:
+        def __init__(self):
+            self.configs = []
+            self.config = None
+            self.kv = _FakeNatsKv()
+
+        async def key_value(self, _bucket):
+            raise Missing("not found")
+
+        def create_key_value(self, config=None, **kwargs):
+            self.config = config or kwargs
+            self.configs.append(self.config)
+            return self.kv
+
+    js = FakeJs()
+    store = NatsJetStreamCooldownStore(js=js, counter_ttl_seconds=7)
+    try:
+        store.flush()
+        ttls = [cfg.get("ttl") if isinstance(cfg, dict) else getattr(cfg, "ttl", None) for cfg in js.configs]
+        assert 7 in ttls
+        assert 86400 in ttls
+        store.incr("tenant", "dep", 17, success=False)
+        assert store.refresh_counts("tenant", "dep", 17) == (0, 1)
+    finally:
+        store.close()
+
+
+def test_router_runtime_uses_async_nats_methods_without_sync_result(monkeypatch):
+    from mnemos.domain.pantheon.cooldown_nats import NatsJetStreamCooldownStore
+    from mnemos.domain.pantheon.runtime import RouterRuntime
+
+    store = NatsJetStreamCooldownStore(js=_FakeNatsKv())
+    monkeypatch.setattr(store, "_run_sync", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sync path")))
+    runtime = RouterRuntime(CooldownManager(store), clock=lambda: NOW, sleep=lambda _delay: None)  # type: ignore[arg-type]
+
+    async def call(_deployment):
+        return "ok"
+
+    try:
+        result = __import__("asyncio").run(runtime.route(["dep"], call, classify=lambda exc: _err(500)))
+        assert result.result == "ok"
+    finally:
+        store.close()

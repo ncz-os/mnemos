@@ -464,6 +464,13 @@ class _ResilienceSettings(BaseSettings):
             "MNEMOS_CIRCUIT_BREAKER_REDIS_PREFIX",
         ),
     )
+    circuit_breaker_nats_prefix: str = Field(
+        "cb.",
+        validation_alias=AliasChoices(
+            "MNEMOS_RESILIENCE_CIRCUIT_BREAKER_NATS_PREFIX",
+            "MNEMOS_CIRCUIT_BREAKER_NATS_PREFIX",
+        ),
+    )
     rate_limiter_redis_prefix: str = Field(
         "mnemos:rl:",
         validation_alias=AliasChoices(
@@ -695,6 +702,7 @@ class PantheonSettings(BaseSettings):
         None,
         validation_alias="MNEMOS_PANTHEON_CATALOG_CACHE_PATH",
     )
+    nats_key_secret: str = Field("", validation_alias="MNEMOS_PANTHEON_NATS_KEY_SECRET")
 
     @field_validator(
         "consultation_cap",

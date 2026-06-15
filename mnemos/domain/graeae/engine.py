@@ -504,6 +504,11 @@ class GraeaeEngine:
     async def close(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+        close_breakers = getattr(self._circuit_breakers, "close", None)
+        if close_breakers is not None:
+            result = close_breakers()
+            if asyncio.iscoroutine(result):
+                await result
 
     async def reload_from_registry(self, pool) -> Dict[str, str]:
         """Refresh self.providers[*]['model'] from model_registry.

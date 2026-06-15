@@ -31,8 +31,9 @@ async def _close_pantheon_http_client() -> None:
     if not service_enabled(get_settings(), "pantheon"):
         return
 
-    from mnemos.domain.pantheon.gateway import aclose_http_client
+    from mnemos.domain.pantheon.gateway import aclose_http_client, aclose_runtime
 
+    await aclose_runtime()
     await aclose_http_client()
 
 
