@@ -307,5 +307,66 @@ async def test_live_catalog_reads_synced_json_cache(monkeypatch):
     models = await catalog.list_models()
     response = await catalog.models_response()
 
-    assert [model["id"] for model in models] == ["cached-gpt"]
-    assert response["data"][0]["pricing_source"] == "litellm"
+    cached_model = next(model for model in models if model["id"] == "cached-gpt")
+    response_model = next(model for model in response["data"] if model["id"] == "cached-gpt")
+
+    assert cached_model["pricing_source"] == "litellm"
+    assert response_model["pricing_source"] == "litellm"
+
+
+@pytest.mark.asyncio
+async def test_catalog_includes_codex_fleet_model_with_synced_cache_pricing(monkeypatch):
+    from mnemos.domain.pantheon import catalog
+
+    class _Engine:
+        providers = {
+            "openai": {
+                "url": "https://api.openai.com/v1/chat/completions",
+                "model": "gpt-5.5",
+                "weight": 0.88,
+                "api": "openai",
+                "key_name": "openai",
+                "input_cost_per_mtok": 5.0,
+                "output_cost_per_mtok": 30.0,
+            }
+        }
+
+        def provider_status(self):
+            return {}
+
+    cached = {
+        "schema": "mnemos.pantheon.catalog.v1",
+        "generated_at": "now",
+        "sources": [{"source": "litellm", "ok": True, "records": 8383}],
+        "models": [
+            {
+                "id": "gpt-5.3-codex",
+                "provider": "openai",
+                "registry_provider": "openai",
+                "display_name": "GPT-5.3 Codex",
+                "capabilities": ["code", "reasoning", "tools"],
+                "price_in": 1.1,
+                "price_out": 4.4,
+                "input_cost_per_mtok": 1.1,
+                "output_cost_per_mtok": 4.4,
+                "cost_per_mtok": 2.75,
+                "context_window": 200000,
+                "max_output_tokens": 100000,
+                "pricing_source": "litellm",
+                "pricing_raw_model_id": "gpt-5.3-codex",
+            }
+        ],
+    }
+
+    monkeypatch.setattr(catalog, "get_graeae_engine", lambda: _Engine())
+    monkeypatch.setattr(catalog._lc, "_pool", None)
+    monkeypatch.setattr(pricing, "read_json_cache", lambda *_args, **_kwargs: cached)
+
+    models = await catalog.list_models()
+    by_id = {model["id"]: model for model in models}
+
+    assert "gpt-5.5" in by_id
+    assert by_id["gpt-5.3-codex"]["provider"] == "openai"
+    assert by_id["gpt-5.3-codex"]["price_in"] == 1.1
+    assert by_id["gpt-5.3-codex"]["price_out"] == 4.4
+    assert by_id["gpt-5.3-codex"]["pricing_source"] == "litellm"

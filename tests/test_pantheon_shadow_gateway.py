@@ -162,6 +162,47 @@ def test_endpoint_routing_by_codex_model_uses_responses_url(monkeypatch):
     assert model_uses_responses_api("gpt-5.3-codex") is True
 
 
+def test_codex_fleet_model_is_cataloged_and_resolvable(monkeypatch):
+    from mnemos.domain.pantheon import catalog, pricing, router
+
+    class _Engine:
+        providers = {
+            "openai": {
+                "url": "https://api.openai.com/v1/chat/completions",
+                "model": "gpt-5.5",
+                "weight": 0.88,
+                "api": "openai",
+                "key_name": "openai",
+            }
+        }
+
+        def provider_status(self):
+            return {"circuit_breakers": {"openai": {"state": "closed"}}}
+
+    monkeypatch.setattr(catalog, "get_graeae_engine", lambda: _Engine())
+    monkeypatch.setattr(catalog._lc, "_pool", None)
+    monkeypatch.setattr(pricing, "read_json_cache", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        router,
+        "get_settings",
+        lambda: SimpleNamespace(
+            pantheon=SimpleNamespace(
+                default_quality_floor=0.0,
+                default_max_cost_usd_per_mtok=None,
+                routing_window_minutes=15,
+            )
+        ),
+    )
+
+    models = asyncio.run(catalog.list_models())
+    decision = asyncio.run(router.route_model("gpt-5.3-codex", {"messages": []}))
+
+    assert "gpt-5.3-codex" in {model["id"] for model in models}
+    assert decision.provider == "openai"
+    assert decision.model_id == "gpt-5.3-codex"
+    assert model_uses_responses_api(decision.model_id) is True
+
+
 def test_tool_call_passthrough_payload_and_response_arguments(monkeypatch):
     body = {
         "messages": [
