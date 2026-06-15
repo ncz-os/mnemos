@@ -14,7 +14,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -4242,6 +4242,31 @@ class PostgresBackend:
                 if not tx.closed:
                     await tx.commit()
 
+    async def insert_pantheon_routing_audit(
+        self,
+        tx: Transaction,
+        record: Mapping[str, Any],
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            INSERT INTO pantheon_routing_audit
+                   (request_id, tenant_user_id, alias_or_model, resolved_to, outcome,
+                    latency_ms, tokens_in, tokens_out, cost_usd, error_class, payload)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+            """,
+            record.get("request_id"),
+            record.get("tenant_user_id"),
+            record.get("alias_or_model"),
+            record.get("resolved_to"),
+            record.get("outcome"),
+            record.get("latency_ms"),
+            record.get("tokens_in"),
+            record.get("tokens_out"),
+            record.get("cost_usd"),
+            record.get("error_class"),
+            record.get("payload_json"),
+        )
+
     async def record_usage_ledger(
         self,
         tx: Transaction,
@@ -4250,7 +4275,7 @@ class PostgresBackend:
         row = await _postgres_tx(tx).conn.fetchrow(
             """
             WITH resolved_prices AS (
-                SELECT input_cost_per_mtok, output_cost_per_mtok, raw
+                SELECT input_cost_per_mtok, output_cost_per_mtok
                 FROM model_registry
                 WHERE provider=$1 AND model_id=$2
             ),
@@ -4273,11 +4298,7 @@ class PostgresBackend:
                     CASE WHEN COALESCE(pl.auth_method, 'api') = 'subscription' THEN 0
                          ELSE (($4::NUMERIC * COALESCE(rp.input_cost_per_mtok, 0)::NUMERIC)
                               + ($5::NUMERIC * COALESCE(rp.output_cost_per_mtok, 0)::NUMERIC)
-                              + ($6::NUMERIC * COALESCE(
-                                  NULLIF(rp.raw->>'reasoning_cost_per_mtok', '')::NUMERIC,
-                                  rp.output_cost_per_mtok,
-                                  0
-                                )::NUMERIC)) / 1000000
+                              + ($6::NUMERIC * COALESCE(rp.output_cost_per_mtok, 0)::NUMERIC)) / 1000000
                     END,
                     $7, $8, $9, $10, $11, $12, $13, $14,
                     COALESCE(pl.auth_method, 'api') = 'subscription'
