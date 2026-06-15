@@ -23,6 +23,59 @@ _DEFAULT_CACHE_PATHS = (
     "data/llm_provider_registry.json",
     "llm_provider_registry.json",
 )
+_CACHE_OVERLAY_KEYS = (
+    "display_name",
+    "capabilities",
+    "usage_tier",
+    "cost_per_mtok",
+    "price_in",
+    "price_out",
+    "input_cost_per_mtok",
+    "output_cost_per_mtok",
+    "quality_score",
+    "arena_rank",
+    "graeae_weight",
+    "release_date",
+    "last_synced",
+    "context_window",
+    "model_max_ctx",
+    "max_output_tokens",
+    "p50_latency_ms",
+    "available",
+    "deprecated",
+    "pricing_source",
+    "pricing_fetched_at",
+    "pricing_raw_model_id",
+)
+_PANTHEON_FLEET_MODELS: tuple[dict[str, Any], ...] = (
+    {
+        "provider": "openai",
+        "model_id": "gpt-5.3-codex",
+        "display_name": "GPT-5.3 Codex",
+        "capabilities": ["chat", "code", "reasoning", "tools"],
+        "usage_tier": "frontier",
+        "input_cost_per_mtok": 0.0,
+        "output_cost_per_mtok": 0.0,
+        "context_window": 200000,
+        "max_output_tokens": 100000,
+        "quality_score": 0.92,
+        "available": True,
+        "deprecated": False,
+    },
+    {
+        "provider": "openai",
+        "model_id": "gpt-5.5",
+        "display_name": "GPT-5.5",
+        "capabilities": ["chat", "reasoning", "tools", "vision"],
+        "usage_tier": "frontier",
+        "input_cost_per_mtok": 5.0,
+        "output_cost_per_mtok": 30.0,
+        "quality_score": 0.94,
+        "available": True,
+        "deprecated": False,
+    },
+)
+_FLEET_MODELS_BY_ID = {str(model["model_id"]).lower(): model for model in _PANTHEON_FLEET_MODELS}
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
@@ -34,9 +87,42 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
         return default
 
 
+def _first_not_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def _registry_provider(graeae_provider: str) -> str:
     mapping = GRAEAE_REGISTRY_MAP.get(graeae_provider)
     return mapping["registry_provider"] if mapping else graeae_provider
+
+
+def _fleet_model(model_id: Any) -> dict[str, Any] | None:
+    return _FLEET_MODELS_BY_ID.get(str(model_id or "").strip().lower())
+
+
+def _catalog_key(model: dict[str, Any]) -> tuple[str, str] | None:
+    provider = str(model.get("provider") or "").strip()
+    model_id = str(model.get("id") or model.get("model_id") or "").strip()
+    if not provider or not model_id:
+        return None
+    return (provider, model_id.lower())
+
+
+def _provider_aliases(model: dict[str, Any]) -> set[str]:
+    aliases = {
+        str(model.get("provider") or "").strip(),
+        str(model.get("registry_provider") or "").strip(),
+        str(model.get("owned_by") or "").strip(),
+    }
+    fleet = _fleet_model(model.get("id") or model.get("model_id"))
+    if fleet:
+        aliases.add(str(fleet.get("provider") or "").strip())
+    if "codex" in aliases:
+        aliases.add("openai")
+    return {alias for alias in aliases if alias}
 
 
 def _cost_per_mtok(source: dict[str, Any]) -> float | None:
@@ -158,10 +244,16 @@ def _normalize_model(
         "capabilities": capabilities,
         "usage_tier": _usage_tier({**provider_cfg, **model_source}, quality_score, cost),
         "cost_per_mtok": cost,
-        "price_in": model_source.get("price_in") or provider_cfg.get("price_in"),
-        "price_out": model_source.get("price_out") or provider_cfg.get("price_out"),
-        "input_cost_per_mtok": model_source.get("input_cost_per_mtok") or provider_cfg.get("input_cost_per_mtok"),
-        "output_cost_per_mtok": model_source.get("output_cost_per_mtok") or provider_cfg.get("output_cost_per_mtok"),
+        "price_in": _first_not_none(model_source.get("price_in"), provider_cfg.get("price_in")),
+        "price_out": _first_not_none(model_source.get("price_out"), provider_cfg.get("price_out")),
+        "input_cost_per_mtok": _first_not_none(
+            model_source.get("input_cost_per_mtok"),
+            provider_cfg.get("input_cost_per_mtok"),
+        ),
+        "output_cost_per_mtok": _first_not_none(
+            model_source.get("output_cost_per_mtok"),
+            provider_cfg.get("output_cost_per_mtok"),
+        ),
         "quality_score": quality_score,
         "arena_rank": model_source.get("arena_rank") or provider_cfg.get("arena_rank"),
         "graeae_weight": model_source.get("graeae_weight") or provider_cfg.get("graeae_weight"),
@@ -178,6 +270,89 @@ def _normalize_model(
         "deprecated": bool(model_source.get("deprecated", provider_cfg.get("deprecated", False))),
         "health": health,
     }
+
+
+def _coerce_cached_model(item: dict[str, Any]) -> dict[str, Any] | None:
+    model_id = str(item.get("id") or item.get("model_id") or "").strip()
+    if not model_id:
+        return None
+    fleet = _fleet_model(model_id)
+    provider = str(
+        (fleet or {}).get("provider")
+        or item.get("provider")
+        or item.get("registry_provider")
+        or item.get("owned_by")
+        or ""
+    ).strip()
+    if not provider:
+        return None
+    cfg = {
+        "model": model_id,
+        "api": item.get("api") or "openai",
+        "weight": item.get("quality_score") or item.get("graeae_weight") or item.get("weight") or 0.0,
+        "price_in": item.get("price_in"),
+        "price_out": item.get("price_out"),
+        "input_cost_per_mtok": item.get("input_cost_per_mtok"),
+        "output_cost_per_mtok": item.get("output_cost_per_mtok"),
+        "context_window": item.get("context_window"),
+        "model_max_ctx": item.get("model_max_ctx"),
+        "max_output_tokens": item.get("max_output_tokens"),
+    }
+    health = item.get("health") if isinstance(item.get("health"), dict) else {"state": "cached"}
+    normalized = _normalize_model(
+        provider=provider,
+        provider_cfg=cfg,
+        model_source={**item, "model_id": model_id},
+        health=health,
+    )
+    for key in _CACHE_OVERLAY_KEYS:
+        if key in item:
+            normalized[key] = item[key]
+    normalized["provider"] = provider
+    normalized["registry_provider"] = _registry_provider(provider)
+    normalized["owned_by"] = str(item.get("owned_by") or provider)
+    normalized["health"] = health
+    return normalized
+
+
+def _overlay_cached_model(base: dict[str, Any], cached: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key in _CACHE_OVERLAY_KEYS:
+        if key in cached and cached[key] is not None:
+            out[key] = cached[key]
+    cached_caps = cached.get("capabilities")
+    if isinstance(cached_caps, (list, tuple, set)):
+        out["capabilities"] = sorted(
+            {
+                str(cap).strip()
+                for cap in [*(base.get("capabilities") or []), *cached_caps]
+                if str(cap).strip()
+            }
+        )
+    out["id"] = base["id"]
+    out["provider"] = base["provider"]
+    out["registry_provider"] = base["registry_provider"]
+    out["object"] = "model"
+    out["owned_by"] = str(base.get("owned_by") or base["provider"])
+    out["health"] = base.get("health") or cached.get("health") or {}
+    return out
+
+
+def _fill_missing_model_defaults(base: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key in _CACHE_OVERLAY_KEYS:
+        if out.get(key) is None and defaults.get(key) is not None:
+            out[key] = defaults[key]
+    default_caps = defaults.get("capabilities")
+    if isinstance(default_caps, (list, tuple, set)):
+        out["capabilities"] = sorted(
+            {
+                str(cap).strip()
+                for cap in [*(base.get("capabilities") or []), *default_caps]
+                if str(cap).strip()
+            }
+        )
+    return out
 
 
 async def _registry_rows() -> list[Any]:
@@ -246,7 +421,13 @@ def _synced_cache_models() -> list[dict[str, Any]] | None:
     models = payload.get("models")
     if not isinstance(models, list) or not models:
         return None
-    cached = [dict(model) for model in models if isinstance(model, dict)]
+    cached = [
+        normalized
+        for model in models
+        if isinstance(model, dict)
+        for normalized in [_coerce_cached_model(dict(model))]
+        if normalized is not None
+    ]
     return cached or None
 
 
@@ -288,18 +469,9 @@ def _cache_payload_models(payload: Any) -> list[dict[str, Any]]:
     for item in raw:
         if not isinstance(item, dict):
             continue
-        provider = str(item.get("provider") or item.get("owned_by") or "").strip()
-        model_id = str(item.get("id") or item.get("model_id") or "").strip()
-        if not provider or not model_id:
-            continue
-        cfg = {"model": model_id, "api": "openai", "weight": item.get("quality_score") or item.get("weight") or 0.0}
-        normalized = _normalize_model(
-            provider=provider,
-            provider_cfg=cfg,
-            model_source={**item, "model_id": model_id},
-            health={"state": "cached"},
-        )
-        models.append(normalized)
+        normalized = _coerce_cached_model(dict(item))
+        if normalized is not None:
+            models.append(normalized)
     return models
 
 
@@ -330,16 +502,78 @@ def _model_sources(provider_cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"model_id": provider_cfg.get("model")}]
 
 
+def _pantheon_provider_defaults() -> dict[str, dict[str, Any]]:
+    try:
+        from mnemos.domain.pantheon.gateway import _PANTHEON_PROVIDER_DEFAULTS
+
+        return {provider: dict(cfg) for provider, cfg in _PANTHEON_PROVIDER_DEFAULTS.items()}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[PANTHEON] gateway provider defaults unavailable for catalog: %s", exc)
+        return {}
+
+
+def _catalog_provider_cfgs(engine_providers: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    cfgs = _pantheon_provider_defaults()
+    for provider, cfg in engine_providers.items():
+        cfgs[provider] = {**cfgs.get(provider, {}), **dict(cfg)}
+    return cfgs
+
+
+def _cache_indexes(
+    cached_models: list[dict[str, Any]] | None,
+) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for model in cached_models or []:
+        model_id = str(model.get("id") or model.get("model_id") or "").strip()
+        if not model_id:
+            continue
+        lower_id = model_id.lower()
+        by_id.setdefault(lower_id, []).append(model)
+        for provider in _provider_aliases(model):
+            by_key[(provider, lower_id)] = model
+    return by_key, by_id
+
+
+def _cached_overlay_for(
+    model: dict[str, Any],
+    by_key: dict[tuple[str, str], dict[str, Any]],
+    by_id: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    model_id = str(model.get("id") or model.get("model_id") or "").strip()
+    if not model_id:
+        return None
+    lower_id = model_id.lower()
+    for provider in _provider_aliases(model):
+        cached = by_key.get((provider, lower_id))
+        if cached is not None:
+            return cached
+    id_matches = by_id.get(lower_id) or []
+    if len(id_matches) == 1 or _fleet_model(model_id):
+        return id_matches[0] if id_matches else None
+    return None
+
+
+def _fleet_model_sources(provider_cfgs: dict[str, dict[str, Any]]) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
+    out: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    for source in _PANTHEON_FLEET_MODELS:
+        provider = str(source.get("provider") or "").strip()
+        if not provider or provider not in provider_cfgs:
+            continue
+        provider_cfg = dict(provider_cfgs[provider])
+        provider_cfg.setdefault("model", source["model_id"])
+        provider_cfg.setdefault("api", "openai")
+        provider_cfg.setdefault("key_name", provider)
+        provider_cfg.setdefault("weight", source.get("quality_score") or 0.0)
+        out.append((provider, provider_cfg, dict(source)))
+    return out
+
+
 async def list_models(*, use_synced_cache: bool = True) -> list[dict[str, Any]]:
     """Return the extended PANTHEON model catalog."""
-    if use_synced_cache:
-        cached_models = _synced_cache_models()
-        if cached_models is not None:
-            return _sort_models(cached_models)
-
-    cached = _cached_catalog_models()
-    if cached:
-        return _sort_models(cached)
+    synced_cached_models = _synced_cache_models() if use_synced_cache else None
+    legacy_cached_models = _cached_catalog_models() if use_synced_cache and synced_cached_models is None else []
+    cached_by_key, cached_by_id = _cache_indexes(synced_cached_models or legacy_cached_models)
 
     engine = get_graeae_engine()
     try:
@@ -348,8 +582,21 @@ async def list_models(*, use_synced_cache: bool = True) -> list[dict[str, Any]]:
         provider_status = {}
 
     models: dict[tuple[str, str], dict[str, Any]] = {}
-    for provider, cfg in engine.providers.items():
+
+    def add_model(normalized: dict[str, Any], *, overwrite: bool = True) -> None:
+        cached = _cached_overlay_for(normalized, cached_by_key, cached_by_id)
+        if cached is not None:
+            normalized = _overlay_cached_model(normalized, cached)
+        key = _catalog_key(normalized)
+        if key is not None and (overwrite or key not in models):
+            models[key] = normalized
+
+    engine_provider_cfgs = {name: dict(cfg) for name, cfg in engine.providers.items()}
+    provider_cfgs = _catalog_provider_cfgs(engine_provider_cfgs)
+    for provider, cfg in provider_cfgs.items():
         provider_cfg = dict(cfg)
+        if provider_cfg.get("enabled") is False:
+            continue
         health = _provider_health(provider, provider_status)
         for model_source in _model_sources(provider_cfg):
             if not model_source.get("model_id") and not model_source.get("id"):
@@ -360,16 +607,19 @@ async def list_models(*, use_synced_cache: bool = True) -> list[dict[str, Any]]:
                 model_source=model_source,
                 health=health,
             )
-            models[(normalized["provider"], normalized["id"])] = normalized
+            add_model(normalized)
 
     registry_to_graeae = {cfg["registry_provider"]: name for name, cfg in GRAEAE_REGISTRY_MAP.items()}
-    provider_cfgs = {name: dict(cfg) for name, cfg in engine.providers.items()}
     for row in await _registry_rows():
         registry_provider = str(_row_get(row, "provider") or "")
+        model_id = _row_get(row, "model_id")
         provider = registry_to_graeae.get(registry_provider, registry_provider)
-        provider_cfg = provider_cfgs.get(provider, {"model": _row_get(row, "model_id")})
+        fleet = _fleet_model(model_id)
+        if fleet:
+            provider = str(fleet.get("provider") or provider)
+        provider_cfg = provider_cfgs.get(provider, {"model": model_id})
         model_source = {
-            "model_id": _row_get(row, "model_id"),
+            "model_id": model_id,
             "display_name": _row_get(row, "display_name"),
             "capabilities": _row_get(row, "capabilities") or [],
             "price_in": _row_get(row, "price_in"),
@@ -393,7 +643,26 @@ async def list_models(*, use_synced_cache: bool = True) -> list[dict[str, Any]]:
             model_source=model_source,
             health=health,
         )
-        models[(normalized["provider"], normalized["id"])] = normalized
+        add_model(normalized)
+
+    for provider, provider_cfg, model_source in _fleet_model_sources(provider_cfgs):
+        health = _provider_health(provider, provider_status)
+        normalized = _normalize_model(
+            provider=provider,
+            provider_cfg=provider_cfg,
+            model_source=model_source,
+            health=health,
+        )
+        key = _catalog_key(normalized)
+        if key is not None and key in models:
+            models[key] = _fill_missing_model_defaults(models[key], normalized)
+        else:
+            add_model(normalized, overwrite=False)
+
+    for cached_model in synced_cached_models or legacy_cached_models:
+        key = _catalog_key(cached_model)
+        if key is not None and key not in models:
+            models[key] = cached_model
 
     return _sort_models(list(models.values()))
 
