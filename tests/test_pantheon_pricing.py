@@ -360,13 +360,15 @@ async def test_catalog_includes_codex_fleet_model_with_synced_cache_pricing(monk
 
     monkeypatch.setattr(catalog, "get_graeae_engine", lambda: _Engine())
     monkeypatch.setattr(catalog._lc, "_pool", None)
+    monkeypatch.setattr(catalog, "get_settings", lambda: SimpleNamespace(pantheon=SimpleNamespace(passthrough_provider="nvidia")))
     monkeypatch.setattr(pricing, "read_json_cache", lambda *_args, **_kwargs: cached)
 
     models = await catalog.list_models()
     by_id = {model["id"]: model for model in models}
 
     assert "gpt-5.5" in by_id
-    assert by_id["gpt-5.3-codex"]["provider"] == "openai"
+    assert by_id["gpt-5.3-codex"]["provider"] == "nvidia"
+    assert by_id["gpt-5.3-codex"]["model_id"] == "openai/openai/gpt-5.3-codex"
     assert by_id["gpt-5.3-codex"]["price_in"] == 1.1
     assert by_id["gpt-5.3-codex"]["price_out"] == 4.4
     assert by_id["gpt-5.3-codex"]["pricing_source"] == "litellm"

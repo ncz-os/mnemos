@@ -497,6 +497,17 @@ def _stream_usage_response(
     return {"model": model, "usage": response_usage}
 
 
+def _first_chat_message(chat: dict[str, Any]) -> dict[str, Any]:
+    choices = chat.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return {}
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return {}
+    message = choice.get("message")
+    return message if isinstance(message, dict) else {}
+
+
 async def _list_models_impl() -> dict[str, Any]:
     catalog, *_ = _pantheon_imports()
     return await catalog.models_response()
@@ -705,8 +716,9 @@ async def _responses_impl(
     if not isinstance(result, JSONResponse):
         return result
     chat = json.loads(result.body.decode("utf-8"))
-    choice = (chat.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
+    message = _first_chat_message(chat)
+    usage = chat.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
     output: list[dict[str, Any]] = []
     if message.get("content") is not None:
         output.append(
@@ -736,9 +748,9 @@ async def _responses_impl(
             "model": chat.get("model"),
             "output": output,
             "usage": {
-                "input_tokens": (chat.get("usage") or {}).get("prompt_tokens", 0),
-                "output_tokens": (chat.get("usage") or {}).get("completion_tokens", 0),
-                "total_tokens": (chat.get("usage") or {}).get("total_tokens", 0),
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
             },
         },
     )
