@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 import uuid
+from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request
@@ -93,6 +95,36 @@ def _to_http_exception(exc: Exception) -> HTTPException:
         status_code=getattr(exc, "status_code", 500),
         detail=getattr(exc, "message", str(exc)),
     )
+
+
+def _safe_float(raw: Any, default: float = 0.0) -> float:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _collect_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(_collect_text(item) for item in value.values())
+    if isinstance(value, list):
+        return " ".join(_collect_text(item) for item in value)
+    return ""
+
+
+def _approx_text_tokens(value: Any) -> int:
+    text = _collect_text(value)
+    return max(0, int((len(text) + 3) / 4))
+
+
+def _approx_prompt_tokens(body: dict[str, Any]) -> int:
+    if isinstance(body.get("messages"), list):
+        return _approx_text_tokens(body["messages"])
+    if "input" in body:
+        return _approx_text_tokens(body.get("input"))
+    return 0
 
 
 def _pantheon_session_id(request: Request, user: UserContext) -> str:
@@ -194,8 +226,9 @@ def _audit_payload_for_response(
     namespace: str | None = None,
     forwarded_user: str | None = None,
     resolved_wire_model: str | None = None,
+    estimated_cost_usd: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    return routing_payload(
+    payload, metadata = routing_payload(
         request_id=request_id,
         tenant_user_id=tenant_user_id,
         session_id=session_id,
@@ -208,24 +241,46 @@ def _audit_payload_for_response(
         forwarded_user=forwarded_user,
         resolved_wire_model=resolved_wire_model,
     )
+    if estimated_cost_usd is not None:
+        payload["cost_usd"] = estimated_cost_usd
+        metadata["cost_usd"] = estimated_cost_usd
+        metadata["estimated_cost_usd"] = estimated_cost_usd
+    return payload, metadata
 
 
 def _estimate_cost_usd(decision: Any, body: dict[str, Any]) -> float:
     pantheon = body.get("pantheon") if isinstance(body.get("pantheon"), dict) else {}
+    is_passthrough = getattr(decision, "route_type", None) == "passthrough"
     raw = body.get("estimated_cost_usd", pantheon.get("estimated_cost_usd"))
-    if raw is not None:
+    if raw is not None and not is_passthrough:
         try:
             return max(0.0, float(raw))
         except (TypeError, ValueError):
             return 0.0
     model = decision.model or {}
-    max_tokens = body.get("max_tokens", pantheon.get("max_tokens", 0))
+    max_tokens = (
+        body.get("max_tokens")
+        or body.get("max_completion_tokens")
+        or body.get("max_output_tokens")
+        or pantheon.get("max_tokens")
+        or pantheon.get("max_completion_tokens")
+        or pantheon.get("max_output_tokens")
+        or 0
+    )
     try:
         out_tokens = max(0, int(max_tokens or 0))
     except (TypeError, ValueError):
         out_tokens = 0
-    in_cost = float(model.get("input_cost_per_mtok") or model.get("cost_per_mtok") or 0.0)
-    out_cost = float(model.get("output_cost_per_mtok") or model.get("cost_per_mtok") or 0.0)
+    in_cost = _safe_float(model.get("input_cost_per_mtok") or model.get("cost_per_mtok") or 0.0)
+    out_cost = _safe_float(model.get("output_cost_per_mtok") or model.get("cost_per_mtok") or 0.0)
+    if is_passthrough:
+        if out_tokens <= 0:
+            try:
+                out_tokens = max(1, int(get_settings().pantheon.passthrough_default_estimated_output_tokens))
+            except Exception:
+                out_tokens = 4096
+        in_tokens = max(1, _approx_prompt_tokens(body))
+        return ((in_tokens * in_cost) + (out_tokens * out_cost)) / 1_000_000.0
     return (out_tokens * out_cost) / 1_000_000.0 if out_tokens else (in_cost + out_cost) / 1_000_000.0
 
 
@@ -244,15 +299,20 @@ def _budget_denied_response(decision: Any) -> JSONResponse:
     )
 
 
-async def _check_budget_or_deny(budget_module: Any, decision: Any, body: dict[str, Any]) -> JSONResponse | None:
+async def _check_budget_or_deny(
+    budget_module: Any,
+    decision: Any,
+    body: dict[str, Any],
+) -> tuple[JSONResponse | None, float]:
     import mnemos.core.lifecycle as lc
 
+    estimated_cost_usd = _estimate_cost_usd(decision, body)
     budget_decision = await budget_module.evaluate_budget(
         backend=lc._persistence_backend,
-        estimated_cost_usd=_estimate_cost_usd(decision, body),
+        estimated_cost_usd=estimated_cost_usd,
         caller_subsystem="pantheon",
     )
-    return None if budget_decision.allowed else _budget_denied_response(budget_decision)
+    return (None if budget_decision.allowed else _budget_denied_response(budget_decision), estimated_cost_usd)
 
 
 async def _record_pantheon_ledger(payload: dict[str, Any], metadata: dict[str, Any], decision: Any) -> None:
@@ -262,6 +322,9 @@ async def _record_pantheon_ledger(payload: dict[str, Any], metadata: dict[str, A
     recorder = getattr(backend, "record_usage_ledger", None) if backend is not None else None
     if recorder is None:
         return
+    cost_override = None
+    if getattr(decision, "route_type", None) == "passthrough" and payload.get("cost_usd") is not None:
+        cost_override = Decimal(str(payload["cost_usd"]))
     record = UsageLedgerRecord(
         provider=str(decision.provider or "pantheon"),
         model=str(decision.model_id or decision.alias),
@@ -277,6 +340,7 @@ async def _record_pantheon_ledger(payload: dict[str, Any], metadata: dict[str, A
         request_count=1,
         plan_window_id=compute_plan_window_id(str(decision.provider or "pantheon"), "api"),
         path_kind="api",
+        est_cost_usd=cost_override,
     )
     try:
         async with backend.transactional() as tx:
@@ -303,6 +367,7 @@ async def _log_route_outcome(
     namespace: str | None = None,
     forwarded_user: str | None = None,
     resolved_wire_model: str | None = None,
+    estimated_cost_usd: float | None = None,
 ) -> None:
     payload, metadata = _audit_payload_for_response(
         routing_payload=routing_payload,
@@ -317,27 +382,119 @@ async def _log_route_outcome(
         namespace=namespace,
         forwarded_user=forwarded_user,
         resolved_wire_model=resolved_wire_model,
+        estimated_cost_usd=estimated_cost_usd,
     )
-    await _record_pantheon_ledger(payload, metadata, decision)
+    if outcome != "budget_denied":
+        await _record_pantheon_ledger(payload, metadata, decision)
     schedule_routing_audit(payload, metadata)
 
 
-def _stream_event_wire_model(event: str) -> str | None:
-    wire_model: str | None = None
+def _stream_event_payloads(event: str) -> list[dict[str, Any]]:
+    raw_payloads = []
     for line in event.splitlines():
         if not line.startswith("data:"):
             continue
         raw = line[5:].strip()
         if not raw or raw == "[DONE]":
             continue
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        model = payload.get("model") if isinstance(payload, dict) else None
+        raw_payloads.append(raw)
+    if not raw_payloads:
+        return []
+    joined = "\n".join(raw_payloads)
+    try:
+        payload = json.loads(joined)
+        return [payload] if isinstance(payload, dict) else []
+    except json.JSONDecodeError:
+        payloads: list[dict[str, Any]] = []
+        for raw in raw_payloads:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                payloads.append(payload)
+        return payloads
+
+
+def _stream_event_wire_model(event: str) -> str | None:
+    wire_model: str | None = None
+    for payload in _stream_event_payloads(event):
+        model = payload.get("model")
         if isinstance(model, str) and model:
             wire_model = model
     return wire_model
+
+
+def _normalize_usage(usage: Any) -> dict[str, int] | None:
+    if not isinstance(usage, dict):
+        return None
+
+    def _int_value(*keys: str) -> int | None:
+        for key in keys:
+            if usage.get(key) is None:
+                continue
+            try:
+                return max(0, int(usage[key]))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    prompt_tokens = _int_value("prompt_tokens", "input_tokens")
+    completion_tokens = _int_value("completion_tokens", "output_tokens")
+    total_tokens = _int_value("total_tokens")
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+    prompt = prompt_tokens or 0
+    completion = completion_tokens or 0
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total_tokens if total_tokens is not None else prompt + completion,
+    }
+
+
+def _stream_event_usage(event: str) -> dict[str, int] | None:
+    usage: dict[str, int] | None = None
+    for payload in _stream_event_payloads(event):
+        event_usage = _normalize_usage(payload.get("usage"))
+        if event_usage is not None:
+            usage = event_usage
+    return usage
+
+
+def _stream_event_completion_text(event: str) -> str:
+    fragments: list[str] = []
+    for payload in _stream_event_payloads(event):
+        choices = payload.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            if content is not None:
+                fragments.append(str(content))
+    return "".join(fragments)
+
+
+def _stream_usage_response(
+    *,
+    model: str,
+    usage: dict[str, int] | None,
+    fallback_prompt_tokens: int,
+    completion_text: str,
+) -> dict[str, Any] | None:
+    if usage is None and not completion_text:
+        return None
+    response_usage = usage or {
+        "prompt_tokens": fallback_prompt_tokens,
+        "completion_tokens": _approx_text_tokens(completion_text),
+    }
+    response_usage.setdefault("total_tokens", response_usage["prompt_tokens"] + response_usage["completion_tokens"])
+    return {"model": model, "usage": response_usage}
 
 
 async def _list_models_impl() -> dict[str, Any]:
@@ -390,8 +547,23 @@ async def _chat_completions_impl(
         if cap_result is not None and not cap_result.allowed:
             return _consultation_cap_exceeded(cap_result)
         if budget is not None:
-            budget_response = await _check_budget_or_deny(budget, decision, body)
+            budget_started_at = time.perf_counter()
+            budget_response, estimated_cost_usd = await _check_budget_or_deny(budget, decision, body)
             if budget_response is not None:
+                await _log_route_outcome(
+                    routing_payload=routing_payload,
+                    schedule_routing_audit=schedule_routing_audit,
+                    request_id=request_id,
+                    tenant_user_id=user.user_id,
+                    session_id=session_id,
+                    decision=decision,
+                    outcome="budget_denied",
+                    started_at=budget_started_at,
+                    namespace=user.namespace,
+                    forwarded_user=identity.opaque_user,
+                    resolved_wire_model=decision.model_id or decision.alias,
+                    estimated_cost_usd=estimated_cost_usd,
+                )
                 return budget_response
         started_at = time.perf_counter()
         forward_body = gateway.attach_upstream_identity(body, identity)
@@ -399,6 +571,22 @@ async def _chat_completions_impl(
             async def audited_stream():
                 stream_buffer = ""
                 wire_model: str | None = None
+                usage: dict[str, int] | None = None
+                completion_text = ""
+                outcome = "success"
+                error_class: str | None = None
+                fallback_prompt_tokens = _approx_prompt_tokens(body)
+
+                def ingest_event(event: str) -> None:
+                    nonlocal completion_text, usage, wire_model
+                    event_model = _stream_event_wire_model(event)
+                    if event_model:
+                        wire_model = event_model
+                    event_usage = _stream_event_usage(event)
+                    if event_usage is not None:
+                        usage = event_usage
+                    completion_text += _stream_event_completion_text(event)
+
                 try:
                     async for chunk in gateway.stream_chat_completion(decision, forward_body):
                         try:
@@ -408,43 +596,47 @@ async def _chat_completions_impl(
                         events = stream_buffer.split("\n\n")
                         stream_buffer = events.pop()
                         for event in events:
-                            event_model = _stream_event_wire_model(event)
-                            if event_model:
-                                wire_model = event_model
+                            ingest_event(event)
                         yield chunk
-                except Exception as exc:
-                    await _log_route_outcome(
-                        routing_payload=routing_payload,
-                        schedule_routing_audit=schedule_routing_audit,
-                        request_id=request_id,
-                        tenant_user_id=user.user_id,
-                        session_id=session_id,
-                        decision=decision,
-                        outcome="error",
-                        started_at=started_at,
-                        error_class=exc.__class__.__name__,
-                        namespace=user.namespace,
-                        forwarded_user=identity.opaque_user,
-                        resolved_wire_model=wire_model or decision.model_id or decision.alias,
-                    )
+                except asyncio.CancelledError as exc:
+                    outcome = "cancelled"
+                    error_class = exc.__class__.__name__
                     raise
-                if stream_buffer:
-                    event_model = _stream_event_wire_model(stream_buffer)
-                    if event_model:
-                        wire_model = event_model
-                await _log_route_outcome(
-                    routing_payload=routing_payload,
-                    schedule_routing_audit=schedule_routing_audit,
-                    request_id=request_id,
-                    tenant_user_id=user.user_id,
-                    session_id=session_id,
-                    decision=decision,
-                    outcome="success",
-                    started_at=started_at,
-                    namespace=user.namespace,
-                    forwarded_user=identity.opaque_user,
-                    resolved_wire_model=wire_model or decision.model_id or decision.alias,
-                )
+                except GeneratorExit as exc:
+                    outcome = "cancelled"
+                    error_class = exc.__class__.__name__
+                    raise
+                except Exception as exc:
+                    outcome = "error"
+                    error_class = exc.__class__.__name__
+                    raise
+                finally:
+                    if stream_buffer:
+                        ingest_event(stream_buffer)
+                    response = _stream_usage_response(
+                        model=wire_model or decision.model_id or decision.alias,
+                        usage=usage,
+                        fallback_prompt_tokens=fallback_prompt_tokens,
+                        completion_text=completion_text,
+                    )
+                    try:
+                        await _log_route_outcome(
+                            routing_payload=routing_payload,
+                            schedule_routing_audit=schedule_routing_audit,
+                            request_id=request_id,
+                            tenant_user_id=user.user_id,
+                            session_id=session_id,
+                            decision=decision,
+                            outcome=outcome,
+                            started_at=started_at,
+                            response=response,
+                            error_class=error_class,
+                            namespace=user.namespace,
+                            forwarded_user=identity.opaque_user,
+                            resolved_wire_model=wire_model or decision.model_id or decision.alias,
+                        )
+                    except Exception as exc:
+                        logger.debug("[PANTHEON] streaming route audit failed: %s", exc)
 
             return StreamingResponse(
                 audited_stream(),
@@ -579,8 +771,23 @@ async def embeddings(
     identity = _upstream_identity(gateway, request, user, session_id=session_id, request_id=request_id)
     try:
         decision = await pantheon_router.route_model(model, body)
-        budget_response = await _check_budget_or_deny(budget, decision, body)
+        budget_started_at = time.perf_counter()
+        budget_response, estimated_cost_usd = await _check_budget_or_deny(budget, decision, body)
         if budget_response is not None:
+            await _log_route_outcome(
+                routing_payload=routing_payload,
+                schedule_routing_audit=schedule_routing_audit,
+                request_id=request_id,
+                tenant_user_id=user.user_id,
+                session_id=session_id,
+                decision=decision,
+                outcome="budget_denied",
+                started_at=budget_started_at,
+                namespace=user.namespace,
+                forwarded_user=identity.opaque_user,
+                resolved_wire_model=decision.model_id or decision.alias,
+                estimated_cost_usd=estimated_cost_usd,
+            )
             return budget_response
         started_at = time.perf_counter()
         forward_body = gateway.attach_upstream_identity(body, identity)
