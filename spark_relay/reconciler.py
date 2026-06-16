@@ -197,12 +197,15 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
     key = relay_crypto.load_key()
+    # honest caps (2026-06-16): the reconciler only lands patches + reports
+    # status back to the hive; it executes NO build work, so it advertises no
+    # build capabilities (never ["*"]).
     hive = HiveClient(
         urn="urn:agent:mnemos:pythia:spark-relay-reconciler",
         runtime="mnemos",
         kind="mnemos",
         host="pythia",
-        capabilities=["*"],
+        capabilities=[],
     )
     relay = RelayClient()
     lander = PatchLander()

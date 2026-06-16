@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 
 from . import relay_crypto
@@ -104,12 +105,25 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
     key = relay_crypto.load_key()
+    # honest caps (2026-06-16): spark-0c53 is a GB10 aarch64 build/inference
+    # node. It advertises ONLY what it can really do — never ["*"], which let
+    # the bus route work spark could not honestly complete (a contributor to
+    # the false-done quarantine). Operator-overridable via SPARK_CAPABILITIES
+    # (comma-separated); the default is the proven-real set.
+    _caps = [
+        c.strip()
+        for c in os.environ.get(
+            "SPARK_CAPABILITIES",
+            "python,git,bash,build-venv,arm64,gpu",
+        ).split(",")
+        if c.strip() and c.strip() != "*"
+    ] or ["python", "git", "bash", "build-venv", "arm64", "gpu"]
     hive = HiveClient(
         urn=f"urn:agent:system:{SPARK_HOST}:spark-relay-enqueuer",
         runtime="system",
         kind="system",
         host=SPARK_HOST,
-        capabilities=["*"],
+        capabilities=_caps,
         provider="nvidia-ngc",
         model="qwen/qwen3-coder-480b-a35b-instruct",
     )
