@@ -425,7 +425,12 @@ async def test_pantheon_budget_denies_when_knemon_over_cap(monkeypatch, pantheon
 
     assert response.status_code == 402
     assert response.json()["error"]["type"] == "pantheon_budget_exceeded"
-    assert _routing_audits(db_pool) == []
+    await _drain_background_tasks()
+    [audit] = _routing_audits(db_pool)
+    payload = audit["payload"]
+    assert payload["outcome"] == "budget_denied"
+    assert payload["error_class"] is None
+    assert payload["metadata"]["outcome"] == "budget_denied"
 
 
 @pytest.mark.asyncio

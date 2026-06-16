@@ -29,6 +29,127 @@ def _decision(**kw):
     return RouteDecision(**base)
 
 
+def _passthrough_router_settings(*, enabled: bool = True, provider: str = "nvidia") -> SimpleNamespace:
+    return SimpleNamespace(
+        pantheon=SimpleNamespace(
+            default_quality_floor=0.0,
+            default_max_cost_usd_per_mtok=None,
+            routing_window_minutes=15,
+            passthrough_enabled=enabled,
+            passthrough_provider=provider,
+            passthrough_default_input_cost_per_mtok=5.0,
+            passthrough_default_output_cost_per_mtok=30.0,
+            passthrough_default_estimated_output_tokens=4096,
+        )
+    )
+
+
+def _passthrough_gateway_settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        pantheon=SimpleNamespace(
+            cross_provider_fallback=False,
+            upstream_timeout_seconds=60.0,
+            reasoning_output_token_budget=8000,
+        )
+    )
+
+
+class _NoopCapBucket:
+    def check_and_increment(self, **_kwargs):
+        raise AssertionError("pass-through models should not consume consultation cap")
+
+
+def test_passthrough_pricing_backfills_paid_zero_cache_but_keeps_free_tier_zero(monkeypatch):
+    from mnemos.api.routes import pantheon as pantheon_routes
+    from mnemos.domain.pantheon import router
+
+    monkeypatch.setattr("mnemos.core.config.GRAEAE_CONFIG", {"providers": {}})
+    monkeypatch.setattr("mnemos.domain.graeae.api_keys.get_provider_config", lambda _provider: {})
+
+    paid_settings = _passthrough_router_settings(provider="paid-provider").pantheon
+    paid_model = router._passthrough_model(
+        "paidvendor/zero-priced-model",
+        "paid-provider",
+        paid_settings,
+        [
+            {
+                "id": "cached-pricing-row",
+                "provider": "paid-provider",
+                "registry_provider": "paid-provider",
+                "pricing_raw_model_id": "paidvendor/zero-priced-model",
+                "input_cost_per_mtok": 0.0,
+                "output_cost_per_mtok": 0.0,
+                "price_in": 0.0,
+                "price_out": 0.0,
+                "cost_per_mtok": 0.0,
+                "usage_tier": "frontier",
+            }
+        ],
+    )
+    paid_decision = _decision(
+        provider="paid-provider",
+        model_id="paidvendor/zero-priced-model",
+        route_type="passthrough",
+        model=paid_model,
+    )
+
+    assert paid_model["input_cost_per_mtok"] == 5.0
+    assert paid_model["output_cost_per_mtok"] == 30.0
+    assert paid_model["cost_per_mtok"] == 17.5
+    assert (
+        pantheon_routes._estimate_cost_usd(
+            paid_decision,
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "estimated_cost_usd": 0,
+            },
+        )
+        > 0
+    )
+
+    monkeypatch.setattr(
+        "mnemos.domain.graeae.api_keys.get_provider_config",
+        lambda provider: {"tier": "free"} if provider == "custom-free" else {},
+    )
+    configured_free_model = router._passthrough_model(
+        "custom/free-model",
+        "custom-free",
+        _passthrough_router_settings(provider="custom-free").pantheon,
+        [],
+    )
+    assert configured_free_model["input_cost_per_mtok"] == 0.0
+    assert configured_free_model["output_cost_per_mtok"] == 0.0
+    assert configured_free_model["cost_per_mtok"] == 0.0
+
+    free_settings = _passthrough_router_settings(provider="nvidia").pantheon
+    free_model = router._passthrough_model(
+        "nvcf/meta/llama-3.3-70b-instruct",
+        "nvidia",
+        free_settings,
+        [],
+    )
+    free_decision = _decision(
+        provider="nvidia",
+        model_id="nvcf/meta/llama-3.3-70b-instruct",
+        route_type="passthrough",
+        model=free_model,
+    )
+
+    assert free_model["input_cost_per_mtok"] == 0.0
+    assert free_model["output_cost_per_mtok"] == 0.0
+    assert free_model["cost_per_mtok"] == 0.0
+    assert (
+        pantheon_routes._estimate_cost_usd(
+            free_decision,
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "estimated_cost_usd": 999,
+            },
+        )
+        == 0.0
+    )
+
+
 def test_shadow_app_serves_models_without_auth_startup(monkeypatch):
     from mnemos.api.pantheon_shadow import app
     from mnemos.core.config import _reset_settings_for_tests
@@ -680,6 +801,513 @@ def test_streaming_telemetry_logs_after_stream_with_real_wire_model(monkeypatch)
     assert logs[0]["outcome"] == "success"
     assert logs[0]["resolved_wire_model"] == "cheap-chat-2026-06-14"
     assert scheduled[0][0]["resolved_to"] == "cheap-chat-2026-06-14"
+
+
+def test_unknown_explicit_model_routes_through_budget_cooldown_and_audit(monkeypatch):
+    from mnemos.api.routes import pantheon as pantheon_routes
+    from mnemos.domain.pantheon import catalog, router
+
+    explicit_model = "nvcf/meta/llama-3.3-70b-instruct"
+    budget_calls: list[dict] = []
+    scheduled: list[tuple[dict, dict]] = []
+    posted: list[tuple[str, dict]] = []
+    store = InMemoryCooldownStore()
+    runtime = RouterRuntime(CooldownManager(store), clock=lambda: 1000.0, sleep=lambda _seconds: asyncio.sleep(0))
+
+    async def _models():
+        return [
+            {
+                "id": "cheap-chat",
+                "provider": "openai",
+                "registry_provider": "openai",
+                "available": True,
+                "cost_per_mtok": 0.1,
+            }
+        ]
+
+    class _Budget:
+        async def evaluate_budget(self, **kwargs):
+            budget_calls.append(kwargs)
+            return SimpleNamespace(allowed=True)
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def __init__(self, model: str):
+            self._model = model
+
+        def json(self):
+            return {
+                "id": "chatcmpl-pass",
+                "object": "chat.completion",
+                "created": 1,
+                "model": self._model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            }
+
+    class _Client:
+        async def post(self, url, **kwargs):
+            posted.append((url, kwargs["json"]))
+            return _Resp(kwargs["json"]["model"])
+
+    monkeypatch.setattr(catalog, "list_models", _models)
+    monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings())
+    monkeypatch.setattr(gateway, "get_settings", _passthrough_gateway_settings)
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
+    monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
+    gateway.set_runtime(runtime)
+    monkeypatch.setattr(
+        pantheon_routes,
+        "_pantheon_imports",
+        lambda: (
+            catalog,
+            gateway,
+            router,
+            router.PantheonRoutingError,
+            _NoopCapBucket(),
+            routing_payload,
+            lambda payload, metadata: scheduled.append((payload, metadata)),
+            _Budget(),
+        ),
+    )
+
+    try:
+        response = asyncio.run(
+            pantheon_routes._chat_completions_impl(
+                SimpleNamespace(headers={}, query_params={}, state=SimpleNamespace(), client=SimpleNamespace(host="test")),
+                {"model": explicit_model, "messages": [{"role": "user", "content": "hi"}]},
+                SimpleNamespace(user_id="u1", namespace="ns1"),
+            )
+        )
+    finally:
+        gateway.set_runtime(None)
+
+    assert response.status_code == 200
+    assert budget_calls and budget_calls[0]["caller_subsystem"] == "pantheon"
+    assert posted[0][0] == "https://inference-api.nvidia.com/v1/chat/completions"
+    assert posted[0][1]["model"] == explicit_model
+    assert posted[0][1]["messages"] == [{"role": "user", "content": "hi"}]
+    assert posted[0][1]["user"] == "mnemos:bb82030dbc2bcaba"
+    assert store.get_counts("ns1:u1", f"nvidia:{explicit_model}", 16) == (1, 0)
+    assert scheduled[0][0]["alias_or_model"] == explicit_model
+    assert scheduled[0][0]["resolved_to"] == explicit_model
+    assert scheduled[0][0]["outcome"] == "success"
+    assert scheduled[0][0]["tokens_in"] == 3
+    assert scheduled[0][0]["tokens_out"] == 2
+
+
+def test_unknown_explicit_embedding_model_uses_runtime_and_audit(monkeypatch):
+    from mnemos.api.routes import pantheon as pantheon_routes
+    from mnemos.domain.pantheon import catalog, router
+
+    explicit_model = "nvcf/nvidia/nv-embedqa-e5-v5"
+    budget_calls: list[dict] = []
+    scheduled: list[tuple[dict, dict]] = []
+    posted: list[tuple[str, dict]] = []
+    store = InMemoryCooldownStore()
+
+    async def _models():
+        return []
+
+    class _Budget:
+        async def evaluate_budget(self, **kwargs):
+            budget_calls.append(kwargs)
+            return SimpleNamespace(allowed=True)
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "object": "list",
+                "model": explicit_model,
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
+                "usage": {"prompt_tokens": 4, "total_tokens": 4},
+            }
+
+    class _Client:
+        async def post(self, url, **kwargs):
+            posted.append((url, kwargs["json"]))
+            return _Resp()
+
+    monkeypatch.setattr(catalog, "list_models", _models)
+    monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings())
+    monkeypatch.setattr(gateway, "get_settings", _passthrough_gateway_settings)
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
+    monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
+    gateway.set_runtime(RouterRuntime(CooldownManager(store), clock=lambda: 1000.0))
+    monkeypatch.setattr(
+        pantheon_routes,
+        "_pantheon_imports",
+        lambda: (
+            catalog,
+            gateway,
+            router,
+            router.PantheonRoutingError,
+            _NoopCapBucket(),
+            routing_payload,
+            lambda payload, metadata: scheduled.append((payload, metadata)),
+            _Budget(),
+        ),
+    )
+
+    try:
+        endpoint = pantheon_routes.embeddings.__wrapped__
+        response = asyncio.run(
+            endpoint(
+                SimpleNamespace(headers={}, query_params={}, state=SimpleNamespace(), client=SimpleNamespace(host="test")),
+                {"model": explicit_model, "input": "hello"},
+                None,
+                SimpleNamespace(user_id="u1", namespace="ns1"),
+            )
+        )
+    finally:
+        gateway.set_runtime(None)
+
+    assert response.status_code == 200
+    assert budget_calls
+    assert posted[0][0] == "https://inference-api.nvidia.com/v1/embeddings"
+    assert posted[0][1]["model"] == explicit_model
+    assert posted[0][1]["input"] == "hello"
+    assert store.get_counts("ns1:u1", f"nvidia:{explicit_model}", 16) == (1, 0)
+    assert scheduled[0][0]["alias_or_model"] == explicit_model
+    assert scheduled[0][0]["resolved_to"] == explicit_model
+    assert scheduled[0][0]["outcome"] == "success"
+
+
+def test_paid_unknown_explicit_model_over_cap_denies_before_upstream(monkeypatch):
+    from mnemos.api.routes import pantheon as pantheon_routes
+    from mnemos.domain.knemon.budget import BudgetVerdict
+    from mnemos.domain.pantheon import catalog, router
+
+    explicit_model = "paidvendor/expensive-model"
+    budget_calls: list[dict] = []
+    scheduled: list[tuple[dict, dict]] = []
+    spent_usd = 199.99
+    limit_usd = 200.0
+
+    async def _models():
+        return []
+
+    class _Budget:
+        async def evaluate_budget(self, **kwargs):
+            budget_calls.append(kwargs)
+            estimated = float(kwargs["estimated_cost_usd"])
+            if spent_usd + estimated <= limit_usd:
+                return SimpleNamespace(allowed=True)
+            return SimpleNamespace(
+                allowed=False,
+                verdict=BudgetVerdict.DENY,
+                reason=f"estimated ${estimated:.4f} would exceed remaining ${limit_usd - spent_usd:.4f}",
+                remaining_usd=limit_usd - spent_usd,
+                limit_usd=limit_usd,
+                spent_usd=spent_usd,
+            )
+
+    class _Client:
+        async def post(self, *_args, **_kwargs):
+            raise AssertionError("budget denial must happen before upstream dispatch")
+
+    monkeypatch.setattr(catalog, "list_models", _models)
+    monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings(provider="paid-provider"))
+    monkeypatch.setattr(gateway, "get_settings", _passthrough_gateway_settings)
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
+    monkeypatch.setattr(
+        pantheon_routes,
+        "_pantheon_imports",
+        lambda: (
+            catalog,
+            gateway,
+            router,
+            router.PantheonRoutingError,
+            _NoopCapBucket(),
+            routing_payload,
+            lambda payload, metadata: scheduled.append((payload, metadata)),
+            _Budget(),
+        ),
+    )
+
+    response = asyncio.run(
+        pantheon_routes._chat_completions_impl(
+            SimpleNamespace(headers={}, query_params={}, state=SimpleNamespace(), client=SimpleNamespace(host="test")),
+            {
+                "model": explicit_model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "estimated_cost_usd": 0,
+            },
+            SimpleNamespace(user_id="u1", namespace="ns1"),
+        )
+    )
+
+    assert response.status_code == 402
+    assert json.loads(response.body.decode("utf-8"))["error"]["type"] == "pantheon_budget_exceeded"
+    assert budget_calls
+    assert budget_calls[0]["estimated_cost_usd"] > limit_usd - spent_usd
+    assert scheduled
+    payload, metadata = scheduled[0]
+    assert payload["outcome"] == "budget_denied"
+    assert payload["alias_or_model"] == explicit_model
+    assert payload["resolved_to"] == explicit_model
+    assert payload["cost_usd"] == budget_calls[0]["estimated_cost_usd"]
+    assert metadata["estimated_cost_usd"] == budget_calls[0]["estimated_cost_usd"]
+
+
+def test_free_nvidia_passthrough_zero_estimate_is_not_pre_denied(monkeypatch):
+    from mnemos.api.routes import pantheon as pantheon_routes
+    from mnemos.domain.knemon.budget import BudgetVerdict
+    from mnemos.domain.pantheon import catalog, router
+
+    explicit_model = "nvcf/meta/llama-3.3-70b-instruct"
+    budget_calls: list[dict] = []
+    posted: list[tuple[str, dict]] = []
+    spent_usd = 199.99
+    limit_usd = 200.0
+
+    async def _models():
+        return []
+
+    class _Budget:
+        async def evaluate_budget(self, **kwargs):
+            budget_calls.append(kwargs)
+            estimated = float(kwargs["estimated_cost_usd"])
+            if spent_usd + estimated <= limit_usd:
+                return SimpleNamespace(allowed=True)
+            return SimpleNamespace(
+                allowed=False,
+                verdict=BudgetVerdict.DENY,
+                reason=f"estimated ${estimated:.4f} would exceed remaining ${limit_usd - spent_usd:.4f}",
+                remaining_usd=limit_usd - spent_usd,
+                limit_usd=limit_usd,
+                spent_usd=spent_usd,
+            )
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "id": "chatcmpl-free-pass",
+                "object": "chat.completion",
+                "created": 1,
+                "model": explicit_model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            }
+
+    class _Client:
+        async def post(self, url, **kwargs):
+            posted.append((url, kwargs["json"]))
+            return _Resp()
+
+    monkeypatch.setattr(catalog, "list_models", _models)
+    monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings(provider="nvidia"))
+    monkeypatch.setattr(gateway, "get_settings", _passthrough_gateway_settings)
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
+    monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
+    monkeypatch.setattr(
+        pantheon_routes,
+        "_pantheon_imports",
+        lambda: (
+            catalog,
+            gateway,
+            router,
+            router.PantheonRoutingError,
+            _NoopCapBucket(),
+            routing_payload,
+            lambda _payload, _metadata: None,
+            _Budget(),
+        ),
+    )
+
+    response = asyncio.run(
+        pantheon_routes._chat_completions_impl(
+            SimpleNamespace(headers={}, query_params={}, state=SimpleNamespace(), client=SimpleNamespace(host="test")),
+            {
+                "model": explicit_model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "estimated_cost_usd": 999,
+            },
+            SimpleNamespace(user_id="u1", namespace="ns1"),
+        )
+    )
+
+    assert response.status_code == 200
+    assert budget_calls[0]["estimated_cost_usd"] == 0.0
+    assert posted[0][0] == "https://inference-api.nvidia.com/v1/chat/completions"
+    assert posted[0][1]["model"] == explicit_model
+
+
+def test_unknown_explicit_model_streaming_passthrough(monkeypatch):
+    from mnemos.api.routes import pantheon as pantheon_routes
+    from mnemos.domain.pantheon import catalog, router
+
+    explicit_model = "nvcf/meta/llama-3.3-70b-instruct"
+    posted: list[tuple[str, dict]] = []
+    scheduled: list[tuple[dict, dict]] = []
+
+    async def _models():
+        return []
+
+    class _Budget:
+        async def evaluate_budget(self, **_kwargs):
+            return SimpleNamespace(allowed=True)
+
+    class _StreamResp:
+        status_code = 200
+
+        async def aread(self):
+            return b""
+
+        async def aiter_bytes(self):
+            yield (
+                b'data: {"id":"chatcmpl-pass","object":"chat.completion.chunk","created":1,'
+                + f'"model":"{explicit_model}","choices":[{{"index":0,"delta":{{"content":"ok"}}}}]}}\n\n'.encode()
+            )
+            yield (
+                b'data: {"id":"chatcmpl-pass","object":"chat.completion.chunk","created":1,'
+                + f'"model":"{explicit_model}","choices":[],"usage":'.encode()
+                + b'{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}\n\n'
+            )
+            yield b"data: [DONE]\n\n"
+
+    class _StreamManager:
+        async def __aenter__(self):
+            return _StreamResp()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Client:
+        def stream(self, _method, url, **kwargs):
+            posted.append((url, kwargs["json"]))
+            return _StreamManager()
+
+    monkeypatch.setattr(catalog, "list_models", _models)
+    monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings())
+    monkeypatch.setattr(gateway, "get_settings", _passthrough_gateway_settings)
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
+    monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
+    gateway.set_runtime(RouterRuntime(CooldownManager(InMemoryCooldownStore()), clock=lambda: 1000.0))
+    monkeypatch.setattr(
+        pantheon_routes,
+        "_pantheon_imports",
+        lambda: (
+            catalog,
+            gateway,
+            router,
+            router.PantheonRoutingError,
+            _NoopCapBucket(),
+            routing_payload,
+            lambda payload, metadata: scheduled.append((payload, metadata)),
+            _Budget(),
+        ),
+    )
+
+    try:
+        response = asyncio.run(
+            pantheon_routes._chat_completions_impl(
+                SimpleNamespace(headers={}, query_params={}, state=SimpleNamespace(), client=SimpleNamespace(host="test")),
+                {"model": explicit_model, "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                SimpleNamespace(user_id="u1", namespace="ns1"),
+            )
+        )
+
+        async def _consume():
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+            return chunks
+
+        chunks = asyncio.run(_consume())
+    finally:
+        gateway.set_runtime(None)
+
+    assert chunks[-1] == b"data: [DONE]\n\n"
+    assert posted[0][0] == "https://inference-api.nvidia.com/v1/chat/completions"
+    assert posted[0][1]["model"] == explicit_model
+    assert posted[0][1]["stream_options"] == {"include_usage": True}
+    assert scheduled[0][0]["resolved_to"] == explicit_model
+    assert scheduled[0][0]["outcome"] == "success"
+    assert scheduled[0][0]["tokens_in"] == 11
+    assert scheduled[0][0]["tokens_out"] == 7
+    assert scheduled[0][0]["cost_usd"] == 0.0
+
+
+def test_auto_cheap_still_uses_policy_selection(monkeypatch):
+    from mnemos.domain.pantheon import catalog, router
+
+    calls: list[tuple[str, list[str]]] = []
+    cheap = {
+        "id": "cheap-chat",
+        "provider": "openai",
+        "available": True,
+        "deprecated": False,
+        "cost_per_mtok": 0.1,
+        "quality_score": 0.1,
+    }
+
+    async def _models():
+        return [cheap]
+
+    async def _resolve_with_policy(_pool, alias, candidates, *, window_minutes):
+        calls.append((alias, [candidate["id"] for candidate in candidates]))
+        return SimpleNamespace(
+            selected=cheap,
+            candidates=["cheap-chat"],
+            scores={"cheap-chat": {"total": 1.0}},
+            selection_reason=f"policy window {window_minutes}",
+        )
+
+    monkeypatch.setattr(catalog, "list_models", _models)
+    monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings())
+    monkeypatch.setattr(router, "resolve_with_policy", _resolve_with_policy)
+
+    decision = asyncio.run(router.route_model("auto:cheap", {"messages": [{"role": "user", "content": "hi"}]}))
+
+    assert calls == [("auto:cheap", ["cheap-chat"])]
+    assert decision.route_type == "auto"
+    assert decision.model_id == "cheap-chat"
+    assert decision.selection_reason == "policy window 15"
+
+
+def test_auto_alias_selection_failure_does_not_passthrough(monkeypatch):
+    from mnemos.domain.pantheon import catalog, router
+
+    async def _models():
+        return []
+
+    monkeypatch.setattr(catalog, "list_models", _models)
+    monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings())
+
+    with pytest.raises(router.PantheonRoutingError) as exc:
+        asyncio.run(router.route_model("auto:cheap", {"messages": [{"role": "user", "content": "hi"}]}))
+
+    assert exc.value.status_code == 404
+    assert "cost ceiling" in exc.value.message
+
+
+def test_passthrough_disabled_preserves_unknown_model_404(monkeypatch):
+    from mnemos.domain.pantheon import catalog, router
+
+    async def _models():
+        return []
+
+    monkeypatch.setattr(catalog, "list_models", _models)
+    monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings(enabled=False))
+
+    with pytest.raises(router.PantheonRoutingError) as exc:
+        asyncio.run(router.route_model("nvcf/meta/llama-3.3-70b-instruct", {}))
+
+    assert exc.value.status_code == 404
 
 
 def test_shadow_smoke_tool_call_check_is_assertive():

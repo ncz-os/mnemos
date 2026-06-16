@@ -1818,7 +1818,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         try:
             if not apply:
                 await _call(cursor.execute, "SELECT COUNT(*) AS cnt FROM memories WHERE content_hash IS NULL")
-                row = await _fetchone_dict(cursor)
+                row = await _row_to_dict(cursor, await _call(cursor.fetchone))
                 return int((row or {}).get("cnt") or 0)
             await _call(
                 cursor.execute,
@@ -4495,6 +4495,44 @@ class Db2Backend(OracleBackend):
                         record.tokens_in,
                         record.tokens_out,
                         record.tokens_reasoning,
+                        record.latency_ms,
+                        record.outcome,
+                        record.caller_subsystem,
+                        record.tier,
+                        record.session_id,
+                        record.request_count,
+                        record.plan_window_id,
+                        record.path_kind or "api",
+                    ),
+                )
+                row = await _call(cursor.fetchone)
+            elif record.est_cost_usd is not None:
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT id, est_cost_usd
+                    FROM FINAL TABLE (
+                        INSERT INTO usage_ledger (
+                            provider, model, task_kind, tokens_in, tokens_out,
+                            tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                            caller_subsystem, tier, session_id, request_count,
+                            plan_window_id, path_kind, subscription_amortized
+                        )
+                        VALUES (
+                            ?, ?, ?, ?, ?, ?,
+                            CAST(? AS DECIMAL(12, 6)),
+                            ?, ?, ?, ?, ?, ?, ?, ?, SMALLINT(0)
+                        )
+                    )
+                    """,
+                    (
+                        record.provider,
+                        record.model,
+                        record.task_kind,
+                        record.tokens_in,
+                        record.tokens_out,
+                        record.tokens_reasoning,
+                        record.est_cost_usd,
                         record.latency_ms,
                         record.outcome,
                         record.caller_subsystem,

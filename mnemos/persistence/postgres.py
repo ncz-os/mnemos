@@ -4272,6 +4272,58 @@ class PostgresBackend:
         tx: Transaction,
         record: UsageLedgerRecord,
     ) -> UsageLedgerResult:
+        if record.est_cost_usd is not None:
+            row = await _postgres_tx(tx).conn.fetchrow(
+                """
+                WITH resolved_plan AS (
+                    SELECT auth_method
+                    FROM subscription_plans
+                    WHERE provider=$1 AND plan_name=$10
+                      AND effective_from <= CURRENT_DATE
+                      AND (effective_until IS NULL OR effective_until >= CURRENT_DATE)
+                ),
+                inserted AS (
+                    INSERT INTO usage_ledger (
+                        provider, model, task_kind, tokens_in, tokens_out,
+                        tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                        caller_subsystem, tier, session_id, request_count,
+                        plan_window_id, path_kind, subscription_amortized
+                    )
+                    SELECT
+                        $1, $2, $3, $4, $5, $6,
+                        CASE WHEN COALESCE(pl.auth_method, 'api') = 'subscription' THEN 0
+                             ELSE $15::NUMERIC
+                        END,
+                        $7, $8, $9, $10, $11, $12, $13, $14,
+                        COALESCE(pl.auth_method, 'api') = 'subscription'
+                    FROM (SELECT 1) seed
+                    LEFT JOIN resolved_plan pl ON TRUE
+                    RETURNING id, est_cost_usd
+                )
+                SELECT id, est_cost_usd,
+                       COALESCE((SELECT auth_method FROM resolved_plan), 'api') AS auth_method
+                FROM inserted
+                """,
+                record.provider,
+                record.model,
+                record.task_kind,
+                record.tokens_in,
+                record.tokens_out,
+                record.tokens_reasoning,
+                record.latency_ms,
+                record.outcome,
+                record.caller_subsystem,
+                record.tier,
+                record.session_id,
+                record.request_count,
+                record.plan_window_id,
+                record.path_kind or "api",
+                record.est_cost_usd,
+            )
+            if row is None:
+                raise RuntimeError("usage_ledger insert returned no row")
+            return UsageLedgerResult(id=int(row["id"]), est_cost_usd=row["est_cost_usd"])
+
         row = await _postgres_tx(tx).conn.fetchrow(
             """
             WITH resolved_prices AS (
