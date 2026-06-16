@@ -14,10 +14,10 @@ from collections.abc import Iterable
 EXTRA_PROBES: dict[str, tuple[str, ...]] = {
     "morpheus": ("numpy",),
     "persephone": ("zstandard",),
-    "pantheon": (),
-    "knemon": (),
-    "graeae": (),
-    "hive": (),
+    "pantheon": ("mnemos.domain.pantheon.catalog",),
+    "knemon": ("mnemos.domain.knemon.router",),
+    "graeae": ("mnemos.domain.graeae.engine",),
+    "hive": ("mnemos.domain.hive",),
     "kronos": ("numpy",),
     "knossos": (),
     "apollo": (),
@@ -63,7 +63,7 @@ def is_extra_installed(name: str) -> bool:
 
 
 def install_hint(name: str) -> str:
-    return f"pip install mnemos-os[{name}]  (or [server]/[ml]/[full] bundle)"
+    return f"pip install mnemos-core[{name}]  (or [server]/[ml]/[full] bundle)"
 
 
 def missing_extra_detail(name: str, *, label: str | None = None) -> dict[str, str]:

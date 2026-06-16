@@ -106,7 +106,10 @@ _lifespan_cleanup_hooks: dict = {}
 
 async def _close_graeae_engine_if_loaded() -> None:
     """Close the singleton GRAEAE engine even when API hook registration is skipped."""
-    from mnemos.domain.graeae.engine import get_graeae_engine
+    try:
+        from mnemos.domain.graeae.engine import get_graeae_engine
+    except ImportError:
+        return
 
     await get_graeae_engine().close()
 
