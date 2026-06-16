@@ -5,9 +5,9 @@ set -euo pipefail
 #
 # The generated build context contains:
 #   ./core     this mnemos-core repository at the selected build ref
-#   ./pantheon gitlab.com/ncz-os/ncz-pantheon.git at a resolved full commit
-#   ./knemon   gitlab.com/ncz-os/ncz-knemon.git at a resolved full commit
-#   ./graeae   gitlab.com/ncz-os/ncz-graeae.git at a resolved full commit
+#   ./pantheon gitlab.com/ncz-os/pantheon.git at a resolved full commit
+#   ./knemon   gitlab.com/ncz-os/knemon.git at a resolved full commit
+#   ./graeae   gitlab.com/ncz-os/graeae.git at a resolved full commit
 #
 # Runtime import contract, matching the old monorepo image:
 #   import mnemos.core
@@ -191,7 +191,7 @@ fi
 
 echo "[split] context: $CONTEXT_DIR"
 echo "[split] core:    $CORE_COMMIT"
-echo "[split] add-ons: $(redact_url "$ADDON_REMOTE_BASE")/{ncz-pantheon,ncz-knemon,ncz-graeae}.git"
+echo "[split] add-ons: $(redact_url "$ADDON_REMOTE_BASE")/{pantheon,knemon,graeae}.git"
 echo "[split] refs:    pantheon=$ADDON_PANTHEON_REF knemon=$ADDON_KNEMON_REF graeae=$ADDON_GRAEAE_REF"
 echo "[split] image:   $IMAGE_TAG"
 
@@ -364,9 +364,9 @@ clone_addon() {
   printf '%s\n' "$commit"
 }
 
-PANTHEON_COMMIT=$(clone_addon pantheon ncz-pantheon "$ADDON_PANTHEON_REF")
-KNEMON_COMMIT=$(clone_addon knemon ncz-knemon "$ADDON_KNEMON_REF")
-GRAEAE_COMMIT=$(clone_addon graeae ncz-graeae "$ADDON_GRAEAE_REF")
+PANTHEON_COMMIT=$(clone_addon pantheon pantheon "$ADDON_PANTHEON_REF")
+KNEMON_COMMIT=$(clone_addon knemon knemon "$ADDON_KNEMON_REF")
+GRAEAE_COMMIT=$(clone_addon graeae graeae "$ADDON_GRAEAE_REF")
 
 echo "[split] resolved add-on commits:"
 echo "        pantheon $PANTHEON_COMMIT"
