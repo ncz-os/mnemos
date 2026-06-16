@@ -17,6 +17,10 @@ import requests
 log = logging.getLogger("spark_relay")
 
 HIVE_BASE = os.environ.get("HIVE_BASE", "http://192.168.207.67:5005")
+# C1: bus transport auth bearer token (env-sourced, never baked in). Applied as
+# a default header on the dedicated hive session below; mnemos_search uses its
+# own MNEMOS_TOKEN and is unaffected.
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 MNEMOS_BASE = os.environ.get("MNEMOS_BASE", "http://192.168.207.67:5002")
 MNEMOS_TOKEN = os.environ.get("MNEMOS_TOKEN", "")
 _TIMEOUT = float(os.environ.get("RELAY_HTTP_TIMEOUT", "30"))
@@ -54,6 +58,8 @@ class HiveClient:
         self.provider = provider
         self.model = model
         self._session = requests.Session()
+        if HIVE_BUS_TOKEN:
+            self._session.headers["Authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
 
     def register(self, metadata: dict[str, Any] | None = None) -> None:
         """Register and ADOPT the server-assigned URN. The hive replaces the
