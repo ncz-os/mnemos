@@ -300,6 +300,13 @@ def _passthrough_decision(model_id: str, settings: Any, models: list[dict[str, A
     )
 
 
+def _wire_model_id(model: dict[str, Any] | None) -> str | None:
+    if not isinstance(model, dict):
+        return None
+    raw = model.get("model_id") or model.get("id")
+    return str(raw) if raw is not None else None
+
+
 def _is_explicit_passthrough_candidate(model_or_alias: str) -> bool:
     requested = model_or_alias.strip()
     return bool(requested) and not requested.startswith("auto:") and not requested.startswith("consensus:")
@@ -346,7 +353,7 @@ async def route_model(model_or_alias: str, body: dict[str, Any] | None = None) -
         resolved = {
             **resolved,
             "provider": selected["provider"],
-            "resolved_model": selected["id"],
+            "resolved_model": _wire_model_id(selected) or selected["id"],
             "model": selected,
             "reason": policy_route.selection_reason,
         }
@@ -356,7 +363,7 @@ async def route_model(model_or_alias: str, body: dict[str, Any] | None = None) -
     return RouteDecision(
         alias=resolved["alias"],
         provider=resolved["provider"],
-        model_id=resolved["resolved_model"],
+        model_id=_wire_model_id(resolved.get("model")) or resolved["resolved_model"],
         route_type=resolved["type"],
         reason=resolved["reason"],
         model=resolved["model"],
@@ -405,7 +412,8 @@ def build_fallback_chain(
         if not m:
             continue
         provider = m.get("provider")
-        key = (provider, cid)
+        wire_model_id = _wire_model_id(m) or cid
+        key = (provider, wire_model_id)
         if not provider or key in seen:
             continue
         seen.add(key)
@@ -413,7 +421,7 @@ def build_fallback_chain(
             RouteDecision(
                 alias=primary.alias,
                 provider=str(provider),
-                model_id=cid,
+                model_id=wire_model_id,
                 route_type="single",
                 reason="fallback-candidate",
                 model=m,

@@ -337,6 +337,75 @@ def test_shadow_app_openai_responses_dispatches_codex_model(monkeypatch):
     assert seen["forward_decision"].model_id == "gpt-5.3-codex"
 
 
+def test_shadow_app_responses_handles_empty_choices_and_missing_usage(monkeypatch):
+    from mnemos.api.pantheon_shadow import app
+    from mnemos.api.routes import pantheon as pantheon_routes
+    from mnemos.core.config import _reset_settings_for_tests
+
+    decision = _decision(
+        alias="gpt-5.5",
+        provider="nvidia",
+        model_id="openai/openai/gpt-5.5",
+        route_type="literal",
+        model={"id": "gpt-5.5", "model_id": "openai/openai/gpt-5.5", "usage_tier": "frontier"},
+    )
+
+    class _PantheonRouter:
+        async def route_model(self, _model, _body):
+            return decision
+
+    class _CapBucket:
+        def check_and_increment(self, **_kwargs):
+            raise AssertionError("frontier model should not consume consultation cap")
+
+    async def _forward_chat_completion(_actual_decision, _body):
+        return {
+            "id": "chatcmpl-empty",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "openai/openai/gpt-5.5",
+            "choices": [],
+        }
+
+    def _routing_payload(**_kwargs):
+        return {}, {}
+
+    with monkeypatch.context() as m:
+        m.setenv("MNEMOS_PROFILE", "server")
+        m.setenv("MNEMOS_PANTHEON_ENABLED", "true")
+        m.setattr(dependencies, "PERSONAL_SINGLETON", None)
+        m.setattr(dependencies, "_auth_enabled", False)
+        m.setattr(gateway, "forward_chat_completion", _forward_chat_completion)
+        m.setattr(
+            pantheon_routes,
+            "_pantheon_imports",
+            lambda: (
+                None,
+                gateway,
+                _PantheonRouter(),
+                Exception,
+                _CapBucket(),
+                _routing_payload,
+                lambda _payload, _metadata: None,
+            ),
+        )
+        _reset_settings_for_tests()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                json={"model": "gpt-5.5", "input": "Return nothing."},
+            )
+
+    _reset_settings_for_tests()
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["model"] == "openai/openai/gpt-5.5"
+    assert data["output"] == []
+    assert data["usage"] == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
 def test_endpoint_routing_by_codex_model_uses_responses_url(monkeypatch):
     posted = {}
 
@@ -439,48 +508,86 @@ def test_passthrough_provider_prefers_operator_base_url_over_engine_url(monkeypa
     assert posted[0][1]["model"] == "openai/openai/gpt-5.5"
 
 
+def test_chat_null_content_response_passes_through_without_usage(monkeypatch):
+    posted = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "id": "chatcmpl-null-content",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "openai/openai/gpt-5.5",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": None},
+                        "finish_reason": "length",
+                    }
+                ],
+            }
+
+    class _Client:
+        async def post(self, url, **kwargs):
+            posted["url"] = url
+            posted["json"] = kwargs["json"]
+            return _Resp()
+
+    monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
+    monkeypatch.setattr(
+        gateway,
+        "_provider_config",
+        lambda d: {"api": "openai", "url": "https://inference-api.nvidia.com/v1/chat/completions"},
+    )
+    monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
+
+    data = asyncio.run(
+        gateway._forward_chat_once(
+            _decision(provider="nvidia", model_id="openai/openai/gpt-5.5", route_type="literal"),
+            {"messages": [{"role": "user", "content": "hi"}]},
+        )
+    )
+
+    assert posted["url"] == "https://inference-api.nvidia.com/v1/chat/completions"
+    assert posted["json"]["model"] == "openai/openai/gpt-5.5"
+    assert data["choices"][0]["message"]["content"] is None
+    assert "usage" not in data
+
+
 def test_codex_fleet_model_is_cataloged_and_resolvable(monkeypatch):
     from mnemos.domain.pantheon import catalog, pricing, router
 
     class _Engine:
-        providers = {
-            "openai": {
-                "url": "https://api.openai.com/v1/chat/completions",
-                "model": "gpt-5.5",
-                "weight": 0.88,
-                "api": "openai",
-                "key_name": "openai",
-            }
-        }
+        providers = {}
 
         def provider_status(self):
-            return {"circuit_breakers": {"openai": {"state": "closed"}}}
+            return {"circuit_breakers": {"nvidia": {"state": "closed"}}}
 
     monkeypatch.setattr(catalog, "get_graeae_engine", lambda: _Engine())
     monkeypatch.setattr(catalog._lc, "_pool", None)
     monkeypatch.setattr(pricing, "read_json_cache", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(catalog, "get_settings", lambda: _passthrough_router_settings(provider="nvidia"))
     monkeypatch.setattr(
         router,
         "get_settings",
-        lambda: SimpleNamespace(
-            pantheon=SimpleNamespace(
-                default_quality_floor=0.0,
-                default_max_cost_usd_per_mtok=None,
-                routing_window_minutes=15,
-            )
-        ),
+        lambda: _passthrough_router_settings(provider="nvidia"),
     )
 
     models = asyncio.run(catalog.list_models())
-    decision = asyncio.run(router.route_model("gpt-5.3-codex", {"messages": []}))
+    by_id = {model["id"]: model for model in models}
+    decision = asyncio.run(router.route_model("gpt-5.5", {"messages": []}))
 
-    assert "gpt-5.3-codex" in {model["id"] for model in models}
-    assert decision.provider == "openai"
-    assert decision.model_id == "gpt-5.3-codex"
-    assert model_uses_responses_api(decision.model_id) is True
+    assert by_id["gpt-5.5"]["provider"] == "nvidia"
+    assert by_id["gpt-5.5"]["model_id"] == "openai/openai/gpt-5.5"
+    assert decision.provider == "nvidia"
+    assert decision.model["id"] == "gpt-5.5"
+    assert decision.model_id == "openai/openai/gpt-5.5"
 
 
-def test_codex_fleet_model_skipped_without_registered_openai_provider(monkeypatch):
+def test_codex_fleet_cache_pricing_remaps_to_passthrough_provider(monkeypatch):
     from mnemos.domain.pantheon import catalog, pricing
 
     class _Engine:
@@ -512,12 +619,54 @@ def test_codex_fleet_model_skipped_without_registered_openai_provider(monkeypatc
     monkeypatch.setattr(catalog, "get_graeae_engine", lambda: _Engine())
     monkeypatch.setattr(catalog._lc, "_pool", None)
     monkeypatch.setattr(pricing, "read_json_cache", lambda *_args, **_kwargs: cached)
+    monkeypatch.setattr(catalog, "get_settings", lambda: _passthrough_router_settings(provider="nvidia"))
 
     models = asyncio.run(catalog.list_models())
-    ids = {model["id"] for model in models}
+    by_id = {model["id"]: model for model in models}
 
-    assert "nvidia/llama-3.3-70b-instruct" in ids
-    assert "gpt-5.3-codex" not in ids
+    assert "nvidia/llama-3.3-70b-instruct" in by_id
+    assert by_id["gpt-5.3-codex"]["provider"] == "nvidia"
+    assert by_id["gpt-5.3-codex"]["model_id"] == "openai/openai/gpt-5.3-codex"
+
+
+def test_auto_cheap_fleet_dispatch_uses_prefixed_passthrough_wire_id(monkeypatch):
+    from mnemos.domain.pantheon import catalog, router
+    from mnemos.domain.pantheon.policy import ResolvedRoute
+
+    fleet_model = {
+        "id": "gpt-5.3-codex",
+        "model_id": "openai/openai/gpt-5.3-codex",
+        "provider": "nvidia",
+        "registry_provider": "nvidia",
+        "available": True,
+        "deprecated": False,
+        "capabilities": ["chat", "code", "reasoning", "tools"],
+        "quality_score": 0.92,
+        "cost_per_mtok": 0.0,
+    }
+
+    async def _models():
+        return [fleet_model]
+
+    async def _resolve_with_policy(_pool, _alias, candidates, *, window_minutes):
+        return ResolvedRoute(
+            selected=candidates[0],
+            candidates=[candidate["id"] for candidate in candidates],
+            rolling_window_minutes=window_minutes,
+            scores={candidates[0]["id"]: {"total": 1.0}},
+            selection_reason=f"policy window {window_minutes}",
+            telemetry_available=True,
+        )
+
+    monkeypatch.setattr(catalog, "list_models", _models)
+    monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings(provider="nvidia"))
+    monkeypatch.setattr(router, "resolve_with_policy", _resolve_with_policy)
+
+    decision = asyncio.run(router.route_model("auto:cheap", {"messages": [{"role": "user", "content": "hi"}]}))
+
+    assert decision.provider == "nvidia"
+    assert decision.model["id"] == "gpt-5.3-codex"
+    assert decision.model_id == "openai/openai/gpt-5.3-codex"
 
 
 def test_tool_call_passthrough_payload_and_response_arguments(monkeypatch):
