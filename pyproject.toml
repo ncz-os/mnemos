@@ -3,6 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
+# Intentional split rename: the deploy unit is the built image, not a PyPI mnemos-os dist.
 name = "mnemos-core"
 version = "6.0.0rc1"
 description = "MNEMOS core: agent memory OS base with GDPR right-to-be-forgotten, PERSEPHONE archival, KRONOS recall observability, multi-backend persistence, and multi-worker support"
@@ -112,7 +113,7 @@ sqlite = [
 # deployment bundle (edge/server/ml/interop/full) or mix bundles.
 morpheus = ["numpy>=1.24"]
 persephone = ["zstandard>=0.25"]
-pantheon = ["mnemos-pantheon"]
+pantheon = ["mnemos-pantheon>=0.2,<0.3"]
 kronos = ["numpy>=1.24"]
 kronos-gpu = ["cupy>=12"]
 knossos = []
@@ -120,24 +121,24 @@ apollo = []
 artemis = ["networkx>=3.3", "scipy>=1.11"]
 nats = ["nats-py>=2.14.0"]
 hot = ["mnemos-hot>=0.2.0"]
-knemon = ["mnemos-knemon"]
+knemon = ["mnemos-knemon>=0.1,<0.2"]
 edge = [
   "aiosqlite>=0.20.0",
   "sqlite-vec>=0.1.6",
 ]
-server = ["mnemos-core[nats,persephone,pantheon,knemon,graeae,hive]"]
+# Bundle extras intentionally recurse through mnemos-core[...] and require pip>=21.2/uv, the build toolchain.
+server = ["mnemos-core[nats,persephone,pantheon,knemon,graeae]"]
 ml = ["mnemos-core[morpheus,kronos,apollo,artemis,hot]"]
 interop = ["mnemos-core[knossos]"]
-# ── Feature-layer extras (GRAEAE consult de8f4b2b, 2026-06-01) ───────────────
-# Install layers stack: core (base) <- graeae <- hive. `hive` chains `graeae`
-# so the dependency direction is enforced at install time as well as runtime
-# (Settings.enforce_layer_direction). Pair with a storage extra, e.g.
-# `pip install mnemos-core[hive,postgres]`. See docs/LAYERED_INSTALL.md.
-# TODO(codex): move GRAEAE-only / hive-only third-party deps out of base
-# `dependencies` into these extras so a base install pulls neither.
-graeae = ["mnemos-graeae"]
-hive = ["mnemos-hive"]
-full = ["mnemos-core[morpheus,persephone,pantheon,knemon,graeae,hive,kronos,knossos,apollo,artemis,nats,hot,edge]"]
+# Feature-layer extras. The hive build fabric is a separate ncz-os/hive track
+# and is not an installable mnemos-core split distribution.
+graeae = ["mnemos-graeae>=0.1,<0.2"]
+full = [
+  "mnemos-core[morpheus,persephone,kronos,knossos,apollo,artemis,nats,hot,edge]",
+  "mnemos-pantheon>=0.2,<0.3",
+  "mnemos-knemon>=0.1,<0.2",
+  "mnemos-graeae>=0.1,<0.2",
+]
 # Enterprise backend drivers (feat/oracle-port branch). oracledb uses thin
 # mode by default — no Oracle Instant Client required. ibm_db pulls the
 # DB2 CLI driver as part of its build; on platforms without a pre-built
@@ -180,6 +181,7 @@ dev = [
 # filesystem.
 mnemos = "mnemos.cli.main:app"
 mnemos-install = "mnemos.installer.__main__:main"
+refresh-pantheon-catalog = "mnemos.tools.refresh_pantheon_catalog:main"
 
 [tool.setuptools]
 # Ship every file listed in MANIFEST.in (SQL migrations, config example,

@@ -9,7 +9,7 @@ import string
 import sys
 from dataclasses import dataclass, field
 
-from mnemos.core.extras import FEATURE_BUNDLES, EXTRA_PROBES
+from mnemos.core.extras import FEATURE_BUNDLES, EXTRA_PROBES, UNAVAILABLE_EXTRAS
 from mnemos.core.services import COMPONENT_SERVICE_ENABLES, PROFILE_SERVICE_MANIFEST, SERVICE_ENV_OVERRIDES
 
 from .detect import SystemInfo, check_port_free
@@ -17,7 +17,7 @@ from .detect import SystemInfo, check_port_free
 
 @dataclass
 class Config:
-    profile: str = "edge"           # 'server', 'edge', 'dev'
+    profile: str = "edge"  # 'server', 'edge', 'dev'
     db_host: str = "localhost"
     db_port: int = 5432
     db_name: str = "mnemos"
@@ -26,8 +26,8 @@ class Config:
     sqlite_path: str = "~/.mnemos/mnemos.db"
     listen_port: int = 5002
     service_user: str = "mnemos"
-    auth_enabled: bool = False       # False for personal
-    rls_enabled: bool = False        # False for personal
+    auth_enabled: bool = False  # False for personal
+    rls_enabled: bool = False  # False for personal
     graeae_providers: dict = field(default_factory=dict)
     inference_embed_host: str = "http://localhost:11434"
     install_docling: bool = True
@@ -35,8 +35,8 @@ class Config:
     profile_services_enabled: bool = False
     service_flags: dict[str, bool] = field(default_factory=dict)
     create_service: bool = True
-    create_new_db: bool = True       # True = create DB, False = use existing
-    embedding_dim: int = 768         # vec0/embedding dimension; honors MNEMOS_EMBEDDING_DIM
+    create_new_db: bool = True  # True = create DB, False = use existing
+    embedding_dim: int = 768  # vec0/embedding dimension; honors MNEMOS_EMBEDDING_DIM
 
 
 _PROVIDERS = [
@@ -89,8 +89,12 @@ def normalize_component_selection(raw: str | None) -> tuple[str, ...]:
         component = _COMPONENT_ALIASES.get(item.strip().lower(), item.strip().lower())
         if not component:
             continue
+        if component in UNAVAILABLE_EXTRAS:
+            raise ValueError(UNAVAILABLE_EXTRAS[component])
         if component not in valid:
-            raise ValueError(f"Unknown MNEMOS component/bundle {component!r}; choose one of: {', '.join(_SELECTABLE_COMPONENTS)}")
+            raise ValueError(
+                f"Unknown MNEMOS component/bundle {component!r}; choose one of: {', '.join(_SELECTABLE_COMPONENTS)}"
+            )
         selected.setdefault(component, None)
     return tuple(selected)
 
@@ -107,11 +111,12 @@ def default_components_for_profile(profile: str) -> tuple[str, ...]:
 
 def pip_extra_spec(selected_components: tuple[str, ...]) -> str:
     # PANTHEON is intentionally not pulled by the managed server default. The
-    # pyproject server extra remains unchanged for backward compatibility; the
     # installer expands server into its runtime-required extras instead of using
-    # mnemos-os[server].
+    # the broader mnemos-core[server] bundle.
     extras: set[str] = set()
     for component in selected_components:
+        if component in UNAVAILABLE_EXTRAS:
+            raise ValueError(UNAVAILABLE_EXTRAS[component])
         if component == "server":
             extras.update({"nats", "persephone"})
         elif component == "ml":
@@ -119,7 +124,21 @@ def pip_extra_spec(selected_components: tuple[str, ...]) -> str:
         elif component == "interop":
             extras.add("knossos")
         elif component == "full":
-            extras.update({"edge", "nats", "persephone", "pantheon", "morpheus", "kronos", "knossos", "apollo", "artemis", "hot", "graeae", "hive"})
+            extras.update(
+                {
+                    "edge",
+                    "nats",
+                    "persephone",
+                    "pantheon",
+                    "morpheus",
+                    "kronos",
+                    "knossos",
+                    "apollo",
+                    "artemis",
+                    "hot",
+                    "graeae",
+                }
+            )
         else:
             extras.add(component)
     return f".[{','.join(sorted(extras))}]" if extras else "."
@@ -336,9 +355,7 @@ def run_wizard(
 
     configure_providers = False
     if cfg.profile in {"edge", "dev"}:
-        configure_providers = _prompt_bool(
-            "Configure LLM provider API keys for GRAEAE reasoning?", default=False
-        )
+        configure_providers = _prompt_bool("Configure LLM provider API keys for GRAEAE reasoning?", default=False)
     else:
         configure_providers = True
 
@@ -361,9 +378,7 @@ def run_wizard(
     # 6. Embedding inference host
     # ------------------------------------------------------------------ #
     _section("Embeddings")
-    cfg.inference_embed_host = _prompt(
-        "Embedding inference host", default="http://localhost:11434"
-    )
+    cfg.inference_embed_host = _prompt("Embedding inference host", default="http://localhost:11434")
 
     # ------------------------------------------------------------------ #
     # 7. Docling
@@ -377,9 +392,7 @@ def run_wizard(
     # 8. Service installation
     # ------------------------------------------------------------------ #
     _section("System Service")
-    cfg.create_service = _prompt_bool(
-        "Install MNEMOS as a system service (auto-start on boot)?", default=True
-    )
+    cfg.create_service = _prompt_bool("Install MNEMOS as a system service (auto-start on boot)?", default=True)
 
     # ------------------------------------------------------------------ #
     # 9. Confirmation
