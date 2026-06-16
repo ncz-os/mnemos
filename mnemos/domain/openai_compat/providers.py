@@ -1,9 +1,9 @@
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
+from mnemos.core.extras import missing_extra_detail
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.db import openai_compat_repo
-from mnemos.domain.graeae.engine import get_graeae_engine
 
 from .content import _flatten_messages_for_prompt, _has_content_blocks, _has_message_names, _plain_value
 from .schemas import ChatCompletionRequest
@@ -38,6 +38,14 @@ class OpenAICompatError(Exception):
         super().__init__(str(detail))
         self.status_code = status_code
         self.detail = detail
+
+
+def get_graeae_engine() -> Any:
+    try:
+        from mnemos.domain.graeae.engine import get_graeae_engine as _get_graeae_engine
+    except ImportError as exc:
+        raise OpenAICompatError(status_code=503, detail=missing_extra_detail("graeae", label="GRAEAE")) from exc
+    return _get_graeae_engine()
 
 
 def _generation_params(request: ChatCompletionRequest) -> Dict[str, Any]:

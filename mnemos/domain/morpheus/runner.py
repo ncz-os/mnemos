@@ -26,6 +26,7 @@ from mnemos.db.deletion_log import log_morpheus_run_memory_deletions
 import numpy as np
 
 from mnemos.core.config import get_settings, hot_rs_enabled, morpheus_orphan_timeout_hours_env
+from mnemos.core.extras import is_extra_installed
 from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.ids import new_memory_id
 from mnemos.core.eligibility import eligible_for_morpheus
@@ -1143,6 +1144,8 @@ async def _call_morpheus_muse(
     task_type: str,
     timeout: int,
 ) -> str:
+    if not is_extra_installed("graeae"):
+        return ""
     try:
         from mnemos.domain.graeae.engine import get_graeae_engine
 
@@ -1318,6 +1321,8 @@ async def _synthesise_cluster_summary(contents: List[str], *, use_llm: bool) -> 
             "MORPHEUS synthesis (extractive — first sentence of each "
             f"member of this {len(contents)}-memory cluster):\n\n" + "\n".join(bullets)
         )
+    if not is_extra_installed("graeae"):
+        return await _synthesise_cluster_summary(contents, use_llm=False)
     try:
         from mnemos.domain.graeae.engine import get_graeae_engine
 

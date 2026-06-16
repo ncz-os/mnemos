@@ -677,7 +677,7 @@ class _RecorderConcurrency:
 
 
 def _engine_with_client(monkeypatch, data):
-    from mnemos.domain.graeae import engine as engine_module
+    engine_module = pytest.importorskip("mnemos.domain.graeae.engine")
 
     engine = engine_module.GraeaeEngine()
     client = _Client(data)
@@ -691,7 +691,7 @@ def _engine_with_client(monkeypatch, data):
 
 
 def _stream_engine_gateway(monkeypatch, lines):
-    from mnemos.domain.graeae import engine as engine_module
+    engine_module = pytest.importorskip("mnemos.domain.graeae.engine")
 
     engine = engine_module.GraeaeEngine()
     engine.providers = {

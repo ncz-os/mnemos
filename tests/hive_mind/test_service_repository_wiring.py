@@ -10,7 +10,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from mnemos.core.plan_windows import compute_plan_window_id
-from mnemos.domain.knemon.router import KnemonRouteRequest, route
 from mnemos.hive_mind import service
 from mnemos.hive_mind.repository import SqliteHiveMindRepository
 from mnemos.hive_mind.zeroclaw_triage import routing_patch_for_decision
@@ -23,6 +22,11 @@ class _ServiceDbKnemonBackend:
     @asynccontextmanager
     async def transactional(self):
         yield self.conn
+
+
+def _knemon_router():
+    router_module = pytest.importorskip("mnemos.domain.knemon.router")
+    return router_module.KnemonRouteRequest, router_module.route
 
 
 def test_hive_service_register_create_and_claim_use_repository_contract(monkeypatch, tmp_path) -> None:
@@ -343,6 +347,7 @@ def test_routing_patch_does_not_widen_explicit_submitter_cost_cap(monkeypatch, t
 
 @pytest.mark.asyncio
 async def test_registered_worker_subscription_pools_feed_knemon_routing(monkeypatch, tmp_path) -> None:
+    KnemonRouteRequest, route = _knemon_router()
     db_path = str(tmp_path / "hive-service-pools.sqlite3")
     monkeypatch.setattr(service, "DB_PATH", db_path)
     monkeypatch.setattr(service, "_REPO", SqliteHiveMindRepository(db_path))
@@ -464,6 +469,7 @@ async def test_registered_worker_subscription_pools_feed_knemon_routing(monkeypa
 
 @pytest.mark.asyncio
 async def test_subscription_pool_route_controls_provider_and_claimability(monkeypatch, tmp_path) -> None:
+    KnemonRouteRequest, route = _knemon_router()
     db_path = str(tmp_path / "hive-service-pool-claim.sqlite3")
     monkeypatch.setattr(service, "DB_PATH", db_path)
     monkeypatch.setattr(service, "_REPO", SqliteHiveMindRepository(db_path))
