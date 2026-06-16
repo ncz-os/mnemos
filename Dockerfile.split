@@ -40,6 +40,10 @@ COPY core/requirements.txt core/pyproject.toml ./core/
 COPY pantheon/pyproject.toml ./pantheon/
 COPY knemon/pyproject.toml ./knemon/
 COPY graeae/pyproject.toml ./graeae/
+COPY core/scripts/merge_split_requirements.py \
+     core/scripts/audit_split_namespace.py \
+     core/scripts/resolve_split_wheels.py \
+     ./scripts/
 
 # The old Oracle image installed core requirements.txt plus oracledb. The split
 # image keeps that base and adds third-party dependencies declared by the
@@ -48,7 +52,7 @@ COPY graeae/pyproject.toml ./graeae/
 # mnemos-core[extra], expand that extra into concrete third-party requirements
 # because the first-party wheels are installed with --no-deps. Only plain
 # requirement specs are merged; pip option/flag lines are logged and dropped.
-RUN python -c "exec('''from pathlib import Path\nimport re\nimport sys\nimport tomllib\n\nfirst_party = {\"mnemos-core\", \"mnemos-pantheon\", \"mnemos-knemon\", \"mnemos-graeae\"}\nreqs = []\nseen_extras = set()\ncore = tomllib.loads(Path(\"core/pyproject.toml\").read_text())\noptional = core.get(\"project\", {}).get(\"optional-dependencies\", {})\n\n\ndef parse_req(req: str) -> tuple[str, tuple[str, ...]]:\n    match = re.match(r\"\\s*([A-Za-z0-9_.-]+)\\s*(?:\\[([^\\]]+)\\])?\", req)\n    if match is None:\n        return \"\", ()\n    name = match.group(1).lower().replace(\"_\", \"-\")\n    extras = tuple(extra.strip().lower().replace(\"_\", \"-\") for extra in (match.group(2) or \"\").split(\",\") if extra.strip())\n    return name, extras\n\n\ndef add_core_line(line: str, lineno: int) -> None:\n    stripped = line.strip()\n    if not stripped or stripped.startswith(\"#\"):\n        return\n    if stripped.startswith(\"-\"):\n        print(f\"[split] dropping pip option from core/requirements.txt:{lineno}: {stripped} (only plain requirement specs are merged)\", file=sys.stderr)\n        return\n    reqs.append(stripped)\n\n\ndef expand_core_extra(extra: str) -> None:\n    if extra in seen_extras:\n        return\n    seen_extras.add(extra)\n    for dep in optional.get(extra, []):\n        add_req(dep)\n\n\ndef add_req(req: str) -> None:\n    req = req.strip()\n    if not req:\n        return\n    name, extras = parse_req(req)\n    if name == \"mnemos-core\":\n        for extra in extras:\n            expand_core_extra(extra)\n        return\n    if name in first_party:\n        return\n    reqs.append(req)\n\n\nfor lineno, line in enumerate(Path(\"core/requirements.txt\").read_text().splitlines(), 1):\n    add_core_line(line, lineno)\n\nfor pkg in (\"pantheon\", \"knemon\", \"graeae\"):\n    data = tomllib.loads(Path(pkg, \"pyproject.toml\").read_text())\n    for dep in data.get(\"project\", {}).get(\"dependencies\", []):\n        add_req(dep)\n\nreqs.append(\"oracledb>=4.0.1\")\nmerged = list(dict.fromkeys(reqs))\nPath(\"/tmp/requirements.split.txt\").write_text(\"\\n\".join(merged) + \"\\n\")\n''')"
+RUN python scripts/merge_split_requirements.py
 
 RUN uv pip install --system build setuptools wheel
 RUN uv pip install --system -r /tmp/requirements.split.txt
@@ -61,7 +65,7 @@ COPY graeae ./graeae
 # Wheels share the mnemos PEP 420 namespace at install time. Fail before wheel
 # build if two distributions would install the same module file, or if any tree
 # ships namespace __init__.py markers that would collapse the namespace.
-RUN python -c "exec('''from pathlib import Path\nimport sys\n\nroots = (\"core\", \"pantheon\", \"knemon\", \"graeae\")\nforbidden = {\n    \"mnemos/__init__.py\",\n    \"mnemos/domain/__init__.py\",\n    \"mnemos/api/__init__.py\",\n    \"mnemos/api/routes/__init__.py\",\n}\nowners = {}\nerrors = []\nfor root in roots:\n    base = Path(root) / \"mnemos\"\n    if not base.exists():\n        continue\n    for path in base.rglob(\"*\"):\n        if not (path.is_file() or path.is_symlink()):\n            continue\n        rel = path.relative_to(root).as_posix()\n        if rel in forbidden:\n            errors.append(f\"{root}: forbidden namespace marker {rel}\")\n        previous = owners.setdefault(rel, root)\n        if previous != root:\n            errors.append(f\"duplicate mnemos namespace file {rel}: {previous}, {root}\")\nif errors:\n    print(\"\\n\".join(errors), file=sys.stderr)\n    raise SystemExit(1)\n''')"
+RUN python scripts/audit_split_namespace.py
 
 RUN python -m pip wheel --no-deps --no-build-isolation --wheel-dir /wheelhouse \
     ./core \
@@ -97,12 +101,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /tmp/requirements.split.txt /tmp/requirements.split.txt
 COPY --from=builder /wheelhouse /wheelhouse
+COPY --from=builder /app/scripts/resolve_split_wheels.py /tmp/resolve_split_wheels.py
 
 RUN uv pip install --system -r /tmp/requirements.split.txt && \
-    python -c "exec('''from pathlib import Path\nimport sys\n\nwheelhouse = Path(\"/wheelhouse\")\nexpected = (\"mnemos_core\", \"mnemos_pantheon\", \"mnemos_knemon\", \"mnemos_graeae\")\nresolved = []\nfor stem in expected:\n    matches = sorted(wheelhouse.glob(f\"{stem}-*.whl\"))\n    if len(matches) != 1:\n        print(f\"expected exactly one {stem} wheel, found {len(matches)}\", file=sys.stderr)\n        for match in matches:\n            print(match, file=sys.stderr)\n        raise SystemExit(1)\n    resolved.append(str(matches[0]))\nPath(\"/tmp/first-party-wheels.txt\").write_text(\"\\n\".join(resolved) + \"\\n\")\n''')" && \
+    python /tmp/resolve_split_wheels.py && \
     uv pip install --system --no-deps --reinstall --no-index -r /tmp/first-party-wheels.txt && \
     python -m pip check && \
-    rm -rf /wheelhouse /tmp/requirements.split.txt /tmp/first-party-wheels.txt
+    rm -rf /wheelhouse /tmp/requirements.split.txt /tmp/first-party-wheels.txt /tmp/resolve_split_wheels.py
 
 # Dockerfile.oracle left a monorepo-shaped runtime tree at /app. Preserve the
 # core shape for code paths that derive repo-root assets such as db/ and
