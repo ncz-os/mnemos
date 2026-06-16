@@ -4,9 +4,9 @@
 # build context root to contain four sibling package source trees:
 #
 #   ./core     mnemos-core
-#   ./pantheon ncz-os/pantheon
-#   ./knemon   ncz-os/knemon
-#   ./graeae   ncz-os/graeae
+#   ./pantheon ncz-os/ncz-pantheon
+#   ./knemon   ncz-os/ncz-knemon
+#   ./graeae   ncz-os/ncz-graeae
 #
 # The four projects are installed as distinct distributions. Their PEP 420
 # mnemos.* namespace package trees overlay into one importable runtime tree.
@@ -21,24 +21,21 @@
 #   ./build-split.sh
 
 ARG MNEMOS_CORE_REF=unknown
-ARG MNEMOS_PANTHEON_REF=main
-ARG MNEMOS_KNEMON_REF=main
-ARG MNEMOS_GRAEAE_REF=main
+ARG MNEMOS_PANTHEON_REF=unknown
+ARG MNEMOS_KNEMON_REF=unknown
+ARG MNEMOS_GRAEAE_REF=unknown
 
 FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
+COPY --from=ghcr.io/astral-sh/uv:0.11.21 /uv /uvx /bin/
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ libpq-dev curl git && \
     rm -rf /var/lib/apt/lists/*
 
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:$PATH"
-
-# Copy only dependency manifests first for better layer caching. Runtime source
-# is copied in the final stage before the four first-party distributions are
-# installed with --no-deps.
+# Copy only dependency manifests first for better layer caching.
 COPY core/requirements.txt core/pyproject.toml ./core/
 COPY pantheon/pyproject.toml ./pantheon/
 COPY knemon/pyproject.toml ./knemon/
@@ -47,11 +44,30 @@ COPY graeae/pyproject.toml ./graeae/
 # The old Oracle image installed core requirements.txt plus oracledb. The split
 # image keeps that base and adds third-party dependencies declared by the
 # extracted add-on distributions. First-party mnemos-* dependencies are filtered
-# out here and handled by installing the local source directories in the runtime
-# stage.
-RUN python -c 'from pathlib import Path; import re, tomllib; first_party={"mnemos-core", "mnemos-pantheon", "mnemos-knemon", "mnemos-graeae"}; dist_name=lambda req: re.split(r"\s*(?:[<>=!~;\[]|@)", req.strip(), maxsplit=1)[0].lower().replace("_", "-"); reqs=[line.strip() for line in Path("core/requirements.txt").read_text().splitlines() if line.strip() and not line.lstrip().startswith("#")]; reqs += [dep.strip() for pkg in ("pantheon", "knemon", "graeae") for dep in tomllib.loads(Path(pkg, "pyproject.toml").read_text()).get("project", {}).get("dependencies", []) if dep.strip() and dist_name(dep) not in first_party]; reqs.append("oracledb>=4.0.1"); Path("/tmp/requirements.split.txt").write_text("\n".join(dict.fromkeys(reqs)) + "\n")'
+# out here and handled by installing local wheels later. If an add-on asks for
+# mnemos-core[extra], expand that extra into concrete third-party requirements
+# because the first-party wheels are installed with --no-deps. Only plain
+# requirement specs are merged; pip option/flag lines are logged and dropped.
+RUN python -c "exec('''from pathlib import Path\nimport re\nimport sys\nimport tomllib\n\nfirst_party = {\"mnemos-core\", \"mnemos-pantheon\", \"mnemos-knemon\", \"mnemos-graeae\"}\nreqs = []\nseen_extras = set()\ncore = tomllib.loads(Path(\"core/pyproject.toml\").read_text())\noptional = core.get(\"project\", {}).get(\"optional-dependencies\", {})\n\n\ndef parse_req(req: str) -> tuple[str, tuple[str, ...]]:\n    match = re.match(r\"\\s*([A-Za-z0-9_.-]+)\\s*(?:\\[([^\\]]+)\\])?\", req)\n    if match is None:\n        return \"\", ()\n    name = match.group(1).lower().replace(\"_\", \"-\")\n    extras = tuple(extra.strip().lower().replace(\"_\", \"-\") for extra in (match.group(2) or \"\").split(\",\") if extra.strip())\n    return name, extras\n\n\ndef add_core_line(line: str, lineno: int) -> None:\n    stripped = line.strip()\n    if not stripped or stripped.startswith(\"#\"):\n        return\n    if stripped.startswith(\"-\"):\n        print(f\"[split] dropping pip option from core/requirements.txt:{lineno}: {stripped} (only plain requirement specs are merged)\", file=sys.stderr)\n        return\n    reqs.append(stripped)\n\n\ndef expand_core_extra(extra: str) -> None:\n    if extra in seen_extras:\n        return\n    seen_extras.add(extra)\n    for dep in optional.get(extra, []):\n        add_req(dep)\n\n\ndef add_req(req: str) -> None:\n    req = req.strip()\n    if not req:\n        return\n    name, extras = parse_req(req)\n    if name == \"mnemos-core\":\n        for extra in extras:\n            expand_core_extra(extra)\n        return\n    if name in first_party:\n        return\n    reqs.append(req)\n\n\nfor lineno, line in enumerate(Path(\"core/requirements.txt\").read_text().splitlines(), 1):\n    add_core_line(line, lineno)\n\nfor pkg in (\"pantheon\", \"knemon\", \"graeae\"):\n    data = tomllib.loads(Path(pkg, \"pyproject.toml\").read_text())\n    for dep in data.get(\"project\", {}).get(\"dependencies\", []):\n        add_req(dep)\n\nreqs.append(\"oracledb>=4.0.1\")\nmerged = list(dict.fromkeys(reqs))\nPath(\"/tmp/requirements.split.txt\").write_text(\"\\n\".join(merged) + \"\\n\")\n''')"
 
+RUN uv pip install --system build setuptools wheel
 RUN uv pip install --system -r /tmp/requirements.split.txt
+
+COPY core ./core
+COPY pantheon ./pantheon
+COPY knemon ./knemon
+COPY graeae ./graeae
+
+# Wheels share the mnemos PEP 420 namespace at install time. Fail before wheel
+# build if two distributions would install the same module file, or if any tree
+# ships namespace __init__.py markers that would collapse the namespace.
+RUN python -c "exec('''from pathlib import Path\nimport sys\n\nroots = (\"core\", \"pantheon\", \"knemon\", \"graeae\")\nforbidden = {\n    \"mnemos/__init__.py\",\n    \"mnemos/domain/__init__.py\",\n    \"mnemos/api/__init__.py\",\n    \"mnemos/api/routes/__init__.py\",\n}\nowners = {}\nerrors = []\nfor root in roots:\n    base = Path(root) / \"mnemos\"\n    if not base.exists():\n        continue\n    for path in base.rglob(\"*\"):\n        if not (path.is_file() or path.is_symlink()):\n            continue\n        rel = path.relative_to(root).as_posix()\n        if rel in forbidden:\n            errors.append(f\"{root}: forbidden namespace marker {rel}\")\n        previous = owners.setdefault(rel, root)\n        if previous != root:\n            errors.append(f\"duplicate mnemos namespace file {rel}: {previous}, {root}\")\nif errors:\n    print(\"\\n\".join(errors), file=sys.stderr)\n    raise SystemExit(1)\n''')"
+
+RUN python -m pip wheel --no-deps --no-build-isolation --wheel-dir /wheelhouse \
+    ./core \
+    ./pantheon \
+    ./knemon \
+    ./graeae
 
 FROM python:3.11-slim
 
@@ -60,45 +76,41 @@ ARG MNEMOS_PANTHEON_REF
 ARG MNEMOS_KNEMON_REF
 ARG MNEMOS_GRAEAE_REF
 
+COPY --from=ghcr.io/astral-sh/uv:0.11.21 /uv /uvx /bin/
+
 LABEL org.opencontainers.image.title="mnemos-os split" \
       org.opencontainers.image.description="MNEMOS split umbrella image built from mnemos-core plus pantheon, knemon, and graeae namespace packages" \
       mnemos.split.core-ref="${MNEMOS_CORE_REF}" \
       mnemos.split.pantheon-ref="${MNEMOS_PANTHEON_REF}" \
       mnemos.split.knemon-ref="${MNEMOS_KNEMON_REF}" \
-      mnemos.split.graeae-ref="${MNEMOS_GRAEAE_REF}"
+      mnemos.split.graeae-ref="${MNEMOS_GRAEAE_REF}" \
+      org.mnemos.core="${MNEMOS_CORE_REF}" \
+      org.mnemos.addon.pantheon="${MNEMOS_PANTHEON_REF}" \
+      org.mnemos.addon.knemon="${MNEMOS_KNEMON_REF}" \
+      org.mnemos.addon.graeae="${MNEMOS_GRAEAE_REF}"
 
-WORKDIR /src
+WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 libgomp1 curl && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder /tmp/requirements.split.txt /tmp/requirements.split.txt
+COPY --from=builder /wheelhouse /wheelhouse
 
-COPY core ./core
-COPY pantheon ./pantheon
-COPY knemon ./knemon
-COPY graeae ./graeae
+RUN uv pip install --system -r /tmp/requirements.split.txt && \
+    python -c "exec('''from pathlib import Path\nimport sys\n\nwheelhouse = Path(\"/wheelhouse\")\nexpected = (\"mnemos_core\", \"mnemos_pantheon\", \"mnemos_knemon\", \"mnemos_graeae\")\nresolved = []\nfor stem in expected:\n    matches = sorted(wheelhouse.glob(f\"{stem}-*.whl\"))\n    if len(matches) != 1:\n        print(f\"expected exactly one {stem} wheel, found {len(matches)}\", file=sys.stderr)\n        for match in matches:\n            print(match, file=sys.stderr)\n        raise SystemExit(1)\n    resolved.append(str(matches[0]))\nPath(\"/tmp/first-party-wheels.txt\").write_text(\"\\n\".join(resolved) + \"\\n\")\n''')" && \
+    uv pip install --system --no-deps --reinstall --no-index -r /tmp/first-party-wheels.txt && \
+    python -m pip check && \
+    rm -rf /wheelhouse /tmp/requirements.split.txt /tmp/first-party-wheels.txt
 
-RUN python -m pip install --no-deps --no-build-isolation \
-    ./core \
-    ./pantheon \
-    ./knemon \
-    ./graeae
-
-# Dockerfile.oracle left a monorepo-shaped runtime tree at /app. Preserve that
-# shape for code paths that derive repo-root assets such as db/ and
-# config.toml.example from mnemos/.../__file__, while still registering the four
-# split projects above as distinct installed distributions.
-WORKDIR /app
-
+# Dockerfile.oracle left a monorepo-shaped runtime tree at /app. Preserve the
+# core shape for code paths that derive repo-root assets such as db/ and
+# config.toml.example from mnemos/.../__file__. Core runs from /app source,
+# byte-identical to the pinned core wheel; add-ons run from wheels and merge via
+# the PEP 420 namespace. The core wheel remains installed for dependency
+# metadata and pip check.
 COPY core/ ./
-COPY pantheon/mnemos ./mnemos
-COPY knemon/mnemos ./mnemos
-COPY graeae/mnemos ./mnemos
-
-RUN rm -rf /src
 
 ENV PYTHONUNBUFFERED=1
 ENV MNEMOS_PERSISTENCE_BACKEND=oracle
@@ -106,5 +118,6 @@ ENV MNEMOS_PERSISTENCE_BACKEND=oracle
 EXPOSE 5002
 
 # Dockerfile.oracle has no ENTRYPOINT and no image-level HEALTHCHECK; this split
-# image intentionally preserves that behavior.
+# image intentionally preserves that behavior. R6 deploy units override the
+# command/port per service; this CMD is only the default API process.
 CMD ["python", "-m", "uvicorn", "mnemos.api.main:app", "--host", "0.0.0.0", "--port", "5002"]

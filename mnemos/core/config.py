@@ -20,6 +20,7 @@ from typing import Any
 from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from mnemos.core.extras import install_hint, is_extra_installed
 from mnemos.core.services import ServiceResolution, parse_component_selection, resolve_profile_services
 
 
@@ -258,7 +259,6 @@ class _ProfileServiceSettings(BaseSettings):
             env=os.environ,
         )
     )
-
 
 
 class _WebhookSettings(BaseSettings):
@@ -995,11 +995,10 @@ class _HiveMindSettings(BaseModel):
 class _LayerSettings(BaseSettings):
     """Feature-layer enable flags (GRAEAE consult de8f4b2b layering, 2026-06-01).
 
-    Three install layers stack: core (memory/persistence, always on) <- graeae
-    (reasoning) <- hive (job coordination + KNEMON routing). Flags default ON so
-    an existing full deployment is byte-for-byte unchanged; slim/base installs
-    opt OUT via env. Direction enforced by Settings.enforce_layer_direction:
-    hive requires graeae. See docs/LAYERED_INSTALL.md.
+    Two install layers stack in mnemos-core: core (memory/persistence, always
+    on) <- graeae (reasoning). Hive is the separate ncz-os/hive track and stays
+    opt-in here. Direction enforced by Settings.enforce_layer_direction: hive
+    requires graeae. See docs/LAYERED_INSTALL.md.
     """
 
     model_config = _config_model_config()
@@ -1008,9 +1007,22 @@ class _LayerSettings(BaseSettings):
         default=True,
         validation_alias=AliasChoices("MNEMOS_ENABLE_GRAEAE", "ENABLE_GRAEAE"),
     )
+    # Default false: hive is a separate ncz-os/hive track, not a mnemos-core extra.
     enable_hive: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices("MNEMOS_ENABLE_HIVE", "ENABLE_HIVE"),
+        description=(
+            "Enable the hive/KNEMON routing layer. Hive is the separate ncz-os/hive track in this split and is opt-in."
+        ),
+    )
+    strict_layers: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("MNEMOS_STRICT_LAYERS", "STRICT_LAYERS"),
+        description=(
+            "When True, an enabled layer/service whose split distribution is missing "
+            "fails fast at startup; when False (default), it is logged and skipped "
+            "(degraded boot)."
+        ),
     )
 
     @property
@@ -1065,6 +1077,13 @@ class Settings(BaseSettings):
             raise ValueError(
                 "MNEMOS_ENABLE_HIVE requires MNEMOS_ENABLE_GRAEAE: the hive/KNEMON "
                 "layer depends on the GRAEAE reasoning layer."
+            )
+        if self.layers.enable_hive and not is_extra_installed("hive"):
+            raise ValueError(
+                "MNEMOS_ENABLE_HIVE is enabled by configuration, but HIVE is provided "
+                "by the separate ncz-os/hive track and is not installed in this "
+                f"mnemos-core distribution. Disable MNEMOS_ENABLE_HIVE or repair the "
+                f"separate HIVE deployment. Install hint: {install_hint('hive')}"
             )
         return self
 

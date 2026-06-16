@@ -86,6 +86,7 @@ api.log
 dist/
 build/
 __pycache__/
+.split-build/
 
 # Local scripts not for distribution
 sync_argonas_git.py
