@@ -1,13 +1,15 @@
 """API-owned lifespan integrations for domain, webhook, and worker packages."""
+
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 from typing import Any
 
 from mnemos.api.dependencies import configure_auth
 from mnemos.core import lifecycle
-from mnemos.core.extras import is_extra_installed
+from mnemos.core.extras import EXTERNAL_EXTRA_DISTS, is_extra_installed
 from mnemos.core.services import service_enabled
 
 logger = logging.getLogger(__name__)
@@ -210,11 +212,30 @@ async def _pantheon_routing_audit_post_db_hook(pool: Any, settings: Any) -> None
         logger.info("PANTHEON routing audit consumer disabled; pantheon add-on is not installed")
         return
 
+    module_path = "mnemos.workers.pantheon_routing_audit_consumer"
+    dist_name = EXTERNAL_EXTRA_DISTS["pantheon"]
     try:
-        from mnemos.workers.pantheon_routing_audit_consumer import consumer_loop
-    except ImportError:
-        logger.warning("PANTHEON routing audit consumer module is not available")
+        module = importlib.import_module(module_path)
+    except ImportError as exc:
+        logger.warning(
+            "PANTHEON routing audit NATS consumer unavailable; skipping consumer startup "
+            "because %s could not be imported: %s. Reinstall or repair %s, or disable "
+            "MNEMOS_NATS_AUDIT_CONSUMER_ENABLED.",
+            module_path,
+            exc,
+            dist_name,
+        )
         return
+    if not hasattr(module, "consumer_loop"):
+        logger.warning(
+            "PANTHEON routing audit NATS consumer unavailable; skipping consumer startup "
+            "because %s does not expose consumer_loop. Reinstall or repair %s, or disable "
+            "MNEMOS_NATS_AUDIT_CONSUMER_ENABLED.",
+            module_path,
+            dist_name,
+        )
+        return
+    consumer_loop = module.consumer_loop
 
     audit_handle = lifecycle._persistence_backend or pool
     logger.info("Launching PANTHEON routing audit NATS consumer")
@@ -235,6 +256,7 @@ def register_lifespan_hooks() -> None:
         drained = await drain_pending_audit_tasks(timeout=5.0)
         if drained:
             import logging as _logging
+
             _logging.getLogger("mnemos.mcp.audit").info(
                 "drained %d pending mcp_audit_log persist task(s) on shutdown",
                 drained,
@@ -260,12 +282,8 @@ def register_lifespan_hooks() -> None:
     lifecycle.register_lifespan_worker("webhook retry repair worker", _webhook_repair_worker)
     lifecycle.register_lifespan_worker("webhook delivery recovery worker", _webhook_delivery_worker)
     lifecycle.register_lifespan_worker("federation sync worker", _federation_sync_worker)
-    lifecycle.register_post_db_startup_hook(
-        "federation nats consumers", _federation_nats_post_db_hook
-    )
-    lifecycle.register_post_db_startup_hook(
-        "webhook nats trigger", _webhook_nats_post_db_hook
-    )
+    lifecycle.register_post_db_startup_hook("federation nats consumers", _federation_nats_post_db_hook)
+    lifecycle.register_post_db_startup_hook("webhook nats trigger", _webhook_nats_post_db_hook)
     lifecycle.register_post_db_startup_hook(
         "PANTHEON routing audit NATS consumer", _pantheon_routing_audit_post_db_hook
     )

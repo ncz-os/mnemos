@@ -35,8 +35,9 @@ from mnemos.api.routes.versions import router as versions_router
 from mnemos.api.routes.webhooks import router as webhooks_router
 from mnemos.api.lifecycle_hooks import register_lifespan_hooks
 from mnemos.core.config import get_settings, session_secret_required
-from mnemos.core.extras import is_extra_installed
+from mnemos.core.extras import EXTERNAL_EXTRA_DISTS, is_extra_installed
 from mnemos.core.lifecycle import lifespan
+from mnemos.core.services import service_enabled
 from mnemos.core.rate_limit import (
     RateLimitExceeded,
     SlowAPIMiddleware,
@@ -328,18 +329,56 @@ app.add_middleware(
 app.add_middleware(RequestIDMiddleware)
 
 
-def _include_optional_router(extra_name: str, module_path: str, *, label: str | None = None) -> bool:
+def _include_optional_router(
+    extra_name: str,
+    module_path: str,
+    *,
+    label: str | None = None,
+    required: bool = False,
+) -> bool:
     """Mount an add-on router only when its external distribution is importable."""
+    display = label or extra_name.upper()
+    dist_name = EXTERNAL_EXTRA_DISTS.get(extra_name, f"mnemos-core[{extra_name}]")
+    strict = _settings.layers.strict_layers or required
     if not is_extra_installed(extra_name):
+        if strict:
+            message = (
+                f"{display} is enabled by configuration, but the {dist_name} distribution "
+                f"is missing; install {dist_name} or disable the configured layer/service."
+            )
+            logger.error(message)
+            raise RuntimeError(message)
+        logger.debug(
+            "%s add-on distribution %s is not installed; skipping router %s",
+            display,
+            dist_name,
+            module_path,
+        )
         return False
     try:
         module = importlib.import_module(module_path)
-    except ImportError:
-        logger.warning("%s extra probe passed but %s could not be imported", label or extra_name.upper(), module_path)
+    except ImportError as exc:
+        if strict:
+            raise RuntimeError(
+                f"layer '{display}' is enabled (strict_layers) but its module "
+                f"'{module_path}' / distribution could not be imported: {exc}"
+            ) from exc
+        missing_module = getattr(exc, "name", None) or "<unknown>"
+        logger.warning(
+            "%s add-on distribution %s is installed, but importing router %s failed "
+            "because module %s could not be imported; skipping route mount. Install "
+            "or repair %s, or set MNEMOS_STRICT_LAYERS=true to fail fast. ImportError: %s",
+            display,
+            dist_name,
+            module_path,
+            missing_module,
+            dist_name,
+            exc,
+        )
         return False
     router = getattr(module, "router", None)
-    if router is None:
-        logger.warning("%s does not expose a FastAPI router", module_path)
+    if router is None or not hasattr(router, "routes"):
+        logger.warning("%s does not expose a usable FastAPI router at module-level `router`; skipping", module_path)
         return False
     app.include_router(router)
     return True
@@ -350,17 +389,56 @@ app.include_router(metrics_router)  # v3.2 observability: Prometheus /metrics
 # ── Optional add-on router mounts ────────────────────────────────────────────
 # Add-on distributions extend the mnemos namespace (PEP 420). Core must boot
 # without them, so route modules are imported only after their extra probe
-# succeeds.
+# succeeds. Their route surfaces are absent when that add-on is absent; core
+# probes such as /health stay mounted above, and umbrella deploys install+enable
+# all add-ons for full route parity.
 if _settings.layers.enable_graeae:
-    _include_optional_router("graeae", "mnemos.api.routes.consultations", label="GRAEAE")
-    _include_optional_router("graeae", "mnemos.api.routes.providers", label="GRAEAE")
+    _include_optional_router(
+        "graeae",
+        "mnemos.api.routes.consultations",
+        label="GRAEAE",
+        required=_settings.layers.strict_layers,
+    )
+    # providers is a GRAEAE-domain route: lazy graeae.engine dependency, intentionally graeae-gated.
+    _include_optional_router(
+        "graeae",
+        "mnemos.api.routes.providers",
+        label="GRAEAE",
+        required=_settings.layers.strict_layers,
+    )
 if _settings.layers.enable_hive:
-    _include_optional_router("knemon", "mnemos.api.routes.ledger", label="KNEMON")
-    _include_optional_router("knemon", "mnemos.api.routes.knemon_dashboard", label="KNEMON")
-    _include_optional_router("knemon", "mnemos.api.routes.knemon_router", label="KNEMON")
-    _include_optional_router("knemon", "mnemos.api.routes.knemon_utilization", label="KNEMON")
+    _include_optional_router(
+        "knemon",
+        "mnemos.api.routes.ledger",
+        label="KNEMON",
+        required=_settings.layers.strict_layers,
+    )
+    _include_optional_router(
+        "knemon",
+        "mnemos.api.routes.knemon_dashboard",
+        label="KNEMON",
+        required=_settings.layers.strict_layers,
+    )
+    _include_optional_router(
+        "knemon",
+        "mnemos.api.routes.knemon_router",
+        label="KNEMON",
+        required=_settings.layers.strict_layers,
+    )
+    _include_optional_router(
+        "knemon",
+        "mnemos.api.routes.knemon_utilization",
+        label="KNEMON",
+        required=_settings.layers.strict_layers,
+    )
 app.include_router(openai_compat_router)  # Phase 0: OpenAI-compatible gateway
-_include_optional_router("pantheon", "mnemos.api.routes.pantheon", label="PANTHEON")
+if service_enabled(_settings, "pantheon"):
+    _include_optional_router(
+        "pantheon",
+        "mnemos.api.routes.pantheon",
+        label="PANTHEON",
+        required=_settings.layers.strict_layers,
+    )
 app.include_router(sessions_router)  # Phase 0: Session management for stateful chat
 app.include_router(dag_router)  # Phase 3: DAG versioning (git-like)
 app.include_router(webhooks_router)  # v3.0.0: Outbound webhook subscriptions

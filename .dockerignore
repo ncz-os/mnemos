@@ -2,6 +2,10 @@
 # stale metadata into the running app (importlib.metadata reads from
 # egg-info/dist-info, so a 3.1.0-vintage egg-info kept reporting that
 # version even after pyproject was bumped to 3.2.2).
+.split-build/
+**/.split-build
+**/.split-build/*/
+split-provenance.env
 *.egg-info
 *.egg-info/
 build/
