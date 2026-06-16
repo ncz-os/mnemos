@@ -19,6 +19,10 @@ from typing import Any
 from mnemos.core.config import mcp_mnemos_token_env, mcp_mnemos_url_env, system_hive_url_env
 
 HIVE_URL = os.environ.get("HIVE_URL") or system_hive_url_env()
+# C1: bus transport auth bearer token (env-sourced). _http_json is generic, so we
+# pass this explicitly as `bearer` on the hive calls below (the /v1/jobs read +
+# routing PATCH are admin-tier on the bus).
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 MNEMOS_URL = os.environ.get("MNEMOS_URL") or mcp_mnemos_url_env()
 MNEMOS_TOKEN = os.environ.get("MNEMOS_API_KEY") or os.environ.get("MNEMOS_TOKEN") or mcp_mnemos_token_env()
 POLL_INTERVAL = float(os.environ.get("ZEROCLAW_TRIAGE_POLL_INTERVAL", "10"))
@@ -155,7 +159,7 @@ def route_job(job: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def run_once() -> int:
-    code, payload = _http_json("GET", HIVE_URL, "/v1/jobs", query={"status": "queued", "limit": BATCH_LIMIT})
+    code, payload = _http_json("GET", HIVE_URL, "/v1/jobs", query={"status": "queued", "limit": BATCH_LIMIT}, bearer=HIVE_BUS_TOKEN or None)
     if code != 200 or not payload:
         print(f"[zc-triage] hive queue poll failed code={code} resp={payload}", flush=True)
         return 0
@@ -166,7 +170,7 @@ def run_once() -> int:
         patch = route_job(job)
         if not patch:
             continue
-        patch_code, patch_resp = _http_json("PATCH", HIVE_URL, f"/v1/jobs/{job['id']}/routing", body=patch)
+        patch_code, patch_resp = _http_json("PATCH", HIVE_URL, f"/v1/jobs/{job['id']}/routing", body=patch, bearer=HIVE_BUS_TOKEN or None)
         if patch_code == 200:
             routed += 1
             print(
