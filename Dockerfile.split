@@ -1,0 +1,110 @@
+# MNEMOS-OS Dockerfile - split umbrella Oracle-profile image.
+#
+# This is the deploy-switch option-a image for the repo split. It expects the
+# build context root to contain four sibling package source trees:
+#
+#   ./core     mnemos-core
+#   ./pantheon ncz-os/pantheon
+#   ./knemon   ncz-os/knemon
+#   ./graeae   ncz-os/graeae
+#
+# The four projects are installed as distinct distributions. Their PEP 420
+# mnemos.* namespace package trees overlay into one importable runtime tree.
+# Import contract for parity with the old monorepo image:
+#
+#   import mnemos.core
+#   import mnemos.domain.pantheon
+#   import mnemos.domain.knemon
+#   import mnemos.domain.graeae
+#
+# Build with the helper:
+#   ./build-split.sh
+
+ARG MNEMOS_CORE_REF=unknown
+ARG MNEMOS_PANTHEON_REF=main
+ARG MNEMOS_KNEMON_REF=main
+ARG MNEMOS_GRAEAE_REF=main
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libpq-dev curl git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Copy only dependency manifests first for better layer caching. Runtime source
+# is copied in the final stage before the four first-party distributions are
+# installed with --no-deps.
+COPY core/requirements.txt core/pyproject.toml ./core/
+COPY pantheon/pyproject.toml ./pantheon/
+COPY knemon/pyproject.toml ./knemon/
+COPY graeae/pyproject.toml ./graeae/
+
+# The old Oracle image installed core requirements.txt plus oracledb. The split
+# image keeps that base and adds third-party dependencies declared by the
+# extracted add-on distributions. First-party mnemos-* dependencies are filtered
+# out here and handled by installing the local source directories in the runtime
+# stage.
+RUN python -c 'from pathlib import Path; import re, tomllib; first_party={"mnemos-core", "mnemos-pantheon", "mnemos-knemon", "mnemos-graeae"}; dist_name=lambda req: re.split(r"\s*(?:[<>=!~;\[]|@)", req.strip(), maxsplit=1)[0].lower().replace("_", "-"); reqs=[line.strip() for line in Path("core/requirements.txt").read_text().splitlines() if line.strip() and not line.lstrip().startswith("#")]; reqs += [dep.strip() for pkg in ("pantheon", "knemon", "graeae") for dep in tomllib.loads(Path(pkg, "pyproject.toml").read_text()).get("project", {}).get("dependencies", []) if dep.strip() and dist_name(dep) not in first_party]; reqs.append("oracledb>=4.0.1"); Path("/tmp/requirements.split.txt").write_text("\n".join(dict.fromkeys(reqs)) + "\n")'
+
+RUN uv pip install --system -r /tmp/requirements.split.txt
+
+FROM python:3.11-slim
+
+ARG MNEMOS_CORE_REF
+ARG MNEMOS_PANTHEON_REF
+ARG MNEMOS_KNEMON_REF
+ARG MNEMOS_GRAEAE_REF
+
+LABEL org.opencontainers.image.title="mnemos-os split" \
+      org.opencontainers.image.description="MNEMOS split umbrella image built from mnemos-core plus pantheon, knemon, and graeae namespace packages" \
+      mnemos.split.core-ref="${MNEMOS_CORE_REF}" \
+      mnemos.split.pantheon-ref="${MNEMOS_PANTHEON_REF}" \
+      mnemos.split.knemon-ref="${MNEMOS_KNEMON_REF}" \
+      mnemos.split.graeae-ref="${MNEMOS_GRAEAE_REF}"
+
+WORKDIR /src
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 libgomp1 curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+COPY core ./core
+COPY pantheon ./pantheon
+COPY knemon ./knemon
+COPY graeae ./graeae
+
+RUN python -m pip install --no-deps --no-build-isolation \
+    ./core \
+    ./pantheon \
+    ./knemon \
+    ./graeae
+
+# Dockerfile.oracle left a monorepo-shaped runtime tree at /app. Preserve that
+# shape for code paths that derive repo-root assets such as db/ and
+# config.toml.example from mnemos/.../__file__, while still registering the four
+# split projects above as distinct installed distributions.
+WORKDIR /app
+
+COPY core/ ./
+COPY pantheon/mnemos ./mnemos
+COPY knemon/mnemos ./mnemos
+COPY graeae/mnemos ./mnemos
+
+RUN rm -rf /src
+
+ENV PYTHONUNBUFFERED=1
+ENV MNEMOS_PERSISTENCE_BACKEND=oracle
+
+EXPOSE 5002
+
+# Dockerfile.oracle has no ENTRYPOINT and no image-level HEALTHCHECK; this split
+# image intentionally preserves that behavior.
+CMD ["python", "-m", "uvicorn", "mnemos.api.main:app", "--host", "0.0.0.0", "--port", "5002"]
