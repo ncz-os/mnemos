@@ -4468,6 +4468,8 @@ class SqliteBackend:
                 )
         if auth_method == "subscription":
             est_cost = Decimal("0")
+        elif record.est_cost_usd is not None:
+            est_cost = Decimal(str(record.est_cost_usd))
         elif registry_row is None:
             logger.warning(
                 "usage_ledger model_registry price missing for provider=%s model=%s; recording est_cost_usd=0",

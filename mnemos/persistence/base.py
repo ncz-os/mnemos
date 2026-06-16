@@ -70,6 +70,7 @@ class UsageLedgerRecord:
     request_count: int = 1
     plan_window_id: str | None = None
     path_kind: str = "api"
+    est_cost_usd: Decimal | None = None
 
 
 @dataclass(frozen=True)
