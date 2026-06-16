@@ -112,7 +112,7 @@ sqlite = [
 # deployment bundle (edge/server/ml/interop/full) or mix bundles.
 morpheus = ["numpy>=1.24"]
 persephone = ["zstandard>=0.25"]
-pantheon = []
+pantheon = ["nats-py>=2.14.0"]
 kronos = ["numpy>=1.24"]
 kronos-gpu = ["cupy>=12"]
 knossos = []

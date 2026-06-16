@@ -389,6 +389,13 @@ async def _log_route_outcome(
     schedule_routing_audit(payload, metadata)
 
 
+async def _log_route_outcome_best_effort(**kwargs: Any) -> None:
+    try:
+        await _log_route_outcome(**kwargs)
+    except Exception as exc:
+        logger.debug("[PANTHEON] route audit failed: %s", exc)
+
+
 def _stream_event_payloads(event: str) -> list[dict[str, Any]]:
     raw_payloads = []
     for line in event.splitlines():
@@ -561,7 +568,7 @@ async def _chat_completions_impl(
             budget_started_at = time.perf_counter()
             budget_response, estimated_cost_usd = await _check_budget_or_deny(budget, decision, body)
             if budget_response is not None:
-                await _log_route_outcome(
+                await _log_route_outcome_best_effort(
                     routing_payload=routing_payload,
                     schedule_routing_audit=schedule_routing_audit,
                     request_id=request_id,
@@ -654,7 +661,7 @@ async def _chat_completions_impl(
                 media_type="text/event-stream",
             )
         response_data = await gateway.forward_chat_completion(decision, forward_body)
-        await _log_route_outcome(
+        await _log_route_outcome_best_effort(
             routing_payload=routing_payload,
             schedule_routing_audit=schedule_routing_audit,
             request_id=request_id,
@@ -673,7 +680,7 @@ async def _chat_completions_impl(
         raise _to_http_exception(exc) from exc
     except gateway.PantheonGatewayError as exc:
         if decision is not None:
-            await _log_route_outcome(
+            await _log_route_outcome_best_effort(
                 routing_payload=routing_payload,
                 schedule_routing_audit=schedule_routing_audit,
                 request_id=request_id,
@@ -786,7 +793,7 @@ async def embeddings(
         budget_started_at = time.perf_counter()
         budget_response, estimated_cost_usd = await _check_budget_or_deny(budget, decision, body)
         if budget_response is not None:
-            await _log_route_outcome(
+            await _log_route_outcome_best_effort(
                 routing_payload=routing_payload,
                 schedule_routing_audit=schedule_routing_audit,
                 request_id=request_id,
@@ -804,7 +811,7 @@ async def embeddings(
         started_at = time.perf_counter()
         forward_body = gateway.attach_upstream_identity(body, identity)
         response_data = await gateway.forward_embeddings(decision, forward_body)
-        await _log_route_outcome(
+        await _log_route_outcome_best_effort(
             routing_payload=routing_payload,
             schedule_routing_audit=schedule_routing_audit,
             request_id=request_id,
@@ -823,7 +830,7 @@ async def embeddings(
         raise _to_http_exception(exc) from exc
     except gateway.PantheonGatewayError as exc:
         if decision is not None:
-            await _log_route_outcome(
+            await _log_route_outcome_best_effort(
                 routing_payload=routing_payload,
                 schedule_routing_audit=schedule_routing_audit,
                 request_id=request_id,
