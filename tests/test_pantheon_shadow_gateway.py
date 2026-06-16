@@ -59,6 +59,23 @@ class _NoopCapBucket:
         raise AssertionError("pass-through models should not consume consultation cap")
 
 
+def _gemini_null_content_chat_response() -> dict:
+    return {
+        "id": "chatcmpl-null-content",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "gemini-3.1-pro",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": None},
+                "finish_reason": "length",
+            }
+        ],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+    }
+
+
 def test_passthrough_pricing_backfills_paid_zero_cache_but_keeps_free_tier_zero(monkeypatch):
     from mnemos.api.routes import pantheon as pantheon_routes
     from mnemos.domain.pantheon import router
@@ -508,7 +525,7 @@ def test_passthrough_provider_prefers_operator_base_url_over_engine_url(monkeypa
     assert posted[0][1]["model"] == "openai/openai/gpt-5.5"
 
 
-def test_chat_null_content_response_passes_through_without_usage(monkeypatch):
+def test_chat_null_content_response_passes_through_with_usage(monkeypatch):
     posted = {}
 
     class _Resp:
@@ -516,19 +533,7 @@ def test_chat_null_content_response_passes_through_without_usage(monkeypatch):
         text = ""
 
         def json(self):
-            return {
-                "id": "chatcmpl-null-content",
-                "object": "chat.completion",
-                "created": 1,
-                "model": "openai/openai/gpt-5.5",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": None},
-                        "finish_reason": "length",
-                    }
-                ],
-            }
+            return _gemini_null_content_chat_response()
 
     class _Client:
         async def post(self, url, **kwargs):
@@ -546,15 +551,168 @@ def test_chat_null_content_response_passes_through_without_usage(monkeypatch):
 
     data = asyncio.run(
         gateway._forward_chat_once(
-            _decision(provider="nvidia", model_id="openai/openai/gpt-5.5", route_type="literal"),
+            _decision(provider="nvidia", model_id="gemini-3.1-pro", route_type="passthrough"),
             {"messages": [{"role": "user", "content": "hi"}]},
         )
     )
 
     assert posted["url"] == "https://inference-api.nvidia.com/v1/chat/completions"
-    assert posted["json"]["model"] == "openai/openai/gpt-5.5"
+    assert posted["json"]["model"] == "gemini-3.1-pro"
     assert data["choices"][0]["message"]["content"] is None
-    assert "usage" not in data
+    assert data["choices"][0]["finish_reason"] == "length"
+    assert data["usage"] == {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+
+
+def test_shadow_app_chat_passthrough_null_content_response_preserved_and_audited(monkeypatch):
+    from mnemos.api.pantheon_shadow import app
+    from mnemos.api.routes import pantheon as pantheon_routes
+    from mnemos.core.config import _reset_settings_for_tests
+
+    decision = _decision(
+        alias="gemini-3.1-pro",
+        provider="nvidia",
+        model_id="gemini-3.1-pro",
+        route_type="passthrough",
+        model={"id": "gemini-3.1-pro", "model_id": "gemini-3.1-pro", "usage_tier": "frontier"},
+    )
+    logs: list[dict] = []
+    scheduled: list[tuple[dict, dict]] = []
+
+    class _PantheonRouter:
+        async def route_model(self, _model, _body):
+            return decision
+
+    async def _forward_chat_completion(actual_decision, body):
+        assert actual_decision.route_type == "passthrough"
+        assert body["_mnemos_upstream_identity"]["user_id"] == "default"
+        return _gemini_null_content_chat_response()
+
+    def _routing_payload(**kwargs):
+        logs.append(kwargs)
+        return routing_payload(**kwargs)
+
+    def _schedule(payload, metadata):
+        scheduled.append((payload, metadata))
+
+    with monkeypatch.context() as m:
+        m.setenv("MNEMOS_PROFILE", "server")
+        m.setenv("MNEMOS_PANTHEON_ENABLED", "true")
+        m.setattr(dependencies, "PERSONAL_SINGLETON", None)
+        m.setattr(dependencies, "_auth_enabled", False)
+        m.setattr(gateway, "forward_chat_completion", _forward_chat_completion)
+        m.setattr(
+            pantheon_routes,
+            "_pantheon_imports",
+            lambda: (
+                None,
+                gateway,
+                _PantheonRouter(),
+                Exception,
+                _NoopCapBucket(),
+                _routing_payload,
+                _schedule,
+            ),
+        )
+        _reset_settings_for_tests()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={"model": "gemini-3.1-pro", "messages": [{"role": "user", "content": "hi"}]},
+            )
+
+    _reset_settings_for_tests()
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["choices"][0]["message"]["content"] is None
+    assert data["choices"][0]["finish_reason"] == "length"
+    assert data["usage"] == {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+    assert logs[0]["response"]["choices"][0]["message"]["content"] is None
+    assert scheduled[0][0]["tokens_in"] == 11
+    assert scheduled[0][0]["tokens_out"] == 7
+
+
+def test_graeae_openai_compatible_null_content_choice_is_success(monkeypatch):
+    from mnemos.domain.graeae.engine import GraeaeEngine
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return _gemini_null_content_chat_response()
+
+    class _Client:
+        async def post(self, *_args, **_kwargs):
+            return _Resp()
+
+    engine = GraeaeEngine.__new__(GraeaeEngine)
+
+    async def _get_client():
+        return _Client()
+
+    engine._get_client = _get_client
+    monkeypatch.setattr("mnemos.domain.graeae.engine.get_key", lambda _key_name: "key")
+
+    result = asyncio.run(
+        engine._query_openai_compatible(
+            {"key_name": "gemini", "model": "gemini-3.1-pro", "url": "https://example.test/v1/chat/completions"},
+            "hi",
+            30,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["response_text"] == ""
+    assert result["choices"][0]["message"]["content"] is None
+    assert result["choices"][0]["finish_reason"] == "length"
+
+
+def test_graeae_native_gemini_empty_length_candidate_is_success(monkeypatch):
+    from mnemos.domain.graeae.engine import GraeaeEngine
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "candidates": [
+                    {
+                        "content": None,
+                        "finishReason": "MAX_TOKENS",
+                    }
+                ]
+            }
+
+    class _Client:
+        async def post(self, *_args, **_kwargs):
+            return _Resp()
+
+    engine = GraeaeEngine.__new__(GraeaeEngine)
+
+    async def _get_client():
+        return _Client()
+
+    engine._get_client = _get_client
+    monkeypatch.setattr("mnemos.domain.graeae.engine.get_key", lambda _key_name: "key")
+
+    result = asyncio.run(
+        engine._query_gemini(
+            {"key_name": "gemini", "model": "gemini-3.1-pro", "url": "https://example.test/generateContent"},
+            "hi",
+            30,
+            generation_params={"max_tokens": 7},
+            messages=[{"role": "user", "content": "hi"}],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["response_text"] == ""
+    assert result["choices"][0]["message"]["content"] is None
+    assert result["choices"][0]["finish_reason"] == "length"
 
 
 def test_codex_fleet_model_is_cataloged_and_resolvable(monkeypatch):
