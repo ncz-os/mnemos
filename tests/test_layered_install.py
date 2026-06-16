@@ -29,8 +29,11 @@ def test_layer_flags_default_on_and_active_layers() -> None:
 
     layers = _LayerSettings()
     assert layers.enable_graeae is True
-    assert layers.enable_hive is True
-    assert layers.active_layers == {"core", "graeae", "hive"}
+    # hive defaults OFF in the split: it is not an installable mnemos-core extra
+    # (separate ncz-os/hive track), so a default-ON flag for a non-installable
+    # component is incorrect. enable_hive is opt-in.
+    assert layers.enable_hive is False
+    assert layers.active_layers == {"core", "graeae"}
 
 
 def test_active_layers_core_only_when_disabled() -> None:
@@ -88,4 +91,3 @@ def test_layer_matrix_graeae_requires_consultations() -> None:
     assert LAYER_REQUIRED_CAPABILITIES["core"] == set()
     assert LAYER_REQUIRED_CAPABILITIES["graeae"] == {"consultations"}
     assert LAYER_REQUIRED_CAPABILITIES["hive"] == set()
-
