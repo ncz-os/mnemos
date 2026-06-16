@@ -1890,7 +1890,7 @@ class OracleMemoryRepository(MemoryRepository):
         try:
             if not apply:
                 await _call(cursor.execute, "SELECT COUNT(*) AS cnt FROM memories WHERE content_hash IS NULL")
-                row = await _fetchone_dict(cursor)
+                row = await _row_to_dict(cursor, await _call(cursor.fetchone))
                 return int((row or {}).get("cnt") or 0)
             await _call(
                 cursor.execute,
@@ -4799,6 +4799,27 @@ class OracleBackend:
                 VALUES (
                     :provider, :model, :task_kind, :tokens_in, :tokens_out,
                     :tokens_reasoning, 0, :latency_ms, :outcome,
+                    :caller_subsystem, :tier, :session_id, :request_count,
+                    :plan_window_id, :path_kind, :subscription_amortized
+                )
+                RETURNING id, est_cost_usd INTO :rid, :rcost
+                """,
+                    params,
+                )
+            elif record.est_cost_usd is not None:
+                params["est_cost_usd"] = Decimal(str(record.est_cost_usd))
+                await _call(
+                    cursor.execute,
+                    """
+                INSERT INTO usage_ledger (
+                    provider, model, task_kind, tokens_in, tokens_out,
+                    tokens_reasoning, est_cost_usd, latency_ms, outcome,
+                    caller_subsystem, tier, session_id, request_count,
+                    plan_window_id, path_kind, subscription_amortized
+                )
+                VALUES (
+                    :provider, :model, :task_kind, :tokens_in, :tokens_out,
+                    :tokens_reasoning, :est_cost_usd, :latency_ms, :outcome,
                     :caller_subsystem, :tier, :session_id, :request_count,
                     :plan_window_id, :path_kind, :subscription_amortized
                 )

@@ -690,6 +690,26 @@ class PantheonSettings(BaseSettings):
             "PANTHEON_UPSTREAM_TIMEOUT",
         ),
     )
+    passthrough_enabled: bool = Field(
+        True,
+        validation_alias="MNEMOS_PANTHEON_PASSTHROUGH_ENABLED",
+    )
+    passthrough_provider: str = Field(
+        "nvidia",
+        validation_alias="MNEMOS_PANTHEON_PASSTHROUGH_PROVIDER",
+    )
+    passthrough_default_input_cost_per_mtok: float = Field(
+        5.0,
+        validation_alias="MNEMOS_PANTHEON_PASSTHROUGH_DEFAULT_INPUT_COST_PER_MTOK",
+    )
+    passthrough_default_output_cost_per_mtok: float = Field(
+        30.0,
+        validation_alias="MNEMOS_PANTHEON_PASSTHROUGH_DEFAULT_OUTPUT_COST_PER_MTOK",
+    )
+    passthrough_default_estimated_output_tokens: int = Field(
+        4096,
+        validation_alias="MNEMOS_PANTHEON_PASSTHROUGH_DEFAULT_ESTIMATED_OUTPUT_TOKENS",
+    )
     shadow_port: int = Field(
         4101,
         validation_alias="MNEMOS_PANTHEON_SHADOW_PORT",
@@ -710,6 +730,7 @@ class PantheonSettings(BaseSettings):
         "routing_log_queue_size",
         "routing_log_drain_workers",
         "reasoning_output_token_budget",
+        "passthrough_default_estimated_output_tokens",
         "shadow_port",
         mode="before",
     )
@@ -738,6 +759,25 @@ class PantheonSettings(BaseSettings):
         except (TypeError, ValueError):
             return 60.0
         return value if value > 0.0 else 60.0
+
+    @field_validator("passthrough_provider", mode="before")
+    @classmethod
+    def _non_empty_provider(cls, raw: Any) -> str:
+        provider = str(raw or "").strip()
+        return provider or "nvidia"
+
+    @field_validator(
+        "passthrough_default_input_cost_per_mtok",
+        "passthrough_default_output_cost_per_mtok",
+        mode="before",
+    )
+    @classmethod
+    def _positive_cost(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 1.0
+        return value if value > 0.0 else 1.0
 
 
 class KnemonSettings(BaseSettings):

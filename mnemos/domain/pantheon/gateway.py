@@ -30,6 +30,12 @@ _RESPONSES_MODEL_RE = re.compile(r"(?:^|/)(?:gpt-[0-9.]+.*codex|.*codex.*gpt-[0-
 _TOKEN_BUDGET_FIELDS = ("max_output_tokens", "max_completion_tokens", "max_tokens")
 DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 60.0
 _PANTHEON_PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
+    "nvidia": {
+        "url": "https://inference-api.nvidia.com/v1/chat/completions",
+        "api": "openai",
+        "key_name": "nvidia",
+        "enabled": True,
+    },
     "eih": {
         "url": "https://integrate.api.nvidia.com/v1/chat/completions",
         "api": "openai",
@@ -323,6 +329,11 @@ def _provider_payload(decision: RouteDecision, body: dict[str, Any], *, stream: 
     if model_uses_responses_api(decision.model_id):
         return _responses_payload(decision, body, stream=stream)
     payload = _chat_payload(decision, body, stream=stream)
+    if stream is True:
+        stream_options = payload.get("stream_options")
+        stream_options = dict(stream_options) if isinstance(stream_options, dict) else {}
+        stream_options["include_usage"] = True
+        payload["stream_options"] = stream_options
     return _apply_reasoning_budget(payload, decision.model_id)
 
 
@@ -363,20 +374,14 @@ def _responses_to_chat_completion(data: dict[str, Any], decision: RouteDecision)
     created = int(data.get("created_at") or time.time())
     message = _message_from_responses_output(data)
     finish_reason = "tool_calls" if message.get("tool_calls") else "stop"
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-    prompt_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0))
-    completion_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0))
+    usage = _responses_chat_usage(data.get("usage")) or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     return {
         "id": data.get("id") or f"chatcmpl-pantheon-{created}",
         "object": "chat.completion",
         "created": created,
         "model": data.get("model") or decision.model_id or decision.alias,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": {
-            "prompt_tokens": int(prompt_tokens or 0),
-            "completion_tokens": int(completion_tokens or 0),
-            "total_tokens": int((prompt_tokens or 0) + (completion_tokens or 0)),
-        },
+        "usage": usage,
     }
 
 
@@ -444,6 +449,40 @@ async def _forward_chat_once(decision: RouteDecision, body: dict[str, Any]) -> d
     return data
 
 
+@dataclass
+class _OpenChatStream:
+    decision: RouteDecision
+    manager: Any
+    response: httpx.Response
+
+    async def aclose(self) -> None:
+        await self.manager.__aexit__(None, None, None)
+
+
+async def _open_chat_stream_once(decision: RouteDecision, body: dict[str, Any]) -> _OpenChatStream:
+    cfg = _provider_config(decision)
+    client = get_http_client()
+    payload = _provider_payload(decision, body, stream=True)
+    url = _responses_url(cfg) if model_uses_responses_api(decision.model_id) else _chat_url(cfg, decision)
+    manager = client.stream(
+        "POST",
+        url,
+        json=payload,
+        headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
+        timeout=None,
+    )
+    response = await manager.__aenter__()
+    if response.status_code >= 400:
+        body_bytes = await response.aread()
+        await manager.__aexit__(None, None, None)
+        raise PantheonGatewayError(
+            response.status_code,
+            body_bytes[:500].decode("utf-8", "replace"),
+            retry_after_seconds(response),
+        )
+    return _OpenChatStream(decision=decision, manager=manager, response=response)
+
+
 def _decision_cooldown_key(decision: RouteDecision) -> str:
     """Stable cooldown key for a routed provider (avoids hashing RouteDecision)."""
     return f"{decision.provider}:{decision.model_id or decision.alias}"
@@ -455,6 +494,26 @@ def _tenant_of(body: dict[str, Any]) -> str:
     if identity is None:
         return DEFAULT_TENANT
     return f"{identity.namespace}:{identity.user_id}"
+
+
+async def _runtime_chain(decision: RouteDecision) -> list[RouteDecision]:
+    settings = get_settings().pantheon
+    chain = [decision]
+    if getattr(settings, "cross_provider_fallback", False):
+        from mnemos.domain.pantheon import catalog, router
+
+        built = router.build_fallback_chain(decision, await catalog.list_models())
+        # only providers served by this openai-compatible path can run in the
+        # chain; drop graeae-only providers (anthropic/gemini) — keep primary.
+        chain = [d for d in built if _is_openai_api(d)] or [decision]
+    return chain
+
+
+def _raise_route_failure(exc: AllDeploymentsFailed) -> None:
+    last = exc.last_exception
+    if isinstance(last, PantheonGatewayError):
+        raise last
+    raise PantheonGatewayError(503, str(last) if last else str(exc)) from exc
 
 
 async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
@@ -471,14 +530,7 @@ async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any])
     # single-element chain keeps routing semantics unchanged; a non-retryable
     # error (e.g. 400) still surfaces as the original PantheonGatewayError.
     runtime = get_runtime()
-    chain = [decision]
-    if get_settings().pantheon.cross_provider_fallback:
-        from mnemos.domain.pantheon import catalog, router
-
-        built = router.build_fallback_chain(decision, await catalog.list_models())
-        # only providers served by this openai-compatible path can run in the
-        # chain; drop graeae-only providers (anthropic/gemini) — keep primary.
-        chain = [d for d in built if _is_openai_api(d)] or [decision]
+    chain = await _runtime_chain(decision)
     try:
         result = await runtime.route(
             chain,
@@ -488,38 +540,14 @@ async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any])
             key_of=_decision_cooldown_key,
         )
     except AllDeploymentsFailed as exc:
-        last = exc.last_exception
-        if isinstance(last, PantheonGatewayError):
-            raise last
-        raise PantheonGatewayError(503, str(last) if last else str(exc)) from exc
+        _raise_route_failure(exc)
     return result.result
 
 
-async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> AsyncIterator[bytes]:
-    if decision.route_type == "consensus":
-        async for event in consensus_chat_completion_stream(decision, body):
-            yield event
-        return
-
-    cfg = _provider_config(decision)
-    if cfg.get("api", "openai") != "openai":
-        async for event in _graeae_chat_completion_stream(decision, body):
-            yield event
-        return
-
-    client = get_http_client()
-    payload = _provider_payload(decision, body, stream=True)
-    url = _responses_url(cfg) if model_uses_responses_api(decision.model_id) else _chat_url(cfg, decision)
-    async with client.stream(
-        "POST",
-        url,
-        json=payload,
-        headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
-        timeout=None,
-    ) as response:
-        if response.status_code >= 400:
-            body_bytes = await response.aread()
-            raise PantheonGatewayError(response.status_code, body_bytes[:500].decode("utf-8", "replace"))
+async def _yield_openai_chat_stream(opened: _OpenChatStream) -> AsyncIterator[bytes]:
+    try:
+        decision = opened.decision
+        response = opened.response
         if model_uses_responses_api(decision.model_id):
             stream_id = f"chatcmpl-pantheon-{int(time.time())}"
             created = int(time.time())
@@ -557,11 +585,39 @@ async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) 
             return
         async for chunk in response.aiter_bytes():
             yield chunk
+    finally:
+        await opened.aclose()
 
 
-async def forward_embeddings(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
+async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> AsyncIterator[bytes]:
     if decision.route_type == "consensus":
-        raise PantheonGatewayError(400, "consensus aliases are not valid for embeddings")
+        async for event in consensus_chat_completion_stream(decision, body):
+            yield event
+        return
+
+    cfg = _provider_config(decision)
+    if cfg.get("api", "openai") != "openai":
+        async for event in _graeae_chat_completion_stream(decision, body):
+            yield event
+        return
+
+    runtime = get_runtime()
+    chain = await _runtime_chain(decision)
+    try:
+        result = await runtime.route(
+            chain,
+            lambda d: _open_chat_stream_once(d, body),
+            classify=classify,
+            tenant=_tenant_of(body),
+            key_of=_decision_cooldown_key,
+        )
+    except AllDeploymentsFailed as exc:
+        _raise_route_failure(exc)
+    async for chunk in _yield_openai_chat_stream(result.result):
+        yield chunk
+
+
+async def _forward_embeddings_once(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
     cfg = _provider_config(decision)
     client = get_http_client()
     payload = _provider_payload(decision, body, stream=None)
@@ -576,6 +632,23 @@ async def forward_embeddings(decision: RouteDecision, body: dict[str, Any]) -> d
     data = response.json()
     data.setdefault("model", decision.model_id)
     return data
+
+
+async def forward_embeddings(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
+    if decision.route_type == "consensus":
+        raise PantheonGatewayError(400, "consensus aliases are not valid for embeddings")
+    runtime = get_runtime()
+    try:
+        result = await runtime.route(
+            [decision],
+            lambda d: _forward_embeddings_once(d, body),
+            classify=classify,
+            tenant=_tenant_of(body),
+            key_of=_decision_cooldown_key,
+        )
+    except AllDeploymentsFailed as exc:
+        _raise_route_failure(exc)
+    return result.result
 
 
 async def _graeae_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
@@ -646,6 +719,34 @@ async def consensus_chat_completion(decision: RouteDecision, body: dict[str, Any
     )
     content = result.get("consensus_response") or ""
     return _openai_chat_response(decision.alias, None, content, messages)
+
+
+def _responses_chat_usage(usage: Any) -> dict[str, int] | None:
+    if not isinstance(usage, dict):
+        return None
+
+    def _int_value(*keys: str) -> int | None:
+        for key in keys:
+            if usage.get(key) is None:
+                continue
+            try:
+                return max(0, int(usage[key]))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    prompt_tokens = _int_value("input_tokens", "prompt_tokens")
+    completion_tokens = _int_value("output_tokens", "completion_tokens")
+    total_tokens = _int_value("total_tokens")
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+    prompt = prompt_tokens or 0
+    completion = completion_tokens or 0
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total_tokens if total_tokens is not None else prompt + completion,
+    }
 
 
 async def consensus_chat_completion_stream(decision: RouteDecision, body: dict[str, Any]) -> AsyncIterator[bytes]:
@@ -824,6 +925,7 @@ def _responses_stream_events(data: dict[str, Any], *, stream_id: str, created: i
         if not state.get("finished"):
             state["finished"] = True
             reason = "stop" if event_type == "response.completed" else "length"
+            response_obj = data.get("response") if isinstance(data.get("response"), dict) else {}
             events.append(
                 _stream_event(
                     {
@@ -835,6 +937,20 @@ def _responses_stream_events(data: dict[str, Any], *, stream_id: str, created: i
                     }
                 )
             )
+            usage = _responses_chat_usage(response_obj.get("usage") if isinstance(response_obj, dict) else None)
+            if usage is not None:
+                events.append(
+                    _stream_event(
+                        {
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [],
+                            "usage": usage,
+                        }
+                    )
+                )
     return events
 
 

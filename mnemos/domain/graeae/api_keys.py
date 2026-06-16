@@ -139,6 +139,13 @@ def load_provider_registry() -> dict:
 _LLM_PROVIDERS: dict = load_provider_registry()
 
 
+def get_provider_config(provider: str) -> dict:
+    """Return non-secret provider metadata from the loaded registry entry."""
+    canonical = _PROVIDER_ALIASES.get(provider, provider)
+    config = _LLM_PROVIDERS.get(canonical, {})
+    return dict(config) if isinstance(config, dict) else {}
+
+
 def get_key(provider: str) -> str:
     """Return the api_key for a provider.
 
