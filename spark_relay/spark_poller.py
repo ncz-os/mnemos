@@ -72,7 +72,7 @@ NONCOMMIT_PREFIXES = (
 
 KIND_WORKSPACE_MAP = (
     (("ic-engine:", "investorclaw:"), "https://gitlab.com/argonautsystems/ic-engine.git"),
-    (("riskyeats:",), "https://gitlab.com/perlowja/riskyeats.git"),
+    (("riskyeats:",), "https://gitlab.com/argonautsystems/riskyeats.git"),
     (("riskybiz:", "argonaut:"), None),
     (
         ("mnemos:", "feat:knemon", "fix:knemon", "feat:oracle-backend"),
@@ -646,7 +646,7 @@ class AgenticRepoExecutor:
             "mnemos": "https://gitlab.com/mnemos-os/mnemos.git",
             "zeroclaw": "https://gitlab.com/nclawzero/zeroclaw.git",
             "ncz-installer": "https://gitlab.com/nclawzero/ncz-installer.git",
-            "riskyeats": "https://gitlab.com/perlowja/riskyeats.git",
+            "riskyeats": "https://gitlab.com/argonautsystems/riskyeats.git",
             "ic-engine": "https://gitlab.com/argonautsystems/ic-engine.git",
             "investorclaw-enterprise": "https://gitlab.com/argonautsystems/InvestorClaw.git",
             "florida-licenses": "https://gitlab.com/argonautsystems/florida-licenses.git",
