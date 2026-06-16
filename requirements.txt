@@ -74,6 +74,7 @@ typer>=0.9.0
 # semantics (queue==durable enforcement). Older versions silently
 # accepted mismatched queue/durable values — keep the floor here.
 # Install with: pip install 'mnemos-os[nats]'
+nats-py>=2.14.0
 
 # Optional: Intel OpenVINO / phi_server.py (local GPU inference)
 # Install on GPU systems only: pip install mnemos-os[phi]

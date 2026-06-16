@@ -230,6 +230,13 @@ def _content_text(content: Any) -> str:
     return str(content)
 
 
+def _chat_message_content_text(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    return str(content) if content is not None else ""
+
+
 def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else [value]
 
@@ -1395,16 +1402,21 @@ class GraeaeEngine:
             raise RuntimeError(f"No choices in response: {data}")
         normalized_choices = []
         for i, choice in enumerate(choices):
-            message = choice.get("message") or {}
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            message = message if isinstance(message, dict) else {}
             normalized_choices.append({
                 "index": choice.get("index", i),
                 "message": message,
                 "finish_reason": choice.get("finish_reason") or "stop",
             })
-        first_message = normalized_choices[0]["message"]
+        if not normalized_choices:
+            raise RuntimeError(f"No valid choices in response: {data}")
+        first_message = normalized_choices[0].get("message")
         return {
             "status": "success",
-            "response_text": first_message.get("content") or "",
+            "response_text": _chat_message_content_text(first_message),
             "latency_ms": 0,
             "model_id": provider["model"],
             "choices": normalized_choices,
@@ -1580,16 +1592,26 @@ class GraeaeEngine:
             raise RuntimeError(f"No candidates in response: {data}")
         choices = []
         for i, candidate in enumerate(candidates):
-            parts = candidate.get("content", {}).get("parts", [])
-            text = "".join(part.get("text", "") for part in parts)
+            if not isinstance(candidate, dict):
+                continue
+            content = candidate.get("content")
+            content = content if isinstance(content, dict) else {}
+            parts = content.get("parts")
+            parts = parts if isinstance(parts, list) else []
+            text_parts = []
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                value = part.get("text")
+                if value is not None:
+                    text_parts.append(str(value))
+            text = "".join(text_parts)
             choices.append({
                 "index": i,
-                "message": {"role": "assistant", "content": text},
+                "message": {"role": "assistant", "content": text if text else None},
                 "finish_reason": _normalize_gemini_finish_reason(candidate.get("finishReason")),
             })
-        text = choices[0]["message"]["content"] if choices else ""
-        if not text:
-            raise RuntimeError(f"Empty content in candidate: {candidates[0]}")
+        text = _chat_message_content_text(choices[0].get("message") if choices else None)
         return {
             "status": "success",
             "response_text": text,
