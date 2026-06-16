@@ -89,26 +89,3 @@ def test_layer_matrix_graeae_requires_consultations() -> None:
     assert LAYER_REQUIRED_CAPABILITIES["graeae"] == {"consultations"}
     assert LAYER_REQUIRED_CAPABILITIES["hive"] == set()
 
-
-# ── KNEMON model-affinity emission (hive dispatch) ───────────────────────────
-
-
-def test_zeroclaw_caller_gets_model_affinity() -> None:
-    from mnemos.domain.knemon.router import (
-        _dispatch_kind,
-        _dispatch_required_capabilities,
-    )
-
-    selected = {"provider": "groq", "model_id": "llama-3.3-70b-versatile"}
-    assert _dispatch_kind("groq", "zeroclaw") == "zeroclaw"
-    caps = _dispatch_required_capabilities(selected, ["coding"], "zeroclaw")
-    assert "coding" in caps
-    assert any(c.startswith("model:") for c in caps)
-
-
-def test_api_caller_has_no_model_affinity() -> None:
-    from mnemos.domain.knemon.router import _dispatch_required_capabilities
-
-    selected = {"provider": "groq", "model_id": "llama-3.3-70b-versatile"}
-    caps = _dispatch_required_capabilities(selected, ["coding"], "api")
-    assert caps == ["coding"]

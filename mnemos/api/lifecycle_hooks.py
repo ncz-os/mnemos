@@ -7,6 +7,7 @@ from typing import Any
 
 from mnemos.api.dependencies import configure_auth
 from mnemos.core import lifecycle
+from mnemos.core.extras import is_extra_installed
 from mnemos.core.services import service_enabled
 
 logger = logging.getLogger(__name__)
@@ -14,12 +15,16 @@ _registered = False
 
 
 async def _reload_provider_manifest(pool: Any) -> None:
+    if not is_extra_installed("graeae"):
+        return
     from mnemos.domain.graeae.engine import get_graeae_engine
 
     await get_graeae_engine().reload_from_registry(pool)
 
 
 async def _close_graeae_engine() -> None:
+    if not is_extra_installed("graeae"):
+        return
     from mnemos.domain.graeae.engine import get_graeae_engine
 
     await get_graeae_engine().close()
@@ -29,6 +34,8 @@ async def _close_pantheon_http_client() -> None:
     from mnemos.core.config import get_settings
 
     if not service_enabled(get_settings(), "pantheon"):
+        return
+    if not is_extra_installed("pantheon"):
         return
 
     from mnemos.domain.pantheon.gateway import aclose_http_client, aclose_runtime
@@ -199,8 +206,15 @@ async def _pantheon_routing_audit_post_db_hook(pool: Any, settings: Any) -> None
     """Launch the optional PANTHEON routing audit NATS consumer."""
     if not service_enabled(settings, "pantheon_routing_audit_consumer"):
         return
+    if not is_extra_installed("pantheon"):
+        logger.info("PANTHEON routing audit consumer disabled; pantheon add-on is not installed")
+        return
 
-    from mnemos.workers.pantheon_routing_audit_consumer import consumer_loop
+    try:
+        from mnemos.workers.pantheon_routing_audit_consumer import consumer_loop
+    except ImportError:
+        logger.warning("PANTHEON routing audit consumer module is not available")
+        return
 
     audit_handle = lifecycle._persistence_backend or pool
     logger.info("Launching PANTHEON routing audit NATS consumer")

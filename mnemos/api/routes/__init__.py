@@ -1,1 +1,0 @@
-# MNEMOS API handlers

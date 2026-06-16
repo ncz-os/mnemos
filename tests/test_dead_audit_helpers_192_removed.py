@@ -6,9 +6,6 @@ Removed helpers:
 
 - ``ProviderResponse`` Pydantic class in ``mnemos/domain/models.py``
   (line ~438) — declared but never used as a `response_model=`.
-- ``ProviderResponse`` ``@dataclass`` class in
-  ``mnemos/domain/graeae/engine.py`` (line ~76) — declared but
-  never instantiated. Live shape is ``ProviderQueryResponse``.
 - ``ModelRecommendation`` Pydantic class in
   ``mnemos/domain/models.py`` (line ~483) — declared but never
   used. Live recommendation type is the dataclass at
@@ -25,10 +22,6 @@ Removed helpers:
   The duplicate in ``mnemos/db/mcp_audit_repo.py`` IS live.
 - ``_row_get`` in ``mnemos/db/deletion_log.py`` — declared but
   never called inside the module.
-- ``drain_routing_log_queue_for_tests`` in
-  ``mnemos/domain/pantheon/routing_log.py`` — exported in
-  ``__all__`` but no test/script imports or calls it. The
-  ``__all__`` entry was also removed.
 
 Removed fixtures:
 
@@ -50,14 +43,11 @@ import pytest
 # Each row: (filename hint, name to scan).
 REMOVED_HELPERS = (
     ("mnemos/domain/models.py", "ProviderResponse"),
-    ("mnemos/domain/graeae/engine.py", "ProviderResponse"),
     ("mnemos/domain/models.py", "ModelRecommendation"),
     ("mnemos/api/routes/journal.py", "JournalEntry"),
     ("mnemos/db/deletion_log.py", "_sha256_hex"),
     ("mnemos/db/deletion_log.py", "_looks_like_sqlite_conn"),
     ("mnemos/db/deletion_log.py", "_row_get"),
-    ("mnemos/domain/pantheon/routing_log.py",
-     "drain_routing_log_queue_for_tests"),
 )
 
 
@@ -129,18 +119,6 @@ def test_no_external_callers_of_removed_helper(name: str):
     assert not offenders, (
         f"{len(offenders)} source file(s) reference the removed "
         f"`{name}`:\n  " + "\n  ".join(offenders)
-    )
-
-
-def test_routing_log_all_drops_drained_helper():
-    """`__all__` in routing_log.py must not advertise the removed
-    `drain_routing_log_queue_for_tests`."""
-    repo = Path(__file__).resolve().parents[1]
-    src = (repo / "mnemos" / "domain" / "pantheon"
-           / "routing_log.py").read_text()
-    assert '"drain_routing_log_queue_for_tests"' not in src, (
-        "routing_log.py `__all__` re-introduced the removed "
-        "`drain_routing_log_queue_for_tests` entry."
     )
 
 

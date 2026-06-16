@@ -722,6 +722,8 @@ async def reload_graeae_providers(_: UserContext = Depends(require_root)):
     Lets the daily provider /v1/models cron rotate model_ids in-process
     without restarting the container. Returns a dict of changes.
     """
+    if not is_extra_installed("graeae"):
+        raise HTTPException(status_code=503, detail=missing_extra_detail("graeae", label="GRAEAE"))
     backend = backend_or_503()
     from mnemos.domain.graeae.engine import get_graeae_engine
 

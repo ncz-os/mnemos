@@ -737,9 +737,13 @@ def _patch_direct_dag_visibility_fakes(request, monkeypatch):
 async def client(monkeypatch, db_pool: FakePool, mock_graeae_engine):
     """Create an in-process AsyncClient bound to the FastAPI app."""
     import mnemos.core.lifecycle as lc
-    import mnemos.domain.graeae.engine as graeae_engine
     from mnemos.api.dependencies import configure_auth
     from mnemos.api.main import app
+
+    try:
+        import mnemos.domain.graeae.engine as graeae_engine
+    except ImportError:
+        graeae_engine = None
 
     configure_auth({"enabled": False})
     from tests._fake_backend import FakePoolBackedBackend
@@ -748,7 +752,8 @@ async def client(monkeypatch, db_pool: FakePool, mock_graeae_engine):
     monkeypatch.setattr(lc, "_persistence_backend", FakePoolBackedBackend(db_pool))
     monkeypatch.setattr(lc, "_cache", None)
     monkeypatch.setattr(lc, "_worker_status", {"distillation_worker": "idle"})
-    monkeypatch.setattr(graeae_engine, "get_graeae_engine", lambda: mock_graeae_engine)
+    if graeae_engine is not None:
+        monkeypatch.setattr(graeae_engine, "get_graeae_engine", lambda: mock_graeae_engine)
     app.state.pool = db_pool
 
     transport = ASGITransport(app=app)

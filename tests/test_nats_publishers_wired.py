@@ -190,36 +190,6 @@ async def test_delete_memory_publishes_memory_deleted(
     )
 
 
-async def test_consultation_publishes_completed(
-    client,
-    auth_headers: dict[str, str],
-    current_user_override,
-    publish_mock: AsyncMock,
-):
-    resp = await client.post(
-        "/v1/consultations",
-        json={"prompt": "where is paris", "task_type": "reasoning", "mode": "auto"},
-        headers=auth_headers,
-    )
-
-    assert resp.status_code == 200, resp.text
-    consultation_id = resp.json()["consultation_id"]
-    publish_mock.assert_awaited_once()
-    subject, payload = publish_mock.await_args.args
-    assert subject == "mnemos.consultation.completed.alice_ns"
-    assert payload == {
-        "consultation_id": consultation_id,
-        "task_type": "reasoning",
-        "mode": "auto",
-        "winning_muse": "openai",
-        "consensus_score": 0.95,
-        "namespace": "alice.ns",
-        "user_id": "alice",
-        "source_node": NODE_NAME,
-    }
-    assert publish_mock.await_args.kwargs["msg_id"] == f"{consultation_id}.completed"
-
-
 async def test_webhook_create_publishes_subscription_created(
     client,
     auth_headers: dict[str, str],

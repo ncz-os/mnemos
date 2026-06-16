@@ -63,10 +63,6 @@ from .memory import (
     tool_search_memories,
     tool_update_memory,
 )
-from .graeae import (
-    TOOLS as GRAEAE_TOOLS,
-    tool_graeae_consult,
-)
 from .models import (
     TOOLS as MODEL_TOOLS,
     tool_pantheon_list_models,
@@ -89,6 +85,16 @@ else:
 
     async def tool_kronos_forecast(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"success": False, "error": "KRONOS not installed"}
+
+GRAEAE_TOOLS: dict[str, dict[str, Any]] = {}
+if is_extra_installed("graeae"):
+    from .graeae import (
+        TOOLS as GRAEAE_TOOLS,
+        tool_graeae_consult,
+    )
+else:
+    async def tool_graeae_consult(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"success": False, "error": "GRAEAE not installed"}
 
 _DOMAIN_TOOLS: dict[str, dict[str, Any]] = {}
 for _domain_tools in (
@@ -134,6 +140,7 @@ def _filter_unavailable_tools(order: list[str]) -> list[str]:
     extras_for_tool = {
         "pantheon_list_models": "pantheon",
         "pantheon_route_explain": "pantheon",
+        "graeae_consult": "graeae",
         "kronos_anomalies": "kronos",
         "kronos_forecast": "kronos",
     }

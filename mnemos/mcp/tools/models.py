@@ -8,6 +8,7 @@ from typing import Any
 
 import mnemos.core.lifecycle as _lc
 from mnemos.core.auth_context import UserContext
+from mnemos.core.extras import is_extra_installed
 from mnemos.db import mcp_repo
 
 from ._runtime import _rest_get, _safe_path_segment, _tool
@@ -138,6 +139,8 @@ async def tool_pantheon_list_models(
 ) -> dict[str, Any]:
     """Return the extended PANTHEON model catalog."""
     del user
+    if not is_extra_installed("pantheon"):
+        return {"success": False, "error": "PANTHEON not installed"}
     from mnemos.domain.pantheon.catalog import models_response
 
     return {
@@ -157,6 +160,8 @@ async def tool_pantheon_route_explain(
 ) -> dict[str, Any]:
     """Explain PANTHEON alias and routing resolution for an MCP caller."""
     del user
+    if not is_extra_installed("pantheon"):
+        return {"success": False, "error": "PANTHEON not installed"}
     from mnemos.domain.pantheon.router import explain_route
 
     if not isinstance(messages, list) or len(messages) > 100:

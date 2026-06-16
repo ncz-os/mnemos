@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mnemos-os"
+name = "mnemos-core"
 version = "6.0.0rc1"
-description = "MNEMOS-OS v5: agent memory OS with full divergent dream-state pipeline (REPLAY → CLUSTER → CONSOLIDATE → SYNTHESISE → EXTRACT), GDPR right-to-be-forgotten, PERSEPHONE archival, PANTHEON unified LLM facade, KRONOS recall observability, multi-backend persistence, and multi-worker support"
+description = "MNEMOS core: agent memory OS base with GDPR right-to-be-forgotten, PERSEPHONE archival, KRONOS recall observability, multi-backend persistence, and multi-worker support"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -91,7 +91,7 @@ build = ["pyinstaller>=6.0", "sqlite-vec"]
 docling = ["docling>=2.5.0", "docling-core>=2.0.0", "pillow>=10.0.0"]
 # OpenTelemetry tracing. Without this extra, `install_tracing()` is a
 # no-op and the tracing middleware passes through unchanged. Install
-# via `pip install mnemos-os[tracing]` to ship spans via OTLP/HTTP
+# via `pip install mnemos-core[tracing]` to ship spans via OTLP/HTTP
 # to your collector (Tempo, Honeycomb, Jaeger, etc.).
 tracing = [
   "opentelemetry-api>=1.27.0",
@@ -112,7 +112,7 @@ sqlite = [
 # deployment bundle (edge/server/ml/interop/full) or mix bundles.
 morpheus = ["numpy>=1.24"]
 persephone = ["zstandard>=0.25"]
-pantheon = ["nats-py>=2.14.0"]
+pantheon = ["mnemos-pantheon"]
 kronos = ["numpy>=1.24"]
 kronos-gpu = ["cupy>=12"]
 knossos = []
@@ -120,23 +120,24 @@ apollo = []
 artemis = ["networkx>=3.3", "scipy>=1.11"]
 nats = ["nats-py>=2.14.0"]
 hot = ["mnemos-hot>=0.2.0"]
+knemon = ["mnemos-knemon"]
 edge = [
   "aiosqlite>=0.20.0",
   "sqlite-vec>=0.1.6",
 ]
-server = ["mnemos-os[nats,persephone,pantheon]"]
-ml = ["mnemos-os[morpheus,kronos,apollo,artemis,hot]"]
-interop = ["mnemos-os[knossos]"]
+server = ["mnemos-core[nats,persephone,pantheon,knemon,graeae,hive]"]
+ml = ["mnemos-core[morpheus,kronos,apollo,artemis,hot]"]
+interop = ["mnemos-core[knossos]"]
 # ── Feature-layer extras (GRAEAE consult de8f4b2b, 2026-06-01) ───────────────
 # Install layers stack: core (base) <- graeae <- hive. `hive` chains `graeae`
 # so the dependency direction is enforced at install time as well as runtime
 # (Settings.enforce_layer_direction). Pair with a storage extra, e.g.
-# `pip install mnemos-os[hive,postgres]`. See docs/LAYERED_INSTALL.md.
+# `pip install mnemos-core[hive,postgres]`. See docs/LAYERED_INSTALL.md.
 # TODO(codex): move GRAEAE-only / hive-only third-party deps out of base
 # `dependencies` into these extras so a base install pulls neither.
-graeae = ["mnemos-os[pantheon]"]
-hive = ["mnemos-os[graeae]"]
-full = ["mnemos-os[morpheus,persephone,pantheon,kronos,knossos,apollo,artemis,nats,hot,edge,graeae,hive]"]
+graeae = ["mnemos-graeae"]
+hive = ["mnemos-hive"]
+full = ["mnemos-core[morpheus,persephone,pantheon,knemon,graeae,hive,kronos,knossos,apollo,artemis,nats,hot,edge]"]
 # Enterprise backend drivers (feat/oracle-port branch). oracledb uses thin
 # mode by default — no Oracle Instant Client required. ibm_db pulls the
 # DB2 CLI driver as part of its build; on platforms without a pre-built
@@ -149,7 +150,7 @@ db2 = ["ibm_db>=3.2.4"]  # ibm_db_dbi + Db2 CLI driver build
 mysql = ["aiomysql>=0.2.0"]
 # Enterprise bundle — all three enterprise drivers suitable for hosts that
 # need to pick a backend at runtime via MNEMOS_DATABASE_DSN.
-enterprise = ["mnemos-os[oracle,db2,mysql]"]
+enterprise = ["mnemos-core[oracle,db2,mysql]"]
 # [semantic] — optional semantic-similarity quality scoring.
 # fastembed uses ONNX runtime (~10-20 MB), supports the same
 # MiniLM/Nomic embedding family as sentence-transformers, and pulls
@@ -174,12 +175,11 @@ dev = [
 ]
 
 [project.scripts]
-# Entry points that land in PATH after `pip install mnemos-os`. The installer
+# Entry points that land in PATH after `pip install mnemos-core`. The installer
 # can then be invoked as `mnemos-install` without needing install.py on the
 # filesystem.
 mnemos = "mnemos.cli.main:app"
 mnemos-install = "mnemos.installer.__main__:main"
-refresh-pantheon-catalog = "mnemos.domain.pantheon.pricing:main"
 
 [tool.setuptools]
 # Ship every file listed in MANIFEST.in (SQL migrations, config example,
@@ -192,6 +192,7 @@ include-package-data = true
 include = [
   "mnemos*",
 ]
+namespaces = true
 
 # uv: fast Python package installer for Docker builds
 # Install with: curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -252,19 +253,12 @@ name = "domain modules are siblings"
 type = "independence"
 modules = [
   "mnemos.domain.compression",
-  "mnemos.domain.graeae",
   "mnemos.domain.morpheus",
   "mnemos.domain.memory_categorization",
   "mnemos.domain.openai_compat",
   "mnemos.domain.portability",
 ]
 ignore_imports = [
-  # MORPHEUS intentionally invokes GRAEAE as its reasoning backend.
-  "mnemos.domain.morpheus.runner -> mnemos.domain.graeae.engine",
-  # The OpenAI-compatible gateway is an adapter over GRAEAE provider routing.
-  "mnemos.domain.openai_compat.providers -> mnemos.domain.graeae.engine",
-  # Streaming needs GRAEAE's ProviderStreamError to preserve provider error frames.
-  "mnemos.domain.openai_compat.streaming -> mnemos.domain.graeae.engine",
 ]
 
 [[tool.importlinter.contracts]]

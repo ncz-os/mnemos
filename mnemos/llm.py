@@ -9,9 +9,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 import mnemos.core.lifecycle as lifecycle
+from mnemos.core.extras import install_hint, is_extra_installed
 from mnemos.core.plan_windows import compute_plan_window_id, plan_path_kind
-from mnemos.domain.graeae.engine import get_graeae_engine
-from mnemos.domain.pantheon import triage
 from mnemos.persistence.base import UsageLedgerRecord, UsageLedgerResult
 
 logger = logging.getLogger(__name__)
@@ -83,6 +82,14 @@ async def call(task: Task | dict[str, Any]) -> dict[str, Any]:
     available, the result is still returned with ``ledger_status="degraded"``,
     ``ledger_error=repr(exc)``, and ``ledger_record_id=None``.
     """
+    if not is_extra_installed("pantheon"):
+        raise RuntimeError(f"pantheon subsystem not installed. Install via: {install_hint('pantheon')}")
+    if not is_extra_installed("graeae"):
+        raise RuntimeError(f"graeae subsystem not installed. Install via: {install_hint('graeae')}")
+
+    from mnemos.domain.graeae.engine import get_graeae_engine
+    from mnemos.domain.pantheon import triage
+
     request = task if isinstance(task, Task) else Task(**task)
     selected = await triage.recommend(
         request.task_kind,

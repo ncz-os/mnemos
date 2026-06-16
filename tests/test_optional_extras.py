@@ -28,7 +28,8 @@ def _restore_modules(removed: dict[str, ModuleType]) -> None:
 
 
 def test_is_extra_installed_known_no_dep_and_unknown() -> None:
-    assert extras.is_extra_installed("pantheon") is True
+    assert extras.is_extra_installed("knossos") is True
+    assert extras.is_extra_installed("pantheon") is False
     assert extras.is_extra_installed("definitely-not-a-mnemos-extra") is False
 
 
@@ -38,12 +39,12 @@ def test_require_extra_raises_with_install_hint() -> None:
 
     message = str(exc.value)
     assert "definitely-not-a-mnemos-extra subsystem not installed" in message
-    assert "pip install mnemos-os[definitely-not-a-mnemos-extra]" in message
+    assert "pip install mnemos-core[definitely-not-a-mnemos-extra]" in message
 
 
-def test_optional_subsystem_import_works_when_extra_installed() -> None:
-    module = importlib.import_module("mnemos.domain.pantheon")
-    assert hasattr(module, "route_model")
+def test_extracted_subsystem_leaf_import_missing_in_core() -> None:
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("mnemos.domain.pantheon.catalog")
 
 
 def test_optional_subsystem_import_raises_when_dependency_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -58,7 +59,7 @@ def test_optional_subsystem_import_raises_when_dependency_missing(monkeypatch: p
         _restore_modules(removed)
 
     assert "persephone subsystem not installed" in str(exc.value)
-    assert "mnemos-os[persephone]" in str(exc.value)
+    assert "mnemos-core[persephone]" in str(exc.value)
 
 
 def test_optional_route_returns_503_with_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -71,7 +72,7 @@ def test_optional_route_returns_503_with_install_hint(monkeypatch: pytest.Monkey
 
     assert exc.value.status_code == 503
     assert exc.value.detail["error"] == "KRONOS not installed"
-    assert "mnemos-os[kronos]" in exc.value.detail["install"]
+    assert "mnemos-core[kronos]" in exc.value.detail["install"]
 
 
 def test_mcp_tool_filter_hides_missing_extra_tools(monkeypatch: pytest.MonkeyPatch) -> None:
