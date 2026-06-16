@@ -364,6 +364,81 @@ def test_endpoint_routing_by_codex_model_uses_responses_url(monkeypatch):
     assert model_uses_responses_api("gpt-5.3-codex") is True
 
 
+def test_endpoint_helpers_append_suffix_to_base_urls():
+    decision = _decision(model_id="openai/openai/gpt-5.5")
+
+    assert (
+        gateway._chat_url({"url": "https://inference-api.nvidia.com/v1"}, decision)
+        == "https://inference-api.nvidia.com/v1/chat/completions"
+    )
+    assert (
+        gateway._chat_url({"url": "https://inference-api.nvidia.com/v1/chat/completions"}, decision)
+        == "https://inference-api.nvidia.com/v1/chat/completions"
+    )
+    assert (
+        gateway._responses_url({"url": "https://inference-api.nvidia.com/v1/chat/completions"})
+        == "https://inference-api.nvidia.com/v1/responses"
+    )
+    assert (
+        gateway._embeddings_url({"url": "https://inference-api.nvidia.com/v1"})
+        == "https://inference-api.nvidia.com/v1/embeddings"
+    )
+
+
+def test_passthrough_provider_prefers_operator_base_url_over_engine_url(monkeypatch):
+    posted: list[tuple[str, dict]] = []
+
+    class _Engine:
+        providers = {
+            "nvidia": {
+                "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+                "model": "moonshotai/kimi-k2.6",
+                "weight": 0.80,
+                "api": "openai",
+                "key_name": "nvidia",
+            }
+        }
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "id": "chatcmpl-pass",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "openai/openai/gpt-5.5",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+                "usage": {},
+            }
+
+    class _Client:
+        async def post(self, url, **kwargs):
+            posted.append((url, kwargs["json"]))
+            return _Resp()
+
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: _Engine())
+    monkeypatch.setattr(
+        gateway,
+        "get_provider_config",
+        lambda provider: {"base_url": "https://inference-api.nvidia.com/v1"} if provider == "nvidia" else {},
+    )
+    monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
+    monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
+
+    asyncio.run(
+        gateway._forward_chat_once(
+            _decision(provider="nvidia", model_id="openai/openai/gpt-5.5", route_type="passthrough"),
+            {"messages": [{"role": "user", "content": "hi"}]},
+        )
+    )
+
+    assert posted[0][0] == "https://inference-api.nvidia.com/v1/chat/completions"
+    assert "integrate.api.nvidia.com" not in posted[0][0]
+    assert posted[0][1]["model"] == "openai/openai/gpt-5.5"
+
+
 def test_codex_fleet_model_is_cataloged_and_resolvable(monkeypatch):
     from mnemos.domain.pantheon import catalog, pricing, router
 
@@ -696,6 +771,7 @@ def test_eih_and_deepseek_direct_defaults_forward(monkeypatch):
             posted.append((url, kwargs["json"]))
             return _Resp(kwargs["json"]["model"])
 
+    monkeypatch.setattr(gateway, "get_provider_config", lambda _provider: {})
     monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
     monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
 
