@@ -1,1 +1,0 @@
-"""MNEMOS domain logic packages."""

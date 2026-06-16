@@ -36,8 +36,6 @@ EXPECTED_USER_TOOLS = [
     "diff_memory_commits",
     "checkout_memory",
     "recommend_model",
-    "pantheon_list_models",
-    "pantheon_route_explain",
     "list_deletions",
     "kronos_anomalies",
     "kronos_forecast",

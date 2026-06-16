@@ -24,7 +24,7 @@ from fastapi import HTTPException
 from starlette.responses import Response
 
 from mnemos.api.dependencies import UserContext
-from mnemos.api.routes import consultations, dag
+from mnemos.api.routes import dag
 from mnemos.api.routes import memories
 from mnemos.domain.models import MemoryCreateRequest
 
@@ -129,11 +129,8 @@ async def test_webhook_delivery_failure_rolls_back_memory_insert(monkeypatch):
     assert scheduled == []
 
 
-def test_consultations_and_dag_use_backend_outbox_dispatch():
-    consultation_source = inspect.getsource(consultations.consult_graeae)
+def test_dag_uses_backend_outbox_dispatch():
     dag_source = inspect.getsource(dag.merge_branch)
 
-    assert "backend.webhooks.dispatch_event" in consultation_source
     assert "backend.webhooks.dispatch_event" in dag_source
-    assert "mnemos.webhooks.dispatcher" not in inspect.getsource(consultations)
     assert "mnemos.webhooks.dispatcher" not in inspect.getsource(dag)

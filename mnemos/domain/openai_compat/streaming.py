@@ -3,8 +3,6 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any, Callable, Dict, List, Optional
 
-from mnemos.domain.graeae.engine import ProviderStreamError
-
 from .providers import OpenAICompatError, _prepare_provider_route
 from .schemas import ChatCompletionDelta, ChatCompletionStreamChoice, ChatCompletionStreamResponse
 
@@ -183,7 +181,7 @@ async def stream_event_source(
                 yield event
     except Exception as e:
         logger.error("[MNEMOS] Streaming response failed after response start: %s", e, exc_info=True)
-        error_type = e.error_type if isinstance(e, ProviderStreamError) else "provider_stream_error"
+        error_type = getattr(e, "error_type", "provider_stream_error")
         yield _stream_error_event(str(e), error_type=error_type)
     finally:
         try:

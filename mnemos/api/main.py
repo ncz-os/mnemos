@@ -1,5 +1,6 @@
 """MNEMOS API Server v3.0.0 — unified service with consultations + providers + OpenAI-compat gateway."""
 
+import importlib
 import logging
 import os
 import sys
@@ -27,15 +28,14 @@ from mnemos.api.routes.morpheus import router as morpheus_router
 from mnemos.api.routes.narrate import router as narrate_router
 from mnemos.api.routes.oauth import router as oauth_router
 from mnemos.api.routes.openai_compat import router as openai_compat_router
-from mnemos.api.routes.pantheon import router as pantheon_router
 from mnemos.api.routes.portability import router as portability_router
-from mnemos.api.routes.providers import router as providers_router
 from mnemos.api.routes.sessions import router as sessions_router
 from mnemos.api.routes.state import router as state_router
 from mnemos.api.routes.versions import router as versions_router
 from mnemos.api.routes.webhooks import router as webhooks_router
 from mnemos.api.lifecycle_hooks import register_lifespan_hooks
 from mnemos.core.config import get_settings, session_secret_required
+from mnemos.core.extras import is_extra_installed
 from mnemos.core.lifecycle import lifespan
 from mnemos.core.rate_limit import (
     RateLimitExceeded,
@@ -57,6 +57,7 @@ logging.basicConfig(
     level=getattr(logging, _settings.logging.level.upper(), logging.INFO),
     format=_settings.logging.format,
 )
+logger = logging.getLogger(__name__)
 
 # v3.2 observability foundation: request-ID correlation across logs +
 # response headers. Must run BEFORE any handler emits log records so
@@ -326,32 +327,40 @@ app.add_middleware(
 # outermost under Starlette LIFO. See the stack diagram above.
 app.add_middleware(RequestIDMiddleware)
 
+
+def _include_optional_router(extra_name: str, module_path: str, *, label: str | None = None) -> bool:
+    """Mount an add-on router only when its external distribution is importable."""
+    if not is_extra_installed(extra_name):
+        return False
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError:
+        logger.warning("%s extra probe passed but %s could not be imported", label or extra_name.upper(), module_path)
+        return False
+    router = getattr(module, "router", None)
+    if router is None:
+        logger.warning("%s does not expose a FastAPI router", module_path)
+        return False
+    app.include_router(router)
+    return True
+
+
 app.include_router(health_router)
 app.include_router(metrics_router)  # v3.2 observability: Prometheus /metrics
-# ── Layered router mounts (GRAEAE consult de8f4b2b, 2026-06-01) ──────────────
-# core <- graeae <- hive. Flags default ON (full deployment unchanged); slim
-# installs set MNEMOS_ENABLE_GRAEAE/_HIVE=0. See docs/LAYERED_INSTALL.md.
-# TODO(codex): classify remaining routers (pantheon, openai_compat, sessions)
-# into layers + add the matching pyproject extras gating per the doc.
+# ── Optional add-on router mounts ────────────────────────────────────────────
+# Add-on distributions extend the mnemos namespace (PEP 420). Core must boot
+# without them, so route modules are imported only after their extra probe
+# succeeds.
 if _settings.layers.enable_graeae:
-    # Lazy import: a base (core-only) install must not import the GRAEAE module.
-    from mnemos.api.routes.consultations import router as consultations_router
-
-    app.include_router(consultations_router)  # GRAEAE reasoning: /v1/consultations
-app.include_router(providers_router)  # v3.0.0: Unified /v1/providers (model routing)
+    _include_optional_router("graeae", "mnemos.api.routes.consultations", label="GRAEAE")
+    _include_optional_router("graeae", "mnemos.api.routes.providers", label="GRAEAE")
 if _settings.layers.enable_hive:
-    # Lazy import: a base/GRAEAE-only install must not import the hive/KNEMON modules.
-    from mnemos.api.routes.knemon_dashboard import router as knemon_dashboard_router
-    from mnemos.api.routes.knemon_router import router as knemon_router_router
-    from mnemos.api.routes.knemon_utilization import router as knemon_utilization_router
-    from mnemos.api.routes.ledger import router as ledger_router
-
-    app.include_router(ledger_router)  # KNEMON MVP Step 1: token/cost usage ledger
-    app.include_router(knemon_dashboard_router)  # KNEMON dashboard and read-side ledger analytics
-    app.include_router(knemon_router_router)  # KNEMON hybrid router
-    app.include_router(knemon_utilization_router)  # KNEMON subscription-plan utilization analytics
+    _include_optional_router("knemon", "mnemos.api.routes.ledger", label="KNEMON")
+    _include_optional_router("knemon", "mnemos.api.routes.knemon_dashboard", label="KNEMON")
+    _include_optional_router("knemon", "mnemos.api.routes.knemon_router", label="KNEMON")
+    _include_optional_router("knemon", "mnemos.api.routes.knemon_utilization", label="KNEMON")
 app.include_router(openai_compat_router)  # Phase 0: OpenAI-compatible gateway
-app.include_router(pantheon_router)  # PANTHEON v0.1: unified LLM facade (503-gated when disabled)
+_include_optional_router("pantheon", "mnemos.api.routes.pantheon", label="PANTHEON")
 app.include_router(sessions_router)  # Phase 0: Session management for stateful chat
 app.include_router(dag_router)  # Phase 3: DAG versioning (git-like)
 app.include_router(webhooks_router)  # v3.0.0: Outbound webhook subscriptions

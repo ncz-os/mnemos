@@ -6,9 +6,13 @@ from types import SimpleNamespace
 
 def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_path):
     async def run():
-        import mnemos.domain.graeae.engine as graeae_engine
         from mnemos.core import config as core_config
         from mnemos.core import lifecycle
+
+        try:
+            import mnemos.domain.graeae.engine as graeae_engine
+        except ImportError:
+            graeae_engine = None
 
         class FalsyPool:
             def __bool__(self):
@@ -31,7 +35,7 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_p
             async def close(self):
                 self.closed = True
 
-        engine = FakeGraeaeEngine()
+        engine = FakeGraeaeEngine() if graeae_engine is not None else None
 
         monkeypatch.setattr(lifecycle, "_background_tasks", set())
         monkeypatch.setattr(lifecycle, "_worker_tasks", set())
@@ -42,7 +46,8 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_p
         monkeypatch.setattr(lifecycle, "_load_config", lambda: {"worker": {"enabled": False}})
         monkeypatch.setattr(lifecycle.asyncpg, "create_pool", create_pool)
         monkeypatch.setattr(lifecycle.aioredis, "from_url", lambda *_args, **_kwargs: RedisUnavailable())
-        monkeypatch.setattr(graeae_engine, "get_graeae_engine", lambda: engine)
+        if graeae_engine is not None:
+            monkeypatch.setattr(graeae_engine, "get_graeae_engine", lambda: engine)
 
         app = SimpleNamespace(state=SimpleNamespace())
 
@@ -53,6 +58,7 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_p
             assert lifecycle._worker_tasks == set()
 
         assert lifecycle._cache is None
-        assert engine.closed is True
+        if engine is not None:
+            assert engine.closed is True
 
     asyncio.run(run())

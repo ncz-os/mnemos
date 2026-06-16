@@ -43,13 +43,13 @@ class TestOpenAIGatewayStructure:
         except Exception as e:
             pytest.fail(f"Router registration check failed: {e}")
 
-    def test_gateway_imports_graeae(self):
-        """Gateway can import GRAEAE routing."""
+    def test_gateway_imports_provider_router(self):
+        """Gateway can import provider routing helper."""
         try:
             from mnemos.api.routes.openai_compat import _route_to_provider
             assert callable(_route_to_provider)
         except ImportError as e:
-            pytest.fail(f"GRAEAE routing not available: {e}")
+            pytest.fail(f"Provider routing helper not available: {e}")
 
     def test_gateway_imports_mnemos_search(self):
         """Gateway can import MNEMOS search."""
@@ -212,14 +212,6 @@ class TestDistillationWorkerIntegration:
 class TestModelOptimizerIntegration:
     """Verify optimizer is wired into gateway."""
 
-    def test_model_registry_recommend_exists(self):
-        """Model recommendation endpoint exists."""
-        try:
-            from mnemos.api.routes.providers import recommend_model
-            assert callable(recommend_model)
-        except ImportError as e:
-            pytest.fail(f"Model recommendation endpoint missing: {e}")
-
     def test_optimizer_integration(self):
         """Gateway calls optimizer for auto model selection."""
         try:
@@ -324,7 +316,7 @@ class TestV3Surface:
         try:
             import mnemos.api.main as api_server
             route_paths = {route.path for route in api_server.app.routes}
-            expected_routes = {'/v1/memories', '/v1/consultations', '/health'}
+            expected_routes = {'/v1/memories', '/health'}
             for route in expected_routes:
                 matching = {r for r in route_paths if route in r}
                 assert len(matching) > 0, f"Expected route pattern {route} not found"
