@@ -109,16 +109,24 @@ model = "meta/llama-3.3-70b-instruct"
 # Risk profiles
 # ============================================================
 
+# SECURITY (review C3): this profile drives an autonomous code-editing agent. The
+# prior settings (sandbox_enabled=false, workspace_only=false, file_delete + rm +
+# chmod auto-approved, allowed_roots spanning all of /home) made a single
+# prompt-injected job equivalent to unsandboxed RCE on the worker host. Hardened to
+# confine writes to the job workspace and stop auto-approving destructive ops while
+# still allowing the build essentials (git + file_write + bash for commits).
+# file_delete now requires approval (so it is blocked headless); re-add rm/chmod or
+# widen allowed_roots only with an explicit, reviewed justification.
 [risk_profiles.hive_worker]
-auto_approve = ["file_read", "file_write", "file_delete", "bash", "shell", "memory_recall", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search"]
-workspace_only = false
+auto_approve = ["file_read", "file_write", "bash", "shell", "memory_recall", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search"]
+workspace_only = true
 level = "full"
-sandbox_enabled = false
-block_high_risk_commands = false
+sandbox_enabled = true
+block_high_risk_commands = true
 require_approval_for_medium_risk = false
 forbidden_paths = []
 allowed_roots = ["/home", "/tmp", "/var/tmp"]
-allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail", "date", "df", "du", "uname", "uptime", "hostname", "python", "python3", "pip", "node", "free", "sed", "awk", "bash", "sh", "mv", "cp", "mkdir", "rm", "chmod", "tee", "touch", "test", "true", "false"]
+allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail", "date", "df", "du", "uname", "uptime", "hostname", "python", "python3", "pip", "node", "free", "sed", "awk", "bash", "sh", "mv", "cp", "mkdir", "tee", "touch", "test", "true", "false"]
 shell_env_passthrough = ["PATH", "HOME", "USER", "LANG", "LC_ALL"]
 
 # ============================================================
