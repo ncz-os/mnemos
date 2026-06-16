@@ -19,6 +19,7 @@ import time
 from . import relay_crypto
 from .bridge_common import HiveClient, backoff_sleep, mnemos_search
 from .relay_client import RelayClient
+from .spark_poller import NONCOMMIT_PREFIXES, repo_url_for_kind
 
 log = logging.getLogger("spark_relay.enqueuer")
 
@@ -47,14 +48,50 @@ def build_payload(job: dict) -> dict:
     }
 
 
+def _spark_should_offload(job: dict) -> bool:
+    """The Spark only takes work it can actually complete.
+
+    Offload when the job is (a) explicitly host-targeted to the Spark, (b) a
+    no-commit kind (research/analysis/triage/etc. — answered via chat, no repo
+    needed), or (c) a kind the Spark poller can map to a repo. Everything else
+    (notably a general ``build:<repo>`` the relay can't map) is left for the
+    home fleet, which has the full ``zc_native_build`` repo map. This prevents
+    the Spark from claiming build jobs it cannot finish — they would otherwise
+    zombie in 'running' or degrade to a useless chat suggestion.
+    """
+    kind = str(job.get("kind") or "")
+    eligible_hosts = job.get("eligible_hosts") or []
+    if any(str(h).strip().lower() == SPARK_HOST for h in eligible_hosts):
+        return True
+    if kind.startswith(NONCOMMIT_PREFIXES):
+        return True
+    return repo_url_for_kind(kind) is not None
+
+
 def run_once(hive: HiveClient, relay: RelayClient, key: bytes) -> int:
     """Drain the hive of eligible jobs into the bucket. Returns count enqueued."""
     enqueued = 0
+    released_this_sweep: set[str] = set()
     while True:
         job = hive.claim_next()
         if job is None:
             break
         job_id = job["id"]
+        if not _spark_should_offload(job):
+            # Release back to the queue (we are the claimant, so patch_status
+            # defaults claimed_by to our URN) for a home-fleet worker to take.
+            hive.patch_status(
+                job_id,
+                "queued",
+                result={"note": "released by spark enqueuer: not spark-offloadable (no repo mapping)"},
+            )
+            log.info("released %s (kind=%s) — not spark-offloadable", job_id, job.get("kind"))
+            if job_id in released_this_sweep:
+                # Re-claimed our own release before a home worker did; stop to
+                # avoid a hot release/claim loop. Next sweep retries.
+                break
+            released_this_sweep.add(job_id)
+            continue
         try:
             payload = build_payload(job)
             # Embed the claimant URN so the Spark echoes it back in the terminal
