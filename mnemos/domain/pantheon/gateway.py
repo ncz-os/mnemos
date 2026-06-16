@@ -392,6 +392,22 @@ def _responses_to_chat_completion(data: dict[str, Any], decision: RouteDecision)
     }
 
 
+def _first_chat_message(response: dict[str, Any]) -> dict[str, Any]:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return {}
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return {}
+    message = choice.get("message")
+    return message if isinstance(message, dict) else {}
+
+
+def _first_chat_message_content(response: dict[str, Any]) -> str:
+    content = _first_chat_message(response).get("content")
+    return str(content) if content is not None else ""
+
+
 def resolved_wire_model(response: dict[str, Any] | None, decision: RouteDecision) -> str:
     if isinstance(response, dict) and response.get("model"):
         return str(response["model"])
@@ -691,7 +707,7 @@ async def _graeae_chat_completion_stream(decision: RouteDecision, body: dict[str
             "choices": [{"index": 0, "delta": {"role": "assistant"}}],
         }
     )
-    content = response["choices"][0]["message"].get("content") or ""
+    content = _first_chat_message_content(response)
     if content:
         yield _stream_event(
             {
@@ -767,7 +783,7 @@ async def consensus_chat_completion_stream(decision: RouteDecision, body: dict[s
             "choices": [{"index": 0, "delta": {"role": "assistant"}}],
         }
     )
-    content = response["choices"][0]["message"].get("content") or ""
+    content = _first_chat_message_content(response)
     if content:
         yield _stream_event(
             {
@@ -812,19 +828,20 @@ def _request_params(body: dict[str, Any]) -> dict[str, Any]:
 def _openai_chat_response(
     model: str,
     choices: list[dict[str, Any]] | None,
-    content: str,
+    content: Any,
     messages: list[dict[str, Any]],
 ) -> dict[str, Any]:
     created = int(time.time())
-    normalized_choices = choices or [
+    content_text = str(content) if content is not None else ""
+    normalized_choices = choices if isinstance(choices, list) else [
         {
             "index": 0,
-            "message": {"role": "assistant", "content": content},
+            "message": {"role": "assistant", "content": content_text},
             "finish_reason": "stop",
         }
     ]
     prompt_tokens = sum(len(_content_text(message.get("content")).split()) for message in messages)
-    completion_tokens = len(content.split())
+    completion_tokens = len(content_text.split())
     return {
         "id": f"chatcmpl-pantheon-{created}",
         "object": "chat.completion",

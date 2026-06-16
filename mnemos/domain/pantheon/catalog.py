@@ -49,8 +49,9 @@ _CACHE_OVERLAY_KEYS = (
 )
 _PANTHEON_FLEET_MODELS: tuple[dict[str, Any], ...] = (
     {
-        "provider": "openai",
-        "model_id": "gpt-5.3-codex",
+        "provider": "nvidia",
+        "id": "gpt-5.3-codex",
+        "model_id": "openai/openai/gpt-5.3-codex",
         "display_name": "GPT-5.3 Codex",
         "capabilities": ["chat", "code", "reasoning", "tools"],
         "usage_tier": "frontier",
@@ -59,23 +60,31 @@ _PANTHEON_FLEET_MODELS: tuple[dict[str, Any], ...] = (
         "context_window": 200000,
         "max_output_tokens": 100000,
         "quality_score": 0.92,
+        "pricing_raw_model_id": "gpt-5.3-codex",
         "available": True,
         "deprecated": False,
     },
     {
-        "provider": "openai",
-        "model_id": "gpt-5.5",
+        "provider": "nvidia",
+        "id": "gpt-5.5",
+        "model_id": "openai/openai/gpt-5.5",
         "display_name": "GPT-5.5",
         "capabilities": ["chat", "reasoning", "tools", "vision"],
         "usage_tier": "frontier",
         "input_cost_per_mtok": 5.0,
         "output_cost_per_mtok": 30.0,
         "quality_score": 0.94,
+        "pricing_raw_model_id": "gpt-5.5",
         "available": True,
         "deprecated": False,
     },
 )
-_FLEET_MODELS_BY_ID = {str(model["model_id"]).lower(): model for model in _PANTHEON_FLEET_MODELS}
+_FLEET_MODELS_BY_ID = {
+    str(value).strip().lower(): model
+    for model in _PANTHEON_FLEET_MODELS
+    for value in (model.get("id"), model.get("model_id"), model.get("pricing_raw_model_id"))
+    if str(value or "").strip()
+}
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
@@ -103,11 +112,20 @@ def _fleet_model(model_id: Any) -> dict[str, Any] | None:
     return _FLEET_MODELS_BY_ID.get(str(model_id or "").strip().lower())
 
 
+def _fleet_provider(fleet: dict[str, Any]) -> str:
+    try:
+        configured = get_settings().pantheon.passthrough_provider
+    except Exception:
+        configured = None
+    provider = str(configured or fleet.get("provider") or "").strip()
+    return provider or "nvidia"
+
+
 def _fleet_provider_registered(model_id: Any, provider_cfgs: dict[str, dict[str, Any]]) -> bool:
     fleet = _fleet_model(model_id)
     if not fleet:
         return True
-    provider = str(fleet.get("provider") or "").strip()
+    provider = _fleet_provider(fleet)
     return bool(provider and provider in provider_cfgs)
 
 
@@ -127,7 +145,7 @@ def _provider_aliases(model: dict[str, Any]) -> set[str]:
     }
     fleet = _fleet_model(model.get("id") or model.get("model_id"))
     if fleet:
-        aliases.add(str(fleet.get("provider") or "").strip())
+        aliases.add(_fleet_provider(fleet))
     if "codex" in aliases:
         aliases.add("openai")
     return {alias for alias in aliases if alias}
@@ -229,11 +247,12 @@ def _normalize_model(
     model_source: dict[str, Any],
     health: dict[str, Any],
 ) -> dict[str, Any]:
-    model_id = str(model_source.get("model_id") or model_source.get("id") or provider_cfg.get("model") or "")
-    display_name = str(model_source.get("display_name") or model_source.get("name") or model_id)
+    catalog_id = str(model_source.get("id") or model_source.get("model_id") or provider_cfg.get("model") or "")
+    wire_model_id = str(model_source.get("model_id") or provider_cfg.get("model") or catalog_id)
+    display_name = str(model_source.get("display_name") or model_source.get("name") or catalog_id)
     capabilities = model_source.get("capabilities")
     if not isinstance(capabilities, (list, tuple, set)):
-        capabilities = _infer_capabilities(model_id, provider_cfg)
+        capabilities = _infer_capabilities(wire_model_id, provider_cfg)
     capabilities = sorted({str(cap).strip() for cap in capabilities if str(cap).strip()})
     cost = _cost_per_mtok({**provider_cfg, **model_source})
     quality_score = _quality_score(model_source, provider_cfg)
@@ -242,7 +261,8 @@ def _normalize_model(
         p50_latency_ms = health.get("p50_latency_ms")
 
     return {
-        "id": model_id,
+        "id": catalog_id,
+        "model_id": wire_model_id,
         "object": "model",
         "created": int(model_source.get("created") or provider_cfg.get("created") or time.time()),
         "owned_by": str(model_source.get("owned_by") or provider),
@@ -281,12 +301,14 @@ def _normalize_model(
 
 
 def _coerce_cached_model(item: dict[str, Any]) -> dict[str, Any] | None:
-    model_id = str(item.get("id") or item.get("model_id") or "").strip()
-    if not model_id:
+    raw_model_id = str(item.get("id") or item.get("model_id") or "").strip()
+    if not raw_model_id:
         return None
-    fleet = _fleet_model(model_id)
+    fleet = _fleet_model(raw_model_id)
+    model_id = str((fleet or {}).get("id") or raw_model_id).strip()
+    wire_model_id = str((fleet or {}).get("model_id") or item.get("model_id") or model_id).strip()
     provider = str(
-        (fleet or {}).get("provider")
+        (_fleet_provider(fleet) if fleet else None)
         or item.get("provider")
         or item.get("registry_provider")
         or item.get("owned_by")
@@ -295,7 +317,7 @@ def _coerce_cached_model(item: dict[str, Any]) -> dict[str, Any] | None:
     if not provider:
         return None
     cfg = {
-        "model": model_id,
+        "model": wire_model_id,
         "api": item.get("api") or "openai",
         "weight": item.get("quality_score") or item.get("graeae_weight") or item.get("weight") or 0.0,
         "price_in": item.get("price_in"),
@@ -310,7 +332,7 @@ def _coerce_cached_model(item: dict[str, Any]) -> dict[str, Any] | None:
     normalized = _normalize_model(
         provider=provider,
         provider_cfg=cfg,
-        model_source={**item, "model_id": model_id},
+        model_source={**item, "id": model_id, "model_id": wire_model_id},
         health=health,
     )
     for key in _CACHE_OVERLAY_KEYS:
@@ -565,11 +587,11 @@ def _cached_overlay_for(
 def _fleet_model_sources(provider_cfgs: dict[str, dict[str, Any]]) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
     out: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     for source in _PANTHEON_FLEET_MODELS:
-        provider = str(source.get("provider") or "").strip()
+        provider = _fleet_provider(source)
         if not provider or provider not in provider_cfgs:
             continue
         provider_cfg = dict(provider_cfgs[provider])
-        provider_cfg.setdefault("model", source["model_id"])
+        provider_cfg["model"] = source["model_id"]
         provider_cfg.setdefault("api", "openai")
         provider_cfg.setdefault("key_name", provider)
         provider_cfg.setdefault("weight", source.get("quality_score") or 0.0)
@@ -620,16 +642,19 @@ async def list_models(*, use_synced_cache: bool = True) -> list[dict[str, Any]]:
     registry_to_graeae = {cfg["registry_provider"]: name for name, cfg in GRAEAE_REGISTRY_MAP.items()}
     for row in await _registry_rows():
         registry_provider = str(_row_get(row, "provider") or "")
-        model_id = _row_get(row, "model_id")
+        raw_model_id = _row_get(row, "model_id")
         provider = registry_to_graeae.get(registry_provider, registry_provider)
-        fleet = _fleet_model(model_id)
+        fleet = _fleet_model(raw_model_id)
         if fleet:
-            provider = str(fleet.get("provider") or provider)
-            if not _fleet_provider_registered(model_id, provider_cfgs):
+            provider = _fleet_provider(fleet)
+            if not _fleet_provider_registered(raw_model_id, provider_cfgs):
                 continue
-        provider_cfg = provider_cfgs.get(provider, {"model": model_id})
+        model_id = str((fleet or {}).get("id") or raw_model_id)
+        wire_model_id = str((fleet or {}).get("model_id") or raw_model_id)
+        provider_cfg = provider_cfgs.get(provider, {"model": wire_model_id})
         model_source = {
-            "model_id": model_id,
+            "id": model_id,
+            "model_id": wire_model_id,
             "display_name": _row_get(row, "display_name"),
             "capabilities": _row_get(row, "capabilities") or [],
             "price_in": _row_get(row, "price_in"),
