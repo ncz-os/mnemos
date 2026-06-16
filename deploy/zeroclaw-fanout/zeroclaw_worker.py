@@ -41,9 +41,42 @@ from pathlib import Path
 from typing import Optional
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
+# C1: bus transport auth bearer token (env-sourced, never baked in).
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "zeroclaw")
 ZEROCLAW_AGENT = os.environ.get("ZEROCLAW_AGENT", "hive")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname())
+
+# SECURITY (review C3): the zeroclaw agent is an autonomous shell agent that runs
+# job-controlled commands. It must NOT inherit the worker's full environment —
+# os.environ.copy() leaked the entire keyring (every API key/token the worker
+# holds: provider keys, MNEMOS/HIVE bus tokens, GH creds, …) to a process a
+# prompt-injected job can use to exfiltrate them. Build a DEFAULT-DENY allowlist.
+# Provider credentials are expected to come from the agent's own config.toml; if a
+# deployment instead feeds them via env, name those vars explicitly in
+# ZC_AGENT_ENV_ALLOW (comma-separated) — never blanket-copy os.environ.
+_BASE_ENV_ALLOW = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR",
+    "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    "SSH_AUTH_SOCK",
+})
+_ENV_PREFIX_ALLOW = ("LC_", "ZEROCLAW_", "ZC_")
+_EXTRA_ENV_ALLOW = frozenset(
+    v.strip() for v in os.environ.get("ZC_AGENT_ENV_ALLOW", "").split(",") if v.strip()
+)
+
+
+def _build_agent_env() -> dict:
+    """Minimal allowlisted env for the agent subprocess (review C3). Default-deny:
+    only base runtime vars, locale, zeroclaw-specific vars, and any names the
+    operator explicitly opted in via ZC_AGENT_ENV_ALLOW are forwarded."""
+    env = {
+        k: v for k, v in os.environ.items()
+        if k in _BASE_ENV_ALLOW or k in _EXTRA_ENV_ALLOW or k.startswith(_ENV_PREFIX_ALLOW)
+    }
+    env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    env.setdefault("HOME", os.path.expanduser("~"))
+    return env
 _DEFAULT_CAPABILITIES = ",".join(
     [
         # Core skills
@@ -173,7 +206,10 @@ signal.signal(signal.SIGINT, _signal_handler)
 def _http(method: str, path: str, body: dict | None = None, timeout: float = 10.0) -> tuple[int, dict | None]:
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={"content-type": "application/json"})
+    headers = {"content-type": "application/json"}
+    if HIVE_BUS_TOKEN:
+        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
@@ -857,13 +893,11 @@ def run_zeroclaw(
         )
         attempt_start = time.time()
         try:
-            # Pass full env so subprocess sees HOME, PATH, API keys, XDG_*, etc.
-            # Without env=, Popen uses parent process env which under systemd may
-            # be sparse if EnvironmentFile didn't set everything.
-            child_env = os.environ.copy()
-            # Ensure essential paths
-            child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-            child_env.setdefault("HOME", os.path.expanduser("~"))
+            # SECURITY (review C3): default-deny allowlisted env — NOT os.environ.copy().
+            # The agent gets provider creds from its config.toml; the worker keyring
+            # is never handed to the job-controlled subprocess. Opt extra vars in via
+            # ZC_AGENT_ENV_ALLOW.
+            child_env = _build_agent_env()
             proc = subprocess.Popen(
                 cmd, cwd=exec_cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=child_env
             )

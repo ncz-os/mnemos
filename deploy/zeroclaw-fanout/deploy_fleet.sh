@@ -2,6 +2,21 @@
 # Deploy canonical config + auto-fanout + code-exec shim to agent-pool hosts.
 # Per-host User= override (mini for cixmini, ncz for Pis, jasonperlow elsewhere).
 # Usage: ./deploy_fanout_fleet.sh
+#
+# SECURITY (review C2/H3): sudo passwords are NEVER committed to this script.
+# Supply them at deploy time via environment variables, keyed by login user:
+#     export ZC_SUDO_PW_NCZ=...      # bigpi / clawpi (ncz)
+#     export ZC_SUDO_PW_MINI=...     # cixmini (mini)
+#     export ZC_SUDO_PW=...          # fallback for any other non-passwordless user
+# Prefer a root-only EnvironmentFile or a `read -s` prompt over exporting in a
+# shell that records history. Hosts with passwordless sudo (NOPASSWD sudoers,
+# e.g. jasonperlow) leave the value empty and use `sudo -n`.
+#
+# ROTATION: a prior revision of this file committed the ncz sudo password
+# ('Gumbo@Kona1b') and a 'mini' password in plaintext. Both are compromised via
+# git history and MUST be rotated on every affected host (bigpi 192.168.207.65,
+# clawpi 192.168.207.54, cixmini) and purged from history (git filter-repo /
+# BFG) before this repo is shared further.
 
 set -uo pipefail
 
@@ -25,12 +40,22 @@ ROSTER=(
 
 deploy_one() {
   local host=$1 user=$2 home=$3 max_n=$4
+  # SECURITY (review C2/H3): resolve the sudo password from the environment, never
+  # from a baked-in literal. See the header for the variable names + rotation note.
   local sudo_pw=""
   case "$user" in
-    mini) sudo_pw=mini ;;
-    ncz) sudo_pw='Gumbo@Kona1b' ;;
+    mini) sudo_pw="${ZC_SUDO_PW_MINI:-}" ;;
+    ncz)  sudo_pw="${ZC_SUDO_PW_NCZ:-}" ;;
     jasonperlow) sudo_pw="" ;;  # sudo -n (passwordless via NOPASSWD)
+    *)    sudo_pw="${ZC_SUDO_PW:-}" ;;
   esac
+
+  # Fail closed: a non-passwordless login with no password supplied would silently
+  # fall through to `sudo -n` and break mid-deploy. Make the operator set it.
+  if [ "$user" != "jasonperlow" ] && [ -z "$sudo_pw" ]; then
+    echo "FATAL: no sudo password for '$user'@$host. Export ZC_SUDO_PW_${user^^} (or ZC_SUDO_PW) before deploying, or configure NOPASSWD sudoers for this host." >&2
+    return 1
+  fi
 
   echo "=== $user@$host (home=$home, max_n=$max_n) ==="
 

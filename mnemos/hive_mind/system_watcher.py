@@ -35,6 +35,8 @@ import signal
 from mnemos.core.config import agent_host_env, claim_jobs_enabled_env, heartbeat_interval_env, system_hive_url_env
 
 HIVE_URL = system_hive_url_env()
+# C1: bus transport auth bearer token (env-sourced, never baked in).
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 AGENT_HOST = agent_host_env()
 HEARTBEAT_INTERVAL = heartbeat_interval_env()
 CLAIM_JOBS = claim_jobs_enabled_env()
@@ -56,7 +58,10 @@ signal.signal(signal.SIGINT, _signal)
 def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict | None]:
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={"content-type": "application/json"})
+    headers = {"content-type": "application/json"}
+    if HIVE_BUS_TOKEN:
+        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             raw = r.read()

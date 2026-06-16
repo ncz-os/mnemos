@@ -24,6 +24,7 @@ Tools:
 
 from __future__ import annotations
 import json
+import os
 from typing import Any
 
 import httpx
@@ -38,6 +39,9 @@ from starlette.routing import Mount, Route
 from mnemos.core.config import mcp_hive_url_env, mcp_mnemos_token_env, mcp_mnemos_url_env, mcp_port_env
 
 HIVE_URL = mcp_hive_url_env()
+# C1: bus transport auth bearer token (env-sourced). Injected only on bus calls
+# (_hive), kept separate from the MNEMOS token used by _mnemos.
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 MNEMOS_URL = mcp_mnemos_url_env()
 MNEMOS_TOKEN = mcp_mnemos_token_env()
 
@@ -46,6 +50,10 @@ client = httpx.AsyncClient(timeout=15.0)
 
 
 async def _hive(method: str, path: str, **kw) -> dict:
+    if HIVE_BUS_TOKEN:
+        headers = dict(kw.pop("headers", {}) or {})
+        headers.setdefault("Authorization", f"Bearer {HIVE_BUS_TOKEN}")
+        kw["headers"] = headers
     r = await client.request(method, f"{HIVE_URL}{path}", **kw)
     r.raise_for_status()
     if r.status_code == 204:
