@@ -238,12 +238,27 @@ class OpenAIChatExecutor:
             else "You are a Spark coding worker."
         )
         out = self.complete(system=sys_prompt, user=job["prompt"], model=model)
-        # TODO(agentic): apply edits, git commit, git push -> set commit_sha/branch.
-        return {
+        # This executor produces an ANALYSIS/REVIEW text answer only — it never
+        # edits/commits/pushes a repo (commit_sha is always None). Declare an
+        # EXPLICIT, HONEST terminal status so run_once never has to guess.
+        # FALSE-DONE root fix (2026-06-16): the prior code returned NO status and
+        # run_once blanket-defaulted it to "done", so a chat blob — or an empty
+        # reply — was reported to the hive as a completed job with no work done.
+        #   * empty model output -> failed (no real work was produced)
+        #   * non-empty output   -> done, flagged did_repo_work=False so a
+        #     commit-EXPECTING kind mis-routed here cannot pass as a real build
+        #     (run_once downgrades that case to failed).
+        status = "done" if (out or "").strip() else "failed"
+        result = {
+            "status": status,
             "commit_sha": None,
+            "did_repo_work": False,
             "branch": job.get("branch"),
             "metrics": {"backend": self.label, "model": model, "output_chars": len(out), "output": out},
         }
+        if status == "failed":
+            result["error"] = "chat executor produced empty output"
+        return result
 
 
 class FallbackExecutor:
@@ -963,9 +978,41 @@ def run_once(relay: RelayClient, key: bytes, executor: Executor, *, owner: str |
             continue
         try:
             result = executor.execute(job)
-            result.setdefault("status", "done")
+            # FALSE-DONE root fix (2026-06-16): NEVER blanket-default to "done".
+            # The executor must declare its own terminal status truthfully; a
+            # missing status is an executor BUG and fails HONEST (failed), it is
+            # never silently reported as a completed job.
+            if "status" not in result:
+                log.error("executor returned no status for %s — failing honest", uuid)
+                result["status"] = "failed"
+                result.setdefault("error", "executor returned no terminal status")
+            # Truthfulness gate: a job whose KIND expects a committed change must
+            # not be reported "done" with nothing to show. A commit-expecting
+            # kind (anything outside NONCOMMIT_PREFIXES) that produced neither a
+            # commit_sha nor a patch is downgraded to failed — this is exactly
+            # the false-done the quarantine was for (chat text passed off as a
+            # build). needs-review/failed are already honest and pass through.
+            _kind = str(job.get("kind") or "")
+            _commit_expected = not _kind.startswith(NONCOMMIT_PREFIXES)
+            if (
+                result.get("status") == "done"
+                and _commit_expected
+                and not result.get("commit_sha")
+                and not result.get("patch")
+            ):
+                log.error(
+                    "false-done guard: %s kind=%r marked done with no commit/patch — failing honest",
+                    uuid, _kind,
+                )
+                result["status"] = "failed"
+                result.setdefault(
+                    "error",
+                    "commit-expecting kind produced no commit or patch (false-done blocked)",
+                )
             _write_terminal(relay, uuid, result, key, claimant=claimant)
-            log.info("executed %s sha=%s", uuid, result.get("commit_sha"))
+            log.info(
+                "executed %s status=%s sha=%s", uuid, result.get("status"), result.get("commit_sha")
+            )
         except Exception as exc:  # noqa: BLE001 — report failure, keep polling
             log.exception("execute %s failed", uuid)
             _write_terminal(relay, uuid, {"status": "failed", "error": str(exc)}, key, claimant=claimant)
