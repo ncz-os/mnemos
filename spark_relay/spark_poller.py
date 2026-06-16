@@ -85,6 +85,60 @@ KIND_WORKSPACE_MAP = (
 
 REPO_HINT_RE = re.compile(r"(?im)^\s*repo:\s*(?P<repo>\S+)\s*$")
 
+# Allowlisted repo NAME -> clone URL. SSRF guard: every job-supplied repo target
+# (repo: hint OR the build:<repo> kind suffix) resolves ONLY through this map
+# (+ SPARK_REPO_ALLOWLIST env extras). Raw URLs and bare "owner/repo" hints are
+# rejected so a queued job cannot force a clone of an attacker-chosen Git server.
+# Spark scope (operator override 2026-06-06): Spark may work ANY fleet project —
+# its NGC pool is large and non-metered.
+_BASE_REPO_ALIASES = {
+    "mnemos": "https://gitlab.com/mnemos-os/mnemos.git",
+    "zeroclaw": "https://gitlab.com/nclawzero/zeroclaw.git",
+    "ncz-installer": "https://gitlab.com/nclawzero/ncz-installer.git",
+    "riskyeats": "https://gitlab.com/perlowja/riskyeats.git",
+    "ic-engine": "https://gitlab.com/argonautsystems/ic-engine.git",
+    "investorclaw-enterprise": "https://gitlab.com/argonautsystems/InvestorClaw.git",
+    "florida-licenses": "https://gitlab.com/argonautsystems/florida-licenses.git",
+    "fleet-ops": None,
+}
+
+
+def repo_aliases() -> dict:
+    """Base allowlist merged with operator-managed SPARK_REPO_ALLOWLIST extras.
+
+    SPARK_REPO_ALLOWLIST="name=https://host/owner/repo.git,other=https://..."
+    """
+    aliases = dict(_BASE_REPO_ALIASES)
+    for entry in os.environ.get("SPARK_REPO_ALLOWLIST", "").split(","):
+        entry = entry.strip()
+        if "=" in entry:
+            name, url = entry.split("=", 1)
+            aliases.setdefault(name.strip(), url.strip() or None)
+    return aliases
+
+
+def repo_url_for_kind(kind: str | None) -> str | None:
+    """Resolve a job KIND to a clone URL (no job-text hint), or None if unmapped.
+
+    Understands the home-fleet ``build:<repo>`` convention — the suffix after
+    ``build:`` is an allowlisted repo NAME (same allowlist as ``repo:`` hints) —
+    and the legacy colon-prefixed project kinds in :data:`KIND_WORKSPACE_MAP`.
+    Previously the relay only knew the colon-kinds, so every ``build:*`` job the
+    enqueuer offloaded fell through to "no repo mapping for kind".
+    """
+    kind = str(kind or "")
+    if kind.startswith("build:"):
+        repo_token = kind[len("build:"):].split(":", 1)[0].strip()
+        aliases = repo_aliases()
+        # Allowlist-only: an unknown suffix falls through to None (genuinely
+        # unmapped) rather than being treated as a raw repo target.
+        if repo_token in aliases:
+            return aliases[repo_token]
+    for prefixes, url in KIND_WORKSPACE_MAP:
+        if kind.startswith(prefixes):
+            return url
+    return None
+
 
 def worker_id() -> str:
     return os.environ.get("SPARK_WORKER_ID") or socket.gethostname()
@@ -548,38 +602,14 @@ class AgenticRepoExecutor:
             url = self._repo_hint_to_url(hint.group("repo"))
             if url:
                 return url
-        kind = str(job.get("kind") or "")
-        for prefixes, url in KIND_WORKSPACE_MAP:
-            if kind.startswith(prefixes):
-                return url
-        return None
+        return repo_url_for_kind(job.get("kind"))
 
     def _repo_hint_to_url(self, repo: str) -> str | None:
-        # Spark scope (operator override 2026-06-06): Spark may work ANY fleet
-        # project — its NGC pool is large and non-metered. The previous
-        # "open source + NVIDIA-internal only" exclusion of argonautsystems
-        # projects is lifted.
-        aliases = {
-            "mnemos": "https://gitlab.com/mnemos-os/mnemos.git",
-            "zeroclaw": "https://gitlab.com/nclawzero/zeroclaw.git",
-            "ncz-installer": "https://gitlab.com/nclawzero/ncz-installer.git",
-            "riskyeats": "https://gitlab.com/perlowja/riskyeats.git",
-            "ic-engine": "https://gitlab.com/argonautsystems/ic-engine.git",
-            "investorclaw-enterprise": "https://gitlab.com/argonautsystems/InvestorClaw.git",
-            "florida-licenses": "https://gitlab.com/argonautsystems/florida-licenses.git",
-            "fleet-ops": None,
-        }
-        # Optional operator-managed extra allowlist:
-        # SPARK_REPO_ALLOWLIST="name=https://host/owner/repo.git,other=https://..."
-        for entry in os.environ.get("SPARK_REPO_ALLOWLIST", "").split(","):
-            entry = entry.strip()
-            if "=" in entry:
-                name, url = entry.split("=", 1)
-                aliases.setdefault(name.strip(), url.strip() or None)
         # SECURITY: job-supplied repo targets are allowlist-only. Raw URLs and
         # bare "owner/repo" hints are rejected so a queued job cannot force a
         # clone of an arbitrary Git server (SSRF) or attach credentialed clone
         # URLs to an attacker-chosen repository.
+        aliases = repo_aliases()
         if repo in aliases:
             return aliases[repo]
         logging.warning("rejected non-allowlisted repo hint: %r", repo)
