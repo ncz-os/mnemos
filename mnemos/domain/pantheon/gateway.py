@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 
 from mnemos.core.config import get_settings
-from mnemos.domain.graeae.api_keys import get_key
+from mnemos.domain.graeae.api_keys import get_key, get_provider_config
 from mnemos.domain.graeae.engine import get_graeae_engine
 from mnemos.domain.openai_compat.content import _content_text, _flatten_messages_for_prompt
 from mnemos.domain.pantheon.router import RouteDecision
@@ -159,9 +159,20 @@ def _identity_headers(identity: UpstreamIdentity | None) -> dict[str, str]:
 def _provider_config(decision: RouteDecision) -> dict[str, Any]:
     engine = get_graeae_engine()
     defaults = _PANTHEON_PROVIDER_DEFAULTS.get(decision.provider, {})
-    cfg = {**defaults, **dict(engine.providers.get(decision.provider, {}))}
+    provider_cfg = dict(engine.providers.get(decision.provider, {}))
+    try:
+        operator_cfg = {k: v for k, v in get_provider_config(decision.provider).items() if k != "api_key"}
+    except Exception:
+        operator_cfg = {}
+    cfg = {**defaults, **provider_cfg, **operator_cfg}
     if not cfg:
         raise PantheonGatewayError(503, f"provider {decision.provider!r} is not registered")
+    if cfg.get("base_url"):
+        base_url = _base_v1_url(str(cfg["base_url"]))
+        cfg["url"] = base_url + "/chat/completions"
+        cfg["chat_url"] = base_url + "/chat/completions"
+        cfg["responses_url"] = base_url + "/responses"
+        cfg["embeddings_url"] = base_url + "/embeddings"
     if decision.model_id:
         cfg["model"] = decision.model_id
     return cfg
@@ -236,22 +247,18 @@ def _base_v1_url(url: str) -> str:
 def _chat_url(cfg: dict[str, Any], decision: RouteDecision) -> str:
     if model_uses_responses_api(decision.model_id):
         return _responses_url(cfg)
-    url = str(cfg.get("chat_url") or cfg.get("url") or "")
-    if url.endswith("/responses"):
-        return _base_v1_url(url) + "/chat/completions"
-    return url
+    url = str(cfg.get("base_url") or cfg.get("chat_url") or cfg.get("url") or "")
+    return _base_v1_url(url) + "/chat/completions"
 
 
 def _responses_url(cfg: dict[str, Any]) -> str:
-    if cfg.get("responses_url"):
-        return str(cfg["responses_url"])
-    return _base_v1_url(str(cfg.get("url") or "")) + "/responses"
+    url = str(cfg.get("base_url") or cfg.get("responses_url") or cfg.get("url") or "")
+    return _base_v1_url(url) + "/responses"
 
 
 def _embeddings_url(cfg: dict[str, Any]) -> str:
-    if cfg.get("embeddings_url"):
-        return str(cfg["embeddings_url"])
-    return _base_v1_url(str(cfg.get("url") or "")) + "/embeddings"
+    url = str(cfg.get("base_url") or cfg.get("embeddings_url") or cfg.get("url") or "")
+    return _base_v1_url(url) + "/embeddings"
 
 
 def _reasoning_budget() -> int:
