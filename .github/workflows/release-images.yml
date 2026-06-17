@@ -1,0 +1,237 @@
+name: Publish image matrix (ghcr.io)
+
+# Publishes the layered MNEMOS image matrix to ghcr.io:
+#
+#   ghcr.io/<owner>/mnemos-core         base kernel            amd64 + arm64
+#   ghcr.io/<owner>/mnemos              everything API image   amd64 + arm64
+#   ghcr.io/<owner>/mnemos-enterprise   + Oracle/Db2/MySQL     amd64 ONLY
+#
+# (mnemos-stiphos is published from its own repo's workflow — it is a separate
+# service, not part of this umbrella.)
+#
+# Composition is OCI-layered: mnemos is built FROM mnemos-core, and
+# mnemos-enterprise FROM mnemos, each by immutable digest. The heavy base
+# (llama-cpp-python compile + baked GGUF embedder) is built once and shared.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      addon_ref:
+        description: 'Add-on branch/tag/SHA for pantheon/knemon/graeae/charon (default: main)'
+        required: false
+        default: 'main'
+      build_enterprise:
+        description: 'Also build the amd64-only enterprise image'
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: release-images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  ADDON_REMOTE_BASE: https://gitlab.com/ncz-os
+  ADDON_REF: ${{ github.event.inputs.addon_ref || 'main' }}
+
+jobs:
+  # ── 1. base kernel ─────────────────────────────────────────────────────────
+  core:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # NOTE: arm64 here builds under QEMU emulation, which makes the
+      # llama-cpp-python compile slow (tens of minutes). If build minutes
+      # become a problem, split this into a native matrix
+      # (ubuntu-latest + ubuntu-24.04-arm) that pushes by digest and merges
+      # the manifest — only THIS job needs it; the layers below are cheap.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.core
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            MNEMOS_CORE_REF=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=mnemos-core
+          cache-to: type=gha,mode=max,scope=mnemos-core
+          provenance: true
+          sbom: true
+
+  # ── 2. everything API image (FROM mnemos-core) ─────────────────────────────
+  everything:
+    needs: core
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Pre-build the four add-on wheels from their GitLab repos and stage them
+      # into ./wheelhouse for Dockerfile.everything. They are pure-Python
+      # (setuptools) so --no-deps wheel builds need no native toolchain and the
+      # same wheel is arch-independent for both target platforms.
+      - name: Stage add-on wheels
+        env:
+          ADDON_GIT_TOKEN: ${{ secrets.ADDON_GIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p wheelhouse
+          base="${ADDON_REMOTE_BASE}"
+          if [ -n "${ADDON_GIT_TOKEN:-}" ]; then
+            base="https://oauth2:${ADDON_GIT_TOKEN}@gitlab.com/ncz-os"
+          fi
+          declare -A refs=(
+            [pantheon]="${ADDON_REF}"
+            [knemon]="${ADDON_REF}"
+            [graeae]="${ADDON_REF}"
+            [charon]="${ADDON_REF}"
+          )
+          for name in pantheon knemon graeae charon; do
+            echo "::group::wheel ${name}@${refs[$name]}"
+            git clone --depth 1 --branch "${refs[$name]}" "${base}/${name}.git" "src-${name}"
+            ( cd "src-${name}" && echo "${name} $(git rev-parse HEAD)" >> "${GITHUB_WORKSPACE}/addon-provenance.txt" )
+            python -m pip wheel --no-deps --no-build-isolation --wheel-dir wheelhouse "./src-${name}"
+            echo "::endgroup::"
+          done
+          echo "── staged wheels ──"; ls -1 wheelhouse
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.everything
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            MNEMOS_CORE_IMAGE=${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core@${{ needs.core.outputs.digest }}
+            MNEMOS_CORE_REF=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=mnemos-everything
+          cache-to: type=gha,mode=max,scope=mnemos-everything
+          provenance: true
+          sbom: true
+
+  # ── 3. enterprise image (FROM mnemos) — amd64 ONLY ─────────────────────────
+  enterprise:
+    needs: everything
+    if: ${{ github.event_name == 'push' || github.event.inputs.build_enterprise == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-enterprise
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.enterprise
+          # amd64-only by policy (ibm_db has no reliable arm64 wheel).
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            MNEMOS_EVERYTHING_IMAGE=${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos@${{ needs.everything.outputs.digest }}
+            MNEMOS_CORE_REF=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=mnemos-enterprise
+          cache-to: type=gha,mode=max,scope=mnemos-enterprise
+          provenance: true
+          sbom: true
+
+  summary:
+    needs: [core, everything, enterprise]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          {
+            echo "### MNEMOS image matrix"
+            echo ""
+            echo "| Image | Arch | Status |"
+            echo "|---|---|---|"
+            echo "| mnemos-core | amd64+arm64 | ${{ needs.core.result }} |"
+            echo "| mnemos (everything) | amd64+arm64 | ${{ needs.everything.result }} |"
+            echo "| mnemos-enterprise | amd64 | ${{ needs.enterprise.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
