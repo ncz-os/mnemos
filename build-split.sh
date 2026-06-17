@@ -8,12 +8,14 @@ set -euo pipefail
 #   ./pantheon gitlab.com/ncz-os/pantheon.git at a resolved full commit
 #   ./knemon   gitlab.com/ncz-os/knemon.git at a resolved full commit
 #   ./graeae   gitlab.com/ncz-os/graeae.git at a resolved full commit
+#   ./charon   gitlab.com/ncz-os/charon.git at a resolved full commit
 #
 # Runtime import contract, matching the old monorepo image:
 #   import mnemos.core
 #   import mnemos.domain.pantheon
 #   import mnemos.domain.knemon
 #   import mnemos.domain.graeae
+#   import mnemos.domain.portability   (mnemos-charon)
 
 usage() {
   cat <<'EOF'
@@ -59,6 +61,7 @@ ADDON_REF=${ADDON_REF:-main}
 ADDON_PANTHEON_REF=${ADDON_PANTHEON_REF:-$ADDON_REF}
 ADDON_KNEMON_REF=${ADDON_KNEMON_REF:-$ADDON_REF}
 ADDON_GRAEAE_REF=${ADDON_GRAEAE_REF:-$ADDON_REF}
+ADDON_CHARON_REF=${ADDON_CHARON_REF:-$ADDON_REF}
 PODMAN=${PODMAN:-podman}
 VERIFY_IMPORTS=${VERIFY_IMPORTS:-1}
 
@@ -191,8 +194,8 @@ fi
 
 echo "[split] context: $CONTEXT_DIR"
 echo "[split] core:    $CORE_COMMIT"
-echo "[split] add-ons: $(redact_url "$ADDON_REMOTE_BASE")/{pantheon,knemon,graeae}.git"
-echo "[split] refs:    pantheon=$ADDON_PANTHEON_REF knemon=$ADDON_KNEMON_REF graeae=$ADDON_GRAEAE_REF"
+echo "[split] add-ons: $(redact_url "$ADDON_REMOTE_BASE")/{pantheon,knemon,graeae,charon}.git"
+echo "[split] refs:    pantheon=$ADDON_PANTHEON_REF knemon=$ADDON_KNEMON_REF graeae=$ADDON_GRAEAE_REF charon=$ADDON_CHARON_REF"
 echo "[split] image:   $IMAGE_TAG"
 
 safe_rm_rf "$CONTEXT_DIR"
@@ -367,11 +370,13 @@ clone_addon() {
 PANTHEON_COMMIT=$(clone_addon pantheon pantheon "$ADDON_PANTHEON_REF")
 KNEMON_COMMIT=$(clone_addon knemon knemon "$ADDON_KNEMON_REF")
 GRAEAE_COMMIT=$(clone_addon graeae graeae "$ADDON_GRAEAE_REF")
+CHARON_COMMIT=$(clone_addon charon charon "$ADDON_CHARON_REF")
 
 echo "[split] resolved add-on commits:"
 echo "        pantheon $PANTHEON_COMMIT"
 echo "        knemon   $KNEMON_COMMIT"
 echo "        graeae   $GRAEAE_COMMIT"
+echo "        charon   $CHARON_COMMIT"
 
 audit_namespace_collisions() {
   local tmp
@@ -382,7 +387,7 @@ audit_namespace_collisions() {
   local duplicates
 
   tmp=$(mktemp "$CONTEXT_DIR/mnemos-files.XXXXXX")
-  for pkg in core pantheon knemon graeae; do
+  for pkg in core pantheon knemon graeae charon; do
     root="$CONTEXT_DIR/$pkg/mnemos"
     [[ -d "$root" ]] || continue
     for rel in "__init__.py" "domain/__init__.py" "api/__init__.py" "api/routes/__init__.py"; do
@@ -419,9 +424,11 @@ audit_namespace_collisions
   printf 'MNEMOS_PANTHEON_REF=%q\n' "$PANTHEON_COMMIT"
   printf 'MNEMOS_KNEMON_REF=%q\n' "$KNEMON_COMMIT"
   printf 'MNEMOS_GRAEAE_REF=%q\n' "$GRAEAE_COMMIT"
+  printf 'MNEMOS_CHARON_REF=%q\n' "$CHARON_COMMIT"
   printf 'ADDON_PANTHEON_REPO=%q\n' "ncz-pantheon"
   printf 'ADDON_KNEMON_REPO=%q\n' "ncz-knemon"
   printf 'ADDON_GRAEAE_REPO=%q\n' "ncz-graeae"
+  printf 'ADDON_CHARON_REPO=%q\n' "ncz-charon"
 } >"$CONTEXT_DIR/split-provenance.env"
 
 (
@@ -431,6 +438,7 @@ audit_namespace_collisions
     --build-arg "MNEMOS_PANTHEON_REF=$PANTHEON_COMMIT" \
     --build-arg "MNEMOS_KNEMON_REF=$KNEMON_COMMIT" \
     --build-arg "MNEMOS_GRAEAE_REF=$GRAEAE_COMMIT" \
+    --build-arg "MNEMOS_CHARON_REF=$CHARON_COMMIT" \
     -f Dockerfile.split \
     -t "$IMAGE_TAG" \
     .
@@ -573,7 +581,7 @@ verify_module_imports() {
   "$PODMAN" run --rm "$IMAGE_TAG" python -m pip check
 
   echo "[split] verifying exact split module imports"
-  "$PODMAN" run --rm "$IMAGE_TAG" python -c 'import importlib; import importlib.metadata as metadata; import pkgutil; core_root = importlib.import_module("mnemos.core"); modules = ["mnemos", "mnemos.api.main", "mnemos.core"]; modules.extend(module.name for module in pkgutil.walk_packages(core_root.__path__, "mnemos.core.")); optional_modules = {"mnemos-pantheon": ("mnemos.api.routes.pantheon", "mnemos.domain.pantheon.catalog"), "mnemos-knemon": ("mnemos.api.routes.ledger", "mnemos.api.routes.knemon_dashboard", "mnemos.api.routes.knemon_router", "mnemos.api.routes.knemon_utilization", "mnemos.domain.knemon.router"), "mnemos-graeae": ("mnemos.api.routes.providers", "mnemos.api.routes.consultations", "mnemos.domain.graeae.engine")}; installed = []; missing = [];
+  "$PODMAN" run --rm "$IMAGE_TAG" python -c 'import importlib; import importlib.metadata as metadata; import pkgutil; core_root = importlib.import_module("mnemos.core"); modules = ["mnemos", "mnemos.api.main", "mnemos.core"]; modules.extend(module.name for module in pkgutil.walk_packages(core_root.__path__, "mnemos.core.")); optional_modules = {"mnemos-pantheon": ("mnemos.api.routes.pantheon", "mnemos.domain.pantheon.catalog"), "mnemos-knemon": ("mnemos.api.routes.ledger", "mnemos.api.routes.knemon_dashboard", "mnemos.api.routes.knemon_router", "mnemos.api.routes.knemon_utilization", "mnemos.domain.knemon.router"), "mnemos-graeae": ("mnemos.api.routes.providers", "mnemos.api.routes.consultations", "mnemos.domain.graeae.engine"), "mnemos-charon": ("mnemos.api.routes.portability", "mnemos.api.routes.ingest", "mnemos.domain.portability.schemas", "mnemos.domain.portability.serializers", "mnemos.tools.adapters.mem0")}; installed = []; missing = [];
 for dist, dist_modules in optional_modules.items():
     try:
         metadata.version(dist)
@@ -662,8 +670,13 @@ run_oracle_memory_smoke_if_configured() {
   CLEANUP_CONTAINERS+=("$cname")
 
   echo "[split] booting Oracle CRUD/search smoke container"
+  # Map host.containers.internal -> host gateway so a bridged smoke container can
+  # reach a DB published on the host (e.g. DSN host=host.containers.internal). The
+  # deployed app runs host-networked on 127.0.0.1, but binding --network host here
+  # would collide with its port 5002, so we bridge + add-host instead.
   "$PODMAN" run -d \
     --name "$cname" \
+    --add-host host.containers.internal:host-gateway \
     "${db_env[@]}" \
     "${db_mounts[@]}" \
     "$IMAGE_TAG" >/dev/null
@@ -674,7 +687,7 @@ run_oracle_memory_smoke_if_configured() {
   status=$("$PODMAN" exec "$cname" curl -sS --max-time 30 -o /tmp/memory-create.json -w '%{http_code}' \
     -H 'Content-Type: application/json' \
     --data-binary @/tmp/memory-create-request.json \
-    http://127.0.0.1:5002/memories)
+    http://127.0.0.1:5002/v1/memories)
   if [[ "$status" != "201" && "$status" != "200" ]]; then
     echo "[split] Oracle memory create returned HTTP $status" >&2
     "$PODMAN" exec "$cname" cat /tmp/memory-create.json >&2 || true
@@ -698,12 +711,12 @@ run_oracle_memory_smoke_if_configured() {
   memory_id=$("$PODMAN" exec "$cname" python -c 'import json; print(json.load(open("/tmp/memory-create.json"))["id"])')
 
   "$PODMAN" exec "$cname" python3 -c 'import json, sys; json.dump({"query": sys.argv[1], "limit": 5, "semantic": False, "namespace": "default"}, open("/tmp/memory-search-request.json", "w"))' "$marker"
-  expect_json_status "$cname" POST /memories/search 200 /tmp/memory-search.json \
+  expect_json_status "$cname" POST /v1/memories/search 200 /tmp/memory-search.json \
     -H 'Content-Type: application/json' \
     --data-binary @/tmp/memory-search-request.json
   "$PODMAN" exec "$cname" python -c 'import json, sys; payload=json.load(open("/tmp/memory-search.json")); target=sys.argv[1]; ids=[row.get("id") for row in payload.get("memories", [])]; raise SystemExit(0 if target in ids else 1)' "$memory_id"
 
-  status=$("$PODMAN" exec "$cname" curl -sS --max-time 10 -o /tmp/memory-delete.txt -w '%{http_code}' -X DELETE "http://127.0.0.1:5002/memories/$memory_id")
+  status=$("$PODMAN" exec "$cname" curl -sS --max-time 10 -o /tmp/memory-delete.txt -w '%{http_code}' -X DELETE "http://127.0.0.1:5002/v1/memories/$memory_id")
   if [[ "$status" != "204" ]]; then
     echo "[split] Oracle memory delete returned HTTP $status" >&2
     "$PODMAN" exec "$cname" cat /tmp/memory-delete.txt >&2 || true

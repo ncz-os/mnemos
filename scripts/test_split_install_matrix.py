@@ -2,8 +2,8 @@
 """Split-package installability matrix harness.
 
 Verifies the carve promise: mnemos-core installs alone, and each add-on
-(pantheon / knemon / graeae) can be ADDED INDIVIDUALLY on top of it, with
-correct dependency closure and feature gating.
+(pantheon / knemon / graeae / charon) can be ADDED INDIVIDUALLY on top of it,
+with correct dependency closure and feature gating.
 
 For each scenario it builds a fresh venv, installs a package subset from a
 local wheelhouse (--find-links, no PyPI), and probes:
@@ -36,12 +36,16 @@ ADDON_DIST = {
     "pantheon": "mnemos-pantheon",
     "knemon": "mnemos-knemon",
     "graeae": "mnemos-graeae",
+    "charon": "mnemos-charon",
 }
 # pantheon depends on graeae + knemon (+ core); installing it must pull them.
+# charon depends on core only (its migrate-in adapters use stdlib; docling is an
+# opt-in extra), so it adds no transitive add-on closure.
 ADDON_DEPS = {
     "pantheon": {"graeae", "knemon"},
     "knemon": set(),
     "graeae": set(),
+    "charon": set(),
 }
 
 PROBE = r"""
@@ -51,7 +55,7 @@ try:
     import mnemos  # noqa
     from mnemos.core.extras import is_extra_installed
     result["import_core"] = True
-    for x in ("pantheon", "knemon", "graeae", "nats", "persephone"):
+    for x in ("pantheon", "knemon", "graeae", "charon", "nats", "persephone"):
         try:
             result["extras"][x] = bool(is_extra_installed(x))
         except Exception as e:  # noqa
@@ -142,13 +146,16 @@ def check_scenario(name, py, result, want_addons: set[str], expect_broken=False)
     chk("core_imports", result.get("import_core") is True)
     want = expected_extras(want_addons)
     extras = result.get("extras", {})
-    for x in ("pantheon", "knemon", "graeae"):
+    for x in ("pantheon", "knemon", "graeae", "charon"):
         chk(f"extra_{x}=={x in want}", extras.get(x) is (x in want))
     # Route presence (only assert when app booted cleanly).
     routes = result.get("routes")
     if isinstance(routes, list):
         has_providers = any(p.startswith("/v1/providers") for p in routes)
         chk("providers_route==graeae", has_providers == ("graeae" in want))
+        # CHARON mounts the MPF import/export routes only when installed.
+        has_import = any(p.startswith("/v1/import") or p.startswith("/v1/export") for p in routes)
+        chk("mpf_route==charon", has_import == ("charon" in want))
     return out
 
 
@@ -170,8 +177,9 @@ def main():
         ("core+knemon", {"knemon"}),
         ("core+graeae", {"graeae"}),
         ("core+pantheon", {"pantheon"}),  # must pull graeae+knemon
+        ("core+charon", {"charon"}),  # core-only deps; MPF routes mount
         ("core+graeae+knemon", {"graeae", "knemon"}),
-        ("full", {"pantheon", "knemon", "graeae"}),
+        ("full", {"pantheon", "knemon", "graeae", "charon"}),
     ]
     # Adversarial install ORDER for this round (permute add-on install sequence).
     perms = list(itertools.permutations(["mnemos-graeae", "mnemos-knemon", "mnemos-pantheon"]))

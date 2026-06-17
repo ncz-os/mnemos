@@ -61,14 +61,11 @@ dependencies = [
   # no Ollama dependency (mem_1779334716543_f8ebd4, operator-locked
   # 2026-05-21).
   "llama-cpp-python>=0.3",
-  # OpenVINO + optimum-intel embedding backend. Used on Intel CPU/iGPU/NPU
-  # hosts; auto-selected by mnemos/runtime/embedder.py when available.
-  # PYTHIA Phase 1B (2026-05-21): Xe iGPU 49.84 rec/s vs llama-cpp CPU
-  # 11.06 rec/s for the same nomic-embed-text-v1.5 model.
-  "openvino>=2025.0",
-  "optimum-intel[openvino]>=1.20",
-  "transformers>=4.40",
-  "torch>=2.3",
+  # Hardware-accelerated embedder backends (OpenVINO/optimum-intel + the
+  # transformers/torch HF path) are OPT-IN extras, not base deps, so the core
+  # closure stays lean. mnemos/runtime/embedder.py imports them lazily and
+  # auto-falls-back to llama-cpp when absent. Install per host:
+  #   [openvino] Intel CPU/iGPU/NPU · [cuda] NVIDIA · [amd] AMD ROCm
   "slowapi>=0.1.9",
   "limits>=3.6.0",
   "redis>=5.0.0",
@@ -78,7 +75,6 @@ dependencies = [
   # (was a leftover from an earlier health-check experiment).
   "authlib>=1.3.0",
   "itsdangerous>=2.2.0",
-  "prometheus_client>=0.20.0",
   "typer>=0.9.0",
 ]
 
@@ -105,6 +101,12 @@ tracing = [
 structlog = [
   "structlog>=25.0.0",
 ]
+# Prometheus /metrics export. observability.py imports prometheus_client
+# soft-optionally: without this extra the /metrics endpoint serves a tiny
+# stub and the metrics middleware no-ops. Install for real scrape output.
+metrics = [
+  "prometheus_client>=0.20.0",
+]
 sqlite = [
   "aiosqlite>=0.20.0",
   "sqlite-vec>=0.1.6",
@@ -122,22 +124,26 @@ artemis = ["networkx>=3.3", "scipy>=1.11"]
 nats = ["nats-py>=2.14.0"]
 hot = ["mnemos-hot>=0.2.0"]
 knemon = ["mnemos-knemon>=0.1,<0.2"]
+# CHARON portability subsystem (MPF + migrate-in adapters + Docling ingestion).
+# Default-on in the umbrella + server/full bundles; separable for minimal core.
+charon = ["mnemos-charon>=0.1,<0.2"]
 edge = [
   "aiosqlite>=0.20.0",
   "sqlite-vec>=0.1.6",
 ]
 # Bundle extras intentionally recurse through mnemos-core[...] and require pip>=21.2/uv, the build toolchain.
-server = ["mnemos-core[nats,persephone,pantheon,knemon,graeae]"]
+server = ["mnemos-core[nats,persephone,pantheon,knemon,graeae,charon]"]
 ml = ["mnemos-core[morpheus,kronos,apollo,artemis,hot]"]
 interop = ["mnemos-core[knossos]"]
 # Feature-layer extras. The hive build fabric is a separate ncz-os/hive track
 # and is not an installable mnemos-core split distribution.
 graeae = ["mnemos-graeae>=0.1,<0.2"]
 full = [
-  "mnemos-core[morpheus,persephone,kronos,knossos,apollo,artemis,nats,hot,edge]",
+  "mnemos-core[morpheus,persephone,kronos,knossos,apollo,artemis,nats,hot,edge,openvino]",
   "mnemos-pantheon>=0.2,<0.3",
   "mnemos-knemon>=0.1,<0.2",
   "mnemos-graeae>=0.1,<0.2",
+  "mnemos-charon>=0.1,<0.2",
 ]
 # Enterprise backend drivers (feat/oracle-port branch). oracledb uses thin
 # mode by default — no Oracle Instant Client required. ibm_db pulls the
@@ -167,6 +173,26 @@ gpu = ["fastembed-gpu>=0.3.0"]
 # [phi] — Intel-iGPU-accelerated path: OpenVINO + FastEmbed, used
 # in production at PYTHIA. Apache-2.0 across the board, no torch.
 phi = ["openvino-genai>=2024.4.0", "fastembed>=0.3.0"]
+# ── In-process embedder hardware acceleration (mnemos/runtime/embedder.py) ──
+# The base install ships only llama-cpp-python (portable CPU GGUF); the embedder
+# auto-falls-back to it everywhere. None of these accel backends are required
+# for a working core — they are opt-in so the base closure stays lean
+# (no ~5GB torch/CUDA/OpenVINO chain pulled by default).
+#
+# [openvino] — Intel CPU/iGPU/NPU via optimum-intel OVModelForFeatureExtraction.
+# Pulls transformers (+ CPU torch transitively) for tokenizer/export plumbing.
+openvino = ["openvino>=2025.0", "optimum-intel[openvino]>=1.20", "transformers>=4.40"]
+# [cuda] — NVIDIA. The HF/transformers embedder path needs the CUDA torch wheel;
+# install with the PyTorch CUDA index, e.g.:
+#   pip install mnemos-core[cuda] --extra-index-url https://download.pytorch.org/whl/cu124
+# For the default llama-cpp path on NVIDIA, install the CUDA-built wheel from
+#   https://abetlen.github.io/llama-cpp-python/whl/cu124/
+cuda = ["torch>=2.3", "transformers>=4.40"]
+# [amd] — AMD ROCm. Same HF/torch path against the ROCm index, e.g.:
+#   pip install mnemos-core[amd] --extra-index-url https://download.pytorch.org/whl/rocm6.2
+# For llama-cpp on AMD, build the HIPBLAS/Vulkan wheel (or use the MEDUSA HTTP
+# embed backend). torch ROCm wheels are linux-only.
+amd = ["torch>=2.3", "transformers>=4.40"]
 dev = [
   "import-linter>=2.0.0",
   "pytest>=8.0.0",
