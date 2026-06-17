@@ -1,50 +1,99 @@
-# MNEMOS Layered Install — Modular Deployment Architecture
+# MNEMOS Layered Architecture — Distributions, Images, Backends
 
-**Status:** scaffolded on `knemon-hive-unified`, ready for Codex inspect + complete.
-**Design authority:** GRAEAE consult 2026-06-01 (8 muses, consensus 0.89, winner gemini) on `de8f4b2b` Option-A layering. **Directive #2 (GRAEAE-first) satisfied.**
+**Status:** current (split-distribution model). Supersedes the earlier
+monorepo-extras scaffold.
 
-## Problem
+MNEMOS is layered along three **orthogonal** axes. You select each
+independently.
 
-The stack grew into a highly-layered system. Two **orthogonal** axes must be independently selectable; today neither is:
+## Axis 1 — Feature layers (separate distributions, runtime-gated)
 
-- **Feature layers (stack):** `core` (memory/persistence, always on) ← `graeae` (multi-muse reasoning) ← `hive` (job coordination + KNEMON cost/model routing)
-- **Storage backend:** `sqlite` / `postgres` / `oracle` / `db2` / `mysql` (behind the persistence ABC)
+Every subsystem is its own pip distribution on the shared `mnemos.*` PEP 420
+namespace. Core never hard-imports them; routes/MCP tools/workers are mounted
+only when the dist is present (`mnemos.core.extras` presence probes +
+`_include_optional_router`). A missing subsystem returns HTTP 503 with its exact
+install command — never an `ImportError`.
 
-A base install must pull **no** GRAEAE/hive deps and mount **none** of their routers. Not every operator wants all layers. Backend × layer support is uneven (Oracle/Db2 have `NotImplementedError` gaps).
+| Distribution | Layer | Depends on |
+|---|---|---|
+| `mnemos-core` | kernel: EPIMONE persistence, API runtime, MCP, embedder | — |
+| `mnemos-graeae` | GRAEAE multi-muse reasoning bus | core |
+| `mnemos-pantheon` | PANTHEON model catalog/facade | core |
+| `mnemos-knemon` | KNEMON cost/model routing + usage ledger | core |
+| `mnemos-charon` | CHARON portability (MPF, migrate-in, Docling) | core |
+| `mnemos-stiphos` | **STIPHOS hive** — agent coordination, job queue, cost-tier dispatch (beta) | core |
 
-## Design (GRAEAE consensus — DO this, not options)
+**STIPHOS is a separate *service*, not a router** — its own ASGI app and port
+(8080), so it is not part of the `mnemos` everything image. Deploy it as its own
+container/process.
 
-1. **Optional install = Python extras + runtime feature-flags.** Single codebase, isolated deps.
-2. **Conditional mount = lazy local imports** in the FastAPI app + a flag-driven router registry. If a layer is off, its third-party deps are never imported (no `ImportError` on base installs).
-3. **Dependency direction enforced twice:** install-time (extras chaining: `hive` requires `graeae`) + runtime (`Settings.enforce_layer_direction` Pydantic validator).
-4. **Honest backend gating = capabilities matrix** on the persistence ABC, **fail-fast at startup** if an enabled layer isn't supported by the chosen backend.
+Dependency direction is enforced at runtime (the layer validators) and at
+install time (extras chaining in `pyproject.toml`).
 
-## Scaffolded in this commit (compiles, default-ON = full deploy byte-for-byte unchanged)
+## Axis 2 — Published images (OCI layering)
 
-- `mnemos/core/config.py`: `_LayerSettings` (`enable_graeae`/`enable_hive`, env `MNEMOS_ENABLE_GRAEAE`/`_HIVE`, default `True`) + `Settings.layers` + `Settings.active_layers` + `enforce_layer_direction` validator (hive⇒graeae). Verified: rejects hive-without-graeae.
-- `mnemos/api/main.py`: GRAEAE router (`consultations`) gated on `enable_graeae`; KNEMON/hive routers (`ledger`, `knemon_*`) gated on `enable_hive`.
-- `mnemos/persistence/base.py`: `LAYER_REQUIRED_CAPABILITIES` + `backend_supported_layers()` + `assert_backend_supports_layers()` — derives layer support from the existing per-backend `capabilities` set (no per-backend edits needed).
-- `pyproject.toml`: `graeae` + `hive` (chains `graeae`) layer extras; `full` updated.
-
-## Gap list — Codex inspect + fix on `knemon-hive-unified`
-
-**P0 — pre-existing router reconciliation (blocks merge to master):**
-- `mnemos/domain/knemon/router.py` `route()` body came from a stale-base (bf0e166) rewrite and regresses `tests/domain/test_knemon_router.py::test_mid_priority_rejects_tier_c_ceiling` — a contract master ADDED in the 75 commits (priority-tier rejection must fire BEFORE capability-empty rejection). Re-apply ONLY the model-affinity wiring onto **master's** route(); keep the affinity helpers; `diff` route() vs `gitlab/master` to confirm no other master routing behavior was dropped. Full-green `test_knemon_router.py` + `test_knemon_capabilities.py`.
-
-**P1 — finish layering wiring:**
-- `main.py`: classify the remaining routers into layers (`pantheon`, `openai_compat`, `sessions`, `dag`, `webhooks`, `oauth`, `federation`, `kg`, …) — which are core vs graeae vs hive — and gate accordingly. Convert top-of-file router IMPORTS to lazy/local so a base install doesn't import GRAEAE/hive modules at all (currently they're imported even when gated off).
-- `lifespan`/`mnemos.core.lifecycle`: gate layer init (GRAEAE warmup, hive triage/claim wiring) on the flags; call `assert_backend_supports_layers(backend, settings.layers.active_layers)` at startup (fail-fast).
-- `LAYER_REQUIRED_CAPABILITIES`: pin the exact capability names per layer once the taxonomy is final (graeae⇒consultations persistence; hive⇒usage_ledger + hive_mind claim path). Make Oracle/Db2 `NotImplementedError` gaps surface as missing capabilities so gating is honest.
-- `pyproject.toml`: move GRAEAE-only / hive-only third-party deps OUT of base `dependencies` into the `graeae`/`hive` extras (currently base pulls them).
-
-**P2 — tests:**
-- deployment-profile tests for each layer combo × backend: base-only mounts no GRAEAE/hive routes; `[graeae]` mounts consultations; `[hive]` mounts KNEMON; hive-without-graeae fails fast; unsupported backend×layer fails fast.
-
-## Install matrix (target)
+The image matrix is a small, principled set — **not** a combinatorial matrix.
+Each image is built `FROM` the one above, so the heavy base (llama-cpp-python
+compile + baked GGUF embedder) is built once and shared via registry layer
+dedup.
 
 ```
-pip install mnemos-os[sqlite]                 # core memory only
-pip install mnemos-os[graeae,postgres]        # + reasoning, on Postgres
-pip install mnemos-os[hive,postgres]          # + coordination (pulls graeae)
-MNEMOS_ENABLE_HIVE=0 MNEMOS_ENABLE_GRAEAE=0   # runtime slim, even if full installed
+ghcr.io/ncz-os/mnemos-core           kernel                       amd64 + arm64
+        └─ ghcr.io/ncz-os/mnemos      + graeae+pantheon+knemon+charon  amd64 + arm64   ← canonical "everything"
+              └─ ghcr.io/ncz-os/mnemos-enterprise  + Oracle/Db2/MySQL  amd64 ONLY
+
+ghcr.io/ncz-os/mnemos-stiphos        hive service (FROM core)     amd64 + arm64
 ```
+
+Why not a separate "core+graeae" image tier? graeae/pantheon/knemon/charon all
+mount into the **one** `mnemos.api.main:app` process and are runtime-gated, so a
+separate image just toggles routers that are already lazy. graeae is the heavy
+one; the other three are nearly free. The only real image boundaries are:
+kernel · full-API · separate hive service · heavy enterprise drivers.
+
+Build sources: `Dockerfile.core`, `Dockerfile.everything`, `Dockerfile.enterprise`
+(core repo) and `Dockerfile` (mnemos-stiphos repo). Published by
+`.github/workflows/release-images.yml`.
+
+### Multi-arch notes
+
+- `mnemos-core` / `mnemos` / `mnemos-stiphos` are multi-arch (`amd64` + `arm64`).
+- `llama-cpp-python` is the only base dep that compiles from source — it builds
+  per-arch (AVX on amd64, NEON on arm64). Everything else ships aarch64 wheels.
+- The everything image installs add-on wheels **explicitly**, never via
+  `mnemos-core[full]`, because `full` pulls the Intel-only `openvino`
+  accelerator (x86-only). Accelerators are host-opt-in.
+- `mnemos-enterprise` is **amd64-only** (`ibm_db` has no reliable arm64 wheel;
+  enterprise big iron is x86). Other arches are a sponsor-provided-CI request.
+
+## Axis 3 — Storage backend (runtime, behind EPIMONE)
+
+The persistence layer (**EPIMONE**, `mnemos/persistence/`) is a single
+`abc.ABC` contract with swappable backends. The backend is chosen at **runtime**
+by `MNEMOS_DATABASE_DSN` — not by a separate image. SQLite is the portable
+default baked into every image.
+
+| Backend | Driver | In which image |
+|---|---|---|
+| SQLite + sqlite-vec | bundled | all (default) |
+| PostgreSQL + pgvector | `asyncpg` (bundled) | all |
+| Oracle Database 26ai | `oracledb` (thin) | `mnemos-enterprise`, or `mnemos` + `pip install oracledb` |
+| IBM Db2 12.1.5 | `ibm_db` | `mnemos-enterprise` |
+| MySQL 9.0+ | `aiomysql` | `mnemos-enterprise` |
+
+Backend × layer support is gated honestly: `assert_backend_supports_layers()`
+fails fast at startup if an enabled layer needs a capability the chosen backend
+lacks.
+
+## Picking a deployment
+
+| You want | Use |
+|---|---|
+| Minimal memory kernel, edge/embedded | `mnemos-core` image, or `pip install 'mnemos-core[sqlite]'` |
+| Full agent stack, any arch | `mnemos` image, or `pip install 'mnemos-core[server]'` |
+| Full stack on Oracle/Db2/MySQL | `mnemos-enterprise` image |
+| Fleet coordination / job queue | `mnemos-stiphos` image (alongside the above) |
+| A custom subset | `FROM ghcr.io/ncz-os/mnemos-core` + `pip install` the dists you want |
+
+See [INSTALL.md](INSTALL.md) for commands and [../AGENTS.md](../AGENTS.md) for
+the machine-readable agent install matrix.
