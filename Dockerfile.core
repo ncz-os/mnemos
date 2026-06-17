@@ -1,0 +1,121 @@
+# syntax=docker/dockerfile:1
+# ─────────────────────────────────────────────────────────────────────────────
+# mnemos-core — the canonical BASE image (kernel only).
+#
+# Publishes: ghcr.io/ncz-os/mnemos-core
+# Arch:      linux/amd64 + linux/arm64 (multi-arch manifest)
+#
+# This is the trunk of the published image matrix. Everything else is built
+# FROM this image with a thin pip-install layer (OCI layer dedup — the heavy
+# base, including the llama-cpp-python compile and the baked GGUF embedder, is
+# built ONCE and shared across the mnemos / mnemos-enterprise / mnemos-stiphos
+# tags):
+#
+#   mnemos-core            (this file)          kernel: EPIMONE persistence
+#                                               (SQLite default), API runtime,
+#                                               MCP, in-process embedder.
+#   mnemos                 Dockerfile.everything   FROM core + graeae + pantheon
+#                                               + knemon + charon wheels.
+#   mnemos-enterprise      Dockerfile.enterprise   FROM mnemos + Oracle/Db2/MySQL
+#                                               drivers (amd64-only).
+#   mnemos-stiphos         (mnemos-stiphos repo)   FROM core + the hive service.
+#
+# Arch notes:
+#   - llama-cpp-python is the ONLY base dep that compiles from source; it builds
+#     per-arch here (AVX on amd64, NEON on arm64). Everything else in the closure
+#     ships aarch64 wheels.
+#   - No Intel OpenVINO / OpenCL ICD is baked in — that accel path is x86-only
+#     and opt-in (`pip install mnemos-core[openvino]` on the host, or a derived
+#     image). Keeping it out is what makes this base genuinely arch-neutral.
+# ─────────────────────────────────────────────────────────────────────────────
+ARG MNEMOS_CORE_REF=unknown
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+COPY --from=ghcr.io/astral-sh/uv:0.11.21 /uv /uvx /bin/
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libpq-dev curl git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Dependency manifests first for better layer caching.
+COPY pyproject.toml requirements.txt README.md MANIFEST.in ./
+
+RUN uv pip install --system build setuptools wheel
+# Base third-party closure + the SQLite backend deps (aiosqlite + sqlite-vec).
+# SQLite is the portable default backend for this base image; both ship aarch64
+# wheels so the arm64 build stays wheel-only here.
+RUN uv pip install --system -r requirements.txt 'aiosqlite>=0.20.0' 'sqlite-vec>=0.1.6'
+
+COPY . .
+
+# Build the mnemos-core wheel (deps already resolved above; runtime reinstalls
+# it --no-deps for clean importlib.metadata without touching the closure).
+RUN python -m pip wheel --no-deps --no-build-isolation --wheel-dir /wheelhouse .
+
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+ARG MNEMOS_CORE_REF
+
+LABEL org.opencontainers.image.title="mnemos-core" \
+      org.opencontainers.image.description="MNEMOS core kernel: EPIMONE multi-backend persistence (SQLite default), FastAPI runtime, MCP, in-process embedder. Base layer for the mnemos image matrix." \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.source="https://github.com/ncz-os/mnemos" \
+      org.mnemos.core="${MNEMOS_CORE_REF}"
+
+WORKDIR /app
+
+# Runtime system deps only. libgomp1 is required by llama-cpp-python's
+# libllama.so (OpenMP); curl fetches the embedding GGUF below + powers
+# HEALTHCHECK fallbacks. NO compiler in the runtime stage.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 libgomp1 curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Carry the builder's fully-resolved site-packages + console scripts forward
+# (the proven Dockerfile.oracle / Dockerfile.split handoff). Re-running the
+# third-party install here would rebuild source-only deps (llama-cpp-python)
+# and fail with no gcc present.
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder /wheelhouse /wheelhouse
+
+RUN python -m pip install --no-deps --no-index --find-links /wheelhouse mnemos-core && \
+    python -m pip check && \
+    rm -rf /wheelhouse
+
+# Preserve the monorepo-shaped runtime tree at /app so code paths that derive
+# repo-root assets (db/ migrations, config.toml.example) from mnemos/.../__file__
+# keep working. Core runs from /app source, byte-identical to the pinned wheel;
+# the wheel stays installed for dependency metadata + pip check.
+COPY . ./
+
+# In-process embedding model (architectural decision mem_1779334716543_f8ebd4,
+# operator-locked 2026-05-21): in-process embed generation, no Ollama, no
+# llama-server HTTP. nomic-embed-text-v1.5.Q8_0 (768-dim) matches the default
+# vector(768) column. Override at runtime via MNEMOS_EMBED_MODEL_PATH. This GGUF
+# is architecture-neutral.
+RUN mkdir -p /opt/mnemos/models && \
+    curl -fsSL -o /opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf \
+      https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf
+
+# Portable defaults: SQLite under /data (a mountable volume). Override
+# MNEMOS_DATABASE_DSN at runtime to select Postgres / Oracle / Db2 / MySQL
+# without rebuilding.
+ENV PYTHONUNBUFFERED=1 \
+    MNEMOS_EMBED_MODEL_PATH=/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf \
+    MNEMOS_PERSISTENCE_BACKEND=sqlite \
+    MNEMOS_DATABASE_DSN=sqlite:////data/mnemos.db \
+    MNEMOS_SQLITE_PATH=/data/mnemos.db
+
+VOLUME ["/data"]
+
+EXPOSE 5002
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5002/health').read()" || exit 1
+
+CMD ["python", "-m", "uvicorn", "mnemos.api.main:app", "--host", "0.0.0.0", "--port", "5002"]
