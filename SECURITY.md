@@ -3,10 +3,11 @@
 ## Supported versions
 
 The most recently maintained release branch is supported. The current
-release candidate is **`v6.0.0rc1`** (source-install from the `v6.0-rc`
-tag — adds Oracle Database 26ai + IBM Db2 12.1.5 EAP backends). The
-most recently published PyPI release is `v5.0.1` (2026-05-06, on top
-of the v5.0.0 GA from 2026-05-02 and v4.0.0 from 2026-04-29).
+release is **`v6.0.0`** (split-distribution GA — small `mnemos-core`
+plus separately installable `mnemos.*` subsystems and turnkey
+`ghcr.io/ncz-os` images; adds Oracle Database 26ai + IBM Db2 12.1.5 EAP
+backends). It supersedes the v5.0.1 (2026-05-06) / v5.0.0 GA (2026-05-02)
+and v4.0.0 (2026-04-29) line.
 
 ## Current security invariants
 
