@@ -1,4 +1,9 @@
-"""Persistence abstraction public API."""
+"""EPIMONE — persistence abstraction public API.
+
+EPIMONE (Greek Επιμονή, "persistence") is the backend-neutral storage layer:
+one ``abc.ABC`` repository contract, swappable backends (SQLite default;
+PostgreSQL, Oracle, IBM Db2, MySQL). See ``mnemos.persistence.base``.
+"""
 
 from mnemos.persistence.base import (
     ALL_CAPABILITIES,

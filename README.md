@@ -5,9 +5,10 @@
 # MNEMOS + GRAEAE
 
 **MNEMOS v6.0.0rc1 is the — `release/v6.0-rc` branch, `v6.0-rc` tag) is the memory operating system for
-serious agentic work: a packaged FastAPI runtime, **four-backend** persistence
-layer (PostgreSQL + pgvector, Oracle Database 26ai HNSW INMEMORY NEIGHBOR GRAPH,
-IBM Db2 12.1.5 (EAP) DiskANN vector, SQLite + sqlite-vec), GRAEAE reasoning bus,
+serious agentic work: a packaged FastAPI runtime, **EPIMONE** — the four-backend
+persistence layer (SQLite + sqlite-vec by default, PostgreSQL + pgvector,
+Oracle Database 26ai HNSW INMEMORY NEIGHBOR GRAPH, IBM Db2 12.1.5 (EAP) DiskANN
+vector), GRAEAE reasoning bus,
 operator-audited compression stack, divergent dream-state pipeline (REPLAY ->
 CLUSTER -> CONSOLIDATE -> SYNTHESISE -> EXTRACT), GDPR right-to-be-forgotten
 worker, PERSEPHONE archival subsystem, PANTHEON unified LLM facade, KRONOS
