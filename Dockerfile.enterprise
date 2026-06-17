@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1
+# ─────────────────────────────────────────────────────────────────────────────
+# mnemos-enterprise — everything image + enterprise DB drivers.
+#
+# Publishes: ghcr.io/ncz-os/mnemos-enterprise
+# Arch:      linux/amd64 ONLY.
+#
+# Policy: enterprise is amd64-only by design. The Oracle thin driver is pure
+# Python (would run on arm64), but ibm_db (Db2) has no reliable arm64 wheel and
+# the enterprise big-iron audience runs x86. If IBM (Power/ppc64le, LinuxONE/
+# s390x) or Oracle (Ampere/arm64) want this on their hardware, that is a
+# sponsor-provides-the-build-and-CI-resources conversation — ibm_db / thick
+# drivers need native validation on that hardware, we will not emulate it.
+#
+# Built FROM the everything image with one driver layer. Selects a backend at
+# runtime via MNEMOS_DATABASE_DSN; defaults to Oracle to match the canonical
+# PYTHIA deployment.
+# ─────────────────────────────────────────────────────────────────────────────
+ARG MNEMOS_EVERYTHING_IMAGE=ghcr.io/ncz-os/mnemos:latest
+FROM ${MNEMOS_EVERYTHING_IMAGE}
+
+ARG MNEMOS_CORE_REF=unknown
+
+LABEL org.opencontainers.image.title="mnemos-enterprise" \
+      org.opencontainers.image.description="MNEMOS everything image + Oracle / IBM Db2 / MySQL enterprise persistence drivers. amd64-only." \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.source="https://github.com/ncz-os/mnemos" \
+      org.mnemos.core="${MNEMOS_CORE_REF}" \
+      org.mnemos.variant="enterprise"
+
+# Enterprise persistence drivers. oracledb = thin mode by default (no Instant
+# Client); ibm_db bundles the Db2 CLI driver during install; aiomysql is the
+# MySQL 9.0+ async driver. ibm_db ships prebuilt linux/amd64 wheels — this is
+# why the image is amd64-only.
+RUN python -m pip install --no-cache-dir \
+        'oracledb>=4.0.1' \
+        'ibm_db>=3.2.4' \
+        'aiomysql>=0.2.0' && \
+    python -m pip check
+
+# Default to Oracle; override MNEMOS_DATABASE_DSN at runtime to pick any backend.
+ENV MNEMOS_PERSISTENCE_BACKEND=oracle
+
+# Inherits VOLUME /data, EXPOSE 5002, HEALTHCHECK, and the uvicorn CMD.

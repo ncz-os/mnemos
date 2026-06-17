@@ -39,34 +39,56 @@ Memory and reasoning runtime for AI agents: persistent search, versioned storage
 
 ### 1. Agent-driven install
 
-Paste into Claude Code, Cursor, or Codex. The agent runs the install; you confirm.
+Paste into Claude Code, Cursor, or Codex. The agent runs the install; you
+confirm. Agents should read [AGENTS.md](AGENTS.md) — it has the machine-readable
+module registry and a deterministic procedure for installing exactly the
+requested modules on the operator's arch + backend.
+
+The pip package is **`mnemos-core`** (the subsystems are separate dists pulled
+via extras). `mnemos` is the published **image** name, not a pip package.
+
+**Turnkey (container, any arch):**
+
+```
+docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos:latest
+# everything image: core + graeae + pantheon + knemon + charon. SQLite by default.
+# Point at a real DB with -e MNEMOS_DATABASE_DSN='postgres://…' (or oracle://… thin).
+```
+
+**pip (compose your own):**
 
 ```
 Install MNEMOS on this machine.
 
 Steps:
-1. pip install 'mnemos-os[server]==6.0.0rc1'  # source-install from v6.0-rc tag until PyPI publish
+1. pip install 'mnemos-core[server]'   # everything; arch-neutral (no openvino)
 2. mnemos init                         # scaffold config + token
 3. mnemos serve                        # start API on :5002
 4. mnemos doctor                       # verify subsystems
 5. Set MNEMOS_BASE=http://localhost:5002 and MNEMOS_API_KEY=<token from step 2>
    in shell env and any agent config that needs to reach it.
 
-Edge device (SQLite, no Postgres): pip install 'mnemos-os[edge]==6.0.0rc1' instead.
-Full install with all subsystems: pip install 'mnemos-os[full]==6.0.0rc1'
+Edge device (SQLite kernel only): pip install 'mnemos-core[edge]'
+Single subsystem, e.g. reasoning: pip install 'mnemos-core[graeae]'
+Hive (STIPHOS) is a SEPARATE service: pip install 'mnemos-stiphos[mcp]' (port 8080)
 ```
 
 **Enterprise backends (Oracle Database 26ai, IBM Db2 12.1.5 EAP).**
-Until the next PyPI release is cut, install from source against the
-`v6.0-rc` tag (or the `feat/oracle-port` development branch) and add
-the matching extras. See
-[docs/INSTALL.md](docs/INSTALL.md#enterprise-backends-oracle-ai-database-26ai--ibm-db2-1215-eap)
+Turnkey is the **amd64-only** `mnemos-enterprise` image (everything + Oracle/Db2/
+MySQL drivers baked in). Note: Oracle uses the thin driver, so it also runs on
+the plain `mnemos` image and on arm64 — only Db2 actually requires enterprise.
+See [docs/INSTALL.md](docs/INSTALL.md#enterprise-backends-oracle-database-26ai--ibm-db2-1215)
 for full driver, DSN, and migration steps.
 
 ```
-git clone -b feat/oracle-port https://github.com/ncz-os/mnemos
-cd mnemos
-python -m pip install -e '.[server,oracle]'   # or '.[server,db2]' or '.[server,enterprise]'
+# Turnkey (amd64):
+docker run --platform linux/amd64 -p 5002:5002 \
+  -e MNEMOS_DATABASE_DSN='db2://user:pass@host:50000/dbname' \
+  ghcr.io/ncz-os/mnemos-enterprise:latest
+
+# Or from source:
+git clone https://github.com/ncz-os/mnemos && cd mnemos
+python -m pip install -e '.[server,enterprise]'   # or '.[server,oracle]' / '.[server,db2]'
 export MNEMOS_DATABASE_DSN='oracle://user:pass@host:1521/service_name'
 # or:  MNEMOS_DATABASE_DSN='db2://user:pass@host:50000/dbname'
 mnemos install --profile server

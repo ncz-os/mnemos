@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1
+# ─────────────────────────────────────────────────────────────────────────────
+# mnemos — the "everything" API image (canonical PYTHIA-quadlet image).
+#
+# Publishes: ghcr.io/ncz-os/mnemos
+# Arch:      linux/amd64 + linux/arm64
+#
+# Built FROM mnemos-core with one thin pip-install layer of the four add-on
+# wheels (graeae + pantheon + knemon + charon). All four mount into the SINGLE
+# mnemos.api.main:app process and are runtime-gated, so there is no separate
+# "core+graeae" tier — graeae is the heavy one, the rest are nearly free.
+#
+# IMPORTANT (multi-arch): we install the add-on wheels EXPLICITLY and never via
+# `mnemos-core[full]`, because the `full` extra pulls the `openvino` accelerator,
+# which is Intel x86-only and would break the arm64 build. Hardware accel stays
+# host-opt-in.
+#
+# The add-on wheels are pre-built by CI (from the pantheon/knemon/graeae/charon
+# repos) and staged into ./wheelhouse before this build runs. mnemos-core is
+# already installed in the base image and satisfies the add-ons' first-party
+# dependency, so it is not reinstalled.
+# ─────────────────────────────────────────────────────────────────────────────
+ARG MNEMOS_CORE_IMAGE=ghcr.io/ncz-os/mnemos-core:latest
+FROM ${MNEMOS_CORE_IMAGE}
+
+ARG MNEMOS_CORE_REF=unknown
+ARG MNEMOS_PANTHEON_REF=unknown
+ARG MNEMOS_KNEMON_REF=unknown
+ARG MNEMOS_GRAEAE_REF=unknown
+ARG MNEMOS_CHARON_REF=unknown
+
+LABEL org.opencontainers.image.title="mnemos" \
+      org.opencontainers.image.description="MNEMOS everything image: core + GRAEAE reasoning + PANTHEON + KNEMON + CHARON portability, all in one API process. Built FROM mnemos-core." \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.source="https://github.com/ncz-os/mnemos" \
+      org.mnemos.core="${MNEMOS_CORE_REF}" \
+      org.mnemos.addon.pantheon="${MNEMOS_PANTHEON_REF}" \
+      org.mnemos.addon.knemon="${MNEMOS_KNEMON_REF}" \
+      org.mnemos.addon.graeae="${MNEMOS_GRAEAE_REF}" \
+      org.mnemos.addon.charon="${MNEMOS_CHARON_REF}"
+
+# Add-on wheels (mnemos_graeae, mnemos_pantheon, mnemos_knemon, mnemos_charon)
+# staged by CI. Their light third-party deps resolve from the index; mnemos-core
+# is already satisfied by the base image. A constraint pins mnemos-core so the
+# resolver can never pull a divergent core wheel over the baked-in one.
+COPY wheelhouse /tmp/wheelhouse
+
+RUN MNEMOS_CORE_VERSION="$(python -c 'import importlib.metadata as m; print(m.version("mnemos-core"))')" && \
+    printf 'mnemos-core==%s\n' "$MNEMOS_CORE_VERSION" > /tmp/core-constraint.txt && \
+    python -m pip install --no-cache-dir --constraint /tmp/core-constraint.txt \
+        /tmp/wheelhouse/*.whl && \
+    python -m pip check && \
+    rm -rf /tmp/wheelhouse /tmp/core-constraint.txt
+
+# Inherits ENV (sqlite default), VOLUME /data, EXPOSE 5002, HEALTHCHECK, and the
+# uvicorn CMD from mnemos-core. Override MNEMOS_DATABASE_DSN at runtime for
+# Postgres / Oracle (thin) / MySQL.
