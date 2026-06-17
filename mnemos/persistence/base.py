@@ -1,4 +1,12 @@
-"""Backend-neutral persistence interfaces for MNEMOS.
+"""EPIMONE — the backend-neutral persistence layer for MNEMOS.
+
+EPIMONE (Greek Επιμονή, "persistence / perseverance / tenacity") is the
+storage abstraction layer: a single ``abc.ABC`` repository contract that
+every subsystem and all of ``domain/`` + ``api/`` depend on, with swappable
+backends behind it (SQLite by default; PostgreSQL, Oracle, IBM Db2, MySQL).
+It is the trunk of the system, not a carve-out leaf — pull it and nothing
+has a place to live. The import path stays ``mnemos.persistence.*``;
+EPIMONE is the name of the layer, not a module rename.
 
 D.1 backend abstraction is complete for the primary memory graph,
 federation, and state key-value surfaces; API and domain orchestration
