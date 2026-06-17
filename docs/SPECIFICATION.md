@@ -1,9 +1,19 @@
 # MNEMOS Specification
 
-**Version**: `feat/oracle-port` branch (v6 candidate; PyPI baseline = v5.0.1
-on top of v5.0.0 GA shipped 2026-05-02). Adds Oracle Database 26ai + IBM Db2 12.1.5
-backends behind the existing `PersistenceBackend` ABC.
-**Status**: Authoritative for the checked-out tree on `feat/oracle-port`.
+**Version**: v6.0.0 GA (split-distribution release; supersedes the v5.0.1 / v5.0.0
+GA line from 2026-05-02). Adds Oracle Database 26ai + IBM Db2 12.1.5 backends behind
+the EPIMONE `PersistenceBackend` ABC.
+
+> **Packaging note (v6.0.0).** Where this spec says "the `mnemos/` package," that is
+> now the **`mnemos-core`** distribution plus separately installable `mnemos.*`
+> namespace distributions (`mnemos-graeae`, `mnemos-pantheon`, `mnemos-knemon`,
+> `mnemos-charon`) and the standalone **STIPHOS** hive service (`mnemos-stiphos`).
+> The subsystems described below are unchanged in behavior; they are simply shipped
+> as separate, optionally installed layers. See
+> [MNEMOS_CORE_BOUNDARY.md](MNEMOS_CORE_BOUNDARY.md), [INSTALL.md](INSTALL.md), and
+> [LAYERED_INSTALL.md](LAYERED_INSTALL.md).
+
+**Status**: Authoritative for the v6.0.0 tree.
 Where text below references "v5.0.1" it describes the v5 baseline that
 the branch extends; the four-backend persistence surface (Postgres,
 Oracle Database 26ai, Db2 12.1.5, SQLite) is the current branch reality. Behavior
