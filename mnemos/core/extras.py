@@ -28,12 +28,14 @@ EXTERNAL_EXTRA_DISTS: dict[str, str] = {
     "pantheon": "mnemos-pantheon",
     "knemon": "mnemos-knemon",
     "graeae": "mnemos-graeae",
+    "charon": "mnemos-charon",
 }
 
 EXTERNAL_EXTRA_IMPORT_PROBES: dict[str, str] = {
     "pantheon": "mnemos.domain.pantheon",
     "knemon": "mnemos.domain.knemon.router",
     "graeae": "mnemos.domain.graeae.engine",
+    "charon": "mnemos.domain.portability.schemas",
 }
 
 UNAVAILABLE_EXTRAS: dict[str, str] = {
@@ -42,7 +44,7 @@ UNAVAILABLE_EXTRAS: dict[str, str] = {
 
 FEATURE_BUNDLES: dict[str, tuple[str, ...]] = {
     "edge": ("edge",),
-    "server": ("nats", "persephone", "pantheon", "knemon", "graeae"),
+    "server": ("nats", "persephone", "pantheon", "knemon", "graeae", "charon"),
     "ml": ("morpheus", "kronos", "apollo", "artemis", "hot"),
     "interop": ("knossos",),
     "full": (
@@ -51,6 +53,7 @@ FEATURE_BUNDLES: dict[str, tuple[str, ...]] = {
         "pantheon",
         "knemon",
         "graeae",
+        "charon",
         "kronos",
         "knossos",
         "apollo",
