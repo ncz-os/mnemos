@@ -1,6 +1,0 @@
-# Spark relay runtime deps. Install on BOTH PYTHIA and the Spark:
-#   pip install -r spark_relay/requirements.txt
-# (Spark side does not need google-cloud sdk/gcloud CLI — this lib auths via SA key.)
-google-cloud-storage>=2.16.0
-cryptography>=42.0.0
-requests>=2.31.0
