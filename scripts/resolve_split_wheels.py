@@ -10,6 +10,7 @@ EXPECTED_WHEEL_STEMS = (
     "mnemos_pantheon",
     "mnemos_knemon",
     "mnemos_graeae",
+    "mnemos_charon",
 )
 
 

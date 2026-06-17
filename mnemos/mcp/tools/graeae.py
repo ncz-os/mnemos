@@ -16,7 +16,7 @@ from fastapi import HTTPException
 
 from mnemos.api.persistence_helpers import require_consultations_backend
 from mnemos.api.routes.consultations import (
-    _GENESIS_HASH,
+    audit_genesis_hash,
     _extract_memory_ids,
     _require_non_empty_consultation_result,
     _to_graeae_provider,
@@ -197,7 +197,7 @@ async def tool_graeae_consult(
                             owner_id=user.user_id,
                             namespace=user.namespace,
                             memory_ids=memory_ids,
-                            genesis_hash=_GENESIS_HASH,
+                            genesis_hash=audit_genesis_hash(),
                         )
                     )
             except HTTPException as e:
