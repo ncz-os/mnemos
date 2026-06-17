@@ -39,7 +39,7 @@ EXTERNAL_EXTRA_IMPORT_PROBES: dict[str, str] = {
 }
 
 UNAVAILABLE_EXTRAS: dict[str, str] = {
-    "hive": "HIVE is on the separate ncz-os/hive build-fabric track; not installable as a mnemos-core extra in this split.",
+    "hive": "HIVE (GRAEAE Hive Mind) is carved into the standalone mnemos-hive distribution and the separate ncz-os/hive build-fabric track; it deploys as its own service and is intentionally not part of the mnemos-core umbrella.",
 }
 
 FEATURE_BUNDLES: dict[str, tuple[str, ...]] = {
