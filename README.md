@@ -4,7 +4,7 @@
 
 # MNEMOS + GRAEAE
 
-**MNEMOS v6.0.0rc1 is the — `release/v6.0-rc` branch, `v6.0-rc` tag) is the memory operating system for
+**MNEMOS v6.0.0 is the memory operating system for
 serious agentic work: a packaged FastAPI runtime, **EPIMONE** — the four-backend
 persistence layer (SQLite + sqlite-vec by default, PostgreSQL + pgvector,
 Oracle Database 26ai HNSW INMEMORY NEIGHBOR GRAPH, IBM Db2 12.1.5 (EAP) DiskANN
@@ -19,15 +19,17 @@ manage the full lifecycle of agent memory across providers, agents, and time
 horizons: **write, embed, search, compress, version, reason-over, audit,
 federate, export, import, and operate**.
 
-> **Release candidate.** This README documents the **`v6.0-rc` tag** —
-> the canonical release candidate. It adds Oracle Database 26ai and
-> IBM Db2 12.1.5 (Early Access Program) as first-class persistence
-> backends alongside PostgreSQL and SQLite. The most recent published
-> latest published PyPI release is `5.0.1` (legacy); `6.0.0rc1` is the source-install candidate from the `v6.0-rc` tag (Postgres + SQLite only). Enterprise backends
-> ship from source against the tag until pip extras are published:
-> `git clone -b v6.0-rc https://github.com/ncz-os/mnemos`. See
-> [docs/INSTALL.md](docs/INSTALL.md#enterprise-backends-oracle-ai-database-26ai--ibm-db2-1215-eap)
-> for driver, DSN, and migration steps. Development history continues
+> **v6.0.0 — the split-distribution release.** MNEMOS is now a small core
+> (`mnemos-core`) plus separately installable `mnemos.*` namespace subsystems
+> (GRAEAE, PANTHEON, KNEMON, CHARON) and the standalone STIPHOS hive service. It
+> adds Oracle Database 26ai and IBM Db2 12.1.5 (EAP) as first-class persistence
+> backends alongside PostgreSQL and SQLite. Turnkey container images are
+> published to `ghcr.io/ncz-os` (`mnemos-core`, `mnemos`, `mnemos-enterprise`,
+> `mnemos-stiphos`); see [docs/INSTALL.md](docs/INSTALL.md) and
+> [AGENTS.md](AGENTS.md). Enterprise backend
+> driver, DSN, and migration steps are in
+> [docs/INSTALL.md](docs/INSTALL.md#enterprise-backends-oracle-database-26ai--ibm-db2-1215).
+> Development history continues
 > on the `feat/oracle-port` branch.
 
 
