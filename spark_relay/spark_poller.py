@@ -17,11 +17,13 @@ the stub.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import logging
 import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import time
@@ -872,12 +874,19 @@ class AgenticRepoExecutor:
 
 
 class DispatchingExecutor:
-    def __init__(self, chat: Executor, repo: AgenticRepoExecutor):
+    def __init__(self, chat: Executor, repo: AgenticRepoExecutor,
+                 native: "NativeBuildExecutor | None" = None):
         self.chat = chat
         self.repo = repo
+        self.native = native
 
     def execute(self, job: dict) -> dict:
         kind = str(job.get("kind") or "")
+        # build:* kinds are real native builds — clone+author+build+commit+push
+        # via the native executor when one is wired (ZC_BUILD_ONESHOT_PATH set).
+        # Without it, fall through to the legacy patch-only repo path.
+        if kind.startswith("build:") and self.native is not None:
+            return self.native.execute(job)
         if kind.startswith(NONCOMMIT_PREFIXES):
             return self.chat.execute(job)
         return self.repo.execute(job)
@@ -915,9 +924,143 @@ def _make_chat_executor(name: str) -> Executor:
     raise SystemExit(f"unknown executor {name!r}")
 
 
+def _safe_build_executor_path() -> Path | None:
+    """Trusted-path resolution of ZC_BUILD_ONESHOT_PATH (parity with the fleet
+    worker's _safe_oneshot_path): regular file, owned by us, not group/world
+    writable, not a symlink. Returns None when unset or any check fails — the
+    poller then falls back to the chat/patch path instead of importing an
+    untrusted file."""
+    p = os.environ.get("ZC_BUILD_ONESHOT_PATH")
+    if not p:
+        return None
+    pp = Path(p)
+    try:
+        st = os.lstat(pp)  # lstat: never follow a symlink
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None
+    if st.st_uid != os.getuid():
+        return None
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return None
+    return pp
+
+
+_NATIVE_RUN = None
+
+
+def _load_native_run():
+    """Lazily, contained-ly import the native build executor's run() from the
+    trusted ZC_BUILD_ONESHOT_PATH. No sys.path mutation; the fault is isolated
+    to build:* jobs. run() is positional-compatible with zc_oneshot.run():
+    (repo, kind, task, alias, job_id, branch_name, timeout, do_review, do_push)."""
+    global _NATIVE_RUN
+    if _NATIVE_RUN is not None:
+        return _NATIVE_RUN
+    pp = _safe_build_executor_path()
+    if pp is None:
+        raise RuntimeError("ZC_BUILD_ONESHOT_PATH unset or fails trusted-path checks")
+    spec = importlib.util.spec_from_file_location("zc_native_build_exec", str(pp))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    run = getattr(mod, "run", None)
+    if not callable(run):
+        raise RuntimeError(f"{pp} has no callable run()")
+    _NATIVE_RUN = run
+    return _NATIVE_RUN
+
+
+def _map_native_result(res: dict, kind: str) -> dict:
+    """Map a zc_native_build result (exit_code 0=ok / 3=blocked / else=fail,
+    head_sha, pushed_branch, ...) onto the poller's terminal shape
+    {status, commit_sha, branch, metrics}. needs-review/failed stay honest so
+    run_once's false-done guard never has to downgrade us."""
+    ec = int(res.get("exit_code", 1) or 0)
+    head = res.get("head_sha") or (res.get("commits") or [{}])[0].get("sha")
+    metrics = {
+        "backend": "zc_native_build",
+        "exit_code": ec,
+        "pushed": res.get("pushed"),
+        "pushed_branch": res.get("pushed_branch"),
+        "patch": res.get("patch"),
+        "note": res.get("note"),
+        "via": res.get("via"),
+    }
+    if ec == 0 and head:
+        return {
+            "status": "done",
+            "commit_sha": head,
+            "did_repo_work": True,
+            "branch": res.get("pushed_branch") or res.get("local_branch"),
+            "metrics": metrics,
+        }
+    if ec == 3 or res.get("blocked"):
+        return {
+            "status": "needs-review",
+            "commit_sha": head,
+            "branch": res.get("review_branch") or res.get("pushed_branch"),
+            "error": res.get("error"),
+            "metrics": metrics,
+        }
+    return {
+        "status": "failed",
+        "commit_sha": head,
+        "error": res.get("error") or f"zc_native_build exit_code={ec}",
+        "metrics": metrics,
+    }
+
+
+class NativeBuildExecutor:
+    """Run build:* jobs through the native zc build (zc_native_build.py via
+    ZC_BUILD_ONESHOT_PATH) so the GB10 actually clones, authors, builds, commits
+    and (optionally) pushes a zcbuild/<job_id> branch — instead of falling
+    through to the patch-only chat path that yields needs-review/sha=None."""
+
+    def __init__(self, *, alias: str, timeout: float, do_push: bool):
+        self.alias = alias
+        self.timeout = timeout
+        self.do_push = do_push
+
+    def execute(self, job: dict) -> dict:
+        run = _load_native_run()
+        kind = str(job.get("kind") or "")
+        task = job.get("prompt") or job.get("task") or ""
+        jid = job.get("id") or job.get("uuid") or job.get("job_id")
+        # Derive the repo (workspace subdir) from a build:<repo>[:extra] kind and
+        # pass it explicitly — zc_native_build's KIND_WORKSPACE_MAP only knows the
+        # "<workspace>:" prefix forms, not the hive's "build:" prefix, and the
+        # repo arg overrides the kind map. job_id threads through so the output
+        # branch is zcbuild/<bus_job_id> (traceable to the bus job).
+        repo = None
+        if kind.startswith("build:"):
+            parts = kind.split(":")
+            if len(parts) > 1 and parts[1].strip():
+                repo = parts[1].strip()
+        res = run(repo, kind, task, self.alias, jid, None,
+                  self.timeout, True, self.do_push)
+        if not isinstance(res, dict):
+            return {"status": "failed",
+                    "error": f"native build returned non-dict: {type(res).__name__}"}
+        return _map_native_result(res, kind)
+
+
+def _maybe_native_build_executor() -> NativeBuildExecutor | None:
+    """Build a NativeBuildExecutor iff a trusted ZC_BUILD_ONESHOT_PATH is set.
+    Push policy + author alias + timeout come from env so deployment is config,
+    not code."""
+    if _safe_build_executor_path() is None:
+        return None
+    alias = os.environ.get("ZC_BUILD_ALIAS", "hive_ngc_1")
+    timeout = float(os.environ.get("ZC_BUILD_TIMEOUT", "1800"))
+    do_push = os.environ.get("ZC_BUILD_PUSH", "1").strip().lower() not in ("0", "false", "no")
+    return NativeBuildExecutor(alias=alias, timeout=timeout, do_push=do_push)
+
+
 def make_executor(name: str) -> Executor:
     chat = _make_chat_executor(name)
-    return DispatchingExecutor(chat, AgenticRepoExecutor(_ngc_executor()))
+    native = _maybe_native_build_executor()
+    return DispatchingExecutor(chat, AgenticRepoExecutor(_ngc_executor()), native=native)
 
 
 def _seal_terminal(uuid: str, payload: dict, key: bytes) -> bytes:
