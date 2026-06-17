@@ -4,6 +4,19 @@
 `c1f5cda104864e568d216390200395be` (mode=all, winning muse gemini, consensus 1.0;
 groq/claude/perplexity/xai/gemini concurred).
 
+> **SHIPPED in v6.0.0 (2026-06-17).** The extraction described below is complete.
+> `mnemos-core` is carved, and PANTHEON, KNEMON, GRAEAE, CHARON, and the HIVE
+> (now **STIPHOS**) are live as separate `ncz-os` repos — each a `mnemos.*` PEP 420
+> namespace distribution depending only on `mnemos-core`:
+> `ncz-os/{graeae,knemon,pantheon,charon,mnemos-stiphos}` (gitlab + github;
+> codeberg mirror). Turnkey images are published to `ghcr.io/ncz-os`
+> (`mnemos-core`, `mnemos`, `mnemos-enterprise`, `mnemos-stiphos`).
+> Phases 2 and 3 below are therefore **done**; the document is retained as the
+> ratified design/decision record. The single deferred item — the
+> `lifecycle.py::_close_graeae_engine_if_loaded()` lazy-import — is tracked for the
+> hook-inversion follow-up. See [INSTALL.md](INSTALL.md), [LAYERED_INSTALL.md](LAYERED_INSTALL.md),
+> and [../AGENTS.md](../AGENTS.md) for the current install/topology surface.
+
 ## Decision
 
 `mnemos` is a **memory system**. PANTHEON, KNEMON, GRAEAE, and HIVE are **separable
