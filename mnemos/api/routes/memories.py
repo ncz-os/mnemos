@@ -618,7 +618,17 @@ async def list_memories(
             detail="include_archived requires root",
         )
     effective_namespace = namespace if root else user.namespace
-    visibility = VisibilityFilter.for_read(user, namespace=effective_namespace)
+    # Vault DISCOVERY (2026-06-19): root/trusted listing surfaces vault
+    # rows tagged ``vaulted`` so an agent can find credential-class
+    # memories. Content stays redacted here (``_should_redact_secrets``
+    # below still returns True on the default path); the secret value is
+    # fetched with get_memory(id). Non-root callers never see the vault
+    # (include_vault is gated on root inside the factory).
+    visibility = VisibilityFilter.for_read(
+        user,
+        namespace=effective_namespace,
+        include_vault=root,
+    )
     list_request = MemoryListRequest(
         category=category,
         subcategory=subcategory,
@@ -1172,6 +1182,11 @@ async def search_memories(
         user,
         namespace=search_namespace,
         include_secrets=bool(request.include_secrets),
+        # Vault DISCOVERY (2026-06-19): root/trusted search surfaces vault
+        # rows tagged ``vaulted`` (content still redacted unless the
+        # caller also passes include_secrets, the retrieve opt-in). Gated
+        # on root inside the factory; non-root never sees the vault.
+        include_vault=is_root(user),
     )
 
     async with backend.transactional() as tx:
