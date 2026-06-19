@@ -37,7 +37,10 @@ default:
           ;;
         *)
           python3 -m venv .venv
-          .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev]"
+          # sqlite (aiosqlite) is the default backend's async driver and nats
+          # drives the publisher tests; the unit suite needs both or ~27 tests
+          # fail on missing core drivers.
+          .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev,sqlite,nats]"
           export PATH="$CI_PROJECT_DIR/.venv/bin:$PATH"
           ;;
       esac
@@ -232,10 +235,11 @@ test:integration:
     reports:
       junit: junit-integration.xml
     expire_in: 1 week
+  # Needs Postgres/Redis docker services; the ARGOS shell executor cannot
+  # provide them (services: are ignored on a shell runner). Run only when a
+  # docker-executor runner is available and RUN_DB_TESTS is set.
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == "master"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $RUN_DB_TESTS == "true"
 
 test:persistence-parity:
   stage: test
@@ -293,10 +297,11 @@ test:persistence-parity:
     reports:
       junit: junit-persistence-parity.xml
     expire_in: 1 week
+  # Needs Postgres/Redis docker services; the ARGOS shell executor cannot
+  # provide them (services: are ignored on a shell runner). Run only when a
+  # docker-executor runner is available and RUN_DB_TESTS is set.
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == "master"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $RUN_DB_TESTS == "true"
 
 test:multi-worker:
   stage: test

@@ -410,6 +410,8 @@ async def test_document_import_writes_create_audit_entry(sqlite_backend):
 
 @pytest.mark.asyncio
 async def test_mpf_import_writes_create_audit_entry(sqlite_backend, monkeypatch):
+    # mnemos.domain.portability ships in the optional CHARON distribution.
+    pytest.importorskip("mnemos.domain.portability")
     import mnemos.domain.portability.import_ as import_mod
     from mnemos.audit import canonical_payload_hash, memory_id_to_audit_bytes, verify_entry
     from mnemos.domain.portability.schemas import MEMORY_PAYLOAD_VERSION, MPFEnvelope, MPFRecord
