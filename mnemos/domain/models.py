@@ -120,6 +120,12 @@ class MemoryItem(BaseModel):
     # current memory. Search keeps the stale row visible but ranks it
     # behind current rows when recency/decay ordering is applied.
     superseded_by: Optional[str] = None
+    # True when this row lives in the secret vault (credential-class).
+    # Search/list surface it as a DISCOVERY marker so a trusted agent
+    # knows a credential exists even though its content stays redacted on
+    # those enumerating paths; retrieve the full value with
+    # get_memory(id). False/absent for ordinary rows. (2026-06-19)
+    vaulted: bool = False
 
 
 class FederationConsolidationEvent(BaseModel):
@@ -471,6 +477,17 @@ def row_to_memory(row, include_compressed: bool = False, redact_secrets: bool = 
     elif not isinstance(raw_meta, dict):
         raw_meta = None
 
+    # Discovery marker (2026-06-19): a row is vaulted if it lives in the
+    # vault namespace (the canonical signal — secret classification moves
+    # the row to namespace="vault") or carries the secret_vaulted metadata
+    # flag. Surfaced so trusted agents can DISCOVER secrets via search/list
+    # while content stays redacted on those paths.
+    from mnemos.core.secret_detection import VAULT_NAMESPACE as _VAULT_NS
+
+    is_vaulted = row.get("namespace") == _VAULT_NS or bool(
+        isinstance(raw_meta, dict) and raw_meta.get("secret_vaulted")
+    )
+
     content = row["content"]
     compressed = row.get("compressed_content") if include_compressed else None
     verbatim = row.get("verbatim_content")
@@ -515,6 +532,7 @@ def row_to_memory(row, include_compressed: bool = False, redact_secrets: bool = 
         archived=row.get("archived_at") is not None,
         score=normalize_similarity(row),
         superseded_by=row.get("superseded_by") or row.get("consolidated_into"),
+        vaulted=is_vaulted,
     )
 
 
