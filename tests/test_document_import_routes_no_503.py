@@ -4,7 +4,11 @@ import ast
 import inspect
 import textwrap
 
-from mnemos.api.routes import document_import
+import pytest
+
+# document_import is the optional CHARON router; skip cleanly when that
+# subsystem is not installed in the base test environment.
+document_import = pytest.importorskip("mnemos.api.routes.document_import")
 from mnemos.domain.document_repo import DocumentRepository
 
 

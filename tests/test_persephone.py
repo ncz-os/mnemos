@@ -12,12 +12,18 @@ from fastapi.responses import JSONResponse
 from mnemos.api.dependencies import UserContext
 from mnemos.api.routes import memories as memories_handler
 from mnemos.domain.models import MemorySearchRequest
-from mnemos.domain.persephone import runner
-from mnemos.domain.persephone.runner import (
-    archive_memory,
-    restore_memory,
-    sweep_for_archival,
-)
+
+# The persephone package raises RuntimeError at import when its optional extra
+# is not installed; skip the whole module cleanly in that case.
+try:
+    from mnemos.domain.persephone import runner
+    from mnemos.domain.persephone.runner import (
+        archive_memory,
+        restore_memory,
+        sweep_for_archival,
+    )
+except RuntimeError:
+    pytest.skip("persephone subsystem not installed", allow_module_level=True)
 from tests._fake_backend import FakePoolBackedBackend, install_fake_backend
 
 
