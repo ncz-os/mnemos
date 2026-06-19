@@ -629,6 +629,14 @@ async def list_memories(
         namespace=effective_namespace,
         include_vault=root,
     )
+    # When invoked directly (internal callers, unit tests) rather than through
+    # FastAPI's dependency resolution, limit/offset arrive as the Query(...)
+    # sentinels declared as their defaults. Fall back to those defaults so
+    # MemoryListRequest still validates (FastAPI always passes real ints).
+    if not isinstance(limit, int):
+        limit = 20
+    if not isinstance(offset, int):
+        offset = 0
     list_request = MemoryListRequest(
         category=category,
         subcategory=subcategory,
