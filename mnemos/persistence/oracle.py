@@ -3315,21 +3315,171 @@ class OracleConsultationsRepository(ConsultationsRepository):
             await _call(cursor.close)
         return consultation_id
 
-    async def list_audit_log(self, tx: Transaction, **kwargs: Any) -> list[Row]:
-        _ = (tx, kwargs)
-        return []
+    async def list_audit_log(
+        self,
+        tx: Transaction,
+        *,
+        root: bool,
+        user_id: str,
+        namespace: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[Row]:
+        """Oracle port of PostgresConsultationsRepository.list_audit_log.
 
-    async def fetch_audit_chain(self, tx: Transaction, **kwargs: Any) -> list[Row]:
-        _ = (tx, kwargs)
-        return []
+        Dialect deltas vs Postgres: ``$n`` → ``:name`` binds,
+        ``LIMIT/OFFSET`` → ``OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY``,
+        ``NULL::text`` → ``CAST(NULL AS VARCHAR2(64))``. Row keys are
+        lowercased by ``_row_to_dict`` so the route's ``r["created_at"]``
+        access matches.
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if root and namespace is None:
+                await _call(
+                    cursor.execute,
+                    "SELECT id, sequence_num, consultation_id, prompt_hash, response_hash, "
+                    "chain_hash, prev_id, task_type, provider, quality_score, created_at "
+                    "FROM graeae_audit_log WHERE deleted_at IS NULL "
+                    "ORDER BY sequence_num DESC OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY",
+                    {"off": offset, "lim": limit},
+                )
+            elif root:
+                await _call(
+                    cursor.execute,
+                    "SELECT al.id, al.sequence_num, al.consultation_id, al.prompt_hash, "
+                    "al.response_hash, al.chain_hash, al.prev_id, al.task_type, al.provider, "
+                    "al.quality_score, al.created_at "
+                    "FROM graeae_audit_log al "
+                    "JOIN graeae_consultations c ON c.id = al.consultation_id "
+                    "WHERE c.namespace = :ns AND c.deleted_at IS NULL AND al.deleted_at IS NULL "
+                    "ORDER BY al.sequence_num DESC OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY",
+                    {"ns": namespace, "off": offset, "lim": limit},
+                )
+            else:
+                await _call(
+                    cursor.execute,
+                    "WITH visible AS (SELECT al.id, al.sequence_num AS global_sequence_num, "
+                    "al.consultation_id, al.prompt_hash, al.response_hash, al.task_type, "
+                    "al.provider, al.quality_score, al.created_at, "
+                    "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+                    "LAG(al.id) OVER (ORDER BY al.sequence_num ASC) AS scoped_prev_id "
+                    "FROM graeae_audit_log al "
+                    "JOIN graeae_consultations c ON c.id = al.consultation_id "
+                    "WHERE c.owner_id = :uid AND c.namespace = :ns "
+                    "AND c.deleted_at IS NULL AND al.deleted_at IS NULL) "
+                    "SELECT id, scoped_sequence_num AS sequence_num, consultation_id, prompt_hash, "
+                    "response_hash, CAST(NULL AS VARCHAR2(64)) AS chain_hash, "
+                    "scoped_prev_id AS prev_id, task_type, provider, quality_score, created_at "
+                    "FROM visible ORDER BY global_sequence_num DESC "
+                    "OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY",
+                    {"uid": user_id, "ns": namespace, "off": offset, "lim": limit},
+                )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
-    async def get_consultation(self, tx: Transaction, **kwargs: Any) -> Row | None:
-        _ = (tx, kwargs)
-        return None
+    async def fetch_audit_chain(
+        self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None
+    ) -> list[Row]:
+        """Oracle port of PostgresConsultationsRepository.fetch_audit_chain.
 
-    async def get_consultation_artifacts(self, tx: Transaction, **kwargs: Any) -> tuple[Row | None, list[Row]]:
-        _ = (tx, kwargs)
-        return None, []
+        The Postgres ``LEFT JOIN LATERAL (... LIMIT 1) ON TRUE`` becomes a
+        correlated scalar subquery with ``FETCH FIRST 1 ROWS ONLY`` — Oracle
+        supports LATERAL on 12c+ but the scalar form is portable and clearer.
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if root and namespace is None:
+                await _call(
+                    cursor.execute,
+                    "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
+                    "FROM graeae_audit_log ORDER BY sequence_num ASC",
+                )
+            else:
+                binds: dict[str, Any] = {"ns": namespace}
+                owner_clause = ""
+                if not root:
+                    owner_clause = "c.owner_id = :uid AND "
+                    binds["uid"] = user_id
+                await _call(
+                    cursor.execute,
+                    "SELECT al.sequence_num, "
+                    "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+                    "al.prompt_hash, al.response_hash, al.chain_hash, al.prev_id, al.prev_chain_hash, "
+                    "(SELECT p.chain_hash FROM graeae_audit_log p "
+                    "WHERE p.sequence_num < al.sequence_num "
+                    "ORDER BY p.sequence_num DESC FETCH FIRST 1 ROWS ONLY) AS expected_prev_hash "
+                    "FROM graeae_audit_log al "
+                    "JOIN graeae_consultations c ON c.id = al.consultation_id "
+                    f"WHERE {owner_clause}c.namespace = :ns "
+                    "AND c.deleted_at IS NULL AND al.deleted_at IS NULL "
+                    "ORDER BY al.sequence_num ASC",
+                    binds,
+                )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def get_consultation(
+        self, tx: Transaction, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> Row | None:
+        """Oracle port of PostgresConsultationsRepository.get_consultation.
+
+        ``mode`` is an Oracle reserved word; the column is quoted in the DDL
+        so it must be quoted here too (``_row_to_dict`` lowercases the key
+        back to ``mode`` for the route).
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            base = (
+                "SELECT id, prompt, task_type, consensus_response, consensus_score, "
+                'winning_muse, cost, latency_ms, "mode", created '
+                "FROM graeae_consultations WHERE id = :cid AND deleted_at IS NULL"
+            )
+            if root and namespace is None:
+                await _call(cursor.execute, base, {"cid": consultation_id})
+            elif root:
+                await _call(
+                    cursor.execute,
+                    base + " AND namespace = :ns",
+                    {"cid": consultation_id, "ns": namespace},
+                )
+            else:
+                await _call(
+                    cursor.execute,
+                    base + " AND owner_id = :uid AND namespace = :ns",
+                    {"cid": consultation_id, "uid": user_id, "ns": namespace},
+                )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def get_consultation_artifacts(
+        self, tx: Transaction, *, consultation_id: str, root: bool, user_id: str, namespace: str | None
+    ) -> tuple[Row | None, list[Row]]:
+        """Oracle port of PostgresConsultationsRepository.get_consultation_artifacts."""
+        consultation = await self.get_consultation(
+            tx, consultation_id=consultation_id, root=root, user_id=user_id, namespace=namespace
+        )
+        if not consultation:
+            return None, []
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT memory_id, injected_at FROM consultation_memory_refs "
+                "WHERE consultation_id = :cid ORDER BY injected_at",
+                {"cid": consultation_id},
+            )
+            refs = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        return consultation, refs
 
 
 class OracleFederationRepository(FederationRepository):
