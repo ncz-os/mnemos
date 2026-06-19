@@ -87,30 +87,48 @@ class VisibilityFilter:
         *,
         namespace: str | None,
         include_secrets: bool = False,
+        include_vault: bool = False,
     ) -> "VisibilityFilter":
         """Build the read-path filter for a user.
 
         Root callers bypass the predicate entirely. Non-root callers get
         the full ``READABLE`` envelope pinned to ``namespace``.
 
-        ``include_secrets`` / explicit vault targeting controls the
-        secret-vault subtraction. Access control is enforced HERE in the
-        factory (correct-by-construction), not merely by a route check:
-        the vault escape hatches (``include_secrets`` and explicit
-        ``namespace == VAULT_NAMESPACE`` targeting) are ROOT-ONLY.
+        ``include_secrets`` / ``include_vault`` / explicit vault
+        targeting control the secret-vault subtraction. Access control is
+        enforced HERE in the factory (correct-by-construction), not
+        merely by a route check: all three vault escape hatches are
+        ROOT-ONLY.
 
-        * Default (``include_secrets=False``) AND not pinned to the
-          vault namespace -> the vault namespace is subtracted from the
-          result set even for root. Credential-class memories never
-          surface on the default FTS/semantic path.
-        * ROOT caller with ``include_secrets=True`` OR
-          ``namespace == VAULT_NAMESPACE`` -> no subtraction; fleet
-          agents fetch credentials explicitly.
+        Two distinct root opt-ins clear the vault subtraction, for two
+        different jobs:
+
+        * ``include_secrets=True`` OR ``namespace == VAULT_NAMESPACE`` --
+          the RETRIEVE path: the vault row is returned AND content is
+          unmasked (the route's ``_should_redact_secrets`` gate keys on
+          the same ``include_secrets``/vault-target). Fleet agents fetch
+          a credential value explicitly.
+        * ``include_vault=True`` -- the DISCOVERY path (2026-06-19): vault
+          rows are RETURNED so a trusted agent can find that a credential
+          exists, but content redaction is decided INDEPENDENTLY by the
+          route (``_should_redact_secrets`` still returns True on the
+          default path), so discovery surfaces a ``vaulted``-flagged row
+          with credential spans masked. The agent then retrieves the
+          actual value with ``get_memory(id)``. This is what lets
+          search/list show vault rows without dumping secrets inline.
+
+        Behaviour:
+
+        * Default (no opt-in) AND not pinned to the vault namespace -> the
+          vault namespace is subtracted from the result set even for
+          root. Credential-class memories never surface on the default
+          FTS/semantic path.
         * NON-ROOT caller -> the vault is ALWAYS subtracted, regardless
-          of ``include_secrets`` or an explicit ``namespace="vault"``
-          request. A non-root caller cannot enumerate or target the
-          vault even by naming it. (Routes additionally reject these
-          requests up front, but the factory does not depend on that.)
+          of ``include_secrets`` / ``include_vault`` or an explicit
+          ``namespace="vault"`` request. A non-root caller cannot
+          enumerate or target the vault even by naming it. (Routes
+          additionally reject these requests up front, but the factory
+          does not depend on that.)
 
         Release-blocking hardening 2026-06-13: previously the vault
         exclusion was cleared whenever the caller targeted
@@ -121,9 +139,12 @@ class VisibilityFilter:
         caller_is_root = is_root(user)
         # Vault escape hatches are root-only: a non-root caller never
         # clears the vault subtraction, even when targeting the vault
-        # namespace or passing include_secrets.
+        # namespace or passing include_secrets / include_vault.
         unmask_vault = caller_is_root and (include_secrets or namespace == VAULT_NAMESPACE)
-        exclude = () if unmask_vault else DEFAULT_EXCLUDED_NAMESPACES
+        # Discovery opt-in: root callers may also list vault rows WITHOUT
+        # unmasking content (redaction handled separately at the route).
+        show_vault = unmask_vault or (caller_is_root and include_vault)
+        exclude = () if show_vault else DEFAULT_EXCLUDED_NAMESPACES
         if caller_is_root:
             return cls(
                 scope=VisibilityScope.ROOT_BYPASS,
