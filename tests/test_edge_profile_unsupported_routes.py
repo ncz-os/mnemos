@@ -8,6 +8,10 @@ from fastapi.testclient import TestClient
 
 import mnemos.core.lifecycle as lifecycle
 from mnemos.api.dependencies import UserContext, get_current_user, require_root
+
+# document_import is the optional CHARON router; skip cleanly when that
+# subsystem is not installed in the base test environment.
+pytest.importorskip("mnemos.api.routes.document_import")
 from mnemos.api.routes import (
     document_import,
     entities,
