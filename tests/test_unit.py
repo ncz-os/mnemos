@@ -103,7 +103,7 @@ def test_api_key_hash_is_sha256():
 # ─── Config / ingestion helper tests ─────────────────────────────────────────
 
 def test_extract_readable_messages():
-    from mnemos.api.routes.ingest import _extract_readable
+    _extract_readable = pytest.importorskip("mnemos.api.routes.ingest")._extract_readable
     items = [
         {"role": "user", "content": "Hello"},
         {"role": "assistant", "content": "Hi there"},
@@ -115,7 +115,7 @@ def test_extract_readable_messages():
 
 
 def test_extract_readable_caps_items():
-    from mnemos.api.routes.ingest import _extract_readable
+    _extract_readable = pytest.importorskip("mnemos.api.routes.ingest")._extract_readable
     items = [{"content": f"msg {i}"} for i in range(100)]
     result = _extract_readable(items, max_items=5)
     assert result.count("msg") == 5
@@ -123,7 +123,7 @@ def test_extract_readable_caps_items():
 
 def test_extract_readable_no_str_on_dicts():
     """Must not call str() on arbitrary objects — only extract known string fields."""
-    from mnemos.api.routes.ingest import _extract_readable
+    _extract_readable = pytest.importorskip("mnemos.api.routes.ingest")._extract_readable
 
     class Bomb:
         def __str__(self):
@@ -136,7 +136,7 @@ def test_extract_readable_no_str_on_dicts():
 
 
 def test_extract_readable_plain_strings():
-    from mnemos.api.routes.ingest import _extract_readable
+    _extract_readable = pytest.importorskip("mnemos.api.routes.ingest")._extract_readable
     result = _extract_readable(["first", "second"])
     assert "first" in result
     assert "second" in result

@@ -25,7 +25,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-  "fastapi>=0.115.0",
+  # <0.137: 0.137 refactored routing to nest included routes under
+  # _IncludedRouter, which breaks app.routes introspection the codebase and
+  # tests rely on (and the MCP path-wiring check). Pin until adapted.
+  "fastapi>=0.115.0,<0.137",
   "uvicorn[standard]>=0.30.0",
   "gunicorn>=22.0.0",
   "starlette>=0.40.0",
