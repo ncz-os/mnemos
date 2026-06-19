@@ -235,7 +235,6 @@ def test_row_to_memory_redact_then_frame_compose():
 # ── route gate ─────────────────────────────────────────────────────────
 def test_should_frame_data_gate():
     from mnemos.api.routes.memories import _should_frame_data
-    from types import SimpleNamespace
 
     # is_root() reads user; emulate with a minimal context. Use the real
     # helper via monkeypatch-free objects mirroring test_secret_credential_prose.
@@ -398,7 +397,6 @@ def test_search_path_defends_compressed_and_verbatim(monkeypatch):
     include_compressed cannot reintroduce an alternate-field bypass
     (ngc-review HIGH 2026-06-13)."""
     from mnemos.domain.models import MemoryItem
-    import mnemos.api.routes.memories as mod
 
     # Exercise just the final framing loop logic against MemoryItems.
     items = [

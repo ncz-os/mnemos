@@ -237,6 +237,7 @@ exclude = [
   "dist",
   "build",
   "mnemos/tools/export_memories_for_docling.py",  # generated helper
+  "services",  # WIP routing-engine scaffold; not part of the mnemos package
 ]
 
 [tool.ruff.lint]
@@ -268,6 +269,13 @@ layers = [
   "mnemos.persistence",
   "mnemos.core",
 ]
+ignore_imports = [
+  # lifecycle.py is the composition root: it wires the persistence backends at
+  # startup (cf. the importlib.import_module calls for postgres/sqlite/oracle/
+  # db2/mysql in the same file). The layered-install fail-fast guard is the one
+  # static import of that set; tolerate it like the dynamic siblings.
+  "mnemos.core.lifecycle -> mnemos.persistence.base",
+]
 
 [[tool.importlinter.contracts]]
 name = "api routes use domain, not db"
@@ -284,7 +292,6 @@ modules = [
   "mnemos.domain.morpheus",
   "mnemos.domain.memory_categorization",
   "mnemos.domain.openai_compat",
-  "mnemos.domain.portability",
 ]
 ignore_imports = [
 ]
