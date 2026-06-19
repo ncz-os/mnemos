@@ -339,7 +339,6 @@ async def test_bypass_list_default_excludes_vault(sqlite_backend):
     await _seed(sqlite_backend, content=VAULT_CONTENT, namespace=VAULT_NAMESPACE)
     await _seed(sqlite_backend, content="ordinary note about FRI", namespace="default")
 
-    root = SimpleNamespace(user_id="root", is_root=True, namespace="default", group_ids=[])
     # default root list (no include_secrets) -> vault excluded
     vis = VisibilityFilter.for_read(_RootUser(), namespace=None, include_secrets=False)
     async with sqlite_backend.transactional() as tx:

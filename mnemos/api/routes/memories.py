@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import math
-import os
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -22,6 +21,7 @@ from mnemos.api.persistence_helpers import (
     maybe_set_pg_rls as _maybe_set_pg_rls,
     require_postgres_pool_or_503,
 )
+from mnemos.core.config import runtime_env_value_stripped
 from mnemos.core.ids import new_memory_id
 from mnemos.core.extras import is_extra_installed, missing_extra_detail
 from mnemos.core.lifecycle import (
@@ -139,7 +139,7 @@ def effective_semantic_floor() -> float:
     behavior for clients that pre-date the floor). Clamped to [0, 1].
     Invalid values fall back to DEFAULT_SEMANTIC_FLOOR.
     """
-    raw = os.environ.get("MNEMOS_SEMANTIC_FLOOR")
+    raw = runtime_env_value_stripped("MNEMOS_SEMANTIC_FLOOR")
     if raw is None or raw == "":
         return DEFAULT_SEMANTIC_FLOOR
     try:
@@ -162,7 +162,7 @@ def effective_semantic_margin_floor() -> float:
     and keep the absolute-floor behavior only). Invalid / non-finite values
     fall back to DEFAULT_SEMANTIC_MARGIN_FLOOR. Negative clamps to 0 (disabled).
     """
-    raw = os.environ.get("MNEMOS_SEMANTIC_MARGIN_FLOOR")
+    raw = runtime_env_value_stripped("MNEMOS_SEMANTIC_MARGIN_FLOOR")
     if raw is None or raw == "":
         return DEFAULT_SEMANTIC_MARGIN_FLOOR
     try:
@@ -222,7 +222,7 @@ def ood_gate_enabled() -> bool:
     instantly. Residual risk: a genuine zero-lexical-overlap paraphrase with a
     flat distribution; none was observed in tuning.
     """
-    raw = os.environ.get("MNEMOS_SEMANTIC_OOD_GATE")
+    raw = runtime_env_value_stripped("MNEMOS_SEMANTIC_OOD_GATE")
     if raw is None or raw == "":
         return True
     return raw.strip().lower() not in ("0", "false", "no", "off")
