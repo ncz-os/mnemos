@@ -784,6 +784,14 @@ class KnemonSettings(BaseSettings):
     model_config = _config_model_config(env_prefix="MNEMOS_KNEMON_")
 
     weekly_budget_cap_usd: float = 200.0
+    # Universal per-provider weekly spend caps (2026-06-20). CSV of
+    # "<provider>=<usd>" pairs, e.g. "openai=50,anthropic=30,minimax=20". Each
+    # listed provider is capped INDEPENDENTLY of (and in addition to) the global
+    # weekly_budget_cap_usd: a request is denied if EITHER the global cap or the
+    # provider's own cap would be exceeded. Providers omitted here are governed
+    # by the global cap only. Empty (default) preserves single-cap behaviour.
+    # Env: MNEMOS_KNEMON_PROVIDER_BUDGET_CAPS_USD.
+    provider_budget_caps_usd: str = ""
     session_burn_requests_per_hour: int = 10
     session_burn_window_seconds: int = 3600
     subscription_preferred_utilization_pct: float = 70.0
@@ -818,6 +826,28 @@ class KnemonSettings(BaseSettings):
         except (TypeError, ValueError):
             return 200.0
         return max(0.0, value)
+
+    def parsed_provider_budget_caps_usd(self) -> dict[str, float]:
+        """Parse ``provider_budget_caps_usd`` CSV into a ``{provider: cap_usd}`` map.
+
+        Tolerant of whitespace and malformed entries: blank parts, entries
+        without ``=``, non-numeric values, and non-positive caps are skipped so
+        a typo can never silently grant unlimited spend or crash startup.
+        """
+        out: dict[str, float] = {}
+        for part in (self.provider_budget_caps_usd or "").split(","):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            name, _, raw = part.partition("=")
+            name = name.strip().lower()
+            try:
+                value = float(raw.strip())
+            except (TypeError, ValueError):
+                continue
+            if name and value > 0:
+                out[name] = value
+        return out
 
     @field_validator("g1_quality_floor", "g2_quality_floor", mode="before")
     @classmethod
