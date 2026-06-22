@@ -85,13 +85,35 @@ def _split_statements(sql: str) -> list[str]:
     return stmts
 
 
-async def _apply(dsn: str, path: Path, embedding_dim: int = 768) -> None:
+def _default_build_parallelism() -> int:
+    """~75% of host cores (min 2) for CREATE VECTOR INDEX construction."""
+    import os
+
+    cores = os.cpu_count() or 4
+    return max(2, int(cores * 0.75))
+
+
+async def _apply(
+    dsn: str,
+    path: Path,
+    embedding_dim: int = 768,
+    pct_comp: int = 15,
+    build_parallelism: int | None = None,
+    build_mem_budget: int = 4,
+) -> None:
     from mnemos.persistence.db2 import create_db2_pool
 
     sql = path.read_text()
     # Template substitution: {{embedding_dim}} → caller-supplied dim
     # (default 768 for nomic-embed-text; 384 / 1536 / 3072 for others).
     sql = sql.replace("{{embedding_dim}}", str(embedding_dim))
+    # CREATE VECTOR INDEX build-time tuning (Db2 12.1.5 EAP). Host-adaptive
+    # defaults; ignored on 12.1.4 (whole statement is tolerated-to-fail).
+    if build_parallelism is None:
+        build_parallelism = _default_build_parallelism()
+    sql = sql.replace("{{vector_pct_comp}}", str(pct_comp))
+    sql = sql.replace("{{vector_build_parallelism}}", str(build_parallelism))
+    sql = sql.replace("{{vector_build_mem_budget}}", str(build_mem_budget))
     statements = _split_statements(sql)
     print(f"[migrate] {len(statements)} statements from {path.name}")
 
@@ -125,8 +147,35 @@ def main() -> int:
     ap.add_argument(
         "--dim", type=int, default=768, help="Embedding dimension for VECTOR(dim, FLOAT32). Defaults to 768."
     )
+    ap.add_argument(
+        "--pct-comp",
+        type=int,
+        default=15,
+        help="PCT_COMP_VECT_SIZE for CREATE VECTOR INDEX (percent). Higher = lower query latency, more memory. Default 15.",
+    )
+    ap.add_argument(
+        "--build-parallelism",
+        type=int,
+        default=None,
+        help="BUILD_PARALLELISM for CREATE VECTOR INDEX. Default: ~75%% of host cores (min 2).",
+    )
+    ap.add_argument(
+        "--build-mem-budget",
+        type=int,
+        default=4,
+        help="BUILD_MEM_BUDGET (GB) for CREATE VECTOR INDEX construction. Default 4.",
+    )
     args = ap.parse_args()
-    asyncio.run(_apply(args.dsn, Path(args.file), embedding_dim=args.dim))
+    asyncio.run(
+        _apply(
+            args.dsn,
+            Path(args.file),
+            embedding_dim=args.dim,
+            pct_comp=args.pct_comp,
+            build_parallelism=args.build_parallelism,
+            build_mem_budget=args.build_mem_budget,
+        )
+    )
     return 0
 
 
