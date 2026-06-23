@@ -50,6 +50,7 @@ url       = "http://127.0.0.1:5079/openai/v1/chat/completions"
 model     = "gpt-5.5"
 api       = "openai"
 key_name  = "oauth_shim"   # dummy entry in api_keys.json llm_providers
+scope     = "external"     # loopback URL but a cloud model — declare scope
 enabled   = true
 
 [graeae.providers.claude]
@@ -57,12 +58,19 @@ url       = "http://127.0.0.1:5079/anthropic/v1/messages"
 model     = "claude-opus-4-8"
 api       = "anthropic"
 key_name  = "oauth_shim"
+scope     = "external"
 enabled   = true
 ```
 
 Add a dummy `llm_providers.oauth_shim = {"api_key": "local-oauth-shim"}` to
 `api_keys.json` so `get_key()` resolves non-empty.
 
-> Note: GRAEAE `mode` (local/external) is a quorum label, **not** a provider
-> scope filter — to run external-only, disable the local-GPU provider blocks
-> (`cerberus-*`, `hydra-*`, `achilles-*`) rather than relying on `mode`.
+> Note: as of the `mnemos-graeae` scope-filter fix, GRAEAE `mode`
+> (`local`/`external`) **is** a real provider-scope filter — an
+> `external` consult queries only external muses and an empty scoped set
+> errors cleanly. Because this shim sits on loopback (`127.0.0.1:5079`)
+> but proxies a **cloud** model, the OpenAI/Anthropic muse blocks above
+> **must set `scope = "external"`** so they are classified correctly
+> (host inference would otherwise call a loopback URL local). LAN-GPU
+> muses (`cerberus-*`, `hydra-*`, …) are inferred `local` from their
+> RFC-1918 URLs and no longer need to be disabled to run external-only.
