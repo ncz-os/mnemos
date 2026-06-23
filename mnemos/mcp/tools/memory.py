@@ -65,12 +65,40 @@ def _validate_optional_filter(value: str | None, *, label: str) -> str | None:
     return value
 
 
+_SEARCH_MODES = ("semantic", "lexical")
+
+
+def _resolve_search_semantic(mode: str | None, semantic: bool | None) -> bool:
+    """Resolve the effective ``semantic`` flag from the ``mode`` toggle.
+
+    ``mode`` is the primary lexical/semantic toggle:
+      * ``"semantic"`` (default) → pgvector cosine match, with automatic
+        FTS fallback in the same request when the query can't be embedded
+        or yields zero vector rows. This is what natural-language queries
+        want, so it is the default (issue #37: the old ``semantic=False``
+        default silently returned 0 hits for NL queries).
+      * ``"lexical"`` → full-text (FTS) token match only.
+
+    The legacy ``semantic`` boolean is still honored for back-compat:
+    when passed explicitly it overrides ``mode``.
+    """
+    if semantic is not None:
+        return bool(semantic)
+    m = (mode or "semantic").strip().lower()
+    if m not in _SEARCH_MODES:
+        raise ValueError(
+            f"invalid search mode {mode!r}; expected one of {list(_SEARCH_MODES)}"
+        )
+    return m != "lexical"
+
+
 async def tool_search_memories(
     query: str,
     limit: int = 10,
     category: str | None = None,
     subcategory: str | None = None,
-    semantic: bool = False,
+    mode: str = "semantic",
+    semantic: bool | None = None,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
     limit = _bounded_int(
@@ -83,8 +111,9 @@ async def tool_search_memories(
         body["category"] = category
     if subcategory:
         body["subcategory"] = subcategory
-    if semantic:
-        body["semantic"] = True
+    # Always send the resolved flag explicitly so the MCP default is
+    # semantic (with in-request FTS fallback), not the REST FTS default.
+    body["semantic"] = _resolve_search_semantic(mode, semantic)
     ns = _connector_namespace()
     if ns:
         body["namespace"] = ns
@@ -264,16 +293,33 @@ async def tool_bulk_create_memories(
 
 TOOLS: dict[str, dict[str, Any]] = {
     "search_memories": _tool(
-        "Full-text search across MNEMOS memories. Returns ranked results. Filter by category and/or subcategory.",
+        "Search MNEMOS memories. Defaults to SEMANTIC (vector) search so "
+        "natural-language queries match by meaning; set mode='lexical' for "
+        "exact full-text token matching. Returns ranked results; filter by "
+        "category and/or subcategory.",
         {
             "query": {"type": "string", "description": "Search query"},
             "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": MCP_DEFAULT_LIMIT_MAX},
             "category": {"type": "string", "description": "Optional category filter"},
             "subcategory": {"type": "string", "description": "Optional subcategory filter"},
+            "mode": {
+                "type": "string",
+                "enum": list(_SEARCH_MODES),
+                "default": "semantic",
+                "description": (
+                    "Search toggle. 'semantic' (default) = pgvector cosine "
+                    "similarity with automatic full-text fallback when the "
+                    "query can't be embedded or returns no vector hits; "
+                    "'lexical' = full-text token match only. Use 'lexical' "
+                    "for exact keyword/identifier lookups."
+                ),
+            },
             "semantic": {
                 "type": "boolean",
-                "default": False,
-                "description": "True = pgvector cosine similarity; False = full-text search",
+                "description": (
+                    "Deprecated back-compat alias for `mode`; when set it "
+                    "overrides mode (true=semantic, false=lexical)."
+                ),
             },
         },
         ["query"],
