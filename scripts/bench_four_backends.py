@@ -63,6 +63,7 @@ PG_DSN = os.environ.get("PG_DSN", "postgresql://mnemos_user:mnemos_local@localho
 ORACLE_DSN = os.environ.get("ORACLE_DSN", "")
 DB2_DSN = os.environ.get("DB2_DSN", "")
 MYSQL_DSN = os.environ.get("MYSQL_DSN", "")
+MARIADB_DSN = os.environ.get("MARIADB_DSN", "")
 HMAC_KEY = os.environ.get("BENCH_HMAC_KEY", "mnemos-bench-v2")
 
 
@@ -276,6 +277,17 @@ async def _make_mysql_backend(dsn: str):
 
     pool = await create_mysql_pool(dsn, min_size=1, max_size=4)
     b = MysqlBackend(pool, SimpleNamespace())
+    return b, pool
+
+
+async def _make_mariadb_backend(dsn: str):
+    # MariaDB is wire-compatible with aiomysql, so it reuses the MySQL pool;
+    # only the vector dialect differs (handled by MariadbBackend).
+    from mnemos.persistence.mysql import create_mysql_pool
+    from mnemos.persistence.mariadb import MariadbBackend
+
+    pool = await create_mysql_pool(dsn, min_size=1, max_size=4)
+    b = MariadbBackend(pool, SimpleNamespace())
     return b, pool
 
 
@@ -591,6 +603,8 @@ async def _main() -> None:
         factories.append(("db2-12.1.5", _make_db2_backend, DB2_DSN))
     if MYSQL_DSN:
         factories.append(("mysql-9.0", _make_mysql_backend, MYSQL_DSN))
+    if MARIADB_DSN:
+        factories.append(("mariadb-11.8", _make_mariadb_backend, MARIADB_DSN))
 
     if not factories:
         sys.exit("No backends configured. Set at least PG_DSN.")

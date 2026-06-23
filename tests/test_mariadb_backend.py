@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from mnemos.persistence.mariadb import (
     MariadbBackend,
+    MariadbFederationRepository,
     MariadbMemoryRepository,
     _parse_mariadb_dsn,
     create_mariadb_pool,
@@ -47,11 +49,10 @@ async def test_mariadb_insert_memory_uses_mariadb_vector_constructor() -> None:
     repo = MariadbMemoryRepository()
     repo._expected_embedding_dim = 3
     cursor = MagicMock()
-    captured: dict[str, object] = {}
+    captured: list[tuple[str, tuple[object, ...]]] = []
 
     async def execute(sql, params):
-        captured["sql"] = sql
-        captured["params"] = tuple(params)
+        captured.append((sql, tuple(params)))
         cursor.rowcount = 1
 
     cursor.execute = AsyncMock(side_effect=execute)
@@ -78,12 +79,17 @@ async def test_mariadb_insert_memory_uses_mariadb_vector_constructor() -> None:
         updated=None,
     )
 
-    sql = " ".join(str(captured["sql"]).split()).lower()
+    memory_sql = " ".join(str(captured[0][0]).split()).lower()
+    embedding_sql = " ".join(str(captured[1][0]).split()).lower()
     assert result == "INSERT 0 1"
-    assert "vec_fromtext(%s)" in sql
-    assert "to_vector" not in sql
-    assert "vector_distance" not in sql
-    assert captured["params"][15] == "[0.1000000,0.2000000,0.3000000]"
+    assert len(captured) == 2
+    assert "insert into memories" in memory_sql
+    assert "embedding" not in memory_sql
+    assert "insert into memory_embeddings(memory_id, embedding)" in embedding_sql
+    assert "values (%s, vec_fromtext(%s))" in embedding_sql
+    assert "to_vector" not in embedding_sql
+    assert "vector_distance" not in embedding_sql
+    assert captured[1][1] == ("mem1", "[0.1000000,0.2000000,0.3000000]")
 
 
 @pytest.mark.asyncio
@@ -110,8 +116,10 @@ async def test_mariadb_semantic_search_uses_mariadb_vector_distance() -> None:
     )
 
     sql = " ".join(str(captured["sql"]).split()).lower()
-    assert "vec_distance_cosine(m.embedding, vec_fromtext(%s)) as rank_score" in sql
+    assert "join memory_embeddings me on me.memory_id = m.id" in sql
+    assert "vec_distance_cosine(me.embedding, vec_fromtext(%s)) as rank_score" in sql
     assert "order by rank_score asc" in sql
+    assert "m.embedding" not in sql
     assert "to_vector" not in sql
     assert "vector_distance" not in sql
     assert captured["params"] == ("[0.1000000,0.2000000,0.3000000]", "alice", "ns1", 7)
@@ -134,10 +142,66 @@ async def test_mariadb_upsert_embedding_uses_mariadb_vector_constructor() -> Non
     await repo.upsert_memory_embedding(tx, "mem1", [0.1, 0.2, 0.3])
 
     sql = " ".join(str(captured["sql"]).split()).lower()
+    assert "insert into memory_embeddings(memory_id, embedding)" in sql
+    assert "on duplicate key update embedding = vec_fromtext(%s)" in sql
     assert "vec_fromtext(%s)" in sql
     assert "to_vector" not in sql
     assert "vector_distance" not in sql
-    assert captured["params"] == ("[0.1000000,0.2000000,0.3000000]", "mem1")
+    assert captured["params"] == (
+        "mem1",
+        "[0.1000000,0.2000000,0.3000000]",
+        "[0.1000000,0.2000000,0.3000000]",
+    )
+
+
+@pytest.mark.asyncio
+async def test_mariadb_federation_feed_reads_join_table_embedding() -> None:
+    repo = MariadbFederationRepository()
+    cursor = MagicMock()
+    cursor.fetchall = AsyncMock(return_value=[])
+    captured: dict[str, object] = {}
+
+    async def execute(sql, params):
+        captured["sql"] = sql
+        captured["params"] = tuple(params)
+
+    cursor.execute = AsyncMock(side_effect=execute)
+    tx = _tx_for_cursor(cursor)
+    since = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    with (
+        patch("mnemos.core.config.embed_http_model_override", return_value="embed-model"),
+        patch("mnemos.core.config.get_settings"),
+    ):
+        await repo.feed_query(
+            tx,
+            since_updated=since,
+            since_id="cursor-id",
+            namespaces=["tenant-a"],
+            categories=["keep"],
+            limit=25,
+            prefer_compressed=False,
+            include_embedding=True,
+        )
+
+    sql = " ".join(str(captured["sql"]).split()).lower()
+    assert "left join memory_embeddings me on me.memory_id = m.id" in sql
+    assert "vec_totext(me.embedding) as embedding" in sql
+    assert "from_vector(m.embedding)" not in sql
+    assert captured["params"] == (
+        "embed-model",
+        since,
+        since,
+        "cursor-id",
+        "tenant-a",
+        "keep",
+        since,
+        since,
+        "cursor-id",
+        "tenant-a",
+        "keep",
+        25,
+    )
 
 
 def test_mariadb_dsn_reuses_mysql_parser() -> None:
