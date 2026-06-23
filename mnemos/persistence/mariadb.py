@@ -17,11 +17,13 @@ audience: RDS/Aurora MySQL, HeatWave.)
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
+from mnemos.core import eligibility as _eligibility
 from mnemos.persistence.base import (
     BranchRepository,
     CORE_CAPABILITY,
@@ -42,8 +44,6 @@ from mnemos.persistence.base import (
     WebhookRepository,
 )
 from mnemos.persistence.mysql import (
-    _DDL_COMPRESSED_VARIANTS,
-    _DDL_COMPRESSION_CANDIDATES,
     _DDL_COMPRESSION_QUEUE,
     _DDL_CONSULTATION_MEMORY_REFS,
     _DDL_FEDERATION_PEERS,
@@ -51,8 +51,6 @@ from mnemos.persistence.mysql import (
     _DDL_GRAEAE_AUDIT_LOG,
     _DDL_GRAEAE_CONSULTATIONS,
     _DDL_KG_TRIPLES,
-    _DDL_MEMORY_BRANCHES,
-    _DDL_MEMORY_VERSIONS,
     _DDL_MODEL_REGISTRY,
     _DDL_MODEL_REGISTRY_SYNC_LOG,
     _DDL_STATE,
@@ -60,12 +58,14 @@ from mnemos.persistence.mysql import (
     _MysqlTransaction,
     _boosted_rank_supersession_sort_key,
     _content_hash,
+    _cosine_distance_python,
     _ensure_mysql_columns,
     _fetch_all_dicts,
     _is_unique_violation,
     _is_vec_distance_unsupported,
     _mysql_tx,
     _parse_mysql_dsn,
+    _rank_score_sort_key,
     _render_visibility,
     _validate_and_format_vector,
     create_mysql_pool,
@@ -88,9 +88,9 @@ _LOG = logging.getLogger(__name__)
 
 _VECTOR_COLUMN = f"VECTOR({_DEFAULT_EMBEDDING_DIM}) NOT NULL"
 
-_DDL_MEMORIES = f"""\
+_DDL_MEMORIES = """\
 CREATE TABLE IF NOT EXISTS memories (
-    id                VARCHAR(64)   NOT NULL,
+    id                VARCHAR(64) CHARACTER SET ascii NOT NULL,
     content           LONGTEXT      NOT NULL,
     content_hash      VARCHAR(64)   NOT NULL,
     category          VARCHAR(128)  NOT NULL,
@@ -119,20 +119,149 @@ CREATE TABLE IF NOT EXISTS memories (
     deleted_at        DATETIME(6),
     created           DATETIME(6)   NOT NULL DEFAULT NOW(6),
     updated           DATETIME(6)   NOT NULL DEFAULT NOW(6),
-    embedding         {_VECTOR_COLUMN},
     PRIMARY KEY (id),
     INDEX idx_memories_ns_cat  (namespace, category),
     INDEX idx_memories_owner   (owner_id, namespace),
     INDEX idx_memories_hash    (content_hash),
     INDEX idx_memories_federation_remote (federation_source, federation_remote_updated),
     INDEX idx_memories_push (federation_source, federation_last_pushed_at),
-    FULLTEXT INDEX idx_memories_ft (content),
-    VECTOR INDEX (embedding)
+    FULLTEXT INDEX idx_memories_ft (content)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_MEMORY_EMBEDDINGS = f"""\
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    memory_id  VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    embedding  {_VECTOR_COLUMN},
+    PRIMARY KEY (memory_id),
+    VECTOR INDEX (embedding),
+    CONSTRAINT fk_memory_embeddings_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_COMPRESSION_CANDIDATES = """\
+CREATE TABLE IF NOT EXISTS memory_compression_candidates (
+    id                  VARCHAR(64)  NOT NULL DEFAULT (UUID()),
+    memory_id           VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    owner_id            VARCHAR(256) NOT NULL DEFAULT 'default',
+    contest_id          VARCHAR(64),
+    engine_id           VARCHAR(100) NOT NULL,
+    engine_version      VARCHAR(50),
+    compressed_content  LONGTEXT,
+    original_tokens     INT,
+    compressed_tokens   INT,
+    candidate_content   LONGTEXT,
+    candidate_tokens    INT,
+    compression_ratio   DOUBLE,
+    quality_score       DOUBLE,
+    speed_factor        DOUBLE,
+    composite_score     DOUBLE,
+    scoring_profile     VARCHAR(50)  NOT NULL DEFAULT 'balanced',
+    elapsed_ms          INT,
+    judge_model         VARCHAR(200),
+    gpu_used            BOOLEAN      NOT NULL DEFAULT FALSE,
+    is_winner           BOOLEAN      NOT NULL DEFAULT FALSE,
+    reject_reason       TEXT,
+    manifest            JSON,
+    created             TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    created_at          TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    INDEX idx_mcc_memory (memory_id),
+    INDEX idx_mcc_contest (contest_id),
+    INDEX idx_mcc_memory_winner (memory_id, is_winner),
+    INDEX idx_mcc_owner (owner_id),
+    INDEX idx_mcc_engine (engine_id),
+    CONSTRAINT fk_mcc_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_COMPRESSED_VARIANTS = """\
+CREATE TABLE IF NOT EXISTS memory_compressed_variants (
+    memory_id            VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    owner_id             VARCHAR(256) NOT NULL DEFAULT 'default',
+    winner_candidate_id  VARCHAR(64),
+    engine_id            VARCHAR(100) NOT NULL,
+    engine_version       VARCHAR(50),
+    compressed_content   LONGTEXT,
+    compressed_tokens    INT,
+    compression_ratio    DOUBLE,
+    quality_score        DOUBLE,
+    composite_score      DOUBLE,
+    scoring_profile      VARCHAR(50)  NOT NULL DEFAULT 'balanced',
+    judge_model          VARCHAR(200),
+    selected_at          TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (memory_id),
+    INDEX idx_mcv_owner (owner_id),
+    INDEX idx_mcv_engine (engine_id),
+    CONSTRAINT fk_mcv_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+    CONSTRAINT fk_mcv_candidate
+        FOREIGN KEY (winner_candidate_id) REFERENCES memory_compression_candidates(id) ON DELETE SET NULL
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_MEMORY_VERSIONS = """\
+CREATE TABLE IF NOT EXISTS memory_versions (
+    id                VARCHAR(64)   NOT NULL,
+    memory_id         VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    version_num       INT           NOT NULL,
+    content           LONGTEXT      NOT NULL,
+    category          VARCHAR(128),
+    subcategory       VARCHAR(128),
+    metadata          JSON,
+    verbatim_content  LONGTEXT,
+    owner_id          VARCHAR(256)  NOT NULL DEFAULT 'default',
+    namespace         VARCHAR(256)  NOT NULL DEFAULT 'default',
+    permission_mode   INT           NOT NULL DEFAULT 600,
+    source_model      VARCHAR(256),
+    source_provider   VARCHAR(256),
+    source_session    VARCHAR(512),
+    source_agent      VARCHAR(256),
+    snapshot_at       TIMESTAMP(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    snapshot_by       VARCHAR(256),
+    change_type       VARCHAR(40)   NOT NULL DEFAULT 'create',
+    commit_hash       VARCHAR(128),
+    parent_version_id VARCHAR(64),
+    branch            VARCHAR(128)  NOT NULL DEFAULT 'main',
+    merge_parents     JSON,
+    deleted_at        TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_memory_versions_memory_version (memory_id, branch, version_num),
+    INDEX idx_mv_memory_id (memory_id),
+    INDEX idx_mv_memory_id_vnum (memory_id, version_num DESC),
+    INDEX idx_mv_snapshot_at (snapshot_at),
+    INDEX idx_mv_commit_hash (commit_hash),
+    INDEX idx_mv_branch_head (memory_id, branch, version_num DESC),
+    INDEX idx_mv_owner_namespace (owner_id, namespace),
+    INDEX idx_mv_parent_version (parent_version_id),
+    INDEX idx_mv_deleted (deleted_at),
+    CONSTRAINT fk_mv_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_MEMORY_BRANCHES = """\
+CREATE TABLE IF NOT EXISTS memory_branches (
+    memory_id       VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    name            VARCHAR(128) NOT NULL,
+    head_version_id VARCHAR(64),
+    created_by      VARCHAR(256),
+    created_at      TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (memory_id, name),
+    INDEX idx_memory_branches_memory (memory_id),
+    INDEX idx_memory_branches_head (head_version_id),
+    CONSTRAINT fk_memory_branches_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+    CONSTRAINT fk_memory_branches_head
+        FOREIGN KEY (head_version_id) REFERENCES memory_versions(id) ON DELETE SET NULL
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
 _INIT_DDLS = [
     _DDL_MEMORIES,
+    _DDL_MEMORY_EMBEDDINGS,
     _DDL_FEDERATION_PEERS,
     _DDL_FEDERATION_SYNC_LOG,
     _DDL_MEMORY_VERSIONS,
@@ -192,9 +321,6 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
         updated: Any,
     ) -> str:
         conn = tx.conn
-        # Format embedding as MariaDB VEC_FromText literal; NULL when absent.
-        # Inlining it in the INSERT keeps the vector co-transactional
-        # with the row — semantic_search sees it immediately.
         vec_literal: str | None = None
         if embedding:
             self._require_dim(embedding, "insert_memory")
@@ -208,13 +334,12 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
                         quality_rating, verbatim_content, owner_id, namespace,
                         permission_mode, source_model, source_provider,
                         source_session, source_agent,
-                        embedding, created, updated
+                        created, updated
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s,
-                        VEC_FromText(%s),
                         COALESCE(%s, NOW(6)), COALESCE(%s, NOW(6))
                     )
                     ON DUPLICATE KEY UPDATE
@@ -236,12 +361,20 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
                         source_provider,
                         source_session,
                         source_agent,
-                        vec_literal,
                         created,
                         updated,
                     ),
                 )
-                return "INSERT 0 1" if cursor.rowcount else "INSERT 0 0"
+                inserted = bool(cursor.rowcount)
+                if inserted and vec_literal is not None:
+                    await cursor.execute(
+                        """
+                        INSERT INTO memory_embeddings(memory_id, embedding)
+                        VALUES (%s, VEC_FromText(%s))
+                        """,
+                        (memory_id, vec_literal),
+                    )
+                return "INSERT 0 1" if inserted else "INSERT 0 0"
         except Exception as exc:
             if _is_unique_violation(exc):
                 return "INSERT 0 0"
@@ -255,8 +388,12 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
         conn = tx.conn
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "UPDATE memories SET embedding = VEC_FromText(%s) WHERE id = %s",
-                (vec_literal, memory_id),
+                """
+                INSERT INTO memory_embeddings(memory_id, embedding)
+                VALUES (%s, VEC_FromText(%s))
+                ON DUPLICATE KEY UPDATE embedding = VEC_FromText(%s)
+                """,
+                (memory_id, vec_literal, vec_literal),
             )
 
     async def semantic_search(
@@ -281,7 +418,7 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
         self._require_dim(embedding, "semantic_search")
         vec_literal = _validate_and_format_vector(embedding)
         vis_clause, vis_params = _render_visibility(visibility, table_alias="m")
-        where = ["m.deleted_at IS NULL", "m.embedding IS NOT NULL"]
+        where = ["m.deleted_at IS NULL"]
         params: list[Any] = []
         if not include_archived:
             where.append("m.archived_at IS NULL")
@@ -305,7 +442,7 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
         # with dissimilarity. Keep the SQL rank/order expression as the bare
         # distance so the native vector index can serve top-K; recency boost is
         # applied in Python after over-fetching candidates.
-        rank_expr = "VEC_DISTANCE_COSINE(m.embedding, VEC_FromText(%s))"
+        rank_expr = "VEC_DISTANCE_COSINE(me.embedding, VEC_FromText(%s))"
         candidate_limit = max(limit, min(limit * 4, 200)) if boost_recency else limit
 
         # Bind the VEC_FromText placeholder before the rest of the params.
@@ -325,6 +462,7 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
                            m.recall_count, m.last_recalled_at, m.consolidated_into,
                            {rank_expr} AS rank_score
                       FROM memories m
+                      JOIN memory_embeddings me ON me.memory_id = m.id
                      WHERE {" AND ".join(where)}
                      ORDER BY rank_score ASC
                      LIMIT %s
@@ -334,8 +472,7 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
                 rows = await _fetch_all_dicts(cursor)
         except Exception as exc:
             if _is_vec_distance_unsupported(exc):
-                # MySQL Community Edition lacks VEC_DISTANCE_COSINE; fall back to
-                # Python-side cosine computation.
+                # Keep degraded search on the same join-table storage shape.
                 return await self._python_cosine_search(
                     tx,
                     vec_literal=vec_literal,
@@ -354,6 +491,55 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
             rows = rows[:limit]
 
         return rows
+
+    async def _python_cosine_search(
+        self,
+        tx: Transaction,
+        *,
+        vec_literal: str,
+        where: list[str],
+        params: list[Any],
+        limit: int,
+        boost_recency: bool,
+        recency_weight: float,
+    ) -> list[Row]:
+        """Fallback semantic search using the MariaDB embedding join table."""
+        query_vec = json.loads(vec_literal)
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT m.id, m.content, m.category, m.subcategory, m.metadata,
+                       m.quality_rating, m.compressed_content, m.verbatim_content,
+                       m.owner_id, m.namespace, m.permission_mode, m.source_model,
+                       m.source_provider, m.source_session, m.source_agent,
+                       m.group_id, m.created, m.updated, m.archived_at,
+                       m.recall_count, m.last_recalled_at, m.consolidated_into,
+                       VEC_ToText(me.embedding) AS embedding_json
+                  FROM memories m
+                  JOIN memory_embeddings me ON me.memory_id = m.id
+                 WHERE {" AND ".join(where)}
+                """,
+                params,
+            )
+            raw_rows = await _fetch_all_dicts(cursor)
+
+        today = datetime.now(timezone.utc).date()
+        w = float(recency_weight)
+        for row in raw_rows:
+            emb_json = row.pop("embedding_json", None)
+            try:
+                emb = json.loads(emb_json) if emb_json else None
+                dist = _cosine_distance_python(query_vec, emb) if emb else 1.0
+            except (json.JSONDecodeError, ValueError, TypeError):
+                dist = 1.0
+            row["rank_score"] = dist
+
+        if boost_recency:
+            raw_rows.sort(key=lambda row: _boosted_rank_supersession_sort_key(row, today=today, recency_weight=w))
+        else:
+            raw_rows.sort(key=_rank_score_sort_key)
+        return raw_rows[:limit]
 
 
 class MariadbKGRepository(MysqlKGRepository):
@@ -385,7 +571,149 @@ class MariadbConsultationAuditRepository(MysqlConsultationAuditRepository):
 
 
 class MariadbFederationRepository(MysqlFederationRepository):
-    pass
+    async def feed_query(
+        self,
+        tx: Transaction,
+        *,
+        since_updated: Any | None,
+        since_id: str | None,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+        limit: int,
+        prefer_compressed: bool,
+        include_embedding: bool = False,
+    ) -> list[Row]:
+        memory_where = [_eligibility.eligible_for_federation("m")]
+        tombstone_where = [
+            _eligibility.eligible_for_federation_tombstone("m"),
+            "m.consolidated_at IS NOT NULL",
+        ]
+        memory_params: list[Any] = []
+        tombstone_params: list[Any] = []
+        if since_updated is not None:
+            memory_where.append("(m.updated > %s OR (m.updated = %s AND m.id > %s))")
+            memory_params.extend([since_updated, since_updated, since_id])
+            tombstone_where.append("(m.consolidated_at > %s OR (m.consolidated_at = %s AND m.id > %s))")
+            tombstone_params.extend([since_updated, since_updated, since_id])
+        if namespaces:
+            placeholders = ", ".join(["%s"] * len(namespaces))
+            memory_where.append(f"m.namespace IN ({placeholders})")
+            tombstone_where.append(f"m.namespace IN ({placeholders})")
+            memory_params.extend(namespaces)
+            tombstone_params.extend(namespaces)
+        if categories:
+            placeholders = ", ".join(["%s"] * len(categories))
+            memory_where.append(f"m.category IN ({placeholders})")
+            tombstone_where.append(f"m.category IN ({placeholders})")
+            memory_params.extend(categories)
+            tombstone_params.extend(categories)
+
+        if prefer_compressed:
+            use_variant = (
+                "m.archived_at IS NULL "
+                "AND v.compressed_content IS NOT NULL "
+                "AND (2 * CHAR_LENGTH(JSON_QUOTE(v.compressed_content))) "
+                "  < (CHAR_LENGTH(JSON_QUOTE(m.content)) "
+                "     + COALESCE(CHAR_LENGTH(JSON_QUOTE(m.verbatim_content)), 0))"
+            )
+            content_select = f"CASE WHEN {use_variant} THEN v.compressed_content ELSE m.content END AS content,"
+            compressed_select = (
+                f"CASE WHEN {use_variant} THEN v.compressed_content ELSE NULL END AS compressed_content,"
+            )
+            verbatim_select = f"CASE WHEN {use_variant} THEN NULL ELSE m.verbatim_content END AS verbatim_content,"
+            join_compressed = "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id"
+        else:
+            content_select = "m.content,"
+            compressed_select = "NULL AS compressed_content,"
+            verbatim_select = "m.verbatim_content,"
+            join_compressed = ""
+
+        if include_embedding:
+            from mnemos.core.config import embed_http_model_override
+            from mnemos.core.config import get_settings as _gs
+
+            try:
+                http_model = embed_http_model_override()
+                embed_model = http_model or (_gs().providers.inference_embed_model or "").strip() or "unknown"
+            except Exception:
+                embed_model = "unknown"
+            join_embedding = "LEFT JOIN memory_embeddings me ON me.memory_id = m.id"
+            embed_select_memory = "VEC_ToText(me.embedding) AS embedding, %s AS embedding_model,"
+            embed_select_tombstone = "NULL AS embedding, NULL AS embedding_model,"
+            select_params = [embed_model]
+        else:
+            join_embedding = ""
+            embed_select_memory = ""
+            embed_select_tombstone = ""
+            select_params = []
+
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT *
+                FROM (
+                    SELECT NULL AS type,
+                           m.id,
+                           {content_select}
+                           m.category,
+                           m.subcategory,
+                           m.metadata,
+                           m.quality_rating,
+                           {verbatim_select}
+                           m.owner_id,
+                           m.namespace,
+                           m.permission_mode,
+                           m.source_model,
+                           m.source_provider,
+                           m.source_session,
+                           m.source_agent,
+                           m.created,
+                           m.updated,
+                           m.archived_at,
+                           NULL AS consolidated_into,
+                           NULL AS consolidated_at,
+                           {compressed_select}
+                           {embed_select_memory}
+                           NULL AS _trailer
+                    FROM memories m
+                    {join_compressed}
+                    {join_embedding}
+                    WHERE {" AND ".join(memory_where)}
+
+                    UNION ALL
+
+                    SELECT 'consolidation' AS type,
+                           m.id,
+                           NULL AS content,
+                           NULL AS category,
+                           NULL AS subcategory,
+                           NULL AS metadata,
+                           NULL AS quality_rating,
+                           NULL AS verbatim_content,
+                           NULL AS owner_id,
+                           m.namespace,
+                           NULL AS permission_mode,
+                           NULL AS source_model,
+                           NULL AS source_provider,
+                           NULL AS source_session,
+                           NULL AS source_agent,
+                           m.created,
+                           m.consolidated_at AS updated,
+                           NULL AS archived_at,
+                           m.consolidated_into,
+                           m.consolidated_at,
+                           NULL AS compressed_content,
+                           {embed_select_tombstone}
+                           NULL AS _trailer
+                    FROM memories m
+                    WHERE {" AND ".join(tombstone_where)}
+                ) feed
+                ORDER BY updated ASC, id ASC
+                LIMIT %s
+                """,
+                [*select_params, *memory_params, *tombstone_params, limit],
+            )
+            return await _fetch_all_dicts(cursor)
 
 
 class MariadbStateRepository(MysqlStateRepository):
