@@ -108,6 +108,19 @@ from mnemos.persistence.mysql import (
     MysqlVersionRepository,
     MysqlWebhookRepository,
 )
+from mnemos.persistence.mariadb import (
+    MariadbBackend,
+    MariadbBranchRepository,
+    MariadbCompressionQueueRepository,
+    MariadbCompressionRepository,
+    MariadbConsultationAuditRepository,
+    MariadbFederationRepository,
+    MariadbKGRepository,
+    MariadbMemoryRepository,
+    MariadbStateRepository,
+    MariadbVersionRepository,
+    MariadbWebhookRepository,
+)
 from mnemos.persistence.types import ModelRecommendation
 
 __all__ = [
@@ -155,6 +168,17 @@ __all__ = [
     "KGRepository",
     "MemoryRepository",
     "ModelRecommendation",
+    "MariadbBackend",
+    "MariadbBranchRepository",
+    "MariadbCompressionQueueRepository",
+    "MariadbCompressionRepository",
+    "MariadbConsultationAuditRepository",
+    "MariadbFederationRepository",
+    "MariadbKGRepository",
+    "MariadbMemoryRepository",
+    "MariadbStateRepository",
+    "MariadbVersionRepository",
+    "MariadbWebhookRepository",
     "MysqlBackend",
     "MysqlBranchRepository",
     "MysqlCompressionRepository",
