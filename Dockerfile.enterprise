@@ -1,6 +1,15 @@
 # syntax=docker/dockerfile:1
 # ─────────────────────────────────────────────────────────────────────────────
-# mnemos-enterprise — everything image + enterprise DB drivers.
+# mnemos-enterprise — everything image + ALL persistence backends.
+#
+# This is the single backend-agnostic image: it carries the drivers for every
+# supported backend and you pick one at RUNTIME (no rebuild):
+#   • postgres (asyncpg)   — inherited from mnemos-core base deps
+#   • sqlite   (aiosqlite) — inherited from the base (default backend)
+#   • oracle   (oracledb, thin) ─┐
+#   • db2      (ibm_db)          ├─ added by the driver layer below
+#   • mysql    (aiomysql)       ─┘
+# Select via MNEMOS_PERSISTENCE_BACKEND + MNEMOS_DATABASE_DSN at run time.
 #
 # Publishes: ghcr.io/ncz-os/mnemos-enterprise
 # Arch:      linux/amd64 ONLY.
@@ -22,7 +31,7 @@ FROM ${MNEMOS_EVERYTHING_IMAGE}
 ARG MNEMOS_CORE_REF=unknown
 
 LABEL org.opencontainers.image.title="mnemos-enterprise" \
-      org.opencontainers.image.description="MNEMOS everything image + Oracle / IBM Db2 / MySQL enterprise persistence drivers. amd64-only." \
+      org.opencontainers.image.description="MNEMOS everything image with ALL persistence backends (postgres + sqlite from base, plus Oracle / IBM Db2 / MySQL drivers); backend selected at runtime via MNEMOS_DATABASE_DSN. amd64-only." \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/ncz-os/mnemos" \
       org.mnemos.core="${MNEMOS_CORE_REF}" \
