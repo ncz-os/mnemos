@@ -1,0 +1,16 @@
+[Unit]
+Description=GRAEAE OAuth CLI HTTP shim
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jasonperlow
+Environment=HOME=/home/jasonperlow
+WorkingDirectory=/home/jasonperlow
+ExecStart=/usr/bin/python3 /opt/graeae-oauth-shim/shim.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
