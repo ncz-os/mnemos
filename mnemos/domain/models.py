@@ -103,6 +103,13 @@ class MemoryItem(BaseModel):
     embedding: Optional[str] = None  # base64(float32 little-endian)
     embedding_model: Optional[str] = None
     embedding_dim: Optional[int] = None
+    # Embedding lifecycle signal (issue #38). A memory is durable and
+    # retrievable by ID the instant it is written, but is only SEMANTICALLY
+    # searchable once its vector exists. "ready" = embedding present;
+    # "pending" = not embedded yet (inline embed produced nothing — the
+    # backfill worker will fill it, until then use mode="lexical" search);
+    # None = the read path didn't resolve embedding presence (no signal).
+    embedding_status: Optional[str] = None
     # v6.2 M-2.2.1 chain-head piggyback: the source publishes its own
     # latest local audit head as provenance. Receivers must not treat this
     # as their local predecessor because replicas write under
@@ -533,7 +540,25 @@ def row_to_memory(row, include_compressed: bool = False, redact_secrets: bool = 
         score=normalize_similarity(row),
         superseded_by=row.get("superseded_by") or row.get("consolidated_into"),
         vaulted=is_vaulted,
+        # issue #38: only stamp a status when the row actually carries an
+        # embedding-presence signal (e.g. a selected embedding/has_embedding
+        # column). Standard reads don't project the vector, so this stays
+        # None (unknown) rather than guessing "pending" for embedded rows.
+        embedding_status=_row_embedding_status(row),
     )
+
+
+def _row_embedding_status(row) -> Optional[str]:
+    """Derive embedding_status from a backend row, when determinable.
+
+    Returns "ready"/"pending" only if the row exposes an embedding signal
+    (``has_embedding`` boolean, or an ``embedding`` value), else None.
+    """
+    if "has_embedding" in row:
+        return "ready" if row.get("has_embedding") else "pending"
+    if "embedding" in row:
+        return "ready" if row.get("embedding") else "pending"
+    return None
 
 
 class MemoryListResponse(BaseModel):

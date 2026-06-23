@@ -1683,7 +1683,18 @@ async def create_memory(
     )
 
     await _invalidate_caches_after_mutation()
-    return _row_to_memory(row)
+    result = _row_to_memory(row)
+    # issue #38: tell the caller whether this just-saved memory is already
+    # semantically searchable. `vec` is the inline-embed result computed
+    # above; when it's empty the row is durable + ID-retrievable now but
+    # won't match semantic search until the backfill worker embeds it.
+    # Review-gate fix: on SQLite the inline embedding lands in
+    # memories.embedding while semantic_search reads memory_embeddings (only
+    # filled by backfill), so an inline vec is NOT yet searchable there —
+    # backends advertise this via inline_embedding_searchable (default True).
+    inline_searchable = getattr(backend, "inline_embedding_searchable", True)
+    result.embedding_status = "ready" if (vec and inline_searchable) else "pending"
+    return result
 
 
 @router.post("/memories/bulk", response_model=BulkCreateResponse, status_code=201)

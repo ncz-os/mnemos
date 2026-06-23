@@ -3979,6 +3979,13 @@ class SqliteBackend:
     supports_pgvector = False
     uses_sqlite_vec = True
     uses_fts5 = True
+    # On SQLite, insert_memory writes memories.embedding but semantic_search
+    # reads the separate memory_embeddings table, which is only populated by
+    # upsert_memory_embedding / backfill — so an inline-embedded row is NOT
+    # semantically searchable until then. Column-based backends (Oracle/DB2/
+    # MySQL/Postgres) write+read the same memories.embedding and default this
+    # to True via getattr. (issue #38 / review gate 2026-06-23)
+    inline_embedding_searchable = False
 
     def __init__(self, db_path: Path | str, settings: Any):
         self._db_path = Path(db_path)
