@@ -1,9 +1,12 @@
 -- migration: 0001_core_schema_mariadb
--- Mirrors the MySQL backend's embedded init DDL. MariaDB-specific changes are
--- limited to the memories.embedding vector column and VECTOR INDEX.
+-- Mirrors the MySQL backend's embedded init DDL. MariaDB-specific changes use
+-- a separate NOT NULL vector join table with a VECTOR INDEX.
 
 CREATE TABLE IF NOT EXISTS memories (
-    id                VARCHAR(64)   NOT NULL,
+    -- ASCII charset keeps the PK <= 256 bytes, required by MariaDB when the
+    -- table carries a VECTOR INDEX (utf8mb4 VARCHAR(64) = 256B is rejected).
+    -- MNEMOS memory ids are ASCII ("mem_<ts>_<hash>"), so this is lossless.
+    id                VARCHAR(64) CHARACTER SET ascii NOT NULL,
     content           LONGTEXT      NOT NULL,
     content_hash      VARCHAR(64)   NOT NULL,
     category          VARCHAR(128)  NOT NULL,
@@ -32,15 +35,22 @@ CREATE TABLE IF NOT EXISTS memories (
     deleted_at        DATETIME(6),
     created           DATETIME(6)   NOT NULL DEFAULT NOW(6),
     updated           DATETIME(6)   NOT NULL DEFAULT NOW(6),
-    embedding         VECTOR(768)   NOT NULL,
     PRIMARY KEY (id),
     INDEX idx_memories_ns_cat  (namespace, category),
     INDEX idx_memories_owner   (owner_id, namespace),
     INDEX idx_memories_hash    (content_hash),
     INDEX idx_memories_federation_remote (federation_source, federation_remote_updated),
     INDEX idx_memories_push (federation_source, federation_last_pushed_at),
-    FULLTEXT INDEX idx_memories_ft (content),
-    VECTOR INDEX (embedding)
+    FULLTEXT INDEX idx_memories_ft (content)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    memory_id  VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    embedding  VECTOR(768) NOT NULL,
+    PRIMARY KEY (memory_id),
+    VECTOR INDEX (embedding),
+    CONSTRAINT fk_memory_embeddings_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS federation_peers (
@@ -93,7 +103,7 @@ CREATE TABLE IF NOT EXISTS federation_sync_log (
 
 CREATE TABLE IF NOT EXISTS memory_versions (
     id                VARCHAR(64)   NOT NULL,
-    memory_id         VARCHAR(64)   NOT NULL,
+    memory_id         VARCHAR(64) CHARACTER SET ascii NOT NULL,
     version_num       INT           NOT NULL,
     content           LONGTEXT      NOT NULL,
     category          VARCHAR(128),
@@ -130,7 +140,7 @@ CREATE TABLE IF NOT EXISTS memory_versions (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS memory_branches (
-    memory_id       VARCHAR(64)  NOT NULL,
+    memory_id       VARCHAR(64) CHARACTER SET ascii NOT NULL,
     name            VARCHAR(128) NOT NULL,
     head_version_id VARCHAR(64),
     created_by      VARCHAR(256),
@@ -166,7 +176,7 @@ CREATE TABLE IF NOT EXISTS kg_triples (
 
 CREATE TABLE IF NOT EXISTS memory_compression_candidates (
     id                  VARCHAR(64)  NOT NULL DEFAULT (UUID()),
-    memory_id           VARCHAR(64)  NOT NULL,
+    memory_id           VARCHAR(64) CHARACTER SET ascii NOT NULL,
     owner_id            VARCHAR(256) NOT NULL DEFAULT 'default',
     contest_id          VARCHAR(64),
     engine_id           VARCHAR(100) NOT NULL,
@@ -200,7 +210,7 @@ CREATE TABLE IF NOT EXISTS memory_compression_candidates (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS memory_compressed_variants (
-    memory_id            VARCHAR(64)  NOT NULL,
+    memory_id            VARCHAR(64) CHARACTER SET ascii NOT NULL,
     owner_id             VARCHAR(256) NOT NULL DEFAULT 'default',
     winner_candidate_id  VARCHAR(64),
     engine_id            VARCHAR(100) NOT NULL,
