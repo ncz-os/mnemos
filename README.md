@@ -5,10 +5,12 @@
 # MNEMOS + GRAEAE
 
 **MNEMOS v6.0.0 is the memory operating system for
-serious agentic work: a packaged FastAPI runtime, **EPIMONE** — the four-backend
+serious agentic work: a packaged FastAPI runtime, **EPIMONE** — the six-backend
 persistence layer (SQLite + sqlite-vec by default, PostgreSQL + pgvector,
 Oracle Database 26ai HNSW INMEMORY NEIGHBOR GRAPH, IBM Db2 12.1.5 (EAP) DiskANN
-vector), GRAEAE reasoning bus,
+vector, MySQL 9.0 Enterprise/HeatWave `VECTOR_DISTANCE`, and MariaDB 11.7+
+native `VEC_DISTANCE_COSINE` + HNSW — every backend self-provisions its schema
+on first connect), GRAEAE reasoning bus,
 operator-audited compression stack, divergent dream-state pipeline (REPLAY ->
 CLUSTER -> CONSOLIDATE -> SYNTHESISE -> EXTRACT), GDPR right-to-be-forgotten
 worker, PERSEPHONE archival subsystem, PANTHEON unified LLM facade, KRONOS
@@ -150,7 +152,7 @@ Full documentation: [docs/](docs/)
 
 ## Architecture
 
-MNEMOS is a packaged FastAPI service with a single `mnemos` CLI for installation, serving, MCP transport, and operational checks. Agents connect through MCP stdio, MCP HTTP/SSE, REST, or OpenAI-compatible SDKs, while the runtime routes memory, reasoning, session, webhook, federation, portability, and observability work through the `mnemos/` package. Persistence is selected by profile and DSN: **SQLite + sqlite-vec** for edge and development installs, **PostgreSQL + pgvector** for server deployments, **Oracle Database 26ai** (`23.26.1-ee`, HNSW INMEMORY NEIGHBOR GRAPH, JSON Duality, TDE) for enterprise installs, and **IBM Db2 12.1.5** (native `VECTOR(768, FLOAT32)` + DiskANN vector index; runs through **Db2 Oracle Compatibility Mode** with cursor-level Oracle→Db2 token translation — a native Db2 dialect port is on the v6.x roadmap, see [docs/v6.1-roadmap.md](docs/v6.1-roadmap.md). `Db2MemoryRepository.semantic_search` emits native Db2 SQL — `VECTOR_DISTANCE(..., EUCLIDEAN)` + `FETCH APPROX FIRST` — engaging the DiskANN index on the user-facing query path) for enterprise installs. All four backends implement the same `PersistenceBackend` ABC (`mnemos/persistence/base.py`) and share `tests/test_persistence_parity.py`. GRAEAE handles multi-provider reasoning and model routing; MOIRAI handles operator-audited compression through APOLLO and ARTEMIS.
+MNEMOS is a packaged FastAPI service with a single `mnemos` CLI for installation, serving, MCP transport, and operational checks. Agents connect through MCP stdio, MCP HTTP/SSE, REST, or OpenAI-compatible SDKs, while the runtime routes memory, reasoning, session, webhook, federation, portability, and observability work through the `mnemos/` package. Persistence is selected by profile and DSN: **SQLite + sqlite-vec** for edge and development installs, **PostgreSQL + pgvector** for server deployments, **Oracle Database 26ai** (`23.26.1-ee`, HNSW INMEMORY NEIGHBOR GRAPH, JSON Duality, TDE) for enterprise installs, and **IBM Db2 12.1.5** (native `VECTOR(768, FLOAT32)` + DiskANN vector index; runs through **Db2 Oracle Compatibility Mode** with cursor-level Oracle→Db2 token translation — a native Db2 dialect port is on the v6.x roadmap, see [docs/v6.1-roadmap.md](docs/v6.1-roadmap.md). `Db2MemoryRepository.semantic_search` emits native Db2 SQL — `VECTOR_DISTANCE(..., EUCLIDEAN)` + `FETCH APPROX FIRST` — engaging the DiskANN index on the user-facing query path) for enterprise installs, **MySQL 9.0+** (native `VECTOR` + `VECTOR_DISTANCE` — note these functions ship only in MySQL **Enterprise/HeatWave**, not Community) for the managed-cloud MySQL audience (RDS/Aurora MySQL, HeatWave), and **MariaDB 11.7+** (native `VECTOR` columns, `VEC_DISTANCE_COSINE`/`VEC_FromText`, HNSW `VECTOR INDEX` — all in the **free Community** edition, embeddings stored in a `memory_embeddings` join table) as the default open-source/self-hosted vector backend for the MySQL family. All six backends implement the same `PersistenceBackend` ABC (`mnemos/persistence/base.py`), self-provision their schema idempotently on `backend.open()` (DSN-aware, dimension from `MNEMOS_EMBEDDING_DIM`), and share `tests/test_persistence_parity.py`. **Recommended default for vector/semantic workloads: PostgreSQL + pgvector** — the most mature, predictable, and well-scaled vector store (HNSW, broad managed-service support); MariaDB is the strongest *MySQL-family* option but its vector engine is newer/less battle-tested. GRAEAE handles multi-provider reasoning and model routing; MOIRAI handles operator-audited compression through APOLLO and ARTEMIS.
 
 ## Documentation
 
