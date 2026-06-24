@@ -18,6 +18,7 @@ def test_top_level_help_lists_all_subcommands() -> None:
     for command in (
         "serve",
         "worker",
+        "db",
         "install",
         "export",
         "import",
@@ -46,6 +47,8 @@ def test_top_level_help_lists_all_subcommands() -> None:
         ["worker", "distillation", "--help"],
         ["worker", "deletion-requests", "--help"],
         ["worker", "persephone", "--help"],
+        ["db", "--help"],
+        ["db", "ensure-schema", "--help"],
         ["install", "--help"],
         ["export", "--help"],
         ["import", "--help"],
