@@ -11,7 +11,10 @@ search features — DB2 12.1.x especially.
 `mnemos/persistence/base.py` defines ~14 repository ABCs (`MemoryRepository`,
 `KGRepository`, `FederationRepository`, …) and a `PersistenceBackend` Union of
 capability Protocols. Concrete backends (`sqlite`, `postgres`, `mysql`,
-`oracle`, `db2`) implement them. Python's ABC machinery only catches a *missing*
+`mariadb`, `oracle`, `db2`) implement them. `mariadb` subclasses the `mysql`
+repositories and overrides only the vector dialect (`VEC_FromText` /
+`VEC_DISTANCE_COSINE`) with embeddings in a `memory_embeddings` join table
+(MariaDB requires NOT-NULL vector-indexed columns). Python's ABC machinery only catches a *missing*
 method at instantiation; it does **not** catch:
 
 - signature drift between an ABC method and a concrete override,
