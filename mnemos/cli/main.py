@@ -164,6 +164,7 @@ serve_app = typer.Typer(
 worker_app = typer.Typer(help="Run MNEMOS background workers.", no_args_is_help=True)
 artemis_app = typer.Typer(help="ARTEMIS corpus maintenance commands.", no_args_is_help=True)
 morpheus_app = typer.Typer(help="MORPHEUS run maintenance commands.", no_args_is_help=True)
+db_app = typer.Typer(help="Database maintenance commands.", no_args_is_help=True)
 
 
 DOC_IMPORT_EXTENSIONS = {
@@ -448,7 +449,9 @@ async def _open_cli_persistence_backend():
             min_size=PG_CONFIG["pool_min_size"],
             max_size=PG_CONFIG["pool_max_size"],
         )
-    return lifecycle._build_postgres_backend(pool, settings), True
+    backend = lifecycle._build_postgres_backend(pool, settings)
+    await backend.open()
+    return backend, True
 
 
 async def _open_cli_morpheus_pool():
@@ -580,8 +583,7 @@ def _infer_import_source(source: Path) -> ImportSource:
     if source.suffix.lower() in {".mpf", ".json", ".jsonl"}:
         return ImportSource.mpf
     typer.echo(
-        "ERROR: Could not infer import source. Pass --from mpf, mem0, letta, graphiti, cognee, "
-        "mempalace, or docling.",
+        "ERROR: Could not infer import source. Pass --from mpf, mem0, letta, graphiti, cognee, mempalace, or docling.",
         err=True,
     )
     raise typer.Exit(2)
@@ -1054,13 +1056,45 @@ def doctor() -> None:
     raise typer.Exit(code=cli_doctor())
 
 
+@db_app.command("ensure-schema")
+def db_ensure_schema() -> None:
+    """Create or upgrade the configured persistence schema."""
+
+    async def _run() -> str:
+        backend, close_backend = await _open_cli_persistence_backend()
+        try:
+            ensure_schema = getattr(backend, "ensure_schema", None)
+            if callable(ensure_schema):
+                result = ensure_schema()
+                if inspect.isawaitable(result):
+                    await result
+            else:
+                open_backend = getattr(backend, "open", None)
+                if callable(open_backend):
+                    result = open_backend()
+                    if inspect.isawaitable(result):
+                        await result
+            return type(backend).__name__
+        finally:
+            if close_backend:
+                await backend.close()
+
+    try:
+        backend_name = asyncio.run(_run())
+    except Exception as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"Schema ensured for {backend_name}.")
+
+
 @app.command("dump-openapi")
 def dump_openapi(
     output: Optional[str] = typer.Option(
         None,
         "--output",
         "-o",
-        help=("Write the OpenAPI spec to this path instead of stdout. " "Use ``-`` or omit to print to stdout."),
+        help=("Write the OpenAPI spec to this path instead of stdout. Use ``-`` or omit to print to stdout."),
     ),
     indent: int = typer.Option(
         2,
@@ -1187,6 +1221,7 @@ app.add_typer(serve_app, name="serve")
 app.add_typer(worker_app, name="worker")
 app.add_typer(artemis_app, name="artemis")
 app.add_typer(morpheus_app, name="morpheus")
+app.add_typer(db_app, name="db")
 
 
 if __name__ == "__main__":
