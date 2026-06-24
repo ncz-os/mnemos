@@ -58,7 +58,33 @@ docker run -p 5002:5002 \
 docker run -p 5002:5002 \
   -e MNEMOS_DATABASE_DSN='db2://MNEMOS:pass@host:50000/MNEMOS' \
   ghcr.io/ncz-os/mnemos-enterprise:latest
+
+# MariaDB 11.7+ — native vector search in the FREE Community edition
+# (VEC_DISTANCE_COSINE + HNSW VECTOR INDEX; no extension needed). Uses the
+# aiomysql driver (enterprise image). The default open-source / self-hosted
+# vector backend for the MySQL family.
+docker run -p 5002:5002 \
+  -e MNEMOS_DATABASE_DSN='mariadb://mnemos:pass@host:3306/mnemos' \
+  ghcr.io/ncz-os/mnemos-enterprise:latest
+
+# MySQL 9.0+ — VECTOR_DISTANCE ships only in Enterprise/HeatWave (NOT
+# Community; verified absent through 9.3). For open-source MySQL-family
+# vector search, use MariaDB above.
+docker run -p 5002:5002 \
+  -e MNEMOS_DATABASE_DSN='mysql://mnemos:pass@host:3306/mnemos' \
+  ghcr.io/ncz-os/mnemos-enterprise:latest
 ```
+
+> **Choosing a backend.** Every backend self-provisions its full schema on
+> first connect (DSN + `MNEMOS_EMBEDDING_DIM`, no installer step). For
+> vector/semantic workloads the **recommended default is PostgreSQL +
+> pgvector** — the most mature and predictable vector store with the broadest
+> managed-service support. **MariaDB** is the best *open-source MySQL-family*
+> choice (built-in vectors, no extension, free Community edition — unlike MySQL
+> Community which has no `VECTOR_DISTANCE`), but its vector engine is new
+> (11.4/11.7+) and less battle-tested at scale than pgvector. SQLite + sqlite-vec
+> is the zero-dependency edge/dev default; Oracle 26ai and IBM Db2 12.1.5 target
+> enterprise/big-iron deployments.
 
 ### Run the STIPHOS hive service (separate container)
 
@@ -105,7 +131,8 @@ pip install 'mnemos-core[full,enterprise]'
 | `charon` | `mnemos-charon` | CHARON portability (MPF import/export, migrate-in, Docling) |
 | `oracle` | `oracledb` | Oracle Database 26ai backend (thin) |
 | `db2` | `ibm_db` | IBM Db2 12.1.5 backend |
-| `mysql` | `aiomysql` | MySQL 9.0+ backend |
+| `mysql` | `aiomysql` | MySQL 9.0+ backend (Enterprise/HeatWave for vectors) |
+| `mysql` | `aiomysql` | **MariaDB 11.7+** backend too — same `aiomysql` driver; use a `mariadb://` DSN. Vector search is in the free Community edition (no extra driver). |
 
 STIPHOS (the hive) is the standalone **`mnemos-stiphos`** distribution — it is
 NOT an extra of core and is NOT in the everything image; install/run it
@@ -142,7 +169,7 @@ Highest precedence first:
 
 1. `MNEMOS_DATABASE_DSN` (preferred — single DSN, scheme picks the backend)
 2. Per-backend env vars: `ORACLE_DSN`, `DB2_DSN`, `PG_HOST`/`PG_DATABASE`/…
-3. `MNEMOS_PERSISTENCE_BACKEND` / `PG_BACKEND` (`postgres`|`sqlite`|`oracle`|`db2`|`mysql`)
+3. `MNEMOS_PERSISTENCE_BACKEND` / `PG_BACKEND` (`postgres`|`sqlite`|`oracle`|`db2`|`mysql`|`mariadb`)
 4. `MNEMOS_PROFILE` defaults (`server` → postgres, `edge`/`dev` → sqlite)
 
 DSN scheme detection:
