@@ -58,6 +58,7 @@ from mnemos.persistence.types import MEMORY_COLS as _MEMORY_COLS, Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core import webhook_constants
 from mnemos.persistence import nats_events as persistence_nats_events
+from mnemos.persistence.schema import ensure_postgres_schema
 
 logger = logging.getLogger(__name__)
 _RECENCY_E_FOLD_SECONDS = 7 * 24 * 60 * 60
@@ -4213,6 +4214,7 @@ class PostgresBackend:
         self._audit_chain = PostgresAuditChainRepository()
         self._acl = PostgresAclRepository()
         self._closed = False
+        self._schema_ensured = False
 
     @property
     def settings(self) -> Any:
@@ -4610,6 +4612,22 @@ class PostgresBackend:
     @property
     def audit_chain(self) -> AuditChainRepository:
         return self._audit_chain
+
+    async def ensure_schema(self) -> None:
+        """Create or upgrade the configured Postgres schema idempotently."""
+        if self._closed or self._pool is None:
+            return
+        await ensure_postgres_schema(self._pool, self._settings)
+        self._schema_ensured = True
+
+    async def open(self) -> None:
+        """Lifecycle hook: ensure schema and validate connectivity."""
+        if self._closed:
+            return
+        if not self._schema_ensured:
+            await self.ensure_schema()
+        async with self._pool.acquire() as conn:
+            await conn.execute("SELECT 1")
 
     async def ping(self) -> bool:
         try:
