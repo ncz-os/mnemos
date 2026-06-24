@@ -54,6 +54,7 @@ from mnemos.persistence.base import (
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core.secret_detection import VAULT_NAMESPACE
+from mnemos.persistence.schema import ensure_oracle_schema
 
 _LOG = logging.getLogger(__name__)
 
@@ -3380,9 +3381,7 @@ class OracleConsultationsRepository(ConsultationsRepository):
         finally:
             await _call(cursor.close)
 
-    async def fetch_audit_chain(
-        self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None
-    ) -> list[Row]:
+    async def fetch_audit_chain(self, tx: Transaction, *, root: bool, user_id: str, namespace: str | None) -> list[Row]:
         """Oracle port of PostgresConsultationsRepository.fetch_audit_chain.
 
         The Postgres ``LEFT JOIN LATERAL (... LIMIT 1) ON TRUE`` becomes a
@@ -4781,6 +4780,7 @@ class OracleBackend:
         self._pool = pool
         self._settings = settings
         self._closed = False
+        self._schema_ensured = False
         self._memories_repo = OracleMemoryRepository()
         self._kg_triples_repo = OracleKGRepository()
         self._memory_versions_repo = OracleVersionRepository()
@@ -5623,7 +5623,7 @@ class OracleBackend:
         raise NotImplementedError("journal API persistence is not implemented for Oracle schema 0015")
 
     async def open(self) -> None:
-        """Lifecycle hook — validates pool checkout + session callback.
+        """Lifecycle hook — self-provisions schema and validates checkout.
 
         Per Oracle eng review O9 / R3: ``lifecycle._build_oracle_backend``
         and ``lifecycle._build_db2_backend`` both call ``backend.open()``
@@ -5643,6 +5643,8 @@ class OracleBackend:
             return
         if self._pool is None:
             return
+        if not self._schema_ensured:
+            await self.ensure_schema()
         try:
             async with self._pool.acquire() as conn:
                 cursor = await _call(conn.cursor)
@@ -5656,6 +5658,13 @@ class OracleBackend:
                 "OracleBackend.open probe failed (%s); backend remains open but first acquire() may also fail.",
                 exc,
             )
+
+    async def ensure_schema(self) -> None:
+        """Create or upgrade the configured Oracle schema idempotently."""
+        if self._closed or self._pool is None:
+            return
+        await ensure_oracle_schema(self._pool, self._settings)
+        self._schema_ensured = True
 
     async def close(self) -> None:
         if self._closed:
