@@ -69,10 +69,11 @@ def _split_statements(sql: str) -> list[str]:
     return stmts
 
 
-async def _apply(dsn: str, path: Path) -> None:
+async def _apply(dsn: str, path: Path, embedding_dim: int = 768) -> None:
     from mnemos.persistence.oracle import create_oracle_pool
 
     sql = path.read_text()
+    sql = sql.replace("{{embedding_dim}}", str(embedding_dim))
     statements = _split_statements(sql)
     print(f"[migrate] {len(statements)} statements from {path.name}")
 
@@ -106,8 +107,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dsn", default=DEFAULT_DSN)
     ap.add_argument("--file", default=str(DEFAULT_FILE))
+    ap.add_argument(
+        "--dim",
+        type=int,
+        default=int(os.environ.get("MNEMOS_EMBEDDING_DIM", "768")),
+        help="Embedding dimension for VECTOR(dim, FLOAT32). Defaults to MNEMOS_EMBEDDING_DIM or 768.",
+    )
     args = ap.parse_args()
-    asyncio.run(_apply(args.dsn, Path(args.file)))
+    asyncio.run(_apply(args.dsn, Path(args.file), embedding_dim=args.dim))
     return 0
 
 

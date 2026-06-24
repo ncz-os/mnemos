@@ -172,7 +172,7 @@ def setup_sqlite_database(config: Config) -> bool:
 
     db_path = Path(config.sqlite_path).expanduser()
     embedding_dim = getattr(config, "embedding_dim", 768)
-    print(f"[db] Initializing SQLite database at {db_path} " f"(embedding dim: {embedding_dim})...")
+    print(f"[db] Initializing SQLite database at {db_path} (embedding dim: {embedding_dim})...")
 
     settings_shim = SimpleNamespace(database=SimpleNamespace(embedding_dim=embedding_dim))
 
@@ -647,21 +647,17 @@ def run_migrations(config: Config) -> bool:
             return False
         print("OK")
 
-    # Postgres parallel of the SQLite embed-dim story: db/migrations.sql
-    # creates `embedding vector(768)` which pgvector freezes at column-type
-    # creation. We always reconcile against the configured dim — even when
-    # it's the 768 default — because an existing DB might already be at a
-    # non-default dim from a prior install. The helper is idempotent: it
-    # short-circuits OK when the column type already matches the target,
-    # and refuses safely on populated mismatch. The previous `!= 768` guard
-    # silently downgraded an existing 512-D install when the operator
-    # switched config back to the default model.
+    # Postgres parallel of the SQLite embed-dim story: reconcile the
+    # pgvector column and ANN index against the configured dim even when
+    # it is the default. The DSN-aware runtime path performs the same
+    # operation on backend.open(); this host-local installer helper remains
+    # for legacy `mnemos install --upgrade`.
     embedding_dim = getattr(config, "embedding_dim", 768)
     return _alter_postgres_embedding_dim(config, embedding_dim)
 
 
 def _alter_postgres_embedding_dim(config: Config, embedding_dim: int) -> bool:
-    """Re-size `memories.embedding` to vector(<dim>) when MNEMOS_EMBEDDING_DIM != 768.
+    """Re-size `memories.embedding` to vector(<dim>) and ensure HNSW index.
 
     Idempotent: queries the actual stored dim via `format_type(atttypid, atttypmod)`
     and short-circuits if the column already matches. Safe on a fresh install
@@ -671,19 +667,18 @@ def _alter_postgres_embedding_dim(config: Config, embedding_dim: int) -> bool:
     and refuse with a postgres-correct migration instruction set.
 
     Postgres-specific constraints:
-    - pgvector ivfflat index supports up to 2000 dimensions. The existing
-      `idx_memories_embedding` is ivfflat, so we cap the supported dim at 2000.
-      Larger dims need a different ANN strategy (halfvec / no ANN index)
-      which isn't wired into the migration baseline yet.
+    - pgvector HNSW indexes over the ``vector`` type support up to 2000
+      dimensions. Larger dims need halfvec/no-ANN strategy work that is not
+      wired into the baseline yet.
     """
     try:
-        # ivfflat ceiling. Larger dims would need halfvec/no-ANN index strategy
+        # HNSW/vector ceiling. Larger dims would need halfvec/no-ANN index strategy
         # (not currently wired into the migration baseline). Fail closed —
         # don't accept a config the schema can't actually serve.
         if not 1 <= embedding_dim <= 2000:
             print(
                 f"[db] ERROR MNEMOS_EMBEDDING_DIM={embedding_dim} out of supported "
-                "range [1, 2000] for pgvector ivfflat index (used by the "
+                "range [1, 2000] for pgvector HNSW index (used by the "
                 "baseline idx_memories_embedding). Larger dims need a different "
                 "ANN strategy (halfvec / no-ANN index) that is not currently "
                 "wired into migrations. Refusing to proceed — accepting this "
@@ -712,8 +707,8 @@ def _alter_postgres_embedding_dim(config: Config, embedding_dim: int) -> bool:
                     break
         target_type = f"vector({embedding_dim})"
         if current_type == target_type:
-            print(f"[db] memories.embedding already at {target_type}; nothing to do")
-            return True
+            print(f"[db] memories.embedding already at {target_type}; ensuring HNSW index")
+            return _ensure_postgres_embedding_hnsw_index(config)
 
         # Type mismatch. The COUNT and ALTER must run under one ACCESS
         # EXCLUSIVE lock — separate sessions race against any concurrent
@@ -739,6 +734,7 @@ def _alter_postgres_embedding_dim(config: Config, embedding_dim: int) -> bool:
             "UPDATE … SET embedding=NULL; ALTER … TYPE {target_type} USING NULL; "
             "COMMIT; recovery on a quiesced DB instead.', cnt;\n"
             "  END IF;\n"
+            "  DROP INDEX IF EXISTS idx_memories_embedding;\n"
             "  ALTER TABLE memories ALTER COLUMN embedding TYPE {target_type} USING NULL;\n"
             "END;\n"
             "$$;"
@@ -762,10 +758,10 @@ def _alter_postgres_embedding_dim(config: Config, embedding_dim: int) -> bool:
                     f"with {rows_str} non-null rows. Cannot re-size to "
                     f"{target_type} without re-embedding. To migrate: stop "
                     f"this service, then run "
-                    f"`psql -d {config.db_name} -c \"BEGIN; "
+                    f'`psql -d {config.db_name} -c "BEGIN; '
                     f"UPDATE memories SET embedding=NULL; "
                     f"ALTER TABLE memories ALTER COLUMN embedding TYPE "
-                    f"{target_type} USING NULL; COMMIT;\"`, restart the "
+                    f'{target_type} USING NULL; COMMIT;"`, restart the '
                     f"service, and re-embed all memories.",
                     file=sys.stderr,
                 )
@@ -776,9 +772,46 @@ def _alter_postgres_embedding_dim(config: Config, embedding_dim: int) -> bool:
                 )
             return False
         print("OK")
-        return True
+        return _ensure_postgres_embedding_hnsw_index(config)
     except Exception as exc:
         print(f"[db] ERROR in _alter_postgres_embedding_dim: {exc}", file=sys.stderr)
+        return False
+
+
+def _ensure_postgres_embedding_hnsw_index(config: Config) -> bool:
+    """Ensure idx_memories_embedding is an HNSW cosine index."""
+    try:
+        rc, out, err = _psql_superuser(
+            "SELECT am.amname "
+            "FROM pg_class idx "
+            "JOIN pg_index i ON i.indexrelid = idx.oid "
+            "JOIN pg_am am ON am.oid = idx.relam "
+            "WHERE idx.relname = 'idx_memories_embedding';",
+            dbname=config.db_name,
+        )
+        if rc != 0:
+            print(f"[db] ERROR checking embedding index: {err.strip() or '(no detail)'}", file=sys.stderr)
+            return False
+        if out.strip() == "hnsw":
+            print("[db] idx_memories_embedding already uses HNSW")
+            return True
+
+        print("[db] Rebuilding idx_memories_embedding as HNSW...", end=" ")
+        rc, _, err = _psql_superuser(
+            "DROP INDEX IF EXISTS idx_memories_embedding; "
+            "CREATE INDEX IF NOT EXISTS idx_memories_embedding "
+            "ON memories USING hnsw (embedding vector_cosine_ops);",
+            dbname=config.db_name,
+            timeout=120,
+        )
+        if rc != 0:
+            print("FAILED")
+            print(f"[db] ERROR rebuilding embedding index: {err.strip() or '(no detail)'}", file=sys.stderr)
+            return False
+        print("OK")
+        return True
+    except Exception as exc:
+        print(f"[db] ERROR in _ensure_postgres_embedding_hnsw_index: {exc}", file=sys.stderr)
         return False
 
 

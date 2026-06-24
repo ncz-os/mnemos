@@ -591,7 +591,9 @@ async def build_configured_persistence_backend(settings: Any | None = None) -> t
         )
     from mnemos.core.pool import wrap_pool_with_timeout
 
-    return backend_type, _build_postgres_backend(wrap_pool_with_timeout(raw_pool), settings)
+    backend = _build_postgres_backend(wrap_pool_with_timeout(raw_pool), settings)
+    await backend.open()
+    return backend_type, backend
 
 
 def _sqlite_path_from_settings(settings):
@@ -835,6 +837,7 @@ async def lifespan(app):
             _pool = wrap_pool_with_timeout(_raw_pool)
             _pool_manager = PoolManager(_pool)
             _persistence_backend = _build_postgres_backend(_pool, settings)
+            await _persistence_backend.open()
             app.state.pool = _pool  # auth.py reads this via request.app.state.pool
             app.state.pool_manager = _pool_manager
             app.state.persistence_backend = _persistence_backend
