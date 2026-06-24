@@ -65,6 +65,7 @@ from mnemos.persistence.oracle import (
     _uuid_to_raw,
     _validate_and_format_vector,
 )
+from mnemos.persistence.schema import ensure_db2_schema
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter
 
@@ -4172,6 +4173,13 @@ class Db2Backend(OracleBackend):
     supports_db2_vector = True
 
     _UNSUPPORTED_CAPABILITY_MARKERS = frozenset({})
+
+    async def ensure_schema(self) -> None:
+        """Create or upgrade the configured Db2 schema idempotently."""
+        if self._closed or self._pool is None:
+            return
+        await ensure_db2_schema(self._pool, self._settings)
+        self._schema_ensured = True
 
     async def insert_pantheon_routing_audit(
         self,
