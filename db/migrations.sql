@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS memories (
   CONSTRAINT valid_quality_rating CHECK (quality_rating IS NULL OR (quality_rating >= 0 AND quality_rating <= 100))
 );
 
+-- PG schema parity (2026-06-23): columns the federation copy_embeddings +
+-- supersession code paths write but earlier PG migrations never added (they
+-- exist on the MySQL/MariaDB/Oracle/DB2 schemas). Idempotent so both fresh
+-- standups and existing databases converge. Without these, federation writes
+-- to a freshly-stood-up PG replica fail with "column ... does not exist".
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding_model TEXT;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by TEXT;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS federation_last_pushed_at TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
 CREATE INDEX IF NOT EXISTS idx_memories_task_type ON memories(task_type);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created DESC);
