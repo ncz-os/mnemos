@@ -335,10 +335,12 @@ def _normalize_backend_name(configured: str) -> str:
         return "db2"
     if configured in {"mysql", "mysql+aiomysql"}:
         return "mysql"
+    if configured in {"mariadb", "mariadb+aiomysql"}:
+        return "mariadb"
     if configured == "auto":
         return "auto"
     raise ValueError(
-        f"Unsupported persistence backend {configured!r}; expected postgres, sqlite, oracle, db2, mysql, or auto"
+        f"Unsupported persistence backend {configured!r}; expected postgres, sqlite, oracle, db2, mysql, mariadb, or auto"
     )
 
 
@@ -353,6 +355,8 @@ def _backend_from_database_url(database_url: str) -> str | None:
         return "db2"
     if database_url.startswith(("mysql:", "mysql+aiomysql:")):
         return "mysql"
+    if database_url.startswith(("mariadb:", "mariadb+aiomysql:")):
+        return "mariadb"
     return None
 
 
@@ -497,6 +501,17 @@ def _mysql_dsn_from_settings(settings) -> str:
     return ""
 
 
+def _mariadb_dsn_from_settings(settings) -> str:
+    database_settings = getattr(settings, "database", None)
+    if database_settings is None:
+        return ""
+    for field_name in ("dsn", "url"):
+        database_url = getattr(database_settings, field_name, "").strip()
+        if database_url.startswith(("mariadb:", "mariadb+aiomysql:")):
+            return database_url
+    return ""
+
+
 async def _build_mysql_backend(dsn: str, settings: Any):
     """Build and open the MySQL 9.0+ persistence backend."""
     mysql_module = importlib.import_module("mnemos.persistence.mysql")
@@ -504,6 +519,17 @@ async def _build_mysql_backend(dsn: str, settings: Any):
     max_size = PG_CONFIG.get("pool_max_size", 8)
     pool = await mysql_module.create_mysql_pool(dsn, min_size=min_size, max_size=max_size, settings=settings)
     backend = mysql_module.MysqlBackend(pool, settings)
+    await backend.open()
+    return backend
+
+
+async def _build_mariadb_backend(dsn: str, settings: Any):
+    """Build and open the MariaDB 11.7+ persistence backend."""
+    mariadb_module = importlib.import_module("mnemos.persistence.mariadb")
+    min_size = PG_CONFIG.get("pool_min_size", 1)
+    max_size = PG_CONFIG.get("pool_max_size", 8)
+    pool = await mariadb_module.create_mariadb_pool(dsn, min_size=min_size, max_size=max_size, settings=settings)
+    backend = mariadb_module.MariadbBackend(pool, settings)
     await backend.open()
     return backend
 
@@ -538,6 +564,14 @@ async def build_configured_persistence_backend(settings: Any | None = None) -> t
                 "Set MNEMOS_DATABASE_DSN=mysql://user:pass@host:3306/mnemos"
             )
         return backend_type, await _build_mysql_backend(mysql_dsn, settings)
+    if backend_type == "mariadb":
+        mariadb_dsn = _mariadb_dsn_from_settings(settings)
+        if not mariadb_dsn:
+            raise RuntimeError(
+                "MariaDB backend selected but no mariadb:// DSN configured. "
+                "Set MNEMOS_DATABASE_DSN=mariadb://user:pass@host:3306/mnemos"
+            )
+        return backend_type, await _build_mariadb_backend(mariadb_dsn, settings)
 
     database_dsn = _database_dsn_from_settings(settings)
     pool_kwargs = {
@@ -557,7 +591,9 @@ async def build_configured_persistence_backend(settings: Any | None = None) -> t
         )
     from mnemos.core.pool import wrap_pool_with_timeout
 
-    return backend_type, _build_postgres_backend(wrap_pool_with_timeout(raw_pool), settings)
+    backend = _build_postgres_backend(wrap_pool_with_timeout(raw_pool), settings)
+    await backend.open()
+    return backend_type, backend
 
 
 def _sqlite_path_from_settings(settings):
@@ -755,6 +791,24 @@ async def lifespan(app):
                 PG_CONFIG.get("pool_min_size"),
                 PG_CONFIG.get("pool_max_size"),
             )
+        elif backend_type == "mariadb":
+            mariadb_dsn = _mariadb_dsn_from_settings(settings)
+            if not mariadb_dsn:
+                raise RuntimeError(
+                    "MariaDB backend selected but no mariadb:// DSN configured. "
+                    "Set MNEMOS_DATABASE_DSN=mariadb://user:pass@host:3306/mnemos"
+                )
+            _pool = None
+            _pool_manager = None
+            _persistence_backend = await _build_mariadb_backend(mariadb_dsn, settings)
+            app.state.pool = None
+            app.state.pool_manager = None
+            app.state.persistence_backend = _persistence_backend
+            logger.info(
+                "MariaDB persistence backend initialized (pool min=%s max=%s)",
+                PG_CONFIG.get("pool_min_size"),
+                PG_CONFIG.get("pool_max_size"),
+            )
         else:
             database_dsn = _database_dsn_from_settings(settings)
             pool_kwargs = {
@@ -783,6 +837,7 @@ async def lifespan(app):
             _pool = wrap_pool_with_timeout(_raw_pool)
             _pool_manager = PoolManager(_pool)
             _persistence_backend = _build_postgres_backend(_pool, settings)
+            await _persistence_backend.open()
             app.state.pool = _pool  # auth.py reads this via request.app.state.pool
             app.state.pool_manager = _pool_manager
             app.state.persistence_backend = _persistence_backend

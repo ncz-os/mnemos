@@ -87,8 +87,25 @@ CREATE INDEX idx_memories_feed_cursor
 -- still returns correct results (sequential scan) but with EAP-only
 -- latency characteristics; set MNEMOS_DB2_VECTOR_INDEX=exact to
 -- communicate intent on non-EAP builds.
+--
+-- Build-time tuning (Db2 12.1.5 EAP; validated on pegasus db2-mnemos
+-- 2026-06-22 against ~12.6k x 768-dim rows: ~11% faster execute, build ~1s,
+-- recall intact. Ref: IBM community blog "Vector Indexes in Db2", 2026-06-19):
+--   * PCT_COMP_VECT_SIZE — compressed-vector ratio (percent). Higher trades a
+--     little memory for lower query latency; 15 gives ~8-11% faster search vs
+--     the 5% default at a still-tiny footprint for MNEMOS-scale corpora.
+--   * BUILD_PARALLELISM — index-construction worker threads (~75% of cores).
+--   * BUILD_MEM_BUDGET — construction memory budget in GB (less build-time I/O).
+-- Values are template-substituted by db2_apply_migration.py with host-adaptive
+-- defaults (CLI-overridable). On 12.1.4 / non-EAP the whole statement fails and
+-- the runner tolerates it (as before). Query-time SEARCH_LIST_SIZE /
+-- SEARCH_BEAM_WIDTH are intentionally NOT emitted — unsupported on this 12.1.5
+-- EAP build (SQL0104N); they are a later-build feature.
 CREATE VECTOR INDEX idx_memories_emb_diskann
-    ON memories(embedding) WITH DISTANCE EUCLIDEAN @
+    ON memories(embedding) WITH DISTANCE EUCLIDEAN
+    PCT_COMP_VECT_SIZE {{vector_pct_comp}}
+    BUILD_PARALLELISM {{vector_build_parallelism}}
+    BUILD_MEM_BUDGET {{vector_build_mem_budget}} @
 
 CREATE TABLE memory_versions (
     id VARCHAR(100) NOT NULL PRIMARY KEY,

@@ -1,0 +1,375 @@
+-- migration: 0001_core_schema_mariadb
+-- Mirrors the MySQL backend's embedded init DDL. MariaDB-specific changes use
+-- a separate NOT NULL vector join table with a VECTOR INDEX.
+
+CREATE TABLE IF NOT EXISTS memories (
+    -- ASCII charset keeps the PK <= 256 bytes, required by MariaDB when the
+    -- table carries a VECTOR INDEX (utf8mb4 VARCHAR(64) = 256B is rejected).
+    -- MNEMOS memory ids are ASCII ("mem_<ts>_<hash>"), so this is lossless.
+    id                VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    content           LONGTEXT      NOT NULL,
+    content_hash      VARCHAR(64)   NOT NULL,
+    category          VARCHAR(128)  NOT NULL,
+    subcategory       VARCHAR(128),
+    metadata          LONGTEXT,
+    quality_rating    INT           NOT NULL DEFAULT 3,
+    verbatim_content  LONGTEXT,
+    compressed_content LONGTEXT,
+    source_model      VARCHAR(256),
+    source_provider   VARCHAR(256),
+    source_session    VARCHAR(512),
+    source_agent      VARCHAR(256),
+    owner_id          VARCHAR(256)  NOT NULL,
+    namespace         VARCHAR(256)  NOT NULL,
+    permission_mode   INT           NOT NULL DEFAULT 0,
+    group_id          VARCHAR(256),
+    federation_source VARCHAR(512),
+    federation_remote_updated DATETIME(6),
+    consolidated_into VARCHAR(64),
+    consolidated_at   DATETIME(6),
+    federation_last_pushed_at DATETIME(6),
+    federation_push_peer VARCHAR(512),
+    recall_count      INT           NOT NULL DEFAULT 0,
+    last_recalled_at  DATETIME(6),
+    archived_at       DATETIME(6),
+    deleted_at        DATETIME(6),
+    created           DATETIME(6)   NOT NULL DEFAULT NOW(6),
+    updated           DATETIME(6)   NOT NULL DEFAULT NOW(6),
+    PRIMARY KEY (id),
+    INDEX idx_memories_ns_cat  (namespace, category),
+    INDEX idx_memories_owner   (owner_id, namespace),
+    INDEX idx_memories_hash    (content_hash),
+    INDEX idx_memories_federation_remote (federation_source, federation_remote_updated),
+    INDEX idx_memories_push (federation_source, federation_last_pushed_at),
+    FULLTEXT INDEX idx_memories_ft (content)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    memory_id  VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    embedding  VECTOR(768) NOT NULL,
+    PRIMARY KEY (memory_id),
+    VECTOR INDEX (embedding),
+    CONSTRAINT fk_memory_embeddings_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS federation_peers (
+    id                   VARCHAR(64)  NOT NULL,
+    name                 VARCHAR(256),
+    base_url             TEXT,
+    auth_token           TEXT,
+    api_key              TEXT,
+    namespace_filter     JSON,
+    category_filter      JSON,
+    enabled              BOOLEAN      NOT NULL DEFAULT TRUE,
+    sync_interval_secs   INT          NOT NULL DEFAULT 300,
+    last_sync_at         TIMESTAMP(6) NULL,
+    last_sync_cursor     TEXT,
+    cursor_updated       TEXT,
+    last_error           TEXT,
+    last_error_at        TIMESTAMP(6) NULL,
+    total_pulled         INT          NOT NULL DEFAULT 0,
+    compat_mode          VARCHAR(32)  NOT NULL DEFAULT 'strict',
+    peer_mnemos_version  VARCHAR(128),
+    last_schema_check_at TIMESTAMP(6) NULL,
+    copy_embeddings      BOOLEAN      NOT NULL DEFAULT FALSE,
+    created              TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated              TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_federation_peers_name (name),
+    INDEX idx_federation_peers_enabled (enabled, last_sync_at)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS federation_sync_log (
+    id                VARCHAR(64)  NOT NULL,
+    peer_id           VARCHAR(64)  NOT NULL,
+    direction         VARCHAR(16)  NOT NULL DEFAULT 'pull',
+    status            VARCHAR(32)  NOT NULL DEFAULT 'started',
+    started_at        TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    finished_at       TIMESTAMP(6) NULL,
+    memories_pulled   INT          NOT NULL DEFAULT 0,
+    memories_new      INT          NOT NULL DEFAULT 0,
+    memories_updated  INT          NOT NULL DEFAULT 0,
+    records_seen      INT          NOT NULL DEFAULT 0,
+    records_written   INT          NOT NULL DEFAULT 0,
+    error             TEXT,
+    cursor_before     TEXT,
+    cursor_after      TEXT,
+    PRIMARY KEY (id),
+    INDEX idx_federation_sync_log_peer_started (peer_id, started_at),
+    CONSTRAINT fk_federation_sync_log_peer
+        FOREIGN KEY (peer_id) REFERENCES federation_peers(id) ON DELETE CASCADE
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS memory_versions (
+    id                VARCHAR(64)   NOT NULL,
+    memory_id         VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    version_num       INT           NOT NULL,
+    content           LONGTEXT      NOT NULL,
+    category          VARCHAR(128),
+    subcategory       VARCHAR(128),
+    metadata          JSON,
+    verbatim_content  LONGTEXT,
+    owner_id          VARCHAR(256)  NOT NULL DEFAULT 'default',
+    namespace         VARCHAR(256)  NOT NULL DEFAULT 'default',
+    permission_mode   INT           NOT NULL DEFAULT 600,
+    source_model      VARCHAR(256),
+    source_provider   VARCHAR(256),
+    source_session    VARCHAR(512),
+    source_agent      VARCHAR(256),
+    snapshot_at       TIMESTAMP(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    snapshot_by       VARCHAR(256),
+    change_type       VARCHAR(40)   NOT NULL DEFAULT 'create',
+    commit_hash       VARCHAR(128),
+    parent_version_id VARCHAR(64),
+    branch            VARCHAR(128)  NOT NULL DEFAULT 'main',
+    merge_parents     JSON,
+    deleted_at        TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_memory_versions_memory_version (memory_id, branch, version_num),
+    INDEX idx_mv_memory_id (memory_id),
+    INDEX idx_mv_memory_id_vnum (memory_id, version_num DESC),
+    INDEX idx_mv_snapshot_at (snapshot_at),
+    INDEX idx_mv_commit_hash (commit_hash),
+    INDEX idx_mv_branch_head (memory_id, branch, version_num DESC),
+    INDEX idx_mv_owner_namespace (owner_id, namespace),
+    INDEX idx_mv_parent_version (parent_version_id),
+    INDEX idx_mv_deleted (deleted_at),
+    CONSTRAINT fk_mv_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS memory_branches (
+    memory_id       VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    name            VARCHAR(128) NOT NULL,
+    head_version_id VARCHAR(64),
+    created_by      VARCHAR(256),
+    created_at      TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (memory_id, name),
+    INDEX idx_memory_branches_memory (memory_id),
+    INDEX idx_memory_branches_head (head_version_id),
+    CONSTRAINT fk_memory_branches_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+    CONSTRAINT fk_memory_branches_head
+        FOREIGN KEY (head_version_id) REFERENCES memory_versions(id) ON DELETE SET NULL
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS kg_triples (
+    id           VARCHAR(64)  NOT NULL,
+    subject      VARCHAR(512) NOT NULL,
+    predicate    VARCHAR(256) NOT NULL,
+    object       VARCHAR(512) NOT NULL,
+    subject_type VARCHAR(128),
+    object_type  VARCHAR(128),
+    valid_from   DATETIME(6),
+    valid_until  DATETIME(6),
+    memory_id    VARCHAR(64),
+    confidence   FLOAT,
+    created      DATETIME(6)  NOT NULL DEFAULT NOW(6),
+    owner_id     VARCHAR(256) NOT NULL,
+    namespace    VARCHAR(256),
+    deleted_at   DATETIME(6),
+    PRIMARY KEY (id),
+    INDEX idx_kg_memory  (memory_id),
+    INDEX idx_kg_owner   (owner_id, namespace)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS memory_compression_candidates (
+    id                  VARCHAR(64)  NOT NULL DEFAULT (UUID()),
+    memory_id           VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    owner_id            VARCHAR(256) NOT NULL DEFAULT 'default',
+    contest_id          VARCHAR(64),
+    engine_id           VARCHAR(100) NOT NULL,
+    engine_version      VARCHAR(50),
+    compressed_content  LONGTEXT,
+    original_tokens     INT,
+    compressed_tokens   INT,
+    candidate_content   LONGTEXT,
+    candidate_tokens    INT,
+    compression_ratio   DOUBLE,
+    quality_score       DOUBLE,
+    speed_factor        DOUBLE,
+    composite_score     DOUBLE,
+    scoring_profile     VARCHAR(50)  NOT NULL DEFAULT 'balanced',
+    elapsed_ms          INT,
+    judge_model         VARCHAR(200),
+    gpu_used            BOOLEAN      NOT NULL DEFAULT FALSE,
+    is_winner           BOOLEAN      NOT NULL DEFAULT FALSE,
+    reject_reason       TEXT,
+    manifest            JSON,
+    created             TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    created_at          TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    INDEX idx_mcc_memory (memory_id),
+    INDEX idx_mcc_contest (contest_id),
+    INDEX idx_mcc_memory_winner (memory_id, is_winner),
+    INDEX idx_mcc_owner (owner_id),
+    INDEX idx_mcc_engine (engine_id),
+    CONSTRAINT fk_mcc_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS memory_compressed_variants (
+    memory_id            VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    owner_id             VARCHAR(256) NOT NULL DEFAULT 'default',
+    winner_candidate_id  VARCHAR(64),
+    engine_id            VARCHAR(100) NOT NULL,
+    engine_version       VARCHAR(50),
+    compressed_content   LONGTEXT,
+    compressed_tokens    INT,
+    compression_ratio    DOUBLE,
+    quality_score        DOUBLE,
+    composite_score      DOUBLE,
+    scoring_profile      VARCHAR(50)  NOT NULL DEFAULT 'balanced',
+    judge_model          VARCHAR(200),
+    selected_at          TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (memory_id),
+    INDEX idx_mcv_owner (owner_id),
+    INDEX idx_mcv_engine (engine_id),
+    CONSTRAINT fk_mcv_memory
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+    CONSTRAINT fk_mcv_candidate
+        FOREIGN KEY (winner_candidate_id) REFERENCES memory_compression_candidates(id) ON DELETE SET NULL
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS memory_compression_queue (
+    id              VARCHAR(64)  NOT NULL DEFAULT (UUID()),
+    memory_id       VARCHAR(64)  NOT NULL,
+    owner_id        VARCHAR(256) NOT NULL,
+    reason          VARCHAR(256) NOT NULL,
+    status          VARCHAR(32)  NOT NULL DEFAULT 'pending',
+    priority        INT          NOT NULL DEFAULT 0,
+    scoring_profile VARCHAR(256) NOT NULL,
+    attempts        INT          NOT NULL DEFAULT 0,
+    enqueued_at     TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    started_at      TIMESTAMP(6),
+    finished_at     TIMESTAMP(6),
+    error           TEXT,
+    PRIMARY KEY (id),
+    INDEX idx_compression_queue_status   (status),
+    INDEX idx_compression_queue_priority (priority)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS state (
+    owner_id   VARCHAR(100) NOT NULL DEFAULT 'default',
+    namespace  VARCHAR(100) NOT NULL DEFAULT 'default',
+    `key`      VARCHAR(500) NOT NULL,
+    value      LONGTEXT,
+    updated    TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    version    BIGINT       NOT NULL DEFAULT 1,
+    deleted_at TIMESTAMP(6) NULL,
+    UNIQUE KEY uq_state_owner_namespace_key (owner_id, namespace, `key`),
+    INDEX idx_state_owner (owner_id),
+    INDEX idx_state_namespace (namespace)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS model_registry (
+    id                    VARCHAR(64)  NOT NULL DEFAULT (UUID()),
+    provider              VARCHAR(50)  NOT NULL,
+    model_id              VARCHAR(512) NOT NULL,
+    display_name          TEXT,
+    family                TEXT,
+    context_window        INT,
+    max_output_tokens     INT,
+    capabilities          JSON         NOT NULL DEFAULT (JSON_ARRAY()),
+    input_cost_per_mtok   DECIMAL(12,6) DEFAULT 0,
+    output_cost_per_mtok  DECIMAL(12,6) DEFAULT 0,
+    cache_read_per_mtok   DECIMAL(12,6) DEFAULT 0,
+    cache_write_per_mtok  DECIMAL(12,6) DEFAULT 0,
+    available             BOOLEAN      NOT NULL DEFAULT TRUE,
+    deprecated            BOOLEAN      NOT NULL DEFAULT FALSE,
+    arena_score           DECIMAL(8,2),
+    arena_rank            INT,
+    graeae_weight         DECIMAL(5,4),
+    first_seen            TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    last_seen             TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    last_synced           TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    raw                   JSON         NOT NULL DEFAULT (JSON_OBJECT()),
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_model_registry_provider_model (provider, model_id),
+    INDEX idx_model_registry_provider (provider),
+    INDEX idx_model_registry_available (available),
+    INDEX idx_model_registry_arena_score (arena_score),
+    INDEX idx_model_registry_graeae_weight (graeae_weight),
+    INDEX idx_model_registry_family (family(191)),
+    INDEX idx_model_registry_last_synced (last_synced)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS model_registry_sync_log (
+    id                VARCHAR(64)  NOT NULL DEFAULT (UUID()),
+    provider          VARCHAR(50)  NOT NULL,
+    synced_at         TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    models_found      INT          NOT NULL DEFAULT 0,
+    models_added      INT          NOT NULL DEFAULT 0,
+    models_updated    INT          NOT NULL DEFAULT 0,
+    models_deprecated INT          NOT NULL DEFAULT 0,
+    error             TEXT,
+    duration_ms       INT,
+    PRIMARY KEY (id),
+    INDEX idx_model_registry_sync_log_provider (provider),
+    INDEX idx_model_registry_sync_log_synced_at (synced_at)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS graeae_consultations (
+    id                 VARCHAR(64)  NOT NULL,
+    prompt             LONGTEXT     NOT NULL,
+    task_type          VARCHAR(100) NOT NULL,
+    consensus_response LONGTEXT,
+    consensus_score    DOUBLE,
+    winning_muse       VARCHAR(100),
+    cost               DOUBLE       DEFAULT 0,
+    latency_ms         INT          DEFAULT 0,
+    mode               VARCHAR(50)  DEFAULT 'single',
+    owner_id           VARCHAR(256) NOT NULL DEFAULT 'default',
+    namespace          VARCHAR(256) NOT NULL DEFAULT 'default',
+    created            TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at         TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    INDEX idx_graeae_consult_task_type (task_type),
+    INDEX idx_graeae_consult_created (created),
+    INDEX idx_graeae_consult_mode (mode),
+    INDEX idx_graeae_consult_winning_muse (winning_muse),
+    INDEX idx_graeae_consultations_owner (owner_id),
+    INDEX idx_graeae_consultations_owner_namespace (owner_id, namespace),
+    INDEX idx_graeae_consultations_deleted (deleted_at)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS graeae_audit_log (
+    id              VARCHAR(64)  NOT NULL DEFAULT (UUID()),
+    sequence_num    BIGINT       NOT NULL AUTO_INCREMENT,
+    consultation_id VARCHAR(64),
+    prompt          LONGTEXT,
+    prompt_hash     VARCHAR(64),
+    provider        VARCHAR(50),
+    model           VARCHAR(100),
+    response_text   LONGTEXT,
+    response_hash   VARCHAR(64),
+    chain_hash      VARCHAR(64),
+    prev_id         VARCHAR(64),
+    prev_chain_hash VARCHAR(64),
+    task_type       VARCHAR(100),
+    quality_score   DOUBLE,
+    latency_ms      INT,
+    cost_usd        DOUBLE,
+    created_at      TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at      TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_graeae_audit_sequence (sequence_num),
+    INDEX idx_audit_sequence (sequence_num),
+    INDEX idx_audit_created (created_at),
+    INDEX idx_graeae_audit_log_consultation (consultation_id),
+    INDEX idx_graeae_audit_log_created_at (created_at),
+    INDEX idx_graeae_audit_log_chain_hash (chain_hash),
+    INDEX idx_graeae_audit_log_deleted (deleted_at)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS consultation_memory_refs (
+    consultation_id VARCHAR(64) NOT NULL,
+    memory_id       VARCHAR(64) NOT NULL,
+    relevance_score DOUBLE,
+    injected_at     TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (consultation_id, memory_id),
+    INDEX idx_consultation_memory_refs_consultation (consultation_id),
+    INDEX idx_consultation_memory_refs_memory (memory_id),
+    INDEX idx_consultation_memory_refs_injected_at (injected_at)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

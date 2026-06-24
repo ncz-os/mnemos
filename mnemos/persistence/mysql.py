@@ -5,6 +5,14 @@ connection pool.  MySQL 9.0+ is required for the native ``VECTOR``
 column type and ``VECTOR_DISTANCE`` / ``TO_VECTOR`` functions
 used by semantic search.
 
+Positioning — this is MNEMOS's **Enterprise / cloud** MySQL-family vector
+backend. The ``VECTOR_DISTANCE`` function this backend depends on is available
+on **MySQL Enterprise / HeatWave** (and managed services built on them — AWS
+RDS/Aurora MySQL, HeatWave) but is NOT present in MySQL Community Edition
+(verified absent through 9.3). Self-hosted / open-source operators who want
+free native vector search should use the ``mariadb`` backend (MariaDB Community
+ships it) — see ``mnemos.persistence.mariadb``.
+
 Key SQL-level differences from Postgres/Oracle:
 
 - Positional ``%s`` placeholders (aiomysql / PyMySQL convention).
