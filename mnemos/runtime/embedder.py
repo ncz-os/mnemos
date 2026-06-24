@@ -31,8 +31,9 @@ Knobs:
   MNEMOS_EMBED_GPU_LAYERS    llama_cpp n_gpu_layers           default 0
   MNEMOS_EMBED_MAX_CHARS     per-call input truncate          default 8000
 
-Both backends produce nomic-embed-text-v1.5 768-dim vectors, matching the
-existing `memories.embedding vector(768)` column.
+The default local backends produce 768-dim vectors. Set
+MNEMOS_EMBEDDING_DIM to match alternate embedding endpoints before the
+schema is provisioned.
 """
 
 from __future__ import annotations
@@ -84,10 +85,10 @@ DEFAULT_HTTP_TIMEOUT = 30.0
 DEFAULT_HTTP_CB_THRESHOLD = 5  # consecutive failures before opening breaker
 DEFAULT_HTTP_CB_COOLDOWN = 30.0  # seconds breaker stays open before half-open probe
 # bge-base-en-v1.5: 768-dim, standard BERT-base, fully OpenVINO-supported.
-# Matches the existing `memories.embedding vector(768)` column. Nomic
-# uses a custom nomic_bert arch that optimum-intel's OV exporter does
-# not natively support, so we use BGE for the OV path. Operators who
-# need to preserve the nomic vector space should set
+# Schema provisioning sizes the vector column from MNEMOS_EMBEDDING_DIM.
+# Nomic uses a custom nomic_bert arch that optimum-intel's OV exporter
+# does not natively support, so we use BGE for the OV path. Operators
+# who need to preserve the nomic vector space should set
 # MNEMOS_EMBED_BACKEND=llamacpp.
 DEFAULT_OV_MODEL_ID = "BAAI/bge-base-en-v1.5"
 DEFAULT_OV_DEVICE = "AUTO"
@@ -673,9 +674,7 @@ class InProcessEmbedder:
         self.http_url = http_url or embed_http_url_env()
         # Fallback URL: empty string disables; default = MEDUSA so the primary
         # TYPHON outage path falls to MEDUSA before in-process llamacpp.
-        self.http_url_fallback = (
-            http_url_fallback if http_url_fallback is not None else embed_http_url_fallback_env()
-        )
+        self.http_url_fallback = http_url_fallback if http_url_fallback is not None else embed_http_url_fallback_env()
         self.http_model = http_model or embed_http_model_env()
         self.http_timeout = float(http_timeout if http_timeout is not None else embed_http_timeout_env())
         self.max_text_chars = int(max_text_chars if max_text_chars is not None else embed_max_chars_env())

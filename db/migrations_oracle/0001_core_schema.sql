@@ -355,9 +355,9 @@ BEGIN
     add_col('last_recalled_at',           'last_recalled_at TIMESTAMP WITH TIME ZONE');
     add_col('content_hash',               'content_hash VARCHAR2(64)');
     -- Oracle 23ai VECTOR for native cosine similarity (semantic_search).
-    -- Variable-dim so the same column supports 384/768/1024/1536/3072
-    -- embedding models. FLOAT32 matches the python-oracledb wire format.
-    add_col('embedding',                  'embedding VECTOR(*, FLOAT32)');
+    -- Dimension is substituted by the runtime schema provisioner from
+    -- MNEMOS_EMBEDDING_DIM. FLOAT32 matches the python-oracledb wire format.
+    add_col('embedding',                  'embedding VECTOR({{embedding_dim}}, FLOAT32)');
 END;
 /
 

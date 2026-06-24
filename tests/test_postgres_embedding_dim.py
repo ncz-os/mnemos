@@ -1,11 +1,12 @@
 """Postgres parallel of the SQLite embed-dim configurability.
 
-The `_alter_postgres_embedding_dim()` helper runs after migrations apply
-and re-sizes `memories.embedding` from the baseline `vector(768)` to the
-configured dim. These tests don't require a running Postgres; they verify
-the helper's behavior via its public surface (the `_psql_superuser()`
-shell-out is mocked).
+The `_alter_postgres_embedding_dim()` helper runs after migrations apply,
+re-sizes `memories.embedding` from the baseline `vector(768)` to the
+configured dim, and ensures the HNSW vector index. These tests don't
+require a running Postgres; they verify the helper's behavior via its
+public surface (the `_psql_superuser()` shell-out is mocked).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -92,10 +93,10 @@ def test_alter_idempotent_when_target_768_and_current_already_768(tmp_path):
     target is 768, helper short-circuits without ALTER."""
     cfg = _PgConfig()
     with patch("mnemos.installer.db._psql_superuser") as mock_psql:
-        mock_psql.side_effect = [(0, "vector(768)\n", "")]
+        mock_psql.side_effect = [(0, "vector(768)\n", ""), (0, "hnsw\n", "")]
         rc = _alter_postgres_embedding_dim(cfg, 768)
         assert rc is True
-        assert mock_psql.call_count == 1  # only format_type query
+        assert mock_psql.call_count == 2  # format_type + index-method query
 
 
 def test_alter_512_to_768_refuses_on_populated_db(capsys):
@@ -111,7 +112,7 @@ def test_alter_512_to_768_refuses_on_populated_db(capsys):
     with patch("mnemos.installer.db._psql_superuser") as mock_psql:
         mock_psql.side_effect = [
             (0, "vector(512)\n", ""),  # currently 512
-            (1, "", refuse_err),         # plpgsql RAISE EXCEPTION
+            (1, "", refuse_err),  # plpgsql RAISE EXCEPTION
         ]
         rc = _alter_postgres_embedding_dim(cfg, 768)
         assert rc is False  # refused — not silently passed through
@@ -134,15 +135,17 @@ def test_alter_called_for_non_default_dim_on_empty_table():
     with patch("mnemos.installer.db._psql_superuser") as mock_psql:
         mock_psql.side_effect = [
             (0, "vector(768)\n", ""),  # format_type query
-            (0, "DO\n", ""),             # plpgsql DO block (lock + count + ALTER)
+            (0, "DO\n", ""),  # plpgsql DO block (lock + count + ALTER)
+            (0, "hnsw\n", ""),  # index-method query
         ]
         rc = _alter_postgres_embedding_dim(cfg, 512)
         assert rc is True
-        assert mock_psql.call_count == 2
+        assert mock_psql.call_count == 3
         do_call_sql = mock_psql.call_args_list[1].args[0]
         assert "DO $$" in do_call_sql
         assert "LOCK TABLE memories IN ACCESS EXCLUSIVE MODE" in do_call_sql
         assert "vector(512)" in do_call_sql
+        assert "DROP INDEX IF EXISTS idx_memories_embedding" in do_call_sql
         assert "ALTER TABLE memories" in do_call_sql
 
 
@@ -152,11 +155,12 @@ def test_idempotent_when_column_already_at_target_dim_with_rows():
     with patch("mnemos.installer.db._psql_superuser") as mock_psql:
         mock_psql.side_effect = [
             (0, "vector(512)\n", ""),  # already at target
+            (0, "hnsw\n", ""),  # index already correct
         ]
         rc = _alter_postgres_embedding_dim(cfg, 512)
         assert rc is True
-        # Only the format_type query should fire — no plpgsql.
-        assert mock_psql.call_count == 1
+        # Only the format_type + index-method queries should fire — no plpgsql.
+        assert mock_psql.call_count == 2
 
 
 def test_alter_refuses_on_populated_table_at_different_dim(capsys):
@@ -182,7 +186,7 @@ def test_alter_refuses_on_populated_table_at_different_dim(capsys):
         )
         mock_psql.side_effect = [
             (0, "vector(768)\n", ""),  # format_type
-            (1, "", refuse_err),         # plpgsql RAISE EXCEPTION
+            (1, "", refuse_err),  # plpgsql RAISE EXCEPTION
         ]
         rc = _alter_postgres_embedding_dim(cfg, 512)
         assert rc is False
@@ -201,8 +205,8 @@ def test_alter_refuses_on_populated_table_at_different_dim(capsys):
     assert "memory_embeddings" not in err
 
 
-def test_alter_fails_closed_above_2000_for_ivfflat_compat(capsys):
-    """ivfflat caps at 2000-D; values above must FAIL the install.
+def test_alter_fails_closed_above_2000_for_hnsw_vector_compat(capsys):
+    """HNSW over pgvector's vector type caps at 2000-D; larger dims fail.
 
     Round-2 codex finding: returning True here let the installer persist
     the requested dim into config while leaving the DB schema at the
@@ -217,7 +221,7 @@ def test_alter_fails_closed_above_2000_for_ivfflat_compat(capsys):
     captured = capsys.readouterr()
     assert "out of supported" in captured.err
     assert "3072" in captured.err
-    assert "ivfflat" in captured.err
+    assert "HNSW" in captured.err
     assert "Refusing to proceed" in captured.err
 
 
@@ -282,7 +286,8 @@ def test_format_type_failure_still_runs_plpgsql(capsys):
     with patch("mnemos.installer.db._psql_superuser") as mock_psql:
         mock_psql.side_effect = [
             (1, "", "ERROR: relation memories does not exist"),  # format_type fails
-            (0, "DO\n", ""),                                       # plpgsql succeeds
+            (0, "DO\n", ""),  # plpgsql succeeds
+            (0, "hnsw\n", ""),  # index-method query
         ]
         rc = _alter_postgres_embedding_dim(cfg, 512)
         assert rc is True
@@ -338,8 +343,7 @@ def test_config_from_env_infers_server_profile_with_pg_signals(monkeypatch):
 
     cfg = _config_from_env()
     assert cfg.profile == "server", (
-        f"PG_HOST + PG_PASSWORD env shape should infer 'server' profile, "
-        f"got {cfg.profile!r}"
+        f"PG_HOST + PG_PASSWORD env shape should infer 'server' profile, got {cfg.profile!r}"
     )
 
 
@@ -353,10 +357,7 @@ def test_config_from_env_explicit_profile_wins_over_inference(monkeypatch):
     monkeypatch.setenv("PG_PASSWORD", "secret")
 
     cfg = _config_from_env()
-    assert cfg.profile == "edge", (
-        f"explicit MNEMOS_PROFILE=edge must win over PG_* inference, "
-        f"got {cfg.profile!r}"
-    )
+    assert cfg.profile == "edge", f"explicit MNEMOS_PROFILE=edge must win over PG_* inference, got {cfg.profile!r}"
 
 
 def test_config_from_env_no_pg_signals_falls_back_to_personal(monkeypatch):
@@ -366,9 +367,16 @@ def test_config_from_env_no_pg_signals_falls_back_to_personal(monkeypatch):
 
     monkeypatch.delenv("MNEMOS_PROFILE", raising=False)
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -472,6 +480,7 @@ def test_run_migrations_accepts_localhost_default_port():
     # the locality message).
     import io
     import sys
+
     captured = io.StringIO()
     real_stderr = sys.stderr
     sys.stderr = captured
@@ -594,32 +603,24 @@ def test_has_dsn_config_detects_config_toml_url(monkeypatch, tmp_path):
     from mnemos.installer.__main__ import _has_dsn_config
 
     for k in (
-        "DATABASE_URL", "MNEMOS_DATABASE_URL", "PG_URL",
-        "DATABASE_DSN", "MNEMOS_DATABASE_DSN", "PG_DSN",
+        "DATABASE_URL",
+        "MNEMOS_DATABASE_URL",
+        "PG_URL",
+        "DATABASE_DSN",
+        "MNEMOS_DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[database]\n'
-        'url = "postgres://u:p@h:5432/db"\n'
-        'host = "localhost"\n'
-        'database = "mnemos"\n'
-    )
+    config_path.write_text('[database]\nurl = "postgres://u:p@h:5432/db"\nhost = "localhost"\ndatabase = "mnemos"\n')
     assert _has_dsn_config(str(tmp_path)) is True
 
-    config_path.write_text(
-        '[database]\n'
-        'dsn = "host=h dbname=db user=u password=p"\n'
-    )
+    config_path.write_text('[database]\ndsn = "host=h dbname=db user=u password=p"\n')
     assert _has_dsn_config(str(tmp_path)) is True
 
     # Plain non-DSN config.
-    config_path.write_text(
-        '[database]\n'
-        'host = "localhost"\n'
-        'database = "mnemos"\n'
-    )
+    config_path.write_text('[database]\nhost = "localhost"\ndatabase = "mnemos"\n')
     assert _has_dsn_config(str(tmp_path)) is False
 
 
@@ -652,8 +653,12 @@ def test_upgrade_rejects_dsn_config(monkeypatch):
 
     # Clean env then set DATABASE_URL.
     for k in (
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgres://prod-host/mnemos")
@@ -726,12 +731,7 @@ def test_resolve_runtime_backend_toml_overrides_profile(monkeypatch, tmp_path):
         monkeypatch.delenv(k, raising=False)
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[database]\n'
-        'backend = "postgres"\n'
-        'host = "localhost"\n'
-        'database = "mnemos"\n'
-    )
+    config_path.write_text('[database]\nbackend = "postgres"\nhost = "localhost"\ndatabase = "mnemos"\n')
 
     @dataclass
     class _Cfg:
@@ -791,10 +791,18 @@ def test_resolve_runtime_backend_pg_host_env_forces_postgres(monkeypatch, tmp_pa
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PASSWORD", "PG_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PASSWORD",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_HOST", "10.0.0.5")
@@ -816,12 +824,24 @@ def test_resolve_runtime_backend_password_only_does_not_force_postgres(monkeypat
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_PASSWORD", "rotated-secret")
@@ -843,10 +863,20 @@ def test_resolve_runtime_backend_mnemos_db_env_does_not_force_postgres(monkeypat
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
     # MNEMOS_DB_* alone shouldn't be enough.
@@ -866,9 +896,15 @@ def test_resolve_runtime_backend_dsn_url_forces_postgres(monkeypatch, tmp_path):
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
@@ -888,20 +924,33 @@ def test_resolve_runtime_backend_toml_host_non_default_forces_postgres(monkeypat
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[database]\n'
+        "[database]\n"
         'host = "10.0.0.5"\n'
-        'port = 5432\n'
+        "port = 5432\n"
         'database = "mnemos_prod"\n'
         'user = "mnemos_user"\n'
         'password = "secret"\n'
@@ -924,23 +973,31 @@ def test_resolve_runtime_backend_explicit_toml_fields_force_postgres(monkeypatch
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
     # TOML with explicit [database] connection keys (default values).
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[database]\n'
-        'host = "localhost"\n'
-        'database = "mnemos"\n'
-        'user = "mnemos_user"\n'
-    )
+    config_path.write_text('[database]\nhost = "localhost"\ndatabase = "mnemos"\nuser = "mnemos_user"\n')
 
     @dataclass
     class _CfgEdge:
@@ -954,7 +1011,8 @@ def test_resolve_runtime_backend_explicit_toml_fields_force_postgres(monkeypatch
 
 
 def test_resolve_runtime_backend_pure_sqlite_toml_does_not_force_postgres(
-    monkeypatch, tmp_path,
+    monkeypatch,
+    tmp_path,
 ):
     """Symmetric: a config.toml WITHOUT explicit [database] connection
     fields (the shape _write_config_toml emits for sqlite profiles)
@@ -963,19 +1021,26 @@ def test_resolve_runtime_backend_pure_sqlite_toml_does_not_force_postgres(
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
     # Sqlite config (matches what _write_config_toml emits for edge).
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[database]\n'
-        'sqlite_path = "~/.mnemos/mnemos.db"\n'
-    )
+    config_path.write_text('[database]\nsqlite_path = "~/.mnemos/mnemos.db"\n')
 
     @dataclass
     class _CfgEdge:
@@ -1051,12 +1116,25 @@ def test_resolve_runtime_backend_uses_mnemos_config_path(monkeypatch, tmp_path):
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -1112,10 +1190,7 @@ def test_patch_config_toml_takes_config_path_directly(tmp_path):
 
     # Custom path — not repo_path/config.toml.
     custom = tmp_path / "custom-name.toml"
-    custom.write_text(
-        '[database]\n'
-        'embedding_dim = 768\n'
-    )
+    custom.write_text("[database]\nembedding_dim = 768\n")
 
     rc = _patch_config_toml_embedding_dim(str(custom), 512)
     assert rc is True
@@ -1174,13 +1249,13 @@ def test_load_existing_config_does_not_overlay_mnemos_db_host(monkeypatch, tmp_p
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "server"\n'
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = ""\n'  # empty — should fall to PG_HOST, NOT MNEMOS_DB_HOST
         'database = ""\n'
         'user = ""\n'
         'password = ""\n'
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("MNEMOS_DB_HOST", "10.0.0.5")  # WRONG — runtime ignores
@@ -1209,16 +1284,10 @@ def test_load_existing_config_uses_pg_env_for_empty_fields(monkeypatch, tmp_path
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\nprofile = "server"\n'
-        '[database]\n'
-        'backend = "postgres"\n'
-        'host = ""\n'
-        'database = ""\n'
-        '[api]\nport = 5002\n'
+        '[server]\nprofile = "server"\n[database]\nbackend = "postgres"\nhost = ""\ndatabase = ""\n[api]\nport = 5002\n'
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
-    for k in ("MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-              "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD"):
+    for k in ("MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME", "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_HOST", "prod-host.example")
     monkeypatch.setenv("PG_DATABASE", "mnemos_prod")
@@ -1246,9 +1315,17 @@ def test_runtime_parity_loader_only_uses_pg_for_db_fields(monkeypatch):
 
     for k in (
         "MNEMOS_PROFILE",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -1278,8 +1355,11 @@ def test_runtime_parity_loader_uses_pg_env_when_present(monkeypatch):
 
     for k in (
         "MNEMOS_PROFILE",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_HOST", "prod-host.example")
@@ -1302,9 +1382,17 @@ def test_runtime_parity_loader_does_not_force_postgres_on_mnemos_db_only(monkeyp
 
     for k in (
         "MNEMOS_PROFILE",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -1344,9 +1432,16 @@ def test_runtime_parity_loader_pg_password_alone_does_not_force_postgres(monkeyp
 
     for k in (
         "MNEMOS_PROFILE",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -1370,12 +1465,24 @@ def test_resolve_runtime_backend_password_env_alone_resolves_sqlite(monkeypatch,
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_PASSWORD", "secret")
@@ -1394,7 +1501,8 @@ def test_resolve_runtime_backend_password_env_alone_resolves_sqlite(monkeypatch,
 
 
 def test_resolve_runtime_backend_empty_string_toml_does_not_force_postgres(
-    monkeypatch, tmp_path,
+    monkeypatch,
+    tmp_path,
 ):
     """Round-27 MEDIUM: runtime drops empty-string DB connection
     fields before computing explicit_fields. So `[database] host = ""`
@@ -1405,20 +1513,33 @@ def test_resolve_runtime_backend_empty_string_toml_does_not_force_postgres(
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[database]\n'
+        "[database]\n"
         'host = ""\n'
-        'port = 0\n'  # int 0 isn't dropped (only empty strings) — but ports require explicit non-zero
+        "port = 0\n"  # int 0 isn't dropped (only empty strings) — but ports require explicit non-zero
         'database = ""\n'
         'user = ""\n'
         'password = ""\n'
@@ -1432,13 +1553,7 @@ def test_resolve_runtime_backend_empty_string_toml_does_not_force_postgres(
     # an empty string so it remains as a presence signal — but in
     # practice no one writes port = 0; the sanitization handles the
     # documented `field = ""` shape. Test both shapes:
-    config_path.write_text(
-        '[database]\n'
-        'host = ""\n'
-        'database = ""\n'
-        'user = ""\n'
-        'password = ""\n'
-    )
+    config_path.write_text('[database]\nhost = ""\ndatabase = ""\nuser = ""\npassword = ""\n')
     assert _resolve_runtime_backend(_CfgEdge(), repo_path=str(tmp_path)) == "sqlite"
 
 
@@ -1476,14 +1591,19 @@ def test_load_existing_config_password_only_does_not_force_server(monkeypatch, t
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[database]\n'
+        "[database]\n"
         'password = "secret"\n'  # only password — should not be enough
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
         "MNEMOS_DB_USER",
     ):
         monkeypatch.delenv(k, raising=False)
@@ -1502,10 +1622,20 @@ def test_resolve_runtime_backend_accepts_sqlite3_alias_env(monkeypatch, tmp_path
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_BACKEND", "sqlite3")  # alias
@@ -1523,17 +1653,25 @@ def test_resolve_runtime_backend_accepts_sqlite3_alias_toml(monkeypatch, tmp_pat
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[database]\nbackend = "sqlite3"\n'
-    )
+    config_path.write_text('[database]\nbackend = "sqlite3"\n')
 
     @dataclass
     class _CfgServer:
@@ -1548,16 +1686,19 @@ def test_load_existing_config_sqlite3_alias_keeps_edge_profile(monkeypatch, tmp_
     from mnemos.installer.__main__ import _load_existing_config
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[database]\n'
-        'backend = "sqlite3"\n'
-        '[api]\nport = 5002\n'
-    )
+    config_path.write_text('[database]\nbackend = "sqlite3"\n[api]\nport = 5002\n')
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -1583,14 +1724,14 @@ def test_load_existing_config_ignores_legacy_name_key(monkeypatch, tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "server"\n'
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
         'database = ""\n'  # empty — should fall through to PG_DATABASE/default
         'name = "old_db"\n'  # legacy key — runtime ignores
         'user = "mnemos_user"\n'
         'password = ""\n'
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_DATABASE", "prod_db")
@@ -1612,17 +1753,24 @@ def test_load_existing_config_legacy_name_does_not_shadow_default(monkeypatch, t
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "server"\n'
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
         'name = "old_db"\n'  # legacy — should be ignored
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -1646,9 +1794,9 @@ def test_load_existing_config_honors_mnemos_profile_env(monkeypatch, tmp_path):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[database]\n'
+        "[database]\n"
         'backend = ""\n'  # no backend signal
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("MNEMOS_PROFILE", "server")
@@ -1671,9 +1819,9 @@ def test_load_existing_config_honors_mnemos_profile_override(monkeypatch, tmp_pa
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "edge"\n'  # TOML says edge
-        '[database]\n'
+        "[database]\n"
         'backend = "sqlite"\n'
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("MNEMOS_PROFILE_OVERRIDE", "server")
@@ -1693,12 +1841,7 @@ def test_load_existing_config_toml_profile_wins_over_mnemos_profile(monkeypatch,
     from mnemos.installer.__main__ import _load_existing_config
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[server]\nprofile = "edge"\n'
-        '[database]\n'
-        'backend = "sqlite"\n'
-        '[api]\nport = 5002\n'
-    )
+    config_path.write_text('[server]\nprofile = "edge"\n[database]\nbackend = "sqlite"\n[api]\nport = 5002\n')
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.delenv("MNEMOS_PROFILE_OVERRIDE", raising=False)
     monkeypatch.setenv("MNEMOS_PROFILE", "server")  # env says server
@@ -1741,9 +1884,9 @@ def test_cli_profile_server_overrides_stale_edge_toml(monkeypatch, tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "edge"\n'  # stale TOML
-        '[database]\n'
+        "[database]\n"
         'backend = "sqlite"\n'
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     # Simulate `--profile server` having set the override.
@@ -1774,9 +1917,17 @@ def test_runtime_parity_loader_honors_mnemos_profile_override(monkeypatch):
 
     for k in (
         "MNEMOS_PROFILE",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -1793,9 +1944,16 @@ def test_runtime_parity_loader_override_wins_over_mnemos_profile(monkeypatch):
     from mnemos.installer.__main__ import _config_from_env_runtime_parity
 
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("MNEMOS_PROFILE_OVERRIDE", "server")
@@ -1820,13 +1978,26 @@ def test_load_existing_config_no_toml_with_profile_override_returns_config(monke
     from mnemos.installer.__main__ import _load_existing_config
 
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
         "MNEMOS_PROFILE",
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
         "MNEMOS_CONFIG_PATH",
     ):
         monkeypatch.delenv(k, raising=False)
@@ -1843,13 +2014,26 @@ def test_load_existing_config_no_toml_with_pg_backend_returns_config(monkeypatch
     from mnemos.installer.__main__ import _load_existing_config
 
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
         "MNEMOS_CONFIG_PATH",
     ):
         monkeypatch.delenv(k, raising=False)
@@ -1865,13 +2049,26 @@ def test_load_existing_config_no_toml_with_pg_host_returns_config(monkeypatch, t
     from mnemos.installer.__main__ import _load_existing_config
 
     for k in (
-        "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
         "MNEMOS_CONFIG_PATH",
     ):
         monkeypatch.delenv(k, raising=False)
@@ -1887,13 +2084,27 @@ def test_load_existing_config_no_toml_no_signals_returns_none(monkeypatch, tmp_p
     from mnemos.installer.__main__ import _load_existing_config
 
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
         "MNEMOS_CONFIG_PATH",
     ):
         monkeypatch.delenv(k, raising=False)
@@ -1918,10 +2129,19 @@ def test_resolve_runtime_backend_rejects_invalid_env_backend(monkeypatch, tmp_pa
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_BACKEND", "postgress")  # typo
@@ -1942,10 +2162,19 @@ def test_resolve_runtime_backend_accepts_auto_env_backend(monkeypatch, tmp_path)
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_BACKEND", "auto")
@@ -1965,10 +2194,20 @@ def test_resolve_runtime_backend_rejects_invalid_toml_backend(monkeypatch, tmp_p
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2002,9 +2241,14 @@ def test_pg_backend_auto_shadows_toml_then_pg_host_wins(monkeypatch, tmp_path):
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_BACKEND", "auto")
@@ -2031,10 +2275,19 @@ def test_pg_backend_auto_used_when_toml_backend_missing(monkeypatch, tmp_path):
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_BACKEND", "auto")
@@ -2067,16 +2320,26 @@ def test_pg_backend_auto_shadows_toml_postgres_no_other_signals(monkeypatch, tmp
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[database]\nbackend = "postgres"\n'  # shadowed by env auto
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_BACKEND", "auto")
     for k in (
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2102,16 +2365,26 @@ def test_pg_backend_postgres_wins_over_toml_sqlite(monkeypatch, tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[database]\nbackend = "sqlite"\n'  # gets overridden by env
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_BACKEND", "postgres")
     for k in (
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2138,9 +2411,14 @@ def test_resolve_runtime_backend_empty_pg_backend_fails_closed(monkeypatch, tmp_
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_BACKEND", "")  # explicit empty
@@ -2166,8 +2444,12 @@ def test_resolve_runtime_backend_alias_priority_first_present_wins(monkeypatch, 
     monkeypatch.setenv("PERSISTENCE_BACKEND", "")  # higher priority but empty
     monkeypatch.setenv("PG_BACKEND", "postgres")  # lower priority — should NOT win
     for k in (
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2193,16 +2475,26 @@ def test_load_existing_config_empty_pg_backend_shadows_toml_backend(monkeypatch,
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[database]\nbackend = "postgres"\n'  # shadowed by empty env
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_BACKEND", "")  # explicit empty shadows
     for k in (
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2228,20 +2520,27 @@ def test_load_existing_config_preserves_explicit_port_zero(monkeypatch, tmp_path
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "server"\n'
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
-        'port = 0\n'  # explicit invalid port
+        "port = 0\n"  # explicit invalid port
         'database = "mnemos"\n'
         'user = "mnemos_user"\n'
         'password = "secret"\n'
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2309,14 +2608,20 @@ def test_load_existing_config_empty_pg_port_fails_closed(monkeypatch, tmp_path):
     config_path.write_text(
         '[server]\nprofile = "server"\n'
         '[database]\nhost = "localhost"\nport = ""\n'  # explicit empty
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_PORT", "")  # explicit empty
     for k in (
-        "PG_HOST", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2327,11 +2632,7 @@ def test_load_existing_config_empty_pg_port_fails_closed(monkeypatch, tmp_path):
     # round-38 behavior. Round-39 specifically targets PG_PORT=
     # garbage (non-empty malformed). Test that scenario:
     monkeypatch.setenv("PG_PORT", "bad-value")
-    config_path.write_text(
-        '[server]\nprofile = "server"\n'
-        '[database]\nhost = "localhost"\n'
-        '[api]\nport = 5002\n'
-    )
+    config_path.write_text('[server]\nprofile = "server"\n[database]\nhost = "localhost"\n[api]\nport = 5002\n')
     with _pytest.raises(ValueError) as exc_info:
         _load_existing_config(str(tmp_path))
     assert "Invalid Postgres port" in str(exc_info.value)
@@ -2383,17 +2684,19 @@ def test_load_existing_config_explicit_empty_pg_port_fails_closed(monkeypatch, t
     from mnemos.installer.__main__ import _load_existing_config
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[server]\nprofile = "server"\n'
-        '[database]\nhost = "localhost"\n'
-        '[api]\nport = 5002\n'
-    )
+    config_path.write_text('[server]\nprofile = "server"\n[database]\nhost = "localhost"\n[api]\nport = 5002\n')
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_PORT", "")  # explicit empty
     for k in (
-        "PG_HOST", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2408,16 +2711,19 @@ def test_load_existing_config_absent_pg_port_uses_default(monkeypatch, tmp_path)
     from mnemos.installer.__main__ import _load_existing_config
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[server]\nprofile = "server"\n'
-        '[database]\nhost = "localhost"\n'
-        '[api]\nport = 5002\n'
-    )
+    config_path.write_text('[server]\nprofile = "server"\n[database]\nhost = "localhost"\n[api]\nport = 5002\n')
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2435,18 +2741,26 @@ def test_load_existing_config_present_but_absent_embedding_dim_uses_default(monk
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "server"\n'
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
         'database = "mnemos"\n'
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     for k in (
-        "MNEMOS_EMBEDDING_DIM", "PG_EMBEDDING_DIM",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "MNEMOS_EMBEDDING_DIM",
+        "PG_EMBEDDING_DIM",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2468,17 +2782,19 @@ def test_load_existing_config_explicit_empty_pg_host_fails_closed(monkeypatch, t
     from mnemos.installer.__main__ import _load_existing_config
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[server]\nprofile = "server"\n'
-        '[database]\nbackend = "postgres"\n'
-        '[api]\nport = 5002\n'
-    )
+    config_path.write_text('[server]\nprofile = "server"\n[database]\nbackend = "postgres"\n[api]\nport = 5002\n')
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_HOST", "")  # explicit empty
     for k in (
-        "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2496,16 +2812,20 @@ def test_load_existing_config_explicit_empty_pg_database_fails_closed(monkeypatc
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\nprofile = "server"\n'
-        '[database]\nbackend = "postgres"\nhost = "localhost"\n'
-        '[api]\nport = 5002\n'
+        '[server]\nprofile = "server"\n[database]\nbackend = "postgres"\nhost = "localhost"\n[api]\nport = 5002\n'
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_DATABASE", "")
     for k in (
-        "PG_HOST", "PG_PORT", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2521,16 +2841,20 @@ def test_load_existing_config_explicit_empty_pg_user_fails_closed(monkeypatch, t
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\nprofile = "server"\n'
-        '[database]\nbackend = "postgres"\nhost = "localhost"\n'
-        '[api]\nport = 5002\n'
+        '[server]\nprofile = "server"\n[database]\nbackend = "postgres"\nhost = "localhost"\n[api]\nport = 5002\n'
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_USER", "")
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2547,18 +2871,24 @@ def test_load_existing_config_pg_database_explicit_value_wins(monkeypatch, tmp_p
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "server"\n'
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
         'database = ""\n'  # empty TOML placeholder
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_DATABASE", "prod_db")
     for k in (
-        "PG_HOST", "PG_PORT", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2583,10 +2913,17 @@ def test_runtime_parity_loader_rejects_explicit_empty_pg_host(monkeypatch):
     from mnemos.installer.__main__ import _config_from_env_runtime_parity
 
     for k in (
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "PG_PORT", "PG_DATABASE", "PG_USER",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_HOST", "")  # explicit empty
@@ -2603,10 +2940,17 @@ def test_runtime_parity_loader_rejects_explicit_empty_pg_database(monkeypatch):
     from mnemos.installer.__main__ import _config_from_env_runtime_parity
 
     for k in (
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "PG_HOST", "PG_PORT", "PG_USER",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_USER",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_DATABASE", "")
@@ -2624,10 +2968,17 @@ def test_runtime_parity_loader_pg_host_present_signals_postgres(monkeypatch):
     from mnemos.installer.__main__ import _config_from_env_runtime_parity
 
     for k in (
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "PG_PORT", "PG_DATABASE", "PG_USER",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_HOST", "10.0.0.5")
@@ -2645,10 +2996,17 @@ def test_runtime_parity_loader_explicit_empty_pg_port_fails_closed(monkeypatch):
     from mnemos.installer.__main__ import _config_from_env_runtime_parity
 
     for k in (
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "PG_HOST", "PG_DATABASE", "PG_USER",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "PG_HOST",
+        "PG_DATABASE",
+        "PG_USER",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_PORT", "")  # explicit empty
@@ -2674,17 +3032,23 @@ def test_non_empty_toml_host_wins_over_pg_host_env(monkeypatch, tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "server"\n'
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "production.example.com"\n'  # non-empty TOML wins
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_HOST", "stale-staging-host")  # should NOT win
     for k in (
-        "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2700,18 +3064,24 @@ def test_non_empty_toml_database_wins_over_pg_database_env(monkeypatch, tmp_path
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "server"\n'
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
         'database = "mnemos_prod"\n'  # non-empty TOML wins
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_DATABASE", "staging_db")  # should NOT win
     for k in (
-        "PG_HOST", "PG_PORT", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2727,18 +3097,24 @@ def test_non_empty_toml_port_wins_over_pg_port_env(monkeypatch, tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "server"\n'
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
-        'port = 5432\n'  # non-empty TOML wins
-        '[api]\nport = 5002\n'
+        "port = 5432\n"  # non-empty TOML wins
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_PORT", "9999")  # should NOT win
     for k in (
-        "PG_HOST", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2755,19 +3131,24 @@ def test_pg_env_fills_when_toml_field_missing(monkeypatch, tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "server"\n'
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = ""\n'  # empty placeholder
         'database = ""\n'
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_HOST", "production.example.com")
     monkeypatch.setenv("PG_DATABASE", "mnemos_prod")
     for k in (
-        "PG_PORT", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_PORT",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2833,11 +3214,21 @@ def test_resolve_runtime_backend_matches_runtime_settings_for_pg_backend_postgre
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_BACKEND", "postgres")
     for k in (
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2859,11 +3250,21 @@ def test_resolve_runtime_backend_matches_runtime_settings_for_pg_backend_sqlite(
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_BACKEND", "sqlite")
     for k in (
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2891,10 +3292,20 @@ def test_resolve_runtime_backend_whitespace_toml_backend_fails_closed(monkeypatc
     from mnemos.installer.__main__ import _resolve_runtime_backend
 
     for k in (
-        "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+        "MNEMOS_PERSISTENCE_BACKEND",
+        "PERSISTENCE_BACKEND",
+        "PG_BACKEND",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2952,17 +3363,19 @@ def test_load_existing_config_whitespace_pg_host_fails_closed(monkeypatch, tmp_p
     from mnemos.installer.__main__ import _load_existing_config
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[server]\nprofile = "server"\n'
-        '[database]\nbackend = "postgres"\n'
-        '[api]\nport = 5002\n'
-    )
+    config_path.write_text('[server]\nprofile = "server"\n[database]\nbackend = "postgres"\n[api]\nport = 5002\n')
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_HOST", "   ")  # whitespace-only
     for k in (
-        "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -2979,16 +3392,23 @@ def test_load_existing_config_whitespace_toml_host_fails_closed(monkeypatch, tmp
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "server"\n'
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "   "\n'  # whitespace-only TOML
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -3031,17 +3451,19 @@ def test_load_existing_config_padded_pg_host_fails_closed(monkeypatch, tmp_path)
     from mnemos.installer.__main__ import _load_existing_config
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[server]\nprofile = "server"\n'
-        '[database]\nbackend = "postgres"\n'
-        '[api]\nport = 5002\n'
-    )
+    config_path.write_text('[server]\nprofile = "server"\n[database]\nbackend = "postgres"\n[api]\nport = 5002\n')
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("PG_HOST", " localhost")  # padded
     for k in (
-        "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -3058,16 +3480,23 @@ def test_load_existing_config_padded_toml_host_fails_closed(monkeypatch, tmp_pat
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         '[server]\nprofile = "server"\n'
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = " localhost "\n'  # padded TOML
-        '[api]\nport = 5002\n'
+        "[api]\nport = 5002\n"
     )
     monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(config_path))
     for k in (
-        "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-        "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-        "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+        "PG_HOST",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "PG_PASSWORD",
+        "MNEMOS_DB_HOST",
+        "MNEMOS_DB_PORT",
+        "MNEMOS_DB_NAME",
+        "MNEMOS_DB_USER",
+        "MNEMOS_DB_PASSWORD",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -3082,10 +3511,17 @@ def test_runtime_parity_loader_padded_pg_host_fails_closed(monkeypatch):
     from mnemos.installer.__main__ import _config_from_env_runtime_parity
 
     for k in (
-        "MNEMOS_PROFILE", "MNEMOS_PROFILE_OVERRIDE",
-        "PG_PORT", "PG_DATABASE", "PG_USER",
-        "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-        "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+        "MNEMOS_PROFILE",
+        "MNEMOS_PROFILE_OVERRIDE",
+        "PG_PORT",
+        "PG_DATABASE",
+        "PG_USER",
+        "MNEMOS_DATABASE_URL",
+        "DATABASE_URL",
+        "PG_URL",
+        "MNEMOS_DATABASE_DSN",
+        "DATABASE_DSN",
+        "PG_DSN",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PG_HOST", "localhost ")  # padded

@@ -42,19 +42,29 @@ CREATE TABLE IF NOT EXISTS memories (
   original_token_count INT,
   compressed_token_count INT,
 
-  -- Vector embedding
+  -- Vector embedding. Runtime provisioning substitutes this baseline
+  -- dimension with MNEMOS_EMBEDDING_DIM before applying the schema.
   embedding vector(768),
 
   -- Indexes
   CONSTRAINT valid_quality_rating CHECK (quality_rating IS NULL OR (quality_rating >= 0 AND quality_rating <= 100))
 );
 
+-- PG schema parity (2026-06-23): columns the federation copy_embeddings +
+-- supersession code paths write but earlier PG migrations never added (they
+-- exist on the MySQL/MariaDB/Oracle/DB2 schemas). Idempotent so both fresh
+-- standups and existing databases converge. Without these, federation writes
+-- to a freshly-stood-up PG replica fail with "column ... does not exist".
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding_model TEXT;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by TEXT;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS federation_last_pushed_at TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
 CREATE INDEX IF NOT EXISTS idx_memories_task_type ON memories(task_type);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_is_compressed ON memories(is_compressed);
 CREATE INDEX IF NOT EXISTS idx_memories_original_reference ON memories(original_reference);
-CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING ivfflat(embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
 
 -- compression_quality_log: Audit trail of all compression operations
 CREATE TABLE IF NOT EXISTS compression_quality_log (
