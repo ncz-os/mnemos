@@ -16,7 +16,7 @@ import pytest
 from fastapi import HTTPException
 
 from mnemos.domain import federation
-from mnemos.webhooks import validation
+from mnemos.core import net_validation as validation
 
 
 pytestmark = pytest.mark.asyncio
@@ -92,7 +92,7 @@ async def test_make_safe_client_pins_dns_on_success(monkeypatch):
 
 async def _async_validate(url, allow_private=None):
     """Return a ValidatedWebhookURL with a pinned public IP (no real DNS)."""
-    from mnemos.webhooks.validation import ValidatedWebhookURL
+    from mnemos.core.net_validation import ValidatedWebhookURL
 
     return ValidatedWebhookURL(
         url=url,

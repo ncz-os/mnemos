@@ -27,7 +27,7 @@ import asyncio
 import pytest
 from fastapi import HTTPException
 
-from mnemos.webhooks import validation as wv
+from mnemos.core import net_validation as wv
 
 
 @pytest.mark.asyncio
