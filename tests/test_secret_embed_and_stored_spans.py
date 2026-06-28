@@ -13,7 +13,6 @@ from __future__ import annotations
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.core.secret_detection import (
     _stored_spans,
-    redact,
     redact_content,
     redact_field_with_stored,
 )

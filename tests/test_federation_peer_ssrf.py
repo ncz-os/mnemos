@@ -5,7 +5,7 @@ from fastapi import HTTPException
 
 from mnemos.api.routes import federation
 from mnemos.core import config
-from mnemos.webhooks import validation
+from mnemos.core import net_validation as validation
 
 
 pytestmark = pytest.mark.asyncio

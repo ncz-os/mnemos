@@ -1527,14 +1527,11 @@ def db2_vector_index_override() -> str | None:
     return os.environ.get("MNEMOS_DB2_VECTOR_INDEX")
 
 
-def db2_vector_indexing_override() -> str | None:
-    """Return the raw ``DB2_VECTOR_INDEXING`` env override, if present.
-
-    Distinguishes "unset" (``None``) from "set to a disabling value" so a caller
-    can treat an explicit non-truthy value as an opt-out of vector-index DDL.
-    """
-    if "DB2_VECTOR_INDEXING" not in os.environ:
-        return None
+def db2_vector_indexing_env() -> str | None:
+    """Return the raw ``DB2_VECTOR_INDEXING`` toggle, if present. Controls
+    whether ``CREATE VECTOR INDEX`` statements run during Db2 migrations.
+    Centralized here so runtime env reads route through core.config
+    (env-discipline gate)."""
     return os.environ.get("DB2_VECTOR_INDEXING")
 
 
