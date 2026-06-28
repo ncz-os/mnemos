@@ -237,6 +237,14 @@ def _memory_item_from_row(
     # in a world-readable CLEAN/REDACT memory must NOT cross to a remote
     # peer. Federation has no fleet/root "full content" scope — a peer is a
     # separate cluster — so every feed item is masked.
+    #
+    # F5 (adversarial review 2026-06-28): injection-defense `defend()` is
+    # DELIBERATELY NOT applied here. The feed *replicates* memory content;
+    # framing/quarantining at the producer would bake injection-defense
+    # transforms into the peer's stored copy (a replication-fidelity loss),
+    # and the consuming peer already frames at its own read path. The feed is
+    # replication DATA — LLM-bound framing belongs at the consumer's read
+    # boundary, not on the wire.
     from mnemos.core.secret_detection import redact_content
 
     fed_content = redact_content(row["content"])
@@ -376,13 +384,13 @@ async def _validate_peer_base_url(base_url: str) -> None:
         return
     if parsed.scheme == "http" and allow_insecure:
         logger.warning(
-            "federation: registering insecure peer base_url=%s — " "auth token will be sent in cleartext",
+            "federation: registering insecure peer base_url=%s — auth token will be sent in cleartext",
             base_url,
         )
         return
     raise HTTPException(
         status_code=422,
-        detail="peer base_url must use https:// " "(set FEDERATION_ALLOW_INSECURE=true to permit http, not for prod)",
+        detail="peer base_url must use https:// (set FEDERATION_ALLOW_INSECURE=true to permit http, not for prod)",
     )
 
 
