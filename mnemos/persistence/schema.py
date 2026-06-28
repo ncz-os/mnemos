@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from mnemos.core.config import db2_vector_indexing_override, embedding_dim_env
+from mnemos.core.config import db2_vector_indexing_env, embedding_dim_env
 
 _LOG = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -504,7 +504,7 @@ def _is_benign_db2_error(statement: str, exc: Exception) -> bool:
 def _should_skip_db2_vector_index(statement: str) -> bool:
     if "CREATE VECTOR INDEX" not in statement.upper():
         return False
-    raw = db2_vector_indexing_override()
+    raw = db2_vector_indexing_env()
     return raw is not None and raw.strip().upper() not in {"YES", "ON", "TRUE", "1"}
 
 

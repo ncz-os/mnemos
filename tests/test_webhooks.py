@@ -127,7 +127,7 @@ class TestEventValidation:
         from fastapi import HTTPException
 
         from mnemos.api.routes import webhooks as wh
-        from mnemos.webhooks import validation as webhook_validation
+        from mnemos.core import net_validation as webhook_validation
 
         async def _fake_resolve_addrs(host: str):
             if host == "localhost":
