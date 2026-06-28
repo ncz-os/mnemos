@@ -292,6 +292,23 @@ def _should_redact_secrets(user: UserContext, *, include_secrets: bool = False, 
     return not privileged
 
 
+def _content_redacted_for_embedding(content: str, classified) -> str:
+    """Return ``content`` with secret spans masked, for embedding (F2, 2026-06-28).
+
+    Adversarial review F2: embeddings must not encode raw secret text. The
+    ingest classifier records spans per field (authoritative at ingest);
+    reuse them here rather than recomputing, so the embedding is masked
+    consistently with what was classified. Content with no spans is
+    returned unchanged (no recall cost for clean memories).
+    """
+    from mnemos.core.secret_detection import redact
+
+    spans = (getattr(classified, "redact_fields", None) or {}).get("content") or []
+    if not spans:
+        return content
+    return redact(content, spans)
+
+
 def _should_redact_secrets_for_row(user: UserContext, row) -> bool:
     """Row-aware redact gate for the GET-by-id explicit-fetch escape hatch.
 
@@ -1580,7 +1597,9 @@ async def create_memory(
             # upsert_memory_embedding remains outside so DB write errors
             # still propagate.
             try:
-                vec = await _get_embedding(request.content)
+                # F2 (adversarial review 2026-06-28): embed the span-redacted
+                # content, not raw, so secret text never enters the vector index.
+                vec = await _get_embedding(_content_redacted_for_embedding(request.content, _classified))
             except Exception:
                 logger.exception(
                     "[create_memory] inline embed generation failed for %s; "
@@ -1765,7 +1784,8 @@ async def bulk_create_memories(
                 # Compute embedding first so it can be passed inline to
                 # insert_memory (co-transactional; CHILD C v2, 2026-06-06).
                 try:
-                    vec = await _get_embedding(mem.content)
+                    # F2 (adversarial review 2026-06-28): embed span-redacted content.
+                    vec = await _get_embedding(_content_redacted_for_embedding(mem.content, _classified))
                 except Exception:
                     logger.exception(
                         "[bulk_create_memories] inline embed generation failed for %s; "
