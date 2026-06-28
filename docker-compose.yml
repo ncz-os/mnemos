@@ -32,6 +32,7 @@ services:
       # (see EVOLUTION.md "decisions we would revisit" — the two
       # canonical ordering sites must stay in sync until we move to
       # Alembic or sqitch).
+      - ./db/0_init_roles_staging.sql:/docker-entrypoint-initdb.d/00-init-roles.sql
       - ./db/migrations.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./db/migrations_v1_multiuser.sql:/docker-entrypoint-initdb.d/02-multiuser.sql
       - ./db/migrations_v2_versioning.sql:/docker-entrypoint-initdb.d/03-versioning.sql
@@ -93,6 +94,17 @@ services:
       - ./db/migrations_v5_3_3_deletion_log_export_index.sql:/docker-entrypoint-initdb.d/59-deletion-log-export-index.sql
       - ./db/migrations_v5_3_4_mcp_audit_log.sql:/docker-entrypoint-initdb.d/60-mcp-audit-log.sql
       - ./db/migrations_v5_3_5_model_registry_capabilities_gin.sql:/docker-entrypoint-initdb.d/61-model-registry-capabilities-gin.sql
+      - ./db/migrations/0021_hive_agents.sql:/docker-entrypoint-initdb.d/61a-hive-agents.sql
+      - ./db/migrations/0022_hive_jobs.sql:/docker-entrypoint-initdb.d/61b-hive-jobs.sql
+      - ./db/migrations/0023_hive_messages.sql:/docker-entrypoint-initdb.d/61c-hive-messages.sql
+      - ./db/migrations/0024_hive_events.sql:/docker-entrypoint-initdb.d/61d-hive-events.sql
+      - ./db/migrations/0025_hive_cache.sql:/docker-entrypoint-initdb.d/61e-hive-cache.sql
+      - ./db/migrations/0026_hive_worker_kind_stats.sql:/docker-entrypoint-initdb.d/61f-hive-worker-kind-stats.sql
+      - ./db/migrations/0027_hive_scheduled_jobs.sql:/docker-entrypoint-initdb.d/61g-hive-scheduled-jobs.sql
+      - ./db/migrations/0028_federation_peers_copy_embeddings.sql:/docker-entrypoint-initdb.d/61h-federation-peers-copy-embeddings.sql
+      - ./db/migrations/0029_memory_audit_chain.sql:/docker-entrypoint-initdb.d/61i-memory-audit-chain.sql
+      - ./db/migrations/0030_memory_audit_roots.sql:/docker-entrypoint-initdb.d/61j-memory-audit-roots.sql
+      - ./db/migrations/0031_memory_category_decay.sql:/docker-entrypoint-initdb.d/61k-memory-category-decay.sql
       - ./db/migrations/0032_usage_ledger.sql:/docker-entrypoint-initdb.d/62-usage-ledger.sql
       - ./db/migrations/0033_subscription_plans.sql:/docker-entrypoint-initdb.d/63-subscription-plans.sql
       - ./db/migrations/0034_usage_ledger_session_tracking.sql:/docker-entrypoint-initdb.d/64-usage-ledger-session-tracking.sql
@@ -102,7 +114,8 @@ services:
       - ./db/migrations/0038_oauth_sessions_consultations.sql:/docker-entrypoint-initdb.d/68-oauth-sessions-consultations.sql
       - ./db/migrations/0039_knemon_dispatch_rule_refresh.sql:/docker-entrypoint-initdb.d/69-knemon-dispatch-rule-refresh.sql
       - ./db/migrations/0039_subscription_plan_current_limits.sql:/docker-entrypoint-initdb.d/70-subscription-plan-current-limits.sql
-      - ./db/migrations/0043_memory_acl.sql:/docker-entrypoint-initdb.d/71-memory-acl.sql
+      - ./db/migrations/0040_memory_compression_queue_parity.sql:/docker-entrypoint-initdb.d/71-memory-compression-queue-parity.sql
+      - ./db/migrations/0043_memory_acl.sql:/docker-entrypoint-initdb.d/72-memory-acl.sql
     ports:
       - '127.0.0.1:5432:5432'
     healthcheck:
@@ -232,12 +245,13 @@ services:
   mnemos:
     build:
       context: .
+      dockerfile: Dockerfile.arm64-cuda
+    image: mnemos-os:arm64-cuda
+    runtime: nvidia
     command: ["mnemos", "serve"]
     depends_on:
       postgres:
         condition: service_healthy
-      postgres-upgrade:
-        condition: service_completed_successfully
     environment:
       PG_USER: mnemos_user
       PG_PASSWORD: ${POSTGRES_PASSWORD:-mnemos_local}
@@ -248,7 +262,10 @@ services:
       # MNEMOS_DATABASE_DSN: postgres://mnemos_user:${POSTGRES_PASSWORD:-mnemos_local}@postgres:5432/mnemos
       # MNEMOS_DATABASE_DSN: oracle://MNEMOS:${ORACLE_PASSWORD:-changeme}@oracle-ee:1521/ORCLPDB1
       # MNEMOS_DATABASE_DSN: db2://MNEMOS:${DB2_PASSWORD:-changeme}@db2-eap:50000/MNEMOS
-      INFERENCE_EMBED_HOST: http://ollama:11434
+      MNEMOS_EMBED_BACKEND: llamacpp
+      MNEMOS_EMBED_GPU_LAYERS: "999"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
       # On Linux: use http://172.17.0.1:5001 or add --add-host=host.docker.internal:host-gateway
       GRAEAE_URL: ${GRAEAE_URL:-http://host.docker.internal:5001}
       MNEMOS_PROFILE: personal

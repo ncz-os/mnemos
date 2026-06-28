@@ -1,0 +1,17 @@
+[Unit]
+Description=Spark relay enqueuer (PYTHIA side) — hive nvidia jobs -> GCS bucket
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jasonperlow
+WorkingDirectory=/home/jasonperlow/mnemos
+# Secrets via EnvironmentFile (mode 0600). Populate from ~/.api_keys_master.json.
+EnvironmentFile=/home/jasonperlow/.config/spark-relay/relay.env
+ExecStart=/home/jasonperlow/mnemos/.venv/bin/python -m spark_relay.enqueuer --interval 15
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,67 @@
+# MNEMOS-OS Dockerfile — arm64 / PostgreSQL-profile image (GB10 DGX Spark, sm_121).
+#
+# Divergence from the default x86 Dockerfile:
+#   - No Intel OpenCL ICD / IGC / Level-Zero layer (those ship amd64-only .debs).
+#   - Trimmed requirements (requirements.arm64.txt): drops openvino, optimum-intel,
+#     transformers, torch — all Intel/x86-oriented and unused on the llama-cpp path.
+#   - Embedding backend pinned to llama-cpp-python (MNEMOS_EMBED_BACKEND=llamacpp),
+#     the portable GGUF path that builds and runs natively on arm64. The OpenVINO
+#     backend (_select_backend in mnemos/runtime/embedder.py) is never attempted.
+# All embeddings stay in-process (operator-locked mem_1779334716543_f8ebd4); the
+# default nomic-embed-text-v1.5.Q8_0 GGUF (768-dim) matches the pgvector column.
+
+# Stage 1: Builder with uv (fast dependency installation)
+FROM python:3.11-slim as builder
+
+WORKDIR /app
+
+# build tools for asyncpg (libpq) + llama-cpp-python (cmake/scikit-build-core)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ cmake libpq-dev curl git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+COPY pyproject.toml .
+COPY requirements.arm64.txt .
+
+RUN uv pip install --system -r requirements.arm64.txt
+
+# Stage 2: Runtime (minimal footprint)
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# libpq5 for asyncpg; libgomp1 for llama-cpp-python OpenMP; curl for the GGUF fetch.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 libgomp1 curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+
+COPY . .
+
+RUN python -m pip install --no-deps --no-build-isolation .
+
+# In-process embedding model (llama-cpp-python path). nomic-embed-text-v1.5.Q8_0
+# is 768-dim, matching the memories.embedding vector(768) pgvector column.
+RUN mkdir -p /opt/mnemos/models && \
+    curl -fsSL -o /opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf \
+      https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf
+
+ENV PG_USER=mnemos_user \
+    PG_DATABASE=mnemos \
+    PG_HOST=postgres \
+    MNEMOS_EMBED_BACKEND=llamacpp \
+    MNEMOS_EMBED_MODEL_PATH=/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf \
+    MNEMOS_BIND=0.0.0.0 \
+    MNEMOS_PORT=5002 \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 5002
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:5002/health\").read()" || exit 1
+
+CMD ["mnemos", "serve"]

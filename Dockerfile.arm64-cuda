@@ -1,0 +1,81 @@
+# MNEMOS-OS Dockerfile — arm64 / CUDA-accelerated embeddings (GB10 DGX Spark, sm_121).
+#
+# Same PostgreSQL-profile image as Dockerfile.arm64, but llama-cpp-python is built
+# from source against the CUDA 12.9 toolkit (its nvcc supports compute_121; 12.8 does not) so the
+# nomic-embed GGUF runs on the GB10 GPU instead of CPU. The 12.8-built binary runs
+# fine on the box's 13.0 driver. MNEMOS_EMBED_GPU_LAYERS=999 offloads all layers.
+#
+# A /opt/venv virtualenv is built then copied wholesale to the runtime stage, so the
+# package path is stable across the CUDA/Ubuntu base (which splits dist-packages).
+# Embeddings stay in-process (operator-locked mem_1779334716543_f8ebd4); the default
+# nomic-embed-text-v1.5.Q8_0 GGUF (768-dim) matches the pgvector vector(768) column.
+
+# Stage 1: Builder — CUDA devel toolkit (nvcc) + Python 3.12 (ubuntu24.04 default)
+FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS builder
+
+WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-dev python3-venv \
+    gcc g++ cmake ninja-build libpq-dev curl git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir --upgrade pip
+
+COPY pyproject.toml .
+COPY requirements.arm64.txt .
+
+# Build llama-cpp-python from source with CUDA enabled for sm_121 (GB10).
+# --no-binary forces a source build so CMAKE_ARGS take effect; everything else
+# resolves to wheels as usual.
+# compat/ ships libcuda.so.1 (driver stub); symlink it into a default linker
+# search dir so executable links resolve the CUDA driver symbols at build time
+# (no GPU/driver present in the builder). The host driver provides it at runtime.
+RUN ln -sf /usr/local/cuda-12.9/compat/libcuda.so.1 /usr/lib/aarch64-linux-gnu/libcuda.so.1 && \
+    ln -sf /usr/local/cuda-12.9/compat/libcuda.so.1 /usr/lib/aarch64-linux-gnu/libcuda.so && \
+    ldconfig
+ENV CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=121 -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF" \
+    FORCE_CMAKE=1
+RUN pip install --no-cache-dir --no-binary llama-cpp-python -r requirements.arm64.txt
+
+COPY . .
+RUN pip install --no-cache-dir --no-deps .
+
+# Stage 2: Runtime — CUDA runtime libs (no nvcc), Python 3.12
+FROM nvidia/cuda:12.9.1-runtime-ubuntu24.04
+
+WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 libpq5 libgomp1 curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY . .
+
+RUN mkdir -p /opt/mnemos/models && \
+    curl -fsSL -o /opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf \
+      https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf
+
+ENV PG_USER=mnemos_user \
+    PG_DATABASE=mnemos \
+    PG_HOST=postgres \
+    MNEMOS_EMBED_BACKEND=llamacpp \
+    MNEMOS_EMBED_MODEL_PATH=/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf \
+    MNEMOS_EMBED_GPU_LAYERS=999 \
+    MNEMOS_BIND=0.0.0.0 \
+    MNEMOS_PORT=5002 \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 5002
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen(\"http://localhost:5002/health\").read()" || exit 1
+
+CMD ["mnemos", "serve"]
