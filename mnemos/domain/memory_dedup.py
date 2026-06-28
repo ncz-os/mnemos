@@ -13,6 +13,7 @@ from typing import Any
 
 from mnemos.audit.route_helper import write_audit_entry
 from mnemos.core.config import get_settings
+from mnemos.core.secret_detection import redact_field_with_stored
 from mnemos.nats.client import get_node_name as _nats_get_node_name
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.workers.audit_sealer import audit_chain_enabled
@@ -114,7 +115,9 @@ async def _maybe_write_delete_audit(backend: Any, tx: Any, row: Any, memory_id: 
     )
 
 
-async def _dispatch_delete_side_effects(backend: Any, tx: Any, row: Any) -> tuple[list[str], list[tuple[str, dict[str, Any], str]]]:
+async def _dispatch_delete_side_effects(
+    backend: Any, tx: Any, row: Any
+) -> tuple[list[str], list[tuple[str, dict[str, Any], str]]]:
     delivery_ids: list[str] = []
     if getattr(backend, "supports_webhooks", True):
         delivery_ids = await backend.webhooks.dispatch_event(
@@ -124,7 +127,13 @@ async def _dispatch_delete_side_effects(backend: Any, tx: Any, row: Any) -> tupl
                 "memory_id": _row_get(row, "id"),
                 "category": _row_get(row, "category"),
                 "subcategory": _row_get(row, "subcategory"),
-                "content": _row_get(row, "content"),
+                # F3: span-redact outbound webhook content (prefer stored ingest
+                # spans, else recompute) — raw secrets must not leave the server.
+                "content": redact_field_with_stored(
+                    _row_get(row, "content"),
+                    _row_get(row, "metadata"),
+                    "content",
+                ),
                 "owner_id": _row_get(row, "owner_id"),
                 "namespace": _row_get(row, "namespace"),
             },
