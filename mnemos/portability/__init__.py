@@ -9,6 +9,7 @@ Architecture decision: MNEMOS `mem_1782679514682_85c817` (GRAEAE consult
 e3f81616, 2026-06-28).
 """
 
+from mnemos.portability.charon import export_bundle, import_bundle
 from mnemos.portability.mif import (
     MIF_CONTEXT_URI,
     category_to_mif_type,
@@ -21,6 +22,8 @@ from mnemos.portability.mif import (
 )
 
 __all__ = [
+    "export_bundle",
+    "import_bundle",
     "MIF_CONTEXT_URI",
     "category_to_mif_type",
     "concept_to_markdown",
