@@ -309,6 +309,20 @@ def _content_redacted_for_embedding(content: str, classified) -> str:
     return redact(content, spans)
 
 
+def _redacted_for_webhook(content: str, metadata) -> str:
+    """Span-redact ``content`` for outbound webhook payloads (F3, 2026-06-28).
+
+    Webhook payloads leave the server to an external HTTP endpoint; raw
+    secret content must not leak there (a non-root REST read would mask
+    it, and the receiver may feed the payload to an LLM). Use the stored
+    ingest spans when available, else recompute, matching the
+    redact-at-retrieval contract.
+    """
+    from mnemos.core.secret_detection import redact_field_with_stored
+
+    return redact_field_with_stored(content, metadata, "content")
+
+
 def _should_redact_secrets_for_row(user: UserContext, row) -> bool:
     """Row-aware redact gate for the GET-by-id explicit-fetch escape hatch.
 
@@ -541,7 +555,7 @@ async def _insert_memory_with_created_webhook(
         "memory_id": mem_id,
         "category": category,
         "subcategory": subcategory,
-        "content": content,
+        "content": _redacted_for_webhook(content, metadata),
         "owner_id": owner_id,
         "namespace": namespace,
     }
@@ -1655,7 +1669,7 @@ async def create_memory(
                         "memory_id": mem_id,
                         "category": request.category,
                         "subcategory": request.subcategory,
-                        "content": request.content,
+                        "content": _redacted_for_webhook(request.content, _classified.metadata),
                         "owner_id": owner_id,
                         "namespace": namespace,
                     },
@@ -1834,7 +1848,7 @@ async def bulk_create_memories(
                             "memory_id": mid,
                             "category": mem.category,
                             "subcategory": mem.subcategory,
-                            "content": mem.content,
+                            "content": _redacted_for_webhook(mem.content, item_metadata),
                             "owner_id": owner_id,
                             "namespace": namespace,
                         },
@@ -1968,7 +1982,7 @@ async def update_memory(
                         "memory_id": memory_id,
                         "category": row["category"],
                         "subcategory": row["subcategory"],
-                        "content": row["content"],
+                        "content": _redacted_for_webhook(row["content"], row.get("metadata")),
                         "owner_id": row["owner_id"],
                         "namespace": row["namespace"],
                     },
@@ -2063,7 +2077,7 @@ async def delete_memory(
                         "memory_id": row["id"],
                         "category": row["category"],
                         "subcategory": row["subcategory"],
-                        "content": row["content"],
+                        "content": _redacted_for_webhook(row["content"], row.get("metadata")),
                         "owner_id": row["owner_id"],
                         "namespace": row["namespace"],
                     },
