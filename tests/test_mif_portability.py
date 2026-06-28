@@ -140,3 +140,27 @@ def test_minimal_memory_still_valid():
 def test_markdown_rejects_missing_frontmatter():
     with pytest.raises(ValueError):
         mif.markdown_to_concept("no frontmatter here")
+
+
+def test_metadata_mif_type_is_authoritative_over_category():
+    """Phase 2a: a persisted metadata.mif_type pins the base type (all-backend,
+    no schema migration) over the category fallback."""
+    # category 'facts' -> semantic by the map; metadata pins it episodic.
+    c = mif.memory_to_concept(
+        _memory(category="facts", mif_type=None, metadata={"mif_type": "episodic"})
+    )
+    assert c["conceptType"] == "episodic"
+
+
+def test_explicit_mif_type_field_beats_metadata():
+    c = mif.memory_to_concept(
+        _memory(mif_type="procedural", metadata={"mif_type": "episodic"})
+    )
+    assert c["conceptType"] == "procedural"
+
+
+def test_metadata_json_string_mif_type_resolves():
+    import json as _json
+
+    c = mif.memory_to_concept(_memory(category="facts", mif_type=None, metadata=_json.dumps({"mif_type": "procedural"})))
+    assert c["conceptType"] == "procedural"

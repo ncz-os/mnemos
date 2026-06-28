@@ -93,11 +93,21 @@ def category_to_mif_type(category: str | None) -> str:
 
 
 def resolve_mif_type(memory: dict[str, Any]) -> str:
-    """Authoritative base type: the native ``mif_type`` field when present and
-    valid, else the category migration fallback."""
+    """Authoritative base type, in priority order:
+
+    1. the native ``mif_type`` field (a future dedicated column),
+    2. a persisted ``metadata.mif_type`` — the all-backend, no-migration way to
+       set an authoritative type at ingest (the existing JSON metadata column
+       exists on every backend), so a memory whose true nature differs from its
+       category can pin it,
+    3. the ``category`` migration fallback (always yields a valid type).
+    """
     native = (memory.get("mif_type") or "").strip().lower()
     if native in _VALID_TYPES:
         return native
+    meta_type = str(_coerce_meta(memory.get("metadata")).get("mif_type") or "").strip().lower()
+    if meta_type in _VALID_TYPES:
+        return meta_type
     return category_to_mif_type(memory.get("category"))
 
 
