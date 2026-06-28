@@ -17,7 +17,7 @@ cloud-metadata endpoint. Webhook delivery was already defended; this
 makes federation pull equivalent.
 
 The SSRF validator (``validate_webhook_url``) lives in
-``mnemos.webhooks.validation``; it is imported lazily inside
+``mnemos.core.net_validation``; it is imported lazily inside
 ``make_safe_client`` to avoid a circular import (importing this module must
 not trigger ``mnemos.webhooks.__init__``, which loads the webhook sender,
 which imports this module).
@@ -33,7 +33,7 @@ from httpcore._backends.auto import AutoBackend
 import httpx
 
 if TYPE_CHECKING:
-    from mnemos.webhooks.validation import ValidatedWebhookURL
+    from mnemos.core.net_validation import ValidatedWebhookURL
 
 
 class _PinnedDNSBackend(httpcore.AsyncNetworkBackend):
@@ -117,7 +117,7 @@ async def make_safe_client(
     (``WEBHOOK_ALLOW_PRIVATE_HOSTS``); pass an explicit bool to override
     (e.g. federation uses ``FEDERATION_ALLOW_PRIVATE``).
     """
-    from mnemos.webhooks.validation import validate_webhook_url  # lazy: avoid circular import
+    from mnemos.core.net_validation import validate_webhook_url
 
     validated = await validate_webhook_url(url, allow_private=allow_private)
     transport = PinnedDNSAsyncHTTPTransport(

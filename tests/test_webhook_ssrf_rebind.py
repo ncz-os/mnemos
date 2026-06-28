@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from mnemos.webhooks import sender, validation
+from mnemos.webhooks import sender
+from mnemos.core import net_validation as validation
 
 
 pytestmark = pytest.mark.asyncio
