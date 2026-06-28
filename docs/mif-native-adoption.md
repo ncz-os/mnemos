@@ -57,9 +57,17 @@ namespaced under a `mnemos:` key prefix so the round-trip is lossless and valid.
 - `mnemos/portability/mif.py` — the mapping + Markdown↔JSON-LD + schema
   validation (`validate_concept` against the vendored published schemas in
   `mnemos/portability/mif_schemas/`).
-- `tests/test_mif_portability.py` — schema validity, deterministic id, lossless
-  round-trips, native-type override, vault redaction, provenance (#85),
-  foreign-concept import, minimal-memory validity. (13 tests.)
+- `mnemos/portability/charon.py` — MIF **bundle** export/import: a directory of
+  `<conceptType>/<uuid>.md` concept files (matching MIF's path-style relationship
+  targets) + a `mif-manifest.json` index (spec version, schema `$id`, per-concept
+  id/type/path/source). `export_bundle` schema-validates every concept before
+  writing; `import_bundle` reads via the manifest or falls back to a `*.md` walk
+  (so hand-authored MIF dirs import too). This is the CHARON format that replaces
+  the MPF envelope.
+- `tests/test_mif_portability.py` (13) + `tests/test_charon_bundle.py` (6) —
+  schema validity, deterministic id, lossless round-trips, native-type override,
+  vault redaction (incl. in-bundle), provenance (#85), foreign-concept import,
+  bundle layout/manifest, manifest-less import.
 
 ## Remaining phases
 
