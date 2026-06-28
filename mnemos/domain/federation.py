@@ -25,11 +25,19 @@ import httpx
 
 from mnemos.core import eligibility as _eligibility
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
+from mnemos.core.safe_http import make_safe_client
 from mnemos.persistence.base import AuditPersistence, FederationPersistence, FederationRepository, Transaction
 
 FederationBackend = Union[FederationPersistence, AuditPersistence]
 
 logger = logging.getLogger(__name__)
+
+
+def _federation_allow_private() -> bool:
+    """Lazy-read FEDERATION_ALLOW_PRIVATE so module import never loads config."""
+    from mnemos.core.config import get_settings
+
+    return get_settings().federation.allow_private
 
 # Keep this legacy module import-compatible while allowing additive
 # submodules under mnemos/domain/federation/.
@@ -177,11 +185,22 @@ async def _check_peer_schema(
     next worker tick rather than burning the full sync_interval_secs
     (Codex review-round-3 finding #1).
     """
-    import httpx
-
     url = f"{base_url.rstrip('/')}/v1/federation/schema"
+    # F1 (adversarial review 2026-06-28): re-validate the peer URL against the
+    # SSRF blocklist at fetch time and pin DNS so a DNS-rebinding TOCTOU
+    # between peer registration and this sync cannot redirect the
+    # authenticated pull (carrying the peer bearer token) to an
+    # internal/metadata endpoint. A validation failure is durable: the
+    # peer URL is misconfigured or compromised and retrying will not help.
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        client, _ = await make_safe_client(
+            url, timeout=10.0, allow_private=_federation_allow_private(),
+        )
+    except Exception as e:
+        logger.warning("federation: peer %s URL rejected (SSRF/DNS): %s", name, e)
+        return {"ok": False, "transient": False, "reason": f"url-rejected: {type(e).__name__}: {e}"}
+    try:
+        async with client:
             resp = await client.get(url, headers={"Authorization": f"Bearer {auth_token}"})
             if resp.status_code >= 500:
                 # 5xx — transient infra failure on the peer.
@@ -581,7 +600,14 @@ async def _pull_batch(
 
     headers = {"Authorization": f"Bearer {auth_token}"}
 
-    async with httpx.AsyncClient(timeout=FEDERATION_HTTP_TIMEOUT) as client:
+    # F1 (adversarial review 2026-06-28): re-validate + DNS-pin (see _check_peer_schema).
+    try:
+        client, _ = await make_safe_client(
+            url, timeout=FEDERATION_HTTP_TIMEOUT, allow_private=_federation_allow_private(),
+        )
+    except Exception as e:
+        raise RuntimeError(f"federation URL rejected (SSRF/DNS): {type(e).__name__}: {e}") from e
+    async with client:
         r = await client.get(url, params=params, headers=headers)
         if r.status_code == 401:
             raise RuntimeError("federation auth token rejected (401)")
@@ -613,7 +639,14 @@ async def pull_memory_by_id(
         params["category"] = ",".join(category_filter)
     headers = {"Authorization": f"Bearer {auth_token}"}
 
-    async with httpx.AsyncClient(timeout=FEDERATION_HTTP_TIMEOUT) as client:
+    # F1 (adversarial review 2026-06-28): re-validate + DNS-pin (see _check_peer_schema).
+    try:
+        client, _ = await make_safe_client(
+            url, timeout=FEDERATION_HTTP_TIMEOUT, allow_private=_federation_allow_private(),
+        )
+    except Exception as e:
+        raise RuntimeError(f"federation URL rejected (SSRF/DNS): {type(e).__name__}: {e}") from e
+    async with client:
         r = await client.get(url, params=params, headers=headers)
         if r.status_code == 401:
             raise RuntimeError("federation auth token rejected (401)")
