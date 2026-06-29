@@ -50,7 +50,9 @@ def _handlers_consuming(model_name: str) -> list:
     import mnemos.api.routes as routes_pkg
 
     handlers: list = []
-    base_path = Path(routes_pkg.__file__).parent
+    # `mnemos.api.routes` is a namespace package (no __init__.py) after the
+    # mnemos-core carve-out, so __file__ is None; use __path__ for the dir.
+    base_path = Path(next(iter(routes_pkg.__path__)))
     for path in base_path.glob("*.py"):
         if path.name.startswith("_") or path.name == "__init__.py":
             continue
