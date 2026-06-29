@@ -81,6 +81,7 @@ def test_dispatch_table_is_complete() -> None:
         "markdown": "mnemos.tools.export_memories_for_docling",
         "html": "mnemos.tools.export_memories_for_docling",
         "text": "mnemos.tools.export_memories_for_docling",
+        "mif": "mnemos.tools.memory_export",
     }
     assert cli_main.IMPORT_DISPATCH == {
         "mpf": "mnemos.tools.memory_import",
@@ -90,6 +91,7 @@ def test_dispatch_table_is_complete() -> None:
         "graphiti": "mnemos.tools.adapters.graphiti",
         "cognee": "mnemos.tools.adapters.cognee",
         "mempalace": "mnemos.tools.adapters.mempalace",
+        "mif": "mnemos.tools.memory_import",
     }
 
 

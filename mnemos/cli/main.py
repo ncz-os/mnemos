@@ -99,6 +99,7 @@ class ExportFormat(str, Enum):
     markdown = "markdown"
     html = "html"
     text = "text"
+    mif = "mif"
 
 
 class ImportSource(str, Enum):
@@ -109,6 +110,7 @@ class ImportSource(str, Enum):
     cognee = "cognee"
     mempalace = "mempalace"
     docling = "docling"
+    mif = "mif"
 
 
 class ConsultMode(str, Enum):
@@ -135,6 +137,7 @@ EXPORT_DISPATCH: dict[str, str] = {
     "markdown": "mnemos.tools.export_memories_for_docling",
     "html": "mnemos.tools.export_memories_for_docling",
     "text": "mnemos.tools.export_memories_for_docling",
+    "mif": "mnemos.tools.memory_export",
 }
 
 IMPORT_DISPATCH: dict[str, str] = {
@@ -145,6 +148,7 @@ IMPORT_DISPATCH: dict[str, str] = {
     "graphiti": "mnemos.tools.adapters.graphiti",
     "cognee": "mnemos.tools.adapters.cognee",
     "mempalace": "mnemos.tools.adapters.mempalace",
+    "mif": "mnemos.tools.memory_import",
 }
 
 _EXPORT_TOOL_SUBCOMMANDS: dict[ExportFormat, str] = {
@@ -153,6 +157,7 @@ _EXPORT_TOOL_SUBCOMMANDS: dict[ExportFormat, str] = {
     ExportFormat.markdown: "markdown",
     ExportFormat.html: "html",
     ExportFormat.text: "text",
+    ExportFormat.mif: "mif",
 }
 
 app = typer.Typer(help="Unified MNEMOS command line interface.", no_args_is_help=True)
@@ -918,7 +923,7 @@ def export_memories(
     format_: str = typer.Option(
         "mpf",
         "--format",
-        help="Export format: mpf, jsonl, markdown, html, or text.",
+        help="Export format: mpf, jsonl, mif, markdown, html, or text.",
         is_flag=False,
     ),
     out: Path = typer.Option(..., "--out", help="Output file path.", is_flag=False),
@@ -957,6 +962,18 @@ def import_memories(
     """Import memories through the existing portability tools and adapters."""
     selected_source = _parse_import_source(import_from, source)
     extra_args: list[str] = []
+
+    if selected_source == ImportSource.mif:
+        # MIF bundle = a directory of concept files; the tool reads it via --source.
+        argv = ["mif", "--source", str(source)]
+        if owner_id:
+            argv.extend(["--owner-id", owner_id])
+        if namespace:
+            argv.extend(["--namespace", namespace])
+        _append_env_endpoint(argv)
+        argv.extend(extra_args)
+        _run_module_main(IMPORT_DISPATCH[selected_source.value], argv)
+        return
 
     if selected_source == ImportSource.mpf:
         argv = ["json", "--file", str(source)]

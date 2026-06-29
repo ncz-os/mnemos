@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mif-spec.dev/schema/citation.schema.json",
+  "title": "MIF Citation",
+  "description": "JSON Schema for validating MIF citation objects",
+  "type": "object",
+  "required": ["@type", "citationType", "citationRole", "title", "url"],
+  "properties": {
+    "@type": {
+      "const": "Citation",
+      "description": "Must be 'Citation'"
+    },
+    "citationType": {
+      "type": "string",
+      "description": "Source category - either a standard type or custom namespaced type",
+      "oneOf": [
+        {
+          "enum": [
+            "article",
+            "book",
+            "paper",
+            "website",
+            "documentation",
+            "repository",
+            "video",
+            "podcast",
+            "specification",
+            "dataset",
+            "tool",
+            "other"
+          ],
+          "description": "Standard citation types"
+        },
+        {
+          "type": "string",
+          "pattern": "^[a-zA-Z][a-zA-Z0-9]*:[a-zA-Z][a-zA-Z0-9-]*$",
+          "description": "Custom namespaced type (e.g., 'acme:memo')"
+        }
+      ]
+    },
+    "citationRole": {
+      "type": "string",
+      "description": "Relationship to memory - either a standard role or custom namespaced role",
+      "oneOf": [
+        {
+          "enum": [
+            "supports",
+            "refutes",
+            "background",
+            "methodology",
+            "contradicts",
+            "extends",
+            "derived",
+            "source",
+            "example",
+            "review"
+          ],
+          "description": "Standard citation roles"
+        },
+        {
+          "type": "string",
+          "pattern": "^[a-zA-Z][a-zA-Z0-9]*:[a-zA-Z][a-zA-Z0-9-]*$",
+          "description": "Custom namespaced role (e.g., 'legal:precedent')"
+        }
+      ]
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Citation title (required, non-empty)"
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Citation URL (required, valid URI)"
+    },
+    "author": {
+      "description": "Author(s) - can be entity reference object, array of entity references, or plain text string",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/EntityReference",
+          "description": "Single author entity reference"
+        },
+        {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EntityReference" },
+          "minItems": 1,
+          "description": "Multiple author entity references"
+        },
+        {
+          "type": "string",
+          "description": "Plain text author name(s)"
+        }
+      ]
+    },
+    "date": {
+      "type": "string",
+      "format": "date",
+      "description": "Publication date in ISO 8601 format (YYYY-MM-DD)"
+    },
+    "accessed": {
+      "type": "string",
+      "format": "date",
+      "description": "Access date in ISO 8601 format (YYYY-MM-DD)"
+    },
+    "relevance": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Relevance score between 0.0 and 1.0"
+    },
+    "note": {
+      "type": "string",
+      "maxLength": 1000,
+      "description": "Free-form annotation (recommended under 1000 characters)"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "EntityReference": {
+      "$ref": "./definitions/entity-reference.schema.json"
+    }
+  },
+  "examples": [
+    {
+      "@type": "Citation",
+      "citationType": "article",
+      "citationRole": "supports",
+      "title": "Memory Systems in AI Agents",
+      "url": "https://arxiv.org/abs/2024.12345",
+      "author": {
+        "@type": "EntityReference",
+        "entity": { "@id": "urn:mif:entity:person:jane-smith" },
+        "entityType": "Person",
+        "name": "Jane Smith"
+      },
+      "date": "2024-06-15",
+      "accessed": "2026-01-20",
+      "relevance": 0.95,
+      "note": "Foundational paper on semantic memory"
+    },
+    {
+      "@type": "Citation",
+      "citationType": "documentation",
+      "citationRole": "background",
+      "title": "Obsidian Help",
+      "url": "https://help.obsidian.md/",
+      "accessed": "2026-01-18",
+      "relevance": 0.85
+    }
+  ]
+}
