@@ -5614,14 +5614,108 @@ class OracleBackend:
         finally:
             await _call(cursor.close)
 
-    async def create_journal_entry(self, tx: Transaction, **kwargs: Any) -> Row:
-        raise NotImplementedError("journal API persistence is not implemented for Oracle schema 0015")
+    async def create_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            # entry_date NULL -> today (TRUNC(SYSDATE)), mirroring Postgres CURRENT_DATE.
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                VALUES (:id, :owner_id, :namespace,
+                        NVL(CAST(:entry_date AS DATE), TRUNC(SYSDATE)),
+                        :topic, :content, :metadata)
+                """,
+                {
+                    "id": entry_id,
+                    "owner_id": owner_id,
+                    "namespace": namespace,
+                    "entry_date": entry_date,
+                    "topic": topic,
+                    "content": content,
+                    "metadata": json.dumps(metadata or {}),
+                },
+            )
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, TO_CHAR(entry_date, 'YYYY-MM-DD') AS entry_date, topic, content,
+                       metadata, TO_CHAR(created) AS created
+                  FROM journal WHERE id = :id
+                """,
+                {"id": entry_id},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            if row is None:
+                raise RuntimeError("journal insert returned no row")
+            return row
+        finally:
+            await _call(cursor.close)
 
-    async def list_journal_entries(self, tx: Transaction, **kwargs: Any) -> list[Row]:
-        raise NotImplementedError("journal API persistence is not implemented for Oracle schema 0015")
+    async def list_journal_entries(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        entry_date: Any | None,
+        topic: str | None,
+        search: str | None,
+        limit: int,
+    ) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            select = (
+                "SELECT id, TO_CHAR(entry_date, 'YYYY-MM-DD') AS entry_date, topic, content, "
+                "metadata, TO_CHAR(created) AS created FROM journal "
+                "WHERE owner_id = :owner_id AND namespace = :namespace AND deleted_at IS NULL"
+            )
+            binds: dict[str, Any] = {"owner_id": owner_id, "namespace": namespace, "limit": limit}
+            if entry_date is not None:
+                select += " AND entry_date = CAST(:entry_date AS DATE)"
+                binds["entry_date"] = entry_date
+            elif topic:
+                select += " AND topic = :topic"
+                binds["topic"] = topic
+            elif search:
+                select += " AND (LOWER(content) LIKE LOWER(:search) OR LOWER(topic) LIKE LOWER(:search))"
+                binds["search"] = f"%{search}%"
+            select += " ORDER BY created DESC FETCH FIRST :limit ROWS ONLY"
+            await _call(cursor.execute, select, binds)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
-    async def delete_journal_entry(self, tx: Transaction, **kwargs: Any) -> bool:
-        raise NotImplementedError("journal API persistence is not implemented for Oracle schema 0015")
+    async def delete_journal_entry(
+        self,
+        tx: Transaction,
+        *,
+        entry_id: str,
+        owner_id: str,
+        namespace: str,
+    ) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM journal WHERE id = :id AND owner_id = :owner_id "
+                "AND namespace = :namespace AND deleted_at IS NULL",
+                {"id": entry_id, "owner_id": owner_id, "namespace": namespace},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
 
     async def open(self) -> None:
         """Lifecycle hook — self-provisions schema and validates checkout.
