@@ -69,12 +69,19 @@ namespaced under a `mnemos:` key prefix so the round-trip is lossless and valid.
   vault redaction (incl. in-bundle), provenance (#85), foreign-concept import,
   bundle layout/manifest, manifest-less import.
 
-## Remaining phases
+## Phase status
 
-- **2 — native model:** DB migration adding `mif_type` (required) + `mif_uuid`
-  (indexed) + the MIF columns; ingest/classification sets `mif_type`; backfill.
-- **3 — surfaces:** `/v1/export`,`/v1/import` + CLI emit/consume MIF; MPF→MIF
-  migration job; MPF reader kept for rollback.
-- **4 — retire MPF:** remove MPF emission; archive `mnemos-os/mpf`; full
-  Level-3 wiring (citations, DocumentReference #84, PROV #85) + CI conformance
-  gate (OKF + lossless round-trip).
+- **0+1 — primitives:** ✅ mapping + bundle export/import (this MR).
+- **2a — authoritative type, no migration:** ✅ `metadata.mif_type` honored over
+  the category fallback, all backends (this MR). **2b (full indexed column):**
+  pending — `mif_type`/`mif_uuid` are a multi-backend DDL migration (`MEMORY_COLS`
+  in `persistence/types.py` is shared, so the column must land in sqlite +
+  postgres + oracle + mysql + db2); own branch/MR, needs per-backend test infra.
+- **3 — surfaces:** ✅ `mnemos export --format mif` / `mnemos import --from mif`
+  registered here; the `mif` export/import CLI tools live in **`ncz-os/charon`**
+  (MR !1). `/v1/export`,`/v1/import` REST MIF surface = follow-up.
+- **4 — retire MPF:** ✅ offline MPF→MIF migration tool (`mnemos.tools.mpf_to_mif`,
+  `ncz-os/charon` MR !1). Remaining: flip the `mnemos export` default to `mif`
+  (post-merge — must not point at unreleased tooling), archive `mnemos-os/mpf`,
+  CI conformance gate (OKF + lossless round-trip), richer Level-3 citations /
+  DocumentReference (#84) wiring.
