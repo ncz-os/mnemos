@@ -1,7 +1,7 @@
 # Runbook — multiuser/ACL deploy to fleet (Oracle) + NVIDIA/Spark
 
 **Status:** READY — held at the live-apply gate (operator OK required before Stage B on PYTHIA).
-**Target code:** `ncz-os/mnemos` master `a6210bd` (95-commit multiuser/ACL/oauth delta over the deployed `66804e6` / `6.0.0rc1`).
+**Target code:** `ncz-os/mnemos` master `a6210bd` (95-commit multiuser/ACL/oauth delta over the deployed `66804e6` / `6.0.0`).
 **Reviewed:** multi-model adversarial (gpt-5.5 + codex via NGC proxy), findings verified; migration idempotency/dedup fixed (`0043` Oracle ORA-955 guards + `add_col`; `0043` DB2 bare-create+`@`+42711; dup `0041`→`0044`).
 **Backup (pre-taken):** `~/backups/oracle-premulti/mnemos_pre_multiuser_20260608-012218.dmp` (1.2GB schema expdp, PYTHIA `pythia-oracle` ORCLPDB1).
 
@@ -38,7 +38,7 @@ select count(*) from user_tab_columns where table_name='USER_GROUPS' and column_
 
 ## Stage C — restart + verify
 1. `docker compose -f deploy/docker-compose.mnemos-api.yml up -d --force-recreate`
-2. `curl :5002/health` → version advanced past 6.0.0rc1, `acl` in capabilities, `database_connected`.
+2. `curl :5002/health` → version advanced past 6.0.0, `acl` in capabilities, `database_connected`.
 3. Persistence conformance smoke; ACL read/write smoke (grant → read-as-principal → revoke).
 
 ## Stage D — replicas + NVIDIA/Spark
