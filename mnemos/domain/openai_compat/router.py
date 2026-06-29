@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Protocol
 
 from mnemos.core.config import get_registered_task_classifier, get_settings
-from mnemos.core.injection_defense import defend
+from mnemos.core.injection_defense import _strip_one_frame, defend
 from mnemos.core.secret_detection import redact_content
 from mnemos.db import openai_compat_repo
 
@@ -253,7 +253,20 @@ async def get_model(model_id: str, user: Any) -> ModelInfo:
 
 
 async def search_memory_context(*args: Any, **kwargs: Any) -> Any:
-    return await openai_compat_repo.fetch_memory_context(*args, **kwargs)
+    rows = await openai_compat_repo.fetch_memory_context(*args, **kwargs)
+    normalized: list[Any] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            normalized.append(row)
+            continue
+        out = dict(row)
+        value = out.get("content")
+        if isinstance(value, str):
+            inner = _strip_one_frame(value)
+            if inner is not None:
+                out["content"] = inner
+        normalized.append(out)
+    return normalized
 
 
 def format_memory_for_system_prompt(content: Any) -> str:
