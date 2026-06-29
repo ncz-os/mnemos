@@ -166,7 +166,7 @@ MNEMOS is a packaged FastAPI service with a single `mnemos` CLI for installation
 | GRAEAE reasoning | [docs/GRAEAE_FEATURES.md](docs/GRAEAE_FEATURES.md) |
 | PANTHEON provider facade | [docs/PANTHEON.md](docs/PANTHEON.md) |
 | KRONOS observability | [docs/KRONOS.md](docs/KRONOS.md) |
-| Portability format | [docs/MEMORY_EXPORT_FORMAT.md](docs/MEMORY_EXPORT_FORMAT.md) |
+| Portability format (MIF 1.0; MPF legacy) | [docs/MEMORY_EXPORT_FORMAT.md](docs/MEMORY_EXPORT_FORMAT.md) |
 | Scaling | [docs/SCALING.md](docs/SCALING.md) |
 | Single-binary builds | [docs/SINGLE_BINARY.md](docs/SINGLE_BINARY.md) |
 | Operations | [docs/OPERATIONS.md](docs/OPERATIONS.md) |

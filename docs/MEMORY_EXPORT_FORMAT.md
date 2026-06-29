@@ -1,4 +1,23 @@
-# Memory Portability Format (MPF)
+# Memory Portability — MIF 1.0 (primary) and MPF (legacy)
+
+> **The native portability format is now MIF 1.0 — the
+> [Memory Interchange Format](https://mif-spec.dev).** Export and import a MIF
+> bundle (a directory of `<conceptType>/<uuid>.md` concept files plus a
+> `mif-manifest.json`) with `mnemos export --format mif <dir>` and
+> `mnemos import <dir> --from mif`. The mapping and bundle primitives live in
+> `mnemos.portability` (`mnemos.portability.charon` → `export_bundle` /
+> `import_bundle`) in `mnemos-core`.
+>
+> **MPF — the format this document specifies — is now legacy.** It remains
+> supported for emit (`--format mpf`) and, more importantly, is still **read**
+> as a migration source: convert an existing MPF dump to a MIF bundle offline
+> with `mnemos.tools.mpf_to_mif`. New deployments should standardise on MIF;
+> this spec is retained as the authoritative MPF reference for existing data and
+> for the document-ingest envelope described below.
+
+---
+
+# Memory Portability Format (MPF) — legacy spec
 
 **A schema-versioned JSON envelope for moving agent memory and parsed
 documents between systems.** MNEMOS defines it. Other RAG memory
@@ -622,6 +641,10 @@ the PR.
 
 ## Changelog
 
+- **2026-06-28** — MIF 1.0 ([mif-spec.dev](https://mif-spec.dev)) adopted as the
+  native portability format; MPF reclassified as legacy. MPF emit is retained
+  and MPF remains the migration source (offline `mnemos.tools.mpf_to_mif` →
+  MIF bundle). This spec is preserved as the authoritative MPF reference.
 - **2026-04-23** — Initial MPF v0.1 spec. Envelope uses `records[]`
   with `kind` discriminator after GRAEAE architectural consultation
   (4-muse consensus on Option 3 over parallel-arrays Option 1).
