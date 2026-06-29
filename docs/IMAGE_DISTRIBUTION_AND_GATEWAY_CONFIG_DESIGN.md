@@ -90,3 +90,24 @@ upstream.
 - A separately-patched private image (forking behavior by build, not config).
 - Selecting behavior by **image tag** instead of runtime configuration.
 - Putting the structured provider/model catalog into environment variables.
+
+## Addendum: routing in source, connection idempotized
+
+The dividing line within the gateway itself:
+
+- **Routing logic stays in (public) source** — the router, catalog resolution
+  (including the native `wire_model_id`), `RouteDecision`, fallback chains, and
+  the provider-config *merge mechanism*. This is the portable intelligence.
+- **The connection target is idempotent config** — the upstream endpoint a
+  deployment actually dials (a direct provider URL, a local proxy, or a gateway
+  VIP) is never baked; it is supplied at runtime.
+
+Concretely, the PANTHEON gateway's provider table (`_PANTHEON_PROVIDER_DEFAULTS`)
+declares provider **identity** only (key-name, wire API, enabled) — never the
+endpoint **URL**. `_provider_config` resolves the connection by merging, in
+increasing precedence, the in-source identity defaults, the engine provider
+registry, and the operator provider config (`get_provider_config`), plus the
+catalog's provider registry file. If no `base_url`/`url` resolves for a provider,
+the gateway **fails closed** (`503 "no endpoint configured"`) rather than dialing
+a baked vendor URL. The identical published image therefore connects wherever the
+deployment's config points it; with no config it serves nothing.
