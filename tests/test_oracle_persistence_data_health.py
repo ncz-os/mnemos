@@ -93,6 +93,8 @@ def test_oracle_read_visibility_matches_v1_multiuser_shape():
     assert "m.federation_source IS NOT NULL" in clause
     assert "MOD(NVL(m.permission_mode, 0), 10) >= 4" in clause
     assert "m.group_id IN (:v_group0,:v_group1)" in clause
+    assert "EXISTS (SELECT 1 FROM memory_acl macl" in clause
+    assert "macl.principal IN (:v_acl0,:v_acl1,:v_acl2)" in clause
     assert "m.namespace = :v_ns" in clause
     assert "namespace = 'world'" not in clause
     assert params == {
@@ -100,6 +102,9 @@ def test_oracle_read_visibility_matches_v1_multiuser_shape():
         "v_ns": "alice-ns",
         "v_group0": "team-a",
         "v_group1": "team-b",
+        "v_acl0": "user:alice",
+        "v_acl1": "group:team-a",
+        "v_acl2": "group:team-b",
     }
 
 
