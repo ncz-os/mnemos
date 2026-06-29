@@ -30,7 +30,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 VAULT_NAMESPACE = "vault"
 
@@ -738,3 +738,54 @@ def redact_content(content: str | None) -> str:
     if not finding.spans:
         return content
     return redact(content, finding.spans)
+
+
+def _stored_spans(metadata: Any, field_name: str) -> list[tuple[int, int]]:
+    """Extract stored secret spans for ``field_name`` from row metadata.
+
+    Returns ``[]`` when no stored spans are present. Accepts dict metadata
+    or a JSON string (parsed defensively). Honors both the per-field
+    ``secret_redact_fields`` map (preferred) and the legacy content-only
+    ``secret_redact_spans`` list (back-compat for rows written before the
+    per-field map existed).
+    """
+    if metadata is None:
+        return []
+    if isinstance(metadata, str):
+        import json
+
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(metadata, dict):
+        return []
+    fields = metadata.get("secret_redact_fields")
+    if isinstance(fields, dict):
+        spans = fields.get(field_name)
+        if isinstance(spans, list) and spans:
+            return [(int(s), int(e)) for s, e in spans if isinstance(s, int) and isinstance(e, int)]
+    if field_name == "content":
+        legacy = metadata.get("secret_redact_spans")
+        if isinstance(legacy, list) and legacy:
+            return [(int(s), int(e)) for s, e in legacy if isinstance(s, int) and isinstance(e, int)]
+    return []
+
+
+def redact_field_with_stored(content: str | None, metadata: Any, field_name: str) -> str:
+    """Redact ``content`` using stored ingest spans; fall back to recompute.
+
+    F2b (adversarial review 2026-06-28): prefer the spans recorded at ingest
+    classification (authoritative at the time of write) over recomputing
+    ``classify()`` at retrieval, so a later classifier relaxation or pattern
+    change cannot re-expose a secret that was caught at ingest. When no
+    stored spans are present (legacy rows, or CLEAN content with none
+    recorded), fall back to ``redact_content`` (recompute) so the
+    redact-at-retrieval backstop is never weakened.
+    """
+    if not content:
+        return content or ""
+    spans = _stored_spans(metadata, field_name)
+    if spans:
+        return redact(content, spans)
+    return redact_content(content)

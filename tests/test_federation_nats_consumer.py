@@ -320,13 +320,9 @@ async def test_subscribe_with_queue_group_sets_queue_and_deliver_group():
 
     subject, kwargs = js.subscribe_calls[0]
     assert subject == "mnemos.memory.created.>"
-    expected_durable = consumer._queue_durable_name(
-        "fed_pool", "pythia", "mnemos.memory.created.>"
-    )
+    expected_durable = consumer._queue_durable_name("fed_pool", "pythia", "mnemos.memory.created.>")
     assert kwargs["durable"] == expected_durable
-    assert kwargs["queue"] == expected_durable, (
-        "nats-py requires queue == durable for queue-mode subscribe"
-    )
+    assert kwargs["queue"] == expected_durable, "nats-py requires queue == durable for queue-mode subscribe"
     # Distinct namespace from legacy durable.
     assert expected_durable.startswith("mnemos_federation_q_fed_pool_")
     legacy_durable = consumer._durable_name("pythia", "mnemos.memory.created.>")
@@ -413,7 +409,15 @@ async def test_pull_memory_by_id_uses_explicit_endpoint(monkeypatch):
             calls.append((url, params, headers, self.kwargs))
             return _Response()
 
-    monkeypatch.setattr(federation_domain.httpx, "AsyncClient", _Client)
+    # F1 (adversarial review 2026-06-28): pull_memory_by_id now obtains its
+    # client via make_safe_client (validate-then-DNS-pin) instead of a bare
+    # httpx.AsyncClient. Patch that factory to return the stub without real
+    # SSRF validation / DNS resolution of the test host. (The re-validation
+    # itself is covered by test_federation_pull_ssrf.py.)
+    async def _fake_make_safe_client(url, **kwargs):
+        return _Client(**kwargs), url
+
+    monkeypatch.setattr(federation_domain, "make_safe_client", _fake_make_safe_client)
 
     memories = await federation_domain.pull_memory_by_id(
         "https://peer.example/",
@@ -429,7 +433,9 @@ async def test_pull_memory_by_id_uses_explicit_endpoint(monkeypatch):
             "https://peer.example/v1/federation/memory/mem_1",
             {"namespace": "shared", "category": "facts"},
             {"Authorization": "Bearer feed-token"},
-            {"timeout": federation_domain.FEDERATION_HTTP_TIMEOUT},
+            # F1: make_safe_client is called with timeout + allow_private (the
+            # latter gates whether private/loopback targets are permitted).
+            {"timeout": federation_domain.FEDERATION_HTTP_TIMEOUT, "allow_private": False},
         )
     ]
 
