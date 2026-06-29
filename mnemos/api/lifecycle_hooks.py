@@ -197,6 +197,9 @@ async def _webhook_nats_post_db_hook(pool: Any, settings: Any) -> None:
     if not service_enabled(settings, "webhook_nats_trigger"):
         logger.info("webhook nats trigger disabled by profile service manifest")
         return
+    if not (settings.nats.url or "").strip():
+        logger.info("webhook nats trigger disabled (MNEMOS_NATS_URL unset)")
+        return
 
     from mnemos.webhooks.nats_trigger import consumer_loop as webhook_nats_trigger_loop
 

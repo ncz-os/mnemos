@@ -4769,6 +4769,7 @@ class OracleBackend:
     _supports_federation_persistence = True
     _supports_audit_persistence = True
     _supports_state_persistence = True
+    _supports_acl_persistence = True
     supports_webhooks = True  # Oracle has a real OracleWebhookRepository (see .webhooks)
 
     supports_listen_notify = False

@@ -1527,6 +1527,17 @@ def db2_vector_index_override() -> str | None:
     return os.environ.get("MNEMOS_DB2_VECTOR_INDEX")
 
 
+def db2_vector_indexing_override() -> str | None:
+    """Return the raw ``DB2_VECTOR_INDEXING`` env override, if present.
+
+    Distinguishes "unset" (``None``) from "set to a disabling value" so a caller
+    can treat an explicit non-truthy value as an opt-out of vector-index DDL.
+    """
+    if "DB2_VECTOR_INDEXING" not in os.environ:
+        return None
+    return os.environ.get("DB2_VECTOR_INDEXING")
+
+
 def db2_text_search_override() -> str | None:
     """Return the raw Db2 full-text-search env override, if present.
 

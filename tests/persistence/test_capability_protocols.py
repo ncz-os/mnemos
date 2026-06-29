@@ -4,7 +4,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from mnemos.persistence.base import (
+    ACL_CAPABILITY,
     ALL_CAPABILITIES,
+    AclPersistence,
     AuditPersistence,
     ConsultationsPersistence,
     CorePersistence,
@@ -32,6 +34,7 @@ def _protocol_results(backend: object) -> dict[str, bool]:
         "federation": isinstance(backend, FederationPersistence),
         "audit": isinstance(backend, AuditPersistence),
         "state": isinstance(backend, StatePersistence),
+        "acl": isinstance(backend, AclPersistence),
     }
 
 
@@ -39,25 +42,37 @@ def test_sqlite_backend_advertises_all_capabilities(tmp_path: Path) -> None:
     backend = SqliteBackend(tmp_path / "mnemos.db", _settings())
 
     assert backend.capabilities == set(ALL_CAPABILITIES)
-    assert _protocol_results(backend) == {capability: True for capability in ALL_CAPABILITIES}
+    assert _protocol_results(backend) == {
+        **{capability: True for capability in ALL_CAPABILITIES},
+        ACL_CAPABILITY: False,
+    }
 
 
 def test_postgres_backend_advertises_all_capabilities() -> None:
     backend = PostgresBackend(pool=object(), settings=_settings())
 
-    assert backend.capabilities == set(ALL_CAPABILITIES)
-    assert _protocol_results(backend) == {capability: True for capability in ALL_CAPABILITIES}
+    assert backend.capabilities == set(ALL_CAPABILITIES) | {ACL_CAPABILITY}
+    assert _protocol_results(backend) == {
+        **{capability: True for capability in ALL_CAPABILITIES},
+        ACL_CAPABILITY: True,
+    }
 
 
 def test_oracle_backend_advertises_all_capabilities() -> None:
     backend = OracleBackend(pool=object(), settings=_settings())
 
-    assert backend.capabilities == set(ALL_CAPABILITIES)
-    assert _protocol_results(backend) == {capability: True for capability in ALL_CAPABILITIES}
+    assert backend.capabilities == set(ALL_CAPABILITIES) | {ACL_CAPABILITY}
+    assert _protocol_results(backend) == {
+        **{capability: True for capability in ALL_CAPABILITIES},
+        ACL_CAPABILITY: True,
+    }
 
 
 def test_db2_backend_advertises_all_capabilities() -> None:
     backend = Db2Backend(pool=object(), settings=_settings())
 
-    assert backend.capabilities == set(ALL_CAPABILITIES)
-    assert _protocol_results(backend) == {capability: True for capability in ALL_CAPABILITIES}
+    assert backend.capabilities == set(ALL_CAPABILITIES) | {ACL_CAPABILITY}
+    assert _protocol_results(backend) == {
+        **{capability: True for capability in ALL_CAPABILITIES},
+        ACL_CAPABILITY: True,
+    }

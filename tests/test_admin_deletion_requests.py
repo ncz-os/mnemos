@@ -17,7 +17,7 @@ lifecycle and restore route.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -589,9 +589,9 @@ async def test_cancel_deletion_request_409_on_soft_deleted(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_restore_deletion_request_restores_soft_deleted_rows(monkeypatch):
-    soft_deleted_at = datetime(2026, 5, 1, 23, 5, 0, tzinfo=timezone.utc)
-    restore_by = datetime(2026, 5, 31, 23, 5, 0, tzinfo=timezone.utc)
-    restored_at = datetime(2026, 5, 2, 0, 0, 0, tzinfo=timezone.utc)
+    restored_at = datetime.now(timezone.utc).replace(microsecond=0)
+    soft_deleted_at = restored_at - timedelta(hours=1)
+    restore_by = restored_at + timedelta(days=30)
     mock_conn = AsyncMock()
     mock_conn.fetchrow = AsyncMock(
         side_effect=[
