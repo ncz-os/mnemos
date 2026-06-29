@@ -23,6 +23,7 @@ import inspect
 import json
 import logging
 import math
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -3005,11 +3006,139 @@ class OracleOAuthRepository(OAuthRepository):
         finally:
             await _call(cursor.close)
 
-    async def provision_or_link_user(self, tx: Transaction, **kwargs: Any) -> tuple[str, str]:
-        raise NotImplementedError("Oracle OAuth identity provisioning repository is not implemented")
+    async def provision_or_link_user(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        external_id: str,
+        claims: dict[str, Any],
+    ) -> tuple[str, str]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            raw_claims = json.dumps(claims)
 
-    async def create_session(self, tx: Transaction, **kwargs: Any) -> str:
-        raise NotImplementedError("Oracle OAuth session creation repository is not implemented")
+            async def _touch_existing() -> tuple[str, str] | None:
+                """Load the (provider, external_id) identity if present, refresh
+                its last_login_at/raw_claims, and return (user_id, id)."""
+                await _call(
+                    cursor.execute,
+                    "SELECT id, user_id FROM oauth_identities "
+                    "WHERE provider = :provider AND external_id = :external_id",
+                    {"provider": provider, "external_id": external_id},
+                )
+                row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+                if not row:
+                    return None
+                await _call(
+                    cursor.execute,
+                    "UPDATE oauth_identities SET last_login_at = SYSTIMESTAMP, raw_claims = :raw_claims WHERE id = :id",
+                    {"raw_claims": raw_claims, "id": row["id"]},
+                )
+                return str(row["user_id"]), str(row["id"])
+
+            existing = await _touch_existing()
+            if existing:
+                return existing
+
+            email = claims.get("email")
+            display_name = claims.get("name") or claims.get("preferred_username")
+            email_verified_claim = claims.get("email_verified")
+            if isinstance(email_verified_claim, bool):
+                email_verified = email_verified_claim
+            elif isinstance(email_verified_claim, str):
+                email_verified = email_verified_claim.strip().lower() == "true"
+            else:
+                email_verified = False
+
+            user_id: str | None = None
+            if email and email_verified:
+                await _call(cursor.execute, "SELECT id FROM users WHERE email = :email", {"email": email})
+                link_target = await _row_to_dict(cursor, await _call(cursor.fetchone))
+                if link_target:
+                    user_id = str(link_target["id"])
+            if user_id is None:
+                user_id = re.sub(r"[^a-zA-Z0-9._:-]+", "", f"{provider}:{external_id}")[:64] or (
+                    f"{provider}:{uuid.uuid4().hex[:12]}"
+                )
+                # ON CONFLICT (id) DO NOTHING equivalent. MERGE is not atomic
+                # against a concurrent first INSERT of the same user_id: both
+                # sessions can take the NOT MATCHED branch and one hits ORA-00001.
+                # Mirror OracleAclRepository.grant_acl — retry once, where the row
+                # now exists and the (empty) MATCHED branch is a no-op.
+                merge_user_sql = (
+                    "MERGE INTO users t USING (SELECT :id AS id FROM dual) s ON (t.id = s.id) "
+                    "WHEN NOT MATCHED THEN INSERT (id, display_name, email, role) "
+                    "VALUES (:id, :display_name, :email, 'user')"
+                )
+                merge_user_binds = {"id": user_id, "display_name": display_name, "email": email}
+                try:
+                    await _call(cursor.execute, merge_user_sql, merge_user_binds)
+                except Exception as exc:  # noqa: BLE001 — re-raised unless it's the dup race
+                    if not _is_unique_violation(exc):
+                        raise
+                    await _call(cursor.execute, merge_user_sql, merge_user_binds)
+            identity_id = uuid.uuid4().hex
+            insert_sql = (
+                "INSERT INTO oauth_identities "
+                "(id, user_id, provider, external_id, email, display_name, raw_claims, last_login_at) "
+                "VALUES (:id, :user_id, :provider, :external_id, :email, :display_name, :raw_claims, SYSTIMESTAMP)"
+            )
+            insert_binds = {
+                "id": identity_id,
+                "user_id": user_id,
+                "provider": provider,
+                "external_id": external_id,
+                "email": email,
+                "display_name": display_name,
+                "raw_claims": raw_claims,
+            }
+            try:
+                await _call(cursor.execute, insert_sql, insert_binds)
+            except Exception as exc:  # noqa: BLE001 — re-raised unless it's the first-login race
+                if not _is_unique_violation(exc):
+                    raise
+                # A concurrent first login inserted this (provider, external_id)
+                # between our initial check and INSERT (uq_oauth_identity_provider_external).
+                # Adopt the winning identity instead of surfacing ORA-00001/23505.
+                existing = await _touch_existing()
+                if existing is None:
+                    raise
+                return existing
+            return user_id, identity_id
+        finally:
+            await _call(cursor.close)
+
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        user_id: str,
+        identity_id: str | None,
+        expires_at: Any,
+        user_agent: str,
+        ip_address: str | None,
+    ) -> str:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "INSERT INTO oauth_sessions "
+                "(session_id, user_id, identity_id, expires_at, user_agent, ip_address) "
+                "VALUES (:session_id, :user_id, :identity_id, :expires_at, :user_agent, :ip_address)",
+                {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "identity_id": identity_id,
+                    "expires_at": expires_at,
+                    "user_agent": user_agent,
+                    "ip_address": ip_address,
+                },
+            )
+            return session_id
+        finally:
+            await _call(cursor.close)
 
     async def revoke_session(self, tx: Transaction, session_id: str) -> bool:
         cursor = await _call(_conn_from_tx(tx).cursor)
@@ -3153,8 +3282,40 @@ class OracleAclRepository(AclRepository):
 
 
 class OracleSessionsRepository(SessionsRepository):
-    async def create_session(self, tx: Transaction, **kwargs: Any) -> Row:
-        raise NotImplementedError("Oracle chat sessions repository is not implemented")
+    async def create_session(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        namespace: str,
+        model: str,
+        initial_context: str | None,
+    ) -> Row:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            session_id = uuid.uuid4().hex
+            await _call(
+                cursor.execute,
+                "INSERT INTO sessions (id, user_id, namespace, model, last_activity) "
+                "VALUES (:id, :user_id, :namespace, :model, SYSTIMESTAMP)",
+                {"id": session_id, "user_id": user_id, "namespace": namespace, "model": model},
+            )
+            if initial_context:
+                await _call(
+                    cursor.execute,
+                    "INSERT INTO session_messages (session_id, role, content, message_id) "
+                    "VALUES (:session_id, 'system', :content, :message_id)",
+                    {"session_id": session_id, "content": initial_context, "message_id": uuid.uuid4().hex},
+                )
+            await _call(
+                cursor.execute,
+                "SELECT id, TO_CHAR(created_at) AS created_at, model FROM sessions "
+                "WHERE id = :id AND user_id = :user_id AND namespace = :namespace AND deleted_at IS NULL",
+                {"id": session_id, "user_id": user_id, "namespace": namespace},
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
 
     async def get_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> Row | None:
         cursor = await _call(_conn_from_tx(tx).cursor)
@@ -3173,8 +3334,42 @@ class OracleSessionsRepository(SessionsRepository):
         _ = (tx, session_id, limit)
         return []
 
-    async def add_message(self, tx: Transaction, **kwargs: Any) -> Any:
-        raise NotImplementedError("Oracle chat session messages repository is not implemented")
+    async def add_message(
+        self,
+        tx: Transaction,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        model: str | None = None,
+        tokens_used: int | None = None,
+        memories_injected: int | None = None,
+    ) -> Any:
+        # session_messages.id is a NUMBER identity column on Oracle; the
+        # message_id (canonical TEXT handle, mirrored from Postgres) is generated
+        # client-side and returned so the method stays Db2-translatable (no
+        # Oracle RETURNING ... INTO, which the Db2 adapter cannot rewrite).
+        message_id = uuid.uuid4().hex
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "INSERT INTO session_messages "
+                "(session_id, role, content, model, tokens_used, memories_injected, message_id) "
+                "VALUES (:session_id, :role, :content, :model, :tokens_used, :memories_injected, :message_id)",
+                {
+                    "session_id": session_id,
+                    "role": role,
+                    "content": content,
+                    "model": model,
+                    "tokens_used": tokens_used,
+                    "memories_injected": memories_injected,
+                    "message_id": message_id,
+                },
+            )
+            return message_id
+        finally:
+            await _call(cursor.close)
 
     async def fetch_provider_history(self, tx: Transaction, session_id: str) -> list[Row]:
         _ = (tx, session_id)
