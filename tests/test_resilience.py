@@ -359,8 +359,9 @@ def test_factory_redis_uri_without_client_falls_back_with_warning(caplog, monkey
     assert "Redis resilience backend requested but unavailable" in caplog.text
 
 
-def test_lifecycle_redis_unreachable_degrades_to_no_resilience_client(monkeypatch, caplog):
+def test_lifecycle_redis_unreachable_degrades_to_no_resilience_client(monkeypatch, caplog, tmp_path):
     async def run():
+        from mnemos.core import config as core_config
         from mnemos.core import lifecycle
 
         class FalsyPool:
@@ -380,8 +381,10 @@ def test_lifecycle_redis_unreachable_degrades_to_no_resilience_client(monkeypatc
         async def create_pool(**_kwargs):
             return FalsyPool()
 
-        settings = _settings("redis://redis:6379/0")
-        monkeypatch.setattr(lifecycle, "get_settings", lambda: settings)
+        monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(tmp_path / "missing.toml"))
+        monkeypatch.setenv("MNEMOS_SQLITE_PATH", str(tmp_path / "mnemos.sqlite3"))
+        monkeypatch.setenv("RATE_LIMIT_STORAGE_URI", "redis://redis:6379/0")
+        core_config.reload_settings()
         monkeypatch.setattr(lifecycle, "_load_config", lambda: {"worker": {"enabled": False}})
         monkeypatch.setattr(lifecycle, "_background_tasks", set())
         monkeypatch.setattr(lifecycle, "_worker_tasks", set())
