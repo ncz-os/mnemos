@@ -314,6 +314,14 @@ test:multi-worker:
     - |
       cat > docker-compose.multi-worker.ci.yml <<'YAML'
       services:
+        postgres:
+          # Do NOT publish 5432 to the runner host: the argos runner already has
+          # a host listener on :5432, so the base compose's '127.0.0.1:5432:5432'
+          # bind collides ("address already in use"). The stack reaches postgres
+          # over the compose network (PG_HOST=postgres), so the host publish is
+          # unused in CI. `!reset` clears the inherited ports list (compose >=2.24;
+          # argos runs 2.40).
+          ports: !reset []
         redis:
           image: redis:7-alpine
           healthcheck:
