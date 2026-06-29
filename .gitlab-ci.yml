@@ -374,6 +374,10 @@ test:multi-worker:
       '
     - docker compose -f docker-compose.yml -f docker-compose.multi-worker.ci.yml logs --no-color mnemos
   after_script:
+    # Capture service logs even when `up` fails (the script step aborts before its
+    # own `logs mnemos`, but after_script always runs) so postgres/mnemos startup
+    # errors are visible in the job output instead of an opaque "exited (3)".
+    - docker compose -f docker-compose.yml -f docker-compose.multi-worker.ci.yml logs --no-color --tail=120 postgres mnemos redis || true
     - docker compose -f docker-compose.yml -f docker-compose.multi-worker.ci.yml down -v --remove-orphans || true
   allow_failure: true
   rules:
