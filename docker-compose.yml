@@ -28,6 +28,10 @@ services:
       POSTGRES_DB: mnemos
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Bootstrap the "mnemos" role before the migration init scripts run: they
+      # GRANT to "mnemos" (the production role name) while this compose's user is
+      # "mnemos_user"; without it initdb aborts ('role "mnemos" does not exist').
+      - ./db/ci/00-create-mnemos-role.sql:/docker-entrypoint-initdb.d/00-create-mnemos-role.sql
       # Migration ordering must match mnemos/installer/db.py::run_migrations()
       # (see EVOLUTION.md "decisions we would revisit" — the two
       # canonical ordering sites must stay in sync until we move to
