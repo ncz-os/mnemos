@@ -742,6 +742,93 @@ CREATE TABLE IF NOT EXISTS memory_branches (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
+# Journal API table — canonical per-owner/per-namespace journal, matching
+# PostgreSQL (db/migrations.sql + v3 ownership/namespace + v4_2 soft-delete).
+# The MySQL family never carried these peripheral tables; add them here so the
+# inherited journal/usage-ledger/category-decay repositories have schema.
+_DDL_JOURNAL = """\
+CREATE TABLE IF NOT EXISTS journal (
+    id         VARCHAR(36)  NOT NULL,
+    owner_id   VARCHAR(100) NOT NULL DEFAULT 'default',
+    namespace  VARCHAR(100) NOT NULL DEFAULT 'default',
+    entry_date DATE         NOT NULL,
+    topic      VARCHAR(100),
+    content    LONGTEXT,
+    metadata   JSON,
+    created    TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    INDEX idx_journal_owner_namespace (owner_id, namespace),
+    INDEX idx_journal_entry_date (entry_date),
+    INDEX idx_journal_topic (topic),
+    INDEX idx_journal_created (created)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+# KNEMON token/cost usage ledger (mirrors db/migrations/0032_usage_ledger.sql).
+_DDL_USAGE_LEDGER = """\
+CREATE TABLE IF NOT EXISTS usage_ledger (
+    id               BIGINT        NOT NULL AUTO_INCREMENT,
+    provider         VARCHAR(255)  NOT NULL,
+    model            VARCHAR(255)  NOT NULL,
+    task_kind        VARCHAR(255)  NOT NULL,
+    tokens_in        INT           NOT NULL,
+    tokens_out       INT           NOT NULL,
+    tokens_reasoning INT           NOT NULL DEFAULT 0,
+    est_cost_usd     DECIMAL(12,6) NOT NULL,
+    latency_ms       INT           NOT NULL,
+    outcome          VARCHAR(32)   NOT NULL,
+    caller_subsystem VARCHAR(255)  NOT NULL,
+    tier             VARCHAR(255)  NOT NULL,
+    session_id       VARCHAR(64),
+    request_count    INT           NOT NULL DEFAULT 1,
+    plan_window_id   VARCHAR(64),
+    path_kind        VARCHAR(64)   NOT NULL DEFAULT 'api',
+    subscription_amortized TINYINT NOT NULL DEFAULT 0,
+    ts               TIMESTAMP(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    INDEX usage_ledger_ts_idx (ts),
+    INDEX usage_ledger_model_idx (provider, model),
+    INDEX usage_ledger_session_idx (session_id),
+    INDEX usage_ledger_window_idx (plan_window_id),
+    CONSTRAINT ck_usage_ledger_tokens_in_nonneg CHECK (tokens_in >= 0),
+    CONSTRAINT ck_usage_ledger_tokens_out_nonneg CHECK (tokens_out >= 0),
+    CONSTRAINT ck_usage_ledger_tokens_reasoning_nonneg CHECK (tokens_reasoning >= 0),
+    CONSTRAINT ck_usage_ledger_est_cost_nonneg CHECK (est_cost_usd >= 0),
+    CONSTRAINT ck_usage_ledger_latency_nonneg CHECK (latency_ms >= 0),
+    CONSTRAINT ck_usage_ledger_outcome CHECK (outcome IN ('ok','err','timeout'))
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+# Per-category temporal-decay config (mirrors db/migrations/0031_memory_category_decay.sql).
+_DDL_CATEGORY_DECAY = """\
+CREATE TABLE IF NOT EXISTS memory_category_decay (
+    category       VARCHAR(64)   NOT NULL,
+    half_life_days DECIMAL(10,2) NOT NULL,
+    decay_kind     VARCHAR(16)   NOT NULL,
+    floor          DECIMAL(5,4)  NOT NULL DEFAULT 0,
+    PRIMARY KEY (category),
+    CONSTRAINT ck_memory_category_decay_kind CHECK (decay_kind IN ('exponential','sigmoid','none')),
+    CONSTRAINT ck_memory_category_decay_floor CHECK (floor >= 0 AND floor <= 1),
+    CONSTRAINT ck_memory_category_decay_halflife CHECK (half_life_days > 0)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+# Seed the canonical decay defaults (idempotent — INSERT IGNORE on the PK).
+_DDL_CATEGORY_DECAY_SEED = """\
+INSERT IGNORE INTO memory_category_decay (category, half_life_days, decay_kind, floor) VALUES
+    ('feedback', 365, 'exponential', 0.5),
+    ('rules', 730, 'exponential', 0.7),
+    ('user', 365, 'exponential', 0.6),
+    ('reference', 180, 'exponential', 0.3),
+    ('project', 60, 'exponential', 0.05),
+    ('facts', 90, 'exponential', 0.2),
+    ('infrastructure', 30, 'exponential', 0.1),
+    ('credentials', 14, 'sigmoid', 0.0),
+    ('working', 7, 'exponential', 0.0),
+    ('(default)', 180, 'exponential', 0.1)
+"""
+
 _INIT_DDLS = [
     _DDL_MEMORIES,
     _DDL_FEDERATION_PEERS,
@@ -758,6 +845,10 @@ _INIT_DDLS = [
     _DDL_GRAEAE_CONSULTATIONS,
     _DDL_GRAEAE_AUDIT_LOG,
     _DDL_CONSULTATION_MEMORY_REFS,
+    _DDL_JOURNAL,
+    _DDL_USAGE_LEDGER,
+    _DDL_CATEGORY_DECAY,
+    _DDL_CATEGORY_DECAY_SEED,
 ]
 
 
@@ -1524,10 +1615,16 @@ class MysqlMemoryRepository(MemoryRepository):
         vis = VisibilityFilter.for_read(user, namespace=namespace)
         return await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=vis)
 
-    # --- unimplemented methods (port forthcoming) ---
-
     async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None:
-        raise NotImplementedError("mysql: assert_memory_readable not yet implemented")
+        # Mirror the Oracle backend: re-create the READABLE filter from the
+        # user context and delegate to get_memory (which applies _render_visibility).
+        from mnemos.core.security import is_root
+
+        namespace = None if is_root(user) else user.namespace
+        visibility = VisibilityFilter.for_read(user, namespace=namespace)
+        row = await self.get_memory(tx, memory_id, visibility=visibility, include_archived=True)
+        if row is None:
+            raise PermissionError("Memory not found")
 
     async def fetch_memory_log(
         self,
@@ -1537,7 +1634,25 @@ class MysqlMemoryRepository(MemoryRepository):
         limit: int,
         user: UserContext,
     ) -> list[Row]:
-        raise NotImplementedError("mysql: fetch_memory_log not yet implemented")
+        # Simplified vs the Postgres recursive-CTE walk, matching the Oracle
+        # backend: latest N versions on this branch, version_num DESC. Caller-side
+        # assert_memory_readable enforces handler-level visibility.
+        _ = user
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT id, memory_id, version_num, content, commit_hash,
+                       parent_version_id, branch, snapshot_at, snapshot_by,
+                       change_type, category, subcategory, owner_id, namespace
+                  FROM memory_versions
+                 WHERE memory_id = %s AND branch = %s AND deleted_at IS NULL
+                 ORDER BY version_num DESC
+                 LIMIT %s
+                """,
+                (memory_id, branch, limit),
+            )
+            return await _fetch_all_dicts(cursor)
 
     async def fetch_diff_commit_pair(
         self,
@@ -1547,7 +1662,18 @@ class MysqlMemoryRepository(MemoryRepository):
         commit_b: str,
         user: UserContext,
     ) -> tuple[Row | None, Row | None]:
-        raise NotImplementedError("mysql: fetch_diff_commit_pair not yet implemented")
+        _ = user
+        conn = tx.conn
+        sql = (
+            "SELECT content, version_num FROM memory_versions "
+            "WHERE memory_id = %s AND commit_hash = %s AND deleted_at IS NULL"
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(sql, (memory_id, commit_a))
+            row_a = await _fetchone_dict(cursor)
+            await cursor.execute(sql, (memory_id, commit_b))
+            row_b = await _fetchone_dict(cursor)
+            return row_a, row_b
 
     async def fetch_checkout_commit(
         self,
@@ -1556,7 +1682,19 @@ class MysqlMemoryRepository(MemoryRepository):
         commit_hash: str,
         user: UserContext,
     ) -> Row | None:
-        raise NotImplementedError("mysql: fetch_checkout_commit not yet implemented")
+        _ = user
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT commit_hash, version_num, branch, category, subcategory,
+                       content, change_type, snapshot_at, snapshot_by
+                  FROM memory_versions
+                 WHERE memory_id = %s AND commit_hash = %s AND deleted_at IS NULL
+                """,
+                (memory_id, commit_hash),
+            )
+            return await _fetchone_dict(cursor)
 
     async def fetch_memory_export(
         self,
@@ -1568,7 +1706,29 @@ class MysqlMemoryRepository(MemoryRepository):
         limit: int,
         offset: int,
     ) -> list[Row]:
-        raise NotImplementedError("mysql: fetch_memory_export not yet implemented")
+        conn = tx.conn
+        where = ["deleted_at IS NULL"]
+        params: list[Any] = []
+        if effective_owner:
+            where.append("owner_id = %s")
+            params.append(effective_owner)
+        if effective_ns:
+            where.append("namespace = %s")
+            params.append(effective_ns)
+        if category:
+            where.append("category = %s")
+            params.append(category)
+        sql = (
+            "SELECT id, content, category, subcategory, created, updated, "
+            "owner_id, namespace, permission_mode, quality_rating, "
+            "source_model, source_provider, source_session, source_agent, metadata "
+            "FROM memories WHERE " + " AND ".join(where) + " "
+            "ORDER BY created ASC LIMIT %s OFFSET %s"
+        )
+        params.extend([limit, offset])
+        async with conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
 
     async def fetch_referenced_memory_allowlist(
         self,
@@ -1578,7 +1738,23 @@ class MysqlMemoryRepository(MemoryRepository):
         scope_owner: str | None = None,
         scope_namespace: str | None = None,
     ) -> list[Row]:
-        raise NotImplementedError("mysql: fetch_referenced_memory_allowlist not yet implemented")
+        ids = list(referenced_ids)
+        if not ids:
+            return []
+        conn = tx.conn
+        placeholders = ", ".join(["%s"] * len(ids))
+        where = [f"id IN ({placeholders})", "deleted_at IS NULL"]
+        params: list[Any] = list(ids)
+        if scope_owner is not None:
+            where.append("owner_id = %s")
+            params.append(scope_owner)
+        if scope_namespace is not None:
+            where.append("namespace = %s")
+            params.append(scope_namespace)
+        sql = "SELECT id, owner_id, namespace FROM memories WHERE " + " AND ".join(where)
+        async with conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
 
     async def backfill_missing_content_hashes(
         self,
@@ -1670,7 +1846,40 @@ class MysqlMemoryRepository(MemoryRepository):
         canonical_id: str,
         duplicate_ids: Sequence[str],
     ) -> int:
-        raise NotImplementedError("mysql: consolidate_duplicate_memories not yet implemented")
+        ids = list(duplicate_ids)
+        if not ids:
+            return 0
+        conn = tx.conn
+        placeholders = ", ".join(["%s"] * len(ids))
+        async with conn.cursor() as cursor:
+            # Canonical must exist and be active. Mirrors the Postgres EXISTS
+            # guard; MySQL forbids referencing the UPDATE target table in a
+            # subquery (error 1093), so the canonical check runs as its own SELECT.
+            await cursor.execute(
+                "SELECT 1 FROM memories WHERE id = %s AND deleted_at IS NULL "
+                "AND archived_at IS NULL AND consolidated_into IS NULL",
+                (canonical_id,),
+            )
+            if await cursor.fetchone() is None:
+                return 0
+            # Redirect duplicates to the canonical id + soft-delete, matching
+            # Postgres/SQLite so federation consolidation tombstones can emit.
+            await cursor.execute(
+                f"""
+                UPDATE memories
+                   SET consolidated_into = %s,
+                       consolidated_at = CURRENT_TIMESTAMP(6),
+                       deleted_at = COALESCE(deleted_at, CURRENT_TIMESTAMP(6)),
+                       updated = CURRENT_TIMESTAMP(6)
+                 WHERE id IN ({placeholders})
+                   AND id <> %s
+                   AND deleted_at IS NULL
+                   AND archived_at IS NULL
+                   AND consolidated_into IS NULL
+                """,
+                (canonical_id, *ids, canonical_id),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
 
 
 # ── KG, Version, Branch, Compression, Webhook, ConsultationAudit,
@@ -4370,10 +4579,120 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         return {*MYSQL_CAPABILITY_DETAILS, KG_CAPABILITY, STATE_DETAIL_CAPABILITY}
 
     async def record_usage_ledger(self, tx: Transaction, record: Any) -> Any:
-        raise NotImplementedError("mysql: usage_ledger is not yet implemented")
+        """Record model-token usage (KNEMON), mirroring the Postgres recorder.
+
+        est_cost_usd is taken from the record when provided, else computed from
+        ``model_registry`` MTok prices (reasoning tokens billed at the output
+        rate). Subscription-plan rows zero the cost and set subscription_amortized.
+        A missing model_registry match (non-subscription) logs price drift and
+        defaults cost to 0 so the usage row is still recorded (fail-open on price).
+        """
+        from decimal import Decimal
+
+        from mnemos.persistence.base import UsageLedgerResult
+
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            # Resolve the plan's auth_method; subscription_plans may be absent on
+            # MySQL (not in the init schema) — treat any lookup failure as 'api'.
+            auth_method = "api"
+            try:
+                await cursor.execute(
+                    "SELECT auth_method FROM subscription_plans "
+                    "WHERE provider = %s AND plan_name = %s "
+                    "AND effective_from <= CURRENT_DATE "
+                    "AND (effective_until IS NULL OR effective_until >= CURRENT_DATE)",
+                    (record.provider, record.tier),
+                )
+                plan_row = await _fetchone_dict(cursor)
+                if plan_row and plan_row.get("auth_method"):
+                    auth_method = str(plan_row["auth_method"]).lower()
+            except Exception as exc:  # noqa: BLE001
+                # subscription_plans isn't in the MySQL/MariaDB schema (KNEMON
+                # subscription tracking isn't ported), so a missing-table lookup
+                # falls back to api pricing. Re-raise any other error.
+                errno = getattr(getattr(exc, "args", (None,))[0], "errno", None)
+                msg = str(exc)
+                if errno != 1146 and "1146" not in msg and "doesn't exist" not in msg:
+                    raise
+                auth_method = "api"
+            is_subscription = auth_method == "subscription"
+
+            registry_match = True
+            if record.est_cost_usd is not None:
+                cost = Decimal(0) if is_subscription else Decimal(record.est_cost_usd)
+            elif is_subscription:
+                cost = Decimal(0)
+            else:
+                await cursor.execute(
+                    "SELECT input_cost_per_mtok, output_cost_per_mtok FROM model_registry "
+                    "WHERE provider = %s AND model_id = %s",
+                    (record.provider, record.model),
+                )
+                price = await _fetchone_dict(cursor)
+                registry_match = price is not None
+                in_rate = Decimal(str((price or {}).get("input_cost_per_mtok") or 0))
+                out_rate = Decimal(str((price or {}).get("output_cost_per_mtok") or 0))
+                cost = (
+                    Decimal(record.tokens_in) * in_rate
+                    + Decimal(record.tokens_out) * out_rate
+                    + Decimal(record.tokens_reasoning) * out_rate
+                ) / Decimal(1_000_000)
+
+            if not is_subscription and not registry_match:
+                _LOG.warning(
+                    "usage_ledger model_registry price missing for provider=%s model=%s; recording est_cost_usd=0",
+                    record.provider,
+                    record.model,
+                )
+
+            await cursor.execute(
+                """
+                INSERT INTO usage_ledger (
+                    provider, model, task_kind, tokens_in, tokens_out, tokens_reasoning,
+                    est_cost_usd, latency_ms, outcome, caller_subsystem, tier,
+                    session_id, request_count, plan_window_id, path_kind, subscription_amortized
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    record.provider,
+                    record.model,
+                    record.task_kind,
+                    record.tokens_in,
+                    record.tokens_out,
+                    record.tokens_reasoning,
+                    cost,
+                    record.latency_ms,
+                    record.outcome,
+                    record.caller_subsystem,
+                    record.tier,
+                    record.session_id,
+                    record.request_count,
+                    record.plan_window_id,
+                    record.path_kind or "api",
+                    1 if is_subscription else 0,
+                ),
+            )
+            new_id = getattr(cursor, "lastrowid", None)
+            if not new_id:
+                await cursor.execute("SELECT LAST_INSERT_ID() AS id")
+                row = await _fetchone_dict(cursor)
+                new_id = (row or {}).get("id")
+            # Return the value as stored (DECIMAL(12,6) rounding), matching the
+            # Postgres/Oracle recorders which return the inserted column value.
+            await cursor.execute("SELECT est_cost_usd FROM usage_ledger WHERE id = %s", (new_id,))
+            stored = await _fetchone_dict(cursor)
+        stored_cost = (stored or {}).get("est_cost_usd")
+        return UsageLedgerResult(
+            id=int(new_id),
+            est_cost_usd=Decimal(str(stored_cost)) if stored_cost is not None else cost,
+        )
 
     async def fetch_category_decay_rows(self, tx: Transaction) -> list[Row]:
-        raise NotImplementedError("mysql: category decay is not yet implemented")
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT category, half_life_days, decay_kind, floor FROM memory_category_decay")
+            return await _fetch_all_dicts(cursor)
 
     async def upsert_category_decay(
         self,
@@ -4384,7 +4703,19 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         decay_kind: str,
         floor: float,
     ) -> None:
-        raise NotImplementedError("mysql: category decay is not yet implemented")
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO memory_category_decay (category, half_life_days, decay_kind, floor)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    half_life_days = VALUES(half_life_days),
+                    decay_kind = VALUES(decay_kind),
+                    floor = VALUES(floor)
+                """,
+                (category, half_life_days, decay_kind, floor),
+            )
 
     async def create_journal_entry(
         self,
@@ -4398,7 +4729,29 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         content: str,
         metadata: dict[str, Any] | None,
     ) -> Row:
-        raise NotImplementedError("mysql: journal persistence is not yet implemented")
+        conn = tx.conn
+        metadata_json = json.dumps(metadata or {})
+        async with conn.cursor() as cursor:
+            if entry_date is None:
+                await cursor.execute(
+                    "INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata) "
+                    "VALUES (%s, %s, %s, CURRENT_DATE, %s, %s, %s)",
+                    (entry_id, owner_id, namespace, topic, content, metadata_json),
+                )
+            else:
+                await cursor.execute(
+                    "INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (entry_id, owner_id, namespace, entry_date, topic, content, metadata_json),
+                )
+            await cursor.execute(
+                "SELECT id, entry_date, topic, content, metadata, created FROM journal WHERE id = %s",
+                (entry_id,),
+            )
+            row = await _fetchone_dict(cursor)
+        if row is None:
+            raise RuntimeError("journal insert returned no row")
+        return row
 
     async def list_journal_entries(
         self,
@@ -4411,7 +4764,26 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         search: str | None,
         limit: int,
     ) -> list[Row]:
-        raise NotImplementedError("mysql: journal persistence is not yet implemented")
+        conn = tx.conn
+        sql = (
+            "SELECT id, entry_date, topic, content, metadata, created FROM journal "
+            "WHERE owner_id = %s AND namespace = %s AND deleted_at IS NULL"
+        )
+        params: list[Any] = [owner_id, namespace]
+        if entry_date is not None:
+            sql += " AND entry_date = %s"
+            params.append(entry_date)
+        elif topic:
+            sql += " AND topic = %s"
+            params.append(topic)
+        elif search:
+            sql += " AND (LOWER(content) LIKE LOWER(%s) OR LOWER(topic) LIKE LOWER(%s))"
+            params.extend([f"%{search}%", f"%{search}%"])
+        sql += " ORDER BY created DESC LIMIT %s"
+        params.append(limit)
+        async with conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
 
     async def delete_journal_entry(
         self,
@@ -4421,7 +4793,13 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         owner_id: str,
         namespace: str,
     ) -> bool:
-        raise NotImplementedError("mysql: journal persistence is not yet implemented")
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM journal WHERE id = %s AND owner_id = %s AND namespace = %s AND deleted_at IS NULL",
+                (entry_id, owner_id, namespace),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
 
     @asynccontextmanager
     async def transactional(self) -> AsyncIterator[Transaction]:
