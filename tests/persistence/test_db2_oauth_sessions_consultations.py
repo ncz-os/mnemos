@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mnemos.persistence.base import ALL_CAPABILITIES
-from mnemos.persistence.db2 import Db2Backend, Db2ConsultationsRepository, Db2OAuthRepository, Db2SessionsRepository
+from mnemos.persistence.base import ACL_CAPABILITY, ALL_CAPABILITIES
+from mnemos.persistence.db2 import Db2Backend, Db2ConsultationsRepository, Db2OAuthRepository
 from mnemos.persistence.sqlite import SqliteBackend
 
 
@@ -109,7 +109,7 @@ async def test_db2_protocol_parity_matches_sqlite_facade_shape(tmp_path: Path) -
 def test_db2_backend_advertises_protocols_and_methods() -> None:
     backend = Db2Backend(pool=object(), settings=_settings())
 
-    assert backend.capabilities == set(ALL_CAPABILITIES)
+    assert backend.capabilities == set(ALL_CAPABILITIES) | {ACL_CAPABILITY}
     for name in (
         "register_oauth_token",
         "lookup_oauth_token",
@@ -183,11 +183,12 @@ async def test_db2_repositories_emit_native_positional_sql() -> None:
     conn = _RecordingConn()
     token = bytes.fromhex("55" * 32)
     session_id = uuid.uuid4()
+    backend = Db2Backend(pool=object(), settings=_settings())
 
     assert await Db2OAuthRepository().lookup_oauth_token(conn, token=token) is None
     assert await Db2OAuthRepository().redeem_oauth_state(conn, state=token) is None
-    assert await Db2SessionsRepository().lookup_session(conn, session_id=session_id) is None
-    assert await Db2SessionsRepository().expire_session(conn, session_id=session_id) is True
+    assert await backend.lookup_session(conn, session_id=session_id) is None
+    assert await backend.expire_session(conn, session_id=session_id) is True
     assert await Db2ConsultationsRepository().list_consultations(conn, user_id="alice") == []
 
     sql = "\n".join(statement for statement, _ in conn.cursor_obj.statements)

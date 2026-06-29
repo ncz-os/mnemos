@@ -1638,7 +1638,6 @@ ALL_CAPABILITIES: frozenset[CapabilityName] = frozenset(
         FEDERATION_CAPABILITY,
         AUDIT_CAPABILITY,
         STATE_CAPABILITY,
-        ACL_CAPABILITY,
     }
 )
 

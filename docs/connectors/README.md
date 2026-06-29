@@ -6,7 +6,7 @@
 > Codex CLI). Defaults are off; configuration is opt-in; surface area is
 > intentionally narrow. APIs may change between minor releases without a
 > deprecation cycle until the surface is promoted to `stable` in a later
-> release. v6.0.0rc1 keeps stdio/HTTP registry parity in the `mnemos.mcp`
+> release. v6.0.0 keeps stdio/HTTP registry parity in the `mnemos.mcp`
 > package, but broad remote connector packaging remains experimental.
 
 For surfaces without native MCP support, the `mnemos-bridge-*` adapter
@@ -218,7 +218,7 @@ Automated connector smoke coverage lives in
 subcommand for Claude Code, Claude Desktop, Cursor, Codex CLI,
 Continue.dev, and Cline, plus the HTTP/SSE bridge used by ChatGPT
 Pro Developer Mode. The tests use a loopback mock MNEMOS REST backend,
-send MCP `tools/list`, assert the canonical 23-tool registry, then call
+send MCP `tools/list`, assert the canonical 24-tool registry, then call
 `search_memories` with a benign query and verify the success envelope.
 
 Run the connector smoke directly:
@@ -360,7 +360,7 @@ to it, we ship the fix as a PR. That's the contract.
 
 While `experimental`:
 
-- Endpoints under `/admin/tunnels/*` are **not implemented as of v6.0.0rc1**;
+- Endpoints under `/admin/tunnels/*` are **not implemented as of v6.0.0**;
   the `mnemos-tunnel-setup` script that calls them is aspirational. They
   may be implemented, renamed, restructured, or withdrawn in any minor
   release. The manual `mnemos serve mcp-http` + ngrok path documented in
