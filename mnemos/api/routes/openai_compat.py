@@ -68,6 +68,7 @@ _EXPORTS = {
 __all__ = [
     "router",
     "list_models",
+    "recommend_model",
     "get_model",
     "chat_completions",
     "_prepare_provider_route",
@@ -261,6 +262,20 @@ async def list_models(
         return await domain_router.list_models(user=user)
     except providers.OpenAICompatError as exc:
         raise _to_http_exception(exc) from exc
+
+
+@router.get("/v1/providers/recommend")
+async def recommend_model(
+    task_type: str = "reasoning",
+    cost_budget: float = 10.0,
+    quality_floor: float = 0.85,
+):
+    recommendation = await domain_router.get_model_recommendation(
+        task_type=task_type,
+        cost_budget=cost_budget,
+        quality_floor=quality_floor,
+    )
+    return {"recommended": recommendation}
 
 
 @router.get("/v1/models/{model_id}")

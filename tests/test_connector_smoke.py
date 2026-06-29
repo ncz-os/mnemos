@@ -243,7 +243,7 @@ def _assert_backend_search_request(requests: list[dict[str, Any]]) -> None:
             "method": "POST",
             "path": "/v1/memories/search",
             "authorization": f"Bearer {BACKEND_TOKEN}",
-            "body": {"query": SEARCH_QUERY, "limit": 1},
+            "body": {"query": SEARCH_QUERY, "limit": 1, "semantic": True},
         }
     ]
 

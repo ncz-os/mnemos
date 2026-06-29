@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mnemos.persistence.base import ALL_CAPABILITIES
+from mnemos.persistence.base import ACL_CAPABILITY, ALL_CAPABILITIES
 from mnemos.persistence.oracle import OracleBackend
 from mnemos.persistence.sqlite import SqliteBackend
 
@@ -108,7 +108,7 @@ async def test_sqlite_protocol_roundtrip_matches_oracle_facade_shape(tmp_path: P
 def test_oracle_backend_advertises_protocols_and_methods() -> None:
     backend = OracleBackend(pool=object(), settings=_settings())
 
-    assert backend.capabilities == set(ALL_CAPABILITIES)
+    assert backend.capabilities == set(ALL_CAPABILITIES) | {ACL_CAPABILITY}
     for name in (
         "register_oauth_token",
         "lookup_oauth_token",

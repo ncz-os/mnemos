@@ -582,14 +582,14 @@ def test_legacy_chunk_key_update_is_wrapped_in_savepoint():
     its lexical position is inside ``async with conn.transaction()``.
     The route-level outer transaction now comes from
     ``PersistenceBackend.transactional()``; the raw asyncpg
-    savepoint belongs in ``mnemos/db/document_repo.py``.
+    savepoint belongs in ``mnemos/domain/document_repo.py``.
     """
     import ast
 
     repo_path = (
         REPO_ROOT
         / "mnemos"
-        / "db"
+        / "domain"
         / "document_repo.py"
     )
     tree = ast.parse(repo_path.read_text(encoding="utf-8"))
