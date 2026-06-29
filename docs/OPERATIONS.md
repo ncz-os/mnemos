@@ -1,6 +1,6 @@
 # MNEMOS Operations — Multi-Node Deployment & Maintenance
 
-**Status:** Canonical (v6.0.0rc1 production line, updated 2026-05-08)
+**Status:** Canonical (v6.0.0 production line, updated 2026-05-08)
 **Audience:** Operators, SREs, release engineers
 **Scope:** Continuous operation and maintenance of MNEMOS production + staging + test clusters
 
@@ -462,7 +462,7 @@ Response (JSON):
 ```json
 {
   "status": "healthy",
-  "version": "6.0.0rc1",
+  "version": "6.0.0",
   "profile": "server",
   "database_connected": true,
   "distillation_worker": "healthy"
@@ -920,4 +920,4 @@ sudo journalctl -u mnemos -f
 **Document version:** 1.0
 **Last updated:** 2026-05-08
 **Maintained by:** Operations team
-**Status:** Active, current for v6.0.0rc1 production line
+**Status:** Active, current for v6.0.0 production line

@@ -1793,6 +1793,8 @@ async def bulk_create_memories(
                     created=None,
                     updated=None,
                 )
+                if vec:
+                    await backend.memories.upsert_memory_embedding(tx, mid, vec)
                 await _write_memory_mutation_audit_entry(
                     backend,
                     tx,

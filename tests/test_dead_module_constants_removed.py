@@ -38,7 +38,14 @@ def test_dead_module_constant_removed(module_path, name):
     """Each dead constant must stay removed unless reintroduced
     with a real callsite."""
     repo = Path(__file__).resolve().parents[1]
-    src = (repo / module_path).read_text()
+    module = repo / module_path
+    if not module.exists():
+        # Module was removed or relocated (e.g. carved into a sibling package
+        # like mnemos-charon): a constant in a file that no longer exists here
+        # is, by definition, removed. The guard stays meaningful for the
+        # modules that remain in-tree.
+        return
+    src = module.read_text()
     # Look for an assignment of the constant — `NAME = ...` at the
     # start of a line.
     import re
