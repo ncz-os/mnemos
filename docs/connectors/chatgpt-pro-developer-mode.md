@@ -47,7 +47,7 @@ service; everything stays in your MNEMOS.
 ```
 
 The MCP HTTP/SSE bridge (`mnemos serve mcp-http`) shares the exact same
-23 tool definitions as the stdio MCP server. A memory written from Claude
+24 tool definitions as the stdio MCP server. A memory written from Claude
 Desktop is queryable from ChatGPT and vice versa.
 
 ## Setup — manual path (works today)
@@ -180,7 +180,7 @@ conversation. Same memory is visible from your other agents.
 The `mnemos-tunnel-setup` helper (`scripts/mnemos_tunnel_setup.py`) is
 checked in as an aspirational contract. It expects a daemon-side
 `/admin/tunnels/*` REST surface plus a `mnemos.tunnels.ngrok_bridge`
-module; **neither has shipped as of v6.0.0rc1** (verified in the repo).
+module; **neither has shipped as of v6.0.0** (verified in the repo).
 Use the manual path above. The snippet below describes the eventual
 flow:
 
