@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mif-spec.dev/schema/definitions/entity-reference.schema.json",
+  "title": "MIF Entity Reference",
+  "description": "Reference to an entity (person, organization, technology, etc.) within a MIF memory",
+  "type": "object",
+  "required": ["@type", "entity"],
+  "properties": {
+    "@type": {
+      "const": "EntityReference"
+    },
+    "entity": {
+      "type": "object",
+      "description": "Entity identifier object",
+      "required": ["@id"],
+      "properties": {
+        "@id": {
+          "type": "string",
+          "pattern": "^urn:mif:entity:",
+          "description": "Entity URN identifier (e.g., urn:mif:entity:person:jane-smith)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "entityType": {
+      "type": "string",
+      "description": "Entity type classification",
+      "oneOf": [
+        {
+          "enum": ["Person", "Organization", "Technology", "Concept", "File"]
+        },
+        {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "description": "Custom entity type from ontology (e.g., grazing-plan, soil-profile)"
+        }
+      ]
+    },
+    "name": {
+      "type": "string",
+      "description": "Display name for the entity"
+    },
+    "role": {
+      "type": "string",
+      "description": "Role of the entity in the memory context (e.g., author, subject, topic)"
+    }
+  },
+  "additionalProperties": false
+}
