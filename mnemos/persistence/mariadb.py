@@ -44,16 +44,20 @@ from mnemos.persistence.base import (
     WebhookRepository,
 )
 from mnemos.persistence.mysql import (
+    _DDL_CATEGORY_DECAY,
+    _DDL_CATEGORY_DECAY_SEED,
     _DDL_COMPRESSION_QUEUE,
     _DDL_CONSULTATION_MEMORY_REFS,
     _DDL_FEDERATION_PEERS,
     _DDL_FEDERATION_SYNC_LOG,
     _DDL_GRAEAE_AUDIT_LOG,
     _DDL_GRAEAE_CONSULTATIONS,
+    _DDL_JOURNAL,
     _DDL_KG_TRIPLES,
     _DDL_MODEL_REGISTRY,
     _DDL_MODEL_REGISTRY_SYNC_LOG,
     _DDL_STATE,
+    _DDL_USAGE_LEDGER,
     _DEFAULT_EMBEDDING_DIM,
     _MysqlTransaction,
     _boosted_rank_supersession_sort_key,
@@ -276,6 +280,10 @@ _INIT_DDLS = [
     _DDL_GRAEAE_CONSULTATIONS,
     _DDL_GRAEAE_AUDIT_LOG,
     _DDL_CONSULTATION_MEMORY_REFS,
+    _DDL_JOURNAL,
+    _DDL_USAGE_LEDGER,
+    _DDL_CATEGORY_DECAY,
+    _DDL_CATEGORY_DECAY_SEED,
 ]
 
 
