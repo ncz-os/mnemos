@@ -24,11 +24,13 @@ Run:
   MNEMOS_BASE=http://localhost:5002  \
   python3 mcp_http_server.py --host 127.0.0.1 --port 5004
 """
+
 from __future__ import annotations
 
 import argparse
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import sys
@@ -44,6 +46,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, PlainTextResponse
+
 try:
     from starlette.responses import StreamingResponse
 except ImportError:  # pragma: no cover - exercised only by lightweight test stubs.
@@ -51,6 +54,7 @@ except ImportError:  # pragma: no cover - exercised only by lightweight test stu
 from starlette.routing import Mount, Route
 
 from mnemos.core.config import get_settings, mcp_nats_raw_enabled
+
 # Reuse the exact same Server instance + tool registrations from
 # the stdio entry point. Importing for the side effect of having
 # tools registered against `app`.
@@ -63,8 +67,7 @@ from mnemos.mcp.tools import (
 
 # stderr logging — matches mcp_server.py convention so log shipping
 # from container stdout/stderr stays consistent.
-logging.basicConfig(level=logging.INFO, stream=sys.stderr,
-                    format="%(asctime)s [%(levelname)s] mcp_http: %(message)s")
+logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s [%(levelname)s] mcp_http: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -115,16 +118,14 @@ def _load_token_principals() -> dict[str, MCPClientPrincipal]:
             parts = [part.strip() for part in item.split(":", 2)]
             if len(parts) not in (2, 3) or not parts[0] or not parts[1]:
                 _fatal_auth_config(
-                    "FATAL: MNEMOS_MCP_TOKENS entries must be "
-                    "user_id:token or user_id:mcp_token:api_key.\n"
+                    "FATAL: MNEMOS_MCP_TOKENS entries must be user_id:token or user_id:mcp_token:api_key.\n"
                 )
             user_id = parts[0]
             token = parts[1]
             api_key = parts[2] if len(parts) == 3 and parts[2] else token
             if token in principals:
                 _fatal_auth_config(
-                    "FATAL: duplicate bearer token in MNEMOS_MCP_TOKENS. "
-                    "Each MCP client token must be unique.\n"
+                    "FATAL: duplicate bearer token in MNEMOS_MCP_TOKENS. Each MCP client token must be unique.\n"
                 )
             principals[token] = MCPClientPrincipal(user_id=user_id, api_key=api_key)
         if not principals:
@@ -160,6 +161,24 @@ def _load_token_principals() -> dict[str, MCPClientPrincipal]:
 TOKEN_PRINCIPALS = _load_token_principals()
 
 
+def _match_principal(presented: str) -> MCPClientPrincipal | None:
+    """Constant-time bearer-token match (F4, 2026-06-28).
+
+    A plain ``TOKEN_PRINCIPALS.get(presented)`` compares dict keys with
+    short-circuiting equality, leaking token bytes through response timing —
+    inconsistent with the ``hmac.compare_digest`` checks elsewhere
+    (``mcp_audit.py``, ``audit/crypto.py``, the hashed HTTP-API path). Compare
+    against every configured token with ``hmac.compare_digest`` and do **not**
+    early-exit on a hit, so neither the match position nor which token matched
+    is observable via timing.
+    """
+    matched: MCPClientPrincipal | None = None
+    for token, candidate in TOKEN_PRINCIPALS.items():
+        if hmac.compare_digest(presented, token):
+            matched = candidate
+    return matched
+
+
 def _principal_id(principal: MCPClientPrincipal) -> str:
     """Return the stable caller identity used to bind SSE sessions."""
     api_key_fingerprint = hashlib.sha256((principal.api_key or "").encode()).hexdigest()
@@ -185,7 +204,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": 'Bearer realm="mnemos-mcp"'},
             )
         presented = auth.split(" ", 1)[1].strip()
-        principal = TOKEN_PRINCIPALS.get(presented)
+        principal = _match_principal(presented)
         if principal is None:
             return JSONResponse(
                 {"error": "invalid bearer token"},
@@ -243,10 +262,10 @@ def _extract_path_session_id(scope) -> str | None:
     path = scope.get("path", "")
     root_path = scope.get("root_path", "")
     if root_path and path.startswith(root_path):
-        path = path[len(root_path):]
+        path = path[len(root_path) :]
     messages_prefix = "/messages/"
     if path.startswith(messages_prefix) and len(path) > len(messages_prefix):
-        return _session_id_key(path[len(messages_prefix):].strip("/"))
+        return _session_id_key(path[len(messages_prefix) :].strip("/"))
     if root_path.rstrip("/") == "/messages" and path.strip("/"):
         return _session_id_key(path.strip("/"))
     return None
@@ -282,7 +301,9 @@ def _authenticated_principal_id_from_scope(scope) -> str | None:
 async def _bound_sse_connection(request, principal_id: str):
     session_key = None
     transport_context = sse.connect_sse(
-        request.scope, request.receive, request._send,
+        request.scope,
+        request.receive,
+        request._send,
     )
     async with _sse_session_bind_lock:
         before_sessions = set(getattr(sse, "_read_stream_writers", {}))
@@ -291,9 +312,7 @@ async def _bound_sse_connection(request, principal_id: str):
         new_sessions = after_sessions - before_sessions
         if len(new_sessions) != 1:
             await transport_context.__aexit__(None, None, None)
-            raise RuntimeError(
-                "Could not identify newly-created MCP SSE session for principal binding"
-            )
+            raise RuntimeError("Could not identify newly-created MCP SSE session for principal binding")
         session_key = _session_id_key(new_sessions.pop())
         _sse_session_principals[session_key] = principal_id
 
@@ -401,11 +420,9 @@ def _principal_cache_get(principal_id: str) -> MCPUserContext | None:
     return entry  # type: ignore[return-value]
 
 
-def _principal_cache_set(principal_id: str,
-                         context: MCPUserContext) -> None:
+def _principal_cache_set(principal_id: str, context: MCPUserContext) -> None:
     """Write the tuple-shaped entry with TTL; cap size."""
-    if len(_principal_context_cache) >= _PRINCIPAL_CACHE_MAX \
-            and principal_id not in _principal_context_cache:
+    if len(_principal_context_cache) >= _PRINCIPAL_CACHE_MAX and principal_id not in _principal_context_cache:
         # Evict the half-oldest entries by expiry time so a single
         # eviction storm doesn't repeat on every subsequent set.
         # Bare-context entries (test direct-assign) sort to the
@@ -413,8 +430,8 @@ def _principal_cache_set(principal_id: str,
         def _expiry_key(item: tuple[str, Any]) -> float:
             v = item[1]
             return v[1] if isinstance(v, tuple) else float("inf")
-        items = sorted(_principal_context_cache.items(),
-                       key=_expiry_key)
+
+        items = sorted(_principal_context_cache.items(), key=_expiry_key)
         for k, _ in items[: max(1, len(items) // 2)]:
             _principal_context_cache.pop(k, None)
     _principal_context_cache[principal_id] = (
@@ -426,6 +443,7 @@ def _principal_cache_set(principal_id: str,
 # Indirection so tests can monkeypatch the clock.
 def _monotonic() -> float:
     import time
+
     return time.monotonic()
 
 
@@ -498,7 +516,8 @@ def _parse_nats_sse_subjects(request, context: MCPUserContext) -> list[str]:
         if raw:
             subjects = [part.strip() for part in raw.split(",") if part.strip()]
             invalid = [
-                subject for subject in subjects
+                subject
+                for subject in subjects
                 if not subject.startswith("mnemos.") or any(ch.isspace() for ch in subject)
             ]
             if invalid:
@@ -777,19 +796,23 @@ starlette_app = Starlette(
 
 def main() -> None:
     p = argparse.ArgumentParser(description="MNEMOS MCP HTTP/SSE server")
-    p.add_argument("--host", default="127.0.0.1",
-                   help="Bind address (default: 127.0.0.1; use 0.0.0.0 if "
-                        "running behind a tunnel/proxy that shares the box)")
-    p.add_argument("--port", type=int, default=5004,
-                   help="Listen port (default: 5004 — alongside MNEMOS API "
-                        "on 5002, GRAEAE on 5002, federation on 5002)")
+    p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address (default: 127.0.0.1; use 0.0.0.0 if running behind a tunnel/proxy that shares the box)",
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=5004,
+        help="Listen port (default: 5004 — alongside MNEMOS API on 5002, GRAEAE on 5002, federation on 5002)",
+    )
     args = p.parse_args()
 
     logger.info("MNEMOS MCP HTTP/SSE listening on %s:%d", args.host, args.port)
     logger.info("Bearer principals configured (count=%d)", len(TOKEN_PRINCIPALS))
     logger.info("MNEMOS backend: %s", get_settings().server.base)
-    uvicorn.run(starlette_app, host=args.host, port=args.port,
-                log_level="info", access_log=False)
+    uvicorn.run(starlette_app, host=args.host, port=args.port, log_level="info", access_log=False)
 
 
 if __name__ == "__main__":
