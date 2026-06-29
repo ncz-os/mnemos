@@ -499,11 +499,14 @@ def row_to_memory(row, include_compressed: bool = False, redact_secrets: bool = 
     compressed = row.get("compressed_content") if include_compressed else None
     verbatim = row.get("verbatim_content")
     if redact_secrets:
-        from mnemos.core.secret_detection import redact_content
+        # F2b (adversarial review 2026-06-28): prefer the spans recorded at
+        # ingest classification (authoritative) over recomputing, so a later
+        # classifier relaxation cannot re-expose a secret caught at ingest.
+        from mnemos.core.secret_detection import redact_field_with_stored
 
-        content = redact_content(content)
-        compressed = redact_content(compressed) if compressed else compressed
-        verbatim = redact_content(verbatim) if verbatim else verbatim
+        content = redact_field_with_stored(content, raw_meta, "content")
+        compressed = redact_field_with_stored(compressed, raw_meta, "compressed_content") if compressed else compressed
+        verbatim = redact_field_with_stored(verbatim, raw_meta, "verbatim_content") if verbatim else verbatim
 
     if frame_data:
         from mnemos.core.injection_defense import defend

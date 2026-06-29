@@ -19,6 +19,7 @@ from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.api.routes._postgres_only import _require_postgres_backend
 from mnemos.api.routes.memories import _schedule_outbox_deliveries
+from mnemos.core.secret_detection import redact_field_with_stored
 from mnemos.core.visibility import read_visibility_predicate
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
@@ -895,7 +896,14 @@ async def merge_branch(
                             "memory_id": memory_id,
                             "category": source_head["category"],
                             "subcategory": source_head["subcategory"],
-                            "content": source_head["content"],
+                            # F3: span-redact outbound webhook content (prefer
+                            # stored ingest spans, else recompute) so raw secrets
+                            # never leave the server to an external endpoint.
+                            "content": redact_field_with_stored(
+                                source_head["content"],
+                                source_head.get("metadata"),
+                                "content",
+                            ),
                             "owner_id": merge_owner_id,
                             "namespace": merge_namespace,
                             "merge_source": request.source_branch,
