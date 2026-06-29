@@ -195,11 +195,12 @@ async def test_forecast_persephone_eligibility_counts_future_window():
     assert await forecast_persephone_eligibility(pool, "default", archive_after_days=180, days_ahead=30) == 1
 
 
-def test_kronos_routes_disabled_return_503(monkeypatch):
+def test_kronos_routes_disabled_return_503(monkeypatch, tmp_path):
     from mnemos.api.main import app
     from mnemos.core.config import _reset_settings_for_tests
 
     monkeypatch.setenv("MNEMOS_KRONOS_ENABLED", "false")
+    monkeypatch.setenv("MNEMOS_SQLITE_PATH", str(tmp_path / "mnemos.sqlite3"))
     _reset_settings_for_tests()
     app.dependency_overrides[get_current_user] = lambda: _root()
     try:
@@ -208,18 +209,20 @@ def test_kronos_routes_disabled_return_503(monkeypatch):
     finally:
         app.dependency_overrides.pop(get_current_user, None)
         monkeypatch.delenv("MNEMOS_KRONOS_ENABLED", raising=False)
+        monkeypatch.delenv("MNEMOS_SQLITE_PATH", raising=False)
         _reset_settings_for_tests()
 
     assert response.status_code == 503
     assert response.json()["detail"] == "KRONOS disabled in this profile"
 
 
-def test_kronos_routes_enabled_return_expected_json_shape(monkeypatch):
+def test_kronos_routes_enabled_return_expected_json_shape(monkeypatch, tmp_path):
     from mnemos.api.main import app
     from mnemos.core.config import _reset_settings_for_tests
     import mnemos.core.lifecycle as lc
 
     monkeypatch.setenv("MNEMOS_KRONOS_ENABLED", "true")
+    monkeypatch.setenv("MNEMOS_SQLITE_PATH", str(tmp_path / "mnemos.sqlite3"))
     _reset_settings_for_tests()
     app.dependency_overrides[get_current_user] = lambda: _root()
     try:
@@ -233,6 +236,7 @@ def test_kronos_routes_enabled_return_expected_json_shape(monkeypatch):
     finally:
         app.dependency_overrides.pop(get_current_user, None)
         monkeypatch.delenv("MNEMOS_KRONOS_ENABLED", raising=False)
+        monkeypatch.delenv("MNEMOS_SQLITE_PATH", raising=False)
         _reset_settings_for_tests()
 
     assert response.status_code == 200

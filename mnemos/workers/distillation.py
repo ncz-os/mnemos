@@ -360,7 +360,7 @@ class MemoryDistillationWorker:
             # fall back to the legacy asyncpg direct query.
             import mnemos.core.lifecycle as _lc
 
-            backend = _lc._persistence_backend
+            backend = _lc._persistence_backend if self.db_pool is None else None
             if backend is not None and hasattr(backend, "compression_queue"):
                 async with backend.transactional() as tx:
                     row = await tx.conn.fetchrow("""

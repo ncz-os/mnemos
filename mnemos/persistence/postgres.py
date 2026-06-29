@@ -4177,6 +4177,7 @@ class PostgresBackend:
     _supports_federation_persistence = True
     _supports_audit_persistence = True
     _supports_state_persistence = True
+    _supports_acl_persistence = True
 
     supports_listen_notify = True
     supports_advisory_locks = True
