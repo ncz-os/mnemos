@@ -360,6 +360,24 @@ def _pg_result_count(result: str | None) -> int:
         return 0
 
 
+def _json_list(value: Any) -> list[Any]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
 async def _queue_federation_nats_upsert_from_db(tx: PostgresTransaction, memory_id: str) -> None:
     if not persistence_nats_events.federation_nats_enabled():
         return
@@ -634,9 +652,9 @@ class PostgresMemoryRepository(MemoryRepository):
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         sql = (
             "SELECT id, content, category, subcategory, created, updated, "
-            "owner_id, namespace, permission_mode, quality_rating, "
+            "owner_id, group_id, namespace, permission_mode, quality_rating, "
             "source_model, source_provider, source_session, source_agent, "
-            "metadata, "
+            "metadata, verbatim_content, archived_at, consolidated_into, embedding::text AS embedding, "
             # Provenance-bearing columns for MPF v0.2 emission. Morpheus
             # writes (provenance='morpheus_local', morpheus_run_id,
             # source_memories[]); federation pulls write
@@ -978,15 +996,22 @@ class PostgresMemoryRepository(MemoryRepository):
                 "source_agent",
                 "group_id",
                 "archived_at",
+                "consolidated_into",
                 "namespace",
+                "updated",
             }
         ]
         if not keys:
             return await self.get_memory(tx, memory_id, visibility=visibility)
-        set_clauses = [f"{col}=${i + 2}" for i, col in enumerate(keys)]
-        set_clauses.append("updated=NOW()")
+        mutable_keys = [col for col in keys if col != "updated"]
+        set_clauses = [f"{col}=${i + 2}" for i, col in enumerate(mutable_keys)]
+        values = [fields[k] for k in mutable_keys]
+        if "updated" in keys and fields.get("updated") is not None:
+            set_clauses.append(f"updated=${len(values) + 2}")
+            values.append(fields["updated"])
+        else:
+            set_clauses.append("updated=NOW()")
         set_sql = ", ".join(set_clauses)
-        values = [fields[k] for k in keys]
         vis_clause, vis_params, _ = _render_postgres_visibility(
             visibility,
             start_idx=len(values) + 2,
@@ -1697,6 +1722,10 @@ class PostgresVersionRepository(VersionRepository):
         branch: str | None,
         merge_parents: Any,
     ) -> str:
+        # Postgres stores merge_parents as uuid[]; normalize JSON text or
+        # tuples to the Python list shape asyncpg expects at the repo layer.
+        merge_parent_ids = [str(parent) for parent in _json_list(merge_parents)]
+        metadata_text = metadata_json if isinstance(metadata_json, str) else json.dumps(metadata_json)
         conn = _postgres_tx(tx).conn
         return await conn.execute(
             """
@@ -1724,7 +1753,7 @@ class PostgresVersionRepository(VersionRepository):
             content,
             category,
             subcategory,
-            metadata_json,
+            metadata_text,
             verbatim_content,
             owner_id,
             namespace,
@@ -1739,7 +1768,7 @@ class PostgresVersionRepository(VersionRepository):
             commit_hash,
             parent_version_id,
             branch,
-            merge_parents,
+            merge_parent_ids,
         )
 
     async def fetch_memory_version_by_id(self, tx: Transaction, version_id: str) -> Row | None:

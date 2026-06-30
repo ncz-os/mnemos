@@ -53,6 +53,7 @@ from mnemos.persistence.oracle import (
     _conn_from_tx,
     _content_hash,
     _fetch_all_dicts,
+    _json_list_text,
     _is_unique_violation,
     _json_text,
     _json_value,
@@ -1141,14 +1142,20 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             for key, value in fields.items():
                 if key not in self._UPDATABLE_FIELDS:
                     continue
+                if key == "updated":
+                    continue
                 sets_parts.append(f"{key} = ?")
                 params_list.append(value)
             if "content" in fields and "content" in self._UPDATABLE_FIELDS:
                 sets_parts.append("content_hash = ?")
                 params_list.append(_content_hash(fields["content"]))
-            if not sets_parts:
+            if not sets_parts and fields.get("updated") is None:
                 return await self.get_memory(tx, memory_id, visibility=visibility)
-            sets_parts.append("updated = CURRENT TIMESTAMP")
+            if "updated" in fields and fields.get("updated") is not None:
+                sets_parts.append("updated = CAST(? AS TIMESTAMP)")
+                params_list.append(fields["updated"])
+            else:
+                sets_parts.append("updated = CURRENT TIMESTAMP")
 
             clause, vis_params = _render_visibility(visibility)
             where = ["id = ?", "deleted_at IS NULL"]
@@ -1444,9 +1451,9 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             params_list.extend([offset, limit])
             sql = (
                 "SELECT id, content, category, subcategory, created, updated, "
-                "owner_id, namespace, permission_mode, quality_rating, "
+                "owner_id, group_id, namespace, permission_mode, quality_rating, "
                 "source_model, source_provider, source_session, source_agent, "
-                "metadata "
+                "metadata, verbatim_content, archived_at, consolidated_into, embedding "
                 "FROM memories WHERE " + " AND ".join(where) + " "
                 "ORDER BY created ASC "
                 "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
@@ -2143,6 +2150,11 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
         branch: str | None,
         merge_parents: Any,
     ) -> str:
+        # Db2 stores version JSON fields as text-compatible JSON values;
+        # normalize Python lists/dicts here so callers can use one repo
+        # contract across SQLite/Postgres/Oracle/Db2/MySQL.
+        merge_parents_json = _json_list_text(merge_parents)
+        metadata_text = metadata_json if isinstance(metadata_json, str) else _json_text(metadata_json, {})
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         affected = 0
@@ -2176,7 +2188,7 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
                     content,
                     category,
                     subcategory,
-                    metadata_json,
+                    metadata_text,
                     verbatim_content,
                     owner_id,
                     namespace,
@@ -2191,7 +2203,7 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
                     commit_hash,
                     parent_version_id,
                     branch,
-                    merge_parents,
+                    merge_parents_json,
                     version_id,  # for the NOT EXISTS subquery
                 ),
             )
@@ -2369,8 +2381,8 @@ class Db2BranchRepository(_Db2OraCompatMixin, OracleBranchRepository):
                 "             PARTITION BY memory_id, branch "
                 "             ORDER BY version_num DESC"
                 "         ) AS rn "
-                "  FROM memory_versions"
-                "  WHERE " + " AND ".join(where) + ""
+                "  FROM memory_versions "
+                f"  WHERE {' AND '.join(where)}"
                 ") WHERE rn = 1"
             )
             await _call(cursor.execute, sql, tuple(params))
