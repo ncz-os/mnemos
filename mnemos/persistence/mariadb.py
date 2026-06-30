@@ -306,6 +306,47 @@ async def create_mariadb_pool(
 class MariadbMemoryRepository(MysqlMemoryRepository):
     """MariaDB 11.7+ memory repository with MariaDB vector SQL."""
 
+    async def fetch_memory_export(
+        self,
+        tx: Transaction,
+        *,
+        effective_owner: str | None,
+        effective_ns: str | None,
+        category: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[Row]:
+        # MariaDB stores embeddings in a separate memory_embeddings table (read
+        # via VEC_ToText), unlike MySQL's inline memories.embedding column — so the
+        # inherited MysqlMemoryRepository.fetch_memory_export (FROM_VECTOR(embedding))
+        # cannot run here. Mirror it with a LEFT JOIN + VEC_ToText.
+        conn = tx.conn
+        where = ["m.deleted_at IS NULL"]
+        params: list[Any] = []
+        if effective_owner:
+            where.append("m.owner_id = %s")
+            params.append(effective_owner)
+        if effective_ns:
+            where.append("m.namespace = %s")
+            params.append(effective_ns)
+        if category:
+            where.append("m.category = %s")
+            params.append(category)
+        sql = (
+            "SELECT m.id, m.content, m.category, m.subcategory, m.created, m.updated, "
+            "m.owner_id, m.group_id, m.namespace, m.permission_mode, m.quality_rating, "
+            "m.source_model, m.source_provider, m.source_session, m.source_agent, "
+            "m.metadata, m.verbatim_content, m.archived_at, m.consolidated_into, "
+            "VEC_ToText(me.embedding) AS embedding "
+            "FROM memories m LEFT JOIN memory_embeddings me ON me.memory_id = m.id "
+            "WHERE " + " AND ".join(where) + " "
+            "ORDER BY m.created ASC LIMIT %s OFFSET %s"
+        )
+        params.extend([limit, offset])
+        async with conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
+
     async def insert_memory(
         self,
         tx: Transaction,
