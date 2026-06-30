@@ -1455,7 +1455,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 "source_model, source_provider, source_session, source_agent, "
                 "metadata, verbatim_content, archived_at, consolidated_into, embedding "
                 "FROM memories WHERE " + " AND ".join(where) + " "
-                "ORDER BY created ASC "
+                "ORDER BY created ASC, id ASC "
                 "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
             )
             await _call(cursor.execute, sql, tuple(params_list))
