@@ -28,6 +28,7 @@ recursive-include db *.sql
 
 # Bundled last-good seed data for offline PANTHEON pricing refreshes
 recursive-include mnemos/domain/pantheon *.json
+recursive-include mnemos/portability/mif_schemas *.json
 
 # Integrations bundle (claude-code / openclaw / zeroclaw / hermes) —
 # include every file. These directories carry mixed extensions (*.md /
