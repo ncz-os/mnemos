@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -836,6 +837,26 @@ async def test_version_fetch_by_id_and_ids(backend_case: BackendCase):
     assert _dicts(rows) == [
         {"id": version_id, "memory_id": memory_id, "owner_id": f"{backend_case.prefix}-owner", "namespace": "default"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_version_merge_parents_roundtrip_from_python_list(backend_case: BackendCase):
+    async with backend_case.backend.transactional() as tx:
+        memory_id, v1, _commit = await _seed_versioned_memory(backend_case, tx)
+        v2, _commit2 = await _insert_version(
+            backend_case,
+            tx,
+            memory_id,
+            version_num=2,
+            content="merge parent list content",
+            parent_version_id=v1,
+            merge_parents=[v1],
+        )
+        row = await backend_case.backend.memory_versions.fetch_memory_version_by_id(tx, v2)
+    merge_parents = row["merge_parents"]
+    if isinstance(merge_parents, str):
+        merge_parents = json.loads(merge_parents)
+    assert merge_parents == [v1]
 
 
 @pytest.mark.asyncio
