@@ -367,6 +367,13 @@ def _json_value(value: Any, default: Any = None) -> Any:
         return default
 
 
+def _json_list_text(value: Any) -> str:
+    parsed = _json_value(value, [])
+    if not isinstance(parsed, list):
+        parsed = []
+    return json.dumps(parsed, separators=(",", ":"))
+
+
 def _ts_for_oracle(value: Any) -> Any:
     if value is None or isinstance(value, datetime):
         return value
@@ -818,6 +825,11 @@ class OracleVersionRepository(VersionRepository):
         branch: str | None,
         merge_parents: Any,
     ) -> str:
+        # Repository contract: callers pass JSON-like values (for example a
+        # Python list for merge_parents). Oracle stores this column as JSON
+        # text/CLOB, so normalize at the dialect boundary.
+        merge_parents_json = _json_list_text(merge_parents)
+        metadata_text = metadata_json if isinstance(metadata_json, str) else _json_text(metadata_json, {})
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         affected = 0
@@ -855,7 +867,7 @@ class OracleVersionRepository(VersionRepository):
                     "content": content,
                     "category": category,
                     "subcategory": subcategory,
-                    "metadata": metadata_json,
+                    "metadata": metadata_text,
                     "verbatim_content": verbatim_content,
                     "owner_id": owner_id,
                     "namespace": namespace,
@@ -870,7 +882,7 @@ class OracleVersionRepository(VersionRepository):
                     "commit_hash": commit_hash,
                     "parent_version_id": parent_version_id,
                     "branch": branch,
-                    "merge_parents": merge_parents,
+                    "merge_parents": merge_parents_json,
                 },
             )
             affected = int(getattr(cursor, "rowcount", 0) or 0)
@@ -1028,8 +1040,8 @@ class OracleBranchRepository(BranchRepository):
                 "             PARTITION BY memory_id, branch "
                 "             ORDER BY version_num DESC"
                 "         ) AS rn "
-                "  FROM memory_versions"
-                "  WHERE " + " AND ".join(where) + ""
+                "  FROM memory_versions "
+                f"  WHERE {' AND '.join(where)}"
                 ") WHERE rn = 1"
             )
             await _call(cursor.execute, sql, params)
@@ -1471,7 +1483,9 @@ class OracleMemoryRepository(MemoryRepository):
             "source_agent",
             "group_id",
             "archived_at",
+            "consolidated_into",
             "namespace",
+            "updated",
         }
     )
 
@@ -1493,14 +1507,20 @@ class OracleMemoryRepository(MemoryRepository):
             for key, value in fields.items():
                 if key not in self._UPDATABLE_FIELDS:
                     continue
+                if key == "updated":
+                    continue
                 sets.append(f"{key} = :f_{key}")
                 params[f"f_{key}"] = value
             if "content" in fields and "content" in self._UPDATABLE_FIELDS:
                 sets.append("content_hash = :f_content_hash")
                 params["f_content_hash"] = _content_hash(fields["content"])
-            if not sets:
+            if not sets and fields.get("updated") is None:
                 return await self.get_memory(tx, memory_id, visibility=visibility)
-            sets.append("updated = SYSTIMESTAMP")
+            if "updated" in fields and fields.get("updated") is not None:
+                sets.append("updated = CAST(:f_updated AS TIMESTAMP WITH TIME ZONE)")
+                params["f_updated"] = fields["updated"]
+            else:
+                sets.append("updated = SYSTIMESTAMP")
 
             clause, vis_params = _render_visibility(visibility)
             where = ["id = :id", "deleted_at IS NULL"]
@@ -1687,9 +1707,9 @@ class OracleMemoryRepository(MemoryRepository):
                 params["cat"] = category
             sql = (
                 "SELECT id, content, category, subcategory, created, updated, "
-                "owner_id, namespace, permission_mode, quality_rating, "
+                "owner_id, group_id, namespace, permission_mode, quality_rating, "
                 "source_model, source_provider, source_session, source_agent, "
-                "metadata "
+                "metadata, verbatim_content, archived_at, consolidated_into, embedding "
                 "FROM memories WHERE " + " AND ".join(where) + " "
                 "ORDER BY created ASC "
                 "OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY"

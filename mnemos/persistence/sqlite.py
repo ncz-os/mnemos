@@ -748,7 +748,9 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         limit: int,
         offset: int,
     ) -> list[Row]:
-        conditions: list[str] = []
+        # Exclude soft-deleted rows (matches oracle/postgres/db2/mysql and the
+        # normal read paths) so export never resurrects tombstoned memories.
+        conditions: list[str] = ["deleted_at IS NULL"]
         params: list[Any] = []
         if effective_owner:
             conditions.append("owner_id = ?")
@@ -771,9 +773,9 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             # collide with the v0.2 record-level `provenance` field
             # name in serializer logic.
             "SELECT id, content, category, subcategory, created, updated, "
-            "owner_id, namespace, permission_mode, quality_rating, "
+            "owner_id, group_id, namespace, permission_mode, quality_rating, "
             "source_model, source_provider, source_session, source_agent, "
-            "metadata, "
+            "metadata, verbatim_content, archived_at, consolidated_into, embedding, "
             "provenance AS prov_kind, morpheus_run_id, "
             "source_memory_ids, federation_source "
             f"FROM memories {where} ORDER BY created ASC LIMIT ? OFFSET ?",
@@ -1267,17 +1269,23 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 "source_agent",
                 "group_id",
                 "archived_at",
+                "consolidated_into",
                 "namespace",
+                "updated",
             }
         ]
         if not keys:
             return await self.get_memory(tx, memory_id, visibility=visibility)
-        set_clauses = [f"{col} = ?" for col in keys]
-        values: list[Any] = [fields[k] for k in keys]
+        set_clauses = [f"{col} = ?" for col in keys if col != "updated"]
+        values: list[Any] = [fields[k] for k in keys if k != "updated"]
         if "content" in fields:
             set_clauses.append("content_hash = ?")
             values.append(_content_hash_for_sqlite(fields["content"]))
-        set_clauses.append("updated = CURRENT_TIMESTAMP")
+        if "updated" in keys and fields.get("updated") is not None:
+            set_clauses.append("updated = ?")
+            values.append(fields["updated"])
+        else:
+            set_clauses.append("updated = CURRENT_TIMESTAMP")
         set_sql = ", ".join(set_clauses)
         # WHERE id=? + visibility predicate. Authorization folded into
         # the same UPDATE/RETURNING — same TOCTOU-safe shape as the
