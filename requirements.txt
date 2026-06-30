@@ -2,7 +2,11 @@
 # Generated 2026-04-10 — reflects actual imports
 
 # API framework
-fastapi>=0.115.0
+# Upper bound mirrors pyproject.toml: fastapi >=0.137 ships _IncludedRouter,
+# which breaks the app.routes introspection the codebase/tests/MCP path-wiring
+# rely on. Without this cap the build resolves the latest fastapi and `pip check`
+# fails against mnemos-core's <0.137 constraint. Pin until adapted.
+fastapi>=0.115.0,<0.137
 uvicorn[standard]>=0.30.0
 gunicorn>=22.0.0
 starlette>=0.40.0
