@@ -128,103 +128,13 @@ END;
 /
 
 -- =====================================================================
--- worker_kind_stats + hive_cache + scheduled_jobs (Phase 2 spec — were
--- in my mnemos/hive_mind/oracle_ddl.sql but not 0010)
+-- hive_worker_kind_stats + hive_cache + hive_scheduled_jobs are now
+-- created by their dedicated canonical migrations (0026 / 0025 / 0027).
+-- This migration formerly created preliminary shapes here, which then
+-- collided with the canonical shapes (the later migrations skip-created
+-- on the pre-existing table and failed indexing columns the old shape
+-- lacked — ORA-00904). Creating them only in 0025/0026/0027 yields the
+-- canonical shape on a fresh deploy; those migrations also self-heal a
+-- pre-existing (old-shape) table for already-drifted instances. 0011's
+-- remaining job is the additive hive_agents / hive_jobs ALTERs above.
 -- =====================================================================
-DECLARE
-    e_exists EXCEPTION;
-    PRAGMA EXCEPTION_INIT(e_exists, -955);
-BEGIN
-    EXECUTE IMMEDIATE q'[
-        CREATE TABLE hive_worker_kind_stats (
-            agent_urn       VARCHAR2(256) NOT NULL,
-            kind            VARCHAR2(64) NOT NULL,
-            claims          NUMBER DEFAULT 0 NOT NULL,
-            completions     NUMBER DEFAULT 0 NOT NULL,
-            failures        NUMBER DEFAULT 0 NOT NULL,
-            cancellations   NUMBER DEFAULT 0 NOT NULL,
-            tokens_in       NUMBER DEFAULT 0 NOT NULL,
-            tokens_out      NUMBER DEFAULT 0 NOT NULL,
-            est_cost_usd    NUMBER(14,6) DEFAULT 0 NOT NULL,
-            total_duration_sec NUMBER(14,3) DEFAULT 0 NOT NULL,
-            last_seen_at    TIMESTAMP WITH TIME ZONE,
-            CONSTRAINT pk_hive_worker_kind_stats PRIMARY KEY (agent_urn, kind)
-        )
-    ]';
-EXCEPTION WHEN e_exists THEN NULL;
-END;
-/
-
-DECLARE
-    e_exists EXCEPTION;
-    PRAGMA EXCEPTION_INIT(e_exists, -955);
-BEGIN
-    EXECUTE IMMEDIATE
-        'CREATE INDEX idx_hive_wks_kind ON hive_worker_kind_stats(kind)';
-EXCEPTION WHEN e_exists THEN NULL;
-END;
-/
-
-DECLARE
-    e_exists EXCEPTION;
-    PRAGMA EXCEPTION_INIT(e_exists, -955);
-BEGIN
-    EXECUTE IMMEDIATE q'[
-        CREATE TABLE hive_cache (
-            cache_key       VARCHAR2(500) PRIMARY KEY,
-            source_job_id   VARCHAR2(64),
-            value           CLOB CHECK (value IS JSON),
-            provider        VARCHAR2(64),
-            model           VARCHAR2(128),
-            result_mnemos_id VARCHAR2(64),
-            hit_count       NUMBER DEFAULT 0 NOT NULL,
-            cost_saved_usd  NUMBER(14,6) DEFAULT 0 NOT NULL,
-            stored_at       TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
-            expires_at      TIMESTAMP WITH TIME ZONE
-        )
-    ]';
-EXCEPTION WHEN e_exists THEN NULL;
-END;
-/
-
-DECLARE
-    e_exists EXCEPTION;
-    PRAGMA EXCEPTION_INIT(e_exists, -955);
-BEGIN
-    EXECUTE IMMEDIATE
-        'CREATE INDEX idx_hive_cache_expires ON hive_cache(expires_at)';
-EXCEPTION WHEN e_exists THEN NULL;
-END;
-/
-
-DECLARE
-    e_exists EXCEPTION;
-    PRAGMA EXCEPTION_INIT(e_exists, -955);
-BEGIN
-    EXECUTE IMMEDIATE q'[
-        CREATE TABLE hive_scheduled_jobs (
-            id              VARCHAR2(64) PRIMARY KEY,
-            owner_urn       VARCHAR2(256) NOT NULL,
-            cron_expr       VARCHAR2(120),
-            run_at          TIMESTAMP WITH TIME ZONE,
-            payload         CLOB NOT NULL CHECK (payload IS JSON),
-            enabled         NUMBER(1) DEFAULT 1 NOT NULL CHECK (enabled IN (0,1)),
-            last_run_at     TIMESTAMP WITH TIME ZONE,
-            last_run_status VARCHAR2(20),
-            next_run_at     TIMESTAMP WITH TIME ZONE NOT NULL,
-            created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
-        )
-    ]';
-EXCEPTION WHEN e_exists THEN NULL;
-END;
-/
-
-DECLARE
-    e_exists EXCEPTION;
-    PRAGMA EXCEPTION_INIT(e_exists, -955);
-BEGIN
-    EXECUTE IMMEDIATE
-        'CREATE INDEX idx_hive_sched_next ON hive_scheduled_jobs(enabled, next_run_at)';
-EXCEPTION WHEN e_exists THEN NULL;
-END;
-/
