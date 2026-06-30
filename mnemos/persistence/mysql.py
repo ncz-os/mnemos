@@ -147,6 +147,24 @@ def _json_list(value: Any) -> list[Any]:
     return parsed if isinstance(parsed, list) else []
 
 
+def _json_list_text(value: Any) -> str:
+    return json.dumps(_json_list(value))
+
+
+def _json_text(value: Any, default: Any = None) -> str:
+    if value is None:
+        value = default
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped and stripped[0] in "[{":
+            try:
+                return json.dumps(json.loads(stripped))
+            except json.JSONDecodeError:
+                pass
+        return value
+    return json.dumps(value if value is not None else default)
+
+
 def _validate_and_format_vector(embedding: Sequence[float]) -> str:
     """Validate and format an embedding into a MySQL TO_VECTOR-compatible string.
 
@@ -1218,7 +1236,9 @@ class MysqlMemoryRepository(MemoryRepository):
             "source_agent",
             "group_id",
             "archived_at",
+            "consolidated_into",
             "namespace",
+            "updated",
         }
     )
 
@@ -1240,15 +1260,21 @@ class MysqlMemoryRepository(MemoryRepository):
             where.append(vis_clause)
             params += vis_params
 
-        safe_fields = {k: v for k, v in fields.items() if k in self._UPDATABLE_FIELDS}
+        safe_fields = {k: v for k, v in fields.items() if k in self._UPDATABLE_FIELDS and k != "updated"}
         if not safe_fields:
-            return await self.get_memory(tx, memory_id, visibility=visibility)
+            if "updated" not in fields or fields.get("updated") is None:
+                return await self.get_memory(tx, memory_id, visibility=visibility)
         set_cols = ", ".join(f"{col} = %s" for col in safe_fields)
         set_vals = list(safe_fields.values())
+        if "updated" in fields and fields.get("updated") is not None:
+            set_cols = f"{set_cols}, updated = %s" if set_cols else "updated = %s"
+            set_vals.append(fields["updated"])
+        else:
+            set_cols = f"{set_cols}, updated = NOW(6)" if set_cols else "updated = NOW(6)"
 
         async with conn.cursor() as cursor:
             await cursor.execute(
-                f"UPDATE memories m SET {set_cols}, updated = NOW(6) WHERE {' AND '.join(where)}",
+                f"UPDATE memories m SET {set_cols} WHERE {' AND '.join(where)}",
                 set_vals + params,
             )
             if not cursor.rowcount:
@@ -1720,8 +1746,9 @@ class MysqlMemoryRepository(MemoryRepository):
             params.append(category)
         sql = (
             "SELECT id, content, category, subcategory, created, updated, "
-            "owner_id, namespace, permission_mode, quality_rating, "
-            "source_model, source_provider, source_session, source_agent, metadata "
+            "owner_id, group_id, namespace, permission_mode, quality_rating, "
+            "source_model, source_provider, source_session, source_agent, "
+            "metadata, verbatim_content, archived_at, consolidated_into, FROM_VECTOR(embedding) AS embedding "
             "FROM memories WHERE " + " AND ".join(where) + " "
             "ORDER BY created ASC LIMIT %s OFFSET %s"
         )
@@ -2337,6 +2364,11 @@ class MysqlVersionRepository(VersionRepository):
         branch: str | None,
         merge_parents: Any,
     ) -> str:
+        # MySQL stores version JSON fields as JSON text; normalize Python
+        # list/dict inputs internally so importers can pass backend-neutral
+        # values just like they do for SQLite/Postgres/Oracle/Db2.
+        merge_parents_json = _json_list_text(merge_parents)
+        metadata_text = _json_text(metadata_json, {})
         conn = tx.conn
         try:
             async with conn.cursor() as cursor:
@@ -2368,7 +2400,7 @@ class MysqlVersionRepository(VersionRepository):
                         content,
                         category,
                         subcategory,
-                        metadata_json,
+                        metadata_text,
                         verbatim_content,
                         owner_id,
                         namespace,
@@ -2383,7 +2415,7 @@ class MysqlVersionRepository(VersionRepository):
                         commit_hash,
                         parent_version_id,
                         branch,
-                        json.dumps(merge_parents if merge_parents is not None else []),
+                        merge_parents_json,
                     ),
                 )
                 return "INSERT 0 1" if cursor.rowcount else "INSERT 0 0"
@@ -2595,7 +2627,9 @@ class MysqlBranchRepository(BranchRepository):
         if not memory_ids:
             return []
         params: list[Any] = list(memory_ids)
-        conditions = [f"memory_id IN ({', '.join(['%s'] * len(memory_ids))})"]
+        # Exclude soft-deleted versions so a tombstoned higher version_num cannot
+        # become the branch head (matches log/export/fetch paths; MariaDB inherits).
+        conditions = ["deleted_at IS NULL", f"memory_id IN ({', '.join(['%s'] * len(memory_ids))})"]
         if authorized_version_uuids is not None:
             if not authorized_version_uuids:
                 return []
