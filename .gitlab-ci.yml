@@ -314,6 +314,42 @@ test:multi-worker:
     - |
       cat > docker-compose.multi-worker.ci.yml <<'YAML'
       services:
+        postgres:
+          # Drop the base compose's fixed host-port publish (127.0.0.1:5432:5432).
+          # COMPOSE_PROJECT_NAME makes container names pipeline-unique, but the
+          # host port is not — concurrent pipelines on the shared runner collide
+          # ("failed to bind host port 127.0.0.1:5432: address already in use").
+          # The multi-worker smoke reaches postgres over the compose network
+          # (PG_HOST: postgres), so no host publish is needed. Requires Compose
+          # >= 2.24 for the !reset tag (ARGOS runner is 2.40).
+          ports: !reset []
+          # The base compose's initdb.d mounts are incomplete for a *fresh*
+          # DB, so `docker compose up` on a clean volume aborts (postgres
+          # exit 3) before this smoke job can run. Two gaps, both patched
+          # here for the throwaway CI database (volumes merge by append, so
+          # the base initdb mounts are preserved):
+          #
+          #   1. Role seed. initdb only creates POSTGRES_USER=mnemos_user,
+          #      but migrations_model_registry.sql (and others) GRANT to a
+          #      bare `mnemos` role. Same script docker-compose.staging.yml
+          #      mounts; sorts before 01-schema.sql.
+          #   2. hive_agents create. 0036-hive-agents-subscription-pools
+          #      ALTERs hive_agents, but the base compose never mounts the
+          #      migration that CREATEs it. 0021_hive_agents.sql is the
+          #      cross-backend (pg/oracle/db2) numbered-series creator that
+          #      0036 belongs to; the "655-" prefix sorts it after the
+          #      subscription tables and before 66-0036.
+          #
+          # NOTE (follow-up): the canonical runner mnemos/installer/db.py has
+          # the same fresh-init gap for hive/full deploys (includes 0036 but
+          # not the hive_agents creator). That is a production-deploy fix that
+          # needs a lineage decision (0021 numbered-series vs the flat
+          # migrations_v6_0_hive_mind.sql) and is tracked separately; this
+          # override only makes the CI smoke DB init.
+          volumes:
+            - ./mnemos/db_migrations/0_init_roles_staging.sql:/docker-entrypoint-initdb.d/00-init-roles.sql
+            - ./mnemos/db_migrations/migrations/0021_hive_agents.sql:/docker-entrypoint-initdb.d/655-hive-agents-create.sql
+
         redis:
           image: redis:7-alpine
           healthcheck:
