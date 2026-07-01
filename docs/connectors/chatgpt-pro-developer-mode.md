@@ -47,7 +47,7 @@ service; everything stays in your MNEMOS.
 ```
 
 The MCP HTTP/SSE bridge (`mnemos serve mcp-http`) shares the exact same
-24 tool definitions as the stdio MCP server. A memory written from Claude
+25 tool definitions as the stdio MCP server. A memory written from Claude
 Desktop is queryable from ChatGPT and vice versa.
 
 ## Setup — manual path (works today)

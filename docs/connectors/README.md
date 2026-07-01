@@ -218,7 +218,7 @@ Automated connector smoke coverage lives in
 subcommand for Claude Code, Claude Desktop, Cursor, Codex CLI,
 Continue.dev, and Cline, plus the HTTP/SSE bridge used by ChatGPT
 Pro Developer Mode. The tests use a loopback mock MNEMOS REST backend,
-send MCP `tools/list`, assert the canonical 24-tool registry, then call
+send MCP `tools/list`, assert the canonical 25-tool registry, then call
 `search_memories` with a benign query and verify the success envelope.
 
 Run the connector smoke directly:
