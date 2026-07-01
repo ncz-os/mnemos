@@ -217,6 +217,9 @@ refresh-pantheon-catalog = "mnemos.tools.refresh_pantheon_catalog:main"
 # systemd unit) into the sdist.
 include-package-data = true
 
+[tool.setuptools.package-data]
+"mnemos.db_migrations" = ["*.sql", "**/*.sql"]
+
 [tool.setuptools.packages.find]
 # Include the coherent v4 Python package tree. Top-level db/ remains a SQL
 # migrations directory and is shipped via MANIFEST.in, not as a Python package.
