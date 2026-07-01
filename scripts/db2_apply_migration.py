@@ -1,4 +1,4 @@
-"""Apply db/migrations_db2/0001_core_schema.sql to a target Db2 instance.
+"""Apply mnemos/db_migrations/migrations_db2/0001_core_schema.sql to a target Db2 instance.
 
 Splits on the Db2 CLP ``@`` statement terminator (not the sqlplus ``/``
 + ``;`` pair the Oracle equivalent uses). Idempotent — treats SQLSTATE 42710 (object exists) only
@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 DEFAULT_DSN = os.environ.get("DB2_PROOF_DSN", "db2://db2inst1:mnemos_dev@192.168.207.67:50000/MNEMOS")
-DEFAULT_FILE = REPO_ROOT / "db" / "migrations_db2" / "0001_core_schema.sql"
+DEFAULT_FILE = REPO_ROOT / "mnemos" / "db_migrations" / "migrations_db2" / "0001_core_schema.sql"
 
 # SQLSTATE codes the Db2 migration applier treats as idempotent-replay
 # signals (logged but not fatal). Per IBM Db2 12.1 SQLCODE/SQLSTATE

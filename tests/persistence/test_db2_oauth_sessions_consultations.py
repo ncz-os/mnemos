@@ -131,7 +131,7 @@ def test_db2_backend_advertises_protocols_and_methods() -> None:
 
 def test_db2_0038_migration_contains_guarded_native_schema() -> None:
     root = Path(__file__).resolve().parents[2]
-    sql = (root / "db/migrations_db2/0038_oauth_sessions_consultations.sql").read_text()
+    sql = (root / "mnemos/db_migrations/migrations_db2/0038_oauth_sessions_consultations.sql").read_text()
 
     for table in (
         "oauth_tokens",

@@ -1,7 +1,7 @@
 """Db2-native migration DDL syntax probes.
 
 Driver-free, DB-free regex assertions that verify
-``db/migrations_db2/0001_core_schema.sql`` has been rewritten to use
+``mnemos/db_migrations/migrations_db2/0001_core_schema.sql`` has been rewritten to use
 Db2-native types with zero Oracle-compatibility-alias tokens remaining.
 
 The port is described in ``docs/native-db2-port-plan.md`` §2.3 and
@@ -20,7 +20,7 @@ import pytest
 from scripts.db2_apply_migration import _split_statements
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_FIXTURE = _REPO_ROOT / "db" / "migrations_db2" / "0001_core_schema.sql"
+_FIXTURE = _REPO_ROOT / "mnemos" / "db_migrations" / "migrations_db2" / "0001_core_schema.sql"
 _BACKFILL_FIXTURES = (
     ("0002_graeae.sql", 9),
     ("0010_hive_mind.sql", 1),
@@ -90,7 +90,7 @@ def test_header_mentions_db2_native_no_ora_compat() -> None:
 @pytest.mark.parametrize(("basename", "expected_count"), _BACKFILL_FIXTURES)
 def test_backfill_migrations_parse_with_db2_runner_splitter(basename: str, expected_count: int) -> None:
     """The Db2 runner splits on @, so backfill migrations must use @ terminators."""
-    path = _REPO_ROOT / "db" / "migrations_db2" / basename
+    path = _REPO_ROOT / "mnemos" / "db_migrations" / "migrations_db2" / basename
     sql = path.read_text()
     percent_terminated = [
         (line_no, line)

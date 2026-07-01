@@ -95,8 +95,8 @@ HIDDEN_IMPORTS = [
 ] + collect_submodules("mnemos")
 
 datas = []
-datas += _files_matching("db/migrations*.sql", "db")
-datas += _files_matching("db/migrations_sqlite/*.sql", "db/migrations_sqlite")
+datas += _files_matching("mnemos/db_migrations/migrations*.sql", "mnemos/db_migrations")
+datas += _files_matching("mnemos/db_migrations/migrations_sqlite/*.sql", "mnemos/db_migrations/migrations_sqlite")
 if _tree_size(ROOT / "docs") <= DOCS_MAX_BUNDLE_BYTES:
     datas += _files_under(ROOT / "docs", "docs")
 datas += collect_data_files("sqlite_vec")

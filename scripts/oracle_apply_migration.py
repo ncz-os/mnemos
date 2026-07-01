@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 DEFAULT_DSN = os.environ.get("ORACLE_PROOF_DSN", "oracle://mnemos:mnemos_dev@192.168.207.25:1521/FREEPDB1")
-DEFAULT_FILE = REPO_ROOT / "db" / "migrations_oracle" / "0001_core_schema.sql"
+DEFAULT_FILE = REPO_ROOT / "mnemos" / "db_migrations" / "migrations_oracle" / "0001_core_schema.sql"
 
 
 def _split_statements(sql: str) -> list[str]:

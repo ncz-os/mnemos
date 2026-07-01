@@ -336,7 +336,7 @@ def _local_migrations_fingerprint() -> str:
     import hashlib
     from pathlib import Path
 
-    db_dir = Path(__file__).resolve().parents[2] / "db"
+    db_dir = Path(__file__).resolve().parents[2] / "mnemos" / "db_migrations"
     if not db_dir.is_dir():
         _MIGRATIONS_FINGERPRINT_CACHE = ""
         return ""

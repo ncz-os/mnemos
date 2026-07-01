@@ -813,7 +813,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
     — neither of which engages the Db2 12.1.5 DiskANN vector index.
     The override emits ``VECTOR_DISTANCE(..., EUCLIDEAN)`` +
     ``FETCH APPROX FIRST K ROWS ONLY`` so the vector index created by
-    ``db/migrations_db2/0001_core_schema.sql`` is actually used by the
+    ``mnemos/db_migrations/migrations_db2/0001_core_schema.sql`` is actually used by the
     app path (not only by ``scripts/bench_v4.py``).
 
     Mode is selected by ``_resolve_db2_vector_index_mode`` — see
@@ -4170,7 +4170,7 @@ class Db2Backend(OracleBackend):
     On ``open()``, probes the ``DB2_VECTOR_INDEXING`` registry variable
     and logs a clear warning if the operator hasn't enabled native
     vector indexing — without it the DiskANN index from
-    ``db/migrations_db2/0001_core_schema.sql`` cannot be created, and
+    ``mnemos/db_migrations/migrations_db2/0001_core_schema.sql`` cannot be created, and
     the app-path ``semantic_search`` override silently degrades to
     exact scan even when ``MNEMOS_DB2_VECTOR_INDEX=approx`` is set.
     """
