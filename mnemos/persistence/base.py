@@ -944,6 +944,34 @@ class ConsultationsRepository(ABC):
         namespace: str | None,
     ) -> tuple[Row | None, list[Row]]: ...
 
+    @abstractmethod
+    async def fetch_consultation_full(
+        self,
+        tx: Transaction,
+        consultation_id: str,
+    ) -> dict[str, Any] | None:
+        """Assemble a verbatim classified view of one GRAEAE consultation.
+
+        Reads the single ``graeae_consultations`` row plus every
+        ``graeae_audit_log`` row for that consultation (ordered by
+        ``sequence_num``) and materialises them into a structured dict:
+
+            {
+              "consultation_id": str,
+              "source":   {prompt, context, task_type, mode, created},
+              "quorum":   {consensus_score, winning_muse, cost, latency_ms,
+                           model_variants, muses: [{provider, model,
+                           quality_score, latency_ms}]},
+              "synthesis": {text},
+              "muses":    [{provider, model, response_text}],
+            }
+
+        Returns ``None`` when the consultation id is unknown. CLOB /
+        large-text columns are materialised to ``str`` so callers can
+        JSON-serialise the result without further unwrapping.
+        """
+        ...
+
 
 class FederationRepository(ABC):
     """Federation persistence surface."""
