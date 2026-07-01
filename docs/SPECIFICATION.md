@@ -232,7 +232,7 @@ warning when used with multiple workers.
 |---|---|---|
 | API | `mnemos.api.main:app` via `mnemos serve` | REST service on port 5002 |
 | CLI | `mnemos.cli.main:app` | `serve`, `install`, `worker`, `export`, `import`, `consult`, `health`, `version` |
-| MCP | `mnemos.mcp.stdio`, `mnemos.mcp.http` | 24 tools from `mnemos/mcp/tools/` |
+| MCP | `mnemos.mcp.stdio`, `mnemos.mcp.http` | 25 tools from `mnemos/mcp/tools/` |
 | Distillation worker | `mnemos/workers/distillation.py` | Drains `memory_compression_queue`; runs APOLLO + ARTEMIS contests |
 | Registry sync | `scripts/sync_provider_models.py` | Scheduled provider + Arena/LMArena sync |
 
@@ -405,7 +405,7 @@ Rate limiting: SlowAPI, opt-in via `RATE_LIMIT_ENABLED=true`.
 Body size: default 5 MB, `MAX_BODY_BYTES` override. Chunked-transfer
 aware streaming limiter (not just Content-Length check).
 
-### 5.2 MCP (stdio and HTTP/SSE, 24 tools)
+### 5.2 MCP (stdio and HTTP/SSE, 25 tools)
 
 Entry points: `mnemos.mcp.stdio` and `mnemos.mcp.http`. Both use
 the shared tool registry under `mnemos/mcp/tools/`. Tool manifest:

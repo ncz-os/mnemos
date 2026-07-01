@@ -91,9 +91,13 @@ if is_extra_installed("graeae"):
     from .graeae import (
         TOOLS as GRAEAE_TOOLS,
         tool_graeae_consult,
+        tool_graeae_get_consultation,
     )
 else:
     async def tool_graeae_consult(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"success": False, "error": "GRAEAE not installed"}
+
+    async def tool_graeae_get_consultation(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"success": False, "error": "GRAEAE not installed"}
 
 _DOMAIN_TOOLS: dict[str, dict[str, Any]] = {}
@@ -130,6 +134,7 @@ _TOOL_ORDER = [
     "pantheon_list_models",
     "pantheon_route_explain",
     "graeae_consult",
+    "graeae_get_consultation",
     "list_deletions",
     "kronos_anomalies",
     "kronos_forecast",
@@ -141,6 +146,7 @@ def _filter_unavailable_tools(order: list[str]) -> list[str]:
         "pantheon_list_models": "pantheon",
         "pantheon_route_explain": "pantheon",
         "graeae_consult": "graeae",
+        "graeae_get_consultation": "graeae",
         "kronos_anomalies": "kronos",
         "kronos_forecast": "kronos",
     }
@@ -425,6 +431,7 @@ __all__ = [
     "tool_get_memory",
     "tool_get_stats",
     "tool_graeae_consult",
+    "tool_graeae_get_consultation",
     "tool_input_schema",
     "tool_kg_create_triple",
     "tool_kg_search",
