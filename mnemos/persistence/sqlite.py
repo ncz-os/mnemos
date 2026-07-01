@@ -2832,7 +2832,7 @@ class SqliteConsultationsRepository(_SqliteRepository, ConsultationsRepository):
                 consultation_id,
                 kwargs["prompt"],
                 kwargs["task_type"],
-                kwargs["consensus_response"][:500],
+                kwargs["consensus_response"],
                 kwargs["consensus_score"],
                 kwargs["winning_muse"],
                 kwargs["cost"],

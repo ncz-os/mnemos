@@ -3463,7 +3463,7 @@ class OracleConsultationsRepository(ConsultationsRepository):
                     "id": consultation_id,
                     "prompt": kwargs["prompt"],
                     "task_type": kwargs["task_type"],
-                    "consensus_response": kwargs["consensus_response"][:500],
+                    "consensus_response": kwargs["consensus_response"],
                     "consensus_score": kwargs["consensus_score"],
                     "winning_muse": kwargs["winning_muse"],
                     "cost": kwargs["cost"],
