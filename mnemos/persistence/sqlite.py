@@ -52,7 +52,11 @@ from mnemos.persistence.base import (
     VersionRepository,
     WebhookRepository,
 )
-from mnemos.persistence.types import MEMORY_COLS as _MEMORY_COLS, Row
+from mnemos.persistence.types import (
+    MEMORY_COLS as _MEMORY_COLS,
+    Row,
+    assemble_consultation_full,
+)
 from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core import eligibility as _eligibility
@@ -2955,6 +2959,38 @@ class SqliteConsultationsRepository(_SqliteRepository, ConsultationsRepository):
             (consultation_id,),
         )
         return consultation, refs
+
+    async def fetch_consultation_full(
+        self, tx: Transaction, consultation_id: str
+    ) -> dict[str, Any] | None:
+        """SQLite implementation of fetch_consultation_full.
+
+        The SQLite ``graeae_consultations`` schema does not carry the
+        optional ``context_uncompressed`` / ``context_compressed`` /
+        ``model_variants`` columns that the Postgres profile has, so we
+        select only the columns guaranteed by the local DDL and surface
+        the optional ones as ``None`` when absent — read-path only, no
+        schema migration per the brief.
+        """
+        conn = self._conn(tx)
+        consultation = await _fetch_one(
+            conn,
+            "SELECT id, prompt, task_type, consensus_response, consensus_score, "
+            "winning_muse, cost, latency_ms, mode, created "
+            "FROM graeae_consultations WHERE id=? AND deleted_at IS NULL",
+            (consultation_id,),
+        )
+        if not consultation:
+            return None
+        audit_rows = await _fetch_all(
+            conn,
+            "SELECT provider, model, response_text, response_hash, quality_score, "
+            "latency_ms, sequence_num "
+            "FROM graeae_audit_log WHERE consultation_id=? AND deleted_at IS NULL "
+            "ORDER BY sequence_num ASC",
+            (consultation_id,),
+        )
+        return assemble_consultation_full(consultation, audit_rows)
 
 
 class SqliteFederationRepository(_SqliteRepository, FederationRepository):
