@@ -360,6 +360,12 @@ test:multi-worker:
 
         mnemos:
           command: ["mnemos", "serve", "--host", "0.0.0.0", "--workers", "2"]
+          # Same host-port collision as postgres above: the base compose
+          # publishes 0.0.0.0:5002, so concurrent pipelines on the shared
+          # runner collide ("Bind for 0.0.0.0:5002 failed: port is already
+          # allocated"). The smoke container reaches mnemos over the compose
+          # network (http://mnemos:5002), so drop the host publish.
+          ports: !reset []
           environment:
             RATE_LIMIT_STORAGE_URI: redis://redis:6379/1
             MNEMOS_WORKERS: "2"
