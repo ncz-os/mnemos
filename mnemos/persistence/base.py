@@ -949,8 +949,15 @@ class ConsultationsRepository(ABC):
         self,
         tx: Transaction,
         consultation_id: str,
+        *,
+        root: bool = False,
+        user_id: str | None = None,
+        namespace: str | None = None,
     ) -> dict[str, Any] | None:
         """Assemble a verbatim classified view of one GRAEAE consultation.
+
+        Owner-scoped: non-root callers only resolve their own consultations
+        (``owner_id == user_id``); an invisible/unknown id returns ``None``.
 
         Reads the single ``graeae_consultations`` row plus every
         ``graeae_audit_log`` row for that consultation (ordered by
