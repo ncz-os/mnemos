@@ -413,7 +413,7 @@ async def test_consolidate_update_produces_version_snapshots_for_federation():
 
 def test_version_trigger_covers_consolidate_update_columns():
     repo_root = Path(__file__).resolve().parents[1]
-    sql = (repo_root / "db" / "migrations_v3_5_trigger_same_memory_parent.sql").read_text()
+    sql = (repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_trigger_same_memory_parent.sql").read_text()
     compact = " ".join(sql.split())
 
     assert "OLD.metadata IS DISTINCT FROM NEW.metadata" in compact
