@@ -2675,7 +2675,7 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         try:
             await _call(
                 cursor.execute,
-                "SELECT model_id, display_name, family, input_cost_per_mtok, "
+                "SELECT provider, model_id, display_name, family, input_cost_per_mtok, "
                 "output_cost_per_mtok, capabilities, arena_score, arena_rank, "
                 "graeae_weight, context_window "
                 "FROM model_registry "
@@ -2687,35 +2687,39 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         finally:
             await _call(cursor.close)
 
-        # Schema lacks explicit `provider` column — derive from model_id prefix
-        # (e.g. "nvidia/qwen3-coder-480b" -> provider="nvidia", model_id="qwen3-coder-480b")
-        # or from family for bare model_ids like "gemini-2.5-flash-lite".
+        # model_registry has an authoritative `provider` column (part of the
+        # (provider, model_id) unique key). Prefer it. The model_id-prefix /
+        # family derivation below is only a fallback for legacy rows whose
+        # provider column is NULL/blank — without it, seeded rows like
+        # provider="deepseek-direct", model_id="deepseek-v4-flash" would be
+        # mis-surfaced as "deepseek-v4" (derived from family).
         normalized: list[dict[str, Any]] = []
         for row in raw_rows:
             mid = str(row.get("model_id") or "")
             family = str(row.get("family") or "")
+            real_provider = str(row.get("provider") or "").strip()
             if "/" in mid:
-                provider, model_local = mid.split("/", 1)
+                derived_provider, model_local = mid.split("/", 1)
             elif "/" in family:
-                provider = family.split("/", 1)[0]
+                derived_provider = family.split("/", 1)[0]
                 model_local = mid
             else:
                 # Heuristic: try gemini/openai/anthropic family prefixes
                 low = mid.lower()
                 if low.startswith("gemini-"):
-                    provider = "gemini"
+                    derived_provider = "gemini"
                 elif low.startswith("gpt-") or low.startswith("o3") or low.startswith("o4"):
-                    provider = "openai"
+                    derived_provider = "openai"
                 elif low.startswith("claude-"):
-                    provider = "anthropic"
+                    derived_provider = "anthropic"
                 elif low.startswith("grok-"):
-                    provider = "xai"
+                    derived_provider = "xai"
                 elif low.startswith("llama-") or low.startswith("kimi-"):
-                    provider = "groq"
+                    derived_provider = "groq"
                 else:
-                    provider = family or "unknown"
+                    derived_provider = family or "unknown"
                 model_local = mid
-            row["provider"] = provider
+            row["provider"] = real_provider or derived_provider
             row["model_id"] = model_local if model_local else mid
             normalized.append(row)
         return normalized
