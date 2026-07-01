@@ -80,6 +80,33 @@ v4.2.0a14 alpha line):
 PROTEUS barrage (2026-05-02) validated at 2500 concurrent writes,
 2000 reads, 200 searches: 98.5% / 99.7% / 100% success.
 
+## Planned — v7.0 — Rust persistence layer (PersistenceBackend ABC refactor)
+
+**Goal:** move the database persistence layer — today a Python `PersistenceBackend`
+ABC with per-engine implementations (PostgreSQL, Oracle AI Database 26ai, IBM DB2
+12.1.5, MariaDB, MySQL, SQLite) — onto a **Rust core**, extending the existing
+`mnemos_hot` accelerator (v0.2: cosine/top-k, batch cosine, embedding parse +
+L2-normalize, composite rerank, deterministic judge, SHA-256 batch) from compute
+kernels *into the storage layer itself*.
+
+**Rationale:** the persistence ABC is the hottest and most correctness-critical seam
+in MNEMOS — every store, search, federation write, and audit-chain mutation flows
+through it. A Rust ABC gives (a) a single memory-safe, strongly-typed backend
+contract shared across all six databases, (b) connection-pool + vector-search
+performance without Python overhead, and (c) a clean FFI boundary so the Python
+service, the Rust CLI clients (`mnemosctl`), and the MCP bridge all speak to one
+storage core.
+
+**Scope (candidate, not yet committed):**
+- 📋 Express the persistence contract as a **Rust trait** (the ABC) with per-engine
+  implementations behind it, mirroring the current Python `PersistenceBackend`.
+- 📋 Preserve each engine's **DSN-aware one-step schema standup** + native-vector path.
+- 📋 Keep the **Ed25519/Merkle mutation audit chain** + federation continuity at the
+  trait boundary so every backend inherits them uniformly.
+- 📋 **Incremental cutover behind a flag** (as `mnemos_hot` did with
+  `MNEMOS_HOT_RS_ENABLED`), retaining the Python backend as fallback until parity is
+  proven per engine.
+
 ## Planned — PINAKES (LLM wiki substrate)
 
 Full design + feature tree in [`docs/PINAKES.md`](./docs/PINAKES.md). PINAKES
