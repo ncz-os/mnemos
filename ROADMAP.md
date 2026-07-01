@@ -8,8 +8,38 @@ This document is kept intentionally narrow. It lists what the next release will 
 
 ## Current status — v6.0.0 GA (split-distribution release; legacy GA v5.0.1 shipped 2026-05-08)
 
-v5.0 closes the v3.6 + v4.x charters and rolls up the v4.2.0a14
-alpha line. Major new surfaces in this release:
+**v6.0.0 (split-distribution GA)** makes MNEMOS a modular, multi-backend,
+portability-first memory platform. New in v6.0.0:
+
+- ✅ **MIF 1.0 as the native portability format** — CHARON native adapter with
+  lossless round-trip export/import, MIF bundles (concept files + manifest), and a
+  JSON-LD projection against the published mif-spec.dev schemas (`mnemos export
+  --format mif` / `import --source mif`). The earlier MPF format is now legacy.
+- ✅ **Enterprise database backends** — DSN-aware one-step schema standup for
+  PostgreSQL, Oracle AI Database 26ai, and IBM DB2 12.1.5 (native `VECTOR`); a new
+  MariaDB vector backend; a fully-implemented MySQL surface (federation, versioning,
+  branching, knowledge graph, compression, consultation-audit, state); and SQLite
+  recency-boost.
+- ✅ **Split-distribution modular install** — profile→services manifest with
+  `install --profile/--with`, scoped migrations, and knemon/graeae/hive/pantheon as
+  opt-in extras.
+- ✅ **PANTHEON LLM gateway** — OpenAI-compatible multi-provider mesh with adaptive
+  routing, cross-provider fallback, durable cooldown stores (SQLite/Oracle/
+  write-behind), external pricing-catalog ingest, per-tenant budget pre-gate + BYOK,
+  and lossless token-compression.
+- ✅ **KNEMON cost governance** — 48h ledger baseline, subscription-mode + tier-split
+  dashboards, by-plan/forecast routes, model registry + pricing ingest, and budget
+  delegation with cross-backend routing-audit.
+- ✅ **Security hardening** — universal Ed25519/Merkle mutation audit chain with
+  federation continuity; prompt-injection defense (retrieved memories treated as
+  untrusted DATA); credential-prose detection + redact-at-retrieval + secret-vault
+  search exclusion; per-principal memory ACLs + delegated group-admin; OOD-query
+  rejection + semantic relevance floor.
+- ✅ **Retrieval + dedup** — current_only/exclude_superseded retrieval across all
+  backends, reversible content-hash dedup, and embedding_status surfaced on memories.
+
+The v5.0 foundation this builds on (closes the v3.6 + v4.x charters and rolls up the
+v4.2.0a14 alpha line):
 
 - ✅ GDPR right-to-be-forgotten: deletion-request lifecycle +
   soft-delete worker + hard-delete worker.
@@ -257,7 +287,15 @@ Remaining after v3.5.0:
 
 ## MPF v0.2 — independent evolution + MIF idea adoption — SHIPPED 2026-05-06
 
-**Strategy 2026-05-06:** MNEMOS's Memory Portability Format (`mnemos-os/mpf`) resumes independent evolution. MIF (Zircote, mif-spec.dev) is treated as an idea source for specific concepts worth adopting, not an alignment target. MNEMOS does not contribute upstream to MIF; both formats coexist in the ecosystem. (Supersedes the 2026-04-26 alignment posture.)
+> **⚠ SUPERSEDED (v6.0.0):** MNEMOS adopted **MIF 1.0 as its native portability
+> format** — a CHARON native adapter with lossless round-trip export/import, MIF
+> bundles, and a JSON-LD projection against the published mif-spec.dev schemas
+> (`mnemos export/import --format/--source mif`). **MPF is now legacy.** The
+> "independent evolution / read-only MIF interop / both formats coexist" strategy
+> below no longer holds; MIF is the alignment target, not merely an idea source. See
+> the v6.0.0 status section and `mnemos/portability/mif.py`.
+
+**Strategy 2026-05-06 (historical):** MNEMOS's Memory Portability Format (`mnemos-os/mpf`) resumes independent evolution. MIF (Zircote, mif-spec.dev) is treated as an idea source for specific concepts worth adopting, not an alignment target. MNEMOS does not contribute upstream to MIF; both formats coexist in the ecosystem. (Supersedes the 2026-04-26 alignment posture.)
 
 Spec landed at `mnemos-os/mpf` tag `v0.2.0` (commit `fd2e7f7`). Pushed to all three remotes (gitlab + github + argonas).
 
