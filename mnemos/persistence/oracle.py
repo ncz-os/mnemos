@@ -1184,21 +1184,32 @@ class OracleMemoryRepository(MemoryRepository):
                 cursor.execute,
                 """
                 INSERT INTO memories (
-                    id, content, category, subcategory, metadata, content_hash,
-                    quality_rating, verbatim_content, owner_id, namespace, permission_mode,
+                    id, category, subcategory, content_hash,
+                    quality_rating, owner_id, namespace, permission_mode,
                     source_model, source_provider, source_session, source_agent,
-                    embedding, created, updated
+                    embedding, created, updated,
+                    content, metadata, verbatim_content
                 )
-                SELECT
-                    :id, :content, :category, :subcategory, :metadata, :content_hash,
-                    :quality_rating, :verbatim_content, :owner_id, :namespace, :permission_mode,
+                VALUES (
+                    :id, :category, :subcategory, :content_hash,
+                    :quality_rating, :owner_id, :namespace, :permission_mode,
                     :source_model, :source_provider, :source_session, :source_agent,
                     TO_VECTOR(:embedding),
                     NVL(CAST(:created AS TIMESTAMP WITH TIME ZONE), SYSTIMESTAMP),
-                    NVL(CAST(:updated AS TIMESTAMP WITH TIME ZONE), SYSTIMESTAMP)
-                FROM dual
-                WHERE NOT EXISTS (SELECT 1 FROM memories WHERE id = :id)
+                    NVL(CAST(:updated AS TIMESTAMP WITH TIME ZONE), SYSTIMESTAMP),
+                    :content, :metadata, :verbatim_content
+                )
                 """,
+                # Two Oracle LOB-binding constraints shape this statement:
+                #  1. Plain VALUES (not `INSERT ... SELECT :content FROM dual`) so
+                #     oracledb binds the CLOB columns against their known target
+                #     type — the SELECT form transmits a str as VARCHAR2 and
+                #     raises ORA-01461 past 32767 bytes (large memories exceed it).
+                #  2. The CLOB columns (content, metadata, verbatim_content) are
+                #     bound LAST — Oracle raises ORA-24816 if non-LOB bind data
+                #     follows a LOB bind in the same statement.
+                # Idempotency is preserved by the unique-violation catch below
+                # instead of the old WHERE NOT EXISTS guard.
                 {
                     "id": memory_id,
                     "content": content,
@@ -1711,7 +1722,7 @@ class OracleMemoryRepository(MemoryRepository):
                 "source_model, source_provider, source_session, source_agent, "
                 "metadata, verbatim_content, archived_at, consolidated_into, embedding "
                 "FROM memories WHERE " + " AND ".join(where) + " "
-                "ORDER BY created ASC "
+                "ORDER BY created ASC, id ASC "
                 "OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY"
             )
             await _call(cursor.execute, sql, params)
