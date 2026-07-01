@@ -106,6 +106,9 @@ services:
       - ./mnemos/db_migrations/migrations_v5_3_3_deletion_log_export_index.sql:/docker-entrypoint-initdb.d/59-deletion-log-export-index.sql
       - ./mnemos/db_migrations/migrations_v5_3_4_mcp_audit_log.sql:/docker-entrypoint-initdb.d/60-mcp-audit-log.sql
       - ./mnemos/db_migrations/migrations_v5_3_5_model_registry_capabilities_gin.sql:/docker-entrypoint-initdb.d/61-model-registry-capabilities-gin.sql
+      # hive_agents CREATE before 0036 ALTERs it. "61a" sorts after 61 and
+      # before 62 so it runs ahead of 66-hive-agents-subscription-pools.
+      - ./mnemos/db_migrations/migrations/0021_hive_agents.sql:/docker-entrypoint-initdb.d/61a-hive-agents.sql
       - ./mnemos/db_migrations/migrations/0032_usage_ledger.sql:/docker-entrypoint-initdb.d/62-usage-ledger.sql
       - ./mnemos/db_migrations/migrations/0033_subscription_plans.sql:/docker-entrypoint-initdb.d/63-subscription-plans.sql
       - ./mnemos/db_migrations/migrations/0034_usage_ledger_session_tracking.sql:/docker-entrypoint-initdb.d/64-usage-ledger-session-tracking.sql
