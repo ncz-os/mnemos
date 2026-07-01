@@ -1638,7 +1638,7 @@ async def test_sqlite_fts5_relevance_ordering(tmp_path):
 
 def test_sqlite_migration_chain_mirrors_postgres_chain():
     repo_root = os.path.dirname(os.path.dirname(__file__))
-    sqlite_dir = os.path.join(repo_root, "db", "migrations_sqlite")
+    sqlite_dir = os.path.join(repo_root, "mnemos", "db_migrations", "migrations_sqlite")
     sqlite_files = sorted(name for name in os.listdir(sqlite_dir) if name.endswith(".sql"))
     assert len(sqlite_files) == len(sqlite_persistence.SQLITE_MIGRATION_FILES)
     assert set(sqlite_files) == set(sqlite_persistence.SQLITE_MIGRATION_FILES)
@@ -1646,7 +1646,7 @@ def test_sqlite_migration_chain_mirrors_postgres_chain():
 
 def test_sqlite_migration_files_are_nonempty():
     repo_root = os.path.dirname(os.path.dirname(__file__))
-    sqlite_dir = os.path.join(repo_root, "db", "migrations_sqlite")
+    sqlite_dir = os.path.join(repo_root, "mnemos", "db_migrations", "migrations_sqlite")
     for name in sqlite_persistence.SQLITE_MIGRATION_FILES:
         path = os.path.join(sqlite_dir, name)
         assert os.path.getsize(path) > 0
