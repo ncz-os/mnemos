@@ -17,7 +17,7 @@ from mnemos.core.config import db2_vector_indexing_override, embedding_dim_env
 
 _LOG = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_DB_DIR = _REPO_ROOT / "db"
+_DB_DIR = _REPO_ROOT / "mnemos" / "db_migrations"
 
 _POSTGRES_LEGACY_MIGRATIONS: tuple[Path, ...] = (
     _DB_DIR / "migrations.sql",

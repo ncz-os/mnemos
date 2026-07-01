@@ -748,7 +748,7 @@ async def reload_graeae_providers(_: UserContext = Depends(require_root)):
 # The endpoints are root-only. ``deletion_requests`` rows
 # survive the wipe — they're the audit-bearing breadcrumb that
 # proves a deletion happened. Schema details are in
-# ``db/migrations_v4_2_deletion_requests.sql``.
+# ``mnemos/db_migrations/migrations_v4_2_deletion_requests.sql``.
 
 
 def _row_to_deletion_request(row) -> DeletionRequestItem:

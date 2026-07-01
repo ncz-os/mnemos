@@ -85,13 +85,13 @@ async def test_postgres_standup_repairs_empty_wrong_dim_column_and_index() -> No
 def test_postgres_standup_migration_order_includes_full_numbered_surface() -> None:
     paths = {path.relative_to(Path(__file__).resolve().parents[1]).as_posix() for path in postgres_migration_paths()}
 
-    assert "db/migrations.sql" in paths
-    assert "db/migrations/0029_memory_audit_chain.sql" in paths
-    assert "db/migrations/0030_memory_audit_roots.sql" in paths
-    assert "db/migrations/0031_memory_category_decay.sql" in paths
-    assert "db/migrations/0040_memory_compression_queue_parity.sql" in paths
-    assert "db/migrations/0044_model_registry_pricing.sql" in paths
-    assert "db/migrations/0046_graeae_soft_delete_ownership.sql" in paths
+    assert "mnemos/db_migrations/migrations.sql" in paths
+    assert "mnemos/db_migrations/migrations/0029_memory_audit_chain.sql" in paths
+    assert "mnemos/db_migrations/migrations/0030_memory_audit_roots.sql" in paths
+    assert "mnemos/db_migrations/migrations/0031_memory_category_decay.sql" in paths
+    assert "mnemos/db_migrations/migrations/0040_memory_compression_queue_parity.sql" in paths
+    assert "mnemos/db_migrations/migrations/0044_model_registry_pricing.sql" in paths
+    assert "mnemos/db_migrations/migrations/0046_graeae_soft_delete_ownership.sql" in paths
 
 
 def test_oracle_and_db2_standup_use_full_migration_sets_and_dim_templates() -> None:
@@ -101,16 +101,16 @@ def test_oracle_and_db2_standup_use_full_migration_sets_and_dim_templates() -> N
 
     assert len(oracle_paths) > 1
     assert len(db2_paths) > 1
-    assert (repo_root / "db/migrations_oracle/0046_graeae_soft_delete_ownership.sql") in oracle_paths
-    assert (repo_root / "db/migrations_db2/0046_graeae_soft_delete_ownership.sql") in db2_paths
+    assert (repo_root / "mnemos/db_migrations/migrations_oracle/0046_graeae_soft_delete_ownership.sql") in oracle_paths
+    assert (repo_root / "mnemos/db_migrations/migrations_db2/0046_graeae_soft_delete_ownership.sql") in db2_paths
 
     oracle_sql = render_migration_sql(
-        repo_root / "db/migrations_oracle/0001_core_schema.sql",
+        repo_root / "mnemos/db_migrations/migrations_oracle/0001_core_schema.sql",
         backend="oracle",
         embedding_dim=1024,
     )
     db2_sql = render_migration_sql(
-        repo_root / "db/migrations_db2/0001_core_schema.sql",
+        repo_root / "mnemos/db_migrations/migrations_db2/0001_core_schema.sql",
         backend="db2",
         embedding_dim=1024,
     )

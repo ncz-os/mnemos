@@ -109,7 +109,8 @@ async def _run(dsn: str) -> int:
             # ── 0. Ensure target table exists ──────────────────────────
             migration_sql = (
                 REPO_ROOT
-                / "db"
+                / "mnemos"
+                / "db_migrations"
                 / "migrations_oracle"
                 / "0041_knemon_tier_assignments.sql"
             )

@@ -51,9 +51,9 @@ REPO = Path(__file__).resolve().parent.parent
 
 # Three parity-required backends — keys are display labels, values are dirs
 BACKENDS = {
-    "pg": REPO / "db" / "migrations",
-    "oracle": REPO / "db" / "migrations_oracle",
-    "db2": REPO / "db" / "migrations_db2",
+    "pg": REPO / "mnemos" / "db_migrations" / "migrations",
+    "oracle": REPO / "mnemos" / "db_migrations" / "migrations_oracle",
+    "db2": REPO / "mnemos" / "db_migrations" / "migrations_db2",
 }
 
 

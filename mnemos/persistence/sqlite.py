@@ -4614,7 +4614,7 @@ class SqliteBackend:
             logger.debug("sqlite-vec Python loader unavailable; using cosine UDF fallback: %s", exc)
 
     async def _apply_migrations(self, conn: Any) -> None:
-        migrations_dir = Path(__file__).resolve().parents[2] / "db" / "migrations_sqlite"
+        migrations_dir = Path(__file__).resolve().parents[2] / "mnemos" / "db_migrations" / "migrations_sqlite"
         for migration_name in SQLITE_MIGRATION_FILES:
             migration_path = migrations_dir / migration_name
             if not migration_path.exists():
