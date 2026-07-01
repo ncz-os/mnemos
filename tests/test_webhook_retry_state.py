@@ -3331,7 +3331,7 @@ def test_slow_delivery_loop_does_not_starve_repair_worker(monkeypatch):
 def test_retry_terminal_state_migration_repairs_existing_superseded_rows():
     repo_root = Path(__file__).resolve().parents[1]
     sql = (
-        repo_root / "db" / "migrations_v3_5_webhook_retry_terminal_state.sql"
+        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_retry_terminal_state.sql"
     ).read_text()
     compact = " ".join(sql.split())
 
@@ -3348,7 +3348,7 @@ def test_retry_terminal_state_migration_repairs_existing_superseded_rows():
 def test_webhook_attempt_lease_migration_adds_claim_columns():
     repo_root = Path(__file__).resolve().parents[1]
     sql = (
-        repo_root / "db" / "migrations_v3_5_webhook_attempt_lease.sql"
+        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_attempt_lease.sql"
     ).read_text()
     compact = " ".join(sql.split())
 
@@ -3361,7 +3361,7 @@ def test_webhook_attempt_lease_migration_adds_claim_columns():
 def test_webhook_writer_revision_migration_adds_legacy_marker():
     repo_root = Path(__file__).resolve().parents[1]
     sql = (
-        repo_root / "db" / "migrations_v3_5_webhook_writer_revision.sql"
+        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_writer_revision.sql"
     ).read_text()
     compact = " ".join(sql.split())
 
@@ -3373,7 +3373,7 @@ def test_webhook_writer_revision_migration_adds_legacy_marker():
 def test_webhook_status_updated_at_migration_adds_triggered_transition_clock():
     repo_root = Path(__file__).resolve().parents[1]
     sql = (
-        repo_root / "db" / "migrations_v3_5_webhook_status_updated_at.sql"
+        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_status_updated_at.sql"
     ).read_text()
     compact = " ".join(sql.split())
 
@@ -3395,7 +3395,7 @@ def test_webhook_status_updated_at_migration_adds_triggered_transition_clock():
 def test_webhook_superseded_marker_migration_adds_old_compatible_audit_marker():
     repo_root = Path(__file__).resolve().parents[1]
     sql = (
-        repo_root / "db" / "migrations_v3_5_webhook_superseded_marker.sql"
+        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_superseded_marker.sql"
     ).read_text()
     compact = " ".join(sql.split())
 
@@ -3410,7 +3410,7 @@ def test_webhook_superseded_marker_migration_adds_old_compatible_audit_marker():
 def test_webhook_attempt_unique_migration_adds_live_chain_attempt_invariant():
     repo_root = Path(__file__).resolve().parents[1]
     sql = (
-        repo_root / "db" / "migrations_v3_5_webhook_attempt_unique.sql"
+        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_attempt_unique.sql"
     ).read_text()
     compact = " ".join(sql.split())
 
@@ -3427,7 +3427,7 @@ def test_webhook_attempt_unique_migration_adds_live_chain_attempt_invariant():
 def test_webhook_succeeded_unique_migration_deduplicates_existing_succeeded_rows():
     repo_root = Path(__file__).resolve().parents[1]
     sql = (
-        repo_root / "db" / "migrations_v3_5_webhook_succeeded_unique.sql"
+        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_succeeded_unique.sql"
     ).read_text()
     compact = " ".join(sql.split())
 
@@ -3519,7 +3519,7 @@ def test_webhook_succeeded_unique_migration_deduplicates_existing_succeeded_rows
 def test_succeeded_terminal_trigger_migration_blocks_status_revert():
     repo_root = Path(__file__).resolve().parents[1]
     sql = (
-        repo_root / "db" / "migrations_v3_5_webhook_succeeded_terminal_trigger.sql"
+        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_succeeded_terminal_trigger.sql"
     ).read_text()
     compact = " ".join(sql.split())
 
@@ -3626,11 +3626,11 @@ def test_webhook_succeeded_terminal_trigger_migration_list_sync():
     for compose_name in ("docker-compose.yml", "docker-compose.staging.yml"):
         text = (repo_root / compose_name).read_text()
         assert (
-            "./db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql:"
+            "./mnemos/db_migrations/migrations_v3_5_webhook_succeeded_terminal_trigger.sql:"
             "/docker-entrypoint-initdb.d/33-webhook-succeeded-terminal-trigger.sql"
         ) in text, compose_name
         assert (
-            "./db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql:"
+            "./mnemos/db_migrations/migrations_v3_5_webhook_succeeded_terminal_trigger.sql:"
             "/migrations/33-webhook-succeeded-terminal-trigger.sql:ro"
         ) in text, compose_name
         assert "-f /migrations/33-webhook-succeeded-terminal-trigger.sql" in text, compose_name
