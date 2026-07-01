@@ -54,7 +54,11 @@ from mnemos.persistence.base import (
     VersionRepository,
     WebhookRepository,
 )
-from mnemos.persistence.types import MEMORY_COLS as _MEMORY_COLS, Row
+from mnemos.persistence.types import (
+    MEMORY_COLS as _MEMORY_COLS,
+    Row,
+    assemble_consultation_full,
+)
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core import webhook_constants
 from mnemos.persistence import nats_events as persistence_nats_events
@@ -3196,6 +3200,50 @@ class PostgresConsultationsRepository(ConsultationsRepository):
             consultation_id,
         )
         return consultation, list(refs)
+
+    async def fetch_consultation_full(
+        self, tx: Transaction, consultation_id: str,
+        *, root: bool = False, user_id: str | None = None, namespace: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Postgres implementation of fetch_consultation_full.
+
+        Reads the verbatim ``graeae_consultations`` row (including the
+        optional ``context_uncompressed`` / ``context_compressed`` /
+        ``model_variants`` columns the v3 DDL defines) plus every
+        ``graeae_audit_log`` row for that consultation in invocation
+        order. Both queries use the same backend-neutral transaction
+        handle so they see a consistent snapshot.
+
+        Owner-scoped: a non-root caller only resolves its own consultations
+        (``owner_id = user_id``); an invisible/unknown id returns ``None``.
+        Mirrors ``list_audit_log`` scoping.
+        """
+        conn = _postgres_tx(tx).conn
+        where = "id=$1 AND deleted_at IS NULL"
+        params: list[Any] = [consultation_id]
+        if not root:
+            params.append(user_id)
+            where += f" AND owner_id=${len(params)}"
+        if namespace is not None:
+            params.append(namespace)
+            where += f" AND namespace=${len(params)}"
+        consultation = await conn.fetchrow(
+            "SELECT id, prompt, context_uncompressed, context_compressed, "
+            "task_type, consensus_response, consensus_score, winning_muse, "
+            "cost, latency_ms, mode, model_variants, created "
+            "FROM graeae_consultations WHERE " + where,
+            *params,
+        )
+        if consultation is None:
+            return None
+        audit_rows = await conn.fetch(
+            "SELECT provider, model, response_text, response_hash, quality_score, "
+            "latency_ms, sequence_num "
+            "FROM graeae_audit_log WHERE consultation_id=$1 AND deleted_at IS NULL "
+            "ORDER BY sequence_num ASC",
+            consultation_id,
+        )
+        return assemble_consultation_full(dict(consultation), [dict(r) for r in audit_rows])
 
 
 class PostgresFederationRepository(FederationRepository):

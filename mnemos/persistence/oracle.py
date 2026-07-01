@@ -52,7 +52,7 @@ from mnemos.persistence.base import (
     VersionRepository,
     WebhookRepository,
 )
-from mnemos.persistence.types import Row
+from mnemos.persistence.types import Row, assemble_consultation_full
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.schema import ensure_oracle_schema
@@ -3709,6 +3709,57 @@ class OracleConsultationsRepository(ConsultationsRepository):
         finally:
             await _call(cursor.close)
         return consultation, refs
+
+    async def fetch_consultation_full(
+        self, tx: Transaction, consultation_id: str,
+        *, root: bool = False, user_id: str | None = None, namespace: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Oracle port of PostgresConsultationsRepository.fetch_consultation_full.
+
+        ``mode`` is an Oracle reserved word and must stay quoted in the
+        SELECT list; ``_row_to_dict`` lowercases the column name back to
+        ``mode`` for the assembler. Async CLOB columns are resolved by
+        ``_row_to_dict`` → ``_materialize_value`` before the dict reaches
+        the assembler, so the LOB handles never leak to the caller.
+
+        Owner-scoped: a non-root caller only resolves its own consultations
+        (``owner_id = user_id``); an invisible/unknown id returns ``None``
+        (the route surfaces 404). Mirrors ``list_audit_log`` scoping.
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = "id = :cid AND deleted_at IS NULL"
+            binds: dict[str, Any] = {"cid": consultation_id}
+            if not root:
+                where += " AND owner_id = :uid"
+                binds["uid"] = user_id
+            if namespace is not None:
+                where += " AND namespace = :ns"
+                binds["ns"] = namespace
+            await _call(
+                cursor.execute,
+                "SELECT id, prompt, context_uncompressed, context_compressed, "
+                "task_type, consensus_response, consensus_score, winning_muse, "
+                'cost, latency_ms, "mode", model_variants, created '
+                "FROM graeae_consultations WHERE " + where,
+                binds,
+            )
+            consultation = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            if consultation is None:
+                return None
+            await _call(
+                cursor.execute,
+                "SELECT provider, model, response_text, response_hash, quality_score, "
+                "latency_ms, sequence_num "
+                "FROM graeae_audit_log WHERE consultation_id = :cid AND deleted_at IS NULL "
+                "ORDER BY sequence_num ASC",
+                {"cid": consultation_id},
+            )
+            audit_rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        return assemble_consultation_full(consultation, audit_rows)
 
 
 class OracleFederationRepository(FederationRepository):
