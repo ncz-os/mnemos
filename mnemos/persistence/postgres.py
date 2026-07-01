@@ -3202,7 +3202,8 @@ class PostgresConsultationsRepository(ConsultationsRepository):
         return consultation, list(refs)
 
     async def fetch_consultation_full(
-        self, tx: Transaction, consultation_id: str
+        self, tx: Transaction, consultation_id: str,
+        *, root: bool = False, user_id: str | None = None, namespace: str | None = None,
     ) -> dict[str, Any] | None:
         """Postgres implementation of fetch_consultation_full.
 
@@ -3212,14 +3213,26 @@ class PostgresConsultationsRepository(ConsultationsRepository):
         ``graeae_audit_log`` row for that consultation in invocation
         order. Both queries use the same backend-neutral transaction
         handle so they see a consistent snapshot.
+
+        Owner-scoped: a non-root caller only resolves its own consultations
+        (``owner_id = user_id``); an invisible/unknown id returns ``None``.
+        Mirrors ``list_audit_log`` scoping.
         """
         conn = _postgres_tx(tx).conn
+        where = "id=$1 AND deleted_at IS NULL"
+        params: list[Any] = [consultation_id]
+        if not root:
+            params.append(user_id)
+            where += f" AND owner_id=${len(params)}"
+        if namespace is not None:
+            params.append(namespace)
+            where += f" AND namespace=${len(params)}"
         consultation = await conn.fetchrow(
             "SELECT id, prompt, context_uncompressed, context_compressed, "
             "task_type, consensus_response, consensus_score, winning_muse, "
             "cost, latency_ms, mode, model_variants, created "
-            "FROM graeae_consultations WHERE id=$1 AND deleted_at IS NULL",
-            consultation_id,
+            "FROM graeae_consultations WHERE " + where,
+            *params,
         )
         if consultation is None:
             return None

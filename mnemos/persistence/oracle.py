@@ -3711,7 +3711,8 @@ class OracleConsultationsRepository(ConsultationsRepository):
         return consultation, refs
 
     async def fetch_consultation_full(
-        self, tx: Transaction, consultation_id: str
+        self, tx: Transaction, consultation_id: str,
+        *, root: bool = False, user_id: str | None = None, namespace: str | None = None,
     ) -> dict[str, Any] | None:
         """Oracle port of PostgresConsultationsRepository.fetch_consultation_full.
 
@@ -3720,17 +3721,29 @@ class OracleConsultationsRepository(ConsultationsRepository):
         ``mode`` for the assembler. Async CLOB columns are resolved by
         ``_row_to_dict`` → ``_materialize_value`` before the dict reaches
         the assembler, so the LOB handles never leak to the caller.
+
+        Owner-scoped: a non-root caller only resolves its own consultations
+        (``owner_id = user_id``); an invisible/unknown id returns ``None``
+        (the route surfaces 404). Mirrors ``list_audit_log`` scoping.
         """
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
+            where = "id = :cid AND deleted_at IS NULL"
+            binds: dict[str, Any] = {"cid": consultation_id}
+            if not root:
+                where += " AND owner_id = :uid"
+                binds["uid"] = user_id
+            if namespace is not None:
+                where += " AND namespace = :ns"
+                binds["ns"] = namespace
             await _call(
                 cursor.execute,
                 "SELECT id, prompt, context_uncompressed, context_compressed, "
                 "task_type, consensus_response, consensus_score, winning_muse, "
                 'cost, latency_ms, "mode", model_variants, created '
-                "FROM graeae_consultations WHERE id = :cid AND deleted_at IS NULL",
-                {"cid": consultation_id},
+                "FROM graeae_consultations WHERE " + where,
+                binds,
             )
             consultation = await _row_to_dict(cursor, await _call(cursor.fetchone))
             if consultation is None:

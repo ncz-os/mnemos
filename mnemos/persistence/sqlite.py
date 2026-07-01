@@ -2961,7 +2961,8 @@ class SqliteConsultationsRepository(_SqliteRepository, ConsultationsRepository):
         return consultation, refs
 
     async def fetch_consultation_full(
-        self, tx: Transaction, consultation_id: str
+        self, tx: Transaction, consultation_id: str,
+        *, root: bool = False, user_id: str | None = None, namespace: str | None = None,
     ) -> dict[str, Any] | None:
         """SQLite implementation of fetch_consultation_full.
 
@@ -2971,14 +2972,26 @@ class SqliteConsultationsRepository(_SqliteRepository, ConsultationsRepository):
         select only the columns guaranteed by the local DDL and surface
         the optional ones as ``None`` when absent — read-path only, no
         schema migration per the brief.
+
+        Owner-scoped: a non-root caller only resolves its own consultations
+        (``owner_id = user_id``); an invisible/unknown id returns ``None``.
+        Mirrors ``list_audit_log`` scoping.
         """
         conn = self._conn(tx)
+        where = "id=? AND deleted_at IS NULL"
+        params: list[Any] = [consultation_id]
+        if not root:
+            where += " AND owner_id=?"
+            params.append(user_id)
+        if namespace is not None:
+            where += " AND namespace=?"
+            params.append(namespace)
         consultation = await _fetch_one(
             conn,
             "SELECT id, prompt, task_type, consensus_response, consensus_score, "
             "winning_muse, cost, latency_ms, mode, created "
-            "FROM graeae_consultations WHERE id=? AND deleted_at IS NULL",
-            (consultation_id,),
+            "FROM graeae_consultations WHERE " + where,
+            tuple(params),
         )
         if not consultation:
             return None
