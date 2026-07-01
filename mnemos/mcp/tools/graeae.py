@@ -22,6 +22,7 @@ from mnemos.api.routes.consultations import (
     _to_graeae_provider,
 )
 from mnemos.core.auth_context import UserContext
+from mnemos.core.security import is_root
 
 from ._runtime import (
     current_mcp_backend_api_key,
@@ -248,6 +249,69 @@ async def tool_graeae_consult(
             reset_mcp_backend_context(context_tokens)
 
 
+async def tool_graeae_get_consultation(
+    consultation_id: str,
+    section: str = "all",
+    page: int = 1,
+    page_size: int = 6000,
+    user: UserContext | None = None,
+) -> dict[str, Any]:
+    """Recall one past GRAEAE consultation, verbatim and classified, paged.
+
+    Recovers the full untruncated consultation a prior ``graeae_consult`` may
+    have returned clipped: classified into source / quorum / synthesis /
+    muses, one record per page (``total_pages`` reports how many pages the
+    requested ``section`` spans). Owner-scoped — a non-root caller only
+    recalls its own consultations; an unknown/invisible id returns an error.
+    """
+    from mnemos.core import lifecycle as _lifecycle
+    from mnemos.domain.consultation_recall import (
+        VALID_FULL_SECTIONS,
+        paginate_full_parts,
+        select_full_parts,
+    )
+
+    if section not in VALID_FULL_SECTIONS:
+        return {"success": False, "error": f"section must be one of {VALID_FULL_SECTIONS}"}
+    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+        return {"success": False, "error": "page must be an integer >= 1"}
+    if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 1:
+        return {"success": False, "error": "page_size must be an integer >= 1"}
+    try:
+        user = _mcp_user_or_system(user)
+    except PermissionError as e:
+        return {"success": False, "error": str(e)}
+    if _lifecycle._persistence_backend is None:
+        return {
+            "success": False,
+            "error": "consultation recall needs the in-process persistence backend "
+            "(HTTP app / in-process caller); it is unavailable over the stdio MCP bridge",
+        }
+    backend = require_consultations_backend()
+    root = is_root(user)
+    async with backend.transactional() as tx:
+        full = await backend.consultations.fetch_consultation_full(
+            tx,
+            consultation_id,
+            root=root,
+            user_id=user.user_id,
+            namespace=None if root else user.namespace,
+        )
+    if full is None:
+        return {"success": False, "error": "consultation not found", "consultation_id": consultation_id}
+    parts = select_full_parts(full, section)
+    page_parts, total_pages = paginate_full_parts(parts, page_size, page)
+    return {
+        "success": True,
+        "consultation_id": consultation_id,
+        "section": section,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "parts": page_parts,
+    }
+
+
 TOOLS: dict[str, dict[str, Any]] = {
     "graeae_consult": _tool(
         "Consult GRAEAE multi-provider consensus engine. "
@@ -287,5 +351,38 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         ["prompt"],
         tool_graeae_consult,
+    ),
+    "graeae_get_consultation": _tool(
+        "Recall a past GRAEAE consultation verbatim, classified into source / "
+        "quorum / synthesis / muses and PAGED, so a prior graeae_consult "
+        "response that was truncated can be retrieved in full. One record per "
+        "page; read total_pages and walk the pages of the section you need "
+        "(synthesis is usually the one truncated). Owner-scoped: you only see "
+        "your own consultations.",
+        {
+            "consultation_id": {
+                "type": "string",
+                "description": "The consultation_id returned by a prior graeae_consult / "
+                               "listed by graeae_list_consultations.",
+            },
+            "section": {
+                "type": "string",
+                "enum": ["all", "source", "quorum", "synthesis", "muses"],
+                "description": "Which classified part(s) to return. Default 'all'.",
+            },
+            "page": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-based page number within the section. Default 1.",
+            },
+            "page_size": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Char budget per page before a part is split into sub-pages. "
+                               "Default 6000.",
+            },
+        },
+        ["consultation_id"],
+        tool_graeae_get_consultation,
     ),
 }
