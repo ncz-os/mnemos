@@ -26,9 +26,9 @@ fi
 auth_args=()
 [[ -n "${MNEMOS_API_KEY:-}" ]] && auth_args=(-H "Authorization: Bearer $MNEMOS_API_KEY")
 
-if ! response=$(curl -sS --max-time 3 \
+if ! response=$(curl -sS --fail-with-body --max-time 3 \
   "${auth_args[@]}" \
-  "$MNEMOS_BASE/memories?limit=$MNEMOS_CONTEXT_LIMIT" 2>>"$MNEMOS_HOOK_LOG"); then
+  "$MNEMOS_BASE/v1/memories?limit=$MNEMOS_CONTEXT_LIMIT" 2>>"$MNEMOS_HOOK_LOG"); then
   log "MNEMOS unreachable at $MNEMOS_BASE — skipping"
   printf '{}\n'
   exit 0
