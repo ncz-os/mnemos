@@ -778,7 +778,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             "metadata, verbatim_content, archived_at, consolidated_into, embedding, "
             "provenance AS prov_kind, morpheus_run_id, "
             "source_memory_ids, federation_source "
-            f"FROM memories {where} ORDER BY created ASC LIMIT ? OFFSET ?",
+            f"FROM memories {where} ORDER BY created ASC, id ASC LIMIT ? OFFSET ?",
             params,
         )
 
