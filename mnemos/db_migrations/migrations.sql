@@ -210,34 +210,35 @@ CREATE INDEX IF NOT EXISTS idx_kg_memory_id  ON kg_triples(memory_id);
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- View: Compression statistics by task type
+-- View: Compression statistics
+-- NOTE: `ensure_postgres_schema` re-runs this file on every `mnemos serve`
+-- startup. If any later migration redefines this view, its column list must
+-- stay identical here — `CREATE OR REPLACE VIEW` cannot rename/reorder
+-- existing columns and startup aborts with "cannot change name of view
+-- column" on the mismatch. Keep every definition of this view in lockstep.
 CREATE OR REPLACE VIEW v_compression_stats AS
 SELECT
-  m.task_type,
-  COUNT(*) as total_compressions,
-  AVG(cql.quality_rating) as avg_quality_rating,
-  MIN(cql.quality_rating) as min_quality_rating,
-  MAX(cql.quality_rating) as max_quality_rating,
-  AVG(cql.compression_ratio) as avg_compression_ratio,
-  COUNT(CASE WHEN cql.reviewed THEN 1 END) as reviewed_count,
-  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cql.quality_rating) as median_quality
-FROM compression_quality_log cql
-LEFT JOIN memories m ON cql.memory_id = m.id
-GROUP BY m.task_type;
+    COUNT(*) AS total_compressions,
+    COUNT(*) FILTER (WHERE reviewed) AS reviewed,
+    COUNT(*) FILTER (WHERE NOT reviewed) AS unreviewed,
+    AVG(CAST(quality_rating AS FLOAT)) AS avg_quality,
+    AVG(compression_ratio) AS avg_ratio
+FROM compression_quality_log;
 
 -- View: Unreviewed compressions (require attention)
+-- Same idempotency constraint as v_compression_stats above — keep this
+-- column list in lockstep with any later migration that redefines the view.
 CREATE OR REPLACE VIEW v_unreviewed_compressions AS
 SELECT
-  cql.id,
-  cql.memory_id,
-  m.task_type,
-  cql.quality_rating,
-  cql.compression_ratio,
-  cql.created,
-  m.content,
-  cql.quality_summary
+    cql.id,
+    cql.memory_id,
+    cql.original_token_count AS original_size,
+    cql.compressed_token_count AS compressed_size,
+    cql.compression_ratio,
+    cql.created AS compressed_at,
+    m.category,
+    m.content
 FROM compression_quality_log cql
-JOIN memories m ON cql.memory_id = m.id
-WHERE cql.reviewed = FALSE
-  AND cql.quality_rating < 80
-ORDER BY cql.quality_rating ASC, cql.created DESC;
+LEFT JOIN memories m ON m.id = cql.memory_id
+WHERE NOT cql.reviewed
+ORDER BY cql.created DESC;
