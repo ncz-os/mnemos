@@ -666,7 +666,7 @@ class PostgresMemoryRepository(MemoryRepository):
             "source_memories, federation_source "
             "FROM memories "
             f"{where} "
-            f"ORDER BY created ASC "
+            f"ORDER BY created ASC, id ASC "
             f"LIMIT ${idx} OFFSET ${idx + 1}"
         )
         params.extend([limit, offset])
