@@ -136,7 +136,7 @@ class TestDAGImplementation:
 
     def test_migration_v3_dag_exists(self):
         """DAG migration file exists and is readable."""
-        migration_path = Path(__file__).parent.parent / 'db' / 'migrations_v3_dag.sql'
+        migration_path = Path(__file__).parent.parent / 'mnemos' / 'db_migrations' / 'migrations_v3_dag.sql'
         assert migration_path.exists(), f"DAG migration not found at {migration_path}"
         content = migration_path.read_text()
         # Verify key DAG concepts are in migration
