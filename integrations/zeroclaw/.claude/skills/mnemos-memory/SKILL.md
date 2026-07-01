@@ -25,7 +25,7 @@ If the user's task looks like something that might have been solved before, sear
 - **Start broad with full-text:** `search_memories(query="topic keywords", limit=10)` before narrowing
 - **Filter by category** when you know the domain: `search_memories(query="auth flow", category="decisions")`
 - **Use semantic search** for concept-level matches: `search_memories(query="...", semantic=true)`
-- **Large context loads:** use `POST /v1/memories/rehydrate` directly via the REST API (this path is not an MCP tool in the current `mcp_server.py`). Chain multiple `search_memories` calls with a running token tally if you need to stay within MCP.
+- **Large context loads:** use `POST /v1/memories/rehydrate` directly via the REST API (this path is not an MCP tool in the current `mnemos.mcp.stdio` bridge). Chain multiple `search_memories` calls with a running token tally if you need to stay within MCP.
 
 ## When to store
 
@@ -86,4 +86,4 @@ Before acting on a returned memory, check that it is still current:
 | `kg_search` / `kg_timeline` | Knowledge-graph read ops (list triples, subject timeline) |
 | `get_stats` | Category counts, compression statistics |
 
-Rehydration (token-budgeted context load) is a REST-only endpoint (`POST /v1/memories/rehydrate`); not exposed as an MCP tool in the current `mcp_server.py`.
+Rehydration (token-budgeted context load) is a REST-only endpoint (`POST /v1/memories/rehydrate`); not exposed as an MCP tool in the current `mnemos.mcp.stdio` bridge.

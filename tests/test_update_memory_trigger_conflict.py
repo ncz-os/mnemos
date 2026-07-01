@@ -56,7 +56,7 @@ def _mn001_error(message: str = "cross-memory branch head") -> asyncpg.PostgresE
 
 def _trigger_sql() -> str:
     repo_root = Path(__file__).resolve().parents[1]
-    return (repo_root / "db" / "migrations_v3_5_trigger_same_memory_parent.sql").read_text()
+    return (repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_trigger_same_memory_parent.sql").read_text()
 
 
 def _extract_update_branch(sql: str) -> str:

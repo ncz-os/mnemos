@@ -29,7 +29,7 @@ def test_mcp_audit_log_migration_in_postgres_list():
 
     assert "migrations_v5_3_4_mcp_audit_log.sql" in EXPECTED_MIGRATIONS
     repo_root = Path(__file__).resolve().parents[1]
-    assert (repo_root / "db" / "migrations_v5_3_4_mcp_audit_log.sql").exists()
+    assert (repo_root / "mnemos" / "db_migrations" / "migrations_v5_3_4_mcp_audit_log.sql").exists()
 
 
 def test_mcp_audit_log_migration_in_sqlite_list():
@@ -39,7 +39,7 @@ def test_mcp_audit_log_migration_in_sqlite_list():
 
     assert "migrations_v5_3_4_mcp_audit_log_sqlite.sql" in EXPECTED_SQLITE_MIGRATIONS
     repo_root = Path(__file__).resolve().parents[1]
-    assert (repo_root / "db" / "migrations_sqlite" / "migrations_v5_3_4_mcp_audit_log_sqlite.sql").exists()
+    assert (repo_root / "mnemos" / "db_migrations" / "migrations_sqlite" / "migrations_v5_3_4_mcp_audit_log_sqlite.sql").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +224,7 @@ def test_postgres_migration_creates_mcp_audit_log_table():
     """Schema includes the table + indexes + outcome CHECK."""
     from pathlib import Path
 
-    sql = (Path(__file__).resolve().parents[1] / "db" / "migrations_v5_3_4_mcp_audit_log.sql").read_text()
+    sql = (Path(__file__).resolve().parents[1] / "mnemos" / "db_migrations" / "migrations_v5_3_4_mcp_audit_log.sql").read_text()
     assert "CREATE TABLE IF NOT EXISTS mcp_audit_log" in sql
     assert "parameter_shape JSONB NOT NULL DEFAULT '{}'::jsonb" in sql
     # Outcome CHECK constraint matches VALID_OUTCOMES in the repo.
@@ -241,7 +241,7 @@ def test_sqlite_migration_creates_parallel_table():
     from pathlib import Path
 
     sql = (
-        Path(__file__).resolve().parents[1] / "db" / "migrations_sqlite" / "migrations_v5_3_4_mcp_audit_log_sqlite.sql"
+        Path(__file__).resolve().parents[1] / "mnemos" / "db_migrations" / "migrations_sqlite" / "migrations_v5_3_4_mcp_audit_log_sqlite.sql"
     ).read_text()
     assert "CREATE TABLE IF NOT EXISTS mcp_audit_log" in sql
     # Same outcome CHECK, sqlite version stores parameter_shape as TEXT.
@@ -773,7 +773,7 @@ def test_postgres_migration_grants_insert_to_runtime_role():
     silently fail with permission denied."""
     from pathlib import Path
 
-    sql = (Path(__file__).resolve().parents[1] / "db" / "migrations_v5_3_4_mcp_audit_log.sql").read_text()
+    sql = (Path(__file__).resolve().parents[1] / "mnemos" / "db_migrations" / "migrations_v5_3_4_mcp_audit_log.sql").read_text()
     assert "GRANT SELECT, INSERT ON mcp_audit_log TO mnemos_user" in sql
     # Idempotent: only granted if role exists.
     assert "FROM pg_roles WHERE rolname = 'mnemos_user'" in sql
