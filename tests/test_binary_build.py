@@ -29,7 +29,7 @@ def test_mnemos_spec_parses_and_targets_cli_app():
     assert "strip=True" in source
     assert '"sqlite_vec"' in source
     assert '"google.genai"' in source
-    assert '"db/migrations_sqlite"' in source
+    assert '"mnemos/db_migrations/migrations_sqlite"' in source
     assert 'name=BINARY_NAME' in source
     assert 'collect_dynamic_libs("sqlite_vec")' in source
 

@@ -18,7 +18,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
 INSTALLER_DB = REPO_ROOT / "mnemos" / "installer" / "db.py"
-MIGRATION = REPO_ROOT / "db" / "migrations_v1_multiuser.sql"
+MIGRATION = REPO_ROOT / "mnemos" / "db_migrations" / "migrations_v1_multiuser.sql"
 
 
 def _api_keys_columns_in_schema() -> set[str]:

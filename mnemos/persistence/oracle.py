@@ -1145,7 +1145,7 @@ class OracleMemoryRepository(MemoryRepository):
     """Oracle memories repo — ABC-conformant.
 
     Implements the lightweight CRUD surface that maps cleanly to the
-    Oracle schema in ``db/migrations_oracle/0001_core_schema.sql``.
+    Oracle schema in ``mnemos/db_migrations/migrations_oracle/0001_core_schema.sql``.
     Visibility-filtered, vector, and FTS paths are stubbed pending
     Oracle 23ai VECTOR setup and a namespace-policy translation of the
     Postgres ``read_visibility_predicate`` helper (P1 follow-up).

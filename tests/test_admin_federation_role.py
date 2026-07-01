@@ -28,7 +28,7 @@ from mnemos.domain.models import UserCreateRequest
 
 REPO_ROOT = Path(__file__).parent.parent
 FEDERATION_HANDLER = REPO_ROOT / "mnemos" / "api" / "routes" / "federation.py"
-FEDERATION_MIGRATION = REPO_ROOT / "db" / "migrations_v3_federation.sql"
+FEDERATION_MIGRATION = REPO_ROOT / "mnemos" / "db_migrations" / "migrations_v3_federation.sql"
 
 
 @pytest.fixture
