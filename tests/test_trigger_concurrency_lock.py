@@ -8,7 +8,7 @@ from pathlib import Path
 
 def _trigger_sql() -> str:
     repo_root = Path(__file__).resolve().parents[1]
-    return (repo_root / "db" / "migrations_v3_5_trigger_same_memory_parent.sql").read_text()
+    return (repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_trigger_same_memory_parent.sql").read_text()
 
 
 def _compact(sql: str) -> str:

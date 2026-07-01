@@ -32,8 +32,8 @@ auth_args=()
 
 query_json=$(python3 -c 'import json,sys; print(json.dumps({"query": sys.argv[1], "limit": int(sys.argv[2]), "semantic": True}))' "$prompt" "$MNEMOS_SEARCH_LIMIT")
 
-if ! response=$(curl -sS --max-time 5 \
-  -X POST "$MNEMOS_BASE/memories/search" \
+if ! response=$(curl -sS --fail-with-body --max-time 5 \
+  -X POST "$MNEMOS_BASE/v1/memories/search" \
   -H 'Content-Type: application/json' \
   "${auth_args[@]}" \
   -d "$query_json" 2>>"$MNEMOS_HOOK_LOG"); then

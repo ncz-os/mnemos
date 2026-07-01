@@ -245,7 +245,7 @@ def test_import_chunk_key_unique_index_matches_on_conflict_arbiter():
     """
     migration_path = (
         REPO_ROOT
-        / "db"
+        / "mnemos" / "db_migrations"
         / "migrations_v4_2_document_import_chunk_idempotency.sql"
     )
     sql = migration_path.read_text(encoding="utf-8")
@@ -312,7 +312,7 @@ def test_import_chunk_key_migration_uses_concurrently_no_begin():
     """
     migration_path = (
         REPO_ROOT
-        / "db"
+        / "mnemos" / "db_migrations"
         / "migrations_v4_2_document_import_chunk_idempotency.sql"
     )
     sql = migration_path.read_text(encoding="utf-8")
@@ -370,7 +370,7 @@ def test_deletion_requests_blank_namespace_migration_do_blocks_terminate_with_se
 
     path = (
         REPO_ROOT
-        / "db"
+        / "mnemos" / "db_migrations"
         / "migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql"
     )
     sql = path.read_text(encoding="utf-8")
@@ -425,7 +425,7 @@ def test_deletion_requests_blank_namespace_migration_has_no_embedded_control_cha
 
     path = (
         REPO_ROOT
-        / "db"
+        / "mnemos" / "db_migrations"
         / "migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql"
     )
     raw = path.read_text(encoding="utf-8")
@@ -492,7 +492,7 @@ def test_no_embedded_control_chars_invariant_catches_nel(tmp_path, monkeypatch):
 
     real_path = (
         REPO_ROOT
-        / "db"
+        / "mnemos" / "db_migrations"
         / "migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql"
     )
     raw = real_path.read_text(encoding="utf-8")
@@ -533,7 +533,7 @@ def test_deletion_requests_blank_namespace_uses_unicode_aware_predicate():
     """
     migration_path = (
         REPO_ROOT
-        / "db"
+        / "mnemos" / "db_migrations"
         / "migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql"
     )
     migration_sql = migration_path.read_text(encoding="utf-8")
@@ -646,7 +646,7 @@ def test_round_68_partial_index_repair_runbook_exists():
     """
     repair_path = (
         REPO_ROOT
-        / "db"
+        / "mnemos" / "db_migrations"
         / "scripts"
         / "repair_round_68_partial_chunk_key_index.sql"
     )
