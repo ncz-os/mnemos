@@ -52,7 +52,7 @@ v4.2.0a14 alpha line):
 - ✅ KRONOS v0.1: recall-pattern anomaly detection + forecasting.
 - ✅ DAG wiring for compression derivations.
 - ✅ NATS substrate v0.2: PANTHEON routing pub/sub bounded slice.
-- ✅ MCP §6.4 cross-tenant security gates across 24 tools,
+- ✅ MCP §6.4 cross-tenant security gates across 25 tools,
   including `pantheon_list_models`, `pantheon_route_explain`,
   `tool_kronos_anomalies`, `tool_kronos_forecast`, and
   `list_deletions`.
@@ -392,7 +392,7 @@ Same code, same API, same KNOSSOS interop. Single-binary, embeddable, MemPalace-
 ### Track 6 — surface integrations (multi-vendor MCP + REST connectors) — v4.1
 
 MNEMOS exposes mature MCP transports (`mnemos.mcp.stdio`, `mnemos.mcp.http`) and
-24 tools from one canonical registry. v4.0 kept the working MCP surface and the
+25 tools from one canonical registry. v4.0 kept the working MCP surface and the
 initial connector docs; broad connector-gallery packaging and bridge tooling
 landed in v4.1.
 
