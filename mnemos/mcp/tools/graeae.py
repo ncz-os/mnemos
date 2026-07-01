@@ -1,7 +1,7 @@
 """MCP tool handler for GRAEAE multi-provider consensus consultations.
 
 Exposes the GRAEAE engine's consult() method over MCP so reasoning
-consultations are callable from STUDIO and jperlow-mlt(.4) without
+consultations are callable from any configured MNEMOS client without
 HTTP loopback — the engine runs in-process, exactly as the
 /v1/consultations route does.
 """

@@ -9,7 +9,7 @@ MIGRATION_NAME = "migrations_v3_5_rls_group_select_unix_bits.sql"
 
 def _migration_sql() -> str:
     repo_root = Path(__file__).resolve().parents[1]
-    return (repo_root / "db" / MIGRATION_NAME).read_text()
+    return (repo_root / "mnemos" / "db_migrations" / MIGRATION_NAME).read_text()
 
 
 def test_rls_group_select_policy_uses_unix_group_bits():

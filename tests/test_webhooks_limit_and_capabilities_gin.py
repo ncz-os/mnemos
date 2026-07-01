@@ -61,7 +61,7 @@ def test_capabilities_gin_migration_file_exists():
     """The migration file that adds the GIN index must exist on
     disk under db/. Without it the installer's canonical loader
     would fail with a missing-file error."""
-    p = (REPO / "db"
+    p = (REPO / "mnemos" / "db_migrations"
          / "migrations_v5_3_5_model_registry_capabilities_gin.sql")
     assert p.exists(), (
         "migrations_v5_3_5_model_registry_capabilities_gin.sql "

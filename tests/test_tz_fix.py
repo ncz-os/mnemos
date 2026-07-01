@@ -57,7 +57,7 @@ async def test_morpheus_cluster_phase_handles_legacy_timestamp_columns_after_tz_
     window_end = legacy_created.replace(tzinfo=timezone.utc) + timedelta(minutes=5)
     migration_sql = (
         Path(__file__).resolve().parents[1]
-        / "db"
+        / "mnemos" / "db_migrations"
         / "migrations_v5_0_3_timestamp_tz_upgrade.sql"
     ).read_text()
 

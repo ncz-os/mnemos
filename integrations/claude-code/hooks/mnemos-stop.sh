@@ -68,11 +68,18 @@ fi
 auth_args=()
 [[ -n "${MNEMOS_API_KEY:-}" ]] && auth_args=(-H "Authorization: Bearer $MNEMOS_API_KEY")
 
-curl -sS --max-time 10 \
+if curl -sS --fail-with-body --max-time 10 \
   -X POST "$MNEMOS_BASE/ingest/session" \
   -H 'Content-Type: application/json' \
   "${auth_args[@]}" \
-  -d "$body" >> "$MNEMOS_HOOK_LOG" 2>&1 || log "ingest failed"
-
-log "ingested session $session_id"
+  -d "$body" >> "$MNEMOS_HOOK_LOG" 2>&1; then
+  log "ingested session $session_id"
+else
+  # --fail-with-body makes curl exit non-zero on any HTTP 4xx/5xx (not just
+  # network errors), so success is no longer logged on a failed POST. A
+  # 404/503 here usually means the backend lacks the CHARON ingest route:
+  # POST /ingest/session ships in the mnemos-charon / "everything" image,
+  # not in core.
+  log "ingest failed (session $session_id) — POST /ingest/session requires the CHARON/everything image"
+fi
 printf '{}\n'
