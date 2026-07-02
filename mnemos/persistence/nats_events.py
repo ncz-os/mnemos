@@ -9,7 +9,13 @@ import logging
 import re
 from typing import Any, Mapping
 
-from mnemos.core.config import get_settings, nats_federation_enabled, nats_webhooks_enabled
+from mnemos.core.config import (
+    federation_feed_include_private,
+    get_settings,
+    nats_federation_enabled,
+    nats_webhooks_enabled,
+)
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.nats import client as nats_client
 from mnemos.nats import publisher as nats_publisher
 
@@ -138,6 +144,15 @@ def is_federation_memory_publishable(row: Mapping[str, Any] | Any) -> bool:
         return False
     if _row_value(row, "consolidated_into") is not None:
         return False
+    # Secret vault is NEVER federated (credential boundary), independent of
+    # the world-read gate below — mirrors the SQL feed_query vault exclusion.
+    if _row_value(row, "namespace") == VAULT_NAMESPACE:
+        return False
+    # Trusted feed servers replicate the full corpus; the Unix world-read bit
+    # only gates untrusted/multi-tenant deployments. See
+    # config.federation_feed_include_private.
+    if federation_feed_include_private():
+        return True
     try:
         permission_mode = int(_row_value(row, "permission_mode", 0))
     except (TypeError, ValueError):

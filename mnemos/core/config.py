@@ -1568,6 +1568,27 @@ def nats_federation_enabled() -> bool:
     return get_settings().services.resolution.enabled("nats_federation")
 
 
+def federation_feed_include_private() -> bool:
+    """Trusted-environment federation feed scope.
+
+    When true, the ``/v1/federation/feed`` endpoint (and the NATS federation
+    export predicate) expose ALL locally-authored, non-vault memories rather
+    than only world-readable ones. This is intended for trusted fleet peers,
+    where the whole point of federation is to replicate the full corpus.
+
+    The Unix-style world-read bit (``permission_mode % 10 >= 4``) was added for
+    enterprise multi-tenancy and must NOT wedge federation between trusted
+    peers. Two guards ALWAYS apply regardless of this flag: the secret-vault
+    namespace is never federated (credential boundary), and
+    ``federation_source IS NULL`` prevents federation loops.
+
+    Default false preserves the world-readable-only behavior for
+    untrusted/multi-tenant deployments. Set
+    ``MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=1`` on a trusted feed server.
+    """
+    return runtime_env_value_stripped("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE").lower() in {"yes", "1", "true"}
+
+
 def session_secret_required() -> bool:
     """Return whether startup must fail when MNEMOS_SESSION_SECRET is unset."""
     return runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET").lower() in {"yes", "1", "true"}
