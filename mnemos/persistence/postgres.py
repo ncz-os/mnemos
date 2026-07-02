@@ -1384,7 +1384,13 @@ class PostgresMemoryRepository(MemoryRepository):
         _log_search_phase(search_trace_id, search_started_at, "ann_scan")
         if not boost_recency or len(rows) <= 1:
             _log_search_phase(search_trace_id, search_started_at, "rerank")
-            return rows[:limit]
+            # Return mutable dicts, not raw asyncpg Records. The route stamps the
+            # canonical semantic score onto each row only `if isinstance(r, dict)`
+            # (Records are immutable and cannot be assigned to), so returning
+            # Records here silently skipped the stamp -> relevance_score=0 for every
+            # hit -> the semantic floor dropped all rows. Mirror the recency branch,
+            # which already converts via dict(row.items()).
+            return [dict(r.items()) if hasattr(r, "items") else dict(r) for r in rows[:limit]]
 
         candidates = [_parse_pgvector_text(row.get("_embedding_text")) for row in rows]
         recency_boost = [
@@ -3202,8 +3208,13 @@ class PostgresConsultationsRepository(ConsultationsRepository):
         return consultation, list(refs)
 
     async def fetch_consultation_full(
-        self, tx: Transaction, consultation_id: str,
-        *, root: bool = False, user_id: str | None = None, namespace: str | None = None,
+        self,
+        tx: Transaction,
+        consultation_id: str,
+        *,
+        root: bool = False,
+        user_id: str | None = None,
+        namespace: str | None = None,
     ) -> dict[str, Any] | None:
         """Postgres implementation of fetch_consultation_full.
 
