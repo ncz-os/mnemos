@@ -5071,6 +5071,12 @@ class OracleBackend:
     supports_row_level_security = False
     supports_pgvector = False
 
+    # Dialect-specific single-row liveness probe used by open()/ping().
+    # Oracle (and the Db2 *compat* cursor, which translates DUAL->Db2) use
+    # ``DUAL``; the Db2 *native* cursor rejects ``FROM DUAL`` outright, so
+    # Db2BackendNative overrides this with ``SYSIBM.SYSDUMMY1``.
+    _LIVENESS_PROBE_SQL = "SELECT 1 FROM DUAL"
+
     def __init__(self, pool: Any, settings: Any):
         self._pool = pool
         self._settings = settings
@@ -5854,7 +5860,7 @@ class OracleBackend:
             async with self._pool.acquire() as conn:
                 cursor = await _call(conn.cursor)
                 try:
-                    await _call(cursor.execute, "SELECT 1 FROM DUAL")
+                    await _call(cursor.execute, self._LIVENESS_PROBE_SQL)
                     await _call(cursor.fetchone)
                 finally:
                     await _call(cursor.close)
@@ -6038,7 +6044,7 @@ class OracleBackend:
             async with self._pool.acquire() as conn:
                 cursor = await _call(conn.cursor)
                 try:
-                    await _call(cursor.execute, "SELECT 1 FROM DUAL")
+                    await _call(cursor.execute, self._LIVENESS_PROBE_SQL)
                     await _call(cursor.fetchone)
                 finally:
                     await _call(cursor.close)
