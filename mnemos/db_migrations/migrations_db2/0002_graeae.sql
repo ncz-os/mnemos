@@ -73,10 +73,11 @@ BEGIN
       injected_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
       CONSTRAINT pk_consultation_memory_refs PRIMARY KEY (id),
       CONSTRAINT fk_cmr_consultation FOREIGN KEY (consultation_id) REFERENCES graeae_consultations(id) ON DELETE CASCADE,
-      CONSTRAINT fk_cmr_memory FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE SET NULL,
-      CONSTRAINT unique_consultation_memory UNIQUE (consultation_id, memory_id)
+      CONSTRAINT fk_cmr_memory FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE SET NULL
     )';
 END@
+
+BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE UNIQUE INDEX uniq_consultation_memory ON consultation_memory_refs (consultation_id, memory_id)'; END@
 
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_consultation_memory_refs_consultation ON consultation_memory_refs(consultation_id)'; END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END; EXECUTE IMMEDIATE 'CREATE INDEX idx_consultation_memory_refs_memory ON consultation_memory_refs(memory_id)'; END@

@@ -1,7 +1,7 @@
 -- 0017_memory_compression_queue.sql — Db2 12.1.5 (Oracle Compat) port.
 
 CREATE TABLE memory_compression_queue (
-    id VARCHAR(36) PRIMARY KEY,
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
     memory_id VARCHAR(36) NOT NULL,
     priority INTEGER DEFAULT 0 NOT NULL,
     queued_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,

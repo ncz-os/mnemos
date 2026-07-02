@@ -2,7 +2,7 @@
 -- Adapted from Oracle 23ai version with Db2 timestamp / CLOB handling.
 
 CREATE TABLE api_keys (
-    id VARCHAR(36) PRIMARY KEY,
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
     name VARCHAR(100) NOT NULL,
     provider VARCHAR(50) NOT NULL,
     key_hash VARCHAR(128) NOT NULL,

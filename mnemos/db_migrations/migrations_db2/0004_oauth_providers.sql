@@ -1,7 +1,7 @@
 -- 0004_oauth_providers.sql — Db2 12.1.5 (Oracle Compat) port.
 
 CREATE TABLE oauth_providers (
-    id VARCHAR(36) PRIMARY KEY,
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
     name VARCHAR(100) NOT NULL UNIQUE,
     client_id VARCHAR(200),
     client_secret_hash VARCHAR(200),
