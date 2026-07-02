@@ -62,6 +62,8 @@ services:
       MNEMOS_DATABASE_DSN: "db2://db2inst1:${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}@db2:50000/MNEMOS"
       MNEMOS_EMBEDDING_DIM: "1024"        # bge-m3; MUST match the embedder (NOT *_DATABASE_* )
       RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
+      MNEMOS_SEMANTIC_FLOOR: "0.45"       # tuned to bundled quantized bge-m3 (~0.56 paraphrase); see docs/BACKENDS.md
+      MNEMOS_SEMANTIC_MARGIN_FLOOR: "0"   # disable OOD/margin gate; compressed-similarity embedder bunches scores
       MNEMOS_EMBED_BACKEND: http
       MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
       MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
@@ -94,6 +96,8 @@ services:
       MNEMOS_DATABASE_DSN: "oracle://system:${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}@oracle:1521/FREEPDB1"
       MNEMOS_EMBEDDING_DIM: "1024"
       RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
+      MNEMOS_SEMANTIC_FLOOR: "0.45"       # tuned to bundled quantized bge-m3 (~0.56 paraphrase); see docs/BACKENDS.md
+      MNEMOS_SEMANTIC_MARGIN_FLOOR: "0"   # disable OOD/margin gate; compressed-similarity embedder bunches scores
       MNEMOS_EMBED_BACKEND: http
       MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
       MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
@@ -130,6 +134,8 @@ services:
       MNEMOS_DATABASE_DSN: "postgres://mnemos:${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}@postgres:5432/mnemos"
       MNEMOS_EMBEDDING_DIM: "1024"
       RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
+      MNEMOS_SEMANTIC_FLOOR: "0.45"       # tuned to bundled quantized bge-m3 (~0.56 paraphrase); see docs/BACKENDS.md
+      MNEMOS_SEMANTIC_MARGIN_FLOOR: "0"   # disable OOD/margin gate; compressed-similarity embedder bunches scores
       MNEMOS_EMBED_BACKEND: http
       MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
       MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
@@ -164,6 +170,8 @@ services:
       MNEMOS_DATABASE_DSN: "mariadb://mnemos:${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}@mariadb:3306/mnemos"
       MNEMOS_EMBEDDING_DIM: "1024"
       RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
+      MNEMOS_SEMANTIC_FLOOR: "0.45"       # tuned to bundled quantized bge-m3 (~0.56 paraphrase); see docs/BACKENDS.md
+      MNEMOS_SEMANTIC_MARGIN_FLOOR: "0"   # disable OOD/margin gate; compressed-similarity embedder bunches scores
       MNEMOS_EMBED_BACKEND: http
       MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
       MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
