@@ -8,9 +8,9 @@ CREATE TABLE api_keys (
     key_hash VARCHAR(128) NOT NULL,
     scopes CLOB(1M),
     rate_limit_per_min INTEGER,
-    created TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    last_used_at TIMESTAMP(6) WITH TIME ZONE,
-    revoked_at TIMESTAMP(6) WITH TIME ZONE,
+    created TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_used_at TIMESTAMP(6),
+    revoked_at TIMESTAMP(6),
     owner_id VARCHAR(36),
     namespace VARCHAR(100)
 );

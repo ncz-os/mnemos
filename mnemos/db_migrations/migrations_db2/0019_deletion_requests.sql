@@ -5,8 +5,8 @@ CREATE TABLE deletion_requests (
     memory_id VARCHAR(36) NOT NULL,
     requested_by VARCHAR(36),
     reason CLOB(1M),
-    requested_at TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    processed_at TIMESTAMP(6) WITH TIME ZONE,
+    requested_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    processed_at TIMESTAMP(6),
     status VARCHAR(20) DEFAULT 'pending' NOT NULL
 );
 
