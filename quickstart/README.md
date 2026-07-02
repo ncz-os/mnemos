@@ -15,7 +15,7 @@ TechXchange write-up — **we lead with Db2** (see why in [`docs/BACKENDS.md`](d
 
 | Profile | Engine | Why |
 |---|---|---|
-| **`db2`** | IBM Db2 Community Edition | **Recommended** — native `VECTOR` + DiskANN, fewest CE limits |
+| **`db2`** | IBM Db2 Community Edition | **Recommended** — native `VECTOR` + vector index, fewest CE limits |
 | `oracle` | Oracle Database 23ai **Free** | AI Vector Search (EE-eval note in BACKENDS.md) |
 | `postgres` | PostgreSQL + pgvector | pure open source, most familiar |
 | `mariadb` | MariaDB 11.7+ | pure open source, no vendor tiers |
@@ -37,7 +37,7 @@ embedder instead, repoint `MNEMOS_EMBED_HTTP_URL` / `MNEMOS_EMBEDDING_DIM` — s
 ```bash
 cp .env.example .env                    # REQUIRED: set DB_PASSWORD (no default is baked in)
 docker compose --profile db2 up -d      # or: oracle | postgres | mariadb
-./scripts/init-db2-vectors.sh           # Db2 ONLY, one-time (Oracle-compat + DiskANN)
+./scripts/init-db2-vectors.sh           # Db2 ONLY, one-time (Oracle-compat + vector indexing)
 curl -s localhost:5002/health           # {"status":"healthy",...}
 ```
 

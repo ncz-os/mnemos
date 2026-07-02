@@ -7,7 +7,7 @@ index) on first connect — no manual DDL.
 
 | Profile | Engine | Free tier | Vector | Notes |
 |---|---|---|---|---|
-| `db2` | IBM Db2 Community Edition | free (`LICENSE=accept`) | native `VECTOR` + DiskANN | **Recommended lead** — fewest CE limits |
+| `db2` | IBM Db2 Community Edition | free (`LICENSE=accept`) | native `VECTOR` + vector index | **Recommended lead** — fewest CE limits |
 | `oracle` | Oracle Database 23ai **Free** | free | AI Vector Search (HNSW/IVF) | see EE note below |
 | `postgres` | PostgreSQL + pgvector | open source | pgvector HNSW | most familiar |
 | `mariadb` | MariaDB 11.7+ | open source | community `VECTOR` | pure OSS path |
@@ -29,7 +29,7 @@ with no change to mnemos and no change to your data model.**
 
 | Engine | License / edition | Cores | Memory | Data size | Prod use | Vector |
 |---|---|---|---|---|---|---|
-| **Db2 Community Edition** | free (`db2dec.lic`, permanent) | ≤ 4 cores | ≤ 8 GB instance (Soft Stop) | **unlimited** | allowed (small workloads) | native `VECTOR` + DiskANN |
+| **Db2 Community Edition** | free (`db2dec.lic`, permanent) | ≤ 4 cores | ≤ 8 GB instance (Soft Stop) | **unlimited** | allowed (small workloads) | native `VECTOR` + vector index |
 | **Oracle 23ai Free** | free (OTN) | ≤ 2 CPUs (foreground) | ≤ 2 GB (SGA+PGA) | ≤ 12 GB user data | allowed | AI Vector Search |
 | **PostgreSQL + pgvector** | open source (PostgreSQL Lic.) | *no engine cap* — host-bound | host-bound | host-bound | yes | pgvector HNSW (≤ 2000 dims indexed) |
 | **MariaDB** | open source (GPLv2) | *no engine cap* — host-bound | host-bound | host-bound | yes | native `VECTOR` (11.7+) |
@@ -55,7 +55,7 @@ guides quote); Oracle from the [Oracle Database Free FAQ](https://www.oracle.com
 ---
 
 ## Db2 Community Edition — the lead
-Native `VECTOR` type + `VECTOR_DISTANCE` + DiskANN index, exposed via Oracle-compat mode
+Native `VECTOR` type + `VECTOR_DISTANCE` + vector indexing (via `DB2_VECTOR_INDEXING`), exposed via Oracle-compat mode
 (`DB2_COMPATIBILITY_VECTOR=ORA`, `DB2_VECTOR_INDEXING=YES`; applied by
 `scripts/init-db2-vectors.sh`). Db2 CE has the **fewest capability limits of the "enterprise"
 free tiers** (generous size/feature envelope for evaluation), which is why we lead with it.
