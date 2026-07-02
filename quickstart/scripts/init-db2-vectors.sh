@@ -2,7 +2,7 @@
 # One-time Db2 CE vector setup for the mnemos quickstart.
 #
 # Ensures Oracle-compatibility mode (native VECTOR type + VECTOR_DISTANCE) and
-# vector indexing (DiskANN) are enabled, and that the MNEMOS database is UTF-8
+# vector indexing are enabled, and that the MNEMOS database is UTF-8
 # on a 32K pagesize. Safe to re-run (idempotent). The docker-compose env sets
 # these on first boot; this script guarantees they're applied even if the image
 # created the DB before the registry vars took effect.
