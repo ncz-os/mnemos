@@ -4413,9 +4413,18 @@ class OracleFederationRepository(FederationRepository):
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
+            from mnemos.core.config import federation_feed_include_private
+
+            # World-read gate is opt-out on trusted feed servers. Keep the
+            # original clause ORDER (right after federation_source) so the
+            # default-mode SQL stays byte-identical to pre-flag behavior.
+            # Trusted fleet peers set MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=1
+            # to replicate the full corpus; the vault exclusion + loop-guard
+            # below ALWAYS hold regardless of the flag.
+            world_read = [] if federation_feed_include_private() else ["MOD(m.permission_mode, 10) >= 4"]
             where = [
                 "m.federation_source IS NULL",
-                "MOD(m.permission_mode, 10) >= 4",
+                *world_read,
                 "m.deleted_at IS NULL",
                 "m.archived_at IS NULL",
                 "m.consolidated_into IS NULL",
@@ -4479,10 +4488,14 @@ class OracleFederationRepository(FederationRepository):
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
+            from mnemos.core.config import federation_feed_include_private
+
+            # Mirrors feed_query: world-read gate opt-out, original order kept.
+            world_read = [] if federation_feed_include_private() else ["MOD(m.permission_mode, 10) >= 4"]
             where = [
                 "m.id = :id",
                 "m.federation_source IS NULL",
-                "MOD(m.permission_mode, 10) >= 4",
+                *world_read,
                 "m.deleted_at IS NULL",
                 "m.archived_at IS NULL",
                 "m.consolidated_into IS NULL",
