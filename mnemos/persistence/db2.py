@@ -4765,6 +4765,11 @@ class Db2BackendNative(Db2Backend):
     supports_pgvector = False
     supports_db2_vector = True
 
+    # The native cursor rejects ``FROM DUAL`` (it does no Oracle->Db2 token
+    # translation), so the inherited open()/ping() liveness probe must use
+    # Db2's one-row catalog view instead of Oracle's DUAL.
+    _LIVENESS_PROBE_SQL = "SELECT 1 FROM SYSIBM.SYSDUMMY1"
+
     def __init__(self, pool: Any, settings: Any):
         # Accept a pre-built _Db2NativeAsyncConnectionPool (built by
         # create_db2_native_pool). Everything else — repo wiring,
