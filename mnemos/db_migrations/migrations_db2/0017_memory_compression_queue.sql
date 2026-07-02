@@ -4,8 +4,8 @@ CREATE TABLE memory_compression_queue (
     id VARCHAR(36) PRIMARY KEY,
     memory_id VARCHAR(36) NOT NULL,
     priority INTEGER DEFAULT 0 NOT NULL,
-    queued_at TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    processed_at TIMESTAMP(6) WITH TIME ZONE,
+    queued_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    processed_at TIMESTAMP(6),
     status VARCHAR(20) DEFAULT 'pending' NOT NULL
 );
 

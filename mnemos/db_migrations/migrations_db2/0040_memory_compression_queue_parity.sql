@@ -53,9 +53,9 @@ BEGIN
       priority         SMALLINT                    NOT NULL DEFAULT 0,
       scoring_profile  VARCHAR(32)                 NOT NULL DEFAULT ''balanced'',
       attempts         SMALLINT                    NOT NULL DEFAULT 0,
-      enqueued_at      TIMESTAMP(6) WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      started_at       TIMESTAMP(6) WITH TIME ZONE,
-      finished_at      TIMESTAMP(6) WITH TIME ZONE,
+      enqueued_at      TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      started_at       TIMESTAMP(6),
+      finished_at      TIMESTAMP(6),
       error            VARCHAR(4000),
       CONSTRAINT mcq_pk PRIMARY KEY (id),
       CONSTRAINT mcq_memory_fk FOREIGN KEY (memory_id)

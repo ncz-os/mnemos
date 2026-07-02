@@ -3,7 +3,7 @@
 CREATE TABLE user_groups (
     user_id VARCHAR(36) NOT NULL,
     group_id VARCHAR(36) NOT NULL,
-    assigned_at TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    assigned_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
     PRIMARY KEY (user_id, group_id)
 );
 

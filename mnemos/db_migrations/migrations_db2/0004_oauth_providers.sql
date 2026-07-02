@@ -9,7 +9,7 @@ CREATE TABLE oauth_providers (
     token_url VARCHAR(500),
     scopes CLOB(1M),
     enabled SMALLINT DEFAULT 1 NOT NULL,
-    created TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+    created TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 
 CREATE INDEX idx_oauth_providers_name ON oauth_providers (name);

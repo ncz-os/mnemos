@@ -7,7 +7,7 @@ CREATE TABLE mcp_audit_log (
     request CLOB(1M),
     response CLOB(1M),
     duration_ms INTEGER,
-    created TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+    created TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 
 CREATE INDEX idx_mcp_audit_log_session ON mcp_audit_log (session_id);

@@ -5,7 +5,7 @@
 --            db/migrations_oracle/0021_hive_agents.sql + db/migrations/0021_hive_agents.sql.
 --
 -- Notes:
---   - JSON via CLOB CHECK IS JSON FORMAT in Db2 12.1 (native JSON column
+--   - JSON via CLOB + CHECK SYSTOOLS.JSON2BSON(col) IS NOT NULL (Db2 12.1 native JSON validation
 --     type exists in 12.1.5 EAP — switch when GA per v6.1 P0 #6).
 --   - DOUBLE PRECISION semantics matched via DOUBLE (Db2).
 
@@ -19,13 +19,13 @@ BEGIN
       session_id            VARCHAR(128)  NOT NULL,
       pid                   INTEGER,
       capabilities          CLOB(1M) INLINE LENGTH 4096
-        CHECK (capabilities IS JSON FORMAT JSON STRICT),
+        CHECK (SYSTOOLS.JSON2BSON(capabilities) IS NOT NULL),
       version               VARCHAR(64),
       started_at            DOUBLE NOT NULL,
       last_heartbeat        DOUBLE NOT NULL,
       status                VARCHAR(16)   NOT NULL,
       metadata              CLOB(1M) INLINE LENGTH 4096
-        CHECK (metadata IS JSON FORMAT JSON STRICT),
+        CHECK (SYSTOOLS.JSON2BSON(metadata) IS NOT NULL),
       runtime               VARCHAR(64),
       model                 VARCHAR(128),
       provider              VARCHAR(64),

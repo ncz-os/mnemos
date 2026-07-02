@@ -16,7 +16,7 @@ BEGIN
       tokens_in       INTEGER       NOT NULL,
       tokens_out      INTEGER       NOT NULL,
       cost_usd        DECIMAL(14,8) NOT NULL,
-      ts_utc          TIMESTAMP(6) WITH TIME ZONE NOT NULL,
+      ts_utc          TIMESTAMP(6) NOT NULL,
       CONSTRAINT pk_knemon_phase1_20260528 PRIMARY KEY (event_id)
     )';
 END@
@@ -33,13 +33,13 @@ BEGIN
       id              BIGINT GENERATED ALWAYS AS IDENTITY NOT NULL,
       baseline_name   VARCHAR(128)  NOT NULL,
       table_name      VARCHAR(128)  NOT NULL,
-      window_start    TIMESTAMP(6) WITH TIME ZONE NOT NULL,
-      window_end      TIMESTAMP(6) WITH TIME ZONE NOT NULL,
+      window_start    TIMESTAMP(6) NOT NULL,
+      window_end      TIMESTAMP(6) NOT NULL,
       event_count     INTEGER       NOT NULL,
       session_count   INTEGER       NOT NULL,
       task_kind_count INTEGER       NOT NULL,
       source_table    VARCHAR(128)  NOT NULL,
-      created_at      TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      created_at      TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
       notes           VARCHAR(1024),
       CONSTRAINT pk_knemon_baselines PRIMARY KEY (id),
       CONSTRAINT uq_knemon_baseline_name UNIQUE (baseline_name)

@@ -17,16 +17,16 @@ BEGIN
       priority                 INTEGER        DEFAULT 0 NOT NULL,
       deadline                 DOUBLE,
       required_capabilities    CLOB(1M) INLINE LENGTH 4096
-        CHECK (required_capabilities IS JSON FORMAT JSON STRICT),
+        CHECK (SYSTOOLS.JSON2BSON(required_capabilities) IS NOT NULL),
       eligible_kinds           CLOB(1M) INLINE LENGTH 4096
-        CHECK (eligible_kinds IS JSON FORMAT JSON STRICT),
+        CHECK (SYSTOOLS.JSON2BSON(eligible_kinds) IS NOT NULL),
       status                   VARCHAR(16)    NOT NULL,
       claimed_by               VARCHAR(256),
       claimed_at               DOUBLE,
       started_at               DOUBLE NOT NULL,
       ended_at                 DOUBLE,
       result                   CLOB(4M) INLINE LENGTH 4096
-        CHECK (result IS JSON FORMAT JSON STRICT),
+        CHECK (SYSTOOLS.JSON2BSON(result) IS NOT NULL),
       required_autonomy        VARCHAR(32),
       max_cost_tier            VARCHAR(2),
       preferred_providers      CLOB(1M) INLINE LENGTH 4096,
