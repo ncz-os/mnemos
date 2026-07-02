@@ -5,7 +5,7 @@
 -- Mirrors db/migrations_oracle/0032_usage_ledger.sql.
 
 CREATE TABLE usage_ledger (
-  id                 BIGINT        GENERATED ALWAYS AS IDENTITY,
+  id                 BIGINT        GENERATED ALWAYS AS IDENTITY NOT NULL,
   provider           VARCHAR(128)  NOT NULL,
   model              VARCHAR(256)  NOT NULL,
   task_kind          VARCHAR(64)   NOT NULL,

@@ -1,7 +1,7 @@
 -- 0019_deletion_requests.sql — Db2 12.1.5 (Oracle Compat) port.
 
 CREATE TABLE deletion_requests (
-    id VARCHAR(36) PRIMARY KEY,
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
     memory_id VARCHAR(36) NOT NULL,
     requested_by VARCHAR(36),
     reason CLOB(1M),
