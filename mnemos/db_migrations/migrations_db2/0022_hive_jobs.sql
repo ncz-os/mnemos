@@ -1,3 +1,4 @@
+--#SET TERMINATOR @
 -- migration: 0022_hive_jobs
 -- target:    IBM Db2 12.1.5
 -- purpose:   Hive Mind job queue (Db2 variant). Mirrors PG + Oracle.
@@ -16,21 +17,21 @@ BEGIN
       description              CLOB(2M),
       priority                 INTEGER        DEFAULT 0 NOT NULL,
       deadline                 DOUBLE,
-      required_capabilities    CLOB(1M) INLINE LENGTH 4096
+      required_capabilities    CLOB(1M) INLINE LENGTH 1024
         CHECK (SYSTOOLS.JSON2BSON(required_capabilities) IS NOT NULL),
-      eligible_kinds           CLOB(1M) INLINE LENGTH 4096
+      eligible_kinds           CLOB(1M) INLINE LENGTH 1024
         CHECK (SYSTOOLS.JSON2BSON(eligible_kinds) IS NOT NULL),
       status                   VARCHAR(16)    NOT NULL,
       claimed_by               VARCHAR(256),
       claimed_at               DOUBLE,
       started_at               DOUBLE NOT NULL,
       ended_at                 DOUBLE,
-      result                   CLOB(4M) INLINE LENGTH 4096
+      result                   CLOB(4M) INLINE LENGTH 1024
         CHECK (SYSTOOLS.JSON2BSON(result) IS NOT NULL),
       required_autonomy        VARCHAR(32),
       max_cost_tier            VARCHAR(2),
-      preferred_providers      CLOB(1M) INLINE LENGTH 4096,
-      preferred_models         CLOB(1M) INLINE LENGTH 4096,
+      preferred_providers      CLOB(1M) INLINE LENGTH 1024,
+      preferred_models         CLOB(1M) INLINE LENGTH 1024,
       claimed_runtime          VARCHAR(64),
       claimed_model            VARCHAR(128),
       claimed_provider         VARCHAR(64),
@@ -38,13 +39,13 @@ BEGIN
       tokens_in                BIGINT,
       tokens_out               BIGINT,
       estimated_cost_usd       DECIMAL(12, 6),
-      mnemos_refs              CLOB(1M) INLINE LENGTH 4096,
+      mnemos_refs              CLOB(1M) INLINE LENGTH 1024,
       result_mnemos_id         VARCHAR(64),
-      required_resources       CLOB(1M) INLINE LENGTH 4096,
-      claimed_host_caps        CLOB(1M) INLINE LENGTH 4096,
+      required_resources       CLOB(1M) INLINE LENGTH 1024,
+      claimed_host_caps        CLOB(1M) INLINE LENGTH 1024,
       project                  VARCHAR(64),
-      tags                     CLOB(1M) INLINE LENGTH 4096,
-      depends_on               CLOB(1M) INLINE LENGTH 4096,
+      tags                     CLOB(1M) INLINE LENGTH 1024,
+      depends_on               CLOB(1M) INLINE LENGTH 1024,
       retry_count              INTEGER        DEFAULT 0 NOT NULL,
       max_retries              INTEGER        DEFAULT 2 NOT NULL,
       retry_backoff_until      DOUBLE,
@@ -54,26 +55,26 @@ BEGIN
         CHECK (status IN (''queued'',''offered'',''claimed'',''running'',
                           ''done'',''failed'',''cancelled''))
     )';
-END%
+END@
 
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_jobs_queue ON hive_jobs(status, priority DESC, started_at ASC)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_jobs_submitter ON hive_jobs(submitter_urn)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_jobs_claimed_by ON hive_jobs(claimed_by)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_jobs_parent ON hive_jobs(parent_job_id)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_jobs_project ON hive_jobs(project)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_jobs_backoff ON hive_jobs(retry_backoff_until)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_jobs_kind_status ON hive_jobs(kind, status)';
-END%
+END@

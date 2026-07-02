@@ -1,3 +1,4 @@
+--#SET TERMINATOR @
 -- migration: 0040_memory_compression_queue_parity
 -- target:    IBM Db2 12.1.5 (Oracle Compat mode) — GA 2026-06-06
 -- purpose:   GAP 1 (job 019e7049, CHILD A) — bring the Db2
@@ -11,7 +12,7 @@
 --            Architectural law mem_1780005765033 — identical schema +
 --            feature set on every hive backend behind the persistence ABC.
 --
--- Statement terminator is ``%`` (Db2 compound-SQL convention used across
+-- Statement terminator is ``@`` (Db2 compound-SQL convention used across
 -- db/migrations_db2/; see 0021_hive_agents.sql). SQLSTATE 42710 =
 -- "object already exists" → swallowed for idempotent CREATE.
 --
@@ -36,7 +37,7 @@ BEGIN
   IF v_stub > 0 THEN
     EXECUTE IMMEDIATE 'DROP TABLE memory_compression_queue';
   END IF;
-END%
+END@
 
 -- Full-parity table. id has no column DEFAULT (Db2 forbids non-deterministic
 -- functions like GENERATE_UNIQUE in DEFAULT); the BEFORE INSERT trigger below
@@ -67,7 +68,7 @@ BEGIN
       CONSTRAINT mcq_scoring_profile_valid
         CHECK (scoring_profile IN (''balanced'',''quality_first'',''speed_first'',''custom''))
     )';
-END%
+END@
 
 -- Reconcile a table left by a prior 0040 that created memory_id too narrow
 -- (36); real ids (mnemos_<sha32>, 39 chars) overflow it. Widen in place.
@@ -83,7 +84,7 @@ BEGIN
   IF v_narrow > 0 THEN
     EXECUTE IMMEDIATE 'ALTER TABLE memory_compression_queue ALTER COLUMN memory_id SET DATA TYPE VARCHAR(100)';
   END IF;
-END%
+END@
 
 -- DB-side id generation (parity with PG gen_random_uuid + Oracle SYS_GUID
 -- defaults): populate id when the INSERT omits it. HEX(GENERATE_UNIQUE())
@@ -95,17 +96,17 @@ BEGIN
     REFERENCING NEW AS n FOR EACH ROW
     WHEN (n.id IS NULL)
       SET n.id = LOWER(HEX(GENERATE_UNIQUE()))';
-END%
+END@
 
 BEGIN
   DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX idx_mcq_ready ON memory_compression_queue (status, priority DESC, enqueued_at)';
-END%
+END@
 BEGIN
   DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX idx_mcq_memory ON memory_compression_queue (memory_id)';
-END%
+END@
 BEGIN
   DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX idx_mcq_owner ON memory_compression_queue (owner_id)';
-END%
+END@

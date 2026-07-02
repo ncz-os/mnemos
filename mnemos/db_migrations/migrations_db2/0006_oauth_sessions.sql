@@ -18,13 +18,11 @@ BEGIN
        AND NOT EXISTS (SELECT 1 FROM SYSCAT.COLUMNS
                         WHERE TABSCHEMA = CURRENT SCHEMA AND TABNAME = 'OAUTH_SESSIONS' AND COLNAME = 'SESSION_ID')
     THEN
-      FOR r AS SELECT COUNT(*) AS n FROM oauth_sessions DO
-        IF r.n = 0 THEN
-          EXECUTE IMMEDIATE 'DROP TABLE oauth_sessions';
-        ELSE
-          EXECUTE IMMEDIATE 'RENAME TABLE oauth_sessions TO oauth_sessions_legacy_0006';
-        END IF;
-      END FOR;
+      -- Rename aside via dynamic SQL only: a static ``FROM oauth_sessions`` is
+      -- validated at compound-statement COMPILE time and fails with SQL0204N on
+      -- a fresh DB where the table does not yet exist. Rename (never DROP) keeps
+      -- the no-data-loss guarantee; an empty divergent table lands aside harmlessly.
+      EXECUTE IMMEDIATE 'RENAME TABLE oauth_sessions TO oauth_sessions_legacy_0006';
     END IF;
   END FOR;
 END@
