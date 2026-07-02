@@ -1,3 +1,4 @@
+--#SET TERMINATOR @
 -- migration: 0021_hive_agents
 -- target:    IBM Db2 12.1.5 (Oracle Compat mode)
 -- schema:    HIVE_MIND (or active session schema)
@@ -39,23 +40,23 @@ BEGIN
       CONSTRAINT ck_hive_agents_status
         CHECK (status IN (''online'',''idle'',''offline'',''error''))
     )';
-END%
+END@
 
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_agents_status    ON hive_agents(status)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_agents_kind      ON hive_agents(kind)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_agents_heartbeat ON hive_agents(kind, last_heartbeat DESC)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_agents_runtime   ON hive_agents(runtime)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_agents_provider  ON hive_agents(provider)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_agents_cost_tier ON hive_agents(cost_tier)';
-END%
+END@

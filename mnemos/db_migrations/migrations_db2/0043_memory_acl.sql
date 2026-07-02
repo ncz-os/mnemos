@@ -1,3 +1,4 @@
+--#SET TERMINATOR @
 -- 0043_memory_acl.sql — Db2 12.1.5 (Oracle Compat) port.
 --
 -- Per-principal ACL escape hatch + delegated group-admin. RLS is not used on

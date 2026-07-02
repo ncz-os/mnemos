@@ -26,13 +26,11 @@ BEGIN
        AND NOT EXISTS (SELECT 1 FROM SYSCAT.COLUMNS
                         WHERE TABSCHEMA = CURRENT SCHEMA AND TABNAME = 'JOURNAL' AND COLNAME = 'OWNER_ID')
     THEN
-      FOR r AS SELECT COUNT(*) AS n FROM journal DO
-        IF r.n = 0 THEN
-          EXECUTE IMMEDIATE 'DROP TABLE journal';
-        ELSE
-          EXECUTE IMMEDIATE 'RENAME TABLE journal TO journal_audit_legacy_0015';
-        END IF;
-      END FOR;
+      -- Rename aside via dynamic SQL only: a static ``FROM journal`` is validated
+      -- at compound-statement COMPILE time and fails with SQL0204N on a fresh DB
+      -- where the table does not yet exist. Rename (never DROP) keeps the
+      -- no-data-loss guarantee; an empty divergent table lands aside harmlessly.
+      EXECUTE IMMEDIATE 'RENAME TABLE journal TO journal_audit_legacy_0015';
     END IF;
   END FOR;
 END@
