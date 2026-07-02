@@ -212,10 +212,13 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- View: Compression statistics
 -- NOTE: `ensure_postgres_schema` re-runs this file on every `mnemos serve`
--- startup. If any later migration redefines this view, its column list must
--- stay identical here — `CREATE OR REPLACE VIEW` cannot rename/reorder
--- existing columns and startup aborts with "cannot change name of view
--- column" on the mismatch. Keep every definition of this view in lockstep.
+-- startup, and later migrations (v3_dag, v5_0_3) legitimately redefine this
+-- view with a different column list. `CREATE OR REPLACE VIEW` cannot
+-- rename/reorder existing columns, so on restart this statement aborted with
+-- "cannot change name of view column" against the later definition. DROP-then-
+-- CREATE (as those later migrations already do) makes the re-run idempotent
+-- regardless of column drift.
+DROP VIEW IF EXISTS v_compression_stats CASCADE;
 CREATE OR REPLACE VIEW v_compression_stats AS
 SELECT
     COUNT(*) AS total_compressions,
@@ -226,8 +229,9 @@ SELECT
 FROM compression_quality_log;
 
 -- View: Unreviewed compressions (require attention)
--- Same idempotency constraint as v_compression_stats above — keep this
--- column list in lockstep with any later migration that redefines the view.
+-- Same idempotency constraint as v_compression_stats above; DROP-then-CREATE
+-- so a re-run survives any later column-list redefinition.
+DROP VIEW IF EXISTS v_unreviewed_compressions CASCADE;
 CREATE OR REPLACE VIEW v_unreviewed_compressions AS
 SELECT
     cql.id,
