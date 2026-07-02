@@ -1,3 +1,4 @@
+--#SET TERMINATOR @
 -- migration: 0024_hive_events
 -- target:    IBM Db2 12.1.5
 
@@ -13,17 +14,17 @@ BEGIN
       agent_urn  VARCHAR(256),
       CONSTRAINT pk_hive_events PRIMARY KEY (id)
     )';
-END%
+END@
 
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_events_ts      ON hive_events(ts DESC)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_events_kind    ON hive_events(kind)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_events_agent   ON hive_events(agent_urn)';
-END%
+END@
 BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
   EXECUTE IMMEDIATE 'CREATE INDEX ix_hive_events_kind_ts ON hive_events(kind, ts DESC)';
-END%
+END@

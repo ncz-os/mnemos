@@ -1,3 +1,4 @@
+--#SET TERMINATOR @
 -- migration: 0036_hive_agents_subscription_pools
 -- target:    IBM Db2 12.1.5 (Oracle Compat mode)
 -- purpose:   Advertise workspace-local subscription pools per hive agent.
@@ -16,4 +17,4 @@ BEGIN
         CHECK (SYSTOOLS.JSON2BSON(subscription_pools) IS NOT NULL)
     ';
   END IF;
-END%
+END@
