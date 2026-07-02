@@ -54,7 +54,7 @@ services:
       retries: 30
       start_period: 240s
   mnemos-db2:
-    image: ghcr.io/ncz-os/mnemos-enterprise:6.0.0-allbackends
+    image: ghcr.io/ncz-os/mnemos-enterprise:sha-d79dc40   # all backends + PG semantic-recall fix; bump to next semver release when cut
     container_name: mnemos
     depends_on: { db2: { condition: service_healthy } }
     environment:
@@ -88,7 +88,7 @@ services:
       retries: 30
       start_period: 120s
   mnemos-oracle:
-    image: ghcr.io/ncz-os/mnemos-enterprise:6.0.0-allbackends
+    image: ghcr.io/ncz-os/mnemos-enterprise:sha-d79dc40   # all backends + PG semantic-recall fix; bump to next semver release when cut
     container_name: mnemos
     depends_on: { oracle: { condition: service_healthy } }
     environment:
@@ -126,7 +126,7 @@ services:
       timeout: 5s
       retries: 20
   mnemos-postgres:
-    image: ghcr.io/ncz-os/mnemos-enterprise:6.0.0-allbackends
+    image: ghcr.io/ncz-os/mnemos-enterprise:sha-d79dc40   # all backends + PG semantic-recall fix; bump to next semver release when cut
     container_name: mnemos
     depends_on: { postgres: { condition: service_healthy } }
     environment:
@@ -162,7 +162,7 @@ services:
       timeout: 5s
       retries: 20
   mnemos-mariadb:
-    image: ghcr.io/ncz-os/mnemos-enterprise:6.0.0-allbackends
+    image: ghcr.io/ncz-os/mnemos-enterprise:sha-d79dc40   # all backends + PG semantic-recall fix; bump to next semver release when cut
     container_name: mnemos
     depends_on: { mariadb: { condition: service_healthy } }
     environment:
