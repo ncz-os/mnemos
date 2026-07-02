@@ -4365,13 +4365,12 @@ class MysqlFederationRepository(FederationRepository):
         since_updated: Any | None = None,
         limit: int = 100,
     ) -> list[Row]:
-        where = [
-            "federation_source IS NULL",
-            "deleted_at IS NULL",
-            "archived_at IS NULL",
-            "consolidated_into IS NULL",
-            "(MOD(permission_mode, 10)) >= 4",
-        ]
+        # Use the canonical federation-eligibility predicate (unaliased): it is
+        # trusted-scope aware (world-read gate is opt-out via
+        # MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE), always excludes the secret
+        # vault, and always enforces the federation_source loop-guard — keeping
+        # this push path consistent with feed_query/get_feed_memory.
+        where = [_eligibility.eligible_for_federation("")]
         params: list[Any] = []
         if peer_name is not None:
             where.append("(federation_push_peer IS NULL OR federation_push_peer = %s)")

@@ -372,3 +372,54 @@ async def test_every_backend_feed_and_by_id_apply_canonical_federation_gates(
         _assert_tombstone_federation_gates(tombstone_feed_sql, public_token, vault_token)
     else:
         assert backend in {"oracle", "db2"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend,module_name,repo_name,tx_factory,dialect_tokens", FEDERATION_GATE_CASES)
+async def test_trusted_feed_scope_drops_world_read_but_keeps_vault_and_loopguard(
+    backend: str,
+    module_name: str,
+    repo_name: str,
+    tx_factory: Any,
+    dialect_tokens: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=1: the world-read gate must drop
+    from BOTH the batch feed and the by-id path (all backends), while the
+    federation_source loop-guard and the vault exclusion ALWAYS remain."""
+    import sys
+
+    monkeypatch.setenv("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE", "1")
+    sys.modules.setdefault("oracledb", _FakeModule())
+    sys.modules.setdefault("asyncpg", _FakeAsyncpgModule())
+    module = __import__(module_name, fromlist=[repo_name])
+    repo = getattr(module, repo_name)()
+    calls: list[dict[str, Any]] = []
+    tx = tx_factory(calls)
+
+    await repo.feed_query(
+        tx,
+        since_updated=None,
+        since_id=None,
+        namespaces=[],
+        categories=[],
+        limit=25,
+        prefer_compressed=False,
+    )
+    await repo.get_feed_memory(tx, "mem-1", namespaces=[], categories=[])
+
+    assert len(calls) >= 2, backend
+    live_feed_sql, tombstone_feed_sql = _split_feed_branches(calls[0]["sql"])
+    by_id_sql = _normalized_sql(calls[1]["sql"])
+    public_token, vault_token = dialect_tokens
+
+    for sql in (live_feed_sql, by_id_sql):
+        # World-read gate is DROPPED in trusted mode ...
+        assert public_token not in sql, f"{backend}: world-read gate must be absent in trusted mode"
+        # ... but loop-guard and vault exclusion ALWAYS hold.
+        assert "M.FEDERATION_SOURCE IS NULL" in sql, f"{backend}: loop-guard must always hold"
+        assert vault_token in sql, f"{backend}: vault exclusion must always hold"
+    if tombstone_feed_sql is not None:
+        assert public_token not in tombstone_feed_sql
+        assert "M.FEDERATION_SOURCE IS NULL" in tombstone_feed_sql
+        assert vault_token in tombstone_feed_sql
