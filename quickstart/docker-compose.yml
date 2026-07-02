@@ -64,9 +64,12 @@ services:
       RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
       MNEMOS_SEMANTIC_FLOOR: "0.45"       # tuned to bundled quantized bge-m3 (~0.56 paraphrase); see docs/BACKENDS.md
       MNEMOS_SEMANTIC_MARGIN_FLOOR: "0"   # disable OOD/margin gate; compressed-similarity embedder bunches scores
+      MNEMOS_ENABLE_GRAEAE: "false"       # core memory only; GRAEAE is an optional add-on (see docs), and MariaDB doesn't implement it
       MNEMOS_EMBED_BACKEND: http
       MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
       MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
+      MNEMOS_EMBED_HTTP_URL_FALLBACK: ""  # standardize on 1024: no fallback to the image's baked 768-dim/private-IP embedder
+      MNEMOS_EMBED_MODEL_PATH: ""         # disable the baked local 768-dim nomic fallback — fail loud, never silently mismatch dims
       MNEMOS_PROFILE: server
       MNEMOS_AUTH_ENABLED: "false"
     ports: ["5002:5002"]
@@ -98,9 +101,12 @@ services:
       RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
       MNEMOS_SEMANTIC_FLOOR: "0.45"       # tuned to bundled quantized bge-m3 (~0.56 paraphrase); see docs/BACKENDS.md
       MNEMOS_SEMANTIC_MARGIN_FLOOR: "0"   # disable OOD/margin gate; compressed-similarity embedder bunches scores
+      MNEMOS_ENABLE_GRAEAE: "false"       # core memory only; GRAEAE is an optional add-on (see docs), and MariaDB doesn't implement it
       MNEMOS_EMBED_BACKEND: http
       MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
       MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
+      MNEMOS_EMBED_HTTP_URL_FALLBACK: ""  # standardize on 1024: no fallback to the image's baked 768-dim/private-IP embedder
+      MNEMOS_EMBED_MODEL_PATH: ""         # disable the baked local 768-dim nomic fallback — fail loud, never silently mismatch dims
       MNEMOS_PROFILE: server
       MNEMOS_AUTH_ENABLED: "false"
     ports: ["5002:5002"]
@@ -136,9 +142,12 @@ services:
       RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
       MNEMOS_SEMANTIC_FLOOR: "0.45"       # tuned to bundled quantized bge-m3 (~0.56 paraphrase); see docs/BACKENDS.md
       MNEMOS_SEMANTIC_MARGIN_FLOOR: "0"   # disable OOD/margin gate; compressed-similarity embedder bunches scores
+      MNEMOS_ENABLE_GRAEAE: "false"       # core memory only; GRAEAE is an optional add-on (see docs), and MariaDB doesn't implement it
       MNEMOS_EMBED_BACKEND: http
       MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
       MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
+      MNEMOS_EMBED_HTTP_URL_FALLBACK: ""  # standardize on 1024: no fallback to the image's baked 768-dim/private-IP embedder
+      MNEMOS_EMBED_MODEL_PATH: ""         # disable the baked local 768-dim nomic fallback — fail loud, never silently mismatch dims
       MNEMOS_PROFILE: server
       MNEMOS_AUTH_ENABLED: "false"
     ports: ["5002:5002"]
@@ -172,9 +181,12 @@ services:
       RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
       MNEMOS_SEMANTIC_FLOOR: "0.45"       # tuned to bundled quantized bge-m3 (~0.56 paraphrase); see docs/BACKENDS.md
       MNEMOS_SEMANTIC_MARGIN_FLOOR: "0"   # disable OOD/margin gate; compressed-similarity embedder bunches scores
+      MNEMOS_ENABLE_GRAEAE: "false"       # core memory only; GRAEAE is an optional add-on (see docs), and MariaDB doesn't implement it
       MNEMOS_EMBED_BACKEND: http
       MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
       MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
+      MNEMOS_EMBED_HTTP_URL_FALLBACK: ""  # standardize on 1024: no fallback to the image's baked 768-dim/private-IP embedder
+      MNEMOS_EMBED_MODEL_PATH: ""         # disable the baked local 768-dim nomic fallback — fail loud, never silently mismatch dims
       MNEMOS_PROFILE: server
       MNEMOS_AUTH_ENABLED: "false"
     ports: ["5002:5002"]
