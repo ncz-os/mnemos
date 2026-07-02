@@ -89,7 +89,11 @@ _DB2_MIGRATIONS_DIR = _DB_DIR / "migrations_db2"
 
 _PG_DUPLICATE_STATES = {"42710", "42P07", "42701"}
 _PG_UNDEFINED_STATES = {"42704", "42P01"}
-_DB2_BENIGN_STATES = {"42710", "42P07", "42701", "42711"}
+# SQLSTATEs that are benign on (re)provisioning: object/column already exists
+# (42710/42P07/42701/42711) and 01550 = SQL0605W "index not created because a
+# matching index already exists" (e.g. an explicit CREATE INDEX that duplicates
+# the index a UNIQUE/PK constraint already created). Warnings, not failures.
+_DB2_BENIGN_STATES = {"42710", "42P07", "42701", "42711", "01550"}
 _DB2_VECTOR_INDEX_BENIGN_CODES = {"42601", "56098", "SQL0104N", "SQL0270N"}
 
 
