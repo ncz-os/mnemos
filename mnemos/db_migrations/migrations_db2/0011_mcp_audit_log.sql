@@ -1,7 +1,7 @@
 -- 0011_mcp_audit_log.sql — Db2 12.1.5 (Oracle Compat) port.
 
 CREATE TABLE mcp_audit_log (
-    id VARCHAR(36) PRIMARY KEY,
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
     session_id VARCHAR(36),
     tool_name VARCHAR(100) NOT NULL,
     request CLOB(1M),
