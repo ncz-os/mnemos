@@ -1,7 +1,7 @@
 -- 0016_memory_archive.sql — Db2 12.1.5 (Oracle Compat) port.
 
 CREATE TABLE memory_archive (
-    id VARCHAR(36) PRIMARY KEY,
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
     original_memory_id VARCHAR(36) NOT NULL,
     content CLOB(1M) NOT NULL,
     metadata CLOB(1M),

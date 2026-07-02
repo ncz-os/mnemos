@@ -1,7 +1,7 @@
 -- 0020_compression_quality_log.sql — Db2 12.1.5 (Oracle Compat) port.
 
 CREATE TABLE compression_quality_log (
-    id VARCHAR(36) PRIMARY KEY,
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
     memory_id VARCHAR(36) NOT NULL,
     original_size BIGINT,
     compressed_size BIGINT,

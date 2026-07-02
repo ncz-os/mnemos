@@ -1,7 +1,7 @@
 -- 0014_entities.sql — Db2 12.1.5 (Oracle Compat) port.
 
 CREATE TABLE entities (
-    id VARCHAR(36) PRIMARY KEY,
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
     kind VARCHAR(50) NOT NULL,
     name VARCHAR(200) NOT NULL,
     attributes CLOB(1M),
