@@ -14,7 +14,7 @@ CREATE TABLE memory_acl (
     principal  VARCHAR(150) NOT NULL,
     perm       SMALLINT DEFAULT 4 NOT NULL,
     granted_by VARCHAR(100),
-    created    TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    created    TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
     CONSTRAINT pk_memory_acl PRIMARY KEY (memory_id, principal),
     CONSTRAINT fk_memory_acl_memory FOREIGN KEY (memory_id)
         REFERENCES memories (id) ON DELETE CASCADE,

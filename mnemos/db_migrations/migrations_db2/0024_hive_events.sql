@@ -9,7 +9,7 @@ BEGIN
       ts         DOUBLE          NOT NULL,
       kind       VARCHAR(64)     NOT NULL,
       payload    CLOB(2M) INLINE LENGTH 4096
-        CHECK (payload IS JSON FORMAT JSON STRICT) NOT NULL,
+        CHECK (SYSTOOLS.JSON2BSON(payload) IS NOT NULL) NOT NULL,
       agent_urn  VARCHAR(256),
       CONSTRAINT pk_hive_events PRIMARY KEY (id)
     )';

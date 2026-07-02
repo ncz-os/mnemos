@@ -5,7 +5,7 @@ CREATE TABLE memory_archive (
     original_memory_id VARCHAR(36) NOT NULL,
     content CLOB(1M) NOT NULL,
     metadata CLOB(1M),
-    archived_at TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    archived_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
     reason VARCHAR(100)
 );
 

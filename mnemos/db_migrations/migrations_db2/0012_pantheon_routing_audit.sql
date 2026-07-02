@@ -19,8 +19,8 @@ BEGIN
       cost_usd       DECIMAL(10,4),
       error_class    VARCHAR(256),
       payload        CLOB(2M) INLINE LENGTH 4096 NOT NULL
-        CHECK (payload IS JSON FORMAT JSON STRICT),
-      created        TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        CHECK (SYSTOOLS.JSON2BSON(payload) IS NOT NULL),
+      created        TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP,
       CONSTRAINT pk_pantheon_routing_audit PRIMARY KEY (id)
     )';
 END@
@@ -63,7 +63,7 @@ BEGIN
     EXECUTE IMMEDIATE 'ALTER TABLE pantheon_routing_audit ADD COLUMN payload CLOB(2M) INLINE LENGTH 4096';
   END IF;
   IF (SELECT COUNT(*) FROM syscat.columns WHERE tabschema = CURRENT SCHEMA AND tabname = 'PANTHEON_ROUTING_AUDIT' AND colname = 'CREATED') = 0 THEN
-    EXECUTE IMMEDIATE 'ALTER TABLE pantheon_routing_audit ADD COLUMN created TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP';
+    EXECUTE IMMEDIATE 'ALTER TABLE pantheon_routing_audit ADD COLUMN created TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP';
   END IF;
 END@
 
