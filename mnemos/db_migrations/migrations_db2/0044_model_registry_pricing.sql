@@ -45,7 +45,7 @@ BEGIN
             price_in        DECIMAL(12,6),
             price_out       DECIMAL(12,6),
             price_cached    DECIMAL(12,6),
-            prices          CLOB CHECK (prices IS JSON),
+            prices          CLOB CHECK (SYSTOOLS.JSON2BSON(prices) IS NOT NULL),
             recorded_at     TIMESTAMP NOT NULL DEFAULT CURRENT TIMESTAMP
         )';
 END

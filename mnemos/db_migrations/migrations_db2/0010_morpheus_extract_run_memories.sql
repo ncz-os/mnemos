@@ -3,7 +3,7 @@
 CREATE TABLE morpheus_extract_run_memories (
     run_id VARCHAR(36) NOT NULL,
     memory_id VARCHAR(36) NOT NULL,
-    extracted_at TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    extracted_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
     PRIMARY KEY (run_id, memory_id)
 );
 

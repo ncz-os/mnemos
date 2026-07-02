@@ -36,13 +36,13 @@ BEGIN
       session_id VARCHAR(200) NOT NULL,
       user_id VARCHAR(100) NOT NULL,
       identity_id VARCHAR(36),
-      created TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
-      expires_at TIMESTAMP(6) WITH TIME ZONE NOT NULL,
-      last_used_at TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      created TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      expires_at TIMESTAMP(6) NOT NULL,
+      last_used_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
       revoked SMALLINT DEFAULT 0 NOT NULL,
       user_agent VARCHAR(1000),
       ip_address VARCHAR(50),
-      revoked_at TIMESTAMP(6) WITH TIME ZONE,
+      revoked_at TIMESTAMP(6),
       CONSTRAINT pk_oauth_sessions PRIMARY KEY (session_id)
     )';
 END@

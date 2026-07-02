@@ -41,8 +41,8 @@ BEGIN
       email VARCHAR(200),
       display_name VARCHAR(200),
       raw_claims CLOB(1M),
-      last_login_at TIMESTAMP(6) WITH TIME ZONE,
-      created TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      last_login_at TIMESTAMP(6),
+      created TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
       CONSTRAINT pk_oauth_identities PRIMARY KEY (id)
     )';
 END@

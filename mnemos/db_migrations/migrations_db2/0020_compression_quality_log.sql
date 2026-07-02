@@ -7,7 +7,7 @@ CREATE TABLE compression_quality_log (
     compressed_size BIGINT,
     quality_rating DOUBLE,
     quality_summary CLOB(1M),
-    created TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+    created TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 
 CREATE INDEX idx_compression_quality_memory ON compression_quality_log (memory_id);

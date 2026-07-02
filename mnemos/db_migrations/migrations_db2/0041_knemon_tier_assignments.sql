@@ -16,7 +16,7 @@ BEGIN
       p95_latency_ms   INTEGER       NOT NULL,
       avg_latency_ms   INTEGER       NOT NULL,
       iteration        INTEGER       DEFAULT 0 NOT NULL,
-      last_updated     TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      last_updated     TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
       CONSTRAINT pk_knemon_tier_assignments PRIMARY KEY (id),
       CONSTRAINT uq_knemon_tier_task_kind UNIQUE (task_kind),
       CONSTRAINT ck_knemon_tier_valid CHECK (tier IN (''B1'',''B2'',''C1'',''C2''))

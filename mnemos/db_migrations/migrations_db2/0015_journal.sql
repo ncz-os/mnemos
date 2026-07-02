@@ -48,8 +48,8 @@ BEGIN
       topic VARCHAR(100),
       content CLOB(1M),
       metadata CLOB(1M),
-      created TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
-      deleted_at TIMESTAMP(6) WITH TIME ZONE,
+      created TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      deleted_at TIMESTAMP(6),
       CONSTRAINT pk_journal PRIMARY KEY (id)
     )';
 END@
