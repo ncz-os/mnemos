@@ -1,0 +1,172 @@
+# mnemos — free-backend agent-memory quickstart (Db2 · Oracle · Postgres · MariaDB)
+#
+# One mnemos image, four FREE official database backends. Pick ONE with a compose
+# profile — mnemos self-provisions its schema (native vector column + index) on
+# first connect, and an AI agent reads/writes it over MCP (see docs/AGENTS.md).
+#
+#   cp .env.example .env
+#   docker compose --profile db2      up -d     # lead / recommended
+#   docker compose --profile oracle   up -d
+#   docker compose --profile postgres up -d
+#   docker compose --profile mariadb  up -d
+#
+# Then (Db2 only, one-time): ./scripts/init-db2-vectors.sh
+# Verify any backend:        curl -s localhost:5002/health
+#
+# Backend choice: see README.md / docs/BACKENDS.md. Short version —
+#   • Db2 CE       — recommended: native VECTOR + DiskANN, fewest CE limits.
+#   • Oracle Free  — 23ai Free w/ AI Vector Search (see the EE-eval note in BACKENDS.md).
+#   • Postgres     — pgvector, pure open source, most familiar.
+#   • MariaDB      — pure open source, community vector.
+#
+# CPU-only by default (bge-m3 embeddings on CPU). No GPU required.
+services:
+
+  # ---- shared embedding server (all profiles): OpenAI-compatible /v1/embeddings ----
+  embed:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: mnemos-embed
+    command: ["-hf", "gpustack/bge-m3-GGUF:Q8_0", "--embeddings", "--host", "0.0.0.0", "--port", "8080"]
+    ports: ["8090:8080"]
+    profiles: ["db2", "oracle", "postgres", "mariadb"]
+
+  # ============================ Db2 CE (lead) ============================
+  db2:
+    image: icr.io/db2_community/db2:latest
+    container_name: mnemos-db2
+    privileged: true
+    environment:
+      LICENSE: accept
+      DB2INSTANCE: db2inst1
+      DB2INST1_PASSWORD: ${DB_PASSWORD:-mnemos_quickstart}
+      DBNAME: MNEMOS
+      CODESET: UTF-8
+      TERRITORY: US
+      DB2_COMPATIBILITY_VECTOR: "ORA"     # native VECTOR type + VECTOR_DISTANCE
+      DB2_VECTOR_INDEXING: "YES"          # DiskANN
+    ports: ["50001:50000"]
+    volumes: ["db2-data:/database"]
+    profiles: ["db2"]
+    healthcheck:
+      test: ["CMD-SHELL", "su - db2inst1 -c 'db2 connect to MNEMOS' >/dev/null 2>&1"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 240s
+  mnemos-db2:
+    image: ghcr.io/ncz-os/mnemos-enterprise:latest
+    container_name: mnemos
+    depends_on: { db2: { condition: service_healthy } }
+    environment:
+      MNEMOS_PERSISTENCE_BACKEND: db2
+      MNEMOS_DATABASE_DSN: "db2://db2inst1:${DB_PASSWORD:-mnemos_quickstart}@db2:50000/MNEMOS"
+      MNEMOS_EMBEDDING_DIM: "1024"        # bge-m3; MUST match the embedder (NOT *_DATABASE_* )
+      MNEMOS_EMBED_BACKEND: http
+      MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
+      MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
+      MNEMOS_PROFILE: server
+      MNEMOS_AUTH_ENABLED: "false"
+    ports: ["5002:5002"]
+    profiles: ["db2"]
+
+  # ============================ Oracle 23ai Free ============================
+  oracle:
+    image: container-registry.oracle.com/database/free:latest   # Oracle Database 23ai Free
+    container_name: mnemos-oracle
+    environment:
+      ORACLE_PWD: ${DB_PASSWORD:-mnemos_quickstart}
+    ports: ["1521:1521"]
+    volumes: ["oracle-data:/opt/oracle/oradata"]
+    profiles: ["oracle"]
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'SELECT 1 FROM dual;' | sqlplus -s system/${DB_PASSWORD:-mnemos_quickstart}@localhost:1521/FREEPDB1 | grep -q 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+  mnemos-oracle:
+    image: ghcr.io/ncz-os/mnemos-enterprise:latest
+    container_name: mnemos
+    depends_on: { oracle: { condition: service_healthy } }
+    environment:
+      MNEMOS_PERSISTENCE_BACKEND: oracle
+      MNEMOS_DATABASE_DSN: "oracle://system:${DB_PASSWORD:-mnemos_quickstart}@oracle:1521/FREEPDB1"
+      MNEMOS_EMBEDDING_DIM: "1024"
+      MNEMOS_EMBED_BACKEND: http
+      MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
+      MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
+      MNEMOS_PROFILE: server
+      MNEMOS_AUTH_ENABLED: "false"
+    ports: ["5002:5002"]
+    profiles: ["oracle"]
+
+  # ============================ Postgres + pgvector ============================
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: mnemos-postgres
+    environment:
+      POSTGRES_USER: mnemos
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mnemos_quickstart}
+      POSTGRES_DB: mnemos
+    ports: ["5432:5432"]
+    volumes: ["pg-data:/var/lib/postgresql/data"]
+    profiles: ["postgres"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mnemos -d mnemos"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+  mnemos-postgres:
+    image: ghcr.io/ncz-os/mnemos-enterprise:latest
+    container_name: mnemos
+    depends_on: { postgres: { condition: service_healthy } }
+    environment:
+      MNEMOS_PERSISTENCE_BACKEND: postgres
+      MNEMOS_DATABASE_DSN: "postgres://mnemos:${DB_PASSWORD:-mnemos_quickstart}@postgres:5432/mnemos"
+      MNEMOS_EMBEDDING_DIM: "1024"
+      MNEMOS_EMBED_BACKEND: http
+      MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
+      MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
+      MNEMOS_PROFILE: server
+      MNEMOS_AUTH_ENABLED: "false"
+    ports: ["5002:5002"]
+    profiles: ["postgres"]
+
+  # ============================ MariaDB (pure OSS) ============================
+  mariadb:
+    image: mariadb:11.8      # 11.7+ ships the VECTOR type + vector index
+    container_name: mnemos-mariadb
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_PASSWORD:-mnemos_quickstart}
+      MARIADB_DATABASE: mnemos
+      MARIADB_USER: mnemos
+      MARIADB_PASSWORD: ${DB_PASSWORD:-mnemos_quickstart}
+    ports: ["3306:3306"]
+    volumes: ["maria-data:/var/lib/mysql"]
+    profiles: ["mariadb"]
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh --connect --innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+  mnemos-mariadb:
+    image: ghcr.io/ncz-os/mnemos-enterprise:latest
+    container_name: mnemos
+    depends_on: { mariadb: { condition: service_healthy } }
+    environment:
+      MNEMOS_PERSISTENCE_BACKEND: mariadb
+      MNEMOS_DATABASE_DSN: "mariadb://mnemos:${DB_PASSWORD:-mnemos_quickstart}@mariadb:3306/mnemos"
+      MNEMOS_EMBEDDING_DIM: "1024"
+      MNEMOS_EMBED_BACKEND: http
+      MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
+      MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
+      MNEMOS_PROFILE: server
+      MNEMOS_AUTH_ENABLED: "false"
+    ports: ["5002:5002"]
+    profiles: ["mariadb"]
+
+volumes:
+  db2-data:
+  oracle-data:
+  pg-data:
+  maria-data:
