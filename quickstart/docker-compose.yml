@@ -14,7 +14,7 @@
 # Verify any backend:        curl -s localhost:5002/health
 #
 # Backend choice: see README.md / docs/BACKENDS.md. Short version —
-#   • Db2 CE       — recommended: native VECTOR + DiskANN, fewest CE limits.
+#   • Db2 CE       — recommended: native VECTOR + vector index, fewest CE limits.
 #   • Oracle Free  — 23ai Free w/ AI Vector Search (see the EE-eval note in BACKENDS.md).
 #   • Postgres     — pgvector, pure open source, most familiar.
 #   • MariaDB      — pure open source, community vector.
@@ -43,7 +43,7 @@ services:
       CODESET: UTF-8
       TERRITORY: US
       DB2_COMPATIBILITY_VECTOR: "ORA"     # native VECTOR type + VECTOR_DISTANCE
-      DB2_VECTOR_INDEXING: "YES"          # DiskANN
+      DB2_VECTOR_INDEXING: "YES"          # enables CREATE VECTOR INDEX (Db2 12.1.5)
     ports: ["50001:50000"]
     volumes: ["db2-data:/database"]
     profiles: ["db2"]
