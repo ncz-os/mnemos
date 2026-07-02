@@ -1,8 +1,47 @@
+--#SET TERMINATOR @
 -- migration: 0037_deepseek_direct_provider_seed
 -- Db2 mirror of Oracle 0037_deepseek_direct_provider_seed.
+--
+-- model_registry is created by the standalone migrations_model_registry.sql
+-- (PostgreSQL syntax) which the Db2 native suite does NOT apply — it only globs
+-- migrations_db2/*.sql. So provision the canonical model_registry shape here
+-- (guarded + idempotent) before the seed, mirroring the Oracle sibling. Pricing
+-- columns (price_in/out/cached/price_updated_at) are added by 0044. SMALLINT
+-- booleans, DECIMAL money, CLOB+JSON2BSON for capabilities/raw_payload — the Db2
+-- native equivalents of Oracle NUMBER(1)/NUMBER(p,s)/CLOB-IS-JSON.
+BEGIN
+  DECLARE CONTINUE HANDLER FOR SQLSTATE '42710' BEGIN END;
+  EXECUTE IMMEDIATE '
+    CREATE TABLE model_registry (
+      id                   VARCHAR(100)   NOT NULL,
+      provider             VARCHAR(50)    NOT NULL,
+      model_id             VARCHAR(400)   NOT NULL,
+      display_name         VARCHAR(400),
+      family               VARCHAR(200),
+      context_window       INTEGER,
+      max_output_tokens    INTEGER,
+      capabilities         CLOB(1M) INLINE LENGTH 1024
+        CHECK (capabilities IS NULL OR SYSTOOLS.JSON2BSON(capabilities) IS NOT NULL),
+      input_cost_per_mtok  DECIMAL(12, 6) DEFAULT 0,
+      output_cost_per_mtok DECIMAL(12, 6) DEFAULT 0,
+      cache_read_per_mtok  DECIMAL(12, 6) DEFAULT 0,
+      cache_write_per_mtok DECIMAL(12, 6) DEFAULT 0,
+      available            SMALLINT       DEFAULT 1 NOT NULL,
+      deprecated           SMALLINT       DEFAULT 0 NOT NULL,
+      arena_score          DECIMAL(8, 2),
+      arena_rank           INTEGER,
+      graeae_weight        DECIMAL(5, 4),
+      first_seen           TIMESTAMP(6)   DEFAULT CURRENT TIMESTAMP NOT NULL,
+      last_seen            TIMESTAMP(6)   DEFAULT CURRENT TIMESTAMP NOT NULL,
+      last_synced          TIMESTAMP(6)   DEFAULT CURRENT TIMESTAMP NOT NULL,
+      raw_payload          CLOB(1M) INLINE LENGTH 1024
+        CHECK (raw_payload IS NULL OR SYSTOOLS.JSON2BSON(raw_payload) IS NOT NULL),
+      CONSTRAINT pk_model_registry PRIMARY KEY (id)
+    )';
+END@
 
 DELETE FROM model_registry
-WHERE provider LIKE 'parity_postgres_%';
+WHERE provider LIKE 'parity_postgres_%'@
 
 MERGE INTO model_registry AS dst
 USING (
@@ -57,4 +96,4 @@ WHEN NOT MATCHED THEN INSERT (
   src.capabilities, src.available, src.deprecated, src.arena_score,
   src.arena_rank, src.graeae_weight, CURRENT TIMESTAMP, CURRENT TIMESTAMP,
   CURRENT TIMESTAMP, src.raw_payload
-);
+)@

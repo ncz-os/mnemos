@@ -1,3 +1,4 @@
+--#SET TERMINATOR @
 -- migration: 0038_oauth_sessions_consultations
 -- Db2 mirror of Oracle 0038_oauth_sessions_consultations.
 -- Statement terminator: @
