@@ -38,7 +38,7 @@ services:
     environment:
       LICENSE: accept
       DB2INSTANCE: db2inst1
-      DB2INST1_PASSWORD: ${DB_PASSWORD:-mnemos_quickstart}
+      DB2INST1_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}
       DBNAME: MNEMOS
       CODESET: UTF-8
       TERRITORY: US
@@ -54,13 +54,14 @@ services:
       retries: 30
       start_period: 240s
   mnemos-db2:
-    image: ghcr.io/ncz-os/mnemos-enterprise:latest
+    image: ghcr.io/ncz-os/mnemos-enterprise:6.0.0-allbackends
     container_name: mnemos
     depends_on: { db2: { condition: service_healthy } }
     environment:
       MNEMOS_PERSISTENCE_BACKEND: db2
-      MNEMOS_DATABASE_DSN: "db2://db2inst1:${DB_PASSWORD:-mnemos_quickstart}@db2:50000/MNEMOS"
+      MNEMOS_DATABASE_DSN: "db2://db2inst1:${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}@db2:50000/MNEMOS"
       MNEMOS_EMBEDDING_DIM: "1024"        # bge-m3; MUST match the embedder (NOT *_DATABASE_* )
+      RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
       MNEMOS_EMBED_BACKEND: http
       MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
       MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
@@ -74,24 +75,25 @@ services:
     image: container-registry.oracle.com/database/free:latest   # Oracle Database 23ai Free
     container_name: mnemos-oracle
     environment:
-      ORACLE_PWD: ${DB_PASSWORD:-mnemos_quickstart}
+      ORACLE_PWD: ${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}
     ports: ["1521:1521"]
     volumes: ["oracle-data:/opt/oracle/oradata"]
     profiles: ["oracle"]
     healthcheck:
-      test: ["CMD-SHELL", "echo 'SELECT 1 FROM dual;' | sqlplus -s system/${DB_PASSWORD:-mnemos_quickstart}@localhost:1521/FREEPDB1 | grep -q 1"]
+      test: ["CMD-SHELL", "echo 'SELECT 1 FROM dual;' | sqlplus -s system/${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}@localhost:1521/FREEPDB1 | grep -q 1"]
       interval: 20s
       timeout: 10s
       retries: 30
       start_period: 120s
   mnemos-oracle:
-    image: ghcr.io/ncz-os/mnemos-enterprise:latest
+    image: ghcr.io/ncz-os/mnemos-enterprise:6.0.0-allbackends
     container_name: mnemos
     depends_on: { oracle: { condition: service_healthy } }
     environment:
       MNEMOS_PERSISTENCE_BACKEND: oracle
-      MNEMOS_DATABASE_DSN: "oracle://system:${DB_PASSWORD:-mnemos_quickstart}@oracle:1521/FREEPDB1"
+      MNEMOS_DATABASE_DSN: "oracle://system:${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}@oracle:1521/FREEPDB1"
       MNEMOS_EMBEDDING_DIM: "1024"
+      RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
       MNEMOS_EMBED_BACKEND: http
       MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
       MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
@@ -106,10 +108,13 @@ services:
     container_name: mnemos-postgres
     environment:
       POSTGRES_USER: mnemos
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-mnemos_quickstart}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}
       POSTGRES_DB: mnemos
     ports: ["5432:5432"]
-    volumes: ["pg-data:/var/lib/postgresql/data"]
+    volumes:
+      - "pg-data:/var/lib/postgresql/data"
+      # create the mnemos_user app role before mnemos first connects (see script header)
+      - "./scripts/init-postgres-role.sh:/docker-entrypoint-initdb.d/10-mnemos-role.sh:ro"
     profiles: ["postgres"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mnemos -d mnemos"]
@@ -117,13 +122,14 @@ services:
       timeout: 5s
       retries: 20
   mnemos-postgres:
-    image: ghcr.io/ncz-os/mnemos-enterprise:latest
+    image: ghcr.io/ncz-os/mnemos-enterprise:6.0.0-allbackends
     container_name: mnemos
     depends_on: { postgres: { condition: service_healthy } }
     environment:
       MNEMOS_PERSISTENCE_BACKEND: postgres
-      MNEMOS_DATABASE_DSN: "postgres://mnemos:${DB_PASSWORD:-mnemos_quickstart}@postgres:5432/mnemos"
+      MNEMOS_DATABASE_DSN: "postgres://mnemos:${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}@postgres:5432/mnemos"
       MNEMOS_EMBEDDING_DIM: "1024"
+      RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
       MNEMOS_EMBED_BACKEND: http
       MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
       MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
@@ -137,10 +143,10 @@ services:
     image: mariadb:11.8      # 11.7+ ships the VECTOR type + vector index
     container_name: mnemos-mariadb
     environment:
-      MARIADB_ROOT_PASSWORD: ${DB_PASSWORD:-mnemos_quickstart}
+      MARIADB_ROOT_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}
       MARIADB_DATABASE: mnemos
       MARIADB_USER: mnemos
-      MARIADB_PASSWORD: ${DB_PASSWORD:-mnemos_quickstart}
+      MARIADB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}
     ports: ["3306:3306"]
     volumes: ["maria-data:/var/lib/mysql"]
     profiles: ["mariadb"]
@@ -150,13 +156,14 @@ services:
       timeout: 5s
       retries: 20
   mnemos-mariadb:
-    image: ghcr.io/ncz-os/mnemos-enterprise:latest
+    image: ghcr.io/ncz-os/mnemos-enterprise:6.0.0-allbackends
     container_name: mnemos
     depends_on: { mariadb: { condition: service_healthy } }
     environment:
       MNEMOS_PERSISTENCE_BACKEND: mariadb
-      MNEMOS_DATABASE_DSN: "mariadb://mnemos:${DB_PASSWORD:-mnemos_quickstart}@mariadb:3306/mnemos"
+      MNEMOS_DATABASE_DSN: "mariadb://mnemos:${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}@mariadb:3306/mnemos"
       MNEMOS_EMBEDDING_DIM: "1024"
+      RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
       MNEMOS_EMBED_BACKEND: http
       MNEMOS_EMBED_HTTP_URL: "http://embed:8080/v1/embeddings"
       MNEMOS_EMBED_HTTP_MODEL: "bge-m3"
