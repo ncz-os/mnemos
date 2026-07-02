@@ -26,10 +26,16 @@ shared CPU **bge-m3** embedder (1024-dim). No GPU.
 ## Prerequisites
 Docker + Docker Compose · ~6 GB RAM free (Db2/Oracle first-boot is the heavy part) · no GPU.
 
+**Embeddings run on CPU** — the bundled `embed` service is llama.cpp serving **bge-m3** (1024-dim).
+On first boot it **downloads the GGUF model** (`gpustack/bge-m3-GGUF:Q8_0`, ~600 MB from Hugging
+Face), so the very first store may wait ~1–2 min for the embedder to finish loading; it's cached
+for subsequent runs. No GPU or embedding API key required. (To use your own OpenAI-compatible
+embedder instead, repoint `MNEMOS_EMBED_HTTP_URL` / `MNEMOS_EMBEDDING_DIM` — see `.env.example`.)
+
 ## Run it
 
 ```bash
-cp .env.example .env                    # optional: set DB_PASSWORD
+cp .env.example .env                    # REQUIRED: set DB_PASSWORD (no default is baked in)
 docker compose --profile db2 up -d      # or: oracle | postgres | mariadb
 ./scripts/init-db2-vectors.sh           # Db2 ONLY, one-time (Oracle-compat + DiskANN)
 curl -s localhost:5002/health           # {"status":"healthy",...}
