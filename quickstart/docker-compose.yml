@@ -54,11 +54,12 @@ services:
       retries: 30
       start_period: 240s
   mnemos-db2:
-    image: ghcr.io/ncz-os/mnemos-enterprise:sha-d79dc40   # all backends + PG semantic-recall fix; bump to next semver release when cut
+    image: ghcr.io/ncz-os/mnemos-enterprise:sha-3d892a5   # all backends + PG recall fix + native-Db2 provisioning; bump to next semver release when cut
     container_name: mnemos
     depends_on: { db2: { condition: service_healthy } }
     environment:
       MNEMOS_PERSISTENCE_BACKEND: db2
+      MNEMOS_DB2_DIALECT: native          # native Db2 SQL (no Oracle-compat translation); requires the native-provisioning image (>= sha-3d892a5)
       MNEMOS_DATABASE_DSN: "db2://db2inst1:${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}@db2:50000/MNEMOS"
       MNEMOS_EMBEDDING_DIM: "1024"        # bge-m3; MUST match the embedder (NOT *_DATABASE_* )
       RATE_LIMIT_STORAGE: "memory://"     # in-process rate limiter; no external Redis (required by recent images)
@@ -91,7 +92,7 @@ services:
       retries: 30
       start_period: 120s
   mnemos-oracle:
-    image: ghcr.io/ncz-os/mnemos-enterprise:sha-d79dc40   # all backends + PG semantic-recall fix; bump to next semver release when cut
+    image: ghcr.io/ncz-os/mnemos-enterprise:sha-3d892a5   # all backends + PG recall fix + native-Db2 provisioning; bump to next semver release when cut
     container_name: mnemos
     depends_on: { oracle: { condition: service_healthy } }
     environment:
@@ -132,7 +133,7 @@ services:
       timeout: 5s
       retries: 20
   mnemos-postgres:
-    image: ghcr.io/ncz-os/mnemos-enterprise:sha-d79dc40   # all backends + PG semantic-recall fix; bump to next semver release when cut
+    image: ghcr.io/ncz-os/mnemos-enterprise:sha-3d892a5   # all backends + PG recall fix + native-Db2 provisioning; bump to next semver release when cut
     container_name: mnemos
     depends_on: { postgres: { condition: service_healthy } }
     environment:
@@ -171,7 +172,7 @@ services:
       timeout: 5s
       retries: 20
   mnemos-mariadb:
-    image: ghcr.io/ncz-os/mnemos-enterprise:sha-d79dc40   # all backends + PG semantic-recall fix; bump to next semver release when cut
+    image: ghcr.io/ncz-os/mnemos-enterprise:sha-3d892a5   # all backends + PG recall fix + native-Db2 provisioning; bump to next semver release when cut
     container_name: mnemos
     depends_on: { mariadb: { condition: service_healthy } }
     environment:
