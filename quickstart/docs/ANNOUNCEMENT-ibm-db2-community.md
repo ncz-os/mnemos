@@ -17,13 +17,15 @@ I've published an open-source **Quick Start** that turns **Db2 Community Edition
 
 ### What it demonstrates about Db2 12.1.5
 
-Every memory is embedded to a **1024-dimension vector** (a CPU `bge-m3` model ships in the compose) and stored in Db2's **native `VECTOR` data type**. Semantic recall is served by **`VECTOR_DISTANCE`**, with Db2 12.1.5's **vector indexing** enabled via the `DB2_VECTOR_INDEXING` registry variable (the Quick Start sets `DB2_COMPATIBILITY_VECTOR=ORA` and the indexing var for you in a one-line init script). Ask *"which marsupial demonstrates vector search?"* and you get back the note about a quokka — no shared keywords, pure vector similarity. It's a concrete, hands-on way to see the new vector features working end to end.
+Every memory is embedded to a **1024-dimension vector** (a CPU `bge-m3` model ships in the compose) and stored in Db2's **native `VECTOR` data type**. Semantic recall is served by **`VECTOR_DISTANCE`**, with Db2 12.1.5's **vector indexing** enabled via the `DB2_VECTOR_INDEXING` registry variable (a one-line init script turns on the datatype + indexing for you). Ask *"which marsupial demonstrates vector search?"* and you get back the note about a quokka — no shared keywords, pure vector similarity. It's a concrete, hands-on way to see the new vector features working end to end.
+
+**This is a fully Db2-native adapter, not Oracle-compatibility mode.** mnemos emits native Db2 SQL throughout — native `VECTOR`/`VECTOR_DISTANCE`, `MERGE … USING SYSIBM.SYSDUMMY1`, `SYSTOOLS.JSON2BSON` JSON validation, `?` positional binds, `GENERATE_UNIQUE()` keys — with **no Oracle-dialect translation layer** (backend class `Db2BackendNative`). The only registry setting the Quick Start touches, `DB2_COMPATIBILITY_VECTOR`, is Db2's own server-side switch for the 12.1.5 `VECTOR` datatype — a Db2 feature toggle, not an application-side Oracle shim.
 
 And it's on **Db2 Community Edition** — free, permanent license, generous envelope (4 cores / 8 GB / **unlimited** database size), so anyone can evaluate the vector stack at no cost.
 
 ### Who it's useful for
 
-- **Db2 folks (and IBMers):** a clean, reproducible demo of the 12.1.5 vector datatype + `VECTOR_DISTANCE` + indexing, with a real workload (agent memory) on top — not a toy. The whole schema runs on **native Db2 SQL** (native `VECTOR`, `MERGE … USING SYSIBM.SYSDUMMY1`, `SYSTOOLS.JSON2BSON` JSON validation, `GENERATE_UNIQUE()` keys) — a first-class Db2 integration, not a lowest-common-denominator port with an Oracle-compat translation layer.
+- **Db2 folks (and IBMers):** a clean, reproducible demo of the 12.1.5 vector datatype + `VECTOR_DISTANCE` + indexing, with a real workload (agent memory) on top — not a toy, and a **first-class native-Db2 integration** (see the native-adapter note above), not a lowest-common-denominator port.
 - **Everyone else:** a genuinely useful tool — durable, private, cross-session memory for your AI assistant, backed by a database many teams already run.
 
 ### Use it with your AI agents (over MCP)
@@ -39,7 +41,7 @@ git clone https://github.com/ncz-os/mnemos
 cd mnemos/quickstart
 cp .env.example .env                 # set DB_PASSWORD
 docker compose --profile db2 up -d
-./scripts/init-db2-vectors.sh        # one-time: Oracle-compat + vector indexing
+./scripts/init-db2-vectors.sh        # one-time: enable Db2 VECTOR datatype + vector indexing
 curl -s localhost:5002/health        # {"status":"healthy", ...}
 ```
 
