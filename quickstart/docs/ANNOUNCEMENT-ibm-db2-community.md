@@ -23,7 +23,7 @@ And it's on **Db2 Community Edition** — free, permanent license, generous enve
 
 ### Who it's useful for
 
-- **Db2 folks (and IBMers):** a clean, reproducible demo of the 12.1.5 vector datatype + `VECTOR_DISTANCE` + indexing, with a real workload (agent memory) on top — not a toy.
+- **Db2 folks (and IBMers):** a clean, reproducible demo of the 12.1.5 vector datatype + `VECTOR_DISTANCE` + indexing, with a real workload (agent memory) on top — not a toy. The whole schema runs on **native Db2 SQL** (native `VECTOR`, `MERGE … USING SYSIBM.SYSDUMMY1`, `SYSTOOLS.JSON2BSON` JSON validation, `GENERATE_UNIQUE()` keys) — a first-class Db2 integration, not a lowest-common-denominator port with an Oracle-compat translation layer.
 - **Everyone else:** a genuinely useful tool — durable, private, cross-session memory for your AI assistant, backed by a database many teams already run.
 
 ### Use it with your AI agents (over MCP)
