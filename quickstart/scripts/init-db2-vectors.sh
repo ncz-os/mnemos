@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One-time Db2 CE vector setup for the mnemos quickstart.
 #
-# Ensures Oracle-compatibility mode (native VECTOR type + VECTOR_DISTANCE) and
+# Enables Db2's VECTOR datatype + VECTOR_DISTANCE (via the DB2_COMPATIBILITY_VECTOR
+# server registry switch) and
 # vector indexing are enabled, and that the MNEMOS database is UTF-8
 # on a 32K pagesize. Safe to re-run (idempotent). The docker-compose env sets
 # these on first boot; this script guarantees they're applied even if the image
@@ -17,7 +18,7 @@ until docker exec "$C" su - db2inst1 -c "db2 connect to MNEMOS" >/dev/null 2>&1;
   sleep 5
 done
 
-echo "[init] applying Oracle-compat + vector indexing registry vars…"
+echo "[init] applying Db2 VECTOR datatype + vector-indexing registry vars…"
 docker exec "$C" su - db2inst1 -c '
   db2set DB2_COMPATIBILITY_VECTOR=ORA
   db2set DB2_VECTOR_INDEXING=YES

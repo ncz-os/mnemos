@@ -37,7 +37,7 @@ embedder instead, repoint `MNEMOS_EMBED_HTTP_URL` / `MNEMOS_EMBEDDING_DIM` — s
 ```bash
 cp .env.example .env                    # REQUIRED: set DB_PASSWORD (no default is baked in)
 docker compose --profile db2 up -d      # or: oracle | postgres | mariadb
-./scripts/init-db2-vectors.sh           # Db2 ONLY, one-time (Oracle-compat + vector indexing)
+./scripts/init-db2-vectors.sh           # Db2 ONLY, one-time (enable Db2 VECTOR datatype + vector indexing)
 curl -s localhost:5002/health           # {"status":"healthy",...}
 ```
 

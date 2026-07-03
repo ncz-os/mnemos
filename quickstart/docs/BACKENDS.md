@@ -55,7 +55,7 @@ guides quote); Oracle from the [Oracle Database Free FAQ](https://www.oracle.com
 ---
 
 ## Db2 Community Edition — the lead
-Native `VECTOR` type + `VECTOR_DISTANCE` + vector indexing (via `DB2_VECTOR_INDEXING`), exposed via Oracle-compat mode
+Native `VECTOR` type + `VECTOR_DISTANCE` + vector indexing (via `DB2_VECTOR_INDEXING`), enabled via the DB2_COMPATIBILITY_VECTOR + DB2_VECTOR_INDEXING server registry variables
 (`DB2_COMPATIBILITY_VECTOR=ORA`, `DB2_VECTOR_INDEXING=YES`; applied by
 `scripts/init-db2-vectors.sh`). Db2 CE has the **fewest capability limits of the "enterprise"
 free tiers** (generous size/feature envelope for evaluation), which is why we lead with it.
