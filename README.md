@@ -37,6 +37,15 @@ federate, export, import, and operate**.
 
 ## Quick Start
 
+> **🚀 Fastest path — the [free-backend Quickstart](quickstart/README.md).**
+> Two commands to durable, MCP-accessible agent memory on a **free** database.
+> It's built around **IBM Db2 12.1.5** — the reference deployment for the
+> *"mnemos on Db2"* IBM TechXchange write-up — but the exact same image and
+> steps run unchanged on **Oracle Database 23ai Free**, **PostgreSQL + pgvector**,
+> or **MariaDB 11.7+**. Pick a backend in
+> [`quickstart/docs/BACKENDS.md`](quickstart/docs/BACKENDS.md); we lead with Db2,
+> it works with all of them.
+
 Memory and reasoning runtime for AI agents: persistent search, versioned storage, webhook fanout, and a unified LLM routing bus - all behind a single MCP interface.
 
 ---
