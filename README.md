@@ -1,3 +1,10 @@
+> ## 📍 Canonical source: GitLab
+> The authoritative source for this project lives on GitLab — always: **https://gitlab.com/ncz-os/mnemos**
+>
+> This GitHub repository is retained **only** to host container images on ghcr.io (`mnemos-core`, `mnemos`, `mnemos-enterprise`). Development, issues, and merge requests happen on GitLab.
+
+---
+
 <p align="center">
   <img src="docs/images/logo.png" alt="MNEMOS" width="400" />
 </p>
