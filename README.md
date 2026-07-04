@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/logo.png" alt="MNEMOS" width="220" />
+  <img src="docs/images/logo.png" alt="MNEMOS" width="400" />
 </p>
 
 # MNEMOS + GRAEAE
