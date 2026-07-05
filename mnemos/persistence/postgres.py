@@ -10,8 +10,6 @@ import hashlib
 import inspect
 import json
 import logging
-import re
-import secrets
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -24,6 +22,7 @@ import asyncpg
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import embed_http_model_override, hot_rs_enabled
 from mnemos.core.native_accel import load_hot_rs
+from mnemos.core.oauth import _mint_user_id
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.core.recommendation import choose_recommended_model
 from mnemos.core.visibility import (
@@ -72,14 +71,6 @@ _FEDERATION_NATS_MEMORY_ROW_COLS = (
     "source_model, source_provider, source_session, source_agent, archived_at, "
     "federation_source, deleted_at, consolidated_into"
 )
-_USER_ID_SAFE = re.compile(r"[^a-zA-Z0-9._:-]+")
-
-
-def _mint_user_id(provider: str, external_id: str) -> str:
-    slug = _USER_ID_SAFE.sub("", f"{provider}:{external_id}")
-    return slug[:64] or f"{provider}:{secrets.token_hex(6)}"
-
-
 def _log_search_phase(
     trace_id: str | None,
     started_at: float | None,
@@ -2736,13 +2727,23 @@ class PostgresOAuthRepository(OAuthRepository):
                 user_id = link_target["id"]
         if user_id is None:
             user_id = _mint_user_id(provider, external_id)
-            await conn.execute(
+            inserted_user_id = await conn.fetchval(
                 "INSERT INTO users (id, display_name, email, role) "
-                "VALUES ($1, $2, $3, 'user') ON CONFLICT (id) DO NOTHING",
+                "VALUES ($1, $2, $3, 'user') "
+                "ON CONFLICT (id) DO NOTHING RETURNING id",
                 user_id,
                 display_name,
                 email,
             )
+            if inserted_user_id is None:
+                existing = await conn.fetchrow(
+                    "SELECT id, user_id FROM oauth_identities WHERE provider=$1 AND external_id=$2",
+                    provider,
+                    external_id,
+                )
+                if existing:
+                    return existing["user_id"], str(existing["id"])
+                raise ValueError("OAuth user id collision during provisioning")
         identity_id = await conn.fetchval(
             "INSERT INTO oauth_identities "
             "(user_id, provider, external_id, email, display_name, raw_claims, last_login_at) "

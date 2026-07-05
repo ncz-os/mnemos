@@ -25,6 +25,7 @@ Knobs:
   MNEMOS_EMBED_BACKEND       auto|openvino|llamacpp           default auto
   MNEMOS_EMBED_OV_MODEL_ID   HF model id for openvino path    default nomic-ai/nomic-embed-text-v1.5
   MNEMOS_EMBED_OV_DEVICE     OpenVINO device (AUTO|GPU|CPU|NPU)  default AUTO
+  MNEMOS_EMBED_TRUST_REMOTE_CODE allow HF remote code for custom models default false
   MNEMOS_EMBED_MODEL_PATH    .gguf for llamacpp path          default /opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf
   MNEMOS_EMBED_N_CTX         llama_cpp n_ctx                  default 8192
   MNEMOS_EMBED_THREADS       llama_cpp n_threads              default os.cpu_count()
@@ -62,6 +63,7 @@ from mnemos.core.config import (
     embed_ov_device_env,
     embed_ov_model_id_env,
     embed_threads_env,
+    embed_trust_remote_code_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,10 +107,11 @@ class _OpenVINOBackend:
     last_hidden_state is L2-normalized to match the nomic convention.
     """
 
-    def __init__(self, model_id: str, device: str, max_chars: int) -> None:
+    def __init__(self, model_id: str, device: str, max_chars: int, trust_remote_code: bool) -> None:
         self.model_id = model_id
         self.device = device
         self.max_chars = max_chars
+        self.trust_remote_code = trust_remote_code
         self._model = None
         self._tokenizer = None
         self._embed_dim: int | None = None
@@ -144,14 +147,12 @@ class _OpenVINOBackend:
             resolved,
             available,
         )
-        # nomic-embed-text-v1.5 ships custom modeling code (nomic-bert-2048),
-        # so transformers requires trust_remote_code to load both the
-        # tokenizer (rotary tokenizer overrides) and the optimum-intel
-        # exporter (custom forward). Plain BERT/MiniLM models ignore this
-        # flag, so it's safe as a blanket default. Operators who don't
-        # trust remote code can set MNEMOS_EMBED_OV_MODEL_ID to a
-        # standard BERT model.
-        self._tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True)
+        if self.trust_remote_code:
+            logger.warning("[EMBED][ov] trusting remote model code for model_id=%s", self.model_id)
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self.model_id,
+            trust_remote_code=self.trust_remote_code,
+        )
         # Detect pre-exported local OpenVINO IR directory (export=False),
         # otherwise fall back to HF export path (export=True).
         _is_local_ir = os.path.isdir(self.model_id) and os.path.isfile(
@@ -161,7 +162,7 @@ class _OpenVINOBackend:
             self.model_id,
             export=not _is_local_ir,
             device=resolved,
-            trust_remote_code=True,
+            trust_remote_code=self.trust_remote_code,
         )
         self._numpy = np
         # Warmup + dim probe
@@ -283,11 +284,13 @@ class _CixNpuBackend:
         tokenizer_id: str,
         max_seq_len: int,
         max_chars: int,
+        trust_remote_code: bool,
     ) -> None:
         self.model_path = model_path
         self.tokenizer_id = tokenizer_id
         self.max_seq_len = max_seq_len
         self.max_chars = max_chars
+        self.trust_remote_code = trust_remote_code
         self._engine = None
         self._tokenizer = None
         self._embed_dim: int | None = None
@@ -318,7 +321,12 @@ class _CixNpuBackend:
             self.tokenizer_id,
             self.max_seq_len,
         )
-        self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
+        if self.trust_remote_code:
+            logger.warning("[EMBED][cix-npu] trusting remote tokenizer code for tokenizer=%s", self.tokenizer_id)
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self.tokenizer_id,
+            trust_remote_code=self.trust_remote_code,
+        )
         self._engine = NPU()
         self._engine.load_graph(str(path))
         # The .cix advertises its output dim via libnoe descriptors; warmup
@@ -652,12 +660,16 @@ class InProcessEmbedder:
         npu_threshold_chars: int | None = None,
         # shared
         max_text_chars: int | None = None,
+        trust_remote_code: bool | None = None,
     ) -> None:
         requested = backend or embed_backend_env()
         self.backend_choice = requested
 
         self.ov_model_id = ov_model_id or embed_ov_model_id_env()
         self.ov_device = (ov_device or embed_ov_device_env()).upper()
+        self.trust_remote_code = (
+            trust_remote_code if trust_remote_code is not None else embed_trust_remote_code_env()
+        )
 
         self.model_path = model_path or embed_model_path_env()
         self.cix_model_path = cix_model_path or embed_cix_model_path_env()
@@ -691,6 +703,7 @@ class InProcessEmbedder:
                 model_id=self.ov_model_id,
                 device=self.ov_device,
                 max_chars=self.max_text_chars,
+                trust_remote_code=self.trust_remote_code,
             )
         if name == "cix-npu":
             return _CixNpuBackend(
@@ -698,6 +711,7 @@ class InProcessEmbedder:
                 tokenizer_id=self.cix_tokenizer_id,
                 max_seq_len=self.cix_max_seq_len,
                 max_chars=self.max_text_chars,
+                trust_remote_code=self.trust_remote_code,
             )
         if name == "http":
             return _HttpBackend(
@@ -734,6 +748,7 @@ class InProcessEmbedder:
                 tokenizer_id=self.cix_tokenizer_id,
                 max_seq_len=self.cix_max_seq_len,
                 max_chars=self.max_text_chars,
+                trust_remote_code=self.trust_remote_code,
             )
         # HTTP fallback chain (mem_1779334716543_f8ebd4 EXCEPTION clause):
         # the http backend falls through PRIMARY -> REMOTE-SECONDARY -> in-

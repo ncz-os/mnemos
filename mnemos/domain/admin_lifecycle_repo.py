@@ -81,10 +81,24 @@ class AdminLifecycleRepository:
             memory_id,
         )
 
-    async def restore_memory(self, tx: Transaction, memory_id: str, restored_by: str) -> None:
+    async def restore_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        restored_by: str,
+        *,
+        expected_owner_id: str | None = None,
+        expected_namespace: str | None = None,
+    ) -> None:
         from mnemos.domain.persephone.runner import restore_memory
 
-        await restore_memory(_conn(tx), memory_id, restored_by)
+        await restore_memory(
+            _conn(tx),
+            memory_id,
+            restored_by,
+            expected_owner_id=expected_owner_id,
+            expected_namespace=expected_namespace,
+        )
 
     async def fetch_persephone_status(self, tx: Transaction, *, namespace: str | None) -> tuple[int, Any, Any]:
         clauses: list[str] = []
