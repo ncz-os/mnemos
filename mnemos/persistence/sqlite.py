@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - local CI can run without optional extr
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import embed_http_model_override, hot_rs_enabled
 from mnemos.core.native_accel import load_hot_rs
+from mnemos.core.oauth import _mint_user_id
 from mnemos.persistence.base import (
     AuditChainRepository,
     BranchRepository,
@@ -2574,15 +2575,21 @@ class SqliteOAuthRepository(_SqliteRepository, OAuthRepository):
             if link_target:
                 user_id = link_target["id"]
         if user_id is None:
-            user_id = (
-                re.sub(r"[^a-zA-Z0-9._:-]+", "", f"{provider}:{external_id}")[:64]
-                or f"{provider}:{uuid.uuid4().hex[:12]}"
-            )
-            await _execute(
+            user_id = _mint_user_id(provider, external_id)
+            inserted = await _execute_count(
                 conn,
                 "INSERT OR IGNORE INTO users (id, display_name, email, role) VALUES (?, ?, ?, 'user')",
                 (user_id, display_name, email),
             )
+            if inserted == 0:
+                existing = await _fetch_one(
+                    conn,
+                    "SELECT id, user_id FROM oauth_identities WHERE provider=? AND external_id=?",
+                    (provider, external_id),
+                )
+                if existing:
+                    return existing["user_id"], str(existing["id"])
+                raise ValueError("OAuth user id collision during provisioning")
         identity_id = uuid.uuid4().hex
         await _execute(
             conn,

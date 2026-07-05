@@ -673,13 +673,19 @@ async def persephone_restore_memory(
             raise HTTPException(status_code=404, detail="Memory not found")
         if row["archived_at"] is None:
             raise HTTPException(status_code=409, detail="Memory is not archived")
-        if not (is_root(user) or row["owner_id"] == user.user_id):
+        if not is_root(user) and (row["owner_id"] != user.user_id or row["namespace"] != user.namespace):
             raise HTTPException(
                 status_code=403,
-                detail="restore requires root or memory owner",
+                detail="restore requires root or memory owner in the same namespace",
             )
         try:
-            await _admin_lifecycle_repo.restore_memory(tx, memory_id, user.user_id)
+            await _admin_lifecycle_repo.restore_memory(
+                tx,
+                memory_id,
+                user.user_id,
+                expected_owner_id=None if is_root(user) else user.user_id,
+                expected_namespace=None if is_root(user) else user.namespace,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
     await _invalidate_memory_read_caches()

@@ -195,7 +195,14 @@ async def archive_memory(conn: Any, memory_id: str, archived_by: str | None = No
             raise RuntimeError(f"memory {memory_id!r} was not archived")
 
 
-async def restore_memory(conn: Any, memory_id: str, restored_by: str | None = None) -> None:
+async def restore_memory(
+    conn: Any,
+    memory_id: str,
+    restored_by: str | None = None,
+    *,
+    expected_owner_id: str | None = None,
+    expected_namespace: str | None = None,
+) -> None:
     """Restore an archived memory's live content from ``memory_archive``."""
     restored_by = restored_by or "system:persephone-restore"
     async with conn.transaction():
@@ -223,22 +230,34 @@ async def restore_memory(conn: Any, memory_id: str, restored_by: str | None = No
             "SELECT set_config('mnemos.current_user_id', $1, true)",
             restored_by,
         )
+        args = [
+            memory_id,
+            memory["content"],
+            memory.get("verbatim_content"),
+            json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+        ]
+        predicates = [
+            "id = $1",
+            "archived_at IS NOT NULL",
+            "deleted_at IS NULL",
+        ]
+        if expected_owner_id is not None:
+            args.append(expected_owner_id)
+            predicates.append(f"owner_id = ${len(args)}")
+        if expected_namespace is not None:
+            args.append(expected_namespace)
+            predicates.append(f"namespace = ${len(args)}")
         result = await conn.execute(
-            """
+            f"""
             UPDATE memories
                SET content = $2,
                    verbatim_content = $3,
                    metadata = $4::jsonb,
                    archived_at = NULL,
                    updated = NOW()
-             WHERE id = $1
-               AND archived_at IS NOT NULL
-               AND deleted_at IS NULL
+             WHERE {" AND ".join(predicates)}
             """,
-            memory_id,
-            memory["content"],
-            memory.get("verbatim_content"),
-            json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+            *args,
         )
         if result == "UPDATE 0":
             raise RuntimeError(f"memory {memory_id!r} was not restored")

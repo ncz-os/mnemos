@@ -95,6 +95,28 @@ class TestOAuthWiring:
         admin_oauth_paths = [p for p in paths if p.startswith("/admin/oauth")]
         assert len(admin_oauth_paths) >= 3, f"expected admin oauth routes, got: {admin_oauth_paths}"
 
+    def test_oauth_state_cookie_honors_https_only_setting(self, monkeypatch):
+        import importlib
+
+        import mnemos.api.main as api_server
+        from mnemos.core import config
+
+        monkeypatch.setenv("MNEMOS_SESSION_HTTPS_ONLY", "true")
+        config.reload_settings()
+        try:
+            api_server = importlib.reload(api_server)
+            state_middlewares = [
+                middleware
+                for middleware in api_server.app.user_middleware
+                if middleware.kwargs.get("session_cookie") == "mnemos_oauth_state"
+            ]
+            assert len(state_middlewares) == 1
+            assert state_middlewares[0].kwargs["https_only"] is True
+        finally:
+            monkeypatch.delenv("MNEMOS_SESSION_HTTPS_ONLY", raising=False)
+            config.reload_settings()
+            importlib.reload(api_server)
+
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────
 
@@ -109,6 +131,21 @@ class TestOAuthHelpers:
         assert "/" not in uid
         assert "|" not in uid
         assert uid.startswith("google:")
+
+    def test_mint_user_id_distinguishes_truncation_collisions(self):
+        from mnemos.core.oauth import _mint_user_id
+
+        first = _mint_user_id("custom", "a" * 80 + "x")
+        second = _mint_user_id("custom", "a" * 80 + "y")
+
+        assert first != second
+        assert len(first) <= 64
+        assert len(second) <= 64
+
+    def test_mint_user_id_distinguishes_sanitizer_collisions(self):
+        from mnemos.core.oauth import _mint_user_id
+
+        assert _mint_user_id("custom", "ab") != _mint_user_id("custom", "a|b")
 
     def test_extract_external_id_prefers_sub(self):
         from mnemos.core.oauth import _extract_external_id
@@ -149,6 +186,28 @@ class TestSessionTokens:
         from mnemos.core.oauth import SESSION_COOKIE_MAX_AGE, SESSION_TTL
         assert SESSION_TTL.total_seconds() >= 86400      # at least one day
         assert SESSION_COOKIE_MAX_AGE == int(SESSION_TTL.total_seconds())
+
+
+class TestProvisioningConflicts:
+    @pytest.mark.asyncio
+    async def test_user_id_insert_conflict_fails_closed_without_matching_identity(self):
+        from mnemos.core.oauth import provision_or_link_user
+
+        class _Conn:
+            async def fetchrow(self, *_args):
+                return None
+
+            async def fetchval(self, sql, *_args):
+                assert "RETURNING id" in sql
+                return None
+
+        with pytest.raises(ValueError, match="OAuth user id collision"):
+            await provision_or_link_user(
+                _Conn(),
+                "custom",
+                "attacker-subject",
+                {"name": "Attacker"},
+            )
 
 
 # ── Integration ──────────────────────────────────────────────────────────────

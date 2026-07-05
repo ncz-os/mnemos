@@ -362,6 +362,10 @@ class _ProviderSettings(BaseSettings):
         return embed_cix_max_seq_len_env()
 
     @property
+    def embed_trust_remote_code(self) -> bool:
+        return embed_trust_remote_code_env()
+
+    @property
     def embed_hybrid(self) -> str:
         return embed_hybrid_env()
 
@@ -1396,6 +1400,13 @@ def runtime_env_float(name: str, default: float) -> float:
         return default
 
 
+def runtime_env_bool(name: str, default: bool = False) -> bool:
+    raw = runtime_env_value_stripped(name)
+    if not raw:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
 def embedding_dim_env() -> int:
     return int(runtime_env_value("MNEMOS_EMBEDDING_DIM", "768"))
 
@@ -1466,6 +1477,10 @@ def embed_cix_tokenizer_id_env() -> str:
 
 def embed_cix_max_seq_len_env() -> int:
     return int(runtime_env_value("MNEMOS_EMBED_CIX_MAX_SEQ_LEN", "256"))
+
+
+def embed_trust_remote_code_env() -> bool:
+    return runtime_env_bool("MNEMOS_EMBED_TRUST_REMOTE_CODE", False)
 
 
 def embed_hybrid_env() -> str:
