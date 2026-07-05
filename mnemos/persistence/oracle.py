@@ -23,7 +23,6 @@ import inspect
 import json
 import logging
 import math
-import re
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -32,6 +31,7 @@ from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 from mnemos.core.config import oracle_pdb_env, runtime_env_value_stripped, vector_dim_max_env
+from mnemos.core.oauth import _mint_user_id
 from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.base import (
     AclRepository,
@@ -3093,26 +3093,27 @@ class OracleOAuthRepository(OAuthRepository):
                 if link_target:
                     user_id = str(link_target["id"])
             if user_id is None:
-                user_id = re.sub(r"[^a-zA-Z0-9._:-]+", "", f"{provider}:{external_id}")[:64] or (
-                    f"{provider}:{uuid.uuid4().hex[:12]}"
-                )
-                # ON CONFLICT (id) DO NOTHING equivalent. MERGE is not atomic
-                # against a concurrent first INSERT of the same user_id: both
-                # sessions can take the NOT MATCHED branch and one hits ORA-00001.
-                # Mirror OracleAclRepository.grant_acl — retry once, where the row
-                # now exists and the (empty) MATCHED branch is a no-op.
-                merge_user_sql = (
-                    "MERGE INTO users t USING (SELECT :id AS id FROM dual) s ON (t.id = s.id) "
-                    "WHEN NOT MATCHED THEN INSERT (id, display_name, email, role) "
-                    "VALUES (:id, :display_name, :email, 'user')"
-                )
-                merge_user_binds = {"id": user_id, "display_name": display_name, "email": email}
+                user_id = _mint_user_id(provider, external_id)
                 try:
-                    await _call(cursor.execute, merge_user_sql, merge_user_binds)
+                    await _call(
+                        cursor.execute,
+                        "INSERT INTO users (id, display_name, email, role) "
+                        "VALUES (:id, :display_name, :email, 'user')",
+                        {"id": user_id, "display_name": display_name, "email": email},
+                    )
                 except Exception as exc:  # noqa: BLE001 — re-raised unless it's the dup race
                     if not _is_unique_violation(exc):
                         raise
-                    await _call(cursor.execute, merge_user_sql, merge_user_binds)
+                    await _call(
+                        cursor.execute,
+                        "SELECT id, user_id FROM oauth_identities "
+                        "WHERE provider = :provider AND external_id = :external_id",
+                        {"provider": provider, "external_id": external_id},
+                    )
+                    existing = await _row_to_dict(cursor, await _call(cursor.fetchone))
+                    if existing:
+                        return str(existing["user_id"]), str(existing["id"])
+                    raise ValueError("OAuth user id collision during provisioning") from exc
             identity_id = uuid.uuid4().hex
             insert_sql = (
                 "INSERT INTO oauth_identities "

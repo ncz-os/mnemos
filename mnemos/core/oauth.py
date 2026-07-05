@@ -20,12 +20,13 @@ Design notes
 - When `kind == 'oidc'`, authlib handles discovery via `server_metadata_url`.
 - When `kind == 'oauth2'`, the admin must supply authorize_url/token_url/userinfo_url.
 - User provisioning rule: look up `(provider, external_id)` first; if present
-  reuse user. Otherwise, if claims include an email that matches an existing
-  user's email, link the identity to that user. Otherwise create a new user
-  with id = `{provider}:{external_id}` sanitized.
+  reuse user. Otherwise, if claims include a verified email that matches an
+  existing user's email, link the identity to that user. Otherwise create a new
+  user with a safe id derived from `{provider}:{external_id}` plus a hash suffix.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import secrets
@@ -151,11 +152,25 @@ def _extract_external_id(provider_name: str, claims: Dict[str, Any]) -> Optional
 
 
 _USER_ID_SAFE = re.compile(r"[^a-zA-Z0-9._:-]+")
+_USER_ID_MAX_LEN = 64
+_USER_ID_HASH_LEN = 16
 
 
 def _mint_user_id(provider: str, external_id: str) -> str:
-    slug = _USER_ID_SAFE.sub("", f"{provider}:{external_id}")
-    return slug[:64] or f"{provider}:{secrets.token_hex(6)}"
+    raw = f"{provider}:{external_id}"
+    slug = _USER_ID_SAFE.sub("", raw)
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:_USER_ID_HASH_LEN]
+    prefix_len = _USER_ID_MAX_LEN - _USER_ID_HASH_LEN - 1
+    prefix = slug[:prefix_len].rstrip("._:-") or _USER_ID_SAFE.sub("", provider)[:prefix_len].rstrip("._:-") or "oauth"
+    return f"{prefix}:{digest}"
+
+
+async def _existing_identity(conn: asyncpg.Connection, provider: str, external_id: str):
+    return await conn.fetchrow(
+        "SELECT id, user_id FROM oauth_identities WHERE provider=$1 AND external_id=$2",
+        provider,
+        external_id,
+    )
 
 
 async def provision_or_link_user(
@@ -168,10 +183,7 @@ async def provision_or_link_user(
     import json as _json
 
     # 1. Exact identity match — this provider has seen this external_id before.
-    existing = await conn.fetchrow(
-        "SELECT id, user_id FROM oauth_identities WHERE provider=$1 AND external_id=$2",
-        provider, external_id,
-    )
+    existing = await _existing_identity(conn, provider, external_id)
     if existing:
         await conn.execute(
             "UPDATE oauth_identities SET last_login_at=NOW(), raw_claims=$2::jsonb "
@@ -223,12 +235,18 @@ async def provision_or_link_user(
     # 3. Create a new user if no match.
     if user_id is None:
         user_id = _mint_user_id(provider, external_id)
-        await conn.execute(
+        inserted_user_id = await conn.fetchval(
             "INSERT INTO users (id, display_name, email, role) "
             "VALUES ($1, $2, $3, 'user') "
-            "ON CONFLICT (id) DO NOTHING",
+            "ON CONFLICT (id) DO NOTHING "
+            "RETURNING id",
             user_id, display_name, email,
         )
+        if inserted_user_id is None:
+            existing = await _existing_identity(conn, provider, external_id)
+            if existing:
+                return existing["user_id"], str(existing["id"])
+            raise ValueError("OAuth user id collision during provisioning")
 
     identity_id = await conn.fetchval(
         """

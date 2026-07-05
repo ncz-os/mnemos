@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 from mnemos.api.dependencies import UserContext
@@ -202,8 +203,40 @@ def _root() -> UserContext:
     )
 
 
+def _alice(namespace: str = "default") -> UserContext:
+    return UserContext(
+        user_id="alice", group_ids=[], role="user",
+        namespace=namespace, authenticated=True,
+    )
+
+
 def _request():
     return SimpleNamespace(headers={})
+
+
+class _RouteTx:
+    async def __aenter__(self):
+        return object()
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+class _RouteBackend:
+    def transactional(self):
+        return _RouteTx()
+
+
+class _RestoreRepo:
+    def __init__(self, row):
+        self.row = row
+        self.restore_calls: list[tuple] = []
+
+    async def fetch_memory_archive_state(self, _tx, _memory_id):
+        return self.row
+
+    async def restore_memory(self, *args, **kwargs):
+        self.restore_calls.append((args, kwargs))
 
 
 @pytest.mark.asyncio
@@ -250,6 +283,61 @@ async def test_archive_then_restore_reproduces_original_content_byte_exactly():
     assert conn.memories["m_restore"]["content"].encode("utf-8") == original.encode("utf-8")
     assert conn.memories["m_restore"]["archived_at"] is None
     assert "m_restore" not in conn.archive
+
+
+@pytest.mark.asyncio
+async def test_restore_route_rejects_owner_match_in_wrong_namespace(monkeypatch):
+    from mnemos.api.routes import admin
+
+    repo = _RestoreRepo(
+        {
+            "id": "m_cross",
+            "owner_id": "alice",
+            "namespace": "tenant-b",
+            "archived_at": NOW,
+        }
+    )
+    monkeypatch.setattr(admin, "_require_persephone_enabled", lambda: None)
+    monkeypatch.setattr(admin, "backend_or_503", lambda: _RouteBackend())
+    monkeypatch.setattr(admin, "_admin_lifecycle_repo", repo)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await admin.persephone_restore_memory("m_cross", user=_alice("tenant-a"))
+
+    assert excinfo.value.status_code == 403
+    assert repo.restore_calls == []
+
+
+@pytest.mark.asyncio
+async def test_restore_route_passes_owner_namespace_filters(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from mnemos.api.routes import admin
+
+    repo = _RestoreRepo(
+        {
+            "id": "m_same",
+            "owner_id": "alice",
+            "namespace": "tenant-a",
+            "archived_at": NOW,
+        }
+    )
+    monkeypatch.setattr(admin, "_require_persephone_enabled", lambda: None)
+    monkeypatch.setattr(admin, "backend_or_503", lambda: _RouteBackend())
+    monkeypatch.setattr(admin, "_admin_lifecycle_repo", repo)
+    monkeypatch.setattr(admin, "_invalidate_memory_read_caches", AsyncMock())
+
+    response = await admin.persephone_restore_memory("m_same", user=_alice("tenant-a"))
+
+    assert response.memory_id == "m_same"
+    assert response.restored is True
+    assert len(repo.restore_calls) == 1
+    args, kwargs = repo.restore_calls[0]
+    assert args[1:] == ("m_same", "alice")
+    assert kwargs == {
+        "expected_owner_id": "alice",
+        "expected_namespace": "tenant-a",
+    }
 
 
 def _install_stateful_backend(monkeypatch, memories: list[dict]):

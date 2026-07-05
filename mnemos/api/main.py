@@ -299,7 +299,7 @@ app.add_middleware(
     session_cookie="mnemos_oauth_state",
     max_age=600,  # 10 minutes — just for the redirect roundtrip
     same_site="lax",
-    https_only=False,  # set MNEMOS_SESSION_HTTPS_ONLY=1 to harden in prod
+    https_only=_settings.server.session_https_only,
 )
 
 # CORS: set CORS_ORIGINS env var to restrict in production (comma-separated list).

@@ -4,11 +4,13 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 import mnemos.core.lifecycle as _lc
 from mnemos._version import __version__ as _MNEMOS_VERSION
+from mnemos.api.dependencies import require_root
 from mnemos.core.config import get_settings
+from mnemos.core.auth_context import UserContext
 from mnemos.persistence.base import capability_details_for_backend
 from mnemos.nats.client import publishing_enabled
 from mnemos.domain.models import HealthResponse, StatsResponse
@@ -49,7 +51,7 @@ async def health_check() -> HealthResponse:
 
 
 @router.get("/stats", response_model=StatsResponse)
-async def get_stats() -> StatsResponse:
+async def get_stats(_user: UserContext = Depends(require_root)) -> StatsResponse:
     """Get system statistics from database (cached 60 s)."""
     # Cache key versioned to invalidate after the federation-aware
     # native/federated split shipped in v3.4.x. Bumping the suffix
