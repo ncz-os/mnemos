@@ -13,7 +13,11 @@ Design: Docling solves document->structure; mnemos+Db2 solve durable vector reca
 MIF (--emit-mif) is the vendor-neutral hand-off between them.
 """
 from __future__ import annotations
-import argparse, json, os, re, sys
+import argparse
+import json
+import os
+import re
+import sys
 from pathlib import Path
 
 DOC_EXTS = {".pdf", ".docx", ".pptx", ".html", ".htm", ".md", ".txt"}
