@@ -22,7 +22,7 @@ from scripts.db2_apply_migration import _split_statements
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _FIXTURE = _REPO_ROOT / "mnemos" / "db_migrations" / "migrations_db2" / "0001_core_schema.sql"
 _BACKFILL_FIXTURES = (
-    ("0002_graeae.sql", 9),
+    ("0002_graeae.sql", 10),
     ("0010_hive_mind.sql", 1),
     ("0011_hive_mind_extended_columns.sql", 1),
     ("0012_pantheon_routing_audit.sql", 5),
