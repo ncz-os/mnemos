@@ -112,6 +112,7 @@ def test_cix_backend_missing_model_raises():
         tokenizer_id="BAAI/bge-small-zh-v1.5",
         max_seq_len=256,
         max_chars=8000,
+        trust_remote_code=False,
     )
     # Expect either FileNotFoundError (no .cix) OR RuntimeError (no /dev/aipu),
     # depending on which check fails first on the host.
@@ -257,7 +258,7 @@ def test_ov_backend_detects_local_ir_directory(tmp_path, monkeypatch):
 
     monkeypatch.setitem(__import__("sys").modules, "openvino", _FakeOV)
 
-    backend = emb_mod._OpenVINOBackend(model_id=str(ir_dir), device="CPU", max_chars=512)
+    backend = emb_mod._OpenVINOBackend(model_id=str(ir_dir), device="CPU", max_chars=512, trust_remote_code=False)
     try:
         backend._load_sync()
     except Exception:
@@ -322,7 +323,7 @@ def test_ov_backend_export_true_for_hf_repo_id(tmp_path, monkeypatch):
 
     monkeypatch.setitem(__import__("sys").modules, "openvino", _FakeOV)
 
-    backend = emb_mod._OpenVINOBackend(model_id="BAAI/bge-base-en-v1.5", device="CPU", max_chars=512)
+    backend = emb_mod._OpenVINOBackend(model_id="BAAI/bge-base-en-v1.5", device="CPU", max_chars=512, trust_remote_code=False)
     try:
         backend._load_sync()
     except Exception:
