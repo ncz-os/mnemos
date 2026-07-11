@@ -162,6 +162,25 @@ def test_select_backend_explicit_request_honored():
 
 @pytest.mark.skipif(not _HAS_MODEL, reason=f"requires GGUF at {_MODEL_PATH}")
 @pytest.mark.asyncio
+async def test_real_embed_is_l2_normalized():
+    # Regression guard (found 2026-07-10): _LlamaCppBackend._embed_sync
+    # used to return llama.cpp's raw create_embedding() output with no
+    # normalization, unlike _OpenVINOBackend and _CixNpuBackend which
+    # both L2-normalize. A raw (un-normalized) vector has arbitrary
+    # magnitude, so mnemos/api/routes/memories.py's score_to_similarity()
+    # -- which assumes unit vectors under the euclidean_unit metric
+    # (sim = 1 - d^2/2, valid only for d in [0, 2]) -- silently clamps
+    # every result to a similarity of 0.0 and the relevance floor drops
+    # every row. No exception anywhere: insert_memory stores the vector
+    # fine, semantic_search runs fine, it just always returns 0 rows.
+    e = InProcessEmbedder()
+    vec = await e.embed("normalization regression guard")
+    norm = sum(x * x for x in vec) ** 0.5
+    assert abs(norm - 1.0) < 1e-4, f"embedding must be L2-normalized (unit length), got norm={norm}"
+
+
+@pytest.mark.skipif(not _HAS_MODEL, reason=f"requires GGUF at {_MODEL_PATH}")
+@pytest.mark.asyncio
 async def test_real_embed_returns_nonempty_vector():
     e = InProcessEmbedder()
     vec = await e.embed("the quick brown fox jumps over the lazy dog")
@@ -323,7 +342,9 @@ def test_ov_backend_export_true_for_hf_repo_id(tmp_path, monkeypatch):
 
     monkeypatch.setitem(__import__("sys").modules, "openvino", _FakeOV)
 
-    backend = emb_mod._OpenVINOBackend(model_id="BAAI/bge-base-en-v1.5", device="CPU", max_chars=512, trust_remote_code=False)
+    backend = emb_mod._OpenVINOBackend(
+        model_id="BAAI/bge-base-en-v1.5", device="CPU", max_chars=512, trust_remote_code=False
+    )
     try:
         backend._load_sync()
     except Exception:
@@ -360,7 +381,7 @@ def test_ov_device_env_auto_propagates_to_embedder():
         resolved = getattr(e, "ov_device", None) or getattr(e, "device", None)
         if resolved is None:
             pytest.skip(
-                "InProcessEmbedder does not expose ov_device/device attribute; " "OV_DEVICE plumbing not yet wired"
+                "InProcessEmbedder does not expose ov_device/device attribute; OV_DEVICE plumbing not yet wired"
             )
         assert str(resolved).upper() in {"AUTO", "CPU", "GPU", "NPU"}, f"expected AUTO/CPU/GPU/NPU, got {resolved!r}"
     finally:
