@@ -251,7 +251,21 @@ class _LlamaCppBackend:
         if not truncated.strip():
             return []
         r = self._llm.create_embedding(truncated)
-        return list(r["data"][0]["embedding"])
+        vec = list(r["data"][0]["embedding"])
+        # L2-normalize to match the nomic/bge convention (see
+        # _OpenVINOBackend / _CixNpuBackend, which already do this).
+        # Without it, raw llama.cpp embeddings have arbitrary magnitude,
+        # so a Euclidean distance computed against them is nowhere near
+        # the [0, 2] range score_to_similarity()'s euclidean_unit metric
+        # assumes for unit vectors -- every result silently clamps to a
+        # similarity of 0.0 and gets floor-filtered, with no exception
+        # anywhere in the stack (found 2026-07-10 debugging PEGASUS/
+        # ACHILLES semantic search returning 0 rows despite embeddings
+        # being generated and stored correctly).
+        norm = sum(x * x for x in vec) ** 0.5
+        if norm > 0:
+            vec = [x / norm for x in vec]
+        return vec
 
     @property
     def loaded(self) -> bool:
@@ -667,9 +681,7 @@ class InProcessEmbedder:
 
         self.ov_model_id = ov_model_id or embed_ov_model_id_env()
         self.ov_device = (ov_device or embed_ov_device_env()).upper()
-        self.trust_remote_code = (
-            trust_remote_code if trust_remote_code is not None else embed_trust_remote_code_env()
-        )
+        self.trust_remote_code = trust_remote_code if trust_remote_code is not None else embed_trust_remote_code_env()
 
         self.model_path = model_path or embed_model_path_env()
         self.cix_model_path = cix_model_path or embed_cix_model_path_env()
