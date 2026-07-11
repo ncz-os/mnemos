@@ -7,12 +7,21 @@ from typing import Any
 import pytest
 
 from mnemos.persistence.schema import (
+    _is_benign_db2_error,
+    _is_benign_oracle_error,
+    _is_benign_postgres_error,
     db2_migration_paths,
     ensure_postgres_schema,
     oracle_migration_paths,
     postgres_migration_paths,
     render_migration_sql,
 )
+
+
+class _FakeSqlstateError(Exception):
+    def __init__(self, message: str, sqlstate: str = "") -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
 
 
 class _Acquire:
@@ -119,3 +128,42 @@ def test_oracle_and_db2_standup_use_full_migration_sets_and_dim_templates() -> N
     assert "VECTOR(*, FLOAT32)" not in oracle_sql
     assert "VECTOR(1024, FLOAT32)" in db2_sql
     assert "{{embedding_dim}}" not in db2_sql
+
+
+def test_db2_unique_violation_on_seed_insert_replay_is_benign() -> None:
+    # Regression (found 2026-07-11): a static seed-data INSERT (e.g.
+    # 0033_subscription_plans) is replayed on every startup with no separate
+    # migration-tracking table. A duplicate-key hit on replay means "this
+    # exact row was already inserted by a prior run" -- benign, not a real
+    # conflict. Without this, a Db2-backed host crash-loops forever after any
+    # restart following a partial-then-recovered prior migration run.
+    exc = Exception(
+        "ibm_db_dbi::IntegrityError: Statement Execute Failed: "
+        "[IBM][CLI Driver][DB2/LINUXX8664] SQL0803N One or more values in "
+        "the INSERT statement... SQLSTATE=23505 SQLCODE=-803"
+    )
+    assert _is_benign_db2_error("INSERT INTO subscription_plans (...) VALUES (...)", exc)
+
+
+def test_db2_genuine_duplicate_object_error_still_benign() -> None:
+    # Existing coverage: DDL replay (CREATE TABLE on an already-provisioned
+    # table) must remain benign -- this fix must not regress it.
+    exc = Exception("SQLCODE=-601 SQLSTATE=42710 table already exists")
+    assert _is_benign_db2_error("CREATE TABLE subscription_plans (...)", exc)
+
+
+def test_postgres_unique_violation_on_seed_insert_replay_is_benign() -> None:
+    exc = _FakeSqlstateError("duplicate key value violates unique constraint", sqlstate="23505")
+    assert _is_benign_postgres_error("INSERT INTO subscription_plans (...) VALUES (...)", exc)
+
+
+def test_oracle_unique_constraint_violation_on_seed_insert_replay_is_benign() -> None:
+    exc = Exception("ORA-00001: unique constraint (MNEMOS.PK_SUBSCRIPTION_PLANS) violated")
+    assert _is_benign_oracle_error(exc)
+
+
+def test_db2_unrelated_error_is_not_benign() -> None:
+    # Guard against over-broadening: a genuine, unrelated Db2 error must
+    # still surface as a hard failure.
+    exc = Exception("SQLCODE=-104 SQLSTATE=42601 unexpected token")
+    assert not _is_benign_db2_error("SELECT * FROM memories", exc)
