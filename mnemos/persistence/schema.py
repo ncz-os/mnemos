@@ -87,13 +87,22 @@ _POSTGRES_NUMBERED_DIR = _DB_DIR / "migrations"
 _ORACLE_MIGRATIONS_DIR = _DB_DIR / "migrations_oracle"
 _DB2_MIGRATIONS_DIR = _DB_DIR / "migrations_db2"
 
-_PG_DUPLICATE_STATES = {"42710", "42P07", "42701"}
+_PG_DUPLICATE_STATES = {"42710", "42P07", "42701", "23505"}
 _PG_UNDEFINED_STATES = {"42704", "42P01"}
 # SQLSTATEs that are benign on (re)provisioning: object/column already exists
 # (42710/42P07/42701/42711) and 01550 = SQL0605W "index not created because a
 # matching index already exists" (e.g. an explicit CREATE INDEX that duplicates
 # the index a UNIQUE/PK constraint already created). Warnings, not failures.
-_DB2_BENIGN_STATES = {"42710", "42P07", "42701", "42711", "01550"}
+# 23505 (unique_violation, ANSI-standard SQLSTATE shared by Postgres and Db2)
+# is included because a static seed-data INSERT (e.g. 0033_subscription_plans)
+# is replayed on every startup with no separate migration-tracking table;
+# a duplicate-key hit on replay means "this exact row was already inserted by
+# a prior run," which is exactly as benign as the DDL-already-exists cases
+# above -- not a real conflict, since the migration file's INSERT is static
+# and deterministic. Found 2026-07-11 when a Db2-backed host's mnemos-api
+# container crash-looped forever on this exact migration after a restart
+# following a partial-then-recovered prior run.
+_DB2_BENIGN_STATES = {"42710", "42P07", "42701", "42711", "01550", "23505"}
 _DB2_VECTOR_INDEX_BENIGN_CODES = {"42601", "56098", "SQL0104N", "SQL0270N"}
 
 
@@ -494,6 +503,10 @@ def _is_benign_oracle_error(exc: Exception) -> bool:
             "ORA-02261",
             "ORA-02275",
             "ORA-04081",
+            # Unique constraint violated: benign on replay of a static
+            # seed-data INSERT (see _DB2_BENIGN_STATES / _PG_DUPLICATE_STATES
+            # for the full rationale -- same class of gap, all three backends).
+            "ORA-00001",
         )
     )
 
