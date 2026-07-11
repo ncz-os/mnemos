@@ -57,6 +57,45 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.0.1] — 2026-07-10
+
+### Fixed — `_LlamaCppBackend` embeddings missing L2-normalization
+
+`mnemos/runtime/embedder.py`'s `_LlamaCppBackend._embed_sync` returned
+`llama_cpp.Llama.create_embedding()`'s raw output unnormalized, unlike
+`_OpenVINOBackend._embed_sync` and `_CixNpuBackend._embed_sync`, which
+both L2-normalize. Any deployment on `MNEMOS_EMBED_BACKEND=llamacpp`
+(the in-process path for AMD ROCm / NVIDIA CUDA / CPU hosts per the
+2026-05-21 in-process-embedding architecture decision) stored
+correctly-shaped but wrong-magnitude vectors.
+
+`mnemos/api/routes/memories.py`'s `score_to_similarity()` converts a
+backend's raw distance to a similarity via `sim = 1.0 - (v*v)/2.0` for
+the `euclidean_unit` metric — valid only when both vectors are unit
+length (max distance ≈ 2). Un-normalized llama.cpp vectors produced raw
+distances around 20+, so `sim` came out deeply negative, clamped to
+`0.0`, and fell below `effective_semantic_floor()` (default 0.65) on
+every query. `insert_memory` succeeded and the vector really was
+stored (confirmed via direct `VECTOR_DIMENSION_COUNT()` / raw
+`VECTOR_DISTANCE` queries) — `semantic_search` just silently returned
+zero rows, with no exception or log line anywhere in the stack.
+
+Fix: `_embed_sync` now L2-normalizes its output, matching the other
+two in-process backends.
+
+**Operator note:** any memories written under `MNEMOS_EMBED_BACKEND=llamacpp`
+before this fix have wrong-magnitude vectors permanently stored and
+will not surface in search until re-embedded/backfilled. Separately —
+not a code bug, but a deployment trap this fix's investigation
+surfaced — switching embedding *backend* is not the same as preserving
+the embedding *model*: two different models at the same dimensionality
+(e.g. bge-m3 vs bge-large-en-v1.5, both 1024-dim) produce mutually
+incompatible vector spaces, so a host with an existing corpus must
+migrate to a backend serving the *identical* model or run a full
+re-embed.
+
+Pinned by `tests/test_inprocess_embedder.py::test_real_embed_is_l2_normalized`.
+
 ### Fixed — Webhook deliveries limit cap + capabilities GIN index (#205)
 
 Two LOW audit findings (`mem_1778221719390_8cb1ba`) bundled.

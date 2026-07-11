@@ -6,10 +6,11 @@ This document is kept intentionally narrow. It lists what the next release will 
 
 ---
 
-## Current status — v6.0.0 GA (split-distribution release; legacy GA v5.0.1 shipped 2026-05-08)
+## Current status — v6.0.1 GA (patch release on the v6.0.0 split-distribution line; legacy GA v5.0.1 shipped 2026-05-08)
 
-**v6.0.0 (split-distribution GA)** makes MNEMOS a modular, multi-backend,
-portability-first memory platform. New in v6.0.0:
+**v6.0.1** is a patch release on top of **v6.0.0 (split-distribution GA)**,
+which made MNEMOS a modular, multi-backend, portability-first memory
+platform. New in v6.0.0:
 
 - ✅ **MIF 1.0 as the native portability format** — CHARON native adapter with
   lossless round-trip export/import, MIF bundles (concept files + manifest), and a
