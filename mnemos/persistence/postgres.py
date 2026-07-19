@@ -4272,6 +4272,7 @@ class PostgresBackend:
     supports_advisory_locks = True
     supports_row_level_security = True
     supports_pgvector = True
+    supports_webhooks = True  # backed by PostgresWebhookRepository, see .webhooks
 
     def __init__(self, pool: asyncpg.Pool, settings: Any):
         self._pool = pool
