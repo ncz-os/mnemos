@@ -35,8 +35,12 @@ def current_user_override(monkeypatch: pytest.MonkeyPatch):
     async def fake_embedding(_text: str) -> list[float]:
         return [0.1, 0.2, 0.3]
 
+    async def fake_embeddings_batch(texts: list[str]) -> list[list[float]]:
+        return [[0.1, 0.2, 0.3] for _text in texts]
+
     app.dependency_overrides[get_current_user] = override_user
     monkeypatch.setattr(memories, "_get_embedding", fake_embedding)
+    monkeypatch.setattr(memories, "_get_embeddings_batch", fake_embeddings_batch)
     try:
         yield current
     finally:
@@ -86,7 +90,48 @@ async def test_bulk_create_emits_memory_created_for_each_success(
     assert {call["namespace"] for call in webhook_calls} == {"alice-ns"}
     assert {call["payload"]["owner_id"] for call in webhook_calls} == {"alice"}
     assert {call["payload"]["namespace"] for call in webhook_calls} == {"alice-ns"}
-    assert backend.commits == 3
+    assert backend.commits == 1
+    assert backend.rollbacks == 0
+
+
+async def test_bulk_create_uses_single_batch_embedding_call(
+    client,
+    auth_headers: dict[str, str],
+    current_user_override,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = install_fake_backend(monkeypatch)
+    batch_calls: list[list[str]] = []
+
+    async def fake_embeddings_batch(texts: list[str]) -> list[list[float]]:
+        batch_calls.append(list(texts))
+        return [[float(i), float(i + 1), float(i + 2)] for i, _text in enumerate(texts)]
+
+    async def fail_single_embedding(_text: str) -> list[float]:
+        raise AssertionError("bulk create must not call per-item embedding")
+
+    from mnemos.api.routes import memories
+
+    monkeypatch.setattr(memories, "_get_embeddings_batch", fake_embeddings_batch)
+    monkeypatch.setattr(memories, "_get_embedding", fail_single_embedding)
+
+    resp = await client.post(
+        "/v1/memories/bulk",
+        json={"memories": [_memory("first"), _memory("second")]},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    assert data["created"] == 2
+    assert data["errors"] == []
+    assert batch_calls == [["first", "second"]]
+    insert_calls = [payload for name, payload in backend.memories.calls if name == "insert_memory"]
+    assert [call["embedding"] for call in insert_calls] == [
+        [0.0, 1.0, 2.0],
+        [1.0, 2.0, 3.0],
+    ]
+    assert backend.commits == 1
     assert backend.rollbacks == 0
 
 
@@ -124,7 +169,7 @@ async def test_bulk_create_dispatches_only_successful_items(
     assert [call["payload"]["content"] for call in webhook_calls] == ["valid one", "valid two"]
     assert {call["owner_id"] for call in webhook_calls} == {"alice"}
     assert {call["namespace"] for call in webhook_calls} == {"alice-ns"}
-    assert backend.commits == 2
+    assert backend.commits == 1
     assert backend.rollbacks == 0
 
 
@@ -159,5 +204,5 @@ async def test_bulk_create_fails_when_outbox_enqueue_fails(
         "dispatch_event",
         "dispatch_event",
     ]
-    assert backend.commits == 0
-    assert backend.rollbacks == 2
+    assert backend.commits == 1
+    assert backend.rollbacks == 0
