@@ -916,16 +916,10 @@ async def merge_branch(
                     delivery_ids = []
 
         if live_tracks_target:
-            if _lc._cache:
-                try:
-                    await _lc._cache.delete("stats:global")
-                    try:
-                        async for key in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                            await _lc._cache.delete(key)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+            # The transaction above has committed. Advance the shared
+            # visibility generation before any stale in-flight search can
+            # write a key that a later request will read.
+            await _lc.invalidate_visibility_caches("stats:global")
             _schedule_outbox_deliveries(delivery_ids)
 
         logger.info(

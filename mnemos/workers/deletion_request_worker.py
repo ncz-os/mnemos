@@ -600,26 +600,13 @@ async def invalidate_deletion_scope_caches(
     target_user_id: str,
     target_namespace: str | None,
 ) -> None:
-    """Evict cached search/stat responses that may include this target."""
+    """Advance visibility generation and evict cached search/stat responses."""
     import mnemos.core.lifecycle as _lc
 
-    if not _lc._cache:
-        return
-    try:
-        await _lc._cache.delete("stats:global")
-        await _lc._cache.delete("stats:global:v2")
-        try:
-            async for key in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                await _lc._cache.delete(key)
-        except Exception:
-            pass
-    except Exception:
-        logger.warning(
-            "failed to invalidate deletion caches for target_user_id=%s target_namespace=%s",
-            target_user_id,
-            target_namespace,
-            exc_info=True,
-        )
+    # target_user_id/namespace are retained in the public helper signature for
+    # logging and call-site compatibility. The search cache is intentionally
+    # invalidated globally because keys are not scope-versioned.
+    await _lc.invalidate_visibility_caches("stats:global", "stats:global:v2")
 
 
 async def count_live_target_rows(

@@ -271,6 +271,101 @@ _cache: Optional[aioredis.Redis] = None
 _redis_client: Optional[aioredis.Redis] = None
 _rls_enabled: bool = False  # set from config at startup; read by handlers
 
+# Search-cache generations live outside the ``mnemos:search:*`` namespace so
+# the best-effort SCAN cleanup below can never delete the correctness marker.
+# The value is an atomic Redis counter, not a timestamp: every visibility
+# mutation advances it and searches capture one generation before querying.
+VISIBILITY_EPOCH_KEY = "mnemos:vis:epoch"
+# Module-level latch: set when we know the running Redis cannot be trusted
+# to give us a correct, up-to-date epoch (e.g. an INCR failed). Reads of the
+# epoch short-circuit to ``None`` while this is set, forcing both cache reads
+# and cache writes to bypass. Reset on the next successful advance, so a
+# transient blip temporarily disables caching instead of ever serving stale.
+_epoch_untrusted: bool = False
+
+
+async def get_visibility_epoch() -> int | None:
+    """Read the search-cache visibility generation.
+
+    ``None`` means we cannot provide a trustworthy generation — either Redis
+    is unavailable, the read raised, or a prior advance attempt failed and
+    left the cache in an untrusted state. Callers must bypass both cache
+    reads and cache writes in that case; treating a failed advance as
+    generation zero could resurrect a response cached under an older,
+    pre-bump epoch after a mutation committed.
+    """
+    global _epoch_untrusted
+    cache = _cache
+    if cache is None:
+        return None
+    if _epoch_untrusted:
+        # Stick to the safe side until the next successful advance clears
+        # the latch; the marker is only cleared by ``invalidate_visibility_caches``
+        # so we are not optimizing here.
+        return None
+    try:
+        raw = await cache.get(VISIBILITY_EPOCH_KEY)
+        if raw is None:
+            return 0
+        if isinstance(raw, bytes):
+            raw = raw.decode("ascii")
+        epoch = int(raw)
+        if epoch < 0:
+            raise ValueError("visibility epoch must not be negative")
+        return epoch
+    except Exception as exc:
+        # Anytime the marker read itself fails, refuse to serve cached data
+        # on the next request by setting the latch. The next successful
+        # ``invalidate_visibility_caches`` will clear it.
+        _epoch_untrusted = True
+        logger.warning("[CACHE] visibility epoch read failed; bypassing search cache: %s", exc)
+        return None
+
+
+async def invalidate_visibility_caches(*stats_keys: str) -> None:
+    """Advance the search-cache generation and evict old read caches.
+
+    The atomic ``INCR`` is the correctness barrier and deliberately happens
+    before the best-effort SCAN/DELETE cleanup. An in-flight search that
+    captured the previous generation can still write after this function
+    returns, but its key belongs to an obsolete generation and is never read
+    by a later search. Deletion is retained as garbage collection and for the
+    existing non-race invalidation contract.
+
+    Cache failures are intentionally best-effort, matching the historical
+    invalidation behavior. If ``INCR`` fails, the next epoch read will
+    short-circuit so callers bypass caching until a subsequent mutation
+    succeeds in advancing the counter.
+    """
+    global _epoch_untrusted
+    cache = _cache
+    if cache is None:
+        return
+
+    try:
+        # Redis INCR is atomic across workers and initializes a missing key to 1.
+        await cache.incr(VISIBILITY_EPOCH_KEY)
+        _epoch_untrusted = False
+    except Exception as exc:
+        _epoch_untrusted = True
+        logger.warning("[CACHE] visibility epoch bump failed: %s", exc)
+
+    for key in stats_keys:
+        try:
+            await cache.delete(key)
+        except Exception as exc:
+            logger.warning("[CACHE] cache invalidation failed for %s: %s", key, exc)
+
+    try:
+        async for key in cache.scan_iter(match="mnemos:search:*", count=500):
+            try:
+                await cache.delete(key)
+            except Exception as exc:
+                logger.warning("[CACHE] search cache deletion failed for %s: %s", key, exc)
+    except Exception as exc:
+        logger.warning("[CACHE] search cache scan failed: %s", exc)
+
+
 
 def _build_postgres_backend(pool, settings):
     """Build the current persistence backend without a static core -> db edge."""

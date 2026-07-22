@@ -101,9 +101,20 @@ class _FakeCache:
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
         self.deleted: list[str] = []
+        self.events: list[tuple[str, str]] = []
+        self.epoch = 0
 
     async def get(self, key: str):
+        if key == lifecycle.VISIBILITY_EPOCH_KEY:
+            self.events.append(("get", key))
+            return str(self.epoch) if self.epoch else None
         return self.store.get(key)
+
+    async def incr(self, key: str) -> int:
+        assert key == lifecycle.VISIBILITY_EPOCH_KEY
+        self.epoch += 1
+        self.events.append(("incr", key))
+        return self.epoch
 
     async def setex(self, key: str, ttl: int, value: str) -> None:
         self.store[key] = value

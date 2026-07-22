@@ -523,18 +523,13 @@ async def _publish_nats_with_timeout(
 
 
 async def _invalidate_caches_after_mutation() -> None:
-    """Drop /stats + per-user search cache entries on any memory write."""
-    if not _lc._cache:
-        return
-    try:
-        await _lc._cache.delete("stats:global:v2")
-        try:
-            async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                await _lc._cache.delete(_k)
-        except Exception:
-            pass
-    except Exception:
-        pass
+    """Advance visibility generation and drop /stats + search caches.
+
+    The generation bump closes the write-after-invalidate window; the scan is
+    retained as best-effort garbage collection for the pre-existing cache
+    invalidation behavior.
+    """
+    await _lc.invalidate_visibility_caches("stats:global:v2")
 
 
 def _row_archived_at(row) -> object | None:
@@ -1231,8 +1226,15 @@ async def search_memories(
     # serialization aliases distinct semantics. JSON encoding inside
     # _get_cache_key now preserves None as null vs "" as "" so the
     # digest reflects the request's actual filter shape.
+    # Capture the visibility generation before the cache lookup and, crucially,
+    # before the database query. If a visibility mutation commits while this
+    # request is in flight, its eventual write remains under this old epoch and
+    # can never be read by a request using the new epoch.
+    visibility_epoch = await _lc.get_visibility_epoch()
+
     cache_key = _get_cache_key(
         "search",
+        visibility_epoch,
         user.user_id,
         user.namespace,
         request.query,
@@ -1266,7 +1268,7 @@ async def search_memories(
         ood_gate_enabled(),
     )
 
-    if _lc._cache and not request.include_compressed:
+    if _lc._cache and visibility_epoch is not None and not request.include_compressed:
         try:
             cached = await _lc._cache.get(cache_key)
             if cached:
@@ -1565,7 +1567,7 @@ async def search_memories(
     )
     _log_search_phase(search_trace_id, search_started_at, "serialize")
 
-    if _lc._cache and not request.include_compressed and not compression_applied:
+    if _lc._cache and visibility_epoch is not None and not request.include_compressed and not compression_applied:
         try:
             # v6.2 M-2.2.3: per-profile cache TTL. fast/balanced 5min;
             # deep 30s (less cacheable per spec — reranker scoring drifts

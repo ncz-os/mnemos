@@ -366,17 +366,8 @@ CompressionProfile = Literal["balanced", "quality_first", "speed_first", "custom
 
 
 async def _invalidate_memory_read_caches() -> None:
-    if not _lc._cache:
-        return
-    try:
-        await _lc._cache.delete("stats:global:v2")
-        try:
-            async for key in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                await _lc._cache.delete(key)
-        except Exception:
-            pass
-    except Exception:
-        pass
+    """Advance visibility generation and evict memory read caches."""
+    await _lc.invalidate_visibility_caches("stats:global:v2")
 
 
 class CompressionEnqueueRequest(BaseModel):
