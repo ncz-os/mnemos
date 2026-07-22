@@ -80,6 +80,13 @@ reads if `INCR` ever fails: subsequent epoch reads return `None` and
 handlers bypass both cache reads and writes until a later mutation
 succeeds in advancing the counter.
 
+Belt-and-suspenders: `search_memories` ALSO re-reads the epoch right
+before the cache write and refuses to write if the captured epoch has
+changed during the request. The epoch-in-key scheme is the primary
+correctness barrier (the orphan would be unreachable anyway), but
+skipping the write entirely keeps the would-be orphan out of Redis
+memory and gives an immediate post-query safety net.
+
 Applied uniformly at every visibility-narrowing call site:
 
 - `mnemos.api.routes.acl._invalidate_search_caches_after_acl_change`

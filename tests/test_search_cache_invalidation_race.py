@@ -478,12 +478,17 @@ async def test_search_memories_bypasses_cache_when_epoch_untrusted(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_search_memories_write_uses_captured_epoch_not_post_query_epoch(monkeypatch):
-    """The cache write must use the SAME epoch as the cache read.
+    """Belt-and-suspenders: when the visibility epoch advances mid-request,
+    the handler MUST skip the cache write entirely so no orphan entry is
+    left under the old-epoch key in Redis.
 
-    We verify this by bumping the epoch between the read and the write
-    and asserting the handler still wrote under the epoch captured at
-    the top of the function (i.e. the key uses the pre-bump epoch and
-    the bumped epoch is never written by this request).
+    We bump the epoch between the search's cache READ and the cache WRITE
+    and assert:
+      * the cache write was SKIPPED (no orphan entry written)
+      * the handler's response is still the DB result from before the bump
+        (the principal asked for the data while they still had visibility)
+      * a SUBSEQUENT search sees a different cache key (the new epoch) and
+        starts with a fresh DB query — never reads the would-be-orphan
     """
     backend = install_fake_backend(monkeypatch)
     backend.memories.configure_return("fts_search", [])
@@ -494,14 +499,13 @@ async def test_search_memories_write_uses_captured_epoch_not_post_query_epoch(mo
     monkeypatch.setattr(memories_handler, "load_decay_table", _empty_decay_table)
 
     # Wrap the DB call site so the epoch is advanced AFTER the search's
-    # cache READ but BEFORE the cache WRITE. This is the precise ordering
-    # the race exploits.
+    # cache READ but BEFORE the post-query epoch re-check (which gates the
+    # cache WRITE). This is the precise ordering the race exploits.
     real_fts_search = backend.memories.fts_search
 
     async def _fts_then_poke_epoch(*args, **kwargs):
         # Advance the visibility epoch AFTER any preceding cache read but
-        # BEFORE the handler writes. In production this would be a
-        # concurrent ACL revoke / archive / permission_mode tighten.
+        # BEFORE the post-query re-check that gates the cache write.
         await _lc.invalidate_visibility_caches()
         return await real_fts_search(*args, **kwargs)
 
@@ -511,23 +515,50 @@ async def test_search_memories_write_uses_captured_epoch_not_post_query_epoch(mo
     user = _alice()
     response = await memories_handler.search_memories(request, user=user)
 
-    # The handler's captured epoch was 0 (initial). After the in-flight
-    # mutation, the in-memory store now has epoch=1, but the handler
-    # wrote under the epoch-0 key because it captured epoch=0 up front.
+    # The handler captured epoch=0 then observed epoch=1 after the in-flight
+    # mutation. The belt-and-suspenders check correctly skipped the write.
     search_reads = [k for k in cache.reads if k != _lc.VISIBILITY_EPOCH_KEY]
-    written_keys = {entry[0] for entry in cache.writes}
     assert search_reads, "handler should have attempted the cache read"
-    assert written_keys, "handler should have written to the cache"
-    # The write key is the same as the read key (same captured epoch,
-    # ignoring the bump that happened mid-request).
-    for wkey, _ttl, _value in cache.writes:
-        assert wkey in set(search_reads)
-    # And the current cache key (epoch=1) is NOT in the writes done by
-    # THIS request — proving the handler wrote under the OLD epoch.
+    assert cache.writes == [], (
+        "handler must NOT write to the cache when the epoch changed mid-request; "
+        f"observed writes: {cache.writes}"
+    )
     fresh_epoch = await _lc.get_visibility_epoch()
     assert fresh_epoch == 1
-    # The response body itself is still the search result from before
-    # the in-flight mutation — that's expected (the principal asked
-    # for the data when they had visibility); the fix prevents future
-    # requests from serving that payload, not this one.
+    # No old-epoch key was created — the would-be orphan never lands in
+    # Redis at all. The store contains no search entries.
+    search_keys_in_store = [
+        k for k in cache.store if k != _lc.VISIBILITY_EPOCH_KEY and k.startswith("mnemos:search:")
+    ]
+    assert search_keys_in_store == [], (
+        f"no orphan search key must remain in the cache; saw: {search_keys_in_store}"
+    )
+
+    # The response body itself is still the search result from before the
+    # in-flight mutation — that's expected (the principal asked for the data
+    # while they still had visibility); the fix prevents future requests from
+    # serving that payload, not this one.
     assert response is not None
+
+    # And a SUBSEQUENT search after the bump reads the cache under the new
+    # epoch, MISSES (correctly — the bump happened before any key was
+    # written), and writes its own key. Critically: the new write key
+    # differs from the read key of the original request, so the orphan
+    # defense and the new-epoch keying both agree.
+    cache.writes.clear()
+    cache.reads.clear()
+    backend.memories.fts_search = real_fts_search  # type: ignore[method-assign]
+    backend.memories.configure_return("fts_search", [])
+    response2 = await memories_handler.search_memories(request, user=user)
+    subsequent_read_keys = [k for k in cache.reads if k != _lc.VISIBILITY_EPOCH_KEY]
+    subsequent_write_keys = {entry[0] for entry in cache.writes}
+    assert subsequent_read_keys, "second search must attempt a cache read"
+    assert subsequent_write_keys, "second search must write to the cache"
+    # The first request's read key (epoch=0) was under a DIFFERENT key than
+    # this request's read key (epoch=1) — confirming the cache key always
+    # uses the epoch captured at the top of the handler.
+    assert subsequent_read_keys[0] not in search_reads, (
+        "subsequent search must compute a new-epoch key; the cache key "
+        "shape changed because the captured epoch advanced"
+    )
+    assert response2 is not None
