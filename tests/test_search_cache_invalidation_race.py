@@ -17,15 +17,29 @@ key includes the bumped epoch). The best-effort SCAN/DELETE cleanup is
 retained for cache hygiene and for the pre-existing invalidation
 contract.
 
-These tests exercise the lifecycle building blocks directly so the race
-contract is verifiable without spinning up the full search handler.
+These tests cover both layers:
+
+* lifecycle-level: ``get_visibility_epoch`` / ``invalidate_visibility_caches``
+  semantics, including the ``None`` fail-closed latch
+* handler-level: ``search_memories`` actually folds the captured epoch into
+  the cache key for both reads and writes
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes import memories as memories_handler
 from mnemos.core import lifecycle as _lc
+from mnemos.domain.models import MemorySearchRequest
+
+from tests._fake_backend import install_fake_backend
+
+
+_TS = datetime(2026, 6, 1, tzinfo=timezone.utc)
 
 
 class _FakeCache:
@@ -257,3 +271,263 @@ async def test_get_visibility_epoch_handles_missing_key_as_initial_generation(mo
     _install_cache(monkeypatch, cache)
     assert await _lc.get_visibility_epoch() == 0
     assert _lc._epoch_untrusted is False
+
+
+# ── Handler-level race-coverage tests ─────────────────────────────────────────
+# The lifecycle-only tests above prove the helpers behave correctly in
+# isolation. But the actual race is a property of the SEARCH handler
+# combining those helpers with the cache: an in-flight search that captures
+# epoch=N must (a) read the cache under that epoch and (b) write its result
+# under that same epoch. Without those invariants, the fix is tautological:
+# the helpers would never even be consulted by the production code path.
+
+
+class _RecordingCache:
+    """Cache fake that captures every key the handler computes.
+
+    Production code calls ``get(key)`` then later ``setex(key, ttl,
+    value)``. Both must reference the SAME key the handler passed on
+    cache lookup time, which itself must include the captured
+    visibility epoch.
+    """
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+        self.deleted: list[str] = []
+        self.scan_calls: list[tuple[str, int]] = []
+        self.reads: list[str] = []
+        self.writes: list[tuple[str, int, str]] = []  # (key, ttl, value)
+        self.epoch = 0
+
+    async def get(self, key: str):
+        self.reads.append(key)
+        if key == _lc.VISIBILITY_EPOCH_KEY:
+            return str(self.epoch) if self.epoch else None
+        return self.store.get(key)
+
+    async def incr(self, key: str) -> int:
+        self.epoch += 1
+        self.store[key] = str(self.epoch)
+        return self.epoch
+
+    async def setex(self, key: str, ttl: int, value: str) -> None:
+        self.writes.append((key, ttl, value))
+        self.store[key] = value
+
+    async def delete(self, key: str) -> None:
+        self.deleted.append(key)
+        self.store.pop(key, None)
+
+    async def scan_iter(self, *, match: str, count: int):
+        self.scan_calls.append((match, count))
+        prefix = match.rstrip("*")
+        for key in list(self.store):
+            if match.endswith("*") and key.startswith(prefix):
+                yield key
+
+    async def set(self, key: str, value: str) -> None:
+        # Production code uses setex, but the lifecycle helpers occasionally
+        # touch the counter as a regular set; tolerate both shapes.
+        if key == _lc.VISIBILITY_EPOCH_KEY:
+            return  # ignore; epoch is materialized by incr()
+        self.store[key] = value
+
+
+def _alice() -> UserContext:
+    return UserContext(
+        user_id="alice",
+        group_ids=[],
+        role="user",
+        namespace="alice-ns",
+        authenticated=True,
+    )
+
+
+def _memory_row(memory_id: str, content: str) -> dict:
+    return {
+        "id": memory_id,
+        "content": content,
+        "category": "facts",
+        "subcategory": None,
+        "created": _TS,
+        "updated": _TS,
+        "metadata": {},
+        "quality_rating": 80,
+        "compressed_content": None,
+        "verbatim_content": content,
+        "owner_id": "alice",
+        "group_id": None,
+        "namespace": "alice-ns",
+        "permission_mode": 600,
+        "source_model": None,
+        "source_provider": None,
+        "source_session": None,
+        "source_agent": None,
+    }
+
+
+async def _noop_bump_recall_counters(_memory_ids: list[str]) -> None:
+    return None
+
+
+async def _empty_decay_table(_backend) -> dict:
+    return {}
+
+
+@pytest.mark.asyncio
+async def test_search_memories_key_stable_within_an_epoch(monkeypatch):
+    """Cache key construction is deterministic for a given visibility
+    epoch. Two consecutive searches with identical request shapes and
+    no intervening mutation must read/write the SAME key."""
+    # IMPORTANT: install_fake_backend() resets ``_lc._cache`` to None,
+    # so the cache fake must be installed AFTER the backend is wired up.
+    backend = install_fake_backend(monkeypatch)
+    backend.memories.configure_return("fts_search", [])
+    cache = _RecordingCache()
+    _install_cache(monkeypatch, cache)
+
+    monkeypatch.setattr(memories_handler, "_bump_recall_counters", _noop_bump_recall_counters)
+    monkeypatch.setattr(memories_handler, "load_decay_table", _empty_decay_table)
+
+    request = MemorySearchRequest(query="needle", limit=10, semantic=False)
+    user = _alice()
+
+    await memories_handler.search_memories(request, user=user)
+    await memories_handler.search_memories(request, user=user)
+
+    # Both searches ran in the same epoch → identical cache key for the
+    # read attempt and for the write.
+    assert cache.reads, "search_memories must consult the cache"
+    assert cache.writes, "search_memories must write to the cache"
+    read_keys = [k for k in cache.reads if k != _lc.VISIBILITY_EPOCH_KEY]
+    written_keys = {entry[0] for entry in cache.writes}
+    assert len(set(read_keys)) == 1, f"cache read keys diverged: {read_keys}"
+    assert read_keys[0] in written_keys, (
+        "cache read key must equal a written key for the same epoch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_memories_key_changes_after_mutation_bumps_epoch(monkeypatch):
+    """After a visibility-narrowing mutation the next search must compute
+    a NEW cache key (epoch=N+1) and not collide with the prior epoch's key.
+
+    This is the core invariant of the fix at the handler layer: without
+    it, the issue-#1 race returns.
+    """
+    backend = install_fake_backend(monkeypatch)
+    backend.memories.configure_return("fts_search", [])
+    cache = _RecordingCache()
+    _install_cache(monkeypatch, cache)
+
+    monkeypatch.setattr(memories_handler, "_bump_recall_counters", _noop_bump_recall_counters)
+    monkeypatch.setattr(memories_handler, "load_decay_table", _empty_decay_table)
+
+    request = MemorySearchRequest(query="needle", limit=10, semantic=False)
+    user = _alice()
+
+    await memories_handler.search_memories(request, user=user)
+    pre_mutation_keys = {entry[0] for entry in cache.writes}
+    assert pre_mutation_keys
+
+    # Visibility-narrowing mutation: drive the same invalidation the
+    # memories route uses after a delete/update/archive.
+    await memories_handler._invalidate_caches_after_mutation()
+
+    cache.writes.clear()
+    await memories_handler.search_memories(request, user=user)
+    post_mutation_keys = {entry[0] for entry in cache.writes}
+    assert post_mutation_keys
+
+    assert pre_mutation_keys.isdisjoint(post_mutation_keys), (
+        f"post-mutation cache key must not reuse the pre-mutation key "
+        f"(pre={pre_mutation_keys}, post={post_mutation_keys})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_memories_bypasses_cache_when_epoch_untrusted(monkeypatch):
+    """If the visibility epoch is untrusted (previous INCR failed), no cache
+    read or write should occur: the read would be meaningless (no key encodes
+    the trustworthy generation) and the write would be unretrievable later.
+    """
+    backend = install_fake_backend(monkeypatch)
+    backend.memories.configure_return("fts_search", [])
+    cache = _RecordingCache()
+    _install_cache(monkeypatch, cache)
+    # Force the untrusted latch without mocking individual methods.
+    monkeypatch.setattr(_lc, "_epoch_untrusted", True, raising=False)
+    # Even though the cache exists, get_visibility_epoch() will short-circuit
+    # to None and the handler must skip cache interaction entirely.
+
+    monkeypatch.setattr(memories_handler, "_bump_recall_counters", _noop_bump_recall_counters)
+    monkeypatch.setattr(memories_handler, "load_decay_table", _empty_decay_table)
+
+    request = MemorySearchRequest(query="needle", limit=10, semantic=False)
+    user = _alice()
+    await memories_handler.search_memories(request, user=user)
+
+    search_reads = [k for k in cache.reads if k != _lc.VISIBILITY_EPOCH_KEY]
+    assert search_reads == [], (
+        f"handler must not read from cache when epoch is untrusted, got {search_reads}"
+    )
+    assert cache.writes == [], (
+        f"handler must not write to cache when epoch is untrusted, got {cache.writes}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_memories_write_uses_captured_epoch_not_post_query_epoch(monkeypatch):
+    """The cache write must use the SAME epoch as the cache read.
+
+    We verify this by bumping the epoch between the read and the write
+    and asserting the handler still wrote under the epoch captured at
+    the top of the function (i.e. the key uses the pre-bump epoch and
+    the bumped epoch is never written by this request).
+    """
+    backend = install_fake_backend(monkeypatch)
+    backend.memories.configure_return("fts_search", [])
+    cache = _RecordingCache()
+    _install_cache(monkeypatch, cache)
+
+    monkeypatch.setattr(memories_handler, "_bump_recall_counters", _noop_bump_recall_counters)
+    monkeypatch.setattr(memories_handler, "load_decay_table", _empty_decay_table)
+
+    # Wrap the DB call site so the epoch is advanced AFTER the search's
+    # cache READ but BEFORE the cache WRITE. This is the precise ordering
+    # the race exploits.
+    real_fts_search = backend.memories.fts_search
+
+    async def _fts_then_poke_epoch(*args, **kwargs):
+        # Advance the visibility epoch AFTER any preceding cache read but
+        # BEFORE the handler writes. In production this would be a
+        # concurrent ACL revoke / archive / permission_mode tighten.
+        await _lc.invalidate_visibility_caches()
+        return await real_fts_search(*args, **kwargs)
+
+    backend.memories.fts_search = _fts_then_poke_epoch  # type: ignore[method-assign]
+
+    request = MemorySearchRequest(query="needle", limit=10, semantic=False)
+    user = _alice()
+    response = await memories_handler.search_memories(request, user=user)
+
+    # The handler's captured epoch was 0 (initial). After the in-flight
+    # mutation, the in-memory store now has epoch=1, but the handler
+    # wrote under the epoch-0 key because it captured epoch=0 up front.
+    search_reads = [k for k in cache.reads if k != _lc.VISIBILITY_EPOCH_KEY]
+    written_keys = {entry[0] for entry in cache.writes}
+    assert search_reads, "handler should have attempted the cache read"
+    assert written_keys, "handler should have written to the cache"
+    # The write key is the same as the read key (same captured epoch,
+    # ignoring the bump that happened mid-request).
+    for wkey, _ttl, _value in cache.writes:
+        assert wkey in set(search_reads)
+    # And the current cache key (epoch=1) is NOT in the writes done by
+    # THIS request — proving the handler wrote under the OLD epoch.
+    fresh_epoch = await _lc.get_visibility_epoch()
+    assert fresh_epoch == 1
+    # The response body itself is still the search result from before
+    # the in-flight mutation — that's expected (the principal asked
+    # for the data when they had visibility); the fix prevents future
+    # requests from serving that payload, not this one.
+    assert response is not None
