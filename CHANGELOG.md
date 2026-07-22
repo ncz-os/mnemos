@@ -57,6 +57,45 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+### Fixed — search cache write-after-invalidate (TOCTOU) race on visibility-narrowing mutations
+
+Closes #1. The per-user search cache (`mnemos:search:*`, TTL up to 300s
+fast/balanced, 30s deep) was invalidated post-commit on every
+visibility-narrowing mutation with a one-shot `scan_iter`+`delete`.
+That left a classic write-after-invalidate window: a search that read
+rows from the DB before the mutation committed could write its now-stale
+result AFTER the invalidation ran, leaving a reachable stale entry live
+for the search TTL — a revocation-freshness leak (a principal whose read
+access was just narrowed could still receive a cached hit until TTL
+expiry).
+
+The fix folds a monotonic visibility/ACL epoch (`mnemos:vis:epoch`, an
+atomic Redis counter) into every search cache key. Each search captures
+the epoch BEFORE its DB query runs; any in-flight write that completes
+after a mutation commits lands under its OLD-epoch key, which is
+unreachable to all future searches (their key embeds the bumped epoch).
+The best-effort `scan_iter`+`delete` sweep is retained as cache hygiene
+and to preserve the pre-existing invalidation contract. Fail-closed for
+reads if `INCR` ever fails: subsequent epoch reads return `None` and
+handlers bypass both cache reads and writes until a later mutation
+succeeds in advancing the counter.
+
+Applied uniformly at every visibility-narrowing call site:
+
+- `mnemos.api.routes.acl._invalidate_search_caches_after_acl_change`
+- `mnemos.api.routes.admin._invalidate_memory_read_caches`
+- `mnemos.api.routes.dag.merge_branch` (live_tracks_target branch)
+- `mnemos.api.routes.memories._invalidate_caches_after_mutation`
+- `mnemos.workers.deletion_request_worker.invalidate_deletion_scope_caches`
+
+Regression coverage in
+`tests/test_search_cache_invalidation_race.py` exercises both the
+lifecycle helpers (`get_visibility_epoch` / `invalidate_visibility_caches`)
+in isolation and the `search_memories` handler end-to-end, asserting the
+cache key changes on every epoch bump, that the bypass path is taken
+when the epoch is untrusted, and that the cache write uses the epoch
+captured BEFORE the DB query (the exact TOCTOU window the fix closes).
+
 ### Fixed — schema migration replay crash-loops on a seed-data unique-violation
 
 Static seed-data migrations (e.g. `0033_subscription_plans`) are replayed
