@@ -57,6 +57,75 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+### Fixed — `memory_versions` schema widens to match live-memory read tenancy (GitLab issue #2)
+
+Per-version snapshot reads (`/v1/memories/{id}/log`, `/branches`,
+`/commits/{hash}`, `/versions`, `/versions/{n}`, `/diff`) previously failed
+closed for any reader who was NOT the owner or a world-reader of the live
+memory — a deliberate parity with the pre-ACL snapshot posture, but
+silent for the ACL- and group-only reader surfaces that
+`feat/multiuser-acl-group-admin` already widened for live-memory reads.
+
+Root cause: `memory_versions` carried no `group_id` column, so the
+`group_id = ANY($groups)` disjunct in the visibility predicate could not
+fire against snapshots.
+
+Fix widens snapshot tenancy end-to-end on all 4 supported backends:
+
+1. **Schema migration** `0048_memory_versions_group_id.sql` — adds
+   `group_id` to `memory_versions`, backfills from the live `memories`
+   table, drops a `(memory_id, group_id)` index for both row lookup and
+   predicate firing, and patches the postgres snapshot trigger to
+   carry `group_id` forward on INSERT/UPDATE/DELETE so new snapshots
+   stay group-correct without a follow-up write.
+2. **`version_visibility_predicate`** widened to mirror
+   `read_visibility_predicate` — owner via `owner_id = $caller`, world
+   via `(permission_mode % 10) >= 4`, group via
+   `((permission_mode / 10) % 10) >= 4 AND group_id = ANY($groups)`,
+   per-principal ACL via `EXISTS (memory_acl WHERE perm & ACL_READ)`.
+   The narrow owner+world shape is preserved under
+   `version_visibility_owner_world_predicate` for back-compat consumers.
+3. **Backend `insert_memory_version` signatures** updated to accept
+   `group_id` so the snapshot trigger has it to record (postgres /
+   sqlite / oracle / db2 / mysql/mariadb).
+4. **DAG `/log` post-walk filter** `_snap_visible` honors the widened
+   group + ACL logic (the recursive CTE doesn't take an `EXISTS`
+   disjunct cleanly; one memory_acl row keyed on `memory_id` widens
+   read to every surviving snapshot).
+
+**Behavior change beyond ACL parity:** group-only readers of a
+private memory now see its history (where they previously got an
+empty list / 404). This is intentional per the issue — closing
+the ACL gap without a parallel fix for group readers would have
+left snapshot reads asymmetric with the live-memory surface.
+
+**Backend coverage is honest:** the migration ships for all four
+supported engines (postgres / sqlite / oracle / db2 / mysql+mariadb
+share one row in `installer/db.py`'s canonical loader; mariadb's
+DDL is included even though the production primary is postgres).
+Operators who skipped a backend pre-#2 don't need any extra step;
+the migration replays idempotently on first boot after upgrade.
+
+`Fed:` (related, not closing this issue alone) the equivalent
+endpoint-level regression coverage lives in
+`tests/test_version_visibility_acl_group.py`,
+`tests/test_versions_acl_widening.py`, and
+`tests/test_dag_log_acl_widening.py`.
+
+### Fixed — `make dev` omitted `requirements.txt`, so NATS-dependent tests ran without nats-py
+
+The 8 NATS-test failures (publisher / consumer / webhook-trigger)
+were a test-environment gap, not a regression: `make dev` ran
+`pip install -e .[dev]`, which installs the dev extras and the
+package itself but NOT `requirements.txt` (where `nats-py` lives
+as a runtime dependency for the v4.2 NATS JetStream substrate).
+Without `nats-py` in the venv, `from nats.js.api import StreamConfig`
+imported clean only inside tests that mocked `nats.js.api`
+explicitly; the rest fell into a fallback branch where
+`ConsumerConfig` was `None` and the drift detector couldn't run.
+`make dev` now also does `pip install -r requirements.txt` so a
+fresh venv + `make test` produces a complete test environment.
+
 ### Fixed — schema migration replay crash-loops on a seed-data unique-violation
 
 Static seed-data migrations (e.g. `0033_subscription_plans`) are replayed
