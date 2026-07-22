@@ -824,6 +824,11 @@ class OracleVersionRepository(VersionRepository):
         parent_version_id: str | None,
         branch: str | None,
         merge_parents: Any,
+        # #2: group_id propagated from the live memory row at
+        # snapshot-creation time. Optional arg — older callers that
+        # pre-date the GitLab #2 widening pass through and the INSERT
+        # leaves the column NULL.
+        group_id: str | None = None,
     ) -> str:
         # Repository contract: callers pass JSON-like values (for example a
         # Python list for merge_parents). Oracle stores this column as JSON
@@ -842,7 +847,8 @@ class OracleVersionRepository(VersionRepository):
                     metadata, verbatim_content, owner_id, namespace,
                     permission_mode, source_model, source_provider, source_session,
                     source_agent, snapshot_at, snapshot_by, change_type,
-                    commit_hash, parent_version_id, branch, merge_parents
+                    commit_hash, parent_version_id, branch, merge_parents,
+                    group_id
                 )
                 SELECT
                     :id, :memory_id, :version_num, :content, :category, :subcategory,
@@ -856,7 +862,8 @@ class OracleVersionRepository(VersionRepository):
                     NVL(:change_type, 'create'),
                     :commit_hash, :parent_version_id,
                     NVL(:branch, 'main'),
-                    :merge_parents
+                    :merge_parents,
+                    :group_id
                 FROM dual
                 WHERE NOT EXISTS (SELECT 1 FROM memory_versions WHERE id = :id)
                 """,
@@ -883,6 +890,7 @@ class OracleVersionRepository(VersionRepository):
                     "parent_version_id": parent_version_id,
                     "branch": branch,
                     "merge_parents": merge_parents_json,
+                    "group_id": group_id,
                 },
             )
             affected = int(getattr(cursor, "rowcount", 0) or 0)

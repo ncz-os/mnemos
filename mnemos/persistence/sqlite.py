@@ -125,6 +125,12 @@ SQLITE_MIGRATION_FILES = [
     "0038_oauth_sessions_consultations.sql",
     "0039_subscription_plan_current_limits.sql",
     "0043_memory_acl.sql",
+    # 0048 (GitLab #2 ncz-os/mnemos#2) — backfill memory_versions
+    # with group_id so the version_visibility_predicate's group
+    # branch can fire against historical snapshots. ACL widening
+    # composes via memory_acl.memory_id so no schema change is
+    # needed on memory_versions for the ACL branch.
+    "migrations_v6_3_memory_versions_group_id.sql",
 ]
 
 
@@ -1797,6 +1803,13 @@ class SqliteVersionRepository(_SqliteRepository, VersionRepository):
         parent_version_id: str | None,
         branch: str | None,
         merge_parents: Any,
+        # #2: group_id propagated from the live memory row at
+        # snapshot-creation time. Optional arg — older callers
+        # that pre-date the GitLab #2 widening pass through and the
+        # INSERT leaves the column NULL (consistent with a memory
+        # that's never had a group_id set). The migration's
+        # backfill UPDATE then catches legacy rows on next startup.
+        group_id: str | None = None,
     ) -> str:
         await _execute(
             self._conn(tx),
@@ -1807,7 +1820,8 @@ class SqliteVersionRepository(_SqliteRepository, VersionRepository):
                 owner_id, namespace, permission_mode,
                 source_model, source_provider, source_session, source_agent,
                 snapshot_at, snapshot_by, change_type,
-                commit_hash, parent_version_id, branch, merge_parents
+                commit_hash, parent_version_id, branch, merge_parents,
+                group_id
             )
             VALUES (
                 ?, ?, ?, ?,
@@ -1815,7 +1829,8 @@ class SqliteVersionRepository(_SqliteRepository, VersionRepository):
                 ?, ?, COALESCE(?, 600),
                 ?, ?, ?, ?,
                 COALESCE(?, CURRENT_TIMESTAMP), ?, COALESCE(?, 'create'),
-                ?, ?, COALESCE(?, 'main'), ?
+                ?, ?, COALESCE(?, 'main'), ?,
+                ?
             )
             """,
             (
@@ -1841,6 +1856,7 @@ class SqliteVersionRepository(_SqliteRepository, VersionRepository):
                 parent_version_id,
                 branch,
                 _json_text(merge_parents, default=[]),
+                group_id,
             ),
         )
         return "INSERT 0 1"

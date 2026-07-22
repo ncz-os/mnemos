@@ -119,6 +119,8 @@ services:
       - ./mnemos/db_migrations/migrations/0039_knemon_dispatch_rule_refresh.sql:/docker-entrypoint-initdb.d/69-knemon-dispatch-rule-refresh.sql
       - ./mnemos/db_migrations/migrations/0039_subscription_plan_current_limits.sql:/docker-entrypoint-initdb.d/70-subscription-plan-current-limits.sql
       - ./mnemos/db_migrations/migrations/0043_memory_acl.sql:/docker-entrypoint-initdb.d/71-memory-acl.sql
+      # GitLab #2 (ncz-os/mnemos#2) — backfill memory_versions.group_id
+      - ./mnemos/db_migrations/migrations/0048_memory_versions_group_id.sql:/docker-entrypoint-initdb.d/72-memory-versions-group-id.sql
     ports:
       - '127.0.0.1:5433:5432'  # NOTE: 5433 (not 5432) to avoid host-Postgres collision on PROTEUS / any host with system Postgres
     healthcheck:
@@ -184,6 +186,8 @@ services:
       - ./mnemos/db_migrations/migrations/0039_knemon_dispatch_rule_refresh.sql:/migrations/69-knemon-dispatch-rule-refresh.sql:ro
       - ./mnemos/db_migrations/migrations/0039_subscription_plan_current_limits.sql:/migrations/70-subscription-plan-current-limits.sql:ro
       - ./mnemos/db_migrations/migrations/0043_memory_acl.sql:/migrations/71-memory-acl.sql:ro
+      # GitLab #2 (ncz-os/mnemos#2) — backfill memory_versions.group_id
+      - ./mnemos/db_migrations/migrations/0048_memory_versions_group_id.sql:/migrations/72-memory-versions-group-id.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -234,7 +238,9 @@ services:
       -f /migrations/68-oauth-sessions-consultations.sql
       -f /migrations/69-knemon-dispatch-rule-refresh.sql
       -f /migrations/70-subscription-plan-current-limits.sql
-      -f /migrations/71-memory-acl.sql"
+      -f /migrations/71-memory-acl.sql
+      # GitLab #2 (ncz-os/mnemos#2) — backfill memory_versions.group_id
+      -f /migrations/72-memory-versions-group-id.sql"
     restart: "no"
 
   mnemos:

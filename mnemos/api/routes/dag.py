@@ -179,9 +179,12 @@ async def get_memory_log(
         async with pool.acquire() as conn:
             await _assert_memory_readable(conn, memory_id, user)
             # Recursive CTE: walk from HEAD backward through parent_version_id.
-            # Carries owner_id/namespace/permission_mode and the actual parent
-            # identity through both arms so the post-walk filter can drop
-            # snapshots the caller can't read without inventing parent edges.
+            # Carries owner_id/namespace/permission_mode/group_id and the actual
+            # parent identity through both arms so the post-walk filter can
+            # drop snapshots the caller can't read without inventing parent
+            # edges. group_id is included for the GitLab #2 group-reader
+            # widening: a snapshot taken with the memory group-readable is
+            # also group-readable per-version.
             rows = await conn.fetch(
                 """
                 WITH RECURSIVE commit_walk AS (
@@ -191,7 +194,7 @@ async def get_memory_log(
                         parent_mv.commit_hash AS parent_commit_hash,
                         mv.version_num, mv.branch, mv.content, mv.category,
                         mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
-                        mv.owner_id, mv.namespace, mv.permission_mode,
+                        mv.owner_id, mv.namespace, mv.permission_mode, mv.group_id,
                         1 AS depth
                     FROM memory_versions mv
                     LEFT JOIN memory_versions parent_mv
@@ -219,7 +222,7 @@ async def get_memory_log(
                         parent_mv.commit_hash AS parent_commit_hash,
                         mv.version_num, mv.branch, mv.content, mv.category,
                         mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
-                        mv.owner_id, mv.namespace, mv.permission_mode,
+                        mv.owner_id, mv.namespace, mv.permission_mode, mv.group_id,
                         cw.depth + 1
                     FROM memory_versions mv
                     LEFT JOIN memory_versions parent_mv
@@ -236,7 +239,7 @@ async def get_memory_log(
                     id, commit_hash, parent_version_id, parent_commit_hash,
                     version_num, branch, content, category, subcategory,
                     snapshot_at, snapshot_by, change_type,
-                    owner_id, namespace, permission_mode
+                    owner_id, namespace, permission_mode, group_id
                 FROM commit_walk
                 ORDER BY depth ASC
                 LIMIT $3
@@ -255,13 +258,69 @@ async def get_memory_log(
             # private (mode 600) → snapshotted into v1 → relaxed to
             # public (mode 644) MUST NOT expose v1 to readers who
             # only became authorized after the permission flip.
-            # Mirrors api/handlers/versions.py + mnemos/db/mcp_repo.py.
+            #
+            # GitLab #2 (ncz-os/mnemos#2) widens this predicate so that
+            # * group-readers of the live memory also see its snapshots
+            #   (group_id match against the caller's UserContext.group_ids),
+            # * ACL-granted readers of the live memory also see its snapshots
+            #   (memory_acl.disjunct via a dedicated EXISTS check below).
+            # Per-snapshot ACL rows are not duplicated onto snapshots;
+            # memory_acl is keyed on memory_id so it applies to every
+            # surviving snapshot of that memory uniformly. Migration
+            # 0048_memory_versions_acl.sql backfills group_id onto the
+            # snapshot table and adds the supporting index used here.
             if user.role != "root":
+                caller_user_id = user.user_id
+                caller_group_ids = list(user.group_ids or [])
+                # One extra roundtrip per /log call: does this caller have an
+                # ACL grant on this memory_id? If yes, every snapshot of the
+                # memory is visible regardless of its own permission_mode /
+                # owner_id / group_id (which is correct behavior — the ACL
+                # grant on the LIVE memory widens read to every historical
+                # snapshot of that memory). If no, we fall back to the
+                # snapshot-level per-row predicate below.
+                acl_principal_set: list[str] = []
+                if caller_user_id:
+                    acl_principal_set.append(f"user:{caller_user_id}")
+                for g in caller_group_ids:
+                    if g:
+                        acl_principal_set.append(f"group:{g}")
+                acl_grant = await conn.fetchrow(
+                    """
+                    SELECT 1 FROM memory_acl macl
+                    WHERE macl.memory_id = $1
+                      AND macl.principal = ANY($2::text[])
+                      AND (macl.perm & 4) <> 0
+                    LIMIT 1
+                    """,
+                    memory_id,
+                    acl_principal_set,
+                )
+                acl_widening = acl_grant is not None
 
                 def _snap_visible(r) -> bool:
                     if r["namespace"] != user.namespace:
                         return False
-                    return r["owner_id"] == user.user_id or (r["permission_mode"] % 10) >= 4
+                    if acl_widening:
+                        return True
+                    perm_mode = r["permission_mode"]
+                    # Owner.
+                    if r["owner_id"] == caller_user_id:
+                        return True
+                    # World (Unix ones-digit >= 4).
+                    if (perm_mode % 10) >= 4:
+                        return True
+                    # Group (Unix tens-digit >= 4): the snapshot's group_id
+                    # must match one of the caller's groups. Pre-#2 schema
+                    # snapshots carry NULL group_id so this branch fires
+                    # only on rows touched after the backfill migration.
+                    if (
+                        ((perm_mode // 10) % 10) >= 4
+                        and r["group_id"] is not None
+                        and r["group_id"] in caller_group_ids
+                    ):
+                        return True
+                    return False
 
                 rows = [r for r in rows if _snap_visible(r)]
 
@@ -337,6 +396,7 @@ async def get_memory_branches(
 
                 vis_clause, vis_params = version_visibility_predicate(
                     user.user_id,
+                    list(user.group_ids or []),
                     start_param_idx=2,
                     table_alias="mv",
                 )
@@ -446,6 +506,7 @@ async def create_branch(
 
                         vis_clause, vis_params = version_visibility_predicate(
                             user.user_id,
+                            list(user.group_ids or []),
                             start_param_idx=3,
                         )
                         ns_ph = f"${len(vis_params) + 3}"
@@ -479,6 +540,7 @@ async def create_branch(
 
                         vis_clause, vis_params = version_visibility_predicate(
                             user.user_id,
+                            list(user.group_ids or []),
                             start_param_idx=2,
                             table_alias="mv",
                         )
@@ -583,6 +645,7 @@ async def get_commit(
                 # parent_hash when the parent is invisible.
                 vis_mv, vis_mv_params = version_visibility_predicate(
                     user.user_id,
+                    list(user.group_ids or []),
                     start_param_idx=3,
                     table_alias="mv",
                 )
@@ -591,6 +654,7 @@ async def get_commit(
                 # offsets continue after the row's namespace param.
                 vis_mv2, vis_mv2_params = version_visibility_predicate(
                     user.user_id,
+                    list(user.group_ids or []),
                     start_param_idx=len(vis_mv_params) + 4,
                     table_alias="mv2",
                 )
@@ -714,6 +778,7 @@ async def merge_branch(
 
                 vis_clause, vis_params = version_visibility_predicate(
                     user.user_id,
+                    list(user.group_ids or []),
                     start_param_idx=3,
                     table_alias="mv",
                 )

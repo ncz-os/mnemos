@@ -121,6 +121,7 @@ def read_visibility_predicate(
 
 def version_visibility_predicate(
     user_id: str,
+    group_ids: List[str],
     start_param_idx: int,
     table_alias: str = "",
 ) -> Tuple[str, list]:
@@ -134,20 +135,83 @@ def version_visibility_predicate(
     fetch the v1 private snapshot via ``list_versions`` /
     ``get_version`` / ``diff_versions``.
 
-    Narrower than ``read_visibility_predicate`` because
-    ``memory_versions`` does NOT carry ``group_id`` or
-    ``federation_source`` columns (introduced after v2 versioning).
-    Snapshots that were group-readable or federated at the time
-    they were taken are NOT visible per-version — fail-closed
-    against missing historical fields. Backfilling those columns
-    onto ``memory_versions`` is a separate migration decision.
+    Mirrors ``read_visibility_predicate`` for the per-snapshot read
+    set so snapshot reads honor the SAME widening the live-memory
+    surface already does (PR for GitLab #2 — ncz-os/mnemos#2,
+    aligned with the feat/multiuser-acl-group-admin merge that
+    widened live-memory reads). Snapshots inherit:
 
-    Branches:
-    - owner: ``owner_id = $caller``
-    - world: ``(permission_mode % 10) >= 4``
+    - owner via ``owner_id = $caller``
+    - world via ``(permission_mode % 10) >= 4``
+    - group via ``((permission_mode / 10) % 10) >= 4 AND
+                 group_id IS NOT NULL AND group_id = ANY($groups)``
+    - per-principal ACL via ``EXISTS (SELECT 1 FROM memory_acl ...)``
+
+    The federation-source disjunct is deliberately absent: a
+    federated-pulled live memory whose author has never written
+    locally does not have local snapshots for the federation row
+    (snapshots are produced by the writer's own trigger), so
+    widening to ``federation_source IS NOT NULL`` on snapshots
+    would only return ``deleted_at IS NULL`` rows that survive as
+    historical artifacts, which is a leak/expansion we don't want
+    here. Federation read access is enforced UP STREAM at the
+    live-memory gate (``read_visibility_predicate``) and snapshots
+    are only visible via ``/log`` etc. when the caller has live
+    access; once that gate passes, owner/world/group/ACL widening
+    is the right next layer.
 
     The namespace pin (a separate ``namespace = $`` predicate) is
     expected to be added by the caller alongside this clause.
+
+    Schema prerequisites (see migration 0048_memory_versions_acl.sql):
+    ``memory_versions`` must carry ``group_id`` plus an
+    ``memory_acl`` join key. The pre-#2 snapshot table did NOT
+    carry ``group_id``; backfill is required for the group branch
+    to fire correctly for snapshots taken before the migration.
+    ACL rows are keyed on ``memory_id`` so they compose with any
+    snapshot table shape — no schema change required for the ACL
+    branch beyond snapshot rows inheriting the live memory's id
+    (which they already do).
+
+    ``group_ids`` is sourced from ``UserContext.group_ids`` (resolved
+    at auth time) rather than re-querying ``user_groups`` via EXISTS;
+    same authoritative source the RLS policy uses, just pre-resolved.
+
+    ``table_alias`` is prepended to every column reference (e.g.
+    ``"mv"`` → ``mv.owner_id``) for queries that join multiple tables
+    and need disambiguation. Default empty produces unqualified
+    column names suitable for single-table queries.
+    """
+    n = start_param_idx
+    p = f"{table_alias}." if table_alias else ""
+    clause = (
+        "("
+        f"{p}owner_id=${n}"
+        f" OR ({p}permission_mode % 10) >= 4"
+        f" OR ((({p}permission_mode / 10) % 10) >= 4 "
+        f"AND {p}group_id IS NOT NULL "
+        f"AND {p}group_id = ANY(${n + 1}::text[]))"
+        f" OR EXISTS (SELECT 1 FROM memory_acl macl "
+        f"WHERE macl.memory_id = {p}memory_id "
+        f"AND macl.principal = ANY(${n + 2}::text[]) "
+        f"AND (macl.perm & {ACL_READ_BIT}) <> 0)"
+        ")"
+    )
+    return clause, [user_id, list(group_ids), acl_principals(user_id, group_ids)]
+
+
+def version_visibility_owner_world_predicate(
+    user_id: str,
+    start_param_idx: int,
+    table_alias: str = "",
+) -> Tuple[str, list]:
+    """Backwards-compatible narrow snapshot predicate (owner + world only).
+
+    Retained for tests and code paths that deliberately want the
+    pre-#2 narrow behavior. New code should call
+    ``version_visibility_predicate`` (above) instead so the same
+    widening the live-memory surface already ships also applies
+    to per-version reads.
     """
     n = start_param_idx
     p = f"{table_alias}." if table_alias else ""
@@ -178,7 +242,9 @@ async def _assert_target_head_visible(
         return
 
     vis_clause, vis_params = version_visibility_predicate(
-        user.user_id, start_param_idx=2,
+        user.user_id,
+        list(getattr(user, "group_ids", []) or []),
+        start_param_idx=2,
     )
     ns_ph = f"${len(vis_params) + 2}"
     row = await conn.fetchrow(

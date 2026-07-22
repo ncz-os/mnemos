@@ -2149,6 +2149,11 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
         parent_version_id: str | None,
         branch: str | None,
         merge_parents: Any,
+        # #2: group_id propagated from the live memory row at
+        # snapshot-creation time. Optional arg — older callers that
+        # pre-date the GitLab #2 widening pass through and the INSERT
+        # leaves the column NULL.
+        group_id: str | None = None,
     ) -> str:
         # Db2 stores version JSON fields as text-compatible JSON values;
         # normalize Python lists/dicts here so callers can use one repo
@@ -2167,7 +2172,8 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
                     metadata, verbatim_content, owner_id, namespace,
                     permission_mode, source_model, source_provider, source_session,
                     source_agent, snapshot_at, snapshot_by, change_type,
-                    commit_hash, parent_version_id, branch, merge_parents
+                    commit_hash, parent_version_id, branch, merge_parents,
+                    group_id
                 )
                 SELECT
                     ?, ?, ?, ?, ?, ?,
@@ -2177,6 +2183,7 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
                     COALESCE(CAST(? AS TIMESTAMP), CURRENT TIMESTAMP),
                     ?, COALESCE(CAST(? AS VARCHAR(40)), 'create'),
                     ?, ?, COALESCE(CAST(? AS VARCHAR(100)), 'main'),
+                    ?,
                     ?
                 FROM SYSIBM.SYSDUMMY1
                 WHERE NOT EXISTS (SELECT 1 FROM memory_versions WHERE id = ?)
@@ -2204,6 +2211,7 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
                     parent_version_id,
                     branch,
                     merge_parents_json,
+                    group_id,
                     version_id,  # for the NOT EXISTS subquery
                 ),
             )

@@ -17,6 +17,7 @@ install:       ## Install production dependencies
 dev:           ## Install development dependencies
 	$(PYTHON) -m venv $(VENV)
 	$(PIP) install --upgrade pip
+	$(PIP) install -r requirements.txt
 	$(PIP) install -e ".[dev]"
 
 test:          ## Run unit tests (auto-installs dev deps on first run)
