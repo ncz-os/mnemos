@@ -523,18 +523,13 @@ async def _publish_nats_with_timeout(
 
 
 async def _invalidate_caches_after_mutation() -> None:
-    """Drop /stats + per-user search cache entries on any memory write."""
-    if not _lc._cache:
-        return
-    try:
-        await _lc._cache.delete("stats:global:v2")
-        try:
-            async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                await _lc._cache.delete(_k)
-        except Exception:
-            pass
-    except Exception:
-        pass
+    """Advance visibility generation and drop /stats + search caches.
+
+    The generation bump closes the write-after-invalidate window; the scan is
+    retained as best-effort garbage collection for the pre-existing cache
+    invalidation behavior.
+    """
+    await _lc.invalidate_visibility_caches("stats:global:v2")
 
 
 def _row_archived_at(row) -> object | None:
@@ -1231,8 +1226,22 @@ async def search_memories(
     # serialization aliases distinct semantics. JSON encoding inside
     # _get_cache_key now preserves None as null vs "" as "" so the
     # digest reflects the request's actual filter shape.
+    # Capture the visibility generation before the cache lookup and, crucially,
+    # before the database query. If a visibility mutation commits while this
+    # request is in flight, its eventual write remains under this old epoch and
+    # can never be read by a request using the new epoch.
+    #
+    # Belt-and-suspenders: we ALSO re-read the epoch after the DB query and
+    # refuse the cache write if it changed during the request. The epoch-in-key
+    # scheme is the primary correctness barrier (an orphan under an old epoch
+    # is unreachable by future searches), but skipping the write entirely
+    # avoids leaving an unreachable-but-live key in Redis for the search TTL
+    # and gives an immediate post-query safety net.
+    visibility_epoch = await _lc.get_visibility_epoch()
+
     cache_key = _get_cache_key(
         "search",
+        visibility_epoch,
         user.user_id,
         user.namespace,
         request.query,
@@ -1266,7 +1275,7 @@ async def search_memories(
         ood_gate_enabled(),
     )
 
-    if _lc._cache and not request.include_compressed:
+    if _lc._cache and visibility_epoch is not None and not request.include_compressed:
         try:
             cached = await _lc._cache.get(cache_key)
             if cached:
@@ -1565,23 +1574,54 @@ async def search_memories(
     )
     _log_search_phase(search_trace_id, search_started_at, "serialize")
 
-    if _lc._cache and not request.include_compressed and not compression_applied:
+    # Belt-and-suspenders post-query epoch check (issue #1, acceptable
+    # alternative). If the epoch advanced between the read of `visibility_epoch`
+    # above and now, a visibility-narrowing mutation committed while this
+    # request was in flight. Skip the cache write so we don't leave an orphan
+    # under the old-epoch key that future searches (using the new epoch) would
+    # never read but that would still occupy Redis memory until TTL expiry.
+    # Note: this re-read can itself race with a concurrent mutation, but the
+    # primary correctness barrier — folding the captured epoch into the cache
+    # key — still guarantees no future search can serve the stale payload.
+    if (
+        _lc._cache
+        and visibility_epoch is not None
+        and not request.include_compressed
+        and not compression_applied
+    ):
         try:
-            # v6.2 M-2.2.3: per-profile cache TTL. fast/balanced 5min;
-            # deep 30s (less cacheable per spec — reranker scoring drifts
-            # faster as memories churn).
-            _profile_ttl = {
-                SearchProfile.FAST: 300,
-                SearchProfile.BALANCED: 300,
-                SearchProfile.DEEP: 30,
-            }
-            await _lc._cache.setex(
-                cache_key,
-                _profile_ttl[search_profile],
-                response.model_dump_json(),
+            post_query_epoch = await _lc.get_visibility_epoch()
+            epoch_unchanged = (
+                post_query_epoch is not None and post_query_epoch == visibility_epoch
             )
         except Exception as e:
-            logger.warning(f"[CACHE] search write error: {e}")
+            epoch_unchanged = False
+            logger.warning(f"[CACHE] epoch re-check failed; skipping cache write: {e}")
+
+        if epoch_unchanged:
+            try:
+                # v6.2 M-2.2.3: per-profile cache TTL. fast/balanced 5min;
+                # deep 30s (less cacheable per spec — reranker scoring drifts
+                # faster as memories churn).
+                _profile_ttl = {
+                    SearchProfile.FAST: 300,
+                    SearchProfile.BALANCED: 300,
+                    SearchProfile.DEEP: 30,
+                }
+                await _lc._cache.setex(
+                    cache_key,
+                    _profile_ttl[search_profile],
+                    response.model_dump_json(),
+                )
+            except Exception as e:
+                logger.warning(f"[CACHE] search write error: {e}")
+        else:
+            logger.debug(
+                "[CACHE] visibility epoch changed mid-request "
+                "(captured=%s post_query=%s); skipping cache write",
+                visibility_epoch,
+                post_query_epoch,
+            )
 
     return response
 

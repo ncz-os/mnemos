@@ -41,22 +41,8 @@ router = APIRouter(prefix="/v1/memories", tags=["acl"])
 
 
 async def _invalidate_search_caches_after_acl_change() -> None:
-    """Drop the per-user search cache after an ACL grant/revoke.
-
-    Search responses are cached under keys derived from
-    user/group/namespace/query state — *not* ACL grant state. A grant
-    widens read visibility and a revoke narrows it, so a response cached
-    while a principal held a grant would otherwise be replayable after the
-    grant is revoked until TTL expiry — a permission-revocation leak. This
-    mirrors ``_invalidate_caches_after_mutation`` on the memories route.
-    """
-    if not _lc._cache:
-        return
-    try:
-        async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-            await _lc._cache.delete(_k)
-    except Exception:
-        pass
+    """Advance the visibility generation after an ACL grant or revoke."""
+    await _lc.invalidate_visibility_caches()
 
 
 _ALLOWED_PERM_BITS = ACL_READ_BIT | ACL_WRITE_BIT

@@ -17,16 +17,25 @@ install:       ## Install production dependencies
 dev:           ## Install development dependencies
 	$(PYTHON) -m venv $(VENV)
 	$(PIP) install --upgrade pip
-	$(PIP) install -e ".[dev]"
+	$(PIP) install --e ".[dev,sqlite,nats]"
+	# .[sqlite] adds aiosqlite + sqlite-vec (default backend async driver
+	# and FTS5/vec0 dependency for the SQLite tests). .[nats] adds
+	# nats-py so the JetStream publisher/migration coverage is exercised.
+	# CI installs the same combined extras; matching them here keeps
+	# `make test` and the GitLab unit job in lockstep.
 
 test:          ## Run unit tests (auto-installs dev deps on first run)
 	@test -x $(PYTEST) || $(MAKE) dev
-	$(PYTEST) tests/ -v --tb=short --ignore=tests/test_live_e2e.py
+	# `-p no:randomly` matches CI behavior: pytest-randomly ships in the
+	# dev closure but the suite still has a handful of pre-existing
+	# inter-file monkeypatch leaks that show up only under randomized
+	# ordering. Pinning the order here keeps `make test` deterministic.
+	$(PYTEST) tests/ -v --tb=short --ignore=tests/test_live_e2e.py -p no:randomly
 
 test-uv:       ## Run tests in a fresh uv-managed .venv (reproducible, no pre-existing venv needed)
 	uv venv .venv
-	uv pip install --python .venv/bin/python -e '.[dev]'
-	.venv/bin/pytest tests/ -v --tb=short --ignore=tests/test_live_e2e.py
+	uv pip install --python .venv/bin/python -e '.[dev,sqlite,nats]'
+	.venv/bin/pytest tests/ -v --tb=short --ignore=tests/test_live_e2e.py -p no:randomly
 
 test-archive:  ## Run archive salvage tests
 	@test -x $(PYTEST) || $(MAKE) dev

@@ -289,6 +289,17 @@ class _FakeCache:
     def __init__(self, keys):
         self.keys = list(keys)
         self.deleted: list[str] = []
+        self.epoch = 0
+
+    async def get(self, key):
+        if key == _lc.VISIBILITY_EPOCH_KEY:
+            return str(self.epoch) if self.epoch else None
+        return None
+
+    async def incr(self, key):
+        assert key == _lc.VISIBILITY_EPOCH_KEY
+        self.epoch += 1
+        return self.epoch
 
     async def scan_iter(self, *, match, count):  # noqa: ARG002 — signature parity
         for k in list(self.keys):
