@@ -482,6 +482,7 @@ class PostgresMemoryRepository(MemoryRepository):
         else:
             vis_clause, vis_params = _core_version_visibility_predicate(
                 user.user_id,
+                list(user.group_ids or []),
                 start_param_idx=4,
                 table_alias="mv",
             )
@@ -561,6 +562,7 @@ class PostgresMemoryRepository(MemoryRepository):
 
         vis_clause, vis_params = _core_version_visibility_predicate(
             user.user_id,
+            list(user.group_ids or []),
             start_param_idx=3,
         )
         ns_ph = f"${len(vis_params) + 3}"
@@ -598,6 +600,7 @@ class PostgresMemoryRepository(MemoryRepository):
 
         vis_clause, vis_params = _core_version_visibility_predicate(
             user.user_id,
+            list(user.group_ids or []),
             start_param_idx=3,
         )
         ns_ph = f"${len(vis_params) + 3}"
@@ -1722,6 +1725,12 @@ class PostgresVersionRepository(VersionRepository):
         parent_version_id: str | None,
         branch: str | None,
         merge_parents: Any,
+        # #2: group_id propagated from the live memory row at
+        # snapshot-creation time. Optional arg — older callers that
+        # pre-date the GitLab #2 widening pass through and the INSERT
+        # leaves the column NULL, which is the documented legacy
+        # behavior.
+        group_id: str | None = None,
     ) -> str:
         # Postgres stores merge_parents as uuid[]; normalize JSON text or
         # tuples to the Python list shape asyncpg expects at the repo layer.
@@ -1736,7 +1745,8 @@ class PostgresVersionRepository(VersionRepository):
                 owner_id, namespace, permission_mode,
                 source_model, source_provider, source_session, source_agent,
                 snapshot_at, snapshot_by, change_type,
-                commit_hash, parent_version_id, branch, merge_parents
+                commit_hash, parent_version_id, branch, merge_parents,
+                group_id
             )
             VALUES (
                 $1::uuid, $2, $3, $4,
@@ -1744,7 +1754,8 @@ class PostgresVersionRepository(VersionRepository):
                 $9, $10, COALESCE($11, 600),
                 $12, $13, $14, $15,
                 COALESCE($16, NOW()), $17, COALESCE($18, 'create'),
-                $19, $20::uuid, COALESCE($21, 'main'), $22::uuid[]
+                $19, $20::uuid, COALESCE($21, 'main'), $22::uuid[],
+                $23
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -1770,6 +1781,7 @@ class PostgresVersionRepository(VersionRepository):
             parent_version_id,
             branch,
             merge_parent_ids,
+            group_id,
         )
 
     async def fetch_memory_version_by_id(self, tx: Transaction, version_id: str) -> Row | None:
@@ -1811,6 +1823,7 @@ class PostgresBranchRepository(BranchRepository):
 
             vis_clause, vis_params = _core_version_visibility_predicate(
                 user.user_id,
+                list(user.group_ids or []),
                 start_param_idx=3,
             )
             ns_ph = f"${len(vis_params) + 3}"
@@ -1840,6 +1853,7 @@ class PostgresBranchRepository(BranchRepository):
 
             vis_clause, vis_params = _core_version_visibility_predicate(
                 user.user_id,
+                list(user.group_ids or []),
                 start_param_idx=2,
                 table_alias="mv",
             )
@@ -1875,6 +1889,7 @@ class PostgresBranchRepository(BranchRepository):
 
             vis_clause, vis_params = _core_version_visibility_predicate(
                 user.user_id,
+                list(user.group_ids or []),
                 start_param_idx=3,
                 table_alias="mv",
             )

@@ -274,6 +274,11 @@ CREATE TABLE IF NOT EXISTS memory_versions (
   parent_version_id TEXT REFERENCES memory_versions(id) ON DELETE SET NULL,
   branch TEXT NOT NULL DEFAULT 'main',
   merge_parents TEXT NOT NULL DEFAULT '[]',
+  -- #2: group_id mirrored from the live memory at snapshot-creation
+  -- time. NULL for legacy rows predating the 0048 backfill; those
+  -- rely on memory_acl (which is keyed on memory_id, not snapshot
+  -- id) for cross-history widening.
+  group_id TEXT,
   UNIQUE(memory_id, branch, version_num)
 );
 
@@ -282,6 +287,8 @@ CREATE INDEX IF NOT EXISTS idx_mv_memory_id_vnum ON memory_versions(memory_id, v
 CREATE INDEX IF NOT EXISTS idx_mv_snapshot_at ON memory_versions(snapshot_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_commit_hash ON memory_versions(commit_hash)
   WHERE commit_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_mv_memory_id_group_id
+  ON memory_versions (memory_id, group_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_main_linear ON memory_versions(memory_id, version_num)
   WHERE branch = 'main';
 

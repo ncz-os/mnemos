@@ -608,6 +608,12 @@ def run_migrations(config: Config) -> bool:
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0039_knemon_dispatch_rule_refresh.sql",
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0039_subscription_plan_current_limits.sql",
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0043_memory_acl.sql",
+        # 0048 (GitLab #2 ncz-os/mnemos#2) — backfill memory_versions
+        # with group_id so the version_visibility_predicate's group
+        # branch can fire against historical snapshots. ACL widening
+        # composes via memory_acl.memory_id so no schema change is
+        # needed on memory_versions for the ACL branch.
+        repo_path / "mnemos" / "db_migrations" / "migrations" / "0048_memory_versions_group_id.sql",
     ]
 
     if selected_components:

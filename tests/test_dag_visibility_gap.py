@@ -58,6 +58,13 @@ class _Conn:
         if compact.startswith("SELECT owner_id, namespace FROM memories WHERE id = $1"):
             return {"owner_id": "alice", "namespace": "alice-ns"}
 
+        # GitLab #2 (ncz-os/mnemos#2): the post-walk filter now also asks
+        # memory_acl whether the caller has an ACL grant on this memory_id.
+        # For these unit-test rows alice has no ACL grants, so the response
+        # is None (no widening beyond the standard owner/world/group predicate).
+        if "FROM memory_acl macl" in compact and "macl.memory_id = $1" in compact:
+            return None
+
         raise AssertionError(f"unexpected fetchrow SQL: {sql}")
 
     async def fetch(self, sql: str, *args):

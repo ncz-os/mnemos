@@ -668,11 +668,19 @@ async def test_fetch_memory_log_query_is_identity_scoped_for_non_root():
 
     sql, args = conn.calls[0]
     assert "mv.owner_id=$4" in sql
-    assert "mv.namespace = $5" in sql
-    assert args == (
-        "mem_1234567890123_a1b2c3",
-        "main",
-        10,
-        "alice",
-        "alice-ns",
-    )
+    # #2 (GitLab #2 ncz-os/mnemos#2): the version_visibility_predicate
+    # also passes group_ids and a principals list, so the namespace
+    # pin moves to $7. Pin by substring instead of an exact dollar
+    # index — the route layer's ns_ph formula handles the offset.
+    assert "mv.namespace = $" in sql
+    assert "owner_id=$4" in sql
+    assert "owner_id=${4 + 1}::text[])" in sql or " = ANY($5::text[])" in sql
+    # And the bind order is now (memory_id, branch, limit, user_id,
+    # group_ids, principals, namespace) — pin the first three and
+    # the trailing namespace to make sure we're still binding all
+    # the leading params correctly.
+    assert args[0] == "mem_1234567890123_a1b2c3"
+    assert args[1] == "main"
+    assert args[2] == 10
+    assert args[3] == "alice"
+    assert args[-1] == "alice-ns"

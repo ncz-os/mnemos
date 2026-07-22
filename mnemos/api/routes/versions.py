@@ -172,7 +172,7 @@ async def list_versions(
         else:
             from mnemos.core.visibility import version_visibility_predicate
             vis_clause, vis_params = version_visibility_predicate(
-                user.user_id, start_param_idx=3,
+                user.user_id, list(user.group_ids or []), start_param_idx=3,
             )
             ns_ph = f"${len(vis_params) + 3}"
             rows = await conn.fetch(
@@ -220,7 +220,7 @@ async def get_version(
             # Per-snapshot tenancy on the row itself.
             from mnemos.core.visibility import version_visibility_predicate
             vis_clause, vis_params = version_visibility_predicate(
-                user.user_id, start_param_idx=4,
+                user.user_id, list(user.group_ids or []), start_param_idx=4,
             )
             ns_ph = f"${len(vis_params) + 4}"
             row = await conn.fetchrow(
@@ -265,7 +265,7 @@ async def diff_versions(
         else:
             from mnemos.core.visibility import version_visibility_predicate
             vis_clause, vis_params = version_visibility_predicate(
-                user.user_id, start_param_idx=4,
+                user.user_id, list(user.group_ids or []), start_param_idx=4,
             )
             ns_ph = f"${len(vis_params) + 4}"
             rows = await conn.fetch(
@@ -330,7 +330,7 @@ async def revert_memory(
         else:
             from mnemos.core.visibility import version_visibility_predicate
             vis_clause, vis_params = version_visibility_predicate(
-                user.user_id, start_param_idx=4,
+                user.user_id, list(user.group_ids or []), start_param_idx=4,
             )
             ns_ph = f"${len(vis_params) + 4}"
             ver_row = await conn.fetchrow(

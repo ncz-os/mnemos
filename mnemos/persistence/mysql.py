@@ -2363,6 +2363,11 @@ class MysqlVersionRepository(VersionRepository):
         parent_version_id: str | None,
         branch: str | None,
         merge_parents: Any,
+        # #2: group_id propagated from the live memory row at
+        # snapshot-creation time. Optional arg — older callers that
+        # pre-date the GitLab #2 widening pass through and the INSERT
+        # leaves the column NULL.
+        group_id: str | None = None,
     ) -> str:
         # MySQL stores version JSON fields as JSON text; normalize Python
         # list/dict inputs internally so importers can pass backend-neutral
@@ -2380,7 +2385,8 @@ class MysqlVersionRepository(VersionRepository):
                         owner_id, namespace, permission_mode,
                         source_model, source_provider, source_session, source_agent,
                         snapshot_at, snapshot_by, change_type,
-                        commit_hash, parent_version_id, branch, merge_parents
+                        commit_hash, parent_version_id, branch, merge_parents,
+                        group_id
                     )
                     VALUES (
                         %s, %s, %s, %s,
@@ -2388,7 +2394,8 @@ class MysqlVersionRepository(VersionRepository):
                         %s, COALESCE(%s, 'default'), COALESCE(%s, 600),
                         %s, %s, %s, %s,
                         COALESCE(%s, CURRENT_TIMESTAMP(6)), %s, COALESCE(%s, 'create'),
-                        %s, %s, COALESCE(%s, 'main'), %s
+                        %s, %s, COALESCE(%s, 'main'), %s,
+                        %s
                     )
                     ON DUPLICATE KEY UPDATE
                         id = id
@@ -2416,6 +2423,7 @@ class MysqlVersionRepository(VersionRepository):
                         parent_version_id,
                         branch,
                         merge_parents_json,
+                        group_id,
                     ),
                 )
                 return "INSERT 0 1" if cursor.rowcount else "INSERT 0 0"
