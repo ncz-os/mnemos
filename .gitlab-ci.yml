@@ -482,20 +482,24 @@ release:linux-aarch64:
   variables:
     MNEMOS_EXPECTED_PLATFORM: linux-aarch64
   tags:
-    - ultra-podman-arm64
-  # No linux-aarch64 GitLab runner currently exists on the fleet. The
-  # `ultra-podman-arm64` tag matches nothing: ULTRA's runner is a shell
-  # executor on macOS, and build-binary.sh detects the platform with
-  # `uname` and refuses ("expected linux-aarch64, detected macos-aarch64").
+    - linux-arm64
+  # Runs on TYDEUS (IGX Thor, Ubuntu 24.04 aarch64), GitLab group runner
+  # "TYDEUS arm64 Linux", tags [linux-arm64, tydeus].
   #
-  # The template would otherwise run this on every master push and on the
-  # nightly schedule, where it sits PENDING forever — and `allow_failure`
-  # does not help, because it forgives a failed job, never a queued one.
-  # That kept every scheduled pipeline from reaching a terminal state.
+  # The previous tag `ultra-podman-arm64` matched no runner at all: ULTRA's
+  # runner is a shell executor on macOS, and build-binary.sh detects the
+  # platform with `uname` and refuses ("expected linux-aarch64, detected
+  # macos-aarch64"). An unmatched tag leaves the job PENDING forever, and
+  # `allow_failure` does not help — it forgives a failed job, never a queued
+  # one — so scheduled pipelines never reached a terminal state.
   #
-  # Restrict it to tags so branch and scheduled pipelines stay readable.
-  # Restore the master/schedule rule once a real linux-arm64 runner is
-  # registered and tagged.
+  # Still restricted to tags, deliberately. TYDEUS is currently running
+  # timing-sensitive model benchmarks, and adding a Rust release build to
+  # every master push and nightly would add CPU contention that could skew
+  # those measurements. Tagged releases are infrequent enough not to matter.
+  # Once the benchmark campaign is done, drop this `rules:` block to fall
+  # back to the template and match release:linux-x86_64 / macos-aarch64,
+  # which do build on master.
   rules:
     - if: $CI_COMMIT_TAG
       allow_failure: false
