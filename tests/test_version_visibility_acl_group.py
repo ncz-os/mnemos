@@ -34,9 +34,7 @@ surface rather than spinning up a full HTTP client because:
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -293,7 +291,7 @@ async def test_fetch_memory_log_acl_grant_widens_visibility():
     # _assert_memory_readable bypasses since we never call it here;
     # we just exercise fetch_memory_log directly with the snippet
     # the route layer composes.
-    rows = await mcp_repo.fetch_memory_log(
+    await mcp_repo.fetch_memory_log(
         conn,  # type: ignore[arg-type]
         memory_id="mem-1",
         branch="main",
