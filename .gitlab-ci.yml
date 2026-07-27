@@ -463,6 +463,23 @@ release:linux-aarch64:
     MNEMOS_EXPECTED_PLATFORM: linux-aarch64
   tags:
     - ultra-podman-arm64
+  # No linux-aarch64 GitLab runner currently exists on the fleet. The
+  # `ultra-podman-arm64` tag matches nothing: ULTRA's runner is a shell
+  # executor on macOS, and build-binary.sh detects the platform with
+  # `uname` and refuses ("expected linux-aarch64, detected macos-aarch64").
+  #
+  # The template would otherwise run this on every master push and on the
+  # nightly schedule, where it sits PENDING forever — and `allow_failure`
+  # does not help, because it forgives a failed job, never a queued one.
+  # That kept every scheduled pipeline from reaching a terminal state.
+  #
+  # Restrict it to tags so branch and scheduled pipelines stay readable.
+  # Restore the master/schedule rule once a real linux-arm64 runner is
+  # registered and tagged.
+  rules:
+    - if: $CI_COMMIT_TAG
+      allow_failure: false
+    - when: never
 
 release:macos-aarch64:
   extends: .release_binary_template
