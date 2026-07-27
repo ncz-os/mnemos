@@ -247,8 +247,19 @@ exclude = [
 ]
 
 [tool.ruff.lint]
-# Default select is E+F+W; we add a tight ignore list for patterns that are
-# intentional in this codebase.
+# Select E+F+W explicitly rather than relying on ruff's default.
+#
+# This used to be implicit, with a comment noting "default select is E+F+W".
+# That was true of the ruff we happened to resolve, but newer ruff broadened
+# its defaults, so an unpinned `ruff>=0.5.0` silently started enforcing rule
+# families this codebase has never adopted (I001, RET, DTZ, RUF, UP): 2971
+# errors appeared with no source change. The old behaviour was only being
+# preserved by a stale cached virtualenv pinning an old ruff — once .venv
+# stopped being cached, the lint gate broke.
+#
+# Naming the families makes the gate reproducible on any ruff version.
+# Adopting further rule sets should be a deliberate, separate change.
+select = ["E", "F", "W"]
 ignore = [
   "E402",  # module-level import not at top — legit with sys.path.insert + conditional imports
   "E501",  # line-too-long — we set line-length above; trust that
