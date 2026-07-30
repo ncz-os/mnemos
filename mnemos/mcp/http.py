@@ -388,6 +388,49 @@ async def handle_sse(request):
 # hidden for the process lifetime. Bounded LRU + TTL closes
 # both gaps without per-request httpx round-trips.
 _principal_context_cache: dict[str, tuple[MCPUserContext, float]] = {}
+
+# Generation stamp for the principal-context cache.
+#
+# MCPUserContext carries `role` and `namespace` -- authorization inputs. The
+# cache held them for _PRINCIPAL_CACHE_TTL_SECONDS with NOTHING invalidating it
+# on an ACL change, so narrowing a principal's role left MCP honouring the old
+# one for up to five minutes. That is the same revocation-freshness leak the
+# search cache was fixed for (ncz-os/mnemos#1), on a more sensitive value.
+#
+# The visibility epoch already advances on every visibility-narrowing mutation.
+# Reading it here is sync-safe: it is only a cached integer refreshed by the
+# async path, and a stale-but-lower generation can only cause an extra miss,
+# never a stale hit.
+_principal_cache_generation: int = 0
+
+
+def _register_epoch_listener() -> None:
+    """Subscribe to visibility-epoch bumps, if core is importable.
+
+    Registration is pull-based so core never has to import this module (which
+    exits at import when MNEMOS_MCP_TOKEN is unset).
+    """
+    try:
+        from mnemos.core.lifecycle import register_visibility_epoch_listener
+
+        register_visibility_epoch_listener(principal_cache_invalidate)
+    except Exception:
+        pass
+
+
+def principal_cache_invalidate(generation: int | None = None) -> None:
+    """Drop every cached principal context.
+
+    Called when the visibility epoch advances. Cheap and unconditional: the
+    cache is capped and repopulates on the next request, and being wrong in the
+    direction of "recompute" is the only safe direction for an authz input.
+    """
+    global _principal_cache_generation
+    if generation is not None:
+        if generation == _principal_cache_generation:
+            return
+        _principal_cache_generation = generation
+    _principal_context_cache.clear()
 _PRINCIPAL_CACHE_TTL_SECONDS = 300.0  # 5 min — short enough that
 # role/namespace changes propagate within a sane window; long
 # enough that high-rps SSE callers don't re-hit /auth/oauth/me.
@@ -817,3 +860,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+_register_epoch_listener()
