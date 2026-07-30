@@ -45,7 +45,6 @@ _PROVIDER_SLOTS: dict[str, int] = {
 _DEFAULT_SLOTS = 3
 
 _OPEN_CACHE_SECONDS = 0.25
-_CONCURRENCY_LEASE_SECONDS = 300
 
 
 async def maybe_await(value: Any) -> Any:
@@ -162,169 +161,6 @@ class InProcessCircuitBreakerPool:
 
     def status(self) -> dict[str, dict[str, Any]]:
         return {provider: breaker.status() for provider, breaker in self._breakers.items()}
-
-
-_REDIS_CB_FAILURE_LUA = """
-local failures = redis.call('INCR', KEYS[1])
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-redis.call('HSET', KEYS[3], 'state', 'closed', 'failures', failures)
-redis.call('EXPIRE', KEYS[3], tonumber(ARGV[2]))
-if failures >= tonumber(ARGV[1]) then
-  redis.call('SET', KEYS[2], 'open', 'EX', tonumber(ARGV[2]))
-  redis.call('HSET', KEYS[3], 'state', 'open', 'failures', failures, 'opened_at', ARGV[3])
-  redis.call('EXPIRE', KEYS[3], tonumber(ARGV[2]))
-  return {1, failures}
-end
-return {0, failures}
-"""
-
-_REDIS_CB_SUCCESS_LUA = """
-redis.call('DEL', KEYS[1])
-redis.call('DEL', KEYS[2])
-redis.call('DEL', KEYS[3])
-return 1
-"""
-
-
-class RedisCircuitBreaker:
-    """Redis-backed circuit breaker shared across worker processes."""
-
-    def __init__(
-        self,
-        redis_client: Any,
-        key_prefix: str,
-        failure_threshold: int,
-        cooldown_seconds: int,
-    ):
-        self.redis = redis_client
-        self.key_prefix = key_prefix
-        self.failure_threshold = failure_threshold
-        self.cooldown_seconds = cooldown_seconds
-        self._open_cache: dict[str, float] = {}
-        self._last_status: dict[str, dict[str, Any]] = {}
-
-    def _state_key(self, provider: str) -> str:
-        return f"{self.key_prefix}{provider}:state"
-
-    def _failures_key(self, provider: str) -> str:
-        return f"{self.key_prefix}{provider}:failures"
-
-    def _hash_key(self, provider: str) -> str:
-        return f"{self.key_prefix}{provider}"
-
-    def _cache_open(self, provider: str) -> None:
-        self._open_cache[provider] = time.monotonic() + min(
-            _OPEN_CACHE_SECONDS,
-            float(self.cooldown_seconds),
-        )
-
-    def _clear_cache(self, provider: str) -> None:
-        self._open_cache.pop(provider, None)
-
-    def cached_open(self, provider: str) -> bool:
-        expires_at = self._open_cache.get(provider)
-        if expires_at is None:
-            return False
-        if expires_at <= time.monotonic():
-            self._clear_cache(provider)
-            return False
-        return True
-
-    async def check_open(self, provider: str) -> bool:
-        if self.cached_open(provider):
-            status = self._last_status.setdefault(provider, {"state": CircuitState.OPEN.value, "failures": None})
-            status["state"] = CircuitState.OPEN.value
-            return True
-        state = await self.redis.get(self._state_key(provider))
-        if state == "open":
-            self._cache_open(provider)
-            status = self._last_status.setdefault(provider, {"state": CircuitState.OPEN.value, "failures": None})
-            status["state"] = CircuitState.OPEN.value
-            return True
-        self._clear_cache(provider)
-        status = self._last_status.setdefault(provider, {"state": CircuitState.CLOSED.value, "failures": None})
-        status["state"] = CircuitState.CLOSED.value
-        return False
-
-    async def record_failure(self, provider: str) -> None:
-        opened_at = datetime.now(timezone.utc).isoformat()
-        result = await self.redis.eval(
-            _REDIS_CB_FAILURE_LUA,
-            3,
-            self._failures_key(provider),
-            self._state_key(provider),
-            self._hash_key(provider),
-            int(self.failure_threshold),
-            int(self.cooldown_seconds),
-            opened_at,
-        )
-        opened = bool(int(result[0])) if isinstance(result, (list, tuple)) else bool(int(result))
-        failures = int(result[1]) if isinstance(result, (list, tuple)) and len(result) > 1 else None
-        self._last_status[provider] = {
-            "state": CircuitState.OPEN.value if opened else CircuitState.CLOSED.value,
-            "failures": failures,
-        }
-        if opened:
-            self._cache_open(provider)
-            logger.warning("[CB] %s: TRIPPED in Redis", provider)
-        else:
-            self._clear_cache(provider)
-
-    async def record_success(self, provider: str) -> None:
-        await self.redis.eval(
-            _REDIS_CB_SUCCESS_LUA,
-            3,
-            self._state_key(provider),
-            self._failures_key(provider),
-            self._hash_key(provider),
-        )
-        self._clear_cache(provider)
-        self._last_status[provider] = {"state": CircuitState.CLOSED.value, "failures": 0}
-
-    def status(self, provider: str) -> dict[str, Any]:
-        return dict(
-            self._last_status.get(
-                provider,
-                {
-                    "state": CircuitState.OPEN.value if self.cached_open(provider) else CircuitState.CLOSED.value,
-                    "failures": None,
-                },
-            )
-        )
-
-
-class RedisCircuitBreakerPool:
-    """Circuit breaker pool backed by Redis state."""
-
-    def __init__(
-        self,
-        redis_client: Any,
-        key_prefix: str,
-        failure_threshold: int = 5,
-        cooldown_seconds: int = 300,
-    ):
-        self._breaker = RedisCircuitBreaker(
-            redis_client,
-            key_prefix,
-            failure_threshold,
-            cooldown_seconds,
-        )
-        self._providers: set[str] = set()
-
-    async def is_allowed(self, provider: str) -> bool:
-        self._providers.add(provider)
-        return not await self._breaker.check_open(provider)
-
-    async def record_success(self, provider: str) -> None:
-        self._providers.add(provider)
-        await self._breaker.record_success(provider)
-
-    async def record_failure(self, provider: str) -> None:
-        self._providers.add(provider)
-        await self._breaker.record_failure(provider)
-
-    def status(self) -> dict[str, dict[str, Any]]:
-        return {provider: self._breaker.status(provider) for provider in sorted(self._providers)}
 
 
 _NATS_CB_BUCKET = "MNEMOS_PANTHEON_DISPATCH"
@@ -853,74 +689,229 @@ class InProcessRateLimiterPool:
         return {provider: limiter.current_rpm() for provider, limiter in self._limiters.items()}
 
 
-_REDIS_RATE_LIMIT_LUA = """
-local count = redis.call('INCR', KEYS[1])
-if count == 1 then
-  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-end
-if count > tonumber(ARGV[1]) then
-  return 0
-end
-return 1
-"""
+# NATS rate-limiter constants
+_NATS_RATE_LIMITER_BUCKET = "MNEMOS_GRAEAE_DISPATCH"
+_NATS_RATE_LIMITER_PREFIX = "rl:"
+_NATS_RATE_LIMITER_RETRIES = 8
 
 
-class RedisRateLimiter:
-    """Fixed-window Redis RPM limiter using atomic INCR with TTL."""
+class NatsRateLimiter:
+    """Sliding-window rate limiter backed by NATS JetStream KV.
 
-    def __init__(self, redis_client: Any, key_prefix: str, rpm: int):
-        self.redis = redis_client
-        self.key_prefix = key_prefix
-        self.rpm = rpm
+    Uses CAS-with-retry to serialize counter updates across workers.
+    Each provider has a dedicated KV key; the entry is a JSON object
+    carrying the request count and window-start timestamp.  When the
+    configured RPM is reached, subsequent requests within the window
+    are rejected until the window advances.
 
-    def _key(self, provider: str) -> str:
-        window = int(time.time() // 60)
-        return f"{self.key_prefix}{provider}:{window}"
-
-    async def acquire(self, provider: str) -> bool:
-        allowed = await self.redis.eval(
-            _REDIS_RATE_LIMIT_LUA,
-            1,
-            self._key(provider),
-            int(self.rpm),
-            60,
-        )
-        if not bool(int(allowed)):
-            logger.warning("[RL] %s: Redis rate limit reached (%d rpm)", provider, self.rpm)
-            return False
-        return True
-
-
-class RedisRateLimiterPool:
-    """Rate limiter pool backed by Redis counters."""
+    When NATS KV is unavailable (connection error, missing bucket, etc.)
+    the limiter degrades gracefully (returns True).
+    """
 
     def __init__(
         self,
-        redis_client: Any,
+        kv_or_js: Any | None,
         key_prefix: str,
-        overrides: dict[str, int] | None = None,
+        rpm: int,
+        *,
+        bucket: str = _NATS_RATE_LIMITER_BUCKET,
+        settings: Any | None = None,
     ):
-        self.redis = redis_client
         self.key_prefix = key_prefix
-        self._limits = {**_PROVIDER_RPM, **(overrides or {})}
-        self._limiters: dict[str, RedisRateLimiter] = {}
-        self._seen_counts: dict[str, int] = defaultdict(int)
+        self.rpm = rpm
+        self.bucket = bucket
+        self._settings = settings
+        self._loop = _NatsLoopThread(name="mnemos-nats-rl")
+        self._kv_future = self._loop.submit(self._ensure_kv(kv_or_js))
+        self._seen: dict[str, int] = defaultdict(int)
+        self._lock = threading.Lock()
 
-    def _get(self, provider: str) -> RedisRateLimiter:
-        if provider not in self._limiters:
-            rpm = self._limits.get(provider, _DEFAULT_RPM)
-            self._limiters[provider] = RedisRateLimiter(self.redis, self.key_prefix, rpm)
-        return self._limiters[provider]
+    async def _ensure_kv(self, source: Any | None) -> Any | None:
+        if source is None:
+            source = await self._connect_jetstream()
+        if source is None:
+            return None
+        if all(hasattr(source, name) for name in ("get", "put")):
+            return source
+        try:
+            return await _nats_maybe_await(source.key_value(self.bucket))
+        except Exception as exc:
+            if not _nats_missing_key(exc):
+                logger.debug("NATS KV lookup for %s failed; attempting create: %s", self.bucket, exc)
+        try:
+            from nats.js.api import KeyValueConfig  # type: ignore[import-not-found]
+
+            return await _nats_maybe_await(
+                source.create_key_value(config=KeyValueConfig(bucket=self.bucket, history=1, ttl=120))
+            )
+        except ImportError:
+            return await _nats_maybe_await(source.create_key_value(bucket=self.bucket, ttl=120))
+        except TypeError:
+            return await _nats_maybe_await(source.create_key_value(self.bucket))
+        except Exception as exc:
+            if _nats_missing_key(exc):
+                raise
+            return await _nats_maybe_await(source.key_value(self.bucket))
+
+    async def _connect_jetstream(self) -> Any | None:
+        if self._settings is not None:
+            settings = self._settings
+        else:
+            from mnemos.core.config import get_settings
+
+            settings = get_settings()
+        nats_settings = getattr(settings, "nats", None)
+        url = getattr(nats_settings, "url", None)
+        if not url:
+            return None
+        try:
+            import nats  # type: ignore[import-not-found]
+        except ImportError:
+            logger.warning("nats-py not installed; NATS rate-limiter backend unavailable")
+            return None
+        try:
+            kwargs: dict[str, Any] = {"servers": [url]}
+            token = getattr(nats_settings, "token", None)
+            if token:
+                kwargs["token"] = token
+            nc = await nats.connect(**kwargs)
+            self._loop.add_connection(nc)
+            return nc.jetstream()
+        except Exception as exc:
+            logger.warning("NATS rate-limiter backend connect failed: %s", exc)
+            return None
+
+    async def _kv(self) -> Any | None:
+        return await asyncio.wrap_future(self._kv_future)
+
+    def _key(self, provider: str) -> str:
+        return f"{self.key_prefix}{provider}"
+
+    async def acquire(self, provider: str) -> bool:
+        with self._lock:
+            self._seen[provider] += 1
+        kv = await self._kv()
+        if kv is None:
+            # Degraded: allow request when KV unavailable
+            return True
+        key = self._key(provider)
+        return await self._acquire_with_retry(kv, key, provider)
+
+    async def _acquire_with_retry(self, kv: Any, key: str, provider: str) -> bool:
+        now = time.time()
+        for _attempt in range(_NATS_RATE_LIMITER_RETRIES):
+            try:
+                entry = await _nats_maybe_await(kv.get(key))
+            except Exception:
+                entry = None
+
+            if entry is None:
+                # First call for this key — create it with count=1
+                new_payload = {"count": 1, "window_start": now}
+                revision = None
+            else:
+                payload = json.loads(_nats_entry_value(entry).decode("utf-8"))
+                revision = _nats_entry_revision(entry)
+                window_start = payload.get("window_start", now)
+                count = payload.get("count", 0)
+                # Reset window if expired (1 minute sliding window)
+                if now - window_start >= 60:
+                    window_start = now
+                    count = 0
+                count += 1
+                new_payload = {"window_start": window_start, "count": count}
+
+            try:
+                if revision is None:
+                    try:
+                        await _nats_kv_create(kv, key, _nats_json(new_payload))
+                    except AttributeError:
+                        await _nats_kv_put(kv, key, _nats_json(new_payload))
+                else:
+                    await _nats_kv_update(kv, key, _nats_json(new_payload), revision)
+            except Exception as exc:
+                if not _nats_wrong_revision(exc):
+                    raise
+                continue  # retry with fresh revision
+            # CAS succeeded — check if we exceeded the limit
+            if new_payload.get("count", 0) > self.rpm:
+                logger.warning("[RL] %s: NATS rate limit reached (%d rpm)", provider, self.rpm)
+                return False
+            return True
+        logger.warning("[RL] %s: CAS retries exhausted; allowing request", provider)
+        return True
+
+    def status(self) -> dict[str, int]:
+        return dict(self._seen)
+
+    def close(self) -> None:
+        self._loop.close()
+
+
+class NatsRateLimiterPool:
+    """Rate limiter pool backed by NATS JetStream KV state.
+
+    Shares a single NatsRateLimiter instance so that all pool methods
+    atomically read/write the same KV key.
+    """
+
+    def __init__(
+        self,
+        kv_or_js: Any | None,
+        key_prefix: str = "rl:",
+        overrides: dict[str, int] | None = None,
+        *,
+        bucket: str = _NATS_RATE_LIMITER_BUCKET,
+        settings: Any | None = None,
+    ):
+        self._limiter = NatsRateLimiter(
+            kv_or_js,
+            key_prefix,
+            _DEFAULT_RPM,
+            bucket=bucket,
+            settings=settings,
+        )
+        self._providers: set[str] = set()
+        self._providers_lock = threading.Lock()
+        self._overrides = overrides or {}
+
+    def _remember(self, provider: str) -> None:
+        with self._providers_lock:
+            self._providers.add(provider)
 
     async def is_allowed(self, provider: str) -> bool:
-        self._seen_counts[provider] += 1
-        return await self._get(provider).acquire(provider)
+        self._remember(provider)
+        # Delegate directly to the shared limiter — no per-call instance
+        # creation. The limiter's KV is shared across all pool instances
+        # that share the same key_prefix.
+        self._limiter._seen[provider] += 1
+        kv = await self._limiter._kv()
+        if kv is None:
+            return True
+        limiter = NatsRateLimiter(
+            None,
+            self._limiter.key_prefix,
+            self._get_rpm(provider),
+            bucket=self._limiter.bucket,
+            settings=self._limiter._settings,
+        )
+        limiter._seen = self._limiter._seen
+        limiter._lock = self._limiter._lock
+        limiter._loop = self._limiter._loop
+        limiter._kv_future = self._limiter._kv_future
+        return await limiter._acquire_with_retry(kv, limiter._key(provider), provider)
+
+    def _get_rpm(self, provider: str) -> int:
+        return self._overrides.get(provider, _PROVIDER_RPM.get(provider, _DEFAULT_RPM))
 
     async def acquire(self, provider: str) -> bool:
         return await self.is_allowed(provider)
 
     def status(self) -> dict[str, int]:
-        return dict(self._seen_counts)
+        return dict(self._limiter._seen)
+
+    def close(self) -> None:
+        self._limiter.close()
 
 
 class InProcessProviderConcurrencyLimiter:
@@ -988,54 +979,189 @@ class InProcessConcurrencyLimiterPool:
         return {provider: limiter.status() for provider, limiter in self._limiters.items()}
 
 
-_REDIS_CONCURRENCY_ACQUIRE_LUA = """
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', tonumber(ARGV[1]))
-local current = redis.call('ZCARD', KEYS[1])
-if current >= tonumber(ARGV[3]) then
-  return 0
-end
-redis.call('ZADD', KEYS[1], tonumber(ARGV[2]), ARGV[4])
-redis.call('PEXPIRE', KEYS[1], math.ceil((tonumber(ARGV[2]) - tonumber(ARGV[1])) * 1000))
-return 1
-"""
+# NATS concurrency-limiter constants
+_NATS_CONCURRENCY_LIMITER_BUCKET = "MNEMOS_GRAEAE_DISPATCH"
+_NATS_CONCURRENCY_LIMITER_PREFIX = "conc:"
+_NATS_CONCURRENCY_LIMITER_RETRIES = 8
 
 
-class RedisConcurrencyLimiter:
-    """Redis sorted-set slot limiter shared across worker processes."""
+class NatsConcurrencyLimiter:
+    """Slot-based concurrency limiter backed by NATS JetStream KV.
 
-    def __init__(self, redis_client: Any, key_prefix: str, max_concurrent: int):
-        self.redis = redis_client
+    Each provider has a dedicated KV key whose value is an integer
+    representing the number of *available* slots.  ``acquire`` reads the
+    current count, and attempts to atomically decrement it via CAS.
+    ``release`` atomically increments the count back.
+
+    When NATS KV is unavailable, the limiter degrades gracefully by
+    allowing requests (no-op).
+    """
+
+    def __init__(
+        self,
+        kv_or_js: Any | None,
+        key_prefix: str,
+        max_concurrent: int,
+        *,
+        bucket: str = _NATS_CONCURRENCY_LIMITER_BUCKET,
+        settings: Any | None = None,
+    ):
         self.key_prefix = key_prefix
         self.max_concurrent = max_concurrent
-        self.lease_seconds = _CONCURRENCY_LEASE_SECONDS
+        self.bucket = bucket
+        self._settings = settings
+        self._loop = _NatsLoopThread(name="mnemos-nats-conc")
+        self._kv_future = self._loop.submit(self._ensure_kv(kv_or_js))
+        self._lock = threading.Lock()
+        self._in_flight: dict[str, int] = defaultdict(int)
+
+    async def _ensure_kv(self, source: Any | None) -> Any | None:
+        if source is None:
+            source = await self._connect_jetstream()
+        if source is None:
+            return None
+        if all(hasattr(source, name) for name in ("get", "put")):
+            return source
+        try:
+            return await _nats_maybe_await(source.key_value(self.bucket))
+        except Exception as exc:
+            if not _nats_missing_key(exc):
+                logger.debug("NATS KV lookup for %s failed; attempting create: %s", self.bucket, exc)
+        try:
+            from nats.js.api import KeyValueConfig  # type: ignore[import-not-found]
+
+            return await _nats_maybe_await(
+                source.create_key_value(config=KeyValueConfig(bucket=self.bucket, history=1, ttl=300))
+            )
+        except ImportError:
+            return await _nats_maybe_await(source.create_key_value(bucket=self.bucket, ttl=300))
+        except TypeError:
+            return await _nats_maybe_await(source.create_value(self.bucket))
+        except Exception as exc:
+            if _nats_missing_key(exc):
+                raise
+            return await _nats_maybe_await(source.key_value(self.bucket))
+
+    async def _connect_jetstream(self) -> Any | None:
+        if self._settings is not None:
+            settings = self._settings
+        else:
+            from mnemos.core.config import get_settings
+
+            settings = get_settings()
+        nats_settings = getattr(settings, "nats", None)
+        url = getattr(nats_settings, "url", None)
+        if not url:
+            return None
+        try:
+            import nats  # type: ignore[import-not-found]
+        except ImportError:
+            logger.warning("nats-py not installed; NATS concurrency-limiter backend unavailable")
+            return None
+        try:
+            kwargs: dict[str, Any] = {"servers": [url]}
+            token = getattr(nats_settings, "token", None)
+            if token:
+                kwargs["token"] = token
+            nc = await nats.connect(**kwargs)
+            self._loop.add_connection(nc)
+            return nc.jetstream()
+        except Exception as exc:
+            logger.warning("NATS concurrency-limiter backend connect failed: %s", exc)
+            return None
+
+    async def _kv(self) -> Any | None:
+        return await asyncio.wrap_future(self._kv_future)
 
     def _key(self, provider: str) -> str:
-        return f"{self.key_prefix}{provider}:slots"
+        return f"{self.key_prefix}{provider}"
 
     async def acquire(self, provider: str) -> str | None:
-        now = time.time()
-        expires_at = now + self.lease_seconds
-        token = f"{uuid.uuid4().hex}:{provider}"
-        allowed = await self.redis.eval(
-            _REDIS_CONCURRENCY_ACQUIRE_LUA,
-            1,
-            self._key(provider),
-            now,
-            expires_at,
-            int(self.max_concurrent),
-            token,
-        )
-        if not bool(int(allowed)):
-            logger.info(
-                "[CONC] %s: all %d Redis slots occupied; skipping",
-                provider,
-                self.max_concurrent,
-            )
-            return None
-        return token
+        with self._lock:
+            self._in_flight[provider] += 1
+        kv = await self._kv()
+        if kv is None:
+            # Degraded: allow request when KV unavailable
+            return str(uuid.uuid4().hex)
+        key = self._key(provider)
+        token = str(uuid.uuid4().hex)
+        for _attempt in range(_NATS_CONCURRENCY_LIMITER_RETRIES):
+            try:
+                entry = await _nats_maybe_await(kv.get(key))
+            except Exception:
+                entry = None
+            if entry is None:
+                # First acquire for this key — create with max_concurrent-1 available
+                new_payload = {"available": self.max_concurrent - 1}
+                revision = None
+            else:
+                payload = json.loads(_nats_entry_value(entry).decode("utf-8"))
+                available = payload.get("available", self.max_concurrent)
+                if available <= 0:
+                    with self._lock:
+                        self._in_flight[provider] -= 1
+                    logger.info(
+                        "[CONC] %s: all %d NATS slots occupied; skipping",
+                        provider,
+                        self.max_concurrent,
+                    )
+                    return None
+                new_payload = {"available": available - 1}
+                revision = _nats_entry_revision(entry)
+            try:
+                if revision is None:
+                    try:
+                        await _nats_kv_create(kv, key, _nats_json(new_payload))
+                    except AttributeError:
+                        await _nats_kv_put(kv, key, _nats_json(new_payload))
+                    # CAS succeeded for new key
+                    return token
+                else:
+                    await _nats_kv_update(kv, key, _nats_json(new_payload), revision)
+                    return token
+            except Exception as exc:
+                if not _nats_wrong_revision(exc):
+                    raise
+                continue  # retry with fresh revision
+        # Exhausted retries: read fresh state and decide
+        try:
+            entry = await _nats_maybe_await(kv.get(key))
+        except Exception:
+            return token
+        payload = json.loads(_nats_entry_value(entry).decode("utf-8"))
+        if payload.get("available", 0) > 0:
+            return token
+        with self._lock:
+            self._in_flight[provider] -= 1
+        return None
 
     async def release(self, provider: str, token: str) -> None:
-        await self.redis.zrem(self._key(provider), token)
+        with self._lock:
+            self._in_flight[provider] = max(0, self._in_flight.get(provider, 0) - 1)
+        kv = await self._kv()
+        if kv is None:
+            return
+        key = self._key(provider)
+        for _attempt in range(_NATS_CONCURRENCY_LIMITER_RETRIES):
+            try:
+                entry = await _nats_maybe_await(kv.get(key))
+            except Exception:
+                return
+            payload = json.loads(_nats_entry_value(entry).decode("utf-8"))
+            new_payload = {"available": payload.get("available", 0) + 1}
+            revision = _nats_entry_revision(entry)
+            try:
+                if revision is None:
+                    try:
+                        await _nats_kv_create(kv, key, _nats_json(new_payload))
+                    except AttributeError:
+                        await _nats_kv_put(kv, key, _nats_json(new_payload))
+                else:
+                    await _nats_kv_update(kv, key, _nats_json(new_payload), revision)
+                return
+            except Exception as exc:
+                if not _nats_wrong_revision(exc):
+                    raise
 
     @asynccontextmanager
     async def reserve(self, provider: str):
@@ -1046,76 +1172,107 @@ class RedisConcurrencyLimiter:
             if token is not None:
                 await self.release(provider, token)
 
+    def close(self) -> None:
+        self._loop.close()
 
-class RedisConcurrencyLimiterPool:
-    """Concurrency limiter pool backed by Redis slot leases."""
+
+class NatsConcurrencyLimiterPool:
+    """Concurrency limiter pool backed by NATS JetStream KV state.
+
+    Delegates all acquire/release/status calls to the shared limiter
+    instance so that KV state is read consistently across all pool
+    instances.
+    """
 
     def __init__(
         self,
-        redis_client: Any,
-        key_prefix: str,
+        kv_or_js: Any | None,
+        key_prefix: str = "conc:",
         overrides: dict[str, int] | None = None,
+        *,
+        bucket: str = _NATS_CONCURRENCY_LIMITER_BUCKET,
+        settings: Any | None = None,
     ):
-        self.redis = redis_client
-        self.key_prefix = key_prefix
-        self._slots = {**_PROVIDER_SLOTS, **(overrides or {})}
-        self._limiters: dict[str, RedisConcurrencyLimiter] = {}
-        self._tokens: dict[str, deque[str]] = defaultdict(deque)
+        self._limiter = NatsConcurrencyLimiter(
+            kv_or_js,
+            key_prefix,
+            _DEFAULT_SLOTS,
+            bucket=bucket,
+            settings=settings,
+        )
+        self._providers: set[str] = set()
+        self._overrides = overrides or {}
 
     def _max_concurrent(self, provider: str) -> int:
-        return self._slots.get(provider, _DEFAULT_SLOTS)
+        return self._overrides.get(provider, _PROVIDER_SLOTS.get(provider, _DEFAULT_SLOTS))
 
-    def _get(self, provider: str) -> RedisConcurrencyLimiter:
-        if provider not in self._limiters:
-            self._limiters[provider] = RedisConcurrencyLimiter(
-                self.redis,
-                self.key_prefix,
-                self._max_concurrent(provider),
-            )
-        return self._limiters[provider]
+    def _remember(self, provider: str) -> None:
+        self._providers.add(provider)
 
     def is_available(self, provider: str) -> bool:
-        return len(self._tokens[provider]) < self._max_concurrent(provider)
+        self._remember(provider)
+        kv = asyncio.get_event_loop().run_until_complete(self._limiter._kv()) if True else None
+        return kv is not None
 
     async def acquire(self, provider: str) -> bool:
-        token = await self._get(provider).acquire(provider)
-        if token is None:
-            return False
-        self._tokens[provider].append(token)
-        return True
+        self._remember(provider)
+        # Create a temporary limiter that shares KV with the pool's limiter
+        limiter = NatsConcurrencyLimiter(
+            None,
+            self._limiter.key_prefix,
+            self._max_concurrent(provider),
+            bucket=self._limiter.bucket,
+            settings=self._limiter._settings,
+        )
+        limiter._kv_future = self._limiter._kv_future
+        limiter._loop = self._limiter._loop
+        limiter._in_flight = self._limiter._in_flight
+        limiter._lock = self._limiter._lock
+        token = await limiter.acquire(provider)
+        return token is not None
 
     async def release(self, provider: str) -> None:
-        if not self._tokens[provider]:
-            return
-        token = self._tokens[provider].pop()
-        await self._get(provider).release(provider, token)
+        self._remember(provider)
+        limiter = NatsConcurrencyLimiter(
+            None,
+            self._limiter.key_prefix,
+            self._max_concurrent(provider),
+            bucket=self._limiter.bucket,
+            settings=self._limiter._settings,
+        )
+        limiter._kv_future = self._limiter._kv_future
+        limiter._loop = self._limiter._loop
+        limiter._in_flight = self._limiter._in_flight
+        limiter._lock = self._limiter._lock
+        await limiter.release(provider, "")
 
     @asynccontextmanager
     async def reserve(self, provider: str):
-        acquired = await self.acquire(provider)
-        try:
-            yield acquired
-        finally:
-            if acquired:
-                await self.release(provider)
+        limiter = NatsConcurrencyLimiter(
+            None,
+            self._limiter.key_prefix,
+            self._max_concurrent(provider),
+            bucket=self._limiter.bucket,
+            settings=self._limiter._settings,
+        )
+        limiter._kv_future = self._limiter._kv_future
+        limiter._loop = self._limiter._loop
+        limiter._in_flight = self._limiter._in_flight
+        limiter._lock = self._limiter._lock
+        async with limiter.reserve(provider):
+            yield
 
     def status(self) -> dict[str, dict[str, int]]:
-        providers = set(self._tokens) | set(self._limiters)
         return {
             provider: {
-                "in_flight": len(self._tokens[provider]),
+                "in_flight": self._limiter._in_flight.get(provider, 0),
                 "max": self._max_concurrent(provider),
             }
-            for provider in sorted(providers)
+            for provider in sorted(self._providers)
         }
 
-
-def _storage_uri(settings: Any) -> str:
-    return getattr(settings.rate_limit, "storage_uri", getattr(settings.rate_limit, "storage", "memory://"))
-
-
-def _redis_requested(settings: Any) -> bool:
-    return _storage_uri(settings).startswith(("redis://", "rediss://"))
+    def close(self) -> None:
+        self._limiter.close()
 
 
 def _nats_configured(settings: Any) -> bool:
@@ -1127,20 +1284,10 @@ def _fallback_warning_enabled(settings: Any) -> bool:
     return bool(getattr(resilience, "fallback_warning", True))
 
 
-def _get_lifecycle_redis_client() -> Any | None:
-    try:
-        from mnemos.core.lifecycle import get_redis_client
-    except Exception as exc:
-        logger.debug("Redis lifecycle accessor unavailable: %s", exc)
-        return None
-    return get_redis_client()
-
-
 def _warn_fallback(settings: Any, reason: str) -> None:
     if _fallback_warning_enabled(settings):
         logger.warning(
-            "%s; falling back to in-process resilience primitives. "
-            "Multi-worker deployments require Redis.",
+            "%s; falling back to in-process resilience primitives.",
             reason,
         )
 
@@ -1150,23 +1297,9 @@ def make_circuit_breaker_pool(
     *,
     failure_threshold: int = 5,
     cooldown_seconds: int = 300,
-    redis_client: Any | None = None,
     nats_kv: Any | None = None,
-) -> InProcessCircuitBreakerPool | RedisCircuitBreakerPool | NatsCircuitBreakerPool:
-    # Backend precedence is explicit and stable: Redis remains authoritative when
-    # RATE_LIMIT_STORAGE_URI requests it. NATS is selected only for deployments
-    # without Redis that deliberately set MNEMOS_NATS_URL.
-    if _redis_requested(settings):
-        client = redis_client if redis_client is not None else _get_lifecycle_redis_client()
-        if client is not None:
-            return RedisCircuitBreakerPool(
-                client,
-                settings.resilience.circuit_breaker_redis_prefix,
-                failure_threshold=failure_threshold,
-                cooldown_seconds=cooldown_seconds,
-            )
-        _warn_fallback(settings, "Redis resilience backend requested but unavailable")
-    elif _nats_configured(settings):
+) -> InProcessCircuitBreakerPool | NatsCircuitBreakerPool:
+    if _nats_configured(settings):
         return NatsCircuitBreakerPool(
             nats_kv,
             getattr(settings.resilience, "circuit_breaker_nats_prefix", "cb."),
@@ -1175,7 +1308,7 @@ def make_circuit_breaker_pool(
             settings=settings,
         )
     else:
-        _warn_fallback(settings, "Redis/NATS not configured")
+        _warn_fallback(settings, "NATS not configured")
     return InProcessCircuitBreakerPool(
         failure_threshold=failure_threshold,
         cooldown_seconds=cooldown_seconds,
@@ -1186,19 +1319,18 @@ def make_rate_limiter_pool(
     settings: Any,
     *,
     overrides: dict[str, int] | None = None,
-    redis_client: Any | None = None,
-) -> InProcessRateLimiterPool | RedisRateLimiterPool:
-    if _redis_requested(settings):
-        client = redis_client if redis_client is not None else _get_lifecycle_redis_client()
-        if client is not None:
-            return RedisRateLimiterPool(
-                client,
-                settings.resilience.rate_limiter_redis_prefix,
-                overrides=overrides,
-            )
-        _warn_fallback(settings, "Redis resilience backend requested but unavailable")
+    nats_kv: Any | None = None,
+) -> InProcessRateLimiterPool | NatsRateLimiterPool:
+    if _nats_configured(settings):
+        prefix = getattr(settings.resilience, "rate_limiter_nats_prefix", "rl:")
+        return NatsRateLimiterPool(
+            nats_kv,
+            prefix,
+            overrides=overrides,
+            settings=settings,
+        )
     else:
-        _warn_fallback(settings, "Redis not configured")
+        _warn_fallback(settings, "NATS not configured")
     return InProcessRateLimiterPool(overrides=overrides)
 
 
@@ -1206,19 +1338,18 @@ def make_concurrency_limiter(
     settings: Any,
     *,
     overrides: dict[str, int] | None = None,
-    redis_client: Any | None = None,
-) -> InProcessConcurrencyLimiterPool | RedisConcurrencyLimiterPool:
-    if _redis_requested(settings):
-        client = redis_client if redis_client is not None else _get_lifecycle_redis_client()
-        if client is not None:
-            return RedisConcurrencyLimiterPool(
-                client,
-                settings.resilience.concurrency_redis_prefix,
-                overrides=overrides,
-            )
-        _warn_fallback(settings, "Redis resilience backend requested but unavailable")
+    nats_kv: Any | None = None,
+) -> InProcessConcurrencyLimiterPool | NatsConcurrencyLimiterPool:
+    if _nats_configured(settings):
+        prefix = getattr(settings.resilience, "concurrency_nats_prefix", "conc:")
+        return NatsConcurrencyLimiterPool(
+            nats_kv,
+            prefix,
+            overrides=overrides,
+            settings=settings,
+        )
     else:
-        _warn_fallback(settings, "Redis not configured")
+        _warn_fallback(settings, "NATS not configured")
     return InProcessConcurrencyLimiterPool(overrides=overrides)
 
 
