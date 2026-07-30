@@ -57,6 +57,10 @@ class _Conn:
         compact = " ".join(sql.split())
         if compact.startswith("SELECT owner_id, namespace FROM memories WHERE id = $1"):
             return {"owner_id": "alice", "namespace": "alice-ns"}
+        # ACL disjunct — this test fixtures no ACL grants for the
+        # memory, so the query must return None (no matching row).
+        if "FROM memory_acl" in compact:
+            return None
 
         raise AssertionError(f"unexpected fetchrow SQL: {sql}")
 

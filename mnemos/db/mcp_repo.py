@@ -64,6 +64,7 @@ async def fetch_memory_log(
     else:
         vis_clause, vis_params = version_visibility_predicate(
             user.user_id,
+            user.group_ids,
             start_param_idx=4,
             table_alias="mv",
         )
@@ -200,6 +201,7 @@ async def _fetch_branch_start_by_commit(
 
     vis_clause, vis_params = version_visibility_predicate(
         user.user_id,
+        user.group_ids,
         start_param_idx=3,
     )
     ns_ph = f"${len(vis_params) + 3}"
@@ -230,6 +232,7 @@ async def _fetch_main_branch_start(conn: Any, memory_id: str, user: UserContext)
 
     vis_clause, vis_params = version_visibility_predicate(
         user.user_id,
+        user.group_ids,
         start_param_idx=2,
         table_alias="mv",
     )
@@ -307,6 +310,7 @@ async def _fetch_existing_branch(
 
     vis_clause, vis_params = version_visibility_predicate(
         user.user_id,
+        user.group_ids,
         start_param_idx=3,
         table_alias="mv",
     )
@@ -348,6 +352,7 @@ async def fetch_diff_commit_pair(
 
     vis_clause, vis_params = version_visibility_predicate(
         user.user_id,
+        user.group_ids,
         start_param_idx=3,
     )
     ns_ph = f"${len(vis_params) + 3}"
@@ -384,6 +389,7 @@ async def fetch_checkout_commit(
 
     vis_clause, vis_params = version_visibility_predicate(
         user.user_id,
+        user.group_ids,
         start_param_idx=3,
     )
     ns_ph = f"${len(vis_params) + 3}"

@@ -20,7 +20,11 @@ from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.api.routes._postgres_only import _require_postgres_backend
 from mnemos.api.routes.memories import _schedule_outbox_deliveries
 from mnemos.core.secret_detection import redact_field_with_stored
-from mnemos.core.visibility import read_visibility_predicate
+from mnemos.core.visibility import (
+    ACL_READ_BIT,
+    acl_principals,
+    read_visibility_predicate,
+)
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
 
@@ -42,6 +46,16 @@ def _branch_advisory_lock_key(memory_id: str, branch: str, _hashlib_mod=None) ->
     if key >= 2**63:
         key -= 2**64
     return key
+
+
+# Defensive cap on the size of the principals list passed to memory_acl
+# lookups. In practice this list comes from ``acl_principals()`` which
+# builds ``[user:<id>] + [group:<g> for g in group_ids]``, and group_ids
+# is resolved at auth time — so it's tiny. The cap exists to defend
+# against future code paths that might construct principals from a less
+# trusted source (e.g. an HTTP header) and to keep the SQL below PG's
+# per-query parameter limit with a wide safety margin.
+_MAX_PRINCIPALS_PER_QUERY = 1024
 
 
 async def _assert_memory_writable(conn, memory_id: str, user: UserContext) -> None:
@@ -179,9 +193,10 @@ async def get_memory_log(
         async with pool.acquire() as conn:
             await _assert_memory_readable(conn, memory_id, user)
             # Recursive CTE: walk from HEAD backward through parent_version_id.
-            # Carries owner_id/namespace/permission_mode and the actual parent
-            # identity through both arms so the post-walk filter can drop
-            # snapshots the caller can't read without inventing parent edges.
+            # Carries owner_id/namespace/permission_mode/group_id and the actual
+            # parent identity through both arms so the post-walk filter can
+            # drop snapshots the caller can't read without inventing parent
+            # edges.
             rows = await conn.fetch(
                 """
                 WITH RECURSIVE commit_walk AS (
@@ -191,7 +206,7 @@ async def get_memory_log(
                         parent_mv.commit_hash AS parent_commit_hash,
                         mv.version_num, mv.branch, mv.content, mv.category,
                         mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
-                        mv.owner_id, mv.namespace, mv.permission_mode,
+                        mv.owner_id, mv.namespace, mv.permission_mode, mv.group_id,
                         1 AS depth
                     FROM memory_versions mv
                     LEFT JOIN memory_versions parent_mv
@@ -219,7 +234,7 @@ async def get_memory_log(
                         parent_mv.commit_hash AS parent_commit_hash,
                         mv.version_num, mv.branch, mv.content, mv.category,
                         mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
-                        mv.owner_id, mv.namespace, mv.permission_mode,
+                        mv.owner_id, mv.namespace, mv.permission_mode, mv.group_id,
                         cw.depth + 1
                     FROM memory_versions mv
                     LEFT JOIN memory_versions parent_mv
@@ -236,7 +251,7 @@ async def get_memory_log(
                     id, commit_hash, parent_version_id, parent_commit_hash,
                     version_num, branch, content, category, subcategory,
                     snapshot_at, snapshot_by, change_type,
-                    owner_id, namespace, permission_mode
+                    owner_id, namespace, permission_mode, group_id
                 FROM commit_walk
                 ORDER BY depth ASC
                 LIMIT $3
@@ -257,11 +272,54 @@ async def get_memory_log(
             # only became authorized after the permission flip.
             # Mirrors api/handlers/versions.py + mnemos/db/mcp_repo.py.
             if user.role != "root":
+                principals = acl_principals(user.user_id, user.group_ids)
+                # Defensive cap on principals size — guards against a
+                # pathological caller with thousands of group_ids
+                # blowing through PG's 65535-parameter limit (1 array
+                # is fine, but values that arrive through any later
+                # code path that unpacks the array would not be).
+                # In practice user.group_ids is server-resolved and
+                # small; this is belt-and-braces.
+                if len(principals) > _MAX_PRINCIPALS_PER_QUERY:
+                    logger.warning(
+                        "[DAG] principals list size %d exceeds cap %d; "
+                        "truncating for ACL visibility check on %s",
+                        len(principals), _MAX_PRINCIPALS_PER_QUERY, memory_id,
+                    )
+                    principals = principals[:_MAX_PRINCIPALS_PER_QUERY]
+                # The memory_acl.perm bit mask MUST come from the
+                # ACL_READ_BIT constant, never be hard-coded: an
+                # accidental constant drift here would silently flip
+                # authorization to a different permission (e.g. write
+                # bit 2) without any test catching it.
+                #
+                # memory_acl.perm is SMALLINT; we cast the bound
+                # parameter to smallint so the bitwise operator keeps
+                # its native type and the planner can fold it to a
+                # constant predicate.
+                #
+                # We use fetchrow (returns record-or-None) rather than
+                # fetchval (returns scalar-or-None) for parity with
+                # the rest of dag.py and to keep the fake backend in
+                # tests/test_dag_visibility_gap.py trivially mockable.
+                acl_visible = bool(principals) and bool(await conn.fetchrow(
+                    "SELECT 1 FROM memory_acl WHERE memory_id = $1 "
+                    "AND principal = ANY($2::text[]) "
+                    "AND (perm & $3::smallint) <> 0 LIMIT 1",
+                    memory_id, principals, ACL_READ_BIT,
+                ))
 
                 def _snap_visible(r) -> bool:
                     if r["namespace"] != user.namespace:
                         return False
-                    return r["owner_id"] == user.user_id or (r["permission_mode"] % 10) >= 4
+                    group_visible = (
+                        ((r["permission_mode"] // 10) % 10) >= 4
+                        and r["group_id"] is not None
+                        and r["group_id"] in user.group_ids
+                    )
+                    return (r["owner_id"] == user.user_id
+                            or (r["permission_mode"] % 10) >= 4
+                            or group_visible or acl_visible)
 
                 rows = [r for r in rows if _snap_visible(r)]
 
@@ -337,6 +395,7 @@ async def get_memory_branches(
 
                 vis_clause, vis_params = version_visibility_predicate(
                     user.user_id,
+                    user.group_ids,
                     start_param_idx=2,
                     table_alias="mv",
                 )
@@ -446,6 +505,7 @@ async def create_branch(
 
                         vis_clause, vis_params = version_visibility_predicate(
                             user.user_id,
+                            user.group_ids,
                             start_param_idx=3,
                         )
                         ns_ph = f"${len(vis_params) + 3}"
@@ -479,6 +539,7 @@ async def create_branch(
 
                         vis_clause, vis_params = version_visibility_predicate(
                             user.user_id,
+                            user.group_ids,
                             start_param_idx=2,
                             table_alias="mv",
                         )
@@ -583,6 +644,7 @@ async def get_commit(
                 # parent_hash when the parent is invisible.
                 vis_mv, vis_mv_params = version_visibility_predicate(
                     user.user_id,
+                    user.group_ids,
                     start_param_idx=3,
                     table_alias="mv",
                 )
@@ -591,6 +653,7 @@ async def get_commit(
                 # offsets continue after the row's namespace param.
                 vis_mv2, vis_mv2_params = version_visibility_predicate(
                     user.user_id,
+                    user.group_ids,
                     start_param_idx=len(vis_mv_params) + 4,
                     table_alias="mv2",
                 )
@@ -714,6 +777,7 @@ async def merge_branch(
 
                 vis_clause, vis_params = version_visibility_predicate(
                     user.user_id,
+                    user.group_ids,
                     start_param_idx=3,
                     table_alias="mv",
                 )
