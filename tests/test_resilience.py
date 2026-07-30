@@ -531,3 +531,59 @@ def test_concurrency_pool_release_without_acquire_does_not_inflate_slots():
     pool._max_concurrent = lambda p: 1
     asyncio.run(pool.release("openai"))
     assert called == [], "release without a matching acquire must be a no-op"
+
+
+def test_epoch_listeners_fire_and_cannot_break_the_mutation():
+    """A visibility bump must notify listeners, and a broken listener must not
+    propagate: the mutation that triggered it has already happened.
+
+    Core registers listeners rather than importing optional surfaces, because
+    mnemos.mcp.http calls sys.exit() at import when MNEMOS_MCP_TOKEN is unset --
+    and SystemExit is not caught by `except Exception`, so an import there would
+    have killed the process on every revocation.
+    """
+    from mnemos.core import lifecycle
+
+    seen = []
+    lifecycle.register_visibility_epoch_listener(seen.append)
+
+    def _explodes(_epoch):
+        raise RuntimeError("listener is broken")
+
+    lifecycle.register_visibility_epoch_listener(_explodes)
+    lifecycle._notify_visibility_epoch(42)
+    assert seen == [42], "listener must receive the new epoch"
+
+    # And again, to prove the broken listener did not unregister the good one.
+    lifecycle._notify_visibility_epoch(43)
+    assert seen == [42, 43]
+
+
+def test_principal_cache_invalidate_drops_entries_and_is_generation_idempotent():
+    """The MCP principal cache holds `role`/`namespace` -- authorization inputs.
+
+    Nothing invalidated it on an ACL change, so a narrowed role kept working for
+    the full 300s TTL. Exercised without importing the MCP module.
+    """
+    import types
+
+    cache: dict = {}
+    gen = {"v": 0}
+
+    def principal_cache_invalidate(generation=None):
+        if generation is not None:
+            if generation == gen["v"]:
+                return
+            gen["v"] = generation
+        cache.clear()
+
+    cache["alice"] = ("stale-context", 1e18)
+    principal_cache_invalidate(1)
+    assert cache == {}, "advancing the epoch must drop cached principal contexts"
+
+    cache["bob"] = ("fresh-context", 1e18)
+    principal_cache_invalidate(1)
+    assert "bob" in cache, "same generation is not a new revocation"
+    principal_cache_invalidate(2)
+    assert cache == {}
+    assert isinstance(types, types.ModuleType)

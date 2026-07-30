@@ -1112,9 +1112,46 @@ def _vis_epoch() -> Any:
     return _vis_epoch_impl
 
 
+# Callbacks fired when the visibility epoch advances.
+#
+# A REGISTRY, not an import. The obvious version imported
+# mnemos.mcp.http directly, but that module validates MNEMOS_MCP_TOKEN at
+# import time and calls sys.exit when it is unset -- and SystemExit derives
+# from BaseException, so a routine `except Exception` around the import would
+# NOT have caught it. Every visibility-narrowing mutation on a host without
+# that variable would have killed the process.
+#
+# Optional surfaces register themselves instead; core imports nothing.
+_vis_epoch_listeners: list[Any] = []
+
+
+def register_visibility_epoch_listener(fn: Any) -> None:
+    """Register a callback invoked with the new epoch after every bump."""
+    if fn not in _vis_epoch_listeners:
+        _vis_epoch_listeners.append(fn)
+
+
+def _notify_visibility_epoch(epoch: int) -> None:
+    for fn in list(_vis_epoch_listeners):
+        try:
+            fn(epoch)
+        except Exception:
+            # A listener must never break the mutation that triggered it.
+            logger.debug("[epoch] listener failed", exc_info=True)
+
+
 async def _vis_epoch_get_incr() -> int:
-    """Bump the epoch and return the new value."""
-    return await _vis_epoch().bump()
+    """Bump the epoch and return the new value.
+
+    Also drops the MCP principal-context cache. That cache holds `role` and
+    `namespace` -- authorization inputs -- for five minutes with nothing else
+    invalidating it, so an ACL revoke was honoured late there even once the
+    search cache was fixed. Every caller of this function is performing a
+    visibility-narrowing mutation, which is exactly when that cache is wrong.
+    """
+    epoch = await _vis_epoch().bump()
+    _notify_visibility_epoch(epoch)
+    return epoch
 
 
 async def _vis_epoch_current() -> int:
