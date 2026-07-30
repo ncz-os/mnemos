@@ -1,6 +1,8 @@
 from __future__ import annotations
-
 import asyncio
+import threading
+import pytest
+
 import logging
 import time
 from types import SimpleNamespace
@@ -374,3 +376,158 @@ def test_nats_circuit_breaker_keys_are_opaque():
             assert plaintext not in key
     finally:
         breaker.close()
+
+
+# ---------------------------------------------------------------------------
+# NatsVisibilityEpoch — the failure modes that actually matter.
+#
+# The original coverage passed epochs 0 and 1 into _get_cache_key() and asserted
+# the keys differed. That proves hashing takes an extra argument; it proves
+# nothing about CAS races, retry exhaustion, degraded recovery, or monotonicity.
+# ---------------------------------------------------------------------------
+
+
+class KeyNotFoundError(Exception):
+    """Named so _nats_missing_key() classifies it as nats-py errors are."""
+
+
+class _FakeEntry:
+    def __init__(self, value, revision):
+        self.value = value
+        self.revision = revision
+
+
+class _FakeKV:
+    """Minimal JetStream KV with real revision semantics."""
+
+    def __init__(self, *, fail_updates=0):
+        self._val = None
+        self._rev = 0
+        self._fail_updates = fail_updates
+
+    async def get(self, key):
+        if self._val is None:
+            # Must match _nats_missing_key(), which keys on "not found".
+            raise KeyNotFoundError("key not found")
+        return _FakeEntry(self._val, self._rev)
+
+    async def create(self, key, value):
+        if self._val is not None:
+            raise RuntimeError("wrong last sequence")
+        self._val, self._rev = value, 1
+        return self._rev
+
+    async def update(self, key, value, last=None):
+        if self._fail_updates > 0:
+            self._fail_updates -= 1
+            # Emulate a competing writer: bump the revision so `last` is stale.
+            self._rev += 1
+            raise RuntimeError("wrong last sequence")
+        if last != self._rev:
+            raise RuntimeError("wrong last sequence")
+        self._val, self._rev = value, self._rev + 1
+        return self._rev
+
+
+def _epoch_with(kv):
+    from mnemos.core.resilience import NatsVisibilityEpoch
+
+    e = NatsVisibilityEpoch.__new__(NatsVisibilityEpoch)
+    e.bucket = "test"
+    e._settings = None
+    e._floor = 0
+    e._floor_lock = threading.Lock()
+
+    async def _kv():
+        return kv
+
+    e._kv = _kv
+    return e
+
+
+def test_epoch_bump_increments_and_persists():
+    kv = _FakeKV()
+    e = _epoch_with(kv)
+    assert asyncio.run(e.bump()) == 1
+    assert asyncio.run(e.bump()) == 2
+    assert asyncio.run(e.current()) == 2
+
+
+def test_epoch_bump_retries_through_cas_contention():
+    # Two lost races, then success: the value must still advance exactly once
+    # per successful bump, never skipping backwards.
+    kv = _FakeKV(fail_updates=2)
+    e = _epoch_with(kv)
+    asyncio.run(e.bump())
+    first = asyncio.run(e.current())
+    assert first >= 1
+    assert asyncio.run(e.bump()) > first
+
+
+def test_epoch_raises_when_it_cannot_advance():
+    """Retry exhaustion must be LOUD.
+
+    Silently returning a degraded value here is what re-opens the revocation
+    leak: the caller discards the return, later reads succeed against the
+    healthy store, and they see the OLD epoch.
+    """
+    from mnemos.core.resilience import VisibilityEpochBumpFailed
+
+    kv = _FakeKV(fail_updates=10_000)
+    e = _epoch_with(kv)
+    asyncio.run(e.bump())  # seed
+    with pytest.raises(VisibilityEpochBumpFailed):
+        asyncio.run(e.bump(attempts=3))
+
+
+def test_epoch_never_moves_backward_on_recovery():
+    """A degraded epoch is a large time bucket; the persisted counter is small.
+
+    Handing back the small number after recovery would make cache entries
+    written during the outage readable again.
+    """
+    kv = _FakeKV()
+    e = _epoch_with(kv)
+
+    async def _no_kv():
+        return None
+
+    e._kv = _no_kv
+    degraded = asyncio.run(e.current())
+    assert degraded > 1000, "degraded epoch should be a clock-derived bucket"
+
+    async def _kv():
+        return kv
+
+    e._kv = _kv
+    asyncio.run(e.bump())
+    assert asyncio.run(e.current()) >= degraded, "epoch moved backward on recovery"
+
+
+def test_concurrency_pool_release_without_acquire_does_not_inflate_slots():
+    """An unmatched release must not hand back a slot that was never taken."""
+    from mnemos.core.resilience import NatsConcurrencyLimiterPool
+
+    pool = NatsConcurrencyLimiterPool.__new__(NatsConcurrencyLimiterPool)
+    pool._tokens = {}
+    pool._token_lock = threading.Lock()
+    pool._providers = set()
+    pool._remember = lambda p: pool._providers.add(p)
+    called = []
+
+    class _L:
+        key_prefix = "x"
+        bucket = "b"
+        _settings = None
+        _kv_future = None
+        _loop = None
+        _in_flight = {}
+        _lock = threading.Lock()
+
+        async def release(self, provider, token):
+            called.append(token)
+
+    pool._limiter = _L()
+    pool._max_concurrent = lambda p: 1
+    asyncio.run(pool.release("openai"))
+    assert called == [], "release without a matching acquire must be a no-op"
