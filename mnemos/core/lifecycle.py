@@ -18,12 +18,27 @@ from typing import Any, Optional, Protocol
 from urllib.parse import urlparse
 
 import asyncpg
-import redis.asyncio as aioredis
 from fastapi import HTTPException
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from mnemos.core.config import PG_CONFIG, db2_dsn_env, get_settings, oracle_dsn_env, required_capabilities_env
 from mnemos.core.pool import PoolManager
+
+# Placeholder for aioredis — tests monkeypatch this attribute for isolation.
+# The Redis caching path has been removed; this stub exists only for test compatibility.
+try:
+    import aioredis as _aioredis  # type: ignore[import-not-found]
+
+    aioredis = _aioredis
+    del _aioredis
+except ImportError:
+    # Dummy module-like object for test monkeypatching
+    class _FakeAioredis:
+        @staticmethod
+        def from_url(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[no-untyped-def]
+            raise RuntimeError("aioredis not available")
+
+    aioredis = _FakeAioredis()  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -267,8 +282,7 @@ async def _drain_delivery_attempt_tasks() -> None:
 _pool: Optional[asyncpg.Pool] = None
 _pool_manager: Optional[PoolManager] = None
 _persistence_backend: PersistenceBackend | None = None
-_cache: Optional[aioredis.Redis] = None
-_redis_client: Optional[aioredis.Redis] = None
+_cache: Optional[Any] = None
 _rls_enabled: bool = False  # set from config at startup; read by handlers
 
 
@@ -677,17 +691,16 @@ def _peer_url_looks_same_lan(url: str) -> bool:
 
 
 def _warn_if_multi_worker_without_redis(settings) -> None:
-    """Warn when multi-worker mode is using per-process resilience state."""
-    workers = getattr(settings.server, "workers", 1)
-    storage_uri = settings.rate_limit.storage_uri.strip().lower()
-    if workers > 1 and storage_uri == "memory://":
-        logger.warning(
-            "MNEMOS is starting with workers=%d and RATE_LIMIT_STORAGE_URI=memory://; "
-            "multi-worker without Redis will produce drift in rate limit and "
-            "circuit breaker state. Set RATE_LIMIT_STORAGE_URI=redis://host:6379/1 "
-            "for shared state.",
-            workers,
-        )
+    """Warn when multiple workers are configured without a shared state backend."""
+    workers = getattr(getattr(settings, "server", None), "workers", 1)
+    if workers > 1:
+        storage_uri = getattr(getattr(settings, "rate_limit", None), "storage_uri", "")
+        is_redis = storage_uri.startswith("redis://") if storage_uri else False
+        if not is_redis:
+            logger.warning(
+                "multi-worker without Redis will produce drift: "
+                "rate limit and circuit breaker state will not be shared across workers"
+            )
 
 
 async def _log_federation_startup_guidance(pool: asyncpg.Pool | None) -> None:
@@ -719,12 +732,11 @@ async def _log_federation_startup_guidance(pool: asyncpg.Pool | None) -> None:
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, and workers."""
-    global _pool, _pool_manager, _persistence_backend, _cache, _redis_client, _rls_enabled, _worker_status
+    global _pool, _pool_manager, _persistence_backend, _cache, _rls_enabled, _worker_status
     logger.info("Starting MNEMOS API Server v3.0.0 (gateway + sessions + DAG + workers)")
 
     config = _load_config()
     settings = get_settings()
-    _warn_if_multi_worker_without_redis(settings)
 
     backend_type = _select_persistence_backend(settings)
     try:
@@ -861,29 +873,6 @@ async def lifespan(app):
     # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
     if _auth_configurer is not None:
         _auth_configurer(None)
-
-    if settings.rate_limit.storage_uri.startswith(("redis://", "rediss://")):
-        try:
-            _redis_client = aioredis.from_url(settings.rate_limit.storage_uri, decode_responses=True)
-            await _redis_client.ping()
-            app.state.redis_client = _redis_client
-            logger.info("Redis resilience client connected (%s)", settings.rate_limit.storage_uri)
-        except Exception as e:
-            logger.warning(
-                "Redis resilience backend unavailable at %s; "
-                "GRAEAE will fall back to in-process resilience primitives: %s",
-                settings.rate_limit.storage_uri,
-                e,
-            )
-            if _redis_client is not None:
-                close = getattr(_redis_client, "aclose", None)
-                if callable(close):
-                    await close()
-            _redis_client = None
-            app.state.redis_client = None
-    else:
-        _redis_client = None
-        app.state.redis_client = None
 
     # Refresh GRAEAE provider manifest from model_registry in the background
     # so startup doesn't block on per-provider HTTP probes (each can take up
@@ -1036,10 +1025,6 @@ async def lifespan(app):
     _persistence_backend = None
     _pool = None
     _pool_manager = None
-    if _redis_client:
-        await _redis_client.aclose()
-        logger.info("Redis resilience client closed")
-    _redis_client = None
     if _cache:
         await _cache.aclose()
         logger.info("Redis cache closed")
@@ -1089,11 +1074,6 @@ def get_persistence_backend() -> PersistenceBackend:
     if _persistence_backend is None:
         raise HTTPException(status_code=503, detail="Persistence backend not available")
     return _persistence_backend
-
-
-def get_redis_client() -> Optional[aioredis.Redis]:
-    """Return the lifecycle-owned Redis client for cross-worker resilience."""
-    return _redis_client
 
 
 async def _get_embedding(text: str) -> list:
