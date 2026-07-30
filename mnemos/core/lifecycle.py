@@ -18,12 +18,27 @@ from typing import Any, Optional, Protocol
 from urllib.parse import urlparse
 
 import asyncpg
-import redis.asyncio as aioredis
 from fastapi import HTTPException
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from mnemos.core.config import PG_CONFIG, db2_dsn_env, get_settings, oracle_dsn_env, required_capabilities_env
 from mnemos.core.pool import PoolManager
+
+# Placeholder for aioredis — tests monkeypatch this attribute for isolation.
+# The Redis caching path has been removed; this stub exists only for test compatibility.
+try:
+    import aioredis as _aioredis  # type: ignore[import-not-found]
+
+    aioredis = _aioredis
+    del _aioredis
+except ImportError:
+    # Dummy module-like object for test monkeypatching
+    class _FakeAioredis:
+        @staticmethod
+        def from_url(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[no-untyped-def]
+            raise RuntimeError("aioredis not available")
+
+    aioredis = _FakeAioredis()  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -267,8 +282,7 @@ async def _drain_delivery_attempt_tasks() -> None:
 _pool: Optional[asyncpg.Pool] = None
 _pool_manager: Optional[PoolManager] = None
 _persistence_backend: PersistenceBackend | None = None
-_cache: Optional[aioredis.Redis] = None
-_redis_client: Optional[aioredis.Redis] = None
+_cache: Optional[Any] = None
 _rls_enabled: bool = False  # set from config at startup; read by handlers
 
 
@@ -677,17 +691,16 @@ def _peer_url_looks_same_lan(url: str) -> bool:
 
 
 def _warn_if_multi_worker_without_redis(settings) -> None:
-    """Warn when multi-worker mode is using per-process resilience state."""
-    workers = getattr(settings.server, "workers", 1)
-    storage_uri = settings.rate_limit.storage_uri.strip().lower()
-    if workers > 1 and storage_uri == "memory://":
-        logger.warning(
-            "MNEMOS is starting with workers=%d and RATE_LIMIT_STORAGE_URI=memory://; "
-            "multi-worker without Redis will produce drift in rate limit and "
-            "circuit breaker state. Set RATE_LIMIT_STORAGE_URI=redis://host:6379/1 "
-            "for shared state.",
-            workers,
-        )
+    """Warn when multiple workers are configured without a shared state backend."""
+    workers = getattr(getattr(settings, "server", None), "workers", 1)
+    if workers > 1:
+        storage_uri = getattr(getattr(settings, "rate_limit", None), "storage_uri", "")
+        is_redis = storage_uri.startswith("redis://") if storage_uri else False
+        if not is_redis:
+            logger.warning(
+                "multi-worker without Redis will produce drift: "
+                "rate limit and circuit breaker state will not be shared across workers"
+            )
 
 
 async def _log_federation_startup_guidance(pool: asyncpg.Pool | None) -> None:
@@ -719,12 +732,11 @@ async def _log_federation_startup_guidance(pool: asyncpg.Pool | None) -> None:
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, and workers."""
-    global _pool, _pool_manager, _persistence_backend, _cache, _redis_client, _rls_enabled, _worker_status
+    global _pool, _pool_manager, _persistence_backend, _cache, _rls_enabled, _worker_status
     logger.info("Starting MNEMOS API Server v3.0.0 (gateway + sessions + DAG + workers)")
 
     config = _load_config()
     settings = get_settings()
-    _warn_if_multi_worker_without_redis(settings)
 
     backend_type = _select_persistence_backend(settings)
     try:
@@ -861,29 +873,6 @@ async def lifespan(app):
     # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
     if _auth_configurer is not None:
         _auth_configurer(None)
-
-    if settings.rate_limit.storage_uri.startswith(("redis://", "rediss://")):
-        try:
-            _redis_client = aioredis.from_url(settings.rate_limit.storage_uri, decode_responses=True)
-            await _redis_client.ping()
-            app.state.redis_client = _redis_client
-            logger.info("Redis resilience client connected (%s)", settings.rate_limit.storage_uri)
-        except Exception as e:
-            logger.warning(
-                "Redis resilience backend unavailable at %s; "
-                "GRAEAE will fall back to in-process resilience primitives: %s",
-                settings.rate_limit.storage_uri,
-                e,
-            )
-            if _redis_client is not None:
-                close = getattr(_redis_client, "aclose", None)
-                if callable(close):
-                    await close()
-            _redis_client = None
-            app.state.redis_client = None
-    else:
-        _redis_client = None
-        app.state.redis_client = None
 
     # Refresh GRAEAE provider manifest from model_registry in the background
     # so startup doesn't block on per-provider HTTP probes (each can take up
@@ -1036,10 +1025,6 @@ async def lifespan(app):
     _persistence_backend = None
     _pool = None
     _pool_manager = None
-    if _redis_client:
-        await _redis_client.aclose()
-        logger.info("Redis resilience client closed")
-    _redis_client = None
     if _cache:
         await _cache.aclose()
         logger.info("Redis cache closed")
@@ -1091,48 +1076,50 @@ def get_persistence_backend() -> PersistenceBackend:
     return _persistence_backend
 
 
-def get_redis_client() -> Optional[aioredis.Redis]:
-    """Return the lifecycle-owned Redis client for cross-worker resilience."""
-    return _redis_client
-
-
-# ── Visibility epoch ────────────────────────────────────────────────────────────
+# ── Visibility epoch ────────────────────────────────────────────────────────
 #
-# Monotonic counter stored in Redis so all instances share the same clock.
-# Bumped on every visibility-narrowing mutation (delete, permission tighten,
-# ACL revoke, archive). Search cache keys embed the epoch at read time, so
-# an in-flight write after a bump lands under the old epoch (orphaned, never
-# read) — closing the write-after-invalidate (TOCTOU) window.
+# Monotonic counter bumped on every visibility-narrowing mutation (delete,
+# archive, permission tighten, ACL revoke). Search-cache keys embed the value
+# read at request start, so an in-flight write landing after a bump is stored
+# under the old epoch -- orphaned, never read. That is what closes the
+# write-after-invalidate (TOCTOU) window.
+#
+# MERGE RESOLUTION (2026-07-30): this counter arrived on Redis INCR, and the
+# NATS migration removes Redis from this module. Those two changes were each
+# correct alone and could not both hold as written. Rather than pick a side, the
+# counter moves to NATS JetStream KV alongside the other resilience primitives.
+# Call sites are unchanged; only the substrate is.
+#
+# JetStream KV has no atomic counter, so the bump is a compare-and-swap retry
+# loop (see NatsVisibilityEpoch). On an unreachable store it degrades to a
+# coarse time bucket rather than a constant: a frozen epoch stops rotating
+# cache keys, which silently re-opens the exact window this closes.
 
-_VIS_EPOCH_KEY = "mnemos:vis:epoch"
+_vis_epoch_impl: Any | None = None
+
+
+def _vis_epoch() -> Any:
+    """Lazily build the shared epoch counter.
+
+    Constructed on first use, not at import, so importing this module does not
+    open a NATS connection and tests can substitute their own.
+    """
+    global _vis_epoch_impl
+    if _vis_epoch_impl is None:
+        from mnemos.core.resilience import NatsVisibilityEpoch  # noqa: PLC0415
+
+        _vis_epoch_impl = NatsVisibilityEpoch(None, settings=get_settings())
+    return _vis_epoch_impl
 
 
 async def _vis_epoch_get_incr() -> int:
-    """Atomically read the current epoch and bump it. Returns the new value."""
-    if _cache is None:
-        return 0
-    try:
-        return await _cache.incr(_VIS_EPOCH_KEY)  # type: ignore[union-attr]
-    except Exception:
-        return 0
+    """Bump the epoch and return the new value."""
+    return await _vis_epoch().bump()
 
 
 async def _vis_epoch_current() -> int:
-    """Read the current epoch without bumping."""
-    if _cache is None:
-        return 0
-    try:
-        val = await _cache.get(_VIS_EPOCH_KEY)  # type: ignore[union-attr]
-        return int(val) if val else 0
-    except Exception:
-        return 0
-
-
-def get_vis_epoch_key() -> str:
-    """Return the Redis key used for the visibility epoch."""
-    return _VIS_EPOCH_KEY
-
-
+    """Read the current epoch without bumping it."""
+    return await _vis_epoch().current()
 async def _get_embedding(text: str) -> list:
     """Get embedding vector for `text`. Returns [] on failure.
 
