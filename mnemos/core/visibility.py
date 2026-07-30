@@ -121,30 +121,36 @@ def read_visibility_predicate(
 
 def version_visibility_predicate(
     user_id: str,
+    group_ids: List[str],
     start_param_idx: int,
     table_alias: str = "",
 ) -> Tuple[str, list]:
-    """Per-snapshot visibility predicate for ``memory_versions`` rows.
+    """Build group- and ACL-aware visibility for snapshot rows.
 
     Snapshot tenancy is evaluated against THE SNAPSHOT's own
-    ``owner_id`` / ``namespace`` / ``permission_mode`` columns, NOT
-    the live memory's. This closes a class of bug Codex flagged
-    where a memory created private (mode 600), snapshotted into v1,
-    later relaxed to public (mode 644) lets every reader of v2+ also
-    fetch the v1 private snapshot via ``list_versions`` /
-    ``get_version`` / ``diff_versions``.
+    ``owner_id`` / ``namespace`` / ``permission_mode`` / ``group_id``
+    columns, NOT the live memory's. This closes a class of bug Codex
+    flagged where a memory created private (mode 600), snapshotted
+    into v1, later relaxed to public (mode 644) lets every reader of
+    v2+ also fetch the v1 private snapshot via ``list_versions`` /
+    ``get_version`` / ``diff_versions``. The frozen-on-snapshot
+    ``group_id`` (backfilled by migration 0048) provides the same
+    group-readable semantics the live memory has — a reader in
+    ``team-a`` sees snapshots taken while ``group_id = 'team-a'``
+    AND group bits were set, but never snapshots taken under a
+    different group.
 
-    Narrower than ``read_visibility_predicate`` because
-    ``memory_versions`` does NOT carry ``group_id`` or
-    ``federation_source`` columns (introduced after v2 versioning).
-    Snapshots that were group-readable or federated at the time
-    they were taken are NOT visible per-version — fail-closed
-    against missing historical fields. Backfilling those columns
-    onto ``memory_versions`` is a separate migration decision.
-
-    Branches:
+    Branches (matching ``read_visibility_predicate``):
     - owner: ``owner_id = $caller``
     - world: ``(permission_mode % 10) >= 4``
+    - group: ``((permission_mode / 10) % 10) >= 4 AND group_id IS NOT NULL
+              AND group_id = ANY($groups)``
+    - acl: ``EXISTS (SELECT 1 FROM memory_acl macl …)`` — per-principal
+      escape hatch on the parent memory. Joining through
+      ``memory_acl.memory_id`` (not the snapshot's own id) means a
+      grant/revocation applies consistently to the whole history of
+      that memory without duplicating mutable principals into every
+      version row.
 
     The namespace pin (a separate ``namespace = $`` predicate) is
     expected to be added by the caller alongside this clause.
@@ -155,9 +161,16 @@ def version_visibility_predicate(
         "("
         f"{p}owner_id=${n}"
         f" OR ({p}permission_mode % 10) >= 4"
+        f" OR ((({p}permission_mode / 10) % 10) >= 4 "
+        f"AND {p}group_id IS NOT NULL "
+        f"AND {p}group_id = ANY(${n + 1}::text[]))"
+        f" OR EXISTS (SELECT 1 FROM memory_acl macl "
+        f"WHERE macl.memory_id = {p}memory_id "
+        f"AND macl.principal = ANY(${n + 2}::text[]) "
+        f"AND (macl.perm & {ACL_READ_BIT}) <> 0)"
         ")"
     )
-    return clause, [user_id]
+    return clause, [user_id, list(group_ids), acl_principals(user_id, group_ids)]
 
 
 async def _assert_target_head_visible(
@@ -178,7 +191,7 @@ async def _assert_target_head_visible(
         return
 
     vis_clause, vis_params = version_visibility_predicate(
-        user.user_id, start_param_idx=2,
+        user.user_id, user.group_ids, start_param_idx=2,
     )
     ns_ph = f"${len(vis_params) + 2}"
     row = await conn.fetchrow(
