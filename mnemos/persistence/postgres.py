@@ -482,6 +482,7 @@ class PostgresMemoryRepository(MemoryRepository):
         else:
             vis_clause, vis_params = _core_version_visibility_predicate(
                 user.user_id,
+                user.group_ids,
                 start_param_idx=4,
                 table_alias="mv",
             )
@@ -561,6 +562,7 @@ class PostgresMemoryRepository(MemoryRepository):
 
         vis_clause, vis_params = _core_version_visibility_predicate(
             user.user_id,
+            user.group_ids,
             start_param_idx=3,
         )
         ns_ph = f"${len(vis_params) + 3}"
@@ -598,6 +600,7 @@ class PostgresMemoryRepository(MemoryRepository):
 
         vis_clause, vis_params = _core_version_visibility_predicate(
             user.user_id,
+            user.group_ids,
             start_param_idx=3,
         )
         ns_ph = f"${len(vis_params) + 3}"
@@ -1811,6 +1814,7 @@ class PostgresBranchRepository(BranchRepository):
 
             vis_clause, vis_params = _core_version_visibility_predicate(
                 user.user_id,
+                user.group_ids,
                 start_param_idx=3,
             )
             ns_ph = f"${len(vis_params) + 3}"
@@ -1840,6 +1844,7 @@ class PostgresBranchRepository(BranchRepository):
 
             vis_clause, vis_params = _core_version_visibility_predicate(
                 user.user_id,
+                user.group_ids,
                 start_param_idx=2,
                 table_alias="mv",
             )
@@ -1875,6 +1880,7 @@ class PostgresBranchRepository(BranchRepository):
 
             vis_clause, vis_params = _core_version_visibility_predicate(
                 user.user_id,
+                user.group_ids,
                 start_param_idx=3,
                 table_alias="mv",
             )
