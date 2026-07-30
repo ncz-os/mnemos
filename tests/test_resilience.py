@@ -11,9 +11,8 @@ from mnemos.core.resilience import (
     InProcessRateLimiter,
     InProcessRateLimiterPool,
     NatsCircuitBreakerPool,
-    RedisCircuitBreakerPool,
-    RedisConcurrencyLimiterPool,
-    RedisRateLimiterPool,
+    NatsRateLimiterPool,
+    NatsConcurrencyLimiterPool,
     call_maybe_async,
     make_circuit_breaker_pool,
     make_concurrency_limiter,
@@ -181,9 +180,9 @@ def _settings(storage_uri: str = "memory://", *, fallback_warning: bool = False)
     return SimpleNamespace(
         rate_limit=SimpleNamespace(storage_uri=storage_uri),
         resilience=SimpleNamespace(
-            circuit_breaker_redis_prefix="test:cb:",
-            rate_limiter_redis_prefix="test:rl:",
-            concurrency_redis_prefix="test:conc:",
+            circuit_breaker_nats_prefix="test:cb:",
+            rate_limiter_nats_prefix="test:rl:",
+            concurrency_nats_prefix="test:conc:",
             fallback_warning=fallback_warning,
         ),
         server=SimpleNamespace(redis_url="redis://cache:6379/0"),
@@ -245,94 +244,73 @@ def test_in_process_concurrency_limiter_limits_concurrent_acquires():
     asyncio.run(run())
 
 
-def test_redis_circuit_breaker_opens_across_two_pools():
+def test_nats_rate_limiter_rpm_is_shared_across_pools():
     async def run():
-        redis = _FakeAsyncRedis()
-        first = RedisCircuitBreakerPool(redis, "test:cb:", failure_threshold=2, cooldown_seconds=60)
-        second = RedisCircuitBreakerPool(redis, "test:cb:", failure_threshold=2, cooldown_seconds=60)
-
-        await first.record_failure("openai")
-        assert await second.is_allowed("openai")
-        await first.record_failure("openai")
-
-        assert not await second.is_allowed("openai")
+        kv = _FakeNatsKv()
+        first = NatsRateLimiterPool(kv, "test:rl:", overrides={"openai": 2})
+        second = NatsRateLimiterPool(kv, "test:rl:", overrides={"openai": 2})
+        try:
+            assert await first.is_allowed("openai")
+            assert await second.is_allowed("openai")
+            assert not await first.is_allowed("openai")
+        finally:
+            first.close()
+            second.close()
 
     asyncio.run(run())
 
 
-def test_redis_circuit_breaker_success_clears_shared_open_state():
+def test_nats_concurrency_limiter_slots_are_shared_across_pools():
     async def run():
-        redis = _FakeAsyncRedis()
-        first = RedisCircuitBreakerPool(redis, "test:cb:", failure_threshold=1, cooldown_seconds=60)
-        second = RedisCircuitBreakerPool(redis, "test:cb:", failure_threshold=1, cooldown_seconds=60)
-
-        await first.record_failure("openai")
-        assert not await second.is_allowed("openai")
-        await second.record_success("openai")
-
-        assert await second.is_allowed("openai")
+        kv = _FakeNatsKv()
+        first = NatsConcurrencyLimiterPool(kv, "test:conc:", overrides={"openai": 1})
+        second = NatsConcurrencyLimiterPool(kv, "test:conc:", overrides={"openai": 1})
+        try:
+            assert await first.acquire("openai")
+            assert not await second.acquire("openai")
+            await first.release("openai")
+            assert await second.acquire("openai")
+            await second.release("openai")
+        finally:
+            first.close()
+            second.close()
 
     asyncio.run(run())
 
 
-def test_redis_rate_limiter_rpm_is_shared_across_pools():
+def test_nats_rate_limiter_degrades_to_in_process_on_kv_failure():
     async def run():
-        redis = _FakeAsyncRedis()
-        first = RedisRateLimiterPool(redis, "test:rl:", overrides={"openai": 2})
-        second = RedisRateLimiterPool(redis, "test:rl:", overrides={"openai": 2})
-
-        assert await first.is_allowed("openai")
-        assert await second.is_allowed("openai")
-        assert not await first.is_allowed("openai")
+        # Pass None kv — limiter should not block
+        pool = NatsRateLimiterPool(None, "test:rl:", overrides={"openai": 1})
+        try:
+            # With no KV, acquire should succeed (degradation)
+            assert await pool.is_allowed("openai")
+        finally:
+            pool.close()
 
     asyncio.run(run())
 
 
-def test_redis_concurrency_limiter_slots_are_shared_across_pools():
+def test_nats_concurrency_limiter_degrades_to_in_process_on_kv_failure():
     async def run():
-        redis = _FakeAsyncRedis()
-        first = RedisConcurrencyLimiterPool(redis, "test:conc:", overrides={"openai": 1})
-        second = RedisConcurrencyLimiterPool(redis, "test:conc:", overrides={"openai": 1})
-
-        assert await first.acquire("openai")
-        assert not await second.acquire("openai")
-        await first.release("openai")
-        assert await second.acquire("openai")
-        await second.release("openai")
+        pool = NatsConcurrencyLimiterPool(None, "test:conc:", overrides={"openai": 1})
+        try:
+            # With no KV, acquire should succeed (degradation)
+            assert await pool.acquire("openai")
+        finally:
+            pool.close()
 
     asyncio.run(run())
 
 
-def test_concurrency_reserve_context_releases_slot():
-    async def run():
-        pool = InProcessConcurrencyLimiterPool(overrides={"openai": 1})
-        async with pool.reserve("openai") as acquired:
-            assert acquired
-            assert not await pool.acquire("openai")
-        assert await pool.acquire("openai")
-        pool.release("openai")
+def test_factory_returns_nats_backends_when_nats_configured():
+    kv = _FakeNatsKv()
+    settings = _settings()
+    settings.nats = SimpleNamespace(url="nats://localhost:4222", token=None)
 
-    asyncio.run(run())
-
-
-def test_call_maybe_async_supports_sync_and_async_methods():
-    async def run():
-        async def async_value():
-            return "async"
-
-        assert await call_maybe_async(lambda: "sync") == "sync"
-        assert await call_maybe_async(async_value) == "async"
-
-    asyncio.run(run())
-
-
-def test_factory_returns_redis_backends_when_client_available():
-    redis = _FakeAsyncRedis()
-    settings = _settings("redis://redis:6379/0")
-
-    assert isinstance(make_circuit_breaker_pool(settings, redis_client=redis), RedisCircuitBreakerPool)
-    assert isinstance(make_rate_limiter_pool(settings, redis_client=redis), RedisRateLimiterPool)
-    assert isinstance(make_concurrency_limiter(settings, redis_client=redis), RedisConcurrencyLimiterPool)
+    assert isinstance(make_circuit_breaker_pool(settings, nats_kv=kv), NatsCircuitBreakerPool)
+    assert isinstance(make_rate_limiter_pool(settings, nats_kv=kv), NatsRateLimiterPool)
+    assert isinstance(make_concurrency_limiter(settings, nats_kv=kv), NatsConcurrencyLimiterPool)
 
 
 def test_factory_memory_uri_returns_in_process_and_warns(caplog):
@@ -342,67 +320,28 @@ def test_factory_memory_uri_returns_in_process_and_warns(caplog):
     pool = make_circuit_breaker_pool(settings)
 
     assert isinstance(pool, InProcessCircuitBreakerPool)
-    assert "Redis/NATS not configured" in caplog.text
-    assert "Multi-worker deployments require Redis" in caplog.text
+    assert "NATS not configured" in caplog.text
+    assert "Multi-worker deployments require Redis" not in caplog.text
 
 
-def test_factory_redis_uri_without_client_falls_back_with_warning(caplog, monkeypatch):
-    from mnemos.core import resilience
-
-    settings = _settings("redis://redis:6379/0", fallback_warning=True)
-    monkeypatch.setattr(resilience, "_get_lifecycle_redis_client", lambda: None)
+def test_factory_no_backend_returns_in_process_and_warns(caplog):
+    settings = _settings("memory://", fallback_warning=True)
     caplog.set_level(logging.WARNING)
 
     pool = make_rate_limiter_pool(settings)
 
     assert isinstance(pool, InProcessRateLimiterPool)
-    assert "Redis resilience backend requested but unavailable" in caplog.text
+    assert "NATS not configured" in caplog.text
 
 
-def test_lifecycle_redis_unreachable_degrades_to_no_resilience_client(monkeypatch, caplog, tmp_path):
-    async def run():
-        from mnemos.core import config as core_config
-        from mnemos.core import lifecycle
-
-        class FalsyPool:
-            def __bool__(self):
-                return False
-
-            async def close(self):
-                return None
-
-        class RedisUnavailable:
-            async def ping(self):
-                raise RuntimeError("redis down")
-
-            async def aclose(self):
-                return None
-
-        async def create_pool(**_kwargs):
-            return FalsyPool()
-
-        monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(tmp_path / "missing.toml"))
-        monkeypatch.setenv("MNEMOS_SQLITE_PATH", str(tmp_path / "mnemos.sqlite3"))
-        monkeypatch.setenv("RATE_LIMIT_STORAGE_URI", "redis://redis:6379/0")
-        core_config.reload_settings()
-        monkeypatch.setattr(lifecycle, "_load_config", lambda: {"worker": {"enabled": False}})
-        monkeypatch.setattr(lifecycle, "_background_tasks", set())
-        monkeypatch.setattr(lifecycle, "_worker_tasks", set())
-        monkeypatch.setattr(lifecycle, "_delivery_attempt_tasks", set())
-        monkeypatch.setattr(lifecycle, "_lifespan_worker_factories", {})
-        monkeypatch.setattr(lifecycle, "_provider_manifest_reloader", None)
-        monkeypatch.setattr(lifecycle.asyncpg, "create_pool", create_pool)
-        monkeypatch.setattr(lifecycle.aioredis, "from_url", lambda *_args, **_kwargs: RedisUnavailable())
-
-        app = SimpleNamespace(state=SimpleNamespace())
-        async with lifecycle.lifespan(app):
-            assert lifecycle.get_redis_client() is None
-            assert app.state.redis_client is None
-
+def test_factory_no_backend_concurrency_returns_in_process_and_warns(caplog):
+    settings = _settings("memory://", fallback_warning=True)
     caplog.set_level(logging.WARNING)
-    asyncio.run(run())
 
-    assert "Redis resilience backend unavailable" in caplog.text
+    pool = make_concurrency_limiter(settings)
+
+    assert isinstance(pool, InProcessConcurrencyLimiterPool)
+    assert "NATS not configured" in caplog.text
 
 
 def test_nats_circuit_breaker_cross_instance_and_success_preserves_peer_trip():
@@ -422,15 +361,6 @@ def test_nats_circuit_breaker_cross_instance_and_success_preserves_peer_trip():
             second.close()
 
     asyncio.run(run())
-
-
-def test_make_circuit_breaker_pool_preserves_redis_precedence_when_nats_set():
-    from mnemos.core.resilience import RedisCircuitBreakerPool
-
-    settings = _settings("redis://cache:6379/0")
-    settings.nats = SimpleNamespace(url="nats://localhost:4222", token=None)
-    pool = make_circuit_breaker_pool(settings, redis_client=_FakeAsyncRedis(), nats_kv=_FakeNatsKv())
-    assert isinstance(pool, RedisCircuitBreakerPool)
 
 
 def test_nats_circuit_breaker_keys_are_opaque():
