@@ -1096,6 +1096,43 @@ def get_redis_client() -> Optional[aioredis.Redis]:
     return _redis_client
 
 
+# ── Visibility epoch ────────────────────────────────────────────────────────────
+#
+# Monotonic counter stored in Redis so all instances share the same clock.
+# Bumped on every visibility-narrowing mutation (delete, permission tighten,
+# ACL revoke, archive). Search cache keys embed the epoch at read time, so
+# an in-flight write after a bump lands under the old epoch (orphaned, never
+# read) — closing the write-after-invalidate (TOCTOU) window.
+
+_VIS_EPOCH_KEY = "mnemos:vis:epoch"
+
+
+async def _vis_epoch_get_incr() -> int:
+    """Atomically read the current epoch and bump it. Returns the new value."""
+    if _cache is None:
+        return 0
+    try:
+        return await _cache.incr(_VIS_EPOCH_KEY)  # type: ignore[union-attr]
+    except Exception:
+        return 0
+
+
+async def _vis_epoch_current() -> int:
+    """Read the current epoch without bumping."""
+    if _cache is None:
+        return 0
+    try:
+        val = await _cache.get(_VIS_EPOCH_KEY)  # type: ignore[union-attr]
+        return int(val) if val else 0
+    except Exception:
+        return 0
+
+
+def get_vis_epoch_key() -> str:
+    """Return the Redis key used for the visibility epoch."""
+    return _VIS_EPOCH_KEY
+
+
 async def _get_embedding(text: str) -> list:
     """Get embedding vector for `text`. Returns [] on failure.
 

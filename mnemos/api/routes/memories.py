@@ -523,7 +523,13 @@ async def _publish_nats_with_timeout(
 
 
 async def _invalidate_caches_after_mutation() -> None:
-    """Drop /stats + per-user search cache entries on any memory write."""
+    """Drop /stats + per-user search cache entries on any memory write.
+
+    Also bumps the visibility epoch so that in-flight search writes land
+    under the old epoch (orphaned) rather than leaking stale visibility into
+    the new epoch — closing the write-after-invalidate (TOCTOU) window
+    (mnemos-#<issue>).
+    """
     if not _lc._cache:
         return
     try:
@@ -533,6 +539,10 @@ async def _invalidate_caches_after_mutation() -> None:
                 await _lc._cache.delete(_k)
         except Exception:
             pass
+    except Exception:
+        pass
+    try:
+        await _lc._vis_epoch_get_incr()  # bump; errors silently
     except Exception:
         pass
 
@@ -1231,6 +1241,14 @@ async def search_memories(
     # serialization aliases distinct semantics. JSON encoding inside
     # _get_cache_key now preserves None as null vs "" as "" so the
     # digest reflects the request's actual filter shape.
+    # v6.3 TOCTOU guard: fold a monotonic visibility epoch into the cache key
+    # so an in-flight cache write after a bump lands under the old epoch
+    # (orphaned, never read).  Bump is triggered by every visibility-narrowing
+    # mutation (delete, archive, ACL revoke, permission-mode tighten).
+    try:
+        _epoch = await _lc._vis_epoch_current()
+    except Exception:
+        _epoch = 0
     cache_key = _get_cache_key(
         "search",
         user.user_id,
@@ -1264,6 +1282,7 @@ async def search_memories(
         # MNEMOS_SEMANTIC_OOD_GATE must NOT serve a stale gated/ungated
         # result from before the flip (ngc-review 2026-06-13).
         ood_gate_enabled(),
+        _epoch,  # v6.3 TOCTOU guard — epoch at read time
     )
 
     if _lc._cache and not request.include_compressed:

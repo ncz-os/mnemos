@@ -926,6 +926,10 @@ async def merge_branch(
                         pass
                 except Exception:
                     pass
+            try:
+                await _lc._vis_epoch_get_incr()  # bump; errors silently
+            except Exception:
+                pass
             _schedule_outbox_deliveries(delivery_ids)
 
         logger.info(

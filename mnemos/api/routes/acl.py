@@ -49,12 +49,19 @@ async def _invalidate_search_caches_after_acl_change() -> None:
     while a principal held a grant would otherwise be replayable after the
     grant is revoked until TTL expiry — a permission-revocation leak. This
     mirrors ``_invalidate_caches_after_mutation`` on the memories route.
+
+    Also bumps the visibility epoch so in-flight search writes land under
+    the old epoch (orphaned) rather than leaking stale visibility.
     """
     if not _lc._cache:
         return
     try:
         async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
             await _lc._cache.delete(_k)
+    except Exception:
+        pass
+    try:
+        await _lc._vis_epoch_get_incr()  # bump; errors silently
     except Exception:
         pass
 
