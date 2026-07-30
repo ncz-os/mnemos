@@ -600,7 +600,11 @@ async def invalidate_deletion_scope_caches(
     target_user_id: str,
     target_namespace: str | None,
 ) -> None:
-    """Evict cached search/stat responses that may include this target."""
+    """Evict cached search/stat responses that may include this target.
+
+    Also bumps the visibility epoch so in-flight search writes land under
+    the old epoch (orphaned) rather than leaking stale visibility.
+    """
     import mnemos.core.lifecycle as _lc
 
     if not _lc._cache:
@@ -620,6 +624,10 @@ async def invalidate_deletion_scope_caches(
             target_namespace,
             exc_info=True,
         )
+    try:
+        await _lc._vis_epoch_get_incr()  # bump; errors silently
+    except Exception:
+        pass
 
 
 async def count_live_target_rows(

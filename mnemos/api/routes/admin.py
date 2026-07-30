@@ -377,6 +377,10 @@ async def _invalidate_memory_read_caches() -> None:
             pass
     except Exception:
         pass
+    try:
+        await _lc._vis_epoch_get_incr()  # bump; errors silently
+    except Exception:
+        pass
 
 
 class CompressionEnqueueRequest(BaseModel):
