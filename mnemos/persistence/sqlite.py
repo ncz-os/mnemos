@@ -125,6 +125,7 @@ SQLITE_MIGRATION_FILES = [
     "0038_oauth_sessions_consultations.sql",
     "0039_subscription_plan_current_limits.sql",
     "0043_memory_acl.sql",
+    "0048_memory_versions_visibility.sql",
 ]
 
 
@@ -295,7 +296,28 @@ def _version_visibility_clause(
 ) -> str:
     p = f"{table_alias}." if table_alias else ""
     params.append(user.user_id)
-    return f"({p}owner_id = ? OR ({p}permission_mode % 10) >= 4)"
+    group_ids = list(user.group_ids)
+    if group_ids:
+        group_clause = f"{p}group_id IN ({_placeholders(group_ids)})"
+        params.extend(group_ids)
+    else:
+        group_clause = "0"
+    # Unlike live-memory ACL matching, versions join by memory_id, not row id.
+    principals = acl_principals(user.user_id, group_ids)
+    acl_clause = ""
+    if principals:
+        params.extend(principals)
+        acl_clause = (
+            " OR EXISTS (SELECT 1 FROM memory_acl macl "
+            f"WHERE macl.memory_id = {p}memory_id "
+            f"AND macl.principal IN ({_placeholders(principals)}) "
+            f"AND (macl.perm & {ACL_READ_BIT}) <> 0)"
+        )
+    return (
+        f"({p}owner_id = ? OR ({p}permission_mode % 10) >= 4 "
+        f"OR ((({p}permission_mode / 10) % 10) >= 4 AND {p}group_id IS NOT NULL AND {group_clause})"
+        f"{acl_clause})"
+    )
 
 
 def _sqlite_memory_cols(table_alias: str = "") -> str:
