@@ -703,6 +703,14 @@ _VIS_EPOCH_KEY = "vis:epoch"
 _VIS_EPOCH_DEGRADED_BUCKET_SECS = 5
 
 
+class VisibilityEpochBumpFailed(RuntimeError):
+    """Raised when a visibility-narrowing mutation could not advance the epoch.
+
+    Callers must treat this as "the cache may still serve pre-revocation
+    results" -- it is a security-relevant failure, not a cache miss.
+    """
+
+
 class NatsVisibilityEpoch:
     """Monotonic visibility/ACL epoch shared across workers, backed by NATS KV.
 
@@ -741,11 +749,35 @@ class NatsVisibilityEpoch:
         self._settings = settings
         self._loop = _NatsLoopThread(name="mnemos-nats-epoch")
         self._kv_future = self._loop.submit(self._ensure_kv(kv_or_js))
+        # High-water mark across BOTH substrates, so neither a degraded->live
+        # transition nor a live->degraded one can move the epoch backward.
+        self._floor = 0
+        self._floor_lock = threading.Lock()
 
     def _degraded(self) -> int:
-        # Monotonic and shared by construction: every worker derives the same
-        # value from the clock, so they agree without talking to each other.
-        return int(time.time()) // _VIS_EPOCH_DEGRADED_BUCKET_SECS
+        # Derived from the clock so every worker agrees without coordinating.
+        #
+        # OFFSET so a degraded value can never collide with, or fall below, a
+        # persisted counter. Without this, recovery moves the epoch BACKWARD:
+        # degraded returns ~3.5e8 (a time bucket) while the persisted counter is
+        # a small integer, so the first successful read after NATS returns hands
+        # out a LOWER epoch than callers already saw -- and cache entries written
+        # under the higher degraded epoch become readable again. Monotonicity is
+        # the whole contract of this counter.
+        bucket = int(time.time()) // _VIS_EPOCH_DEGRADED_BUCKET_SECS
+        with self._floor_lock:
+            self._floor = max(self._floor, bucket)
+            return self._floor
+
+    def _observe(self, value: int) -> int:
+        """Record a persisted epoch and return a never-decreasing view of it.
+
+        A persisted counter that is lower than a degraded value already handed
+        out would otherwise un-orphan cache entries written during the outage.
+        """
+        with self._floor_lock:
+            self._floor = max(self._floor, value)
+            return self._floor
 
     async def _kv(self) -> Any | None:
         try:
@@ -790,7 +822,7 @@ class NatsVisibilityEpoch:
             return self._degraded()
         try:
             entry = await _nats_maybe_await(kv.get(_VIS_EPOCH_KEY))
-            return int(json.loads(_nats_entry_value(entry).decode("utf-8"))["epoch"])
+            return self._observe(int(json.loads(_nats_entry_value(entry).decode("utf-8"))["epoch"]))
         except Exception as exc:
             if _nats_missing_key(exc):
                 return 0
@@ -806,6 +838,10 @@ class NatsVisibilityEpoch:
         kv = await self._kv()
         if kv is None:
             return self._degraded()
+        try:
+            start_epoch = await self.current()
+        except Exception:
+            start_epoch = -1
         for _ in range(attempts):
             try:
                 entry = await _nats_maybe_await(kv.get(_VIS_EPOCH_KEY))
@@ -814,7 +850,7 @@ class NatsVisibilityEpoch:
                     return self._degraded()
                 try:
                     await _nats_kv_create(kv, _VIS_EPOCH_KEY, _nats_json({"epoch": 1}))
-                    return 1
+                    return self._observe(1)
                 except Exception:
                     continue  # lost the create race; re-read and CAS
             revision = _nats_entry_revision(entry)
@@ -830,14 +866,33 @@ class NatsVisibilityEpoch:
                     return self._degraded()
             try:
                 await _nats_kv_update(kv, _VIS_EPOCH_KEY, _nats_json({"epoch": nxt}), revision)
-                return nxt
+                return self._observe(nxt)
             except Exception as exc:
                 if _nats_wrong_revision(exc):
                     continue
                 return self._degraded()
-        # Contention beyond the retry budget: degrade rather than return a value
-        # that might be lower than one already published.
-        return self._degraded()
+        # Retry budget exhausted while KV is otherwise HEALTHY. This is the
+        # dangerous case, and returning a degraded value silently was wrong:
+        # the caller discards the return, later reads call current() which
+        # succeeds against the still-healthy store, and they get the OLD
+        # persisted epoch -- so a stale search result written before the
+        # revocation stays readable. That is the exact TOCTOU bug this class
+        # exists to close, reappearing under contention.
+        #
+        # Re-read and only accept advancement. If the epoch moved (a competing
+        # bump won the race), the invalidation we wanted has effectively
+        # happened and we can return it. If it did NOT move, we could not
+        # invalidate, and the caller must not be told everything is fine.
+        try:
+            observed = await self.current()
+        except Exception:
+            observed = None
+        if observed is not None and observed > start_epoch:
+            return observed
+        raise VisibilityEpochBumpFailed(
+            "could not advance the visibility epoch after "
+            f"{attempts} attempts; caches may still serve pre-revocation results"
+        )
 
 
 class NatsRateLimiter:
@@ -1346,6 +1401,10 @@ class NatsConcurrencyLimiterPool:
             settings=settings,
         )
         self._providers: set[str] = set()
+        # provider -> outstanding acquire tokens, so release() gives back the
+        # slot it actually took.
+        self._tokens: dict[str, list[str]] = {}
+        self._token_lock = threading.Lock()
         self._overrides = overrides or {}
 
     def _max_concurrent(self, provider: str) -> int:
@@ -1374,7 +1433,17 @@ class NatsConcurrencyLimiterPool:
         limiter._in_flight = self._limiter._in_flight
         limiter._lock = self._limiter._lock
         token = await limiter.acquire(provider)
-        return token is not None
+        if token is None:
+            return False
+        # The underlying limiter is TOKEN-based: release(provider, token) is how
+        # a slot is given back. Collapsing the token to a bool here and then
+        # releasing with "" meant every release incremented the available-slot
+        # count whether or not it matched an acquire, so a double release -- or
+        # a release on a path that never acquired -- raised capacity above max
+        # and quietly disabled the limiter.
+        with self._token_lock:
+            self._tokens.setdefault(provider, []).append(token)
+        return True
 
     async def release(self, provider: str) -> None:
         self._remember(provider)
@@ -1389,7 +1458,15 @@ class NatsConcurrencyLimiterPool:
         limiter._loop = self._limiter._loop
         limiter._in_flight = self._limiter._in_flight
         limiter._lock = self._limiter._lock
-        await limiter.release(provider, "")
+        with self._token_lock:
+            token = self._tokens.get(provider, []).pop() if self._tokens.get(provider) else None
+        if token is None:
+            # Nothing outstanding for this provider. Releasing anyway would
+            # inflate the slot count past max. Stay silent-but-safe: the caller
+            # double-released, which is a bug in the caller, not a reason to
+            # corrupt the limiter for everyone else.
+            return
+        await limiter.release(provider, token)
 
     @asynccontextmanager
     async def reserve(self, provider: str):
@@ -1404,8 +1481,11 @@ class NatsConcurrencyLimiterPool:
         limiter._loop = self._limiter._loop
         limiter._in_flight = self._limiter._in_flight
         limiter._lock = self._limiter._lock
-        async with limiter.reserve(provider):
-            yield
+        # Yield the acquisition result. The previous version yielded None, so
+        # `async with pool.reserve(p) as ok:` silently bound ok=None and every
+        # caller testing it treated a refused slot as success.
+        async with limiter.reserve(provider) as acquired:
+            yield acquired
 
     def status(self) -> dict[str, dict[str, int]]:
         return {
