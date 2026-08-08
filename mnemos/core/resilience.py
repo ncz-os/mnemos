@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import defaultdict
 from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
