@@ -538,6 +538,8 @@ class NatsCircuitBreaker:
 
     async def record_success(self, provider: str) -> None:
         await self._run_bounded(self._record_success(provider), fallback=None)
+        with self._state_lock:
+            self._local_failures[provider] = 0
         self._local_fallback.record_success(provider)
 
     async def _record_success(self, provider: str) -> None:
@@ -547,18 +549,8 @@ class NatsCircuitBreaker:
             return
         now = time.time()
         for _attempt in range(_NATS_CAS_ATTEMPTS):
-            payload, revision = await self._read(provider)
-            if payload and payload.get("state") == CircuitState.OPEN.value:
-                opened_at = float(payload.get("opened_at_epoch", 0.0))
-                if opened_at + self.cooldown_seconds > now:
-                    self._cache_open(provider)
-                    self._set_status(
-                        provider,
-                        {"state": CircuitState.OPEN.value, "failures": int(payload.get("failures", 0))},
-                    )
-                    return
-            failures = max(0, int(payload.get("failures", 0)) - 1) if payload else 0
-            new_payload = {"state": CircuitState.CLOSED.value, "failures": failures, "updated_at_epoch": now}
+            _payload, revision = await self._read(provider)
+            new_payload = {"state": CircuitState.CLOSED.value, "failures": 0, "updated_at_epoch": now}
             try:
                 if revision is None:
                     try:
@@ -568,7 +560,7 @@ class NatsCircuitBreaker:
                 else:
                     await _nats_kv_update(kv, key, _nats_json(new_payload), revision)
                 self._clear_cache(provider)
-                self._set_status(provider, {"state": CircuitState.CLOSED.value, "failures": failures})
+                self._set_status(provider, {"state": CircuitState.CLOSED.value, "failures": 0})
                 return
             except Exception as exc:
                 if not _nats_wrong_revision(exc):
