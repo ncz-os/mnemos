@@ -24,8 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from mnemos.core.config import PG_CONFIG, db2_dsn_env, get_settings, oracle_dsn_env, required_capabilities_env
 from mnemos.core.pool import PoolManager
 
-# Placeholder for aioredis — tests monkeypatch this attribute for isolation.
-# The Redis caching path has been removed; this stub exists only for test compatibility.
+# Redis still backs optional API response/search caches. Keep the import guarded
+# so deployments without the extra degrade cleanly and tests can monkeypatch it.
 try:
     import aioredis as _aioredis  # type: ignore[import-not-found]
 
@@ -1157,6 +1157,8 @@ async def _vis_epoch_get_incr() -> int:
 async def _vis_epoch_current() -> int:
     """Read the current epoch without bumping it."""
     return await _vis_epoch().current()
+
+
 async def _get_embedding(text: str) -> list:
     """Get embedding vector for `text`. Returns [] on failure.
 
