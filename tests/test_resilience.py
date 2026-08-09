@@ -346,18 +346,19 @@ def test_factory_no_backend_concurrency_returns_in_process_and_warns(caplog):
     assert "NATS not configured" in caplog.text
 
 
-def test_nats_circuit_breaker_cross_instance_and_success_preserves_peer_trip():
+def test_nats_circuit_breaker_success_resets_shared_failure_state():
     async def run():
         kv = _FakeNatsKv()
-        first = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=2, cooldown_seconds=60)
-        second = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=2, cooldown_seconds=60)
+        first = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=3, cooldown_seconds=60)
+        second = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=3, cooldown_seconds=60)
         try:
             await first.record_failure("openai")
-            assert await second.is_allowed("openai")
             await second.record_failure("openai")
-            assert not await first.is_allowed("openai")
             await first.record_success("openai")
-            assert not await second.is_allowed("openai")
+            await second.record_failure("openai")
+            await first.record_failure("openai")
+            assert await second.is_allowed("openai")
+            assert second.status()["openai"]["failures"] == 2
         finally:
             first.close()
             second.close()
