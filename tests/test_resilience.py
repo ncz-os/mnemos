@@ -17,6 +17,7 @@ from mnemos.core.resilience import (
     NatsRateLimiterPool,
     NatsRateLimiter,
     NatsConcurrencyLimiterPool,
+    _nats_create_kv_bucket,
     make_circuit_breaker_pool,
     make_concurrency_limiter,
     make_rate_limiter_pool,
@@ -72,6 +73,25 @@ class _FakeNatsKv:
         return await self.put(key, value)
 
 
+class _ExpiringFakeNatsKv(_FakeNatsKv):
+    """Bucket-TTL approximation: any write refreshes every entry's expiry."""
+
+    def __init__(self, ttl_seconds: float):
+        super().__init__()
+        self._ttl_seconds = ttl_seconds
+        self._expires_at = 0.0
+
+    async def get(self, key: str):
+        if time.monotonic() >= self._expires_at:
+            self._values.clear()
+        return await super().get(key)
+
+    async def put(self, key: str, value: bytes):
+        revision = await super().put(key, value)
+        self._expires_at = time.monotonic() + self._ttl_seconds
+        return revision
+
+
 class _BrokenNatsKv:
     async def get(self, key: str):
         raise RuntimeError("KV read failed")
@@ -84,6 +104,11 @@ class _BrokenNatsKv:
 
     async def update(self, key: str, value: bytes, *, last: int, **kwargs):
         raise RuntimeError("KV update failed")
+
+
+class _ContendedNatsKv(_FakeNatsKv):
+    async def update(self, key: str, value: bytes, *, last: int, **kwargs):
+        raise _WrongLastError("wrong last sequence")
 
 
 class _FakeAsyncRedis:
@@ -291,6 +316,68 @@ def test_nats_concurrency_limiter_slots_are_shared_across_pools():
         finally:
             first.close()
             second.close()
+
+    asyncio.run(run())
+
+
+def test_nats_concurrency_heartbeat_keeps_slot_record_alive():
+    async def run():
+        kv = _ExpiringFakeNatsKv(ttl_seconds=0.04)
+        limiter = NatsConcurrencyLimiter(
+            kv,
+            "test:conc:",
+            max_concurrent=1,
+            heartbeat_seconds=0.01,
+        )
+        try:
+            token = await limiter.acquire("openai")
+            assert token is not None
+
+            # The backing entry would have expired twice over without renewal.
+            await asyncio.sleep(0.09)
+            assert await limiter.acquire("openai") is None
+
+            await limiter.release("openai", token)
+            next_token = await limiter.acquire("openai")
+            assert next_token is not None
+            await limiter.release("openai", next_token)
+        finally:
+            limiter.close()
+
+    asyncio.run(run())
+
+
+def test_nats_concurrency_cas_exhaustion_does_not_grant_unreserved_slot():
+    async def run():
+        kv = _ContendedNatsKv()
+        await kv.put("test:conc:openai", b'{"available":1}')
+        limiter = NatsConcurrencyLimiter(kv, "test:conc:", max_concurrent=1)
+        try:
+            assert await limiter.acquire("openai") is None
+            assert limiter._in_flight["openai"] == 0
+            assert not limiter._heartbeats
+        finally:
+            limiter.close()
+
+    asyncio.run(run())
+
+
+def test_nats_bucket_compatibility_path_preserves_ttl():
+    class PositionalConfigJetStream:
+        def __init__(self):
+            self.config = None
+
+        async def create_key_value(self, *args, **kwargs):
+            if kwargs:
+                raise TypeError("config must be positional")
+            self.config = args[0]
+            return object()
+
+    async def run():
+        js = PositionalConfigJetStream()
+        await _nats_create_kv_bucket(js, "TEST_BUCKET", 120)
+        assert js.config.bucket == "TEST_BUCKET"
+        assert js.config.ttl == 120
 
     asyncio.run(run())
 

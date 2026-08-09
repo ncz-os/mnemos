@@ -461,32 +461,11 @@ class _RateLimitSettings(BaseSettings):
 class _ResilienceSettings(BaseSettings):
     model_config = _config_model_config()
 
-    circuit_breaker_redis_prefix: str = Field(
-        "mnemos:cb:",
-        validation_alias=AliasChoices(
-            "MNEMOS_RESILIENCE_CIRCUIT_BREAKER_REDIS_PREFIX",
-            "MNEMOS_CIRCUIT_BREAKER_REDIS_PREFIX",
-        ),
-    )
     circuit_breaker_nats_prefix: str = Field(
         "cb.",
         validation_alias=AliasChoices(
             "MNEMOS_RESILIENCE_CIRCUIT_BREAKER_NATS_PREFIX",
             "MNEMOS_CIRCUIT_BREAKER_NATS_PREFIX",
-        ),
-    )
-    rate_limiter_redis_prefix: str = Field(
-        "mnemos:rl:",
-        validation_alias=AliasChoices(
-            "MNEMOS_RESILIENCE_RATE_LIMITER_REDIS_PREFIX",
-            "MNEMOS_RATE_LIMITER_REDIS_PREFIX",
-        ),
-    )
-    concurrency_redis_prefix: str = Field(
-        "mnemos:conc:",
-        validation_alias=AliasChoices(
-            "MNEMOS_RESILIENCE_CONCURRENCY_REDIS_PREFIX",
-            "MNEMOS_CONCURRENCY_REDIS_PREFIX",
         ),
     )
     fallback_warning: bool = Field(True, validation_alias="MNEMOS_RESILIENCE_FALLBACK_WARNING")
