@@ -12,10 +12,12 @@ from mnemos.core.resilience import (
     InProcessConcurrencyLimiterPool,
     InProcessRateLimiter,
     InProcessRateLimiterPool,
+    NatsConcurrencyLimiter,
     NatsCircuitBreakerPool,
     NatsRateLimiterPool,
+    NatsRateLimiter,
     NatsConcurrencyLimiterPool,
-    call_maybe_async,
+    _nats_create_kv_bucket,
     make_circuit_breaker_pool,
     make_concurrency_limiter,
     make_rate_limiter_pool,
@@ -69,6 +71,44 @@ class _FakeNatsKv:
         if kwargs:
             raise AssertionError(f"per-key KV kwargs are not supported: {kwargs}")
         return await self.put(key, value)
+
+
+class _ExpiringFakeNatsKv(_FakeNatsKv):
+    """Bucket-TTL approximation: any write refreshes every entry's expiry."""
+
+    def __init__(self, ttl_seconds: float):
+        super().__init__()
+        self._ttl_seconds = ttl_seconds
+        self._expires_at = 0.0
+
+    async def get(self, key: str):
+        if time.monotonic() >= self._expires_at:
+            self._values.clear()
+        return await super().get(key)
+
+    async def put(self, key: str, value: bytes):
+        revision = await super().put(key, value)
+        self._expires_at = time.monotonic() + self._ttl_seconds
+        return revision
+
+
+class _BrokenNatsKv:
+    async def get(self, key: str):
+        raise RuntimeError("KV read failed")
+
+    async def create(self, key: str, value: bytes, **kwargs):
+        raise RuntimeError("KV create failed")
+
+    async def put(self, key: str, value: bytes):
+        raise RuntimeError("KV write failed")
+
+    async def update(self, key: str, value: bytes, *, last: int, **kwargs):
+        raise RuntimeError("KV update failed")
+
+
+class _ContendedNatsKv(_FakeNatsKv):
+    async def update(self, key: str, value: bytes, *, last: int, **kwargs):
+        raise _WrongLastError("wrong last sequence")
 
 
 class _FakeAsyncRedis:
@@ -280,13 +320,74 @@ def test_nats_concurrency_limiter_slots_are_shared_across_pools():
     asyncio.run(run())
 
 
+def test_nats_concurrency_heartbeat_keeps_slot_record_alive():
+    async def run():
+        kv = _ExpiringFakeNatsKv(ttl_seconds=0.04)
+        limiter = NatsConcurrencyLimiter(
+            kv,
+            "test:conc:",
+            max_concurrent=1,
+            heartbeat_seconds=0.01,
+        )
+        try:
+            token = await limiter.acquire("openai")
+            assert token is not None
+
+            # The backing entry would have expired twice over without renewal.
+            await asyncio.sleep(0.09)
+            assert await limiter.acquire("openai") is None
+
+            await limiter.release("openai", token)
+            next_token = await limiter.acquire("openai")
+            assert next_token is not None
+            await limiter.release("openai", next_token)
+        finally:
+            limiter.close()
+
+    asyncio.run(run())
+
+
+def test_nats_concurrency_cas_exhaustion_does_not_grant_unreserved_slot():
+    async def run():
+        kv = _ContendedNatsKv()
+        await kv.put("test:conc:openai", b'{"available":1}')
+        limiter = NatsConcurrencyLimiter(kv, "test:conc:", max_concurrent=1)
+        try:
+            assert await limiter.acquire("openai") is None
+            assert limiter._in_flight["openai"] == 0
+            assert not limiter._heartbeats
+        finally:
+            limiter.close()
+
+    asyncio.run(run())
+
+
+def test_nats_bucket_compatibility_path_preserves_ttl():
+    class PositionalConfigJetStream:
+        def __init__(self):
+            self.config = None
+
+        async def create_key_value(self, *args, **kwargs):
+            if kwargs:
+                raise TypeError("config must be positional")
+            self.config = args[0]
+            return object()
+
+    async def run():
+        js = PositionalConfigJetStream()
+        await _nats_create_kv_bucket(js, "TEST_BUCKET", 120)
+        assert js.config.bucket == "TEST_BUCKET"
+        assert js.config.ttl == 120
+
+    asyncio.run(run())
+
+
 def test_nats_rate_limiter_degrades_to_in_process_on_kv_failure():
     async def run():
-        # Pass None kv — limiter should not block
-        pool = NatsRateLimiterPool(None, "test:rl:", overrides={"openai": 1})
+        pool = NatsRateLimiterPool(None, "test:rl:", overrides={"openai": 1}, settings=_settings())
         try:
-            # With no KV, acquire should succeed (degradation)
             assert await pool.is_allowed("openai")
+            assert not await pool.is_allowed("openai")
         finally:
             pool.close()
 
@@ -295,12 +396,93 @@ def test_nats_rate_limiter_degrades_to_in_process_on_kv_failure():
 
 def test_nats_concurrency_limiter_degrades_to_in_process_on_kv_failure():
     async def run():
-        pool = NatsConcurrencyLimiterPool(None, "test:conc:", overrides={"openai": 1})
+        pool = NatsConcurrencyLimiterPool(None, "test:conc:", overrides={"openai": 1}, settings=_settings())
         try:
-            # With no KV, acquire should succeed (degradation)
             assert await pool.acquire("openai")
+            assert not await pool.acquire("openai")
+            await pool.release("openai")
+            assert await pool.acquire("openai")
+            await pool.release("openai")
         finally:
             pool.close()
+
+    asyncio.run(run())
+
+
+def test_nats_limiters_directly_enforce_in_process_fallback_without_kv():
+    async def run():
+        rate = NatsRateLimiter(None, "test:rl:", rpm=1, settings=_settings())
+        concurrency = NatsConcurrencyLimiter(None, "test:conc:", max_concurrent=1, settings=_settings())
+        try:
+            assert await rate.acquire("openai")
+            assert not await rate.acquire("openai")
+
+            token = await concurrency.acquire("openai")
+            assert token is not None
+            assert await concurrency.acquire("openai") is None
+            await concurrency.release("openai", token)
+
+            next_token = await concurrency.acquire("openai")
+            assert next_token is not None
+            await concurrency.release("openai", next_token)
+        finally:
+            rate.close()
+            concurrency.close()
+
+    asyncio.run(run())
+
+
+def test_nats_rate_limiter_degrades_after_kv_operation_failure():
+    async def run():
+        pool = NatsRateLimiterPool(_BrokenNatsKv(), "test:rl:", overrides={"openai": 1})
+        try:
+            assert await pool.is_allowed("openai")
+            assert not await pool.is_allowed("openai")
+        finally:
+            pool.close()
+
+    asyncio.run(run())
+
+
+def test_nats_concurrency_limiter_degrades_after_kv_operation_failure():
+    async def run():
+        pool = NatsConcurrencyLimiterPool(_BrokenNatsKv(), "test:conc:", overrides={"openai": 1})
+        try:
+            assert await pool.acquire("openai")
+            assert not await pool.acquire("openai")
+            await pool.release("openai")
+            assert await pool.acquire("openai")
+            await pool.release("openai")
+        finally:
+            pool.close()
+
+    asyncio.run(run())
+
+
+def test_factories_without_injected_kv_enforce_in_process_fallback(monkeypatch):
+    async def unavailable(_self):
+        return None
+
+    monkeypatch.setattr(NatsRateLimiterPool.__module__ + ".NatsRateLimiter._connect_jetstream", unavailable)
+    monkeypatch.setattr(
+        NatsConcurrencyLimiterPool.__module__ + ".NatsConcurrencyLimiter._connect_jetstream",
+        unavailable,
+    )
+    settings = _settings()
+    settings.nats = SimpleNamespace(url="nats://unavailable:4222", token=None)
+
+    async def run():
+        rate = make_rate_limiter_pool(settings, overrides={"openai": 1})
+        concurrency = make_concurrency_limiter(settings, overrides={"openai": 1})
+        try:
+            assert await rate.is_allowed("openai")
+            assert not await rate.is_allowed("openai")
+            assert await concurrency.acquire("openai")
+            assert not await concurrency.acquire("openai")
+            await concurrency.release("openai")
+        finally:
+            rate.close()
+            concurrency.close()
 
     asyncio.run(run())
 
@@ -346,18 +528,19 @@ def test_factory_no_backend_concurrency_returns_in_process_and_warns(caplog):
     assert "NATS not configured" in caplog.text
 
 
-def test_nats_circuit_breaker_cross_instance_and_success_preserves_peer_trip():
+def test_nats_circuit_breaker_success_resets_shared_failure_state():
     async def run():
         kv = _FakeNatsKv()
-        first = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=2, cooldown_seconds=60)
-        second = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=2, cooldown_seconds=60)
+        first = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=3, cooldown_seconds=60)
+        second = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=3, cooldown_seconds=60)
         try:
             await first.record_failure("openai")
-            assert await second.is_allowed("openai")
             await second.record_failure("openai")
-            assert not await first.is_allowed("openai")
             await first.record_success("openai")
-            assert not await second.is_allowed("openai")
+            await second.record_failure("openai")
+            await first.record_failure("openai")
+            assert await second.is_allowed("openai")
+            assert second.status()["openai"]["failures"] == 2
         finally:
             first.close()
             second.close()
