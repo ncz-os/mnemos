@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import time
 from typing import Any
 
 from mnemos.api.dependencies import configure_auth
@@ -64,7 +65,11 @@ async def _run_distillation_worker(_pool: Any) -> None:
 
     backoff = 1.0
     while True:
-        worker = MemoryDistillationWorker()
+        worker = MemoryDistillationWorker(
+            _pool,
+            on_started=lambda: lifecycle._worker_status.__setitem__("distillation_worker", "healthy"),
+            on_heartbeat=lambda: lifecycle._worker_status.__setitem__("last_heartbeat", time.time()),
+        )
         try:
             lifecycle._worker_status["distillation_worker"] = "starting"
             await worker.start()
@@ -79,7 +84,7 @@ async def _run_distillation_worker(_pool: Any) -> None:
             logger.exception(f"Distillation worker crashed: {e} - restarting in {backoff:.0f}s")
         finally:
             try:
-                if getattr(worker, "db_pool", None):
+                if getattr(worker, "db_pool", None) and getattr(worker, "_owns_pool", True):
                     await worker.db_pool.close()
             except Exception:
                 pass
@@ -164,6 +169,7 @@ async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
         configured_nats_peers,
         consumer_loop,
     )
+    from mnemos.workers.federation_memory_nats_consumer import run_configured_consumers
 
     peers = list(configured_nats_peers(settings))
     if peers and not settings.nats.node_name.strip():
@@ -186,6 +192,11 @@ async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
     for peer in peers:
         logger.info("Launching federation nats consumer for peer %s", peer.name)
         lifecycle.schedule_worker(consumer_loop(pool, peer, queue_group=queue_group))
+
+    # Repository-level memory writes publish the v0.3 direct-upsert contract on
+    # MNEMOS_FEDERATION, while route writes still emit the legacy MNEMOS_MEMORY
+    # nudges above. Run both consumers until the legacy contract is retired.
+    lifecycle.schedule_worker(run_configured_consumers(pool, settings=settings))
 
 
 async def _webhook_nats_post_db_hook(pool: Any, settings: Any) -> None:

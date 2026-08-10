@@ -4983,11 +4983,9 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                     },
                 )
                 await conn.commit()
-        except Exception as exc:
-            _LOG.warning(
-                "MysqlBackend.open probe failed (%s); backend remains open but first acquire() may also fail.",
-                exc,
-            )
+        except Exception:
+            _LOG.exception("MysqlBackend.open failed while provisioning the required schema")
+            raise
 
     async def close(self) -> None:
         if self._closed:

@@ -61,6 +61,7 @@ def test_federation_post_db_hook_threads_queue_group_to_consumer_loop(monkeypatc
     from mnemos.api import lifecycle_hooks
     from mnemos.core import lifecycle
     from mnemos.federation import nats_consumer
+    from mnemos.workers import federation_memory_nats_consumer
 
     scheduled_kwargs: list[dict] = []
     scheduled_coros: list = []
@@ -80,6 +81,12 @@ def test_federation_post_db_hook_threads_queue_group_to_consumer_loop(monkeypatc
 
     monkeypatch.setattr(lifecycle, "schedule_worker", fake_schedule_worker)
     monkeypatch.setattr(nats_consumer, "consumer_loop", fake_consumer_loop)
+    direct_contract_scheduled = []
+
+    async def fake_direct_consumers(pool, *, settings):
+        direct_contract_scheduled.append((pool, settings))
+
+    monkeypatch.setattr(federation_memory_nats_consumer, "run_configured_consumers", fake_direct_consumers)
     monkeypatch.setattr(
         nats_consumer,
         "configured_nats_peers",
@@ -103,3 +110,5 @@ def test_federation_post_db_hook_threads_queue_group_to_consumer_loop(monkeypatc
         "lifecycle hook must thread MNEMOS_FEDERATION_NATS_QUEUE_GROUP "
         "into consumer_loop or queue groups remain unwired in production"
     )
+    assert direct_contract_scheduled == []
+    assert len(scheduled_coros) == 2

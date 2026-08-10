@@ -262,14 +262,36 @@ def setup_database(config: Config, info) -> bool:
 
     print(f"[db] Setting up database '{config.db_name}' as user '{config.db_user}'...")
 
-    # 1. Create user (idempotent via DO block)
+    # 1. Create stable roles referenced by the migration grants. ``mnemos`` is
+    # the group role; ``mnemos_user`` remains a compatibility grant target when
+    # the operator chooses a different application login.
+    role_sql = (
+        "DO $$ BEGIN "
+        "  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'mnemos') THEN "
+        "    CREATE ROLE mnemos NOLOGIN; "
+        "  END IF; "
+        + (
+            "  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'mnemos_user') THEN "
+            "    CREATE ROLE mnemos_user NOLOGIN; "
+            "  END IF; "
+            if config.db_user != "mnemos_user"
+            else ""
+        )
+        + "END $$;"
+    )
+    rc, _, err = _psql_superuser(role_sql)
+    if rc != 0:
+        print(f"[db] ERROR creating migration roles: {err}", file=sys.stderr)
+        return False
+
+    # Create user (idempotent via DO block)
     escaped_pw = config.db_password.replace("'", "''")
     create_user_sql = (
         f"DO $$ BEGIN "
         f"  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{config.db_user}') THEN "
         f"    CREATE USER {config.db_user} WITH PASSWORD '{escaped_pw}'; "
         f"  ELSE "
-        f"    ALTER USER {config.db_user} WITH PASSWORD '{escaped_pw}'; "
+        f"    ALTER ROLE {config.db_user} LOGIN PASSWORD '{escaped_pw}'; "
         f"  END IF; "
         f"END $$;"
     )
@@ -278,6 +300,12 @@ def setup_database(config: Config, info) -> bool:
         print(f"[db] ERROR creating user: {err}", file=sys.stderr)
         return False
     print(f"[db] User '{config.db_user}' ready.")
+
+    if config.db_user != "mnemos":
+        rc, _, err = _psql_superuser(f"GRANT mnemos TO {config.db_user}")
+        if rc != 0:
+            print(f"[db] ERROR granting mnemos role membership: {err}", file=sys.stderr)
+            return False
 
     # 2. Create database (idempotent)
     rc, out, _ = _psql_superuser(f"SELECT 1 FROM pg_database WHERE datname='{config.db_name}'")

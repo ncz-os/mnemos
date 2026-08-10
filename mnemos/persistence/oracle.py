@@ -2767,8 +2767,18 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         return await self._registry_rows(tx)
 
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
-        _ = (tx, model_id)
-        return None
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider FROM model_registry WHERE model_id = :m "
+                "AND available = 1 AND deprecated = 0 AND ROWNUM = 1",
+                {"m": model_id},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            return row.get("provider") if row else None
+        finally:
+            await _call(cursor.close)
 
     # ── model-registry WRITES (Oracle MERGE; daily provider sync) ──────────────
     async def upsert_model(self, tx: Transaction, model: dict[str, Any]) -> bool:

@@ -65,6 +65,14 @@ UPDATE deletion_requests
 RETURNING id
 """
 
+_REQUEUE_CONFIRMED_SQL = """
+UPDATE deletion_requests
+   SET status = 'confirmed'
+ WHERE id = $1
+   AND status = 'sweep_verifying'
+RETURNING id
+"""
+
 _MARK_HARD_DELETED_SQL = """
 UPDATE deletion_requests
    SET status = 'hard_deleted',
@@ -783,11 +791,16 @@ async def process_one_deletion_request(pool: Any) -> DeletionRequestResult | Non
                     counts[label] = counts.get(label, 0) + count
 
             if result is None:
+                requeued = await conn.fetchrow(_REQUEUE_CONFIRMED_SQL, request["id"])
+                if requeued is None:
+                    raise RuntimeError(
+                        f"deletion request {request['id']} disappeared before retry transition"
+                    )
                 result = DeletionRequestResult(
                     request_id=str(request["id"]),
                     target_user_id=request["target_user_id"],
                     target_namespace=request["target_namespace"],
-                    status="sweep_verifying",
+                    status="confirmed",
                     row_counts=counts,
                     soft_deleted_at=None,
                     restore_by=None,
