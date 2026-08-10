@@ -118,7 +118,7 @@ def pip_extra_spec(selected_components: tuple[str, ...]) -> str:
         if component in UNAVAILABLE_EXTRAS:
             raise ValueError(UNAVAILABLE_EXTRAS[component])
         if component == "server":
-            extras.update({"nats", "persephone"})
+            extras.update({"nats", "persephone", "knemon", "graeae", "charon"})
         elif component == "ml":
             extras.update({"morpheus", "kronos", "apollo", "artemis", "hot", "persephone"})
         elif component == "interop":
@@ -137,6 +137,8 @@ def pip_extra_spec(selected_components: tuple[str, ...]) -> str:
                     "artemis",
                     "hot",
                     "graeae",
+                    "knemon",
+                    "charon",
                 }
             )
         else:

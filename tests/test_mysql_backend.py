@@ -78,6 +78,17 @@ async def test_mysql_backend_advertises_implemented_capabilities_and_pings():
     assert await backend.ping() is True
 
 
+async def test_mysql_open_propagates_schema_provisioning_failure():
+    cursor = MagicMock()
+    cursor.execute = AsyncMock(side_effect=RuntimeError("ddl denied"))
+    conn = MagicMock()
+    conn.cursor = MagicMock(return_value=_AsyncCursorContext(cursor))
+    backend = MysqlBackend(_FakePool(conn), SimpleNamespace(database=SimpleNamespace(embedding_dim=3)))
+
+    with pytest.raises(RuntimeError, match="ddl denied"):
+        await backend.open()
+
+
 async def test_mysql_semantic_search_without_recency_uses_visibility_params_once():
     repo = MysqlMemoryRepository()
     repo._expected_embedding_dim = 3

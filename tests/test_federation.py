@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
+import hashlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -100,6 +101,74 @@ class _NoopRawTx:
         return None
 
 
+@pytest.mark.asyncio
+async def test_sync_peer_records_feed_failure_then_raises(monkeypatch):
+    from mnemos._version import __version__
+    from mnemos.domain import federation
+
+    signature = ".".join(__version__.split(".")[:2])
+
+    class Repo:
+        def __init__(self):
+            self.finished = None
+            self.recorded_error = None
+
+        async def get_sync_peer(self, tx, peer_id):
+            return {
+                "name": "peer-a",
+                "enabled": True,
+                "last_sync_cursor": None,
+                "base_url": "https://peer.example",
+                "auth_token": "token",
+                "namespace_filter": None,
+                "category_filter": None,
+                "compat_mode": "strict",
+                "copy_embeddings": False,
+            }
+
+        async def update_peer_schema_check(self, tx, peer_id, peer_version):
+            return None
+
+        async def create_sync_log(self, tx, peer_id, cursor_before):
+            return "log-1"
+
+        async def finish_sync_log(self, tx, **kwargs):
+            self.finished = kwargs
+
+        async def record_sync_error(self, tx, peer_id, error):
+            self.recorded_error = error
+
+    class Backend:
+        def __init__(self):
+            self.federation = Repo()
+
+        @asynccontextmanager
+        async def transactional(self):
+            yield object()
+
+    async def schema_ok(*args, **kwargs):
+        return {
+            "ok": True,
+            "mnemos_version": __version__,
+            "schema_signature": signature,
+            "migrations_fingerprint": None,
+        }
+
+    async def pull_fails(*args, **kwargs):
+        raise TimeoutError("feed timed out")
+
+    backend = Backend()
+    monkeypatch.setattr(federation, "_local_migrations_fingerprint", lambda: "")
+    monkeypatch.setattr(federation, "_check_peer_schema", schema_ok)
+    monkeypatch.setattr(federation, "_pull_batch", pull_fails)
+
+    with pytest.raises(federation.FederationSyncError, match="feed timed out"):
+        await federation.sync_peer(backend, "peer-1")
+
+    assert backend.federation.finished["error"] == "TimeoutError: feed timed out"
+    assert backend.federation.recorded_error == "TimeoutError: feed timed out"
+
+
 class _FeedBackend:
     def __init__(self, pool: _FeedPool):
         from mnemos.persistence.postgres import PostgresFederationRepository
@@ -134,6 +203,20 @@ class TestFederationWiring:
             "FEDERATION_BATCH_LIMIT",
         ):
             assert hasattr(federation, name), f"mnemos.domain.federation missing: {name}"
+
+    def test_migration_fingerprint_includes_nested_backend_migrations(self, monkeypatch):
+        from mnemos.domain import federation
+
+        db_dir = Path(federation.__file__).resolve().parents[2] / "mnemos" / "db_migrations"
+        expected = hashlib.sha256()
+        for path in sorted(db_dir.rglob("*.sql"), key=lambda item: item.relative_to(db_dir).as_posix()):
+            expected.update(path.relative_to(db_dir).as_posix().encode())
+            expected.update(b"\0")
+            expected.update(path.read_bytes())
+            expected.update(b"\0\0")
+        monkeypatch.setattr(federation, "_MIGRATIONS_FINGERPRINT_CACHE", None)
+
+        assert federation._local_migrations_fingerprint() == expected.hexdigest()[:16]
 
     def test_federation_handler_router(self):
         from mnemos.api.routes import federation as handler

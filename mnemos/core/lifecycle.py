@@ -411,7 +411,7 @@ def _database_dsn_from_settings(settings) -> str:
         return ""
     for field_name in ("dsn", "url"):
         database_url = getattr(database_settings, field_name, "").strip()
-        if database_url.startswith(("postgres:", "postgresql:")):
+        if database_url.startswith(("postgres:", "postgresql:")) or "=" in database_url:
             return database_url
     return ""
 

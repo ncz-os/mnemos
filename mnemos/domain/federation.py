@@ -164,6 +164,10 @@ class FederationSchemaTransient(FederationSchemaError):
     next worker tick can retry. → HTTP 503."""
 
 
+class FederationSyncError(Exception):
+    """A peer feed failed after schema preflight and the failure was recorded."""
+
+
 async def _check_peer_schema(
     base_url: str,
     auth_token: str,
@@ -325,10 +329,10 @@ def _local_migrations_fingerprint() -> str:
         means querying information_schema (or a migration ledger
         table) at /schema-serving time, which is more expensive and
         scoped for the "core fields + extensions" contract work.
-      - The hash includes only db/migrations*.sql — handler-level
-        contract changes (new endpoints, payload shape changes) are
-        not captured here; mnemos_version + schema_signature carry
-        that signal.
+      - The hash includes every deployed SQL migration, including numbered and
+        backend-specific directories. Handler-level contract changes (new
+        endpoints, payload shape changes) are not captured here;
+        mnemos_version + schema_signature carry that signal.
     """
     global _MIGRATIONS_FINGERPRINT_CACHE
     if _MIGRATIONS_FINGERPRINT_CACHE is not None:
@@ -341,8 +345,9 @@ def _local_migrations_fingerprint() -> str:
         _MIGRATIONS_FINGERPRINT_CACHE = ""
         return ""
     h = hashlib.sha256()
-    for p in sorted(db_dir.glob("migrations*.sql")):
-        h.update(p.name.encode("utf-8"))
+    for p in sorted(db_dir.rglob("*.sql"), key=lambda path: path.relative_to(db_dir).as_posix()):
+        relative_name = p.relative_to(db_dir).as_posix()
+        h.update(relative_name.encode("utf-8"))
         h.update(b"\0")
         try:
             h.update(p.read_bytes())
@@ -557,6 +562,9 @@ async def sync_peer(
             await repo.record_sync_error(tx, peer_id, err)
         else:
             await repo.record_sync_success(tx, peer_id, cursor_persisted, total_pulled)
+
+    if err:
+        raise FederationSyncError(f"federation sync with {peer['name']} failed: {err}")
 
     logger.info(
         "federation: peer=%s pulled=%d new=%d updated=%d cursor=%s",

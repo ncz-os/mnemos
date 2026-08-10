@@ -376,7 +376,10 @@ class NatsCircuitBreaker:
             return None
 
     async def _kv(self) -> Any | None:
-        return await asyncio.wrap_future(self._kv_future)
+        try:
+            return await asyncio.wrap_future(self._kv_future)
+        except Exception:
+            return None
 
     def _key_secret(self) -> bytes:
         if self._settings is not None:
@@ -925,6 +928,7 @@ class NatsRateLimiter:
         self._kv_future = self._loop.submit(self._ensure_kv(kv_or_js))
         self._seen: dict[str, int] = defaultdict(int)
         self._lock = threading.Lock()
+        self._local_fallback = InProcessRateLimiterPool(overrides={})
 
     async def _ensure_kv(self, source: Any | None) -> Any | None:
         if source is None:
@@ -992,12 +996,20 @@ class NatsRateLimiter:
             self._seen[provider] += 1
         kv = await self._kv()
         if kv is None:
-            # Degraded: allow request when KV unavailable
-            return True
+            fallback = self._local_fallback._get(provider)
+            if fallback.rpm != self.rpm:
+                fallback = InProcessRateLimiter(provider, self.rpm)
+                self._local_fallback._limiters[provider] = fallback
+            return fallback.is_allowed()
         key = self._key(provider)
-        return await self._acquire_with_retry(kv, key, provider)
+        try:
+            return await self._acquire_with_retry(kv, key, provider)
+        except Exception as exc:
+            logger.warning("[RL] %s: NATS operation failed; using in-process limit: %s", provider, exc)
+            return self._local_fallback._get(provider).is_allowed()
 
-    async def _acquire_with_retry(self, kv: Any, key: str, provider: str) -> bool:
+    async def _acquire_with_retry(self, kv: Any, key: str, provider: str, rpm: int | None = None) -> bool:
+        effective_rpm = self.rpm if rpm is None else rpm
         now = time.time()
         for _attempt in range(_NATS_RATE_LIMITER_RETRIES):
             try:
@@ -1034,12 +1046,12 @@ class NatsRateLimiter:
                     raise
                 continue  # retry with fresh revision
             # CAS succeeded — check if we exceeded the limit
-            if new_payload.get("count", 0) > self.rpm:
-                logger.warning("[RL] %s: NATS rate limit reached (%d rpm)", provider, self.rpm)
+            if new_payload.get("count", 0) > effective_rpm:
+                logger.warning("[RL] %s: NATS rate limit reached (%d rpm)", provider, effective_rpm)
                 return False
             return True
-        logger.warning("[RL] %s: CAS retries exhausted; allowing request", provider)
-        return True
+        logger.warning("[RL] %s: CAS retries exhausted; denying request", provider)
+        return False
 
     def status(self) -> dict[str, int]:
         return dict(self._seen)
@@ -1074,6 +1086,7 @@ class NatsRateLimiterPool:
         self._providers: set[str] = set()
         self._providers_lock = threading.Lock()
         self._overrides = overrides or {}
+        self._fallback = InProcessRateLimiterPool(overrides=self._overrides)
 
     def _remember(self, provider: str) -> None:
         with self._providers_lock:
@@ -1087,19 +1100,17 @@ class NatsRateLimiterPool:
         self._limiter._seen[provider] += 1
         kv = await self._limiter._kv()
         if kv is None:
-            return True
-        limiter = NatsRateLimiter(
-            None,
-            self._limiter.key_prefix,
-            self._get_rpm(provider),
-            bucket=self._limiter.bucket,
-            settings=self._limiter._settings,
-        )
-        limiter._seen = self._limiter._seen
-        limiter._lock = self._limiter._lock
-        limiter._loop = self._limiter._loop
-        limiter._kv_future = self._limiter._kv_future
-        return await limiter._acquire_with_retry(kv, limiter._key(provider), provider)
+            return self._fallback.is_allowed(provider)
+        try:
+            return await self._limiter._acquire_with_retry(
+                kv,
+                self._limiter._key(provider),
+                provider,
+                self._get_rpm(provider),
+            )
+        except Exception as exc:
+            logger.warning("[RL] %s: NATS operation failed; using in-process limit: %s", provider, exc)
+            return self._fallback.is_allowed(provider)
 
     def _get_rpm(self, provider: str) -> int:
         return self._overrides.get(provider, _PROVIDER_RPM.get(provider, _DEFAULT_RPM))
@@ -1214,6 +1225,8 @@ class NatsConcurrencyLimiter:
         self._kv_future = self._loop.submit(self._ensure_kv(kv_or_js))
         self._lock = threading.Lock()
         self._in_flight: dict[str, int] = defaultdict(int)
+        self._local_fallback = InProcessConcurrencyLimiterPool()
+        self._local_tokens: set[str] = set()
 
     async def _ensure_kv(self, source: Any | None) -> Any | None:
         if source is None:
@@ -1271,18 +1284,33 @@ class NatsConcurrencyLimiter:
             return None
 
     async def _kv(self) -> Any | None:
-        return await asyncio.wrap_future(self._kv_future)
+        try:
+            return await asyncio.wrap_future(self._kv_future)
+        except Exception:
+            return None
 
     def _key(self, provider: str) -> str:
         return f"{self.key_prefix}{provider}"
 
-    async def acquire(self, provider: str) -> str | None:
+    async def acquire(self, provider: str, max_concurrent: int | None = None) -> str | None:
+        effective_max = self.max_concurrent if max_concurrent is None else max_concurrent
         with self._lock:
             self._in_flight[provider] += 1
         kv = await self._kv()
         if kv is None:
-            # Degraded: allow request when KV unavailable
-            return str(uuid.uuid4().hex)
+            with self._lock:
+                self._in_flight[provider] -= 1
+            fallback = self._local_fallback._get(provider)
+            if fallback.max_concurrent != effective_max:
+                fallback = InProcessProviderConcurrencyLimiter(provider, effective_max)
+                self._local_fallback._limiters[provider] = fallback
+            if not await fallback.acquire():
+                return None
+            token = str(uuid.uuid4().hex)
+            self._local_tokens.add(token)
+            with self._lock:
+                self._in_flight[provider] += 1
+            return token
         key = self._key(provider)
         token = str(uuid.uuid4().hex)
         for _attempt in range(_NATS_CONCURRENCY_LIMITER_RETRIES):
@@ -1292,18 +1320,18 @@ class NatsConcurrencyLimiter:
                 entry = None
             if entry is None:
                 # First acquire for this key — create with max_concurrent-1 available
-                new_payload = {"available": self.max_concurrent - 1}
+                new_payload = {"available": effective_max - 1}
                 revision = None
             else:
                 payload = json.loads(_nats_entry_value(entry).decode("utf-8"))
-                available = payload.get("available", self.max_concurrent)
+                available = payload.get("available", effective_max)
                 if available <= 0:
                     with self._lock:
                         self._in_flight[provider] -= 1
                     logger.info(
                         "[CONC] %s: all %d NATS slots occupied; skipping",
                         provider,
-                        self.max_concurrent,
+                        effective_max,
                     )
                     return None
                 new_payload = {"available": available - 1}
@@ -1323,19 +1351,18 @@ class NatsConcurrencyLimiter:
                 if not _nats_wrong_revision(exc):
                     raise
                 continue  # retry with fresh revision
-        # Exhausted retries: read fresh state and decide
-        try:
-            entry = await _nats_maybe_await(kv.get(key))
-        except Exception:
-            return token
-        payload = json.loads(_nats_entry_value(entry).decode("utf-8"))
-        if payload.get("available", 0) > 0:
-            return token
         with self._lock:
             self._in_flight[provider] -= 1
+        logger.warning("[CONC] %s: CAS retries exhausted; denying request", provider)
         return None
 
     async def release(self, provider: str, token: str) -> None:
+        if token in self._local_tokens:
+            self._local_tokens.remove(token)
+            self._local_fallback.release(provider)
+            with self._lock:
+                self._in_flight[provider] = max(0, self._in_flight.get(provider, 0) - 1)
+            return
         with self._lock:
             self._in_flight[provider] = max(0, self._in_flight.get(provider, 0) - 1)
         kv = await self._kv()
@@ -1420,19 +1447,7 @@ class NatsConcurrencyLimiterPool:
 
     async def acquire(self, provider: str) -> bool:
         self._remember(provider)
-        # Create a temporary limiter that shares KV with the pool's limiter
-        limiter = NatsConcurrencyLimiter(
-            None,
-            self._limiter.key_prefix,
-            self._max_concurrent(provider),
-            bucket=self._limiter.bucket,
-            settings=self._limiter._settings,
-        )
-        limiter._kv_future = self._limiter._kv_future
-        limiter._loop = self._limiter._loop
-        limiter._in_flight = self._limiter._in_flight
-        limiter._lock = self._limiter._lock
-        token = await limiter.acquire(provider)
+        token = await self._limiter.acquire(provider, self._max_concurrent(provider))
         if token is None:
             return False
         # The underlying limiter is TOKEN-based: release(provider, token) is how
@@ -1447,17 +1462,6 @@ class NatsConcurrencyLimiterPool:
 
     async def release(self, provider: str) -> None:
         self._remember(provider)
-        limiter = NatsConcurrencyLimiter(
-            None,
-            self._limiter.key_prefix,
-            self._max_concurrent(provider),
-            bucket=self._limiter.bucket,
-            settings=self._limiter._settings,
-        )
-        limiter._kv_future = self._limiter._kv_future
-        limiter._loop = self._limiter._loop
-        limiter._in_flight = self._limiter._in_flight
-        limiter._lock = self._limiter._lock
         with self._token_lock:
             token = self._tokens.get(provider, []).pop() if self._tokens.get(provider) else None
         if token is None:
@@ -1466,26 +1470,16 @@ class NatsConcurrencyLimiterPool:
             # double-released, which is a bug in the caller, not a reason to
             # corrupt the limiter for everyone else.
             return
-        await limiter.release(provider, token)
+        await self._limiter.release(provider, token)
 
     @asynccontextmanager
     async def reserve(self, provider: str):
-        limiter = NatsConcurrencyLimiter(
-            None,
-            self._limiter.key_prefix,
-            self._max_concurrent(provider),
-            bucket=self._limiter.bucket,
-            settings=self._limiter._settings,
-        )
-        limiter._kv_future = self._limiter._kv_future
-        limiter._loop = self._limiter._loop
-        limiter._in_flight = self._limiter._in_flight
-        limiter._lock = self._limiter._lock
-        # Yield the acquisition result. The previous version yielded None, so
-        # `async with pool.reserve(p) as ok:` silently bound ok=None and every
-        # caller testing it treated a refused slot as success.
-        async with limiter.reserve(provider) as acquired:
+        acquired = await self.acquire(provider)
+        try:
             yield acquired
+        finally:
+            if acquired:
+                await self.release(provider)
 
     def status(self) -> dict[str, dict[str, int]]:
         return {
