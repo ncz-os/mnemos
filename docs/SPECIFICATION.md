@@ -839,6 +839,9 @@ supported for `server` with Redis via
 `RATE_LIMIT_STORAGE_URI=redis://host:6379/1`; in-process `memory://` fallback
 logs a startup warning when `MNEMOS_WORKERS > 1` because rate-limit,
 circuit-breaker, and concurrency state can drift between processes.
+When Redis is selected, provider admission fails closed if Redis is unavailable.
+`MNEMOS_RESILIENCE_ALLOW_IN_PROCESS_FALLBACK=true` is an explicit development
+or single-worker opt-out and is unsafe for horizontally scaled production.
 
 ### 11.4 Backup / restore
 

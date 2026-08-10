@@ -108,6 +108,7 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v3_5_session_compression_ratio_drop.sql",
     "migrations_v3_5_session_compression_legacy_drop.sql",
     "migrations_v3_5_sessions_consultations_namespace.sql",
+    "migrations_v4_2_deletion_requests.sql",
     "migrations_v4_2_compression_candidates_reject_reason.sql",
     "migrations_v4_2_morpheus_consolidate_sqlite.sql",
     "migrations_v4_2_morpheus_extract_sqlite.sql",
@@ -4716,6 +4717,18 @@ class SqliteBackend:
                 raise
 
     async def _ensure_repository_columns(self, conn: Any) -> None:
+        for table in (
+            "memory_versions",
+            "kg_triples",
+            "graeae_consultations",
+            "memory_branches",
+            "session_messages",
+            "session_memory_injections",
+            "graeae_audit_log",
+            "journal",
+            "entities",
+        ):
+            await self._ensure_columns(conn, table, {"deleted_at": "deleted_at TEXT"})
         await self._ensure_columns(
             conn,
             "sessions",

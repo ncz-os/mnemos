@@ -925,9 +925,17 @@ async def lifespan(app):
     # Start registered background workers. API owns registrations so core stays
     # below API/domain/webhook/worker packages in the dependency graph.
     worker_enabled = config.get("worker", {}).get("enabled", True)
+    if not worker_enabled:
+        _worker_status["distillation_worker"] = "disabled"
     scheduled_workers = 0
-    if _pool:
+    worker_handle = _pool if _pool is not None else _persistence_backend
+    if worker_handle is not None:
         for worker_name, (factory, honor_worker_enabled) in _lifespan_worker_factories.items():
+            if _pool is None and worker_name not in {
+                "deletion_request_worker",
+                "persephone archival worker",
+            }:
+                continue
             if honor_worker_enabled and not worker_enabled:
                 logger.info("%s disabled", worker_name)
                 if worker_name == "distillation_worker":
@@ -935,7 +943,7 @@ async def lifespan(app):
                 if worker_name == "deletion_request_worker":
                     _worker_status["deletion_request_worker"] = "disabled"
                 continue
-            worker_coro = factory(_pool)
+            worker_coro = factory(worker_handle)
             if worker_coro is None:
                 logger.info("%s disabled", worker_name)
                 if worker_name == "distillation_worker":

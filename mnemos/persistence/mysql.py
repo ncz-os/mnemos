@@ -411,6 +411,52 @@ CREATE TABLE IF NOT EXISTS memories (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
+_DDL_DELETION_REQUESTS = """\
+CREATE TABLE IF NOT EXISTS deletion_requests (
+    id VARCHAR(64) NOT NULL DEFAULT (UUID()),
+    target_user_id VARCHAR(256) NOT NULL,
+    target_namespace VARCHAR(256),
+    requested_by VARCHAR(256) NOT NULL,
+    requested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    confirmed_at DATETIME(6),
+    status VARCHAR(32) NOT NULL DEFAULT 'requested',
+    notes TEXT,
+    soft_deleted_at DATETIME(6),
+    restore_by DATETIME(6),
+    hard_deleted_at DATETIME(6),
+    restored_at DATETIME(6),
+    PRIMARY KEY (id),
+    INDEX idx_deletion_requests_claim (status, confirmed_at, requested_at),
+    INDEX idx_deletion_requests_target (target_user_id, target_namespace)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_MEMORY_ARCHIVE = """\
+CREATE TABLE IF NOT EXISTS memory_archive (
+    id VARCHAR(64) NOT NULL,
+    archived_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    archived_by VARCHAR(256) NOT NULL DEFAULT 'system:persephone',
+    compressed_content LONGBLOB NOT NULL,
+    compression_algo VARCHAR(32) NOT NULL DEFAULT 'zstd',
+    original_size_bytes BIGINT NOT NULL,
+    compressed_size_bytes BIGINT NOT NULL,
+    schema_version INT NOT NULL DEFAULT 1,
+    PRIMARY KEY (id),
+    INDEX idx_memory_archive_archived_at (archived_at),
+    CONSTRAINT fk_memory_archive_memory FOREIGN KEY (id) REFERENCES memories(id) ON DELETE RESTRICT
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_DELETION_LOG = """\
+CREATE TABLE IF NOT EXISTS deletion_log (
+    id VARCHAR(64) NOT NULL, memory_id VARCHAR(64) NOT NULL, content_hash VARCHAR(64) NOT NULL,
+    owner_id VARCHAR(256), namespace VARCHAR(256), requested_by VARCHAR(256) NOT NULL,
+    requested_at DATETIME(6) NOT NULL, executed_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    request_kind VARCHAR(32) NOT NULL, reason TEXT, source JSON, PRIMARY KEY (id),
+    INDEX idx_deletion_log_memory (memory_id), INDEX idx_deletion_log_owner_ns (owner_id, namespace)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
 _DDL_FEDERATION_PEERS = """\
 CREATE TABLE IF NOT EXISTS federation_peers (
     id                   VARCHAR(64)  NOT NULL,
@@ -849,6 +895,9 @@ INSERT IGNORE INTO memory_category_decay (category, half_life_days, decay_kind, 
 
 _INIT_DDLS = [
     _DDL_MEMORIES,
+    _DDL_DELETION_REQUESTS,
+    _DDL_DELETION_LOG,
+    _DDL_MEMORY_ARCHIVE,
     _DDL_FEDERATION_PEERS,
     _DDL_FEDERATION_SYNC_LOG,
     _DDL_MEMORY_VERSIONS,

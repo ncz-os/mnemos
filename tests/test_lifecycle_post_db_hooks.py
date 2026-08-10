@@ -100,7 +100,7 @@ def test_federation_post_db_hook_threads_queue_group_to_consumer_loop(monkeypatc
 
     settings = SimpleNamespace(
         nats=SimpleNamespace(node_name="argonas"),
-        federation=SimpleNamespace(nats_queue_group="fed_pool"),
+        federation=SimpleNamespace(nats_queue_group="fed_pool", nats_peers=[object()]),
     )
 
     asyncio.run(lifecycle_hooks._federation_nats_post_db_hook(object(), settings))
