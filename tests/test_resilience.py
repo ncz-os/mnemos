@@ -770,3 +770,36 @@ def test_principal_cache_invalidate_drops_entries_and_is_generation_idempotent()
     principal_cache_invalidate(2)
     assert cache == {}
     assert isinstance(types, types.ModuleType)
+
+
+def test_call_maybe_async_handles_sync_and_async_callables():
+    """call_maybe_async is public API with no callers; pin its contract.
+
+    It exists so the NATS-backed pools can drive both real async clients and
+    the synchronous fakes used in these tests through one code path. Nothing
+    in the tree calls it today, which is how its import here came to be
+    flagged as unused - the coverage gap, not the import, was the defect.
+    """
+
+    async def run():
+        def sync_add(a, b):
+            return a + b
+
+        async def async_add(a, b):
+            return a + b
+
+        assert await call_maybe_async(sync_add, 2, 3) == 5
+        assert await call_maybe_async(async_add, 2, 3) == 5
+
+        # Keyword arguments must survive the indirection.
+        assert await call_maybe_async(sync_add, a=4, b=5) == 9
+
+        # An exception raised by the callable propagates rather than being
+        # swallowed into a never-awaited coroutine.
+        def boom():
+            raise _WrongLastError("propagated")
+
+        with pytest.raises(_WrongLastError):
+            await call_maybe_async(boom)
+
+    asyncio.run(run())
