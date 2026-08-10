@@ -104,6 +104,30 @@ async def test_create_memory_publishes_memory_created(
     assert publish_mock.await_args.kwargs["msg_id"] == "mem_create.created"
 
 
+async def test_create_memory_sanitizes_nats_wildcards_and_spaces(
+    client,
+    auth_headers: dict[str, str],
+    current_user_override,
+    publish_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    current_user_override["user"] = _alice("team .* east")
+    backend = install_fake_backend(monkeypatch)
+    monkeypatch.setattr("mnemos.api.routes.memories.new_memory_id", lambda: "mem_safe_subject")
+    row = _memory_row("mem_safe_subject")
+    row["namespace"] = "team .* east"
+    backend.memories.configure_return("get_memory", row)
+
+    resp = await client.post(
+        "/v1/memories",
+        json={"content": "remember this", "category": "facts"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert publish_mock.await_args.args[0] == "mnemos.memory.created.team_east"
+
+
 async def test_bulk_create_publishes_memory_created_per_success(
     client,
     auth_headers: dict[str, str],

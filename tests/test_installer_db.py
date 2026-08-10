@@ -8,6 +8,25 @@ from mnemos.installer import db
 from mnemos.installer.wizard import Config
 
 
+def test_setup_database_creates_fixed_migration_roles(monkeypatch):
+    statements: list[str] = []
+
+    def fake_psql(sql: str, dbname: str = "postgres"):
+        statements.append(sql)
+        if sql.startswith("SELECT 1 FROM pg_database"):
+            return 0, "1\n", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(db, "_psql_superuser", fake_psql)
+    cfg = Config(profile="server", db_user="custom_login", db_password="secret")
+
+    assert db.setup_database(cfg, type("Info", (), {"postgres_running": True})()) is True
+    combined = "\n".join(statements)
+    assert "CREATE ROLE mnemos NOLOGIN" in combined
+    assert "CREATE ROLE mnemos_user NOLOGIN" in combined
+    assert "GRANT mnemos TO custom_login" in combined
+
+
 def test_psql_superuser_file_streams_sql_via_stdin(monkeypatch, tmp_path):
     sql = "SELECT 'migration via stdin';\n"
     migration = tmp_path / "_MEIfake" / "migrations.sql"

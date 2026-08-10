@@ -331,3 +331,14 @@ def test_oracle_dsn_envvar_takes_precedence_over_pg_host(monkeypatch: pytest.Mon
         # ORACLE_DSN env var should select the oracle backend even without
         # MNEMOS_DATABASE_DSN being set.
         assert lifecycle._select_persistence_backend(settings) == "oracle"
+
+
+def test_libpq_dsn_is_forwarded_to_asyncpg() -> None:
+    settings = SimpleNamespace(
+        database=SimpleNamespace(
+            dsn="host=db.internal port=6543 dbname=prod user=mnemos",
+            url="",
+        )
+    )
+
+    assert lifecycle._database_dsn_from_settings(settings) == settings.database.dsn

@@ -122,8 +122,11 @@ _DB_CONNECT_ARGS = {
 
 
 class MemoryDistillationWorker:
-    def __init__(self):
-        self.db_pool = None   # asyncpg Pool — set in start()
+    def __init__(self, db_pool=None, *, on_started=None, on_heartbeat=None):
+        self.db_pool = db_pool
+        self._owns_pool = db_pool is None
+        self._on_started = on_started
+        self._on_heartbeat = on_heartbeat
         # Contest engines — populated in start() once config is loaded
         self._contest_engines = []
         # v3.3 S-II judge — populated alongside engines in start()
@@ -146,15 +149,21 @@ class MemoryDistillationWorker:
         # dependency on the lifecycle wrap during test bootstrap.
         from mnemos.core.pool import wrap_pool_with_timeout
 
-        raw_pool = await asyncpg.create_pool(
-            min_size=1, max_size=3, command_timeout=60, **_DB_CONNECT_ARGS,
-        )
+        database = get_settings().database
+        dsn = (getattr(database, "dsn", "") or getattr(database, "url", "")).strip()
+        if dsn:
+            raw_pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3, command_timeout=60)
+        else:
+            raw_pool = await asyncpg.create_pool(
+                min_size=1, max_size=3, command_timeout=60, **_DB_CONNECT_ARGS,
+            )
         return wrap_pool_with_timeout(raw_pool)
 
     async def start(self):
         """Start background worker"""
         logger.info(f"Connecting to DB: {_PG_CONFIG['host']}:{_PG_CONFIG['port']}/{_PG_CONFIG['database']}")
-        self.db_pool = await self._create_pool()
+        if self.db_pool is None:
+            self.db_pool = await self._create_pool()
 
         # Construct contest engines if available. Each engine is
         # lazy about creating HTTP clients — construction itself is
@@ -268,13 +277,19 @@ class MemoryDistillationWorker:
 
         logger.info("[OK] Distillation worker started")
         logger.info(f"Config: batch={BATCH_SIZE}, interval={CHECK_INTERVAL}s")
+        if self._on_started is not None:
+            self._on_started()
 
         while True:
             try:
                 await self.process_contest_queue_batch()
                 await self.log_stats()
+                if self._on_heartbeat is not None:
+                    self._on_heartbeat()
             except Exception as e:
                 logger.error(f"Worker error: {e}", exc_info=True)
+                if not self._owns_pool:
+                    raise
                 try:
                     await self.db_pool.close()
                     self.db_pool = await self._create_pool()

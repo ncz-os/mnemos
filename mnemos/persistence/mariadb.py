@@ -940,11 +940,9 @@ class MariadbBackend(MysqlBackend):
                     },
                 )
                 await conn.commit()
-        except Exception as exc:
-            _LOG.warning(
-                "MariadbBackend.open probe failed (%s); backend remains open but first acquire() may also fail.",
-                exc,
-            )
+        except Exception:
+            _LOG.exception("MariadbBackend.open failed while provisioning the required schema")
+            raise
 
 
 __all__ = [

@@ -287,6 +287,7 @@ def test_nats_rate_limiter_degrades_to_in_process_on_kv_failure():
         try:
             # With no KV, acquire should succeed (degradation)
             assert await pool.is_allowed("openai")
+            assert not await pool.is_allowed("openai")
         finally:
             pool.close()
 
@@ -299,6 +300,10 @@ def test_nats_concurrency_limiter_degrades_to_in_process_on_kv_failure():
         try:
             # With no KV, acquire should succeed (degradation)
             assert await pool.acquire("openai")
+            assert not await pool.acquire("openai")
+            await pool.release("openai")
+            assert await pool.acquire("openai")
+            await pool.release("openai")
         finally:
             pool.close()
 
