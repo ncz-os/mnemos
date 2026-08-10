@@ -262,6 +262,10 @@ class _NatsLoopThread:
             self._owned_connections.clear()
         for nc in connections:
             try:
+                aclose = getattr(nc, "aclose", None)
+                if aclose is not None:
+                    await _nats_maybe_await(aclose())
+                    continue
                 drain = getattr(nc, "drain", None)
                 if drain is not None:
                     await _nats_maybe_await(drain())
@@ -640,6 +644,255 @@ class NatsCircuitBreakerPool:
 
     def close(self) -> None:
         self._breaker.close()
+
+
+_REDIS_CB_FAILURE_SCRIPT = """
+local failures = redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+redis.call('HSET', KEYS[3], 'state', 'closed', 'failures', failures)
+redis.call('EXPIRE', KEYS[3], ARGV[2])
+if failures >= tonumber(ARGV[1]) then
+  redis.call('SET', KEYS[2], 'open', 'EX', ARGV[2])
+  redis.call('HSET', KEYS[3], 'state', 'open', 'failures', failures, 'opened_at', ARGV[3])
+  redis.call('EXPIRE', KEYS[3], ARGV[2])
+  return {1, failures}
+end
+return {0, failures}
+"""
+
+_REDIS_CB_SUCCESS_SCRIPT = """
+redis.call('DEL', KEYS[1])
+redis.call('DEL', KEYS[2])
+redis.call('DEL', KEYS[3])
+return 1
+"""
+
+_REDIS_RATE_SCRIPT = """
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+if count <= tonumber(ARGV[1]) then return 1 end
+return 0
+"""
+
+_REDIS_CONCURRENCY_ACQUIRE_SCRIPT = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
+redis.call('EXPIRE', KEYS[1], math.ceil(tonumber(ARGV[2]) - tonumber(ARGV[1])))
+return 1
+"""
+
+
+class _RedisPoolBase:
+    """Own a Redis asyncio client on a dedicated loop for sync/async callers."""
+
+    def __init__(self, storage_uri: str, *, redis_client: Any | None, allow_fallback: bool) -> None:
+        self._storage_uri = storage_uri
+        self._injected_client = redis_client
+        self._allow_fallback = allow_fallback
+        self._loop = _NatsLoopThread(name="mnemos-redis-resilience")
+        self._client_future = self._loop.submit(self._connect())
+
+    async def _connect(self) -> Any:
+        if self._injected_client is not None:
+            return self._injected_client
+        import redis.asyncio as redis
+
+        client = redis.from_url(self._storage_uri, decode_responses=True)
+        await client.ping()
+        self._loop.add_connection(client)
+        return client
+
+    async def _run(self, coro_factory: Any) -> Any:
+        async def operation() -> Any:
+            client = await asyncio.wrap_future(self._client_future)
+            return await coro_factory(client)
+
+        return await asyncio.wrap_future(self._loop.submit(operation()))
+
+    def close(self) -> None:
+        self._loop.close()
+
+
+class RedisCircuitBreakerPool(_RedisPoolBase):
+    """Atomic Redis circuit breaker shared by all API workers."""
+
+    def __init__(
+        self,
+        storage_uri: str,
+        key_prefix: str,
+        *,
+        failure_threshold: int = 5,
+        cooldown_seconds: int = 300,
+        redis_client: Any | None = None,
+        allow_fallback: bool = False,
+    ) -> None:
+        super().__init__(storage_uri, redis_client=redis_client, allow_fallback=allow_fallback)
+        self.key_prefix = key_prefix
+        self.failure_threshold = failure_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self._fallback = InProcessCircuitBreakerPool(failure_threshold, cooldown_seconds)
+        self._providers: set[str] = set()
+        self._last_status: dict[str, dict[str, Any]] = {}
+
+    def _keys(self, provider: str) -> tuple[str, str, str]:
+        digest = hashlib.sha256(provider.encode()).hexdigest()
+        base = f"{self.key_prefix}{digest}"
+        return f"{base}:failures", f"{base}:state", f"{base}:status"
+
+    async def is_allowed(self, provider: str) -> bool:
+        self._providers.add(provider)
+        try:
+            state = await self._run(lambda client: client.get(self._keys(provider)[1]))
+            allowed = state != "open"
+            self._last_status[provider] = {
+                "state": CircuitState.CLOSED.value if allowed else CircuitState.OPEN.value,
+                "failures": None,
+            }
+            return allowed
+        except Exception as exc:
+            logger.error("[CB] %s: Redis unavailable: %s", provider, exc, exc_info=True)
+            return self._fallback.is_allowed(provider) if self._allow_fallback else False
+
+    async def record_failure(self, provider: str) -> None:
+        self._providers.add(provider)
+        self._fallback.record_failure(provider)
+        try:
+            keys = self._keys(provider)
+            result = await self._run(
+                lambda client: client.eval(
+                    _REDIS_CB_FAILURE_SCRIPT,
+                    3,
+                    *keys,
+                    self.failure_threshold,
+                    self.cooldown_seconds,
+                    time.time(),
+                )
+            )
+            opened, failures = int(result[0]), int(result[1])
+            self._last_status[provider] = {
+                "state": CircuitState.OPEN.value if opened else CircuitState.CLOSED.value,
+                "failures": failures,
+            }
+        except Exception as exc:
+            logger.error("[CB] %s: Redis failure record failed: %s", provider, exc, exc_info=True)
+
+    async def record_success(self, provider: str) -> None:
+        self._providers.add(provider)
+        self._fallback.record_success(provider)
+        try:
+            await self._run(lambda client: client.eval(_REDIS_CB_SUCCESS_SCRIPT, 3, *self._keys(provider)))
+            self._last_status[provider] = {"state": CircuitState.CLOSED.value, "failures": 0}
+        except Exception as exc:
+            logger.error("[CB] %s: Redis success record failed: %s", provider, exc, exc_info=True)
+
+    def status(self) -> dict[str, dict[str, Any]]:
+        return {provider: self._last_status.get(provider, {"state": "unknown", "failures": None}) for provider in self._providers}
+
+
+class RedisRateLimiterPool(_RedisPoolBase):
+    """Atomic fixed-window Redis provider rate limiter."""
+
+    def __init__(self, storage_uri: str, key_prefix: str, *, overrides: dict[str, int] | None = None, redis_client: Any | None = None, allow_fallback: bool = False) -> None:
+        super().__init__(storage_uri, redis_client=redis_client, allow_fallback=allow_fallback)
+        self.key_prefix = key_prefix
+        self._overrides = overrides or {}
+        self._fallback = InProcessRateLimiterPool(self._overrides)
+        self._seen: dict[str, int] = defaultdict(int)
+
+    def _limit(self, provider: str) -> int:
+        return self._overrides.get(provider, _PROVIDER_RPM.get(provider, _DEFAULT_RPM))
+
+    async def is_allowed(self, provider: str) -> bool:
+        self._seen[provider] += 1
+        window = int(time.time() // 60)
+        key = f"{self.key_prefix}{provider}:{window}"
+        try:
+            result = await self._run(lambda client: client.eval(_REDIS_RATE_SCRIPT, 1, key, self._limit(provider), 60))
+            return bool(int(result))
+        except Exception as exc:
+            logger.error("[RL] %s: Redis unavailable: %s", provider, exc, exc_info=True)
+            return self._fallback.is_allowed(provider) if self._allow_fallback else False
+
+    acquire = is_allowed
+
+    def status(self) -> dict[str, int]:
+        return dict(self._seen)
+
+
+class RedisConcurrencyLimiterPool(_RedisPoolBase):
+    """Redis sorted-set reservation ledger with atomic expiring leases."""
+
+    def __init__(self, storage_uri: str, key_prefix: str, *, overrides: dict[str, int] | None = None, lease_seconds: int = 300, redis_client: Any | None = None, allow_fallback: bool = False) -> None:
+        super().__init__(storage_uri, redis_client=redis_client, allow_fallback=allow_fallback)
+        self.key_prefix = key_prefix
+        self._overrides = overrides or {}
+        self._lease_seconds = lease_seconds
+        self._fallback = InProcessConcurrencyLimiterPool(self._overrides)
+        self._tokens: dict[str, list[str]] = defaultdict(list)
+
+    def _limit(self, provider: str) -> int:
+        return self._overrides.get(provider, _PROVIDER_SLOTS.get(provider, _DEFAULT_SLOTS))
+
+    async def acquire(self, provider: str) -> bool:
+        token = uuid.uuid4().hex
+        now = time.time()
+        try:
+            result = await self._run(
+                lambda client: client.eval(
+                    _REDIS_CONCURRENCY_ACQUIRE_SCRIPT,
+                    1,
+                    f"{self.key_prefix}{provider}",
+                    now,
+                    now + self._lease_seconds,
+                    self._limit(provider),
+                    token,
+                )
+            )
+            if not int(result):
+                return False
+            self._tokens[provider].append(token)
+            return True
+        except Exception as exc:
+            logger.error("[CONC] %s: Redis unavailable: %s", provider, exc, exc_info=True)
+            if not self._allow_fallback:
+                return False
+            if await self._fallback.acquire(provider):
+                self._tokens[provider].append("local:" + token)
+                return True
+            return False
+
+    async def release(self, provider: str) -> None:
+        if not self._tokens.get(provider):
+            return
+        token = self._tokens[provider].pop()
+        if token.startswith("local:"):
+            self._fallback.release(provider)
+            return
+        try:
+            await self._run(lambda client: client.zrem(f"{self.key_prefix}{provider}", token))
+        except Exception as exc:
+            logger.error(
+                "[CONC] %s: Redis release failed; lease will expire: %s",
+                provider,
+                exc,
+                exc_info=True,
+            )
+
+    def is_available(self, provider: str) -> bool:
+        return True
+
+    @asynccontextmanager
+    async def reserve(self, provider: str):
+        acquired = await self.acquire(provider)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                await self.release(provider)
+
+    def status(self) -> dict[str, dict[str, int]]:
+        return {provider: {"in_flight": len(tokens), "max": self._limit(provider)} for provider, tokens in self._tokens.items()}
 
 
 class InProcessRateLimiter:
@@ -1498,6 +1751,15 @@ def _nats_configured(settings: Any) -> bool:
     return bool(getattr(getattr(settings, "nats", None), "url", None))
 
 
+def _redis_storage_uri(settings: Any) -> str | None:
+    uri = str(getattr(getattr(settings, "rate_limit", None), "storage_uri", "") or "")
+    return uri if uri.startswith(("redis://", "rediss://")) else None
+
+
+def _allow_in_process_fallback(settings: Any) -> bool:
+    return bool(getattr(getattr(settings, "resilience", None), "allow_in_process_fallback", False))
+
+
 def _fallback_warning_enabled(settings: Any) -> bool:
     resilience = getattr(settings, "resilience", None)
     return bool(getattr(resilience, "fallback_warning", True))
@@ -1517,7 +1779,7 @@ def make_circuit_breaker_pool(
     failure_threshold: int = 5,
     cooldown_seconds: int = 300,
     nats_kv: Any | None = None,
-) -> InProcessCircuitBreakerPool | NatsCircuitBreakerPool:
+) -> InProcessCircuitBreakerPool | NatsCircuitBreakerPool | RedisCircuitBreakerPool:
     if _nats_configured(settings):
         return NatsCircuitBreakerPool(
             nats_kv,
@@ -1526,8 +1788,16 @@ def make_circuit_breaker_pool(
             cooldown_seconds=cooldown_seconds,
             settings=settings,
         )
-    else:
-        _warn_fallback(settings, "NATS not configured")
+    redis_uri = _redis_storage_uri(settings)
+    if redis_uri:
+        return RedisCircuitBreakerPool(
+            redis_uri,
+            getattr(settings.resilience, "circuit_breaker_redis_prefix", "mnemos:cb:"),
+            failure_threshold=failure_threshold,
+            cooldown_seconds=cooldown_seconds,
+            allow_fallback=_allow_in_process_fallback(settings),
+        )
+    _warn_fallback(settings, "NATS not configured and no Redis resilience backend configured")
     return InProcessCircuitBreakerPool(
         failure_threshold=failure_threshold,
         cooldown_seconds=cooldown_seconds,
@@ -1539,7 +1809,7 @@ def make_rate_limiter_pool(
     *,
     overrides: dict[str, int] | None = None,
     nats_kv: Any | None = None,
-) -> InProcessRateLimiterPool | NatsRateLimiterPool:
+) -> InProcessRateLimiterPool | NatsRateLimiterPool | RedisRateLimiterPool:
     if _nats_configured(settings):
         prefix = getattr(settings.resilience, "rate_limiter_nats_prefix", "rl:")
         return NatsRateLimiterPool(
@@ -1548,8 +1818,15 @@ def make_rate_limiter_pool(
             overrides=overrides,
             settings=settings,
         )
-    else:
-        _warn_fallback(settings, "NATS not configured")
+    redis_uri = _redis_storage_uri(settings)
+    if redis_uri:
+        return RedisRateLimiterPool(
+            redis_uri,
+            getattr(settings.resilience, "rate_limiter_redis_prefix", "mnemos:rl:"),
+            overrides=overrides,
+            allow_fallback=_allow_in_process_fallback(settings),
+        )
+    _warn_fallback(settings, "NATS not configured and no Redis resilience backend configured")
     return InProcessRateLimiterPool(overrides=overrides)
 
 
@@ -1558,7 +1835,7 @@ def make_concurrency_limiter(
     *,
     overrides: dict[str, int] | None = None,
     nats_kv: Any | None = None,
-) -> InProcessConcurrencyLimiterPool | NatsConcurrencyLimiterPool:
+) -> InProcessConcurrencyLimiterPool | NatsConcurrencyLimiterPool | RedisConcurrencyLimiterPool:
     if _nats_configured(settings):
         prefix = getattr(settings.resilience, "concurrency_nats_prefix", "conc:")
         return NatsConcurrencyLimiterPool(
@@ -1567,8 +1844,16 @@ def make_concurrency_limiter(
             overrides=overrides,
             settings=settings,
         )
-    else:
-        _warn_fallback(settings, "NATS not configured")
+    redis_uri = _redis_storage_uri(settings)
+    if redis_uri:
+        return RedisConcurrencyLimiterPool(
+            redis_uri,
+            getattr(settings.resilience, "concurrency_redis_prefix", "mnemos:conc:"),
+            overrides=overrides,
+            lease_seconds=int(getattr(settings.resilience, "concurrency_lease_seconds", 300)),
+            allow_fallback=_allow_in_process_fallback(settings),
+        )
+    _warn_fallback(settings, "NATS not configured and no Redis resilience backend configured")
     return InProcessConcurrencyLimiterPool(overrides=overrides)
 
 

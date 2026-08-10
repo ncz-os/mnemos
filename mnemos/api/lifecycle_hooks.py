@@ -132,7 +132,7 @@ def _deletion_request_worker(pool: Any):
 
     from mnemos.workers.deletion_request_worker import deletion_request_worker_loop
 
-    return deletion_request_worker_loop(pool)
+    return deletion_request_worker_loop(lifecycle._persistence_backend or pool)
 
 
 def _persephone_archival_worker(pool: Any):
@@ -144,7 +144,7 @@ def _persephone_archival_worker(pool: Any):
 
     from mnemos.workers.persephone_archival_worker import persephone_archival_worker_loop
 
-    return persephone_archival_worker_loop(pool)
+    return persephone_archival_worker_loop(lifecycle._persistence_backend or pool)
 
 
 async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
@@ -163,6 +163,10 @@ async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
     """
     if not service_enabled(settings, "federation_nats_consumers"):
         logger.info("federation nats consumers disabled by profile service manifest")
+        return
+    nats_url = getattr(settings.nats, "url", None)
+    if nats_url is not None and not str(nats_url).strip():
+        logger.info("federation nats consumers disabled (MNEMOS_NATS_URL unset)")
         return
 
     from mnemos.federation.nats_consumer import (
@@ -195,8 +199,11 @@ async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
 
     # Repository-level memory writes publish the v0.3 direct-upsert contract on
     # MNEMOS_FEDERATION, while route writes still emit the legacy MNEMOS_MEMORY
-    # nudges above. Run both consumers until the legacy contract is retired.
-    lifecycle.schedule_worker(run_configured_consumers(pool, settings=settings))
+    # nudges above. Do not create a task when no direct-contract peers exist:
+    # scheduling the coroutine and relying on its first body check leaks a
+    # pending task until the event loop gets another turn during startup.
+    if getattr(settings.federation, "nats_peers", ()):
+        lifecycle.schedule_worker(run_configured_consumers(pool, settings=settings))
 
 
 async def _webhook_nats_post_db_hook(pool: Any, settings: Any) -> None:
