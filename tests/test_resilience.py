@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from mnemos.core.resilience import (
     InProcessCircuitBreakerPool,
+    call_maybe_async,
     InProcessConcurrencyLimiterPool,
     InProcessRateLimiter,
     InProcessRateLimiterPool,
