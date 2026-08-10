@@ -725,6 +725,20 @@ async def process_one_deletion_request(pool: Any) -> DeletionRequestResult | Non
     transition share one transaction. A mid-flight exception aborts
     everything, leaving the request in ``confirmed`` for retry.
     """
+    if hasattr(pool, "transactional") and not hasattr(pool, "acquire"):
+        from mnemos.persistence.worker_lifecycle import process_one_deletion_request as process_backend
+
+        payload = await process_backend(
+            pool,
+            verify_attempts=DEFAULT_VERIFY_ATTEMPTS,
+            restore_days=RESTORE_GRACE_DAYS,
+        )
+        if payload is None:
+            return None
+        result = DeletionRequestResult(**payload)
+        await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
+        return result
+
     result: DeletionRequestResult | None = None
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -851,6 +865,18 @@ async def hard_delete_soft_deleted_request(
 
 async def process_one_hard_deletion_request(pool: Any) -> DeletionRequestResult | None:
     """Hard-delete one expired soft-deleted request under SKIP LOCKED."""
+    if hasattr(pool, "transactional") and not hasattr(pool, "acquire"):
+        from mnemos.persistence.worker_lifecycle import (
+            process_one_hard_deletion_request as process_backend,
+        )
+
+        payload = await process_backend(pool)
+        if payload is None:
+            return None
+        result = DeletionRequestResult(**payload)
+        await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
+        return result
+
     result: DeletionRequestResult | None = None
     async with pool.acquire() as conn:
         async with conn.transaction():

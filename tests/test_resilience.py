@@ -15,6 +15,9 @@ from mnemos.core.resilience import (
     NatsCircuitBreakerPool,
     NatsRateLimiterPool,
     NatsConcurrencyLimiterPool,
+    RedisCircuitBreakerPool,
+    RedisConcurrencyLimiterPool,
+    RedisRateLimiterPool,
     call_maybe_async,
     make_circuit_breaker_pool,
     make_concurrency_limiter,
@@ -182,9 +185,14 @@ def _settings(storage_uri: str = "memory://", *, fallback_warning: bool = False)
     return SimpleNamespace(
         rate_limit=SimpleNamespace(storage_uri=storage_uri),
         resilience=SimpleNamespace(
+            circuit_breaker_redis_prefix="test:cb:",
+            rate_limiter_redis_prefix="test:rl:",
+            concurrency_redis_prefix="test:conc:",
             circuit_breaker_nats_prefix="test:cb:",
             rate_limiter_nats_prefix="test:rl:",
             concurrency_nats_prefix="test:conc:",
+            allow_in_process_fallback=False,
+            concurrency_lease_seconds=30,
             fallback_warning=fallback_warning,
         ),
         server=SimpleNamespace(redis_url="redis://cache:6379/0"),
@@ -318,6 +326,90 @@ def test_factory_returns_nats_backends_when_nats_configured():
     assert isinstance(make_circuit_breaker_pool(settings, nats_kv=kv), NatsCircuitBreakerPool)
     assert isinstance(make_rate_limiter_pool(settings, nats_kv=kv), NatsRateLimiterPool)
     assert isinstance(make_concurrency_limiter(settings, nats_kv=kv), NatsConcurrencyLimiterPool)
+
+
+def test_redis_resilience_state_is_shared_and_atomic():
+    async def run():
+        redis = _FakeAsyncRedis()
+        cb1 = RedisCircuitBreakerPool(
+            "redis://unused", "test:cb:", failure_threshold=2, redis_client=redis
+        )
+        cb2 = RedisCircuitBreakerPool(
+            "redis://unused", "test:cb:", failure_threshold=2, redis_client=redis
+        )
+        rl1 = RedisRateLimiterPool(
+            "redis://unused", "test:rl:", overrides={"openai": 2}, redis_client=redis
+        )
+        rl2 = RedisRateLimiterPool(
+            "redis://unused", "test:rl:", overrides={"openai": 2}, redis_client=redis
+        )
+        conc1 = RedisConcurrencyLimiterPool(
+            "redis://unused", "test:conc:", overrides={"openai": 1}, redis_client=redis
+        )
+        conc2 = RedisConcurrencyLimiterPool(
+            "redis://unused", "test:conc:", overrides={"openai": 1}, redis_client=redis
+        )
+        pools = (cb1, cb2, rl1, rl2, conc1, conc2)
+        try:
+            await cb1.record_failure("openai")
+            assert await cb2.is_allowed("openai")
+            await cb2.record_failure("openai")
+            assert not await cb1.is_allowed("openai")
+            assert await rl1.is_allowed("openai")
+            assert await rl2.is_allowed("openai")
+            assert not await rl1.is_allowed("openai")
+            assert await conc1.acquire("openai")
+            assert not await conc2.acquire("openai")
+            await conc1.release("openai")
+            assert await conc2.acquire("openai")
+            await conc2.release("openai")
+        finally:
+            for pool in pools:
+                pool.close()
+
+    asyncio.run(run())
+
+
+def test_redis_resilience_fails_closed_unless_development_opt_out():
+    class BrokenRedis:
+        async def get(self, _key):
+            raise RuntimeError("down")
+
+        async def eval(self, *_args):
+            raise RuntimeError("down")
+
+        async def zrem(self, *_args):
+            raise RuntimeError("down")
+
+    async def run():
+        strict = RedisRateLimiterPool("redis://unused", "strict:", redis_client=BrokenRedis())
+        development = RedisRateLimiterPool(
+            "redis://unused", "dev:", redis_client=BrokenRedis(), allow_fallback=True
+        )
+        try:
+            assert not await strict.is_allowed("openai")
+            assert await development.is_allowed("openai")
+        finally:
+            strict.close()
+            development.close()
+
+    asyncio.run(run())
+
+
+def test_factory_selects_redis_resilience_backends():
+    settings = _settings("redis://cache:6379/1")
+    pools = (
+        make_circuit_breaker_pool(settings),
+        make_rate_limiter_pool(settings),
+        make_concurrency_limiter(settings),
+    )
+    try:
+        assert isinstance(pools[0], RedisCircuitBreakerPool)
+        assert isinstance(pools[1], RedisRateLimiterPool)
+        assert isinstance(pools[2], RedisConcurrencyLimiterPool)
+    finally:
+        for pool in pools:
+            pool.close()
 
 
 def test_factory_memory_uri_returns_in_process_and_warns(caplog):

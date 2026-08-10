@@ -490,6 +490,19 @@ class _ResilienceSettings(BaseSettings):
         ),
     )
     fallback_warning: bool = Field(True, validation_alias="MNEMOS_RESILIENCE_FALLBACK_WARNING")
+    allow_in_process_fallback: bool = Field(
+        False,
+        validation_alias="MNEMOS_RESILIENCE_ALLOW_IN_PROCESS_FALLBACK",
+        description=(
+            "Development/single-worker opt-out from fail-closed shared resilience. "
+            "Never enable for a multi-worker production deployment."
+        ),
+    )
+    concurrency_lease_seconds: int = Field(
+        300,
+        ge=1,
+        validation_alias="MNEMOS_RESILIENCE_CONCURRENCY_LEASE_SECONDS",
+    )
 
 
 class _ObservabilitySettings(BaseSettings):
