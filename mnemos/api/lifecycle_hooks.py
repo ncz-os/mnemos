@@ -132,7 +132,25 @@ def _deletion_request_worker(pool: Any):
 
     from mnemos.workers.deletion_request_worker import deletion_request_worker_loop
 
-    return deletion_request_worker_loop(lifecycle._persistence_backend or pool)
+    # PostgreSQL supplies its asyncpg pool here; the backend-neutral lifecycle
+    # repository is used only when lifecycle has no PostgreSQL pool.
+    def success() -> None:
+        lifecycle._worker_status["deletion_request_worker"] = "healthy"
+        lifecycle._worker_status["deletion_request_worker_last_success"] = time.time()
+        lifecycle._worker_status["deletion_request_worker_last_error"] = None
+
+    def error(exc: Exception) -> None:
+        lifecycle._worker_status["deletion_request_worker"] = "error"
+        lifecycle._worker_status["deletion_request_worker_last_error"] = str(exc)
+        lifecycle._worker_status["deletion_request_worker_last_error_at"] = time.time()
+
+    lifecycle._worker_status["deletion_request_worker"] = "starting"
+    return deletion_request_worker_loop(
+        pool,
+        on_started=lambda: lifecycle._worker_status.__setitem__("deletion_request_worker", "starting"),
+        on_success=success,
+        on_error=error,
+    )
 
 
 def _persephone_archival_worker(pool: Any):
@@ -144,7 +162,23 @@ def _persephone_archival_worker(pool: Any):
 
     from mnemos.workers.persephone_archival_worker import persephone_archival_worker_loop
 
-    return persephone_archival_worker_loop(lifecycle._persistence_backend or pool)
+    def success() -> None:
+        lifecycle._worker_status["persephone_archival_worker"] = "healthy"
+        lifecycle._worker_status["persephone_archival_worker_last_success"] = time.time()
+        lifecycle._worker_status["persephone_archival_worker_last_error"] = None
+
+    def error(exc: Exception) -> None:
+        lifecycle._worker_status["persephone_archival_worker"] = "error"
+        lifecycle._worker_status["persephone_archival_worker_last_error"] = str(exc)
+        lifecycle._worker_status["persephone_archival_worker_last_error_at"] = time.time()
+
+    lifecycle._worker_status["persephone_archival_worker"] = "starting"
+    return persephone_archival_worker_loop(
+        pool,
+        on_started=lambda: lifecycle._worker_status.__setitem__("persephone_archival_worker", "starting"),
+        on_success=success,
+        on_error=error,
+    )
 
 
 async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:

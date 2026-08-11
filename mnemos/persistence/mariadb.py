@@ -50,6 +50,7 @@ from mnemos.persistence.mysql import (
     _DDL_CONSULTATION_MEMORY_REFS,
     _DDL_DELETION_REQUESTS,
     _DDL_DELETION_LOG,
+    _DDL_ENTITIES,
     _DDL_FEDERATION_PEERS,
     _DDL_FEDERATION_SYNC_LOG,
     _DDL_GRAEAE_AUDIT_LOG,
@@ -59,6 +60,9 @@ from mnemos.persistence.mysql import (
     _DDL_KG_TRIPLES,
     _DDL_MODEL_REGISTRY,
     _DDL_MODEL_REGISTRY_SYNC_LOG,
+    _DDL_SESSIONS,
+    _DDL_SESSION_MESSAGES,
+    _DDL_SESSION_MEMORY_INJECTIONS,
     _DDL_STATE,
     _DDL_USAGE_LEDGER,
     _DEFAULT_EMBEDDING_DIM,
@@ -256,6 +260,7 @@ CREATE TABLE IF NOT EXISTS memory_branches (
     head_version_id VARCHAR(64),
     created_by      VARCHAR(256),
     created_at      TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at      TIMESTAMP(6) NULL,
     PRIMARY KEY (memory_id, name),
     INDEX idx_memory_branches_memory (memory_id),
     INDEX idx_memory_branches_head (head_version_id),
@@ -276,6 +281,10 @@ _INIT_DDLS = [
     _DDL_FEDERATION_SYNC_LOG,
     _DDL_MEMORY_VERSIONS,
     _DDL_MEMORY_BRANCHES,
+    _DDL_ENTITIES,
+    _DDL_SESSIONS,
+    _DDL_SESSION_MESSAGES,
+    _DDL_SESSION_MEMORY_INJECTIONS,
     _DDL_KG_TRIPLES,
     _DDL_COMPRESSION_CANDIDATES,
     _DDL_COMPRESSED_VARIANTS,
@@ -905,6 +914,38 @@ class MariadbBackend(MysqlBackend):
                         "federation_last_pushed_at": "federation_last_pushed_at DATETIME(6)",
                         "federation_push_peer": "federation_push_peer VARCHAR(512)",
                     },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "memory_branches",
+                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "entities",
+                    {
+                        "owner_id": "owner_id VARCHAR(256) NOT NULL DEFAULT 'default'",
+                        "namespace": "namespace VARCHAR(256) NOT NULL DEFAULT 'default'",
+                        "deleted_at": "deleted_at TIMESTAMP(6) NULL",
+                    },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "sessions",
+                    {
+                        "namespace": "namespace VARCHAR(256) NOT NULL DEFAULT 'default'",
+                        "deleted_at": "deleted_at TIMESTAMP(6) NULL",
+                    },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "session_messages",
+                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "session_memory_injections",
+                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
                 )
                 await _ensure_mysql_columns(
                     conn,

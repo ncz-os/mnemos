@@ -1780,14 +1780,6 @@ def make_circuit_breaker_pool(
     cooldown_seconds: int = 300,
     nats_kv: Any | None = None,
 ) -> InProcessCircuitBreakerPool | NatsCircuitBreakerPool | RedisCircuitBreakerPool:
-    if _nats_configured(settings):
-        return NatsCircuitBreakerPool(
-            nats_kv,
-            getattr(settings.resilience, "circuit_breaker_nats_prefix", "cb."),
-            failure_threshold=failure_threshold,
-            cooldown_seconds=cooldown_seconds,
-            settings=settings,
-        )
     redis_uri = _redis_storage_uri(settings)
     if redis_uri:
         return RedisCircuitBreakerPool(
@@ -1796,6 +1788,14 @@ def make_circuit_breaker_pool(
             failure_threshold=failure_threshold,
             cooldown_seconds=cooldown_seconds,
             allow_fallback=_allow_in_process_fallback(settings),
+        )
+    if _nats_configured(settings):
+        return NatsCircuitBreakerPool(
+            nats_kv,
+            getattr(settings.resilience, "circuit_breaker_nats_prefix", "cb."),
+            failure_threshold=failure_threshold,
+            cooldown_seconds=cooldown_seconds,
+            settings=settings,
         )
     _warn_fallback(settings, "NATS not configured and no Redis resilience backend configured")
     return InProcessCircuitBreakerPool(
@@ -1810,14 +1810,6 @@ def make_rate_limiter_pool(
     overrides: dict[str, int] | None = None,
     nats_kv: Any | None = None,
 ) -> InProcessRateLimiterPool | NatsRateLimiterPool | RedisRateLimiterPool:
-    if _nats_configured(settings):
-        prefix = getattr(settings.resilience, "rate_limiter_nats_prefix", "rl:")
-        return NatsRateLimiterPool(
-            nats_kv,
-            prefix,
-            overrides=overrides,
-            settings=settings,
-        )
     redis_uri = _redis_storage_uri(settings)
     if redis_uri:
         return RedisRateLimiterPool(
@@ -1825,6 +1817,14 @@ def make_rate_limiter_pool(
             getattr(settings.resilience, "rate_limiter_redis_prefix", "mnemos:rl:"),
             overrides=overrides,
             allow_fallback=_allow_in_process_fallback(settings),
+        )
+    if _nats_configured(settings):
+        prefix = getattr(settings.resilience, "rate_limiter_nats_prefix", "rl:")
+        return NatsRateLimiterPool(
+            nats_kv,
+            prefix,
+            overrides=overrides,
+            settings=settings,
         )
     _warn_fallback(settings, "NATS not configured and no Redis resilience backend configured")
     return InProcessRateLimiterPool(overrides=overrides)
@@ -1836,14 +1836,6 @@ def make_concurrency_limiter(
     overrides: dict[str, int] | None = None,
     nats_kv: Any | None = None,
 ) -> InProcessConcurrencyLimiterPool | NatsConcurrencyLimiterPool | RedisConcurrencyLimiterPool:
-    if _nats_configured(settings):
-        prefix = getattr(settings.resilience, "concurrency_nats_prefix", "conc:")
-        return NatsConcurrencyLimiterPool(
-            nats_kv,
-            prefix,
-            overrides=overrides,
-            settings=settings,
-        )
     redis_uri = _redis_storage_uri(settings)
     if redis_uri:
         return RedisConcurrencyLimiterPool(
@@ -1852,6 +1844,14 @@ def make_concurrency_limiter(
             overrides=overrides,
             lease_seconds=int(getattr(settings.resilience, "concurrency_lease_seconds", 300)),
             allow_fallback=_allow_in_process_fallback(settings),
+        )
+    if _nats_configured(settings):
+        prefix = getattr(settings.resilience, "concurrency_nats_prefix", "conc:")
+        return NatsConcurrencyLimiterPool(
+            nats_kv,
+            prefix,
+            overrides=overrides,
+            settings=settings,
         )
     _warn_fallback(settings, "NATS not configured and no Redis resilience backend configured")
     return InProcessConcurrencyLimiterPool(overrides=overrides)

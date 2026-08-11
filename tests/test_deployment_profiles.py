@@ -272,6 +272,63 @@ async def test_health_returns_active_profile(monkeypatch: pytest.MonkeyPatch, tm
     assert "state" in response.persistence_capability_details
 
 
+@pytest.mark.asyncio
+async def test_health_degrades_when_deletion_worker_is_failing(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from mnemos.api.routes import health
+
+    class _PingableBackend:
+        capabilities = {"core"}
+
+        async def ping(self) -> bool:
+            return True
+
+    with _isolated_settings(monkeypatch, tmp_path, env={"MNEMOS_PROFILE": "edge"}):
+        monkeypatch.setattr(health._lc, "_persistence_backend", _PingableBackend())
+        monkeypatch.setattr(
+            health._lc,
+            "_worker_status",
+            {
+                "distillation_worker": "healthy",
+                "deletion_request_worker": "error",
+                "persephone_archival_worker": "disabled",
+            },
+        )
+        response = await health.health_check()
+
+    assert response.database_connected is True
+    assert response.deletion_request_worker == "error"
+    assert response.status == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_health_degrades_when_deletion_worker_heartbeat_is_stale(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from mnemos.api.routes import health
+
+    class _PingableBackend:
+        capabilities = {"core"}
+
+        async def ping(self) -> bool:
+            return True
+
+    with _isolated_settings(monkeypatch, tmp_path, env={"MNEMOS_PROFILE": "edge"}):
+        monkeypatch.setattr(health._lc, "_persistence_backend", _PingableBackend())
+        monkeypatch.setattr(
+            health._lc,
+            "_worker_status",
+            {
+                "distillation_worker": "healthy",
+                "deletion_request_worker": "healthy",
+                "deletion_request_worker_last_success": 1.0,
+                "persephone_archival_worker": "disabled",
+            },
+        )
+        response = await health.health_check()
+
+    assert response.status == "degraded"
+
+
 # ─── Enterprise backend DSN detection ─────────────────────────────────────────
 #
 # These tests verify that the runtime config layer recognizes the Oracle and
