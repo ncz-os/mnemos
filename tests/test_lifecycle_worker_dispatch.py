@@ -9,6 +9,7 @@ def test_postgres_lifecycle_workers_receive_pool_not_backend(monkeypatch):
     pool = object()
     backend = object()
     deletion_calls = []
+    hard_deletion_calls = []
     archival_calls = []
 
     monkeypatch.setattr(lifecycle_hooks, "service_enabled", lambda *_args: True)
@@ -25,9 +26,17 @@ def test_postgres_lifecycle_workers_receive_pool_not_backend(monkeypatch):
     )
 
     lifecycle_hooks._deletion_request_worker(pool)
+    monkeypatch.setattr(
+        deletion_request_worker,
+        "deletion_request_worker_loop",
+        lambda handle, **kwargs: hard_deletion_calls.append((handle, kwargs)) or object(),
+    )
+    lifecycle_hooks._hard_deletion_request_worker(pool)
     lifecycle_hooks._persephone_archival_worker(pool)
 
     assert deletion_calls[0][0] is pool
+    assert hard_deletion_calls[0][0] is pool
+    assert hard_deletion_calls[0][1]["phase"] == "hard_delete"
     assert archival_calls[0][0] is pool
 
     deletion_calls[0][1]["on_error"](RuntimeError("deletion failed"))

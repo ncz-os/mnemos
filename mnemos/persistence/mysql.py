@@ -1008,7 +1008,7 @@ async def create_mysql_pool(
     except ImportError as exc:
         raise ImportError(
             "The MySQL persistence backend requires the 'aiomysql' package. "
-            "Install it with: pip install 'mnemos-os[mysql]'"
+            "Install it with: pip install 'mnemos-core[mysql]'"
         ) from exc
 
     kwargs = _parse_mysql_dsn(dsn)
