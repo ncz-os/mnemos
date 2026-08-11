@@ -685,6 +685,17 @@ redis.call('EXPIRE', KEYS[1], math.ceil(tonumber(ARGV[2]) - tonumber(ARGV[1])))
 return 1
 """
 
+_REDIS_CONCURRENCY_RENEW_SCRIPT = """
+local score = redis.call('ZSCORE', KEYS[1], ARGV[3])
+if not score or tonumber(score) <= tonumber(ARGV[1]) then
+  redis.call('ZREM', KEYS[1], ARGV[3])
+  return 0
+end
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
+redis.call('EXPIRE', KEYS[1], math.ceil(tonumber(ARGV[2]) - tonumber(ARGV[1])))
+return 1
+"""
+
 
 class _RedisPoolBase:
     """Own a Redis asyncio client on a dedicated loop for sync/async callers."""
@@ -838,35 +849,69 @@ class RedisConcurrencyLimiterPool(_RedisPoolBase):
         self._lease_seconds = lease_seconds
         self._fallback = InProcessConcurrencyLimiterPool(self._overrides)
         self._tokens: dict[str, list[str]] = defaultdict(list)
+        self._heartbeats: dict[str, asyncio.Task[None]] = {}
+
+    async def _acquire_token(self, provider: str) -> str | None:
+        """Acquire and return the exact reservation owned by this caller."""
+        token = uuid.uuid4().hex
+        now = time.time()
+        result = await self._run(
+            lambda client: client.eval(
+                _REDIS_CONCURRENCY_ACQUIRE_SCRIPT,
+                1,
+                f"{self.key_prefix}{provider}",
+                now,
+                now + self._lease_seconds,
+                self._limit(provider),
+                token,
+            )
+        )
+        return token if int(result) else None
+
+    async def _renew_token(self, provider: str, token: str) -> bool:
+        now = time.time()
+        renewed = await self._run(
+            lambda client: client.eval(
+                _REDIS_CONCURRENCY_RENEW_SCRIPT,
+                1,
+                f"{self.key_prefix}{provider}",
+                now,
+                now + self._lease_seconds,
+                token,
+            )
+        )
+        return bool(int(renewed))
+
+    async def _heartbeat(self, provider: str, token: str) -> None:
+        interval = max(0.1, self._lease_seconds / 3)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if not await self._renew_token(provider, token):
+                    logger.error("[CONC] %s: Redis reservation lease was lost", provider)
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[CONC] %s: Redis reservation renewal failed: %s", provider, exc, exc_info=True)
 
     def _limit(self, provider: str) -> int:
         return self._overrides.get(provider, _PROVIDER_SLOTS.get(provider, _DEFAULT_SLOTS))
 
     async def acquire(self, provider: str) -> bool:
-        token = uuid.uuid4().hex
-        now = time.time()
         try:
-            result = await self._run(
-                lambda client: client.eval(
-                    _REDIS_CONCURRENCY_ACQUIRE_SCRIPT,
-                    1,
-                    f"{self.key_prefix}{provider}",
-                    now,
-                    now + self._lease_seconds,
-                    self._limit(provider),
-                    token,
-                )
-            )
-            if not int(result):
+            token = await self._acquire_token(provider)
+            if token is None:
                 return False
             self._tokens[provider].append(token)
+            self._heartbeats[token] = asyncio.create_task(self._heartbeat(provider, token))
             return True
         except Exception as exc:
             logger.error("[CONC] %s: Redis unavailable: %s", provider, exc, exc_info=True)
             if not self._allow_fallback:
                 return False
             if await self._fallback.acquire(provider):
-                self._tokens[provider].append("local:" + token)
+                self._tokens[provider].append("local:" + uuid.uuid4().hex)
                 return True
             return False
 
@@ -877,6 +922,13 @@ class RedisConcurrencyLimiterPool(_RedisPoolBase):
         if token.startswith("local:"):
             self._fallback.release(provider)
             return
+        heartbeat = self._heartbeats.pop(token, None)
+        if heartbeat is not None:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
         try:
             await self._run(lambda client: client.zrem(f"{self.key_prefix}{provider}", token))
         except Exception as exc:
@@ -892,12 +944,49 @@ class RedisConcurrencyLimiterPool(_RedisPoolBase):
 
     @asynccontextmanager
     async def reserve(self, provider: str):
-        acquired = await self.acquire(provider)
+        token: str | None = None
+        local = False
+        heartbeat: asyncio.Task[None] | None = None
+        try:
+            token = await self._acquire_token(provider)
+        except Exception as exc:
+            logger.error("[CONC] %s: Redis unavailable: %s", provider, exc, exc_info=True)
+            if self._allow_fallback and await self._fallback.acquire(provider):
+                local = True
+                token = "local:" + uuid.uuid4().hex
+        acquired = token is not None
+        if token is not None:
+            self._tokens[provider].append(token)
+            if not local:
+                heartbeat = asyncio.create_task(self._heartbeat(provider, token))
+                self._heartbeats[token] = heartbeat
         try:
             yield acquired
         finally:
-            if acquired:
-                await self.release(provider)
+            if heartbeat is not None:
+                heartbeat.cancel()
+                try:
+                    await heartbeat
+                except asyncio.CancelledError:
+                    pass
+                self._heartbeats.pop(token, None)
+            if token is not None:
+                try:
+                    self._tokens[provider].remove(token)
+                except ValueError:
+                    pass
+                if local:
+                    self._fallback.release(provider)
+                else:
+                    try:
+                        await self._run(lambda client: client.zrem(f"{self.key_prefix}{provider}", token))
+                    except Exception as exc:
+                        logger.error(
+                            "[CONC] %s: Redis release failed; lease will expire: %s",
+                            provider,
+                            exc,
+                            exc_info=True,
+                        )
 
     def status(self) -> dict[str, dict[str, int]]:
         return {provider: {"in_flight": len(tokens), "max": self._limit(provider)} for provider, tokens in self._tokens.items()}

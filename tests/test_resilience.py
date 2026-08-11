@@ -120,6 +120,8 @@ class _FakeAsyncRedis:
             return self._eval_circuit_failure(keys, args)
         if "redis.call('DEL', KEYS[3])" in script:
             return self._eval_circuit_success(keys)
+        if "redis.call('ZSCORE'" in script:
+            return self._eval_concurrency_renew(keys, args)
         if "ZREMRANGEBYSCORE" in script:
             return self._eval_concurrency_acquire(keys, args)
         return self._eval_rate_limit(keys, args)
@@ -178,6 +180,17 @@ class _FakeAsyncRedis:
         members = {member: score for member, score in members.items() if score > now}
         if len(members) >= max_concurrent:
             self._zsets[key] = (members, expires_at)
+            return 0
+        members[token] = expires_at
+        self._zsets[key] = (members, expires_at)
+        return 1
+
+    def _eval_concurrency_renew(self, keys, args):
+        key = keys[0]
+        now, expires_at, token = float(args[0]), float(args[1]), str(args[2])
+        members, _old_expires_at = self._zsets.get(key, ({}, None))
+        if members.get(token, float("-inf")) <= now:
+            members.pop(token, None)
             return 0
         members[token] = expires_at
         self._zsets[key] = (members, expires_at)
@@ -404,6 +417,65 @@ def test_redis_resilience_fails_closed_unless_development_opt_out():
         finally:
             strict.close()
             development.close()
+
+    asyncio.run(run())
+
+
+def test_redis_concurrency_renews_long_running_reservation_and_releases_its_token():
+    async def run():
+        redis = _FakeAsyncRedis()
+        pool = RedisConcurrencyLimiterPool(
+            "redis://unused",
+            "test:conc:",
+            overrides={"openai": 1},
+            lease_seconds=0.3,
+            redis_client=redis,
+        )
+        contender = RedisConcurrencyLimiterPool(
+            "redis://unused",
+            "test:conc:",
+            overrides={"openai": 1},
+            lease_seconds=0.3,
+            redis_client=redis,
+        )
+        try:
+            assert await pool.acquire("openai")
+            token = pool._tokens["openai"][0]
+            first_expiry = redis._zsets["test:conc:openai"][0][token]
+            await asyncio.sleep(0.15)
+            renewed_expiry = redis._zsets["test:conc:openai"][0][token]
+            assert renewed_expiry > first_expiry
+            assert not await contender.acquire("openai")
+            await pool.release("openai")
+            assert token not in redis._zsets["test:conc:openai"][0]
+        finally:
+            pool.close()
+            contender.close()
+
+    asyncio.run(run())
+
+
+def test_redis_concurrency_development_fallback_still_releases_local_slot():
+    class BrokenRedis:
+        async def eval(self, *_args):
+            raise RuntimeError("down")
+
+    async def run():
+        pool = RedisConcurrencyLimiterPool(
+            "redis://unused",
+            "test:conc:",
+            overrides={"openai": 1},
+            redis_client=BrokenRedis(),
+            allow_fallback=True,
+        )
+        try:
+            assert await pool.acquire("openai")
+            assert not await pool.acquire("openai")
+            await pool.release("openai")
+            assert await pool.acquire("openai")
+            await pool.release("openai")
+        finally:
+            pool.close()
 
     asyncio.run(run())
 
