@@ -65,6 +65,7 @@ WEBHOOK_SHUTDOWN_DRAIN_SECONDS = float(get_settings().webhook.shutdown_drain_sec
 _worker_status: dict = {
     "distillation_worker": "idle",  # idle, healthy, error
     "deletion_request_worker": "idle",
+    "persephone_archival_worker": "idle",
     "last_heartbeat": None,
 }
 

@@ -328,6 +328,15 @@ def test_factory_returns_nats_backends_when_nats_configured():
     assert isinstance(make_concurrency_limiter(settings, nats_kv=kv), NatsConcurrencyLimiterPool)
 
 
+def test_factory_prefers_fail_closed_redis_when_redis_and_nats_are_configured():
+    settings = _settings("redis://limits:6379/1")
+    settings.nats = SimpleNamespace(url="nats://localhost:4222", token=None)
+
+    assert isinstance(make_circuit_breaker_pool(settings), RedisCircuitBreakerPool)
+    assert isinstance(make_rate_limiter_pool(settings), RedisRateLimiterPool)
+    assert isinstance(make_concurrency_limiter(settings), RedisConcurrencyLimiterPool)
+
+
 def test_redis_resilience_state_is_shared_and_atomic():
     async def run():
         redis = _FakeAsyncRedis()

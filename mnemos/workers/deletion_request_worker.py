@@ -959,6 +959,9 @@ async def deletion_request_worker_loop(
     batch_size: int = DEFAULT_BATCH_SIZE,
     check_interval_seconds: float = DEFAULT_CHECK_INTERVAL_SECONDS,
     phase: str = "soft_delete",
+    on_started: Any = None,
+    on_success: Any = None,
+    on_error: Any = None,
 ) -> None:
     """Perpetual lifecycle worker loop."""
     if phase not in {"soft_delete", "hard_delete"}:
@@ -968,14 +971,20 @@ async def deletion_request_worker_loop(
         if phase == "hard_delete"
         else process_deletion_requests
     )
+    if on_started is not None:
+        on_started()
     while True:
         try:
             counts = await process_batch(pool, batch_size=batch_size)
+            if on_success is not None:
+                on_success()
             if counts:
                 logger.info("deletion request worker phase=%s batch: %s", phase, counts)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            if on_error is not None:
+                on_error(exc)
             logger.exception("deletion request worker phase=%s batch failed", phase)
         await asyncio.sleep(check_interval_seconds)
 

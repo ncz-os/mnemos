@@ -7,10 +7,33 @@ import pytest
 
 from mnemos.domain.persephone.runner import sweep_for_archival
 from mnemos.persistence.sqlite import SqliteBackend
+from mnemos.persistence.worker_lifecycle import _Ops
 from mnemos.workers.deletion_request_worker import (
     process_one_deletion_request,
     process_one_hard_deletion_request,
 )
+
+
+def test_db2_worker_sql_uses_driver_positional_markers():
+    from mnemos.persistence.db2 import _adapt_oracle_to_db2
+
+    rendered = _Ops(SimpleNamespace(conn=None), "db2").sql("UPDATE t SET a = ? WHERE b = ?")
+
+    assert rendered == "UPDATE t SET a = ? WHERE b = ?"
+    assert _adapt_oracle_to_db2(rendered, ("one", "two")) == (rendered, ("one", "two"))
+
+
+@pytest.mark.parametrize(
+    ("dialect", "expected"),
+    [
+        ("sqlite", "a = ? AND b = ?"),
+        ("mysql", "a = %s AND b = %s"),
+        ("oracle", "a = :1 AND b = :2"),
+        ("db2", "a = ? AND b = ?"),
+    ],
+)
+def test_worker_sql_paramstyle_matches_each_driver(dialect, expected):
+    assert _Ops(SimpleNamespace(conn=None), dialect).sql("a = ? AND b = ?") == expected
 
 
 @pytest.mark.asyncio
