@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
+import time
 
 import pytest
 from typer.testing import CliRunner
@@ -248,6 +249,7 @@ def test_cli_install_profile_flag_forwards_to_installer(monkeypatch: pytest.Monk
 
 @pytest.mark.asyncio
 async def test_health_returns_active_profile(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from fastapi import Response
     from mnemos.api.routes import health
 
     class _PingableBackend:
@@ -261,7 +263,7 @@ async def test_health_returns_active_profile(monkeypatch: pytest.MonkeyPatch, tm
         monkeypatch.setattr(health._lc, "_persistence_backend", _PingableBackend())
         monkeypatch.setattr(health._lc, "_worker_status", {"distillation_worker": "idle"})
         monkeypatch.setattr(health, "publishing_enabled", lambda: True)
-        response = await health.health_check()
+        response = await health.health_check(Response())
 
     assert response.profile == "edge"
     assert response.database_connected is True
@@ -274,6 +276,7 @@ async def test_health_returns_active_profile(monkeypatch: pytest.MonkeyPatch, tm
 
 @pytest.mark.asyncio
 async def test_health_degrades_when_deletion_worker_is_failing(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from fastapi import Response
     from mnemos.api.routes import health
 
     class _PingableBackend:
@@ -293,7 +296,7 @@ async def test_health_degrades_when_deletion_worker_is_failing(monkeypatch: pyte
                 "persephone_archival_worker": "disabled",
             },
         )
-        response = await health.health_check()
+        response = await health.health_check(Response())
 
     assert response.database_connected is True
     assert response.deletion_request_worker == "error"
@@ -301,9 +304,41 @@ async def test_health_degrades_when_deletion_worker_is_failing(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
+async def test_health_sets_503_when_critical_worker_is_failing(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from fastapi import Response
+    from mnemos.api.routes import health
+
+    class _PingableBackend:
+        capabilities = {"core"}
+
+        async def ping(self) -> bool:
+            return True
+
+    with _isolated_settings(monkeypatch, tmp_path, env={"MNEMOS_PROFILE": "edge"}):
+        monkeypatch.setattr(health._lc, "_persistence_backend", _PingableBackend())
+        monkeypatch.setattr(
+            health._lc,
+            "_worker_status",
+            {
+                "distillation_worker": "disabled",
+                "deletion_request_worker": "healthy",
+                "deletion_request_worker_last_success": time.time(),
+                "hard_deletion_request_worker": "error",
+                "persephone_archival_worker": "disabled",
+            },
+        )
+        raw_response = Response()
+        response = await health.health_check(raw_response)
+
+    assert response.status == "degraded"
+    assert raw_response.status_code == 503
+
+
+@pytest.mark.asyncio
 async def test_health_degrades_when_deletion_worker_heartbeat_is_stale(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
+    from fastapi import Response
     from mnemos.api.routes import health
 
     class _PingableBackend:
@@ -324,7 +359,7 @@ async def test_health_degrades_when_deletion_worker_heartbeat_is_stale(
                 "persephone_archival_worker": "disabled",
             },
         )
-        response = await health.health_check()
+        response = await health.health_check(Response())
 
     assert response.status == "degraded"
 

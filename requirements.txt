@@ -27,7 +27,7 @@ asyncpg>=0.29.0          # async API path (lifecycle.py + handlers)
 #
 # Enterprise backend drivers are NOT in default deps (the runtime imports
 # them lazily inside the matching backend modules). Install via the
-# pyproject extras (`pip install 'mnemos-os[oracle]'` etc.) or uncomment
+# pyproject extras (`pip install 'mnemos-core[oracle]'` etc.) or uncomment
 # the lines below for a flat requirements-driven build. See
 # docs/INSTALL.md "Enterprise Backends" for full setup.
 # oracledb>=2.0    # Oracle 23ai backend (mnemos/persistence/oracle.py)
@@ -58,7 +58,7 @@ redis>=5.0.0
 python-dotenv>=1.0.0
 
 # MCP server
-mcp>=1.0.0
+mcp>=1.0.0,<2
 
 # Async utilities (transitive, pinned for stability)
 anyio>=4.4.0
@@ -76,11 +76,11 @@ typer>=0.9.0
 # v4.2.0a8+ queue-group support depends on nats-py 2.14+ subscribe
 # semantics (queue==durable enforcement). Older versions silently
 # accepted mismatched queue/durable values — keep the floor here.
-# Install with: pip install 'mnemos-os[nats]'
+# Install with: pip install 'mnemos-core[nats]'
 nats-py>=2.14.0
 
 # Optional: Intel OpenVINO / phi_server.py (local GPU inference)
-# Install on GPU systems only: pip install mnemos-os[phi]
+# Install on GPU systems only: pip install mnemos-core[phi]
 # openvino-genai>=2024.4.0
 # fastembed>=0.3.0
 

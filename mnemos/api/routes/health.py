@@ -5,7 +5,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 import mnemos.core.lifecycle as _lc
 from mnemos._version import __version__ as _MNEMOS_VERSION
@@ -30,7 +30,7 @@ def _worker_unhealthy(name: str, status: str, *, max_silence_seconds: float) -> 
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health_check() -> HealthResponse:
+async def health_check(response: Response) -> HealthResponse:
     """Return health status including DB pool and background workers."""
     db_ok = False
     backend = _lc._persistence_backend
@@ -46,10 +46,16 @@ async def health_check() -> HealthResponse:
     # Get worker status
     worker_status = _lc._worker_status.get("distillation_worker", "unknown")
     deletion_status = _lc._worker_status.get("deletion_request_worker", "unknown")
+    hard_deletion_status = _lc._worker_status.get("hard_deletion_request_worker", "unknown")
     persephone_status = _lc._worker_status.get("persephone_archival_worker", "unknown")
     critical_worker_failed = _worker_unhealthy(
         "deletion_request_worker",
         deletion_status,
+        max_silence_seconds=65.0,
+    )
+    critical_worker_failed = critical_worker_failed or _worker_unhealthy(
+        "hard_deletion_request_worker",
+        hard_deletion_status,
         max_silence_seconds=65.0,
     )
     settings = get_settings()
@@ -60,13 +66,17 @@ async def health_check() -> HealthResponse:
             max_silence_seconds=max(5.0, settings.persephone.check_interval_seconds * 2 + 5.0),
         )
 
+    healthy = db_ok and not critical_worker_failed
+    if not healthy:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return HealthResponse(
-        status="healthy" if db_ok and not critical_worker_failed else "degraded",
+        status="healthy" if healthy else "degraded",
         timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         database_connected=db_ok,
         version=_MNEMOS_VERSION,
         distillation_worker=worker_status,
         deletion_request_worker=deletion_status,
+        hard_deletion_request_worker=hard_deletion_status,
         persephone_archival_worker=persephone_status,
         profile=settings.profile,
         nats_publishing_enabled=publishing_enabled(),

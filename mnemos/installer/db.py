@@ -306,6 +306,11 @@ def setup_database(config: Config, info) -> bool:
         if rc != 0:
             print(f"[db] ERROR granting mnemos role membership: {err}", file=sys.stderr)
             return False
+    if config.db_user != "mnemos_user":
+        rc, _, err = _psql_superuser(f"GRANT mnemos_user TO {config.db_user}")
+        if rc != 0:
+            print(f"[db] ERROR granting mnemos_user role membership: {err}", file=sys.stderr)
+            return False
 
     # 2. Create database (idempotent)
     rc, out, _ = _psql_superuser(f"SELECT 1 FROM pg_database WHERE datname='{config.db_name}'")

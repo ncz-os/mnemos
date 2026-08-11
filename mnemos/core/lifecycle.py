@@ -65,6 +65,7 @@ WEBHOOK_SHUTDOWN_DRAIN_SECONDS = float(get_settings().webhook.shutdown_drain_sec
 _worker_status: dict = {
     "distillation_worker": "idle",  # idle, healthy, error
     "deletion_request_worker": "idle",
+    "hard_deletion_request_worker": "idle",
     "persephone_archival_worker": "idle",
     "last_heartbeat": None,
 }
@@ -934,6 +935,7 @@ async def lifespan(app):
         for worker_name, (factory, honor_worker_enabled) in _lifespan_worker_factories.items():
             if _pool is None and worker_name not in {
                 "deletion_request_worker",
+                "hard_deletion_request_worker",
                 "persephone archival worker",
             }:
                 continue
@@ -943,6 +945,8 @@ async def lifespan(app):
                     _worker_status["distillation_worker"] = "disabled"
                 if worker_name == "deletion_request_worker":
                     _worker_status["deletion_request_worker"] = "disabled"
+                if worker_name == "hard_deletion_request_worker":
+                    _worker_status["hard_deletion_request_worker"] = "disabled"
                 continue
             worker_coro = factory(worker_handle)
             if worker_coro is None:
@@ -951,6 +955,8 @@ async def lifespan(app):
                     _worker_status["distillation_worker"] = "disabled"
                 if worker_name == "deletion_request_worker":
                     _worker_status["deletion_request_worker"] = "disabled"
+                if worker_name == "hard_deletion_request_worker":
+                    _worker_status["hard_deletion_request_worker"] = "disabled"
                 continue
             logger.info("Launching %s", worker_name)
             _schedule_worker(worker_coro)

@@ -21,7 +21,8 @@ def test_health_remains_public_when_auth_enabled():
     finally:
         configure_auth({"enabled": False})
 
-    assert response.status_code == 200
+    assert response.status_code == 503
+    assert response.json()["status"] == "degraded"
 
 
 def test_stats_requires_auth_when_auth_enabled():

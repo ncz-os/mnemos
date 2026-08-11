@@ -661,6 +661,9 @@ return {0, failures}
 """
 
 _REDIS_CB_SUCCESS_SCRIPT = """
+if redis.call('GET', KEYS[2]) == 'open' then
+  return 0
+end
 redis.call('DEL', KEYS[1])
 redis.call('DEL', KEYS[2])
 redis.call('DEL', KEYS[3])
@@ -781,8 +784,13 @@ class RedisCircuitBreakerPool(_RedisPoolBase):
         self._providers.add(provider)
         self._fallback.record_success(provider)
         try:
-            await self._run(lambda client: client.eval(_REDIS_CB_SUCCESS_SCRIPT, 3, *self._keys(provider)))
-            self._last_status[provider] = {"state": CircuitState.CLOSED.value, "failures": 0}
+            closed = int(
+                await self._run(lambda client: client.eval(_REDIS_CB_SUCCESS_SCRIPT, 3, *self._keys(provider)))
+            )
+            if closed:
+                self._last_status[provider] = {"state": CircuitState.CLOSED.value, "failures": 0}
+            else:
+                self._last_status[provider] = {"state": CircuitState.OPEN.value, "failures": None}
         except Exception as exc:
             logger.error("[CB] %s: Redis success record failed: %s", provider, exc, exc_info=True)
 
