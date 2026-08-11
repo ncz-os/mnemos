@@ -12,7 +12,13 @@ from mnemos.core.extras import is_extra_installed
 logger = logging.getLogger(__name__)
 
 
-async def persephone_archival_worker_loop(pool: Any) -> None:
+async def persephone_archival_worker_loop(
+    pool: Any,
+    *,
+    on_started: Any = None,
+    on_success: Any = None,
+    on_error: Any = None,
+) -> None:
     """Run periodic PERSEPHONE archival sweeps when explicitly enabled."""
     if not is_extra_installed("persephone"):
         logger.info("PERSEPHONE worker disabled (extra not installed)")
@@ -32,6 +38,8 @@ async def persephone_archival_worker_loop(pool: Any) -> None:
         settings.batch_size,
         settings.check_interval_seconds,
     )
+    if on_started is not None:
+        on_started()
     while True:
         try:
             archived = await sweep_for_archival(
@@ -40,11 +48,15 @@ async def persephone_archival_worker_loop(pool: Any) -> None:
                 archive_after_days=settings.archive_after_days,
                 batch_size=settings.batch_size,
             )
+            if on_success is not None:
+                on_success()
             if archived:
                 logger.info("PERSEPHONE archival sweep archived %d row(s)", archived)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            if on_error is not None:
+                on_error(exc)
             logger.exception("PERSEPHONE archival sweep failed")
         await asyncio.sleep(settings.check_interval_seconds)
 

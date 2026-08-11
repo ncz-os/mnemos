@@ -112,6 +112,17 @@ def test_oracle_and_db2_standup_use_full_migration_sets_and_dim_templates() -> N
     assert len(db2_paths) > 1
     assert (repo_root / "mnemos/db_migrations/migrations_oracle/0046_graeae_soft_delete_ownership.sql") in oracle_paths
     assert (repo_root / "mnemos/db_migrations/migrations_db2/0046_graeae_soft_delete_ownership.sql") in db2_paths
+    oracle_lifecycle = repo_root / "mnemos/db_migrations/migrations_oracle/0051_lifecycle_schema_parity.sql"
+    db2_lifecycle = repo_root / "mnemos/db_migrations/migrations_db2/0051_lifecycle_schema_parity.sql"
+    assert oracle_lifecycle in oracle_paths
+    assert db2_lifecycle in db2_paths
+
+    for path in (oracle_lifecycle, db2_lifecycle):
+        lifecycle_sql = path.read_text().lower()
+        assert "memory_branches" in lifecycle_sql and "deleted_at" in lifecycle_sql
+        assert "session_memory_injections" in lifecycle_sql
+        assert "entities" in lifecycle_sql and "owner_id" in lifecycle_sql and "namespace" in lifecycle_sql
+        assert "memory_archive" in lifecycle_sql and "varchar" in lifecycle_sql and "100" in lifecycle_sql
 
     oracle_sql = render_migration_sql(
         repo_root / "mnemos/db_migrations/migrations_oracle/0001_core_schema.sql",

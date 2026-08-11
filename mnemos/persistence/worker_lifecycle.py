@@ -41,7 +41,7 @@ class _Ops:
         self.dialect = dialect
 
     def sql(self, template: str) -> str:
-        marker = "?" if self.dialect == "sqlite" else "%s" if self.dialect == "mysql" else ":{}"
+        marker = "?" if self.dialect in {"sqlite", "db2"} else "%s" if self.dialect == "mysql" else ":{}"
         index = 0
         pieces: list[str] = []
         for piece in template.split("?")[:-1]:
