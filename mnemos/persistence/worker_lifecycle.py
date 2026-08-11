@@ -31,6 +31,24 @@ def backend_dialect(backend: Any) -> str:
     raise TypeError(f"unsupported lifecycle worker backend: {type(backend).__name__}")
 
 
+def transaction_dialect(tx: Any) -> str:
+    """Resolve a lifecycle dialect from a backend transaction wrapper."""
+    tx_name = type(tx).__name__.lower()
+    conn_name = type(getattr(tx, "conn", None)).__name__.lower()
+    conn_module = type(getattr(tx, "conn", None)).__module__.lower()
+    if "postgres" in tx_name:
+        return "postgres"
+    if "sqlite" in tx_name or "sqlite" in conn_name:
+        return "sqlite"
+    if "mysql" in tx_name or "mariadb" in tx_name:
+        return "mysql"
+    if "db2" in conn_name or "db2" in conn_module:
+        return "db2"
+    if "oracle" in tx_name or "oracle" in conn_name or "oracledb" in conn_module:
+        return "oracle"
+    raise TypeError(f"unsupported lifecycle transaction: {type(tx).__name__}")
+
+
 async def _await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
@@ -205,6 +223,102 @@ async def _soft_delete(ops: _Ops, user_id: str, namespace: str | None, at: datet
     return counts
 
 
+async def restore_soft_deleted_target(
+    tx: Any,
+    *,
+    user_id: str,
+    namespace: str | None,
+    soft_deleted_at: Any,
+) -> dict[str, int]:
+    """Restore only rows changed by the matching soft-delete sweep."""
+    ops = _Ops(tx, transaction_dialect(tx))
+    counts: dict[str, int] = {}
+    for table, owner_col in _OWNER_TABLES:
+        counts[table] = await ops.execute(
+            f"UPDATE {table} SET deleted_at = NULL WHERE {_scope(owner_col)} AND deleted_at = ?",
+            user_id,
+            namespace,
+            namespace,
+            soft_deleted_at,
+        )
+    for table, fk, parent, parent_id, owner_col in _RELATED_TABLES:
+        counts[table] = await ops.execute(
+            f"UPDATE {table} SET deleted_at = NULL WHERE {fk} IN "
+            f"(SELECT {parent_id} FROM {parent} WHERE {_scope(owner_col)}) AND deleted_at = ?",
+            user_id,
+            namespace,
+            namespace,
+            soft_deleted_at,
+        )
+    return counts
+
+
+async def _hard_delete_scope(ops: _Ops, request: dict[str, Any]) -> dict[str, int]:
+    user_id = request["target_user_id"]
+    namespace = request.get("target_namespace")
+    counts: dict[str, int] = {}
+    memories = await ops.fetchall(
+        f"SELECT id, content, owner_id, namespace FROM memories WHERE {_scope('owner_id')} "
+        "AND deleted_at IS NOT NULL",
+        user_id,
+        namespace,
+        namespace,
+    )
+    for memory in memories:
+        content_hash = hashlib.sha256(str(memory.get("content") or "").encode()).hexdigest()
+        values = (
+            memory["id"], content_hash, memory.get("owner_id"), memory.get("namespace"),
+            request.get("requested_by") or "deletion_request_worker",
+            request.get("requested_at") or datetime.now(timezone.utc),
+            request.get("request_kind") or "tombstone_collected", request.get("notes"),
+            json.dumps(request.get("source") or ["deletion_request_worker", str(request["id"])]),
+        )
+        columns = (
+            "memory_id, content_hash, owner_id, namespace, requested_by, requested_at, "
+            "request_kind, reason, source"
+        )
+        if ops.dialect in {"oracle", "db2"}:
+            await ops.execute(
+                f"INSERT INTO deletion_log ({columns}, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                *values,
+                "completed",
+            )
+        else:
+            await ops.execute(
+                f"INSERT INTO deletion_log (id, {columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                uuid.uuid4().hex,
+                *values,
+            )
+    for table, fk, parent, parent_id, owner_col in _RELATED_TABLES:
+        counts[table] = await ops.execute(
+            f"DELETE FROM {table} WHERE {fk} IN "
+            f"(SELECT {parent_id} FROM {parent} WHERE {_scope(owner_col)}) AND deleted_at IS NOT NULL",
+            user_id,
+            namespace,
+            namespace,
+        )
+    counts["memory_archive"] = await ops.execute(
+        "DELETE FROM memory_archive WHERE id IN "
+        f"(SELECT id FROM memories WHERE {_scope('owner_id')} AND deleted_at IS NOT NULL)",
+        user_id,
+        namespace,
+        namespace,
+    )
+    for table, owner_col in _OWNER_TABLES:
+        counts[table] = await ops.execute(
+            f"DELETE FROM {table} WHERE {_scope(owner_col)} AND deleted_at IS NOT NULL",
+            user_id,
+            namespace,
+            namespace,
+        )
+    return counts
+
+
+async def hard_delete_target(tx: Any, request: dict[str, Any]) -> dict[str, int]:
+    """Hard-delete one already-soft-deleted scope in the caller's transaction."""
+    return await _hard_delete_scope(_Ops(tx, transaction_dialect(tx)), request)
+
+
 async def process_one_deletion_request(backend: Any, *, verify_attempts: int, restore_days: int) -> dict[str, Any] | None:
     dialect = backend_dialect(backend)
     async with backend.transactional() as tx:
@@ -266,62 +380,7 @@ async def process_one_hard_deletion_request(backend: Any) -> dict[str, Any] | No
             return None
         user_id = request["target_user_id"]
         namespace = request.get("target_namespace")
-        counts: dict[str, int] = {}
-        memories = await ops.fetchall(
-            f"SELECT id, content, owner_id, namespace FROM memories WHERE {_scope('owner_id')} "
-            "AND deleted_at IS NOT NULL",
-            user_id,
-            namespace,
-            namespace,
-        )
-        for memory in memories:
-            content_hash = hashlib.sha256(str(memory.get("content") or "").encode()).hexdigest()
-            values = (
-                memory["id"], content_hash, memory.get("owner_id"), memory.get("namespace"),
-                request.get("requested_by") or "deletion_request_worker",
-                request.get("requested_at") or datetime.now(timezone.utc),
-                "tombstone_collected", request.get("notes"),
-                json.dumps(["deletion_request_worker", str(request["id"])]),
-            )
-            columns = (
-                "memory_id, content_hash, owner_id, namespace, requested_by, requested_at, "
-                "request_kind, reason, source"
-            )
-            if dialect in {"oracle", "db2"}:
-                await ops.execute(
-                    f"INSERT INTO deletion_log ({columns}, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    *values,
-                    "completed",
-                )
-            else:
-                await ops.execute(
-                    f"INSERT INTO deletion_log (id, {columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    uuid.uuid4().hex,
-                    *values,
-                )
-        # Children first for FK safety. Archive rows are also children of memories.
-        for table, fk, parent, parent_id, owner_col in _RELATED_TABLES:
-            counts[table] = await ops.execute(
-                f"DELETE FROM {table} WHERE {fk} IN "
-                f"(SELECT {parent_id} FROM {parent} WHERE {_scope(owner_col)}) AND deleted_at IS NOT NULL",
-                user_id,
-                namespace,
-                namespace,
-            )
-        counts["memory_archive"] = await ops.execute(
-            "DELETE FROM memory_archive WHERE id IN "
-            f"(SELECT id FROM memories WHERE {_scope('owner_id')} AND deleted_at IS NOT NULL)",
-            user_id,
-            namespace,
-            namespace,
-        )
-        for table, owner_col in _OWNER_TABLES:
-            counts[table] = await ops.execute(
-                f"DELETE FROM {table} WHERE {_scope(owner_col)} AND deleted_at IS NOT NULL",
-                user_id,
-                namespace,
-                namespace,
-            )
+        counts = await _hard_delete_scope(ops, request)
         now = datetime.now(timezone.utc)
         await ops.execute(
             "UPDATE deletion_requests SET status = 'hard_deleted', hard_deleted_at = ? "

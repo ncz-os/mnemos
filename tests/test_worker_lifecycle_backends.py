@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from mnemos.domain.persephone.runner import sweep_for_archival
+from mnemos.domain.admin_lifecycle_repo import AdminLifecycleRepository
 from mnemos.persistence.sqlite import SqliteBackend
 from mnemos.persistence.worker_lifecycle import _Ops
 from mnemos.workers.deletion_request_worker import (
@@ -138,5 +139,81 @@ async def test_sqlite_hard_delete_preserves_durable_audit_log(tmp_path):
         assert audit["memory_id"] == "m-expired"
         assert len(audit["content_hash"]) == 64
         assert audit["request_kind"] == "tombstone_collected"
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_admin_lifecycle_repository_covers_crud_archive_restore_and_purge(tmp_path):
+    backend = SqliteBackend(tmp_path / "admin-lifecycle.sqlite3", SimpleNamespace())
+    repo = AdminLifecycleRepository()
+    await backend.open()
+    old = datetime.now(timezone.utc) - timedelta(days=60)
+    try:
+        async with backend.transactional() as tx:
+            await tx.conn.execute(
+                "INSERT INTO memories (id, content, owner_id, namespace, created, updated) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("m-admin", "payload", "user-1", "private", old, old),
+            )
+            request = await repo.create_deletion_request(
+                tx,
+                target_user_id="user-1",
+                target_namespace="private",
+                requested_by="root",
+                notes="ticket",
+            )
+            request_id = request["id"]
+
+        async with backend.transactional() as tx:
+            assert (await repo.get_deletion_request(tx, request_id))["status"] == "requested"
+            assert len(await repo.list_deletion_requests(tx, status="requested", target_user_id="user-1", limit=10)) == 1
+            assert (await repo.confirm_deletion_request(tx, request_id))["status"] == "confirmed"
+            assert (await repo.cancel_deletion_request(tx, request_id))["status"] == "cancelled"
+            await repo.archive_memory(tx, "m-admin", "root")
+            state = await repo.fetch_memory_archive_state(tx, "m-admin")
+            assert state["archived_at"] is not None
+            count, last_run, _oldest = await repo.fetch_persephone_status(tx, namespace="private")
+            assert count == 1
+            assert last_run is not None
+            await repo.restore_memory(tx, "m-admin", "root")
+
+        deleted_at = datetime.now(timezone.utc).replace(microsecond=0)
+        async with backend.transactional() as tx:
+            await tx.conn.execute("UPDATE memories SET deleted_at = ? WHERE id = ?", (deleted_at, "m-admin"))
+            await tx.conn.execute(
+                "INSERT INTO deletion_requests "
+                "(id, target_user_id, target_namespace, requested_by, status, soft_deleted_at, restore_by) "
+                "VALUES (?, ?, ?, ?, 'soft_deleted', ?, ?)",
+                ("restore-request", "user-1", "private", "root", deleted_at, deleted_at + timedelta(days=1)),
+            )
+            existing = await repo.lock_deletion_request(tx, "restore-request")
+            restored = await repo.restore_soft_deleted_request(tx, request_id="restore-request", existing=existing)
+            assert restored["status"] == "restored"
+
+        async with backend.transactional() as tx:
+            await tx.conn.execute("UPDATE memories SET deleted_at = ? WHERE id = ?", (deleted_at, "m-admin"))
+            await tx.conn.execute(
+                "INSERT INTO deletion_requests "
+                "(id, target_user_id, target_namespace, requested_by, status, soft_deleted_at, restore_by) "
+                "VALUES (?, ?, ?, ?, 'soft_deleted', ?, ?)",
+                ("purge-request", "user-1", "private", "root", deleted_at, deleted_at + timedelta(days=1)),
+            )
+            existing = await repo.lock_deletion_request(tx, "purge-request")
+            purged = await repo.force_purge_soft_deleted_request(
+                tx,
+                request_id="purge-request",
+                existing=existing,
+                requested_by="root",
+                reason="urgent",
+            )
+            assert purged["status"] == "hard_deleted"
+
+        async with backend.transactional() as tx:
+            assert await (await tx.conn.execute("SELECT 1 FROM memories WHERE id = 'm-admin'")).fetchone() is None
+            audit = await (
+                await tx.conn.execute("SELECT request_kind FROM deletion_log WHERE memory_id = 'm-admin'")
+            ).fetchone()
+            assert audit["request_kind"] == "admin_purge"
     finally:
         await backend.close()
