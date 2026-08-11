@@ -153,6 +153,35 @@ def _deletion_request_worker(pool: Any):
     )
 
 
+def _hard_deletion_request_worker(pool: Any):
+    from mnemos.core.config import get_settings
+
+    if not service_enabled(get_settings(), "deletion_request_worker"):
+        logger.info("hard deletion request worker disabled by profile service manifest")
+        return None
+
+    from mnemos.workers.deletion_request_worker import deletion_request_worker_loop
+
+    def success() -> None:
+        lifecycle._worker_status["hard_deletion_request_worker"] = "healthy"
+        lifecycle._worker_status["hard_deletion_request_worker_last_success"] = time.time()
+        lifecycle._worker_status["hard_deletion_request_worker_last_error"] = None
+
+    def error(exc: Exception) -> None:
+        lifecycle._worker_status["hard_deletion_request_worker"] = "error"
+        lifecycle._worker_status["hard_deletion_request_worker_last_error"] = str(exc)
+        lifecycle._worker_status["hard_deletion_request_worker_last_error_at"] = time.time()
+
+    lifecycle._worker_status["hard_deletion_request_worker"] = "starting"
+    return deletion_request_worker_loop(
+        pool,
+        phase="hard_delete",
+        on_started=lambda: lifecycle._worker_status.__setitem__("hard_deletion_request_worker", "starting"),
+        on_success=success,
+        on_error=error,
+    )
+
+
 def _persephone_archival_worker(pool: Any):
     from mnemos.core.config import get_settings
 
@@ -237,7 +266,17 @@ async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
     # scheduling the coroutine and relying on its first body check leaks a
     # pending task until the event loop gets another turn during startup.
     if getattr(settings.federation, "nats_peers", ()):
-        lifecycle.schedule_worker(run_configured_consumers(pool, settings=settings))
+        from mnemos.persistence.postgres import PostgresBackend
+
+        backend = lifecycle.get_persistence_backend()
+        if isinstance(backend, PostgresBackend):
+            lifecycle.schedule_worker(run_configured_consumers(pool, settings=settings))
+        else:
+            logger.warning(
+                "federation direct-upsert NATS consumers are unsupported on persistence backend %s; "
+                "HTTP-backed federation NATS consumers remain enabled",
+                type(backend).__name__,
+            )
 
 
 async def _webhook_nats_post_db_hook(pool: Any, settings: Any) -> None:
@@ -331,6 +370,11 @@ def register_lifespan_hooks() -> None:
     lifecycle.register_lifespan_worker(
         "deletion_request_worker",
         _deletion_request_worker,
+        honor_worker_enabled=True,
+    )
+    lifecycle.register_lifespan_worker(
+        "hard_deletion_request_worker",
+        _hard_deletion_request_worker,
         honor_worker_enabled=True,
     )
     lifecycle.register_lifespan_worker("persephone archival worker", _persephone_archival_worker)

@@ -25,6 +25,7 @@ def test_setup_database_creates_fixed_migration_roles(monkeypatch):
     assert "CREATE ROLE mnemos NOLOGIN" in combined
     assert "CREATE ROLE mnemos_user NOLOGIN" in combined
     assert "GRANT mnemos TO custom_login" in combined
+    assert "GRANT mnemos_user TO custom_login" in combined
 
 
 def test_psql_superuser_file_streams_sql_via_stdin(monkeypatch, tmp_path):

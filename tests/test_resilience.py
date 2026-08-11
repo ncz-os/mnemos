@@ -146,6 +146,9 @@ class _FakeAsyncRedis:
         return [0, current]
 
     def _eval_circuit_success(self, keys):
+        self._cleanup_key(keys[1])
+        if self._strings.get(keys[1], (None, None))[0] == "open":
+            return 0
         for key in keys:
             self._strings.pop(key, None)
             self._hashes.pop(key, None)
@@ -460,6 +463,28 @@ def test_nats_circuit_breaker_cross_instance_and_success_preserves_peer_trip():
         try:
             await first.record_failure("openai")
             assert await second.is_allowed("openai")
+            await second.record_failure("openai")
+            assert not await first.is_allowed("openai")
+            await first.record_success("openai")
+            assert not await second.is_allowed("openai")
+        finally:
+            first.close()
+            second.close()
+
+    asyncio.run(run())
+
+
+def test_redis_circuit_breaker_stale_success_preserves_concurrent_trip():
+    async def run():
+        redis = _FakeAsyncRedis()
+        first = RedisCircuitBreakerPool(
+            "redis://unused", "test:cb:", failure_threshold=2, cooldown_seconds=60, redis_client=redis
+        )
+        second = RedisCircuitBreakerPool(
+            "redis://unused", "test:cb:", failure_threshold=2, cooldown_seconds=60, redis_client=redis
+        )
+        try:
+            await first.record_failure("openai")
             await second.record_failure("openai")
             assert not await first.is_allowed("openai")
             await first.record_success("openai")
