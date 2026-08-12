@@ -26,6 +26,7 @@ Run:
 """
 
 from __future__ import annotations
+import httpx
 
 import argparse
 import asyncio
@@ -363,7 +364,12 @@ async def handle_sse(request):
     principal_id = getattr(request.state, "mnemos_mcp_principal_id", None)
     if principal_id is None and principal is not None:
         principal_id = _principal_id(principal)
-    principal_context = await _resolve_mcp_user_context(request)
+    try:
+        principal_context = await _resolve_mcp_user_context(request)
+    except PermissionError:
+        # Revoked/expired key: refuse the stream rather than opening it with a
+        # context synthesised from the caller's own claimed identity.
+        return PlainTextResponse("unauthorized", status_code=403)
     context_tokens = set_mcp_backend_context(
         api_key=principal.api_key if principal else None,
         user_id=principal_context.user_id,
@@ -522,8 +528,6 @@ async def _resolve_mcp_user_context(request) -> MCPUserContext:
 
     if principal is not None and principal.api_key:
         try:
-            import httpx
-
             base = get_settings().server.base.rstrip("/")
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(
@@ -540,7 +544,24 @@ async def _resolve_mcp_user_context(request) -> MCPUserContext:
             if principal_id:
                 _principal_cache_set(principal_id, context)
             return context
+        except httpx.HTTPStatusError as exc:
+            # FAIL CLOSED on an authentication verdict. A 401/403 from
+            # /auth/oauth/me means this key is revoked, expired or not
+            # entitled. Falling through to the permissive context below would
+            # mint an authenticated MCPUserContext from the caller's own
+            # claimed identity, so a revoked API key would keep working
+            # indefinitely -- _match_principal only compares the static token
+            # and never consults revocation.
+            status = exc.response.status_code if exc.response is not None else None
+            if status in (401, 403):
+                logger.warning(
+                    "MCP principal context rejected by auth service (HTTP %s); denying", status
+                )
+                raise PermissionError("MCP principal is not authorized") from exc
+            logger.warning("MCP principal context lookup failed with HTTP %s: %s", status, exc)
         except Exception as exc:
+            # Transport/timeout failures are NOT an authorization verdict, so
+            # the degraded context below is still appropriate for them.
             logger.warning("MCP NATS SSE principal context lookup failed: %s", exc)
 
     context = MCPUserContext(
@@ -749,7 +770,10 @@ async def handle_nats_event_stream(request):
         return PlainTextResponse("streaming responses unavailable", status_code=503)
 
     try:
-        context = await _resolve_mcp_user_context(request)
+        try:
+            context = await _resolve_mcp_user_context(request)
+        except PermissionError:
+            return PlainTextResponse("unauthorized", status_code=403)
         subjects = _parse_nats_sse_subjects(request, context)
     except ValueError as exc:
         return PlainTextResponse(str(exc), status_code=400)
