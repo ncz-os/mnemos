@@ -1628,7 +1628,15 @@ def audit_chain_enabled_flag() -> bool:
 
 
 def system_hive_url_env() -> str:
-    return runtime_env_value("HIVE_URL", "http://192.168.207.8:5005")
+    """Hive bus URL for in-fleet system callers (triage, workers).
+
+    The previous default pointed at .8, which is not a bus host, while the
+    fanout worker hardcoded .67. With HIVE_URL unset the two halves therefore
+    addressed DIFFERENT hosts and silently never saw each other's jobs. Both
+    sides now read this one function, so a wrong value is wrong in one place
+    instead of divergent across two.
+    """
+    return runtime_env_value("HIVE_URL", "http://192.168.207.67:5005")
 
 
 def mcp_hive_url_env() -> str:
