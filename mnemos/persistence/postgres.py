@@ -7,6 +7,8 @@ persistence interface.
 from __future__ import annotations
 
 import hashlib
+
+from mnemos.core import audit_chain
 import inspect
 import json
 import logging
@@ -3087,23 +3089,46 @@ class PostgresConsultationsRepository(ConsultationsRepository):
         prev = await conn.fetchrow("SELECT id, chain_hash FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT 1")
         prev_chain = prev["chain_hash"] if prev else kwargs["genesis_hash"]
         prev_id = prev["id"] if prev else None
-        chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
-        await conn.execute(
+        # sequence_num is BIGSERIAL, so it is not known until the row exists --
+        # and the v2 chain hash binds it. Insert first to obtain it, then sign.
+        # Both statements run inside this transaction under the advisory lock
+        # taken above, so no other writer can interleave and the row is never
+        # visible to another session with a placeholder hash.
+        task_type = kwargs["task_type"] or "reasoning"
+        quality_score = kwargs["consensus_score"]
+        audit_row = await conn.fetchrow(
             "INSERT INTO graeae_audit_log "
             "(consultation_id, prompt, prompt_hash, provider, response_text, response_hash, "
-            "chain_hash, prev_id, prev_chain_hash, task_type, quality_score) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            "chain_hash, prev_id, prev_chain_hash, task_type, quality_score, chain_algo) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING sequence_num",
             consultation_id,
             kwargs["prompt"],
             prompt_hash,
             kwargs["winning_muse"],
             kwargs["consensus_response"],
             response_hash,
-            chain_hash,
+            "",  # placeholder, replaced below once sequence_num is known
             prev_id,
             prev_chain,
-            kwargs["task_type"] or "reasoning",
-            kwargs["consensus_score"],
+            task_type,
+            quality_score,
+            audit_chain.CURRENT_ALGO,
+        )
+        chain_hash = audit_chain.compute_v2(
+            key=kwargs.get("audit_key"),
+            prev_chain_hash=prev_chain,
+            prompt_hash=prompt_hash,
+            response_hash=response_hash,
+            sequence_num=audit_row["sequence_num"],
+            consultation_id=consultation_id,
+            task_type=task_type,
+            provider=kwargs["winning_muse"],
+            quality_score=quality_score,
+        )
+        await conn.execute(
+            "UPDATE graeae_audit_log SET chain_hash=$1 WHERE sequence_num=$2",
+            chain_hash,
+            audit_row["sequence_num"],
         )
         for memory_id in kwargs["memory_ids"]:
             await conn.execute(
@@ -3157,7 +3182,12 @@ class PostgresConsultationsRepository(ConsultationsRepository):
         conn = _postgres_tx(tx).conn
         if root and namespace is None:
             return await conn.fetch(
-                "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
+                # consultation_id/task_type/provider/quality_score are bound into
+                # the v2 chain hash, and chain_algo says which algorithm signed
+                # the row. Omitting them made the verifier hash None for half its
+                # inputs and reject every row.
+                "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id, "
+                "consultation_id, task_type, provider, quality_score, chain_algo "
                 "FROM graeae_audit_log ORDER BY sequence_num ASC"
             )
         owner_clause = "" if root else "c.owner_id = $2 AND "
