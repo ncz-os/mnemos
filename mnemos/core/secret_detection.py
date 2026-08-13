@@ -27,6 +27,8 @@ when the value itself looks secret-grade, otherwise REDACT.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -158,14 +160,61 @@ _ENV_SECRET_RE = re.compile(
     r"[A-Z0-9_]*)[ \t]*=[ \t]*(['\"]?)([^\s'\"]{8,})\2"
 )
 
-# Explicit fleet-secret denylist — the literal credentials confirmed to
-# have leaked. ALWAYS masked + drives VAULT wherever they appear, even if
-# every other heuristic misses the surrounding prose shape.
-_FLEET_LITERALS: tuple[str, ...] = (
-    "***REMOVED-CREDENTIAL***",
-    "***REMOVED-CREDENTIAL***",
+# Explicit secret denylist — specific credentials that must ALWAYS be masked
+# and drive VAULT wherever they appear, even when every other heuristic misses
+# the surrounding prose shape. The generic heuristics catch these in credential
+# context ("password=X", "sshpass -p X"); the denylist is what still catches a
+# bare, low-entropy value dropped into ordinary prose.
+#
+# STORED AS DIGESTS, NEVER PLAINTEXT. A denylist of real credentials is itself
+# a credential leak: this module ships in a published sdist, so any literal
+# here would be permanently readable by anyone who downloads the package. Only
+# SHA-256 digests are held, and candidate tokens are hashed for comparison, so
+# the list can name a secret without disclosing it.
+#
+# Deployments add their own via MNEMOS_SECRET_DENY_LITERALS (comma-separated,
+# plaintext in the environment, hashed at import and never retained).
+_DENY_DIGESTS: frozenset[str] = frozenset(
+    {
+        # Fleet credentials confirmed to have leaked into prose.
+        "bf746deac1e9a391abe084a369b304c783de51c2173e60131e8d842e8cb6eb88",
+        "f920dc9b6fcc7d037f1300269976db036549da3af4117f91a14709c42a097885",
+        # Obviously-fake value used by the module self-test and unit tests, so
+        # the denylist path is exercised without shipping a real credential.
+        "dbba25a7a6cbcac63a326941b395a9d3ddcdd0d8beb5f316ca78cb6f9b23a870",
+        "5eb17397dbb83e35b60e3f79efd4f96be85e965bc35ff6205bb731ad88b6a000",
+    }
+    | {
+        hashlib.sha256(lit.strip().encode()).hexdigest()
+        for lit in os.environ.get("MNEMOS_SECRET_DENY_LITERALS", "").split(",")
+        if lit.strip()
+    }
 )
-_FLEET_LITERAL_RE = re.compile("|".join(re.escape(lit) for lit in _FLEET_LITERALS))
+
+# Candidate tokens: a denylisted value appears as a whitespace/quote-delimited
+# run, so tokenising is enough and avoids hashing every window of the text.
+_TOKEN_RE = re.compile(r"[^\s,;:'\"()\[\]{}<>]+")
+
+
+def _is_denylisted(value: str) -> bool:
+    """True if ``value`` hashes to a denylisted credential."""
+    if not value:
+        return False
+    return hashlib.sha256(value.encode()).hexdigest() in _DENY_DIGESTS
+
+
+def _iter_denylisted(text: str):
+    """Yield (start, end) spans of denylisted tokens found in ``text``."""
+    for mo in _TOKEN_RE.finditer(text):
+        tok = mo.group(0)
+        if _is_denylisted(tok):
+            yield mo.start(), mo.end()
+            continue
+        # Trailing punctuation ("...<secret>." / "'X'") is common in prose.
+        stripped = tok.strip(".!?'\"`")
+        if stripped and stripped != tok and _is_denylisted(stripped):
+            off = tok.find(stripped)
+            yield mo.start() + off, mo.start() + off + len(stripped)
 
 # Headers/markers that declare a memory to be a CREDENTIAL RECORD (the
 # whole thing exists to store secrets) -> VAULT the entire memory.
@@ -342,7 +391,7 @@ def _weak_assign_worth_redacting(head: str, value: str) -> bool:
 
 
 def _prose_value_is_credential(value: str) -> bool:
-    """Heuristic for a NO-colon prose value like 'sudo password ***REMOVED-CREDENTIAL***'.
+    """Heuristic for a NO-colon prose value like 'sudo password <value>'.
 
     Reject obvious English stopwords/labels so 'password rotation' or
     'password is required' don't redact. Accept anything that looks like a
@@ -354,7 +403,7 @@ def _prose_value_is_credential(value: str) -> bool:
         return False
     if v.lower() in _PROSE_STOPWORDS:
         return False
-    if _FLEET_LITERAL_RE.fullmatch(v):
+    if _is_denylisted(v):
         return True
     # A plausible password: >=4 chars and not a plain dictionary word.
     if len(v) < 4:
@@ -382,7 +431,7 @@ def _record_password_is_credential(value: str) -> bool:
     v = value.strip()
     if not v or len(v) < 6 or _PLACEHOLDER_RE.match(v):
         return False
-    if _FLEET_LITERAL_RE.fullmatch(v):
+    if _is_denylisted(v):
         return True
     # Dates and version-ish path segments are common in notes and paths.
     if re.fullmatch(r"\d{1,4}[-/]\d{1,2}[-/]\d{1,4}", v):
@@ -467,8 +516,10 @@ _PREFILTER_RE = re.compile(
     # provider token prefixes (literal, safe as substrings)
     r" ghp_ | gho_ | ghu_ | ghs_ | ghr_ | github_pat_ | glpat- | sk- | xai- |"
     r" AKIA | AIza | xox |"
-    # explicit fleet literals
-    r" ***REMOVED-CREDENTIAL*** | ***REMOVED-CREDENTIAL***"
+    # NOTE: denylisted literals are deliberately absent here — the prefilter
+    # must not carry plaintext credentials (see _DENY_DIGESTS). Their prose
+    # carriers ("password", "pw", "sshpass") already anchor the prefilter, and
+    # _prefilter_hits() consults the digest denylist directly as a backstop.
     r")"
 )
 
@@ -511,12 +562,12 @@ PREFILTER_SAMPLES: dict[str, str] = {
     "prose_pass": "sudo password Tr0ub4&3x",
     "prose_pass_quoted": 'password is "correct horse battery"',
     "pw_kv": "pw: s3cretValue123",
-    "pw_kv_root": "root pw ***REMOVED-CREDENTIAL***",
+    "pw_kv_root": "root pw DenylistSelfTest@NotARealSecret1",
     "env_secret": "API_TOKEN=abcdefgh1234",
     "env_secret_concat": "APIKEY=abcdefgh1234",
     "password_auth": "PasswordAuthentication yes",
     "hex64": "a" * 64,
-    "fleet_literal": "***REMOVED-CREDENTIAL***",
+    "fleet_literal": "DenylistSelfTest@NotARealSecret1",
     "cred_record_token": "alice/Tr0ub4dor&3",
 }
 
@@ -564,10 +615,10 @@ def classify(content: str | None) -> SecretFinding:
     cred_span_count = 0  # distinct credential spans -> "predominantly" signal
 
     # 0. Explicit fleet-literal denylist → VAULT, always mask.
-    for mo in _FLEET_LITERAL_RE.finditer(text):
+    for _dstart, _dend in _iter_denylisted(text):
         _escalate(finding, SecretClass.VAULT)
         finding.reasons.append("fleet_literal")
-        finding.spans.append((mo.start(), mo.end()))
+        finding.spans.append((_dstart, _dend))
         cred_span_count += 1
 
     # 1. High-confidence token shapes → VAULT.
@@ -630,7 +681,7 @@ def classify(content: str | None) -> SecretFinding:
                 if _PLACEHOLDER_RE.match(value) or value.lower() in _PROSE_STOPWORDS:
                     continue
             # A fleet literal or secret-grade value → VAULT; else REDACT span.
-            if _FLEET_LITERAL_RE.fullmatch(value) or _value_is_secret_grade(value):
+            if _is_denylisted(value) or _value_is_secret_grade(value):
                 _escalate(finding, SecretClass.VAULT)
                 cred_span_count += 1
             else:
