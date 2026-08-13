@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+
+from mnemos.core import audit_chain
 import inspect
 import json
 import logging
@@ -2880,12 +2882,17 @@ class SqliteConsultationsRepository(_SqliteRepository, ConsultationsRepository):
         response_hash = hashlib.sha256(kwargs["consensus_response"].encode()).hexdigest()
         prev = await _fetch_one(conn, "SELECT id, chain_hash FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT 1")
         prev_chain = prev["chain_hash"] if prev else kwargs["genesis_hash"]
-        chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
+        # sequence_num is assigned on insert and is bound into the v2 hash, so
+        # write the row first and sign it once the number exists. SQLite writers
+        # are serialised by the connection, so no other write interleaves.
+        task_type = kwargs["task_type"] or "reasoning"
+        quality_score = kwargs["consensus_score"]
         await _execute(
             conn,
             "INSERT INTO graeae_audit_log "
             "(consultation_id, prompt, prompt_hash, provider, response_text, response_hash, chain_hash, "
-            "prev_id, prev_chain_hash, task_type, quality_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "prev_id, prev_chain_hash, task_type, quality_score, chain_algo) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 consultation_id,
                 kwargs["prompt"],
@@ -2893,12 +2900,32 @@ class SqliteConsultationsRepository(_SqliteRepository, ConsultationsRepository):
                 kwargs["winning_muse"],
                 kwargs["consensus_response"],
                 response_hash,
-                chain_hash,
+                "",  # placeholder, replaced below once sequence_num is known
                 prev["id"] if prev else None,
                 prev_chain,
-                kwargs["task_type"] or "reasoning",
-                kwargs["consensus_score"],
+                task_type,
+                quality_score,
+                audit_chain.CURRENT_ALGO,
             ),
+        )
+        inserted = await _fetch_one(
+            conn, "SELECT sequence_num FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT 1"
+        )
+        chain_hash = audit_chain.compute_v2(
+            key=kwargs.get("audit_key"),
+            prev_chain_hash=prev_chain,
+            prompt_hash=prompt_hash,
+            response_hash=response_hash,
+            sequence_num=inserted["sequence_num"] if inserted else None,
+            consultation_id=consultation_id,
+            task_type=task_type,
+            provider=kwargs["winning_muse"],
+            quality_score=quality_score,
+        )
+        await _execute(
+            conn,
+            "UPDATE graeae_audit_log SET chain_hash=? WHERE sequence_num=?",
+            (chain_hash, inserted["sequence_num"] if inserted else None),
         )
         for memory_id in kwargs["memory_ids"]:
             await _execute(
@@ -4729,6 +4756,14 @@ class SqliteBackend:
             "entities",
         ):
             await self._ensure_columns(conn, table, {"deleted_at": "deleted_at TEXT"})
+        # Existing databases predate chain_algo. Backfill it as sha256-v1: those
+        # rows were signed by the legacy unkeyed hash, and labelling them is what
+        # lets the verifier check them WITHOUT re-signing a tamper-evident log.
+        await self._ensure_columns(conn, "graeae_audit_log", {"chain_algo": "chain_algo TEXT"})
+        await _execute(
+            conn,
+            "UPDATE graeae_audit_log SET chain_algo='sha256-v1' WHERE chain_algo IS NULL",
+        )
         await self._ensure_columns(
             conn,
             "sessions",
