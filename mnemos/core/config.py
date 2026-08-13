@@ -469,6 +469,19 @@ class _ResilienceSettings(BaseSettings):
         ),
     )
     fallback_warning: bool = Field(True, validation_alias="MNEMOS_RESILIENCE_FALLBACK_WARNING")
+    allow_in_process_fallback: bool = Field(
+        False,
+        validation_alias="MNEMOS_RESILIENCE_ALLOW_IN_PROCESS_FALLBACK",
+        description=(
+            "Development/single-worker opt-out from fail-closed shared resilience. "
+            "Never enable for a multi-worker production deployment."
+        ),
+    )
+    concurrency_lease_seconds: int = Field(
+        300,
+        ge=1,
+        validation_alias="MNEMOS_RESILIENCE_CONCURRENCY_LEASE_SECONDS",
+    )
 
 
 class _ObservabilitySettings(BaseSettings):
@@ -538,6 +551,18 @@ class _MorpheusSettings(BaseSettings):
     model_config = _config_model_config()
 
     cluster_threshold: float = Field(0.85, validation_alias="MNEMOS_MORPHEUS_CLUSTER_THRESHOLD")
+    cluster_fetch_batch_size: int = Field(
+        1000,
+        ge=1,
+        le=10_000,
+        validation_alias="MNEMOS_MORPHEUS_CLUSTER_FETCH_BATCH_SIZE",
+    )
+    cluster_max_input_count: int = Field(
+        100_000,
+        ge=1,
+        le=10_000_000,
+        validation_alias="MNEMOS_MORPHEUS_CLUSTER_MAX_INPUT_COUNT",
+    )
     use_llm: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_USE_LLM")
     consolidate: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_CONSOLIDATE")
     extract: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_EXTRACT")
@@ -1019,6 +1044,20 @@ class _LayerSettings(BaseSettings):
     enable_graeae: bool = Field(
         default=True,
         validation_alias=AliasChoices("MNEMOS_ENABLE_GRAEAE", "ENABLE_GRAEAE"),
+    )
+    # Default true so installing the distribution keeps working exactly as
+    # before. The point of the flag is the OTHER direction: CHARON's routes
+    # (and, through them, Docling) previously mounted whenever the wheel was
+    # present, with no way to decline. Edge and small-host images that ship the
+    # umbrella wheel can now set this false and skip the import entirely.
+    enable_charon: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("MNEMOS_ENABLE_CHARON", "ENABLE_CHARON"),
+        description=(
+            "Mount the CHARON portability/ingest routes when the mnemos-charon "
+            "distribution is installed. Disable on memory-constrained hosts that "
+            "carry the umbrella wheel but never import documents."
+        ),
     )
     # Default false: hive is a separate ncz-os/hive track, not a mnemos-core extra.
     enable_hive: bool = Field(
@@ -1594,7 +1633,15 @@ def audit_chain_enabled_flag() -> bool:
 
 
 def system_hive_url_env() -> str:
-    return runtime_env_value("HIVE_URL", "http://192.168.207.8:5005")
+    """Hive bus URL for in-fleet system callers (triage, workers).
+
+    The previous default pointed at .8, which is not a bus host, while the
+    fanout worker hardcoded .67. With HIVE_URL unset the two halves therefore
+    addressed DIFFERENT hosts and silently never saw each other's jobs. Both
+    sides now read this one function, so a wrong value is wrong in one place
+    instead of divergent across two.
+    """
+    return runtime_env_value("HIVE_URL", "http://192.168.207.67:5005")
 
 
 def mcp_hive_url_env() -> str:

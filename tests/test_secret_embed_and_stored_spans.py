@@ -23,12 +23,12 @@ def test_content_redacted_for_embedding_uses_stored_spans():
     """F2: _content_redacted_for_embedding masks secret spans before embedding."""
     from mnemos.api.routes.memories import _content_redacted_for_embedding
 
-    secret = "INFRASTRUCTURE CREDENTIALS: root pw is ***REMOVED-CREDENTIAL***"
+    secret = "INFRASTRUCTURE CREDENTIALS: root pw is DenylistSelfTest@NotARealSecret1"
     classified = classify_persisted_text_fields(
         content=secret, namespace="default", classified_at="ingest",
     )
     redacted = _content_redacted_for_embedding(secret, classified)
-    assert "***REMOVED-CREDENTIAL***" not in redacted
+    assert "DenylistSelfTest@NotARealSecret1" not in redacted
     assert "[REDACTED]" in redacted
 
 

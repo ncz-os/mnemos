@@ -115,8 +115,8 @@ pip install 'mnemos-core[server]'
 pip install 'mnemos-core[full,enterprise]'
 ```
 
-> **Do not use `[full]` on arm64 hosts that can't build OpenVINO** — `full`
-> pulls the Intel-only `openvino` accelerator. Use `[server]` (which is
+> **Do not use `[full]` on arm64 hosts** — `full` no longer pulls the
+> Intel-only `openvino` accelerator. Use `[server]` (which is
 > `nats,persephone,pantheon,knemon,graeae,charon`) for an arch-neutral
 > everything install, and add accelerators per host (`[openvino]`/`[cuda]`/`[amd]`)
 > only where supported.
@@ -150,7 +150,7 @@ uvicorn mnemos.hive_mind.service:app --host 0.0.0.0 --port 8080
 | `edge` | `aiosqlite`, `sqlite-vec` |
 | `server` | `nats`, `persephone`, `pantheon`, `knemon`, `graeae`, `charon` |
 | `ml` | `morpheus`, `kronos`, `apollo`, `artemis`, `hot` |
-| `full` | `server` + ML + `edge` + `openvino` (x86-only) + all four add-on dists |
+| `full` | `server` + ML + `edge` + all four add-on dists |
 | `enterprise` | `oracle`, `db2`, `mysql` |
 
 ### Adding a subsystem later

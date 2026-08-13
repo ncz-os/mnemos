@@ -72,8 +72,20 @@ def test_component_selection_normalization_and_pip_expansion():
     assert spec.startswith(".[")
     assert "nats" in spec
     assert "persephone" in spec
+    assert "knemon" in spec
+    assert "graeae" in spec
+    assert "charon" in spec
     assert "morpheus" in spec
     assert "pantheon" in spec
+
+
+def test_full_bundle_includes_all_split_subsystems():
+    spec = pip_extra_spec(("full",))
+
+    assert "pantheon" in spec
+    assert "knemon" in spec
+    assert "graeae" in spec
+    assert "charon" in spec
 
 
 def test_installer_service_flags_map_to_existing_env_names():
@@ -102,6 +114,12 @@ def test_blank_wizard_component_selection_preserves_legacy_startup(monkeypatch):
     assert cfg.selected_components == ()
     assert cfg.profile_services_enabled is False
     assert cfg.service_flags == {}
+
+
+def test_blank_component_selection_still_installs_local_project():
+    from mnemos.installer.__main__ import _project_install_spec
+
+    assert _project_install_spec(Config(selected_components=())) == "."
 
 
 def test_apply_component_selection_only_enables_managed_services_when_selected():

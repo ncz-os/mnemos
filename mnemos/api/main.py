@@ -445,8 +445,9 @@ app.include_router(kg_router)
 # (default in the umbrella + server/full bundles; absent in minimal core). The
 # SQL/data-access for the MPF flow stays in core (mnemos.db.portability_repo +
 # persistence backends); only the orchestration/route surface is carved out.
-_include_optional_router("charon", "mnemos.api.routes.portability", label="CHARON")
-_include_optional_router("charon", "mnemos.api.routes.ingest", label="CHARON")
+if _settings.layers.enable_charon:
+    _include_optional_router("charon", "mnemos.api.routes.portability", label="CHARON")
+    _include_optional_router("charon", "mnemos.api.routes.ingest", label="CHARON")
 app.include_router(admin_router)
 app.include_router(mcp_audit_router)  # Phase-D MCP audit (#146)
 app.include_router(kronos_router)

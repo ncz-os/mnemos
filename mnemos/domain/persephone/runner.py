@@ -271,6 +271,15 @@ async def sweep_for_archival(
     batch_size: int,
 ) -> int:
     """Archive up to ``batch_size`` cold memories in one namespace."""
+    if hasattr(pool, "transactional") and not hasattr(pool, "acquire"):
+        from mnemos.persistence.worker_lifecycle import sweep_for_archival as sweep_backend
+
+        return await sweep_backend(
+            pool,
+            namespace=namespace,
+            archive_after_days=archive_after_days,
+            batch_size=batch_size,
+        )
     if archive_after_days < 1:
         raise ValueError("archive_after_days must be >= 1")
     if batch_size < 1:
