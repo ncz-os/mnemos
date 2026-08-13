@@ -1353,7 +1353,7 @@ def test_openai_memory_credentials_redacted_before_injection(monkeypatch):
     from mnemos.core.injection_defense import FRAME_OPEN
     from mnemos.db import openai_compat_repo
 
-    secret = "password=***REMOVED-CREDENTIAL***"
+    secret = "password=DenylistSelfTest@NotARealSecret1"
     assert secret not in openai_compat.format_memory_for_system_prompt(secret)
     assert "password=[REDACTED]" in openai_compat.format_memory_for_system_prompt(secret)
     assert openai_compat.format_memory_for_system_prompt(secret).startswith(FRAME_OPEN)

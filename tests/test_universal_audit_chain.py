@@ -561,7 +561,7 @@ async def test_audit_payload_hash_uses_persisted_vault_metadata_on_create_and_up
     from mnemos.core.secret_detection import VAULT_NAMESPACE
     from mnemos.persistence.visibility import VisibilityFilter
 
-    secret_text = "INFRASTRUCTURE CREDENTIALS: TYPHON root login password is ***REMOVED-CREDENTIAL***"
+    secret_text = "INFRASTRUCTURE CREDENTIALS: TYPHON root login password is DenylistSelfTest2NotReal99"
     created = await create_memory(
         MemoryCreateRequest(content=secret_text, category="infrastructure"),
         response=SimpleNamespace(status_code=201),

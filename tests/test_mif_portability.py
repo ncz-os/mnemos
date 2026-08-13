@@ -101,9 +101,9 @@ def test_provenance_maps_source_fields():
 
 
 def test_vault_memory_never_emits_secret_content():
-    c = mif.memory_to_concept(_memory(id="mem_vault_1", namespace="vault", content="ROOT_PW=***REMOVED-CREDENTIAL***"))
+    c = mif.memory_to_concept(_memory(id="mem_vault_1", namespace="vault", content="ROOT_PW=DenylistSelfTest@NotARealSecret1"))
     assert c["content"] == mif.VAULT_REDACTED_BODY
-    assert "***REMOVED-CREDENTIAL***" not in mif.concept_to_markdown(c)
+    assert "DenylistSelfTest@NotARealSecret1" not in mif.concept_to_markdown(c)
     assert c["provenance"]["sourceRef"] == mif.VAULT_REDACTED_REF
     assert "sourceText" not in c.get("embedding", {}), "vault embedding must not carry source text"
     assert "summary" not in c, "vault must not emit a plaintext compression summary"
