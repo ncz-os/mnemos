@@ -823,3 +823,42 @@ def test_call_maybe_async_handles_sync_and_async_callables():
             await call_maybe_async(boom)
 
     asyncio.run(run())
+
+
+def test_nats_concurrency_slot_record_is_renewed_while_a_call_is_in_flight():
+    """A live caller must refresh its slot record inside the bucket TTL.
+
+    The KV bucket expires records so a worker that dies mid-call cannot pin a
+    slot forever. Without a heartbeat that same expiry fires under a call that
+    is STILL RUNNING: the capacity is silently handed back and the limiter
+    over-admits. Regression test for the renewal dropped in the resilience
+    refactor (restores master efa3849).
+    """
+    import mnemos.core.resilience as res
+
+    async def run():
+        kv = _FakeNatsKv()
+        pool = res.NatsConcurrencyLimiterPool(kv, "test:conc:", overrides={"openai": 1})
+        limiter = pool._limiter
+        try:
+            token = await pool.acquire("openai")
+            assert token, "expected the first acquire to be granted"
+
+            # Holding a NATS slot must register a renewal watchdog for the token.
+            assert limiter._heartbeats, "acquiring a NATS slot must start a lease heartbeat"
+
+            # The renewal must KEEP the slot held. A refresh that restores
+            # availability is precisely the over-admission bug.
+            await limiter._refresh_slot_record("openai")
+            assert not await pool.acquire("openai"), (
+                "capacity must still be held after a renewal"
+            )
+
+            await pool.release("openai")
+            assert not limiter._heartbeats, "release must stop the heartbeat"
+            assert await pool.acquire("openai"), "slot should be reusable after release"
+            await pool.release("openai")
+        finally:
+            pool.close()
+
+    asyncio.run(run())

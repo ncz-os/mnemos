@@ -3,6 +3,7 @@ from __future__ import annotations
 """GRAEAE resilience primitives with in-process and Redis-backed backends."""
 
 import asyncio
+import concurrent.futures
 import hashlib
 import hmac
 import inspect
@@ -1546,6 +1547,15 @@ _NATS_CONCURRENCY_LIMITER_PREFIX = "conc:"
 _NATS_CONCURRENCY_LIMITER_RETRIES = 8
 
 
+# NATS concurrency slot lease. The KV bucket carries a TTL so a worker that
+# dies mid-call cannot pin a slot forever. A live caller therefore has to renew
+# its record from a heartbeat well inside that TTL -- otherwise the record
+# expires under a still-running call, the capacity is silently handed back, and
+# the limiter over-admits. The interval must stay comfortably below the TTL.
+_NATS_CONCURRENCY_LEASE_TTL_SECONDS = 300
+_NATS_CONCURRENCY_HEARTBEAT_SECONDS = 30.0
+
+
 class NatsConcurrencyLimiter:
     """Slot-based concurrency limiter backed by NATS JetStream KV.
 
@@ -1577,6 +1587,8 @@ class NatsConcurrencyLimiter:
         self._in_flight: dict[str, int] = defaultdict(int)
         self._local_fallback = InProcessConcurrencyLimiterPool()
         self._local_tokens: set[str] = set()
+        # token -> heartbeat future renewing that token's slot-record TTL.
+        self._heartbeats: dict[str, Any] = {}
 
     async def _ensure_kv(self, source: Any | None) -> Any | None:
         if source is None:
@@ -1594,10 +1606,10 @@ class NatsConcurrencyLimiter:
             from nats.js.api import KeyValueConfig  # type: ignore[import-not-found]
 
             return await _nats_maybe_await(
-                source.create_key_value(config=KeyValueConfig(bucket=self.bucket, history=1, ttl=300))
+                source.create_key_value(config=KeyValueConfig(bucket=self.bucket, history=1, ttl=_NATS_CONCURRENCY_LEASE_TTL_SECONDS))
             )
         except ImportError:
-            return await _nats_maybe_await(source.create_key_value(bucket=self.bucket, ttl=300))
+            return await _nats_maybe_await(source.create_key_value(bucket=self.bucket, ttl=_NATS_CONCURRENCY_LEASE_TTL_SECONDS))
         except TypeError:
             return await _nats_maybe_await(source.create_value(self.bucket))
         except Exception as exc:
@@ -1693,9 +1705,11 @@ class NatsConcurrencyLimiter:
                     except AttributeError:
                         await _nats_kv_put(kv, key, _nats_json(new_payload))
                     # CAS succeeded for new key
+                    self._start_heartbeat(provider, token)
                     return token
                 else:
                     await _nats_kv_update(kv, key, _nats_json(new_payload), revision)
+                    self._start_heartbeat(provider, token)
                     return token
             except Exception as exc:
                 if not _nats_wrong_revision(exc):
@@ -1706,7 +1720,93 @@ class NatsConcurrencyLimiter:
         logger.warning("[CONC] %s: CAS retries exhausted; denying request", provider)
         return None
 
+    async def _refresh_slot_record(self, provider: str) -> None:
+        """Refresh the slot record's TTL while a provider call still holds it.
+
+        The KV bucket carries a TTL so a worker that dies mid-call cannot pin a
+        slot forever. That same TTL will happily expire a record belonging to a
+        call that is still running, which silently hands the capacity back and
+        lets the limiter over-admit. Re-touching the record inside the TTL is
+        what makes a long call safe.
+        """
+        kv = await self._kv()
+        if kv is None:
+            raise RuntimeError("NATS concurrency-limiter KV became unavailable")
+        key = self._key(provider)
+        for _attempt in range(_NATS_CONCURRENCY_LIMITER_RETRIES):
+            try:
+                entry = await _nats_maybe_await(kv.get(key))
+            except Exception as exc:
+                if not _nats_missing_key(exc):
+                    raise
+                # Expiry must never silently restore capacity while the call is
+                # still in flight. Recreate fail-closed: ordinary releases and
+                # eventual bucket expiry recover the capacity safely.
+                try:
+                    await _nats_kv_create(kv, key, _nats_json({"available": 0}))
+                    logger.error(
+                        "NATS concurrency slot record expired while %s was in flight; recreated fail-closed",
+                        provider,
+                        exc_info=True,
+                    )
+                    return
+                except Exception as create_exc:
+                    if _nats_wrong_revision(create_exc):
+                        continue
+                    raise
+            payload = json.loads(_nats_entry_value(entry).decode("utf-8"))
+            revision = _nats_entry_revision(entry)
+            try:
+                # Rewriting the identical value is enough to reset the TTL; the
+                # CAS revision guard keeps a concurrent acquire/release from
+                # being clobbered by the refresh.
+                if revision is None:
+                    await _nats_kv_put(kv, key, _nats_json(payload))
+                else:
+                    await _nats_kv_update(kv, key, _nats_json(payload), revision)
+                return
+            except Exception as exc:
+                if not _nats_wrong_revision(exc):
+                    raise
+                continue
+
+    async def _heartbeat(self, provider: str, token: str) -> None:
+        while True:
+            try:
+                await asyncio.sleep(_NATS_CONCURRENCY_HEARTBEAT_SECONDS)
+                await self._refresh_slot_record(provider)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A transient renewal error must not permanently stop the
+                # watchdog. If the record expires before NATS recovers, the
+                # next iteration recreates it fail-closed.
+                logger.exception(
+                    "NATS concurrency heartbeat failed for %s token %s",
+                    provider,
+                    token,
+                )
+
+    def _start_heartbeat(self, provider: str, token: str) -> None:
+        heartbeat = self._loop.submit(self._heartbeat(provider, token))
+        with self._lock:
+            self._heartbeats[token] = heartbeat
+
+    async def _stop_heartbeat(self, token: str) -> None:
+        with self._lock:
+            heartbeat = self._heartbeats.pop(token, None)
+        if heartbeat is None:
+            return
+        heartbeat.cancel()
+        try:
+            await asyncio.wrap_future(heartbeat)
+        except (asyncio.CancelledError, TimeoutError, concurrent.futures.CancelledError):
+            pass
+        except Exception:
+            logger.debug("NATS concurrency heartbeat teardown raised", exc_info=True)
+
     async def release(self, provider: str, token: str) -> None:
+        await self._stop_heartbeat(token)
         if token in self._local_tokens:
             self._local_tokens.remove(token)
             self._local_fallback.release(provider)
@@ -1750,6 +1850,13 @@ class NatsConcurrencyLimiter:
                 await self.release(provider, token)
 
     def close(self) -> None:
+        # Cancel outstanding slot heartbeats before the loop thread goes away,
+        # so shutdown never leaves renewal tasks running against a closed loop.
+        with self._lock:
+            heartbeats = list(self._heartbeats.values())
+            self._heartbeats.clear()
+        for heartbeat in heartbeats:
+            heartbeat.cancel()
         self._loop.close()
 
 
