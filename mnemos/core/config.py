@@ -572,6 +572,18 @@ class _MorpheusSettings(BaseSettings):
     model_config = _config_model_config()
 
     cluster_threshold: float = Field(0.85, validation_alias="MNEMOS_MORPHEUS_CLUSTER_THRESHOLD")
+    cluster_fetch_batch_size: int = Field(
+        1000,
+        ge=1,
+        le=10_000,
+        validation_alias="MNEMOS_MORPHEUS_CLUSTER_FETCH_BATCH_SIZE",
+    )
+    cluster_max_input_count: int = Field(
+        100_000,
+        ge=1,
+        le=10_000_000,
+        validation_alias="MNEMOS_MORPHEUS_CLUSTER_MAX_INPUT_COUNT",
+    )
     use_llm: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_USE_LLM")
     consolidate: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_CONSOLIDATE")
     extract: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_EXTRACT")

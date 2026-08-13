@@ -90,11 +90,6 @@ async def test_dispatch_on_conn_batches_inserts_and_schedules_nats(monkeypatch: 
     assert publish_calls == []
 
     await scheduled[0]
-    assert publish_calls == [
-        "delivery_queued",
-        "outbox_insert",
-        "delivery_queued",
-        "outbox_insert",
-        "delivery_queued",
-        "outbox_insert",
-    ]
+    assert len(publish_calls) == 6
+    assert publish_calls.count("delivery_queued") == 3
+    assert publish_calls.count("outbox_insert") == 3

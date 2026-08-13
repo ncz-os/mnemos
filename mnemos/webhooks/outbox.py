@@ -59,23 +59,18 @@ async def _publish_delivery_nats_notifications(
     for delivery in deliveries:
         delivery_id = delivery["delivery_id"]
         try:
-            await publish_delivery_queued(
-                delivery_id=delivery_id,
-                subscription_id=delivery["subscription_id"],
-                event_type=event_type,
-                url=delivery["url"],
-                payload_hash=payload_hash,
-                namespace=delivery["namespace"],
-                owner_id=delivery["owner_id"],
-            )
-            await publish_webhook_outbox_insert(
-                delivery_id=delivery_id,
-                subscription_id=delivery["subscription_id"],
-                event_type=event_type,
-                url=delivery["url"],
-                payload_hash=payload_hash,
-                namespace=delivery["namespace"],
-                owner_id=delivery["owner_id"],
+            publish_args = {
+                "delivery_id": delivery_id,
+                "subscription_id": delivery["subscription_id"],
+                "event_type": event_type,
+                "url": delivery["url"],
+                "payload_hash": payload_hash,
+                "namespace": delivery["namespace"],
+                "owner_id": delivery["owner_id"],
+            }
+            await asyncio.gather(
+                publish_delivery_queued(**publish_args),
+                publish_webhook_outbox_insert(**publish_args),
             )
         except Exception:
             logger.warning(
