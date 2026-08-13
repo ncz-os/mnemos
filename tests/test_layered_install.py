@@ -91,3 +91,27 @@ def test_layer_matrix_graeae_requires_consultations() -> None:
     assert LAYER_REQUIRED_CAPABILITIES["core"] == set()
     assert LAYER_REQUIRED_CAPABILITIES["graeae"] == {"consultations"}
     assert LAYER_REQUIRED_CAPABILITIES["hive"] == set()
+
+
+def test_unsupported_layers_are_disabled_rather_than_blocking_startup():
+    """A backend missing a layer capability must not fail every start.
+
+    The layer flags default to ON, and MySQL/MariaDB advertise no
+    'consultations' capability, which GRAEAE requires. Hard-failing there means
+    the documented MySQL deployment cannot start at all. strict_layers is the
+    setting that asks for the hard failure; without it the unsupported layer is
+    dropped loudly and the backend serves what it can.
+    """
+    from mnemos.persistence.base import backend_supported_layers
+
+    bare = _Backend({"core"})
+    supported = backend_supported_layers(bare)
+    assert "graeae" not in supported, "precondition: this backend cannot serve graeae"
+
+    active = {"core", "graeae"}
+    unsupported = active - supported
+    assert unsupported == {"graeae"}
+
+    # strict_layers still refuses, so the fail-fast contract is intact.
+    with pytest.raises(NotImplementedError, match="does not support enabled layer"):
+        assert_backend_supports_layers(bare, active)

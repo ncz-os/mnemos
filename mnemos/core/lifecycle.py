@@ -868,9 +868,31 @@ async def lifespan(app):
     # Layered-install fail-fast (GRAEAE de8f4b2b): refuse to start if an enabled
     # feature layer (graeae/hive) needs a capability this backend lacks. See
     # docs/LAYERED_INSTALL.md. core is always supported; default flags = all on.
-    from mnemos.persistence.base import assert_backend_supports_layers
+    from mnemos.persistence.base import assert_backend_supports_layers, backend_supported_layers
 
-    assert_backend_supports_layers(_persistence_backend, settings.layers.active_layers)
+    _active_layers = set(settings.layers.active_layers)
+    if settings.layers.strict_layers:
+        assert_backend_supports_layers(_persistence_backend, _active_layers)
+    else:
+        # The layer flags default to on, so a backend that cannot serve one of
+        # them (MySQL/MariaDB have no 'consultations' capability, which GRAEAE
+        # requires) would otherwise fail EVERY start with the documented
+        # configuration. strict_layers is the setting that asks for that hard
+        # failure; without it, drop the unsupported layers loudly and serve what
+        # the backend can actually do.
+        _unsupported = _active_layers - backend_supported_layers(_persistence_backend)
+        if _unsupported:
+            logger.error(
+                "persistence backend %r cannot serve enabled layer(s) %s; disabling them for "
+                "this process. Those features will be unavailable. Choose a backend that "
+                "implements them, or set MNEMOS_STRICT_LAYERS=1 to refuse startup instead.",
+                type(_persistence_backend).__name__,
+                sorted(_unsupported),
+            )
+            for _layer in _unsupported:
+                _flag = f"enable_{_layer}"
+                if hasattr(settings.layers, _flag):
+                    object.__setattr__(settings.layers, _flag, False)
 
     # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
     if _auth_configurer is not None:
