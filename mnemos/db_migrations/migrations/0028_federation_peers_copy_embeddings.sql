@@ -9,6 +9,20 @@
 ALTER TABLE federation_peers
   ADD COLUMN IF NOT EXISTS copy_embeddings SMALLINT NOT NULL DEFAULT 0;
 
-ALTER TABLE federation_peers
-  ADD CONSTRAINT ck_federation_peer_copy_embeddings
-    CHECK (copy_embeddings IN (0,1));
+-- PostgreSQL has no ADD CONSTRAINT IF NOT EXISTS. Migrations here carry no
+-- applied-state table and are re-run on every start, so a bare ADD CONSTRAINT
+-- raises "already exists" on the second run -- and because that aborts the
+-- surrounding transaction, every statement after it in this file is skipped
+-- too. Guarding on pg_constraint keeps the file replayable.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'ck_federation_peer_copy_embeddings'
+      AND conrelid = 'federation_peers'::regclass
+  ) THEN
+    ALTER TABLE federation_peers
+      ADD CONSTRAINT ck_federation_peer_copy_embeddings
+        CHECK (copy_embeddings IN (0,1));
+  END IF;
+END $$;

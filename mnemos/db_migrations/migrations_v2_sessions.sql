@@ -18,8 +18,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     CONSTRAINT fk_sessions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_sessions_user_created ON sessions(user_id, created_at DESC);
-CREATE INDEX idx_sessions_expires ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_created ON sessions(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
 -- 2. Session messages table: conversation history
 CREATE TABLE IF NOT EXISTS session_messages (
@@ -37,8 +37,8 @@ CREATE TABLE IF NOT EXISTS session_messages (
     CONSTRAINT fk_session_messages_session FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_session_messages_session_ts ON session_messages(session_id, timestamp ASC);
-CREATE INDEX idx_session_messages_role ON session_messages(session_id, role);
+CREATE INDEX IF NOT EXISTS idx_session_messages_session_ts ON session_messages(session_id, timestamp ASC);
+CREATE INDEX IF NOT EXISTS idx_session_messages_role ON session_messages(session_id, role);
 
 -- 3. Session context injection table: tracks which memories were injected per turn
 CREATE TABLE IF NOT EXISTS session_memory_injections (
@@ -54,6 +54,6 @@ CREATE TABLE IF NOT EXISTS session_memory_injections (
     CONSTRAINT fk_session_memory_injections_memory FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE SET NULL
 );
 
-CREATE INDEX idx_session_memory_injections_session ON session_memory_injections(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_memory_injections_session ON session_memory_injections(session_id);
 
 COMMIT;
