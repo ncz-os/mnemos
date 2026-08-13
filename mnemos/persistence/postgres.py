@@ -3791,6 +3791,23 @@ class PostgresFederationRepository(FederationRepository):
             local_id,
         )
 
+    async def fetch_federated_memory_markers(
+        self,
+        tx: Transaction,
+        local_ids: Sequence[str],
+    ) -> dict[str, Row]:
+        if not local_ids:
+            return {}
+        rows = await _postgres_tx(tx).conn.fetch(
+            """
+            SELECT id, federation_remote_updated
+            FROM memories
+            WHERE id = ANY($1::text[]) AND deleted_at IS NULL
+            """,
+            list(local_ids),
+        )
+        return {str(row["id"]): row for row in rows}
+
     async def insert_federated_memory(
         self,
         tx: Transaction,
