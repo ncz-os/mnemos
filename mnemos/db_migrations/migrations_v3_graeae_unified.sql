@@ -32,9 +32,9 @@ CREATE TABLE IF NOT EXISTS graeae_audit_log (
     CONSTRAINT valid_response_hash CHECK (length(response_hash) = 64)
 );
 
-CREATE INDEX idx_graeae_audit_log_consultation ON graeae_audit_log(consultation_id);
-CREATE INDEX idx_graeae_audit_log_created_at ON graeae_audit_log(created_at DESC);
-CREATE INDEX idx_graeae_audit_log_chain_hash ON graeae_audit_log(chain_hash);
+CREATE INDEX IF NOT EXISTS idx_graeae_audit_log_consultation ON graeae_audit_log(consultation_id);
+CREATE INDEX IF NOT EXISTS idx_graeae_audit_log_created_at ON graeae_audit_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_graeae_audit_log_chain_hash ON graeae_audit_log(chain_hash);
 
 -- 1. consultation_memory_refs: Track which memories were injected into each consultation
 -- Links GRAEAE consultations to the memories they referenced
@@ -55,15 +55,15 @@ CREATE TABLE IF NOT EXISTS consultation_memory_refs (
 );
 
 -- Index for fast lookup of memories referenced by a consultation
-CREATE INDEX idx_consultation_memory_refs_consultation
+CREATE INDEX IF NOT EXISTS idx_consultation_memory_refs_consultation
     ON consultation_memory_refs(consultation_id);
 
 -- Index for fast lookup of which consultations used a specific memory
-CREATE INDEX idx_consultation_memory_refs_memory
+CREATE INDEX IF NOT EXISTS idx_consultation_memory_refs_memory
     ON consultation_memory_refs(memory_id);
 
 -- Index for temporal queries (which memories were injected when)
-CREATE INDEX idx_consultation_memory_refs_injected_at
+CREATE INDEX IF NOT EXISTS idx_consultation_memory_refs_injected_at
     ON consultation_memory_refs(injected_at DESC);
 
 COMMIT;
