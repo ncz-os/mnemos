@@ -111,7 +111,7 @@ def test_native_memory_rows_serializer_matches_python_reference() -> None:
 
 
 def test_native_feed_response_redacts_secret_fields_and_excludes_vault(monkeypatch: pytest.MonkeyPatch) -> None:
-    raw_secret = "***REMOVED-CREDENTIAL***"
+    raw_secret = "DenylistSelfTest@NotARealSecret1"
     rows = [
         {
             **_rows()[0],

@@ -521,6 +521,8 @@ async def trigger_sync(
         # Network/timeout/5xx — peer-side transient infra issue.
         # 503 is the right "try again later" shape.
         raise HTTPException(status_code=503, detail=str(e))
+    except _fed.FederationSyncError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         # Genuinely missing peer (UUID not in federation_peers).
         raise HTTPException(status_code=404, detail=str(e))

@@ -614,12 +614,7 @@ async def persephone_archive_memory(
 
     try:
         async with backend.transactional() as tx:
-            archive_row_snapshot = await tx.conn.fetchrow(
-                "SELECT content, category, subcategory, metadata "
-                "FROM memories WHERE id = $1 AND archived_at IS NULL "
-                "AND deleted_at IS NULL",
-                memory_id,
-            )
+            archive_row_snapshot = await _admin_lifecycle_repo.fetch_memory_archive_snapshot(tx, memory_id)
             await _admin_lifecycle_repo.archive_memory(tx, memory_id, user.user_id)
             try:
                 from mnemos.audit import write_audit_entry

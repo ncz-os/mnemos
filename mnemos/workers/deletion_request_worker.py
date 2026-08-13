@@ -65,6 +65,14 @@ UPDATE deletion_requests
 RETURNING id
 """
 
+_REQUEUE_CONFIRMED_SQL = """
+UPDATE deletion_requests
+   SET status = 'confirmed'
+ WHERE id = $1
+   AND status = 'sweep_verifying'
+RETURNING id
+"""
+
 _MARK_HARD_DELETED_SQL = """
 UPDATE deletion_requests
    SET status = 'hard_deleted',
@@ -717,6 +725,20 @@ async def process_one_deletion_request(pool: Any) -> DeletionRequestResult | Non
     transition share one transaction. A mid-flight exception aborts
     everything, leaving the request in ``confirmed`` for retry.
     """
+    if hasattr(pool, "transactional") and not hasattr(pool, "acquire"):
+        from mnemos.persistence.worker_lifecycle import process_one_deletion_request as process_backend
+
+        payload = await process_backend(
+            pool,
+            verify_attempts=DEFAULT_VERIFY_ATTEMPTS,
+            restore_days=RESTORE_GRACE_DAYS,
+        )
+        if payload is None:
+            return None
+        result = DeletionRequestResult(**payload)
+        await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
+        return result
+
     result: DeletionRequestResult | None = None
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -783,11 +805,16 @@ async def process_one_deletion_request(pool: Any) -> DeletionRequestResult | Non
                     counts[label] = counts.get(label, 0) + count
 
             if result is None:
+                requeued = await conn.fetchrow(_REQUEUE_CONFIRMED_SQL, request["id"])
+                if requeued is None:
+                    raise RuntimeError(
+                        f"deletion request {request['id']} disappeared before retry transition"
+                    )
                 result = DeletionRequestResult(
                     request_id=str(request["id"]),
                     target_user_id=request["target_user_id"],
                     target_namespace=request["target_namespace"],
-                    status="sweep_verifying",
+                    status="confirmed",
                     row_counts=counts,
                     soft_deleted_at=None,
                     restore_by=None,
@@ -838,6 +865,18 @@ async def hard_delete_soft_deleted_request(
 
 async def process_one_hard_deletion_request(pool: Any) -> DeletionRequestResult | None:
     """Hard-delete one expired soft-deleted request under SKIP LOCKED."""
+    if hasattr(pool, "transactional") and not hasattr(pool, "acquire"):
+        from mnemos.persistence.worker_lifecycle import (
+            process_one_hard_deletion_request as process_backend,
+        )
+
+        payload = await process_backend(pool)
+        if payload is None:
+            return None
+        result = DeletionRequestResult(**payload)
+        await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
+        return result
+
     result: DeletionRequestResult | None = None
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -920,6 +959,9 @@ async def deletion_request_worker_loop(
     batch_size: int = DEFAULT_BATCH_SIZE,
     check_interval_seconds: float = DEFAULT_CHECK_INTERVAL_SECONDS,
     phase: str = "soft_delete",
+    on_started: Any = None,
+    on_success: Any = None,
+    on_error: Any = None,
 ) -> None:
     """Perpetual lifecycle worker loop."""
     if phase not in {"soft_delete", "hard_delete"}:
@@ -929,14 +971,20 @@ async def deletion_request_worker_loop(
         if phase == "hard_delete"
         else process_deletion_requests
     )
+    if on_started is not None:
+        on_started()
     while True:
         try:
             counts = await process_batch(pool, batch_size=batch_size)
+            if on_success is not None:
+                on_success()
             if counts:
                 logger.info("deletion request worker phase=%s batch: %s", phase, counts)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            if on_error is not None:
+                on_error(exc)
             logger.exception("deletion request worker phase=%s batch failed", phase)
         await asyncio.sleep(check_interval_seconds)
 

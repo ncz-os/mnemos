@@ -48,14 +48,21 @@ from mnemos.persistence.mysql import (
     _DDL_CATEGORY_DECAY_SEED,
     _DDL_COMPRESSION_QUEUE,
     _DDL_CONSULTATION_MEMORY_REFS,
+    _DDL_DELETION_REQUESTS,
+    _DDL_DELETION_LOG,
+    _DDL_ENTITIES,
     _DDL_FEDERATION_PEERS,
     _DDL_FEDERATION_SYNC_LOG,
     _DDL_GRAEAE_AUDIT_LOG,
     _DDL_GRAEAE_CONSULTATIONS,
     _DDL_JOURNAL,
+    _DDL_MEMORY_ARCHIVE,
     _DDL_KG_TRIPLES,
     _DDL_MODEL_REGISTRY,
     _DDL_MODEL_REGISTRY_SYNC_LOG,
+    _DDL_SESSIONS,
+    _DDL_SESSION_MESSAGES,
+    _DDL_SESSION_MEMORY_INJECTIONS,
     _DDL_STATE,
     _DDL_USAGE_LEDGER,
     _DEFAULT_EMBEDDING_DIM,
@@ -253,6 +260,7 @@ CREATE TABLE IF NOT EXISTS memory_branches (
     head_version_id VARCHAR(64),
     created_by      VARCHAR(256),
     created_at      TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at      TIMESTAMP(6) NULL,
     PRIMARY KEY (memory_id, name),
     INDEX idx_memory_branches_memory (memory_id),
     INDEX idx_memory_branches_head (head_version_id),
@@ -265,11 +273,18 @@ CREATE TABLE IF NOT EXISTS memory_branches (
 
 _INIT_DDLS = [
     _DDL_MEMORIES,
+    _DDL_DELETION_REQUESTS,
+    _DDL_DELETION_LOG,
+    _DDL_MEMORY_ARCHIVE,
     _DDL_MEMORY_EMBEDDINGS,
     _DDL_FEDERATION_PEERS,
     _DDL_FEDERATION_SYNC_LOG,
     _DDL_MEMORY_VERSIONS,
     _DDL_MEMORY_BRANCHES,
+    _DDL_ENTITIES,
+    _DDL_SESSIONS,
+    _DDL_SESSION_MESSAGES,
+    _DDL_SESSION_MEMORY_INJECTIONS,
     _DDL_KG_TRIPLES,
     _DDL_COMPRESSION_CANDIDATES,
     _DDL_COMPRESSED_VARIANTS,
@@ -902,6 +917,38 @@ class MariadbBackend(MysqlBackend):
                 )
                 await _ensure_mysql_columns(
                     conn,
+                    "memory_branches",
+                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "entities",
+                    {
+                        "owner_id": "owner_id VARCHAR(256) NOT NULL DEFAULT 'default'",
+                        "namespace": "namespace VARCHAR(256) NOT NULL DEFAULT 'default'",
+                        "deleted_at": "deleted_at TIMESTAMP(6) NULL",
+                    },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "sessions",
+                    {
+                        "namespace": "namespace VARCHAR(256) NOT NULL DEFAULT 'default'",
+                        "deleted_at": "deleted_at TIMESTAMP(6) NULL",
+                    },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "session_messages",
+                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "session_memory_injections",
+                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
+                )
+                await _ensure_mysql_columns(
+                    conn,
                     "federation_peers",
                     {
                         "auth_token": "auth_token TEXT",
@@ -940,11 +987,9 @@ class MariadbBackend(MysqlBackend):
                     },
                 )
                 await conn.commit()
-        except Exception as exc:
-            _LOG.warning(
-                "MariadbBackend.open probe failed (%s); backend remains open but first acquire() may also fail.",
-                exc,
-            )
+        except Exception:
+            _LOG.exception("MariadbBackend.open failed while provisioning the required schema")
+            raise
 
 
 __all__ = [

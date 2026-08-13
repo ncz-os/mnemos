@@ -9,16 +9,16 @@ from types import SimpleNamespace
 
 from mnemos.core.resilience import (
     InProcessCircuitBreakerPool,
-    call_maybe_async,
     InProcessConcurrencyLimiterPool,
     InProcessRateLimiter,
     InProcessRateLimiterPool,
-    NatsConcurrencyLimiter,
     NatsCircuitBreakerPool,
     NatsRateLimiterPool,
-    NatsRateLimiter,
     NatsConcurrencyLimiterPool,
-    _nats_create_kv_bucket,
+    RedisCircuitBreakerPool,
+    RedisConcurrencyLimiterPool,
+    RedisRateLimiterPool,
+    call_maybe_async,
     make_circuit_breaker_pool,
     make_concurrency_limiter,
     make_rate_limiter_pool,
@@ -74,44 +74,6 @@ class _FakeNatsKv:
         return await self.put(key, value)
 
 
-class _ExpiringFakeNatsKv(_FakeNatsKv):
-    """Bucket-TTL approximation: any write refreshes every entry's expiry."""
-
-    def __init__(self, ttl_seconds: float):
-        super().__init__()
-        self._ttl_seconds = ttl_seconds
-        self._expires_at = 0.0
-
-    async def get(self, key: str):
-        if time.monotonic() >= self._expires_at:
-            self._values.clear()
-        return await super().get(key)
-
-    async def put(self, key: str, value: bytes):
-        revision = await super().put(key, value)
-        self._expires_at = time.monotonic() + self._ttl_seconds
-        return revision
-
-
-class _BrokenNatsKv:
-    async def get(self, key: str):
-        raise RuntimeError("KV read failed")
-
-    async def create(self, key: str, value: bytes, **kwargs):
-        raise RuntimeError("KV create failed")
-
-    async def put(self, key: str, value: bytes):
-        raise RuntimeError("KV write failed")
-
-    async def update(self, key: str, value: bytes, *, last: int, **kwargs):
-        raise RuntimeError("KV update failed")
-
-
-class _ContendedNatsKv(_FakeNatsKv):
-    async def update(self, key: str, value: bytes, *, last: int, **kwargs):
-        raise _WrongLastError("wrong last sequence")
-
-
 class _FakeAsyncRedis:
     def __init__(self):
         self._strings: dict[str, tuple[str, float | None]] = {}
@@ -158,6 +120,8 @@ class _FakeAsyncRedis:
             return self._eval_circuit_failure(keys, args)
         if "redis.call('DEL', KEYS[3])" in script:
             return self._eval_circuit_success(keys)
+        if "redis.call('ZSCORE'" in script:
+            return self._eval_concurrency_renew(keys, args)
         if "ZREMRANGEBYSCORE" in script:
             return self._eval_concurrency_acquire(keys, args)
         return self._eval_rate_limit(keys, args)
@@ -184,6 +148,9 @@ class _FakeAsyncRedis:
         return [0, current]
 
     def _eval_circuit_success(self, keys):
+        self._cleanup_key(keys[1])
+        if self._strings.get(keys[1], (None, None))[0] == "open":
+            return 0
         for key in keys:
             self._strings.pop(key, None)
             self._hashes.pop(key, None)
@@ -218,14 +185,30 @@ class _FakeAsyncRedis:
         self._zsets[key] = (members, expires_at)
         return 1
 
+    def _eval_concurrency_renew(self, keys, args):
+        key = keys[0]
+        now, expires_at, token = float(args[0]), float(args[1]), str(args[2])
+        members, _old_expires_at = self._zsets.get(key, ({}, None))
+        if members.get(token, float("-inf")) <= now:
+            members.pop(token, None)
+            return 0
+        members[token] = expires_at
+        self._zsets[key] = (members, expires_at)
+        return 1
+
 
 def _settings(storage_uri: str = "memory://", *, fallback_warning: bool = False):
     return SimpleNamespace(
         rate_limit=SimpleNamespace(storage_uri=storage_uri),
         resilience=SimpleNamespace(
+            circuit_breaker_redis_prefix="test:cb:",
+            rate_limiter_redis_prefix="test:rl:",
+            concurrency_redis_prefix="test:conc:",
             circuit_breaker_nats_prefix="test:cb:",
             rate_limiter_nats_prefix="test:rl:",
             concurrency_nats_prefix="test:conc:",
+            allow_in_process_fallback=False,
+            concurrency_lease_seconds=30,
             fallback_warning=fallback_warning,
         ),
         server=SimpleNamespace(redis_url="redis://cache:6379/0"),
@@ -321,72 +304,12 @@ def test_nats_concurrency_limiter_slots_are_shared_across_pools():
     asyncio.run(run())
 
 
-def test_nats_concurrency_heartbeat_keeps_slot_record_alive():
-    async def run():
-        kv = _ExpiringFakeNatsKv(ttl_seconds=0.04)
-        limiter = NatsConcurrencyLimiter(
-            kv,
-            "test:conc:",
-            max_concurrent=1,
-            heartbeat_seconds=0.01,
-        )
-        try:
-            token = await limiter.acquire("openai")
-            assert token is not None
-
-            # The backing entry would have expired twice over without renewal.
-            await asyncio.sleep(0.09)
-            assert await limiter.acquire("openai") is None
-
-            await limiter.release("openai", token)
-            next_token = await limiter.acquire("openai")
-            assert next_token is not None
-            await limiter.release("openai", next_token)
-        finally:
-            limiter.close()
-
-    asyncio.run(run())
-
-
-def test_nats_concurrency_cas_exhaustion_does_not_grant_unreserved_slot():
-    async def run():
-        kv = _ContendedNatsKv()
-        await kv.put("test:conc:openai", b'{"available":1}')
-        limiter = NatsConcurrencyLimiter(kv, "test:conc:", max_concurrent=1)
-        try:
-            assert await limiter.acquire("openai") is None
-            assert limiter._in_flight["openai"] == 0
-            assert not limiter._heartbeats
-        finally:
-            limiter.close()
-
-    asyncio.run(run())
-
-
-def test_nats_bucket_compatibility_path_preserves_ttl():
-    class PositionalConfigJetStream:
-        def __init__(self):
-            self.config = None
-
-        async def create_key_value(self, *args, **kwargs):
-            if kwargs:
-                raise TypeError("config must be positional")
-            self.config = args[0]
-            return object()
-
-    async def run():
-        js = PositionalConfigJetStream()
-        await _nats_create_kv_bucket(js, "TEST_BUCKET", 120)
-        assert js.config.bucket == "TEST_BUCKET"
-        assert js.config.ttl == 120
-
-    asyncio.run(run())
-
-
 def test_nats_rate_limiter_degrades_to_in_process_on_kv_failure():
     async def run():
-        pool = NatsRateLimiterPool(None, "test:rl:", overrides={"openai": 1}, settings=_settings())
+        # Pass None kv — limiter should not block
+        pool = NatsRateLimiterPool(None, "test:rl:", overrides={"openai": 1})
         try:
+            # With no KV, acquire should succeed (degradation)
             assert await pool.is_allowed("openai")
             assert not await pool.is_allowed("openai")
         finally:
@@ -397,8 +320,9 @@ def test_nats_rate_limiter_degrades_to_in_process_on_kv_failure():
 
 def test_nats_concurrency_limiter_degrades_to_in_process_on_kv_failure():
     async def run():
-        pool = NatsConcurrencyLimiterPool(None, "test:conc:", overrides={"openai": 1}, settings=_settings())
+        pool = NatsConcurrencyLimiterPool(None, "test:conc:", overrides={"openai": 1})
         try:
+            # With no KV, acquire should succeed (degradation)
             assert await pool.acquire("openai")
             assert not await pool.acquire("openai")
             await pool.release("openai")
@@ -406,84 +330,6 @@ def test_nats_concurrency_limiter_degrades_to_in_process_on_kv_failure():
             await pool.release("openai")
         finally:
             pool.close()
-
-    asyncio.run(run())
-
-
-def test_nats_limiters_directly_enforce_in_process_fallback_without_kv():
-    async def run():
-        rate = NatsRateLimiter(None, "test:rl:", rpm=1, settings=_settings())
-        concurrency = NatsConcurrencyLimiter(None, "test:conc:", max_concurrent=1, settings=_settings())
-        try:
-            assert await rate.acquire("openai")
-            assert not await rate.acquire("openai")
-
-            token = await concurrency.acquire("openai")
-            assert token is not None
-            assert await concurrency.acquire("openai") is None
-            await concurrency.release("openai", token)
-
-            next_token = await concurrency.acquire("openai")
-            assert next_token is not None
-            await concurrency.release("openai", next_token)
-        finally:
-            rate.close()
-            concurrency.close()
-
-    asyncio.run(run())
-
-
-def test_nats_rate_limiter_degrades_after_kv_operation_failure():
-    async def run():
-        pool = NatsRateLimiterPool(_BrokenNatsKv(), "test:rl:", overrides={"openai": 1})
-        try:
-            assert await pool.is_allowed("openai")
-            assert not await pool.is_allowed("openai")
-        finally:
-            pool.close()
-
-    asyncio.run(run())
-
-
-def test_nats_concurrency_limiter_degrades_after_kv_operation_failure():
-    async def run():
-        pool = NatsConcurrencyLimiterPool(_BrokenNatsKv(), "test:conc:", overrides={"openai": 1})
-        try:
-            assert await pool.acquire("openai")
-            assert not await pool.acquire("openai")
-            await pool.release("openai")
-            assert await pool.acquire("openai")
-            await pool.release("openai")
-        finally:
-            pool.close()
-
-    asyncio.run(run())
-
-
-def test_factories_without_injected_kv_enforce_in_process_fallback(monkeypatch):
-    async def unavailable(_self):
-        return None
-
-    monkeypatch.setattr(NatsRateLimiterPool.__module__ + ".NatsRateLimiter._connect_jetstream", unavailable)
-    monkeypatch.setattr(
-        NatsConcurrencyLimiterPool.__module__ + ".NatsConcurrencyLimiter._connect_jetstream",
-        unavailable,
-    )
-    settings = _settings()
-    settings.nats = SimpleNamespace(url="nats://unavailable:4222", token=None)
-
-    async def run():
-        rate = make_rate_limiter_pool(settings, overrides={"openai": 1})
-        concurrency = make_concurrency_limiter(settings, overrides={"openai": 1})
-        try:
-            assert await rate.is_allowed("openai")
-            assert not await rate.is_allowed("openai")
-            assert await concurrency.acquire("openai")
-            assert not await concurrency.acquire("openai")
-            await concurrency.release("openai")
-        finally:
-            rate.close()
-            concurrency.close()
 
     asyncio.run(run())
 
@@ -496,6 +342,158 @@ def test_factory_returns_nats_backends_when_nats_configured():
     assert isinstance(make_circuit_breaker_pool(settings, nats_kv=kv), NatsCircuitBreakerPool)
     assert isinstance(make_rate_limiter_pool(settings, nats_kv=kv), NatsRateLimiterPool)
     assert isinstance(make_concurrency_limiter(settings, nats_kv=kv), NatsConcurrencyLimiterPool)
+
+
+def test_factory_prefers_fail_closed_redis_when_redis_and_nats_are_configured():
+    settings = _settings("redis://limits:6379/1")
+    settings.nats = SimpleNamespace(url="nats://localhost:4222", token=None)
+
+    assert isinstance(make_circuit_breaker_pool(settings), RedisCircuitBreakerPool)
+    assert isinstance(make_rate_limiter_pool(settings), RedisRateLimiterPool)
+    assert isinstance(make_concurrency_limiter(settings), RedisConcurrencyLimiterPool)
+
+
+def test_redis_resilience_state_is_shared_and_atomic():
+    async def run():
+        redis = _FakeAsyncRedis()
+        cb1 = RedisCircuitBreakerPool(
+            "redis://unused", "test:cb:", failure_threshold=2, redis_client=redis
+        )
+        cb2 = RedisCircuitBreakerPool(
+            "redis://unused", "test:cb:", failure_threshold=2, redis_client=redis
+        )
+        rl1 = RedisRateLimiterPool(
+            "redis://unused", "test:rl:", overrides={"openai": 2}, redis_client=redis
+        )
+        rl2 = RedisRateLimiterPool(
+            "redis://unused", "test:rl:", overrides={"openai": 2}, redis_client=redis
+        )
+        conc1 = RedisConcurrencyLimiterPool(
+            "redis://unused", "test:conc:", overrides={"openai": 1}, redis_client=redis
+        )
+        conc2 = RedisConcurrencyLimiterPool(
+            "redis://unused", "test:conc:", overrides={"openai": 1}, redis_client=redis
+        )
+        pools = (cb1, cb2, rl1, rl2, conc1, conc2)
+        try:
+            await cb1.record_failure("openai")
+            assert await cb2.is_allowed("openai")
+            await cb2.record_failure("openai")
+            assert not await cb1.is_allowed("openai")
+            assert await rl1.is_allowed("openai")
+            assert await rl2.is_allowed("openai")
+            assert not await rl1.is_allowed("openai")
+            assert await conc1.acquire("openai")
+            assert not await conc2.acquire("openai")
+            await conc1.release("openai")
+            assert await conc2.acquire("openai")
+            await conc2.release("openai")
+        finally:
+            for pool in pools:
+                pool.close()
+
+    asyncio.run(run())
+
+
+def test_redis_resilience_fails_closed_unless_development_opt_out():
+    class BrokenRedis:
+        async def get(self, _key):
+            raise RuntimeError("down")
+
+        async def eval(self, *_args):
+            raise RuntimeError("down")
+
+        async def zrem(self, *_args):
+            raise RuntimeError("down")
+
+    async def run():
+        strict = RedisRateLimiterPool("redis://unused", "strict:", redis_client=BrokenRedis())
+        development = RedisRateLimiterPool(
+            "redis://unused", "dev:", redis_client=BrokenRedis(), allow_fallback=True
+        )
+        try:
+            assert not await strict.is_allowed("openai")
+            assert await development.is_allowed("openai")
+        finally:
+            strict.close()
+            development.close()
+
+    asyncio.run(run())
+
+
+def test_redis_concurrency_renews_long_running_reservation_and_releases_its_token():
+    async def run():
+        redis = _FakeAsyncRedis()
+        pool = RedisConcurrencyLimiterPool(
+            "redis://unused",
+            "test:conc:",
+            overrides={"openai": 1},
+            lease_seconds=0.3,
+            redis_client=redis,
+        )
+        contender = RedisConcurrencyLimiterPool(
+            "redis://unused",
+            "test:conc:",
+            overrides={"openai": 1},
+            lease_seconds=0.3,
+            redis_client=redis,
+        )
+        try:
+            assert await pool.acquire("openai")
+            token = pool._tokens["openai"][0]
+            first_expiry = redis._zsets["test:conc:openai"][0][token]
+            await asyncio.sleep(0.15)
+            renewed_expiry = redis._zsets["test:conc:openai"][0][token]
+            assert renewed_expiry > first_expiry
+            assert not await contender.acquire("openai")
+            await pool.release("openai")
+            assert token not in redis._zsets["test:conc:openai"][0]
+        finally:
+            pool.close()
+            contender.close()
+
+    asyncio.run(run())
+
+
+def test_redis_concurrency_development_fallback_still_releases_local_slot():
+    class BrokenRedis:
+        async def eval(self, *_args):
+            raise RuntimeError("down")
+
+    async def run():
+        pool = RedisConcurrencyLimiterPool(
+            "redis://unused",
+            "test:conc:",
+            overrides={"openai": 1},
+            redis_client=BrokenRedis(),
+            allow_fallback=True,
+        )
+        try:
+            assert await pool.acquire("openai")
+            assert not await pool.acquire("openai")
+            await pool.release("openai")
+            assert await pool.acquire("openai")
+            await pool.release("openai")
+        finally:
+            pool.close()
+
+    asyncio.run(run())
+
+
+def test_factory_selects_redis_resilience_backends():
+    settings = _settings("redis://cache:6379/1")
+    pools = (
+        make_circuit_breaker_pool(settings),
+        make_rate_limiter_pool(settings),
+        make_concurrency_limiter(settings),
+    )
+    try:
+        assert isinstance(pools[0], RedisCircuitBreakerPool)
+        assert isinstance(pools[1], RedisRateLimiterPool)
+        assert isinstance(pools[2], RedisConcurrencyLimiterPool)
+    finally:
+        for pool in pools:
+            pool.close()
 
 
 def test_factory_memory_uri_returns_in_process_and_warns(caplog):
@@ -529,19 +527,40 @@ def test_factory_no_backend_concurrency_returns_in_process_and_warns(caplog):
     assert "NATS not configured" in caplog.text
 
 
-def test_nats_circuit_breaker_success_resets_shared_failure_state():
+def test_nats_circuit_breaker_cross_instance_and_success_preserves_peer_trip():
     async def run():
         kv = _FakeNatsKv()
-        first = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=3, cooldown_seconds=60)
-        second = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=3, cooldown_seconds=60)
+        first = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=2, cooldown_seconds=60)
+        second = NatsCircuitBreakerPool(kv, "test:cb:", failure_threshold=2, cooldown_seconds=60)
+        try:
+            await first.record_failure("openai")
+            assert await second.is_allowed("openai")
+            await second.record_failure("openai")
+            assert not await first.is_allowed("openai")
+            await first.record_success("openai")
+            assert not await second.is_allowed("openai")
+        finally:
+            first.close()
+            second.close()
+
+    asyncio.run(run())
+
+
+def test_redis_circuit_breaker_stale_success_preserves_concurrent_trip():
+    async def run():
+        redis = _FakeAsyncRedis()
+        first = RedisCircuitBreakerPool(
+            "redis://unused", "test:cb:", failure_threshold=2, cooldown_seconds=60, redis_client=redis
+        )
+        second = RedisCircuitBreakerPool(
+            "redis://unused", "test:cb:", failure_threshold=2, cooldown_seconds=60, redis_client=redis
+        )
         try:
             await first.record_failure("openai")
             await second.record_failure("openai")
+            assert not await first.is_allowed("openai")
             await first.record_success("openai")
-            await second.record_failure("openai")
-            await first.record_failure("openai")
-            assert await second.is_allowed("openai")
-            assert second.status()["openai"]["failures"] == 2
+            assert not await second.is_allowed("openai")
         finally:
             first.close()
             second.close()

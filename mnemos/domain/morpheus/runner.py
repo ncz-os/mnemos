@@ -543,7 +543,10 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
     key "clusters" so phase_synthesise can consume them without a
     separate table.
     """
-    threshold = get_settings().morpheus.cluster_threshold
+    morpheus_settings = get_settings().morpheus
+    threshold = morpheus_settings.cluster_threshold
+    fetch_batch_size = morpheus_settings.cluster_fetch_batch_size
+    max_input_count = morpheus_settings.cluster_max_input_count
 
     async with pool.acquire() as conn:
         run_row = await conn.fetchrow(
@@ -557,8 +560,7 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
             return 0
         min_size = int(run_row["cluster_min_size"])
 
-        rows = await conn.fetch(
-            f"""
+        query = f"""
             SELECT id, embedding::text AS embedding
             FROM memories
             WHERE created BETWEEN $1 AND $2
@@ -568,40 +570,59 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
               AND {eligible_for_morpheus("")}
               AND ($3::text IS NULL OR namespace = $3)
             ORDER BY created
-            """,
+            LIMIT $4
+            """
+        query_args = (
             run_row["window_started_at"],
             run_row["window_ended_at"],
             run_row["namespace"],
+            max_input_count,
         )
 
-    if not rows:
+        clusters: List[dict] = []  # [{"centroid": ndarray, "members": [memory_ids]}]
+        rows_seen = 0
+
+        def consume(row) -> None:
+            nonlocal rows_seen
+            rows_seen += 1
+            vec = _parse_pgvector(row["embedding"])
+            if vec is None:
+                return
+            if not clusters:
+                clusters.append({"centroid": vec.copy(), "members": [row["id"]]})
+                return
+            best_idx = -1
+            best_sim = -1.0
+            scores = _cosine_similarities(vec, [cl["centroid"] for cl in clusters])
+            for i, sim in enumerate(scores):
+                if sim > best_sim:
+                    best_sim = sim
+                    best_idx = i
+            if best_sim >= threshold:
+                cl = clusters[best_idx]
+                n = len(cl["members"])
+                # Running mean update of the centroid (not the more accurate
+                # but more expensive per-step recompute — clusters are small).
+                cl["centroid"] = (cl["centroid"] * n + vec) / (n + 1)
+                cl["members"].append(row["id"])
+            else:
+                clusters.append({"centroid": vec.copy(), "members": [row["id"]]})
+
+        # asyncpg cursors require a transaction. Keep only a bounded prefetch
+        # window resident instead of materialising every text-form vector.
+        # Lightweight test/dialect doubles without cursor support retain the
+        # fetch path; production PostgreSQL always uses the cursor branch.
+        if callable(getattr(conn, "cursor", None)) and callable(getattr(conn, "transaction", None)):
+            async with conn.transaction():
+                async for row in conn.cursor(query, *query_args, prefetch=fetch_batch_size):
+                    consume(row)
+        else:
+            for row in await conn.fetch(query, *query_args):
+                consume(row)
+
+    if rows_seen == 0:
         await update_counters(pool, run_id, clusters_found=0)
         return 0
-
-    clusters: List[dict] = []  # [{"centroid": ndarray, "members": [memory_ids]}]
-    for row in rows:
-        vec = _parse_pgvector(row["embedding"])
-        if vec is None:
-            continue
-        if not clusters:
-            clusters.append({"centroid": vec.copy(), "members": [row["id"]]})
-            continue
-        best_idx = -1
-        best_sim = -1.0
-        scores = _cosine_similarities(vec, [cl["centroid"] for cl in clusters])
-        for i, sim in enumerate(scores):
-            if sim > best_sim:
-                best_sim = sim
-                best_idx = i
-        if best_sim >= threshold:
-            cl = clusters[best_idx]
-            n = len(cl["members"])
-            # Running mean update of the centroid (not the more accurate
-            # but more expensive per-step recompute — clusters are small).
-            cl["centroid"] = (cl["centroid"] * n + vec) / (n + 1)
-            cl["members"].append(row["id"])
-        else:
-            clusters.append({"centroid": vec.copy(), "members": [row["id"]]})
 
     surviving = [c for c in clusters if len(c["members"]) >= min_size]
     cluster_payload = [{"cluster_id": i, "member_memory_ids": c["members"]} for i, c in enumerate(surviving)]
@@ -621,12 +642,13 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
     await update_counters(pool, run_id, clusters_found=n_clusters)
     logger.info(
         "[MORPHEUS] run %s clustered %d memories into %d cluster(s) "
-        "(threshold=%.2f, min_size=%d, dropped %d below min)",
+        "(threshold=%.2f, min_size=%d, max_input=%d, dropped %d below min)",
         run_id,
-        len(rows),
+        rows_seen,
         n_clusters,
         threshold,
         min_size,
+        max_input_count,
         len(clusters) - n_clusters,
     )
     return n_clusters

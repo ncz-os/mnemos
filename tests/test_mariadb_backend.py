@@ -44,6 +44,37 @@ def _visibility() -> VisibilityFilter:
     )
 
 
+class _AsyncPoolContext:
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+
+class _FakePool:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def acquire(self):
+        return _AsyncPoolContext(self._conn)
+
+
+@pytest.mark.asyncio
+async def test_mariadb_open_propagates_schema_provisioning_failure() -> None:
+    cursor = MagicMock()
+    cursor.execute = AsyncMock(side_effect=RuntimeError("ddl denied"))
+    conn = MagicMock()
+    conn.cursor = MagicMock(return_value=_AsyncCursorContext(cursor))
+    backend = MariadbBackend(_FakePool(conn), SimpleNamespace(database=SimpleNamespace(embedding_dim=3)))
+
+    with pytest.raises(RuntimeError, match="ddl denied"):
+        await backend.open()
+
+
 @pytest.mark.asyncio
 async def test_mariadb_insert_memory_uses_mariadb_vector_constructor() -> None:
     repo = MariadbMemoryRepository()

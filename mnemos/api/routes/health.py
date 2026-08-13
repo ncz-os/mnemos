@@ -2,9 +2,10 @@
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 import mnemos.core.lifecycle as _lc
 from mnemos._version import __version__ as _MNEMOS_VERSION
@@ -19,8 +20,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _worker_unhealthy(name: str, status: str, *, max_silence_seconds: float) -> bool:
+    if status in {"starting", "error"}:
+        return True
+    if status != "healthy":
+        return False
+    last_success = _lc._worker_status.get(f"{name}_last_success")
+    return not isinstance(last_success, (int, float)) or time.time() - last_success > max_silence_seconds
+
+
 @router.get("/health", response_model=HealthResponse)
-async def health_check() -> HealthResponse:
+async def health_check(response: Response) -> HealthResponse:
     """Return health status including DB pool and background workers."""
     db_ok = False
     backend = _lc._persistence_backend
@@ -35,14 +45,40 @@ async def health_check() -> HealthResponse:
 
     # Get worker status
     worker_status = _lc._worker_status.get("distillation_worker", "unknown")
+    deletion_status = _lc._worker_status.get("deletion_request_worker", "unknown")
+    hard_deletion_status = _lc._worker_status.get("hard_deletion_request_worker", "unknown")
+    persephone_status = _lc._worker_status.get("persephone_archival_worker", "unknown")
+    critical_worker_failed = _worker_unhealthy(
+        "deletion_request_worker",
+        deletion_status,
+        max_silence_seconds=65.0,
+    )
+    critical_worker_failed = critical_worker_failed or _worker_unhealthy(
+        "hard_deletion_request_worker",
+        hard_deletion_status,
+        max_silence_seconds=65.0,
+    )
+    settings = get_settings()
+    if settings.persephone.enabled:
+        critical_worker_failed = critical_worker_failed or _worker_unhealthy(
+            "persephone_archival_worker",
+            persephone_status,
+            max_silence_seconds=max(5.0, settings.persephone.check_interval_seconds * 2 + 5.0),
+        )
 
+    healthy = db_ok and not critical_worker_failed
+    if not healthy:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return HealthResponse(
-        status="healthy" if db_ok else "degraded",
+        status="healthy" if healthy else "degraded",
         timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         database_connected=db_ok,
         version=_MNEMOS_VERSION,
         distillation_worker=worker_status,
-        profile=get_settings().profile,
+        deletion_request_worker=deletion_status,
+        hard_deletion_request_worker=hard_deletion_status,
+        persephone_archival_worker=persephone_status,
+        profile=settings.profile,
         nats_publishing_enabled=publishing_enabled(),
         persistence_backend=backend_name,
         persistence_capabilities=backend_capabilities,

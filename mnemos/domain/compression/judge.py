@@ -475,7 +475,7 @@ class CrossEncoderJudge(Judge):
             # sentence-transformers themselves; the default judge
             # path is the LLMJudge (no embeddings) or the cheaper
             # heuristic scorer in QualityAnalyzer (uses fastembed
-            # via mnemos-os[ml] when present, pure heuristics
+            # via mnemos-core[ml] when present, pure heuristics
             # otherwise).
             raise ImportError(
                 "CrossEncoderJudge requires sentence-transformers, which "

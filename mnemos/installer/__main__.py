@@ -1676,6 +1676,13 @@ def _print_completion(cfg: "Config", api_key: str | None, repo_path: str) -> Non
     print()
 
 
+def _project_install_spec(cfg) -> str:
+    """Return the local-project pip spec, including selected extras when any."""
+    from .wizard import pip_extra_spec
+
+    return pip_extra_spec(getattr(cfg, "selected_components", ()))
+
+
 def main() -> int:
     args = _parse_args()
     if args.profile:
@@ -2043,14 +2050,11 @@ def main() -> int:
     # Step 7: Install requirements
     # ------------------------------------------------------------------ #
     print("\n[installer] Installing Python dependencies...")
-    extras_to_install = []
-    if getattr(cfg, "selected_components", ()):
-        from .wizard import pip_extra_spec
-
-        extras_to_install.append(pip_extra_spec(cfg.selected_components))
+    extras_to_install = [_project_install_spec(cfg)]
     ok = install_requirements(venv_path, extra=extras_to_install)
     if not ok:
-        print("WARNING: Some dependencies failed to install.", file=sys.stderr)
+        print("ERROR: MNEMOS or its required dependencies failed to install.", file=sys.stderr)
+        return 1
 
     if cfg.install_docling:
         print("\n[installer] Installing docling...")
@@ -2129,19 +2133,25 @@ def main() -> int:
         service_name = "mnemos"
         if sys.platform == "darwin":
             ok = install_launchd(cfg, repo_path)
-            if ok:
-                if not enable_service(f"ai.{service_name}"):
-                    print("[service] WARNING: service enable failed.", file=sys.stderr)
-                if not start_service(f"ai.{service_name}"):
-                    print("[service] WARNING: service start failed.", file=sys.stderr)
+            if not ok:
+                return 1
+            if not enable_service(f"ai.{service_name}"):
+                print("[service] ERROR: service enable failed.", file=sys.stderr)
+                return 1
+            if not start_service(f"ai.{service_name}"):
+                print("[service] ERROR: service start failed.", file=sys.stderr)
+                return 1
         else:
             if info.systemd:
                 ok = install_systemd(cfg, repo_path)
-                if ok:
-                    if not enable_service(service_name):
-                        print("[service] WARNING: service enable failed.", file=sys.stderr)
-                    if not start_service(service_name):
-                        print("[service] WARNING: service start failed.", file=sys.stderr)
+                if not ok:
+                    return 1
+                if not enable_service(service_name):
+                    print("[service] ERROR: service enable failed.", file=sys.stderr)
+                    return 1
+                if not start_service(service_name):
+                    print("[service] ERROR: service start failed.", file=sys.stderr)
+                    return 1
             else:
                 print("[service] No supported init system — service not installed.")
 

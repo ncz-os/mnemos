@@ -19,6 +19,8 @@ See ``docs/oracle-port-status.md`` for the running M7 plan.
 from __future__ import annotations
 
 import hashlib
+
+from mnemos.core import audit_chain
 import inspect
 import json
 import logging
@@ -2767,8 +2769,18 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
         return await self._registry_rows(tx)
 
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
-        _ = (tx, model_id)
-        return None
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT provider FROM model_registry WHERE model_id = :m "
+                "AND available = 1 AND deprecated = 0 AND ROWNUM = 1",
+                {"m": model_id},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            return row.get("provider") if row else None
+        finally:
+            await _call(cursor.close)
 
     # ── model-registry WRITES (Oracle MERGE; daily provider sync) ──────────────
     async def upsert_model(self, tx: Transaction, model: dict[str, Any]) -> bool:
@@ -3484,7 +3496,9 @@ class OracleConsultationsRepository(ConsultationsRepository):
             )
             prev_row = await _row_to_dict(cursor, await _call(cursor.fetchone))
             prev_chain = prev_row["chain_hash"] if prev_row else kwargs["genesis_hash"]
-            chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
+            # Signed after the insert, once sequence_num exists -- it is bound
+            # into the v2 hash. See mnemos/core/audit_chain.py.
+            chain_hash = ""
             audit_id = uuid.uuid4().hex
             # provider is NOT NULL on Oracle but winning_muse can be None on
             # all-muses-failed consensus path (route at consultations.py L361
@@ -3502,10 +3516,11 @@ class OracleConsultationsRepository(ConsultationsRepository):
                 cursor.execute,
                 "INSERT INTO graeae_audit_log "
                 "(id, consultation_id, prompt, prompt_hash, provider, response_text, "
-                "response_hash, chain_hash, prev_id, prev_chain_hash, task_type, quality_score) "
+                "response_hash, chain_hash, prev_id, prev_chain_hash, task_type, quality_score, chain_algo) "
                 "VALUES (:id, :consultation_id, :prompt, :prompt_hash, :provider, :response_text, "
-                ":response_hash, :chain_hash, :prev_id, :prev_chain_hash, :task_type, :quality_score)",
+                ":response_hash, :chain_hash, :prev_id, :prev_chain_hash, :task_type, :quality_score, :chain_algo)",
                 {
+                    "chain_algo": audit_chain.CURRENT_ALGO,
                     "id": audit_id,
                     "consultation_id": consultation_id,
                     "prompt": kwargs["prompt"],
@@ -3519,6 +3534,32 @@ class OracleConsultationsRepository(ConsultationsRepository):
                     "task_type": kwargs["task_type"] or "reasoning",
                     "quality_score": kwargs["consensus_score"],
                 },
+            )
+
+            # Sign the link now that sequence_num exists. Both statements run in
+            # this transaction, so the placeholder hash is never visible to
+            # another session.
+            await _call(
+                cursor.execute,
+                "SELECT sequence_num FROM graeae_audit_log WHERE id = :id",
+                {"id": audit_id},
+            )
+            seq_row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            chain_hash = audit_chain.compute_v2(
+                key=kwargs.get("audit_key"),
+                prev_chain_hash=prev_chain,
+                prompt_hash=prompt_hash,
+                response_hash=response_hash,
+                sequence_num=seq_row["sequence_num"] if seq_row else None,
+                consultation_id=consultation_id,
+                task_type=kwargs["task_type"] or "reasoning",
+                provider=provider_val,
+                quality_score=kwargs["consensus_score"],
+            )
+            await _call(
+                cursor.execute,
+                "UPDATE graeae_audit_log SET chain_hash = :chain_hash WHERE id = :id",
+                {"chain_hash": chain_hash, "id": audit_id},
             )
 
             # Memory refs — Oracle has no INSERT OR IGNORE; the UNIQUE

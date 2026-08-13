@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import time
 from typing import Any
 
 from mnemos.api.dependencies import configure_auth
@@ -64,7 +65,11 @@ async def _run_distillation_worker(_pool: Any) -> None:
 
     backoff = 1.0
     while True:
-        worker = MemoryDistillationWorker()
+        worker = MemoryDistillationWorker(
+            _pool,
+            on_started=lambda: lifecycle._worker_status.__setitem__("distillation_worker", "healthy"),
+            on_heartbeat=lambda: lifecycle._worker_status.__setitem__("last_heartbeat", time.time()),
+        )
         try:
             lifecycle._worker_status["distillation_worker"] = "starting"
             await worker.start()
@@ -79,7 +84,7 @@ async def _run_distillation_worker(_pool: Any) -> None:
             logger.exception(f"Distillation worker crashed: {e} - restarting in {backoff:.0f}s")
         finally:
             try:
-                if getattr(worker, "db_pool", None):
+                if getattr(worker, "db_pool", None) and getattr(worker, "_owns_pool", True):
                     await worker.db_pool.close()
             except Exception:
                 pass
@@ -127,7 +132,54 @@ def _deletion_request_worker(pool: Any):
 
     from mnemos.workers.deletion_request_worker import deletion_request_worker_loop
 
-    return deletion_request_worker_loop(pool)
+    # PostgreSQL supplies its asyncpg pool here; the backend-neutral lifecycle
+    # repository is used only when lifecycle has no PostgreSQL pool.
+    def success() -> None:
+        lifecycle._worker_status["deletion_request_worker"] = "healthy"
+        lifecycle._worker_status["deletion_request_worker_last_success"] = time.time()
+        lifecycle._worker_status["deletion_request_worker_last_error"] = None
+
+    def error(exc: Exception) -> None:
+        lifecycle._worker_status["deletion_request_worker"] = "error"
+        lifecycle._worker_status["deletion_request_worker_last_error"] = str(exc)
+        lifecycle._worker_status["deletion_request_worker_last_error_at"] = time.time()
+
+    lifecycle._worker_status["deletion_request_worker"] = "starting"
+    return deletion_request_worker_loop(
+        pool,
+        on_started=lambda: lifecycle._worker_status.__setitem__("deletion_request_worker", "starting"),
+        on_success=success,
+        on_error=error,
+    )
+
+
+def _hard_deletion_request_worker(pool: Any):
+    from mnemos.core.config import get_settings
+
+    if not service_enabled(get_settings(), "deletion_request_worker"):
+        logger.info("hard deletion request worker disabled by profile service manifest")
+        return None
+
+    from mnemos.workers.deletion_request_worker import deletion_request_worker_loop
+
+    def success() -> None:
+        lifecycle._worker_status["hard_deletion_request_worker"] = "healthy"
+        lifecycle._worker_status["hard_deletion_request_worker_last_success"] = time.time()
+        lifecycle._worker_status["hard_deletion_request_worker_last_error"] = None
+
+    def error(exc: Exception) -> None:
+        lifecycle._worker_status["hard_deletion_request_worker"] = "error"
+        lifecycle._worker_status["hard_deletion_request_worker_last_error"] = str(exc)
+        lifecycle._worker_status["hard_deletion_request_worker_last_error_at"] = time.time()
+
+    lifecycle._worker_status["hard_deletion_request_worker"] = "starting"
+    return deletion_request_worker_loop(
+        pool,
+        phase="hard_delete",
+        on_started=lambda: lifecycle._worker_status.__setitem__("hard_deletion_request_worker", "starting"),
+        on_success=success,
+        on_error=error,
+    )
 
 
 def _persephone_archival_worker(pool: Any):
@@ -139,7 +191,23 @@ def _persephone_archival_worker(pool: Any):
 
     from mnemos.workers.persephone_archival_worker import persephone_archival_worker_loop
 
-    return persephone_archival_worker_loop(pool)
+    def success() -> None:
+        lifecycle._worker_status["persephone_archival_worker"] = "healthy"
+        lifecycle._worker_status["persephone_archival_worker_last_success"] = time.time()
+        lifecycle._worker_status["persephone_archival_worker_last_error"] = None
+
+    def error(exc: Exception) -> None:
+        lifecycle._worker_status["persephone_archival_worker"] = "error"
+        lifecycle._worker_status["persephone_archival_worker_last_error"] = str(exc)
+        lifecycle._worker_status["persephone_archival_worker_last_error_at"] = time.time()
+
+    lifecycle._worker_status["persephone_archival_worker"] = "starting"
+    return persephone_archival_worker_loop(
+        pool,
+        on_started=lambda: lifecycle._worker_status.__setitem__("persephone_archival_worker", "starting"),
+        on_success=success,
+        on_error=error,
+    )
 
 
 async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
@@ -159,11 +227,16 @@ async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
     if not service_enabled(settings, "federation_nats_consumers"):
         logger.info("federation nats consumers disabled by profile service manifest")
         return
+    nats_url = getattr(settings.nats, "url", None)
+    if nats_url is not None and not str(nats_url).strip():
+        logger.info("federation nats consumers disabled (MNEMOS_NATS_URL unset)")
+        return
 
     from mnemos.federation.nats_consumer import (
         configured_nats_peers,
         consumer_loop,
     )
+    from mnemos.workers.federation_memory_nats_consumer import run_configured_consumers
 
     peers = list(configured_nats_peers(settings))
     if peers and not settings.nats.node_name.strip():
@@ -186,6 +259,24 @@ async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
     for peer in peers:
         logger.info("Launching federation nats consumer for peer %s", peer.name)
         lifecycle.schedule_worker(consumer_loop(pool, peer, queue_group=queue_group))
+
+    # Repository-level memory writes publish the v0.3 direct-upsert contract on
+    # MNEMOS_FEDERATION, while route writes still emit the legacy MNEMOS_MEMORY
+    # nudges above. Do not create a task when no direct-contract peers exist:
+    # scheduling the coroutine and relying on its first body check leaks a
+    # pending task until the event loop gets another turn during startup.
+    if getattr(settings.federation, "nats_peers", ()):
+        from mnemos.persistence.postgres import PostgresBackend
+
+        backend = lifecycle.get_persistence_backend()
+        if isinstance(backend, PostgresBackend):
+            lifecycle.schedule_worker(run_configured_consumers(pool, settings=settings))
+        else:
+            logger.warning(
+                "federation direct-upsert NATS consumers are unsupported on persistence backend %s; "
+                "HTTP-backed federation NATS consumers remain enabled",
+                type(backend).__name__,
+            )
 
 
 async def _webhook_nats_post_db_hook(pool: Any, settings: Any) -> None:
@@ -279,6 +370,11 @@ def register_lifespan_hooks() -> None:
     lifecycle.register_lifespan_worker(
         "deletion_request_worker",
         _deletion_request_worker,
+        honor_worker_enabled=True,
+    )
+    lifecycle.register_lifespan_worker(
+        "hard_deletion_request_worker",
+        _hard_deletion_request_worker,
         honor_worker_enabled=True,
     )
     lifecycle.register_lifespan_worker("persephone archival worker", _persephone_archival_worker)

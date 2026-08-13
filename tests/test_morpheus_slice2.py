@@ -321,6 +321,78 @@ async def test_phase_cluster_skips_garbage_embeddings():
     assert n == 1
 
 
+@pytest.mark.asyncio
+async def test_phase_cluster_streams_with_bounded_prefetch(monkeypatch):
+    """Production-shaped connections use a cursor, never whole-corpus fetch."""
+    run_row = {
+        "cluster_min_size": 1,
+        "window_started_at": "2026-04-25T00:00:00",
+        "window_ended_at": "2026-04-25T23:59:59",
+        "namespace": None,
+    }
+
+    class _Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Cursor:
+        def __init__(self, rows):
+            self._rows = iter(rows)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._rows)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    class _Conn:
+        def __init__(self):
+            self.prefetch = None
+            self.cursor_args = ()
+            self.executed = []
+
+        async def fetchrow(self, *_args, **_kwargs):
+            return run_row
+
+        async def fetch(self, *_args, **_kwargs):
+            raise AssertionError("streaming path must not materialize the corpus")
+
+        def transaction(self):
+            return _Transaction()
+
+        def cursor(self, *_args, prefetch):
+            self.prefetch = prefetch
+            self.cursor_args = _args
+            return _Cursor([_row("mem_a", [1.0, 0.0]), _row("mem_b", [0.0, 1.0])])
+
+        async def execute(self, sql, *args):
+            self.executed.append((sql, args))
+            return "UPDATE 1"
+
+    monkeypatch.setenv("MNEMOS_MORPHEUS_CLUSTER_FETCH_BATCH_SIZE", "17")
+    monkeypatch.setenv("MNEMOS_MORPHEUS_CLUSTER_MAX_INPUT_COUNT", "12345")
+    from mnemos.core import config
+    config._reset_settings_for_tests()
+    try:
+        conn = _Conn()
+        n = await phase_cluster(_MockPool(conn), "00000000-0000-0000-0000-000000000006")
+        assert n == 2
+        assert conn.prefetch == 17
+        cursor_sql, *cursor_args = conn.cursor_args
+        assert "LIMIT $4" in cursor_sql
+        assert cursor_args[-1] == 12345
+    finally:
+        monkeypatch.delenv("MNEMOS_MORPHEUS_CLUSTER_FETCH_BATCH_SIZE")
+        monkeypatch.delenv("MNEMOS_MORPHEUS_CLUSTER_MAX_INPUT_COUNT")
+        config._reset_settings_for_tests()
+
+
 # ── phase_synthesise tests ─────────────────────────────────────────────────
 
 @pytest.mark.asyncio

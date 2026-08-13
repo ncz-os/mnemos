@@ -1,6 +1,6 @@
 # GRAEAE Feature Surface
 
-**Status:** current v6.0.1 documentation (patch release on the v6.0.0 line; on top of v5.0.0 GA shipped 2026-05-02).
+**Status:** current v6.1.0 documentation (patch release on the v6.0.0 line; on top of v5.0.0 GA shipped 2026-05-02).
 
 GRAEAE is MNEMOS's multi-provider reasoning bus. It fans a prompt out to live
 LLM providers, scores the responses, persists consultations, and writes a
@@ -19,8 +19,12 @@ hash-chained audit record for each committed consultation.
 | Model registry sync | `mnemos/domain/graeae/provider_sync.py`, `mnemos/domain/graeae/elo_sync.py`, `scripts/sync_provider_models.py` | Provider model discovery plus Arena.ai/LMArena weighting when the sync job is installed. |
 
 The reliability state above uses Redis in the `server` profile when
-`RATE_LIMIT_STORAGE_URI=redis://...` is configured. In-process fallback remains
-for `edge`/`dev` and logs a warning when used with multiple workers.
+`RATE_LIMIT_STORAGE_URI=redis://...` is configured. Redis failures deny new
+provider admission by default. Development and single-worker deployments can
+explicitly opt into process-local degradation with
+`MNEMOS_RESILIENCE_ALLOW_IN_PROCESS_FALLBACK=true`; do not enable that setting
+for a multi-worker production deployment. `memory://` remains the deliberate
+in-process backend for `edge` and `dev` profiles.
 
 ## API Surface
 

@@ -61,6 +61,8 @@ def test_federation_post_db_hook_threads_queue_group_to_consumer_loop(monkeypatc
     from mnemos.api import lifecycle_hooks
     from mnemos.core import lifecycle
     from mnemos.federation import nats_consumer
+    from mnemos.persistence.postgres import PostgresBackend
+    from mnemos.workers import federation_memory_nats_consumer
 
     scheduled_kwargs: list[dict] = []
     scheduled_coros: list = []
@@ -79,7 +81,14 @@ def test_federation_post_db_hook_threads_queue_group_to_consumer_loop(monkeypatc
         return _noop()
 
     monkeypatch.setattr(lifecycle, "schedule_worker", fake_schedule_worker)
+    monkeypatch.setattr(lifecycle, "_persistence_backend", object.__new__(PostgresBackend))
     monkeypatch.setattr(nats_consumer, "consumer_loop", fake_consumer_loop)
+    direct_contract_scheduled = []
+
+    async def fake_direct_consumers(pool, *, settings):
+        direct_contract_scheduled.append((pool, settings))
+
+    monkeypatch.setattr(federation_memory_nats_consumer, "run_configured_consumers", fake_direct_consumers)
     monkeypatch.setattr(
         nats_consumer,
         "configured_nats_peers",
@@ -93,7 +102,7 @@ def test_federation_post_db_hook_threads_queue_group_to_consumer_loop(monkeypatc
 
     settings = SimpleNamespace(
         nats=SimpleNamespace(node_name="argonas"),
-        federation=SimpleNamespace(nats_queue_group="fed_pool"),
+        federation=SimpleNamespace(nats_queue_group="fed_pool", nats_peers=[object()]),
     )
 
     asyncio.run(lifecycle_hooks._federation_nats_post_db_hook(object(), settings))
@@ -103,3 +112,44 @@ def test_federation_post_db_hook_threads_queue_group_to_consumer_loop(monkeypatc
         "lifecycle hook must thread MNEMOS_FEDERATION_NATS_QUEUE_GROUP "
         "into consumer_loop or queue groups remain unwired in production"
     )
+    assert direct_contract_scheduled == []
+    assert len(scheduled_coros) == 2
+
+
+def test_federation_post_db_hook_skips_direct_contract_on_every_non_postgres_backend(monkeypatch, caplog):
+    import asyncio
+    from types import SimpleNamespace
+
+    from mnemos.api import lifecycle_hooks
+    from mnemos.core import lifecycle
+    from mnemos.federation import nats_consumer
+    from mnemos.persistence.db2 import Db2Backend
+    from mnemos.persistence.mysql import MysqlBackend
+    from mnemos.persistence.oracle import OracleBackend
+    from mnemos.persistence.sqlite import SqliteBackend
+    from mnemos.workers import federation_memory_nats_consumer
+
+    scheduled = []
+
+    def fake_schedule_worker(coro):
+        scheduled.append(coro)
+        coro.close()
+
+    async def fake_direct_consumers(pool, *, settings):
+        raise AssertionError("direct consumer must not be scheduled for a non-Postgres backend")
+
+    monkeypatch.setattr(lifecycle, "schedule_worker", fake_schedule_worker)
+    monkeypatch.setattr(federation_memory_nats_consumer, "run_configured_consumers", fake_direct_consumers)
+    monkeypatch.setattr(nats_consumer, "configured_nats_peers", lambda settings: [])
+
+    settings = SimpleNamespace(
+        nats=SimpleNamespace(url="nats://example:4222", node_name="argonas"),
+        federation=SimpleNamespace(nats_queue_group="", nats_peers=[object()]),
+    )
+    for backend_type in (SqliteBackend, OracleBackend, Db2Backend, MysqlBackend):
+        monkeypatch.setattr(lifecycle, "_persistence_backend", object.__new__(backend_type))
+        asyncio.run(lifecycle_hooks._federation_nats_post_db_hook(object(), settings))
+
+    assert scheduled == []
+    for backend_name in ("SqliteBackend", "OracleBackend", "Db2Backend", "MysqlBackend"):
+        assert f"unsupported on persistence backend {backend_name}" in caplog.text

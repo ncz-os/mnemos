@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from scripts.db2_apply_migration import _split_statements
+from mnemos.persistence.schema import split_db2_statements
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _FIXTURE = _REPO_ROOT / "mnemos" / "db_migrations" / "migrations_db2" / "0001_core_schema.sql"
@@ -103,3 +104,32 @@ def test_backfill_migrations_parse_with_db2_runner_splitter(basename: str, expec
     statements = _split_statements(sql)
     assert len(statements) == expected_count
     assert all(not stmt.rstrip().endswith("@") for stmt in statements)
+
+
+def test_memory_versions_trigger_is_one_complete_statement() -> None:
+    path = _REPO_ROOT / "mnemos" / "db_migrations" / "migrations_db2" / "0048_memory_versions_visibility.sql"
+    statements = split_db2_statements(path.read_text())
+
+    assert len(statements) == 4
+    trigger = statements[-1].upper()
+    assert trigger.startswith("CREATE TRIGGER")
+    assert "BEGIN ATOMIC" in trigger
+    assert trigger.rstrip().endswith("END")
+
+
+def test_model_registry_sync_log_is_provisioned_for_db2() -> None:
+    path = _REPO_ROOT / "mnemos" / "db_migrations" / "migrations_db2" / "0049_model_registry_sync_log.sql"
+    sql = path.read_text().upper()
+
+    assert "CREATE TABLE MODEL_REGISTRY_SYNC_LOG" in sql
+    for column in (
+        "ID",
+        "PROVIDER",
+        "SYNCED_AT",
+        "MODELS_FOUND",
+        "MODELS_ADDED",
+        "MODELS_UPDATED",
+        "MODELS_DEPRECATED",
+        "ERROR",
+    ):
+        assert column in sql
