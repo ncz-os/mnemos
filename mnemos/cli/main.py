@@ -3,6 +3,8 @@
 import asyncio
 import inspect
 import json
+import logging
+import os
 import sys
 from contextlib import contextmanager
 from enum import Enum
@@ -14,6 +16,8 @@ import httpx
 import typer
 
 from mnemos.core.config import get_settings, set_profile_override
+
+logger = logging.getLogger(__name__)
 
 
 def _patch_typer_click_compat() -> None:
@@ -629,6 +633,68 @@ def _apply_profile_flag(profile: Optional[DeploymentProfile]) -> None:
     set_profile_override(profile.value)
 
 
+#: Escape hatch for the deliberate "open box on a trusted LAN" case. Named to be
+#: uncomfortable to type, because it disables the only thing standing between an
+#: unauthenticated root-equivalent API and every host that can reach the port.
+UNSAFE_NETWORK_BIND_ENV = "MNEMOS_ALLOW_UNAUTHENTICATED_NETWORK_BIND"
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "127.0.0.0/8"}
+
+
+def _is_loopback_bind(host: str) -> bool:
+    """True only for addresses that cannot receive traffic from another host."""
+    candidate = (host or "").strip().strip("[]")
+    if not candidate:
+        return False
+    if candidate in _LOOPBACK_HOSTS:
+        return True
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        # Not a bare address (a hostname, or 0.0.0.0/:: wildcards land above as
+        # non-loopback). Treat anything unrecognised as reachable -- failing
+        # closed is the whole point of this check.
+        return False
+
+
+def _refuse_unauthenticated_network_bind(host: str, what: str) -> None:
+    """Abort startup if an unauthenticated API would be reachable off-host.
+
+    When authentication is disabled every protected route receives a synthetic
+    ``root`` principal, so binding to a non-loopback address publishes full
+    administrative access to anyone who can reach the port. That combination is
+    never intentional by default, so it fails closed here rather than at the
+    first unauthenticated request.
+    """
+    if _is_loopback_bind(host):
+        return
+    settings = get_settings()
+    auth_enabled = bool(getattr(getattr(settings, "auth", None), "enabled", False))
+    if auth_enabled:
+        return
+    if os.environ.get(UNSAFE_NETWORK_BIND_ENV, "").strip().lower() in {"1", "true", "yes"}:
+        logger.warning(
+            "%s is binding %s with authentication DISABLED because %s is set. "
+            "Every client that can reach this port has root-equivalent access.",
+            what,
+            host,
+            UNSAFE_NETWORK_BIND_ENV,
+        )
+        return
+    raise typer.BadParameter(
+        f"{what} refuses to bind {host} with authentication disabled: every "
+        f"protected route would receive an unauthenticated root principal, so "
+        f"any host that can reach this port gains full administrative access.\n"
+        f"Fix one of:\n"
+        f"  - enable authentication (profile 'server', or set an API key), or\n"
+        f"  - bind loopback only: --host 127.0.0.1\n"
+        f"If an open port on a trusted network really is intended, set "
+        f"{UNSAFE_NETWORK_BIND_ENV}=1."
+    )
+
+
 def _adapter_source_args(import_from: ImportSource, source: Path) -> list[str]:
     source_text = str(source)
 
@@ -682,6 +748,7 @@ def serve(
 
     import uvicorn
 
+    _refuse_unauthenticated_network_bind(host, "mnemos serve")
     worker_count = workers if workers is not None else get_settings().server.workers
     uvicorn.run("mnemos.api.main:app", host=host, port=port, workers=worker_count)
 

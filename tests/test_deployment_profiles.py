@@ -225,10 +225,14 @@ def test_cli_serve_profile_flag_overrides_env(monkeypatch: pytest.MonkeyPatch, t
         import uvicorn
 
         scoped.setattr(uvicorn, "run", fake_uvicorn_run)
-        result = runner.invoke(cli_main.app, ["serve", "--profile", "dev"])
+        # Bind loopback explicitly: this test is about the --profile override,
+        # and the dev profile leaves authentication disabled, which `serve`
+        # rightly refuses to publish on a non-loopback address.
+        result = runner.invoke(cli_main.app, ["serve", "--profile", "dev", "--host", "127.0.0.1"])
 
     assert result.exit_code == 0, result.output
     assert calls["app_path"] == "mnemos.api.main:app"
+    assert calls["host"] == "127.0.0.1"
     assert calls["profile"] == "dev"
     assert calls["workers"] == 1
     config.reload_settings()
