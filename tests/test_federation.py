@@ -157,9 +157,20 @@ async def test_sync_peer_records_feed_failure_then_raises(monkeypatch):
     async def pull_fails(*args, **kwargs):
         raise TimeoutError("feed timed out")
 
+    class _FeedClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    async def safe_client(*args, **kwargs):
+        return _FeedClient(), object()
+
     backend = Backend()
     monkeypatch.setattr(federation, "_local_migrations_fingerprint", lambda: "")
     monkeypatch.setattr(federation, "_check_peer_schema", schema_ok)
+    monkeypatch.setattr(federation, "make_safe_client", safe_client)
     monkeypatch.setattr(federation, "_pull_batch", pull_fails)
 
     with pytest.raises(federation.FederationSyncError, match="feed timed out"):
@@ -665,11 +676,15 @@ class TestStoreMemoriesConcurrency:
         executes: list[tuple] = []
         fetchrows: list[tuple] = []
         select_results = [
-            None,  # initial check: no row
             {"federation_remote_updated": datetime(2026, 5, 1, tzinfo=timezone.utc)},  # post-conflict refetch
         ]
 
         class _FakeConn:
+            async def fetch(self, sql, *args):
+                # Batched initial check: no row exists yet.
+                fetchrows.append((sql, args))
+                return []
+
             async def fetchrow(self, sql, *args):
                 fetchrows.append((sql, args))
                 return select_results.pop(0)
@@ -733,6 +748,14 @@ class TestStoreMemoriesConcurrency:
         execute_calls: list[tuple] = []
 
         class _FakeConn:
+            async def fetch(self, sql, *args):
+                return [{
+                    "id": "fed:pythia:mem_race",
+                    "federation_remote_updated": datetime(
+                        2026, 5, 1, 0, 0, 0, tzinfo=timezone.utc
+                    ),
+                }]
+
             async def fetchrow(self, sql, *args):
                 # Existing row: T0 baseline (older than both A and B).
                 return {

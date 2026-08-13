@@ -1125,6 +1125,22 @@ class FederationRepository(ABC):
     @abstractmethod
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None: ...
 
+    async def fetch_federated_memory_markers(
+        self,
+        tx: Transaction,
+        local_ids: Sequence[str],
+    ) -> dict[str, Row]:
+        """Fetch page markers, with a compatibility fallback for backends.
+
+        Backends with a native set-membership query should override this.
+        """
+        markers: dict[str, Row] = {}
+        for local_id in local_ids:
+            row = await self.fetch_federated_memory_marker(tx, local_id)
+            if row is not None:
+                markers[local_id] = row
+        return markers
+
     @abstractmethod
     async def insert_federated_memory(
         self,
