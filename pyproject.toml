@@ -141,7 +141,7 @@ interop = ["mnemos-core[knossos]"]
 # and is not an installable mnemos-core split distribution.
 graeae = ["mnemos-graeae>=0.1,<0.2"]
 full = [
-  "mnemos-core[morpheus,persephone,kronos,knossos,apollo,artemis,nats,hot,edge,openvino]",
+  "mnemos-core[morpheus,persephone,kronos,knossos,apollo,artemis,nats,hot,edge]",
   "mnemos-pantheon>=0.2,<0.3",
   "mnemos-knemon>=0.1,<0.2",
   "mnemos-graeae>=0.1,<0.2",
