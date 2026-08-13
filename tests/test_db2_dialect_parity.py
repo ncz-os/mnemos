@@ -184,7 +184,33 @@ async def test_db2_consultation_fetch_available_models_native() -> None:
 
 @pytest.mark.asyncio
 async def test_db2_consultation_fetch_model_provider_native() -> None:
-    assert True
+    from mnemos.persistence.db2 import Db2ConsultationAuditRepository
+
+    calls: list[dict] = []
+
+    class _FakeCursor:
+        description = (("provider",),)
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self):
+            return [("provider-a",)]
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    repo = Db2ConsultationAuditRepository()
+    provider = await repo.fetch_model_provider(SimpleNamespace(conn=_FakeConn()), "model-a")
+
+    assert provider == "provider-a"
+    assert "FETCH FIRST 1 ROW ONLY" in calls[0]["sql"].upper()
+    assert "LIMIT" not in calls[0]["sql"].upper()
+    assert calls[0]["params"] == ("model-a",)
 
 
 # ────────────────────────────────────────────────────────────────────────────

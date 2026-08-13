@@ -150,6 +150,27 @@ async def test_worker_soft_deletes_confirmed_request_happy_path():
 
 
 @pytest.mark.asyncio
+async def test_worker_requeues_request_when_verification_is_exhausted(monkeypatch):
+    monkeypatch.setattr(worker, "DEFAULT_VERIFY_ATTEMPTS", 2)
+    conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=_TxContext())
+    conn.fetchrow = AsyncMock(
+        side_effect=[_confirmed_request(), _verifying_request(), {"id": _confirmed_request()["id"]}]
+    )
+    conn.fetchval = AsyncMock(return_value=1)
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+
+    result = await worker.process_one_deletion_request(_pool_for(conn))
+
+    assert result is not None
+    assert result.status == "confirmed"
+    assert result.verification_attempts == 2
+    requeue_sql = conn.fetchrow.await_args_list[-1].args[0]
+    assert "SET status = 'confirmed'" in requeue_sql
+    assert "status = 'sweep_verifying'" in requeue_sql
+
+
+@pytest.mark.asyncio
 async def test_worker_soft_delete_is_namespace_scoped():
     conn = AsyncMock()
     conn.execute = AsyncMock(return_value="UPDATE 0")

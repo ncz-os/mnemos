@@ -2790,7 +2790,8 @@ class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAudit
         try:
             await _call(
                 cursor.execute,
-                "SELECT provider FROM model_registry WHERE model_id = ? AND available = 1 AND deprecated = 0 LIMIT 1",
+                "SELECT provider FROM model_registry WHERE model_id = ? AND available = 1 AND deprecated = 0 "
+                "FETCH FIRST 1 ROW ONLY",
                 (model_id,),
             )
             row = await _fetch_all_dicts(cursor)

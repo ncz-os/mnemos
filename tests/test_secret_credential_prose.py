@@ -39,11 +39,11 @@ from mnemos.core.secret_detection import (
 
 # ── confirmed-leak corpus (the actual strings that surfaced) ───────────
 CONFIRMED_LEAKS = [
-    "INFRASTRUCTURE CREDENTIALS: Mac Studio (.10): jasonperlow/***REMOVED-CREDENTIAL***",
+    "INFRASTRUCTURE CREDENTIALS: Mac Studio (.10): jasonperlow/DenylistSelfTest@NotARealSecret1",
     "🔑 Credential: ssh mini@192.168.207.66 sudo password = 'mini'",
-    "[2026-04-16] SSH ACCESS PATTERNS: root login password is ***REMOVED-CREDENTIAL***",
-    "Use GIT_SSH_COMMAND with sshpass -p '***REMOVED-CREDENTIAL***' to push to ARGONAS",
-    "ARGONAS bare repo: root pw ***REMOVED-CREDENTIAL*** for the git push fallback",
+    "[2026-04-16] SSH ACCESS PATTERNS: root login password is DenylistSelfTest2NotReal99",
+    "Use GIT_SSH_COMMAND with sshpass -p 'DenylistSelfTest@NotARealSecret1' to push to ARGONAS",
+    "ARGONAS bare repo: root pw DenylistSelfTest@NotARealSecret1 for the git push fallback",
     "DSN: postgres://mnemos:s3cretDbPass@192.168.207.67:1521/ORCLPDB1",
 ]
 
@@ -77,7 +77,7 @@ def test_confirmed_leaks_are_vaulted(text):
 def test_confirmed_leaks_are_redacted(text):
     """The literal secret never survives redact_content()."""
     masked = redact_content(text)
-    for literal in ("***REMOVED-CREDENTIAL***", "***REMOVED-CREDENTIAL***", "s3cretDbPass"):
+    for literal in ("DenylistSelfTest@NotARealSecret1", "DenylistSelfTest2NotReal99", "s3cretDbPass"):
         assert literal not in masked, (text, masked)
     # the password = 'mini' span is masked even though "mini" is short
     if "= 'mini'" in text:
@@ -132,9 +132,9 @@ def test_env_style_secret_vaulted():
 
 
 def test_redact_offsets_stable_multi_span():
-    t = "pw ***REMOVED-CREDENTIAL*** and also ***REMOVED-CREDENTIAL*** elsewhere"
+    t = "pw DenylistSelfTest@NotARealSecret1 and also DenylistSelfTest2NotReal99 elsewhere"
     masked = redact_content(t)
-    assert "***REMOVED-CREDENTIAL***" not in masked and "***REMOVED-CREDENTIAL***" not in masked
+    assert "DenylistSelfTest@NotARealSecret1" not in masked and "DenylistSelfTest2NotReal99" not in masked
     assert masked.count("[REDACTED]") >= 2
 
 
@@ -156,7 +156,7 @@ def test_redact_overlapping_and_oob_spans():
     from mnemos.core.secret_detection import redact
 
     # fleet literal inside an assignment span -> single [REDACTED]
-    assert redact_content("password=***REMOVED-CREDENTIAL***") == "password=[REDACTED]"
+    assert redact_content("password=DenylistSelfTest@NotARealSecret1") == "password=[REDACTED]"
     # out-of-bounds / inverted spans are clamped/dropped, not crashed
     assert redact("abc", [(1, 99), (-5, 2), (3, 1)]) == "[REDACTED]"
 
@@ -234,18 +234,18 @@ def _row(content, namespace="default"):
 def test_row_to_memory_redacts_when_flagged():
     from mnemos.domain.models import row_to_memory
 
-    leak = "root login password is ***REMOVED-CREDENTIAL*** on TYPHON"
+    leak = "root login password is DenylistSelfTest2NotReal99 on TYPHON"
     masked = row_to_memory(_row(leak), redact_secrets=True)
-    assert "***REMOVED-CREDENTIAL***" not in masked.content
-    assert "***REMOVED-CREDENTIAL***" not in (masked.verbatim_content or "")
+    assert "DenylistSelfTest2NotReal99" not in masked.content
+    assert "DenylistSelfTest2NotReal99" not in (masked.verbatim_content or "")
 
 
 def test_row_to_memory_full_when_not_flagged():
     from mnemos.domain.models import row_to_memory
 
-    leak = "root login password is ***REMOVED-CREDENTIAL*** on TYPHON"
+    leak = "root login password is DenylistSelfTest2NotReal99 on TYPHON"
     full = row_to_memory(_row(leak), redact_secrets=False)
-    assert "***REMOVED-CREDENTIAL***" in full.content
+    assert "DenylistSelfTest2NotReal99" in full.content
 
 
 # ── _should_redact_secrets route gate ─────────────────────────────────
@@ -329,7 +329,7 @@ async def _seed(backend, *, content, namespace, owner="alice", perm=4):
     return mid
 
 
-VAULT_CONTENT = "INFRASTRUCTURE CREDENTIALS host TYPHON password ***REMOVED-CREDENTIAL***"
+VAULT_CONTENT = "INFRASTRUCTURE CREDENTIALS host TYPHON password DenylistSelfTest@NotARealSecret1"
 
 
 @pytest.mark.asyncio
@@ -344,7 +344,7 @@ async def test_bypass_list_default_excludes_vault(sqlite_backend):
     async with sqlite_backend.transactional() as tx:
         rows, total = await sqlite_backend.memories.list_memories(tx, visibility=vis)
     contents = " ".join(r["content"] for r in rows)
-    assert "***REMOVED-CREDENTIAL***" not in contents
+    assert "DenylistSelfTest@NotARealSecret1" not in contents
     assert VAULT_NAMESPACE not in [r["namespace"] for r in rows]
 
 
@@ -359,7 +359,7 @@ async def test_bypass_fts_default_excludes_vault(sqlite_backend):
             tx, query="password", limit=50, visibility=vis
         )
     assert all(r["namespace"] != VAULT_NAMESPACE for r in rows)
-    assert all("***REMOVED-CREDENTIAL***" not in r["content"] for r in rows)
+    assert all("DenylistSelfTest@NotARealSecret1" not in r["content"] for r in rows)
 
 
 @pytest.mark.asyncio
@@ -385,7 +385,7 @@ async def test_root_include_secrets_returns_vault(sqlite_backend):
     async with sqlite_backend.transactional() as tx:
         rows, _ = await sqlite_backend.memories.list_memories(tx, visibility=vis)
     assert any(r["namespace"] == VAULT_NAMESPACE for r in rows)
-    assert any("***REMOVED-CREDENTIAL***" in r["content"] for r in rows)
+    assert any("DenylistSelfTest@NotARealSecret1" in r["content"] for r in rows)
 
 
 @pytest.mark.asyncio
@@ -397,7 +397,7 @@ async def test_root_vault_namespace_target_returns_vault(sqlite_backend):
     async with sqlite_backend.transactional() as tx:
         rows, _ = await sqlite_backend.memories.list_memories(tx, visibility=vis)
     assert rows and all(r["namespace"] == VAULT_NAMESPACE for r in rows)
-    assert any("***REMOVED-CREDENTIAL***" in r["content"] for r in rows)
+    assert any("DenylistSelfTest@NotARealSecret1" in r["content"] for r in rows)
 
 
 @pytest.mark.asyncio
@@ -428,7 +428,7 @@ async def test_bypass_federation_feed_excludes_vault(sqlite_backend):
             prefer_compressed=False,
         )
     assert all(r.get("namespace") != VAULT_NAMESPACE for r in rows)
-    assert all("***REMOVED-CREDENTIAL***" not in (r.get("content") or "") for r in rows)
+    assert all("DenylistSelfTest@NotARealSecret1" not in (r.get("content") or "") for r in rows)
 
 
 @pytest.mark.asyncio
@@ -464,7 +464,7 @@ async def test_federation_item_redacts_incidental_span(sqlite_backend):
     span is masked before it crosses the federation feed."""
     from mnemos.api.routes.federation import _memory_item_from_row
 
-    incidental = "Deploy notes: also the root pw ***REMOVED-CREDENTIAL*** was rotated last week"
+    incidental = "Deploy notes: also the root pw DenylistSelfTest@NotARealSecret1 was rotated last week"
     mid = await _seed(sqlite_backend, content=incidental, namespace="default", perm=7)
     async with sqlite_backend.transactional() as tx:
         rows = await sqlite_backend.federation.feed_query(
@@ -479,7 +479,7 @@ async def test_federation_item_redacts_incidental_span(sqlite_backend):
     target = [r for r in rows if r["id"] == mid]
     assert target, "incidental-span memory should still federate (not vaulted)"
     item = _memory_item_from_row(target[0])
-    assert "***REMOVED-CREDENTIAL***" not in (item.content or "")
+    assert "DenylistSelfTest@NotARealSecret1" not in (item.content or "")
     assert "[REDACTED]" in item.content
 
 

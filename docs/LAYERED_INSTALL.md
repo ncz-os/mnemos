@@ -61,8 +61,8 @@ Build sources: `Dockerfile.core`, `Dockerfile.everything`, `Dockerfile.enterpris
 - `llama-cpp-python` is the only base dep that compiles from source — it builds
   per-arch (AVX on amd64, NEON on arm64). Everything else ships aarch64 wheels.
 - The everything image installs add-on wheels **explicitly**, never via
-  `mnemos-core[full]`, because `full` pulls the Intel-only `openvino`
-  accelerator (x86-only). Accelerators are host-opt-in.
+  `mnemos-core[full]`, because `full` no longer pulls the Intel-only
+  `openvino` accelerator (x86-only). Accelerators are host-opt-in.
 - `mnemos-enterprise` is **amd64-only** (`ibm_db` has no reliable arm64 wheel;
   enterprise big iron is x86). Other arches are a sponsor-provided-CI request.
 

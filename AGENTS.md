@@ -68,7 +68,7 @@ Given `requested` (a set of module ids) and `backend` (one backend id) and
 3. IF deploy == pip:
    - extras = [ modules[m].extra for m in requested if m not in {core,stiphos} and extra ]
             + [ backends[backend].extra if present ]
-   - if arch == arm64: ensure 'openvino' is NOT in extras; prefer extra "server" over "full".
+   - if arch == arm64: ensure 'openvino' is NOT in extras; prefer extra "server" (which no longer pulls openvino).
    - pip install 'mnemos-core[<comma-joined extras>]'
    - if "stiphos" in requested: ALSO pip install 'mnemos-stiphos[mcp]' and run it as a separate service.
 ```
@@ -132,4 +132,4 @@ backend is live. Routes for absent subsystems return HTTP 503 with the exact
 - Backend = runtime `MNEMOS_DATABASE_DSN`, never a rebuild.
 - `mnemos-enterprise` is amd64-only. Do not deploy it on arm64; use `mnemos` + Oracle-thin/Postgres/MySQL instead.
 - STIPHOS is a separate service/image; never expect it on port 5002 or inside the everything image.
-- On arm64, never install the `openvino` accelerator or the `full` extra that pulls it.
+- On arm64, never install the `openvino` accelerator. The `full` extra no longer pulls it.

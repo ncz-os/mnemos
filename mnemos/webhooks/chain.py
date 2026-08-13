@@ -1,6 +1,7 @@
 """Webhook retry-chain locking and successor management."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import datetime
 from typing import Any, Optional
@@ -59,23 +60,18 @@ async def _insert_successor_delivery(
         webhook_types.NEW_CODE_WRITER_REVISION,
     )
     if row is not None:
-        await publish_delivery_queued(
-            delivery_id=str(row["id"]),
-            subscription_id=delivery["subscription_id"],
-            event_type=delivery["event_type"],
-            url=_record_value(delivery, "url") or "",
-            payload_hash=delivery["payload_hash"],
-            namespace=_record_value(delivery, "namespace"),
-            owner_id=_record_value(delivery, "owner_id"),
-        )
-        await publish_webhook_outbox_insert(
-            delivery_id=str(row["id"]),
-            subscription_id=delivery["subscription_id"],
-            event_type=delivery["event_type"],
-            url=_record_value(delivery, "url") or "",
-            payload_hash=delivery["payload_hash"],
-            namespace=_record_value(delivery, "namespace"),
-            owner_id=_record_value(delivery, "owner_id"),
+        publish_args = {
+            "delivery_id": str(row["id"]),
+            "subscription_id": delivery["subscription_id"],
+            "event_type": delivery["event_type"],
+            "url": _record_value(delivery, "url") or "",
+            "payload_hash": delivery["payload_hash"],
+            "namespace": _record_value(delivery, "namespace"),
+            "owner_id": _record_value(delivery, "owner_id"),
+        }
+        await asyncio.gather(
+            publish_delivery_queued(**publish_args),
+            publish_webhook_outbox_insert(**publish_args),
         )
     return row
 

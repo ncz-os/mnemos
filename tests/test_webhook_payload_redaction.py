@@ -21,14 +21,14 @@ def test_redacted_for_webhook_masks_secret_via_stored_spans():
     """create/bulk dispatch: spans recorded at ingest mask the payload content."""
     from mnemos.api.routes.memories import _redacted_for_webhook
 
-    secret = "INFRASTRUCTURE CREDENTIALS: root pw is ***REMOVED-CREDENTIAL***"
+    secret = "INFRASTRUCTURE CREDENTIALS: root pw is DenylistSelfTest@NotARealSecret1"
     classified = classify_persisted_text_fields(
         content=secret,
         namespace="default",
         classified_at="ingest",
     )
     redacted = _redacted_for_webhook(secret, classified.metadata)
-    assert "***REMOVED-CREDENTIAL***" not in redacted
+    assert "DenylistSelfTest@NotARealSecret1" not in redacted
     assert "[REDACTED]" in redacted
 
 

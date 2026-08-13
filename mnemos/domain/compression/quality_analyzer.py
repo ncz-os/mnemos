@@ -164,7 +164,7 @@ class QualityAnalyzer:
             logger.warning(
                 "fastembed not available; QualityAnalyzer falling back to "
                 "pure-heuristic semantic scoring. "
-                "Install with: pip install 'mnemos-os[ml]'"
+                "Install with: pip install 'mnemos-core[ml]'"
             )
         except Exception as exc:
             logger.warning(

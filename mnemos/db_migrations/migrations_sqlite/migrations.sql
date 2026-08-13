@@ -313,7 +313,8 @@ CREATE TABLE IF NOT EXISTS graeae_audit_log (
   quality_score REAL,
   latency_ms INTEGER,
   cost_usd REAL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    chain_algo    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_sequence ON graeae_audit_log(sequence_num);

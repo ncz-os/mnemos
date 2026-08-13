@@ -16,6 +16,7 @@ contract:
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from mnemos.core.pool import (
@@ -170,3 +171,26 @@ def test_distillation_worker_creates_wrapped_pool(monkeypatch):
     assert isinstance(pool, TimeoutPool)
     # The wrapped instance is the raw pool we created.
     assert pool._pool is raw_sentinel
+
+
+def test_distillation_worker_uses_configured_dsn(monkeypatch):
+    import asyncio
+
+    from mnemos.workers import distillation
+
+    calls = []
+
+    async def _fake_create_pool(*args, **kwargs):
+        calls.append((args, kwargs))
+        return MagicMock(name="raw-asyncpg-pool")
+
+    monkeypatch.setattr(distillation.asyncpg, "create_pool", _fake_create_pool)
+    monkeypatch.setattr(
+        distillation,
+        "get_settings",
+        lambda: SimpleNamespace(database=SimpleNamespace(dsn="postgres://u:p@db:6543/prod", url="")),
+    )
+
+    asyncio.run(distillation.MemoryDistillationWorker._create_pool())
+
+    assert calls[0][0] == ("postgres://u:p@db:6543/prod",)

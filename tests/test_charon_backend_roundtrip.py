@@ -337,7 +337,7 @@ async def test_export_bundle_from_backend_excludes_vault_by_default(sqlite_backe
     """ROOT_BYPASS export must NEVER leak vault memories (F1 posture)."""
     await _seed_memory(
         sqlite_backend,
-        content="INFRASTRUCTURE CREDENTIALS host TYPHON password ***REMOVED-CREDENTIAL***",
+        content="INFRASTRUCTURE CREDENTIALS host TYPHON password DenylistSelfTest@NotARealSecret1",
         namespace=VAULT_NAMESPACE,
     )
     await _seed_memory(sqlite_backend, content="ordinary note", namespace="default")
@@ -347,7 +347,7 @@ async def test_export_bundle_from_backend_excludes_vault_by_default(sqlite_backe
 
     # Vault content MUST NOT survive into the bundle.
     blob = "\n".join(p.read_text() for p in out_dir.rglob("*.md"))
-    assert "***REMOVED-CREDENTIAL***" not in blob
+    assert "DenylistSelfTest@NotARealSecret1" not in blob
     # Vault redaction marker IS in the bundle for any (root opt-in) vault
     # rows — but with our default filter no vault rows are exported at all.
     # Either way: no secret survives.
@@ -431,7 +431,7 @@ async def test_export_bundle_from_backend_drops_unattached_vault_kg_triples(sqli
         sqlite_backend,
         subject="VaultCredential",
         predicate="stores",
-        obj="ROOT_PW=***REMOVED-CREDENTIAL***",
+        obj="ROOT_PW=DenylistSelfTest@NotARealSecret1",
         memory_id=None,
         namespace=VAULT_NAMESPACE,
     )
@@ -451,7 +451,7 @@ async def test_export_bundle_from_backend_drops_unattached_vault_kg_triples(sqli
     triples = [json.loads(line) for line in kg_path.read_text().splitlines() if line.strip()]
     assert manifest["sidecars"]["kg_triples"]["count"] == 1
     assert {row["subject"] for row in triples} == {"Hermes"}
-    assert "***REMOVED-CREDENTIAL***" not in kg_path.read_text()
+    assert "DenylistSelfTest@NotARealSecret1" not in kg_path.read_text()
 
 
 @pytest.mark.asyncio

@@ -42,6 +42,7 @@ from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.persistence.base import DuplicateMemoryError
+from mnemos.persistence.nats_events import safe_subject_segment
 from mnemos.domain.models import (
     DEFAULT_SEMANTIC_FLOOR,
     DEFAULT_SEMANTIC_MARGIN_FLOOR,
@@ -657,7 +658,7 @@ async def _insert_memory_with_created_webhook(
 
     from mnemos.nats.client import get_node_name as _nats_get_node_name
 
-    safe_ns = (namespace or "default").replace(".", "_")
+    safe_ns = safe_subject_segment(namespace)
     nats_intents: list[NatsPublishIntent] = [
         (
             f"mnemos.memory.created.{safe_ns}",
@@ -1797,7 +1798,7 @@ async def create_memory(
     # unreachable. Webhooks outbox above is the durable path.
     from mnemos.nats.client import get_node_name as _nats_get_node_name
 
-    safe_ns = (namespace or "default").replace(".", "_")
+    safe_ns = safe_subject_segment(namespace)
     await _publish_nats_with_timeout(
         f"mnemos.memory.created.{safe_ns}",
         {
@@ -2004,7 +2005,7 @@ async def bulk_create_memories(
 
     source_node = _nats_get_node_name()
     for event in nats_created_events:
-        safe_ns = (event["namespace"] or "default").replace(".", "_")
+        safe_ns = safe_subject_segment(event["namespace"])
         await _publish_nats_with_timeout(
             f"mnemos.memory.created.{safe_ns}",
             {**event, "source_node": source_node},
@@ -2136,7 +2137,7 @@ async def update_memory(
     from mnemos.nats import publish_event as _nats_publish_event
     from mnemos.nats.client import get_node_name as _nats_get_node_name
 
-    safe_ns = (namespace or "default").replace(".", "_")
+    safe_ns = safe_subject_segment(namespace)
     await _nats_publish_event(
         f"mnemos.memory.updated.{safe_ns}",
         {
@@ -2223,7 +2224,7 @@ async def delete_memory(
     from mnemos.nats import publish_event as _nats_publish_event
     from mnemos.nats.client import get_node_name as _nats_get_node_name
 
-    safe_ns = (namespace or "default").replace(".", "_")
+    safe_ns = safe_subject_segment(namespace)
     await _nats_publish_event(
         f"mnemos.memory.deleted.{safe_ns}",
         {
