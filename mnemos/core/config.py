@@ -1054,6 +1054,20 @@ class _LayerSettings(BaseSettings):
         default=True,
         validation_alias=AliasChoices("MNEMOS_ENABLE_GRAEAE", "ENABLE_GRAEAE"),
     )
+    # Default true so installing the distribution keeps working exactly as
+    # before. The point of the flag is the OTHER direction: CHARON's routes
+    # (and, through them, Docling) previously mounted whenever the wheel was
+    # present, with no way to decline. Edge and small-host images that ship the
+    # umbrella wheel can now set this false and skip the import entirely.
+    enable_charon: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("MNEMOS_ENABLE_CHARON", "ENABLE_CHARON"),
+        description=(
+            "Mount the CHARON portability/ingest routes when the mnemos-charon "
+            "distribution is installed. Disable on memory-constrained hosts that "
+            "carry the umbrella wheel but never import documents."
+        ),
+    )
     # Default false: hive is a separate ncz-os/hive track, not a mnemos-core extra.
     enable_hive: bool = Field(
         default=False,
