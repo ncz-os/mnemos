@@ -170,7 +170,12 @@ def test_postgres_unique_violation_on_seed_insert_replay_is_benign() -> None:
 
 def test_oracle_unique_constraint_violation_on_seed_insert_replay_is_benign() -> None:
     exc = Exception("ORA-00001: unique constraint (MNEMOS.PK_SUBSCRIPTION_PLANS) violated")
-    assert _is_benign_oracle_error(exc)
+    # The Oracle idempotency check is now statement-type-scoped: a
+    # uniqueness violation on INSERT INTO subscription_plans is benign
+    # (replay of a static seed), but a uniqueness violation from a
+    # CREATE INDEX / ALTER TABLE ADD CONSTRAINT is a hard failure.
+    assert _is_benign_oracle_error("INSERT INTO subscription_plans (...) VALUES (...)", exc)
+    assert not _is_benign_oracle_error("CREATE UNIQUE INDEX ix_memories_owner ON memories (owner_id, namespace)", exc)
 
 
 def test_db2_unrelated_error_is_not_benign() -> None:
@@ -178,3 +183,75 @@ def test_db2_unrelated_error_is_not_benign() -> None:
     # still surface as a hard failure.
     exc = Exception("SQLCODE=-104 SQLSTATE=42601 unexpected token")
     assert not _is_benign_db2_error("SELECT * FROM memories", exc)
+
+
+# ── Statement-scoped uniqueness suppression ────────────────────────────────
+#
+# The earlier blanket "23505 / ORA-00001 is benign on every migration
+# statement" suppression masked real failures from CREATE INDEX /
+# ALTER TABLE ADD CONSTRAINT where the unique-index collision was
+# actually a logic bug. The idempotency is now statement-type-scoped:
+# unique_violation is ONLY suppressed for INSERT INTO <seed_table>
+# statements (subscription_plans, memory_category_decay, model_registry),
+# never for constraint or index creation. These tests pin that
+# behaviour on every backend.
+
+
+def test_postgres_unique_violation_on_create_index_is_not_benign() -> None:
+    exc = _FakeSqlstateError(
+        "duplicate key value violates unique constraint", sqlstate="23505"
+    )
+    assert not _is_benign_postgres_error(
+        "CREATE UNIQUE INDEX ix_memories_owner ON memories (owner_id, namespace)", exc
+    )
+    assert not _is_benign_postgres_error(
+        "ALTER TABLE memories ADD CONSTRAINT uniq_owner UNIQUE (owner_id)", exc
+    )
+
+
+def test_postgres_unique_violation_on_non_seed_insert_is_not_benign() -> None:
+    """Application-owned rows (memories / sessions / api_keys / etc.)
+    must NOT be silently skipped on a uniqueness violation -- a unique
+    constraint on those tables is a real failure.
+    """
+    exc = _FakeSqlstateError(
+        "duplicate key value violates unique constraint", sqlstate="23505"
+    )
+    assert not _is_benign_postgres_error(
+        "INSERT INTO memories (id, content, owner_id) VALUES ($1, $2, $3)", exc
+    )
+    assert not _is_benign_postgres_error(
+        "INSERT INTO api_keys (user_id, key_hash) VALUES ($1, $2)", exc
+    )
+
+
+def test_postgres_seed_insert_other_seed_tables_is_not_benign() -> None:
+    """Only the curated seed tables are replay-safe. A new table that
+    happens to also be a seed must NOT silently bypass uniqueness
+    failures -- the operator has to opt it in.
+    """
+    exc = _FakeSqlstateError(
+        "duplicate key value violates unique constraint", sqlstate="23505"
+    )
+    assert not _is_benign_postgres_error(
+        "INSERT INTO some_other_seed (...) VALUES (...)", exc
+    )
+
+
+def test_db2_unique_violation_on_create_index_is_not_benign() -> None:
+    exc = Exception(
+        "ibm_db_dbi::IntegrityError: SQL0803N ... SQLSTATE=23505 SQLCODE=-803"
+    )
+    assert not _is_benign_db2_error(
+        "CREATE UNIQUE INDEX ix_memories_owner ON memories (owner_id, namespace)", exc
+    )
+    assert not _is_benign_db2_error(
+        "ALTER TABLE memories ADD CONSTRAINT uniq_owner UNIQUE (owner_id)", exc
+    )
+
+
+def test_oracle_unique_constraint_violation_on_non_seed_insert_is_not_benign() -> None:
+    exc = Exception("ORA-00001: unique constraint (MNEMOS.UNIQ_OWNER) violated")
+    assert not _is_benign_oracle_error(
+        "INSERT INTO memories (id, content, owner_id) VALUES (:id, :content, :owner)", exc
+    )

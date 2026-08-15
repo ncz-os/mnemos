@@ -347,6 +347,11 @@ async def test_worker_hard_deletes_expired_soft_deleted_request_happy_path(monke
         ]
     )
     conn.execute = AsyncMock(side_effect=execute)
+    # The resweep+verify loop must see zero live rows so the request is
+    # allowed to advance to ``hard_deleted`` (otherwise the worker
+    # refuses to mark it complete -- live rows would survive the
+    # irreversible delete, defeating GDPR).
+    conn.fetchval = AsyncMock(return_value=0)
 
     result = await worker.process_one_hard_deletion_request(_pool_for(conn))
 
@@ -380,6 +385,7 @@ async def test_worker_hard_delete_preserves_deletion_request_audit_row(monkeypat
         ]
     )
     conn.execute = AsyncMock(return_value="DELETE 0")
+    conn.fetchval = AsyncMock(return_value=0)
 
     result = await worker.process_one_hard_deletion_request(_pool_for(conn))
 
@@ -425,6 +431,7 @@ async def test_worker_hard_delete_invalidates_search_and_stats_cache(monkeypatch
         ]
     )
     conn.execute = AsyncMock(return_value="DELETE 0")
+    conn.fetchval = AsyncMock(return_value=0)
 
     await worker.process_one_hard_deletion_request(_pool_for(conn))
 
@@ -449,8 +456,67 @@ def test_hard_delete_sql_order_keeps_fk_children_before_parents():
         "sessions",
         "graeae_consultations",
     ]
-    assert labels[9:] == ["kg_triples", "journal", "entities", "state"]
-    assert len(labels) == 13
+    assert labels[9:13] == ["kg_triples", "journal", "entities", "state"]
+    # Identity / credential tables come last: every soft-deleted row must
+    # be gone before we revoke api_keys, drop oauth rows (raw claims, IP,
+    # user agent), and (for all-namespace deletions) the user record
+    # itself. The SQL for these does NOT filter on ``deleted_at IS NOT
+    # NULL`` -- those tables don't carry that column -- but they only run
+    # after the rest of the scope is already verified clean.
+    assert labels[13:] == ["api_keys", "oauth_sessions", "oauth_identities", "user_groups", "users"]
+    assert len(labels) == 18
+
+
+def test_hard_delete_sql_revokes_api_keys_before_deleting_oauth_rows():
+    """GDPR finding: the worker must revoke and delete credentials, then
+    drop OAuth identities/sessions, before recording completion. An
+    all-namespace hard delete that left these rows behind would keep the
+    email, raw OAuth claims, IP addresses, and active API keys of a
+    user that the audit log claims was deleted.
+    """
+    labels = [label for label, _table, _sql in worker._HARD_DELETE_SQL]
+
+    api_keys_index = labels.index("api_keys")
+    oauth_sessions_index = labels.index("oauth_sessions")
+    oauth_identities_index = labels.index("oauth_identities")
+    user_groups_index = labels.index("user_groups")
+    users_index = labels.index("users")
+    # Identity tables must come after the rest of the deletion scope is
+    # already removed -- this protects any in-flight OAuth check from
+    # racing past the revoke: the keys are revoked first, sessions/ids
+    # are dropped next, and finally the user row.
+    assert api_keys_index > labels.index("graeae_audit_log")
+    assert api_keys_index < oauth_sessions_index < oauth_identities_index < user_groups_index < users_index
+
+    # The api_keys statement must set revoked=TRUE so that any concurrent
+    # auth check that already loaded the row sees the credential disabled
+    # before the DELETE lands.
+    api_keys_sql = next(
+        sql for label, _table, sql in worker._HARD_DELETE_SQL if label == "api_keys"
+    )
+    assert "revoked = TRUE" in api_keys_sql
+    assert "user_id = $1" in api_keys_sql
+
+    # The user row is only removed on an all-namespace deletion. A scoped
+    # deletion must keep the user row so other namespaces keep working.
+    users_sql = next(
+        sql for label, _table, sql in worker._HARD_DELETE_SQL if label == "users"
+    )
+    assert "id = $1" in users_sql
+    assert "$2::text IS NULL" in users_sql
+
+
+def test_hard_delete_live_row_count_covers_identity_tables():
+    """Verification must check the identity tables too -- otherwise the
+    sweep+verify loop can pass on the first pass and still leave active
+    credentials / OAuth rows behind.
+    """
+    labels = {label for label, _sql in worker._LIVE_ROW_COUNT_SQL}
+    assert "api_keys" in labels
+    assert "oauth_sessions" in labels
+    assert "oauth_identities" in labels
+    assert "user_groups" in labels
+    assert "users" in labels
 
 
 @pytest.mark.asyncio
@@ -526,3 +592,74 @@ async def test_memory_read_path_filters_soft_deleted_rows():
     assert row is None
     sql = conn.fetchrow.await_args.args[0]
     assert "FROM memories WHERE id=$1 AND deleted_at IS NULL" in sql
+
+
+@pytest.mark.asyncio
+async def test_worker_hard_delete_refuses_when_resweep_finds_live_rows(monkeypatch):
+    """GDPR fence (live-row find): a memory added during the 30-day
+    grace window still carries ``deleted_at IS NULL`` when the
+    hard-delete phase runs, so the worker would skip it forever. The
+    resweep+verify loop must run the soft-delete sweep one more time
+    and refuse to mark the request complete if any live rows remain.
+    """
+    monkeypatch.setattr(lifecycle, "_cache", None)
+    conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=_TxContext())
+    conn.fetchrow = AsyncMock(
+        side_effect=[
+            _soft_deleted_request(),
+            None,  # never reached; the worker must raise first
+        ]
+    )
+    conn.execute = AsyncMock(return_value="DELETE 1")
+    # Simulate a writer that landed a memory during the grace window:
+    # the resweep+verify live-row count returns 1 on the very first
+    # iteration, so the worker must refuse to mark the request complete.
+    conn.fetchval = AsyncMock(return_value=1)
+
+    with pytest.raises(RuntimeError, match="live rows still on scope after resweep"):
+        await worker.process_one_hard_deletion_request(_pool_for(conn))
+
+
+@pytest.mark.asyncio
+async def test_worker_hard_delete_resweep_then_verify_zero_allows_completion(monkeypatch):
+    """Happy path for the resweep+verify gate: first verify call still
+    shows a live row (a writer landed one mid-grace); the resweep runs
+    and the second verify call returns 0; the worker then allows the
+    request to advance to ``hard_deleted``.
+    """
+    monkeypatch.setattr(lifecycle, "_cache", None)
+    conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=_TxContext())
+    conn.fetchrow = AsyncMock(
+        side_effect=[
+            _soft_deleted_request(),
+            _hard_deleted_request(),
+        ]
+    )
+    conn.execute = AsyncMock(return_value="DELETE 1")
+    # 17 live-row labels * 2 passes (one in resweep, one final). The
+    # first 17 calls return 1 (live row found) and the rest return 0
+    # (clean after resweep). DEFAULT_VERIFY_ATTEMPTS = 5, so the resweep
+    # loop only runs once before converging on zero.
+    sequence = iter([1] * 17 + [0] * 50)
+
+    async def fetchval(_sql, *_args):
+        try:
+            return next(sequence)
+        except StopIteration:
+            return 0
+
+    conn.fetchval = AsyncMock(side_effect=fetchval)
+
+    result = await worker.process_one_hard_deletion_request(_pool_for(conn))
+
+    assert result is not None
+    assert result.status == "hard_deleted"
+    # Every label must report zero -- this is the second-line-of-defence
+    # check inside ``hard_delete_soft_deleted_request`` after the
+    # irreversible DELETE statements have run. Any value > 0 means the
+    # request would have been marked complete while subject data
+    # survived, which is exactly what the GDPR fix is preventing.
+    assert result.remaining_counts is not None
+    assert all(v == 0 for v in result.remaining_counts.values()), result.remaining_counts

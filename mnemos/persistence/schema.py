@@ -87,22 +87,22 @@ _POSTGRES_NUMBERED_DIR = _DB_DIR / "migrations"
 _ORACLE_MIGRATIONS_DIR = _DB_DIR / "migrations_oracle"
 _DB2_MIGRATIONS_DIR = _DB_DIR / "migrations_db2"
 
-_PG_DUPLICATE_STATES = {"42710", "42P07", "42701", "23505"}
+_PG_DUPLICATE_STATES = {"42710", "42P07", "42701"}
 _PG_UNDEFINED_STATES = {"42704", "42P01"}
 # SQLSTATEs that are benign on (re)provisioning: object/column already exists
 # (42710/42P07/42701/42711) and 01550 = SQL0605W "index not created because a
 # matching index already exists" (e.g. an explicit CREATE INDEX that duplicates
 # the index a UNIQUE/PK constraint already created). Warnings, not failures.
-# 23505 (unique_violation, ANSI-standard SQLSTATE shared by Postgres and Db2)
-# is included because a static seed-data INSERT (e.g. 0033_subscription_plans)
-# is replayed on every startup with no separate migration-tracking table;
-# a duplicate-key hit on replay means "this exact row was already inserted by
-# a prior run," which is exactly as benign as the DDL-already-exists cases
-# above -- not a real conflict, since the migration file's INSERT is static
-# and deterministic. Found 2026-07-11 when a Db2-backed host's mnemos-api
-# container crash-looped forever on this exact migration after a restart
-# following a partial-then-recovered prior run.
-_DB2_BENIGN_STATES = {"42710", "42P07", "42701", "42711", "01550", "23505"}
+#
+# 23505 (unique_violation) used to be in this set on Db2 (and previously
+# on Postgres via _PG_DUPLICATE_STATES) because a static seed INSERT was
+# replayed on every startup with no migration ledger. That blanket
+# suppression also masked genuine uniqueness failures from CREATE INDEX
+# and ALTER TABLE ADD CONSTRAINT. The fix in
+# ``_is_benign_{postgres,oracle,db2}_error`` now matches 23505 ONLY
+# against INSERT INTO <seed_table> statements; constraint / index
+# uniqueness failures surface as hard migration failures again.
+_DB2_BENIGN_STATES = {"42710", "42P07", "42701", "42711", "01550"}
 _DB2_VECTOR_INDEX_BENIGN_CODES = {"42601", "56098", "SQL0104N", "SQL0270N"}
 
 
@@ -329,7 +329,7 @@ async def _execute_cursor_statement(cursor: Any, statement: str, path: Path, bac
     try:
         await _maybe_await(cursor.execute, statement)
     except Exception as exc:
-        if backend == "oracle" and _is_benign_oracle_error(exc):
+        if backend == "oracle" and _is_benign_oracle_error(statement, exc):
             _LOG.debug("Skipping idempotent Oracle migration replay in %s: %s", path.name, _first_line(exc))
             return
         if backend == "db2" and _is_benign_db2_error(statement, exc):
@@ -484,16 +484,23 @@ def _strip_trailing_semicolon(statement: str) -> str:
 def _is_benign_postgres_error(statement: str, exc: Exception) -> bool:
     state = getattr(exc, "sqlstate", "") or getattr(exc, "pgcode", "")
     head = statement.lstrip().upper()
-    if state in _PG_DUPLICATE_STATES:
-        return True
     if state in _PG_UNDEFINED_STATES and head.startswith(("GRANT ", "DROP POLICY ")):
         return True
+    # 23505 (unique_violation) is ONLY benign for replay of a static
+    # seed INSERT into one of the curated seed tables; never for
+    # constraint or index creation. The earlier blanket suppression
+    # masked real failures: a CREATE INDEX / ALTER TABLE ADD CONSTRAINT
+    # whose unique-index collision was actually a logic bug now surfaces
+    # as a hard migration failure instead of being silently swallowed.
+    if state == "23505" and head.startswith("INSERT "):
+        return _is_idempotent_seed_insert(head)
     return False
 
 
-def _is_benign_oracle_error(exc: Exception) -> bool:
+def _is_benign_oracle_error(statement: str, exc: Exception) -> bool:
     text = str(exc)
-    return any(
+    head = statement.lstrip().upper()
+    if any(
         code in text
         for code in (
             "ORA-00955",
@@ -503,19 +510,72 @@ def _is_benign_oracle_error(exc: Exception) -> bool:
             "ORA-02261",
             "ORA-02275",
             "ORA-04081",
-            # Unique constraint violated: benign on replay of a static
-            # seed-data INSERT (see _DB2_BENIGN_STATES / _PG_DUPLICATE_STATES
-            # for the full rationale -- same class of gap, all three backends).
-            "ORA-00001",
         )
-    )
+    ):
+        return True
+    # ORA-00001 (unique constraint violated) is ONLY benign for replay of
+    # a static seed INSERT into a curated seed table; never for
+    # constraint / index creation.
+    if "ORA-00001" in text and head.startswith("INSERT "):
+        return _is_idempotent_seed_insert(head)
+    return False
 
 
 def _is_benign_db2_error(statement: str, exc: Exception) -> bool:
     text = str(exc)
+    head = statement.lstrip().upper()
     if any(state in text for state in _DB2_BENIGN_STATES):
         return True
-    return "CREATE VECTOR INDEX" in statement.upper() and any(code in text for code in _DB2_VECTOR_INDEX_BENIGN_CODES)
+    if "CREATE VECTOR INDEX" in statement.upper() and any(code in text for code in _DB2_VECTOR_INDEX_BENIGN_CODES):
+        return True
+    # 23505 (unique_violation) on Db2 is only benign for replay of a
+    # static seed INSERT; the original blanket suppression let genuine
+    # CREATE INDEX / ADD CONSTRAINT failures (e.g. a partial-then-recovered
+    # prior run leaving a half-built unique index) silently pass.
+    if "23505" in text and head.startswith("INSERT "):
+        return _is_idempotent_seed_insert(head)
+    return False
+
+
+#: Seed tables whose static INSERT statements are safe to replay (a
+#: unique_violation on these means "this exact row was already inserted
+#: by a prior run" and is benign). Restricted to the seeded-reference
+#: tables; identity / memory / state / kg rows are inserted by the
+#: application, not by migrations, so they are never on this list.
+_IDEMPOTENT_SEED_TABLES: frozenset[str] = frozenset(
+    {
+        "subscription_plans",
+        "memory_category_decay",
+        "model_registry",
+    }
+)
+
+
+def _is_idempotent_seed_insert(head: str) -> bool:
+    """True only when ``head`` is an ``INSERT INTO <table> ...`` against
+    one of the curated seed tables. The parser is intentionally
+    conservative -- it only matches the table identifier immediately
+    after ``INSERT INTO`` and rejects anything else (CTEs, ``INSERT
+    INTO ... SELECT``, multi-table INSERTs, etc.).
+    """
+    if not head.startswith("INSERT "):
+        return False
+    rest = head[len("INSERT ") :].lstrip()
+    if not rest.upper().startswith("INTO "):
+        return False
+    rest = rest[len("INTO ") :].lstrip()
+    # Match the bare table identifier; strip trailing characters that
+    # belong to a column list or VALUES clause.
+    ident_chars = []
+    for ch in rest:
+        if ch.isalnum() or ch == "_":
+            ident_chars.append(ch)
+        else:
+            break
+    if not ident_chars:
+        return False
+    table = "".join(ident_chars).lower()
+    return table in _IDEMPOTENT_SEED_TABLES
 
 
 def _should_skip_db2_vector_index(statement: str) -> bool:

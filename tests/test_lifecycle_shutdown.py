@@ -42,6 +42,12 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_p
         monkeypatch.setattr(lifecycle, "_delivery_attempt_tasks", set())
         monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(tmp_path / "missing.toml"))
         monkeypatch.setenv("MNEMOS_SQLITE_PATH", str(tmp_path / "mnemos.sqlite3"))
+        # The lifespan startup guard refuses an unauthenticated API
+        # bound off-loopback (documented in
+        # ``mnemos.core.network_guard``). This test runs in-process without
+        # a real bind, so simulate a loopback bind via the validated-bind
+        # env handoff -- the same mechanism ``mnemos serve`` uses.
+        monkeypatch.setenv("_MNEMOS_BIND_VALIDATED_HOST", "127.0.0.1")
         core_config.reload_settings()
         monkeypatch.setattr(lifecycle, "_load_config", lambda: {"worker": {"enabled": False}})
         monkeypatch.setattr(lifecycle.asyncpg, "create_pool", create_pool)
