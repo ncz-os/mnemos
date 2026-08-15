@@ -118,4 +118,7 @@ EXPOSE 5002
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5002/health').read()" || exit 1
 
-CMD ["python", "-m", "uvicorn", "mnemos.api.main:app", "--host", "0.0.0.0", "--port", "5002"]
+# Go through `mnemos serve` so the bind address is validated: it refuses to
+# publish an unauthenticated API off-host (set
+# MNEMOS_ALLOW_UNAUTHENTICATED_NETWORK_BIND=1 for a deliberate open box).
+CMD ["mnemos", "serve", "--host", "0.0.0.0", "--port", "5002"]

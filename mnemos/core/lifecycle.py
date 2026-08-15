@@ -735,6 +735,20 @@ async def _log_federation_startup_guidance(pool: asyncpg.Pool | None) -> None:
 async def lifespan(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, and workers."""
     global _pool, _pool_manager, _persistence_backend, _cache, _rls_enabled, _worker_status
+
+    # Before anything is initialized or any port is served: refuse to come up as
+    # an unauthenticated, network-reachable API. `mnemos serve` validates its own
+    # bind and records it; a direct uvicorn/gunicorn launch (which is how the
+    # published images start) leaves no record, so the bind is treated as
+    # reachable and the check fails closed.
+    from mnemos.core import network_guard
+
+    _bind_refusal = network_guard.refusal_reason(
+        network_guard.validated_bind_host(), "the MNEMOS API"
+    )
+    if _bind_refusal is not None:
+        raise RuntimeError(_bind_refusal)
+
     logger.info("Starting MNEMOS API Server v3.0.0 (gateway + sessions + DAG + workers)")
 
     config = _load_config()
