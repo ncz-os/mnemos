@@ -115,3 +115,61 @@ def test_unsupported_layers_are_disabled_rather_than_blocking_startup():
     # strict_layers still refuses, so the fail-fast contract is intact.
     with pytest.raises(NotImplementedError, match="does not support enabled layer"):
         assert_backend_supports_layers(bare, active)
+
+
+# ── Per-backend layer overrides (settings build-time) ────────────────────────
+
+
+def test_mysql_backend_disables_graeae_by_default(monkeypatch):
+    """MySQL has no consultations capability. The documented MySQL
+    enterprise-image command sets only ``MNEMOS_PERSISTENCE_BACKEND=mysql``;
+    GRAEAE must not be on by default or the lifecycle layer-check
+    refuses to start (with strict_layers) or logs a degraded-boot
+    warning (without). The settings builder applies a per-backend
+    default that flips ``enable_graeae`` to False for MySQL / MariaDB
+    so the image boots clean out of the box.
+    """
+    from mnemos.core import config as cfg
+
+    monkeypatch.delenv("MNEMOS_ENABLE_GRAEAE", raising=False)
+    monkeypatch.delenv("MNEMOS_STRICT_LAYERS", raising=False)
+    monkeypatch.setenv("MNEMOS_PERSISTENCE_BACKEND", "mysql")
+    settings = cfg._build_settings()
+    assert settings.layers.enable_graeae is False
+    assert "graeae" not in settings.layers.active_layers
+
+
+def test_mariadb_backend_disables_graeae_by_default(monkeypatch):
+    from mnemos.core import config as cfg
+
+    monkeypatch.delenv("MNEMOS_ENABLE_GRAEAE", raising=False)
+    monkeypatch.setenv("MNEMOS_PERSISTENCE_BACKEND", "mariadb")
+    settings = cfg._build_settings()
+    assert settings.layers.enable_graeae is False
+
+
+def test_postgres_backend_keeps_graeae_default(monkeypatch):
+    """Postgres advertises consultations, so the per-backend override
+    must not flip GRAEAE off.
+    """
+    from mnemos.core import config as cfg
+
+    monkeypatch.delenv("MNEMOS_ENABLE_GRAEAE", raising=False)
+    monkeypatch.setenv("MNEMOS_PERSISTENCE_BACKEND", "postgres")
+    settings = cfg._build_settings()
+    assert settings.layers.enable_graeae is True
+
+
+def test_operator_explicit_enable_graeae_on_mysql_is_respected(monkeypatch):
+    """The per-backend override must NOT silently suppress operator
+    intent: setting ``MNEMOS_ENABLE_GRAEAE=true`` on a MySQL deployment
+    keeps the flag on (the operator has explicitly opted in, presumably
+    to test the layer gap themselves or because they shipped a custom
+    consultations implementation).
+    """
+    from mnemos.core import config as cfg
+
+    monkeypatch.setenv("MNEMOS_PERSISTENCE_BACKEND", "mysql")
+    monkeypatch.setenv("MNEMOS_ENABLE_GRAEAE", "true")
+    settings = cfg._build_settings()
+    assert settings.layers.enable_graeae is True

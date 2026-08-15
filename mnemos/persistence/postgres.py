@@ -2812,6 +2812,48 @@ class PostgresOAuthRepository(OAuthRepository):
             session_id,
         )
 
+    async def lookup_api_key(
+        self, tx: Transaction, key_hash: str
+    ) -> Row | None:
+        return await _postgres_tx(tx).conn.fetchrow(
+            "SELECT ak.id, ak.user_id, ak.revoked, u.role, u.namespace, "
+            "       ug.group_ids "
+            "FROM api_keys ak JOIN users u ON u.id = ak.user_id "
+            "LEFT JOIN LATERAL ("
+            "    SELECT array_agg(group_id) AS group_ids "
+            "    FROM user_groups "
+            "    WHERE user_id = u.id"
+            ") ug ON TRUE "
+            "WHERE ak.key_hash = $1",
+            key_hash,
+        )
+
+    async def touch_api_key(self, tx: Transaction, key_id: Any) -> None:
+        await _postgres_tx(tx).conn.execute(
+            "UPDATE api_keys SET last_used=NOW() WHERE id=$1", key_id
+        )
+
+    async def resolve_active_session(
+        self, tx: Transaction, session_id: str, *, now: Any
+    ) -> Row | None:
+        conn = _postgres_tx(tx).conn
+        row = await conn.fetchrow(
+            "SELECT user_id, identity_id::text AS identity_id, expires_at, revoked "
+            "FROM oauth_sessions WHERE session_id=$1",
+            session_id,
+        )
+        if row is None:
+            return None
+        if row["revoked"]:
+            return None
+        if row["expires_at"] <= now:
+            return None
+        await conn.execute(
+            "UPDATE oauth_sessions SET last_used_at=NOW() WHERE session_id=$1",
+            session_id,
+        )
+        return row
+
 
 class PostgresAclRepository(AclRepository):
     async def grant_acl(

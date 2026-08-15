@@ -1285,6 +1285,7 @@ def _build_settings() -> Settings:
         if isinstance(group, BaseSettings)
     }
     _apply_profile_defaults(settings)
+    _apply_backend_layer_defaults(settings)
     settings.services.resolution = resolve_profile_services(
         profile=settings.profile,
         managed=settings.services.managed,
@@ -1292,6 +1293,54 @@ def _build_settings() -> Settings:
         env=os.environ,
     )
     return settings
+
+
+# Per-backend layer overrides. Backends whose capability set cannot serve
+# a default-on layer have that layer pre-disabled at settings build time,
+# so the documented image commands (``docker run … -e
+# MNEMOS_PERSISTENCE_BACKEND=mysql …`` etc.) boot successfully without
+# needing operators to know about layer flags or ``MNEMOS_STRICT_LAYERS``.
+#
+# Each entry is a (backend_substring, {layer: bool}) mapping. The
+# substring match is case-insensitive on ``settings.database.backend``.
+# ``core`` is always served and is never listed here.
+_BACKEND_LAYER_DEFAULTS: tuple[tuple[str, dict[str, bool]], ...] = (
+    # MySQL/MariaDB have no ``consultations`` capability -- the layer that
+    # GRAEAE depends on. Without this override, the documented MySQL /
+    # MariaDB enterprise image would log a degraded-boot warning on every
+    # start. Operators who actually want GRAEAE on MySQL must set
+    # ``MNEMOS_ENABLE_GRAEAE=true`` (or remove the override via
+    # ``MNEMOS_STRICT_LAYERS=1`` + implement consultations); the override
+    # only suppresses the warning, not the capability gap.
+    ("mysql", {"graeae": False}),
+    ("mariadb", {"graeae": False}),
+)
+
+
+def _apply_backend_layer_defaults(settings: Settings) -> None:
+    """Disable layers the selected backend cannot serve, before the
+    lifecycle layer-check runs. Only flips the flag when the operator
+    has not explicitly set the layer flag via env / TOML, so this stays
+    an opinionated default rather than a silent override of operator
+    intent.
+    """
+    backend = (settings.database.backend or "").strip().lower()
+    if not backend:
+        return
+    explicit_layers = getattr(settings, "_explicit_fields", {}).get("layers", set())
+    for needle, defaults in _BACKEND_LAYER_DEFAULTS:
+        if needle not in backend:
+            continue
+        for layer, default in defaults.items():
+            flag = f"enable_{layer}"
+            if flag in explicit_layers:
+                # Operator explicitly set the flag -- respect their intent.
+                continue
+            current = getattr(settings.layers, flag, None)
+            if current is None:
+                continue
+            if current != default:
+                object.__setattr__(settings.layers, flag, default)
 
 
 def _profile_from_sources(

@@ -292,6 +292,46 @@ def _validate_permission_mode(value: int | None, *, default: int | None = None) 
     return value
 
 
+async def _assert_no_active_deletion(
+    backend,
+    *,
+    owner_id: str,
+    namespace: str,
+) -> None:
+    """Refuse to write a row onto a scope that is currently being deleted.
+
+    Without this fence, a memory added during the 30-day grace window
+    (after the soft-delete sweep has marked the scope, before the
+    hard-delete phase runs) would survive past ``hard_deleted`` -- the
+    hard-delete only removes rows already carrying
+    ``deleted_at IS NOT NULL``, so a row inserted during grace still has
+    ``deleted_at IS NULL`` and is skipped forever, even though the
+    audit log claims the user was hard-deleted. Root is the exception:
+    operators may need to inject tombstone rows even mid-deletion.
+    """
+    from mnemos.persistence.worker_lifecycle import active_deletion_for_scope
+
+    try:
+        active = await active_deletion_for_scope(
+            backend, target_user_id=owner_id, target_namespace=namespace
+        )
+    except Exception:
+        # If the fence itself errors (e.g. backend doesn't expose
+        # transactional), fall through. The hard-delete resweep+verify
+        # loop added in deletion_request_worker.py is the second line of
+        # defence and refuses to mark the request complete on live rows.
+        return
+    if active is not None:
+        restore_by = active.get("restore_by")
+        detail = (
+            "This scope is currently subject to an active deletion request; "
+            "new writes are rejected until the grace window expires. "
+        )
+        if restore_by is not None:
+            detail += f"Restore deadline: {restore_by}."
+        raise HTTPException(status_code=409, detail=detail)
+
+
 def _should_redact_secrets(user: UserContext, *, include_secrets: bool = False, namespace: str | None = None) -> bool:
     """Whether to mask credential spans for this read (redact-at-retrieval).
 
@@ -1627,6 +1667,17 @@ async def create_memory(
     owner_id = request.owner_id or user.user_id
     namespace = request.namespace or user.namespace
     permission_mode = _validate_permission_mode(request.permission_mode, default=600)
+
+    # GDPR fence: refuse to insert onto a scope that is mid-deletion
+    # (soft_deleted and inside the 30-day grace window). A new memory
+    # would otherwise be skipped by the next hard-delete -- it only
+    # removes rows with ``deleted_at IS NOT NULL`` -- and would survive
+    # even though the request is recorded as complete. Root bypasses the
+    # fence so operators can still inject tombstone / restoration rows.
+    if user.role != "root":
+        await _assert_no_active_deletion(
+            backend, owner_id=owner_id, namespace=namespace
+        )
 
     # Secret-vault persisted-text classification (release-blocking 2026-06-14).
     # Classify every text field that will be stored. Any VAULT-class finding in
