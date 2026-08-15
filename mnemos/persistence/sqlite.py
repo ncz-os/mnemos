@@ -125,6 +125,7 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v5_3_4_mcp_audit_log_sqlite.sql",
     "migrations_v6_2_audit_chain_sqlite.sql",
     "migrations_v6_2_category_decay_sqlite.sql",
+    "migrations_v6_3_api_keys_last_used_sqlite.sql",
     "0038_oauth_sessions_consultations.sql",
     "0039_subscription_plan_current_limits.sql",
     "0043_memory_acl.sql",
@@ -148,6 +149,18 @@ def _sqlite_value(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     return value
+
+
+def _isoformat_for_compare(value: Any) -> str:
+    """Normalise a timestamp-like value to an ISO-8601 string for comparison.
+
+    SQLite stores ``expires_at`` as text, so the comparison against a
+    Python ``datetime.now(tz=UTC)`` value has to happen as ISO strings on
+    a single code path that every backend shares.
+    """
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
 
 
 def _json_text(value: Any, *, default: Any = None) -> str:
@@ -2673,6 +2686,69 @@ class SqliteOAuthRepository(_SqliteRepository, OAuthRepository):
             "WHERE s.session_id=? AND s.revoked=0",
             (session_id,),
         )
+
+    async def lookup_api_key(
+        self, tx: Transaction, key_hash: str
+    ) -> Row | None:
+        # SQLite has no array_agg, so resolve groups in a second round-trip
+        # rather than trying to emulate LATERAL.
+        conn = self._conn(tx)
+        row = await _fetch_one(
+            conn,
+            "SELECT ak.id, ak.user_id, ak.revoked, u.role, u.namespace "
+            "FROM api_keys ak JOIN users u ON u.id = ak.user_id "
+            "WHERE ak.key_hash = ?",
+            (key_hash,),
+        )
+        if row is None:
+            return None
+        group_rows = await _fetch_all(
+            conn,
+            "SELECT group_id FROM user_groups WHERE user_id = ?",
+            (row["user_id"],),
+        )
+        # Materialise into the same shape as the Postgres branch so the
+        # auth caller does not need a backend discriminator.
+        merged = dict(row)
+        merged["group_ids"] = [gr["group_id"] for gr in group_rows]
+        return merged
+
+    async def touch_api_key(self, tx: Transaction, key_id: Any) -> None:
+        await _execute_count(
+            self._conn(tx),
+            "UPDATE api_keys SET last_used=CURRENT_TIMESTAMP WHERE id=?",
+            (key_id,),
+        )
+
+    async def resolve_active_session(
+        self, tx: Transaction, session_id: str, *, now: Any
+    ) -> Row | None:
+        conn = self._conn(tx)
+        row = await _fetch_one(
+            conn,
+            "SELECT user_id, identity_id, revoked, expires_at FROM oauth_sessions "
+            "WHERE session_id=?",
+            (session_id,),
+        )
+        if row is None:
+            return None
+        if row["revoked"]:
+            return None
+        expires_at = row["expires_at"]
+        # Compare as ISO-8601 strings so the same caller code works on every
+        # backend regardless of whether the driver returns datetime or text.
+        if (
+            expires_at is not None
+            and now is not None
+            and str(expires_at) <= _isoformat_for_compare(now)
+        ):
+            return None
+        await _execute_count(
+            conn,
+            "UPDATE oauth_sessions SET last_used_at=CURRENT_TIMESTAMP WHERE session_id=?",
+            (session_id,),
+        )
+        return row
 
 
 class SqliteSessionsRepository(_SqliteRepository, SessionsRepository):

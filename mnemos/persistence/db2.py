@@ -3882,6 +3882,82 @@ class Db2OAuthRepository(OracleOAuthRepository):
         out["state"] = _raw_token_text(out.get("state"))
         return out
 
+    # ── Auth lookup overrides (Db2 cursor uses positional binds) ────────────
+    #
+    # The Oracle base class uses named binds (``:name``). Db2 cursors go
+    # through ``ibm_db_dbi`` and bind positionally, so we re-implement the
+    # auth-lookup methods here. Schema parity with Oracle's
+    # ``migrations_db2/0003_api_keys.sql`` and ``0006_oauth_sessions.sql``
+    # is what allows the same SQL shape with positional binds.
+
+    async def lookup_api_key(
+        self, tx: Any, key_hash: str
+    ) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT ak.id, ak.owner_id AS user_id, "
+                "       CASE WHEN ak.revoked_at IS NULL THEN 0 ELSE 1 END AS revoked, "
+                "       u.role, u.namespace "
+                "FROM api_keys ak JOIN users u ON u.id = ak.owner_id "
+                "WHERE ak.key_hash = ?",
+                (key_hash,),
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            if not row:
+                return None
+            await _call(
+                cursor.execute,
+                "SELECT group_id FROM user_groups WHERE user_id = ?",
+                (row["user_id"],),
+            )
+            group_rows = await _fetch_all_dicts(cursor)
+            row["group_ids"] = [gr["group_id"] for gr in group_rows]
+            return row
+        finally:
+            await _call(cursor.close)
+
+    async def touch_api_key(self, tx: Any, key_id: Any) -> None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE api_keys SET last_used_at = CURRENT TIMESTAMP WHERE id = ?",
+                (key_id,),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def resolve_active_session(
+        self, tx: Any, session_id: str, *, now: Any
+    ) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT user_id, identity_id, revoked, expires_at FROM oauth_sessions "
+                "WHERE session_id = ?",
+                (session_id,),
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            if not row:
+                return None
+            if row["revoked"]:
+                return None
+            expires_at = row["expires_at"]
+            if expires_at is not None and now is not None and expires_at <= now:
+                return None
+            await _call(
+                cursor.execute,
+                "UPDATE oauth_sessions SET last_used_at = CURRENT TIMESTAMP "
+                "WHERE session_id = ?",
+                (session_id,),
+            )
+            return row
+        finally:
+            await _call(cursor.close)
+
 
 class Db2SessionsRepository(OracleSessionsRepository):
     """Db2-native protocol sessions persistence."""

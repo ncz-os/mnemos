@@ -50,6 +50,12 @@ RUN python -m pip install --no-deps --no-build-isolation .
 
 ENV PYTHONUNBUFFERED=1
 ENV MNEMOS_PERSISTENCE_BACKEND=oracle
+# Authentication enabled by default so the documented `docker run -p 5002:5002`
+# form comes up fail-closed; the lifecycle startup check in
+# `mnemos.core.network_guard` only allows an unauthenticated, off-host bind
+# when `MNEMOS_ALLOW_UNAUTHENTICATED_NETWORK_BIND=1` is set explicitly.
+ENV MNEMOS_PROFILE=server
+ENV MNEMOS_AUTH_ENABLED=true
 
 EXPOSE 5002
 

@@ -100,3 +100,27 @@ def test_published_images_do_not_bypass_the_guard():
         "these images exec an ASGI server directly, bypassing the bind "
         "validation in `mnemos serve`:\n" + "\n".join(offenders)
     )
+
+
+@pytest.mark.parametrize(
+    "dockerfile_name",
+    ["Dockerfile.core", "Dockerfile.oracle", "Dockerfile.split"],
+)
+def test_published_images_default_to_authenticated(dockerfile_name):
+    """The documented `docker run -p 5002:5002` form must come up fail-closed.
+
+    Each published image binds ``0.0.0.0`` so the bind guard in
+    ``mnemos.core.network_guard`` would refuse to start when authentication
+    is disabled. Pin the image-level defaults so the published artifacts
+    enable auth + ``server`` profile rather than relying on operators to
+    remember to set both.
+    """
+    text = (REPO_ROOT / dockerfile_name).read_text()
+    assert "MNEMOS_AUTH_ENABLED=true" in text, (
+        f"{dockerfile_name} must set MNEMOS_AUTH_ENABLED=true so the "
+        "documented `docker run -p 5002:5002` form fails closed."
+    )
+    assert "MNEMOS_PROFILE=server" in text, (
+        f"{dockerfile_name} must set MNEMOS_PROFILE=server so the server "
+        "profile's auth_enabled=True default is applied."
+    )
