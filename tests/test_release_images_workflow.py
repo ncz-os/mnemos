@@ -65,6 +65,33 @@ def test_release_workflow_uses_lock_on_tag_push():
     )
 
 
+def test_release_workflow_refuses_tag_without_lock_file():
+    """A tagged push whose checkout lacks ``.github/addons.lock.json`` must
+    fail the build rather than fall back to the mutable ``ADDON_REF`` ref.
+    Publishing a version tag built from the branch tip would defeat the
+    reproducibility contract the lock exists to provide: the tag would not
+    pin or identify its overlay source.
+    """
+    workflow = _read_workflow()
+    # The tag branch must exist and hard-fail when the lock file is absent.
+    assert 'elif [ "${is_tag}" = "tag" ]; then' in workflow, (
+        "release-images.yml no longer distinguishes a tag push with a "
+        "missing lock file"
+    )
+    refusal = "tagged release is missing .github/addons.lock.json"
+    assert refusal in workflow, (
+        "a tagged release without the lock file must be refused, not "
+        "built from the mutable ADDON_REF branch"
+    )
+    # The refusal must fire (exit 1) BEFORE the mutable fallback branch is
+    # reachable, so the tag can never slip through to the ADDON_REF path.
+    refusal_idx = workflow.find(refusal)
+    fallback_idx = workflow.find("using ADDON_REF=${ADDON_REF} (mutable)")
+    assert 0 < refusal_idx < fallback_idx
+    refusal_block = workflow[refusal_idx:workflow.find("else", refusal_idx)]
+    assert "exit 1" in refusal_block
+
+
 def test_release_workflow_fetches_locked_sha_detached():
     """The workflow must checkout each add-on detached from the locked
     SHA, not from a branch ref that a stray push could move.

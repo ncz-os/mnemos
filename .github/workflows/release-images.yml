@@ -140,6 +140,14 @@ jobs:
           if [ "${is_tag}" = "tag" ] && [ -f .github/addons.lock.json ]; then
             LOCK="$(jq -c '.' .github/addons.lock.json)"
             echo "── pinning add-on wheels to .github/addons.lock.json ──"
+          elif [ "${is_tag}" = "tag" ]; then
+            # A version tag must NEVER build overlays from a mutable ref:
+            # the tag is the reproducibility contract. If the lock file is
+            # missing (tag cut before it was committed, or deleted), refuse
+            # to publish rather than silently shipping the branch tip under
+            # a version tag.
+            echo "::error::tagged release is missing .github/addons.lock.json; refusing to build add-on wheels from the mutable \`${ADDON_REF}\` ref for a version tag."
+            exit 1
           else
             LOCK=""
             echo "── not a tag push; using ADDON_REF=${ADDON_REF} (mutable) ──"
