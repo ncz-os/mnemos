@@ -655,8 +655,14 @@ async def active_deletion_for_scope(
     """Return the active deletion row for a (user, namespace) scope, if any.
 
     An "active" deletion is one whose status has progressed past
-    ``confirmed`` (sweep_verifying / soft_deleted) but has not yet been
-    hard_deleted. Memory / session / kg / journal write paths call this
+    ``confirmed`` (sweep_verifying / soft_deleted / hard_deleting) but has
+    not yet been hard_deleted. The backend-neutral hard-delete pass claims
+    the request by moving it to ``hard_deleting`` before the resweep, so a
+    write racing an in-flight (or crash-orphaned) hard delete must be
+    refused too: the hard delete only removes rows that already carry
+    ``deleted_at IS NOT NULL``, so a row landed during that window would
+    otherwise survive while the request is marked ``hard_deleted``.
+    Memory / session / kg / journal write paths call this
     before inserting a new row so a live write cannot race past the
     30-day grace window: without this fence, a memory created during
     grace would not be soft-deleted by the next sweep, and the
@@ -671,7 +677,7 @@ async def active_deletion_for_scope(
         "FROM deletion_requests "
         "WHERE target_user_id = ? "
         "  AND (? IS NULL OR (target_namespace IS NULL OR target_namespace = ?)) "
-        "  AND status IN ('sweep_verifying', 'soft_deleted') "
+        "  AND status IN ('sweep_verifying', 'soft_deleted', 'hard_deleting') "
         "ORDER BY COALESCE(soft_deleted_at, confirmed_at) DESC "
         "LIMIT 1"
     )
