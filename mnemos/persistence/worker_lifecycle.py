@@ -550,7 +550,7 @@ async def sweep_for_archival(
     """Archive a cold batch using the active backend transaction."""
     if archive_after_days < 1 or batch_size < 1:
         raise ValueError("archive_after_days and batch_size must be >= 1")
-    from mnemos.domain.persephone.runner import (
+    from mnemos.persistence.archive_format import (
         ARCHIVE_CONTENT_PREFIX,
         ARCHIVE_SCHEMA_VERSION,
         DEFAULT_ARCHIVED_BY,
