@@ -19,7 +19,6 @@ entry points call into this module:
 from __future__ import annotations
 
 import ipaddress
-import os
 
 #: Escape hatch for the deliberate "open box on a trusted LAN" case. Named to be
 #: uncomfortable to type, because it disables the only thing standing between an
@@ -53,7 +52,9 @@ def is_loopback_bind(host: str) -> bool:
 
 
 def unsafe_bind_allowed() -> bool:
-    return os.environ.get(UNSAFE_NETWORK_BIND_ENV, "").strip().lower() in _TRUTHY
+    from mnemos.core.config import runtime_env_value_stripped
+
+    return runtime_env_value_stripped(UNSAFE_NETWORK_BIND_ENV).lower() in _TRUTHY
 
 
 def auth_is_enabled() -> bool:
@@ -93,9 +94,13 @@ def refusal_reason(
 
 def record_validated_bind(host: str) -> None:
     """Tell the app process which host ``mnemos serve`` already validated."""
-    os.environ[BIND_CHECKED_ENV] = host
+    from mnemos.core.config import set_runtime_env_value
+
+    set_runtime_env_value(BIND_CHECKED_ENV, host)
 
 
 def validated_bind_host() -> str | None:
     """The host a parent ``mnemos serve`` validated, if any."""
-    return os.environ.get(BIND_CHECKED_ENV) or None
+    from mnemos.core.config import runtime_env_value
+
+    return runtime_env_value(BIND_CHECKED_ENV) or None

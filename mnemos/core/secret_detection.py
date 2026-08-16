@@ -174,6 +174,17 @@ _ENV_SECRET_RE = re.compile(
 #
 # Deployments add their own via MNEMOS_SECRET_DENY_LITERALS (comma-separated,
 # plaintext in the environment, hashed at import and never retained).
+def _deny_literals_from_env() -> str:
+    """Operator-supplied extra denylist literals.
+
+    Read through ``core.config`` so every process-environment reference stays
+    in that module, which the env-discipline lint enforces.
+    """
+    from mnemos.core.config import runtime_env_value
+
+    return runtime_env_value("MNEMOS_SECRET_DENY_LITERALS", "")
+
+
 _DENY_DIGESTS: frozenset[str] = frozenset(
     {
         # Fleet credentials confirmed to have leaked into prose.
@@ -186,7 +197,7 @@ _DENY_DIGESTS: frozenset[str] = frozenset(
     }
     | {
         hashlib.sha256(lit.strip().encode()).hexdigest()
-        for lit in os.environ.get("MNEMOS_SECRET_DENY_LITERALS", "").split(",")
+        for lit in _deny_literals_from_env().split(",")
         if lit.strip()
     }
 )

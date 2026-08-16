@@ -176,14 +176,23 @@ curl -sS -X POST http://127.0.0.1:18090/api/portfolio/ask \
   --max-time 120
 ```
 
-If your agent supports compliance testing, run:
+If your agent supports compliance testing, acquire the **complete** pinned
+release of the [`mcp-contracts` repo](https://github.com/mnemos-os/mcp-contracts)
+and invoke the checker with the ic-engine project manifest. The checker
+loads its `projects/` manifests and `schemas/` tree from its own checkout,
+so the whole release must be fetched — vendoring `test_mcp_compliance.py`
+alone (or piping a URL into `python3`) will not run:
 
 ```bash
-python3 https://raw.githubusercontent.com/mnemos-os/mcp-contracts/main/test_mcp_compliance.py \
+# Pinned mcp-contracts release (commit SHA)
+CONTRACTS_SHA=0df2f557c66c6a7daa9dc9ff8181bf394c9c3383
+WORKDIR="$(mktemp -d)"
+curl -fsSL "https://github.com/mnemos-os/mcp-contracts/archive/${CONTRACTS_SHA}.tar.gz" \
+  | tar -xzf - -C "${WORKDIR}"
+python3 "${WORKDIR}/mcp-contracts-${CONTRACTS_SHA}/test_mcp_compliance.py" \
+  --project ic-engine \
   --url http://127.0.0.1:18090/mcp
 ```
-
-(Or vendor `test_mcp_compliance.py` from the [`mcp-contracts` repo](https://github.com/ncz-os/mcp-contracts).)
 
 ---
 
