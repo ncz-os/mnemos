@@ -1474,6 +1474,18 @@ def runtime_env_bool(name: str, default: bool = False) -> bool:
     return raw.lower() in {"1", "true", "yes", "on"}
 
 
+def set_runtime_env_value(name: str, value: str) -> None:
+    """Set a process environment value on behalf of a runtime accessor.
+
+    The read helpers above keep environment access in this module; a handful of
+    call sites also need to *publish* a value to a child process (for example
+    handing a validated bind address to the server the CLI is about to start).
+    Routing those writes here keeps every ``os.environ`` reference in one file,
+    which is what the env-discipline lint enforces.
+    """
+    os.environ[name] = value
+
+
 def embedding_dim_env() -> int:
     return int(runtime_env_value("MNEMOS_EMBEDDING_DIM", "768"))
 
