@@ -4,7 +4,6 @@ import asyncio
 import inspect
 import json
 import logging
-import os
 import sys
 from contextlib import contextmanager
 from enum import Enum
