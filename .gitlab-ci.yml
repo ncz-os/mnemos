@@ -59,8 +59,14 @@ default:
           python3 -m venv --clear .venv
           # sqlite (aiosqlite) is the default backend's async driver and nats
           # drives the publisher tests; the unit suite needs both or ~27 tests
-          # fail on missing core drivers.
-          .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev,sqlite,nats]"
+          # fail on missing core drivers. persephone (zstandard) is needed at
+          # *collection* time -- tests/test_worker_lifecycle_backends.py imports
+          # mnemos.domain.persephone.runner at module scope, and the package
+          # raises from require_extra() when the extra is absent. pytest treats
+          # that as a collection error and aborts the entire run, so one missing
+          # pure-Python dependency silently reduced the whole unit suite to
+          # "7 skipped, 1 error".
+          .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev,sqlite,nats,persephone]"
           export PATH="$CI_PROJECT_DIR/.venv/bin:$PATH"
           ;;
       esac
