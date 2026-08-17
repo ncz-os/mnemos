@@ -12,6 +12,17 @@ from typing import Any
 
 import pytest
 
+@pytest.fixture(autouse=True)
+def _offsite_feed_scope(monkeypatch):
+    """These tests pin the SQL shape of the OFFSITE feed scope.
+
+    The world-read gate applies only when
+    MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=0; the default is now the
+    trusted-LAN full-corpus scope, so declare the posture explicitly.
+    """
+    monkeypatch.setenv("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE", "0")
+
+
 
 class _DeterministicUUID:
     def __init__(self) -> None:
