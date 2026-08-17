@@ -252,9 +252,24 @@ async def _claim(ops: _Ops, *, hard: bool) -> dict[str, Any] | None:
     if ops.dialect == "mysql":
         sql = base_sql + " LIMIT 1 FOR UPDATE SKIP LOCKED"
     elif ops.dialect in {"oracle", "db2"}:
-        # Oracle rejects FETCH FIRST combined with FOR UPDATE (ORA-02014).
-        # Db2's Oracle-compatibility cursor supports the same ROWNUM form.
-        sql = f"SELECT * FROM ({base_sql}) WHERE ROWNUM <= 1 FOR UPDATE SKIP LOCKED"
+        # Oracle rejects FOR UPDATE against an inline view carrying ROWNUM /
+        # DISTINCT / GROUP BY (ORA-02014). That covers FETCH FIRST, and it
+        # also covers the "SELECT * FROM (ordered) WHERE ROWNUM <= 1 FOR
+        # UPDATE" form this used to build -- the lock still targets the view.
+        # Measured on the production 23ai primary: the old statement raised
+        # ORA-02014 every tick, so both deletion workers sat in a permanent
+        # error state and /health reported degraded.
+        #
+        # Lock the base TABLE and let the ordering and the limit live in a
+        # scalar subquery, which is only a predicate. An empty queue yields
+        # NULL, so `id = NULL` matches nothing and the caller sees None --
+        # the same "nothing to claim" result as the other dialects.
+        inner = f"SELECT id FROM deletion_requests WHERE {where} ORDER BY {order}"
+        sql = (
+            "SELECT * FROM deletion_requests WHERE id = "
+            f"(SELECT id FROM ({inner}) WHERE ROWNUM = 1) "
+            "FOR UPDATE SKIP LOCKED"
+        )
     else:
         sql = base_sql + " LIMIT 1"
     row = await ops.fetchone(sql, *params)
