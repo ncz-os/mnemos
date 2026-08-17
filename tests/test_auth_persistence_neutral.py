@@ -11,8 +11,8 @@ same call shape.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
+import inspect
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -32,16 +32,37 @@ def _hash(raw: str) -> str:
 async def _exec(backend, sql: str, params: tuple = ()) -> None:
     """Run a raw SQL statement against the backend's transactional connection.
 
-    SQLite's backend uses the stdlib ``sqlite3`` driver (synchronous);
-    other backends expose an async connection. Branch on the connection
-    type so the test stays backend-agnostic.
+    Backends differ in whether ``execute`` is sync or async, so branch on what
+    the call *returns* rather than on the callable. Inspecting the callable is
+    unreliable: the SQLite backend uses ``aiosqlite``, whose ``execute`` is not
+    a coroutine function -- it returns an awaitable ``Result`` wrapper. That
+    made ``asyncio.iscoroutinefunction`` report False, the statement took the
+    sync branch, and the coroutine was dropped un-awaited. Every INSERT here
+    silently did nothing and the lookups under test then correctly found no
+    rows, which read as five product failures rather than one test bug.
     """
     async with backend.transactional() as tx:
-        conn = tx.conn
-        if hasattr(conn, "execute") and asyncio.iscoroutinefunction(conn.execute):
-            await conn.execute(sql, params)
-        else:
-            conn.execute(sql, params)
+        result = tx.conn.execute(sql, params)
+        if inspect.isawaitable(result):
+            await result
+
+
+async def _fetchone(conn, sql: str, params: tuple = ()):
+    """Fetch a single row, tolerating sync and async drivers alike.
+
+    Same reasoning as ``_exec``: branch on what the call returns, never on
+    whether the callable looks like a coroutine function.
+    """
+    if hasattr(conn, "fetchone"):
+        result = conn.fetchone(sql, params)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+    cursor = conn.execute(sql, params)
+    if inspect.isawaitable(cursor):
+        cursor = await cursor
+    row = cursor.fetchone()
+    return await row if inspect.isawaitable(row) else row
 
 
 @pytest.mark.asyncio
@@ -110,12 +131,7 @@ async def test_sqlite_touch_api_key_records_last_used(tmp_path):
             await backend.oauth.touch_api_key(tx, key_id)
 
         async with backend.transactional() as tx:
-            conn = tx.conn
-            if hasattr(conn, "fetchone") and asyncio.iscoroutinefunction(conn.fetchone):
-                row = await conn.fetchone("SELECT last_used FROM api_keys WHERE id=?", (key_id,))
-            else:
-                cursor = conn.execute("SELECT last_used FROM api_keys WHERE id=?", (key_id,))
-                row = cursor.fetchone()
+            row = await _fetchone(tx.conn, "SELECT last_used FROM api_keys WHERE id=?", (key_id,))
         assert row["last_used"] is not None
     finally:
         await backend.close()
