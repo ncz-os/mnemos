@@ -411,7 +411,19 @@ test:multi-worker:
       YAML
     - docker compose -f docker-compose.yml -f docker-compose.multi-worker.ci.yml up -d --build redis mnemos
     - |
-      docker compose -f docker-compose.yml -f docker-compose.multi-worker.ci.yml run --rm smoke '
+      # --no-deps is required. Without it `run` re-resolves the smoke service's
+      # depends_on and RECREATES the mnemos container that `up` just started:
+      # the trace shows "Container mnemos-1 Recreate/Recreated/Started" a
+      # fraction of a second before the smoke's first probe, so the smoke was
+      # racing a container that was still booting. The health loop below
+      # tolerates a slow start; it cannot tolerate its target being replaced
+      # underneath it.
+      #
+      # Each step echoes a marker first. When this job fails the trace shows
+      # only curl's exit code, which does not say *which* call failed -- an
+      # HTTP 409 could be the health probe, the memory POST or the webhook
+      # POST, and they mean very different things.
+      docker compose -f docker-compose.yml -f docker-compose.multi-worker.ci.yml run --rm --no-deps smoke '
         set -eu
         ready=0
         for _i in $(seq 1 60); do
@@ -421,16 +433,21 @@ test:multi-worker:
           fi
           sleep 2
         done
+        echo "SMOKE: health ready=$ready"
         test "$ready" = "1"
+        echo "SMOKE: POST /v1/memories"
         curl -fsS -X POST http://mnemos:5002/v1/memories \
           -H "Content-Type: application/json" \
           -d "{\"content\":\"multi-worker smoke memory\",\"category\":\"ci\"}" \
           >/tmp/memory.json
+        echo "SMOKE: GET /v1/memories"
         curl -fsS "http://mnemos:5002/v1/memories?limit=5" >/tmp/memories.json
+        echo "SMOKE: POST /v1/webhooks"
         curl -fsS -X POST http://mnemos:5002/v1/webhooks \
           -H "Content-Type: application/json" \
           -d "{\"url\":\"http://127.0.0.1:9/webhook\",\"events\":[\"memory.created\"],\"description\":\"multi-worker smoke\"}" \
           >/tmp/webhook.json
+        echo "SMOKE: all steps passed"
       '
     - docker compose -f docker-compose.yml -f docker-compose.multi-worker.ci.yml logs --no-color mnemos
   after_script:
