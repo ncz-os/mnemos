@@ -403,12 +403,33 @@ async def sync_peer(
         peer_version = schema_resp["mnemos_version"]
         peer_signature = schema_resp["schema_signature"]
         peer_fingerprint = schema_resp.get("migrations_fingerprint")
-        sig_match = peer_signature == local_signature
+        # Compatibility is decided on the MAJOR version, not major.minor.
+        # Requiring an exact major.minor match meant a 6.0 peer refused a 6.1
+        # peer outright, so every rolling upgrade broke federation across the
+        # whole fleet until an operator hand-set compat_mode=permissive on each
+        # peer. Minor releases are backwards compatible by our own versioning
+        # contract, so same-major peers federate by default; a major difference
+        # still aborts.
+        peer_major = peer_signature.split(".")[0] if peer_signature else ""
+        local_major = local_signature.split(".")[0]
+        same_minor = peer_signature == local_signature
+        sig_match = bool(peer_major) and peer_major == local_major
         if not sig_match:
             schema_abort_reason = (
                 f"schema mismatch: peer={peer_signature} ({peer_version}) local={local_signature} ({_local_v})"
             )
             schema_abort_kind = "incompat"
+        elif not same_minor:
+            # Same major, different minor: the migration sets legitimately
+            # differ, so a fingerprint comparison would always "mismatch" and
+            # is meaningless here. Record the skew and proceed.
+            logger.info(
+                "federation: peer %s is %s and we are %s — same major, "
+                "syncing without a migrations-fingerprint comparison",
+                peer["name"],
+                peer_version,
+                _local_v,
+            )
         elif local_fingerprint == "":
             # We can't compute our own fingerprint (e.g. test rig
             # without a db/ directory). Falling back to signature-only
