@@ -73,6 +73,83 @@ crash-looped forever after a restart following a partial-then-recovered
 prior migration run — every retry hit `SQL0803N`/`SQLSTATE=23505` on the
 same static `INSERT` and never got past schema replay to serve traffic.
 
+## [6.1.1] — 2026-08-17
+
+### Fixed — deletion workers could not claim work on Oracle
+
+Found upgrading the production Oracle 23ai primary to 6.1.0. Both deletion
+workers went to `error` on their first tick and `/health` reported `degraded`:
+
+```
+ORA-02014: cannot select FOR UPDATE from view with DISTINCT, GROUP BY, etc.
+```
+
+The claim branch already knew Oracle rejects `FETCH FIRST` combined with
+`FOR UPDATE`, and built this instead:
+
+```sql
+SELECT * FROM (SELECT * FROM deletion_requests WHERE ... ORDER BY ...)
+WHERE ROWNUM <= 1 FOR UPDATE SKIP LOCKED
+```
+
+That has the same defect. The lock still targets an inline view, and the
+`ROWNUM` inside it is enough to raise ORA-02014 on its own. Oracle now locks
+the base table, with the ordering and the limit moved into a scalar subquery
+(a predicate, not a locked relation). An empty queue yields NULL, so
+`id = NULL` matches nothing and the caller sees "nothing to claim" — the same
+result the other dialects produce.
+
+**Anyone running 6.1.0 on Oracle should upgrade.** Deletion requests are
+accepted and queued but never processed, and the service reports degraded.
+
+### Fixed — Db2 no longer depends on Oracle compatibility mode
+
+Db2 shared the Oracle branch, so it inherited `ROWNUM` — which on Db2 exists
+*only* under `DB2_COMPATIBILITY_VECTOR=ORA`. That made the deletion worker
+depend on an instance-wide Oracle-compatibility setting a Db2 deployment is
+under no obligation to enable. The fleet's Db2 12.1.5 happens to have it on,
+which is why the shared branch appeared to work; on a stock instance it would
+have failed.
+
+Db2 now emits native SQL:
+
+```sql
+... ORDER BY ... FETCH FIRST 1 ROWS ONLY
+FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS SKIP LOCKED DATA
+```
+
+`KEEP UPDATE LOCKS` takes the row lock at read time so two workers cannot both
+read the row and race to the UPDATE; `SKIP LOCKED DATA` makes the others step
+over it rather than block.
+
+### Verification
+
+The generated statement was executed against a live instance of every
+supported backend, not merely asserted in a unit test:
+
+| Backend | Instance | Result |
+|---|---|---|
+| Oracle 23ai EE | production primary + non-prod EE | old form raises ORA-02014; new form returns the row |
+| Db2 CE 12.1.5 | native install | accepted; uses no compatibility-mode construct |
+| PostgreSQL 16 | pgvector/postgres 16 | unchanged, passes |
+| MariaDB 11 | mariadb:11 | unchanged, passes |
+
+`tests/test_deletion_claim_sql_dialects.py` pins the generated shape for all
+four dialects (there is no Oracle or Db2 in unit CI) and fails against the old
+code: `FOR UPDATE` must sit outside every subquery, Db2 must not emit `ROWNUM`,
+the queue ordering must survive, Postgres and MySQL/MariaDB must be untouched,
+and the hard-delete branch must still bind `restore_by` exactly once.
+
+### Known issues
+
+- Two MCP registry-parity tests (`test_http_sse_message_posts_are_bound_to_session_principal`,
+  `test_http_post_rejects_ambiguous_session_id_parameters`) fail when run in
+  isolation and pass in some full-suite orderings. Pre-existing and
+  order-dependent; unrelated to this release's changes.
+- The 6.1.0 known issues below still apply: CHARON `/v1/export` is
+  Postgres-only, and `test:multi-worker` has not yet been observed passing end
+  to end.
+
 ## [6.1.0] — 2026-08-17
 
 59 commits since 6.0.1; 175 files, +10618/-2138.
