@@ -251,7 +251,22 @@ async def _claim(ops: _Ops, *, hard: bool) -> dict[str, Any] | None:
     base_sql = f"SELECT * FROM deletion_requests WHERE {where} ORDER BY {order}"
     if ops.dialect == "mysql":
         sql = base_sql + " LIMIT 1 FOR UPDATE SKIP LOCKED"
-    elif ops.dialect in {"oracle", "db2"}:
+    elif ops.dialect == "db2":
+        # Native Db2. ROWNUM exists only under DB2_COMPATIBILITY_VECTOR=ORA,
+        # so the previous shared Oracle branch made the deletion worker depend
+        # on an instance-wide Oracle-compatibility setting that a Db2
+        # deployment is not required to enable. FETCH FIRST, FOR UPDATE, the
+        # isolation clause and SKIP LOCKED DATA are all core Db2 LUW SQL and
+        # carry no such dependency.
+        #
+        # KEEP UPDATE LOCKS promotes the row lock at read time, so a
+        # concurrent worker cannot read the same row and race to the UPDATE;
+        # SKIP LOCKED DATA makes the others step over it rather than block.
+        sql = (
+            base_sql + " FETCH FIRST 1 ROWS ONLY"
+            " FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS SKIP LOCKED DATA"
+        )
+    elif ops.dialect == "oracle":
         # Oracle rejects FOR UPDATE against an inline view carrying ROWNUM /
         # DISTINCT / GROUP BY (ORA-02014). That covers FETCH FIRST, and it
         # also covers the "SELECT * FROM (ordered) WHERE ROWNUM <= 1 FOR
