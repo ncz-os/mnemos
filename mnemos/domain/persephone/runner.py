@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime
 from typing import Any
 
-import zstandard as zstd
 
 # The archive record format lives in the persistence layer: both layers need
 # it and persistence may not import domain (import-linter contract
