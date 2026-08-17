@@ -114,7 +114,12 @@ RUN mkdir -p /opt/mnemos/models && \
 # Operators who want the old single-user behaviour should set
 # `MNEMOS_PROFILE=edge` together with `MNEMOS_BIND=127.0.0.1` rather than
 # weakening auth on a reachable interface.
-ENV PYTHONUNBUFFERED=1 \
+# This image is a single self-contained container and ships no Redis, but the
+# `server` profile resolves rate_limit.storage_uri to redis://localhost:6379/1.
+# Point the limiter at the in-process store so the published image works as
+# published; deployments that DO run Redis override it.
+ENV RATE_LIMIT_STORAGE_URI=memory:// \
+    PYTHONUNBUFFERED=1 \
     MNEMOS_EMBED_MODEL_PATH=/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf \
     MNEMOS_PERSISTENCE_BACKEND=sqlite \
     MNEMOS_DATABASE_DSN=sqlite:////data/mnemos.db \

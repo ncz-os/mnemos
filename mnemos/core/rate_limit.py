@@ -56,3 +56,31 @@ limiter = Limiter(
     storage_uri=RATE_LIMIT_STORAGE,
     enabled=RATE_LIMIT_ENABLED,
 )
+
+
+def rate_limit_exception_handler(request: Request, exc: Exception):
+    """Handle limiter exceptions, failing OPEN when the store is unreachable.
+
+    SlowAPI's middleware routes every exception raised while checking limits to
+    the registered handler, and `_rate_limit_exceeded_handler` reads
+    ``exc.detail`` unconditionally. That attribute exists only on
+    ``RateLimitExceeded``. When the configured store cannot be reached the
+    limiter raises the backend's error instead -- e.g. ``ConnectionError`` from
+    redis -- and the handler dies with ``AttributeError: 'ConnectionError'
+    object has no attribute 'detail'``, turning a *storage* outage into an
+    unhandled 500 on EVERY route, ``/health`` included.
+
+    An unreachable rate-limit store is an availability problem for the limiter,
+    not for the API: rate limiting is a protective measure, so losing it must
+    degrade to "unlimited", never to "everything is broken". Genuine limit
+    violations still return 429 through SlowAPI's own handler.
+    """
+    if isinstance(exc, RateLimitExceeded):
+        return _rate_limit_exceeded_handler(request, exc)
+    logger.warning(
+        "rate-limit store unavailable (%s: %s); allowing the request through. "
+        "Rate limiting is DISABLED until the store recovers.",
+        type(exc).__name__,
+        exc,
+    )
+    return None
