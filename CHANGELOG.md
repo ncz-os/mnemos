@@ -73,6 +73,49 @@ crash-looped forever after a restart following a partial-then-recovered
 prior migration run — every retry hit `SQL0803N`/`SQLSTATE=23505` on the
 same static `INSERT` and never got past schema replay to serve traffic.
 
+## [6.1.2] — 2026-08-17
+
+### Fixed — Oracle could not restart: the ORA-01451 replay guard was never in the release
+
+**Anyone on 6.1.0 or 6.1.1 with an Oracle backend should upgrade before
+restarting.** The service starts once and cannot start again.
+
+`0050_lifecycle_workers.sql` relaxes a column:
+
+```sql
+ALTER TABLE deletion_requests MODIFY (memory_id NULL)
+```
+
+Migrations carry no applied-state table, so every statement is replayed on
+each start. Oracle rejects a nullability change that is already satisfied
+(`ORA-01451`), where Postgres accepts `DROP NOT NULL` idempotently. The first
+6.1 start therefore succeeded — the column really was `NOT NULL` — and made
+the column nullable. Every start after that replayed the same statement
+against an already-nullable column, raised ORA-01451, and aborted:
+
+```
+RuntimeError: ORACLE schema migration 0050_lifecycle_workers.sql failed at
+`ALTER TABLE deletion_requests MODIFY (memory_id NULL)`: ORA-01451
+```
+
+The guard that forgives this on replay was written and tested, and 6.1.0's
+release notes describe it — but it was on `master` and **not on the release
+branch**. `release/6.1.0` was squashed from `master` before that commit
+landed, so both the v6.1.0 and v6.1.1 tags shipped without it. The only code
+difference between `master` and the release branch was this one file.
+
+Found by upgrading the production Oracle primary: 6.1.0 started (first replay,
+the ALTER was real), and the 6.1.1 restart could not (second replay, the ALTER
+was a no-op). The window between those two states was one restart.
+
+### Process
+
+The release branch is now verified against `master` rather than assumed
+equivalent. A squashed release branch silently omitting a fix that the release
+notes claim is a worse failure than the bug it hides: the notes said the
+Oracle install path was fixed, the tests covering it passed on `master`, and
+the published image did not contain it.
+
 ## [6.1.1] — 2026-08-17
 
 ### Fixed — deletion workers could not claim work on Oracle

@@ -483,7 +483,7 @@ def _strip_trailing_semicolon(statement: str) -> str:
 
 def _is_benign_postgres_error(statement: str, exc: Exception) -> bool:
     state = getattr(exc, "sqlstate", "") or getattr(exc, "pgcode", "")
-    head = statement.lstrip().upper()
+    head = _sql_head(statement)
     if state in _PG_UNDEFINED_STATES and head.startswith(("GRANT ", "DROP POLICY ")):
         return True
     # 23505 (unique_violation) is ONLY benign for replay of a static
@@ -497,9 +497,30 @@ def _is_benign_postgres_error(statement: str, exc: Exception) -> bool:
     return False
 
 
+def _sql_head(statement: str) -> str:
+    """Uppercased statement with leading SQL comments and blank lines removed.
+
+    Migration files open with `--` banner comments, and the splitter hands the
+    comment block to the executor along with the statement it precedes. A bare
+    `statement.lstrip().upper()` therefore starts with "---", so any guard using
+    `startswith("ALTER ")` / `startswith("INSERT ")` silently never matched on a
+    real migration -- only in unit tests that passed a bare statement.
+
+    That is how a benign-error guard can pass its own tests and still not fire
+    in production: 0050_lifecycle_workers.sql aborted a fresh Oracle 6.1 install
+    even with ORA-01451 listed as benign.
+    """
+    for line in statement.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("--"):
+            continue
+        return stripped.upper()
+    return ""
+
+
 def _is_benign_oracle_error(statement: str, exc: Exception) -> bool:
     text = str(exc)
-    head = statement.lstrip().upper()
+    head = _sql_head(statement)
     if any(
         code in text
         for code in (
@@ -513,6 +534,22 @@ def _is_benign_oracle_error(statement: str, exc: Exception) -> bool:
         )
     ):
         return True
+    # ORA-01451 / ORA-01442: the column is ALREADY in the nullability the
+    # statement asks for. Oracle rejects the no-op where Postgres accepts
+    # `DROP NOT NULL` idempotently, so a forward-only migration that relaxes a
+    # column aborts the moment the column is already relaxed. That is the
+    # desired end state, not a failure.
+    #
+    # Scoped to ALTER, like ORA-00001 is scoped to INSERT below: these codes
+    # only describe an already-satisfied nullability change, and blanket
+    # forgiveness would hide genuine errors elsewhere.
+    #
+    # Found by running the 6.1 migrations against Oracle 23.26.1-ee: a FRESH
+    # schema failed on 0050_lifecycle_workers.sql at
+    # `ALTER TABLE deletion_requests MODIFY (memory_id NULL)`, so a clean
+    # Oracle install of 6.1 could not complete provisioning at all.
+    if ("ORA-01451" in text or "ORA-01442" in text) and head.startswith("ALTER "):
+        return True
     # ORA-00001 (unique constraint violated) is ONLY benign for replay of
     # a static seed INSERT into a curated seed table; never for
     # constraint / index creation.
@@ -523,7 +560,7 @@ def _is_benign_oracle_error(statement: str, exc: Exception) -> bool:
 
 def _is_benign_db2_error(statement: str, exc: Exception) -> bool:
     text = str(exc)
-    head = statement.lstrip().upper()
+    head = _sql_head(statement)
     if any(state in text for state in _DB2_BENIGN_STATES):
         return True
     if "CREATE VECTOR INDEX" in statement.upper() and any(code in text for code in _DB2_VECTOR_INDEX_BENIGN_CODES):
