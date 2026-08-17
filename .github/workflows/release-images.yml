@@ -40,22 +40,90 @@ env:
 
 jobs:
   # ── 1. base kernel ─────────────────────────────────────────────────────────
+  #
+  # Built on NATIVE runners, one per architecture, then merged into a manifest
+  # list. This job compiles llama-cpp-python; under QEMU the arm64 leg took
+  # tens of minutes and — because both platforms were a single buildx call —
+  # it gated the amd64 output too, so the amd64-only enterprise image waited on
+  # an emulated build it never uses. ubuntu-24.04-arm is a native arm64 runner
+  # and is free for public repositories.
+  #
+  # Each leg pushes by digest (no tag), and core-manifest assembles the tags.
+  # The merged manifest digest is what the layers below build FROM, so the
+  # `core.digest` output contract is unchanged.
+  core-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            slug: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            slug: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core
+
+      - id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.core
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            MNEMOS_CORE_REF=${{ github.sha }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=mnemos-core-${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=mnemos-core-${{ matrix.slug }}
+          provenance: true
+          sbom: true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-digest-${{ matrix.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Assemble the per-arch digests into one tagged manifest list.
   core:
+    needs: core-build
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      digest: ${{ steps.manifest.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: core-digest-*
+          merge-multiple: true
 
-      # NOTE: arm64 here builds under QEMU emulation, which makes the
-      # llama-cpp-python compile slow (tens of minutes). If build minutes
-      # become a problem, split this into a native matrix
-      # (ubuntu-latest + ubuntu-24.04-arm) that pushes by digest and merges
-      # the manifest — only THIS job needs it; the layers below are cheap.
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -75,21 +143,25 @@ jobs:
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - id: build
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile.core
-          platforms: linux/amd64,linux/arm64
-          push: true
-          build-args: |
-            MNEMOS_CORE_REF=${{ github.sha }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=mnemos-core
-          cache-to: type=gha,mode=max,scope=mnemos-core
-          provenance: true
-          sbom: true
+      - name: Create manifest list
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          ls -1 | sed 's/^/  leg: /'
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core@%s ' *)
+
+      - id: manifest
+        name: Resolve merged digest
+        run: |
+          set -euo pipefail
+          tag="$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
+          digest="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)"
+          echo "merged manifest: $tag -> $digest"
+          docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' \
+            | jq -r '.manifests[]? | "  platform: \(.platform.os)/\(.platform.architecture)"'
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
   # ── 2. everything API image (FROM mnemos-core) ─────────────────────────────
   everything:
@@ -158,6 +230,23 @@ jobs:
                pin="$(echo "${LOCK}" | jq -r --arg k "${name}" '.[$k] // empty')"
                if [ -z "${pin}" ] || [ "${pin}" = "null" ]; then
                  echo "::error::.github/addons.lock.json has no entry for ${name}; refusing to ship a v*.*.* tag without a per-overlay SHA pin."
+                 exit 1
+               fi
+               # Validate the shape, not just presence. The lock shipped with
+               # all-zero placeholder SHAs, which are non-empty and non-null,
+               # so they passed the check above and went straight to
+               # `git fetch origin 0000...` -- an unresolvable object. Every
+               # tagged publish would fail here, but only AFTER the expensive
+               # base image finished building. Fail fast and say why instead.
+               case "${pin}" in
+                 *[!0-9a-f]* | "" ) echo "::error::${name} pin '${pin}' is not a lowercase hex SHA."; exit 1 ;;
+               esac
+               if [ "${#pin}" -ne 40 ]; then
+                 echo "::error::${name} pin '${pin}' is ${#pin} chars; expected a full 40-character SHA."
+                 exit 1
+               fi
+               if [ "${pin}" = "0000000000000000000000000000000000000000" ]; then
+                 echo "::error::${name} is still the all-zero placeholder in .github/addons.lock.json. Replace it with the commit this release should ship."
                  exit 1
                fi
                # Fetch the pinned SHA detached so a stray branch push can
