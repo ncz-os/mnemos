@@ -15,6 +15,13 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from mnemos.persistence.deletion_ops import (
+    DEFAULT_VERIFY_ATTEMPTS,
+    _has_live_rows,
+    count_live_target_rows,
+    soft_delete_target,
+)
+
 
 def backend_dialect(backend: Any) -> str:
     name = type(backend).__name__.lower()
@@ -523,12 +530,6 @@ async def _resweep_and_verify_scope(
     ``DEFAULT_VERIFY_ATTEMPTS`` retries -- the caller must leave the
     request in its current state and try again next tick.
     """
-    from mnemos.workers.deletion_request_worker import (
-        DEFAULT_VERIFY_ATTEMPTS,
-        count_live_target_rows,
-        soft_delete_target,
-        _has_live_rows,
-    )
     for _ in range(max(1, DEFAULT_VERIFY_ATTEMPTS)):
         await soft_delete_target(ops.conn, user_id, namespace, invalidate_cache=False)
         remaining = await count_live_target_rows(ops.conn, user_id, namespace)
