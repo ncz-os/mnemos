@@ -18,8 +18,6 @@ from typing import Any
 from mnemos.persistence.deletion_ops import (
     DEFAULT_VERIFY_ATTEMPTS,
     _has_live_rows,
-    count_live_target_rows,
-    soft_delete_target,
 )
 
 
@@ -529,10 +527,19 @@ async def _resweep_and_verify_scope(
     Raises ``RuntimeError`` when the scope still has live rows after
     ``DEFAULT_VERIFY_ATTEMPTS`` retries -- the caller must leave the
     request in its current state and try again next tick.
+
+    Uses ``_soft_delete``/``_scope_counts``, which route through ``_Ops`` and
+    so speak every backend's dialect. The earlier implementation called the
+    ``soft_delete_target``/``count_live_target_rows`` primitives directly;
+    those bind asyncpg-style (``$1`` placeholders, variadic params), so on
+    SQLite -- the default backend for the published images -- this raised
+    ``TypeError: Connection.execute() takes from 2 to 3 positional arguments
+    but 4 were given`` and no hard deletion could ever complete.
     """
+    remaining: dict[str, int] = {}
     for _ in range(max(1, DEFAULT_VERIFY_ATTEMPTS)):
-        await soft_delete_target(ops.conn, user_id, namespace, invalidate_cache=False)
-        remaining = await count_live_target_rows(ops.conn, user_id, namespace)
+        await _soft_delete(ops, user_id, namespace, datetime.now(timezone.utc))
+        remaining = await _scope_counts(ops, user_id, namespace)
         if not _has_live_rows(remaining):
             return
     raise RuntimeError(
