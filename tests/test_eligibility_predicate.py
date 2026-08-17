@@ -106,7 +106,7 @@ def test_federation_eligibility_rejects_archived_consolidated_private_and_vault_
     ]
 
     assert selected == ["active"]
-    predicate = eligible_for_federation("m")
+    predicate = eligible_for_federation("m", include_private=False)
     assert "m.archived_at IS NULL" in predicate
     assert "m.consolidated_into IS NULL" in predicate
     assert "(m.permission_mode % 10) >= 4" in predicate
@@ -114,7 +114,7 @@ def test_federation_eligibility_rejects_archived_consolidated_private_and_vault_
 
 
 def test_federation_tombstone_eligibility_keeps_visibility_gates():
-    predicate = eligible_for_federation_tombstone("m")
+    predicate = eligible_for_federation_tombstone("m", include_private=False)
 
     assert "m.federation_source IS NULL" in predicate
     assert "(m.permission_mode % 10) >= 4" in predicate

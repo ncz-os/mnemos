@@ -1676,11 +1676,26 @@ def federation_feed_include_private() -> bool:
     namespace is never federated (credential boundary), and
     ``federation_source IS NULL`` prevents federation loops.
 
-    Default false preserves the world-readable-only behavior for
-    untrusted/multi-tenant deployments. Set
-    ``MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=1`` on a trusted feed server.
+    **Defaults to TRUE.** MNEMOS is deployed as a trusted LAN fleet, where the
+    whole point of federation is to replicate the full corpus between peers you
+    control. Defaulting this off wedged exactly that: every memory written
+    through ``create_memory`` carries ``permission_mode`` 600, ``600 % 10 == 0``
+    fails the world-read gate, so the feed offered nothing and peers synced
+    ``{"pulled": 0}`` -- successfully, silently, for three months.
+
+    Set ``MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=0`` for OFFSITE federation, or
+    any deployment peering with parties you do not control, where only
+    explicitly world-readable memories should leave the host.
+
+    Two guards apply either way: the secret-vault namespace is never federated,
+    and ``federation_source IS NULL`` prevents loops.
     """
-    return runtime_env_value_stripped("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE").lower() in {"yes", "1", "true"}
+    raw = runtime_env_value_stripped("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE").lower()
+    if raw in {"no", "0", "false", "off"}:
+        return False
+    if raw in {"yes", "1", "true", "on"}:
+        return True
+    return True  # unset: trusted-LAN posture
 
 
 def session_secret_required() -> bool:

@@ -82,8 +82,12 @@ def test_every_backend_visibility_render_subtracts_exclude_namespaces() -> None:
 
 
 @pytest.mark.asyncio
-async def test_db2_feed_queries_require_public_readable_and_exclude_vault() -> None:
+async def test_db2_feed_queries_require_public_readable_and_exclude_vault(monkeypatch: pytest.MonkeyPatch, ) -> None:
     """Db2 feed SQL must match the public-readable gate used by PG/MySQL."""
+    # Offsite posture: the world-read gate applies only when
+    # MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=0. Declare it rather than relying
+    # on the default, which is now the trusted-LAN full-corpus scope.
+    monkeypatch.setenv("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE", "0")
     from mnemos.core.secret_detection import VAULT_NAMESPACE
     from mnemos.persistence.db2 import Db2FederationRepository
 
@@ -333,7 +337,7 @@ def _assert_tombstone_federation_gates(sql: str, public_token: str, vault_token:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend,module_name,repo_name,tx_factory,dialect_tokens", FEDERATION_GATE_CASES)
-async def test_every_backend_feed_and_by_id_apply_canonical_federation_gates(
+async def test_every_backend_feed_and_by_id_apply_canonical_federation_gates(monkeypatch: pytest.MonkeyPatch,
     backend: str,
     module_name: str,
     repo_name: str,
@@ -341,6 +345,10 @@ async def test_every_backend_feed_and_by_id_apply_canonical_federation_gates(
     dialect_tokens: tuple[str, str],
 ) -> None:
     """Federation feed branches and by-id paths must apply visibility gates."""
+    # Offsite posture: the world-read gate applies only when
+    # MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=0. Declare it rather than relying
+    # on the default, which is now the trusted-LAN full-corpus scope.
+    monkeypatch.setenv("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE", "0")
     import sys
 
     sys.modules.setdefault("oracledb", _FakeModule())

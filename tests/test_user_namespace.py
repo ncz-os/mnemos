@@ -15,7 +15,6 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 
 
 class _Tx:
