@@ -180,7 +180,7 @@ conversation. Same memory is visible from your other agents.
 The `mnemos-tunnel-setup` helper (`scripts/mnemos_tunnel_setup.py`) is
 checked in as an aspirational contract. It expects a daemon-side
 `/admin/tunnels/*` REST surface plus a `mnemos.tunnels.ngrok_bridge`
-module; **neither has shipped as of v6.1.1** (verified in the repo).
+module; **neither has shipped as of v6.1.2** (verified in the repo).
 Use the manual path above. The snippet below describes the eventual
 flow:
 
