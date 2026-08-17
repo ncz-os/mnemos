@@ -1,7 +1,7 @@
 # MNEMOS API Documentation
 
 **Base URL**: `http://localhost:5002`
-**Version**: v6.1.1 current (patch release on the v6.0.0 GA line; legacy GA is v5.0.1) (on top of v5.0.0 GA shipped 2026-05-02)
+**Version**: v6.1.2 current (patch release on the v6.0.0 GA line; legacy GA is v5.0.1) (on top of v5.0.0 GA shipped 2026-05-02)
 **Format**: JSON
 
 ---
@@ -63,7 +63,7 @@ Liveness + readiness check (no auth required).
   "status": "healthy",
   "timestamp": "2026-05-02T14:30:00.000Z",
   "database_connected": true,
-  "version": "6.1.1",
+  "version": "6.1.2",
   "profile": "edge",
   "distillation_worker": "idle"
 }
