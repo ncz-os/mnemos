@@ -648,6 +648,7 @@ async def test_branch_memory_direct_db_path_applies_per_tool_rate_guard(monkeypa
 @pytest.mark.asyncio
 async def test_fetch_memory_log_query_is_identity_scoped_for_non_root():
     from mnemos.db import mcp_repo
+    from mnemos.core.visibility import acl_principals
 
     class Conn:
         def __init__(self):
@@ -658,21 +659,30 @@ async def test_fetch_memory_log_query_is_identity_scoped_for_non_root():
             return []
 
     conn = Conn()
+    user = _alice()
     await mcp_repo.fetch_memory_log(
         conn,
         "mem_1234567890123_a1b2c3",
         "main",
         10,
-        _alice(),
+        user,
     )
 
     sql, args = conn.calls[0]
+    # Placeholder layout after the ACL/group widening slice:
+    #   $1=memory_id, $2=branch, $3=limit,
+    #   $4=owner_id (user_id), $5=group_ids (text[]), $6=principals (text[]),
+    #   $7=namespace.
     assert "mv.owner_id=$4" in sql
-    assert "mv.namespace = $5" in sql
+    assert "mv.group_id = ANY($5::text[])" in sql
+    assert "macl.principal = ANY($6::text[])" in sql
+    assert "mv.namespace = $7" in sql
     assert args == (
         "mem_1234567890123_a1b2c3",
         "main",
         10,
         "alice",
+        [],
+        acl_principals("alice", []),
         "alice-ns",
     )

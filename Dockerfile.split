@@ -136,10 +136,19 @@ COPY core/ ./
 
 ENV PYTHONUNBUFFERED=1
 ENV MNEMOS_PERSISTENCE_BACKEND=oracle
+# Authentication enabled by default so the documented `docker run -p 5002:5002`
+# form comes up fail-closed; the lifecycle startup check in
+# `mnemos.core.network_guard` only allows an unauthenticated, off-host bind
+# when `MNEMOS_ALLOW_UNAUTHENTICATED_NETWORK_BIND=1` is set explicitly.
+ENV MNEMOS_PROFILE=server
+ENV MNEMOS_AUTH_ENABLED=true
 
 EXPOSE 5002
 
 # Dockerfile.oracle has no ENTRYPOINT and no image-level HEALTHCHECK; this split
 # image intentionally preserves that behavior. R6 deploy units override the
 # command/port per service; this CMD is only the default API process.
-CMD ["python", "-m", "uvicorn", "mnemos.api.main:app", "--host", "0.0.0.0", "--port", "5002"]
+# Go through `mnemos serve` so the bind address is validated: it refuses to
+# publish an unauthenticated API off-host (set
+# MNEMOS_ALLOW_UNAUTHENTICATED_NETWORK_BIND=1 for a deliberate open box).
+CMD ["mnemos", "serve", "--host", "0.0.0.0", "--port", "5002"]

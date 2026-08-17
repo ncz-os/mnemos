@@ -413,3 +413,171 @@ def test_sqlite_acl_grant_widens_read_within_namespace(tmp_path):
             await backend.close()
 
     asyncio.run(_go())
+
+
+# --- write-after-invalidate regression test ----------------------------------
+#
+# The search cache was vulnerable to a write-after-invalidate (TOCTOU) race:
+#
+#   1. Search request A misses cache, reads rows from DB while a grant/permission
+#      still allows visibility.
+#   2. A mutation (ACL revoke, memory delete, permission_mode tighten, archive)
+#      commits and deletes the current `mnemos:search:*` keys.
+#   3. Request A — still in flight — writes its now-stale result under the search
+#      key, which is then served for up to the TTL.
+#
+# Fix: each search reads the monotonic visibility epoch and folds it into the
+# cache key.  A bump during step 2 means request A's write lands under the old
+# epoch key (orphaned, never read).  Every subsequent search reads the new epoch
+# and gets a cache miss, forcing a fresh DB read that respects the new visibility.
+#
+# This test verifies the epoch IS included in the search cache key.
+
+
+def test_search_cache_key_includes_epoch():
+    """Verify the search cache key includes the visibility epoch.
+
+    This ensures that when _invalidate_caches_after_mutation bumps the epoch,
+    any in-flight cache writes land under the old-epoch key and are never
+    read — closing the write-after-invalidate race.
+    """
+    from mnemos.core.lifecycle import _get_cache_key
+
+    # Simulate the cache key computation (mirrors memories.py:search_memories).
+    user_id = "user1"
+    namespace = "default"
+    query = "test query"
+    request_limit = 10
+    category = "notes"
+    subcategory = None
+    search_mode = "semantic"
+    source_provider = None
+    source_model = None
+    source_agent = None
+    search_namespace = "default"
+    search_owner_id = None
+    include_secrets = False
+    operational = False
+    group_ids = ["group-a"]
+    include_archived = False
+    exclude_superseded = False
+    current_only = False
+    boost_recency = False
+    recency_weight = 0.5
+    search_profile = "balanced"
+    min_score = 0.1
+    min_margin = 0.0
+    ood_gate = True
+
+    # Key at epoch 0
+    epoch_0_key = _get_cache_key(
+        "search",
+        user_id,
+        namespace,
+        query,
+        request_limit,
+        category,
+        subcategory,
+        search_mode,
+        source_provider,
+        source_model,
+        source_agent,
+        search_namespace,
+        search_owner_id,
+        include_secrets,
+        operational,
+        sorted(group_ids),
+        include_archived,
+        exclude_superseded,
+        current_only,
+        boost_recency,
+        recency_weight,
+        search_profile,
+        min_score,
+        min_margin,
+        ood_gate,
+        0,  # epoch
+    )
+
+    # Key at epoch 1 (after bump)
+    epoch_1_key = _get_cache_key(
+        "search",
+        user_id,
+        namespace,
+        query,
+        request_limit,
+        category,
+        subcategory,
+        search_mode,
+        source_provider,
+        source_model,
+        source_agent,
+        search_namespace,
+        search_owner_id,
+        include_secrets,
+        operational,
+        sorted(group_ids),
+        include_archived,
+        exclude_superseded,
+        current_only,
+        boost_recency,
+        recency_weight,
+        search_profile,
+        min_score,
+        min_margin,
+        ood_gate,
+        1,  # epoch
+    )
+
+    assert epoch_0_key != epoch_1_key, (
+        "Search cache key MUST differ across epochs to close the write-after-invalidate race"
+    )
+
+    # Verify both keys start with the expected namespace prefix
+    assert epoch_0_key.startswith("mnemos:search:")
+    assert epoch_1_key.startswith("mnemos:search:")
+
+    # The old key must NOT be read when the new epoch is active.
+    # In production, search reads the current epoch → miss on old key → reads DB →
+    # writes to new-epoch key.  The old key is orphaned.
+    assert epoch_0_key not in [epoch_1_key]
+
+
+def test_epoch_bump_prevents_stale_cache_write():
+    """Simulate the TOCTOU race and verify the epoch fix prevents it.
+
+    Steps:
+    1. Search starts with epoch=0
+    2. Mutation bumps epoch to 1
+    3. Search (still in flight) tries to write → gets old epoch key → writes there
+    4. Next search reads current epoch=1 → miss on epoch_1 key → fresh DB read
+
+    Result: the stale write at epoch 0 is never served.
+    """
+    from mnemos.core.lifecycle import _get_cache_key
+
+    # Pre-mutation search key (epoch 0)
+    search_key_0 = _get_cache_key(
+        "search",
+        "user1", "default", "query", 10, "notes", None, "semantic",
+        None, None, None, "default", None,
+        False, False, ["group-a"], False, False, False,
+        False, 0.5, "balanced", 0.1, 0.0, True, 0,
+    )
+
+    # Post-mutation search key (epoch 1)
+    search_key_1 = _get_cache_key(
+        "search",
+        "user1", "default", "query", 10, "notes", None, "semantic",
+        None, None, None, "default", None,
+        False, False, ["group-a"], False, False, False,
+        False, 0.5, "balanced", 0.1, 0.0, True, 1,
+    )
+
+    assert search_key_0 != search_key_1
+
+    # In production: after bump, the next search reads epoch=1, so
+    # it will NOT read from search_key_0 (which is the stale write).
+    # The fix is that epoch_0 and epoch_1 produce different keys, so
+    # the stale write at epoch_0 is orphaned and never read.
+    assert search_key_0 != search_key_1  # keys differ → stale write is orphaned

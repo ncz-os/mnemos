@@ -6,11 +6,23 @@ from __future__ import annotations
 
 import os
 import sys
+import hashlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+@pytest.fixture(autouse=True)
+def _offsite_feed_scope(monkeypatch):
+    """These tests pin the SQL shape of the OFFSITE feed scope.
+
+    The world-read gate applies only when
+    MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=0; the default is now the
+    trusted-LAN full-corpus scope, so declare the posture explicitly.
+    """
+    monkeypatch.setenv("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE", "0")
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -100,6 +112,85 @@ class _NoopRawTx:
         return None
 
 
+@pytest.mark.asyncio
+async def test_sync_peer_records_feed_failure_then_raises(monkeypatch):
+    from mnemos._version import __version__
+    from mnemos.domain import federation
+
+    signature = ".".join(__version__.split(".")[:2])
+
+    class Repo:
+        def __init__(self):
+            self.finished = None
+            self.recorded_error = None
+
+        async def get_sync_peer(self, tx, peer_id):
+            return {
+                "name": "peer-a",
+                "enabled": True,
+                "last_sync_cursor": None,
+                "base_url": "https://peer.example",
+                "auth_token": "token",
+                "namespace_filter": None,
+                "category_filter": None,
+                "compat_mode": "strict",
+                "copy_embeddings": False,
+            }
+
+        async def update_peer_schema_check(self, tx, peer_id, peer_version):
+            return None
+
+        async def create_sync_log(self, tx, peer_id, cursor_before):
+            return "log-1"
+
+        async def finish_sync_log(self, tx, **kwargs):
+            self.finished = kwargs
+
+        async def record_sync_error(self, tx, peer_id, error):
+            self.recorded_error = error
+
+    class Backend:
+        def __init__(self):
+            self.federation = Repo()
+
+        @asynccontextmanager
+        async def transactional(self):
+            yield object()
+
+    async def schema_ok(*args, **kwargs):
+        return {
+            "ok": True,
+            "mnemos_version": __version__,
+            "schema_signature": signature,
+            "migrations_fingerprint": None,
+        }
+
+    async def pull_fails(*args, **kwargs):
+        raise TimeoutError("feed timed out")
+
+    class _FeedClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    async def safe_client(*args, **kwargs):
+        return _FeedClient(), object()
+
+    backend = Backend()
+    monkeypatch.setattr(federation, "_local_migrations_fingerprint", lambda: "")
+    monkeypatch.setattr(federation, "_check_peer_schema", schema_ok)
+    monkeypatch.setattr(federation, "make_safe_client", safe_client)
+    monkeypatch.setattr(federation, "_pull_batch", pull_fails)
+
+    with pytest.raises(federation.FederationSyncError, match="feed timed out"):
+        await federation.sync_peer(backend, "peer-1")
+
+    assert backend.federation.finished["error"] == "TimeoutError: feed timed out"
+    assert backend.federation.recorded_error == "TimeoutError: feed timed out"
+
+
 class _FeedBackend:
     def __init__(self, pool: _FeedPool):
         from mnemos.persistence.postgres import PostgresFederationRepository
@@ -134,6 +225,20 @@ class TestFederationWiring:
             "FEDERATION_BATCH_LIMIT",
         ):
             assert hasattr(federation, name), f"mnemos.domain.federation missing: {name}"
+
+    def test_migration_fingerprint_includes_nested_backend_migrations(self, monkeypatch):
+        from mnemos.domain import federation
+
+        db_dir = Path(federation.__file__).resolve().parents[2] / "mnemos" / "db_migrations"
+        expected = hashlib.sha256()
+        for path in sorted(db_dir.rglob("*.sql"), key=lambda item: item.relative_to(db_dir).as_posix()):
+            expected.update(path.relative_to(db_dir).as_posix().encode())
+            expected.update(b"\0")
+            expected.update(path.read_bytes())
+            expected.update(b"\0\0")
+        monkeypatch.setattr(federation, "_MIGRATIONS_FINGERPRINT_CACHE", None)
+
+        assert federation._local_migrations_fingerprint() == expected.hexdigest()[:16]
 
     def test_federation_handler_router(self):
         from mnemos.api.routes import federation as handler
@@ -582,11 +687,15 @@ class TestStoreMemoriesConcurrency:
         executes: list[tuple] = []
         fetchrows: list[tuple] = []
         select_results = [
-            None,  # initial check: no row
             {"federation_remote_updated": datetime(2026, 5, 1, tzinfo=timezone.utc)},  # post-conflict refetch
         ]
 
         class _FakeConn:
+            async def fetch(self, sql, *args):
+                # Batched initial check: no row exists yet.
+                fetchrows.append((sql, args))
+                return []
+
             async def fetchrow(self, sql, *args):
                 fetchrows.append((sql, args))
                 return select_results.pop(0)
@@ -650,6 +759,14 @@ class TestStoreMemoriesConcurrency:
         execute_calls: list[tuple] = []
 
         class _FakeConn:
+            async def fetch(self, sql, *args):
+                return [{
+                    "id": "fed:pythia:mem_race",
+                    "federation_remote_updated": datetime(
+                        2026, 5, 1, 0, 0, 0, tzinfo=timezone.utc
+                    ),
+                }]
+
             async def fetchrow(self, sql, *args):
                 # Existing row: T0 baseline (older than both A and B).
                 return {

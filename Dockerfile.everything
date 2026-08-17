@@ -11,9 +11,8 @@
 # "core+graeae" tier — graeae is the heavy one, the rest are nearly free.
 #
 # IMPORTANT (multi-arch): we install the add-on wheels EXPLICITLY and never via
-# `mnemos-core[full]`, because the `full` extra pulls the `openvino` accelerator,
-# which is Intel x86-only and would break the arm64 build. Hardware accel stays
-# host-opt-in.
+# `mnemos-core[full]`, because the `full` extra no longer pulls the
+# `openvino` accelerator (Intel x86-only). Hardware accel stays host-opt-in.
 #
 # The add-on wheels are pre-built by CI (from the pantheon/knemon/graeae/charon
 # repos) and staged into ./wheelhouse before this build runs. mnemos-core is

@@ -1,11 +1,13 @@
 """Memory CRUD, search, and rehydration endpoints."""
 
 import asyncio
+import inspect
 import json
 import logging
 import math
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Optional
 from uuid import uuid4
 
@@ -40,6 +42,7 @@ from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.persistence.base import DuplicateMemoryError
+from mnemos.persistence.nats_events import safe_subject_segment
 from mnemos.domain.models import (
     DEFAULT_SEMANTIC_FLOOR,
     DEFAULT_SEMANTIC_MARGIN_FLOOR,
@@ -63,6 +66,20 @@ from mnemos.domain.models import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["memories"])
+
+
+@dataclass
+class _BulkCreateCandidate:
+    index: int
+    memory: MemoryCreateRequest
+    memory_id: str
+    verbatim: str
+    owner_id: str
+    namespace: str
+    metadata: dict
+    permission_mode: int
+    embedding_content: str
+    embedding: list[float] | None = None
 
 
 async def _write_memory_mutation_audit_entry(
@@ -275,6 +292,46 @@ def _validate_permission_mode(value: int | None, *, default: int | None = None) 
     return value
 
 
+async def _assert_no_active_deletion(
+    backend,
+    *,
+    owner_id: str,
+    namespace: str,
+) -> None:
+    """Refuse to write a row onto a scope that is currently being deleted.
+
+    Without this fence, a memory added during the 30-day grace window
+    (after the soft-delete sweep has marked the scope, before the
+    hard-delete phase runs) would survive past ``hard_deleted`` -- the
+    hard-delete only removes rows already carrying
+    ``deleted_at IS NOT NULL``, so a row inserted during grace still has
+    ``deleted_at IS NULL`` and is skipped forever, even though the
+    audit log claims the user was hard-deleted. Root is the exception:
+    operators may need to inject tombstone rows even mid-deletion.
+    """
+    from mnemos.persistence.worker_lifecycle import active_deletion_for_scope
+
+    try:
+        active = await active_deletion_for_scope(
+            backend, target_user_id=owner_id, target_namespace=namespace
+        )
+    except Exception:
+        # If the fence itself errors (e.g. backend doesn't expose
+        # transactional), fall through. The hard-delete resweep+verify
+        # loop added in deletion_request_worker.py is the second line of
+        # defence and refuses to mark the request complete on live rows.
+        return
+    if active is not None:
+        restore_by = active.get("restore_by")
+        detail = (
+            "This scope is currently subject to an active deletion request; "
+            "new writes are rejected until the grace window expires. "
+        )
+        if restore_by is not None:
+            detail += f"Restore deadline: {restore_by}."
+        raise HTTPException(status_code=409, detail=detail)
+
+
 def _should_redact_secrets(user: UserContext, *, include_secrets: bool = False, namespace: str | None = None) -> bool:
     """Whether to mask credential spans for this read (redact-at-retrieval).
 
@@ -321,6 +378,65 @@ def _redacted_for_webhook(content: str, metadata) -> str:
     from mnemos.core.secret_detection import redact_field_with_stored
 
     return redact_field_with_stored(content, metadata, "content")
+
+
+async def _get_embeddings_batch(texts: list[str]) -> list[list[float]]:
+    """Embed a request batch through the process embedder."""
+    from mnemos.runtime.embedder import get_embedder
+
+    return await get_embedder().embed_batch(texts)
+
+
+async def _execute_tx_sql(tx, sql: str) -> bool:
+    conn = getattr(tx, "conn", None)
+    if conn is None:
+        return False
+    execute = getattr(conn, "execute", None)
+    if callable(execute):
+        result = execute(sql)
+        if inspect.isawaitable(result):
+            await result
+        return True
+    cursor_factory = getattr(conn, "cursor", None)
+    if not callable(cursor_factory):
+        return False
+    cursor_cm = cursor_factory()
+    if hasattr(cursor_cm, "__aenter__"):
+        async with cursor_cm as cursor:
+            result = cursor.execute(sql)
+            if inspect.isawaitable(result):
+                await result
+        return True
+    cursor = cursor_cm
+    try:
+        result = cursor.execute(sql)
+        if inspect.isawaitable(result):
+            await result
+    finally:
+        close = getattr(cursor, "close", None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+    return True
+
+
+@asynccontextmanager
+async def _bulk_item_savepoint(tx, index: int):
+    name = f"mnemos_bulk_item_{index}"
+    enabled = await _execute_tx_sql(tx, f"SAVEPOINT {name}")
+    can_release = enabled and "mnemos.persistence.oracle" not in type(tx).__module__
+    try:
+        yield
+    except BaseException:
+        if enabled:
+            await _execute_tx_sql(tx, f"ROLLBACK TO SAVEPOINT {name}")
+        if can_release:
+            await _execute_tx_sql(tx, f"RELEASE SAVEPOINT {name}")
+        raise
+    else:
+        if can_release:
+            await _execute_tx_sql(tx, f"RELEASE SAVEPOINT {name}")
 
 
 def _should_redact_secrets_for_row(user: UserContext, row) -> bool:
@@ -448,7 +564,13 @@ async def _publish_nats_with_timeout(
 
 
 async def _invalidate_caches_after_mutation() -> None:
-    """Drop /stats + per-user search cache entries on any memory write."""
+    """Drop /stats + per-user search cache entries on any memory write.
+
+    Also bumps the visibility epoch so that in-flight search writes land
+    under the old epoch (orphaned) rather than leaking stale visibility into
+    the new epoch — closing the write-after-invalidate (TOCTOU) window
+    (mnemos-#<issue>).
+    """
     if not _lc._cache:
         return
     try:
@@ -458,6 +580,10 @@ async def _invalidate_caches_after_mutation() -> None:
                 await _lc._cache.delete(_k)
         except Exception:
             pass
+    except Exception:
+        pass
+    try:
+        await _lc._vis_epoch_get_incr()  # bump; errors silently
     except Exception:
         pass
 
@@ -572,7 +698,7 @@ async def _insert_memory_with_created_webhook(
 
     from mnemos.nats.client import get_node_name as _nats_get_node_name
 
-    safe_ns = (namespace or "default").replace(".", "_")
+    safe_ns = safe_subject_segment(namespace)
     nats_intents: list[NatsPublishIntent] = [
         (
             f"mnemos.memory.created.{safe_ns}",
@@ -1156,6 +1282,14 @@ async def search_memories(
     # serialization aliases distinct semantics. JSON encoding inside
     # _get_cache_key now preserves None as null vs "" as "" so the
     # digest reflects the request's actual filter shape.
+    # v6.3 TOCTOU guard: fold a monotonic visibility epoch into the cache key
+    # so an in-flight cache write after a bump lands under the old epoch
+    # (orphaned, never read).  Bump is triggered by every visibility-narrowing
+    # mutation (delete, archive, ACL revoke, permission-mode tighten).
+    try:
+        _epoch = await _lc._vis_epoch_current()
+    except Exception:
+        _epoch = 0
     cache_key = _get_cache_key(
         "search",
         user.user_id,
@@ -1189,6 +1323,7 @@ async def search_memories(
         # MNEMOS_SEMANTIC_OOD_GATE must NOT serve a stale gated/ungated
         # result from before the flip (ngc-review 2026-06-13).
         ood_gate_enabled(),
+        _epoch,  # v6.3 TOCTOU guard — epoch at read time
     )
 
     if _lc._cache and not request.include_compressed:
@@ -1533,6 +1668,17 @@ async def create_memory(
     namespace = request.namespace or user.namespace
     permission_mode = _validate_permission_mode(request.permission_mode, default=600)
 
+    # GDPR fence: refuse to insert onto a scope that is mid-deletion
+    # (soft_deleted and inside the 30-day grace window). A new memory
+    # would otherwise be skipped by the next hard-delete -- it only
+    # removes rows with ``deleted_at IS NOT NULL`` -- and would survive
+    # even though the request is recorded as complete. Root bypasses the
+    # fence so operators can still inject tombstone / restoration rows.
+    if user.role != "root":
+        await _assert_no_active_deletion(
+            backend, owner_id=owner_id, namespace=namespace
+        )
+
     # Secret-vault persisted-text classification (release-blocking 2026-06-14).
     # Classify every text field that will be stored. Any VAULT-class finding in
     # content or verbatim_content moves the row to the vault namespace;
@@ -1703,7 +1849,7 @@ async def create_memory(
     # unreachable. Webhooks outbox above is the durable path.
     from mnemos.nats.client import get_node_name as _nats_get_node_name
 
-    safe_ns = (namespace or "default").replace(".", "_")
+    safe_ns = safe_subject_segment(namespace)
     await _publish_nats_with_timeout(
         f"mnemos.memory.created.{safe_ns}",
         {
@@ -1741,6 +1887,7 @@ async def bulk_create_memories(
     errors: list[str] = []
     delivery_ids: list[str] = []
     nats_created_events: list[dict] = []
+    candidates: list[_BulkCreateCandidate] = []
     for i, mem in enumerate(request.memories):
         if not mem.content.strip():
             errors.append(f"[{i}] content is empty")
@@ -1770,111 +1917,146 @@ async def bulk_create_memories(
         )
         item_metadata = _classified.metadata
         namespace = _classified.namespace
-        try:
-            async with backend.transactional() as tx:
-                await _maybe_set_pg_rls(tx, user)
-                dedup = await evaluate_memory_create_dedup(
-                    backend.memories,
-                    tx,
-                    owner_id=owner_id,
-                    namespace=namespace,
-                    content=mem.content,
-                    logger=logger,
-                )
-                if dedup.action == "reject" and dedup.existing_id:
-                    errors.append(f"[{i}] duplicate_content: {dedup.existing_id}")
-                    continue
-                if dedup.action == "merge" and dedup.existing_id:
-                    row = await backend.memories.bump_recall_and_get_memory(
-                        tx,
-                        dedup.existing_id,
-                        visibility=_read_visibility_for(user, namespace=namespace),
-                    )
-                    if row is None:
-                        errors.append(f"[{i}] duplicate_content: {dedup.existing_id}")
-                        continue
-                    created_ids.append(row["id"])
-                    continue
-                # Compute embedding first so it can be passed inline to
-                # insert_memory (co-transactional; CHILD C v2, 2026-06-06).
-                try:
-                    # F2 (adversarial review 2026-06-28): embed span-redacted content.
-                    vec = await _get_embedding(_content_redacted_for_embedding(mem.content, _classified))
-                except Exception:
-                    logger.exception(
-                        "[bulk_create_memories] inline embed generation failed for %s; "
-                        "row will be backfilled with embedding later",
-                        mid,
-                    )
-                    vec = None
-                await backend.memories.insert_memory(
-                    tx,
-                    memory_id=mid,
-                    content=mem.content,
-                    category=mem.category,
-                    subcategory=mem.subcategory,
-                    metadata_json=json.dumps(item_metadata),
-                    quality_rating=75,
-                    owner_id=owner_id,
-                    namespace=namespace,
-                    permission_mode=permission_mode,
-                    source_model=mem.source_model,
-                    source_provider=mem.source_provider,
-                    source_session=mem.source_session,
-                    source_agent=mem.source_agent,
-                    verbatim_content=verbatim,
-                    embedding=vec,
-                    created=None,
-                    updated=None,
-                )
-                if vec:
-                    await backend.memories.upsert_memory_embedding(tx, mid, vec)
-                await _write_memory_mutation_audit_entry(
-                    backend,
-                    tx,
-                    op="create",
-                    memory_id=mid,
-                    content=mem.content,
-                    category=mem.category,
-                    subcategory=mem.subcategory,
-                    metadata=item_metadata,
-                    writer_id=user.user_id,
-                )
-                if getattr(backend, "supports_webhooks", True):
-                    item_delivery_ids = await backend.webhooks.dispatch_event(
-                        tx,
-                        "memory.created",
-                        {
-                            "memory_id": mid,
-                            "category": mem.category,
-                            "subcategory": mem.subcategory,
-                            "content": _redacted_for_webhook(mem.content, item_metadata),
-                            "owner_id": owner_id,
-                            "namespace": namespace,
-                        },
-                        owner_id=owner_id,
-                        namespace=namespace,
-                    )
-                else:
-                    item_delivery_ids = []
-        except Exception as e:
-            errors.append(f"[{i}] {e}")
-            continue
-        created_ids.append(mid)
-        nats_created_events.append(
-            {
-                "memory_id": mid,
-                "namespace": namespace,
-                "category": mem.category,
-            }
+        candidates.append(
+            _BulkCreateCandidate(
+                index=i,
+                memory=mem,
+                memory_id=mid,
+                verbatim=verbatim,
+                owner_id=owner_id,
+                namespace=namespace,
+                metadata=item_metadata,
+                permission_mode=permission_mode,
+                embedding_content=_content_redacted_for_embedding(mem.content, _classified),
+            )
         )
-        delivery_ids.extend(item_delivery_ids)
+
+    if candidates:
+        try:
+            embeddings = await _get_embeddings_batch([candidate.embedding_content for candidate in candidates])
+        except Exception:
+            logger.exception(
+                "[bulk_create_memories] batch inline embed generation failed for %d memories; "
+                "rows will be backfilled with embeddings later",
+                len(candidates),
+            )
+            embeddings = []
+        for candidate, vec in zip(candidates, embeddings):
+            candidate.embedding = vec or None
+        if len(embeddings) < len(candidates):
+            for candidate in candidates[len(embeddings) :]:
+                candidate.embedding = None
+
+    if candidates:
+        async with backend.transactional() as tx:
+            await _maybe_set_pg_rls(tx, user)
+            for candidate in candidates:
+                i = candidate.index
+                mem = candidate.memory
+                mid = candidate.memory_id
+                namespace = candidate.namespace
+                owner_id = candidate.owner_id
+                item_metadata = candidate.metadata
+                vec = candidate.embedding
+                item_delivery_ids = []
+                try:
+                    async with _bulk_item_savepoint(tx, i):
+                        if vec is None:
+                            logger.warning(
+                                "[bulk_create_memories] inline embed generation failed for %s; "
+                                "row will be backfilled with embedding later",
+                                mid,
+                            )
+                        dedup = await evaluate_memory_create_dedup(
+                            backend.memories,
+                            tx,
+                            owner_id=owner_id,
+                            namespace=namespace,
+                            content=mem.content,
+                            logger=logger,
+                        )
+                        if dedup.action == "reject" and dedup.existing_id:
+                            errors.append(f"[{i}] duplicate_content: {dedup.existing_id}")
+                            continue
+                        if dedup.action == "merge" and dedup.existing_id:
+                            row = await backend.memories.bump_recall_and_get_memory(
+                                tx,
+                                dedup.existing_id,
+                                visibility=_read_visibility_for(user, namespace=namespace),
+                            )
+                            if row is None:
+                                errors.append(f"[{i}] duplicate_content: {dedup.existing_id}")
+                                continue
+                            created_ids.append(row["id"])
+                            continue
+                        await backend.memories.insert_memory(
+                            tx,
+                            memory_id=mid,
+                            content=mem.content,
+                            category=mem.category,
+                            subcategory=mem.subcategory,
+                            metadata_json=json.dumps(item_metadata),
+                            quality_rating=75,
+                            owner_id=owner_id,
+                            namespace=namespace,
+                            permission_mode=candidate.permission_mode,
+                            source_model=mem.source_model,
+                            source_provider=mem.source_provider,
+                            source_session=mem.source_session,
+                            source_agent=mem.source_agent,
+                            verbatim_content=candidate.verbatim,
+                            embedding=vec,
+                            created=None,
+                            updated=None,
+                        )
+                        if vec:
+                            await backend.memories.upsert_memory_embedding(tx, mid, vec)
+                        await _write_memory_mutation_audit_entry(
+                            backend,
+                            tx,
+                            op="create",
+                            memory_id=mid,
+                            content=mem.content,
+                            category=mem.category,
+                            subcategory=mem.subcategory,
+                            metadata=item_metadata,
+                            writer_id=user.user_id,
+                        )
+                        if getattr(backend, "supports_webhooks", True):
+                            item_delivery_ids = await backend.webhooks.dispatch_event(
+                                tx,
+                                "memory.created",
+                                {
+                                    "memory_id": mid,
+                                    "category": mem.category,
+                                    "subcategory": mem.subcategory,
+                                    "content": _redacted_for_webhook(mem.content, item_metadata),
+                                    "owner_id": owner_id,
+                                    "namespace": namespace,
+                                },
+                                owner_id=owner_id,
+                                namespace=namespace,
+                            )
+                        else:
+                            item_delivery_ids = []
+                except Exception as e:
+                    errors.append(f"[{i}] {e}")
+                    continue
+                created_ids.append(mid)
+                nats_created_events.append(
+                    {
+                        "memory_id": mid,
+                        "namespace": namespace,
+                        "category": mem.category,
+                    }
+                )
+                delivery_ids.extend(item_delivery_ids)
     _schedule_outbox_deliveries(delivery_ids)
     from mnemos.nats.client import get_node_name as _nats_get_node_name
 
     source_node = _nats_get_node_name()
     for event in nats_created_events:
-        safe_ns = (event["namespace"] or "default").replace(".", "_")
+        safe_ns = safe_subject_segment(event["namespace"])
         await _publish_nats_with_timeout(
             f"mnemos.memory.created.{safe_ns}",
             {**event, "source_node": source_node},
@@ -2006,7 +2188,7 @@ async def update_memory(
     from mnemos.nats import publish_event as _nats_publish_event
     from mnemos.nats.client import get_node_name as _nats_get_node_name
 
-    safe_ns = (namespace or "default").replace(".", "_")
+    safe_ns = safe_subject_segment(namespace)
     await _nats_publish_event(
         f"mnemos.memory.updated.{safe_ns}",
         {
@@ -2093,7 +2275,7 @@ async def delete_memory(
     from mnemos.nats import publish_event as _nats_publish_event
     from mnemos.nats.client import get_node_name as _nats_get_node_name
 
-    safe_ns = (namespace or "default").replace(".", "_")
+    safe_ns = safe_subject_segment(namespace)
     await _nats_publish_event(
         f"mnemos.memory.deleted.{safe_ns}",
         {

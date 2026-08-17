@@ -7,6 +7,8 @@ persistence interface.
 from __future__ import annotations
 
 import hashlib
+
+from mnemos.core import audit_chain
 import inspect
 import json
 import logging
@@ -482,6 +484,7 @@ class PostgresMemoryRepository(MemoryRepository):
         else:
             vis_clause, vis_params = _core_version_visibility_predicate(
                 user.user_id,
+                user.group_ids,
                 start_param_idx=4,
                 table_alias="mv",
             )
@@ -561,6 +564,7 @@ class PostgresMemoryRepository(MemoryRepository):
 
         vis_clause, vis_params = _core_version_visibility_predicate(
             user.user_id,
+            user.group_ids,
             start_param_idx=3,
         )
         ns_ph = f"${len(vis_params) + 3}"
@@ -598,6 +602,7 @@ class PostgresMemoryRepository(MemoryRepository):
 
         vis_clause, vis_params = _core_version_visibility_predicate(
             user.user_id,
+            user.group_ids,
             start_param_idx=3,
         )
         ns_ph = f"${len(vis_params) + 3}"
@@ -1811,6 +1816,7 @@ class PostgresBranchRepository(BranchRepository):
 
             vis_clause, vis_params = _core_version_visibility_predicate(
                 user.user_id,
+                user.group_ids,
                 start_param_idx=3,
             )
             ns_ph = f"${len(vis_params) + 3}"
@@ -1840,6 +1846,7 @@ class PostgresBranchRepository(BranchRepository):
 
             vis_clause, vis_params = _core_version_visibility_predicate(
                 user.user_id,
+                user.group_ids,
                 start_param_idx=2,
                 table_alias="mv",
             )
@@ -1875,6 +1882,7 @@ class PostgresBranchRepository(BranchRepository):
 
             vis_clause, vis_params = _core_version_visibility_predicate(
                 user.user_id,
+                user.group_ids,
                 start_param_idx=3,
                 table_alias="mv",
             )
@@ -2804,6 +2812,48 @@ class PostgresOAuthRepository(OAuthRepository):
             session_id,
         )
 
+    async def lookup_api_key(
+        self, tx: Transaction, key_hash: str
+    ) -> Row | None:
+        return await _postgres_tx(tx).conn.fetchrow(
+            "SELECT ak.id, ak.user_id, ak.revoked, u.role, u.namespace, "
+            "       ug.group_ids "
+            "FROM api_keys ak JOIN users u ON u.id = ak.user_id "
+            "LEFT JOIN LATERAL ("
+            "    SELECT array_agg(group_id) AS group_ids "
+            "    FROM user_groups "
+            "    WHERE user_id = u.id"
+            ") ug ON TRUE "
+            "WHERE ak.key_hash = $1",
+            key_hash,
+        )
+
+    async def touch_api_key(self, tx: Transaction, key_id: Any) -> None:
+        await _postgres_tx(tx).conn.execute(
+            "UPDATE api_keys SET last_used=NOW() WHERE id=$1", key_id
+        )
+
+    async def resolve_active_session(
+        self, tx: Transaction, session_id: str, *, now: Any
+    ) -> Row | None:
+        conn = _postgres_tx(tx).conn
+        row = await conn.fetchrow(
+            "SELECT user_id, identity_id::text AS identity_id, expires_at, revoked "
+            "FROM oauth_sessions WHERE session_id=$1",
+            session_id,
+        )
+        if row is None:
+            return None
+        if row["revoked"]:
+            return None
+        if row["expires_at"] <= now:
+            return None
+        await conn.execute(
+            "UPDATE oauth_sessions SET last_used_at=NOW() WHERE session_id=$1",
+            session_id,
+        )
+        return row
+
 
 class PostgresAclRepository(AclRepository):
     async def grant_acl(
@@ -3081,23 +3131,46 @@ class PostgresConsultationsRepository(ConsultationsRepository):
         prev = await conn.fetchrow("SELECT id, chain_hash FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT 1")
         prev_chain = prev["chain_hash"] if prev else kwargs["genesis_hash"]
         prev_id = prev["id"] if prev else None
-        chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
-        await conn.execute(
+        # sequence_num is BIGSERIAL, so it is not known until the row exists --
+        # and the v2 chain hash binds it. Insert first to obtain it, then sign.
+        # Both statements run inside this transaction under the advisory lock
+        # taken above, so no other writer can interleave and the row is never
+        # visible to another session with a placeholder hash.
+        task_type = kwargs["task_type"] or "reasoning"
+        quality_score = kwargs["consensus_score"]
+        audit_row = await conn.fetchrow(
             "INSERT INTO graeae_audit_log "
             "(consultation_id, prompt, prompt_hash, provider, response_text, response_hash, "
-            "chain_hash, prev_id, prev_chain_hash, task_type, quality_score) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            "chain_hash, prev_id, prev_chain_hash, task_type, quality_score, chain_algo) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING sequence_num",
             consultation_id,
             kwargs["prompt"],
             prompt_hash,
             kwargs["winning_muse"],
             kwargs["consensus_response"],
             response_hash,
-            chain_hash,
+            "",  # placeholder, replaced below once sequence_num is known
             prev_id,
             prev_chain,
-            kwargs["task_type"] or "reasoning",
-            kwargs["consensus_score"],
+            task_type,
+            quality_score,
+            audit_chain.CURRENT_ALGO,
+        )
+        chain_hash = audit_chain.compute_v2(
+            key=kwargs.get("audit_key"),
+            prev_chain_hash=prev_chain,
+            prompt_hash=prompt_hash,
+            response_hash=response_hash,
+            sequence_num=audit_row["sequence_num"],
+            consultation_id=consultation_id,
+            task_type=task_type,
+            provider=kwargs["winning_muse"],
+            quality_score=quality_score,
+        )
+        await conn.execute(
+            "UPDATE graeae_audit_log SET chain_hash=$1 WHERE sequence_num=$2",
+            chain_hash,
+            audit_row["sequence_num"],
         )
         for memory_id in kwargs["memory_ids"]:
             await conn.execute(
@@ -3151,7 +3224,12 @@ class PostgresConsultationsRepository(ConsultationsRepository):
         conn = _postgres_tx(tx).conn
         if root and namespace is None:
             return await conn.fetch(
-                "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
+                # consultation_id/task_type/provider/quality_score are bound into
+                # the v2 chain hash, and chain_algo says which algorithm signed
+                # the row. Omitting them made the verifier hash None for half its
+                # inputs and reject every row.
+                "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id, "
+                "consultation_id, task_type, provider, quality_score, chain_algo "
                 "FROM graeae_audit_log ORDER BY sequence_num ASC"
             )
         owner_clause = "" if root else "c.owner_id = $2 AND "
@@ -3755,6 +3833,23 @@ class PostgresFederationRepository(FederationRepository):
             local_id,
         )
 
+    async def fetch_federated_memory_markers(
+        self,
+        tx: Transaction,
+        local_ids: Sequence[str],
+    ) -> dict[str, Row]:
+        if not local_ids:
+            return {}
+        rows = await _postgres_tx(tx).conn.fetch(
+            """
+            SELECT id, federation_remote_updated
+            FROM memories
+            WHERE id = ANY($1::text[]) AND deleted_at IS NULL
+            """,
+            list(local_ids),
+        )
+        return {str(row["id"]): row for row in rows}
+
     async def insert_federated_memory(
         self,
         tx: Transaction,
@@ -4272,6 +4367,7 @@ class PostgresBackend:
     supports_advisory_locks = True
     supports_row_level_security = True
     supports_pgvector = True
+    supports_webhooks = True  # backed by PostgresWebhookRepository, see .webhooks
 
     def __init__(self, pool: asyncpg.Pool, settings: Any):
         self._pool = pool

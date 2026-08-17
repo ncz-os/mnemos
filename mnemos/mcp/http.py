@@ -26,6 +26,7 @@ Run:
 """
 
 from __future__ import annotations
+import httpx
 
 import argparse
 import asyncio
@@ -363,7 +364,12 @@ async def handle_sse(request):
     principal_id = getattr(request.state, "mnemos_mcp_principal_id", None)
     if principal_id is None and principal is not None:
         principal_id = _principal_id(principal)
-    principal_context = await _resolve_mcp_user_context(request)
+    try:
+        principal_context = await _resolve_mcp_user_context(request)
+    except PermissionError:
+        # Revoked/expired key: refuse the stream rather than opening it with a
+        # context synthesised from the caller's own claimed identity.
+        return PlainTextResponse("unauthorized", status_code=403)
     context_tokens = set_mcp_backend_context(
         api_key=principal.api_key if principal else None,
         user_id=principal_context.user_id,
@@ -388,6 +394,49 @@ async def handle_sse(request):
 # hidden for the process lifetime. Bounded LRU + TTL closes
 # both gaps without per-request httpx round-trips.
 _principal_context_cache: dict[str, tuple[MCPUserContext, float]] = {}
+
+# Generation stamp for the principal-context cache.
+#
+# MCPUserContext carries `role` and `namespace` -- authorization inputs. The
+# cache held them for _PRINCIPAL_CACHE_TTL_SECONDS with NOTHING invalidating it
+# on an ACL change, so narrowing a principal's role left MCP honouring the old
+# one for up to five minutes. That is the same revocation-freshness leak the
+# search cache was fixed for (ncz-os/mnemos#1), on a more sensitive value.
+#
+# The visibility epoch already advances on every visibility-narrowing mutation.
+# Reading it here is sync-safe: it is only a cached integer refreshed by the
+# async path, and a stale-but-lower generation can only cause an extra miss,
+# never a stale hit.
+_principal_cache_generation: int = 0
+
+
+def _register_epoch_listener() -> None:
+    """Subscribe to visibility-epoch bumps, if core is importable.
+
+    Registration is pull-based so core never has to import this module (which
+    exits at import when MNEMOS_MCP_TOKEN is unset).
+    """
+    try:
+        from mnemos.core.lifecycle import register_visibility_epoch_listener
+
+        register_visibility_epoch_listener(principal_cache_invalidate)
+    except Exception:
+        pass
+
+
+def principal_cache_invalidate(generation: int | None = None) -> None:
+    """Drop every cached principal context.
+
+    Called when the visibility epoch advances. Cheap and unconditional: the
+    cache is capped and repopulates on the next request, and being wrong in the
+    direction of "recompute" is the only safe direction for an authz input.
+    """
+    global _principal_cache_generation
+    if generation is not None:
+        if generation == _principal_cache_generation:
+            return
+        _principal_cache_generation = generation
+    _principal_context_cache.clear()
 _PRINCIPAL_CACHE_TTL_SECONDS = 300.0  # 5 min — short enough that
 # role/namespace changes propagate within a sane window; long
 # enough that high-rps SSE callers don't re-hit /auth/oauth/me.
@@ -479,8 +528,6 @@ async def _resolve_mcp_user_context(request) -> MCPUserContext:
 
     if principal is not None and principal.api_key:
         try:
-            import httpx
-
             base = get_settings().server.base.rstrip("/")
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(
@@ -497,7 +544,24 @@ async def _resolve_mcp_user_context(request) -> MCPUserContext:
             if principal_id:
                 _principal_cache_set(principal_id, context)
             return context
+        except httpx.HTTPStatusError as exc:
+            # FAIL CLOSED on an authentication verdict. A 401/403 from
+            # /auth/oauth/me means this key is revoked, expired or not
+            # entitled. Falling through to the permissive context below would
+            # mint an authenticated MCPUserContext from the caller's own
+            # claimed identity, so a revoked API key would keep working
+            # indefinitely -- _match_principal only compares the static token
+            # and never consults revocation.
+            status = exc.response.status_code if exc.response is not None else None
+            if status in (401, 403):
+                logger.warning(
+                    "MCP principal context rejected by auth service (HTTP %s); denying", status
+                )
+                raise PermissionError("MCP principal is not authorized") from exc
+            logger.warning("MCP principal context lookup failed with HTTP %s: %s", status, exc)
         except Exception as exc:
+            # Transport/timeout failures are NOT an authorization verdict, so
+            # the degraded context below is still appropriate for them.
             logger.warning("MCP NATS SSE principal context lookup failed: %s", exc)
 
     context = MCPUserContext(
@@ -706,7 +770,10 @@ async def handle_nats_event_stream(request):
         return PlainTextResponse("streaming responses unavailable", status_code=503)
 
     try:
-        context = await _resolve_mcp_user_context(request)
+        try:
+            context = await _resolve_mcp_user_context(request)
+        except PermissionError:
+            return PlainTextResponse("unauthorized", status_code=403)
         subjects = _parse_nats_sse_subjects(request, context)
     except ValueError as exc:
         return PlainTextResponse(str(exc), status_code=400)
@@ -817,3 +884,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+_register_epoch_listener()

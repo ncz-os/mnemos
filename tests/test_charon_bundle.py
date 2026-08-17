@@ -80,7 +80,7 @@ def test_vault_memory_redacted_in_bundle(tmp_path):
     mems = _memories() + [
         {
             "id": "mem_vault_x",
-            "content": "ROOT_PW=***REMOVED-CREDENTIAL***",
+            "content": "ROOT_PW=DenylistSelfTest@NotARealSecret1",
             "category": "infrastructure",
             "namespace": "vault",
             "created": "2026-06-28T20:02:00+00:00",
@@ -88,7 +88,7 @@ def test_vault_memory_redacted_in_bundle(tmp_path):
     ]
     charon.export_bundle(mems, tmp_path)
     blob = "\n".join(p.read_text() for p in tmp_path.rglob("*.md"))
-    assert "***REMOVED-CREDENTIAL***" not in blob
+    assert "DenylistSelfTest@NotARealSecret1" not in blob
     assert mif.VAULT_REDACTED_BODY in blob
 
 

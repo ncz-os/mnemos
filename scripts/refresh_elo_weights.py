@@ -34,19 +34,18 @@ logger = logging.getLogger("refresh_elo_weights")
 def main() -> int:
     parser = argparse.ArgumentParser(description="Refresh GRAEAE provider weights from Arena.ai Elo leaderboard")
     parser.add_argument("--force", action="store_true", help="Bypass cache and fetch fresh data")
-    parser.parse_args()
+    args = parser.parse_args()
 
-    from mnemos.domain.graeae.elo_sync import _REGISTRY_PATH, fetch_elo_weights, save_weights
+    from mnemos.core.config import get_settings
+    from mnemos.domain.graeae.elo_sync import get_elo_weights
 
     logger.info("=== Arena.ai Elo weight refresh ===")
-    logger.info(f"Registry path: {_REGISTRY_PATH}")
+    logger.info("Registry path: %s", get_settings().graeae.elo_registry.expanduser())
 
-    weights = fetch_elo_weights()
+    weights = get_elo_weights(force_refresh=args.force)
     if not weights:
         logger.error("Fetch failed — weights unchanged. Check logs for details.")
         return 1
-
-    save_weights(weights)
 
     logger.info("Provider weights after refresh:")
     for provider, w in sorted(weights.items(), key=lambda x: -x[1]):

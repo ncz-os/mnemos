@@ -111,6 +111,15 @@ jobs:
       # into ./wheelhouse for Dockerfile.everything. They are pure-Python
       # (setuptools) so --no-deps wheel builds need no native toolchain and the
       # same wheel is arch-independent for both target platforms.
+      #
+      # Reproducibility: tagged releases must pin the add-on source to a
+      # known SHA, NOT the mutable ``main`` branch. ``.github/addons.lock.json``
+      # records one commit id per overlay; the CI checks them out detached
+      # and records the resolved SHA in ``addon-provenance.txt`` so the
+      # docker build can stamp it into OCI image labels (one per overlay).
+      # Operator workflow: bump a SHA in addons.lock.json + tag ``vX.Y.Z``
+      # and the image published at that tag is exactly the add-on source
+      # pinned in the lock -- never ``main``, never the branch tip.
       - name: Stage add-on wheels
         env:
           ADDON_GIT_TOKEN: ${{ secrets.ADDON_GIT_TOKEN }}
@@ -121,20 +130,56 @@ jobs:
           if [ -n "${ADDON_GIT_TOKEN:-}" ]; then
             base="https://oauth2:${ADDON_GIT_TOKEN}@gitlab.com/ncz-os"
           fi
-          declare -A refs=(
-            [pantheon]="${ADDON_REF}"
-            [knemon]="${ADDON_REF}"
-            [graeae]="${ADDON_REF}"
-            [charon]="${ADDON_REF}"
-          )
+
+          # Resolve the SHA each overlay should be pinned to. For tagged
+          # releases we use .github/addons.lock.json so the published image
+          # is reproducible from a known commit. For non-tagged (dev)
+          # pushes we fall back to ``${ADDON_REF}`` so contributors can
+          # iterate without editing the lock on every change.
+          is_tag="${GITHUB_REF_TYPE:-}"
+          if [ "${is_tag}" = "tag" ] && [ -f .github/addons.lock.json ]; then
+            LOCK="$(jq -c '.' .github/addons.lock.json)"
+            echo "── pinning add-on wheels to .github/addons.lock.json ──"
+          elif [ "${is_tag}" = "tag" ]; then
+            # A version tag must NEVER build overlays from a mutable ref:
+            # the tag is the reproducibility contract. If the lock file is
+            # missing (tag cut before it was committed, or deleted), refuse
+            # to publish rather than silently shipping the branch tip under
+            # a version tag.
+            echo "::error::tagged release is missing .github/addons.lock.json; refusing to build add-on wheels from the mutable \`${ADDON_REF}\` ref for a version tag."
+            exit 1
+          else
+            LOCK=""
+            echo "── not a tag push; using ADDON_REF=${ADDON_REF} (mutable) ──"
+          fi
+
           for name in pantheon knemon graeae charon; do
-            echo "::group::wheel ${name}@${refs[$name]}"
-            git clone --depth 1 --branch "${refs[$name]}" "${base}/${name}.git" "src-${name}"
-            ( cd "src-${name}" && echo "${name} $(git rev-parse HEAD)" >> "${GITHUB_WORKSPACE}/addon-provenance.txt" )
-            python -m pip wheel --no-deps --no-build-isolation --wheel-dir wheelhouse "./src-${name}"
-            echo "::endgroup::"
+             if [ -n "${LOCK}" ]; then
+               pin="$(echo "${LOCK}" | jq -r --arg k "${name}" '.[$k] // empty')"
+               if [ -z "${pin}" ] || [ "${pin}" = "null" ]; then
+                 echo "::error::.github/addons.lock.json has no entry for ${name}; refusing to ship a v*.*.* tag without a per-overlay SHA pin."
+                 exit 1
+               fi
+               # Fetch the pinned SHA detached so a stray branch push can
+               # never change what ships under this tag.
+               git init -q "src-${name}"
+               ( cd "src-${name}" \
+                   && git remote add origin "${base}/${name}.git" \
+                   && git fetch --depth 1 origin "${pin}" \
+                   && git checkout --quiet --detach FETCH_HEAD \
+                   && echo "${name} $(git rev-parse HEAD)" >> "${GITHUB_WORKSPACE}/addon-provenance.txt" )
+             else
+               ref="${ADDON_REF}"
+               git clone --depth 1 --branch "${ref}" "${base}/${name}.git" "src-${name}"
+               ( cd "src-${name}" && echo "${name} $(git rev-parse HEAD)" >> "${GITHUB_WORKSPACE}/addon-provenance.txt" )
+             fi
+             echo "::group::wheel ${name}"
+             python -m pip wheel --no-deps --no-build-isolation --wheel-dir wheelhouse "./src-${name}"
+             echo "::endgroup::"
           done
           echo "── staged wheels ──"; ls -1 wheelhouse
+          echo "── addon provenance (one SHA per overlay) ──"
+          cat addon-provenance.txt
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -156,6 +201,24 @@ jobs:
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
+      # Translate ``addon-provenance.txt`` (one ``overlay SHA`` line per
+      # add-on) into per-overlay OCI image labels so the published image
+      # records the exact commit each overlay was built from. Without
+      # this, a ``v1.2.3`` tag could not be reproduced and a downstream
+      # consumer has no way to tell whether a given image was built
+      # from main or from a pinned commit.
+      - id: addon-labels
+        run: |
+          set -euo pipefail
+          {
+            echo "labels<<EOF"
+            while read -r name sha; do
+              [ -z "${name:-}" ] && continue
+              echo "org.opencontainers.image.source.${name}=${sha}"
+            done < addon-provenance.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - id: build
         uses: docker/build-push-action@v5
         with:
@@ -167,7 +230,9 @@ jobs:
             MNEMOS_CORE_IMAGE=${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core@${{ needs.core.outputs.digest }}
             MNEMOS_CORE_REF=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            ${{ steps.addon-labels.outputs.labels }}
           cache-from: type=gha,scope=mnemos-everything
           cache-to: type=gha,mode=max,scope=mnemos-everything
           provenance: true

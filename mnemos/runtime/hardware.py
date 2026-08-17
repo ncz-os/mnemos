@@ -15,7 +15,7 @@ falls back to CPU AND ships ~1 GB of unused binary weight.
 
 This module classifies what KIND of accelerator is present so the
 compression / embedding paths can request the matching runtime
-extra (`mnemos-os[gpu]`, `[phi]`, `[ml]`) without making torch a
+extra (`mnemos-core[gpu]`, `[phi]`, `[ml]`) without making torch a
 hard dependency.
 
 The detection is *pure stdlib* — no torch, no nvidia-ml-py, no
@@ -139,7 +139,7 @@ def has_nvidia_tegra() -> bool:
 def has_intel_igpu() -> bool:
     """True iff an Intel integrated GPU is present.
 
-    Intel iGPUs are the OpenVINO target — `mnemos-os[phi]` extra.
+    Intel iGPUs are the OpenVINO target — `mnemos-core[phi]` extra.
     Detection: lspci-grep on Linux, ``system_profiler`` on macOS
     (Intel Macs), Windows WMI is out of scope (no fleet host runs
     native Windows mnemos; WSL2 path uses the Linux probe).
@@ -278,11 +278,11 @@ def cli_doctor() -> int:
     display_extra = "semantic" if profile.suggested_extra == "ml" else profile.suggested_extra
     print(f"Suggested semantic runtime extra: [{display_extra}]")
     if profile.suggested_extra == "ml":
-        print("  → pip install 'mnemos-os[semantic]'  (fastembed, CPU, ~20 MB)")
+        print("  → pip install 'mnemos-core[semantic]'  (fastembed, CPU, ~20 MB)")
     elif profile.suggested_extra == "gpu":
-        print("  → pip install 'mnemos-os[gpu]'  (fastembed-gpu, NVIDIA CUDA EP)")
+        print("  → pip install 'mnemos-core[gpu]'  (fastembed-gpu, NVIDIA CUDA EP)")
     elif profile.suggested_extra == "phi":
-        print("  → pip install 'mnemos-os[phi]'  (OpenVINO + fastembed, Intel iGPU)")
+        print("  → pip install 'mnemos-core[phi]'  (OpenVINO + fastembed, Intel iGPU)")
     _print_optional_extras()
     return 0
 

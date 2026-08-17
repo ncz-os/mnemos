@@ -65,6 +65,14 @@ UPDATE deletion_requests
 RETURNING id
 """
 
+_REQUEUE_CONFIRMED_SQL = """
+UPDATE deletion_requests
+   SET status = 'confirmed'
+ WHERE id = $1
+   AND status = 'sweep_verifying'
+RETURNING id
+"""
+
 _MARK_HARD_DELETED_SQL = """
 UPDATE deletion_requests
    SET status = 'hard_deleted',
@@ -405,6 +413,62 @@ _HARD_DELETE_SQL: tuple[tuple[str, str, str], ...] = (
            AND deleted_at IS NOT NULL
         """,
     ),
+    # Identity / credential tables. These do NOT carry an ``owner_id`` /
+    # ``namespace`` / ``deleted_at`` triple like the memory graph does, so the
+    # WHERE clauses differ. The whole point of GDPR erasure is that subject-
+    # owned identity data (email, raw OAuth claims, IP addresses, user
+    # agents, active credentials) must not outlive the request -- leaving
+    # these rows means a hard-deleted user could still authenticate, get
+    # contacted by their old email, or have their raw claims recovered
+    # later. api_keys is revoked AND deleted (so any in-flight auth check
+    # that raced past this DELETE still sees ``revoked = TRUE``).
+    (
+        "api_keys",
+        "api_keys",
+        """
+        UPDATE api_keys
+           SET revoked = TRUE,
+               last_used = NULL
+         WHERE user_id = $1
+        """,
+    ),
+    (
+        "oauth_sessions",
+        "oauth_sessions",
+        """
+        DELETE FROM oauth_sessions
+         WHERE user_id = $1
+        """,
+    ),
+    (
+        "oauth_identities",
+        "oauth_identities",
+        """
+        DELETE FROM oauth_identities
+         WHERE user_id = $1
+        """,
+    ),
+    (
+        "user_groups",
+        "user_groups",
+        """
+        DELETE FROM user_groups
+         WHERE user_id = $1
+        """,
+    ),
+    # The user row itself is only removed on an all-namespace deletion. For
+    # a per-namespace deletion the same logical user may own data in other
+    # namespaces, so removing the row would orphan those references and
+    # break auth for the surviving namespaces.
+    (
+        "users",
+        "users",
+        """
+        DELETE FROM users
+         WHERE id = $1
+           AND $2::text IS NULL
+        """,
+    ),
 )
 
 _RESTORE_OWNER_NAMESPACE_SQL: tuple[tuple[str, str, str], ...] = tuple(
@@ -562,6 +626,52 @@ _LIVE_ROW_COUNT_SQL: tuple[tuple[str, str], ...] = (
          WHERE al.deleted_at IS NULL
         """,
     ),
+    # Identity / credential tables -- must also verify zero live rows before
+    # marking a request hard_deleted, otherwise an all-namespace request could
+    # leave raw OAuth claims / active sessions / unrevoked API keys behind
+    # (audit trail for incomplete erasure).
+    (
+        "api_keys",
+        """
+        SELECT COUNT(*)
+          FROM api_keys
+         WHERE user_id = $1
+           AND NOT revoked
+        """,
+    ),
+    (
+        "oauth_sessions",
+        """
+        SELECT COUNT(*)
+          FROM oauth_sessions
+         WHERE user_id = $1
+        """,
+    ),
+    (
+        "oauth_identities",
+        """
+        SELECT COUNT(*)
+          FROM oauth_identities
+         WHERE user_id = $1
+        """,
+    ),
+    (
+        "user_groups",
+        """
+        SELECT COUNT(*)
+          FROM user_groups
+         WHERE user_id = $1
+        """,
+    ),
+    (
+        "users",
+        """
+        SELECT COUNT(*)
+          FROM users
+         WHERE id = $1
+           AND $2::text IS NULL
+        """,
+    ),
 )
 
 
@@ -600,7 +710,11 @@ async def invalidate_deletion_scope_caches(
     target_user_id: str,
     target_namespace: str | None,
 ) -> None:
-    """Evict cached search/stat responses that may include this target."""
+    """Evict cached search/stat responses that may include this target.
+
+    Also bumps the visibility epoch so in-flight search writes land under
+    the old epoch (orphaned) rather than leaking stale visibility.
+    """
     import mnemos.core.lifecycle as _lc
 
     if not _lc._cache:
@@ -620,6 +734,10 @@ async def invalidate_deletion_scope_caches(
             target_namespace,
             exc_info=True,
         )
+    try:
+        await _lc._vis_epoch_get_incr()  # bump; errors silently
+    except Exception:
+        pass
 
 
 async def count_live_target_rows(
@@ -635,6 +753,44 @@ async def count_live_target_rows(
 
 def _has_live_rows(counts: dict[str, int]) -> bool:
     return any(count > 0 for count in counts.values())
+
+
+async def resweep_and_verify_target(
+    conn: Any,
+    target_user_id: str,
+    target_namespace: str | None,
+    *,
+    verify_attempts: int = DEFAULT_VERIFY_ATTEMPTS,
+    invalidate_cache: bool = False,
+) -> dict[str, int]:
+    """Re-run the soft-delete sweep + zero-live-row verify loop on the
+    deletion scope before the request is allowed to transition to
+    ``hard_deleted``.
+
+    The 30-day grace window gives writes time to land on the scope
+    after the first sweep. Without this resweep, rows committed between
+    the soft-delete phase and the hard-delete phase (a memory the user
+    added on day 7 of grace, for example) would be skipped by the
+    hard-delete -- it only removes rows already carrying
+    ``deleted_at IS NOT NULL`` -- and the request would be marked
+    complete while those rows survived forever. ``verify_attempts``
+    mirrors the soft-delete phase retry budget so a long-running writer
+    cannot starve the worker indefinitely.
+    """
+    last_remaining: dict[str, int] = {}
+    for _ in range(max(1, verify_attempts)):
+        await soft_delete_target(
+            conn,
+            target_user_id,
+            target_namespace,
+            invalidate_cache=invalidate_cache,
+        )
+        last_remaining = await count_live_target_rows(
+            conn, target_user_id, target_namespace
+        )
+        if not _has_live_rows(last_remaining):
+            return last_remaining
+    return last_remaining
 
 
 async def soft_delete_target(
@@ -709,6 +865,20 @@ async def process_one_deletion_request(pool: Any) -> DeletionRequestResult | Non
     transition share one transaction. A mid-flight exception aborts
     everything, leaving the request in ``confirmed`` for retry.
     """
+    if hasattr(pool, "transactional") and not hasattr(pool, "acquire"):
+        from mnemos.persistence.worker_lifecycle import process_one_deletion_request as process_backend
+
+        payload = await process_backend(
+            pool,
+            verify_attempts=DEFAULT_VERIFY_ATTEMPTS,
+            restore_days=RESTORE_GRACE_DAYS,
+        )
+        if payload is None:
+            return None
+        result = DeletionRequestResult(**payload)
+        await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
+        return result
+
     result: DeletionRequestResult | None = None
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -775,11 +945,16 @@ async def process_one_deletion_request(pool: Any) -> DeletionRequestResult | Non
                     counts[label] = counts.get(label, 0) + count
 
             if result is None:
+                requeued = await conn.fetchrow(_REQUEUE_CONFIRMED_SQL, request["id"])
+                if requeued is None:
+                    raise RuntimeError(
+                        f"deletion request {request['id']} disappeared before retry transition"
+                    )
                 result = DeletionRequestResult(
                     request_id=str(request["id"]),
                     target_user_id=request["target_user_id"],
                     target_namespace=request["target_namespace"],
-                    status="sweep_verifying",
+                    status="confirmed",
                     row_counts=counts,
                     soft_deleted_at=None,
                     restore_by=None,
@@ -797,6 +972,26 @@ async def hard_delete_soft_deleted_request(
     *,
     invalidate_cache: bool = True,
 ) -> DeletionRequestResult:
+    # Re-sweep before the irreversible delete. The 30-day grace window
+    # lets writes land on the scope after the soft-delete phase; without
+    # this fence, those rows would not carry ``deleted_at IS NOT NULL``
+    # when ``hard_delete_target`` runs and would be skipped forever,
+    # while the request is still marked ``hard_deleted`` -- so a memory
+    # added on day 7 of grace would survive past completion. The
+    # resweep/verify loop applies the soft-delete sweep one more time
+    # and refuses to advance the request if any live rows remain.
+    remaining = await resweep_and_verify_target(
+        conn,
+        request["target_user_id"],
+        request["target_namespace"],
+        verify_attempts=DEFAULT_VERIFY_ATTEMPTS,
+        invalidate_cache=False,
+    )
+    if _has_live_rows(remaining):
+        raise RuntimeError(
+            f"refusing to mark deletion request {request['id']} hard_deleted: "
+            f"{remaining} live rows still on scope after resweep+verify"
+        )
     counts = await hard_delete_target(
         conn,
         request["target_user_id"],
@@ -808,6 +1003,19 @@ async def hard_delete_soft_deleted_request(
         source=["deletion_request_worker", str(request["id"])],
         invalidate_cache=False,
     )
+    # Final zero-live-row check covers the identity tables too -- the
+    # hard-delete target ran with ``deleted_at IS NOT NULL`` semantics
+    # only for the memory-graph rows; api_keys / oauth_sessions /
+    # oauth_identities / user_groups / users have no such column and
+    # are removed by separate statements that always run.
+    final_remaining = await count_live_target_rows(
+        conn, request["target_user_id"], request["target_namespace"]
+    )
+    if _has_live_rows(final_remaining):
+        raise RuntimeError(
+            f"refusing to mark deletion request {request['id']} hard_deleted: "
+            f"hard-delete left live rows on scope: {final_remaining}"
+        )
     marked = await conn.fetchrow(_MARK_HARD_DELETED_SQL, request["id"])
     if marked is None:
         raise RuntimeError(
@@ -822,6 +1030,7 @@ async def hard_delete_soft_deleted_request(
         soft_deleted_at=marked["soft_deleted_at"],
         restore_by=marked["restore_by"],
         hard_deleted_at=marked["hard_deleted_at"],
+        remaining_counts=final_remaining,
     )
     if invalidate_cache:
         await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
@@ -830,6 +1039,18 @@ async def hard_delete_soft_deleted_request(
 
 async def process_one_hard_deletion_request(pool: Any) -> DeletionRequestResult | None:
     """Hard-delete one expired soft-deleted request under SKIP LOCKED."""
+    if hasattr(pool, "transactional") and not hasattr(pool, "acquire"):
+        from mnemos.persistence.worker_lifecycle import (
+            process_one_hard_deletion_request as process_backend,
+        )
+
+        payload = await process_backend(pool)
+        if payload is None:
+            return None
+        result = DeletionRequestResult(**payload)
+        await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
+        return result
+
     result: DeletionRequestResult | None = None
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -912,6 +1133,9 @@ async def deletion_request_worker_loop(
     batch_size: int = DEFAULT_BATCH_SIZE,
     check_interval_seconds: float = DEFAULT_CHECK_INTERVAL_SECONDS,
     phase: str = "soft_delete",
+    on_started: Any = None,
+    on_success: Any = None,
+    on_error: Any = None,
 ) -> None:
     """Perpetual lifecycle worker loop."""
     if phase not in {"soft_delete", "hard_delete"}:
@@ -921,14 +1145,20 @@ async def deletion_request_worker_loop(
         if phase == "hard_delete"
         else process_deletion_requests
     )
+    if on_started is not None:
+        on_started()
     while True:
         try:
             counts = await process_batch(pool, batch_size=batch_size)
+            if on_success is not None:
+                on_success()
             if counts:
                 logger.info("deletion request worker phase=%s batch: %s", phase, counts)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            if on_error is not None:
+                on_error(exc)
             logger.exception("deletion request worker phase=%s batch failed", phase)
         await asyncio.sleep(check_interval_seconds)
 

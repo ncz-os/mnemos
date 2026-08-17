@@ -62,6 +62,9 @@ class HealthResponse(BaseModel):
     version: str
     profile: str = "edge"
     distillation_worker: Optional[str] = None  # idle, healthy, error, disabled, unavailable
+    deletion_request_worker: Optional[str] = None
+    hard_deletion_request_worker: Optional[str] = None
+    persephone_archival_worker: Optional[str] = None
     nats_publishing_enabled: bool = False
     persistence_backend: Optional[str] = None
     persistence_capabilities: List[str] = Field(default_factory=list)

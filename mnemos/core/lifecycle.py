@@ -18,12 +18,27 @@ from typing import Any, Optional, Protocol
 from urllib.parse import urlparse
 
 import asyncpg
-import redis.asyncio as aioredis
 from fastapi import HTTPException
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from mnemos.core.config import PG_CONFIG, db2_dsn_env, get_settings, oracle_dsn_env, required_capabilities_env
 from mnemos.core.pool import PoolManager
+
+# Redis still backs optional API response/search caches. Keep the import guarded
+# so deployments without the extra degrade cleanly and tests can monkeypatch it.
+try:
+    import aioredis as _aioredis  # type: ignore[import-not-found]
+
+    aioredis = _aioredis
+    del _aioredis
+except ImportError:
+    # Dummy module-like object for test monkeypatching
+    class _FakeAioredis:
+        @staticmethod
+        def from_url(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[no-untyped-def]
+            raise RuntimeError("aioredis not available")
+
+    aioredis = _FakeAioredis()  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +65,8 @@ WEBHOOK_SHUTDOWN_DRAIN_SECONDS = float(get_settings().webhook.shutdown_drain_sec
 _worker_status: dict = {
     "distillation_worker": "idle",  # idle, healthy, error
     "deletion_request_worker": "idle",
+    "hard_deletion_request_worker": "idle",
+    "persephone_archival_worker": "idle",
     "last_heartbeat": None,
 }
 
@@ -267,8 +284,7 @@ async def _drain_delivery_attempt_tasks() -> None:
 _pool: Optional[asyncpg.Pool] = None
 _pool_manager: Optional[PoolManager] = None
 _persistence_backend: PersistenceBackend | None = None
-_cache: Optional[aioredis.Redis] = None
-_redis_client: Optional[aioredis.Redis] = None
+_cache: Optional[Any] = None
 _rls_enabled: bool = False  # set from config at startup; read by handlers
 
 
@@ -397,7 +413,7 @@ def _database_dsn_from_settings(settings) -> str:
         return ""
     for field_name in ("dsn", "url"):
         database_url = getattr(database_settings, field_name, "").strip()
-        if database_url.startswith(("postgres:", "postgresql:")):
+        if database_url.startswith(("postgres:", "postgresql:")) or "=" in database_url:
             return database_url
     return ""
 
@@ -677,17 +693,16 @@ def _peer_url_looks_same_lan(url: str) -> bool:
 
 
 def _warn_if_multi_worker_without_redis(settings) -> None:
-    """Warn when multi-worker mode is using per-process resilience state."""
-    workers = getattr(settings.server, "workers", 1)
-    storage_uri = settings.rate_limit.storage_uri.strip().lower()
-    if workers > 1 and storage_uri == "memory://":
-        logger.warning(
-            "MNEMOS is starting with workers=%d and RATE_LIMIT_STORAGE_URI=memory://; "
-            "multi-worker without Redis will produce drift in rate limit and "
-            "circuit breaker state. Set RATE_LIMIT_STORAGE_URI=redis://host:6379/1 "
-            "for shared state.",
-            workers,
-        )
+    """Warn when multiple workers are configured without a shared state backend."""
+    workers = getattr(getattr(settings, "server", None), "workers", 1)
+    if workers > 1:
+        storage_uri = getattr(getattr(settings, "rate_limit", None), "storage_uri", "")
+        is_redis = storage_uri.startswith("redis://") if storage_uri else False
+        if not is_redis:
+            logger.warning(
+                "multi-worker without Redis will produce drift: "
+                "rate limit and circuit breaker state will not be shared across workers"
+            )
 
 
 async def _log_federation_startup_guidance(pool: asyncpg.Pool | None) -> None:
@@ -719,12 +734,25 @@ async def _log_federation_startup_guidance(pool: asyncpg.Pool | None) -> None:
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, and workers."""
-    global _pool, _pool_manager, _persistence_backend, _cache, _redis_client, _rls_enabled, _worker_status
+    global _pool, _pool_manager, _persistence_backend, _cache, _rls_enabled, _worker_status
+
+    # Before anything is initialized or any port is served: refuse to come up as
+    # an unauthenticated, network-reachable API. `mnemos serve` validates its own
+    # bind and records it; a direct uvicorn/gunicorn launch (which is how the
+    # published images start) leaves no record, so the bind is treated as
+    # reachable and the check fails closed.
+    from mnemos.core import network_guard
+
+    _bind_refusal = network_guard.refusal_reason(
+        network_guard.validated_bind_host(), "the MNEMOS API"
+    )
+    if _bind_refusal is not None:
+        raise RuntimeError(_bind_refusal)
+
     logger.info("Starting MNEMOS API Server v3.0.0 (gateway + sessions + DAG + workers)")
 
     config = _load_config()
     settings = get_settings()
-    _warn_if_multi_worker_without_redis(settings)
 
     backend_type = _select_persistence_backend(settings)
     try:
@@ -854,36 +882,35 @@ async def lifespan(app):
     # Layered-install fail-fast (GRAEAE de8f4b2b): refuse to start if an enabled
     # feature layer (graeae/hive) needs a capability this backend lacks. See
     # docs/LAYERED_INSTALL.md. core is always supported; default flags = all on.
-    from mnemos.persistence.base import assert_backend_supports_layers
+    from mnemos.persistence.base import assert_backend_supports_layers, backend_supported_layers
 
-    assert_backend_supports_layers(_persistence_backend, settings.layers.active_layers)
+    _active_layers = set(settings.layers.active_layers)
+    if settings.layers.strict_layers:
+        assert_backend_supports_layers(_persistence_backend, _active_layers)
+    else:
+        # The layer flags default to on, so a backend that cannot serve one of
+        # them (MySQL/MariaDB have no 'consultations' capability, which GRAEAE
+        # requires) would otherwise fail EVERY start with the documented
+        # configuration. strict_layers is the setting that asks for that hard
+        # failure; without it, drop the unsupported layers loudly and serve what
+        # the backend can actually do.
+        _unsupported = _active_layers - backend_supported_layers(_persistence_backend)
+        if _unsupported:
+            logger.error(
+                "persistence backend %r cannot serve enabled layer(s) %s; disabling them for "
+                "this process. Those features will be unavailable. Choose a backend that "
+                "implements them, or set MNEMOS_STRICT_LAYERS=1 to refuse startup instead.",
+                type(_persistence_backend).__name__,
+                sorted(_unsupported),
+            )
+            for _layer in _unsupported:
+                _flag = f"enable_{_layer}"
+                if hasattr(settings.layers, _flag):
+                    object.__setattr__(settings.layers, _flag, False)
 
     # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
     if _auth_configurer is not None:
         _auth_configurer(None)
-
-    if settings.rate_limit.storage_uri.startswith(("redis://", "rediss://")):
-        try:
-            _redis_client = aioredis.from_url(settings.rate_limit.storage_uri, decode_responses=True)
-            await _redis_client.ping()
-            app.state.redis_client = _redis_client
-            logger.info("Redis resilience client connected (%s)", settings.rate_limit.storage_uri)
-        except Exception as e:
-            logger.warning(
-                "Redis resilience backend unavailable at %s; "
-                "GRAEAE will fall back to in-process resilience primitives: %s",
-                settings.rate_limit.storage_uri,
-                e,
-            )
-            if _redis_client is not None:
-                close = getattr(_redis_client, "aclose", None)
-                if callable(close):
-                    await close()
-            _redis_client = None
-            app.state.redis_client = None
-    else:
-        _redis_client = None
-        app.state.redis_client = None
 
     # Refresh GRAEAE provider manifest from model_registry in the background
     # so startup doesn't block on per-provider HTTP probes (each can take up
@@ -936,23 +963,36 @@ async def lifespan(app):
     # Start registered background workers. API owns registrations so core stays
     # below API/domain/webhook/worker packages in the dependency graph.
     worker_enabled = config.get("worker", {}).get("enabled", True)
+    if not worker_enabled:
+        _worker_status["distillation_worker"] = "disabled"
     scheduled_workers = 0
-    if _pool:
+    worker_handle = _pool if _pool is not None else _persistence_backend
+    if worker_handle is not None:
         for worker_name, (factory, honor_worker_enabled) in _lifespan_worker_factories.items():
+            if _pool is None and worker_name not in {
+                "deletion_request_worker",
+                "hard_deletion_request_worker",
+                "persephone archival worker",
+            }:
+                continue
             if honor_worker_enabled and not worker_enabled:
                 logger.info("%s disabled", worker_name)
                 if worker_name == "distillation_worker":
                     _worker_status["distillation_worker"] = "disabled"
                 if worker_name == "deletion_request_worker":
                     _worker_status["deletion_request_worker"] = "disabled"
+                if worker_name == "hard_deletion_request_worker":
+                    _worker_status["hard_deletion_request_worker"] = "disabled"
                 continue
-            worker_coro = factory(_pool)
+            worker_coro = factory(worker_handle)
             if worker_coro is None:
                 logger.info("%s disabled", worker_name)
                 if worker_name == "distillation_worker":
                     _worker_status["distillation_worker"] = "disabled"
                 if worker_name == "deletion_request_worker":
                     _worker_status["deletion_request_worker"] = "disabled"
+                if worker_name == "hard_deletion_request_worker":
+                    _worker_status["hard_deletion_request_worker"] = "disabled"
                 continue
             logger.info("Launching %s", worker_name)
             _schedule_worker(worker_coro)
@@ -1036,10 +1076,6 @@ async def lifespan(app):
     _persistence_backend = None
     _pool = None
     _pool_manager = None
-    if _redis_client:
-        await _redis_client.aclose()
-        logger.info("Redis resilience client closed")
-    _redis_client = None
     if _cache:
         await _cache.aclose()
         logger.info("Redis cache closed")
@@ -1091,9 +1127,87 @@ def get_persistence_backend() -> PersistenceBackend:
     return _persistence_backend
 
 
-def get_redis_client() -> Optional[aioredis.Redis]:
-    """Return the lifecycle-owned Redis client for cross-worker resilience."""
-    return _redis_client
+# ── Visibility epoch ────────────────────────────────────────────────────────
+#
+# Monotonic counter bumped on every visibility-narrowing mutation (delete,
+# archive, permission tighten, ACL revoke). Search-cache keys embed the value
+# read at request start, so an in-flight write landing after a bump is stored
+# under the old epoch -- orphaned, never read. That is what closes the
+# write-after-invalidate (TOCTOU) window.
+#
+# MERGE RESOLUTION (2026-07-30): this counter arrived on Redis INCR, and the
+# NATS migration removes Redis from this module. Those two changes were each
+# correct alone and could not both hold as written. Rather than pick a side, the
+# counter moves to NATS JetStream KV alongside the other resilience primitives.
+# Call sites are unchanged; only the substrate is.
+#
+# JetStream KV has no atomic counter, so the bump is a compare-and-swap retry
+# loop (see NatsVisibilityEpoch). On an unreachable store it degrades to a
+# coarse time bucket rather than a constant: a frozen epoch stops rotating
+# cache keys, which silently re-opens the exact window this closes.
+
+_vis_epoch_impl: Any | None = None
+
+
+def _vis_epoch() -> Any:
+    """Lazily build the shared epoch counter.
+
+    Constructed on first use, not at import, so importing this module does not
+    open a NATS connection and tests can substitute their own.
+    """
+    global _vis_epoch_impl
+    if _vis_epoch_impl is None:
+        from mnemos.core.resilience import NatsVisibilityEpoch  # noqa: PLC0415
+
+        _vis_epoch_impl = NatsVisibilityEpoch(None, settings=get_settings())
+    return _vis_epoch_impl
+
+
+# Callbacks fired when the visibility epoch advances.
+#
+# A REGISTRY, not an import. The obvious version imported
+# mnemos.mcp.http directly, but that module validates MNEMOS_MCP_TOKEN at
+# import time and calls sys.exit when it is unset -- and SystemExit derives
+# from BaseException, so a routine `except Exception` around the import would
+# NOT have caught it. Every visibility-narrowing mutation on a host without
+# that variable would have killed the process.
+#
+# Optional surfaces register themselves instead; core imports nothing.
+_vis_epoch_listeners: list[Any] = []
+
+
+def register_visibility_epoch_listener(fn: Any) -> None:
+    """Register a callback invoked with the new epoch after every bump."""
+    if fn not in _vis_epoch_listeners:
+        _vis_epoch_listeners.append(fn)
+
+
+def _notify_visibility_epoch(epoch: int) -> None:
+    for fn in list(_vis_epoch_listeners):
+        try:
+            fn(epoch)
+        except Exception:
+            # A listener must never break the mutation that triggered it.
+            logger.debug("[epoch] listener failed", exc_info=True)
+
+
+async def _vis_epoch_get_incr() -> int:
+    """Bump the epoch and return the new value.
+
+    Also drops the MCP principal-context cache. That cache holds `role` and
+    `namespace` -- authorization inputs -- for five minutes with nothing else
+    invalidating it, so an ACL revoke was honoured late there even once the
+    search cache was fixed. Every caller of this function is performing a
+    visibility-narrowing mutation, which is exactly when that cache is wrong.
+    """
+    epoch = await _vis_epoch().bump()
+    _notify_visibility_epoch(epoch)
+    return epoch
+
+
+async def _vis_epoch_current() -> int:
+    """Read the current epoch without bumping it."""
+    return await _vis_epoch().current()
 
 
 async def _get_embedding(text: str) -> list:

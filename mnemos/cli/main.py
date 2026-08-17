@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import json
+import logging
 import sys
 from contextlib import contextmanager
 from enum import Enum
@@ -14,6 +15,8 @@ import httpx
 import typer
 
 from mnemos.core.config import get_settings, set_profile_override
+
+logger = logging.getLogger(__name__)
 
 
 def _patch_typer_click_compat() -> None:
@@ -629,6 +632,37 @@ def _apply_profile_flag(profile: Optional[DeploymentProfile]) -> None:
     set_profile_override(profile.value)
 
 
+from mnemos.core import network_guard
+
+#: Re-exported for callers and tests that already import these from the CLI.
+UNSAFE_NETWORK_BIND_ENV = network_guard.UNSAFE_NETWORK_BIND_ENV
+_is_loopback_bind = network_guard.is_loopback_bind
+
+
+def _refuse_unauthenticated_network_bind(host: str, what: str) -> None:
+    """Abort startup if an unauthenticated API would be reachable off-host.
+
+    Thin wrapper over :mod:`mnemos.core.network_guard`, which holds the actual
+    policy so the ASGI app enforces the same rule when it is started without
+    this CLI (as the published container images do).
+    """
+    auth_enabled = bool(getattr(getattr(get_settings(), "auth", None), "enabled", False))
+    reason = network_guard.refusal_reason(host, what, auth_enabled=auth_enabled)
+    if reason is not None:
+        raise typer.BadParameter(reason)
+    if not network_guard.is_loopback_bind(host) and not auth_enabled:
+        logger.warning(
+            "%s is binding %s with authentication DISABLED because %s is set. "
+            "Every client that can reach this port has root-equivalent access.",
+            what,
+            host,
+            network_guard.UNSAFE_NETWORK_BIND_ENV,
+        )
+    # Hand the validated decision to the app process we are about to start, so
+    # its own startup check knows the bind address was actually inspected.
+    network_guard.record_validated_bind(host)
+
+
 def _adapter_source_args(import_from: ImportSource, source: Path) -> list[str]:
     source_text = str(source)
 
@@ -682,6 +716,7 @@ def serve(
 
     import uvicorn
 
+    _refuse_unauthenticated_network_bind(host, "mnemos serve")
     worker_count = workers if workers is not None else get_settings().server.workers
     uvicorn.run("mnemos.api.main:app", host=host, port=port, workers=worker_count)
 

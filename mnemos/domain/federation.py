@@ -164,6 +164,10 @@ class FederationSchemaTransient(FederationSchemaError):
     next worker tick can retry. → HTTP 503."""
 
 
+class FederationSyncError(Exception):
+    """A peer feed failed after schema preflight and the failure was recorded."""
+
+
 async def _check_peer_schema(
     base_url: str,
     auth_token: str,
@@ -325,10 +329,10 @@ def _local_migrations_fingerprint() -> str:
         means querying information_schema (or a migration ledger
         table) at /schema-serving time, which is more expensive and
         scoped for the "core fields + extensions" contract work.
-      - The hash includes only db/migrations*.sql — handler-level
-        contract changes (new endpoints, payload shape changes) are
-        not captured here; mnemos_version + schema_signature carry
-        that signal.
+      - The hash includes every deployed SQL migration, including numbered and
+        backend-specific directories. Handler-level contract changes (new
+        endpoints, payload shape changes) are not captured here;
+        mnemos_version + schema_signature carry that signal.
     """
     global _MIGRATIONS_FINGERPRINT_CACHE
     if _MIGRATIONS_FINGERPRINT_CACHE is not None:
@@ -341,8 +345,9 @@ def _local_migrations_fingerprint() -> str:
         _MIGRATIONS_FINGERPRINT_CACHE = ""
         return ""
     h = hashlib.sha256()
-    for p in sorted(db_dir.glob("migrations*.sql")):
-        h.update(p.name.encode("utf-8"))
+    for p in sorted(db_dir.rglob("*.sql"), key=lambda path: path.relative_to(db_dir).as_posix()):
+        relative_name = p.relative_to(db_dir).as_posix()
+        h.update(relative_name.encode("utf-8"))
         h.update(b"\0")
         try:
             h.update(p.read_bytes())
@@ -398,12 +403,33 @@ async def sync_peer(
         peer_version = schema_resp["mnemos_version"]
         peer_signature = schema_resp["schema_signature"]
         peer_fingerprint = schema_resp.get("migrations_fingerprint")
-        sig_match = peer_signature == local_signature
+        # Compatibility is decided on the MAJOR version, not major.minor.
+        # Requiring an exact major.minor match meant a 6.0 peer refused a 6.1
+        # peer outright, so every rolling upgrade broke federation across the
+        # whole fleet until an operator hand-set compat_mode=permissive on each
+        # peer. Minor releases are backwards compatible by our own versioning
+        # contract, so same-major peers federate by default; a major difference
+        # still aborts.
+        peer_major = peer_signature.split(".")[0] if peer_signature else ""
+        local_major = local_signature.split(".")[0]
+        same_minor = peer_signature == local_signature
+        sig_match = bool(peer_major) and peer_major == local_major
         if not sig_match:
             schema_abort_reason = (
                 f"schema mismatch: peer={peer_signature} ({peer_version}) local={local_signature} ({_local_v})"
             )
             schema_abort_kind = "incompat"
+        elif not same_minor:
+            # Same major, different minor: the migration sets legitimately
+            # differ, so a fingerprint comparison would always "mismatch" and
+            # is meaningless here. Record the skew and proceed.
+            logger.info(
+                "federation: peer %s is %s and we are %s — same major, "
+                "syncing without a migrations-fingerprint comparison",
+                peer["name"],
+                peer_version,
+                _local_v,
+            )
         elif local_fingerprint == "":
             # We can't compute our own fingerprint (e.g. test rig
             # without a db/ directory). Falling back to signature-only
@@ -518,27 +544,38 @@ async def sync_peer(
         peer_copy_embeddings = False
 
     try:
-        while True:
-            batch, next_cursor, has_more = await _pull_batch(
-                peer["base_url"],
-                peer["auth_token"],
-                cursor_request,
-                peer["namespace_filter"],
-                peer["category_filter"],
-                copy_embeddings=peer_copy_embeddings,
+        feed_url = peer["base_url"].rstrip("/") + "/v1/federation/feed"
+        try:
+            feed_client, _ = await make_safe_client(
+                feed_url,
+                timeout=FEDERATION_HTTP_TIMEOUT,
+                allow_private=_federation_allow_private(),
             )
-            if not batch:
-                break
-            async with backend.transactional() as tx:
-                new_n, upd_n = await _store_memories(repo, tx, peer["name"], batch, backend=backend)
-            total_pulled += len(batch)
-            total_new += new_n
-            total_updated += upd_n
-            if next_cursor is not None:
-                cursor_request = next_cursor
-                cursor_persisted = next_cursor.updated
-            if not has_more:
-                break
+        except Exception as e:
+            raise RuntimeError(f"federation URL rejected (SSRF/DNS): {type(e).__name__}: {e}") from e
+        async with feed_client:
+            while True:
+                batch, next_cursor, has_more = await _pull_batch(
+                    peer["base_url"],
+                    peer["auth_token"],
+                    cursor_request,
+                    peer["namespace_filter"],
+                    peer["category_filter"],
+                    copy_embeddings=peer_copy_embeddings,
+                    client=feed_client,
+                )
+                if not batch:
+                    break
+                async with backend.transactional() as tx:
+                    new_n, upd_n = await _store_memories(repo, tx, peer["name"], batch, backend=backend)
+                total_pulled += len(batch)
+                total_new += new_n
+                total_updated += upd_n
+                if next_cursor is not None:
+                    cursor_request = next_cursor
+                    cursor_persisted = next_cursor.updated
+                if not has_more:
+                    break
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
         logger.exception("federation: pull from %s failed", peer["name"])
@@ -557,6 +594,9 @@ async def sync_peer(
             await repo.record_sync_error(tx, peer_id, err)
         else:
             await repo.record_sync_success(tx, peer_id, cursor_persisted, total_pulled)
+
+    if err:
+        raise FederationSyncError(f"federation sync with {peer['name']} failed: {err}")
 
     logger.info(
         "federation: peer=%s pulled=%d new=%d updated=%d cursor=%s",
@@ -577,6 +617,7 @@ async def _pull_batch(
     category_filter: Optional[List[str]],
     *,
     copy_embeddings: bool = False,
+    client: Any | None = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[FederationFeedCursor], bool]:
     """HTTP GET one batch. Returns (memories, next_cursor, has_more).
 
@@ -601,13 +642,15 @@ async def _pull_batch(
     headers = {"Authorization": f"Bearer {auth_token}"}
 
     # F1 (adversarial review 2026-06-28): re-validate + DNS-pin (see _check_peer_schema).
+    owns_client = client is None
+    if owns_client:
+        try:
+            client, _ = await make_safe_client(
+                url, timeout=FEDERATION_HTTP_TIMEOUT, allow_private=_federation_allow_private(),
+            )
+        except Exception as e:
+            raise RuntimeError(f"federation URL rejected (SSRF/DNS): {type(e).__name__}: {e}") from e
     try:
-        client, _ = await make_safe_client(
-            url, timeout=FEDERATION_HTTP_TIMEOUT, allow_private=_federation_allow_private(),
-        )
-    except Exception as e:
-        raise RuntimeError(f"federation URL rejected (SSRF/DNS): {type(e).__name__}: {e}") from e
-    async with client:
         r = await client.get(url, params=params, headers=headers)
         if r.status_code == 401:
             raise RuntimeError("federation auth token rejected (401)")
@@ -615,6 +658,9 @@ async def _pull_batch(
             raise RuntimeError("federation auth insufficient role (403)")
         r.raise_for_status()
         body = r.json()
+    finally:
+        if owns_client:
+            await client.aclose()
 
     memories = body.get("memories", []) or []
     next_cursor_raw = body.get("next_cursor")
@@ -678,6 +724,15 @@ async def _store_memories(
     """
     new_n = 0
     upd_n = 0
+    local_ids = [
+        f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}"
+        for mem in memories
+        if mem.get("type") != "consolidation"
+        for remote_id in [mem.get("id")]
+        if isinstance(remote_id, str) and remote_id
+    ]
+    marker_fetch = getattr(repo, "fetch_federated_memory_markers", None)
+    existing_markers = await marker_fetch(tx, local_ids) if callable(marker_fetch) else {}
     # v6.1 F-1.4: model match preflight. Skip embedding when peer's model
     # doesn't match ours — store the row content as before.
     local_embed_model: Optional[str] = None
@@ -722,7 +777,7 @@ async def _store_memories(
         remote_updated = _coerce_datetime(mem.get("updated") or mem.get("created"))
 
         # Check existing
-        existing = await repo.fetch_federated_memory_marker(tx, local_id)
+        existing = existing_markers.get(local_id)
         mutation_applied = False
         source_audit_provenance: dict[str, Any] = {}
         primary_eid = mem.get("audit_latest_entry_id")
