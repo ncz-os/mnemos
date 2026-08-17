@@ -96,10 +96,15 @@ jobs:
           provenance: true
           sbom: true
 
+      # The filename is the digest with the "sha256:" prefix stripped: artifact
+      # paths may not contain a colon. core re-adds the prefix when it builds
+      # the @-references for the manifest.
       - name: Export digest
         run: |
+          set -euo pipefail
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -150,7 +155,7 @@ jobs:
           ls -1 | sed 's/^/  leg: /'
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core@%s ' *)
+            $(printf '${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core@sha256:%s ' *)
 
       - id: manifest
         name: Resolve merged digest
