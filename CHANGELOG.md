@@ -73,6 +73,221 @@ crash-looped forever after a restart following a partial-then-recovered
 prior migration run — every retry hit `SQL0803N`/`SQLSTATE=23505` on the
 same static `INSERT` and never got past schema replay to serve traffic.
 
+## [6.1.0] — 2026-08-17
+
+59 commits since 6.0.1; 175 files, +10618/-2138.
+
+Read this first if you operate a fleet: **federation between 6.0 and 6.1 nodes
+was broken in both directions before this release**, and the fix is in 6.1. See
+"Federation" below — a 6.0 node refuses a 6.1 peer until it is upgraded, so plan
+the rollout rather than mixing versions indefinitely.
+
+### Security — an unauthenticated `mnemos serve` could bind a reachable interface
+
+With authentication disabled — the default under the edge/personal profile —
+every protected route receives a synthetic root principal. `mnemos serve`
+nevertheless defaulted `--host` to `0.0.0.0`, and both the published images and
+the quickstart compose file map that port. The documented `docker run -p
+5002:5002` therefore handed full administrative access to any client that could
+reach the port: read/write/delete of every memory, root-only administration,
+provider spend, and federation and webhook state.
+
+Startup now fails closed on exactly that combination (unauthenticated **and**
+bound off-host). Loopback binds are unaffected; an authenticated service on
+`0.0.0.0` is unaffected. A deliberately open port on a trusted network is still
+possible via `MNEMOS_ALLOW_UNAUTHENTICATED_NETWORK_BIND=1`, named to be
+uncomfortable to type. The guard is enforced in the application, not only in the
+CLI, so importing the app directly cannot bypass it.
+
+### Security — MCP served authorization decisions from a stale cache
+
+`MCPUserContext` carries `role` and `namespace` — authorization inputs — and was
+held for 300 seconds with nothing invalidating it on an ACL change. Narrowing a
+principal's role, or revoking a key, kept being honoured over MCP for up to five
+minutes after the change committed. The principal-context cache is now
+invalidated when visibility narrows, and revoked MCP keys fail closed.
+
+All four cache-backed reads were audited: the search cache was already
+epoch-keyed, `stats:global:v2` holds no per-principal data, and the decay table
+is not visibility-dependent. The MCP principal context was the one that leaked.
+
+### Security — the secret-detection denylist is stored as digests
+
+The denylist itself contained the plaintext values it was meant to detect.
+
+### Federation — three defects that together stopped the fleet replicating
+
+The fleet had not moved a memory since 2026-05-23. Three independent defects
+compounded, and two of them failed silently.
+
+**Compatibility is now decided on the MAJOR version.** The gate compared
+`major.minor` for exact equality, so a 6.0 node refused a 6.1 node outright and
+every rolling minor upgrade broke federation until an operator hand-set
+`compat_mode=permissive` on each peer. Minor releases are backwards compatible
+by our own versioning contract. Cross-minor peers also skip the
+migrations-fingerprint comparison, which legitimately differs between minors; a
+major difference still aborts, and an unreadable peer signature is treated as
+unverifiable rather than implicitly compatible.
+
+**The feed defaults to the trusted-LAN full-corpus scope.** `create_memory`
+writes `permission_mode` 600 and the world-read gate requires `% 10 >= 4`, so
+the feed offered nothing at all. Peers reported `{"pulled": 0}` — successfully,
+and with no error anywhere — which is why this went unnoticed for months. Set
+`federation_feed_include_private=false` for offsite federation, where the
+narrow scope is the correct default.
+
+**LAN peers are registrable.** `FEDERATION_ALLOW_PRIVATE` and
+`FEDERATION_ALLOW_INSECURE` defaulted false, so a private fleet could not
+register its own peers. Both now default true for LAN installs; set them false
+for offsite federation.
+
+The SSRF guard was split rather than loosened while doing this. Link-local
+(cloud instance metadata), multicast, reserved and unspecified addresses are
+blocked on every network regardless of the flag; RFC1918 and loopback are what
+the flag gates. A DNS name that resolves to 169.254.169.254 is still refused
+with the flag on.
+
+### Fixed — hard deletion was broken on SQLite, the default backend
+
+The GDPR resweep called the `soft_delete_target` / `count_live_target_rows`
+primitives, which bind asyncpg-style (`$1` placeholders, variadic params). On
+aiosqlite that raised `TypeError: Connection.execute() takes from 2 to 3
+positional arguments but 4 were given`, so no hard deletion could ever complete
+on the backend the published images use by default. It now calls the
+backend-neutral `_soft_delete` / `_scope_counts` pair, which is what its own
+docstring already described.
+
+### Fixed — Oracle: a fresh 6.1 install could not complete its migrations
+
+Against `oracle/database:23.26.1-ee` — the version the fleet runs — a fresh
+schema aborted at `0050_lifecycle_workers.sql`:
+
+```
+ALTER TABLE deletion_requests MODIFY (memory_id NULL)
+ORA-01451: column to be modified to NULL cannot be modified to NULL
+```
+
+Oracle rejects a nullability change that is already satisfied, where Postgres
+accepts `DROP NOT NULL` idempotently. Provisioning failed outright, and this
+would have run against the production primary that a Data Guard standby
+replicates from. `ORA-01451`/`ORA-01442` are now benign on replay for `ALTER`
+statements — including when the statement begins with SQL comments, which
+defeated the first attempt at this fix because the leading `--` lines meant the
+statement never matched `startswith("ALTER ")`.
+
+### Fixed — migrations are replayable
+
+Migrations carry no applied-state table: the ordered SQL list is re-run on every
+start, so every statement must be idempotent. Three were not, and each raised
+"already exists" against a real 6.0.1 database — two `CREATE INDEX` and one
+`ADD CONSTRAINT`. The consequence was not cosmetic: psql aborts the surrounding
+transaction on error, so every remaining statement in that file was skipped,
+silently, and differently depending on how far a previous run had got.
+
+### Fixed — an unreachable rate-limit store returned 500 on every route
+
+`Dockerfile.core` sets `MNEMOS_PROFILE=server`, which resolves
+`rate_limit.storage_uri` to `redis://localhost:6379/1`, but the single-container
+image ships no Redis. Every request then raised `ConnectionError` inside
+SlowAPI's limit check, which routes exceptions to the registered handler;
+that handler read `exc.detail`, an attribute only `RateLimitExceeded` carries.
+The result was `AttributeError` and **HTTP 500 on every route, `/health`
+included**, on a container that otherwise reported "Application startup
+complete".
+
+Rate limiting is a protective measure: losing its store now degrades to
+"unlimited" and logs loudly, never to "the API is broken". The image also
+defaults to `memory://`. Genuine limit violations still return 429.
+
+### Fixed — the GRAEAE consultation audit chain never verified
+
+Three components disagreed. The writers hashed
+`sha256(prev + prompt_hash + response_hash)`; the verifier computed an HMAC over
+eight ordered fields; and `fetch_audit_chain` did not even SELECT four of those
+fields. The verifier therefore hashed `None` for half its inputs and rejected
+every row ever written. The hashing now lives in `mnemos/core/audit_chain.py`,
+shared by the writers and the verifier, is signed with the algorithm the
+verifier actually checks, and is versioned. The Oracle writer was ported to the
+keyed v2 chain.
+
+### Fixed — assorted correctness
+
+- **Postgres** advertises the `supports_webhooks` capability flag it implements.
+- **MySQL/MariaDB** no longer fail every start over a single unsupported layer.
+- **Hive bus** default corrected to the real bus host.
+
+### Resilience — NATS
+
+- Circuit-breaker failure counts reset on success, so a recovered endpoint stops
+  being treated as failing.
+- Concurrency-slot leases are renewed while a call is in flight, instead of
+  expiring under a long call.
+- The visibility epoch moved from a Redis `INCR` to NATS JetStream KV.
+- Degradation now enforces real limits rather than nominal ones.
+
+### Performance
+
+- **Bulk create** batches embeddings and commits in a single transaction.
+- **Webhook delivery** batches inserts and publishes to NATS post-commit.
+- **CHARON** route surface can be declined, so small hosts do not pay for it.
+- **openvino** dropped from the `full` extra; it is a large dependency that most
+  installs do not use.
+
+### Architecture and hygiene
+
+- **Layering is enforced and clean**: all 7 import-linter contracts pass.
+  `persistence` no longer imports `domain` (the archive record format moved down
+  to `mnemos/persistence/archive_format.py`) and no longer imports `workers`
+  (the deletion primitives and the SQL they sweep moved down to
+  `mnemos/persistence/deletion_ops.py`, which is where connection-level SQL
+  belongs).
+- **env-discipline restored**: all process-environment access routes through
+  `core.config`.
+- **ruff** rule families are selected explicitly rather than inherited.
+
+### Platform
+
+- Verified building and serving on **native aarch64** (CIX Sky1): the image
+  builds, the container reports healthy, and `/health` returns 200.
+- Containers are the only distribution; native single-binary builds were dropped.
+- `release:linux-aarch64` runs on the TYDEUS arm64 runner and is restricted to
+  tags.
+- CI no longer caches `.venv`, which was causing intermittent
+  missing-dependency failures.
+
+### Testing
+
+The unit suite is green: **3194 passed, 87 skipped, 0 failed**.
+
+Two classes of reported failure turned out not to be product defects, which is
+worth recording because both misled triage:
+
+- Eight needed `nats-py`, which the local environment lacked and CI installs.
+- Five came from a stale test helper that branched on
+  `asyncio.iscoroutinefunction(conn.execute)`. The SQLite backend moved to
+  aiosqlite, whose `execute` is not a coroutine function — it returns an
+  awaitable `Result`. The check reported False, every INSERT took the
+  synchronous branch and was dropped un-awaited, and the lookups under test
+  then correctly found no rows.
+
+CI also now installs the `persephone` extra. Without it pytest hit a collection
+error and aborted the entire run, reporting "7 skipped, 1 error" while 3000+
+tests never executed — a single missing pure-Python dependency was hiding the
+whole suite.
+
+### Known issues at this release
+
+- **CHARON `/v1/export` is Postgres-only.** On Oracle and Db2 it returns 503
+  `"Database pool not available"`, which reads as a transient outage but is
+  actually by-design unsupported — the route uses raw asyncpg SQL. An
+  Oracle-backed host cannot be backed up through the native export path; use
+  Data Pump.
+- **`test:multi-worker` is advisory** (`allow_failure: true`) and had never
+  actually run before this release — it sits behind the lint stage and was
+  skipped on every recent pipeline. Its first real run failed on a
+  container-recreate race, now fixed; the smoke has not yet been observed
+  passing end to end.
+
 ## [6.0.1] — 2026-07-10
 
 ### Fixed — `_LlamaCppBackend` embeddings missing L2-normalization
