@@ -28,7 +28,6 @@ when the value itself looks secret-grade, otherwise REDACT.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
