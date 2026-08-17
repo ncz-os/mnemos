@@ -50,11 +50,10 @@ async def _claim_sql(dialect: str, *, hard: bool) -> str:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("dialect", ["oracle", "db2"])
 @pytest.mark.parametrize("hard", [False, True], ids=["soft", "hard"])
-async def test_oracle_family_locks_the_table_not_a_view(dialect, hard):
+async def test_oracle_locks_the_table_not_a_view(hard):
     """FOR UPDATE must apply to the base table, never to a ROWNUM view."""
-    sql = await _claim_sql(dialect, hard=hard)
+    sql = await _claim_sql("oracle", hard=hard)
     lock_at = sql.index("FOR UPDATE")
     prefix = sql[:lock_at]
     assert prefix.count("(") == prefix.count(")"), (
@@ -67,10 +66,9 @@ async def test_oracle_family_locks_the_table_not_a_view(dialect, hard):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("dialect", ["oracle", "db2"])
-async def test_oracle_family_never_emits_the_ora_02014_shapes(dialect):
+async def test_oracle_never_emits_the_ora_02014_shapes():
     """The two constructs Oracle refuses to lock through."""
-    sql = await _claim_sql(dialect, hard=False)
+    sql = await _claim_sql("oracle", hard=False)
     assert "FETCH FIRST" not in sql.upper(), "FETCH FIRST + FOR UPDATE is ORA-02014"
     tail = sql[sql.index("FOR UPDATE") :]
     assert "ROWNUM" not in tail.upper()
@@ -108,3 +106,33 @@ async def test_placeholder_count_survives_the_rewrite():
     """
     assert (await _claim_sql("oracle", hard=True)).count("?") == 1
     assert (await _claim_sql("oracle", hard=False)).count("?") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hard", [False, True], ids=["soft", "hard"])
+async def test_db2_uses_native_sql_not_oracle_compatibility(hard):
+    """Db2 must not depend on DB2_COMPATIBILITY_VECTOR=ORA.
+
+    ROWNUM exists on Db2 only under the Oracle-compatibility vector, which is
+    an instance-wide setting a Db2 deployment is not obliged to enable. The
+    fleet's Db2 12.1.5 happens to have it on, so the shared Oracle branch
+    appeared to work there -- it would have failed on a stock instance.
+
+    Verified against Db2 Community Edition 12.1.5: this statement is accepted,
+    and it uses no Oracle-compatibility construct.
+    """
+    sql = await _claim_sql("db2", hard=hard)
+    assert "ROWNUM" not in sql.upper(), (
+        "ROWNUM is Oracle-compatibility-only on Db2: " + sql
+    )
+    assert "FETCH FIRST 1 ROWS ONLY" in sql, "Db2 limits rows with FETCH FIRST"
+    assert "SKIP LOCKED DATA" in sql, "workers must step over each other's rows"
+    assert "KEEP UPDATE LOCKS" in sql, (
+        "the row must be update-locked at read time, or two workers race to the UPDATE"
+    )
+
+
+@pytest.mark.asyncio
+async def test_db2_and_oracle_no_longer_share_a_statement():
+    """They diverged deliberately; a future edit must not re-merge them."""
+    assert await _claim_sql("db2", hard=False) != await _claim_sql("oracle", hard=False)

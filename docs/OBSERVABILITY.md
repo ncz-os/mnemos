@@ -90,7 +90,7 @@ Drop to 10s only if you're actively debugging a latency spike.
 
 ## 3. The shipped metrics
 
-As of v6.1.0 the stable metric surface is:
+As of v6.1.1 the stable metric surface is:
 
 ### 3.1 HTTP request rate
 
@@ -354,4 +354,4 @@ versions.
 
 ---
 
-*v1.0 — 2026-05-08. Tracks MNEMOS server v6.1.0*
+*v1.0 — 2026-05-08. Tracks MNEMOS server v6.1.1*
