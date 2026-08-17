@@ -896,8 +896,22 @@ class _FederationSettings(BaseSettings):
         default_factory=list,
         validation_alias="MNEMOS_FEDERATION_NATS_PEERS",
     )
-    allow_insecure: bool = Field(False, validation_alias="FEDERATION_ALLOW_INSECURE")
-    allow_private: bool = Field(False, validation_alias="FEDERATION_ALLOW_PRIVATE")
+    # LAN federation is the deployed posture: peers are hosts you control on a
+    # private network with no public route. Both of these defaulted to False,
+    # which made that posture impossible -- peer registration runs the webhook
+    # SSRF guard, so an RFC1918 base_url was refused outright with "url host
+    # resolves to a non-routable address", and an http:// peer was refused for
+    # not being https. A fleet could not register its own peers.
+    #
+    # Set BOTH to false for OFFSITE federation, or any peering with parties or
+    # networks you do not control. allow_insecure=false additionally matters
+    # there because the peer auth token travels in clear over http://.
+    #
+    # These do NOT weaken the guard that matters on any network: cloud
+    # instance-metadata hosts (169.254.169.254, metadata.google.internal, ...)
+    # are refused unconditionally in net_validation, before this flag is read.
+    allow_insecure: bool = Field(True, validation_alias="FEDERATION_ALLOW_INSECURE")
+    allow_private: bool = Field(True, validation_alias="FEDERATION_ALLOW_PRIVATE")
     # When set, federation NATS receivers join a JetStream queue group
     # under a SHARED durable consumer per (peer, subject) instead of
     # their default single-replica per-(peer, subject) durable. JetStream

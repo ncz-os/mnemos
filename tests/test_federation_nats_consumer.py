@@ -6,6 +6,7 @@ import asyncio
 import json
 import pytest
 
+from mnemos.core.config import get_settings
 from mnemos.core import config
 from mnemos.domain import federation as federation_domain
 from mnemos.federation import nats_consumer as consumer
@@ -435,7 +436,13 @@ async def test_pull_memory_by_id_uses_explicit_endpoint(monkeypatch):
             {"Authorization": "Bearer feed-token"},
             # F1: make_safe_client is called with timeout + allow_private (the
             # latter gates whether private/loopback targets are permitted).
-            {"timeout": federation_domain.FEDERATION_HTTP_TIMEOUT, "allow_private": False},
+            # The value tracks the federation setting rather than a literal, so
+            # this stays honest under either posture: trusted-LAN (the default)
+            # or offsite, where the operator sets FEDERATION_ALLOW_PRIVATE=0.
+            {
+                "timeout": federation_domain.FEDERATION_HTTP_TIMEOUT,
+                "allow_private": get_settings().federation.allow_private,
+            },
         )
     ]
 

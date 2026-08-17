@@ -42,16 +42,35 @@ class ValidatedWebhookURL:
     resolved_ip: str
 
 
+def _is_never_allowed_ip(ip: _IPAddress) -> bool:
+    """Addresses that are never a legitimate target, on any network.
+
+    Link-local covers the cloud instance-metadata endpoints (169.254.169.254,
+    fe80::a9fe:a9fe); multicast, reserved and unspecified are not hosts you can
+    federate with. These stay blocked even when private addressing is allowed,
+    because "I trust my LAN" is not a reason to let a *hostname* resolve into
+    the metadata service.
+
+    Kept separate from `_is_private_ip` so relaxing private addressing cannot
+    silently relax this class too: a DNS name resolving to 169.254.169.254 is
+    caught here regardless of the allow-private flag, which is exactly the
+    rebinding path that a literal-string blocklist misses.
+    """
+    return ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+
+
+def _is_private_ip(ip: _IPAddress) -> bool:
+    """RFC1918 / loopback: not routable publicly, but a normal LAN peer.
+
+    Blocked by default; permitted when the caller opts in (trusted-LAN
+    federation, local webhook testing).
+    """
+    return ip.is_loopback or ip.is_private
+
+
 def _is_blocked_ip(ip: _IPAddress) -> bool:
-    """SSRF defense: block loopback, private, link-local, multicast, reserved."""
-    return (
-        ip.is_loopback
-        or ip.is_private
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    )
+    """Back-compat: the full strict predicate (both classes)."""
+    return _is_never_allowed_ip(ip) or _is_private_ip(ip)
 
 
 async def _resolve_addrs(host: str) -> List[str]:
@@ -93,7 +112,7 @@ async def validate_webhook_url(
 
     try:
         ip = ipaddress.ip_address(host)
-        if not allow_private_hosts and _is_blocked_ip(ip):
+        if _is_never_allowed_ip(ip) or (not allow_private_hosts and _is_private_ip(ip)):
             raise HTTPException(status_code=422, detail="url host resolves to a non-routable address")
         return ValidatedWebhookURL(
             url=url,
@@ -124,7 +143,7 @@ async def validate_webhook_url(
             ip = ipaddress.ip_address(addr)
         except ValueError:
             continue
-        if not allow_private_hosts and _is_blocked_ip(ip):
+        if _is_never_allowed_ip(ip) or (not allow_private_hosts and _is_private_ip(ip)):
             raise HTTPException(status_code=422, detail="url host resolves to a non-routable address")
         if first_validated_addr is None:
             first_validated_addr = str(ip)
