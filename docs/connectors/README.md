@@ -360,7 +360,7 @@ to it, we ship the fix as a PR. That's the contract.
 
 While `experimental`:
 
-- Endpoints under `/admin/tunnels/*` are **not implemented as of v6.0.1**;
+- Endpoints under `/admin/tunnels/*` are **not implemented as of v6.1.0**;
   the `mnemos-tunnel-setup` script that calls them is aspirational. They
   may be implemented, renamed, restructured, or withdrawn in any minor
   release. The manual `mnemos serve mcp-http` + ngrok path documented in

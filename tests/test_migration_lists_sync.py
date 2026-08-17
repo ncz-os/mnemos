@@ -85,6 +85,7 @@ EXPECTED_MIGRATIONS = [
     "0039_knemon_dispatch_rule_refresh.sql",
     "0039_subscription_plan_current_limits.sql",
     "0043_memory_acl.sql",
+    "0048_memory_versions_visibility.sql",
 ]
 
 EXPECTED_SQLITE_MIGRATIONS = [
@@ -126,6 +127,7 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "migrations_v3_5_session_compression_ratio_drop.sql",
     "migrations_v3_5_session_compression_legacy_drop.sql",
     "migrations_v3_5_sessions_consultations_namespace.sql",
+    "migrations_v4_2_deletion_requests.sql",
     "migrations_v4_2_compression_candidates_reject_reason.sql",
     "migrations_v4_2_morpheus_consolidate_sqlite.sql",
     "migrations_v4_2_morpheus_extract_sqlite.sql",
@@ -140,9 +142,11 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "migrations_v5_3_4_mcp_audit_log_sqlite.sql",
     "migrations_v6_2_audit_chain_sqlite.sql",
     "migrations_v6_2_category_decay_sqlite.sql",
+    "migrations_v6_3_api_keys_last_used_sqlite.sql",
     "0038_oauth_sessions_consultations.sql",
     "0039_subscription_plan_current_limits.sql",
     "0043_memory_acl.sql",
+    "0048_memory_versions_visibility.sql",
 ]
 
 

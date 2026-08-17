@@ -7,11 +7,13 @@ import pytest
 
 from mnemos.persistence.base import (
     ALL_CAPABILITIES,
+    CONSULTATIONS_CAPABILITY,
     CORE_CAPABILITY,
     FEDERATION_CAPABILITY,
     STATE_CAPABILITY,
     CorePersistence,
 )
+from mnemos.persistence.mariadb import MariadbBackend
 from mnemos.persistence.mysql import MysqlBackend, MysqlMemoryRepository
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
@@ -76,6 +78,42 @@ async def test_mysql_backend_advertises_implemented_capabilities_and_pings():
     assert backend.capabilities != set(ALL_CAPABILITIES)
     assert isinstance(backend, CorePersistence)
     assert await backend.ping() is True
+
+
+async def test_mysql_and_mariadb_omit_consultations_capability():
+    """MySQL/MariaDB do not implement the GRAEAE ``consultations``
+    capability. Pin this so a future change adding the capability
+    cannot silently re-enable GRAEAE on those backends without first
+    wiring the consultations repository.
+
+    The documented MySQL/MariaDB deployment commands rely on this
+    contract: with the default GRAEAE-on flag, the lifecycle logs a
+    warning and disables the unsupported layer rather than refusing
+    to start (see test_unsupported_layers_are_disabled_rather_than_blocking_startup
+    in test_layered_install.py). Operators who want GRAEAE on MySQL
+    need a backend that advertises consultations.
+    """
+    cursor = MagicMock()
+    cursor.execute = AsyncMock()
+    cursor.fetchone = AsyncMock(return_value=(1,))
+    conn = MagicMock()
+    conn.cursor = MagicMock(return_value=_AsyncCursorContext(cursor))
+    mysql = MysqlBackend(_FakePool(conn), SimpleNamespace(database=SimpleNamespace(embedding_dim=3)))
+    mariadb = MariadbBackend(_FakePool(conn), SimpleNamespace(database=SimpleNamespace(embedding_dim=3)))
+
+    assert CONSULTATIONS_CAPABILITY not in mysql.capabilities
+    assert CONSULTATIONS_CAPABILITY not in mariadb.capabilities
+
+
+async def test_mysql_open_propagates_schema_provisioning_failure():
+    cursor = MagicMock()
+    cursor.execute = AsyncMock(side_effect=RuntimeError("ddl denied"))
+    conn = MagicMock()
+    conn.cursor = MagicMock(return_value=_AsyncCursorContext(cursor))
+    backend = MysqlBackend(_FakePool(conn), SimpleNamespace(database=SimpleNamespace(embedding_dim=3)))
+
+    with pytest.raises(RuntimeError, match="ddl denied"):
+        await backend.open()
 
 
 async def test_mysql_semantic_search_without_recency_uses_visibility_params_once():

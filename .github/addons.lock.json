@@ -1,0 +1,18 @@
+{
+  "_comment": [
+    "Per-overlay SHA lock for the release-images workflow.",
+    "Each entry pins the git commit that the corresponding add-on wheel",
+    "is built from at release time. The CI fetches and checks these",
+    "SHAs out detached (so a stray branch push can never change what",
+    "ships under a given tag) and records the resolved SHA in OCI image",
+    "labels as org.opencontainers.image.source.<overlay>.",
+    "",
+    "To bump an add-on: replace the SHA with the desired commit id and",
+    "open a PR. Tagging vX.Y.Z then publishes wheels built from exactly",
+    "the SHA recorded here -- the resulting image label is reproducible."
+  ],
+  "pantheon": "0000000000000000000000000000000000000000",
+  "knemon": "0000000000000000000000000000000000000000",
+  "graeae": "0000000000000000000000000000000000000000",
+  "charon": "0000000000000000000000000000000000000000"
+}

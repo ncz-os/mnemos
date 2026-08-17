@@ -58,6 +58,11 @@ ALTER TABLE user_groups ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAU
 -- more. RLS combines SELECT policies with OR, so this purely widens read
 -- visibility to rows the caller has been granted; it cannot expose a row the
 -- caller was not granted. Only the read bit (4) is honored for SELECT.
+--
+-- The literal `4` here MUST stay in sync with
+-- ``mnemos.core.visibility.ACL_READ_BIT``. SQL migrations cannot import
+-- Python constants, so the value is duplicated and locked by
+-- tests/test_version_acl_visibility.py::test_version_predicate_read_bit_uses_acl_read_bit_constant.
 -- ---------------------------------------------------------------------------
 DO $$ BEGIN
     CREATE POLICY mnemos_acl_select ON memories

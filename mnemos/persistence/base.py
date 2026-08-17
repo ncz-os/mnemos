@@ -805,6 +805,39 @@ class OAuthRepository(ABC):
     @abstractmethod
     async def get_identity_for_session(self, tx: Transaction, session_id: str) -> Row | None: ...
 
+    @abstractmethod
+    async def lookup_api_key(
+        self, tx: Transaction, key_hash: str
+    ) -> Row | None:
+        """Resolve an API key to its user context (role/namespace/groups).
+
+        Returns a backend-neutral Row carrying ``id``, ``user_id``,
+        ``revoked``, ``role``, ``namespace``, and ``group_ids`` (list of
+        group ids). Returns ``None`` when no key matches the hash or the
+        key has been revoked. Implementations must NOT raise on missing
+        rows — the auth path turns ``None`` into a 401.
+        """
+
+    @abstractmethod
+    async def touch_api_key(self, tx: Transaction, key_id: Any) -> None:
+        """Bump the ``last_used`` timestamp on the given api_keys row."""
+
+    @abstractmethod
+    async def resolve_active_session(
+        self, tx: Transaction, session_id: str, *, now: Any
+    ) -> Row | None:
+        """Resolve an oauth_sessions row, validate it is still active.
+
+        Returns the row carrying ``user_id`` and ``identity_id`` for
+        valid, non-revoked, non-expired sessions, and updates
+        ``last_used_at`` as a side effect (matching the previous
+        asyncpg path's behaviour). Returns ``None`` for unknown,
+        revoked, or expired sessions. ``now`` is the backend's
+        "current timestamp" sentinel — implementations substitute their
+        native ``NOW()`` / ``CURRENT_TIMESTAMP`` / sysdate literal so
+        the same caller code works on every backend.
+        """
+
 
 class SessionsRepository(ABC):
     """Stateful chat session persistence."""
@@ -1124,6 +1157,22 @@ class FederationRepository(ABC):
 
     @abstractmethod
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None: ...
+
+    async def fetch_federated_memory_markers(
+        self,
+        tx: Transaction,
+        local_ids: Sequence[str],
+    ) -> dict[str, Row]:
+        """Fetch page markers, with a compatibility fallback for backends.
+
+        Backends with a native set-membership query should override this.
+        """
+        markers: dict[str, Row] = {}
+        for local_id in local_ids:
+            row = await self.fetch_federated_memory_marker(tx, local_id)
+            if row is not None:
+                markers[local_id] = row
+        return markers
 
     @abstractmethod
     async def insert_federated_memory(

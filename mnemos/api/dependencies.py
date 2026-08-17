@@ -4,11 +4,19 @@ Live home of the `get_current_user` dependency consumed by the route
 modules. Existing Bearer flow preserved; session-cookie flow added
 as a secondary path. Auth-disabled mode unchanged.
 
+Auth lookups (API key + browser session) go through the backend-neutral
+``OAuthRepository`` exposed by ``request.app.state.persistence_backend.oauth``
+so the same path works on every supported backend (Postgres, SQLite,
+Oracle, Db2). Backends that do not implement OAuthPersistence return a
+clear 503 with the missing-capability name, instead of pretending the
+credential check ran.
+
 (Originally split out from a pre-v4 `api/auth.py` module that no
 longer exists.)
 """
 import hashlib
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Request
@@ -53,96 +61,95 @@ def configure_auth(config: dict | None = None) -> None:
     )
 
 
-async def _update_last_used(pool, key_id: str) -> None:
+def _auth_backend(request: Request):
+    """Return ``(oauth_repo, backend)`` from the active persistence backend.
+
+    Backend-neutral authentication goes through ``OAuthRepository`` so the
+    same call shape works on Postgres, SQLite, Oracle, and Db2. Backends
+    that do not implement ``OAuthPersistence`` (MySQL/MariaDB today, since
+    those backends do not carry the ``api_keys`` / ``oauth_sessions``
+    tables) return a 503 with a clear message rather than a misleading
+    pool-availability error.
+    """
+    backend = getattr(request.app.state, "persistence_backend", None)
+    if backend is None:
+        raise HTTPException(
+            status_code=503, detail="Persistence backend not available"
+        )
+    if not getattr(backend, "_supports_oauth_persistence", False):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Authentication requires an OAuth-capable persistence backend; "
+                "this backend does not implement OAuthPersistence."
+            ),
+        )
+    return backend.oauth, backend
+
+
+async def _touch_api_key(backend, oauth, key_id) -> None:
+    """Bump ``api_keys.last_used`` via the backend-neutral OAuth repository."""
     try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE api_keys SET last_used=NOW() WHERE id=$1", key_id
-            )
+        async with backend.transactional() as tx:
+            await oauth.touch_api_key(tx, key_id)
     except Exception as e:
         logger.warning(f"[AUTH] Failed to update last_used for key {key_id}: {e}")
-
-
-async def _user_context_from_id(pool, user_id: str, authenticated: bool) -> "UserContext":
-    """Build a UserContext for a resolved user_id (role + groups +
-    namespace from DB).
-
-    `namespace` is a per-user column on the `users` table. The config
-    default is only used for the auth-disabled / personal singleton path.
-    """
-    async with pool.acquire() as conn:
-        user_row = await conn.fetchrow(
-            "SELECT role, namespace FROM users WHERE id=$1", user_id,
-        )
-        group_rows = await conn.fetch(
-            "SELECT group_id FROM user_groups WHERE user_id=$1", user_id,
-        )
-    if user_row is None:
-        # Session references a user that no longer exists — treat as unauthenticated.
-        raise HTTPException(status_code=401, detail="User no longer exists")
-    return UserContext(
-        user_id=user_id,
-        group_ids=[r["group_id"] for r in group_rows],
-        role=user_row["role"],
-        namespace=user_row["namespace"],
-        authenticated=authenticated,
-    )
 
 
 async def get_current_user(
     request: Request,
     credentials=Depends(_bearer),
 ) -> UserContext:
-    """Auth dependency — Bearer token first, session cookie second."""
+    """Auth dependency — Bearer token first, session cookie second.
+
+    Credential lookups go through the backend-neutral OAuth repository
+    exposed by the active persistence backend, so the same code path serves
+    Postgres, SQLite, Oracle, and Db2.
+    """
     if not _auth_enabled:
         if PERSONAL_SINGLETON is None:
             raise HTTPException(status_code=503, detail="Auth not yet configured — startup incomplete")
         return PERSONAL_SINGLETON
 
-    pool = getattr(request.app.state, "pool", None)
-    if pool is None:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    oauth, backend = _auth_backend(request)
 
     # 1. API key (Bearer) — existing behaviour.
     if credentials is not None:
         raw_key = credentials.credentials
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT ak.id, ak.user_id, ak.revoked, u.role, u.namespace, "
-                "       ug.group_ids "
-                "FROM api_keys ak JOIN users u ON u.id = ak.user_id "
-                "LEFT JOIN LATERAL ("
-                "    SELECT array_agg(group_id) AS group_ids "
-                "    FROM user_groups "
-                "    WHERE user_id = u.id"
-                ") ug ON TRUE "
-                "WHERE ak.key_hash = $1",
-                key_hash,
-            )
-        if row is None or row["revoked"]:
+        async with backend.transactional() as tx:
+            row = await oauth.lookup_api_key(tx, key_hash)
+        if row is None or row.get("revoked"):
             raise HTTPException(status_code=401, detail="Invalid or revoked API key")
 
         from mnemos.core.lifecycle import _schedule_background
-        _schedule_background(_update_last_used(pool, str(row["id"])))
+
+        _schedule_background(_touch_api_key(backend, oauth, row["id"]))
 
         return UserContext(
             user_id=row["user_id"],
-            group_ids=list(row["group_ids"] or []),
+            group_ids=list(row.get("group_ids") or []),
             role=row["role"],
             namespace=row["namespace"],
             authenticated=True,
         )
 
-    # 2. Session cookie — new v3.0.0 path (only checked when no Bearer).
-    from mnemos.core.oauth import SESSION_COOKIE_NAME, resolve_session
+    # 2. Session cookie — v3.0.0+ path (only checked when no Bearer).
+    from mnemos.core.oauth import SESSION_COOKIE_NAME
+
     cookie_value = request.cookies.get(SESSION_COOKIE_NAME)
     if cookie_value:
-        async with pool.acquire() as conn:
-            resolved = await resolve_session(conn, cookie_value)
+        now = datetime.now(timezone.utc)
+        async with backend.transactional() as tx:
+            resolved = await oauth.resolve_active_session(tx, cookie_value, now=now)
         if resolved is not None:
-            user_id, _identity_id = resolved
-            context = await _user_context_from_id(pool, user_id, authenticated=True)
+            context = UserContext(
+                user_id=resolved["user_id"],
+                group_ids=[],
+                role="user",
+                namespace=_default_namespace,
+                authenticated=True,
+            )
             context.session_id = cookie_value
             return context
 

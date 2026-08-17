@@ -34,7 +34,11 @@ async def sqlite_backend(tmp_path, monkeypatch):
     async def _empty_embedding(_text):
         return None
 
+    async def _empty_embeddings_batch(texts):
+        return [None for _text in texts]
+
     monkeypatch.setattr(memories, "_get_embedding", _empty_embedding)
+    monkeypatch.setattr(memories, "_get_embeddings_batch", _empty_embeddings_batch)
     monkeypatch.setattr(memories, "_publish_nats_with_timeout", _noop_async)
     monkeypatch.setattr(memories, "_invalidate_caches_after_mutation", _noop_async)
     monkeypatch.setattr(memories, "_schedule_outbox_deliveries", lambda _ids: None)
@@ -229,7 +233,9 @@ async def test_bulk_create_writes_verifiable_audit_chain_entries(sqlite_backend)
                 payload_hash=row["payload_hash"],
                 writer_id=row["writer_id"],
                 writer_pubkey=row["writer_pubkey"],
-                signed_at=row["signed_at"].isoformat() if hasattr(row["signed_at"], "isoformat") else str(row["signed_at"]),
+                signed_at=row["signed_at"].isoformat()
+                if hasattr(row["signed_at"], "isoformat")
+                else str(row["signed_at"]),
             )
             assert verify_entry(entry, row["signature"])
 
@@ -293,7 +299,9 @@ async def test_federation_real_feed_source_head_seeds_and_extends_replica_chain(
             payload_hash=first["payload_hash"],
             writer_id=first["writer_id"],
             writer_pubkey=first["writer_pubkey"],
-            signed_at=first["signed_at"].isoformat() if hasattr(first["signed_at"], "isoformat") else str(first["signed_at"]),
+            signed_at=first["signed_at"].isoformat()
+            if hasattr(first["signed_at"], "isoformat")
+            else str(first["signed_at"]),
         )
         assert first["op"] == "replicate"
         assert first["prev_entry_id"] is None
@@ -337,7 +345,9 @@ async def test_federation_real_feed_source_head_seeds_and_extends_replica_chain(
             payload_hash=second["payload_hash"],
             writer_id=second["writer_id"],
             writer_pubkey=second["writer_pubkey"],
-            signed_at=second["signed_at"].isoformat() if hasattr(second["signed_at"], "isoformat") else str(second["signed_at"]),
+            signed_at=second["signed_at"].isoformat()
+            if hasattr(second["signed_at"], "isoformat")
+            else str(second["signed_at"]),
         )
         assert verify_entry(second_entry, second["signature"])
 
@@ -510,7 +520,9 @@ async def test_no_replicate_audit_entry_on_stale_noop(sqlite_backend):
         "updated": "2026-06-14T22:00:00+00:00",
     }
     async with sqlite_backend.transactional() as tx:
-        assert await _store_memories(sqlite_backend.federation, tx, peer_name, [first_payload], backend=sqlite_backend) == (
+        assert await _store_memories(
+            sqlite_backend.federation, tx, peer_name, [first_payload], backend=sqlite_backend
+        ) == (
             1,
             0,
         )
@@ -526,7 +538,9 @@ async def test_no_replicate_audit_entry_on_stale_noop(sqlite_backend):
         "updated": "2026-06-14T21:59:00+00:00",
     }
     async with sqlite_backend.transactional() as tx:
-        assert await _store_memories(sqlite_backend.federation, tx, peer_name, [stale_payload], backend=sqlite_backend) == (
+        assert await _store_memories(
+            sqlite_backend.federation, tx, peer_name, [stale_payload], backend=sqlite_backend
+        ) == (
             0,
             0,
         )
@@ -547,7 +561,7 @@ async def test_audit_payload_hash_uses_persisted_vault_metadata_on_create_and_up
     from mnemos.core.secret_detection import VAULT_NAMESPACE
     from mnemos.persistence.visibility import VisibilityFilter
 
-    secret_text = "INFRASTRUCTURE CREDENTIALS: TYPHON root login password is ***REMOVED-CREDENTIAL***"
+    secret_text = "INFRASTRUCTURE CREDENTIALS: TYPHON root login password is DenylistSelfTest2NotReal99"
     created = await create_memory(
         MemoryCreateRequest(content=secret_text, category="infrastructure"),
         response=SimpleNamespace(status_code=201),

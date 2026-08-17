@@ -12,6 +12,17 @@ from typing import Any
 
 import pytest
 
+@pytest.fixture(autouse=True)
+def _offsite_feed_scope(monkeypatch):
+    """These tests pin the SQL shape of the OFFSITE feed scope.
+
+    The world-read gate applies only when
+    MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=0; the default is now the
+    trusted-LAN full-corpus scope, so declare the posture explicitly.
+    """
+    monkeypatch.setenv("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE", "0")
+
+
 
 class _DeterministicUUID:
     def __init__(self) -> None:
@@ -184,7 +195,33 @@ async def test_db2_consultation_fetch_available_models_native() -> None:
 
 @pytest.mark.asyncio
 async def test_db2_consultation_fetch_model_provider_native() -> None:
-    assert True
+    from mnemos.persistence.db2 import Db2ConsultationAuditRepository
+
+    calls: list[dict] = []
+
+    class _FakeCursor:
+        description = (("provider",),)
+
+        async def execute(self, sql, params=None):
+            calls.append({"sql": sql, "params": params})
+
+        async def fetchall(self):
+            return [("provider-a",)]
+
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    repo = Db2ConsultationAuditRepository()
+    provider = await repo.fetch_model_provider(SimpleNamespace(conn=_FakeConn()), "model-a")
+
+    assert provider == "provider-a"
+    assert "FETCH FIRST 1 ROW ONLY" in calls[0]["sql"].upper()
+    assert "LIMIT" not in calls[0]["sql"].upper()
+    assert calls[0]["params"] == ("model-a",)
 
 
 # ────────────────────────────────────────────────────────────────────────────

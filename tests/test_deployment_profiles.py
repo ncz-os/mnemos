@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
+import time
 
 import pytest
 from typer.testing import CliRunner
@@ -224,10 +225,14 @@ def test_cli_serve_profile_flag_overrides_env(monkeypatch: pytest.MonkeyPatch, t
         import uvicorn
 
         scoped.setattr(uvicorn, "run", fake_uvicorn_run)
-        result = runner.invoke(cli_main.app, ["serve", "--profile", "dev"])
+        # Bind loopback explicitly: this test is about the --profile override,
+        # and the dev profile leaves authentication disabled, which `serve`
+        # rightly refuses to publish on a non-loopback address.
+        result = runner.invoke(cli_main.app, ["serve", "--profile", "dev", "--host", "127.0.0.1"])
 
     assert result.exit_code == 0, result.output
     assert calls["app_path"] == "mnemos.api.main:app"
+    assert calls["host"] == "127.0.0.1"
     assert calls["profile"] == "dev"
     assert calls["workers"] == 1
     config.reload_settings()
@@ -248,6 +253,7 @@ def test_cli_install_profile_flag_forwards_to_installer(monkeypatch: pytest.Monk
 
 @pytest.mark.asyncio
 async def test_health_returns_active_profile(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from fastapi import Response
     from mnemos.api.routes import health
 
     class _PingableBackend:
@@ -261,7 +267,7 @@ async def test_health_returns_active_profile(monkeypatch: pytest.MonkeyPatch, tm
         monkeypatch.setattr(health._lc, "_persistence_backend", _PingableBackend())
         monkeypatch.setattr(health._lc, "_worker_status", {"distillation_worker": "idle"})
         monkeypatch.setattr(health, "publishing_enabled", lambda: True)
-        response = await health.health_check()
+        response = await health.health_check(Response())
 
     assert response.profile == "edge"
     assert response.database_connected is True
@@ -270,6 +276,96 @@ async def test_health_returns_active_profile(monkeypatch: pytest.MonkeyPatch, tm
     assert response.persistence_capabilities == ["core", "state"]
     assert "memory_crud" in response.persistence_capability_details
     assert "state" in response.persistence_capability_details
+
+
+@pytest.mark.asyncio
+async def test_health_degrades_when_deletion_worker_is_failing(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from fastapi import Response
+    from mnemos.api.routes import health
+
+    class _PingableBackend:
+        capabilities = {"core"}
+
+        async def ping(self) -> bool:
+            return True
+
+    with _isolated_settings(monkeypatch, tmp_path, env={"MNEMOS_PROFILE": "edge"}):
+        monkeypatch.setattr(health._lc, "_persistence_backend", _PingableBackend())
+        monkeypatch.setattr(
+            health._lc,
+            "_worker_status",
+            {
+                "distillation_worker": "healthy",
+                "deletion_request_worker": "error",
+                "persephone_archival_worker": "disabled",
+            },
+        )
+        response = await health.health_check(Response())
+
+    assert response.database_connected is True
+    assert response.deletion_request_worker == "error"
+    assert response.status == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_health_sets_503_when_critical_worker_is_failing(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from fastapi import Response
+    from mnemos.api.routes import health
+
+    class _PingableBackend:
+        capabilities = {"core"}
+
+        async def ping(self) -> bool:
+            return True
+
+    with _isolated_settings(monkeypatch, tmp_path, env={"MNEMOS_PROFILE": "edge"}):
+        monkeypatch.setattr(health._lc, "_persistence_backend", _PingableBackend())
+        monkeypatch.setattr(
+            health._lc,
+            "_worker_status",
+            {
+                "distillation_worker": "disabled",
+                "deletion_request_worker": "healthy",
+                "deletion_request_worker_last_success": time.time(),
+                "hard_deletion_request_worker": "error",
+                "persephone_archival_worker": "disabled",
+            },
+        )
+        raw_response = Response()
+        response = await health.health_check(raw_response)
+
+    assert response.status == "degraded"
+    assert raw_response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_health_degrades_when_deletion_worker_heartbeat_is_stale(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from fastapi import Response
+    from mnemos.api.routes import health
+
+    class _PingableBackend:
+        capabilities = {"core"}
+
+        async def ping(self) -> bool:
+            return True
+
+    with _isolated_settings(monkeypatch, tmp_path, env={"MNEMOS_PROFILE": "edge"}):
+        monkeypatch.setattr(health._lc, "_persistence_backend", _PingableBackend())
+        monkeypatch.setattr(
+            health._lc,
+            "_worker_status",
+            {
+                "distillation_worker": "healthy",
+                "deletion_request_worker": "healthy",
+                "deletion_request_worker_last_success": 1.0,
+                "persephone_archival_worker": "disabled",
+            },
+        )
+        response = await health.health_check(Response())
+
+    assert response.status == "degraded"
 
 
 # ─── Enterprise backend DSN detection ─────────────────────────────────────────
@@ -331,3 +427,14 @@ def test_oracle_dsn_envvar_takes_precedence_over_pg_host(monkeypatch: pytest.Mon
         # ORACLE_DSN env var should select the oracle backend even without
         # MNEMOS_DATABASE_DSN being set.
         assert lifecycle._select_persistence_backend(settings) == "oracle"
+
+
+def test_libpq_dsn_is_forwarded_to_asyncpg() -> None:
+    settings = SimpleNamespace(
+        database=SimpleNamespace(
+            dsn="host=db.internal port=6543 dbname=prod user=mnemos",
+            url="",
+        )
+    )
+
+    assert lifecycle._database_dsn_from_settings(settings) == settings.database.dsn

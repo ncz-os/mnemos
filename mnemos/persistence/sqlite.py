@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+
+from mnemos.core import audit_chain
 import inspect
 import json
 import logging
@@ -108,6 +110,7 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v3_5_session_compression_ratio_drop.sql",
     "migrations_v3_5_session_compression_legacy_drop.sql",
     "migrations_v3_5_sessions_consultations_namespace.sql",
+    "migrations_v4_2_deletion_requests.sql",
     "migrations_v4_2_compression_candidates_reject_reason.sql",
     "migrations_v4_2_morpheus_consolidate_sqlite.sql",
     "migrations_v4_2_morpheus_extract_sqlite.sql",
@@ -122,9 +125,11 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v5_3_4_mcp_audit_log_sqlite.sql",
     "migrations_v6_2_audit_chain_sqlite.sql",
     "migrations_v6_2_category_decay_sqlite.sql",
+    "migrations_v6_3_api_keys_last_used_sqlite.sql",
     "0038_oauth_sessions_consultations.sql",
     "0039_subscription_plan_current_limits.sql",
     "0043_memory_acl.sql",
+    "0048_memory_versions_visibility.sql",
 ]
 
 
@@ -144,6 +149,18 @@ def _sqlite_value(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     return value
+
+
+def _isoformat_for_compare(value: Any) -> str:
+    """Normalise a timestamp-like value to an ISO-8601 string for comparison.
+
+    SQLite stores ``expires_at`` as text, so the comparison against a
+    Python ``datetime.now(tz=UTC)`` value has to happen as ISO strings on
+    a single code path that every backend shares.
+    """
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
 
 
 def _json_text(value: Any, *, default: Any = None) -> str:
@@ -295,7 +312,28 @@ def _version_visibility_clause(
 ) -> str:
     p = f"{table_alias}." if table_alias else ""
     params.append(user.user_id)
-    return f"({p}owner_id = ? OR ({p}permission_mode % 10) >= 4)"
+    group_ids = list(user.group_ids)
+    if group_ids:
+        group_clause = f"{p}group_id IN ({_placeholders(group_ids)})"
+        params.extend(group_ids)
+    else:
+        group_clause = "0"
+    # Unlike live-memory ACL matching, versions join by memory_id, not row id.
+    principals = acl_principals(user.user_id, group_ids)
+    acl_clause = ""
+    if principals:
+        params.extend(principals)
+        acl_clause = (
+            " OR EXISTS (SELECT 1 FROM memory_acl macl "
+            f"WHERE macl.memory_id = {p}memory_id "
+            f"AND macl.principal IN ({_placeholders(principals)}) "
+            f"AND (macl.perm & {ACL_READ_BIT}) <> 0)"
+        )
+    return (
+        f"({p}owner_id = ? OR ({p}permission_mode % 10) >= 4 "
+        f"OR ((({p}permission_mode / 10) % 10) >= 4 AND {p}group_id IS NOT NULL AND {group_clause})"
+        f"{acl_clause})"
+    )
 
 
 def _sqlite_memory_cols(table_alias: str = "") -> str:
@@ -2649,6 +2687,69 @@ class SqliteOAuthRepository(_SqliteRepository, OAuthRepository):
             (session_id,),
         )
 
+    async def lookup_api_key(
+        self, tx: Transaction, key_hash: str
+    ) -> Row | None:
+        # SQLite has no array_agg, so resolve groups in a second round-trip
+        # rather than trying to emulate LATERAL.
+        conn = self._conn(tx)
+        row = await _fetch_one(
+            conn,
+            "SELECT ak.id, ak.user_id, ak.revoked, u.role, u.namespace "
+            "FROM api_keys ak JOIN users u ON u.id = ak.user_id "
+            "WHERE ak.key_hash = ?",
+            (key_hash,),
+        )
+        if row is None:
+            return None
+        group_rows = await _fetch_all(
+            conn,
+            "SELECT group_id FROM user_groups WHERE user_id = ?",
+            (row["user_id"],),
+        )
+        # Materialise into the same shape as the Postgres branch so the
+        # auth caller does not need a backend discriminator.
+        merged = dict(row)
+        merged["group_ids"] = [gr["group_id"] for gr in group_rows]
+        return merged
+
+    async def touch_api_key(self, tx: Transaction, key_id: Any) -> None:
+        await _execute_count(
+            self._conn(tx),
+            "UPDATE api_keys SET last_used=CURRENT_TIMESTAMP WHERE id=?",
+            (key_id,),
+        )
+
+    async def resolve_active_session(
+        self, tx: Transaction, session_id: str, *, now: Any
+    ) -> Row | None:
+        conn = self._conn(tx)
+        row = await _fetch_one(
+            conn,
+            "SELECT user_id, identity_id, revoked, expires_at FROM oauth_sessions "
+            "WHERE session_id=?",
+            (session_id,),
+        )
+        if row is None:
+            return None
+        if row["revoked"]:
+            return None
+        expires_at = row["expires_at"]
+        # Compare as ISO-8601 strings so the same caller code works on every
+        # backend regardless of whether the driver returns datetime or text.
+        if (
+            expires_at is not None
+            and now is not None
+            and str(expires_at) <= _isoformat_for_compare(now)
+        ):
+            return None
+        await _execute_count(
+            conn,
+            "UPDATE oauth_sessions SET last_used_at=CURRENT_TIMESTAMP WHERE session_id=?",
+            (session_id,),
+        )
+        return row
+
 
 class SqliteSessionsRepository(_SqliteRepository, SessionsRepository):
     async def create_session(
@@ -2857,12 +2958,17 @@ class SqliteConsultationsRepository(_SqliteRepository, ConsultationsRepository):
         response_hash = hashlib.sha256(kwargs["consensus_response"].encode()).hexdigest()
         prev = await _fetch_one(conn, "SELECT id, chain_hash FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT 1")
         prev_chain = prev["chain_hash"] if prev else kwargs["genesis_hash"]
-        chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
+        # sequence_num is assigned on insert and is bound into the v2 hash, so
+        # write the row first and sign it once the number exists. SQLite writers
+        # are serialised by the connection, so no other write interleaves.
+        task_type = kwargs["task_type"] or "reasoning"
+        quality_score = kwargs["consensus_score"]
         await _execute(
             conn,
             "INSERT INTO graeae_audit_log "
             "(consultation_id, prompt, prompt_hash, provider, response_text, response_hash, chain_hash, "
-            "prev_id, prev_chain_hash, task_type, quality_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "prev_id, prev_chain_hash, task_type, quality_score, chain_algo) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 consultation_id,
                 kwargs["prompt"],
@@ -2870,12 +2976,32 @@ class SqliteConsultationsRepository(_SqliteRepository, ConsultationsRepository):
                 kwargs["winning_muse"],
                 kwargs["consensus_response"],
                 response_hash,
-                chain_hash,
+                "",  # placeholder, replaced below once sequence_num is known
                 prev["id"] if prev else None,
                 prev_chain,
-                kwargs["task_type"] or "reasoning",
-                kwargs["consensus_score"],
+                task_type,
+                quality_score,
+                audit_chain.CURRENT_ALGO,
             ),
+        )
+        inserted = await _fetch_one(
+            conn, "SELECT sequence_num FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT 1"
+        )
+        chain_hash = audit_chain.compute_v2(
+            key=kwargs.get("audit_key"),
+            prev_chain_hash=prev_chain,
+            prompt_hash=prompt_hash,
+            response_hash=response_hash,
+            sequence_num=inserted["sequence_num"] if inserted else None,
+            consultation_id=consultation_id,
+            task_type=task_type,
+            provider=kwargs["winning_muse"],
+            quality_score=quality_score,
+        )
+        await _execute(
+            conn,
+            "UPDATE graeae_audit_log SET chain_hash=? WHERE sequence_num=?",
+            (chain_hash, inserted["sequence_num"] if inserted else None),
         )
         for memory_id in kwargs["memory_ids"]:
             await _execute(
@@ -4694,6 +4820,26 @@ class SqliteBackend:
                 raise
 
     async def _ensure_repository_columns(self, conn: Any) -> None:
+        for table in (
+            "memory_versions",
+            "kg_triples",
+            "graeae_consultations",
+            "memory_branches",
+            "session_messages",
+            "session_memory_injections",
+            "graeae_audit_log",
+            "journal",
+            "entities",
+        ):
+            await self._ensure_columns(conn, table, {"deleted_at": "deleted_at TEXT"})
+        # Existing databases predate chain_algo. Backfill it as sha256-v1: those
+        # rows were signed by the legacy unkeyed hash, and labelling them is what
+        # lets the verifier check them WITHOUT re-signing a tamper-evident log.
+        await self._ensure_columns(conn, "graeae_audit_log", {"chain_algo": "chain_algo TEXT"})
+        await _execute(
+            conn,
+            "UPDATE graeae_audit_log SET chain_algo='sha256-v1' WHERE chain_algo IS NULL",
+        )
         await self._ensure_columns(
             conn,
             "sessions",

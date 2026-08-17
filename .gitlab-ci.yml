@@ -20,7 +20,25 @@ default:
       files:
         - pyproject.toml
     paths:
-      - .venv
+      # NOTE: .venv is deliberately NOT cached.
+      #
+      # It used to be, and it caused intermittent, misleading failures: a
+      # partially-restored cache ("Failed to extract cache") leaves a .venv
+      # that is present but incomplete. `python3 -m venv .venv` does not
+      # clear an existing directory, and `pip install -e .` then sees the
+      # project as already satisfied and skips re-resolving dependencies —
+      # so the missing module is never reinstalled.
+      #
+      # The symptom was a core dependency vanishing at random. It surfaced
+      # as tests/test_connector_smoke.py failing with
+      # "McpError: Connection closed", because the stdio subprocess died on
+      # "ModuleNotFoundError: No module named 'httpx'" — httpx is a core
+      # dependency and should never be absent. Re-running the identical
+      # commit passed.
+      #
+      # Caching .cache/pip keeps the speed benefit (wheels are not
+      # re-downloaded) without the correctness hazard, since the venv is
+      # rebuilt from those cached wheels every job.
       - .cache/pip
   before_script:
     # Policy-injected security analyzers (SAST / secret-detection /
@@ -36,7 +54,9 @@ default:
           echo "security analyzer job ($CI_JOB_NAME) — skipping venv setup"
           ;;
         *)
-          python3 -m venv .venv
+          # --clear so a stray or partially-restored .venv is rebuilt rather
+          # than silently reused with missing packages (see cache note above).
+          python3 -m venv --clear .venv
           # sqlite (aiosqlite) is the default backend's async driver and nats
           # drives the publisher tests; the unit suite needs both or ~27 tests
           # fail on missing core drivers.
@@ -426,50 +446,6 @@ build:docker:
     - if: $CI_COMMIT_BRANCH == "master"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     - if: $CI_COMMIT_TAG
-
-# ---- release -----------------------------------------------------------
-
-.release_binary_template:
-  stage: release
-  tags: [argos, ncz-os]
-  before_script:
-    - python3 -m venv .venv
-    - .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[build]"
-    - export PATH="$CI_PROJECT_DIR/.venv/bin:$PATH"
-  script:
-    - bash scripts/build-binary.sh
-  artifacts:
-    name: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
-    paths:
-      - dist/mnemos-$MNEMOS_EXPECTED_PLATFORM
-    expire_in: 2 weeks
-  rules:
-    - if: $CI_COMMIT_TAG
-      allow_failure: false
-    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      allow_failure: true
-    - when: never
-
-release:linux-x86_64:
-  extends: .release_binary_template
-  variables:
-    MNEMOS_EXPECTED_PLATFORM: linux-x86_64
-  tags:
-    - argos
-
-release:linux-aarch64:
-  extends: .release_binary_template
-  variables:
-    MNEMOS_EXPECTED_PLATFORM: linux-aarch64
-  tags:
-    - ultra-podman-arm64
-
-release:macos-aarch64:
-  extends: .release_binary_template
-  variables:
-    MNEMOS_EXPECTED_PLATFORM: macos-aarch64
-  tags:
-    - ultra-native
 
 # ---- oracle smoke (M7) -------------------------------------------------
 test:oracle-smoke:

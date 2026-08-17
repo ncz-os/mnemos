@@ -18,6 +18,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
+from .wizard import Config
+
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -52,24 +54,8 @@ class SystemInfo:
         return "\n".join(lines)
 
 
-@dataclass
-class Config:
-    """Installation configuration collected from the conversation."""
-    profile: str = "personal"
-    db_host: str = "localhost"
-    db_port: int = 5432
-    db_name: str = "mnemos"
-    db_user: str = "mnemos_user"
-    db_password: str = ""
-    listen_port: int = 5002
-    service_user: str = "mnemos"
-    auth_enabled: bool = False
-    rls_enabled: bool = False
-    graeae_providers: dict[str, Any] = field(default_factory=dict)
-    inference_embed_host: str = "http://localhost:11434"
-    install_docling: bool = False
-    create_service: bool = True
-    embedding_dim: int = 768         # vec0/embedding dimension; honors MNEMOS_EMBEDDING_DIM
+def _canonical_profile(value: str) -> str:
+    return {"personal": "edge", "team": "server", "enterprise": "server"}.get(value, value)
 
 
 # ── Environment detection ─────────────────────────────────────────────────────
@@ -355,7 +341,7 @@ class AgentInstaller:
                 raw = json.loads(match.group(1))
                 cfg = Config()
                 if "profile" in raw:
-                    cfg.profile = str(raw["profile"])
+                    cfg.profile = _canonical_profile(str(raw["profile"]).strip().lower())
                 if "db_host" in raw:
                     cfg.db_host = str(raw["db_host"])
                 if "db_port" in raw:
@@ -429,13 +415,13 @@ class AgentInstaller:
 
         # Profile
         if any(w in text_lower for w in ["personal use", "just me", "personal"]):
-            cfg.profile = "personal"
+            cfg.profile = "edge"
             changed = True
         elif "enterprise" in text_lower:
-            cfg.profile = "enterprise"
+            cfg.profile = "server"
             changed = True
         elif "team" in text_lower:
-            cfg.profile = "team"
+            cfg.profile = "server"
             changed = True
 
         # DB name
@@ -606,6 +592,22 @@ def run_agent_installer() -> Config | None:
     info = detect_environment()
     installer = AgentInstaller(info)
     return installer.run()
+
+
+def run_agent(info: Any) -> Config | None:
+    """Run the conversational installer with the caller's detected environment."""
+    if not isinstance(info, SystemInfo):
+        detected = detect_environment()
+        detected.os_name = str(getattr(info, "os_type", detected.os_name))
+        detected.os_version = str(getattr(info, "distro_version", detected.os_version))
+        caller_python = getattr(info, "python_version", ())
+        if isinstance(caller_python, tuple) and caller_python:
+            detected.python_version = ".".join(str(part) for part in caller_python)
+        detected.postgres_running = bool(getattr(info, "pg_running", detected.postgres_running))
+        detected.postgres_version = str(getattr(info, "pg_version", detected.postgres_version))
+        detected.disk_free_gb = float(getattr(info, "disk_free_gb", detected.disk_free_gb))
+        info = detected
+    return AgentInstaller(info).run()
 
 
 # ── Standalone execution ──────────────────────────────────────────────────────

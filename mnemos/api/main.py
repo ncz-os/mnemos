@@ -39,7 +39,7 @@ from mnemos.core.services import service_enabled
 from mnemos.core.rate_limit import (
     RateLimitExceeded,
     SlowAPIMiddleware,
-    _rate_limit_exceeded_handler,
+    rate_limit_exception_handler,
     limiter,
 )
 
@@ -192,7 +192,9 @@ app.add_middleware(TracingMiddleware)
 
 # Rate limiting (opt-in via RATE_LIMIT_ENABLED=true — see api/rate_limit.py)
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+# Use the wrapper, not SlowAPI's raw handler: the middleware routes storage
+# failures here too, and the raw handler assumes a RateLimitExceeded.
+app.add_exception_handler(RateLimitExceeded, rate_limit_exception_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 # Starlette SessionMiddleware — required by authlib for OAuth state (PKCE verifier,
@@ -445,8 +447,9 @@ app.include_router(kg_router)
 # (default in the umbrella + server/full bundles; absent in minimal core). The
 # SQL/data-access for the MPF flow stays in core (mnemos.db.portability_repo +
 # persistence backends); only the orchestration/route surface is carved out.
-_include_optional_router("charon", "mnemos.api.routes.portability", label="CHARON")
-_include_optional_router("charon", "mnemos.api.routes.ingest", label="CHARON")
+if _settings.layers.enable_charon:
+    _include_optional_router("charon", "mnemos.api.routes.portability", label="CHARON")
+    _include_optional_router("charon", "mnemos.api.routes.ingest", label="CHARON")
 app.include_router(admin_router)
 app.include_router(mcp_audit_router)  # Phase-D MCP audit (#146)
 app.include_router(kronos_router)

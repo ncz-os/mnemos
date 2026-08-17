@@ -461,13 +461,6 @@ class _RateLimitSettings(BaseSettings):
 class _ResilienceSettings(BaseSettings):
     model_config = _config_model_config()
 
-    circuit_breaker_redis_prefix: str = Field(
-        "mnemos:cb:",
-        validation_alias=AliasChoices(
-            "MNEMOS_RESILIENCE_CIRCUIT_BREAKER_REDIS_PREFIX",
-            "MNEMOS_CIRCUIT_BREAKER_REDIS_PREFIX",
-        ),
-    )
     circuit_breaker_nats_prefix: str = Field(
         "cb.",
         validation_alias=AliasChoices(
@@ -475,21 +468,20 @@ class _ResilienceSettings(BaseSettings):
             "MNEMOS_CIRCUIT_BREAKER_NATS_PREFIX",
         ),
     )
-    rate_limiter_redis_prefix: str = Field(
-        "mnemos:rl:",
-        validation_alias=AliasChoices(
-            "MNEMOS_RESILIENCE_RATE_LIMITER_REDIS_PREFIX",
-            "MNEMOS_RATE_LIMITER_REDIS_PREFIX",
-        ),
-    )
-    concurrency_redis_prefix: str = Field(
-        "mnemos:conc:",
-        validation_alias=AliasChoices(
-            "MNEMOS_RESILIENCE_CONCURRENCY_REDIS_PREFIX",
-            "MNEMOS_CONCURRENCY_REDIS_PREFIX",
-        ),
-    )
     fallback_warning: bool = Field(True, validation_alias="MNEMOS_RESILIENCE_FALLBACK_WARNING")
+    allow_in_process_fallback: bool = Field(
+        False,
+        validation_alias="MNEMOS_RESILIENCE_ALLOW_IN_PROCESS_FALLBACK",
+        description=(
+            "Development/single-worker opt-out from fail-closed shared resilience. "
+            "Never enable for a multi-worker production deployment."
+        ),
+    )
+    concurrency_lease_seconds: int = Field(
+        300,
+        ge=1,
+        validation_alias="MNEMOS_RESILIENCE_CONCURRENCY_LEASE_SECONDS",
+    )
 
 
 class _ObservabilitySettings(BaseSettings):
@@ -559,6 +551,18 @@ class _MorpheusSettings(BaseSettings):
     model_config = _config_model_config()
 
     cluster_threshold: float = Field(0.85, validation_alias="MNEMOS_MORPHEUS_CLUSTER_THRESHOLD")
+    cluster_fetch_batch_size: int = Field(
+        1000,
+        ge=1,
+        le=10_000,
+        validation_alias="MNEMOS_MORPHEUS_CLUSTER_FETCH_BATCH_SIZE",
+    )
+    cluster_max_input_count: int = Field(
+        100_000,
+        ge=1,
+        le=10_000_000,
+        validation_alias="MNEMOS_MORPHEUS_CLUSTER_MAX_INPUT_COUNT",
+    )
     use_llm: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_USE_LLM")
     consolidate: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_CONSOLIDATE")
     extract: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_EXTRACT")
@@ -892,8 +896,22 @@ class _FederationSettings(BaseSettings):
         default_factory=list,
         validation_alias="MNEMOS_FEDERATION_NATS_PEERS",
     )
-    allow_insecure: bool = Field(False, validation_alias="FEDERATION_ALLOW_INSECURE")
-    allow_private: bool = Field(False, validation_alias="FEDERATION_ALLOW_PRIVATE")
+    # LAN federation is the deployed posture: peers are hosts you control on a
+    # private network with no public route. Both of these defaulted to False,
+    # which made that posture impossible -- peer registration runs the webhook
+    # SSRF guard, so an RFC1918 base_url was refused outright with "url host
+    # resolves to a non-routable address", and an http:// peer was refused for
+    # not being https. A fleet could not register its own peers.
+    #
+    # Set BOTH to false for OFFSITE federation, or any peering with parties or
+    # networks you do not control. allow_insecure=false additionally matters
+    # there because the peer auth token travels in clear over http://.
+    #
+    # These do NOT weaken the guard that matters on any network: cloud
+    # instance-metadata hosts (169.254.169.254, metadata.google.internal, ...)
+    # are refused unconditionally in net_validation, before this flag is read.
+    allow_insecure: bool = Field(True, validation_alias="FEDERATION_ALLOW_INSECURE")
+    allow_private: bool = Field(True, validation_alias="FEDERATION_ALLOW_PRIVATE")
     # When set, federation NATS receivers join a JetStream queue group
     # under a SHARED durable consumer per (peer, subject) instead of
     # their default single-replica per-(peer, subject) durable. JetStream
@@ -1040,6 +1058,20 @@ class _LayerSettings(BaseSettings):
     enable_graeae: bool = Field(
         default=True,
         validation_alias=AliasChoices("MNEMOS_ENABLE_GRAEAE", "ENABLE_GRAEAE"),
+    )
+    # Default true so installing the distribution keeps working exactly as
+    # before. The point of the flag is the OTHER direction: CHARON's routes
+    # (and, through them, Docling) previously mounted whenever the wheel was
+    # present, with no way to decline. Edge and small-host images that ship the
+    # umbrella wheel can now set this false and skip the import entirely.
+    enable_charon: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("MNEMOS_ENABLE_CHARON", "ENABLE_CHARON"),
+        description=(
+            "Mount the CHARON portability/ingest routes when the mnemos-charon "
+            "distribution is installed. Disable on memory-constrained hosts that "
+            "carry the umbrella wheel but never import documents."
+        ),
     )
     # Default false: hive is a separate ncz-os/hive track, not a mnemos-core extra.
     enable_hive: bool = Field(
@@ -1267,6 +1299,7 @@ def _build_settings() -> Settings:
         if isinstance(group, BaseSettings)
     }
     _apply_profile_defaults(settings)
+    _apply_backend_layer_defaults(settings)
     settings.services.resolution = resolve_profile_services(
         profile=settings.profile,
         managed=settings.services.managed,
@@ -1274,6 +1307,54 @@ def _build_settings() -> Settings:
         env=os.environ,
     )
     return settings
+
+
+# Per-backend layer overrides. Backends whose capability set cannot serve
+# a default-on layer have that layer pre-disabled at settings build time,
+# so the documented image commands (``docker run … -e
+# MNEMOS_PERSISTENCE_BACKEND=mysql …`` etc.) boot successfully without
+# needing operators to know about layer flags or ``MNEMOS_STRICT_LAYERS``.
+#
+# Each entry is a (backend_substring, {layer: bool}) mapping. The
+# substring match is case-insensitive on ``settings.database.backend``.
+# ``core`` is always served and is never listed here.
+_BACKEND_LAYER_DEFAULTS: tuple[tuple[str, dict[str, bool]], ...] = (
+    # MySQL/MariaDB have no ``consultations`` capability -- the layer that
+    # GRAEAE depends on. Without this override, the documented MySQL /
+    # MariaDB enterprise image would log a degraded-boot warning on every
+    # start. Operators who actually want GRAEAE on MySQL must set
+    # ``MNEMOS_ENABLE_GRAEAE=true`` (or remove the override via
+    # ``MNEMOS_STRICT_LAYERS=1`` + implement consultations); the override
+    # only suppresses the warning, not the capability gap.
+    ("mysql", {"graeae": False}),
+    ("mariadb", {"graeae": False}),
+)
+
+
+def _apply_backend_layer_defaults(settings: Settings) -> None:
+    """Disable layers the selected backend cannot serve, before the
+    lifecycle layer-check runs. Only flips the flag when the operator
+    has not explicitly set the layer flag via env / TOML, so this stays
+    an opinionated default rather than a silent override of operator
+    intent.
+    """
+    backend = (settings.database.backend or "").strip().lower()
+    if not backend:
+        return
+    explicit_layers = getattr(settings, "_explicit_fields", {}).get("layers", set())
+    for needle, defaults in _BACKEND_LAYER_DEFAULTS:
+        if needle not in backend:
+            continue
+        for layer, default in defaults.items():
+            flag = f"enable_{layer}"
+            if flag in explicit_layers:
+                # Operator explicitly set the flag -- respect their intent.
+                continue
+            current = getattr(settings.layers, flag, None)
+            if current is None:
+                continue
+            if current != default:
+                object.__setattr__(settings.layers, flag, default)
 
 
 def _profile_from_sources(
@@ -1405,6 +1486,18 @@ def runtime_env_bool(name: str, default: bool = False) -> bool:
     if not raw:
         return default
     return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def set_runtime_env_value(name: str, value: str) -> None:
+    """Set a process environment value on behalf of a runtime accessor.
+
+    The read helpers above keep environment access in this module; a handful of
+    call sites also need to *publish* a value to a child process (for example
+    handing a validated bind address to the server the CLI is about to start).
+    Routing those writes here keeps every ``os.environ`` reference in one file,
+    which is what the env-discipline lint enforces.
+    """
+    os.environ[name] = value
 
 
 def embedding_dim_env() -> int:
@@ -1597,11 +1690,26 @@ def federation_feed_include_private() -> bool:
     namespace is never federated (credential boundary), and
     ``federation_source IS NULL`` prevents federation loops.
 
-    Default false preserves the world-readable-only behavior for
-    untrusted/multi-tenant deployments. Set
-    ``MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=1`` on a trusted feed server.
+    **Defaults to TRUE.** MNEMOS is deployed as a trusted LAN fleet, where the
+    whole point of federation is to replicate the full corpus between peers you
+    control. Defaulting this off wedged exactly that: every memory written
+    through ``create_memory`` carries ``permission_mode`` 600, ``600 % 10 == 0``
+    fails the world-read gate, so the feed offered nothing and peers synced
+    ``{"pulled": 0}`` -- successfully, silently, for three months.
+
+    Set ``MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=0`` for OFFSITE federation, or
+    any deployment peering with parties you do not control, where only
+    explicitly world-readable memories should leave the host.
+
+    Two guards apply either way: the secret-vault namespace is never federated,
+    and ``federation_source IS NULL`` prevents loops.
     """
-    return runtime_env_value_stripped("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE").lower() in {"yes", "1", "true"}
+    raw = runtime_env_value_stripped("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE").lower()
+    if raw in {"no", "0", "false", "off"}:
+        return False
+    if raw in {"yes", "1", "true", "on"}:
+        return True
+    return True  # unset: trusted-LAN posture
 
 
 def session_secret_required() -> bool:
@@ -1615,7 +1723,15 @@ def audit_chain_enabled_flag() -> bool:
 
 
 def system_hive_url_env() -> str:
-    return runtime_env_value("HIVE_URL", "http://192.168.207.8:5005")
+    """Hive bus URL for in-fleet system callers (triage, workers).
+
+    The previous default pointed at .8, which is not a bus host, while the
+    fanout worker hardcoded .67. With HIVE_URL unset the two halves therefore
+    addressed DIFFERENT hosts and silently never saw each other's jobs. Both
+    sides now read this one function, so a wrong value is wrong in one place
+    instead of divergent across two.
+    """
+    return runtime_env_value("HIVE_URL", "http://192.168.207.67:5005")
 
 
 def mcp_hive_url_env() -> str:

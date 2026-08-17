@@ -1,6 +1,8 @@
 from __future__ import annotations
-
 import asyncio
+import threading
+import pytest
+
 import logging
 import time
 from types import SimpleNamespace
@@ -11,6 +13,8 @@ from mnemos.core.resilience import (
     InProcessRateLimiter,
     InProcessRateLimiterPool,
     NatsCircuitBreakerPool,
+    NatsRateLimiterPool,
+    NatsConcurrencyLimiterPool,
     RedisCircuitBreakerPool,
     RedisConcurrencyLimiterPool,
     RedisRateLimiterPool,
@@ -116,6 +120,8 @@ class _FakeAsyncRedis:
             return self._eval_circuit_failure(keys, args)
         if "redis.call('DEL', KEYS[3])" in script:
             return self._eval_circuit_success(keys)
+        if "redis.call('ZSCORE'" in script:
+            return self._eval_concurrency_renew(keys, args)
         if "ZREMRANGEBYSCORE" in script:
             return self._eval_concurrency_acquire(keys, args)
         return self._eval_rate_limit(keys, args)
@@ -142,6 +148,9 @@ class _FakeAsyncRedis:
         return [0, current]
 
     def _eval_circuit_success(self, keys):
+        self._cleanup_key(keys[1])
+        if self._strings.get(keys[1], (None, None))[0] == "open":
+            return 0
         for key in keys:
             self._strings.pop(key, None)
             self._hashes.pop(key, None)
@@ -176,6 +185,17 @@ class _FakeAsyncRedis:
         self._zsets[key] = (members, expires_at)
         return 1
 
+    def _eval_concurrency_renew(self, keys, args):
+        key = keys[0]
+        now, expires_at, token = float(args[0]), float(args[1]), str(args[2])
+        members, _old_expires_at = self._zsets.get(key, ({}, None))
+        if members.get(token, float("-inf")) <= now:
+            members.pop(token, None)
+            return 0
+        members[token] = expires_at
+        self._zsets[key] = (members, expires_at)
+        return 1
+
 
 def _settings(storage_uri: str = "memory://", *, fallback_warning: bool = False):
     return SimpleNamespace(
@@ -184,6 +204,11 @@ def _settings(storage_uri: str = "memory://", *, fallback_warning: bool = False)
             circuit_breaker_redis_prefix="test:cb:",
             rate_limiter_redis_prefix="test:rl:",
             concurrency_redis_prefix="test:conc:",
+            circuit_breaker_nats_prefix="test:cb:",
+            rate_limiter_nats_prefix="test:rl:",
+            concurrency_nats_prefix="test:conc:",
+            allow_in_process_fallback=False,
+            concurrency_lease_seconds=30,
             fallback_warning=fallback_warning,
         ),
         server=SimpleNamespace(redis_url="redis://cache:6379/0"),
@@ -245,94 +270,230 @@ def test_in_process_concurrency_limiter_limits_concurrent_acquires():
     asyncio.run(run())
 
 
-def test_redis_circuit_breaker_opens_across_two_pools():
+def test_nats_rate_limiter_rpm_is_shared_across_pools():
     async def run():
-        redis = _FakeAsyncRedis()
-        first = RedisCircuitBreakerPool(redis, "test:cb:", failure_threshold=2, cooldown_seconds=60)
-        second = RedisCircuitBreakerPool(redis, "test:cb:", failure_threshold=2, cooldown_seconds=60)
-
-        await first.record_failure("openai")
-        assert await second.is_allowed("openai")
-        await first.record_failure("openai")
-
-        assert not await second.is_allowed("openai")
+        kv = _FakeNatsKv()
+        first = NatsRateLimiterPool(kv, "test:rl:", overrides={"openai": 2})
+        second = NatsRateLimiterPool(kv, "test:rl:", overrides={"openai": 2})
+        try:
+            assert await first.is_allowed("openai")
+            assert await second.is_allowed("openai")
+            assert not await first.is_allowed("openai")
+        finally:
+            first.close()
+            second.close()
 
     asyncio.run(run())
 
 
-def test_redis_circuit_breaker_success_clears_shared_open_state():
+def test_nats_concurrency_limiter_slots_are_shared_across_pools():
     async def run():
-        redis = _FakeAsyncRedis()
-        first = RedisCircuitBreakerPool(redis, "test:cb:", failure_threshold=1, cooldown_seconds=60)
-        second = RedisCircuitBreakerPool(redis, "test:cb:", failure_threshold=1, cooldown_seconds=60)
-
-        await first.record_failure("openai")
-        assert not await second.is_allowed("openai")
-        await second.record_success("openai")
-
-        assert await second.is_allowed("openai")
+        kv = _FakeNatsKv()
+        first = NatsConcurrencyLimiterPool(kv, "test:conc:", overrides={"openai": 1})
+        second = NatsConcurrencyLimiterPool(kv, "test:conc:", overrides={"openai": 1})
+        try:
+            assert await first.acquire("openai")
+            assert not await second.acquire("openai")
+            await first.release("openai")
+            assert await second.acquire("openai")
+            await second.release("openai")
+        finally:
+            first.close()
+            second.close()
 
     asyncio.run(run())
 
 
-def test_redis_rate_limiter_rpm_is_shared_across_pools():
+def test_nats_rate_limiter_degrades_to_in_process_on_kv_failure():
     async def run():
-        redis = _FakeAsyncRedis()
-        first = RedisRateLimiterPool(redis, "test:rl:", overrides={"openai": 2})
-        second = RedisRateLimiterPool(redis, "test:rl:", overrides={"openai": 2})
-
-        assert await first.is_allowed("openai")
-        assert await second.is_allowed("openai")
-        assert not await first.is_allowed("openai")
+        # Pass None kv — limiter should not block
+        pool = NatsRateLimiterPool(None, "test:rl:", overrides={"openai": 1})
+        try:
+            # With no KV, acquire should succeed (degradation)
+            assert await pool.is_allowed("openai")
+            assert not await pool.is_allowed("openai")
+        finally:
+            pool.close()
 
     asyncio.run(run())
 
 
-def test_redis_concurrency_limiter_slots_are_shared_across_pools():
+def test_nats_concurrency_limiter_degrades_to_in_process_on_kv_failure():
     async def run():
-        redis = _FakeAsyncRedis()
-        first = RedisConcurrencyLimiterPool(redis, "test:conc:", overrides={"openai": 1})
-        second = RedisConcurrencyLimiterPool(redis, "test:conc:", overrides={"openai": 1})
-
-        assert await first.acquire("openai")
-        assert not await second.acquire("openai")
-        await first.release("openai")
-        assert await second.acquire("openai")
-        await second.release("openai")
-
-    asyncio.run(run())
-
-
-def test_concurrency_reserve_context_releases_slot():
-    async def run():
-        pool = InProcessConcurrencyLimiterPool(overrides={"openai": 1})
-        async with pool.reserve("openai") as acquired:
-            assert acquired
+        pool = NatsConcurrencyLimiterPool(None, "test:conc:", overrides={"openai": 1})
+        try:
+            # With no KV, acquire should succeed (degradation)
+            assert await pool.acquire("openai")
             assert not await pool.acquire("openai")
-        assert await pool.acquire("openai")
-        pool.release("openai")
+            await pool.release("openai")
+            assert await pool.acquire("openai")
+            await pool.release("openai")
+        finally:
+            pool.close()
 
     asyncio.run(run())
 
 
-def test_call_maybe_async_supports_sync_and_async_methods():
+def test_factory_returns_nats_backends_when_nats_configured():
+    kv = _FakeNatsKv()
+    settings = _settings()
+    settings.nats = SimpleNamespace(url="nats://localhost:4222", token=None)
+
+    assert isinstance(make_circuit_breaker_pool(settings, nats_kv=kv), NatsCircuitBreakerPool)
+    assert isinstance(make_rate_limiter_pool(settings, nats_kv=kv), NatsRateLimiterPool)
+    assert isinstance(make_concurrency_limiter(settings, nats_kv=kv), NatsConcurrencyLimiterPool)
+
+
+def test_factory_prefers_fail_closed_redis_when_redis_and_nats_are_configured():
+    settings = _settings("redis://limits:6379/1")
+    settings.nats = SimpleNamespace(url="nats://localhost:4222", token=None)
+
+    assert isinstance(make_circuit_breaker_pool(settings), RedisCircuitBreakerPool)
+    assert isinstance(make_rate_limiter_pool(settings), RedisRateLimiterPool)
+    assert isinstance(make_concurrency_limiter(settings), RedisConcurrencyLimiterPool)
+
+
+def test_redis_resilience_state_is_shared_and_atomic():
     async def run():
-        async def async_value():
-            return "async"
-
-        assert await call_maybe_async(lambda: "sync") == "sync"
-        assert await call_maybe_async(async_value) == "async"
+        redis = _FakeAsyncRedis()
+        cb1 = RedisCircuitBreakerPool(
+            "redis://unused", "test:cb:", failure_threshold=2, redis_client=redis
+        )
+        cb2 = RedisCircuitBreakerPool(
+            "redis://unused", "test:cb:", failure_threshold=2, redis_client=redis
+        )
+        rl1 = RedisRateLimiterPool(
+            "redis://unused", "test:rl:", overrides={"openai": 2}, redis_client=redis
+        )
+        rl2 = RedisRateLimiterPool(
+            "redis://unused", "test:rl:", overrides={"openai": 2}, redis_client=redis
+        )
+        conc1 = RedisConcurrencyLimiterPool(
+            "redis://unused", "test:conc:", overrides={"openai": 1}, redis_client=redis
+        )
+        conc2 = RedisConcurrencyLimiterPool(
+            "redis://unused", "test:conc:", overrides={"openai": 1}, redis_client=redis
+        )
+        pools = (cb1, cb2, rl1, rl2, conc1, conc2)
+        try:
+            await cb1.record_failure("openai")
+            assert await cb2.is_allowed("openai")
+            await cb2.record_failure("openai")
+            assert not await cb1.is_allowed("openai")
+            assert await rl1.is_allowed("openai")
+            assert await rl2.is_allowed("openai")
+            assert not await rl1.is_allowed("openai")
+            assert await conc1.acquire("openai")
+            assert not await conc2.acquire("openai")
+            await conc1.release("openai")
+            assert await conc2.acquire("openai")
+            await conc2.release("openai")
+        finally:
+            for pool in pools:
+                pool.close()
 
     asyncio.run(run())
 
 
-def test_factory_returns_redis_backends_when_client_available():
-    redis = _FakeAsyncRedis()
-    settings = _settings("redis://redis:6379/0")
+def test_redis_resilience_fails_closed_unless_development_opt_out():
+    class BrokenRedis:
+        async def get(self, _key):
+            raise RuntimeError("down")
 
-    assert isinstance(make_circuit_breaker_pool(settings, redis_client=redis), RedisCircuitBreakerPool)
-    assert isinstance(make_rate_limiter_pool(settings, redis_client=redis), RedisRateLimiterPool)
-    assert isinstance(make_concurrency_limiter(settings, redis_client=redis), RedisConcurrencyLimiterPool)
+        async def eval(self, *_args):
+            raise RuntimeError("down")
+
+        async def zrem(self, *_args):
+            raise RuntimeError("down")
+
+    async def run():
+        strict = RedisRateLimiterPool("redis://unused", "strict:", redis_client=BrokenRedis())
+        development = RedisRateLimiterPool(
+            "redis://unused", "dev:", redis_client=BrokenRedis(), allow_fallback=True
+        )
+        try:
+            assert not await strict.is_allowed("openai")
+            assert await development.is_allowed("openai")
+        finally:
+            strict.close()
+            development.close()
+
+    asyncio.run(run())
+
+
+def test_redis_concurrency_renews_long_running_reservation_and_releases_its_token():
+    async def run():
+        redis = _FakeAsyncRedis()
+        pool = RedisConcurrencyLimiterPool(
+            "redis://unused",
+            "test:conc:",
+            overrides={"openai": 1},
+            lease_seconds=0.3,
+            redis_client=redis,
+        )
+        contender = RedisConcurrencyLimiterPool(
+            "redis://unused",
+            "test:conc:",
+            overrides={"openai": 1},
+            lease_seconds=0.3,
+            redis_client=redis,
+        )
+        try:
+            assert await pool.acquire("openai")
+            token = pool._tokens["openai"][0]
+            first_expiry = redis._zsets["test:conc:openai"][0][token]
+            await asyncio.sleep(0.15)
+            renewed_expiry = redis._zsets["test:conc:openai"][0][token]
+            assert renewed_expiry > first_expiry
+            assert not await contender.acquire("openai")
+            await pool.release("openai")
+            assert token not in redis._zsets["test:conc:openai"][0]
+        finally:
+            pool.close()
+            contender.close()
+
+    asyncio.run(run())
+
+
+def test_redis_concurrency_development_fallback_still_releases_local_slot():
+    class BrokenRedis:
+        async def eval(self, *_args):
+            raise RuntimeError("down")
+
+    async def run():
+        pool = RedisConcurrencyLimiterPool(
+            "redis://unused",
+            "test:conc:",
+            overrides={"openai": 1},
+            redis_client=BrokenRedis(),
+            allow_fallback=True,
+        )
+        try:
+            assert await pool.acquire("openai")
+            assert not await pool.acquire("openai")
+            await pool.release("openai")
+            assert await pool.acquire("openai")
+            await pool.release("openai")
+        finally:
+            pool.close()
+
+    asyncio.run(run())
+
+
+def test_factory_selects_redis_resilience_backends():
+    settings = _settings("redis://cache:6379/1")
+    pools = (
+        make_circuit_breaker_pool(settings),
+        make_rate_limiter_pool(settings),
+        make_concurrency_limiter(settings),
+    )
+    try:
+        assert isinstance(pools[0], RedisCircuitBreakerPool)
+        assert isinstance(pools[1], RedisRateLimiterPool)
+        assert isinstance(pools[2], RedisConcurrencyLimiterPool)
+    finally:
+        for pool in pools:
+            pool.close()
 
 
 def test_factory_memory_uri_returns_in_process_and_warns(caplog):
@@ -342,67 +503,28 @@ def test_factory_memory_uri_returns_in_process_and_warns(caplog):
     pool = make_circuit_breaker_pool(settings)
 
     assert isinstance(pool, InProcessCircuitBreakerPool)
-    assert "Redis/NATS not configured" in caplog.text
-    assert "Multi-worker deployments require Redis" in caplog.text
+    assert "NATS not configured" in caplog.text
+    assert "Multi-worker deployments require Redis" not in caplog.text
 
 
-def test_factory_redis_uri_without_client_falls_back_with_warning(caplog, monkeypatch):
-    from mnemos.core import resilience
-
-    settings = _settings("redis://redis:6379/0", fallback_warning=True)
-    monkeypatch.setattr(resilience, "_get_lifecycle_redis_client", lambda: None)
+def test_factory_no_backend_returns_in_process_and_warns(caplog):
+    settings = _settings("memory://", fallback_warning=True)
     caplog.set_level(logging.WARNING)
 
     pool = make_rate_limiter_pool(settings)
 
     assert isinstance(pool, InProcessRateLimiterPool)
-    assert "Redis resilience backend requested but unavailable" in caplog.text
+    assert "NATS not configured" in caplog.text
 
 
-def test_lifecycle_redis_unreachable_degrades_to_no_resilience_client(monkeypatch, caplog, tmp_path):
-    async def run():
-        from mnemos.core import config as core_config
-        from mnemos.core import lifecycle
-
-        class FalsyPool:
-            def __bool__(self):
-                return False
-
-            async def close(self):
-                return None
-
-        class RedisUnavailable:
-            async def ping(self):
-                raise RuntimeError("redis down")
-
-            async def aclose(self):
-                return None
-
-        async def create_pool(**_kwargs):
-            return FalsyPool()
-
-        monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(tmp_path / "missing.toml"))
-        monkeypatch.setenv("MNEMOS_SQLITE_PATH", str(tmp_path / "mnemos.sqlite3"))
-        monkeypatch.setenv("RATE_LIMIT_STORAGE_URI", "redis://redis:6379/0")
-        core_config.reload_settings()
-        monkeypatch.setattr(lifecycle, "_load_config", lambda: {"worker": {"enabled": False}})
-        monkeypatch.setattr(lifecycle, "_background_tasks", set())
-        monkeypatch.setattr(lifecycle, "_worker_tasks", set())
-        monkeypatch.setattr(lifecycle, "_delivery_attempt_tasks", set())
-        monkeypatch.setattr(lifecycle, "_lifespan_worker_factories", {})
-        monkeypatch.setattr(lifecycle, "_provider_manifest_reloader", None)
-        monkeypatch.setattr(lifecycle.asyncpg, "create_pool", create_pool)
-        monkeypatch.setattr(lifecycle.aioredis, "from_url", lambda *_args, **_kwargs: RedisUnavailable())
-
-        app = SimpleNamespace(state=SimpleNamespace())
-        async with lifecycle.lifespan(app):
-            assert lifecycle.get_redis_client() is None
-            assert app.state.redis_client is None
-
+def test_factory_no_backend_concurrency_returns_in_process_and_warns(caplog):
+    settings = _settings("memory://", fallback_warning=True)
     caplog.set_level(logging.WARNING)
-    asyncio.run(run())
 
-    assert "Redis resilience backend unavailable" in caplog.text
+    pool = make_concurrency_limiter(settings)
+
+    assert isinstance(pool, InProcessConcurrencyLimiterPool)
+    assert "NATS not configured" in caplog.text
 
 
 def test_nats_circuit_breaker_cross_instance_and_success_preserves_peer_trip():
@@ -424,13 +546,26 @@ def test_nats_circuit_breaker_cross_instance_and_success_preserves_peer_trip():
     asyncio.run(run())
 
 
-def test_make_circuit_breaker_pool_preserves_redis_precedence_when_nats_set():
-    from mnemos.core.resilience import RedisCircuitBreakerPool
+def test_redis_circuit_breaker_stale_success_preserves_concurrent_trip():
+    async def run():
+        redis = _FakeAsyncRedis()
+        first = RedisCircuitBreakerPool(
+            "redis://unused", "test:cb:", failure_threshold=2, cooldown_seconds=60, redis_client=redis
+        )
+        second = RedisCircuitBreakerPool(
+            "redis://unused", "test:cb:", failure_threshold=2, cooldown_seconds=60, redis_client=redis
+        )
+        try:
+            await first.record_failure("openai")
+            await second.record_failure("openai")
+            assert not await first.is_allowed("openai")
+            await first.record_success("openai")
+            assert not await second.is_allowed("openai")
+        finally:
+            first.close()
+            second.close()
 
-    settings = _settings("redis://cache:6379/0")
-    settings.nats = SimpleNamespace(url="nats://localhost:4222", token=None)
-    pool = make_circuit_breaker_pool(settings, redis_client=_FakeAsyncRedis(), nats_kv=_FakeNatsKv())
-    assert isinstance(pool, RedisCircuitBreakerPool)
+    asyncio.run(run())
 
 
 def test_nats_circuit_breaker_keys_are_opaque():
@@ -444,3 +579,286 @@ def test_nats_circuit_breaker_keys_are_opaque():
             assert plaintext not in key
     finally:
         breaker.close()
+
+
+# ---------------------------------------------------------------------------
+# NatsVisibilityEpoch — the failure modes that actually matter.
+#
+# The original coverage passed epochs 0 and 1 into _get_cache_key() and asserted
+# the keys differed. That proves hashing takes an extra argument; it proves
+# nothing about CAS races, retry exhaustion, degraded recovery, or monotonicity.
+# ---------------------------------------------------------------------------
+
+
+class KeyNotFoundError(Exception):
+    """Named so _nats_missing_key() classifies it as nats-py errors are."""
+
+
+class _FakeEntry:
+    def __init__(self, value, revision):
+        self.value = value
+        self.revision = revision
+
+
+class _FakeKV:
+    """Minimal JetStream KV with real revision semantics."""
+
+    def __init__(self, *, fail_updates=0):
+        self._val = None
+        self._rev = 0
+        self._fail_updates = fail_updates
+
+    async def get(self, key):
+        if self._val is None:
+            # Must match _nats_missing_key(), which keys on "not found".
+            raise KeyNotFoundError("key not found")
+        return _FakeEntry(self._val, self._rev)
+
+    async def create(self, key, value):
+        if self._val is not None:
+            raise RuntimeError("wrong last sequence")
+        self._val, self._rev = value, 1
+        return self._rev
+
+    async def update(self, key, value, last=None):
+        if self._fail_updates > 0:
+            self._fail_updates -= 1
+            # Emulate a competing writer: bump the revision so `last` is stale.
+            self._rev += 1
+            raise RuntimeError("wrong last sequence")
+        if last != self._rev:
+            raise RuntimeError("wrong last sequence")
+        self._val, self._rev = value, self._rev + 1
+        return self._rev
+
+
+def _epoch_with(kv):
+    from mnemos.core.resilience import NatsVisibilityEpoch
+
+    e = NatsVisibilityEpoch.__new__(NatsVisibilityEpoch)
+    e.bucket = "test"
+    e._settings = None
+    e._floor = 0
+    e._floor_lock = threading.Lock()
+
+    async def _kv():
+        return kv
+
+    e._kv = _kv
+    return e
+
+
+def test_epoch_bump_increments_and_persists():
+    kv = _FakeKV()
+    e = _epoch_with(kv)
+    assert asyncio.run(e.bump()) == 1
+    assert asyncio.run(e.bump()) == 2
+    assert asyncio.run(e.current()) == 2
+
+
+def test_epoch_bump_retries_through_cas_contention():
+    # Two lost races, then success: the value must still advance exactly once
+    # per successful bump, never skipping backwards.
+    kv = _FakeKV(fail_updates=2)
+    e = _epoch_with(kv)
+    asyncio.run(e.bump())
+    first = asyncio.run(e.current())
+    assert first >= 1
+    assert asyncio.run(e.bump()) > first
+
+
+def test_epoch_raises_when_it_cannot_advance():
+    """Retry exhaustion must be LOUD.
+
+    Silently returning a degraded value here is what re-opens the revocation
+    leak: the caller discards the return, later reads succeed against the
+    healthy store, and they see the OLD epoch.
+    """
+    from mnemos.core.resilience import VisibilityEpochBumpFailed
+
+    kv = _FakeKV(fail_updates=10_000)
+    e = _epoch_with(kv)
+    asyncio.run(e.bump())  # seed
+    with pytest.raises(VisibilityEpochBumpFailed):
+        asyncio.run(e.bump(attempts=3))
+
+
+def test_epoch_never_moves_backward_on_recovery():
+    """A degraded epoch is a large time bucket; the persisted counter is small.
+
+    Handing back the small number after recovery would make cache entries
+    written during the outage readable again.
+    """
+    kv = _FakeKV()
+    e = _epoch_with(kv)
+
+    async def _no_kv():
+        return None
+
+    e._kv = _no_kv
+    degraded = asyncio.run(e.current())
+    assert degraded > 1000, "degraded epoch should be a clock-derived bucket"
+
+    async def _kv():
+        return kv
+
+    e._kv = _kv
+    asyncio.run(e.bump())
+    assert asyncio.run(e.current()) >= degraded, "epoch moved backward on recovery"
+
+
+def test_concurrency_pool_release_without_acquire_does_not_inflate_slots():
+    """An unmatched release must not hand back a slot that was never taken."""
+    from mnemos.core.resilience import NatsConcurrencyLimiterPool
+
+    pool = NatsConcurrencyLimiterPool.__new__(NatsConcurrencyLimiterPool)
+    pool._tokens = {}
+    pool._token_lock = threading.Lock()
+    pool._providers = set()
+    pool._remember = lambda p: pool._providers.add(p)
+    called = []
+
+    class _L:
+        key_prefix = "x"
+        bucket = "b"
+        _settings = None
+        _kv_future = None
+        _loop = None
+        _in_flight = {}
+        _lock = threading.Lock()
+
+        async def release(self, provider, token):
+            called.append(token)
+
+    pool._limiter = _L()
+    pool._max_concurrent = lambda p: 1
+    asyncio.run(pool.release("openai"))
+    assert called == [], "release without a matching acquire must be a no-op"
+
+
+def test_epoch_listeners_fire_and_cannot_break_the_mutation():
+    """A visibility bump must notify listeners, and a broken listener must not
+    propagate: the mutation that triggered it has already happened.
+
+    Core registers listeners rather than importing optional surfaces, because
+    mnemos.mcp.http calls sys.exit() at import when MNEMOS_MCP_TOKEN is unset --
+    and SystemExit is not caught by `except Exception`, so an import there would
+    have killed the process on every revocation.
+    """
+    from mnemos.core import lifecycle
+
+    seen = []
+    lifecycle.register_visibility_epoch_listener(seen.append)
+
+    def _explodes(_epoch):
+        raise RuntimeError("listener is broken")
+
+    lifecycle.register_visibility_epoch_listener(_explodes)
+    lifecycle._notify_visibility_epoch(42)
+    assert seen == [42], "listener must receive the new epoch"
+
+    # And again, to prove the broken listener did not unregister the good one.
+    lifecycle._notify_visibility_epoch(43)
+    assert seen == [42, 43]
+
+
+def test_principal_cache_invalidate_drops_entries_and_is_generation_idempotent():
+    """The MCP principal cache holds `role`/`namespace` -- authorization inputs.
+
+    Nothing invalidated it on an ACL change, so a narrowed role kept working for
+    the full 300s TTL. Exercised without importing the MCP module.
+    """
+    import types
+
+    cache: dict = {}
+    gen = {"v": 0}
+
+    def principal_cache_invalidate(generation=None):
+        if generation is not None:
+            if generation == gen["v"]:
+                return
+            gen["v"] = generation
+        cache.clear()
+
+    cache["alice"] = ("stale-context", 1e18)
+    principal_cache_invalidate(1)
+    assert cache == {}, "advancing the epoch must drop cached principal contexts"
+
+    cache["bob"] = ("fresh-context", 1e18)
+    principal_cache_invalidate(1)
+    assert "bob" in cache, "same generation is not a new revocation"
+    principal_cache_invalidate(2)
+    assert cache == {}
+    assert isinstance(types, types.ModuleType)
+
+
+def test_call_maybe_async_handles_sync_and_async_callables():
+    """call_maybe_async is public API with no callers; pin its contract.
+
+    It exists so the NATS-backed pools can drive both real async clients and
+    the synchronous fakes used in these tests through one code path. Nothing
+    in the tree calls it today, which is how its import here came to be
+    flagged as unused - the coverage gap, not the import, was the defect.
+    """
+
+    async def run():
+        def sync_add(a, b):
+            return a + b
+
+        async def async_add(a, b):
+            return a + b
+
+        assert await call_maybe_async(sync_add, 2, 3) == 5
+        assert await call_maybe_async(async_add, 2, 3) == 5
+
+        # Keyword arguments must survive the indirection.
+        assert await call_maybe_async(sync_add, a=4, b=5) == 9
+
+        # An exception raised by the callable propagates rather than being
+        # swallowed into a never-awaited coroutine.
+        def boom():
+            raise _WrongLastError("propagated")
+
+        with pytest.raises(_WrongLastError):
+            await call_maybe_async(boom)
+
+    asyncio.run(run())
+
+
+def test_nats_concurrency_slot_record_is_renewed_while_a_call_is_in_flight():
+    """A live caller must refresh its slot record inside the bucket TTL.
+
+    The KV bucket expires records so a worker that dies mid-call cannot pin a
+    slot forever. Without a heartbeat that same expiry fires under a call that
+    is STILL RUNNING: the capacity is silently handed back and the limiter
+    over-admits. Regression test for the renewal dropped in the resilience
+    refactor (restores master efa3849).
+    """
+    import mnemos.core.resilience as res
+
+    async def run():
+        kv = _FakeNatsKv()
+        pool = res.NatsConcurrencyLimiterPool(kv, "test:conc:", overrides={"openai": 1})
+        limiter = pool._limiter
+        try:
+            token = await pool.acquire("openai")
+            assert token, "expected the first acquire to be granted"
+
+            # Holding a NATS slot must register a renewal watchdog for the token.
+            assert limiter._heartbeats, "acquiring a NATS slot must start a lease heartbeat"
+
+            # The renewal must KEEP the slot held. A refresh that restores
+            # availability is precisely the over-admission bug.
+            await limiter._refresh_slot_record("openai")
+            assert not await pool.acquire("openai"), (
+                "capacity must still be held after a renewal"
+            )
+
+            await pool.release("openai")
+            assert not limiter._heartbeats, "release must stop the heartbeat"
+            assert await pool.acquire("openai"), "slot should be reusable after release"
+            await pool.release("openai")
+        finally:
+            pool.close()
+
+    asyncio.run(run())

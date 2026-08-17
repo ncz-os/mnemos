@@ -1,6 +1,6 @@
 # MNEMOS Specification
 
-**Version**: v6.0.1 current (patch release on the v6.0.0 split-distribution line; supersedes the v5.0.1 / v5.0.0
+**Version**: v6.1.0 current (patch release on the v6.0.0 split-distribution line; supersedes the v5.0.1 / v5.0.0
 GA line from 2026-05-02). Adds Oracle Database 26ai + IBM Db2 12.1.5 backends behind
 the EPIMONE `PersistenceBackend` ABC.
 
@@ -803,7 +803,7 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
   application visibility after
   `db/migrations_v3_5_rls_group_select_unix_bits.sql`.
 
-### 10.4 Known gaps (as of v6.0.1)
+### 10.4 Known gaps (as of v6.1.0)
 
 - GDPR deletion requests can still hit the documented final-verify race or
   sweep-verifying exhaustion under sustained target writes; see
@@ -839,6 +839,9 @@ supported for `server` with Redis via
 `RATE_LIMIT_STORAGE_URI=redis://host:6379/1`; in-process `memory://` fallback
 logs a startup warning when `MNEMOS_WORKERS > 1` because rate-limit,
 circuit-breaker, and concurrency state can drift between processes.
+When Redis is selected, provider admission fails closed if Redis is unavailable.
+`MNEMOS_RESILIENCE_ALLOW_IN_PROCESS_FALLBACK=true` is an explicit development
+or single-worker opt-out and is unsafe for horizontally scaled production.
 
 ### 11.4 Backup / restore
 

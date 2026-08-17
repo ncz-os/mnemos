@@ -411,6 +411,52 @@ CREATE TABLE IF NOT EXISTS memories (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
+_DDL_DELETION_REQUESTS = """\
+CREATE TABLE IF NOT EXISTS deletion_requests (
+    id VARCHAR(64) NOT NULL DEFAULT (UUID()),
+    target_user_id VARCHAR(256) NOT NULL,
+    target_namespace VARCHAR(256),
+    requested_by VARCHAR(256) NOT NULL,
+    requested_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    confirmed_at DATETIME(6),
+    status VARCHAR(32) NOT NULL DEFAULT 'requested',
+    notes TEXT,
+    soft_deleted_at DATETIME(6),
+    restore_by DATETIME(6),
+    hard_deleted_at DATETIME(6),
+    restored_at DATETIME(6),
+    PRIMARY KEY (id),
+    INDEX idx_deletion_requests_claim (status, confirmed_at, requested_at),
+    INDEX idx_deletion_requests_target (target_user_id, target_namespace)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_MEMORY_ARCHIVE = """\
+CREATE TABLE IF NOT EXISTS memory_archive (
+    id VARCHAR(64) NOT NULL,
+    archived_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    archived_by VARCHAR(256) NOT NULL DEFAULT 'system:persephone',
+    compressed_content LONGBLOB NOT NULL,
+    compression_algo VARCHAR(32) NOT NULL DEFAULT 'zstd',
+    original_size_bytes BIGINT NOT NULL,
+    compressed_size_bytes BIGINT NOT NULL,
+    schema_version INT NOT NULL DEFAULT 1,
+    PRIMARY KEY (id),
+    INDEX idx_memory_archive_archived_at (archived_at),
+    CONSTRAINT fk_memory_archive_memory FOREIGN KEY (id) REFERENCES memories(id) ON DELETE RESTRICT
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_DELETION_LOG = """\
+CREATE TABLE IF NOT EXISTS deletion_log (
+    id VARCHAR(64) NOT NULL, memory_id VARCHAR(64) NOT NULL, content_hash VARCHAR(64) NOT NULL,
+    owner_id VARCHAR(256), namespace VARCHAR(256), requested_by VARCHAR(256) NOT NULL,
+    requested_at DATETIME(6) NOT NULL, executed_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    request_kind VARCHAR(32) NOT NULL, reason TEXT, source JSON, PRIMARY KEY (id),
+    INDEX idx_deletion_log_memory (memory_id), INDEX idx_deletion_log_owner_ns (owner_id, namespace)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
 _DDL_FEDERATION_PEERS = """\
 CREATE TABLE IF NOT EXISTS federation_peers (
     id                   VARCHAR(64)  NOT NULL,
@@ -750,6 +796,7 @@ CREATE TABLE IF NOT EXISTS memory_branches (
     head_version_id VARCHAR(64),
     created_by      VARCHAR(256),
     created_at      TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at      TIMESTAMP(6) NULL,
     PRIMARY KEY (memory_id, name),
     INDEX idx_memory_branches_memory (memory_id),
     INDEX idx_memory_branches_head (head_version_id),
@@ -757,6 +804,68 @@ CREATE TABLE IF NOT EXISTS memory_branches (
         FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
     CONSTRAINT fk_memory_branches_head
         FOREIGN KEY (head_version_id) REFERENCES memory_versions(id) ON DELETE SET NULL
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_ENTITIES = """\
+CREATE TABLE IF NOT EXISTS entities (
+    id          VARCHAR(64)  NOT NULL,
+    entity_type VARCHAR(50)  NOT NULL,
+    name        VARCHAR(255) NOT NULL,
+    description TEXT,
+    metadata    JSON,
+    owner_id    VARCHAR(256) NOT NULL DEFAULT 'default',
+    namespace   VARCHAR(256) NOT NULL DEFAULT 'default',
+    created     TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated     TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at  TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    INDEX idx_entities_owner_namespace (owner_id, namespace)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_SESSIONS = """\
+CREATE TABLE IF NOT EXISTS sessions (
+    id               VARCHAR(64)  NOT NULL,
+    user_id          VARCHAR(256) NOT NULL,
+    namespace        VARCHAR(256) NOT NULL DEFAULT 'default',
+    created_at       TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    last_activity    TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    model            VARCHAR(200),
+    message_count    INT NOT NULL DEFAULT 0,
+    total_tokens     INT NOT NULL DEFAULT 0,
+    compression_tier INT NOT NULL DEFAULT 1,
+    deleted_at       TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    INDEX idx_sessions_user_namespace (user_id, namespace)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_SESSION_MESSAGES = """\
+CREATE TABLE IF NOT EXISTS session_messages (
+    id                VARCHAR(64) NOT NULL,
+    session_id        VARCHAR(64) NOT NULL,
+    role              VARCHAR(20) NOT NULL,
+    content           LONGTEXT NOT NULL,
+    created_at        TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at        TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    INDEX idx_session_messages_session (session_id),
+    CONSTRAINT fk_session_messages_session FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_SESSION_MEMORY_INJECTIONS = """\
+CREATE TABLE IF NOT EXISTS session_memory_injections (
+    id          VARCHAR(64) NOT NULL,
+    session_id  VARCHAR(64) NOT NULL,
+    memory_id   VARCHAR(64) NOT NULL,
+    injected_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at  TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    INDEX idx_session_memory_injections_session (session_id),
+    CONSTRAINT fk_session_memory_injections_session FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    CONSTRAINT fk_session_memory_injections_memory FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
@@ -849,10 +958,17 @@ INSERT IGNORE INTO memory_category_decay (category, half_life_days, decay_kind, 
 
 _INIT_DDLS = [
     _DDL_MEMORIES,
+    _DDL_DELETION_REQUESTS,
+    _DDL_DELETION_LOG,
+    _DDL_MEMORY_ARCHIVE,
     _DDL_FEDERATION_PEERS,
     _DDL_FEDERATION_SYNC_LOG,
     _DDL_MEMORY_VERSIONS,
     _DDL_MEMORY_BRANCHES,
+    _DDL_ENTITIES,
+    _DDL_SESSIONS,
+    _DDL_SESSION_MESSAGES,
+    _DDL_SESSION_MEMORY_INJECTIONS,
     _DDL_KG_TRIPLES,
     _DDL_COMPRESSION_CANDIDATES,
     _DDL_COMPRESSED_VARIANTS,
@@ -892,7 +1008,7 @@ async def create_mysql_pool(
     except ImportError as exc:
         raise ImportError(
             "The MySQL persistence backend requires the 'aiomysql' package. "
-            "Install it with: pip install 'mnemos-os[mysql]'"
+            "Install it with: pip install 'mnemos-core[mysql]'"
         ) from exc
 
     kwargs = _parse_mysql_dsn(dsn)
@@ -4945,6 +5061,38 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                 )
                 await _ensure_mysql_columns(
                     conn,
+                    "memory_branches",
+                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "entities",
+                    {
+                        "owner_id": "owner_id VARCHAR(256) NOT NULL DEFAULT 'default'",
+                        "namespace": "namespace VARCHAR(256) NOT NULL DEFAULT 'default'",
+                        "deleted_at": "deleted_at TIMESTAMP(6) NULL",
+                    },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "sessions",
+                    {
+                        "namespace": "namespace VARCHAR(256) NOT NULL DEFAULT 'default'",
+                        "deleted_at": "deleted_at TIMESTAMP(6) NULL",
+                    },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "session_messages",
+                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "session_memory_injections",
+                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
+                )
+                await _ensure_mysql_columns(
+                    conn,
                     "federation_peers",
                     {
                         "auth_token": "auth_token TEXT",
@@ -4983,11 +5131,9 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                     },
                 )
                 await conn.commit()
-        except Exception as exc:
-            _LOG.warning(
-                "MysqlBackend.open probe failed (%s); backend remains open but first acquire() may also fail.",
-                exc,
-            )
+        except Exception:
+            _LOG.exception("MysqlBackend.open failed while provisioning the required schema")
+            raise
 
     async def close(self) -> None:
         if self._closed:

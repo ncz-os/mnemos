@@ -123,11 +123,6 @@ jobs:
       - name: Unit tests
         run: |
           .venv/bin/pytest \
-            tests/domain/test_knemon_router.py \
-            tests/api/test_knemon_utilization.py \
-            tests/test_knemon_dispatch_migration.py \
-            tests/test_knemon_ledger.py \
-            tests/test_knemon_triage_llm.py \
             tests/test_migration_lists_sync.py \
             tests/test_plan_windows.py \
             tests/test_settings.py \

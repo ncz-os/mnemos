@@ -57,6 +57,22 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+### Fixed — schema migration replay crash-loops on a seed-data unique-violation
+
+Static seed-data migrations (e.g. `0033_subscription_plans`) are replayed
+on every startup with no separate migration-tracking table. DDL
+already-exists errors were already treated as benign on replay, but a
+duplicate-key violation on the accompanying `INSERT` was not, across all
+three backends (`23505` for Postgres/Db2, `ORA-00001` for Oracle). A
+duplicate-key hit on replay means the exact row was already inserted by a
+prior run — as benign as the already-handled DDL cases, since the
+migration file's `INSERT` is static and deterministic.
+
+Found debugging a Db2-backed host whose `mnemos-api` container
+crash-looped forever after a restart following a partial-then-recovered
+prior migration run — every retry hit `SQL0803N`/`SQLSTATE=23505` on the
+same static `INSERT` and never got past schema replay to serve traffic.
+
 ## [6.0.1] — 2026-07-10
 
 ### Fixed — `_LlamaCppBackend` embeddings missing L2-normalization
