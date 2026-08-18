@@ -135,7 +135,7 @@ Compose v2 are recommended. Allocate at least 4 GB RAM and 2 CPU cores for a
 small local stack, 8 GB RAM and 4 CPU cores for routine server testing, and
 16 GB+ RAM with 8+ CPU cores for production-like multi-service stacks.
 
-The API listens on `5002` by default. MCP HTTP/SSE commonly uses `5004`.
+The API listens on `5002` by default, and `mnemos serve mcp-http` on `5003`.
 PostgreSQL uses `5432`, Redis uses `6379`, and reverse proxies should terminate
 TLS before forwarding to MNEMOS. Outbound network access is only required for
 the LLM, embedding, webhook, federation, or package-index services that the
