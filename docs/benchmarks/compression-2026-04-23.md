@@ -352,7 +352,7 @@ next (not promises for v3.1):
 ## Reproducing this benchmark
 
 Driver scripts retained in `/tmp/` on the dev host and in
-`/home/jasonperlow/mnemos-test/` on <gpu-host>:
+`/home/<user>/mnemos-test/` on <gpu-host>:
 
 - `barrage_seed.py` — harvests 2660+ memories from <pg-host>, filters
   to uncompressed only, stratifies by size, selects ~1000 (subject
@@ -367,9 +367,9 @@ Driver scripts retained in `/tmp/` on the dev host and in
 Running the drain is one command once the test instance is up:
 
 ```bash
-ssh jasonperlow@<host> \
-    /home/jasonperlow/mnemos-test/.venv/bin/python \
-    /home/jasonperlow/mnemos-test/barrage_drain.py
+ssh <user>@<host> \
+    /home/<user>/mnemos-test/.venv/bin/python \
+    /home/<user>/mnemos-test/barrage_drain.py
 ```
 
 Expected timing at current parameters: ~2 hours wall-clock for 464

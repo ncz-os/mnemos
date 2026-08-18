@@ -5,7 +5,7 @@
 ## Context
 
 Two parallel codebases run agent-job coordination:
-- **(A) LIVE** = `/srv/agent-bus/agent_bus.py` (PYTHIA, `graeae-hive.service`, :5005) — 138KB monolith, **no mnemos import**, SQLite `agents.db`. Battle-tested, drives the real fleet. Intentionally has **no cost-tier claim gating** (all executors mutually eligible).
+- **(A) LIVE** = `/srv/agent-bus/agent_bus.py` (the primary, `graeae-hive.service`, :5005) — 138KB monolith, **no mnemos import**, SQLite `agents.db`. Battle-tested, drives the real fleet. Intentionally has **no cost-tier claim gating** (all executors mutually eligible).
 - **(B) REFACTOR** = `mnemos/hive_mind/` (repository + service + triage) — ABC-based, Oracle/Postgres/SQLite-portable, validated through 5 codex adversarial cycles + ~128 tests. **NOT deployed.** Adds cost-tier/pool claim gating.
 
 They have drifted. Post-KNEMON roadmap requires porting the hive SQLite → Oracle 23ai.

@@ -601,7 +601,7 @@ against Oracle on oracle-host. After the script runs:
 ```
 $ curl http://<host>:5003/health
 {"status":"healthy","timestamp":"2026-05-19T23:27:28.359782",
- "database_connected":true,"version":"5.0.1","profile":"edge", ...}
+ "database_connected":true,"version":"6.1.7","profile":"edge", ...}
 
 $ curl -H "Authorization: Bearer $oracle-host_BEARER" \
        http://<host>:5003/v1/memories?limit=1

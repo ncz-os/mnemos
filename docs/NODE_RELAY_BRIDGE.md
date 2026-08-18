@@ -9,8 +9,8 @@ repo.
 ## What it is
 
 node-relay integrates **any remote or airgapped node** as a hive worker even
-when it **cannot reach the home fleet** (192.168.207.x — PYTHIA hive bus `:5005`,
-ARGONAS, MNEMOS) over LAN or VPN. The only requirement is that both the node and
+when it **cannot reach the home network** — the hive bus, the NAS, and MNEMOS —
+over LAN or VPN. The only requirement is that both the node and
 the home fleet can reach a **public-cloud object store** — Google Cloud Storage
 or Amazon S3 (or any S3-compatible endpoint). That bucket is the transport;
 payloads are client-side AES-256-GCM sealed, so the cloud sees only ciphertext
@@ -50,7 +50,7 @@ node poller        list pending/ → atomic-claim claimed/<uuid> → local/cloud
 home reconciler    poll terminal/ → open → LAND patch as hive/node-<id> → PATCH hive done/failed → purge
 ```
 
-Home (PYTHIA, reaches the internet) writes encrypted job objects to
+The home side, which reaches the internet, writes encrypted job objects to
 `pending/<uuid>.json.enc` directly; the node polls `pending/`, **claims via an
 atomic conditional write** of `claimed/<uuid>` (loser backs off), runs a local
 or cloud OpenAI-compatible model, and writes the single create-only

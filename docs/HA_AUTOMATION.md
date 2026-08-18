@@ -1,8 +1,7 @@
 # MNEMOS HA Automation: Patroni + etcd3 + HAProxy
 
-Status: v5.3.0 design and configuration artifacts. The automation is designed
-for the pg-host/gpu-host pg16 + pgvector deployment and is not yet exercised in
-CI.
+Status: design and configuration artifacts. The automation targets a
+PostgreSQL 16 + pgvector primary/standby deployment and is not exercised in CI.
 
 ## Decision
 
@@ -127,15 +126,15 @@ Patroni-managed cluster without data loss.
    final LSN before hand-off:
 
    ```bash
-   ssh jasonperlow@<host> "podman stop mnemos-v3x-podman_mnemos_1 mnemos-v3x-podman_mnemos-mcp-http_1"
+   ssh <user>@<host> "podman stop mnemos-v3x-podman_mnemos_1 mnemos-v3x-podman_mnemos-mcp-http_1"
    ```
 
 3. Confirm gpu-host has replayed all WAL from pg-host.
 
    ```bash
-   ssh jasonperlow@<host> "podman exec mnemos-v3x-podman_postgres_1 \
+   ssh <user>@<host> "podman exec mnemos-v3x-podman_postgres_1 \
        psql -U mnemos_user -d mnemos -tAc 'SELECT sent_lsn FROM pg_stat_replication;'"
-   ssh jasonperlow@<host> "podman exec mnemos-standby \
+   ssh <user>@<host> "podman exec mnemos-standby \
        psql -U mnemos_user -d mnemos -p 5434 -h 127.0.0.1 -tAc 'SELECT pg_last_wal_replay_lsn();'"
    ```
 
@@ -144,7 +143,7 @@ Patroni-managed cluster without data loss.
 4. Take a final physical backup of the primary before changing supervisors.
 
    ```bash
-   ssh jasonperlow@<host> "podman exec mnemos-v3x-podman_postgres_1 \
+   ssh <user>@<host> "podman exec mnemos-v3x-podman_postgres_1 \
        pg_basebackup -h 127.0.0.1 -p 5432 -U replicator \
        -D /tmp/mnemos-pythia-final-basebackup -Fp -Xs -P"
    ```
@@ -163,7 +162,7 @@ Patroni-managed cluster without data loss.
    existing slot name during the transition:
 
    ```bash
-   ssh jasonperlow@<host> "podman run --rm \
+   ssh <user>@<host> "podman run --rm \
        -v mnemos-patroni-cerberus-pgdata:/var/lib/postgresql/data \
        -e PGPASSWORD=replace-with-replicator-password \
        docker.io/pgvector/pgvector:pg16 \

@@ -16,7 +16,7 @@ There is **no `doctor` role** anywhere in the role checks. So the handoff's conc
 
 1. **`mnemos doctor` CLI** (`mnemos/cli/main.py:915` → `mnemos/runtime/hardware.py::cli_doctor`) — a local hardware/health diagnostic. No memory or DB-row access; no network role.
 2. **`doctor:codex-fix` hive job-kind** (`mnemos/domain/knemon/router.py:81`) — a scarce-path job type, not a user role.
-3. **Triage doctor service** (`/srv/agent-bus/zeroclaw_doctor.py`, `zeroclaw-doctor.service` on PYTHIA) — claims `triage:*` jobs from the **hive bus (:5005)**, builds context from the **failed job's description + result JSON** (`zeroclaw_doctor.py:828` "Build searchable text from job description + failed-job results"), invokes codex-cli to decide an action (release / codex-fix / cancel), and patches job status.
+3. **Triage doctor service** (`/srv/agent-bus/zeroclaw_doctor.py`, `zeroclaw-doctor.service` on the primary) — claims `triage:*` jobs from the **hive bus (:5005)**, builds context from the **failed job's description + result JSON** (`zeroclaw_doctor.py:828` "Build searchable text from job description + failed-job results"), invokes codex-cli to decide an action (release / codex-fix / cancel), and patches job status.
 
 ## Triage doctor's data access — NOT MNEMOS memory
 

@@ -31,7 +31,3 @@ For anything you intend to act on, use the live documentation instead:
 | `V4_PLAN.md` | The 4.0 plan, including proposals that were never built. |
 | `CORPUS-REVIEW-2026-04-29.md`, `CORPUS-REVIEW-V4.2-NATS.md` | Point-in-time corpus reviews. |
 | `RFC-002-REENGAGEMENT.md` | A design memo. |
-| `codex-adversarial-review-*.md`, `opus-adversarial-review-*.md` | Adversarial review reports against a specific commit. Their findings were either fixed or superseded. |
-| `handoff-*.md` | Working handoff notes between development sessions. |
-| `FLEET-DISPATCHER-DESIGN-2026-05-20.md` | A design note for a build-dispatch experiment. |
-| `v6.0-workstream-b-complete.md` | A workstream completion note. |

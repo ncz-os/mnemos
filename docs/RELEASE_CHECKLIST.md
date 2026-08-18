@@ -57,12 +57,12 @@ Skip if the release is docs-only.
 
 - [ ] Build the `full-hot` image on pg-host from the working-tree checkout:
   ```bash
-  rsync -az --delete --exclude='.venv*' --exclude='__pycache__' /tmp/mnemos-work/ jasonperlow@<host>:/tmp/mnemos-build-x.y.z/
-  ssh jasonperlow@<host> 'cp /tmp/mnemos_hot-0.2.0-cp311-abi3-manylinux_2_34_x86_64.whl /tmp/mnemos-build-x.y.z/ && cd /tmp/mnemos-build-x.y.z && podman build -f Dockerfile.full -t localhost/mnemos-os:x.y.z-full-hot .'
+  rsync -az --delete --exclude='.venv*' --exclude='__pycache__' /tmp/mnemos-work/ <user>@<host>:/tmp/mnemos-build-x.y.z/
+  ssh <user>@<host> 'cp /tmp/mnemos_hot-0.2.0-cp311-abi3-manylinux_2_34_x86_64.whl /tmp/mnemos-build-x.y.z/ && cd /tmp/mnemos-build-x.y.z && podman build -f Dockerfile.full -t localhost/mnemos-os:x.y.z-full-hot .'
   ```
 - [ ] Save + transfer to gpu-host + oracle-host:
   ```bash
-  ssh jasonperlow@<host> 'podman save -o /tmp/mnemos-os-x.y.z-full-hot.tar localhost/mnemos-os:x.y.z-full-hot && scp /tmp/mnemos-os-x.y.z-full-hot.tar jasonperlow@<host>:/tmp/ && scp /tmp/mnemos-os-x.y.z-full-hot.tar jasonperlow@<host>:/tmp/'
+  ssh <user>@<host> 'podman save -o /tmp/mnemos-os-x.y.z-full-hot.tar localhost/mnemos-os:x.y.z-full-hot && scp /tmp/mnemos-os-x.y.z-full-hot.tar <user>@<host>:/tmp/ && scp /tmp/mnemos-os-x.y.z-full-hot.tar <user>@<host>:/tmp/'
   ```
 - [ ] Roll the **canary** (oracle-host) first:
   - Stop + rename the old container as `_pre<version>` for rollback
@@ -74,7 +74,7 @@ Skip if the release is docs-only.
 - [ ] Run smoke checks across the fleet:
   ```bash
   for h in <host> <host> <host>; do
-    ssh -n jasonperlow@$h 'curl -s http://localhost:5002/health' | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['version'], d['status'], d['database_connected'])"
+    ssh -n <user>@$h 'curl -s http://localhost:5002/health' | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['version'], d['status'], d['database_connected'])"
   done
   ```
 - [ ] Cleanup `_pre<version>` containers + transfer tars only after
@@ -84,21 +84,21 @@ Skip if the release is docs-only.
 
 - [ ] pg-host → gpu-host streaming replication still healthy:
   ```bash
-  ssh jasonperlow@<host> "podman exec mnemos-v3x-podman_postgres_1 psql -U mnemos_user -d mnemos -c 'SELECT application_name, state, replay_lag FROM pg_stat_replication;'"
+  ssh <user>@<host> "podman exec mnemos-v3x-podman_postgres_1 psql -U mnemos_user -d mnemos -c 'SELECT application_name, state, replay_lag FROM pg_stat_replication;'"
   ```
 - [ ] If the release added migrations, confirm they replicated to
       gpu-host automatically:
   ```bash
-  ssh jasonperlow@<host> 'podman exec mnemos-standby psql -U mnemos_user -d mnemos -p 5434 -h 127.0.0.1 -c "\dt" | grep <new_table_name>'
+  ssh <user>@<host> 'podman exec mnemos-standby psql -U mnemos_user -d mnemos -p 5434 -h 127.0.0.1 -c "\dt" | grep <new_table_name>'
   ```
 
 ### Bridge tier-2 verification
 
 - [ ] pg-host cron `bridge-tier2-nightly.sh` succeeded last night:
   ```bash
-  ssh jasonperlow@<host> 'tail -20 /tmp/bridge-tier2-$(date -u +%Y-%m-%d).log'
+  ssh <user>@<host> 'tail -20 /tmp/bridge-tier2-$(date -u +%Y-%m-%d).log'
   ```
-- [ ] Or run it on demand: `ssh jasonperlow@<host> '/usr/local/bin/bridge-tier2-nightly.sh'`.
+- [ ] Or run it on demand: `ssh <user>@<host> '/usr/local/bin/bridge-tier2-nightly.sh'`.
       All three target APIs should pass — if any fail, the bridge or the
       target SDK has drifted and needs a fix before announcing GA.
 
@@ -144,9 +144,9 @@ gh create + push + argonas init + push).
 The nightly tier-2 cron uses clones at `/opt/mnemos-bridges/`. If a bridge
 just released:
 
-- [ ] `ssh jasonperlow@<host> 'cd /opt/mnemos-bridges/mnemos-bridge-<name> && git pull --quiet && /opt/mnemos-bridges/.venv/bin/pip install --quiet -e .'`
+- [ ] `ssh <user>@<host> 'cd /opt/mnemos-bridges/mnemos-bridge-<name> && git pull --quiet && /opt/mnemos-bridges/.venv/bin/pip install --quiet -e .'`
 - [ ] Run the cron once manually:
-      `ssh jasonperlow@<host> '/usr/local/bin/bridge-tier2-nightly.sh'`
+      `ssh <user>@<host> '/usr/local/bin/bridge-tier2-nightly.sh'`
 - [ ] Confirm the daily summary memory landed in MNEMOS:
       `curl -s -H 'Authorization: Bearer <token>' "http://<host>:5002/v1/memories/search?subcategory=bridge-tier2&limit=1"`
 
@@ -261,8 +261,8 @@ For each runner that's part of the operator's stack:
   is `ops/bridge-tier2-nightly.sh` in this repo. Refresh the deployed
   copy with:
   ```bash
-  scp ops/bridge-tier2-nightly.sh jasonperlow@<host>:/tmp/
-  ssh jasonperlow@<host> 'sudo install -m 755 /tmp/bridge-tier2-nightly.sh /usr/local/bin/bridge-tier2-nightly.sh'
+  scp ops/bridge-tier2-nightly.sh <user>@<host>:/tmp/
+  ssh <user>@<host> 'sudo install -m 755 /tmp/bridge-tier2-nightly.sh /usr/local/bin/bridge-tier2-nightly.sh'
   ```
 - The image build artifact for the `-full-hot` images (every release
   since v5.0.6) is `Dockerfile.full` at the repo root. It pulls all
