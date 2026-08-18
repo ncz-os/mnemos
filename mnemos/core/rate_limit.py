@@ -50,7 +50,92 @@ def _client_ip(request: Request) -> str:
     return get_remote_address(request)
 
 
-limiter = Limiter(
+class _FailOpenLimiter(Limiter):
+    """A Limiter that degrades to "unlimited" when its store is unreachable.
+
+    This has to be fixed at the limiter, not at the exception handler, because
+    of how SlowAPIMiddleware routes errors. ``slowapi.middleware._check_limits``
+    does:
+
+        except Exception as e:
+            exception_handler = app.exception_handlers.get(
+                type(e), _rate_limit_exceeded_handler
+            )
+
+    That is an EXACT-TYPE lookup. ``app.add_exception_handler(RateLimitExceeded,
+    ...)`` therefore only ever matches a real limit violation. When the store is
+    down the limiter raises its backend's error -- ``ConnectionError`` from
+    redis -- which matches nothing, so slowapi falls back to its own
+    ``_rate_limit_exceeded_handler``, which reads ``exc.detail``. That attribute
+    exists only on RateLimitExceeded, so the handler itself raises
+
+        AttributeError: 'ConnectionError' object has no attribute 'detail'
+
+    out of ``dispatch`` -- an unhandled 500 on EVERY route, ``/health``
+    included, from a container that started cleanly. Registering the handler
+    for ``Exception`` does not help either: the lookup is by exact type, so it
+    is not subclass-aware, and the set of errors an arbitrary storage backend
+    can raise is not enumerable.
+
+    Catching here means slowapi never sees a non-RateLimitExceeded exception at
+    all, and it covers the ``@limiter.limit()`` decorator path as well as the
+    middleware path.
+
+    Rate limiting is a protective measure: losing its store must degrade to
+    "unlimited", never to "the API is broken". Genuine violations still raise
+    RateLimitExceeded and still return 429.
+
+    Reproduced on an arm64 build of 6.1.6, where the `server` profile defaults
+    ``rate_limit.storage_uri`` to ``redis://localhost:6379/1`` and the image
+    ships no redis.
+    """
+
+    def _check_request_limit(self, request, endpoint_func, in_middleware=True):  # type: ignore[override]
+        try:
+            return super()._check_request_limit(request, endpoint_func, in_middleware)
+        except RateLimitExceeded:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "rate-limit store unavailable (%s: %s); allowing the request through. "
+                "Rate limiting is DISABLED until the store recovers. storage_uri=%s",
+                type(exc).__name__,
+                exc,
+                RATE_LIMIT_STORAGE,
+            )
+            # Swallowing the error is not enough on its own. SlowAPIMiddleware
+            # treats "no exception" as "limits were evaluated" and goes on to
+            # `_inject_headers(response, request.state.view_rate_limit)` -- and
+            # that state is only set by the check we just aborted. Leaving it
+            # unset trades the AttributeError for a different one, still 500 on
+            # every route. Clear it explicitly and make injection a no-op below.
+            try:
+                request.state.view_rate_limit = None
+            except Exception:  # pragma: no cover - request without a mutable state
+                pass
+            return None
+
+    def _inject_headers(self, response, current_limit):  # type: ignore[override]
+        """Skip X-RateLimit headers when no limit was actually evaluated.
+
+        Pairs with the fail-open above: there are no meaningful numbers to
+        report when the store never answered, and slowapi would raise
+        unpacking ``None``.
+        """
+        if not current_limit:
+            return response
+        try:
+            return super()._inject_headers(response, current_limit)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "could not inject rate-limit headers (%s: %s); serving the response as-is.",
+                type(exc).__name__,
+                exc,
+            )
+            return response
+
+
+limiter = _FailOpenLimiter(
     key_func=_client_ip,
     default_limits=[RATE_LIMIT_DEFAULT] if RATE_LIMIT_ENABLED else [],
     storage_uri=RATE_LIMIT_STORAGE,
