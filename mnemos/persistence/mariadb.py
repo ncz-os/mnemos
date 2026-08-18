@@ -635,6 +635,19 @@ class MariadbConsultationAuditRepository(MysqlConsultationAuditRepository):
 
 
 class MariadbFederationRepository(MysqlFederationRepository):
+    # MariaDB does not implement ``CAST(x AS JSON)``. Its JSON type is an
+    # alias for LONGTEXT with a json_valid() CHECK, so the cast is both
+    # unsupported and unnecessary -- the column already holds JSON text.
+    # Inheriting the MySQL form made every peer INSERT fail with
+    #
+    #   (1064, "You have an error in your SQL syntax ... near 'JSON),'")
+    #
+    # which surfaced as HTTP 500 from POST /v1/federation/peers. A MariaDB
+    # node could not be given a peer at all, so it could never federate.
+    # Found on a live MariaDB 11 host while wiring the fleet together.
+    _JSON_BIND = "%s"
+    _JSON_METADATA_EXPR = "COALESCE(NULLIF(metadata, ''), JSON_OBJECT())"
+
     async def feed_query(
         self,
         tx: Transaction,
