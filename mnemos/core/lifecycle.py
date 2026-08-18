@@ -24,22 +24,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from mnemos.core.config import PG_CONFIG, db2_dsn_env, get_settings, oracle_dsn_env, required_capabilities_env
 from mnemos.core.pool import PoolManager
 
-# Redis still backs optional API response/search caches. Keep the import guarded
-# so deployments without the extra degrade cleanly and tests can monkeypatch it.
-try:
-    import aioredis as _aioredis  # type: ignore[import-not-found]
-
-    aioredis = _aioredis
-    del _aioredis
-except ImportError:
-    # Dummy module-like object for test monkeypatching
-    class _FakeAioredis:
-        @staticmethod
-        def from_url(*_args: Any, **_kwargs: Any) -> Any:  # type: ignore[no-untyped-def]
-            raise RuntimeError("aioredis not available")
-
-    aioredis = _FakeAioredis()  # type: ignore[assignment]
-
+# Redis is not a runtime dependency. The optional aioredis cache this shim
+# existed for was never read by anything and has been removed; rate limiting
+# defaults to memory:// and can be pointed at any limits-supported store via
+# RATE_LIMIT_STORAGE_URI when a shared counter is needed (multi-worker or
+# multi-node). Nothing here imports redis.
 logger = logging.getLogger(__name__)
 
 
@@ -949,16 +938,12 @@ async def lifespan(app):
 
     await _log_federation_startup_guidance(_pool)
 
-    _redis_url = settings.server.redis_url
-    try:
-        _cache = aioredis.from_url(_redis_url, decode_responses=True)
-        await _cache.ping()
-        app.state.cache = _cache
-        logger.info(f"Redis cache connected ({_redis_url})")
-    except Exception as e:
-        logger.warning(f"Redis unavailable at {_redis_url}, caching disabled: {e}")
-        _cache = None
-        app.state.cache = None
+    # No Redis cache. This block used to open an aioredis connection, ping it,
+    # and publish it as app.state.cache -- which nothing ever read. It was a
+    # connection opened per boot for no consumer, and the only reason the
+    # package needed redis at runtime.
+    _cache = None
+    app.state.cache = None
 
     # Start registered background workers. API owns registrations so core stays
     # below API/domain/webhook/worker packages in the dependency graph.

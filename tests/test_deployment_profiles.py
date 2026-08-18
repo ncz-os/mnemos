@@ -95,7 +95,11 @@ def test_profile_server_sets_server_defaults(monkeypatch: pytest.MonkeyPatch, tm
     with _isolated_settings(monkeypatch, tmp_path, env={"MNEMOS_PROFILE": "server"}) as settings:
         assert settings.profile == "server"
         assert settings.database.backend == "postgres"
-        assert settings.rate_limit.storage_uri == "redis://localhost:6379/1"
+        # Redis is not required. memory:// is correct for the server profile, which
+        # defaults to a single worker; a shared store is opt-in via
+        # RATE_LIMIT_STORAGE_URI when running multiple workers or nodes, where a
+        # per-process counter would multiply the effective ceiling.
+        assert settings.rate_limit.storage_uri == "memory://"
         assert settings.graeae.mode_default == "auto"
         assert settings.logging.level == "INFO"
         assert settings.compression.workers == 4

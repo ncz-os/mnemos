@@ -21,10 +21,6 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_p
         async def create_pool(**_kwargs):
             return FalsyPool()
 
-        class RedisUnavailable:
-            async def ping(self):
-                raise RuntimeError("redis unavailable")
-
         class FakeGraeaeEngine:
             def __init__(self):
                 self.closed = False
@@ -51,7 +47,8 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_p
         core_config.reload_settings()
         monkeypatch.setattr(lifecycle, "_load_config", lambda: {"worker": {"enabled": False}})
         monkeypatch.setattr(lifecycle.asyncpg, "create_pool", create_pool)
-        monkeypatch.setattr(lifecycle.aioredis, "from_url", lambda *_args, **_kwargs: RedisUnavailable())
+        # No aioredis to patch: the lifecycle no longer opens a Redis cache.
+        # app.state.cache is unconditionally None, asserted below.
         if graeae_engine is not None:
             monkeypatch.setattr(graeae_engine, "get_graeae_engine", lambda: engine)
 
