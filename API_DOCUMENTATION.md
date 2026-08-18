@@ -1,7 +1,7 @@
 # MNEMOS API Documentation
 
 **Base URL**: `http://localhost:5002`
-**Version**: v6.1.7 current (patch release on the v6.0.0 GA line; legacy GA is v5.0.1) (on top of v5.0.0 GA shipped 2026-05-02)
+**Version**: v6.1.7 current
 **Format**: JSON
 
 ---
@@ -29,7 +29,7 @@ The unified `/v1/` namespace is the supported API surface.
 10. [Webhooks](#webhooks)
 11. [OAuth / OIDC](#oauth--oidc)
 12. [Federation](#federation)
-13. [Portability (MPF)](#portability-mpf)
+13. [Portability (MIF)](#portability-mif)
 14. [Error Handling](#error-handling)
 15. [Examples](#examples)
 
@@ -100,7 +100,7 @@ remain owner+namespace scoped.
 ### POST /v1/memories
 
 Create a memory. This writes the memory row and emits a transactional
-`memory.created` webhook event. Compression has been operator-batched since v4.0:
+`memory.created` webhook event. Compression is operator-batched:
 root users enqueue memories through `/admin/compression/enqueue` or
 `/admin/compression/enqueue-all`; the distillation worker then drains
 `memory_compression_queue`.
@@ -131,10 +131,9 @@ manual reconciliation guidance (`handle_trigger_pgerror` in
 
 ### DELETE /v1/memories/{memory_id}
 
-Delete a memory under the same owner+namespace write scope. The v3.5
-trigger migration keeps DELETE snapshot handling live for deployments
-that still attach `trg_memory_version_delete`; broken branch state maps
-to `409`.
+Delete a memory under the same owner+namespace write scope. DELETE snapshot
+handling stays live for deployments that attach `trg_memory_version_delete`;
+broken branch state maps to `409`.
 
 ### POST /v1/memories/search
 
@@ -187,8 +186,8 @@ owner+namespace tenancy model.
 - `PATCH /v1/kg/triples/{triple_id}` — update a triple
 - `DELETE /v1/kg/triples/{triple_id}` — delete a triple
 
-KG tenancy columns were added in v3.1.x and namespace parity became the
-standard across memory and entity surfaces in v3.2-v3.5.
+KG surfaces carry the same tenancy columns and namespace scoping as the memory
+and entity surfaces.
 
 ---
 
@@ -308,8 +307,8 @@ Stateful multi-turn chat with memory injection at turn boundaries.
 
 ## MORPHEUS
 
-Dream-state generation is operator-triggered. v5.0.0 includes the REPLAY,
-CLUSTER, SYNTHESISE, CONSOLIDATE, and EXTRACT phases. Generated memories are
+Dream-state generation is operator-triggered, across the REPLAY, CLUSTER,
+SYNTHESISE, CONSOLIDATE, and EXTRACT phases. Generated memories are
 tagged with `morpheus_run_id`; rollback deletes generated memories for that run.
 
 - `GET /v1/morpheus/runs` — list runs
@@ -377,19 +376,25 @@ Background sync runs every 60 seconds.
 
 ---
 
-## Portability (MPF)
+## Portability (MIF)
 
-MNEMOS Portability Format (MPF) is the native import/export envelope.
+MIF 1.0 (Modeled Information Format) is the native import/export format. A MIF
+bundle is a directory of canonical Markdown concept files laid out by base type
+(`<conceptType>/<uuid>.md`) plus a `mif-manifest.json` index naming the spec
+version, the schema `$id`, and every concept's id, type, path, and source. The
+CHARON subsystem reads and writes it.
 
-- `GET /v1/export` — export MPF v0.1.x envelope. `include_sidecars=true`
-  includes KG triples, memory-version DAGs, and compression manifests where
-  available.
-- `POST /v1/import` — import an MPF envelope. Root plus
-  `preserve_owner=true` is for authoritative restore/migration; non-root
-  imports are scoped to the caller's owner+namespace.
+- `GET /v1/export` — export a MIF bundle. `include_sidecars=true` adds KG
+  triples, memory-version DAGs, and compression manifests where available.
+  These are MNEMOS-native rows that the MIF concept schema has no home for, so
+  they travel alongside the bundle rather than inside it.
+- `POST /v1/import` — import a MIF bundle. Root plus `preserve_owner=true` is
+  for authoritative restore and migration; non-root imports are scoped to the
+  caller's owner+namespace.
 
-CLI helpers: `mnemos export`, `mnemos import`, `mnemos validate-mpf`, and the
-modules under `mnemos/tools/`.
+CLI helpers: `mnemos export`, `mnemos import`, and the modules under
+`mnemos/tools/`. `mnemos validate-mpf` validates an older MPF envelope, for
+operators who still hold one.
 
 ---
 
@@ -407,7 +412,7 @@ Common codes:
 - `401` — missing or invalid auth
 - `403` — role check failed
 - `404` — entity not found
-- `409` — conflict requiring operator action, including incompatible federation schema and v3.5 `MN001` branch-state reconciliation
+- `409` — conflict requiring operator action, including incompatible federation schema and `MN001` branch-state reconciliation
 - `413` — request body exceeds `MAX_BODY_BYTES` (default 5 MB)
 - `429` — rate-limited (when `RATE_LIMIT_ENABLED=true`)
 - `503` — database pool unavailable

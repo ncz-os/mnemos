@@ -1,22 +1,23 @@
 # MNEMOS Quick Start Requirements
 
-**Applies to**: current v6.1.7 release line (legacy GA v5.0.1)
-**TL;DR**: Python 3.11+ for package installs; no host Python for single-binary.
-Use SQLite for `edge`/`dev`, or PostgreSQL 16 + Redis for `server`.
+**Applies to**: current v6.1.7 release line
+**TL;DR**: Python 3.11+ for package installs, or no host Python at all if you
+run the container image. Use SQLite for `edge`/`dev`, or PostgreSQL 16 for
+`server` — plus Redis only if you run more than one worker.
 **Full Details**: See `SYSTEM_REQUIREMENTS.md`
 
 ---
 
-## Single Binary (Fastest Edge Deploy)
+## Container (Fastest Deploy)
 
 ```bash
-curl -L https://github.com/ncz-os/mnemos/releases/download/v6.0-rc/mnemos-linux-x86_64 -o mnemos
-chmod +x mnemos
-./mnemos install --profile edge
-./mnemos serve --profile edge
+docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos:6.1
 ```
 
-**Total Time**: ~5 minutes
+SQLite-backed, zero configuration, no host Python. Pin the minor line (`:6.1`)
+to keep a fleet on identical code.
+
+**Total Time**: ~2 minutes
 
 ---
 
@@ -34,20 +35,22 @@ sudo apt install -y git curl build-essential libpq-dev
 # 3. MNEMOS package (2 minutes)
 python3.11 -m venv ~/.venvs/mnemos
 source ~/.venvs/mnemos/bin/activate
-pip install mnemos-os==6.1.7  # source-install from v6.0-rc tag
+pip install 'mnemos-core[edge]'
 
 # 4. SQLite-backed dev profile
 mnemos install --profile dev
 mnemos serve --profile dev
 ```
 
-For a production `server` profile, add PostgreSQL + pgvector and Redis:
+For a production `server` profile, add PostgreSQL + pgvector. Add Redis too if
+you intend to run more than one worker — the rate-limit and circuit-breaker
+counters are process-local without it:
 
 ```bash
 sudo apt install -y postgresql-16 postgresql-16-pgvector postgresql-client redis-server
 python3.11 -m venv venv
 source venv/bin/activate
-pip install mnemos-os==6.1.7  # source-install from v6.0-rc tag
+pip install 'mnemos-core[server,redis]'
 export MNEMOS_PROFILE=server
 export RATE_LIMIT_STORAGE_URI=redis://localhost:6379/1
 mnemos install --profile server
@@ -326,6 +329,6 @@ kill -9 <PID>
 
 ---
 
-**Version**: v6.0.1
+**Version**: v6.1.7
 **Updated**: 2026-07-10
 **Accuracy**: Production-verified

@@ -568,6 +568,4 @@ Per Month: $441-542
 
 ---
 
-**Originally Written For**: v3.1.0
-**Verified Current For**: v5.0.1 (2026-05-08)
-**Audience**: DevOps, SREs, developers making deployment decisions
+**Audience**: DevOps, SREs, and developers making deployment decisions

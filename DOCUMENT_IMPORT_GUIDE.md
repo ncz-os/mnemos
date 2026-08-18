@@ -1,13 +1,13 @@
 # MNEMOS Document Import with Docling
 
-v3.0.0 includes intelligent document import using IBM's [Docling](https://www.ibm.com/products/docling) library. This allows automatic conversion of documents (PDFs, Word, Excel, PowerPoint, etc.) into MNEMOS memory records with automatic chunking and metadata extraction.
+MNEMOS imports documents through IBM's [Docling](https://www.ibm.com/products/docling) library, converting PDFs, Word, Excel, PowerPoint, and similar formats into memory records with automatic chunking and metadata extraction.
 
 ## Installation
 
 Document import is optional and requires the Docling extra:
 
 ```bash
-pip install mnemos-os[docling]
+pip install 'mnemos-core[docling]'
 ```
 
 This installs:
@@ -160,7 +160,7 @@ Each imported document chunk includes:
 | **400** | Bad Request | Empty file, invalid format |
 | **401** | Unauthorized | Missing/invalid auth token |
 | **413** | Payload Too Large | File exceeds MAX_BODY_BYTES (default 5 MB) |
-| **501** | Not Implemented | Docling not installed (`pip install mnemos-os[docling]`) |
+| **501** | Not Implemented | Docling not installed (`pip install 'mnemos-core[docling]'`) |
 | **503** | Service Unavailable | Database not available |
 
 **Example error response:**
@@ -242,7 +242,7 @@ curl -X PATCH http://localhost:5002/v1/memories/{memory_id} \
 
 **Q: "Docling not installed" error**
 ```bash
-A: Install with: pip install mnemos-os[docling]
+A: Install with: pip install 'mnemos-core[docling]'
 ```
 
 **Q: Document parsing fails with "Unsupported format"**
@@ -279,59 +279,32 @@ A chunk listed in `unconfirmed_memory_ids` is in a **commit-ambiguous** state. T
 
 > **A `GET /v1/memories/{id}` returning 404 does NOT prove the commit rolled back.** Under Postgres MVCC, a fresh-connection read can return 404 while the original transaction is still resolving (e.g., visibility lag during a connection-storm). The COMMIT can become visible after the client has already retried, creating a duplicate row.
 
-### Operator-honest retry contract
+### Retry contract
 
-The stable-chunk-identity primitive shipped in **v4.2.0a14 round-68** (migration `migrations_v4_2_document_import_chunk_idempotency.sql`). Each chunk now carries an `import_chunk_key` derived from `sha256(owner_id NUL namespace NUL source_file NUL chunk_num)`, with a partial UNIQUE index on the column. The chunk INSERT uses `ON CONFLICT (import_chunk_key) DO UPDATE SET import_chunk_key = EXCLUDED.import_chunk_key RETURNING id`, so:
+Each chunk carries an `import_chunk_key` derived from
+`sha256(owner_id NUL namespace NUL source_file NUL chunk_num)`, with a unique
+index on the column (migration
+`migrations_v4_2_document_import_chunk_idempotency.sql`). The chunk INSERT uses
+`ON CONFLICT (import_chunk_key) DO UPDATE SET import_chunk_key =
+EXCLUDED.import_chunk_key RETURNING id`, so:
 
 - A retry of the same chunk hits the existing row.
-- The `RETURNING id` clause returns the existing row's canonical id.
-- The helper appends THAT id to `memory_ids`, not the surrogate `new_memory_id()` value.
+- `RETURNING id` yields that row's canonical id.
+- The helper appends that id to `memory_ids` rather than a fresh surrogate.
 - No duplicate row is created.
 
-This closes the duplicate-on-retry hazard documented in earlier rounds. Clients can safely retry an import after a 503, and the response on retry will surface the canonical ids of the chunks that actually committed during the original attempt — `unconfirmed_memory_ids` is now redundant on the retry response (the chunk's id appears in `memory_ids` instead).
+Clients can therefore retry an import safely after a 503. On retry, the
+response surfaces the canonical ids of the chunks that actually committed
+during the original attempt.
 
-### What `unconfirmed_memory_ids` still does
+### What `unconfirmed_memory_ids` is for
 
-Even with the idempotency primitive, the field stays useful for the **first** 503 response (before the client retries):
+The field matters on the **first** 503 response, before the client retries:
 
-- A 200 on `GET /v1/memories/{id}` proves the original commit succeeded; the client can skip the chunk.
-- A 404 on the same endpoint does not prove rollback (Postgres MVCC visibility lag), but the client can simply retry the import and trust the ON CONFLICT path to deduplicate. With the v4.2.0a14 migration applied this is safe; without it (older deployments) the operator-honest retry options below still apply.
-
-### Pre-migration retry contract (deployments without round-68's migration)
-
-For deployments still on v4.1.x or pre-round-68 v4.2.0a14 alphas:
-
-1. **Treat the import as failed-pending.** Surface 503 to the human operator; require manual reconciliation.
-2. **Accept potential duplicate imports.** Retry the entire file or just the unconfirmed chunks; tolerate that some confirmed-committed memories may be re-imported under fresh non-deterministic IDs.
-3. **Skip retry of unconfirmed chunks.** Retry only chunks that 4xx-failed on content (those did rollback).
-
-Apply the v4.2.0a14 migration to enable safe automatic retry.
-
-### Round-68 alpha → round-73+ upgrade (operator action required)
-
-The round-68 alpha of `migrations_v4_2_document_import_chunk_idempotency.sql` created a **partial unique index** (with a `WHERE import_chunk_key IS NOT NULL` predicate). The helper's `ON CONFLICT (import_chunk_key)` clause cannot infer a partial index as its arbiter, so document import fails with `no unique or exclusion constraint matching the ON CONFLICT specification` on every chunk.
-
-Round-73 ships a **non-partial** index via `CREATE UNIQUE INDEX CONCURRENTLY`. The migration is online-safe for fresh installs and for deployments that already have the non-partial index (idempotent). It cannot, however, repair an existing partial index from inside its `psql -f` script (CONCURRENTLY can't run inside a DO block, and a non-CONCURRENT rebuild would block writes).
-
-If you ran the round-68 alpha (any commit between round-68 and round-72), repair the partial index manually BEFORE applying the round-73 migration:
-
-```bash
-sudo -u postgres psql -d mnemos -f db/scripts/repair_round_68_partial_chunk_key_index.sql
-```
-
-The script does a fully-online `CREATE INDEX CONCURRENTLY` under a temp name + `DROP INDEX CONCURRENTLY` of the old partial + `ALTER INDEX RENAME TO`. No write-blocking step. Idempotent — safe to re-run.
-
-Verify before and after:
-
-```sql
-SELECT indpred IS NULL AS is_non_partial
-  FROM pg_index
- WHERE indexrelid = 'memories_import_chunk_key_uniq'::regclass;
-```
-
-`is_non_partial = t` after the repair. Document import then works on the round-73+ migration.
-
-Fresh installs of v4.2.0a14 round-73+ get the non-partial index directly and do **not** need this script.
+- A 200 from `GET /v1/memories/{id}` proves the original commit succeeded, so
+  the client can skip that chunk.
+- A 404 does not prove rollback, because of MVCC visibility lag. The client
+  should simply retry the import and let the `ON CONFLICT` path deduplicate.
 
 ## See Also
 
