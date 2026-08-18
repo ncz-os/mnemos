@@ -3688,6 +3688,24 @@ class MysqlConsultationAuditRepository(ConsultationAuditRepository):
 
 
 class MysqlFederationRepository(FederationRepository):
+
+    #: How a JSON-typed column is bound in an INSERT/UPDATE.
+    #:
+    #: MySQL has a real JSON type and wants the explicit cast. MariaDB does
+    #: NOT support ``CAST(x AS JSON)`` at all -- its JSON is an alias for
+    #: LONGTEXT with a json_valid() CHECK -- and raises
+    #: ``(1064, "You have an error in your SQL syntax ... near 'JSON)'")``.
+    #: MariadbFederationRepository overrides this to a plain placeholder.
+    #:
+    #: Found creating a federation peer on a live MariaDB host: every
+    #: POST /v1/federation/peers returned 500, so a MariaDB node could not be
+    #: given a peer and therefore could never federate.
+    _JSON_BIND = "CAST(%s AS JSON)"
+
+    #: How an existing TEXT/JSON column is read back as JSON in an expression.
+    #: Same MariaDB limitation as _JSON_BIND: the cast is unsupported there,
+    #: and the column is already LONGTEXT holding JSON, so it needs no cast.
+    _JSON_METADATA_EXPR = "COALESCE(CAST(NULLIF(metadata, '') AS JSON), JSON_OBJECT())"
     _ALLOWED_PEER_COLS = {
         "name",
         "base_url",
@@ -3763,10 +3781,10 @@ class MysqlFederationRepository(FederationRepository):
                    category_filter, enabled, sync_interval_secs, compat_mode,
                    created, updated)
                 VALUES
-                  (%s, %s, %s, %s, %s, CAST(%s AS JSON),
-                   CAST(%s AS JSON), %s, %s, %s,
+                  (%s, %s, %s, %s, %s, {json_bind},
+                   {json_bind}, %s, %s, %s,
                    CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))
-                """,
+                """.format(json_bind=self._JSON_BIND),
                 (
                     peer_id,
                     name,
@@ -3805,7 +3823,7 @@ class MysqlFederationRepository(FederationRepository):
         params: list[Any] = []
         for col, value in updates.items():
             if col in {"namespace_filter", "category_filter"}:
-                assignments.append(f"{col} = CAST(%s AS JSON)")
+                assignments.append(f"{col} = {self._JSON_BIND}")
                 params.append(_json_array_text(value))
             elif col == "enabled":
                 assignments.append("enabled = %s")
@@ -4361,7 +4379,7 @@ class MysqlFederationRepository(FederationRepository):
                        consolidated_at = COALESCE(%s, CURRENT_TIMESTAMP(6)),
                        permission_mode = 400,
                        metadata = JSON_SET(
-                           COALESCE(CAST(NULLIF(metadata, '') AS JSON), JSON_OBJECT()),
+                           {json_metadata},
                            '$.federation_consolidation',
                            JSON_OBJECT(
                                'remote_id', %s,
@@ -4376,7 +4394,7 @@ class MysqlFederationRepository(FederationRepository):
                        SELECT 1 FROM memories
                         WHERE id = %s AND deleted_at IS NULL
                    )
-                """,
+                """.format(json_metadata=self._JSON_METADATA_EXPR),
                 (
                     local_canonical_id,
                     consolidated_at,
