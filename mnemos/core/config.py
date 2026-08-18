@@ -27,7 +27,7 @@ from mnemos.core.services import ServiceResolution, parse_component_selection, r
 PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "server": {
         "backend": "postgres",
-        "rate_limit_storage": "redis://localhost:6379/1",
+        "rate_limit_storage": "memory://",
         "workers": 1,
         "graeae_mode_default": "auto",
         "log_level": "INFO",

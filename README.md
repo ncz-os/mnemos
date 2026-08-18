@@ -28,18 +28,14 @@ manage the full lifecycle of agent memory across providers, agents, and time
 horizons: **write, embed, search, compress, version, reason-over, audit,
 federate, export, import, and operate**.
 
-> **v6.0.0 — the split-distribution release.** MNEMOS is now a small core
-> (`mnemos-core`) plus separately installable `mnemos.*` namespace subsystems
-> (GRAEAE, PANTHEON, KNEMON, CHARON) and the standalone STIPHOS hive service. It
-> adds Oracle Database 26ai and IBM Db2 12.1.5 (EAP) as first-class persistence
-> backends alongside PostgreSQL and SQLite. Turnkey container images are
-> published to `ghcr.io/ncz-os` (`mnemos-core`, `mnemos`, `mnemos-enterprise`,
-> `mnemos-stiphos`); see [docs/INSTALL.md](docs/INSTALL.md) and
-> [AGENTS.md](AGENTS.md). Enterprise backend
-> driver, DSN, and migration steps are in
-> [docs/INSTALL.md](docs/INSTALL.md#enterprise-backends-oracle-database-26ai--ibm-db2-1215).
-> Development history continues
-> on the `feat/oracle-port` branch.
+> **How it is packaged.** MNEMOS ships as a small core (`mnemos-core`) plus
+> separately installable `mnemos.*` namespace subsystems (GRAEAE, PANTHEON,
+> KNEMON, CHARON) and the standalone STIPHOS hive service. Container images are
+> published to `ghcr.io/ncz-os` — `mnemos-core`, `mnemos` (amd64 + arm64), and
+> `mnemos-enterprise` (amd64, adds the Oracle/Db2/MySQL drivers). Pin the minor
+> line (`:6.1`) to keep a fleet on identical code. Install and DSN/driver setup
+> for each backend are in [docs/INSTALL.md](docs/INSTALL.md); the agent-facing
+> contract is in [AGENTS.md](AGENTS.md).
 
 
 ## Quick Start
@@ -168,7 +164,7 @@ Full documentation: [docs/](docs/)
 
 ## Architecture
 
-MNEMOS is a packaged FastAPI service with a single `mnemos` CLI for installation, serving, MCP transport, and operational checks. Agents connect through MCP stdio, MCP HTTP/SSE, REST, or OpenAI-compatible SDKs, while the runtime routes memory, reasoning, session, webhook, federation, portability, and observability work through the `mnemos/` package. Persistence is selected by profile and DSN: **SQLite + sqlite-vec** for edge and development installs, **PostgreSQL + pgvector** for server deployments, **Oracle Database 26ai** (`23.26.1-ee`, HNSW INMEMORY NEIGHBOR GRAPH, JSON Duality, TDE) for enterprise installs, and **IBM Db2 12.1.5** (native `VECTOR(768, FLOAT32)` + DiskANN vector index; runs through **Db2 Oracle Compatibility Mode** with cursor-level Oracle→Db2 token translation — a native Db2 dialect port is on the v6.x roadmap, see [docs/v6.1-roadmap.md](docs/v6.1-roadmap.md). `Db2MemoryRepository.semantic_search` emits native Db2 SQL — `VECTOR_DISTANCE(..., EUCLIDEAN)` + `FETCH APPROX FIRST` — engaging the DiskANN index on the user-facing query path) for enterprise installs, **MySQL 9.0+** (native `VECTOR` + `VECTOR_DISTANCE` — note these functions ship only in MySQL **Enterprise/HeatWave**, not Community) for the managed-cloud MySQL audience (RDS/Aurora MySQL, HeatWave), and **MariaDB 11.7+** (native `VECTOR` columns, `VEC_DISTANCE_COSINE`/`VEC_FromText`, HNSW `VECTOR INDEX` — all in the **free Community** edition, embeddings stored in a `memory_embeddings` join table) as the default open-source/self-hosted vector backend for the MySQL family. All six backends implement the same `PersistenceBackend` ABC (`mnemos/persistence/base.py`), self-provision their schema idempotently on `backend.open()` (DSN-aware, dimension from `MNEMOS_EMBEDDING_DIM`), and share `tests/test_persistence_parity.py`. **Recommended default for vector/semantic workloads: PostgreSQL + pgvector** — the most mature, predictable, and well-scaled vector store (HNSW, broad managed-service support); MariaDB is the strongest *MySQL-family* option but its vector engine is newer/less battle-tested. GRAEAE handles multi-provider reasoning and model routing; MOIRAI handles operator-audited compression through APOLLO and ARTEMIS.
+MNEMOS is a packaged FastAPI service with a single `mnemos` CLI for installation, serving, MCP transport, and operational checks. Agents connect through MCP stdio, MCP HTTP/SSE, REST, or OpenAI-compatible SDKs, while the runtime routes memory, reasoning, session, webhook, federation, portability, and observability work through the `mnemos/` package. Persistence is selected by profile and DSN: **SQLite + sqlite-vec** for edge and development installs, **PostgreSQL + pgvector** for server deployments, **Oracle Database 26ai** (`23.26.1-ee`, HNSW INMEMORY NEIGHBOR GRAPH, JSON Duality, TDE) for enterprise installs, and **IBM Db2 12.1.5** (native `VECTOR(768, FLOAT32)` + DiskANN vector index; the Db2 backend emits native Db2 SQL and does **not** require `DB2_COMPATIBILITY_VECTOR=ORA` — it uses `FETCH FIRST` rather than Oracle-compatibility `ROWNUM`. `Db2MemoryRepository.semantic_search` emits native Db2 SQL — `VECTOR_DISTANCE(..., EUCLIDEAN)` + `FETCH APPROX FIRST` — engaging the DiskANN index on the user-facing query path) for enterprise installs, **MySQL 9.0+** (native `VECTOR` + `VECTOR_DISTANCE` — note these functions ship only in MySQL **Enterprise/HeatWave**, not Community) for the managed-cloud MySQL audience (RDS/Aurora MySQL, HeatWave), and **MariaDB 11.7+** (native `VECTOR` columns, `VEC_DISTANCE_COSINE`/`VEC_FromText`, HNSW `VECTOR INDEX` — all in the **free Community** edition, embeddings stored in a `memory_embeddings` join table) as the default open-source/self-hosted vector backend for the MySQL family. All six backends implement the same `PersistenceBackend` ABC (`mnemos/persistence/base.py`), self-provision their schema idempotently on `backend.open()` (DSN-aware, dimension from `MNEMOS_EMBEDDING_DIM`), and share `tests/test_persistence_parity.py`. **Recommended default for vector/semantic workloads: PostgreSQL + pgvector** — the most mature, predictable, and well-scaled vector store (HNSW, broad managed-service support); MariaDB is the strongest *MySQL-family* option but its vector engine is newer/less battle-tested. GRAEAE handles multi-provider reasoning and model routing; MOIRAI handles operator-audited compression through APOLLO and ARTEMIS.
 
 ## Documentation
 
@@ -182,7 +178,7 @@ MNEMOS is a packaged FastAPI service with a single `mnemos` CLI for installation
 | GRAEAE reasoning | [docs/GRAEAE_FEATURES.md](docs/GRAEAE_FEATURES.md) |
 | PANTHEON provider facade | [docs/PANTHEON.md](docs/PANTHEON.md) |
 | KRONOS observability | [docs/KRONOS.md](docs/KRONOS.md) |
-| Portability format (MIF 1.0; MPF legacy) | [docs/MEMORY_EXPORT_FORMAT.md](docs/MEMORY_EXPORT_FORMAT.md) |
+| Portability format (MIF 1.0) | [docs/MEMORY_EXPORT_FORMAT.md](docs/MEMORY_EXPORT_FORMAT.md) |
 | Scaling | [docs/SCALING.md](docs/SCALING.md) |
 | Single-binary builds | [docs/SINGLE_BINARY.md](docs/SINGLE_BINARY.md) |
 | Operations | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
