@@ -21,7 +21,7 @@ This doc covers:
 - Federation health (peer heartbeat, detection of silent failures)
 
 What this doc does NOT cover:
-- Application code (see `docs/history/V3_5_CHARTER.md`, `docs/history/V3_6_CHARTER.md`, etc. for feature roadmap)
+- Application code (see `ROADMAP.md` for forward-looking scope)
 - High-level architecture (see `README.md` and `docs/MEMORY_ARCHITECTURE.md`)
 - User-facing API (see `API_DOCUMENTATION.md` (root) and `docs/SPECIFICATION.md`)
 
