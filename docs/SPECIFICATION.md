@@ -13,10 +13,9 @@ the EPIMONE `PersistenceBackend` ABC.
 > [MNEMOS_CORE_BOUNDARY.md](MNEMOS_CORE_BOUNDARY.md), [INSTALL.md](INSTALL.md), and
 > [LAYERED_INSTALL.md](LAYERED_INSTALL.md).
 
-**Status**: Authoritative for the v6.0.0 tree.
-Where text below references "v5.0.1" it describes the v5 baseline that
-the branch extends; the four-backend persistence surface (Postgres,
-Oracle Database 26ai, Db2 12.1.5, SQLite) is the current branch reality. Behavior
+**Status**: Authoritative for MNEMOS 6.1.
+The persistence surface is PostgreSQL, SQLite, Oracle Database 26ai,
+IBM Db2 12.1.5 and MySQL/MariaDB. Behavior
 not described here is either undefined (report as a bug) or scoped to a
 future release via `ROADMAP.md`.
 **Purpose**: supply enough structural detail that a scoping tool
