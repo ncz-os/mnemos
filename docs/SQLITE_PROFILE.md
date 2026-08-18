@@ -56,7 +56,7 @@ profile does not rely on trigger functions for retry-chain safety.
 Install the optional dependencies:
 
 ```bash
-pip install "mnemos-os[sqlite]"
+pip install 'mnemos-core[sqlite]'
 ```
 
 Prefer the profile flag:
