@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 # Intentional split rename: the deploy unit is the built image, not a PyPI mnemos-os dist.
 name = "mnemos-core"
-version = "6.1.4"
+version = "6.1.3"
 description = "MNEMOS core: agent memory OS base with GDPR right-to-be-forgotten, PERSEPHONE archival, KRONOS recall observability, multi-backend persistence, and multi-worker support"
 readme = "README.md"
 requires-python = ">=3.11"
