@@ -103,3 +103,4 @@ api_keys.json
 uv.lock
 .venv-ci/
 mnemos_os.egg-info/
+.docs-audit-ledger.json
