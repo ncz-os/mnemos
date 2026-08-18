@@ -73,6 +73,87 @@ crash-looped forever after a restart following a partial-then-recovered
 prior migration run — every retry hit `SQL0803N`/`SQLSTATE=23505` on the
 same static `INSERT` and never got past schema replay to serve traffic.
 
+## [6.1.5] — 2026-08-18
+
+### Fixed — a MariaDB node could not be given a federation peer
+
+`POST /v1/federation/peers` returned HTTP 500 on MariaDB:
+
+```
+(1064, "You have an error in your SQL syntax; check the manual that
+ corresponds to your MariaDB server version for the right syntax to use
+ near 'JSON),\n CAST(NULL AS JSON), 1, 300, 'strict', ...' at line 6")
+```
+
+`MariadbFederationRepository` inherits its SQL from the MySQL repository, which
+binds JSON columns as `CAST(%s AS JSON)`. MySQL has a real JSON type and
+accepts that; MariaDB does not implement the cast at all — its JSON type is an
+alias for LONGTEXT with a `json_valid()` CHECK, so the cast is both unsupported
+and unnecessary.
+
+Because peer creation was the only way to tell a node about a peer, the failure
+was total rather than partial: a MariaDB node could never federate.
+
+The JSON bind and the JSON-column read expression are now overridable class
+attributes; MariaDB overrides both, MySQL keeps the cast.
+`tests/test_mysql_family_json_binding.py` pins the split, asserts the two
+dialects genuinely differ so they cannot be collapsed back together, and
+asserts on the source of `create_peer`/`update_peer` — an inline cast would
+bypass the override and fail only on a live MariaDB, which CI does not have.
+
+## [6.1.4] — 2026-08-18
+
+Two backend-specific schema defects, each of which stopped 6.1 starting on a
+backend that is not PostgreSQL or SQLite. Both were found by upgrading live
+hosts; neither is reachable from the unit suite, which has no Db2 or MariaDB.
+
+### Fixed — Db2 could not migrate: reorg-pending after the lifecycle ALTERs
+
+`0050_lifecycle_workers.sql` issues nine consecutive `ALTER TABLE`s against
+`deletion_requests` and then creates an index on it. Db2 puts a table into
+reorg-pending state after REORG-recommended ALTERs and refuses everything else
+on it until a REORG runs:
+
+```
+SQL0668N Operation not allowed for reason code "7"
+on table "DB2INST1.DELETION_REQUESTS"
+```
+
+The executor now recognises that error, reorganises the named table and retries
+the statement once. Handled in code rather than by adding a `REORG` to the
+`.sql` deliberately: migrations carry no applied-state table and replay on every
+start, so an unconditional REORG would rewrite the table on every boot.
+Reacting to the error means it runs only when Db2 actually asks for it.
+Confirmed firing in production.
+
+### Fixed — MariaDB could not create two tables: foreign-key charset mismatch
+
+```
+(1005, "Can't create table `mnemos`.`memory_archive`
+ (errno: 150 \"Foreign key constraint is incorrectly formed\")")
+```
+
+The MariaDB backend declares `memories.id VARCHAR(64) CHARACTER SET ascii` but
+inherits most of its table definitions from the MySQL module, where columns
+carry no charset clause and take the database default (utf8mb4). MySQL requires
+a foreign key and its referent to agree on charset *and* collation.
+
+Six tables reference `memories(id)`. Four were already redefined with ascii
+columns; `memory_archive` and `session_memory_injections` were left inherited,
+and those are exactly the two that failed. Both are now overridden.
+`session_memory_injections.session_id` stays utf8mb4 on purpose — `sessions.id`
+really is utf8mb4, and each FK column must match its own referent rather than a
+single project-wide charset. `migrations_mysql/0050_lifecycle_workers.sql`
+carried the same omission.
+
+### Known issues
+
+- The MySQL-family charset split is not fully resolved: `memories.id` is ascii
+  while `sessions.id` is utf8mb4 on the same database, because one is
+  overridden by the MariaDB module and the other inherited. Self-consistent and
+  working, but any new table referencing either must pick its charset per
+  column. Unifying them would need an ALTER migration for existing installs.
+
 ## [6.1.3] — 2026-08-17
 
 ### Fixed — the published image required AVX512 and died on the first write
