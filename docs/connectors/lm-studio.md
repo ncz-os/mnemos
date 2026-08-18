@@ -1,6 +1,8 @@
 # LM Studio -> MNEMOS
 
-LM Studio has no native MCP client, so use its OpenAI-compatible local server with tool-aware models and the `mnemos-bridge-openai` adapter once that Phase 2 bridge package is available.
+LM Studio has no native MCP client, so use its OpenAI-compatible local server
+with a tool-aware model plus the
+[`mnemos-bridge-openai`](https://gitlab.com/ncz-os/mnemos-bridge-openai) adapter.
 
 ## What you need — token, host (<mnemos-host>), relevant port(s)
 
@@ -9,8 +11,7 @@ LM Studio has no native MCP client, so use its OpenAI-compatible local server wi
 - Python 3.11+ with the OpenAI SDK.
 - MNEMOS MCP HTTP/SSE reachable at `http://<mnemos-host>:5003/sse`.
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- The upcoming `mnemos-bridge-openai` adapter package from Phase 2 of bridge
-  consolidation.
+- The `mnemos-bridge-openai` adapter.
 - LM Studio's OpenAI-compatible endpoint reachable at
   `http://localhost:1234/v1`.
 - A GGUF quantisation that preserves tool schemas.
@@ -67,6 +68,6 @@ OpenAI-compatible model. The second authenticated request should open a
 - LM Studio does not speak MCP directly; use the OpenAI-compatible tool-call
   path.
 - Tool-call support is per-model; some GGUF quantisations disable tool schemas.
-- The `mnemos-bridge-openai` adapter will provide a uniform experience once
-  the Phase 2 package is available.
+- The `mnemos-bridge-openai` adapter provides a uniform experience across the
+  OpenAI-compatible surfaces.
 - Keep write tools behind explicit approval in shared local-server setups.

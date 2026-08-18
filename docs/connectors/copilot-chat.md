@@ -48,10 +48,9 @@ Copilot Chat's tool-call protocol differs from canonical MCP. Some tool
 shapes may not render in the chat UI. Attachment-style tools are fully
 supported, but structured memory-search returns may be truncated.
 
-For richer OpenAI-compatible tool calling, use the `mnemos-bridge-openai`
-adapter once Phase 2 of the bridge consolidation lands. That path will provide
-the runtime glue for structured Python integration while this guide remains
-the VS Code configuration reference.
+For richer OpenAI-compatible tool calling, use the [`mnemos-bridge-openai`](https://gitlab.com/ncz-os/mnemos-bridge-openai)
+adapter. It provides the runtime glue for structured Python integration, while
+this guide remains the VS Code configuration reference.
 
 ## Verification — one curl or one tool-list call that proves registration worked
 
