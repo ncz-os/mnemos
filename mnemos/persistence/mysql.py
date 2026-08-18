@@ -4742,6 +4742,28 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         return {CORE_CAPABILITY, STATE_CAPABILITY, FEDERATION_CAPABILITY}
 
     @property
+    def audit_chain(self) -> Any | None:
+        """No audit-chain implementation on the MySQL family yet.
+
+        ``None`` is the documented contract for a backend that has not
+        shipped the audit-chain rows -- callers treat it as
+        ``MNEMOS_AUDIT_CHAIN=off``, and federation already guards with
+        ``backend.audit_chain is not None``.
+
+        The property has to exist for that guard to work. The backends are
+        bare classes rather than subclasses of the ABC that declares it, so
+        SqliteBackend / PostgresBackend / OracleBackend each define their
+        own; Db2Backend inherits OracleBackend's. MysqlBackend defined
+        neither, so the guard raised
+
+          AttributeError: 'MariadbBackend' object has no attribute 'audit_chain'
+
+        and every federation sync that applied a mutation failed with HTTP
+        503. Measured on a live MariaDB host: it could pull nothing at all.
+        """
+        return None
+
+    @property
     def capability_details(self) -> set[str]:
         return {*MYSQL_CAPABILITY_DETAILS, KG_CAPABILITY, STATE_DETAIL_CAPABILITY}
 
