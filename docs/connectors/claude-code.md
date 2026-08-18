@@ -30,7 +30,7 @@ Merge into `~/.claude.json`. The MCP process runs on the remote host; `MNEMOS_BA
 
 ## Notes
 
-- Port 5002 is the unified API port (MNEMOS + GRAEAE) as of v6.1.3. Port 5001 is retired.
+- Port 5002 is the unified API port (MNEMOS + GRAEAE) as of v6.1.4. Port 5001 is retired.
 - `PYTHONPATH=/opt/mnemos` is required — the package is editable, not installed in venv site-packages.
 - `MNEMOS_API_KEY` must be in the SSH args via `/usr/bin/env`; Claude Code's `env` block is local-only and does not cross the SSH boundary.
 - GRAEAE MCP tool not yet registered — use `POST http://<mnemos-host>:5002/graeae/consult` with Bearer token as fallback.
