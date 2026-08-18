@@ -24,7 +24,7 @@ names against a MNEMOS backend. The current phase-1 surface implements 16
 MemPalace-compatible tool names and keeps the vocabulary stable: wings, rooms,
 drawers, tunnels, diaries, and graph operations are translated onto MNEMOS
 owner, namespace, category, memory, and KG primitives. The implementation and
-operator framing are documented in [docs/KNOSSOS.md](KNOSSOS.md).
+operator framing are documented in [docs/KNOSSOS.md](../KNOSSOS.md).
 
 Third, federation now has a schema-compatibility preflight. A peer can call
 `GET /v1/federation/schema` and receive `mnemos_version`,
