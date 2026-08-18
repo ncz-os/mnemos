@@ -11,7 +11,7 @@
 
 # MNEMOS + GRAEAE
 
-**MNEMOS v6.1.4 is the memory operating system for
+**MNEMOS v6.1.3 is the memory operating system for
 serious agentic work: a packaged FastAPI runtime, **EPIMONE** — the six-backend
 persistence layer (SQLite + sqlite-vec by default, PostgreSQL + pgvector,
 Oracle Database 26ai HNSW INMEMORY NEIGHBOR GRAPH, IBM Db2 12.1.5 (EAP) DiskANN
