@@ -417,7 +417,7 @@ The settlement, landed in the v3.2 tail:
 
 - **APOLLO** (gpu_optional) — schema-aware dense encoding for
   LLM-to-LLM wire use. Portfolio, decision, person, event, code, and
-  commit schemas as of v6.1.5 LLM-fallback path covers anything that
+  commit schemas as of v6.1.6 LLM-fallback path covers anything that
   doesn't match a schema.
 - **ARTEMIS** (cpu_only) — extractive with identifier preservation,
   labeled-block handling, evidence-based self-scoring. Replaces

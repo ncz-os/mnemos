@@ -1,6 +1,6 @@
 # MNEMOS Specification
 
-**Version**: v6.1.5 current (patch release on the v6.0.0 split-distribution line; supersedes the v5.0.1 / v5.0.0
+**Version**: v6.1.6 current (patch release on the v6.0.0 split-distribution line; supersedes the v5.0.1 / v5.0.0
 GA line from 2026-05-02). Adds Oracle Database 26ai + IBM Db2 12.1.5 backends behind
 the EPIMONE `PersistenceBackend` ABC.
 
@@ -803,7 +803,7 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
   application visibility after
   `db/migrations_v3_5_rls_group_select_unix_bits.sql`.
 
-### 10.4 Known gaps (as of v6.1.5)
+### 10.4 Known gaps (as of v6.1.6)
 
 - GDPR deletion requests can still hit the documented final-verify race or
   sweep-verifying exhaustion under sustained target writes; see
