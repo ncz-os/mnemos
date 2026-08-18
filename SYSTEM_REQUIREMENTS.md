@@ -1,7 +1,7 @@
 # System Requirements
 
 Reference for operators planning a MNEMOS deployment. Covers the
-resource floor for each of the operating modes that the current v6.1.3 release line supports
+resource floor for each of the operating modes that the current v6.1.5 release line supports
 today, plus what drops off at each tier.
 
 Profiles are descriptive sizing tiers. The feature set is controlled by
