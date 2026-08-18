@@ -20,6 +20,19 @@ What this test guards:
 - "current" version claims in docs match `__version__`
 - pip install pins (`mnemos-os==X`) in operator-facing docs match
 - single-binary release URL (`releases/download/vX/...`) matches
+
+The checks above pin ten named phrases in ten named files, which is a
+floor rather than a ceiling: a doc that invents its own wording, or one
+nobody remembered to add to the list, drifts unseen. That happened again
+in the 6.1 audit, so two repo-wide guards were added at the bottom of
+this module:
+
+- `test_no_active_doc_claims_a_superseded_version_is_current` scans every
+  markdown file outside `docs/history/` for the *shape* of a currency
+  claim, whatever wording it uses.
+- `test_no_internal_infrastructure_detail_in_docs` keeps internal host
+  names, private addresses, and real DSN passwords out of the published
+  tree — including the archive, which is just as public.
 """
 from __future__ import annotations
 
@@ -291,5 +304,164 @@ def test_no_stale_release_download_url():
             )
     assert not bad, (
         f"{len(bad)} stale single-binary download URL(s):\n"
+        + "\n".join(bad)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Repo-wide guards.
+#
+# The parametrised checks above pin ten named phrases in ten named files.
+# That is a floor, not a ceiling: it cannot see a doc that invents its own
+# wording, and it cannot see a doc nobody thought to add to the list. Docs
+# have drifted back to a stale "current version" at least three times, and
+# each time the fix was by hand.
+#
+# The two checks below scan every markdown file instead of a fixed list.
+# ---------------------------------------------------------------------------
+
+# Directories whose contents are deliberately historical or not ours.
+_SKIP_DIRS = frozenset({
+    ".git", "build", "node_modules", ".venv", ".venv-ci", "dist",
+    # docs/history/ is an explicitly labelled archive: it is *supposed* to
+    # describe superseded releases. See docs/history/README.md.
+    "history",
+})
+
+# CHANGELOG is a release-by-release record; every entry names its own version.
+_SKIP_FILES = frozenset({"CHANGELOG.md"})
+
+# A version-shaped token: 6.1, 6.1.7, 4.2.0a14.
+_VER = r"v?(\d+\.\d+(?:\.\d+)?(?:[a-zA-Z]+\d+)?)"
+# Same, but the leading "v" is required. Used where a bare number would
+# otherwise match a numbered markdown heading such as "### 7.1 Current state".
+_VVER = r"v(\d+\.\d+(?:\.\d+)?(?:[a-zA-Z]+\d+)?)"
+
+# Phrasings that assert a version is the *live* one. Historical statements
+# ("shipped in v5.0.0", "as of v3.2.4", "v2.4 ships in v3") deliberately do
+# not match: they are accurate fact and must stay readable.
+_CURRENCY_CLAIMS = tuple(re.compile(p, re.IGNORECASE) for p in (
+    rf"current(?:ly)?\s+(?:is\s+)?v{_VER[1:]}\b",
+    rf"current(?:ly)?\s+(?:is\s+)?(?:version\s+){_VER}\b",
+    rf"\b{_VVER}\s+current\b",
+    rf"\bcurrent\s+{_VER}\s+release\b",
+    rf"\b{_VVER}\s+(?:is|are)\s+(?:the\s+)?current\b",
+    rf"\bthe\s+current\s+{_VER}\b",
+    rf"^\s*\**Status\**\s*[:\-]\s*{_VER}\b",
+    rf"\bfull\s+{_VER}\s+feature\s+set\b",
+    rf"\bTracks\s+MNEMOS\s+server\s+{_VER}\b",
+))
+
+# Version-shaped strings that are not the MNEMOS version. Matching one of
+# these on the same line suppresses the finding.
+_NOT_OUR_VERSION = re.compile(
+    r"Apache License|Developer Certificate|python-oracledb|\bDb2\b|\bMySQL\b"
+    r"|\bMariaDB\b|\bOracle\b|\bPostgreSQL\b|\bPython\b|\bNode\b"
+    r"|Document version|schema_version|mif|MIF|\bJSON\b",
+)
+
+
+def _markdown_files() -> list[Path]:
+    out: list[Path] = []
+    for md in sorted(REPO.rglob("*.md")):
+        if any(part in _SKIP_DIRS for part in md.parts):
+            continue
+        if md.name in _SKIP_FILES:
+            continue
+        out.append(md)
+    return out
+
+
+def test_no_active_doc_claims_a_superseded_version_is_current():
+    """No live doc may assert that a non-current version is current.
+
+    This is the guard the ten pinned phrases above could not provide: it
+    reads every markdown file outside the archive and looks for the *shape*
+    of a currency claim, whatever wording the author chose.
+
+    If this fails on a legitimate non-MNEMOS version, add its marker to
+    `_NOT_OUR_VERSION` rather than deleting the assertion.
+    """
+    version = _current_version()
+    minor = ".".join(version.split(".")[:2])
+    bad: list[str] = []
+    for md in _markdown_files():
+        for lineno, line in enumerate(md.read_text().splitlines(), start=1):
+            if _NOT_OUR_VERSION.search(line):
+                continue
+            for rx in _CURRENCY_CLAIMS:
+                m = rx.search(line)
+                if not m:
+                    continue
+                claimed = m.group(1)
+                if claimed in (version, minor):
+                    continue
+                bad.append(
+                    f"  {md.relative_to(REPO)}:{lineno}: claims v{claimed} "
+                    f"is current (live version is {version}) — "
+                    f"{line.strip()[:90]}"
+                )
+                break
+    assert not bad, (
+        f"{len(bad)} doc(s) assert a superseded version is current:\n"
+        + "\n".join(bad)
+    )
+
+
+# Internal infrastructure that must never appear in a published doc. The
+# repo is public; these were removed wholesale in the 6.1 documentation
+# audit and this keeps them out.
+_INTERNAL_HOSTS = re.compile(
+    r"\b(PYTHIA|CERBERUS|ACHILLES|PEGASUS|TYDEUS|TYPHON|ARGONAS|MEDUSA"
+    r"|PROTEUS|CYCLOPS|cixmini|clawpi|bigpi)\b"
+)
+_PRIVATE_ADDR = re.compile(r"\b(?:192\.168|10\.110)\.\d{1,3}\.\d{1,3}\b")
+_DSN_WITH_PASSWORD = re.compile(
+    r"\b(?:postgres|postgresql|oracle|db2|mysql|mariadb)://"
+    r"[^\s:@/]+:(?!<|\$|\{)(?P<pw>[^\s:@/]+)@"
+)
+
+# Passwords that are self-evidently not real. A doc example needs *a*
+# password-shaped token; these are the ones that say "fill me in".
+_PLACEHOLDER_PW = frozenset({
+    "pass", "PASS", "password", "PASSWORD", "passwd", "secret", "SECRET",
+    "yourpassword", "your_password", "changeme", "CHANGEME", "xxx", "XXX",
+    "mypassword", "hunter2", "REDACTED", "placeholder",
+})
+
+
+def test_no_internal_infrastructure_detail_in_docs():
+    """Published docs must not name internal hosts, private addresses, or
+    embed a DSN with a real password.
+
+    Unlike the currency guard, this one covers docs/history/ too: the
+    archive is just as public as the rest of the tree.
+
+    Placeholder DSNs are fine — `<password>`, `$PGPASSWORD`, and `${VAR}`
+    forms are all excluded.
+    """
+    bad: list[str] = []
+    for md in sorted(REPO.rglob("*.md")):
+        if any(p in {".git", "build", "node_modules", ".venv", ".venv-ci", "dist"}
+               for p in md.parts):
+            continue
+        for lineno, line in enumerate(md.read_text().splitlines(), start=1):
+            for label, rx in (
+                ("internal hostname", _INTERNAL_HOSTS),
+                ("private address", _PRIVATE_ADDR),
+                ("DSN with password", _DSN_WITH_PASSWORD),
+            ):
+                m = rx.search(line)
+                if m and rx is _DSN_WITH_PASSWORD:
+                    if m.group("pw") in _PLACEHOLDER_PW:
+                        continue
+                if m:
+                    bad.append(
+                        f"  {md.relative_to(REPO)}:{lineno}: {label} "
+                        f"{m.group(0)!r} — {line.strip()[:80]}"
+                    )
+                    break
+    assert not bad, (
+        f"{len(bad)} internal-detail leak(s) in published docs:\n"
         + "\n".join(bad)
     )
