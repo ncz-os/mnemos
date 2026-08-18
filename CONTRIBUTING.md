@@ -74,9 +74,13 @@ PRs without DCO sign-off on every commit will be asked to amend
 
 ## Development workflow
 
+Development happens on the canonical GitLab project,
+<https://gitlab.com/ncz-os/mnemos>. Open merge requests there; the GitHub
+mirror exists only to publish container images.
+
 - Use a feature branch for non-trivial changes.
 - Keep commits focused and reviewable; split large changes.
-- Install from source through the v4 package entry points:
+- Install from source:
 
 ```bash
 python -m pip install -e ".[dev,sqlite]"
@@ -100,52 +104,47 @@ ruff check . --extend-exclude .venv-ci
 
 The `tests/test_persistence_parity.py` suite enumerates backend arms
 based on which DSN env vars are set. SQLite always runs; the other
-arms are skipped cleanly when their env var is absent. To exercise
-the full matrix:
+arms are skipped cleanly when their env var is absent:
 
 ```bash
 # PostgreSQL parity arm
 export MNEMOS_TEST_DB='postgres://mnemos:<password>@localhost:5432/mnemos'
 
-# Oracle 23ai parity arm
+# Oracle parity arm
 export ORACLE_DSN='oracle://MNEMOS:<password>@localhost:1521/ORCLPDB1'
 
-# IBM Db2 12.1.5 parity arm
+# IBM Db2 parity arm
 export DB2_DSN='db2://MNEMOS:<password>@localhost:50000/MNEMOS'
-
-# Single-DSN selector (overrides per-backend vars)
-export MNEMOS_DATABASE_DSN='oracle://MNEMOS:<password>@localhost:1521/ORCLPDB1'
 
 pytest -q tests/test_persistence_parity.py tests/test_oracle_live.py tests/test_db2_live.py
 ```
 
+The MySQL and MariaDB backends are covered by their own live suites rather
+than the parity harness, and read separate env vars:
+
+```bash
+export MYSQL_DSN='mysql://mnemos:<password>@localhost:3306/mnemos'
+export MARIADB_DSN='mariadb://mnemos:<password>@localhost:3306/mnemos'
+
+pytest -q tests/test_mysql_backend.py tests/test_mariadb_backend.py
+```
+
 Without these env vars, the default `pytest -q` run exercises the
-SQLite arm and the unit-level Oracle/Db2 surface (fake cursors, SQL
-translation safety), and skips the live arms.
+SQLite arm and the unit-level surface for the other backends (fake
+cursors, SQL translation safety), and skips the live arms.
 
 - For changes touching tenancy, DAG history, triggers, import/export, or
   auth, include focused regression tests and document the expected
   operator behavior for 404 vs 409 vs 403 outcomes.
 
-### Building single-binary artifacts
-
-The v4.0 binary release is built with PyInstaller. Use the `build` extra from a
-clean checkout on the target platform:
-
-```bash
-python -m pip install -e ".[build]"
-bash scripts/build-binary.sh
-```
-
-PyInstaller does not cross-compile these artifacts. Build linux-x86_64,
-linux-aarch64, and macos-aarch64 on matching hosts.
-
 ### Multi-worker development
 
 The `dev` and `edge` profiles are intentionally single-worker SQLite profiles.
-For multi-worker work, use the `server` profile with Redis-backed shared state:
+For multi-worker work, use the `server` profile with Redis-backed shared state.
+Redis is an optional extra, so install it first:
 
 ```bash
+python -m pip install -e '.[dev,server,redis]'
 export MNEMOS_PROFILE=server
 export RATE_LIMIT_STORAGE_URI=redis://localhost:6379/1
 export MNEMOS_WORKERS=2
@@ -158,26 +157,32 @@ process-local.
 
 ### Multi-backend development
 
-To target one of the enterprise backends (Oracle 23ai or Db2 12.1.5) for local
-development, install the driver extra and set the matching DSN:
+To target one of the enterprise backends for local development, install the
+driver extra and set the matching DSN:
 
 ```bash
-# Oracle 23ai
+# Oracle Database
 python -m pip install -e '.[dev,server,oracle]'
 export MNEMOS_DATABASE_DSN='oracle://MNEMOS:<password>@localhost:1521/ORCLPDB1'
 mnemos install --profile server
 mnemos serve --profile server
 
-# IBM Db2 12.1.5
+# IBM Db2
 python -m pip install -e '.[dev,server,db2]'
 export MNEMOS_DATABASE_DSN='db2://MNEMOS:<password>@localhost:50000/MNEMOS'
 mnemos install --profile server
 mnemos serve --profile server
+
+# MySQL or MariaDB (both use the aiomysql driver)
+python -m pip install -e '.[dev,server,mysql]'
+export MNEMOS_DATABASE_DSN='mariadb://mnemos:<password>@localhost:3306/mnemos'
+mnemos install --profile server
+mnemos serve --profile server
 ```
 
-See `docs/INSTALL.md` for full driver and DSN guidance, and
-`docs/oracle-port-status.md` / `docs/db2-port-handoff.md` for the current
-repository-surface coverage on each backend.
+See [docs/INSTALL.md](docs/INSTALL.md) for full driver and DSN guidance, and
+[docs/oracle-port-status.md](docs/oracle-port-status.md) for the current
+repository-surface coverage on Oracle.
 
 ## Guidelines
 

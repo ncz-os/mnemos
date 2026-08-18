@@ -2,12 +2,15 @@
 
 ## Supported versions
 
-The most recently maintained release branch is supported. The current
-release is **`v6.0.0`** (split-distribution GA — small `mnemos-core`
-plus separately installable `mnemos.*` subsystems and turnkey
-`ghcr.io/ncz-os` images; adds Oracle Database 26ai + IBM Db2 12.1.5 EAP
-backends). It supersedes the v5.0.1 (2026-05-06) / v5.0.0 GA (2026-05-02)
-and v4.0.0 (2026-04-29) line.
+| Version | Supported |
+|---|---|
+| 6.1.x | Yes — current release line |
+| 6.0.x | Security fixes only; upgrade to 6.1 |
+| Earlier | No |
+
+Only the most recent release line receives fixes. If you are on 6.0 or
+6.0.1, upgrade to 6.1 before reporting an issue so the report is against
+supported code.
 
 ## Current security invariants
 
@@ -26,25 +29,29 @@ These hold in 6.1:
 - Branch creation is race-safe: HTTP and MCP paths lock the parent memory
   row, resolve the start snapshot inside the transaction, and insert with
   `ON CONFLICT DO NOTHING RETURNING`.
-- `db/migrations_v3_5_trigger_same_memory_parent.sql` rejects missing,
-  NULL, or cross-memory branch heads with SQLSTATE `MN001`; the API maps
-  that condition to HTTP 409 with branch reconciliation guidance.
-- `db/migrations_v3_5_rls_group_select_unix_bits.sql` closes task #25:
-  the `mnemos_group_select` RLS policy and application
-  `read_visibility_predicate` both use the Unix group-read bit expression
+- `mnemos/db_migrations/migrations_v3_5_trigger_same_memory_parent.sql`
+  rejects missing, NULL, or cross-memory branch heads with SQLSTATE
+  `MN001`; the API maps that condition to HTTP 409 with branch
+  reconciliation guidance.
+- `mnemos/db_migrations/migrations_v3_5_rls_group_select_unix_bits.sql`
+  keeps the `mnemos_group_select` RLS policy and the application
+  `read_visibility_predicate` on the same Unix group-read bit expression,
   `((permission_mode / 10) % 10) >= 4`.
 - Consultation audit metadata is owner-scoped for non-root callers:
   `/v1/consultations/audit` returns only the caller's consultation audit
   rows, and `/v1/consultations/audit/verify` verifies only that caller's
-  rows. Root keeps the global operational audit view. This closes the
-  v3.4.x cross-tenant audit metadata leak in v3.5.0.
+  rows. Root keeps the global operational audit view.
 - Webhook delivery uses persisted leases, retry-chain convergence, terminal
   success guards, and SSRF checks at subscription and delivery time.
 - MCP stdio and HTTP/SSE use the same registry under `mnemos/mcp/tools/`, with
   per-user HTTP token mapping available through `MNEMOS_MCP_TOKENS`.
-- Multi-worker server deployments use Redis-backed circuit breaker, rate-limit,
-  and concurrency state. The in-process fallback remains for single-worker edge
-  and dev installs and logs a warning if multiple workers are configured.
+- Circuit-breaker, rate-limit, and concurrency state is process-local by
+  default (`memory://`), which is correct for the single-worker edge and dev
+  profiles. Multi-worker or multi-node deployments should install the
+  `redis` extra and set `RATE_LIMIT_STORAGE_URI` to a shared Redis, because
+  a per-process counter multiplies the effective ceiling by the number of
+  processes. Startup logs a warning when more than one worker is configured
+  against process-local state.
 - Runtime configuration is centralized in the Pydantic Settings singleton;
   direct `os.environ` reads are limited to `mnemos/core/config.py` and the
   installer path.
@@ -54,20 +61,27 @@ These hold in 6.1:
 
 ## Reporting a vulnerability
 
-Please do not open a public GitHub issue for suspected vulnerabilities.
+Do not open a public issue for a suspected vulnerability.
 
-Instead, report security issues privately via GitHub: **@mnemos-dev** or by email to **security@mnemos.dev** (configure this address before public release)
+Report it as a **confidential issue** on the canonical GitLab project:
+<https://gitlab.com/ncz-os/mnemos/-/issues/new> — tick **"This issue is
+confidential"** before you submit. Confidential issues are visible only to
+project maintainers.
 
 Please include:
+
 - a description of the issue
 - impact assessment
 - reproduction steps
+- the MNEMOS version, backend, and deployment shape (container or pip,
+  single- or multi-worker)
 - any suggested remediation
 
-If a dedicated disclosure channel is added later, this file should be updated.
+Expect an acknowledgement within a week. There is no bug bounty.
 
 ## Secrets policy
 
 - Never commit `.env` files or live credentials.
 - Store provider keys outside the repository.
-- Sanitize infrastructure-specific details before public release.
+- Keep infrastructure-specific detail — hostnames, private addresses,
+  internal topology — out of the repository entirely, including docs.

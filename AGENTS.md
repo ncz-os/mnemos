@@ -27,6 +27,7 @@ backends:           # selected at RUNTIME via MNEMOS_DATABASE_DSN, not by image
   oracle:   { driver: oracledb, extra: oracle, dsn: "oracle://USER:PASS@HOST:1521/SERVICE", arch: [amd64, arm64], thin: true }
   db2:      { driver: ibm_db,   extra: db2,    dsn: "db2://USER:PASS@HOST:50000/DB", arch: [amd64] }
   mysql:    { driver: aiomysql, extra: mysql,  dsn: "mysql://USER:PASS@HOST:3306/DB", arch: [amd64, arm64] }
+  mariadb:  { driver: aiomysql, extra: mysql,  dsn: "mariadb://USER:PASS@HOST:3306/DB", arch: [amd64, arm64] }
 
 accelerators:       # OPTIONAL embedder accel; default is portable CPU llama-cpp
   openvino: { extra: openvino, arch: [amd64] }          # Intel x86-only
@@ -36,7 +37,7 @@ accelerators:       # OPTIONAL embedder accel; default is portable CPU llama-cpp
 images:
   mnemos-core:       { ref: "ghcr.io/ncz-os/mnemos-core",       contains: [core],                              arch: [amd64, arm64], port: 5002 }
   mnemos:            { ref: "ghcr.io/ncz-os/mnemos",            contains: [core, graeae, pantheon, knemon, charon], arch: [amd64, arm64], port: 5002, canonical_everything: true }
-  mnemos-enterprise: { ref: "ghcr.io/ncz-os/mnemos-enterprise", contains: [core, graeae, pantheon, knemon, charon, oracle, db2, mysql], arch: [amd64], port: 5002 }
+  mnemos-enterprise: { ref: "ghcr.io/ncz-os/mnemos-enterprise", contains: [core, graeae, pantheon, knemon, charon, oracle, db2, mysql], arch: [amd64], port: 5002, note: "the mysql driver (aiomysql) also serves the mariadb backend" }
   mnemos-stiphos:    { ref: "ghcr.io/ncz-os/mnemos-stiphos",    contains: [stiphos],                           arch: [amd64, arm64], port: 8080 }
 ```
 
@@ -55,7 +56,7 @@ Given `requested` (a set of module ids) and `backend` (one backend id) and
    - NEVER select mnemos-enterprise on arm64.
 
 2. IF deploy == container:
-   a. needs_enterprise = backend in {db2}  OR  (backend in {oracle,mysql} AND operator wants the driver baked)
+   a. needs_enterprise = backend in {db2}  OR  (backend in {oracle,mysql,mariadb} AND operator wants the driver baked)
    b. if "stiphos" in requested -> ALSO deploy image mnemos-stiphos (separate container)
    c. choose primary image:
         - requested ⊆ {core}                          -> mnemos-core
@@ -68,7 +69,7 @@ Given `requested` (a set of module ids) and `backend` (one backend id) and
 3. IF deploy == pip:
    - extras = [ modules[m].extra for m in requested if m not in {core,stiphos} and extra ]
             + [ backends[backend].extra if present ]
-   - if arch == arm64: ensure 'openvino' is NOT in extras; prefer extra "server" (which no longer pulls openvino).
+   - if arch == arm64: ensure 'openvino' is NOT in extras; prefer extra "server", which does not pull openvino.
    - pip install 'mnemos-core[<comma-joined extras>]'
    - if "stiphos" in requested: ALSO pip install 'mnemos-stiphos[mcp]' and run it as a separate service.
 ```
@@ -94,6 +95,11 @@ docker run -p 5002:5002 \
 # Db2 (amd64) — enterprise image required
 docker run --platform linux/amd64 -p 5002:5002 \
   -e MNEMOS_DATABASE_DSN='db2://MNEMOS:pass@db2:50000/MNEMOS' \
+  ghcr.io/ncz-os/mnemos-enterprise:latest
+
+# MariaDB 11.7+ — enterprise image carries the aiomysql driver
+docker run --platform linux/amd64 -p 5002:5002 \
+  -e MNEMOS_DATABASE_DSN='mariadb://mnemos:pass@mariadb:3306/mnemos' \
   ghcr.io/ncz-os/mnemos-enterprise:latest
 
 # Hive service (separate container, runs alongside any of the above)
@@ -130,6 +136,8 @@ backend is live. Routes for absent subsystems return HTTP 503 with the exact
 
 - `mnemos-core` is the only pip-installable base; `mnemos`/`mnemos-os` are NOT pip packages.
 - Backend = runtime `MNEMOS_DATABASE_DSN`, never a rebuild.
-- `mnemos-enterprise` is amd64-only. Do not deploy it on arm64; use `mnemos` + Oracle-thin/Postgres/MySQL instead.
+- `mnemos-enterprise` is amd64-only. Do not deploy it on arm64; use `mnemos` + Oracle-thin/Postgres/MySQL/MariaDB instead.
 - STIPHOS is a separate service/image; never expect it on port 5002 or inside the everything image.
-- On arm64, never install the `openvino` accelerator. The `full` extra no longer pulls it.
+- On arm64, never install the `openvino` accelerator. The `full` extra does not pull it.
+- MariaDB has no extra of its own: it is wire-compatible with `aiomysql`, so
+  install the `mysql` extra and use a `mariadb://` DSN.
