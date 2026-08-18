@@ -133,7 +133,7 @@ sshpass -p $oracle-host_SUDO_PASS ssh root@<host> "
 
 # Verify
 curl -H "Authorization: Bearer $TOKEN" http://<host>:5002/health
-# Expected: {"version": "v3.4.0-alpha.1", "status": "healthy", ...}
+# Expected: {"version": "6.1.7", "status": "healthy", ...}
 ```
 
 Staging runs for 1–2 weeks. During this period:
@@ -654,7 +654,7 @@ See `~/.claude/rules/github-behavior.md` for full rate-limit rules and the ratio
 
 ## 11. Federation health
 
-### 11.1 Architecture (v5.0.1 current)
+### 11.1 Architecture
 
 Federation (peer-to-peer memory sync) is specified in `mnemos/api/routes/federation.py`. Key points:
 
@@ -863,13 +863,13 @@ psql -U postgres -d mnemos -c \
 
 ```bash
 # List all containers
-ssh jasonperlow@<host> "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'"
+ssh <user>@<host> "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'"
 
 # Logs for a container
-ssh jasonperlow@<host> "docker logs -f <container-name>"
+ssh <user>@<host> "docker logs -f <container-name>"
 
 # Stop a container
-ssh jasonperlow@<host> "docker stop <container-name>"
+ssh <user>@<host> "docker stop <container-name>"
 ```
 
 ### Database operations
@@ -879,7 +879,7 @@ ssh jasonperlow@<host> "docker stop <container-name>"
 pg_dump -U postgres mnemos | gzip > backup-$(date +%Y%m%d).sql.gz
 
 # List backups on nas-host
-ssh jasonperlow@<host> "ls -lh /mnt/argonas/backups/mnemos/"
+ssh <user>@<host> "ls -lh /mnt/argonas/backups/mnemos/"
 
 # Restore from backup
 gunzip < backup.sql.gz | psql -U postgres -d mnemos

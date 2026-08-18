@@ -24,7 +24,7 @@ Published to `ghcr.io/ncz-os`. Composition is OCI-layered: each image is built
 | `ghcr.io/ncz-os/mnemos-stiphos` | STIPHOS hive service (separate process) | `amd64` + `arm64` | `docker pull ghcr.io/ncz-os/mnemos-stiphos` |
 
 > **`mnemos` is the canonical "everything" image** and the same artifact the
-> reference PYTHIA quadlet deploys.
+> reference quadlet deploys.
 
 > **Enterprise is amd64-only by policy.** The Oracle thin driver would run on
 > arm64, but `ibm_db` (Db2) has no reliable arm64 wheel and the enterprise

@@ -71,7 +71,7 @@ The release is operationally driven: every item directly supports running MNEMOS
    - Advertises models on startup → `catalog.advertise` subject.
    - Heartbeats every 30s → `catalog.heartbeat` with current health.
    - Token bucket per provider's stated rate limit; NAK on rate-limit hit.
-   - Reference implementation ships for: vLLM (CERBERUS), Together, Groq, OpenAI, Gemini, Perplexity.
+   - Reference implementation ships for: vLLM (the GPU host), Together, Groq, OpenAI, Gemini, Perplexity.
 
 5. **Deterministic policy layer (no LLM in the routing decision).**
    - Model aliases: `auto:reasoning`, `auto:cheap-fast`, `free:embedding`, `tool:json`, `consensus:reasoning`.
@@ -214,7 +214,7 @@ All items required for v3.5 to be production-ready at scale:
 - Result: write to `kg_triples` with `extracted_from:<memory_id>` parent link + confidence score.
 
 **Two-model split (cost optimization):**
-- **Fast extractor** (quantized, CPU-capable): `mistral-7b-instruct` via CERBERUS vLLM or local Ollama.
+- **Fast extractor** (quantized, CPU-capable): `mistral-7b-instruct` via the GPU host vLLM or local Ollama.
 - **Strong reasoner** (synthesis): default GRAEAE, fallback to Together `llama-4-405b` if GRAEAE busy.
 
 **Out:** `kg_triples` rows with `source=extracted`, `confidence_score` in [0, 1], `reasoning_notes` field.
@@ -237,19 +237,19 @@ All items required for v3.5 to be production-ready at scale:
 - `/v1/memories/{id}` read path prefers the distilled variant if present (via `Accept` header: `text/plain` → narrated; `application/x-apollo-dense` → dense form).
 
 **Validation items for v3.5:**
-- Distillation queue latency p99 < 5s (measure on PYTHIA production).
+- Distillation queue latency p99 < 5s (measure on the primary production).
 - No memory loss if worker crashes mid-distillation (idempotent re-run on restart).
 - Dashboard metric: `distillation_queue_depth`, `distillation_latency_p50_ms`, `distillation_success_rate`.
 
 ### 2.6 Embedding migration: NV-EmbedQA-1B-v2 NIM deployment + reembedding strategy
 
-**Scope:** MNEMOS currently uses `OpenAI embed-small` (1536 dim) via httpx calls to CERBERUS. v3.5 introduces a managed NIM deployment so embeddings scale with the fleet, and optionally migrate to a better open model (NV-EmbedQA-1B-v2, 768 dim, better semantic quality for memory retrieval).
+**Scope:** MNEMOS currently uses `OpenAI embed-small` (1536 dim) via httpx calls to the GPU host. v3.5 introduces a managed NIM deployment so embeddings scale with the fleet, and optionally migrate to a better open model (NV-EmbedQA-1B-v2, 768 dim, better semantic quality for memory retrieval).
 
 **Migration decision tree (implementation choice, not blocking):**
 - **Option A: augment-then-replace** — keep old embeddings until all new queries prefer new embeddings, then drop old columns.
-- **Option B: alter-and-backfill** — alter column type, backfill new embeddings (batch job, ~2 hours on PYTHIA), drop old immediately.
+- **Option B: alter-and-backfill** — alter column type, backfill new embeddings (batch job, ~2 hours on the primary), drop old immediately.
 
-**Original v3.5 plan:** NIM deployment Helm values + docs for CERBERUS. Reembedding logic stubbed; actual migration left to operator. This did not ship in v3.5.0.
+**Original v3.5 plan:** NIM deployment Helm values + docs for the GPU host. Reembedding logic stubbed; actual migration left to operator. This did not ship in v3.5.0.
 
 **Affected files:** `api/pantheon/workers/embedding_worker.py` (NIM endpoint), `api/models.py` (embedding config), `docs/EMBEDDING_MIGRATION.md` (to be created in v3.5).
 
@@ -348,7 +348,7 @@ env = {PANTHEON_API_KEY = "pantheon-<tenant-token>"}
 
 ### 3.2a Rate-limiting upstream PR donations
 
-The donation work (zeroclaw + OpenClaw IRIS adoption PRs in v3.5) must respect a hard ≤3–4 PRs/24h ceiling on `perlowja` pushes to any single upstream. Background: GitHub abuse heuristic enforcement on 2026-04-25 was triggered by 8+ PRs in 48h + force-push velocity to a single upstream; rate-limit cannot be assumed safe even when `gh` reports headroom. Pacing approach: stage donation PRs across multiple days, batch via GitLab + ARGONAS first, push final reviewable batch to GitHub. See `~/.claude/rules/github-behavior.md` for the full rule + diagnostic methodology + escalation path.
+The donation work (zeroclaw + OpenClaw IRIS adoption PRs in v3.5) must respect a hard ≤3–4 PRs/24h ceiling on `perlowja` pushes to any single upstream. Background: GitHub abuse heuristic enforcement on 2026-04-25 was triggered by 8+ PRs in 48h + force-push velocity to a single upstream; rate-limit cannot be assumed safe even when `gh` reports headroom. Pacing approach: stage donation PRs across multiple days, batch via GitLab + the NAS first, push final reviewable batch to GitHub. See `~/.claude/rules/github-behavior.md` for the full rule + diagnostic methodology + escalation path.
 
 ### 3.3 Second-wave IRIS adoptions (v3.6+)
 
@@ -402,12 +402,12 @@ With IRIS in place, other MCP-aware frameworks (Hermes, Continue, AutoGPT, CrewA
 - [x] Slice 1 audit quick wins shipped in v3.5.0 (`a62a099`).
 - [x] Slice 2 memory-read tenancy + DAG integrity shipped in v3.5.0 (`d42c475`).
 - [x] v3.5 trigger replacement wired into `install.py`, `installer/db.py`, `docker-compose.yml`, and `docker-compose.staging.yml`.
-- [ ] PANTHEON v0.1 running on PYTHIA, accessible at `http://pythia:5002/v1/chat/completions` with extended catalog. **Deferred after v3.5.0.**
+- [ ] PANTHEON v0.1 running on the primary, accessible at `http://pythia:5002/v1/chat/completions` with extended catalog. **Deferred after v3.5.0.**
 - [ ] **IRIS MCP server operational:** `iris://models` resource returns full catalog; `find_model()` tool ranks models by capability constraints; `get_model_health()` reflects PANTHEON health. **Deferred after v3.5.0.**
 - [ ] zeroclaw + OpenClaw both using IRIS for model discovery (MCP connection working; runtime model selection via `iris://models/recommendations/coding`).
 - [ ] Audit log table populated on memory create/update/delete + federation pulls.
 - [ ] Body-size cap + per-tenant rate limit enforced, 413/429 responses working as documented.
-- [ ] APOLLO EXTRACT mining at least 10% of eligible prose memories on PYTHIA production.
+- [ ] APOLLO EXTRACT mining at least 10% of eligible prose memories on the primary production.
 - [ ] PANTHEON routing log feedback loop proves adaptive policy (provider latency improvements over 24h).
 - [ ] zeroclaw + OpenClaw IRIS adoptions merged upstream or documented as PRs for operator merge.
 
@@ -422,7 +422,7 @@ v3.5 GA gate:
 - [ ] CHARON v0.2 export/import round-trip (carried from v3.4 gate; required for federation audit).
 - [ ] zeroclaw + OpenClaw IRIS adoption validated in integration rig (MCP connection, dynamic model selection, fallback on IRIS unavailability).
 - [ ] Audit log backfill on production database (retroactive logging of recent operations for consistency).
-- [ ] Reranker NIM deployment validated on CERBERUS (optional; skip if unavailable).
+- [ ] Reranker NIM deployment validated on the GPU host (optional; skip if unavailable).
 - [ ] APOLLO EXTRACT against 10k+ sample from production (prove cost-benefit).
 - [ ] All docs updated: PANTHEON, IRIS (new), EMBEDDING_MIGRATION, release notes, contributing guide for adding providers and discovery integration.
 

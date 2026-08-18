@@ -36,7 +36,7 @@ MNEMOS v4.0 is the **infrastructure maturity + federation release**. It consolid
 The release spans three coupled work streams:
 
 1. **API consolidation** — unify security, pooling, ID-derivation patterns scattered across 9 handler files into reusable modules.
-2. **GPU stack integration** — deploy KRONOS (Tesseract time-series) on CERBERUS/TYPHON; measure anomaly detection + forecasting ROI; wire into the PANTHEON audit log.
+2. **GPU stack integration** — deploy KRONOS (Tesseract time-series) on the GPU host/the x86 build host; measure anomaly detection + forecasting ROI; wire into the PANTHEON audit log.
 3. **MCP + surface integrations** — bring MNEMOS memory to Claude Code, Cursor, Continue, ChatGPT, Gemini via native MCP or bridged HTTP.
 
 Post-v4.0, MNEMOS is production-ready for enterprise deployment; v5.0 pivots to foundation-tier visibility work + Rust ports.
@@ -453,12 +453,12 @@ pyinstaller --onefile mnemos-cli.spec
 **Tesseract choice:** NVIDIA Tesseract NIM (Normalized Inference Module) — production-grade time-series models.
 
 **Models:**
-- `nv-tesseract:ad-diffusion-1.1.0` (anomaly detection via diffusion) — CPU-capable, 46s per 45-row window on CERBERUS.
-- `nv-tesseract:forecasting-1.0.1` (univariate forecasting) — GPU-recommended, 16GB VRAM on TYPHON.
+- `nv-tesseract:ad-diffusion-1.1.0` (anomaly detection via diffusion) — CPU-capable, 46s per 45-row window on the GPU host.
+- `nv-tesseract:forecasting-1.0.1` (univariate forecasting) — GPU-recommended, 16GB VRAM on the x86 build host.
 
 **Deployment:**
-- CERBERUS: AD-Diffusion NIM in Triton container (shares vLLM inference port or separate Triton instance).
-- TYPHON: Forecasting NIM, solo deploy (8GB + head room; requires Tensor RT 10 minimum).
+- the GPU host: AD-Diffusion NIM in Triton container (shares vLLM inference port or separate Triton instance).
+- the x86 build host: Forecasting NIM, solo deploy (8GB + head room; requires Tensor RT 10 minimum).
 
 **Cost:** ~9 NIMs total across the fleet; ~$900–1200/year at current NVIDIA licensing.
 
@@ -500,16 +500,16 @@ pyinstaller --onefile mnemos-cli.spec
 
 ### 5.4 GPU resource placement
 
-**Before v4.0:** CERBERUS has 9.3 GB in use (Apollo Q6 5.1 GB, Apollo Q4 2.8 GB fallback, unused).
+**Before v4.0:** the GPU host has 9.3 GB in use (Apollo Q6 5.1 GB, Apollo Q4 2.8 GB fallback, unused).
 
 **v4.0 planning:**
 - Drop Apollo Q4 fallback (systemd auto-restart on Q6 failure; Q4 was redundancy overkill).
 - Add EmbedQA-1B NIM (2 GB, handles all embedding).
 - Add RerankQA-1B NIM (2 GB, ranks search results).
 - Add AD-Diffusion NIM (1 GB, anomaly detection).
-- **CERBERUS budget:** ~5.1 (Q6) + 2 (EmbedQA) + 2 (RerankQA) + 1 (AD-Diff) = **10.1 GB** (0.1 GB over current 10GB, acceptable margin).
+- **the GPU host budget:** ~5.1 (Q6) + 2 (EmbedQA) + 2 (RerankQA) + 1 (AD-Diff) = **10.1 GB** (0.1 GB over current 10GB, acceptable margin).
 
-**TYPHON GPU (RTX 5060, 24 GB):**
+**the x86 build host GPU (RTX 5060, 24 GB):**
 - Forecasting NIM: 8 GB.
 - Headroom for operator experiments: 16 GB free.
 - No dedicated allocation; Forecasting is lower priority than agentic batch work.

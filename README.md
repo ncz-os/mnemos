@@ -209,6 +209,7 @@ are covered by their own live suites.
 | GRAEAE reasoning | [docs/GRAEAE_FEATURES.md](docs/GRAEAE_FEATURES.md) |
 | PANTHEON provider facade | [docs/PANTHEON.md](docs/PANTHEON.md) |
 | KRONOS observability | [docs/KRONOS.md](docs/KRONOS.md) |
+| Audit chain | [docs/AUDIT_CHAIN.md](docs/AUDIT_CHAIN.md) |
 | Portability format (MIF 1.0) | [docs/MEMORY_EXPORT_FORMAT.md](docs/MEMORY_EXPORT_FORMAT.md) |
 | Scaling | [docs/SCALING.md](docs/SCALING.md) |
 | Operations | [docs/OPERATIONS.md](docs/OPERATIONS.md) |

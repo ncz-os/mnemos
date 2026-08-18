@@ -251,9 +251,8 @@ per-session caps for `consultation_only` models, best-effort
 aliases, and route explanation output. The memory writes make model routing
 observable to MNEMOS rather than leaving it as transient gateway state.
 
-IRIS is the discovery role over the model catalog. In the current v5.0.1 codebase,
-the discovery role is surfaced through unified MCP model tools rather than a
-separate IRIS server. [`mnemos/mcp/tools/models.py`](../../mnemos/mcp/tools/models.py)
+IRIS is the discovery role over the model catalog. It is surfaced through the
+unified MCP model tools rather than a separate IRIS server. [`mnemos/mcp/tools/models.py`](../../mnemos/mcp/tools/models.py)
 exposes `pantheon_list_models` and `pantheon_route_explain`, giving MCP callers
 structured access to the PANTHEON catalog and routing decisions.
 
