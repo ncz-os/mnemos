@@ -1,6 +1,6 @@
 # MNEMOS Deployment & Configuration Guide
 
-**Status**: v6.1.2 current (patch release on the v6.0.0 GA line; legacy GA is v5.0.1) (released on top of the v5.0.0 GA shipped 2026-05-02).
+**Status**: v6.1.3 current (patch release on the v6.0.0 GA line; legacy GA is v5.0.1) (released on top of the v5.0.0 GA shipped 2026-05-02).
 
 ---
 
@@ -38,7 +38,7 @@ mnemos serve --profile dev
 ### Installation
 
 ```bash
-python -m pip install mnemos-os==6.1.2  # source-install from v6.0-rc tag
+python -m pip install mnemos-os==6.1.3  # source-install from v6.0-rc tag
 mnemos install --profile dev
 mnemos serve --profile dev
 ```
