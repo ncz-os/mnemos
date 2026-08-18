@@ -73,6 +73,46 @@ crash-looped forever after a restart following a partial-then-recovered
 prior migration run — every retry hit `SQL0803N`/`SQLSTATE=23505` on the
 same static `INSERT` and never got past schema replay to serve traffic.
 
+## [6.1.3] — 2026-08-17
+
+### Fixed — the published image required AVX512 and died on the first write
+
+**Anyone running MNEMOS with `MNEMOS_EMBED_BACKEND=llamacpp` on a CPU without
+AVX512 should upgrade.** On 6.1.0–6.1.2 that configuration serves `/health`
+happily and then kills itself on every write.
+
+`llama-cpp-python` is the one base dependency that compiles from source, and
+ggml defaults to `GGML_NATIVE=ON` — `-march=native` against the *build*
+machine. The CI runner has AVX512. Much of the fleet does not. The published
+image therefore contained instructions the target CPU could not execute.
+
+The failure mode is what made this expensive to find:
+
+- `import llama_cpp` **succeeds**, so startup completes and `/health` returns
+  200 — the container looks perfectly healthy.
+- The SIGILL fires on the first *call* into `libllama`, which happens when
+  something embeds, i.e. on the first write.
+- uvicorn dies, systemd restarts it, `/health` goes green again, and the
+  client sees an empty response with no error anywhere.
+
+Measured on the production Oracle host (Core 5 210H, no AVX512): every
+`POST /v1/memories` killed the process, 53 restarts before diagnosis. Three of
+six fleet hosts lack AVX512; the survivors were only spared because they use
+the HTTP embedder and never enter the library.
+
+The build now pins an explicit, portable baseline instead of inheriting the
+runner's instruction set: `GGML_NATIVE=OFF` with AVX/AVX2/FMA/F16C on for
+amd64 (Haswell-era, 2013) and AVX512 explicitly off. arm64 ignores those flags
+and keeps its NEON baseline. `GGML_NATIVE=OFF` is the load-bearing part —
+without it the build silently inherits whatever hardware CI happens to run on,
+which is not a property anyone can see by reading the Dockerfile.
+
+**Operator note:** if you hit this, the immediate workaround without upgrading
+is `MNEMOS_EMBED_BACKEND=http` pointed at an embedding server running the same
+model, which keeps stored vectors compatible. Switching *model* is not safe —
+two models at the same dimensionality produce mutually incompatible vector
+spaces (see 6.0.1).
+
 ## [6.1.2] — 2026-08-17
 
 ### Fixed — Oracle could not restart: the ORA-01451 replay guard was never in the release
