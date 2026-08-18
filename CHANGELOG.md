@@ -15,7 +15,7 @@ All notable changes to MNEMOS are documented here.
 - ✅ **Optional too-short content gate** — `MNEMOS_CONTEST_MIN_CONTENT_LENGTH` skips memories below a threshold before spending GPU time on content that can't be meaningfully compressed.
 - ✅ **v2 versioning trigger bytea fix** — the `mnemos_version_snapshot()` trigger no longer crashes on memories containing backslash sequences (common in code, paths, regex, logs).
 - ✅ **CHARON federation schema preflight** — peers exchange schema signatures before sync and return 409 on incompatible strict-mode pairings.
-- ✅ **Dev↔prod MPF restore drill** — `docs/RESTORE-DRILL.md` is validated on the PYTHIA → PROTEUS path.
+- ✅ **Dev↔prod MPF restore drill** — `docs/RESTORE-DRILL.md` is validated on a primary-to-staging restore path.
 - ✅ **Slice 1: audit quick wins** (`a62a099`) — session history returns the most recent messages first with deterministic system-row pinning, and project URLs now point at `mnemos-os/mnemos`.
 - ✅ **Slice 2: memory-read tenancy + DAG integrity** (`d42c475`) — shared memory read visibility, per-snapshot history visibility, same-memory DAG guards, race-safe branch creation, `MN001` to HTTP 409 reconciliation guidance, and a compose `postgres-upgrade` service for existing volumes.
 - ✅ **Webhook retry state machine + leases + outbox discipline** — persisted leases, one-success-per-chain guards, repair worker separation, bulk-create parity, and terminal success trigger.
@@ -47,7 +47,7 @@ All notable changes to MNEMOS are documented here.
 - The SQLite-backed `edge` profile intentionally exposes a narrower HTTP API: sessions, entities, state, and MORPHEUS telemetry routes return 503 because those surfaces still depend on server-profile Postgres SQL.
 - MORPHEUS run and cluster endpoints are operator-only telemetry. They require root credentials because responses can include namespaces, configs, errors, and memory IDs across tenants.
 - v5.0 still does not ship the separate web frontend, mobile clients, or hosted MNEMOS Cloud; those remain roadmap items.
-- The PROTEUS barrage exposed long-tail latency under sustained 50-concurrent writes (p99 ~33s). Search and read paths held up well (search p99 ~300ms; reads p50 ~120ms). Tuning the worker / pool budget is a v5.1 target.
+- Load testing exposed long-tail latency under sustained 50-concurrent writes (p99 ~33s). Search and read paths held up well (search p99 ~300ms; reads p50 ~120ms). Tuning the worker / pool budget is a v5.1 target.
 - PANTHEON v0.2 caps live in an in-process bucket; horizontal scaling needs a Redis-backed cap store (deferred to v5.1+).
 - Web UX in the separate `mnemos-web` frontend repo
 - Mobile clients: Android Termux hardening first, iOS native later
@@ -73,14 +73,120 @@ crash-looped forever after a restart following a partial-then-recovered
 prior migration run — every retry hit `SQL0803N`/`SQLSTATE=23505` on the
 same static `INSERT` and never got past schema replay to serve traffic.
 
-## [6.1.7] — 2026-08-18
+## [6.1] — 2026-08-18
 
-### Fixed — a dead rate-limit store still took the whole API down
+The 6.1 line. 175 files changed against 6.0.1, +10618/-2138.
 
-6.1.0 claimed this was fixed. It was not, on the path that actually fails.
+**Read this first if you operate a fleet:** federation between 6.0 and 6.1
+nodes does not work in both directions until both sides are on 6.1. A 6.0 node
+refuses a 6.1 peer until it is upgraded, so plan the rollout rather than
+mixing versions indefinitely. See "Federation" below.
 
-`SlowAPIMiddleware` resolves the handler for an error raised while checking
-limits like this:
+### Security — an unauthenticated `mnemos serve` could bind a reachable interface
+
+With authentication disabled — the default under the edge/personal profile —
+every protected route receives a synthetic root principal. `mnemos serve`
+nevertheless defaulted `--host` to `0.0.0.0`, and both the published images and
+the quickstart compose file map that port. The documented `docker run -p
+5002:5002` therefore handed full administrative access to any client that could
+reach the port: read, write, and delete of every memory, root-only
+administration, provider spend, and federation and webhook state.
+
+Startup now fails closed on exactly that combination — unauthenticated **and**
+bound off-host. Loopback binds are unaffected, as is an authenticated service
+on `0.0.0.0`. A deliberately open port on a trusted network is still possible
+via `MNEMOS_ALLOW_UNAUTHENTICATED_NETWORK_BIND=1`, named to be uncomfortable to
+type. The guard is enforced in the application, not only in the CLI, so
+importing the app directly cannot bypass it.
+
+### Security — MCP served authorization decisions from a stale cache
+
+`MCPUserContext` carries `role` and `namespace` — authorization inputs — and
+was held for 300 seconds with nothing invalidating it on an ACL change.
+Narrowing a principal's role, or revoking a key, kept being honoured over MCP
+for up to five minutes after the change committed. The principal-context cache
+is now invalidated when visibility narrows, and revoked MCP keys fail closed.
+
+All four cache-backed reads were audited: the search cache was already
+epoch-keyed, `stats:global:v2` holds no per-principal data, and the decay table
+is not visibility-dependent. The MCP principal context was the one that leaked.
+
+### Security — the secret-detection denylist is stored as digests
+
+The denylist itself contained the plaintext values it was meant to detect.
+
+### Federation — three defects that together stopped replication
+
+Three independent defects compounded, and two of them failed silently.
+
+**Compatibility is now decided on the MAJOR version.** The gate compared
+`major.minor` for exact equality, so a 6.0 node refused a 6.1 node outright and
+every rolling minor upgrade broke federation until an operator hand-set
+`compat_mode=permissive` on each peer. Minor releases are backwards compatible
+by our own versioning contract. Cross-minor peers also skip the
+migrations-fingerprint comparison, which legitimately differs between minors. A
+major difference still aborts, and an unreadable peer signature is treated as
+unverifiable rather than implicitly compatible.
+
+**The feed defaults to the trusted-LAN full-corpus scope.** `create_memory`
+writes `permission_mode` 600 and the world-read gate requires `% 10 >= 4`, so
+the feed offered nothing at all. Peers reported `{"pulled": 0}` successfully,
+with no error anywhere, which is why the condition was invisible. Set
+`federation_feed_include_private=false` for offsite federation, where the
+narrow scope is the correct default.
+
+**LAN peers are registrable.** `FEDERATION_ALLOW_PRIVATE` and
+`FEDERATION_ALLOW_INSECURE` defaulted false, so a private fleet could not
+register its own peers. Both now default true for LAN installs; set them false
+for offsite federation.
+
+The SSRF guard was split rather than loosened while doing this. Link-local
+(cloud instance metadata), multicast, reserved, and unspecified addresses are
+blocked on every network regardless of the flag; RFC1918 and loopback are what
+the flag gates. A DNS name that resolves to 169.254.169.254 is still refused
+with the flag on.
+
+### Fixed — the published image required AVX512 and died on the first write
+
+**Anyone running MNEMOS with `MNEMOS_EMBED_BACKEND=llamacpp` on a CPU without
+AVX512 should upgrade.** That configuration serves `/health` happily and then
+kills itself on every write.
+
+`llama-cpp-python` is the one base dependency that compiles from source, and
+ggml defaults to `GGML_NATIVE=ON` — `-march=native` against the *build*
+machine. The published image therefore contained instructions the target CPU
+could not execute.
+
+The failure mode is what made this expensive to find:
+
+- `import llama_cpp` **succeeds**, so startup completes and `/health` returns
+  200. The container looks perfectly healthy.
+- The SIGILL fires on the first *call* into `libllama`, which happens when
+  something embeds — that is, on the first write.
+- uvicorn dies, the supervisor restarts it, `/health` goes green again, and the
+  client sees an empty response with no error anywhere.
+
+The build now pins an explicit, portable baseline instead of inheriting the
+build machine's instruction set: `GGML_NATIVE=OFF` with AVX, AVX2, FMA, and
+F16C on for amd64 (Haswell-era, 2013) and AVX512 explicitly off. arm64 ignores
+those flags and keeps its NEON baseline. `GGML_NATIVE=OFF` is the load-bearing
+part — without it the build silently inherits whatever hardware built it, which
+is not a property anyone can see by reading the Dockerfile.
+
+**Operator note:** the immediate workaround without upgrading is
+`MNEMOS_EMBED_BACKEND=http` pointed at an embedding server running the same
+model, which keeps stored vectors compatible. Switching *model* is not safe —
+two models at the same dimensionality produce mutually incompatible vector
+spaces (see 6.0.1).
+
+### Fixed — a dead rate-limit store took the whole API down
+
+`Dockerfile.core` sets `MNEMOS_PROFILE=server`, which resolves
+`rate_limit.storage_uri` to `redis://localhost:6379/1`, but the
+single-container image ships no Redis. Every request then raised
+`ConnectionError` inside SlowAPI's limit check.
+
+`SlowAPIMiddleware` resolves the handler for such an error by **exact type**:
 
 ```python
 except Exception as e:
@@ -89,105 +195,128 @@ except Exception as e:
     )
 ```
 
-That is an **exact-type** lookup, and `main.py` registers our fail-open handler
-only for `RateLimitExceeded`. When the store is unreachable the limiter raises
-its backend's error — `ConnectionError` for redis — which matches nothing, so
-slowapi falls back to its own handler, reads `exc.detail`, and raises
+`main.py` registers the fail-open handler only for `RateLimitExceeded`, so a
+`ConnectionError` matched nothing, slowapi fell back to its own handler, read
+`exc.detail`, and raised `AttributeError: 'ConnectionError' object has no
+attribute 'detail'` straight out of `dispatch`. The result was an unhandled
+**500 on every route, `/health` included**, from a container that had reported
+"Application startup complete". Registering the handler for `Exception` does
+not help either: the lookup is not subclass-aware, and the set of errors an
+arbitrary storage backend can raise is not enumerable.
 
-```
-AttributeError: 'ConnectionError' object has no attribute 'detail'
-```
+The fix is at the limiter. `_FailOpenLimiter._check_request_limit` re-raises
+`RateLimitExceeded` and swallows everything else with a loud warning, so
+slowapi never sees a non-`RateLimitExceeded` exception at all. This covers the
+`@limiter.limit()` decorator path as well as the middleware path. Swallowing
+alone is not sufficient — the middleware treats "no exception" as "limits were
+evaluated" and proceeds to
+`_inject_headers(response, request.state.view_rate_limit)`, state that only the
+aborted check sets. `_inject_headers` is now a no-op when no limit was
+evaluated.
 
-straight out of `dispatch`: an unhandled 500 on **every** route, `/health`
-included, from a container that started cleanly. Registering the handler for
-`Exception` would not have helped either — the lookup is not subclass-aware,
-and the set of errors an arbitrary storage backend can raise is not
-enumerable.
-
-The 6.1.0 test passed throughout, because it called the handler directly and so
-never exercised the middleware.
-
-Fixed at the limiter instead: `_FailOpenLimiter._check_request_limit` re-raises
-`RateLimitExceeded` and swallows everything else with a loud warning, so slowapi
-never sees a non-`RateLimitExceeded` exception at all. This covers the
-`@limiter.limit()` decorator path as well as the middleware path.
-
-Swallowing alone was not sufficient. The middleware treats "no exception" as
-"limits were evaluated" and goes on to
-`_inject_headers(response, request.state.view_rate_limit)` — state that is only
-set by the check that just aborted. That merely traded one `AttributeError` for
-another. `_inject_headers` is now a no-op when no limit was evaluated.
-
-Reproduced on the arm64 6.1.6 image, where the `server` profile defaults
-`rate_limit.storage_uri` to `redis://localhost:6379/1` and the image ships no
-redis. Any host on that profile without a redis was dead on arrival; it now
-degrades to unlimited and says so in the log.
+Rate limiting is a protective measure: losing its store now degrades to
+"unlimited" and says so in the log, never to "the API is broken". The image
+also defaults to `memory://`. Genuine limit violations still return 429.
 
 `tests/test_rate_limit_middleware_store_outage.py` drives real requests through
 `SlowAPIMiddleware` with a store that raises, and fails against the stock
-limiter (5 of 7).
+limiter.
 
-## [6.1.6] — 2026-08-18
+### Fixed — hard deletion was broken on SQLite, the default backend
 
-### Fixed — federation sync failed on MariaDB with an AttributeError
+The GDPR resweep called the `soft_delete_target` and `count_live_target_rows`
+primitives, which bind asyncpg-style (`$1` placeholders, variadic params). On
+aiosqlite that raised `TypeError: Connection.execute() takes from 2 to 3
+positional arguments but 4 were given`, so no hard deletion could ever complete
+on the backend the published images use by default. It now calls the
+backend-neutral `_soft_delete` and `_scope_counts` pair, which is what its own
+docstring already described.
 
-```
-federation sync with pythia failed:
-AttributeError: 'MariadbBackend' object has no attribute 'audit_chain'
-```
+### Fixed — Oracle schema migrations
 
-`domain/federation.py` guards its audit write with
-`backend.audit_chain is not None`, which requires the attribute to exist. The
-persistence backends are bare classes rather than subclasses of the ABC that
-declares the property, so each one has to define it: SQLite, PostgreSQL and
-Oracle do, and Db2 inherits Oracle's. The MySQL family defined neither, so
-MariaDB raised instead of answering.
+Migrations carry no applied-state table: the ordered SQL list is re-run on
+every start, so every statement must be idempotent.
 
-Every sync that applied a mutation returned HTTP 503, which meant a MariaDB
-node could not pull a single memory even once its peer existed.
-
-`MysqlBackend` now implements the property and returns `None`, which is what
-the base class documents for a backend that has not shipped audit-chain rows —
-callers treat it as `MNEMOS_AUDIT_CHAIN=off`.
-
-`tests/test_backend_audit_chain_attribute.py` asserts every backend exposes it,
-that it is a property rather than a method (a bound method is never `None`, so
-the guard would silently take the wrong branch), and that the MySQL family
-answers `None` rather than raising.
-
-## [6.1.5] — 2026-08-18
-
-### Fixed — a MariaDB node could not be given a federation peer
-
-`POST /v1/federation/peers` returned HTTP 500 on MariaDB:
+`0050_lifecycle_workers.sql` relaxes a column with `ALTER TABLE
+deletion_requests MODIFY (memory_id NULL)`. Oracle rejects a nullability change
+that is already satisfied, where Postgres accepts `DROP NOT NULL` idempotently:
 
 ```
-(1064, "You have an error in your SQL syntax; check the manual that
- corresponds to your MariaDB server version for the right syntax to use
- near 'JSON),\n CAST(NULL AS JSON), 1, 300, 'strict', ...' at line 6")
+ORA-01451: column to be modified to NULL cannot be modified to NULL
 ```
 
-`MariadbFederationRepository` inherits its SQL from the MySQL repository, which
-binds JSON columns as `CAST(%s AS JSON)`. MySQL has a real JSON type and
-accepts that; MariaDB does not implement the cast at all — its JSON type is an
-alias for LONGTEXT with a `json_valid()` CHECK, so the cast is both unsupported
-and unnecessary.
+A fresh install therefore aborted at that statement, and an existing install
+started exactly once — the first replay made the column nullable, and every
+start after that hit ORA-01451 and aborted. `ORA-01451` and `ORA-01442` are now
+benign on replay for `ALTER` statements, including when the statement begins
+with SQL comments, which defeated the first attempt at this fix because the
+leading `--` lines meant it never matched `startswith("ALTER ")`.
 
-Because peer creation was the only way to tell a node about a peer, the failure
-was total rather than partial: a MariaDB node could never federate.
+### Fixed — migrations are replayable
 
-The JSON bind and the JSON-column read expression are now overridable class
-attributes; MariaDB overrides both, MySQL keeps the cast.
-`tests/test_mysql_family_json_binding.py` pins the split, asserts the two
-dialects genuinely differ so they cannot be collapsed back together, and
-asserts on the source of `create_peer`/`update_peer` — an inline cast would
-bypass the override and fail only on a live MariaDB, which CI does not have.
+Three statements were not idempotent, and each raised "already exists" against
+a real 6.0.1 database: two `CREATE INDEX` and one `ADD CONSTRAINT`. The
+consequence was not cosmetic — psql aborts the surrounding transaction on
+error, so every remaining statement in that file was skipped, silently, and
+differently depending on how far a previous run had got.
 
-## [6.1.4] — 2026-08-18
+### Fixed — deletion workers could not claim work on Oracle
 
-Two backend-specific schema defects, each of which stopped 6.1 starting on a
-backend that is not PostgreSQL or SQLite. Both were found by upgrading live
-hosts; neither is reachable from the unit suite, which has no Db2 or MariaDB.
+Both deletion workers went to `error` on their first tick, and `/health`
+reported `degraded`:
+
+```
+ORA-02014: cannot select FOR UPDATE from view with DISTINCT, GROUP BY, etc.
+```
+
+The claim branch already knew Oracle rejects `FETCH FIRST` combined with
+`FOR UPDATE`, and built this instead:
+
+```sql
+SELECT * FROM (SELECT * FROM deletion_requests WHERE ... ORDER BY ...)
+WHERE ROWNUM <= 1 FOR UPDATE SKIP LOCKED
+```
+
+That has the same defect. The lock still targets an inline view, and the
+`ROWNUM` inside it is enough to raise ORA-02014 on its own. Oracle now locks
+the base table, with the ordering and the limit moved into a scalar subquery —
+a predicate, not a locked relation. An empty queue yields NULL, so `id = NULL`
+matches nothing and the caller sees "nothing to claim", the same result the
+other dialects produce.
+
+### Fixed — Db2 no longer depends on Oracle compatibility mode
+
+Db2 shared the Oracle branch, so it inherited `ROWNUM` — which on Db2 exists
+*only* under `DB2_COMPATIBILITY_VECTOR=ORA`. That made the deletion worker
+depend on an instance-wide Oracle-compatibility setting that a Db2 deployment
+is under no obligation to enable. On a stock instance it would have failed.
+
+Db2 now emits native SQL:
+
+```sql
+... ORDER BY ... FETCH FIRST 1 ROWS ONLY
+FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS SKIP LOCKED DATA
+```
+
+`KEEP UPDATE LOCKS` takes the row lock at read time so two workers cannot both
+read the row and race to the UPDATE; `SKIP LOCKED DATA` makes the others step
+over it rather than block.
+
+The generated statement was executed against a live instance of every supported
+backend rather than merely asserted in a unit test:
+
+| Backend | Result |
+|---|---|
+| Oracle 23ai EE | old form raises ORA-02014; new form returns the row |
+| Db2 CE 12.1 | accepted; uses no compatibility-mode construct |
+| PostgreSQL 16 | unchanged, passes |
+| MariaDB 11 | unchanged, passes |
+
+`tests/test_deletion_claim_sql_dialects.py` pins the generated shape for all
+four dialects and fails against the old code: `FOR UPDATE` must sit outside
+every subquery, Db2 must not emit `ROWNUM`, the queue ordering must survive,
+Postgres and MySQL/MariaDB must be untouched, and the hard-delete branch must
+still bind `restore_by` exactly once.
 
 ### Fixed — Db2 could not migrate: reorg-pending after the lifecycle ALTERs
 
@@ -201,12 +330,11 @@ SQL0668N Operation not allowed for reason code "7"
 on table "DB2INST1.DELETION_REQUESTS"
 ```
 
-The executor now recognises that error, reorganises the named table and retries
-the statement once. Handled in code rather than by adding a `REORG` to the
-`.sql` deliberately: migrations carry no applied-state table and replay on every
-start, so an unconditional REORG would rewrite the table on every boot.
-Reacting to the error means it runs only when Db2 actually asks for it.
-Confirmed firing in production.
+The executor now recognises that error, reorganises the named table, and
+retries the statement once. This is handled in code rather than by adding a
+`REORG` to the `.sql` deliberately: migrations replay on every start, so an
+unconditional REORG would rewrite the table on every boot. Reacting to the
+error means it runs only when Db2 actually asks for it.
 
 ### Fixed — MariaDB could not create two tables: foreign-key charset mismatch
 
@@ -228,299 +356,53 @@ really is utf8mb4, and each FK column must match its own referent rather than a
 single project-wide charset. `migrations_mysql/0050_lifecycle_workers.sql`
 carried the same omission.
 
-### Known issues
+### Fixed — a MariaDB node could not be given a federation peer
 
-- The MySQL-family charset split is not fully resolved: `memories.id` is ascii
-  while `sessions.id` is utf8mb4 on the same database, because one is
-  overridden by the MariaDB module and the other inherited. Self-consistent and
-  working, but any new table referencing either must pick its charset per
-  column. Unifying them would need an ALTER migration for existing installs.
-
-## [6.1.3] — 2026-08-17
-
-### Fixed — the published image required AVX512 and died on the first write
-
-**Anyone running MNEMOS with `MNEMOS_EMBED_BACKEND=llamacpp` on a CPU without
-AVX512 should upgrade.** On 6.1.0–6.1.2 that configuration serves `/health`
-happily and then kills itself on every write.
-
-`llama-cpp-python` is the one base dependency that compiles from source, and
-ggml defaults to `GGML_NATIVE=ON` — `-march=native` against the *build*
-machine. The CI runner has AVX512. Much of the fleet does not. The published
-image therefore contained instructions the target CPU could not execute.
-
-The failure mode is what made this expensive to find:
-
-- `import llama_cpp` **succeeds**, so startup completes and `/health` returns
-  200 — the container looks perfectly healthy.
-- The SIGILL fires on the first *call* into `libllama`, which happens when
-  something embeds, i.e. on the first write.
-- uvicorn dies, systemd restarts it, `/health` goes green again, and the
-  client sees an empty response with no error anywhere.
-
-Measured on the production Oracle host (Core 5 210H, no AVX512): every
-`POST /v1/memories` killed the process, 53 restarts before diagnosis. Three of
-six fleet hosts lack AVX512; the survivors were only spared because they use
-the HTTP embedder and never enter the library.
-
-The build now pins an explicit, portable baseline instead of inheriting the
-runner's instruction set: `GGML_NATIVE=OFF` with AVX/AVX2/FMA/F16C on for
-amd64 (Haswell-era, 2013) and AVX512 explicitly off. arm64 ignores those flags
-and keeps its NEON baseline. `GGML_NATIVE=OFF` is the load-bearing part —
-without it the build silently inherits whatever hardware CI happens to run on,
-which is not a property anyone can see by reading the Dockerfile.
-
-**Operator note:** if you hit this, the immediate workaround without upgrading
-is `MNEMOS_EMBED_BACKEND=http` pointed at an embedding server running the same
-model, which keeps stored vectors compatible. Switching *model* is not safe —
-two models at the same dimensionality produce mutually incompatible vector
-spaces (see 6.0.1).
-
-## [6.1.2] — 2026-08-17
-
-### Fixed — Oracle could not restart: the ORA-01451 replay guard was never in the release
-
-**Anyone on 6.1.0 or 6.1.1 with an Oracle backend should upgrade before
-restarting.** The service starts once and cannot start again.
-
-`0050_lifecycle_workers.sql` relaxes a column:
-
-```sql
-ALTER TABLE deletion_requests MODIFY (memory_id NULL)
-```
-
-Migrations carry no applied-state table, so every statement is replayed on
-each start. Oracle rejects a nullability change that is already satisfied
-(`ORA-01451`), where Postgres accepts `DROP NOT NULL` idempotently. The first
-6.1 start therefore succeeded — the column really was `NOT NULL` — and made
-the column nullable. Every start after that replayed the same statement
-against an already-nullable column, raised ORA-01451, and aborted:
+`POST /v1/federation/peers` returned HTTP 500 on MariaDB:
 
 ```
-RuntimeError: ORACLE schema migration 0050_lifecycle_workers.sql failed at
-`ALTER TABLE deletion_requests MODIFY (memory_id NULL)`: ORA-01451
+(1064, "You have an error in your SQL syntax; check the manual that
+ corresponds to your MariaDB server version for the right syntax to use
+ near 'JSON),\n CAST(NULL AS JSON), 1, 300, 'strict', ...' at line 6")
 ```
 
-The guard that forgives this on replay was written and tested, and 6.1.0's
-release notes describe it — but it was on `master` and **not on the release
-branch**. `release/6.1.0` was squashed from `master` before that commit
-landed, so both the v6.1.0 and v6.1.1 tags shipped without it. The only code
-difference between `master` and the release branch was this one file.
+`MariadbFederationRepository` inherits its SQL from the MySQL repository, which
+binds JSON columns as `CAST(%s AS JSON)`. MySQL has a real JSON type and
+accepts that; MariaDB does not implement the cast at all — its JSON type is an
+alias for LONGTEXT with a `json_valid()` CHECK, so the cast is both unsupported
+and unnecessary. Because peer creation was the only way to tell a node about a
+peer, the failure was total rather than partial: a MariaDB node could never
+federate.
 
-Found by upgrading the production Oracle primary: 6.1.0 started (first replay,
-the ALTER was real), and the 6.1.1 restart could not (second replay, the ALTER
-was a no-op). The window between those two states was one restart.
+The JSON bind and the JSON-column read expression are now overridable class
+attributes; MariaDB overrides both, MySQL keeps the cast.
+`tests/test_mysql_family_json_binding.py` pins the split, asserts the two
+dialects genuinely differ so they cannot be collapsed back together, and
+asserts on the source of `create_peer` and `update_peer` — an inline cast would
+bypass the override and fail only on a live MariaDB, which CI does not have.
 
-### Process
-
-The release branch is now verified against `master` rather than assumed
-equivalent. A squashed release branch silently omitting a fix that the release
-notes claim is a worse failure than the bug it hides: the notes said the
-Oracle install path was fixed, the tests covering it passed on `master`, and
-the published image did not contain it.
-
-## [6.1.1] — 2026-08-17
-
-### Fixed — deletion workers could not claim work on Oracle
-
-Found upgrading the production Oracle 23ai primary to 6.1.0. Both deletion
-workers went to `error` on their first tick and `/health` reported `degraded`:
+### Fixed — federation sync failed on MariaDB with an AttributeError
 
 ```
-ORA-02014: cannot select FOR UPDATE from view with DISTINCT, GROUP BY, etc.
+AttributeError: 'MariadbBackend' object has no attribute 'audit_chain'
 ```
 
-The claim branch already knew Oracle rejects `FETCH FIRST` combined with
-`FOR UPDATE`, and built this instead:
+`domain/federation.py` guards its audit write with
+`backend.audit_chain is not None`, which requires the attribute to exist. The
+persistence backends are bare classes rather than subclasses of the type that
+declares the property, so each one has to define it: SQLite, PostgreSQL, and
+Oracle do, and Db2 inherits Oracle's. The MySQL family defined neither, so
+MariaDB raised instead of answering. Every sync that applied a mutation
+returned HTTP 503, which meant a MariaDB node could not pull a single memory
+even once its peer existed.
 
-```sql
-SELECT * FROM (SELECT * FROM deletion_requests WHERE ... ORDER BY ...)
-WHERE ROWNUM <= 1 FOR UPDATE SKIP LOCKED
-```
-
-That has the same defect. The lock still targets an inline view, and the
-`ROWNUM` inside it is enough to raise ORA-02014 on its own. Oracle now locks
-the base table, with the ordering and the limit moved into a scalar subquery
-(a predicate, not a locked relation). An empty queue yields NULL, so
-`id = NULL` matches nothing and the caller sees "nothing to claim" — the same
-result the other dialects produce.
-
-**Anyone running 6.1.0 on Oracle should upgrade.** Deletion requests are
-accepted and queued but never processed, and the service reports degraded.
-
-### Fixed — Db2 no longer depends on Oracle compatibility mode
-
-Db2 shared the Oracle branch, so it inherited `ROWNUM` — which on Db2 exists
-*only* under `DB2_COMPATIBILITY_VECTOR=ORA`. That made the deletion worker
-depend on an instance-wide Oracle-compatibility setting a Db2 deployment is
-under no obligation to enable. The fleet's Db2 12.1.5 happens to have it on,
-which is why the shared branch appeared to work; on a stock instance it would
-have failed.
-
-Db2 now emits native SQL:
-
-```sql
-... ORDER BY ... FETCH FIRST 1 ROWS ONLY
-FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS SKIP LOCKED DATA
-```
-
-`KEEP UPDATE LOCKS` takes the row lock at read time so two workers cannot both
-read the row and race to the UPDATE; `SKIP LOCKED DATA` makes the others step
-over it rather than block.
-
-### Verification
-
-The generated statement was executed against a live instance of every
-supported backend, not merely asserted in a unit test:
-
-| Backend | Instance | Result |
-|---|---|---|
-| Oracle 23ai EE | production primary + non-prod EE | old form raises ORA-02014; new form returns the row |
-| Db2 CE 12.1.5 | native install | accepted; uses no compatibility-mode construct |
-| PostgreSQL 16 | pgvector/postgres 16 | unchanged, passes |
-| MariaDB 11 | mariadb:11 | unchanged, passes |
-
-`tests/test_deletion_claim_sql_dialects.py` pins the generated shape for all
-four dialects (there is no Oracle or Db2 in unit CI) and fails against the old
-code: `FOR UPDATE` must sit outside every subquery, Db2 must not emit `ROWNUM`,
-the queue ordering must survive, Postgres and MySQL/MariaDB must be untouched,
-and the hard-delete branch must still bind `restore_by` exactly once.
-
-### Known issues
-
-- Two MCP registry-parity tests (`test_http_sse_message_posts_are_bound_to_session_principal`,
-  `test_http_post_rejects_ambiguous_session_id_parameters`) fail when run in
-  isolation and pass in some full-suite orderings. Pre-existing and
-  order-dependent; unrelated to this release's changes.
-- The 6.1.0 known issues below still apply: CHARON `/v1/export` is
-  Postgres-only, and `test:multi-worker` has not yet been observed passing end
-  to end.
-
-## [6.1.0] — 2026-08-17
-
-59 commits since 6.0.1; 175 files, +10618/-2138.
-
-Read this first if you operate a fleet: **federation between 6.0 and 6.1 nodes
-was broken in both directions before this release**, and the fix is in 6.1. See
-"Federation" below — a 6.0 node refuses a 6.1 peer until it is upgraded, so plan
-the rollout rather than mixing versions indefinitely.
-
-### Security — an unauthenticated `mnemos serve` could bind a reachable interface
-
-With authentication disabled — the default under the edge/personal profile —
-every protected route receives a synthetic root principal. `mnemos serve`
-nevertheless defaulted `--host` to `0.0.0.0`, and both the published images and
-the quickstart compose file map that port. The documented `docker run -p
-5002:5002` therefore handed full administrative access to any client that could
-reach the port: read/write/delete of every memory, root-only administration,
-provider spend, and federation and webhook state.
-
-Startup now fails closed on exactly that combination (unauthenticated **and**
-bound off-host). Loopback binds are unaffected; an authenticated service on
-`0.0.0.0` is unaffected. A deliberately open port on a trusted network is still
-possible via `MNEMOS_ALLOW_UNAUTHENTICATED_NETWORK_BIND=1`, named to be
-uncomfortable to type. The guard is enforced in the application, not only in the
-CLI, so importing the app directly cannot bypass it.
-
-### Security — MCP served authorization decisions from a stale cache
-
-`MCPUserContext` carries `role` and `namespace` — authorization inputs — and was
-held for 300 seconds with nothing invalidating it on an ACL change. Narrowing a
-principal's role, or revoking a key, kept being honoured over MCP for up to five
-minutes after the change committed. The principal-context cache is now
-invalidated when visibility narrows, and revoked MCP keys fail closed.
-
-All four cache-backed reads were audited: the search cache was already
-epoch-keyed, `stats:global:v2` holds no per-principal data, and the decay table
-is not visibility-dependent. The MCP principal context was the one that leaked.
-
-### Security — the secret-detection denylist is stored as digests
-
-The denylist itself contained the plaintext values it was meant to detect.
-
-### Federation — three defects that together stopped the fleet replicating
-
-The fleet had not moved a memory since 2026-05-23. Three independent defects
-compounded, and two of them failed silently.
-
-**Compatibility is now decided on the MAJOR version.** The gate compared
-`major.minor` for exact equality, so a 6.0 node refused a 6.1 node outright and
-every rolling minor upgrade broke federation until an operator hand-set
-`compat_mode=permissive` on each peer. Minor releases are backwards compatible
-by our own versioning contract. Cross-minor peers also skip the
-migrations-fingerprint comparison, which legitimately differs between minors; a
-major difference still aborts, and an unreadable peer signature is treated as
-unverifiable rather than implicitly compatible.
-
-**The feed defaults to the trusted-LAN full-corpus scope.** `create_memory`
-writes `permission_mode` 600 and the world-read gate requires `% 10 >= 4`, so
-the feed offered nothing at all. Peers reported `{"pulled": 0}` — successfully,
-and with no error anywhere — which is why this went unnoticed for months. Set
-`federation_feed_include_private=false` for offsite federation, where the
-narrow scope is the correct default.
-
-**LAN peers are registrable.** `FEDERATION_ALLOW_PRIVATE` and
-`FEDERATION_ALLOW_INSECURE` defaulted false, so a private fleet could not
-register its own peers. Both now default true for LAN installs; set them false
-for offsite federation.
-
-The SSRF guard was split rather than loosened while doing this. Link-local
-(cloud instance metadata), multicast, reserved and unspecified addresses are
-blocked on every network regardless of the flag; RFC1918 and loopback are what
-the flag gates. A DNS name that resolves to 169.254.169.254 is still refused
-with the flag on.
-
-### Fixed — hard deletion was broken on SQLite, the default backend
-
-The GDPR resweep called the `soft_delete_target` / `count_live_target_rows`
-primitives, which bind asyncpg-style (`$1` placeholders, variadic params). On
-aiosqlite that raised `TypeError: Connection.execute() takes from 2 to 3
-positional arguments but 4 were given`, so no hard deletion could ever complete
-on the backend the published images use by default. It now calls the
-backend-neutral `_soft_delete` / `_scope_counts` pair, which is what its own
-docstring already described.
-
-### Fixed — Oracle: a fresh 6.1 install could not complete its migrations
-
-Against `oracle/database:23.26.1-ee` — the version the fleet runs — a fresh
-schema aborted at `0050_lifecycle_workers.sql`:
-
-```
-ALTER TABLE deletion_requests MODIFY (memory_id NULL)
-ORA-01451: column to be modified to NULL cannot be modified to NULL
-```
-
-Oracle rejects a nullability change that is already satisfied, where Postgres
-accepts `DROP NOT NULL` idempotently. Provisioning failed outright, and this
-would have run against the production primary that a Data Guard standby
-replicates from. `ORA-01451`/`ORA-01442` are now benign on replay for `ALTER`
-statements — including when the statement begins with SQL comments, which
-defeated the first attempt at this fix because the leading `--` lines meant the
-statement never matched `startswith("ALTER ")`.
-
-### Fixed — migrations are replayable
-
-Migrations carry no applied-state table: the ordered SQL list is re-run on every
-start, so every statement must be idempotent. Three were not, and each raised
-"already exists" against a real 6.0.1 database — two `CREATE INDEX` and one
-`ADD CONSTRAINT`. The consequence was not cosmetic: psql aborts the surrounding
-transaction on error, so every remaining statement in that file was skipped,
-silently, and differently depending on how far a previous run had got.
-
-### Fixed — an unreachable rate-limit store returned 500 on every route
-
-`Dockerfile.core` sets `MNEMOS_PROFILE=server`, which resolves
-`rate_limit.storage_uri` to `redis://localhost:6379/1`, but the single-container
-image ships no Redis. Every request then raised `ConnectionError` inside
-SlowAPI's limit check, which routes exceptions to the registered handler;
-that handler read `exc.detail`, an attribute only `RateLimitExceeded` carries.
-The result was `AttributeError` and **HTTP 500 on every route, `/health`
-included**, on a container that otherwise reported "Application startup
-complete".
-
-Rate limiting is a protective measure: losing its store now degrades to
-"unlimited" and logs loudly, never to "the API is broken". The image also
-defaults to `memory://`. Genuine limit violations still return 429.
+`MysqlBackend` now implements the property and returns `None`, which is what
+the base class documents for a backend that has not shipped audit-chain rows;
+callers treat it as `MNEMOS_AUDIT_CHAIN=off`.
+`tests/test_backend_audit_chain_attribute.py` asserts every backend exposes it,
+that it is a property rather than a method (a bound method is never `None`, so
+the guard would silently take the wrong branch), and that the MySQL family
+answers `None` rather than raising.
 
 ### Fixed — the GRAEAE consultation audit chain never verified
 
@@ -537,7 +419,6 @@ keyed v2 chain.
 
 - **Postgres** advertises the `supports_webhooks` capability flag it implements.
 - **MySQL/MariaDB** no longer fail every start over a single unsupported layer.
-- **Hive bus** default corrected to the real bus host.
 
 ### Resilience — NATS
 
@@ -572,31 +453,12 @@ keyed v2 chain.
 
 - Verified building and serving on **native aarch64** (CIX Sky1): the image
   builds, the container reports healthy, and `/health` returns 200.
-- Containers are the only distribution; native single-binary builds were dropped.
-- `release:linux-aarch64` runs on the TYDEUS arm64 runner and is restricted to
-  tags.
+- Containers are the only distribution; native single-binary builds were
+  dropped.
 - CI no longer caches `.venv`, which was causing intermittent
-  missing-dependency failures.
-
-### Testing
-
-The unit suite is green: **3194 passed, 87 skipped, 0 failed**.
-
-Two classes of reported failure turned out not to be product defects, which is
-worth recording because both misled triage:
-
-- Eight needed `nats-py`, which the local environment lacked and CI installs.
-- Five came from a stale test helper that branched on
-  `asyncio.iscoroutinefunction(conn.execute)`. The SQLite backend moved to
-  aiosqlite, whose `execute` is not a coroutine function — it returns an
-  awaitable `Result`. The check reported False, every INSERT took the
-  synchronous branch and was dropped un-awaited, and the lookups under test
-  then correctly found no rows.
-
-CI also now installs the `persephone` extra. Without it pytest hit a collection
-error and aborted the entire run, reporting "7 skipped, 1 error" while 3000+
-tests never executed — a single missing pure-Python dependency was hiding the
-whole suite.
+  missing-dependency failures, and now installs the `persephone` extra. Without
+  it pytest hit a collection error and aborted the entire run, reporting
+  "7 skipped, 1 error" while 3000+ tests never executed.
 
 ### Known issues at this release
 
@@ -605,11 +467,14 @@ whole suite.
   actually by-design unsupported — the route uses raw asyncpg SQL. An
   Oracle-backed host cannot be backed up through the native export path; use
   Data Pump.
-- **`test:multi-worker` is advisory** (`allow_failure: true`) and had never
-  actually run before this release — it sits behind the lint stage and was
-  skipped on every recent pipeline. Its first real run failed on a
-  container-recreate race, now fixed; the smoke has not yet been observed
-  passing end to end.
+- **The MySQL-family charset split is not fully resolved:** `memories.id` is
+  ascii while `sessions.id` is utf8mb4 on the same database, because one is
+  overridden by the MariaDB module and the other inherited. This is
+  self-consistent and working, but any new table referencing either must pick
+  its charset per column. Unifying them would need an ALTER migration for
+  existing installs.
+- **`test:multi-worker` is advisory** (`allow_failure: true`) and the smoke has
+  not yet been observed passing end to end.
 
 ## [6.0.1] — 2026-07-10
 
@@ -818,7 +683,7 @@ still returns the address list.
 
 ### Fixed — Starlette 1.0 compat + pydantic-settings precedence pin (#199)
 
-Surfaced by a fresh-install barrage on PROTEUS (Python 3.13 +
+Surfaced by a fresh-install load test on a staging node (Python 3.13 +
 Postgres 17 + clean `pip install -e .[dev,server,edge,...]`).
 Two real downstream regressions hidden by stale local
 dependency pins:
@@ -865,7 +730,7 @@ dependency pins:
    silently against modern pydantic-settings on the local box
    because the local pin was stale.
 
-**Barrage results on PROTEUS** (HEAD `110651c` + this slice):
+**Load-test results on staging** (HEAD `110651c` + this slice):
 - All 2521 unit/integration tests pass on Python 3.13 + clean
   install + the 23-tool MCP registry from `_TOOL_ORDER`.
 - ruff clean.
@@ -2160,7 +2025,7 @@ DSN reject paths.
 
 - `_DatabaseSettings.embedding_dim` (default 768) reads `MNEMOS_EMBEDDING_DIM`
   or `PG_EMBEDDING_DIM`. Lets the same source build target multiple embedding
-  models — 768 for nomic-embed-text (PYTHIA fleet default), 512 for
+  models — 768 for nomic-embed-text (the default), 512 for
   bge-small-zh-v1.5 (Cix Sky1 NPU substrate), 1536 for OpenAI
   text-embedding-3-small, 3072 for text-embedding-3-large. Range: [1, 8192]
   per sqlite-vec `SQLITE_VEC_VEC0_MAX_DIMENSIONS`. Out-of-range values warn
@@ -2334,7 +2199,7 @@ CONSOLIDATE → SYNTHESISE → EXTRACT), the right-to-be-forgotten
 worker, the archival subsystem, the unified LLM facade, and the
 recall-pattern observability surface.
 
-A PROTEUS barrage validated the release at 2500 concurrent
+A staging load test validated the release at 2500 concurrent
 writes / 2000 reads / 200 search round-trips against a fresh
 Postgres 17 deployment: 98.5% write success, 99.7% read success,
 100% search success.
@@ -2531,7 +2396,7 @@ Postgres 17 deployment: 98.5% write success, 99.7% read success,
 
 ### Operational
 
-- The PROTEUS barrage exposed long-tail latency under sustained
+- Load testing exposed long-tail latency under sustained
   50-concurrent writes (p99 ~33s) — a v5.1 optimization target.
   Search and read paths held up well (search p99 ~300ms; reads
   p50 ~120ms with the same long tail under contention).
@@ -2972,7 +2837,7 @@ GRAEAE provider-routing fix + container-env operations standard.
   marked `deprecated=true` for Grok-family providers via:
   `UPDATE model_registry SET deprecated = true WHERE provider = 'xai'
    AND model_id ~ '-reasoning$' AND model_id NOT LIKE '%non-reasoning'`.
-  v4.1.2 fleet rollout includes this UPDATE on PYTHIA + CERBERUS
+  v4.1.2 rollout includes this UPDATE on the primary and GPU nodes
   before container restart.
 
 ## [4.0.0] — 2026-04-29
@@ -3322,8 +3187,8 @@ schema fingerprints before opening sync, refusing to pair when their
 migration sets diverge unless an operator explicitly opts in via
 `compat_mode=permissive`. Eight rounds of Codex adversarial review
 on the federation handshake (verdict: SHIP). Restore-drill runbook
-validated end-to-end on 10k records (~13s, 770 rec/sec) PYTHIA →
-PROTEUS.
+validated end-to-end on 10k records (~13s, 770 rec/sec) from a
+primary to a staging node.
 
 ### Added
 
@@ -3357,7 +3222,7 @@ PROTEUS.
   interval peer queued a large batch. New ORDER BY balances
   fairness across heterogeneous intervals.
 - **`FEDERATION_ALLOW_INSECURE` plumbed through staging compose env.**
-  Required for cross-version smoke tests on PROTEUS without
+  Required for cross-version smoke tests on a staging node without
   full TLS termination.
 - **MORPHEUS / APOLLO S-IVB naming locked** — no rename in v3.4.x.
   Both names appear in code, docs, and ops procedures by design;
@@ -3365,8 +3230,8 @@ PROTEUS.
 
 ### Verified
 
-- PROTEUS staging upgraded to v3.4.0, cross-version tested against
-  PYTHIA v3.3.0 — `strict` returns 409 with operator-action message;
+- Staging upgraded to v3.4.0, cross-version tested against a
+  v3.3.0 primary — `strict` returns 409 with operator-action message;
   `permissive` flip succeeds with 200. FK rollback applied during
   the v3.4 migration audit (issue #1 mnemos-os/mnemos rescoped to
   v3.5).
@@ -3374,7 +3239,7 @@ PROTEUS.
 ## [3.4.0] — 2026-04-26
 
 CHARON v0.2 release: full MPF v0.1 sidecar round-trip, plus
-staging-deploy infrastructure for PROTEUS as the cross-version
+staging-deploy infrastructure for the cross-version
 proving ground. Forty-four rounds of Codex adversarial review on the
 sidecar attachment paths (cross-tenant attack surface, DAG
 poisoning, version-DAG divergence, timestamp-shift, commit-hash
@@ -3391,7 +3256,7 @@ export under REPEATABLE READ READ ONLY).
   sidecar requires root + `preserve_owner=true` (architectural
   restriction). Per-surface hard cap on sidecar export to bound
   memory consumption on large catalogs.
-- **`docker-compose.staging.yml`** — PROTEUS staging compose,
+- **`docker-compose.staging.yml`** — staging compose,
   Postgres bound to :5433 (host-Postgres collision avoidance),
   pre-init `mnemos` role for fresh DB initialization.
 - **v3.4 planning charters + ops doc** — `docs/history/V3_5_CHARTER.md`,
@@ -3471,7 +3336,7 @@ retiring ALETHEIA from the default contest.
 - **ALETHEIA retired from the default compression stack.** The
   going-forward stack is LETHE + ANAMNESIS + APOLLO (APOLLO in
   v3.3+ per ROADMAP.md Apollo Program). ALETHEIA won 0 contests in
-  the 2026-04-23 CERBERUS benchmark — its index-list scoring prompt
+  the 2026-04-23 GPU benchmark — its index-list scoring prompt
   doesn't survive instruction-tuned generalist LLMs, and the
   fallback-to-first-N path is strictly inferior to LETHE at lower
   cost. Niche audit found every case where ALETHEIA might
@@ -3838,8 +3703,8 @@ LLM-to-LLM wire use) is staged across v3.2–v3.4 per `ROADMAP.md`.
 
 - **First real benchmark**:
   `docs/benchmarks/compression-2026-04-23.md`. 464 stratified memories
-  from PYTHIA MNEMOS (uncompressed only, small/medium/large buckets)
-  drained through the contest on a CERBERUS test deployment with
+  from a live corpus (uncompressed only, small/medium/large buckets)
+  drained through the contest on a GPU test deployment with
   gemma-4-E4B-it-Q6_K as the judge model. Winner distribution,
   per-category breakdown, ratio histogram, timing histogram per
   engine, outlier cases, and the one real bug the drain surfaced
@@ -3894,7 +3759,7 @@ LLM-to-LLM wire use) is staged across v3.2–v3.4 per `ROADMAP.md`.
   "invalid input syntax for type bytea". Affected any production
   install ingesting memories that contain code, paths, or regex
   patterns — which is most real content. Latent since v2 shipped;
-  surfaced by the v3.1 CERBERUS test deployment running real PYTHIA
+  surfaced by the v3.1 GPU test deployment running real production
   memories. Fix replaces `(text)::bytea` with `convert_to(text,
   'UTF8')` which returns raw UTF-8 bytes without trying to parse
   escape sequences. Idempotent migration; `CREATE OR REPLACE
@@ -3905,7 +3770,7 @@ LLM-to-LLM wire use) is staged across v3.2–v3.4 per `ROADMAP.md`.
   scored `composite_score=0` (ratio at or below MIN_CHUNK_RATIO
   or >= 1.0) previously "won" the contest with
   `persist_contest`'s NULL coercion violating
-  `mcc_winner_has_output`. Surfaced during the 49-memory CERBERUS
+  `mcc_winner_has_output`. Surfaced during the 49-memory GPU
   drain. `run_contest` now requires `composite_score > 0` for
   winner eligibility; zero-composite survivors fall through to
   `reject_reason='inferior'`, and the queue row is marked `failed`
