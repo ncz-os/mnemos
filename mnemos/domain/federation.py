@@ -915,14 +915,39 @@ async def _store_memories(
                 embed_dim_expected,
             )
             if emb_b64 and emb_model:
-                if local_embed_model and emb_model != local_embed_model:
+                # FAIL CLOSED. A vector is only adopted when BOTH sides are
+                # known AND agree. Previously each comparison was guarded by
+                # the local value being truthy:
+                #
+                #   if local_embed_model and emb_model != local_embed_model:
+                #   elif embed_dim_expected and emb_dim and ...:
+                #   else: <accept>
+                #
+                # so a node that could not resolve its own embedder skipped
+                # both checks and fell through to accept ANY peer's vector.
+                # That is not theoretical -- neither MNEMOS_EMBED_HTTP_MODEL
+                # nor providers.inference_embed_model is set on several fleet
+                # hosts, leaving local_embed_model None.
+                #
+                # An unknown fingerprint is unverifiable, not compatible. The
+                # content still lands either way; only the vector is declined,
+                # and a local re-embed fills it in the node's own space.
+                if not local_embed_model or not embed_dim_expected:
+                    logger.debug(
+                        "[federation/embed] skip %s — local embedder unresolved "
+                        "(model=%s dim=%s); cannot verify the peer vector, re-embedding locally",
+                        local_id,
+                        local_embed_model,
+                        embed_dim_expected,
+                    )
+                elif emb_model != local_embed_model:
                     logger.debug(
                         "[federation/embed] skip %s — peer model=%s != local %s",
                         local_id,
                         emb_model,
                         local_embed_model,
                     )
-                elif embed_dim_expected and emb_dim and emb_dim != embed_dim_expected:
+                elif not emb_dim or emb_dim != embed_dim_expected:
                     logger.debug(
                         "[federation/embed] skip %s — dim=%s != expected %s",
                         local_id,
