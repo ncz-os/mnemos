@@ -123,7 +123,7 @@ For existing OpenClaw, Hermes, and zeroclaw integrations:
 - [x] api_server.py updated with router registrations
 - [x] Version bumped to 3.0.0
 - [x] Committed to git (commit 0d7c472)
-- [ ] **NEXT**: Copy all files to `/opt/mnemos` on PYTHIA
+- [ ] **NEXT**: Copy all files to `/opt/mnemos` on the primary
 - [ ] **NEXT**: Apply database migration: `psql mnemos < db/migrations_v3_graeae_unified.sql`
 - [ ] **NEXT**: Restart MNEMOS service: `systemctl restart mnemos`
 - [ ] **NEXT**: Verify endpoints via `/openapi.json` and health check
@@ -138,20 +138,20 @@ Once v3.0.0 is deployed, run:
 ```bash
 # Test OpenAI-compatible endpoints
 curl -H "Authorization: Bearer $MNEMOS_API_KEY" \
-  http://192.168.207.67:5002/v1/models | jq '.data | length'
+  http://<host>:5002/v1/models | jq '.data | length'
 
 # Test single inference
-curl -X POST http://192.168.207.67:5002/v1/chat/completions \
+curl -X POST http://<host>:5002/v1/chat/completions \
   -H "Authorization: Bearer $MNEMOS_API_KEY" \
   -d '{"model":"groq-llama","messages":[{"role":"user","content":"test"}]}'
 
 # Test consultations (GRAEAE reasoning)
-curl -X POST http://192.168.207.67:5002/v1/consultations \
+curl -X POST http://<host>:5002/v1/consultations \
   -H "Authorization: Bearer $MNEMOS_API_KEY" \
   -d '{"prompt":"design a system","task_type":"architecture_design"}'
 
 # Test provider recommendations
-curl http://192.168.207.67:5002/v1/providers/recommend \
+curl http://<host>:5002/v1/providers/recommend \
   -H "Authorization: Bearer $MNEMOS_API_KEY"
 ```
 
@@ -184,11 +184,11 @@ curl http://192.168.207.67:5002/v1/providers/recommend \
 
 ## ⚠️ Known Issues
 
-1. **Database Auth**: Current PYTHIA deployment has asyncpg auth issues with "mnemos" user
+1. **Database Auth**: Current the primary deployment has asyncpg auth issues with "mnemos" user
    - **Workaround**: Check `.env` or environment variables for correct DB credentials
    - **Resolution**: Verify PostgreSQL password for user "mnemos" is set correctly in `/opt/mnemos/.env`
 
-2. **Partial Deployment**: v3.0.0 files exist locally but not yet fully integrated on PYTHIA
+2. **Partial Deployment**: v3.0.0 files exist locally but not yet fully integrated on the primary
    - **Cause**: Files need to be deployed together with proper database migration
    - **Resolution**: Full deployment needed with coordinated service restart
 
@@ -205,4 +205,4 @@ curl http://192.168.207.67:5002/v1/providers/recommend \
 
 **Implementation Status**: ✅ COMPLETE
 **Deployment Status**: 🔄 Ready for final deployment
-**Next Action**: Deploy to PYTHIA and run test suite
+**Next Action**: Deploy to the primary and run test suite

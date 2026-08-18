@@ -63,7 +63,7 @@ No `mypy`/`pyright` gate exists, so this drift is currently unguarded.
 ## Gate protocol
 
 Each phase: branch work → codex `adversarial-review` → codex fixes own findings
-in place → re-review until `approve` → commit → push ARGONAS→GitLab→GitHub.
+in place → re-review until `approve` → commit → push.
 
 ## Findings log
 
@@ -172,8 +172,8 @@ Applied the GRAEAE separation: the 7 browser/OAuth-session members moved from
 `Db2SessionsRepository` onto the `Db2Backend` facade (mirroring `OracleBackend`);
 `Db2SessionsRepository` is now a pure chat repo; `KNOWN_SIGNATURE_DRIFT` entry
 removed; ownership-boundary regression test added
-(`tests/test_db2_session_ownership.py`). Live-verified on the CERBERUS DB2 EAP
-container (`db2://…@192.168.207.96:50001/MNEMOS`): 179 passed / 7 skipped across
+(`tests/test_db2_session_ownership.py`). Live-verified against a Db2
+container: 179 passed / 7 skipped across
 the db2 live + conformance + dialect suites.
 
 **Newly exposed pre-existing gap (operator decision):** the chat
@@ -198,7 +198,7 @@ Python re-rank → cap to limit), with uniform conservative date resolution
 sorts last). sqlite (was a no-op), mysql + oracle (were SQL-side, defeating the
 vector index) converted; postgres + db2 already used it (db2 gained the
 over-fetch + a corrupt-date fix). Verified: sqlite offline (aiosqlite); db2 live
-on CERBERUS DB2 EAP; oracle offline + partial-live (CDB read-only blocked writes);
+on Db2; oracle offline + partial-live (CDB read-only blocked writes);
 mysql offline dialect (VECTOR_DISTANCE is HeatWave-only).
 
 ### Item 3 SHIPPED — all MySQL stub surfaces implemented + live-verified
@@ -211,7 +211,7 @@ references. Capabilities advertise `{core, state, federation}`; the detail set i
 federation}`. The conformance gate's `KNOWN_UNDECLARED` allowlist is now **empty**
 — every declared MySQL capability is genuinely served. Each surface has a
 `MYSQL_DSN`-gated live round-trip test; **all 7 verified live (7 passed) against a
-MySQL 9.0.1 container on CERBERUS** (`:3307`). MySQL vector *search* itself
+MySQL 9.0.1 container** (`:3307`). MySQL vector *search* itself
 remains HeatWave-only (Community lacks `VEC_DISTANCE`), so the vector path is
 covered offline at the SQL-shape layer.
 
@@ -220,7 +220,7 @@ covered offline at the SQL-shape layer.
    / `add_message` are `NotImplementedError` in Oracle + DB2 (chat
    `SessionsRepository`) though both declare `sessions`. Implement chat-session
    writes on the enterprise backends, or drop the `sessions` capability claim.
-2. **Oracle live-write verification** — blocked by the CERBERUS Oracle container
+2. **Oracle live-write verification** — blocked by the test Oracle container
    CDB being open READ ONLY (`ORA-65054`); the recency conversion is verified by
    inspection + offline + partial-live (reads) + db2-parity. Reopen the CDB
    read-write (operator-owned container) to run the Oracle write suite.

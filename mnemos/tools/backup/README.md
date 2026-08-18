@@ -68,12 +68,12 @@ sudo MNEMOS_BACKUP_CONFIG=/etc/mnemos-backup.conf \
 
 ```conf
 BACKUP_TARGET=/mnt/argonas/datapool/backups
-BACKUP_DIRECTORIES=/home/jasonperlow/.claude:/etc/mnemos:/opt/mnemos
+BACKUP_DIRECTORIES=/home/<user>/.claude:/etc/mnemos:/opt/mnemos
 INCLUDE_PG=true
 PG_DATABASES=mnemos
 ```
 
-For **container-hosted Postgres** (e.g. `mnemos-prod-pg` on CERBERUS):
+For **container-hosted Postgres**:
 
 ```conf
 INCLUDE_PG=true
@@ -82,14 +82,14 @@ PG_CONTAINER=mnemos-prod-pg
 PG_USER=mnemos
 ```
 
-The container user (`jasonperlow` in the default service unit) needs
+The container user named in the service unit needs
 to be in the `docker` group so `docker exec` works from the timer.
 
 ### Hosts without Postgres (agent / edge nodes)
 
 ```conf
 BACKUP_TARGET=/mnt/argonas/datapool/backups
-BACKUP_DIRECTORIES=/home/jasonperlow/.claude:/home/jasonperlow/src
+BACKUP_DIRECTORIES=/home/<user>/.claude:/home/<user>/src
 INCLUDE_PG=false
 ```
 
@@ -115,7 +115,7 @@ OnCalendar=Sun 04:00
 ## Retention (run on the backup target)
 
 Copy `retention.sh` to `/usr/local/bin/mnemos-backup-retention.sh` on
-ARGONAS (or whatever host has write access to the backup target) and
+the host with write access to the backup target, and
 schedule it with a systemd timer or cron:
 
 ```bash
@@ -138,13 +138,13 @@ views.
 ## Mac Time Machine (STUDIO, ULTRA)
 
 Macs get **two Time Machine destinations** — local USB (already
-configured) plus an SMB network share on ARGONAS:
+configured) plus an SMB network share on the NAS:
 
-1. Ensure ARGONAS exports `/mnt/datapool/timemachine` over SMB. TrueNAS:
+1. Ensure the NAS exports a Time Machine dataset over SMB. On TrueNAS:
    Storage → Shares → SMB → confirm `timemachine` share exists with
    "Time Machine" preset enabled.
 2. On the Mac: **System Settings → General → Time Machine → + →
-   Other ARGONAS shares**. Pick `timemachine`. Enter credentials.
+   other shares on that NAS**. Pick the Time Machine share. Enter credentials.
 3. Time Machine automatically rotates between both disks. Each disk
    gets its own full retention (24 hourly / 7 daily / 4 weekly).
 
@@ -152,9 +152,9 @@ No scripts needed — this is a native macOS feature.
 
 ---
 
-## Off-site replication (ARGONAS itself)
+## Off-site replication (the NAS itself)
 
-Everything backs up *to* ARGONAS. If ARGONAS fails, you lose
+Everything backs up *to* the NAS. If the NAS fails, you lose
 everything. The recommended setup is **restic** for block-level
 dedup + client-side encryption, with rclone as the transport to
 whatever cloud storage you already pay for (Google Drive, Backblaze
@@ -238,7 +238,7 @@ ls /tmp/restore/                              # verify contents
 rm -rf /tmp/restore/
 ```
 
-If the passphrase lives only in ARGONAS and ARGONAS dies, the
+If the passphrase lives only on the NAS and the NAS dies, the
 off-site is unrecoverable. **Put the restic passphrase in a
 password manager** (1Password, LastPass) before production.
 
@@ -260,7 +260,7 @@ If you have a second physical box on the LAN, periodic snapshot
 replication is free and often faster than cloud:
 
 ```bash
-# on the source NAS (ARGONAS)
+# on the source NAS
 zfs snapshot -r datapool/backups@$(date -u +%Y%m%d-%H%M%S)
 zfs send -i datapool/backups@<prev> datapool/backups@<new> \
     | ssh root@backup-box zfs receive datapool/argonas-backups
@@ -278,13 +278,13 @@ take off-site, repeat with a second disk next week.
 A backup you haven't restored from is a backup you don't have. At
 minimum, once per quarter:
 
-1. Pick a random `pg_dump` file from ARGONAS.
+1. Pick a random `pg_dump` file from the NAS.
 2. Spin up a throwaway Postgres container (`pgvector/pgvector:pg17`).
 3. `pg_restore` into it.
 4. Verify row counts match the production DB as of the dump timestamp.
 5. Delete the throwaway.
 
-Document the last successful restore drill in the ARGONAS backup
+Document the last successful restore drill in the NAS backup
 directory's README so the next operator can see when the coverage was
 last proven.
 

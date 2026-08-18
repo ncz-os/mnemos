@@ -16,7 +16,7 @@ Unify the two parallel, overlapping mnemos subsystems —
 
 — into **one fleet LLM dispatch layer**, and have PANTHEON **expose EIH/NGC + groq + xai
 + together + deepseek-direct directly**, replacing the thin caddy reverse-proxy at the
-`192.168.207.67:4100` VIP.
+a stable VIP on port 4100.
 
 They are split today only by parallel evolution (KNEMON born as a token/cost ledger;
 PANTHEON born as a provider proxy). The tell: `pantheon/budget.py:evaluate_budget`
@@ -29,7 +29,7 @@ KNEMON's ledger **is** that source.
 clients (zc-build/hive hive_ngc_1, nllm, GRAEAE consults, doctor, apps)
         │  OpenAI-compatible API
         ▼
-  VIP 192.168.207.67:4100   ← stays stable across cutover
+  VIP <host>:4100           ← stays stable across cutover
         │
         ▼
   PANTHEON GATEWAY (dispatch plane)

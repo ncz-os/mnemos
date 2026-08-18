@@ -1,12 +1,12 @@
-# v6.2 M-2.2.1 Audit Chain — Operator Guide
+# Audit Chain — Operator Guide
 
-**Status**: feature-complete on `feat/db2-native` branch (2026-05-24)
-**Design ref**: [`v6.2-nexus-pattern-adoption.md`](./v6.2-nexus-pattern-adoption.md) § 1
-**Schema migrations**: `db/migrations*/0029_memory_audit_chain.sql` + `0030_memory_audit_roots.sql` (PG / Oracle / Db2) + `db/migrations_sqlite/migrations_v6_2_audit_chain_sqlite.sql`
+**Schema migrations**: `mnemos/db_migrations/migrations*/0029_memory_audit_chain.sql`
+and `0030_memory_audit_roots.sql` (PostgreSQL, Oracle, Db2), plus
+`mnemos/db_migrations/migrations_sqlite/migrations_v6_2_audit_chain_sqlite.sql`.
 
 ---
 
-## What's shipped
+## What it does
 
 Cryptographically-verifiable append-only audit chain over every memory write. Per-memory linear chain via `prev_entry_hash`; per-window Merkle tree across the global write log, sealed by a periodic worker.
 
@@ -192,13 +192,13 @@ Each entry signs over: `entry_id, memory_id (16-byte SHA-256-of-mem-id-str), pre
 
 ## Known limitations
 
-1. **Schema memory_id is RAW(16)/BYTEA(16)/BLOB**, not the production string `mem_<ts>_<hex6>`. The route helper bridges via `SHA-256(memory_id_str)[:16]` (`memory_id_to_audit_bytes`). Schema refactor to VARCHAR2(128) memory_id tracked as v6.2 follow-up — would let `memory_audit_chain` JOIN directly with the `memories` table without the hash bridge.
+1. **Schema memory_id is RAW(16)/BYTEA(16)/BLOB**, not the production string `mem_<ts>_<hex6>`. The route helper bridges via `SHA-256(memory_id_str)[:16]` (`memory_id_to_audit_bytes`). A schema refactor to a VARCHAR2(128) memory_id would let `memory_audit_chain` JOIN directly with the `memories` table without the hash bridge.
 
 2. **JCS-lite**: production uses Python's `json.dumps(sort_keys=True, separators=(',', ':'), ensure_ascii=False)`. Bytewise identical to RFC 8785 for ASCII-only object keys (our case). Non-ASCII key surrogate-pair edge cases not handled. Swap in `rfc8785` PyPI when/if non-ASCII keys enter the canonical set.
 
-3. **Cross-peer chain validation is passive**: shipped at commits `ac1498d` (feed-side piggyback) + `aa8b96f` (batch fetch) — primary now publishes `audit_latest_entry_id` + `audit_latest_entry_hash` per row in `/v1/federation/feed`. Replicas log primary's claimed chain head on inbound but **don't yet actively reject mismatched feeds** — hardening to halt-on-mismatch follows after the chain has been fielded at scale (risk: a transient peer bug could DoS a replica's pull loop if rejection is too aggressive).
+3. **Cross-peer chain validation is passive.** The primary publishes `audit_latest_entry_id` + `audit_latest_entry_hash` per row in `/v1/federation/feed`. Replicas log primary's claimed chain head on inbound but **don't yet actively reject mismatched feeds** — hardening to halt-on-mismatch follows after the chain has been fielded at scale (risk: a transient peer bug could DoS a replica's pull loop if rejection is too aggressive).
 
-4. ~~No archive-op handler wiring~~ ✅ Shipped at `c612a0e`: `POST /v1/admin/persephone/archive/{memory_id}` now emits `op="archive"` audit entry after the archive commits. Atomicity gap (separate tx) noted in commit message.
+4. **Archive audit entries are not atomic with the archive.** `POST /v1/admin/persephone/archive/{memory_id}` emits an `op="archive"` entry after the archive commits, in a separate transaction.
 
 ---
 
@@ -212,43 +212,7 @@ Each entry signs over: `entry_id, memory_id (16-byte SHA-256-of-mem-id-str), pre
 # 73 audit tests, all pass on Python 3.11
 ```
 
-End-to-end SQLite + sealer + inclusion-proof live test: see `mnemos/audit/__init__.py` docstring usage example, plus the commit-msg verification logs on commits `4f296d1` → `410a810`.
+For an end-to-end SQLite, sealer, and inclusion-proof example, see the usage
+block in the `mnemos/audit/__init__.py` docstring.
 
 ---
-
-## Commit chain summary
-
-22 commits implementing v6.2 M-2.2.1 from scratch + retrieval profile + F-1.5 (2026-05-24):
-
-```
-d7bc8d4 F-1.5: SQLite live-DB ALTER for federation_peers.copy_embeddings
-c4896ff v6.2 M-2.2.3: retrieval-profile dispatcher + MEDUSA reranker client
-4f296d1 v6.2 M-2.2.1: audit chain crypto primitives + 25 unit tests
-f485c45 v6.2 M-2.2.3 followup: per-profile limit cap + cache TTL
-a2e0b0e v6.2 M-2.2.1: audit chain entry builder + 13 tests
-47a3fe3 v6.2 M-2.2.1: AuditChainRepository protocol scaffold
-59d6d73 v6.2 M-2.2.1: Postgres AuditChainRepository implementation
-8b8a9d0 v6.2 M-2.2.1: SQLite audit chain migration
-f5459a4 v6.2 M-2.2.1: SQLite AuditChainRepository implementation
-27b56a8 v6.2 M-2.2.1: Oracle AuditChainRepository + migration fix
-47db30c v6.2 M-2.2.1: Db2 AuditChainRepository
-f5ac362 v6.2 M-2.2.1: audit sealer worker + 7 integration tests
-e6d0677 v6.2 M-2.2.1: route wiring (create_memory) + audit-chain bridge
-39bbba3 v6.2 M-2.2.1: route wiring (update_memory + delete_memory)
-2e2c890 v6.2 M-2.2.1: /v1/audit pubkey + proof endpoints
-ac2e4d3 v6.2 M-2.2.1: federation replicate-op audit wiring
-410a810 v6.2 M-2.2.1: Merkle inclusion proof + endpoint + 10 tests
-4431c20 docs: v6.2 M-2.2.1 audit chain operator guide
-ac1498d v6.2 M-2.2.1: federation feed audit chain-head piggyback
-a9069b9 v6.2 M-2.2.1: get_audit_entry_by_id repo method + endpoint cleanup
-aa8b96f v6.2 M-2.2.1: batch audit lookup for federation feed (N+1 -> 1)
-a6a7d5c test(v6.2 M-2.2.1): repo-method coverage for get_by_id/batch/list_window
-3dfbb11 docs(v6.2 M-2.2.1): update operator guide for chain-head + batch + tests
-e5c926c v6.2 M-2.2.4: per-category temporal decay + 14 tests
-5768960 v6.2 M-2.2.4: /v1/admin/category_decay endpoints + 7 tests
-c612a0e v6.2 M-2.2.1: archive-op audit wiring (5/5 AuditOps covered)
-6aee387 docs(v6.2 M-2.2.1): mark archive-op shipped + close limitation #4
-d464a90 v6.2 M-2.2.1: /v1/audit/health endpoint + chain stats repo method
-```
-
-All 5 AuditOp variants now emitted (create / update / delete / replicate / archive). M-2.2.1 is feature-complete for v6.2 ship. Monitoring story closed via `/v1/audit/health`.

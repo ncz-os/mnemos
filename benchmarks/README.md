@@ -86,8 +86,7 @@ Report sections:
   agent tool-use accuracy, etc.).
 - Real-corpus distribution. 50 hand-curated memories is enough to
   see engine-by-engine tendencies; not enough to predict what
-  PYTHIA's real 6k-memory corpus will look like. That's a separate
-  test once PYTHIA is upgradeable to v3.3.
+  a real 6k-memory corpus will look like. That is a separate test.
 - BPE token economy. Ratios are character-based. For downstream
   LLM context budgeting the unit that matters is BPE tokens from
   the consuming model's tokenizer.
