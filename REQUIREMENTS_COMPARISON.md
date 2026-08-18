@@ -2,8 +2,8 @@
 
 **Quick comparison between bare metal and Docker deployments**
 
-> Originally written for v3.1.0 (2026-04-19). The bare-metal vs Docker
-> tradeoffs and resource floors below remain accurate as of v6.0.0rc1 (legacy GA v5.0.1 + v6.0-rc multi-DB).
+> The bare-metal vs Docker tradeoffs and resource floors below are current
+> for 6.1.
 
 ---
 
