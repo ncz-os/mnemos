@@ -44,10 +44,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml requirements.txt README.md MANIFEST.in ./
 
 RUN uv pip install --system build setuptools wheel
-# Base third-party closure + the SQLite backend deps (aiosqlite + sqlite-vec).
-# SQLite is the portable default backend for this base image; both ship aarch64
-# wheels so the arm64 build stays wheel-only here.
-RUN uv pip install --system -r requirements.txt 'aiosqlite>=0.20.0' 'sqlite-vec>=0.1.6'
+
+# llama-cpp-python compiles from source here, and ggml defaults to
+# GGML_NATIVE=ON -- i.e. -march=native against the BUILD machine. The CI
+# runner has AVX512; much of the fleet does not, so the published image
+# executed an illegal instruction on the first call into libllama.
+#
+# The failure mode is nasty: `import llama_cpp` SUCCEEDS, so the container
+# starts and /health returns 200. The SIGILL only fires when something
+# actually embeds -- i.e. on the first write. Measured on PYTHIA (Core 5
+# 210H, no AVX512): every POST /v1/memories killed uvicorn, systemd restarted
+# it, health went green again, and the client just saw an empty response.
+# 53 restarts before it was diagnosed. Three of six fleet hosts (PYTHIA,
+# CERBERUS, PEGASUS) lack AVX512; the ones that survived did so only because
+# they use the HTTP embedder and never call into the library.
+#
+# Pin an explicit portable baseline instead of the builder's ISA. AVX2/FMA/F16C
+# is Haswell-era (2013) and covers every x86 host we have; arm64 ignores these
+# and keeps its NEON baseline. GGML_NATIVE=OFF is the load-bearing part --
+# without it the build silently inherits whatever the runner happens to be.
+ARG TARGETARCH
+ENV CMAKE_ARGS="-DGGML_NATIVE=OFF"
+RUN if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
+      export CMAKE_ARGS="-DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF"; \
+    fi; \
+    echo "llama.cpp CMAKE_ARGS=${CMAKE_ARGS}" && \
+    uv pip install --system -r requirements.txt 'aiosqlite>=0.20.0' 'sqlite-vec>=0.1.6'
 
 COPY . .
 
