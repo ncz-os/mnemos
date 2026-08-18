@@ -6,7 +6,7 @@ This document is kept intentionally narrow. It lists what the next release will 
 
 ---
 
-## Current status — v6.1.5 GA (patch release on the v6.0.0 split-distribution line; legacy GA v5.0.1 shipped 2026-05-08)
+## Current status — v6.1.6 GA (patch release on the v6.0.0 split-distribution line; legacy GA v5.0.1 shipped 2026-05-08)
 
 **v6.0.1** is a patch release on top of **v6.0.0 (split-distribution GA)**,
 which made MNEMOS a modular, multi-backend, portability-first memory

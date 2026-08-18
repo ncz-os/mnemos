@@ -73,6 +73,34 @@ crash-looped forever after a restart following a partial-then-recovered
 prior migration run — every retry hit `SQL0803N`/`SQLSTATE=23505` on the
 same static `INSERT` and never got past schema replay to serve traffic.
 
+## [6.1.6] — 2026-08-18
+
+### Fixed — federation sync failed on MariaDB with an AttributeError
+
+```
+federation sync with pythia failed:
+AttributeError: 'MariadbBackend' object has no attribute 'audit_chain'
+```
+
+`domain/federation.py` guards its audit write with
+`backend.audit_chain is not None`, which requires the attribute to exist. The
+persistence backends are bare classes rather than subclasses of the ABC that
+declares the property, so each one has to define it: SQLite, PostgreSQL and
+Oracle do, and Db2 inherits Oracle's. The MySQL family defined neither, so
+MariaDB raised instead of answering.
+
+Every sync that applied a mutation returned HTTP 503, which meant a MariaDB
+node could not pull a single memory even once its peer existed.
+
+`MysqlBackend` now implements the property and returns `None`, which is what
+the base class documents for a backend that has not shipped audit-chain rows —
+callers treat it as `MNEMOS_AUDIT_CHAIN=off`.
+
+`tests/test_backend_audit_chain_attribute.py` asserts every backend exposes it,
+that it is a property rather than a method (a bound method is never `None`, so
+the guard would silently take the wrong branch), and that the MySQL family
+answers `None` rather than raising.
+
 ## [6.1.5] — 2026-08-18
 
 ### Fixed — a MariaDB node could not be given a federation peer
