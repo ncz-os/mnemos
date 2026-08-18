@@ -71,7 +71,6 @@ dependencies = [
   #   [openvino] Intel CPU/iGPU/NPU · [cuda] NVIDIA · [amd] AMD ROCm
   "slowapi>=0.1.9",
   "limits>=3.6.0",
-  "redis>=5.0.0",
   "python-dotenv>=1.0.0",
   "mcp>=1.0.0,<2",
   # psutil dropped 2026-05-01: zero import sites in mnemos/ source
@@ -87,6 +86,13 @@ Repository = "https://github.com/ncz-os/mnemos"
 Documentation = "https://github.com/ncz-os/mnemos/blob/master/README.md"
 
 [project.optional-dependencies]
+# Shared rate-limit / resilience counters across processes. NOT required:
+# rate limiting defaults to memory://, which is correct for the
+# single-worker server profile. Install this and set
+# RATE_LIMIT_STORAGE_URI=redis://host:6379/1 when you run multiple
+# workers or multiple nodes, where a per-process counter would multiply
+# the effective ceiling by the number of processes.
+redis = ["redis>=5.0.0"]
 docling = ["docling>=2.5.0", "docling-core>=2.0.0", "pillow>=10.0.0"]
 # OpenTelemetry tracing. Without this extra, `install_tracing()` is a
 # no-op and the tracing middleware passes through unchanged. Install

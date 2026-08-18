@@ -1384,7 +1384,7 @@ def _write_config_toml(cfg, repo_path: str) -> None:
     profile_defaults = {
         "server": {
             "backend": "postgres",
-            "rate_limit_storage": "redis://localhost:6379/1",
+            "rate_limit_storage": "memory://",
             "graeae_mode_default": "auto",
             "log_level": "INFO",
             "compression_workers": 4,
