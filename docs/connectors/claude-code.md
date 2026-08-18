@@ -5,7 +5,7 @@ Claude Code can use MNEMOS as a shared memory layer by SSH-spawning the MNEMOS s
 ## Requirements
 
 - MNEMOS bearer token (see `~/.api_keys_master.json` or your shell env)
-- MNEMOS REST reachable at `http://<mnemos-host>:5002` (v5.x unified port)
+- MNEMOS REST reachable at `http://<mnemos-host>:5002`
 - SSH access from Claude Code machine to `<mnemos-host>`
 - mnemos package installed at `/opt/mnemos` with virtualenv at `/opt/mnemos/venv`
 
@@ -30,10 +30,10 @@ Merge into `~/.claude.json`. The MCP process runs on the remote host; `MNEMOS_BA
 
 ## Notes
 
-- Port 5002 is the unified API port (MNEMOS + GRAEAE) as of v6.1.7. Port 5001 is retired.
+- Port 5002 is the unified API port for both MNEMOS and GRAEAE.
 - `PYTHONPATH=/opt/mnemos` is required — the package is editable, not installed in venv site-packages.
 - `MNEMOS_API_KEY` must be in the SSH args via `/usr/bin/env`; Claude Code's `env` block is local-only and does not cross the SSH boundary.
-- GRAEAE MCP tool not yet registered — use `POST http://<mnemos-host>:5002/graeae/consult` with Bearer token as fallback.
+- GRAEAE reasoning is available as the `graeae_consult` MCP tool, or over REST at `POST http://<mnemos-host>:5002/v1/consultations` with a Bearer token. Both require the `mnemos-graeae` add-on to be installed.
 
 ## Idempotent fix script (for pre-v5.x configs)
 

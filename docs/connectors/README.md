@@ -6,12 +6,11 @@
 > Codex CLI). Defaults are off; configuration is opt-in; surface area is
 > intentionally narrow. APIs may change between minor releases without a
 > deprecation cycle until the surface is promoted to `stable` in a later
-> release. v6.0.0 keeps stdio/HTTP registry parity in the `mnemos.mcp`
-> package, but broad remote connector packaging remains experimental.
+> release. The `mnemos.mcp` package keeps stdio and HTTP registry parity, but
+> broad remote connector packaging remains experimental.
 
 For surfaces without native MCP support, the `mnemos-bridge-*` adapter
-packages (Phase 2 of the bridge consolidation, currently in development)
-provide structured Python integration. The connector docs in this directory
+packages provide structured Python integration. The connector docs in this directory
 provide the configuration snippets; the bridge packages provide the runtime
 glue.
 
@@ -281,8 +280,8 @@ Three reasons:
 2. **The audience is narrow on purpose**. We're not going to spend
    2026 building an installer-app for the consumer market — that's a
    different product with a different operations footprint. The
-   connectors targeting that market (a hosted SaaS, a Tauri desktop
-   app) are v5.0+ framing, not v4.0 scope. See `ROADMAP.md`.
+   connectors targeting that market (a hosted SaaS, a desktop app)
+   are out of scope. See [`ROADMAP.md`](../../ROADMAP.md).
 3. **We are not trying to displace MemPalace, OpenWebUI, Mem0, Letta,
    Graphiti, or Cognee**. Each of those serves a real audience well.
    MNEMOS exists for users who outgrew them or whose workload —
@@ -360,12 +359,12 @@ to it, we ship the fix as a PR. That's the contract.
 
 While `experimental`:
 
-- Endpoints under `/admin/tunnels/*` are **not implemented as of v6.1.7**;
+- Endpoints under `/admin/tunnels/*` are **not implemented**;
   the `mnemos-tunnel-setup` script that calls them is aspirational. They
   may be implemented, renamed, restructured, or withdrawn in any minor
   release. The manual `mnemos serve mcp-http` + ngrok path documented in
   each connector page works today regardless.
-- Default ports (5004 for the MCP HTTP/SSE bridge) may change.
+- Default ports (5003 for the MCP HTTP/SSE bridge) may change.
 - Bearer auth is the current baseline. Per-user token mapping exists on the
   HTTP/SSE bridge; OAuth on the MCP edge remains later work.
 - The `mnemos-tunnel-setup` script's argument shape and config-file

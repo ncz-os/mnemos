@@ -136,7 +136,7 @@ Add to `~/.claude/mcp_servers.json` (Claude Code) or equivalent:
 }
 ```
 
-For HTTP/SSE transport (ChatGPT, remote agents): `mnemos serve mcp-http` on `:5004`.
+For HTTP/SSE transport (ChatGPT, remote agents): `mnemos serve mcp-http`, which listens on `:5003` by default.
 
 Key MCP tools the agent gets:
 
@@ -203,7 +203,7 @@ are covered by their own live suites.
 |---|---|
 | Installation | [docs/INSTALL.md](docs/INSTALL.md) |
 | Specification | [docs/SPECIFICATION.md](docs/SPECIFICATION.md) |
-| System requirements | [docs/SYSTEM_REQUIREMENTS.md](docs/SYSTEM_REQUIREMENTS.md) |
+| System requirements | [SYSTEM_REQUIREMENTS.md](SYSTEM_REQUIREMENTS.md) |
 | Memory architecture | [docs/MEMORY_ARCHITECTURE.md](docs/MEMORY_ARCHITECTURE.md) |
 | Compression | [docs/COMPRESSION.md](docs/COMPRESSION.md) |
 | GRAEAE reasoning | [docs/GRAEAE_FEATURES.md](docs/GRAEAE_FEATURES.md) |

@@ -11,10 +11,9 @@ vLLM can use MNEMOS through its OpenAI-compatible tool-call API when served with
 - Python 3.11+ with the OpenAI SDK.
 - MNEMOS MCP HTTP/SSE reachable at `http://<mnemos-host>:5003/sse`.
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- The upcoming `mnemos-bridge-openai` adapter package from Phase 2 of bridge
-  consolidation.
-- vLLM's OpenAI-compatible endpoint reachable at `http://localhost:8000/v1`
-  or the fleet endpoint you expose.
+- The `mnemos-bridge-openai` adapter.
+- vLLM's OpenAI-compatible endpoint reachable at `http://localhost:8000/v1`,
+  or whichever endpoint you expose.
 
 ## Configuration snippet — vLLM serve plus OpenAI SDK client
 
