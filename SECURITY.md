@@ -11,7 +11,7 @@ and v4.0.0 (2026-04-29) line.
 
 ## Current security invariants
 
-As of v6.0.0rc1 (also covers v5.0.1 GA + carried forward from v4.0.0):
+These hold in 6.1:
 
 - Memory read visibility is symmetric across list/get/search/rehydrate,
   OpenAI-compatible gateway context, version history, DAG history, and MCP
