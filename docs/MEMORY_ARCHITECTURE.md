@@ -323,7 +323,7 @@ We picked pull over push because:
 
 ### 6.2 NATS push as the additive fast path
 
-The current v5.0.1 build adds a NATS JetStream push consumer that delivers
+A NATS JetStream push consumer delivers
 memories with sub-second latency to subscribed peers. Critically,
 the HTTP pull path stays the **durable** fallback — NATS is purely
 a fast-path optimization. If NATS is down or a message is missed,

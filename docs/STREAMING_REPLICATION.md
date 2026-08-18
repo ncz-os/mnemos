@@ -1,11 +1,11 @@
 # PostgreSQL Streaming Replication Runbook
 
-## v5.3 automatic failover
+## Automatic failover
 
-v5.3.0 adds a Patroni-managed HA design for the deployed pg-host/gpu-host
-pg16 + pgvector topology. Use `docs/HA_AUTOMATION.md` for the automatic
-failover plan, etcd3 quorum rationale, Patroni configs, HAProxy ports
-`5000`/`5001`, and migration path from the current manual replica.
+A Patroni-managed HA design covers the PostgreSQL 16 + pgvector topology. See
+[`docs/HA_AUTOMATION.md`](HA_AUTOMATION.md) for the failover plan, the etcd3
+quorum rationale, Patroni configs, HAProxy ports `5000` and `5001`, and the
+migration path from a manual replica.
 
 The manual procedures in this runbook remain the fallback/break-glass path.
 Use them only when Patroni, etcd3 quorum, or HAProxy is unavailable, and keep
@@ -72,7 +72,7 @@ Allow each standby to connect in `pg_hba.conf`:
 
 ```conf
 # TYPE  DATABASE     USER  ADDRESS            METHOD
-host    replication  repl  192.168.10.0/24    scram-sha-256
+host    replication  repl  10.0.0.0/24        scram-sha-256
 ```
 
 Reload or restart PostgreSQL after changing config:
@@ -230,7 +230,7 @@ postgres with `-c port=5434` so it does not collide with gpu-host's separate
 On the **primary** (pg-host):
 
 ```bash
-ssh jasonperlow@<host> "podman exec mnemos-v3x-podman_postgres_1 \
+ssh <user>@<host> "podman exec mnemos-v3x-podman_postgres_1 \
     psql -U mnemos_user -d mnemos -c '
 SELECT client_addr, application_name, state, sync_state,
        sent_lsn, replay_lsn, write_lag, flush_lag, replay_lag
@@ -244,7 +244,7 @@ acknowledgement.
 On the **standby** (gpu-host):
 
 ```bash
-ssh jasonperlow@<host> "podman exec mnemos-standby \
+ssh <user>@<host> "podman exec mnemos-standby \
     psql -U mnemos_user -d mnemos -p 5434 -h 127.0.0.1 -tAc '
 SELECT pg_is_in_recovery(),
        pg_last_wal_replay_lsn(),
@@ -257,7 +257,7 @@ A row-count parity check is the cheapest end-to-end signal:
 
 ```bash
 for h in <host> <host>; do
-  ssh -n jasonperlow@$h "podman exec \
+  ssh -n <user>@$h "podman exec \
     \$(podman ps --format '{{.Names}}' | grep -E 'postgres_1|mnemos-standby' | head -1) \
     psql -U mnemos_user -d mnemos $([ $h = <host> ] && echo '-p 5434 -h 127.0.0.1') \
     -tAc 'SELECT count(*) FROM memories;'"
@@ -273,7 +273,7 @@ Use this when pg-host needs maintenance and you can drain writes cleanly.
 1. **Stop the MNEMOS service on pg-host** so no new writes hit the primary:
 
    ```bash
-   ssh jasonperlow@<host> "podman stop mnemos-v3x-podman_mnemos_1 \
+   ssh <user>@<host> "podman stop mnemos-v3x-podman_mnemos_1 \
        mnemos-v3x-podman_mnemos-mcp-http_1"
    ```
 
@@ -281,10 +281,10 @@ Use this when pg-host needs maintenance and you can drain writes cleanly.
    matches sent_lsn from `pg_stat_replication` on the primary:
 
    ```bash
-   ssh jasonperlow@<host> "podman exec mnemos-v3x-podman_postgres_1 \
+   ssh <user>@<host> "podman exec mnemos-v3x-podman_postgres_1 \
        psql -U mnemos_user -d mnemos -tAc \
        'SELECT sent_lsn FROM pg_stat_replication;'"
-   ssh jasonperlow@<host> "podman exec mnemos-standby \
+   ssh <user>@<host> "podman exec mnemos-standby \
        psql -U mnemos_user -d mnemos -p 5434 -h 127.0.0.1 -tAc \
        'SELECT pg_last_wal_replay_lsn();'"
    ```
@@ -294,14 +294,14 @@ Use this when pg-host needs maintenance and you can drain writes cleanly.
 3. **Promote the standby**:
 
    ```bash
-   ssh jasonperlow@<host> "podman exec mnemos-standby \
+   ssh <user>@<host> "podman exec mnemos-standby \
        psql -U mnemos_user -d mnemos -p 5434 -h 127.0.0.1 -c 'SELECT pg_promote();'"
    ```
 
    Verify the standby is now writable:
 
    ```bash
-   ssh jasonperlow@<host> "podman exec mnemos-standby \
+   ssh <user>@<host> "podman exec mnemos-standby \
        psql -U mnemos_user -d mnemos -p 5434 -h 127.0.0.1 -tAc 'SELECT pg_is_in_recovery();'"
    # Should now return f.
    ```
@@ -309,7 +309,7 @@ Use this when pg-host needs maintenance and you can drain writes cleanly.
 4. **Stop the old primary** so it cannot accept writes:
 
    ```bash
-   ssh jasonperlow@<host> "podman stop mnemos-v3x-podman_postgres_1"
+   ssh <user>@<host> "podman stop mnemos-v3x-podman_postgres_1"
    ```
 
 5. **Repoint MNEMOS at the new primary**. The minimum-impact approach is to
@@ -319,12 +319,12 @@ Use this when pg-host needs maintenance and you can drain writes cleanly.
    launched with:
 
    ```bash
-   ssh jasonperlow@<host> "
+   ssh <user>@<host> "
    cat > /tmp/cerberus_runtime.env << EOF
-   $(podman inspect mnemos-cerberus | python3 -c 'import sys,json; d=json.load(sys.stdin)[0]; [print(e) for e in d[\"Config\"][\"Env\"] if not e.startswith((\"PATH\",\"PYTHON_\",\"GPG_\",\"LANG\",\"container\",\"HOME\",\"PWD\",\"HOSTNAME\"))]' | sed 's/PG_PORT=.*/PG_PORT=5434/;s|DATABASE_URL=.*|DATABASE_URL=postgresql://mnemos_user:mnemos_local@127.0.0.1:5434/mnemos|')
+   $(podman inspect mnemos-standby | python3 -c 'import sys,json; d=json.load(sys.stdin)[0]; [print(e) for e in d[\"Config\"][\"Env\"] if not e.startswith((\"PATH\",\"PYTHON_\",\"GPG_\",\"LANG\",\"container\",\"HOME\",\"PWD\",\"HOSTNAME\"))]' | sed 's/PG_PORT=.*/PG_PORT=5434/;s|DATABASE_URL=.*|DATABASE_URL=postgresql://mnemos_user:$PGPASSWORD@127.0.0.1:5434/mnemos|')
    EOF
-   podman stop mnemos-cerberus && podman rm mnemos-cerberus
-   podman run -d --name mnemos-cerberus --network host --restart unless-stopped \
+   podman stop mnemos-standby && podman rm mnemos-standby
+   podman run -d --name mnemos-standby --network host --restart unless-stopped \
        --env-file /tmp/cerberus_runtime.env localhost/mnemos-os:5.0.1-full-hot \
        mnemos serve
    "
@@ -337,7 +337,7 @@ Use this when pg-host needs maintenance and you can drain writes cleanly.
 6. **Smoke check** the new primary serves writes:
 
    ```bash
-   ssh jasonperlow@<host> "curl -s -H 'Authorization: Bearer \$MNEMOS_TOKEN' \
+   ssh <user>@<host> "curl -s -H 'Authorization: Bearer \$MNEMOS_TOKEN' \
        -X POST http://localhost:5002/v1/memories \
        -H 'Content-Type: application/json' \
        -d '{\"content\":\"failover smoke test\",\"category\":\"infrastructure\"}'"
@@ -367,7 +367,7 @@ After the new primary on gpu-host has been validated, rebuild pg-host as a
 fresh standby pointing at gpu-host:
 
 ```bash
-ssh jasonperlow@<host> "
+ssh <user>@<host> "
 podman volume rm mnemos-v3x-podman_pgdata 2>/dev/null
 podman run --rm \
     -v mnemos-v3x-podman_pgdata:/var/lib/postgresql/data \
@@ -406,7 +406,7 @@ fence gpu-host, repoint clients.
   `replicator` is the *replication role* (used in `primary_conninfo`).
   Application reads against the standby use `mnemos_user` with the same
   password as the primary — `pg_basebackup` clones the role table verbatim.
-- **gpu-host's `mnemos-cerberus` mnemos service currently points at the local
+- **gpu-host's `mnemos-standby` mnemos service currently points at the local
   pg17 (`mnemos-prod-pg` on `:5433`)**, *not* at the pg16 standby on `:5434`.
   This is **intentional**: gpu-host is both an HA peer for pg-host (via the
   pg16 streaming replica on `:5434`) AND its own writable federation peer
@@ -417,7 +417,7 @@ fence gpu-host, repoint clients.
 
   Implication for failover: when pg-host dies, the pg16 standby is what gets
   promoted to be the new MNEMOS-primary, NOT the pg17 instance. Repointing
-  the existing `mnemos-cerberus` container at `:5434` would lose access to
+  the existing `mnemos-standby` container at `:5434` would lose access to
   gpu-host's own federation-peer dataset. Either (a) start a NEW container
   pointed at `:5434` for the promoted-primary role and keep the original
   pg17 service for federation peering, or (b) accept that gpu-host's pg17

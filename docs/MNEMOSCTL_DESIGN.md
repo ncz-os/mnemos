@@ -29,16 +29,16 @@ multi-tenant RBAC management (server admin tool, not user-facing).
 crates for HTTP client + schema types. Compiled binary distributed via:
 
 - `cargo install mnemosctl` from crates.io (when public)
-- fleet binary at `/usr/local/bin/mnemosctl` via deb/rpm + cixmini
+- a single binary at `/usr/local/bin/mnemosctl` via deb/rpm, including on arm64 edge
   installer (per ncz-os bundling pattern)
 - macOS via Homebrew tap
 
 Single static binary, no Python interpreter required. Matches the
-"cixmini story: Postgres + NATS only" goal — no extra runtime deps.
+the "Postgres + NATS only" goal for edge hosts — no extra runtime deps.
 
 Rejected alternative: Python (Click/Typer). Faster to scaffold, but
 duplicates the HTTP client work already done in `mnemos-rs`, drags
-Python interpreter dependency onto edge boxes (cixmini, bigpi), and
+Python interpreter dependency onto edge boxes, and
 splinters schema types across two languages.
 
 ## Command surface
@@ -111,7 +111,7 @@ Local file: `$XDG_CONFIG_HOME/mnemosctl/config.toml` (default
 
 ```toml
 [server.default]
-url = "http://192.168.207.67:5002"
+url = "http://mnemos.example.internal:5002"
 auth = "token"
 
 [server.default.token]
@@ -166,8 +166,8 @@ operators run raw `curl` against `/v1/federation/peers`. Examples:
 ```
 $ mnemosctl federation peers
 ID                                   NAME      URL                          COMPAT   LAST_SYNC  LAST_ERROR
-240f1485-3c7d-428b-b20f-bff45298158d achilles  http://192.168.207.76:5002   permis   2m ago     -
-2f7e2cde-c7f1-4dfb-af3a-3287d7c6f332 cerberus  http://192.168.207.96:5003   strict   1h ago     HTTP 500
+240f1485-3c7d-428b-b20f-bff45298158d node-a    http://node-a.example:5002   permis   2m ago     -
+2f7e2cde-c7f1-4dfb-af3a-3287d7c6f332 node-b    http://node-b.example:5003   strict   1h ago     HTTP 500
 
 $ mnemosctl federation peer sync 2f7e2cde-c7f1-4dfb-af3a-3287d7c6f332
 syncing... cerberus
@@ -227,7 +227,7 @@ N, "request_id": "..."}` to stdout AND non-zero exit.
   where possible — single source of truth for HTTP behavior.
 - Fleet hosts get `mnemosctl` via `ncz agent install` bundle (matches
   zeroclaw/openclaw/hermes/ic-engine/mnemosctl as the 5th NCZ agent
-  per cixmini deploy story).
+  per the edge deploy story).
 
 ## Non-goals
 

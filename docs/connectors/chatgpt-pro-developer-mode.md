@@ -59,7 +59,7 @@ Add to your `docker-compose.override.yml` (<pg-host> prod example):
 ```yaml
 services:
   mnemos-mcp-http:
-    image: ghcr.io/ncz-os/mnemos:5.0.1
+    image: ghcr.io/ncz-os/mnemos:6.1
     pull_policy: never
     depends_on:
       - mnemos
@@ -169,7 +169,7 @@ In a new ChatGPT conversation, the MNEMOS connector is auto-available.
 Ask things like:
 
 - "Search my memory for anything about pgvector benchmarks"
-- "Remember that the v3.2.4 release added the APOLLO LLM-fallback warning"
+- "Remember that APOLLO logs a warning when LLM fallback is enabled without a judge"
 - "What did I decide about the modularization charter?"
 
 ChatGPT calls MNEMOS's MCP tools and folds the results into the
@@ -180,7 +180,7 @@ conversation. Same memory is visible from your other agents.
 The `mnemos-tunnel-setup` helper (`scripts/mnemos_tunnel_setup.py`) is
 checked in as an aspirational contract. It expects a daemon-side
 `/admin/tunnels/*` REST surface plus a `mnemos.tunnels.ngrok_bridge`
-module; **neither has shipped as of v6.1.7** (verified in the repo).
+module; **neither has shipped**.
 Use the manual path above. The snippet below describes the eventual
 flow:
 

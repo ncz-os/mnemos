@@ -47,9 +47,9 @@ surfaces, a model registry with scheduled sync from provider APIs and Arena.ai
 Elo rankings, request-scoped observability, and an OpenAI-compatible gateway
 that injects memory context on the fly.
 
-v5.0 includes the v4 package restructure, `PersistenceBackend` abstraction,
-Postgres/SQLite backends, deployment profiles, single-binary distribution,
-unified CLI, and Redis-coordinated multi-worker support, then adds GDPR
+The runtime provides a `PersistenceBackend` abstraction over six database
+backends, deployment profiles, a unified CLI, and Redis-coordinated
+multi-worker support, plus GDPR
 deletion-request workers, the closed MORPHEUS divergent dream-state pipeline,
 PERSEPHONE archival, PANTHEON, KRONOS, NATS routing-audit substrate, DAG wiring
 for compression derivations, and MCP cross-tenant security gates. The

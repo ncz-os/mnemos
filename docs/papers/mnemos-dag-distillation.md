@@ -51,7 +51,7 @@ archival tables. The central design choice is that memory mutation is recorded
 as a DAG rather than as a linear append-only changelog.
 
 The versioning substrate is defined in
-[`db/migrations_v2_versioning.sql`](../../db/migrations_v2_versioning.sql).
+[`db/migrations_v2_versioning.sql`](../../mnemos/db_migrations/migrations_v2_versioning.sql).
 The migration creates `memory_versions` and a snapshot trigger that records
 create, update, and delete events. Each version row carries `memory_id`,
 `version_num`, `content`, ownership and namespace fields, `change_type`, a
@@ -96,7 +96,7 @@ Compression derivations add two conventional branches:
 | `distilled` | Dense or structured compression artifact | APOLLO |
 | `narrated` | Prose-shaped narration or extractive variant | ARTEMIS or narration path |
 
-[`db/migrations_v4_2_compression_dag.sql`](../../db/migrations_v4_2_compression_dag.sql)
+[`db/migrations_v4_2_compression_dag.sql`](../../mnemos/db_migrations/migrations_v4_2_compression_dag.sql)
 formalizes this by expanding `memory_versions.change_type` to include
 `compress` and documenting `distilled` and `narrated` as branch conventions. The
 branch names are not heavy schema constraints. They are operational contracts:
@@ -122,7 +122,7 @@ side effect. The operator enqueues memories, workers drain
 `memory_compression_candidates` records every attempt. The current winning
 variant is stored in `memory_compressed_variants`. The operator flow is
 summarized in [`docs/COMPRESSION.md`](../COMPRESSION.md), and the schema is
-defined in [`db/migrations_v3_1_compression.sql`](../../db/migrations_v3_1_compression.sql).
+defined in [`db/migrations_v3_1_compression.sql`](../../mnemos/db_migrations/migrations_v3_1_compression.sql).
 
 APOLLO and ARTEMIS are the built-in engines under
 [`mnemos/domain/compression/`](../../mnemos/domain/compression). APOLLO is the
@@ -179,12 +179,12 @@ eligible prose memories and tags those triples with the run id.
 
 The rollback contract is the important architectural feature. The foundation
 migration
-[`db/migrations_v3_3_morpheus.sql`](../../db/migrations_v3_3_morpheus.sql)
+[`db/migrations_v3_3_morpheus.sql`](../../mnemos/db_migrations/migrations_v3_3_morpheus.sql)
 adds `morpheus_runs`, `memories.morpheus_run_id`, `source_memories`, and
 `provenance`. Later migrations add consolidation and extraction columns:
-[`db/migrations_v4_2_morpheus_consolidate.sql`](../../db/migrations_v4_2_morpheus_consolidate.sql)
+[`db/migrations_v4_2_morpheus_consolidate.sql`](../../mnemos/db_migrations/migrations_v4_2_morpheus_consolidate.sql)
 and
-[`db/migrations_v4_2_morpheus_extract.sql`](../../db/migrations_v4_2_morpheus_extract.sql).
+[`db/migrations_v4_2_morpheus_extract.sql`](../../mnemos/db_migrations/migrations_v4_2_morpheus_extract.sql).
 Each row created or mutated by a run is tagged with `morpheus_run_id`; triples
 created by extraction use `extracted_by_run_id`. Rollback deletes run-created
 summary rows, removes extracted triples from that run, and restores
@@ -204,8 +204,8 @@ before syncing and decide whether strict or permissive compatibility applies.
 CHARON is the portability subsystem. There is no `docs/CHARON.md` in this
 tree; the current documentation is split across
 [`docs/MEMORY_EXPORT_FORMAT.md`](../MEMORY_EXPORT_FORMAT.md),
-[`mnemos/tools/README.md`](../../mnemos/tools/README.md), and the adapter
-modules under [`mnemos/tools/adapters/`](../../mnemos/tools/adapters). MPF
+[`mnemos/tools/README.md`](../../mnemos/tools/README.md), and the portability
+modules under [`mnemos/portability/`](../../mnemos/portability/). MPF
 v0.1.1 carries memory records plus sidecars such as `kg_triples`,
 `memory_versions`, and `compression_manifest`. The adapter set covers Mem0,
 Letta, Graphiti, Cognee, and MemPalace as import/export peers, with each adapter
@@ -222,14 +222,14 @@ best-effort import that fails halfway through a corpus.
 
 PERSEPHONE moves cold memories out of the live working set while preserving a
 visible pointer. The migration
-[`db/migrations_v4_2_persephone.sql`](../../db/migrations_v4_2_persephone.sql)
+[`db/migrations_v4_2_persephone.sql`](../../mnemos/db_migrations/migrations_v4_2_persephone.sql)
 creates `memory_archive` with zstd-compressed payload bytes and adds
 `memories.archived_at`. Archived memories keep a live row with an archive
 marker, so reads, federation feeds, and operator tools can see that the memory
 exists without carrying the full payload in the hot table.
 
 Eligibility is driven by recall-tracking columns added in
-[`db/migrations_v3_3_recall_tracking.sql`](../../db/migrations_v3_3_recall_tracking.sql):
+[`db/migrations_v3_3_recall_tracking.sql`](../../mnemos/db_migrations/migrations_v3_3_recall_tracking.sql):
 `recall_count` and `last_recalled_at`. The admin routes in
 [`mnemos/api/routes/admin.py`](../../mnemos/api/routes/admin.py) expose root
 sweeps, explicit archive, explicit restore, and status. The status endpoint
@@ -245,16 +245,14 @@ that are not being recalled.
 ## 8. PANTHEON, IRIS, and the Feedback Loop
 
 PANTHEON is MNEMOS's unified LLM facade, documented in
-[`docs/PANTHEON.md`](../PANTHEON.md) and implemented under
-[`mnemos/domain/pantheon/`](../../mnemos/domain/pantheon). The v0.2 slice adds
+[`docs/PANTHEON.md`](../PANTHEON.md) and distributed separately as the `mnemos-pantheon` package. The v0.2 slice adds
 per-session caps for `consultation_only` models, best-effort
 `pantheon_routing` memory writes, rolling-window adaptive routing for `auto:*`
 aliases, and route explanation output. The memory writes make model routing
 observable to MNEMOS rather than leaving it as transient gateway state.
 
-IRIS is the discovery role over the model catalog. In the current v5.0.1 codebase,
-the discovery role is surfaced through unified MCP model tools rather than a
-separate IRIS server. [`mnemos/mcp/tools/models.py`](../../mnemos/mcp/tools/models.py)
+IRIS is the discovery role over the model catalog. It is surfaced through the
+unified MCP model tools rather than a separate IRIS server. [`mnemos/mcp/tools/models.py`](../../mnemos/mcp/tools/models.py)
 exposes `pantheon_list_models` and `pantheon_route_explain`, giving MCP callers
 structured access to the PANTHEON catalog and routing decisions.
 
@@ -374,8 +372,8 @@ the same round-trip claims.
 
 ## References
 
-- [MNEMOS versioning migration](../../db/migrations_v2_versioning.sql)
-- [MNEMOS compression DAG migration](../../db/migrations_v4_2_compression_dag.sql)
+- [MNEMOS versioning migration](../../mnemos/db_migrations/migrations_v2_versioning.sql)
+- [MNEMOS compression DAG migration](../../mnemos/db_migrations/migrations_v4_2_compression_dag.sql)
 - [MNEMOS compression domain](../../mnemos/domain/compression)
 - [MNEMOS MORPHEUS runner](../../mnemos/domain/morpheus/runner.py)
 - [MNEMOS federation routes](../../mnemos/api/routes/federation.py)

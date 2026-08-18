@@ -107,8 +107,8 @@ later acts as a federation source for another node and re-emits the
 test data as native).
 
 **Schema gotcha**: `memory_versions` and `memory_branches` still lack a FK
-cascade to `memories`. v5.0.0 includes the deletion-request workflow for
-user-scope wipes, but restore-drill cleanup of test imports still needs
+cascade to `memories`. The deletion-request workflow covers user-scope wipes,
+but restore-drill cleanup of test imports still needs
 explicit DELETEs in dependency order, plus an orphan sweep:
 
 ```sql

@@ -1,4 +1,4 @@
-# Anti-Memory Poisoning Strategy in MNEMOS-OS
+# Anti-Memory Poisoning Strategy in MNEMOS
 
 ## Problem Statement
 
@@ -7,11 +7,13 @@ Memory poisoning occurs when infrastructure changes (API failures, model updates
 **Examples:**
 - API endpoint changes from `/v1/auth` to `/v2/auth`, but memory still references old endpoint
 - Model renamed from `gpt-4` to `gpt-4o`, but memory caches the old name
-- Infrastructure IP changes from `192.168.1.1` to `192.168.1.2`, memory has stale reference
+- A service moves from `auth.internal` to `auth-v2.internal`, but memory still
+  points at the old host
 
-## MNEMOS-OS Solution: Git-Like DAG with Versioning
+## The MNEMOS Solution: a Git-Like DAG with Versioning
 
-MNEMOS-OS implements anti-memory poisoning through **immutable, versioned memory history** with content-addressed commits (Phase 3: DAG Versioning).
+MNEMOS counters memory poisoning with **immutable, versioned memory history**
+and content-addressed commits.
 
 ### Key Mechanisms
 
@@ -84,9 +86,7 @@ session_memory_injections:
 **Problem:** Infrastructure changed; memory contradicts current state.
 **Solution:**
 - Session memory injections are logged (session_memory_injections table)
-- Each injection records memory_id, relevance_score, and timestamp; v3.5 removed
-  the legacy session compression-ratio columns because they were not the real
-  compression store
+- Each injection records memory_id, relevance_score, and timestamp
 - Audit trail shows which memories were used and when
 - Can trace decision back to specific memory version via commit_hash
 - Revert to known-good configuration by checking out stable commit
@@ -177,7 +177,7 @@ curl 'http://localhost:5002/v1/memories/{id}/diff?from=1&to=10'
 
 ### Conclusion
 
-MNEMOS-OS's DAG versioning + audit trail provides **infrastructure-level protection** against memory poisoning:
+MNEMOS's DAG versioning + audit trail provides **infrastructure-level protection** against memory poisoning:
 - **Immutability** prevents accidental/malicious overwrites
 - **Causality chains** enable root-cause analysis
 - **Branch isolation** allows safe experimentation

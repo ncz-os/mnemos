@@ -1,4 +1,4 @@
-# mnemos-api deployment (PYTHIA)
+# mnemos-api deployment
 
 Compose-managed (was an orphan `docker run`). Image built from `Dockerfile.oracle`.
 

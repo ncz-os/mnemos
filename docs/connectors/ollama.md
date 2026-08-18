@@ -1,6 +1,7 @@
 # Ollama -> MNEMOS
 
-Ollama has no native MCP client, so use its OpenAI-compatible API with tool-aware local models and the `mnemos-bridge-openai` adapter once that Phase 2 bridge package is available.
+Ollama has no native MCP client, so use its OpenAI-compatible API with a
+tool-aware local model plus the [`mnemos-bridge-openai`](https://gitlab.com/ncz-os/mnemos-bridge-openai) adapter.
 
 ## What you need — token, host (<mnemos-host>), relevant port(s)
 
@@ -11,8 +12,7 @@ Ollama has no native MCP client, so use its OpenAI-compatible API with tool-awar
 - Python 3.11+ with the OpenAI SDK.
 - MNEMOS MCP HTTP/SSE reachable at `http://<mnemos-host>:5003/sse`.
 - A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- The upcoming `mnemos-bridge-openai` adapter package from Phase 2 of bridge
-  consolidation.
+- The `mnemos-bridge-openai` adapter.
 - Ollama's OpenAI-compatible endpoint reachable at `http://localhost:11434/v1`.
 - A private shell environment for the token.
 

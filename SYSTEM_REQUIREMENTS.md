@@ -26,13 +26,13 @@ backend). Pi 4 class is the intended floor for the embedded tier.
   extension for `server`. Server multi-worker deployments also need Redis.
 * **Disk**: corpus + manifests + backups.
   - Memory text: ~1 KB/row average; 100k rows ≈ 100 MB.
-  - v3.1 compression candidates: ~1.5x the memory row count, ~2 KB/row.
+  - Compression candidates: ~1.5x the memory row count, ~2 KB/row.
   - Backups: see `mnemos/tools/backup/` — daily pg_dump + weekly rsync
     pattern uses another ~2x the live corpus size in rolling storage.
 * **Network**: internal only for the contest path; outbound only
   required if using an externally hosted embedding/LLM endpoint.
 
-## Server tier — full v5.3 feature set
+## Server tier — full feature set
 
 Intended for the primary deployment host that runs the API + worker
 for production ingest.
@@ -43,15 +43,14 @@ for production ingest.
   of the memories + candidates tables + indexes. `shared_buffers`
   ≈ 25% of RAM is a fine default.
 * **Disk**: 50 GB+ SSD for a year of daily ops at moderate ingest
-  (~10k memories/day). NVMe strongly preferred — the v3_dag manifest
-  writes are write-heavy.
+  (~10k memories/day). NVMe strongly preferred — the DAG manifest writes
+  are write-heavy.
 * **GPU**:
   - **Recommended**: NVIDIA RTX 4000-class or better, 8 GB+ VRAM, CUDA 12+.
     APOLLO's schema-aware fast path is CPU-cheap; GPU is only needed
     for APOLLO's optional LLM fallback and judge-LLM scoring.
   - **Sufficient**: any CUDA-capable GPU with enough VRAM to load
-    the chosen embedding/LLM model. The default models (see
-    `CLAUDE.md` at the repo root) fit on 8 GB.
+    the chosen embedding/LLM model. The default models fit on 8 GB.
 * **Ancillary**: Redis is not required for the default single-worker
   deployment. Redis is required for multi-worker shared rate-limit and
   circuit-breaker state; see `docs/SCALING.md`.
@@ -95,13 +94,13 @@ Defaults are the server-tier shape.
 | -------------------------------------- | -------- | ------------------------------------------------------------------- |
 | `MNEMOS_CONTEST_ENABLED`               | `true`   | Toggle the contest path                                             |
 | `MNEMOS_CONTEST_MIN_CONTENT_LENGTH`    | `0`      | Skip contests for memories shorter than N chars (GPU-constrained installs) |
-| `MNEMOS_CONTEST_STALE_THRESHOLD_SECS`  | `600`    | Stale-running queue-row reclaim threshold (v3.1.1)                  |
+| `MNEMOS_CONTEST_STALE_THRESHOLD_SECS`  | `600`    | Stale-running queue-row reclaim threshold                           |
 
 Set them via the service-unit environment file or `docker run -e …`.
 
-## Observed resource usage (v3.1)
+## Observed resource usage
 
-From real deployments as of 2026-04-23:
+Measured on two reference deployments:
 
 | Host      | Tier        | CPU avg  | RAM resident | Disk (live) | GPU util                     |
 | --------- | ----------- | -------- | ------------ | ----------- | ---------------------------- |
@@ -136,7 +135,7 @@ Compose v2 are recommended. Allocate at least 4 GB RAM and 2 CPU cores for a
 small local stack, 8 GB RAM and 4 CPU cores for routine server testing, and
 16 GB+ RAM with 8+ CPU cores for production-like multi-service stacks.
 
-The API listens on `5002` by default. MCP HTTP/SSE commonly uses `5004`.
+The API listens on `5002` by default, and `mnemos serve mcp-http` on `5003`.
 PostgreSQL uses `5432`, Redis uses `6379`, and reverse proxies should terminate
 TLS before forwarding to MNEMOS. Outbound network access is only required for
 the LLM, embedding, webhook, federation, or package-index services that the
@@ -190,5 +189,3 @@ Common first checks:
 * `curl http://localhost:5002/health` returns healthy service state.
 
 ---
-
-*Last updated: 2026-05-08 (v5.0.1 doc sync)*

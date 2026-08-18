@@ -101,7 +101,7 @@ Use plain `psql -t -A -c "SELECT row_to_json(t) FROM ..."`
 with no COPY escape layer.
 
 This pitfall was documented during the 2026-04-24 v2.3.0→v3.x
-migration of 6,688 memories on PYTHIA; out of the 3,041 first-run
+migration of 6,688 memories on a production instance; out of the 3,041 first-run
 failures, 100% were recovered by re-exporting with plain SELECT.
 
 ## Import subcommand reference

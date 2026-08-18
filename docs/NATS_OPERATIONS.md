@@ -1,11 +1,10 @@
 # NATS / JetStream Operations
 
-Operational reference for the NATS substrate that backs MNEMOS v4.2's
-federation push consumers and webhook delivery triggers. This is the
-"what's actually on disk" companion to
-[`mnemos/domain/graeae/MQ_INTEGRATION.md`](../mnemos/domain/graeae/MQ_INTEGRATION.md)
-(GRAEAE consultation fan-out — separate, behind
-`MNEMOS_GRAEAE_NATS_FANOUT` flag).
+Operational reference for the NATS substrate that backs MNEMOS federation
+push consumers and webhook delivery triggers. GRAEAE consultation fan-out is a
+separate path behind the `MNEMOS_GRAEAE_NATS_FANOUT` flag, and ships with the
+`mnemos-graeae` distribution. For the design rationale, see
+[`docs/NATS_SUBSTRATE.md`](NATS_SUBSTRATE.md).
 
 ## Streams
 

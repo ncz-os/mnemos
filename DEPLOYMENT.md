@@ -11,8 +11,8 @@ variables or `config.toml` entries still override those defaults.
 
 | Profile | Default stack | Use it for |
 |---------|---------------|------------|
-| `server` | Postgres + Redis + single worker by default, multi-worker safe when Redis is present | Production deployments and shared service installs |
-| `edge` | SQLite + in-process rate limits + one worker | Laptop, Pi, edge appliance, Consumer MNEMOS, bigpi/clawpi/zeropi, Termux on S21 |
+| `server` | Postgres + single worker; multi-worker safe once Redis backs the shared counters | Production deployments and shared service installs |
+| `edge` | SQLite + in-process rate limits + one worker | Laptop, Raspberry Pi, edge appliance, Termux |
 | `dev` | SQLite + in-process rate limits + debug logging | Local development and test loops |
 
 Examples:
@@ -23,44 +23,59 @@ mnemos serve --profile edge
 mnemos serve --profile dev
 ```
 
-`MNEMOS_PROFILE=personal` is a legacy v3.x alias and resolves to `edge`.
+`MNEMOS_PROFILE=personal` is an alias that resolves to `edge`.
 
 ---
 
 ## Quick Start
 
 ### Prerequisites
-- PostgreSQL 12+ and Redis for the `server` profile, or SQLite for `edge`/`dev`
-- Python 3.11+ when using the Python package; no host Python is required for the single-binary artifact
+- PostgreSQL 12+ for the `server` profile, or SQLite for `edge`/`dev`
+- Redis only if you run more than one worker — see [Runtime Scaling](#runtime-scaling)
+- Python 3.11+ when installing the Python package; none when running a container image
 - LLM provider API keys (Together AI or Groq free tier recommended)
 - (Optional) GPU or local inference endpoint for APOLLO's LLM fallback and self-hosted LLMs
 
 ### Installation
 
+The pip package is **`mnemos-core`**. `mnemos` is the published container image
+name, not a pip package — `pip install mnemos` and `pip install mnemos-os` will
+not get you MNEMOS.
+
 ```bash
-python -m pip install mnemos-os==6.1.7  # source-install from v6.0-rc tag
+python -m pip install 'mnemos-core[edge]'
 mnemos install --profile dev
 mnemos serve --profile dev
 ```
 
 The API will be available at `http://localhost:5002`.
 
-For the no-Python edge path:
+For the no-host-Python path, run the container image:
 
 ```bash
-curl -L https://github.com/ncz-os/mnemos/releases/download/v6.0-rc/mnemos-linux-x86_64 -o mnemos
-chmod +x mnemos
-./mnemos install --profile edge
-./mnemos serve --profile edge
+docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos:6.1
 ```
 
 ---
 
 ## Runtime Scaling
 
-MNEMOS runs one worker by default. Horizontal scaling is supported when Redis
-backs shared rate-limit, circuit-breaker, and concurrency state; see
-`docs/SCALING.md`.
+MNEMOS runs one worker by default, and rate-limit, circuit-breaker, and
+concurrency counters are process-local (`memory://`). That is correct for a
+single worker and wrong for several: each process would get its own copy of
+every counter, multiplying the effective ceiling by the worker count.
+
+Before raising `MNEMOS_WORKERS`, install the `redis` extra and point the
+counters at a shared store:
+
+```bash
+python -m pip install 'mnemos-core[server,redis]'
+export RATE_LIMIT_STORAGE_URI=redis://localhost:6379/1
+export MNEMOS_WORKERS=4
+```
+
+Startup logs a warning if more than one worker is configured against
+process-local state. See [docs/SCALING.md](docs/SCALING.md).
 
 ---
 
@@ -104,58 +119,50 @@ operationally visible. Do not use shared-token mode for multi-tenant HTTP MCP.
 
 ---
 
-## v3.5 Federation Cursor Compatibility
+## Federation Feed Cursors
 
-The v3.5 federation feed cursor is opaque and carries both `updated` and
-`id`, with feed pages ordered by that same pair. This fixes the timestamp tie
-case where a page could end in the middle of many memories sharing one
-`updated` value.
+The federation feed cursor is opaque and carries both `updated` and `id`, with
+feed pages ordered by that same pair, so a page cannot end in the middle of a
+run of memories that share one `updated` value.
 
-No database migration is required. `federation_peers.last_sync_cursor` remains
-the existing timestamp column; the puller sends that timestamp as a compound
-cursor with the lowest id boundary, uses the peer's compound cursor between
-pages during a sync, and persists the timestamp portion for the next completed
-sync. Feed servers do not accept timestamp-only cursors; malformed cursors are
-treated the same as a missing cursor and start an initial fetch from the
-beginning.
+`federation_peers.last_sync_cursor` is a timestamp column. The puller sends
+that timestamp as a compound cursor with the lowest id boundary, uses the
+peer's compound cursor between pages during a sync, and persists the timestamp
+portion for the next completed sync. Feed servers do not accept timestamp-only
+cursors; a malformed cursor is treated the same as a missing one and starts an
+initial fetch from the beginning.
 
 ---
 
-## v3.5 Webhook Retry Migration Gate
+## Webhook Delivery Ownership
 
-The v3.5 webhook retry migrations change delivery ownership from in-transaction
-row locks to persisted attempt leases. Apply this gate when upgrading an
-existing deployment:
+Webhook delivery ownership is held by persisted attempt leases rather than
+in-transaction row locks. Superseded attempts use `status='abandoned'` plus
+`superseded=TRUE`, so retry-chain advancement stays visible to audit queries
+while live recovery predicates remain simple.
 
-1. Stop or drain all MNEMOS processes that can write webhook delivery attempts.
-2. Run the ordered migrations through `db/migrations_v3_5_webhook_retry_terminal_state.sql`, `db/migrations_v3_5_webhook_attempt_lease.sql`, `db/migrations_v3_5_webhook_writer_revision.sql`, `db/migrations_v3_5_webhook_status_updated_at.sql`, `db/migrations_v3_5_webhook_superseded_marker.sql`, `db/migrations_v3_5_webhook_attempt_unique.sql`, `db/migrations_v3_5_webhook_succeeded_unique.sql`, and `db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql`.
-3. Restart MNEMOS workers on the new build.
+Two unique indexes enforce the invariants structurally, so a race between
+writers cannot corrupt a retry chain:
 
-Draining those writers remains the operationally clean upgrade path.
-Superseded attempts use `status='abandoned'` plus `superseded=TRUE`, so retry
-chain advancement is visible to audit queries while keeping live recovery
-predicates simple.
-The live unique index on `(subscription_id, event_type, payload_hash,
-attempt_num)` structurally prevents duplicate successor rows if writers race
-after a no-successor check. The succeeded unique index on
-`(subscription_id, event_type, payload_hash) WHERE status='succeeded'`
-structurally enforces one terminal success per retry chain if workers race
-past the app-level chain-peer guard. Workers use per-attempt leases plus
-per-chain advisory locks, lifecycle starts a dedicated repair worker that runs
-repeated sweeps for the first minute independent of delivery send latency, and
-current code explicitly writes `NEW_CODE_WRITER_REVISION=1`.
-`db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql` adds a database
-trigger that fires before any `webhook_deliveries` UPDATE attempting to move a
-row away from `status='succeeded'`. A stale writer that tries to revert an ACK
-to `pending` or `retrying` fails with SQLSTATE `23514` (`check_violation`) at
-the trigger boundary; audit-only updates such as response-body capture or lease
-cleanup still succeed.
-The startup/periodic repair worker is idempotent and terminalizes any
-lease-free `pending` or `retrying` row with a newer successor, including
-out-of-order status overwrites of rows already marked `superseded=TRUE`. It skips
-rows with an unexpired `lease_token` / `lease_expires_at` pair so an in-flight
-new worker can finalize without losing ownership.
-Rows with `writer_revision=1` are recoverable immediately.
+- `(subscription_id, event_type, payload_hash, attempt_num)` prevents duplicate
+  successor rows if writers race after a no-successor check.
+- `(subscription_id, event_type, payload_hash) WHERE status='succeeded'`
+  enforces one terminal success per retry chain if workers race past the
+  app-level chain-peer guard.
+
+A database trigger fires before any `webhook_deliveries` UPDATE that tries to
+move a row away from `status='succeeded'`. A stale writer attempting to revert
+an ACK to `pending` or `retrying` fails with SQLSTATE `23514`
+(`check_violation`) at the trigger boundary; audit-only updates such as
+response-body capture or lease cleanup still succeed.
+
+Workers use per-attempt leases plus per-chain advisory locks. Lifecycle starts
+a dedicated repair worker that runs repeated sweeps for the first minute,
+independent of delivery send latency. That worker is idempotent: it terminalizes
+any lease-free `pending` or `retrying` row that has a newer successor, including
+out-of-order status overwrites of rows already marked `superseded=TRUE`, and
+skips rows with an unexpired `lease_token` / `lease_expires_at` pair so an
+in-flight worker can finalize without losing ownership.
 
 `WEBHOOK_LEASE_SECONDS` is the authoritative webhook delivery ownership knob.
 Claims write and return `lease_expires_at` / `claim_db_now` from PostgreSQL
@@ -223,7 +230,7 @@ See `.env.example` for complete options including GPU setup, compression contest
 ### When You Need GPU
 
 MNEMOS works great on CPU alone. GPU is only beneficial if:
-- You want APOLLO's LLM fallback for content that misses a schema (v3.3+)
+- You want APOLLO's LLM fallback for content that misses a schema
 - You're running large local LLMs (70B+ parameters)
 
 **For most users**: Use external LLM providers (Together AI, Groq) instead. They're cheaper and faster than self-hosting.
@@ -306,22 +313,9 @@ For current installs, `docker-compose.yml` and `docker-compose.staging.yml`
 therefore include `postgres-upgrade`, which waits for Postgres health and
 then applies the ordered migration tail before the MNEMOS service starts.
 
-The canonical order lives in `mnemos/installer/db.py`; compose must mirror that
-loader. The v3.5 upgrade tail remains relevant for pre-v4 databases and is
-followed by the v4 profile/persistence additions where needed.
-`trigger-same-memory-parent`, `rls-group-select-unix-bits`,
-`webhook-retry-terminal-state`, `webhook-attempt-lease`,
-`webhook-writer-revision`, `webhook-status-updated-at`,
-`webhook-superseded-marker`, `webhook-attempt-unique`,
-`webhook-succeeded-unique`, `webhook-succeeded-terminal-trigger`,
-`entities-namespace-unique`, `state-journal-namespace`,
-`session-compression-ratio-drop`, `session-compression-legacy-drop`, and
-`sessions-consultations-namespace`.
-
-Fresh volumes receive these migrations from the initdb mounts, ending at
-`/docker-entrypoint-initdb.d/38-sessions-consultations-namespace.sql`. Existing
-volumes receive the same SQL through `/migrations/24-...sql` through
-`/migrations/38-sessions-consultations-namespace.sql` in the one-shot
+The canonical migration order lives in `mnemos/installer/db.py`, and compose
+must mirror that loader. Fresh volumes receive the chain from the initdb
+mounts; existing volumes receive the same SQL through the one-shot
 `postgres-upgrade` service. Use the `docker-compose.yml` `postgres-upgrade`
 service block as the example for manual upgrades.
 
@@ -353,7 +347,7 @@ promotion, and HAProxy/PgBouncer-style writer endpoints.
 
 ## Portability, MORPHEUS, and Compression Operations
 
-MPF portability is available through `GET /v1/export` and `POST /v1/import`.
+Portability uses MIF 1.0 through `GET /v1/export` and `POST /v1/import`.
 Use root plus `preserve_owner=true` only for authoritative restores or
 migrations; non-root imports are scoped to the caller's owner+namespace. The
 CLI helpers are available through `mnemos export`, `mnemos import`, and the
@@ -361,15 +355,13 @@ modules under `mnemos/tools/`.
 
 MORPHEUS dream-state runs are operator-triggered through
 `POST /admin/morpheus/runs` and inspected through `/v1/morpheus/runs*`.
-v5.0 runs cover REPLAY, CLUSTER, SYNTHESISE, CONSOLIDATE, and EXTRACT, append
+Runs cover REPLAY, CLUSTER, SYNTHESISE, CONSOLIDATE, and EXTRACT, append
 generated memories tagged with `morpheus_run_id`, and roll back by deleting
 memories from that run.
 
 Compression is operator-batched. Use `POST /admin/compression/enqueue` or
 `POST /admin/compression/enqueue-all` to feed the contest worker. The active
-built-in engines are APOLLO and ARTEMIS; the retired LETHE / ANAMNESIS /
-ALETHEIA engines and the legacy session compression columns are not part of
-the v5.0 runtime.
+built-in engines are APOLLO and ARTEMIS.
 
 ---
 
@@ -508,33 +500,18 @@ sudo -u postgres createuser -P mnemos  # Enter password interactively
 # Run migrations in canonical order through the installer
 mnemos install --profile server
 
-# Existing DBs on v3.4.1 must apply v3.5 migrations 24-38 in order before the v4 tail.
-# The compose one-shot is the canonical example for existing volumes:
-docker compose up postgres-upgrade
-
-# For non-compose installs, follow the same order as mnemos/installer/db.py:
-psql -U mnemos -d mnemos -v ON_ERROR_STOP=1 \
-  -f db/migrations_v3_5_trigger_same_memory_parent.sql \
-  -f db/migrations_v3_5_rls_group_select_unix_bits.sql \
-  -f db/migrations_v3_5_webhook_retry_terminal_state.sql \
-  -f db/migrations_v3_5_webhook_attempt_lease.sql \
-  -f db/migrations_v3_5_webhook_writer_revision.sql \
-  -f db/migrations_v3_5_webhook_status_updated_at.sql \
-  -f db/migrations_v3_5_webhook_superseded_marker.sql \
-  -f db/migrations_v3_5_webhook_attempt_unique.sql \
-  -f db/migrations_v3_5_webhook_succeeded_unique.sql \
-  -f db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql \
-  -f db/migrations_v3_5_entities_namespace_unique.sql \
-  -f db/migrations_v3_5_state_journal_namespace.sql \
-  -f db/migrations_v3_5_session_compression_ratio_drop.sql \
-  -f db/migrations_v3_5_session_compression_legacy_drop.sql \
-  -f db/migrations_v3_5_sessions_consultations_namespace.sql \
-  -f db/migrations_v4_2_users_username.sql \
-  -f db/migrations_v4_2_compression_candidates_nullable_tokens.sql \
-  -f db/migrations_v4_2_state_value_text.sql
-
 # Verify
 psql -U mnemos -d mnemos -c "SELECT version();"
+```
+
+`mnemos install` is the supported way to apply the migration chain: it reads
+the canonical order from `mnemos/installer/db.py` and is idempotent, so it is
+safe to re-run against an existing database. For containerized Postgres with
+an existing data volume, use the compose one-shot instead, because initdb
+scripts do not re-run on an already-initialized volume:
+
+```bash
+docker compose up postgres-upgrade
 ```
 
 ### 2. Environment Variables
@@ -660,7 +637,7 @@ psql -d mnemos -c "REINDEX TABLE memories;"
 
 ### 409: Memory branch state is inconsistent
 
-Current releases keep the v3.5 trigger behavior: SQLSTATE `MN001` maps to HTTP 409 when
+SQLSTATE `MN001` maps to HTTP 409 when
 `memory_branches` is missing, has `NULL head_version_id`, or points at a
 `memory_versions` row from another memory. Inspect and reconcile the
 branch rows before retrying:
@@ -674,11 +651,15 @@ WHERE mb.memory_id = '<memory_id>';
 
 The correct branch head must be a `memory_versions.id` with the same
 `memory_id` as the branch row. Do not repair by pointing at another
-memory's version; the v3.5 trigger will reject the next write.
+memory's version; the trigger will reject the next write.
 
 ---
 
 ## Support
 
-- GitHub: https://github.com/ncz-os/mnemos
-- Issues: https://github.com/ncz-os/mnemos/issues
+Development and issue tracking live on the canonical GitLab project:
+
+- Source: <https://gitlab.com/ncz-os/mnemos>
+- Issues: <https://gitlab.com/ncz-os/mnemos/-/issues>
+
+The GitHub repository exists only to publish container images to ghcr.io.
