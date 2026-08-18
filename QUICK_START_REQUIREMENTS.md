@@ -1,6 +1,6 @@
 # MNEMOS Quick Start Requirements
 
-**Applies to**: current v6.1.6 release line (legacy GA v5.0.1)
+**Applies to**: current v6.1.7 release line (legacy GA v5.0.1)
 **TL;DR**: Python 3.11+ for package installs; no host Python for single-binary.
 Use SQLite for `edge`/`dev`, or PostgreSQL 16 + Redis for `server`.
 **Full Details**: See `SYSTEM_REQUIREMENTS.md`
@@ -34,7 +34,7 @@ sudo apt install -y git curl build-essential libpq-dev
 # 3. MNEMOS package (2 minutes)
 python3.11 -m venv ~/.venvs/mnemos
 source ~/.venvs/mnemos/bin/activate
-pip install mnemos-os==6.1.6  # source-install from v6.0-rc tag
+pip install mnemos-os==6.1.7  # source-install from v6.0-rc tag
 
 # 4. SQLite-backed dev profile
 mnemos install --profile dev
@@ -47,7 +47,7 @@ For a production `server` profile, add PostgreSQL + pgvector and Redis:
 sudo apt install -y postgresql-16 postgresql-16-pgvector postgresql-client redis-server
 python3.11 -m venv venv
 source venv/bin/activate
-pip install mnemos-os==6.1.6  # source-install from v6.0-rc tag
+pip install mnemos-os==6.1.7  # source-install from v6.0-rc tag
 export MNEMOS_PROFILE=server
 export RATE_LIMIT_STORAGE_URI=redis://localhost:6379/1
 mnemos install --profile server
