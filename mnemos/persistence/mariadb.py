@@ -56,13 +56,11 @@ from mnemos.persistence.mysql import (
     _DDL_GRAEAE_AUDIT_LOG,
     _DDL_GRAEAE_CONSULTATIONS,
     _DDL_JOURNAL,
-    _DDL_MEMORY_ARCHIVE,
     _DDL_KG_TRIPLES,
     _DDL_MODEL_REGISTRY,
     _DDL_MODEL_REGISTRY_SYNC_LOG,
     _DDL_SESSIONS,
     _DDL_SESSION_MESSAGES,
-    _DDL_SESSION_MEMORY_INJECTIONS,
     _DDL_STATE,
     _DDL_USAGE_LEDGER,
     _DEFAULT_EMBEDDING_DIM,
@@ -268,6 +266,58 @@ CREATE TABLE IF NOT EXISTS memory_branches (
         FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
     CONSTRAINT fk_memory_branches_head
         FOREIGN KEY (head_version_id) REFERENCES memory_versions(id) ON DELETE SET NULL
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+# ---------------------------------------------------------------------------
+# MariaDB-specific overrides for two tables that reference memories(id).
+#
+# This backend declares `memories.id VARCHAR(64) CHARACTER SET ascii`, but the
+# MySQL definitions it otherwise inherits declare their columns without a
+# charset, so they take the table default (utf8mb4). MySQL requires a foreign
+# key and its referent to agree on charset AND collation, so the inherited
+# definitions cannot form their FK here:
+#
+#   (1005, 'Can\'t create table `mnemos`.`memory_archive`
+#    (errno: 150 "Foreign key constraint is incorrectly formed")')
+#
+# Measured on a live MariaDB 11 host: 6.1 could not start at all -- schema
+# provisioning aborted on memory_archive, and again on
+# session_memory_injections once that was fixed by hand.
+#
+# The other four tables that reference memories(id) --
+# memory_embeddings, compression_candidates, memory_versions, memory_branches
+# -- are already redefined in this module with `CHARACTER SET ascii` columns.
+# These two were the ones left inherited. session_id stays utf8mb4 because
+# sessions.id is inherited from the MySQL module and really is utf8mb4; each
+# FK column has to match its own referent, not a single project-wide charset.
+_DDL_MEMORY_ARCHIVE = """\
+CREATE TABLE IF NOT EXISTS memory_archive (
+    id VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    archived_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    archived_by VARCHAR(256) NOT NULL DEFAULT 'system:persephone',
+    compressed_content LONGBLOB NOT NULL,
+    compression_algo VARCHAR(32) NOT NULL DEFAULT 'zstd',
+    original_size_bytes BIGINT NOT NULL,
+    compressed_size_bytes BIGINT NOT NULL,
+    schema_version INT NOT NULL DEFAULT 1,
+    PRIMARY KEY (id),
+    INDEX idx_memory_archive_archived_at (archived_at),
+    CONSTRAINT fk_memory_archive_memory FOREIGN KEY (id) REFERENCES memories(id) ON DELETE RESTRICT
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_SESSION_MEMORY_INJECTIONS = """\
+CREATE TABLE IF NOT EXISTS session_memory_injections (
+    id          VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    session_id  VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+    memory_id   VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    injected_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at  TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    INDEX idx_session_memory_injections_session (session_id),
+    CONSTRAINT fk_session_memory_injections_session FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    CONSTRAINT fk_session_memory_injections_memory FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 

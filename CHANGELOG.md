@@ -73,6 +73,68 @@ crash-looped forever after a restart following a partial-then-recovered
 prior migration run — every retry hit `SQL0803N`/`SQLSTATE=23505` on the
 same static `INSERT` and never got past schema replay to serve traffic.
 
+## [6.1.4] — 2026-08-18
+
+Three backend-specific schema defects, each of which stopped 6.1 starting on a
+backend that is not PostgreSQL or SQLite. All three were found by actually
+upgrading live hosts; none is reachable from the unit suite, which has no
+Oracle, Db2 or MariaDB.
+
+### Fixed — Db2 could not migrate: reorg-pending after the lifecycle ALTERs
+
+`0050_lifecycle_workers.sql` issues nine consecutive `ALTER TABLE`s against
+`deletion_requests` and then creates an index on it. Db2 puts a table into
+reorg-pending state after REORG-recommended ALTERs and refuses everything else
+on it until a REORG runs:
+
+```
+SQL0668N Operation not allowed for reason code "7"
+on table "DB2INST1.DELETION_REQUESTS"
+```
+
+The executor now recognises that error, reorganises the named table and retries
+the statement once. This is handled in code rather than by adding a `REORG` to
+the `.sql` deliberately: migrations carry no applied-state table and replay on
+every start, so an unconditional REORG would rewrite the table on every boot.
+Reacting to the error means it runs only when Db2 actually asks for it.
+
+### Fixed — MariaDB could not create two tables: foreign-key charset mismatch
+
+```
+(1005, "Can't create table `mnemos`.`memory_archive`
+ (errno: 150 \"Foreign key constraint is incorrectly formed\")")
+```
+
+The MariaDB backend declares `memories.id VARCHAR(64) CHARACTER SET ascii`,
+but inherits most of its table definitions from the MySQL module, where columns
+carry no charset clause and therefore take the database default — utf8mb4 on
+any normal install. MySQL requires a foreign key and its referent to agree on
+charset *and* collation, so those inherited definitions could not form their
+FK against this backend's `memories`.
+
+Six tables reference `memories(id)`. Four (`memory_embeddings`,
+`compression_candidates`, `memory_versions`, `memory_branches`) were already
+redefined with ascii columns; `memory_archive` and `session_memory_injections`
+were left inherited, and those are exactly the two that failed. Both are now
+overridden.
+
+`session_memory_injections.session_id` stays utf8mb4 on purpose: `sessions.id`
+really is utf8mb4 here, and each FK column has to match *its own* referent
+rather than a single project-wide charset.
+
+The standalone `migrations_mysql/0050_lifecycle_workers.sql` carried the same
+omission and is fixed the same way.
+
+### Known issues
+
+- The MySQL-family charset split is not fully resolved. `memories.id` is ascii
+  while `sessions.id` is utf8mb4 on the same database, because one is
+  overridden by the MariaDB module and the other is inherited. That is
+  self-consistent and works, but it means any *new* table referencing either
+  must pick its charset per column. Making ids uniformly ascii across the
+  family would need an ALTER migration for existing installs and is not
+  attempted here.
+
 ## [6.1.3] — 2026-08-17
 
 ### Fixed — the published image required AVX512 and died on the first write
