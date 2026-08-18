@@ -321,10 +321,10 @@ Use this when pg-host needs maintenance and you can drain writes cleanly.
    ```bash
    ssh <user>@<host> "
    cat > /tmp/cerberus_runtime.env << EOF
-   $(podman inspect mnemos-cerberus | python3 -c 'import sys,json; d=json.load(sys.stdin)[0]; [print(e) for e in d[\"Config\"][\"Env\"] if not e.startswith((\"PATH\",\"PYTHON_\",\"GPG_\",\"LANG\",\"container\",\"HOME\",\"PWD\",\"HOSTNAME\"))]' | sed 's/PG_PORT=.*/PG_PORT=5434/;s|DATABASE_URL=.*|DATABASE_URL=postgresql://mnemos_user:mnemos_local@127.0.0.1:5434/mnemos|')
+   $(podman inspect mnemos-standby | python3 -c 'import sys,json; d=json.load(sys.stdin)[0]; [print(e) for e in d[\"Config\"][\"Env\"] if not e.startswith((\"PATH\",\"PYTHON_\",\"GPG_\",\"LANG\",\"container\",\"HOME\",\"PWD\",\"HOSTNAME\"))]' | sed 's/PG_PORT=.*/PG_PORT=5434/;s|DATABASE_URL=.*|DATABASE_URL=postgresql://mnemos_user:$PGPASSWORD@127.0.0.1:5434/mnemos|')
    EOF
-   podman stop mnemos-cerberus && podman rm mnemos-cerberus
-   podman run -d --name mnemos-cerberus --network host --restart unless-stopped \
+   podman stop mnemos-standby && podman rm mnemos-standby
+   podman run -d --name mnemos-standby --network host --restart unless-stopped \
        --env-file /tmp/cerberus_runtime.env localhost/mnemos-os:5.0.1-full-hot \
        mnemos serve
    "
@@ -406,7 +406,7 @@ fence gpu-host, repoint clients.
   `replicator` is the *replication role* (used in `primary_conninfo`).
   Application reads against the standby use `mnemos_user` with the same
   password as the primary — `pg_basebackup` clones the role table verbatim.
-- **gpu-host's `mnemos-cerberus` mnemos service currently points at the local
+- **gpu-host's `mnemos-standby` mnemos service currently points at the local
   pg17 (`mnemos-prod-pg` on `:5433`)**, *not* at the pg16 standby on `:5434`.
   This is **intentional**: gpu-host is both an HA peer for pg-host (via the
   pg16 streaming replica on `:5434`) AND its own writable federation peer
@@ -417,7 +417,7 @@ fence gpu-host, repoint clients.
 
   Implication for failover: when pg-host dies, the pg16 standby is what gets
   promoted to be the new MNEMOS-primary, NOT the pg17 instance. Repointing
-  the existing `mnemos-cerberus` container at `:5434` would lose access to
+  the existing `mnemos-standby` container at `:5434` would lose access to
   gpu-host's own federation-peer dataset. Either (a) start a NEW container
   pointed at `:5434` for the promoted-primary role and keep the original
   pg17 service for federation peering, or (b) accept that gpu-host's pg17
