@@ -322,6 +322,21 @@ async def _ensure_postgres_embedding_shape(conn: Any, embedding_dim: int) -> Non
         )
 
 
+#: ``SQL0668N ... reason code "7" on table "SCHEMA.TABLE"`` -- Db2 has put the
+#: table in reorg-pending state and refuses further operations on it until a
+#: REORG runs.
+_DB2_REORG_PENDING_RE = re.compile(
+    r'SQL0668N.*?reason code\s*"7".*?on table\s*"([A-Za-z0-9_$#.]+)"',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _db2_reorg_pending_table(exc: Exception) -> str | None:
+    """Return the table Db2 wants reorganised, if that is what failed."""
+    match = _DB2_REORG_PENDING_RE.search(str(exc))
+    return match.group(1) if match else None
+
+
 async def _execute_cursor_statement(cursor: Any, statement: str, path: Path, backend: str) -> None:
     if backend == "db2" and _should_skip_db2_vector_index(statement):
         _LOG.warning("Skipping Db2 vector index creation because DB2_VECTOR_INDEXING is not enabled.")
@@ -335,6 +350,31 @@ async def _execute_cursor_statement(cursor: Any, statement: str, path: Path, bac
         if backend == "db2" and _is_benign_db2_error(statement, exc):
             _LOG.debug("Skipping idempotent Db2 migration replay in %s: %s", path.name, _first_line(exc))
             return
+        # Db2 puts a table into reorg-pending after REORG-recommended ALTERs
+        # and then refuses everything else on it. 0050_lifecycle_workers.sql
+        # issues nine consecutive ALTERs against deletion_requests and then
+        # creates an index on it, so a real 6.0.1 database could not migrate
+        # to 6.1 at all:
+        #
+        #   SQL0668N Operation not allowed for reason code "7" on table
+        #   "DB2INST1.DELETION_REQUESTS"
+        #
+        # Reorganise and retry once. This is deliberately handled here rather
+        # than by adding a REORG to the .sql: migrations carry no
+        # applied-state table and are replayed on every start, so an
+        # unconditional REORG would rewrite the table on every boot. Doing it
+        # on the error means it runs only when Db2 actually asks for it.
+        if backend == "db2":
+            table = _db2_reorg_pending_table(exc)
+            if table:
+                _LOG.warning(
+                    "Db2 reports %s in reorg-pending state during %s; reorganising and retrying.",
+                    table,
+                    path.name,
+                )
+                await _maybe_await(cursor.execute, f"CALL SYSPROC.ADMIN_CMD('REORG TABLE {table}')")
+                await _maybe_await(cursor.execute, statement)
+                return
         raise RuntimeError(
             f"{backend.upper()} schema migration {path.name} failed at `{_statement_head(statement)}`: {exc}"
         ) from exc
