@@ -73,6 +73,60 @@ crash-looped forever after a restart following a partial-then-recovered
 prior migration run — every retry hit `SQL0803N`/`SQLSTATE=23505` on the
 same static `INSERT` and never got past schema replay to serve traffic.
 
+## [6.1.7] — 2026-08-18
+
+### Fixed — a dead rate-limit store still took the whole API down
+
+6.1.0 claimed this was fixed. It was not, on the path that actually fails.
+
+`SlowAPIMiddleware` resolves the handler for an error raised while checking
+limits like this:
+
+```python
+except Exception as e:
+    exception_handler = app.exception_handlers.get(
+        type(e), _rate_limit_exceeded_handler
+    )
+```
+
+That is an **exact-type** lookup, and `main.py` registers our fail-open handler
+only for `RateLimitExceeded`. When the store is unreachable the limiter raises
+its backend's error — `ConnectionError` for redis — which matches nothing, so
+slowapi falls back to its own handler, reads `exc.detail`, and raises
+
+```
+AttributeError: 'ConnectionError' object has no attribute 'detail'
+```
+
+straight out of `dispatch`: an unhandled 500 on **every** route, `/health`
+included, from a container that started cleanly. Registering the handler for
+`Exception` would not have helped either — the lookup is not subclass-aware,
+and the set of errors an arbitrary storage backend can raise is not
+enumerable.
+
+The 6.1.0 test passed throughout, because it called the handler directly and so
+never exercised the middleware.
+
+Fixed at the limiter instead: `_FailOpenLimiter._check_request_limit` re-raises
+`RateLimitExceeded` and swallows everything else with a loud warning, so slowapi
+never sees a non-`RateLimitExceeded` exception at all. This covers the
+`@limiter.limit()` decorator path as well as the middleware path.
+
+Swallowing alone was not sufficient. The middleware treats "no exception" as
+"limits were evaluated" and goes on to
+`_inject_headers(response, request.state.view_rate_limit)` — state that is only
+set by the check that just aborted. That merely traded one `AttributeError` for
+another. `_inject_headers` is now a no-op when no limit was evaluated.
+
+Reproduced on the arm64 6.1.6 image, where the `server` profile defaults
+`rate_limit.storage_uri` to `redis://localhost:6379/1` and the image ships no
+redis. Any host on that profile without a redis was dead on arrival; it now
+degrades to unlimited and says so in the log.
+
+`tests/test_rate_limit_middleware_store_outage.py` drives real requests through
+`SlowAPIMiddleware` with a store that raises, and fails against the stock
+limiter (5 of 7).
+
 ## [6.1.6] — 2026-08-18
 
 ### Fixed — federation sync failed on MariaDB with an AttributeError

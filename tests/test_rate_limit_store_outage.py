@@ -12,6 +12,13 @@ cleanly and reported "Application startup complete".
 
 Rate limiting is a protective measure. Losing its store must degrade to
 "unlimited", never to "the API is broken".
+
+NOTE: these tests call ``rate_limit_exception_handler`` DIRECTLY. That proves the
+handler's contract but NOT that it is reached. SlowAPIMiddleware resolves handlers
+by exact exception type, so a store outage (ConnectionError) never matches the
+``RateLimitExceeded`` registration and goes to slowapi's own handler instead --
+this file passed while the service was still returning 500 on every route. The
+middleware path is covered by tests/test_rate_limit_middleware_store_outage.py.
 """
 
 from __future__ import annotations
