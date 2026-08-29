@@ -101,6 +101,28 @@ def register_provider_manifest_reloader(reloader) -> None:
     _provider_manifest_reloader = reloader
 
 
+# Lifespan workers that drive themselves off the backend-neutral persistence
+# layer rather than the asyncpg pool, and are therefore safe to start when
+# _pool is None (SQLite / Oracle / Db2 / MySQL backends). Any worker missing
+# from this set is skipped outright on a non-PostgreSQL backend.
+#
+# "federation sync worker" belongs here: its factory resolves
+# lifecycle._persistence_backend, never the pool, so on SQLite it was
+# registered and then silently dropped — federation peers were pulled only by
+# an explicit POST /v1/federation/peers/{id}/sync, never on sync_interval_secs.
+# Profile gating still applies afterwards (the edge profile leaves it off until
+# MNEMOS_FEDERATION_ENABLED is set), so this only restores the operator's
+# opt-in, it does not turn the worker on by default.
+_POOL_FREE_LIFESPAN_WORKERS = frozenset(
+    {
+        "deletion_request_worker",
+        "hard_deletion_request_worker",
+        "persephone archival worker",
+        "federation sync worker",
+    }
+)
+
+
 def register_lifespan_worker(name: str, factory, *, honor_worker_enabled: bool = False) -> None:
     """Register an app worker factory called with the lifecycle DB pool."""
     _lifespan_worker_factories[name] = (factory, honor_worker_enabled)
@@ -954,11 +976,7 @@ async def lifespan(app):
     worker_handle = _pool if _pool is not None else _persistence_backend
     if worker_handle is not None:
         for worker_name, (factory, honor_worker_enabled) in _lifespan_worker_factories.items():
-            if _pool is None and worker_name not in {
-                "deletion_request_worker",
-                "hard_deletion_request_worker",
-                "persephone archival worker",
-            }:
+            if _pool is None and worker_name not in _POOL_FREE_LIFESPAN_WORKERS:
                 continue
             if honor_worker_enabled and not worker_enabled:
                 logger.info("%s disabled", worker_name)
