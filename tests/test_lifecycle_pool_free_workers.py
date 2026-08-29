@@ -52,6 +52,7 @@ def test_federation_sync_worker_is_allowed_without_a_postgres_pool():
             "hard_deletion_request_worker",
             "persephone archival worker",
             "federation sync worker",
+            "embedding worker",
         }
     ),
 )

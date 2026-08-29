@@ -1000,6 +1000,21 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             )
         return [{"id": row["id"], "content": row["content"]} for row in rows]
 
+    async def fetch_memories_missing_embeddings(self, tx: Transaction, limit: int) -> list[Row]:
+        # Two gaps on SQLite, both invisible to semantic_search, which joins
+        # memory_embeddings: a NULL column (federation pulls arrive with no
+        # vector), and a populated column with no join row (the inline
+        # create path -- see inline_embedding_searchable = False).
+        return await _fetch_all(
+            self._conn(tx),
+            "SELECT m.id AS id, m.content AS content FROM memories m "
+            "WHERE m.deleted_at IS NULL AND m.content IS NOT NULL AND m.content != '' "
+            "  AND (m.embedding IS NULL OR NOT EXISTS ("
+            "        SELECT 1 FROM memory_embeddings me WHERE me.memory_id = m.id)) "
+            "ORDER BY m.updated ASC LIMIT ?",
+            (limit,),
+        )
+
     async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
         self._require_dim(embedding, "upsert_memory_embedding")
         embedding_json = json.dumps([float(value) for value in embedding])

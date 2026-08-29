@@ -1263,6 +1263,29 @@ class OracleMemoryRepository(MemoryRepository):
         finally:
             await _call(cursor.close)
 
+    async def fetch_memories_missing_embeddings(self, tx: Transaction, limit: int) -> list[Row]:
+        # No `content <> ''` here, unlike the other backends: Oracle stores the
+        # empty string AS NULL, so `content IS NOT NULL` already excludes it.
+        # Without that guard an unembeddable row is re-selected every pass.
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, content
+                  FROM memories
+                 WHERE deleted_at IS NULL AND embedding IS NULL
+                   AND content IS NOT NULL
+                 ORDER BY updated ASC
+                 FETCH FIRST :row_limit ROWS ONLY
+                """,
+                {"row_limit": limit},
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
     async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
         """Write a precomputed embedding to memories.embedding.
 
