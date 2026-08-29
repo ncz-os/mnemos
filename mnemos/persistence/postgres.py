@@ -764,6 +764,16 @@ class PostgresMemoryRepository(MemoryRepository):
             await _queue_federation_nats_upsert_from_db(pg_tx, memory_id)
         return result
 
+    async def fetch_memories_missing_embeddings(self, tx: Transaction, limit: int) -> list[Row]:
+        conn = _postgres_tx(tx).conn
+        return await conn.fetch(
+            "SELECT id, content FROM memories "
+            "WHERE deleted_at IS NULL AND embedding IS NULL "
+            "  AND content IS NOT NULL AND content <> '' "
+            "ORDER BY updated ASC LIMIT $1",
+            limit,
+        )
+
     async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
         """Write a precomputed embedding vector to memories.embedding for the
         given memory_id. Idempotent; no-op when embedding is empty.

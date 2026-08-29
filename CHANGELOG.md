@@ -57,6 +57,36 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+### Added — embedding worker backfills memories semantic search cannot reach
+
+Embedding was inline-only: `create_memory` embeds on the write path and
+nothing ever revisited a row that missed out. Two ordinary paths left rows
+without a usable vector, and neither was visible in `/health` or in search
+results — a semantic query just quietly returned fewer rows.
+
+* **Federation pulls.** `/v1/federation/feed` ships `embedding_b64` only when
+  the peer sets `copy_embeddings`, and the consumer stores what it is given
+  rather than computing one. Every pulled row on a peer that does not copy
+  embeddings landed unembedded, so a federated replica could not answer a
+  semantic query about anything it had replicated.
+* **Inline writes on join-table backends.** SQLite and MariaDB read
+  `memory_embeddings` in `semantic_search` while the create path writes
+  `memories.embedding` — SQLite advertises this as
+  `inline_embedding_searchable = False`. Those rows held a vector and were
+  still unreachable.
+
+The new `mnemos.workers.embedding_worker` pairs a new backend-neutral
+`MemoryRepository.fetch_memories_missing_embeddings` with the existing
+`upsert_memory_embedding`, so it closes both gaps on every backend. "Missing"
+is per-dialect: a NULL column for the column-based backends (PostgreSQL,
+Oracle, Db2, MySQL), absence from the join table for SQLite and MariaDB.
+
+The worker is registered like its siblings and gated by the profile service
+manifest, with `MNEMOS_EMBEDDING_WORKER_ENABLED` as the operator override. It
+processes a small batch per pass and backs off when there is nothing to do. A
+backend that cannot enumerate unembedded rows raises `NotImplementedError` and
+the worker stops with a warning rather than looping while doing nothing.
+
 ### Fixed — federation sync worker never started on non-PostgreSQL backends
 
 The lifespan worker loop skips any registered worker missing from a

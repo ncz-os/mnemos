@@ -130,6 +130,7 @@ _POOL_FREE_LIFESPAN_WORKERS = frozenset(
         "hard_deletion_request_worker",
         "persephone archival worker",
         "federation sync worker",
+        "embedding worker",
     }
 )
 

@@ -1233,6 +1233,22 @@ class MysqlMemoryRepository(MemoryRepository):
             )
             return await _fetch_all_dicts(cursor)
 
+    async def fetch_memories_missing_embeddings(self, tx: Transaction, limit: int) -> list[Row]:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT id, content
+                  FROM memories
+                 WHERE deleted_at IS NULL AND embedding IS NULL
+                   AND content IS NOT NULL AND content <> ''
+                 ORDER BY updated ASC
+                 LIMIT %s
+                """,
+                (limit,),
+            )
+            return await _fetch_all_dicts(cursor)
+
     async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
         if not embedding:
             return

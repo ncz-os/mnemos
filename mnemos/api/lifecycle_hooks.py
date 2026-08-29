@@ -123,6 +123,21 @@ def _federation_sync_worker(pool: Any):
     return federation_worker_loop(backend)
 
 
+def _embedding_worker(pool: Any):
+    from mnemos.core.config import get_settings
+
+    if not service_enabled(get_settings(), "embedding_worker"):
+        logger.info("embedding worker disabled by profile service manifest")
+        return None
+
+    from mnemos.workers.embedding_worker import embedding_worker_loop
+
+    backend = lifecycle._persistence_backend
+    if backend is None:
+        raise RuntimeError("embedding worker requires an initialized persistence backend")
+    return embedding_worker_loop(backend)
+
+
 def _deletion_request_worker(pool: Any):
     from mnemos.core.config import get_settings
 
@@ -381,6 +396,7 @@ def register_lifespan_hooks() -> None:
     lifecycle.register_lifespan_worker("webhook retry repair worker", _webhook_repair_worker)
     lifecycle.register_lifespan_worker("webhook delivery recovery worker", _webhook_delivery_worker)
     lifecycle.register_lifespan_worker("federation sync worker", _federation_sync_worker)
+    lifecycle.register_lifespan_worker("embedding worker", _embedding_worker)
     lifecycle.register_post_db_startup_hook("federation nats consumers", _federation_nats_post_db_hook)
     lifecycle.register_post_db_startup_hook("webhook nats trigger", _webhook_nats_post_db_hook)
     lifecycle.register_post_db_startup_hook(

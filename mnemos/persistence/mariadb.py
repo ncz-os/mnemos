@@ -444,6 +444,27 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
                 return "INSERT 0 0"
             raise
 
+    async def fetch_memories_missing_embeddings(self, tx: Transaction, limit: int) -> list[Row]:
+        # MariaDB keeps vectors in memory_embeddings (see semantic_search's
+        # LEFT JOIN), not on memories.embedding, so the inherited MySQL
+        # column-NULL predicate would report every row as missing forever.
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT m.id AS id, m.content AS content
+                  FROM memories m
+                 WHERE m.deleted_at IS NULL
+                   AND m.content IS NOT NULL AND m.content <> ''
+                   AND NOT EXISTS (
+                       SELECT 1 FROM memory_embeddings me WHERE me.memory_id = m.id)
+                 ORDER BY m.updated ASC
+                 LIMIT %s
+                """,
+                (limit,),
+            )
+            return await _fetch_all_dicts(cursor)
+
     async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
         if not embedding:
             return

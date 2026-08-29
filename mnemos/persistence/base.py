@@ -119,6 +119,32 @@ class MemoryRepository(ABC):
     SEMANTIC_SCORE_COLUMN: str = "rank_score"
     SEMANTIC_SCORE_METRIC: str = "cosine_distance"
 
+    async def fetch_memories_missing_embeddings(
+        self,
+        tx: Transaction,
+        limit: int,
+    ) -> list[Row]:
+        """Rows that semantic_search cannot reach because they have no vector.
+
+        Returns ``(id, content)`` pairs, oldest-first, capped at ``limit``.
+
+        "Missing" is backend-specific, which is why this cannot live in the
+        worker. Column-based backends store the vector on ``memories.embedding``
+        and read it back from there, so a NULL column is the whole story. The
+        SQLite and MariaDB backends read ``memory_embeddings`` in
+        semantic_search while the inline create path writes only
+        ``memories.embedding`` (SQLite advertises this as
+        ``inline_embedding_searchable = False``), so a row can hold a vector and
+        still be unreachable -- those backends must also report rows absent from
+        the join table.
+
+        Backends that do not implement this raise NotImplementedError, and the
+        embedding worker disables itself rather than silently doing nothing.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement fetch_memories_missing_embeddings"
+        )
+
     @abstractmethod
     async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None: ...
 

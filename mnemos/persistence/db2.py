@@ -1092,6 +1092,26 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         finally:
             await _call(cursor.close)
 
+    async def fetch_memories_missing_embeddings(self, tx: Any, limit: int) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, content
+                  FROM memories
+                 WHERE deleted_at IS NULL AND embedding IS NULL
+                   AND content IS NOT NULL AND content <> ''
+                 ORDER BY updated ASC
+                 FETCH FIRST ? ROWS ONLY
+                """,
+                (limit,),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
     async def upsert_memory_embedding(self, tx: Any, memory_id: str, embedding: Sequence[float]) -> None:
         """Db2 override: positional bind (?) vs Oracle :name.
 
