@@ -57,6 +57,25 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+### Fixed — federation sync worker never started on non-PostgreSQL backends
+
+The lifespan worker loop skips any registered worker missing from a
+hardcoded allow-list when `_pool is None`, which is every non-PostgreSQL
+backend (SQLite, Oracle, Db2, MySQL). `"federation sync worker"` was
+registered but absent from that list, so on those backends it was dropped
+before its factory ran, with no log line either way.
+
+On a SQLite/edge node this meant federation peers were only ever pulled by
+an explicit `POST /v1/federation/peers/{id}/sync`; the configured
+`sync_interval_secs` did nothing, and `/v1/federation/status` still looked
+healthy because `last_error` stays null when no sync is attempted.
+
+The allow-list is now the `_POOL_FREE_LIFESPAN_WORKERS` constant and
+includes the federation sync worker, whose factory resolves the
+backend-neutral persistence layer and never touches the asyncpg pool.
+Profile gating is unchanged — the edge profile still leaves the worker off
+until `MNEMOS_FEDERATION_ENABLED` is set.
+
 ### Fixed — schema migration replay crash-loops on a seed-data unique-violation
 
 Static seed-data migrations (e.g. `0033_subscription_plans`) are replayed
