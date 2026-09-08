@@ -151,3 +151,30 @@ standardized.
    `clio.git`, `knemon.git` on ARGONAS still need their actual
    relationship to mnemos core confirmed (live-vs-superseded) — flagged
    in `AGENTS.md`'s "unconfirmed relationship" section, not resolved.
+
+## 6. Addendum — REST-surface drift check (found after the above was written)
+
+The new MCP OAuth server is a separate process that proxies to PYTHIA's
+LIVE `mnemos-api` container (`ghcr.io/ncz-os/mnemos-enterprise:6.1`), but
+was coded by reading the STALE 5.x-era `/opt/mnemos` checkout's route
+source — a real risk that the 6.x refactor changed request/response
+shapes underneath it. Spot-checked against the live container:
+
+- `memories.*`, `kg.*` routes: structurally identical (same paths,
+  methods, response models) despite `memories.py` growing from ~1300 to
+  2292+ lines. Low risk.
+- `consultations` route: file was renamed/moved (no longer
+  `api/routes/consultations.py`, exact new location not found — a sudo
+  session expired mid-check), but the route itself is live and accepts
+  the same request shape. Currently returns 503
+  `"Shared consultation quota storage is unavailable"` — a real,
+  **pre-existing, unrelated** infra issue (quota/Redis-shaped backend
+  down on PYTHIA), not caused by tonight's work, but worth fixing
+  separately.
+- **NOT YET CHECKED against the live 6.1 container**: `bulk_create_memories`,
+  `branch_memory`/`checkout_memory`/`diff_memory_commits`/`log_memory`
+  (DAG/versioning), `list_deletions`, `kronos_anomalies`/`kronos_forecast`,
+  `pantheon_list_models`/`pantheon_route_explain`, `recommend_model`,
+  `get_stats`. Any of these could have moved/changed shape in the 6.x
+  refactor the same way consultations did — don't assume they're fine
+  because memories/kg were.
