@@ -36,7 +36,8 @@ class TestOpenAIGatewayStructure:
         """OpenAI router is registered in app."""
         try:
             import mnemos.api.main as api_server
-            route_paths = {route.path for route in api_server.app.routes}
+            from tests.test_unit import _registered_route_paths
+            route_paths = _registered_route_paths(api_server.app)
             # Should have /v1/chat/completions and /v1/models endpoints
             v1_routes = {r for r in route_paths if '/v1/' in r}
             assert len(v1_routes) > 0, "No /v1/* routes found"
@@ -76,7 +77,8 @@ class TestSessionManagementStructure:
         """Sessions router is registered in app."""
         try:
             import mnemos.api.main as api_server
-            route_paths = {route.path for route in api_server.app.routes}
+            from tests.test_unit import _registered_route_paths
+            route_paths = _registered_route_paths(api_server.app)
             session_routes = {r for r in route_paths if '/sessions' in r}
             assert len(session_routes) > 0, "No /sessions routes found"
         except Exception as e:
@@ -118,7 +120,8 @@ class TestDAGImplementation:
         """DAG router is registered in app."""
         try:
             import mnemos.api.main as api_server
-            route_paths = {route.path for route in api_server.app.routes}
+            from tests.test_unit import _registered_route_paths
+            route_paths = _registered_route_paths(api_server.app)
             dag_routes = {r for r in route_paths if '/branches' in r or '/commits' in r}
             assert len(dag_routes) > 0, "No DAG routes found"
         except Exception as e:
@@ -323,7 +326,8 @@ class TestV3Surface:
         """Core v3 routes are mounted on the app."""
         try:
             import mnemos.api.main as api_server
-            route_paths = {route.path for route in api_server.app.routes}
+            from tests.test_unit import _registered_route_paths
+            route_paths = _registered_route_paths(api_server.app)
             expected_routes = {'/v1/memories', '/v1/consultations', '/health'}
             for route in expected_routes:
                 matching = {r for r in route_paths if route in r}

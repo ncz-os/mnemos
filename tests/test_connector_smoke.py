@@ -132,12 +132,26 @@ def _first_stdio_config(doc_path: Path) -> dict[str, Any]:
         if not isinstance(servers, dict):
             continue
         for cfg in servers.values():
+            if not isinstance(cfg, dict):
+                continue
+            # Direct invocation (canonical).
             if (
-                isinstance(cfg, dict)
-                and cfg.get("command") == "mnemos"
+                cfg.get("command") == "mnemos"
                 and cfg.get("args", [])[:2] == ["serve", "mcp-stdio"]
             ):
                 return cfg
+            # SSH-wrapped invocation (operator forwards MNEMOS_API_KEY
+            # across the SSH boundary; the local args include
+            # "mnemos serve mcp-stdio").  Project-local convention —
+            # keep this in sync with the docs/connectors/claude-code.md
+            # note about MNEMOS_API_KEY crossing the SSH boundary.
+            if cfg.get("command") == "ssh":
+                if any(
+                    isinstance(a, str) and a == "mnemos"
+                    for a in cfg.get("args", [])
+                ):
+                    return {"command": "mnemos", "args": ["serve", "mcp-stdio"],
+                            "env": {}}
 
     for block in _extract_fenced_blocks(text, "toml"):
         try:

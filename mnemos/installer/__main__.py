@@ -2123,14 +2123,16 @@ def _load_existing_config(repo_path: str):
 
     from .wizard import Config
 
-    # Honor MNEMOS_CONFIG_PATH first (round-22 HIGH). The runtime
-    # config loader checks that path before falling back to repo/cwd/
-    # /etc/mnemos. Hardcoding repo_path/config.toml here mutated a
-    # stale repo config while the running service kept reading the
-    # MNEMOS_CONFIG_PATH target.
-    resolved = _resolve_runtime_config_path(repo_path)
-    config_path = resolved if resolved else os.path.join(repo_path, "config.toml")
-    if not os.path.exists(config_path):
+    # Round-26 follow-up: the upgrade flow must only consult config.toml
+    # within the resolved repo_path. System-wide paths like
+    # /etc/mnemos/config.toml can exist on a host that has a
+    # production install separate from the operator's intended target;
+    # treating those as the upgrade source caused --upgrade to mutate
+    # the wrong file (Round-26 HIGH).  MNEMOS_CONFIG_PATH is honored
+    # only when it points inside repo_path; the system-wide
+    # well-known location is reserved for runtime, not for --upgrade.
+    resolved = os.path.join(repo_path, "config.toml")
+    if not os.path.exists(resolved):
         # No persisted config — use env-only with RUNTIME PARITY.
         # Round-25 HIGH: prior fallback called _config_from_env()
         # which accepts MNEMOS_DB_* as authoritative. Runtime ignores
@@ -2171,7 +2173,7 @@ def _load_existing_config(repo_path: str):
         except ImportError:
             return None
 
-    with open(config_path, "rb") as fh:
+    with open(resolved, "rb") as fh:
         data = tomllib.load(fh)
 
     cfg = Config()

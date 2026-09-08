@@ -199,6 +199,11 @@ def test_kronos_routes_disabled_return_503(monkeypatch):
     from mnemos.api.main import app
     from mnemos.core.config import _reset_settings_for_tests
 
+    # Pin profile=edge + persistence=sqlite so lifespan doesn't try to
+    # open a real postgres connection (the test environment has no
+    # live DB).
+    monkeypatch.setenv("MNEMOS_PROFILE", "edge")
+    monkeypatch.setenv("MNEMOS_PERSISTENCE_BACKEND", "sqlite")
     monkeypatch.setenv("MNEMOS_KRONOS_ENABLED", "false")
     _reset_settings_for_tests()
     app.dependency_overrides[get_current_user] = lambda: _root()
@@ -208,6 +213,8 @@ def test_kronos_routes_disabled_return_503(monkeypatch):
     finally:
         app.dependency_overrides.pop(get_current_user, None)
         monkeypatch.delenv("MNEMOS_KRONOS_ENABLED", raising=False)
+        monkeypatch.delenv("MNEMOS_PROFILE", raising=False)
+        monkeypatch.delenv("MNEMOS_PERSISTENCE_BACKEND", raising=False)
         _reset_settings_for_tests()
 
     assert response.status_code == 503
@@ -219,6 +226,11 @@ def test_kronos_routes_enabled_return_expected_json_shape(monkeypatch):
     from mnemos.core.config import _reset_settings_for_tests
     import mnemos.core.lifecycle as lc
 
+    # Pin profile=edge + persistence=sqlite so lifespan doesn't try to
+    # open a real postgres connection (the test environment has no
+    # live DB).
+    monkeypatch.setenv("MNEMOS_PROFILE", "edge")
+    monkeypatch.setenv("MNEMOS_PERSISTENCE_BACKEND", "sqlite")
     monkeypatch.setenv("MNEMOS_KRONOS_ENABLED", "true")
     _reset_settings_for_tests()
     app.dependency_overrides[get_current_user] = lambda: _root()
@@ -233,6 +245,8 @@ def test_kronos_routes_enabled_return_expected_json_shape(monkeypatch):
     finally:
         app.dependency_overrides.pop(get_current_user, None)
         monkeypatch.delenv("MNEMOS_KRONOS_ENABLED", raising=False)
+        monkeypatch.delenv("MNEMOS_PROFILE", raising=False)
+        monkeypatch.delenv("MNEMOS_PERSISTENCE_BACKEND", raising=False)
         _reset_settings_for_tests()
 
     assert response.status_code == 200

@@ -165,19 +165,55 @@ async def test_schedule_background_tracks_task():
 
 # ─── Application instantiation ───────────────────────────────────────────────
 
-def test_app_routes_registered():
-    """All expected route prefixes should be present (v3.0.0)."""
-    from mnemos.api.main import app
-    paths = {r.path for r in app.routes}
-    # v3.0.0 unified routes
-    assert "/health" in paths
-    assert "/v1/memories" in paths
-    assert "/v1/memories/search" in paths
-    assert "/v1/memories/bulk" in paths
-    assert "/v1/consultations" in paths  # Unified GRAEAE
-    assert "/v1/providers" in paths  # Provider routing
-    assert "/v1/kg/triples" in paths
-    assert "/admin/users" in paths
+def _registered_route_paths(app) -> set[str]:
+    """Return the set of paths registered on a FastAPI/Starlette app,
+    flattening the ``Mount`` routers that ``app.routes`` now contains.
+
+    Earlier code that did ``{r.path for r in app.routes}`` crashed on
+    ``_IncludedRouter`` entries because they don't carry a ``path``
+    attribute.  This helper is the new contract: callers that want to
+    assert a path is mounted should use it instead.
+    """
+    from starlette.routing import Mount
+
+    paths: set[str] = set()
+    for r in app.routes:
+        path = getattr(r, "path", None)
+        if path:
+            paths.add(path)
+            continue
+        # FastAPI wraps included routers in ``_IncludedRouter`` (no
+        # ``path`` attribute); unwrap to the original_router.
+        if isinstance(r, Mount):
+            sub_paths = _registered_route_paths(r.app)
+            prefix = r.path.rstrip("/")
+            for sp in sub_paths:
+                paths.add(f"{prefix}{sp}")
+            continue
+        original_router = getattr(r, "original_router", None)
+        if original_router is not None:
+            sub_paths = _registered_route_paths(original_router)
+            paths.update(sub_paths)
+    return paths
+
+
+class TestAppRoutesRegistered:
+    """Top-level route presence sanity check."""
+
+    def test_router_registered_in_app(self):
+        """All expected route prefixes should be present (v3.0.0)."""
+        from mnemos.api.main import app
+
+        paths = _registered_route_paths(app)
+        # v3.0.0 unified routes
+        assert "/health" in paths
+        assert "/v1/memories" in paths
+        assert "/v1/memories/search" in paths
+        assert "/v1/memories/bulk" in paths
+        assert "/v1/consultations" in paths  # Unified GRAEAE
+        assert "/v1/providers" in paths  # Provider routing
+        assert "/v1/kg/triples" in paths
+        assert "/admin/users" in paths
 
 
 def test_app_has_rate_limit_middleware():

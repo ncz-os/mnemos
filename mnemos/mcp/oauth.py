@@ -228,7 +228,27 @@ class OAuthService:
         return response
 
     async def authorize(self, request: Request):
+        """Step 1 of the OAuth 2.1 authorization code flow (with PKCE).
+
+        The admin passphrase MUST be supplied via the POST body — never the
+        query string. Query strings are logged by access logs, reverse
+        proxies (ngrok, Cloudflare), and browser history, so accepting the
+        passphrase there would leak it to anyone who can read those logs.
+
+        GET renders the approval form (no passphrase required to render the
+        page). The browser submits the form via POST with the passphrase in
+        the body. ``authorize_post`` is the only entry that consumes the
+        passphrase and grants a code.
+        """
         q = request.query_params
+        # Defense in depth: refuse any GET that carries a passphrase in the
+        # URL, even by accident. Real clients only POST it.
+        if "passphrase" in q:
+            return JSONResponse(
+                {"error": "invalid_request",
+                 "error_description": "passphrase must be sent in the POST body, not the query string"},
+                status_code=400,
+            )
         client_id, redirect_uri = q.get("client_id", ""), q.get("redirect_uri", "")
         client = await self.store.get_client(client_id)
         challenge = q.get("code_challenge", "")
@@ -236,24 +256,55 @@ class OAuthService:
             return JSONResponse({"error": "invalid_request", "error_description": "PKCE S256 is required"}, status_code=400)
         if not client or redirect_uri not in client["redirect_uris"]:
             return JSONResponse({"error": "invalid_request", "error_description": "unknown client or redirect_uri"}, status_code=400)
-        supplied = q.get("passphrase")
-        if supplied is None:
-            return HTMLResponse(
-                "<h1>Authorize MNEMOS MCP</h1><form method='post'>"
-                "<label>Admin passphrase <input name='passphrase' type='password' autofocus></label>"
-                + "".join(f"<input type='hidden' name='{k}' value='{_html(v)}'>" for k, v in q.multi_items() if k != "passphrase")
-                + "<button type='submit'>Approve</button></form>"
-            )
-        if not hmac.compare_digest(supplied, self.admin_passphrase):
-            return HTMLResponse("authorization denied", status_code=403)
-        return await self._grant_code(q, client)
+        # Render the approval page; the browser submits via POST.
+        return HTMLResponse(
+            "<h1>Authorize MNEMOS MCP</h1><form method='post'>"
+            "<label>Admin passphrase <input name='passphrase' type='password' autofocus></label>"
+            + "".join(f"<input type='hidden' name='{_html(k)}' value='{_html(v)}'>" for k, v in q.multi_items())
+            + "<button type='submit'>Approve</button></form>"
+        )
 
     async def authorize_post(self, request: Request):
+        """Step 2 of the flow: validate the form-posted passphrase and
+        issue an authorization code. Passphrase comes from the POST body
+        only; a query-string passphrase is rejected by ``authorize`` so
+        it can never reach this code path via the GET route."""
         form = await request.form()
-        # Keep passphrase in memory only; never put it in logs or redirect URLs.
+        # ``request.form()`` returns a Starlette ``FormData`` (multi-dict
+        # wrapper) with an ``.items()`` method.  Keep passphrase in
+        # memory only; never put it in logs or redirect URLs.
         data = {str(k): str(v) for k, v in form.items()}
+        supplied = data.pop("passphrase", None)
+        # Defense in depth: if the form also carries a passphrase query
+        # parameter (it shouldn't), reject.  This catches any path that
+        # bypasses the GET guard above.
+        if "passphrase" in request.query_params:
+            return JSONResponse(
+                {"error": "invalid_request",
+                 "error_description": "passphrase must be sent in the POST body, not the query string"},
+                status_code=400,
+            )
+        if supplied is None or not hmac.compare_digest(str(supplied), self.admin_passphrase):
+            return HTMLResponse("authorization denied", status_code=403)
+        client_id = data.get("client_id", "")
+        redirect_uri = data.get("redirect_uri", "")
+        challenge = data.get("code_challenge", "")
+        if data.get("response_type") != "code" \
+                or data.get("code_challenge_method") != "S256" or not challenge:
+            return JSONResponse(
+                {"error": "invalid_request",
+                 "error_description": "PKCE S256 is required"},
+                status_code=400,
+            )
+        client = await self.store.get_client(client_id)
+        if not client or redirect_uri not in client["redirect_uris"]:
+            return JSONResponse(
+                {"error": "invalid_request",
+                 "error_description": "unknown client or redirect_uri"},
+                status_code=400,
+            )
         request2 = type("QueryRequest", (), {"query_params": data})()
-        return await self.authorize(request2)  # type: ignore[arg-type]
+        return await self._grant_code(request2.query_params, client)
 
     async def _grant_code(self, q: Any, client: dict[str, Any]):
         code = secrets.token_urlsafe(32)

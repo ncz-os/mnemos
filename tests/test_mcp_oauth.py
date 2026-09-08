@@ -32,7 +32,7 @@ def _build_service(**overrides):
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro) if False else asyncio.new_event_loop().run_until_complete(coro)
+    return asyncio.new_event_loop().run_until_complete(coro)
 
 
 def test_jwt_round_trip_and_expiry():
@@ -78,12 +78,19 @@ def test_authorization_code_flow_issues_refreshable_jwt():
     reg = _run(service.register({"redirect_uris": ["https://client.example/cb"]}))
     cid = reg["client_id"]
     verifier = "verifier-32-bytes-1234567890abcdef"
+    # Authorize step renders the approval form (no passphrase in GET).
     request = _request({"response_type": "code", "client_id": cid,
         "redirect_uri": "https://client.example/cb", "code_challenge": mcp_oauth.pkce_s256(verifier),
-        "code_challenge_method": "S256", "state": "abc", "passphrase": "test-passphrase"})
+        "code_challenge_method": "S256", "state": "abc"})
     response = _run(service.authorize(request))
-    assert response.status_code == 303
-    location = response.headers["location"]
+    assert response.status_code == 200
+    # Step 2: POST the passphrase in the form body.
+    approval = _form_post({"response_type": "code", "client_id": cid,
+        "redirect_uri": "https://client.example/cb", "code_challenge": mcp_oauth.pkce_s256(verifier),
+        "code_challenge_method": "S256", "state": "abc", "passphrase": "test-passphrase"})
+    code_response = _run(service.authorize_post(approval))
+    assert code_response.status_code == 303
+    location = code_response.headers["location"]
     assert "code=" in location and "state=abc" in location
     code = parse_qs(urlparse(location).query)["code"][0]
     token_response = _run(service.token({"grant_type": "authorization_code", "code": code,
@@ -109,10 +116,12 @@ def test_pkce_is_enforced_not_optional():
         "redirect_uri": "https://client.example/cb", "code_challenge": "abc"})
     bad = _run(service.authorize(request))
     assert bad.status_code == 400
-    request2 = _request({"response_type": "code", "client_id": cid,
+    # Step 2 via POST with passphrase.
+    approval = _form_post({"response_type": "code", "client_id": cid,
         "redirect_uri": "https://client.example/cb", "code_challenge": mcp_oauth.pkce_s256("any"),
         "code_challenge_method": "S256", "passphrase": "test-passphrase"})
-    ok = _run(service.authorize(request2))
+    ok = _run(service.authorize_post(approval))
+    assert ok.status_code == 303
     code = parse_qs(urlparse(ok.headers["location"]).query)["code"][0]
     bad_token = _run(service.token({"grant_type": "authorization_code", "code": code,
         "client_id": cid, "redirect_uri": "https://client.example/cb", "code_verifier": "WRONG"}))
@@ -123,19 +132,22 @@ def test_passphrase_is_required_and_never_logged(caplog):
     service = _build_service(admin_passphrase="topsecret-1234")
     reg = _run(service.register({"redirect_uris": ["https://client.example/cb"]}))
     cid = reg["client_id"]
+    # GET (no passphrase) renders the approval form, which must not contain
+    # the real passphrase anywhere.
     missing = _run(service.authorize(_request({"response_type": "code", "client_id": cid,
         "redirect_uri": "https://client.example/cb",
         "code_challenge": mcp_oauth.pkce_s256("vvv"), "code_challenge_method": "S256"})))
     assert missing.status_code == 200
     assert "topsecret-1234" not in missing.body.decode("utf-8")
-    wrong = _run(service.authorize(_request({"response_type": "code", "client_id": cid,
+    # Wrong passphrase via POST is rejected.
+    wrong = _run(service.authorize_post(_form_post({"response_type": "code", "client_id": cid,
         "redirect_uri": "https://client.example/cb",
         "code_challenge": mcp_oauth.pkce_s256("vvv"), "code_challenge_method": "S256",
         "passphrase": "wrong"})))
     assert wrong.status_code == 403
     caplog.clear()
     with caplog.at_level("DEBUG"):
-        _run(service.authorize(_request({"response_type": "code", "client_id": cid,
+        _run(service.authorize_post(_form_post({"response_type": "code", "client_id": cid,
             "redirect_uri": "https://client.example/cb",
             "code_challenge": mcp_oauth.pkce_s256("vvv"), "code_challenge_method": "S256",
             "passphrase": "topsecret-1234"})))
@@ -143,7 +155,52 @@ def test_passphrase_is_required_and_never_logged(caplog):
         assert "topsecret-1234" not in record.getMessage()
 
 
+def test_query_string_passphrase_is_rejected():
+    """Defense in depth: passphrase in the URL query string is refused
+    even by the GET path. This prevents the secret from ending up in
+    access logs, proxy logs, and browser history."""
+    service = _build_service(admin_passphrase="topsecret-1234")
+    reg = _run(service.register({"redirect_uris": ["https://client.example/cb"]}))
+    cid = reg["client_id"]
+    # GET with passphrase in the query string must 400.
+    leaked = _run(service.authorize(_request({"response_type": "code", "client_id": cid,
+        "redirect_uri": "https://client.example/cb",
+        "code_challenge": mcp_oauth.pkce_s256("vvv"), "code_challenge_method": "S256",
+        "passphrase": "topsecret-1234"})))
+    assert leaked.status_code == 400
+    assert "topsecret-1234" not in leaked.body.decode("utf-8")
+    # POST with passphrase in the query string must also 400, even if the
+    # body is correct.
+    leaked_post = _run(service.authorize_post(_form_post({
+        "response_type": "code", "client_id": cid,
+        "redirect_uri": "https://client.example/cb",
+        "code_challenge": mcp_oauth.pkce_s256("vvv"), "code_challenge_method": "S256",
+        "passphrase": "topsecret-1234",
+    }, query={"passphrase": "topsecret-1234"})))
+    assert leaked_post.status_code == 400
+    assert "topsecret-1234" not in leaked_post.body.decode("utf-8")
+
+
 def _request(params: dict):
     scope = {"type": "http", "method": "GET", "path": "/oauth/authorize",
              "query_string": urlencode(params).encode("ascii")}
     return Request(scope)
+
+
+class _FormPostRequest:
+    """Hand-rolled Starlette request stub that mimics ``request.form()``
+    for the authorize-post code path without depending on httpx."""
+
+    def __init__(self, data: dict[str, str], query: dict[str, str] | None = None):
+        self._data = data
+        self.query_params = query or {}
+
+    async def form(self):
+        from starlette.datastructures import FormData
+        # Return a FormData (real Starlette object) so the production
+        # code's ``form.items()`` and ``form.multi_items()`` work.
+        return FormData(list(self._data.items()))
+
+
+def _form_post(data: dict[str, str], query: dict[str, str] | None = None):
+    return _FormPostRequest(data, query=query)

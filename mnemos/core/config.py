@@ -812,6 +812,23 @@ def _apply_profile_defaults(settings: Settings) -> None:
 
 
 def _load_toml() -> dict[str, Any]:
+    """Load the active MNEMOS TOML config.
+
+    If ``MNEMOS_CONFIG_PATH`` is explicitly set, it is treated as the
+    sole source of truth: a missing path is a hard error-equivalent
+    (empty config) rather than a silent fallback to one of the well-
+    known locations.  This prevents test fixtures that point
+    ``MNEMOS_CONFIG_PATH`` at a temp file from accidentally inheriting
+    settings from the project-local ``config.toml``.
+    """
+    configured_path = os.environ.get("MNEMOS_CONFIG_PATH", "").strip()
+    if configured_path:
+        path = Path(configured_path).expanduser()
+        if not path.exists():
+            return {}
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+        return data if isinstance(data, dict) else {}
     for toml_path in _config_paths():
         if toml_path.exists():
             with toml_path.open("rb") as f:

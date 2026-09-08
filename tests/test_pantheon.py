@@ -77,6 +77,11 @@ def pantheon_client(monkeypatch):
     import mnemos.domain.pantheon.catalog as pantheon_catalog
     import mnemos.domain.pantheon.gateway as pantheon_gateway
 
+    # Pin profile=edge + persistence=sqlite so lifespan doesn't try to
+    # open a real postgres connection (the test environment has no
+    # live DB).
+    monkeypatch.setenv("MNEMOS_PROFILE", "edge")
+    monkeypatch.setenv("MNEMOS_PERSISTENCE_BACKEND", "sqlite")
     monkeypatch.setenv("MNEMOS_PANTHEON_ENABLED", "true")
     monkeypatch.setenv("MNEMOS_PANTHEON_DEFAULT_QUALITY_FLOOR", "0.90")
     monkeypatch.setenv("MNEMOS_PANTHEON_DEFAULT_MAX_COST", "10.0")
@@ -97,6 +102,8 @@ def pantheon_client(monkeypatch):
         monkeypatch.delenv("MNEMOS_PANTHEON_ENABLED", raising=False)
         monkeypatch.delenv("MNEMOS_PANTHEON_DEFAULT_QUALITY_FLOOR", raising=False)
         monkeypatch.delenv("MNEMOS_PANTHEON_DEFAULT_MAX_COST", raising=False)
+        monkeypatch.delenv("MNEMOS_PROFILE", raising=False)
+        monkeypatch.delenv("MNEMOS_PERSISTENCE_BACKEND", raising=False)
         _reset_settings_for_tests()
 
 
@@ -104,6 +111,11 @@ def test_models_disabled_returns_503(monkeypatch):
     from mnemos.api.main import app
     from mnemos.core.config import _reset_settings_for_tests
 
+    # Pin profile=edge + persistence=sqlite so lifespan doesn't try to
+    # open a real postgres connection (the test environment has no
+    # live DB).
+    monkeypatch.setenv("MNEMOS_PROFILE", "edge")
+    monkeypatch.setenv("MNEMOS_PERSISTENCE_BACKEND", "sqlite")
     monkeypatch.setenv("MNEMOS_PANTHEON_ENABLED", "false")
     _reset_settings_for_tests()
     app.dependency_overrides[get_current_user] = lambda: _user()
@@ -113,6 +125,8 @@ def test_models_disabled_returns_503(monkeypatch):
     finally:
         app.dependency_overrides.pop(get_current_user, None)
         monkeypatch.delenv("MNEMOS_PANTHEON_ENABLED", raising=False)
+        monkeypatch.delenv("MNEMOS_PROFILE", raising=False)
+        monkeypatch.delenv("MNEMOS_PERSISTENCE_BACKEND", raising=False)
         _reset_settings_for_tests()
 
     assert response.status_code == 503

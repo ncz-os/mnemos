@@ -46,15 +46,21 @@ def _extract_mcp_paths() -> list[str]:
 def _registered_prefixes() -> list[str]:
     """Enumerate the static prefixes of every route registered in the
     FastAPI app. Returns prefixes suitable for startswith() matching
-    against mnemos/mcp/tools/ literal path prefixes."""
+    against mnemos/mcp/tools/ literal path prefixes.
+
+    The FastAPI app uses ``_IncludedRouter`` for every included
+    router, so this helper walks ``app.routes`` plus each included
+    router's ``original_router.routes`` (and ``Mount.app.routes``
+    recursively for any ``Mount`` entries) to recover the full set
+    of registered paths.
+    """
     # Import lazily — the app import chain pulls in asyncpg / pgvector
     # stubs, which conftest.py sets up.
     from mnemos.api.main import app  # noqa: E402
+    from tests.test_unit import _registered_route_paths
+    paths = _registered_route_paths(app)
     prefixes: set[str] = set()
-    for route in app.routes:
-        path = getattr(route, "path", "")
-        if not path:
-            continue
+    for path in paths:
         # Strip FastAPI path params ({memory_id}) — we only compare on
         # the static segments.
         static = re.sub(r"\{[^}]+\}", "", path).rstrip("/")

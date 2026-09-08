@@ -43,7 +43,8 @@ class TestWebhookModuleWiring:
 
     def test_router_registered_in_app(self):
         import mnemos.api.main as api_server
-        paths = {r.path for r in api_server.app.routes}
+        from tests.test_unit import _registered_route_paths
+        paths = _registered_route_paths(api_server.app)
         webhook_paths = [p for p in paths if p.startswith("/v1/webhooks")]
         assert len(webhook_paths) >= 3, f"expected webhook routes, got: {webhook_paths}"
 
