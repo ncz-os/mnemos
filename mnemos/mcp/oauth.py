@@ -8,6 +8,7 @@ in-memory store is useful for isolated tests and explicit development use.
 from __future__ import annotations
 
 import base64
+import json
 import hashlib
 import hmac
 import os
@@ -103,12 +104,15 @@ class PostgresOAuthStore:
             return row["signing_key"] if row else None
 
     async def save_client(self, row: dict[str, Any]) -> None:
+        redirect_uris = row["redirect_uris"]
+        if isinstance(redirect_uris, list):
+            redirect_uris = json.dumps(redirect_uris)
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO oauth_mcp_clients
                    (client_id, client_secret, redirect_uris, token_endpoint_auth_method)
                    VALUES ($1, $2, $3, $4)""",
-                row["client_id"], row.get("client_secret"), row["redirect_uris"],
+                row["client_id"], row.get("client_secret"), redirect_uris,
                 row["token_endpoint_auth_method"],
             )
 
@@ -165,6 +169,18 @@ class PostgresOAuthStore:
         async with self.pool.acquire() as conn:
             await conn.execute(
                 "UPDATE oauth_mcp_tokens SET revoked_at = NOW() WHERE jti = $1", jti,
+            )
+
+    async def save_signing_key(self, *, key_id: str, signing_key: str) -> None:
+        """Persist a signing key. Idempotent on (key_id); the first
+        writer wins via ``ON CONFLICT DO NOTHING`` so concurrent
+        first-boots don't clobber each other's key."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO oauth_mcp_signing_keys (key_id, signing_key)
+                   VALUES ($1, $2)
+                   ON CONFLICT (key_id) DO NOTHING""",
+                key_id, signing_key,
             )
 
 
@@ -369,14 +385,43 @@ def set_oauth_service(service: OAuthService | None) -> None:
 
 
 def get_oauth_service() -> OAuthService:
+    """Return the process-wide OAuth service singleton.
+
+    The first caller resolves the signing key from, in priority order:
+
+      1. ``MNEMOS_OAUTH_SIGNING_KEY`` env / config (explicit operator override).
+      2. The persistent store (only ``PostgresOAuthStore`` exposes
+         ``get_signing_key``); on a cold start against Postgres with an
+         empty ``oauth_mcp_signing_keys`` table, the startup path
+         generates a fresh 32-byte key and persists it.
+      3. Otherwise a missing signing key is a hard error — we will not
+         silently fall back to a generated ephemeral key, because that
+         would invalidate every previously-issued refresh token on the
+         next restart.
+
+    The store passed in is whatever the caller installed via
+    ``set_oauth_service()`` at startup; if no service has been installed
+    yet, an in-memory store is used so import-time callers and the
+    bare ``mcp_http_app`` test fixture continue to work without
+    Postgres. Production deploys that want persistence set
+    ``MNEMOS_OAUTH_DATABASE_URL``; ``mcp/http.py``'s lifespan then
+    builds an asyncpg pool, a ``PostgresOAuthStore``, and calls
+    ``set_oauth_service`` before any request lands.
+    """
     global _service
     if _service is None:
+        from mnemos.core.config import get_settings  # local to keep this module import-light
+
         settings = get_settings()
         key = settings.oauth.signing_key
-        # The key may be supplied by environment/config; otherwise production
-        # startup obtains it from the PG store. An explicit key is preferred.
         if not key:
-            raise RuntimeError("MNEMOS_OAUTH_SIGNING_KEY is not configured")
+            raise RuntimeError(
+                "MNEMOS_OAUTH_SIGNING_KEY is not configured and no service "
+                "with a persistent signing key has been installed via "
+                "set_oauth_service(). Set MNEMOS_OAUTH_SIGNING_KEY, or "
+                "start the server with MNEMOS_OAUTH_DATABASE_URL so the "
+                "Postgres-backed store can provide it."
+            )
         _service = OAuthService(base_url=settings.server.base, signing_key=key,
             store=InMemoryOAuthStore(), registration_secret=settings.oauth.registration_secret,
             admin_passphrase=settings.oauth.admin_passphrase)

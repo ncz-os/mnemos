@@ -31,6 +31,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import secrets
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -786,16 +787,89 @@ async def _drain_audit_tasks_on_shutdown() -> None:
 
 @asynccontextmanager
 async def _mcp_http_lifespan(_app: Starlette):
-    """Lifespan context manager wrapping the audit-drain on
-    shutdown. Replaces the pre-Starlette-1.0 `on_shutdown=[...]`
-    kwarg, which was removed in Starlette 1.0.0
-    (deprecated in 0.x). Caught by the PROTEUS fresh-install
-    barrage on 2026-05-08; a fresh install on Python 3.13 + the
-    current Starlette pin would 9-fail in test_mcp_nats_sse +
-    test_mcp_http_health + test_connector_smoke without this.
+    """Lifespan context manager.
+
+    Responsibilities (in order):
+
+      1. If ``MNEMOS_OAUTH_DATABASE_URL`` is set, build an asyncpg pool,
+         a ``PostgresOAuthStore`` against it, and register a real
+         ``OAuthService`` via ``set_oauth_service()`` BEFORE any request
+         lands. On shutdown, close the pool. This is the fix that makes
+         clients / auth-codes / tokens / refresh-tokens survive a
+         process restart; without it ``get_oauth_service()`` lazily
+         builds an ``InMemoryOAuthStore`` and every restart wipes
+         everything.
+
+      2. Round-3 residual #2 of #146 (#149): drain in-flight MCP audit
+         persist tasks before the loop closes. (Pre-existing
+         behavior.)
     """
-    yield
-    await _drain_audit_tasks_on_shutdown()
+    import os
+    import asyncpg
+
+    from mnemos.mcp import oauth as _oauth_module
+
+    pool = None
+    dsn = os.environ.get("MNEMOS_OAUTH_DATABASE_URL", "").strip()
+    if dsn:
+        try:
+            pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4)
+        except Exception as exc:
+            logger.error(
+                "MNEMOS_OAUTH_DATABASE_URL is set but asyncpg.create_pool "
+                "failed (%s); falling back to in-memory OAuth store. "
+                "Clients/codes/tokens WILL NOT persist across restarts.",
+                exc,
+                exc_info=True,
+            )
+            pool = None
+    if pool is not None:
+        try:
+            settings = get_settings()
+            store = _oauth_module.PostgresOAuthStore(pool)
+            signing_key = settings.oauth.signing_key or await store.get_signing_key()
+            if not signing_key:
+                signing_key = secrets.token_urlsafe(32)
+                await store.save_signing_key(
+                    key_id="default", signing_key=signing_key,
+                )
+                logger.info(
+                    "OAuth signing key generated and persisted to "
+                    "oauth_mcp_signing_keys (key_id=default) on first boot."
+                )
+            service = _oauth_module.OAuthService(
+                base_url=settings.server.base,
+                signing_key=signing_key,
+                store=store,
+                registration_secret=settings.oauth.registration_secret,
+                admin_passphrase=settings.oauth.admin_passphrase,
+            )
+            _oauth_module.set_oauth_service(service)
+            logger.info(
+                "OAuth store wired to Postgres (env MNEMOS_OAUTH_DATABASE_URL)."
+            )
+        except Exception as exc:
+            logger.exception(
+                "Failed to construct Postgres-backed OAuth service (%s); "
+                "leaving OAuth store unset.",
+                exc,
+            )
+            if pool is not None:
+                await pool.close()
+                pool = None
+
+    try:
+        yield
+    finally:
+        # Restore the in-memory default so a re-import in the same
+        # process (the test fixture pattern) starts from a clean slate.
+        _oauth_module.set_oauth_service(None)
+        if pool is not None:
+            try:
+                await pool.close()
+            except Exception:
+                logger.exception("Failed to close OAuth asyncpg pool on shutdown")
+        await _drain_audit_tasks_on_shutdown()
 
 
 starlette_app = Starlette(
