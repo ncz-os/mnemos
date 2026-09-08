@@ -171,6 +171,36 @@ async def _publish_nats_with_timeout(
             logger.warning("NATS publish retry scheduling failed for %s: %s", subject, exc)
 
 
+_BULK_PUBLISH_CONCURRENCY = 16
+
+
+async def _publish_bulk_created_events(
+    events: list[dict],
+    source_node: str,
+) -> None:
+    """Publish bulk-create NATS events with bounded concurrency.
+
+    The per-item transaction/dedup/insert path stays serial because it owns
+    the per-item ``errors[]`` contract; only these fire-and-forget publishes
+    are overlapped, so a 1,000-item bulk no longer costs 1,000 sequential
+    publish round trips.
+    """
+    if not events:
+        return
+    sem = asyncio.Semaphore(_BULK_PUBLISH_CONCURRENCY)
+
+    async def _publish_one(event: dict) -> None:
+        safe_ns = (event["namespace"] or "default").replace(".", "_")
+        async with sem:
+            await _publish_nats_with_timeout(
+                f"mnemos.memory.created.{safe_ns}",
+                {**event, "source_node": source_node},
+                msg_id=f"{event['memory_id']}.created",
+            )
+
+    await asyncio.gather(*(_publish_one(event) for event in events))
+
+
 async def _invalidate_caches_after_mutation() -> None:
     """Drop /stats + per-user search cache entries on any memory write."""
     if not _lc._cache:
@@ -1076,13 +1106,7 @@ async def bulk_create_memories(
     _schedule_outbox_deliveries(delivery_ids)
     from mnemos.nats.client import get_node_name as _nats_get_node_name
     source_node = _nats_get_node_name()
-    for event in nats_created_events:
-        safe_ns = (event["namespace"] or "default").replace(".", "_")
-        await _publish_nats_with_timeout(
-            f"mnemos.memory.created.{safe_ns}",
-            {**event, "source_node": source_node},
-            msg_id=f"{event['memory_id']}.created",
-        )
+    await _publish_bulk_created_events(nats_created_events, source_node)
     await _invalidate_caches_after_mutation()
     return BulkCreateResponse(created=len(created_ids), memory_ids=created_ids, errors=errors)
 

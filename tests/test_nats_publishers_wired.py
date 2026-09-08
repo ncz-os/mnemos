@@ -249,3 +249,46 @@ async def test_webhook_create_publishes_subscription_created(
         "source_node": NODE_NAME,
     }
     assert publish_mock.await_args.kwargs["msg_id"] == f"webhook.{webhook_id}.subscription.created"
+
+
+# ── Audit finding: bulk create awaited one NATS publish at a time, so a
+# 1,000-item request cost 1,000 sequential publish round trips. The per-item
+# transaction/dedup path stays serial because it owns the errors[] contract;
+# only the fire-and-forget publishes are overlapped.
+
+
+async def test_bulk_create_publishes_are_overlapped(
+    client,
+    auth_headers: dict[str, str],
+    current_user_override,
+    publish_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import asyncio
+
+    install_fake_backend(monkeypatch)
+
+    state = {"in_flight": 0, "peak": 0}
+
+    async def _tracked_publish(*_args, **_kwargs):
+        state["in_flight"] += 1
+        state["peak"] = max(state["peak"], state["in_flight"])
+        try:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        finally:
+            state["in_flight"] -= 1
+
+    publish_mock.side_effect = _tracked_publish
+
+    resp = await client.post(
+        "/v1/memories/bulk",
+        json={"memories": [{"content": f"item {i}"} for i in range(8)]},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert publish_mock.await_count == 8
+    assert state["peak"] > 1, (
+        "bulk-create NATS publishes are still fully serialised"
+    )
