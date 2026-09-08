@@ -105,6 +105,9 @@ class _Conn:
         compact = " ".join(sql.split())
 
         if compact.startswith("UPDATE memories SET consolidated_into=$2"):
+            assert "id = ANY($1::text[])" in compact, (
+                "phase_consolidate must batch the per-member UPDATE"
+            )
             return self._execute_consolidate_update(*args)
         if compact.startswith("UPDATE memories SET consolidated_into = NULL"):
             return self._execute_restore(*args)
@@ -134,21 +137,39 @@ class _Conn:
 
     def _execute_consolidate_update(
         self,
-        memory_id: str,
+        memory_ids: list[str],
         canonical_id: str,
         run_id: str,
         namespace: str | None,
         permission_mode: int,
     ) -> str:
+        # phase_consolidate now issues ONE set-based UPDATE per cluster
+        # (id = ANY($1::text[])) instead of one round trip per member.
+        updated = 0
+        for memory_id in memory_ids:
+            if self._consolidate_one(
+                memory_id, canonical_id, run_id, namespace, permission_mode
+            ):
+                updated += 1
+        return f"UPDATE {updated}"
+
+    def _consolidate_one(
+        self,
+        memory_id: str,
+        canonical_id: str,
+        run_id: str,
+        namespace: str | None,
+        permission_mode: int,
+    ) -> bool:
         row = self.memories.get(memory_id)
         if row is None or row.get("deleted_at") is not None:
-            return "UPDATE 0"
+            return False
         if row.get("archived_at") is not None:
-            return "UPDATE 0"
+            return False
         if row.get("consolidated_into") is not None or row.get("morpheus_run_id") is not None:
-            return "UPDATE 0"
+            return False
         if namespace is not None and row.get("namespace") != namespace:
-            return "UPDATE 0"
+            return False
 
         metadata = dict(row.get("metadata") or {})
         metadata.setdefault("pre_consolidate_permission_mode", row["permission_mode"])
@@ -162,7 +183,7 @@ class _Conn:
             "permission_mode": permission_mode,
             "metadata": dict(metadata),
         })
-        return "UPDATE 1"
+        return True
 
     def _execute_restore(self, run_id: str, metadata_key: str) -> str:
         restored = 0

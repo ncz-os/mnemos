@@ -365,6 +365,25 @@ class _MorpheusSettings(BaseSettings):
     extract_min_confidence: float = Field(0.6, validation_alias="MNEMOS_MORPHEUS_EXTRACT_MIN_CONFIDENCE")
     extract_muse: str = Field("qwen3-7b", validation_alias="MNEMOS_MORPHEUS_EXTRACT_MUSE")
     extract_verifier: str = Field("openai", validation_alias="MNEMOS_MORPHEUS_EXTRACT_VERIFIER")
+    # Hard ceilings on the per-run candidate sets. CLUSTER is O(n^2 * d) in the
+    # number of distinct clusters and EXTRACT makes one (or two) LLM calls per
+    # candidate — both inside a synchronous, root-triggered HTTP request. Without
+    # a LIMIT a single run pulls the whole historical backlog into that request.
+    max_cluster_candidates: int = Field(
+        5000, validation_alias="MNEMOS_MORPHEUS_MAX_CLUSTER_CANDIDATES"
+    )
+    max_extract_candidates: int = Field(
+        500, validation_alias="MNEMOS_MORPHEUS_MAX_EXTRACT_CANDIDATES"
+    )
+
+    @field_validator("max_cluster_candidates", "max_extract_candidates", mode="before")
+    @classmethod
+    def _positive_candidate_cap(cls, raw: Any) -> int:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 1
+        return max(value, 1)
 
 
 class _PersephoneSettings(BaseSettings):

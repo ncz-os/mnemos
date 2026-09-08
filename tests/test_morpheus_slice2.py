@@ -444,3 +444,60 @@ async def test_phase_synthesise_inherits_majority_category():
     assert insert is not None
     # args[2] is category in the INSERT VALUES order.
     assert insert[1][2] == "decisions"
+
+
+# ── Audit finding: phase_cluster had no LIMIT on its window scan ────────────
+# The scan materialised every row in the window and then compared each one
+# against every accumulated cluster — O(n^2 * d) work with no ceiling, in a
+# synchronous request that accepts a window of up to 8,760 hours.
+
+
+@pytest.mark.asyncio
+async def test_phase_cluster_query_carries_a_limit(monkeypatch):
+    """The candidate query binds an explicit LIMIT taken from
+    MNEMOS_MORPHEUS_MAX_CLUSTER_CANDIDATES."""
+    from mnemos.core import config as core_config
+
+    monkeypatch.setenv("MNEMOS_MORPHEUS_MAX_CLUSTER_CANDIDATES", "7")
+    core_config._reset_settings_for_tests()
+    try:
+        run_row = {
+            "cluster_min_size": 1,
+            "window_started_at": "2026-04-25T00:00:00",
+            "window_ended_at": "2026-04-25T23:59:59",
+            "namespace": None,
+        }
+        captured: list = []
+
+        class _CapturingConn:
+            async def fetchrow(self, *_args, **_kwargs):
+                return run_row
+
+            async def fetch(self, sql, *args, **_kwargs):
+                captured.append((" ".join(sql.split()), args))
+                return []
+
+            async def execute(self, *_args, **_kwargs):
+                return "OK"
+
+        conn = _CapturingConn()
+
+        class _CapturingPool:
+            def acquire(self_inner):
+                class _Ctx:
+                    async def __aenter__(self_ctx):
+                        return conn
+
+                    async def __aexit__(self_ctx, *_exc):
+                        return False
+
+                return _Ctx()
+
+        await phase_cluster(_CapturingPool(), "00000000-0000-0000-0000-0000000000c1")
+
+        assert captured, "phase_cluster did not call fetch"
+        sql, args = captured[0]
+        assert "LIMIT $4" in sql, "phase_cluster must bound its window scan"
+        assert args[-1] == 7
+    finally:
+        core_config._reset_settings_for_tests()

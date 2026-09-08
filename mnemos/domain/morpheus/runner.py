@@ -547,7 +547,9 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
     key "clusters" so phase_synthesise can consume them without a
     separate table.
     """
-    threshold = get_settings().morpheus.cluster_threshold
+    _morpheus = get_settings().morpheus
+    threshold = _morpheus.cluster_threshold
+    max_candidates = max(1, int(_morpheus.max_cluster_candidates))
 
     async with pool.acquire() as conn:
         run_row = await conn.fetchrow(
@@ -572,9 +574,18 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
               AND {eligible_for_morpheus('')}
               AND ($3::text IS NULL OR namespace = $3)
             ORDER BY created
+            LIMIT $4
             """,
             run_row["window_started_at"], run_row["window_ended_at"],
-            run_row["namespace"],
+            run_row["namespace"], max_candidates,
+        )
+
+    if len(rows) >= max_candidates:
+        logger.warning(
+            "[MORPHEUS] run %s clustered only the first %d memor%s in the window "
+            "(MNEMOS_MORPHEUS_MAX_CLUSTER_CANDIDATES); narrow window_hours or "
+            "raise the cap to cover the rest",
+            run_id, max_candidates, "y" if max_candidates == 1 else "ies",
         )
 
     if not rows:
@@ -749,11 +760,16 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
                 namespace,
             ) or 0)
 
-        for row in rows:
-            member_id = str(row["id"])
-            if member_id == canonical_id:
-                continue
-
+        member_updates = [
+            str(row["id"])
+            for row in rows
+            if str(row["id"]) != canonical_id
+        ]
+        if member_updates:
+            # One set-based UPDATE per cluster rather than an acquire()+UPDATE
+            # per member: the predicate is identical for every non-canonical
+            # member, so ANY($1::text[]) selects exactly the same rows in a
+            # single round trip.
             async with pool.acquire() as conn:
                 result = await conn.execute(
                     """
@@ -773,14 +789,14 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
                                 true
                             )
                         END
-                    WHERE id=$1
+                    WHERE id = ANY($1::text[])
                       AND deleted_at IS NULL
                       AND archived_at IS NULL
                       AND consolidated_into IS NULL
                       AND morpheus_run_id IS NULL
                       AND ($4::text IS NULL OR namespace=$4)
                     """,
-                    member_id,
+                    member_updates,
                     canonical_id,
                     run_id,
                     namespace,
@@ -922,7 +938,8 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
 
     async with pool.acquire() as conn:
         run_row = await conn.fetchrow(
-            "SELECT config, namespace FROM morpheus_runs WHERE id=$1::uuid",
+            "SELECT config, namespace, window_started_at, window_ended_at "
+            "FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
         )
     if run_row is None:
@@ -946,19 +963,34 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
 
     namespace = run_row["namespace"]
     verify = _extract_verify_enabled(config)
+    max_candidates = max(1, int(settings.max_extract_candidates))
     async with pool.acquire() as conn:
+        # Bound by the run window (like phase_cluster) AND by an explicit LIMIT.
+        # Without both, a one-hour run selected the complete historical backlog
+        # and turned it into serial LLM calls inside one synchronous request.
         candidates = await conn.fetch(
             f"""
             SELECT id, verbatim_content, owner_id, namespace
             FROM memories
             WHERE {eligible_for_morpheus('')}
+              AND created BETWEEN $1 AND $2
               AND triples_extracted_at IS NULL
               AND verbatim_content IS NOT NULL
-              AND length(verbatim_content) >= $1
-              AND ($2::text IS NULL OR namespace = $2)
+              AND length(verbatim_content) >= $3
+              AND ($4::text IS NULL OR namespace = $4)
             ORDER BY created
+            LIMIT $5
             """,
-            min_chars, namespace,
+            run_row["window_started_at"], run_row["window_ended_at"],
+            min_chars, namespace, max_candidates,
+        )
+
+    if len(candidates) >= max_candidates:
+        logger.warning(
+            "[MORPHEUS] run %s extracted from only the first %d candidate(s) in "
+            "the window (MNEMOS_MORPHEUS_MAX_EXTRACT_CANDIDATES); the remaining "
+            "backlog is picked up by subsequent runs",
+            run_id, max_candidates,
         )
 
     memories_processed = 0
