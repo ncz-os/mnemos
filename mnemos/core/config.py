@@ -531,6 +531,12 @@ class _OAuthSettings(BaseSettings):
     model_config = _config_model_config()
 
     trust_proxy: bool = Field(False, validation_alias="OAUTH_TRUST_PROXY")
+    # MCP OAuth authorization-server settings. Secrets are intentionally read
+    # only from environment/config and are never emitted in logs.
+    signing_key: str = Field("", validation_alias="MNEMOS_OAUTH_SIGNING_KEY")
+    registration_secret: str = Field("", validation_alias="MNEMOS_OAUTH_REGISTRATION_SECRET")
+    admin_passphrase: str = Field("", validation_alias="MNEMOS_OAUTH_ADMIN_PASSPHRASE")
+    issuer: str = Field("", validation_alias="MNEMOS_OAUTH_ISSUER")
 
 
 class _AuthSettings(BaseSettings):

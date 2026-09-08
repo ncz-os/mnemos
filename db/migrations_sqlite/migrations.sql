@@ -626,3 +626,42 @@ CREATE TABLE IF NOT EXISTS morpheus_runs (
 CREATE INDEX IF NOT EXISTS idx_morpheus_runs_status ON morpheus_runs(status);
 CREATE INDEX IF NOT EXISTS idx_morpheus_runs_started ON morpheus_runs(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_morpheus_runs_namespace ON morpheus_runs(namespace);
+
+CREATE TABLE IF NOT EXISTS oauth_mcp_clients (
+    client_id                    TEXT PRIMARY KEY,
+    client_secret                TEXT,
+    redirect_uris                TEXT NOT NULL,
+    token_endpoint_auth_method   TEXT NOT NULL DEFAULT 'none',
+    created                      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS oauth_mcp_authorization_codes (
+    code                     TEXT PRIMARY KEY,
+    client_id                TEXT NOT NULL REFERENCES oauth_mcp_clients(client_id) ON DELETE CASCADE,
+    code_challenge           TEXT NOT NULL,
+    code_challenge_method    TEXT NOT NULL,
+    redirect_uri             TEXT NOT NULL,
+    expires_at               TEXT NOT NULL,
+    used_at                  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_oauth_mcp_codes_client ON oauth_mcp_authorization_codes(client_id);
+CREATE INDEX IF NOT EXISTS idx_oauth_mcp_codes_expires ON oauth_mcp_authorization_codes(expires_at);
+
+CREATE TABLE IF NOT EXISTS oauth_mcp_tokens (
+    jti                  TEXT PRIMARY KEY,
+    refresh_token_hash   TEXT NOT NULL,
+    client_id            TEXT NOT NULL REFERENCES oauth_mcp_clients(client_id) ON DELETE CASCADE,
+    expires_at           TEXT NOT NULL,
+    revoked_at           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_oauth_mcp_tokens_client ON oauth_mcp_tokens(client_id);
+CREATE INDEX IF NOT EXISTS idx_oauth_mcp_tokens_hash ON oauth_mcp_tokens(refresh_token_hash);
+
+CREATE TABLE IF NOT EXISTS oauth_mcp_signing_keys (
+    key_id        TEXT PRIMARY KEY,
+    signing_key   TEXT NOT NULL,
+    created       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    rotated_at    TEXT
+);

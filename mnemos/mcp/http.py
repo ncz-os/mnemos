@@ -40,6 +40,7 @@ from uuid import UUID
 
 import uvicorn
 from mcp.server.sse import SseServerTransport
+import jwt
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -51,6 +52,15 @@ except ImportError:  # pragma: no cover - exercised only by lightweight test stu
 from starlette.routing import Mount, Route
 
 from mnemos.core.config import get_settings, mcp_nats_raw_enabled
+from mnemos.mcp.oauth import (
+    authorize_post_route,
+    authorize_route,
+    metadata_authorization,
+    metadata_resource,
+    register_route,
+    token_route,
+    get_oauth_service,
+)
 # Reuse the exact same Server instance + tool registrations from
 # the stdio entry point. Importing for the side effect of having
 # tools registered against `app`.
@@ -160,6 +170,30 @@ def _load_token_principals() -> dict[str, MCPClientPrincipal]:
 TOKEN_PRINCIPALS = _load_token_principals()
 
 
+def _verify_presented_token(presented: str) -> MCPClientPrincipal | None:
+    """Accept either a static bearer from ``TOKEN_PRINCIPALS`` or a valid JWT.
+
+    The two paths are deliberately not equivalent in storage: static tokens
+    are looked up server-side, JWTs are verified cryptographically.  The
+    principal returned in both cases is the same shape so the rest of the
+    SSE/RPC pipeline doesn't have to branch on token type.
+    """
+    static = TOKEN_PRINCIPALS.get(presented)
+    if static is not None:
+        return static
+    try:
+        service = get_oauth_service()
+    except RuntimeError:
+        return None
+    try:
+        claims = service.validate_access_token(presented)
+    except jwt.PyJWTError:
+        return None
+    user_id = claims.get("sub")
+    api_key = get_settings().server.api_key.strip() or None
+    return MCPClientPrincipal(user_id=user_id, api_key=api_key)
+
+
 def _principal_id(principal: MCPClientPrincipal) -> str:
     """Return the stable caller identity used to bind SSE sessions."""
     api_key_fingerprint = hashlib.sha256((principal.api_key or "").encode()).hexdigest()
@@ -175,7 +209,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     client knows what scheme to use."""
 
     async def dispatch(self, request, call_next):
-        if request.url.path in {"/health", "/healthz"}:
+        path = request.url.path
+        if path in {"/health", "/healthz"} or path.startswith("/.well-known/") \
+                or path.startswith("/oauth/") or path == "/":
             return await call_next(request)
         auth = request.headers.get("authorization", "")
         if not auth.lower().startswith("bearer "):
@@ -185,7 +221,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": 'Bearer realm="mnemos-mcp"'},
             )
         presented = auth.split(" ", 1)[1].strip()
-        principal = TOKEN_PRINCIPALS.get(presented)
+        principal = _verify_presented_token(presented)
         if principal is None:
             return JSONResponse(
                 {"error": "invalid bearer token"},
@@ -766,6 +802,12 @@ starlette_app = Starlette(
     routes=[
         Route("/health", endpoint=healthz),
         Route("/healthz", endpoint=healthz),
+        Route("/.well-known/oauth-authorization-server", endpoint=metadata_authorization),
+        Route("/.well-known/oauth-protected-resource", endpoint=metadata_resource),
+        Route("/oauth/authorize", endpoint=authorize_route, methods=["GET"]),
+        Route("/oauth/authorize", endpoint=authorize_post_route, methods=["POST"]),
+        Route("/oauth/token", endpoint=token_route, methods=["POST"]),
+        Route("/oauth/register", endpoint=register_route, methods=["POST"]),
         Route("/sse", endpoint=handle_sse),
         Route(NATS_SSE_PATH, endpoint=handle_nats_event_stream),
         Mount("/messages/", app=handle_post_message),
