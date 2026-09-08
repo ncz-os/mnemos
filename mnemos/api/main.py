@@ -275,7 +275,11 @@ app.add_middleware(
     session_cookie='mnemos_oauth_state',
     max_age=600,  # 10 minutes — just for the redirect roundtrip
     same_site='lax',
-    https_only=False,  # set MNEMOS_SESSION_HTTPS_ONLY=1 to harden in prod
+    # This cookie carries authlib's OAuth state and PKCE code_verifier, so it
+    # must honour MNEMOS_SESSION_HTTPS_ONLY exactly as the login session cookie
+    # does (mnemos/api/routes/oauth.py). A hardcoded False silently ignored the
+    # operator's hardening switch and sent the verifier in cleartext over HTTP.
+    https_only=_settings.server.session_https_only,
 )
 
 # CORS: set CORS_ORIGINS env var to restrict in production (comma-separated list).

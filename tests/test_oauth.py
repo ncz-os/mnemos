@@ -242,3 +242,34 @@ class TestOAuthIntegration:
             )
         finally:
             await conn.close()
+
+
+# ── Audit finding: MNEMOS_SESSION_HTTPS_ONLY was ignored for the OAuth state
+# cookie. mnemos/api/main.py hardcoded https_only=False on the
+# SessionMiddleware carrying authlib's OAuth state and PKCE code_verifier,
+# while the comment beside it told operators that env var hardened exactly
+# that cookie. The flag was honoured only for the post-login session cookie.
+
+
+class TestOAuthStateCookieHardening:
+    def test_state_cookie_is_not_hardcoded_insecure(self):
+        src = (Path(__file__).parent.parent / "mnemos" / "api" / "main.py").read_text()
+        assert "https_only=False" not in src, (
+            "the OAuth state cookie must not hardcode https_only=False — "
+            "it carries the PKCE code_verifier"
+        )
+        assert "https_only=_settings.server.session_https_only" in src, (
+            "the OAuth state cookie must read MNEMOS_SESSION_HTTPS_ONLY"
+        )
+
+    def test_state_cookie_matches_the_configured_setting(self):
+        from starlette.middleware.sessions import SessionMiddleware
+
+        from mnemos.api.main import app
+        from mnemos.core.config import get_settings
+
+        session_mw = [mw for mw in app.user_middleware if mw.cls is SessionMiddleware]
+        assert session_mw, "SessionMiddleware is not installed on the app"
+        kwargs = getattr(session_mw[0], "kwargs", None) or session_mw[0].options
+        assert kwargs["session_cookie"] == "mnemos_oauth_state"
+        assert kwargs["https_only"] == get_settings().server.session_https_only
