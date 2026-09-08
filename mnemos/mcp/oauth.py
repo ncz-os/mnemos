@@ -422,7 +422,7 @@ def get_oauth_service() -> OAuthService:
                 "start the server with MNEMOS_OAUTH_DATABASE_URL so the "
                 "Postgres-backed store can provide it."
             )
-        _service = OAuthService(base_url=settings.server.base, signing_key=key,
+        _service = OAuthService(base_url=(settings.oauth.issuer or settings.server.base), signing_key=key,
             store=InMemoryOAuthStore(), registration_secret=settings.oauth.registration_secret,
             admin_passphrase=settings.oauth.admin_passphrase)
     return _service

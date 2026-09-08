@@ -838,7 +838,7 @@ async def _mcp_http_lifespan(_app: Starlette):
                     "oauth_mcp_signing_keys (key_id=default) on first boot."
                 )
             service = _oauth_module.OAuthService(
-                base_url=settings.server.base,
+                base_url=(settings.oauth.issuer or settings.server.base),
                 signing_key=signing_key,
                 store=store,
                 registration_secret=settings.oauth.registration_secret,
