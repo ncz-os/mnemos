@@ -63,6 +63,11 @@ from .memory import (
     tool_search_memories,
     tool_update_memory,
 )
+from .graeae import (
+    TOOLS as GRAEAE_TOOLS,
+    tool_graeae_consult,
+    tool_graeae_get_consultation,
+)
 from .models import (
     TOOLS as MODEL_TOOLS,
     tool_pantheon_list_models,
@@ -92,6 +97,7 @@ for _domain_tools in (
     KG_TOOLS,
     DAG_TOOLS,
     MODEL_TOOLS,
+    GRAEAE_TOOLS,
     DELETION_TOOLS,
     KRONOS_TOOLS,
 ):
@@ -118,6 +124,8 @@ _TOOL_ORDER = [
     "recommend_model",
     "pantheon_list_models",
     "pantheon_route_explain",
+    "graeae_consult",
+    "graeae_get_consultation",
     "list_deletions",
     "kronos_anomalies",
     "kronos_forecast",

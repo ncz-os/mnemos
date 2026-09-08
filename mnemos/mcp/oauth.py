@@ -444,10 +444,13 @@ async def metadata_resource(_request: Request):
 
 
 async def register_route(request: Request):
+    # RFC 7591 dynamic client registration is intentionally OPEN: a client_id
+    # by itself grants no access to any tool or memory. The real security
+    # boundary is /oauth/authorize (passphrase-gated). Standard OAuth clients
+    # (ChatGPT included) call this endpoint automatically with no way to
+    # supply an out-of-band secret, so gating registration itself breaks
+    # every spec-compliant client's auto-discovery flow.
     service = get_oauth_service()
-    presented = request.headers.get("x-mnemos-oauth-registration-secret", "")
-    if not service.registration_secret or not hmac.compare_digest(presented, service.registration_secret):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
         return JSONResponse(await service.register(await request.json()), status_code=201)
     except (ValueError, TypeError) as exc:

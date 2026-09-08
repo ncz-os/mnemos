@@ -130,13 +130,14 @@ MNEMOS is designed to be the memory layer for the agentic tooling you already us
 3. **Native `/v1/*` REST surface.** For integrations that want to speak to MNEMOS directly: `/v1/memories`, `/v1/consultations`, `/v1/providers`, `/v1/sessions`, `/v1/webhooks`, `/v1/federation`, `/v1/kg/triples`. The full API is language-agnostic; pick your HTTP client and go.
 
 Current MCP tools come from one registry shared by stdio and HTTP/SSE
-(23 tools total): `search_memories`, `list_memories`, `get_memory`,
+(25 tools total): `search_memories`, `list_memories`, `get_memory`,
 `create_memory`, `update_memory`, `delete_memory`,
 `bulk_create_memories`, `list_deletions`, `get_stats`,
 `kg_create_triple`, `kg_search`, `kg_timeline`, `update_triple`,
 `delete_triple`, `log_memory`, `branch_memory`, `diff_memory_commits`,
 `checkout_memory`, `recommend_model`, `pantheon_list_models`,
-`pantheon_route_explain`, `kronos_anomalies`, and `kronos_forecast`.
+`pantheon_route_explain`, `graeae_consult`, `graeae_get_consultation`,
+`kronos_anomalies`, and `kronos_forecast`.
 
 ### Bridge family (Phase 2 of the consolidation, shipped 2026-05-04)
 
@@ -680,7 +681,7 @@ Landed with the v3.0 release line:
 - ✅ **Slice 1: audit quick wins** (`a62a099`) — session history returns the most recent messages first with deterministic system-row pinning, and project URLs now point at `mnemos-os/mnemos`.
 - ✅ **Slice 2: memory-read tenancy + DAG integrity** (`d42c475`) — shared memory read visibility, per-snapshot history visibility, same-memory DAG guards, race-safe branch creation, `MN001` to HTTP 409 reconciliation guidance, and a compose `postgres-upgrade` service for existing volumes.
 - ✅ **Webhook retry state machine + leases + outbox discipline** — persisted leases, one-success-per-chain guards, repair worker separation, bulk-create parity, and terminal success trigger.
-- ✅ **MCP unified registry** — stdio and HTTP/SSE expose the same 23 tools from `mnemos/mcp/tools/`, including CRUD, KG, DAG, bulk create, stats, deletion-request management, model recommendation, KRONOS observability, and the PANTHEON model facade.
+- ✅ **MCP unified registry** — stdio and HTTP/SSE expose the same 25 tools from `mnemos/mcp/tools/`, including CRUD, KG, DAG, bulk create, stats, deletion-request management, model recommendation, KRONOS observability, and the PANTHEON model facade.
 - ✅ **Faithful OpenAI-compatible gateway** — propagated generation controls, OpenAI-format SSE, registry-honest model discovery, and explicit 400/404 responses when the selected provider cannot honor a requested feature.
 - ✅ **Namespace-uniform tenancy** — state, journal, entities, sessions, consultations, webhooks, and memory read/history paths use the owner+namespace discipline.
 - ✅ **PostgreSQL streaming-replication doctrine** — single-site HA uses Postgres primary/standby replication; MNEMOS federation is for remote or curated data flows.
@@ -699,7 +700,7 @@ v3.5.1 is a documentation-triage patch shipped on 2026-04-28. It bumps package/r
 - ✅ **KRONOS v0.1** — recall-pattern anomaly detection (z-score over `recall_count` history), namespace drift detection, recall-load forecasting (EWMA), PERSEPHONE eligibility forecast. CPU-only via numpy; Tesseract GPU integration deferred to v5.1.
 - ✅ **DAG wiring for compression derivations** — every successful compression contest persists a child row in `memory_versions` parented to the source memory's `branch='main'` HEAD on `branch='distilled'` or `branch='narrated'`; `change_type='compress'` extends the CHECK constraint; commit hash is content-derived.
 - ✅ **NATS substrate v0.2** — bounded next slice. PANTHEON routing-log → `mnemos.pantheon.routing` opt-in publish; `pantheon_routing_audit` table fed by an optional consumer worker.
-- ✅ **MCP §6.4 cross-tenant security gates** — uniform error-shape normalization across all 23 tools, parameter-shape audit log (no raw values), per-tool rate buckets, role + namespace validation in the dispatcher, root-bypass logged as warning, generic error messages from `_safe_path_*` helpers (no value echo).
+- ✅ **MCP §6.4 cross-tenant security gates** — uniform error-shape normalization across all 25 tools, parameter-shape audit log (no raw values), per-tool rate buckets, role + namespace validation in the dispatcher, root-bypass logged as warning, generic error messages from `_safe_path_*` helpers (no value echo).
 - ✅ **Document-import retry-safety** — content-derived `import_chunk_key` prevents duplicate chunk insertion on retry; ON CONFLICT (key) DO UPDATE returns canonical row id.
 - ✅ **Connector smoke gallery** — end-to-end smoke per surface (Claude Code, Cursor, Codex CLI, Continue, Cline, Claude Desktop, ChatGPT) with mechanically-validated JSON snippets.
 - ✅ **Rust hot-path accelerator (mnemos_hot v0.2)** — Rust implementations of cosine, top_k, batch cosine, embedding parse, embedding L2-normalize, composite search re-rank, deterministic judge scoring, and SHA-256 batch hashing. All wired with MNEMOS_HOT_RS_ENABLED=1 opt-in plus identical Python fallback.

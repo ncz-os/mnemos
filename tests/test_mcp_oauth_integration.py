@@ -621,32 +621,34 @@ async def test_legacy_static_bearer_issues_mcp_tools_list(
 
 
 @pytest.mark.asyncio
-async def test_dcr_rejects_missing_registration_secret(
+async def test_dcr_succeeds_with_no_header(
     mcp_http_app: FreshApp,
 ) -> None:
+    """DCR is intentionally open (RFC 7591): registering a client_id grants
+    no access by itself. Standard clients (ChatGPT included) call this
+    endpoint automatically with no way to supply an out-of-band secret, so
+    this must succeed with no special header at all."""
     async with _client(mcp_http_app) as client:
         response = await client.post(
             "/oauth/register",
             json={"redirect_uris": ["https://client.example/cb"]},
         )
-    assert response.status_code == 401
+    assert response.status_code == 201
+    body = response.json()
+    assert body["client_id"].startswith("mnemos_")
 
 
 @pytest.mark.asyncio
-async def test_dcr_rejects_wrong_registration_secret(
+async def test_dcr_rejects_missing_redirect_uris(
     mcp_http_app: FreshApp,
 ) -> None:
     async with _client(mcp_http_app) as client:
-        response = await client.post(
-            "/oauth/register",
-            json={"redirect_uris": ["https://client.example/cb"]},
-            headers={"X-Mnemos-OAuth-Registration-Secret": "wrong"},
-        )
-    assert response.status_code == 401
+        response = await client.post("/oauth/register", json={})
+    assert response.status_code == 400
 
 
 @pytest.mark.asyncio
-async def test_dcr_with_admin_secret_issues_client_id(
+async def test_dcr_issues_client_id(
     mcp_http_app: FreshApp,
 ) -> None:
     async with _client(mcp_http_app) as client:
@@ -654,7 +656,6 @@ async def test_dcr_with_admin_secret_issues_client_id(
             "/oauth/register",
             json={"redirect_uris": ["https://client.example/cb"],
                   "token_endpoint_auth_method": "none"},
-            headers={"X-Mnemos-OAuth-Registration-Secret": mcp_http_app.registration_secret},
         )
     assert response.status_code == 201
     body = response.json()

@@ -38,6 +38,8 @@ EXPECTED_USER_TOOLS = [
     "recommend_model",
     "pantheon_list_models",
     "pantheon_route_explain",
+    "graeae_consult",
+    "graeae_get_consultation",
     "list_deletions",
     "kronos_anomalies",
     "kronos_forecast",
