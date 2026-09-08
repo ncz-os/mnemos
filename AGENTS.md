@@ -1,143 +1,140 @@
-# AGENTS.md — machine-readable install guide for MNEMOS
+# AGENTS.md — the MNEMOS repo family
 
-This file lets an automated agent install/deploy MNEMOS for an operator given a
-**requested set of modules**, deterministically. Human guide: [docs/INSTALL.md](docs/INSTALL.md).
+This repo was split into many smaller repos for maintainability. That makes
+"audit mnemos" ambiguous — there is no single checkout that contains
+everything. This file exists so an agent asked to do a full MNEMOS audit
+(dead code / security / performance) knows what "everything" actually means,
+without re-deriving it from scratch by grepping docs and guessing.
 
-The pip package is `mnemos-core`. `mnemos` is an **image** name, not a pip
-package — never run `pip install mnemos` or `pip install mnemos-os`.
+**Before trusting this file:** it is a snapshot (2026-09-08). Repos get
+added, renamed, or retired. If something here looks stale (a repo is gone,
+a "separate" repo turns out to be merged in-tree, a branch name is wrong),
+verify against the live state rather than assuming this file is current —
+and update it once you've confirmed the correction.
 
----
+## Authoritative source
 
-## Module registry
+**`gitlab.com/ncz-os/mnemos` is the authoritative line for mnemos core.**
+As of 2026-09-08, a separate bare repo on ARGONAS (`mnemos-production.git`,
+what `/opt/mnemos` on PYTHIA actually tracks) had independently diverged
+from GitLab since an April fork point (`d093bc33`) — 517 commits unique to
+the ARGONAS line, 1255 unique to GitLab's, with GitLab's line materially
+more current. Do not treat `mnemos-production.git` or any ARGONAS checkout
+as source of truth without first checking it against GitLab; work aimed at
+core mnemos should target a branch off GitLab's current `master`.
 
-```yaml
-# id -> how to obtain it. Subsystems share the mnemos.* namespace and are
-# runtime-gated: installing the dist mounts the routes; absence => HTTP 503.
-modules:
-  core:       { dist: mnemos-core,     extra: null,       kind: kernel,   arch: [amd64, arm64] }
-  graeae:     { dist: mnemos-graeae,   extra: graeae,     kind: router,   arch: [amd64, arm64] }
-  pantheon:   { dist: mnemos-pantheon, extra: pantheon,   kind: router,   arch: [amd64, arm64] }
-  knemon:     { dist: mnemos-knemon,   extra: knemon,     kind: router,   arch: [amd64, arm64] }
-  charon:     { dist: mnemos-charon,   extra: charon,     kind: router,   arch: [amd64, arm64] }
-  stiphos:    { dist: mnemos-stiphos,  extra: null,       kind: service,  arch: [amd64, arm64], port: 8080, note: "separate service, not in the everything image" }
+## Installation and optional modules
 
-backends:           # selected at RUNTIME via MNEMOS_DATABASE_DSN, not by image
-  sqlite:   { driver: bundled,  dsn: "sqlite:////data/mnemos.db", arch: [amd64, arm64], default: true }
-  postgres: { driver: asyncpg,  dsn: "postgres://USER:PASS@HOST:5432/DB", arch: [amd64, arm64] }
-  oracle:   { driver: oracledb, extra: oracle, dsn: "oracle://USER:PASS@HOST:1521/SERVICE", arch: [amd64, arm64], thin: true }
-  db2:      { driver: ibm_db,   extra: db2,    dsn: "db2://USER:PASS@HOST:50000/DB", arch: [amd64] }
-  mysql:    { driver: aiomysql, extra: mysql,  dsn: "mysql://USER:PASS@HOST:3306/DB", arch: [amd64, arm64] }
-  mariadb:  { driver: aiomysql, extra: mysql,  dsn: "mariadb://USER:PASS@HOST:3306/DB", arch: [amd64, arm64] }
+Core installs stay small; almost everything beyond memory CRUD is an
+opt-in pip extra (`pip install mnemos-os[<extra>]`, comma-separate for
+more than one). Without an extra installed, its feature is a documented
+no-op, not an error — e.g. `install_tracing()` silently does nothing
+without `[tracing]`.
 
-accelerators:       # OPTIONAL embedder accel; default is portable CPU llama-cpp
-  openvino: { extra: openvino, arch: [amd64] }          # Intel x86-only
-  cuda:     { extra: cuda,     arch: [amd64, arm64] }    # needs PyTorch CUDA index
-  amd:      { extra: amd,      arch: [amd64] }           # ROCm, linux-only
+**v5 feature extras** (the named subsystems from the section above):
 
-images:
-  mnemos-core:       { ref: "ghcr.io/ncz-os/mnemos-core",       contains: [core],                              arch: [amd64, arm64], port: 5002 }
-  mnemos:            { ref: "ghcr.io/ncz-os/mnemos",            contains: [core, graeae, pantheon, knemon, charon], arch: [amd64, arm64], port: 5002, canonical_everything: true }
-  mnemos-enterprise: { ref: "ghcr.io/ncz-os/mnemos-enterprise", contains: [core, graeae, pantheon, knemon, charon, oracle, db2, mysql], arch: [amd64], port: 5002, note: "the mysql driver (aiomysql) also serves the mariadb backend" }
-  mnemos-stiphos:    { ref: "ghcr.io/ncz-os/mnemos-stiphos",    contains: [stiphos],                           arch: [amd64, arm64], port: 8080 }
-```
+| Extra | Adds | Subsystem |
+|---|---|---|
+| `morpheus` | numpy | MORPHEUS / APOLLO S-IVB dream-state pipeline |
+| `persephone` | zstandard | PERSEPHONE archival |
+| `pantheon` | *(none — pure in-tree)* | PANTHEON LLM proxy/facade |
+| `kronos` | numpy | KRONOS recall observability |
+| `kronos-gpu` | cupy | KRONOS GPU acceleration |
+| `knossos` | *(none — pure in-tree)* | KNOSSOS (MemPalace-compatible interop) |
+| `apollo` | *(none — pure in-tree)* | APOLLO compression worker |
+| `artemis` | networkx, scipy | graph-based subsystem |
+| `nats` | nats-py | NATS event bus integration |
+| `hot` | mnemos-hot | pulls in `mnemos-hot-rs`'s PyO3 extension |
+| `edge` | aiosqlite, sqlite-vec | edge/embedded SQLite deployment |
 
----
+**Bundles** (combine several extras for a deployment shape):
 
-## Decision procedure
+- `server` = nats + persephone + pantheon
+- `ml` = morpheus + kronos + apollo + artemis + hot
+- `interop` = knossos
+- `full` = everything above
 
-Given `requested` (a set of module ids) and `backend` (one backend id) and
-`deploy` (`container` | `pip`) and `arch` (`amd64` | `arm64`):
+**Cross-cutting extras** (not subsystem-specific):
 
-```
-1. VALIDATE ARCH
-   - if backend.arch excludes arch  -> ERROR: backend unsupported on arch
-     (notably: db2 is amd64-only)
-   - if any requested accelerator excludes arch -> drop it + warn
-   - NEVER select mnemos-enterprise on arm64.
+- `build` — pyinstaller + sqlite-vec, for producing a standalone binary
+- `docling` — document-import support
+- `tracing` — OpenTelemetry (OTLP/HTTP spans); no-op without it
+- `structlog` — structured JSON logs, opt in at runtime via `MNEMOS_STRUCTURED_LOGS=true`
+- `sqlite` — aiosqlite + sqlite-vec (base SQLite backend support, distinct from `edge`)
+- `semantic` — CPU semantic-similarity scoring via fastembed (ONNX, no torch/CUDA)
+- `gpu` — CUDA-accelerated embeddings (fastembed-gpu); **do not install on non-NVIDIA hardware** (Apple Silicon, Intel iGPU, Tegra, ARM) — use `semantic` or `phi` instead
+- `phi` — Intel-iGPU-accelerated path (OpenVINO + FastEmbed); this is the production path on PYTHIA
+- `dev` — test/lint tooling (pytest, import-linter, etc.)
 
-2. IF deploy == container:
-   a. needs_enterprise = backend in {db2}  OR  (backend in {oracle,mysql,mariadb} AND operator wants the driver baked)
-   b. if "stiphos" in requested -> ALSO deploy image mnemos-stiphos (separate container)
-   c. choose primary image:
-        - requested ⊆ {core}                          -> mnemos-core
-        - requested ⊆ {core,graeae,pantheon,knemon,charon} AND not needs_enterprise -> mnemos   (everything)
-        - needs_enterprise                             -> mnemos-enterprise   (requires arch == amd64)
-   d. run: docker run -p PORT:PORT -v mnemos-data:/data \
-            -e MNEMOS_DATABASE_DSN='<backends[backend].dsn>' <image.ref>:latest
-        (omit the -e line to use the default SQLite backend)
+When auditing or extending a subsystem, check whether it's gated behind
+one of these extras before assuming a feature is dead code — an
+apparently-unused import guarded by `is_extra_installed("kronos")` (see
+`mnemos/mcp/tools/__init__.py`'s handling of KRONOS_TOOLS for the pattern)
+is conditional, not dead.
 
-3. IF deploy == pip:
-   - extras = [ modules[m].extra for m in requested if m not in {core,stiphos} and extra ]
-            + [ backends[backend].extra if present ]
-   - if arch == arm64: ensure 'openvino' is NOT in extras; prefer extra "server", which does not pull openvino.
-   - pip install 'mnemos-core[<comma-joined extras>]'
-   - if "stiphos" in requested: ALSO pip install 'mnemos-stiphos[mcp]' and run it as a separate service.
-```
+## Repos that are real MNEMOS subsystems (separate git repos)
 
----
+| Repo | What it is |
+|---|---|
+| `mnemos` (this repo) | Core: API, MCP tool registry, domain logic |
+| `mnemos-bridge-core` | Shared MCP transport/dispatch library used by the other bridges |
+| `mnemos-bridge-openai` | OpenAI SDK adapter (Chat Completions tool-call shape) |
+| `mnemos-bridge-anthropic` | Anthropic SDK adapter |
+| `mnemos-bridge-gemini` | Google Gemini adapter |
+| `mnemos-bridge-claude-connector` | OAuth-fronted remote MCP connector for Claude |
+| `mnemos-bridge-aider` | Aider IDE/CLI integration |
+| `mnemos-bridge-crewai` | CrewAI tool adapter |
+| `mnemos-hot-rs` | PyO3 Rust extension (hot-path scoring/embedding math) |
+| `mnemos-rs` | Rust CLI client |
+| `mnemosctl` | Rust admin CLI (root-level operations: sync, migration, etc.) |
+| `mnemos-stiphos` | Job/hive bus service (agent registration, job claim/update, dashboard) |
 
-## Canonical recipes
+A **full audit** = all of the above, at minimum. Confirmed empty/unused as
+of 2026-09-08, exclude unless repopulated: `mnemos-embedkit`, `mnemos-mobile`.
 
-```bash
-# Everything, SQLite, any arch (turnkey)
-docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos:latest
+## In-tree subsystems (NOT separate repos — live inside `mnemos/domain/` etc.)
 
-# Everything on PostgreSQL
-docker run -p 5002:5002 \
-  -e MNEMOS_DATABASE_DSN='postgres://mnemos:pass@db:5432/mnemos' \
-  ghcr.io/ncz-os/mnemos:latest
+Covered automatically by auditing this repo; do not go looking for a
+separate deployable for these unless you have a specific reason to doubt
+that:
 
-# Everything on Oracle (thin) — no enterprise image needed
-docker run -p 5002:5002 \
-  -e MNEMOS_DATABASE_DSN='oracle://MNEMOS:pass@ora:1521/ORCLPDB1' \
-  ghcr.io/ncz-os/mnemos:latest
+- **GRAEAE** — multi-provider consensus/consultation engine (`mnemos/domain/graeae/`)
+- **PANTHEON** — the MNEMOS LLM proxy/unified facade (`mnemos/domain/pantheon/`; `pantheon` is an empty pip-extras group, confirming zero external package dependency)
+- **KRONOS** — recall-pattern observability/forecasting
+- **MORPHEUS** / release-name **APOLLO S-IVB** — the dream-state synthesis pipeline (REPLAY → CLUSTER → SYNTHESISE → COMMIT)
+- **PERSEPHONE** — cold-storage archival subsystem
+- **CHARON** — the portability/export-import hub (`mnemos/tools/`); superseded the older **MPF** format with **MIF**
+- **MOIRAI** — the compression subsystem
 
-# Db2 (amd64) — enterprise image required
-docker run --platform linux/amd64 -p 5002:5002 \
-  -e MNEMOS_DATABASE_DSN='db2://MNEMOS:pass@db2:50000/MNEMOS' \
-  ghcr.io/ncz-os/mnemos-enterprise:latest
+## Related repos with an unconfirmed relationship to mnemos core
 
-# MariaDB 11.7+ — enterprise image carries the aiomysql driver
-docker run --platform linux/amd64 -p 5002:5002 \
-  -e MNEMOS_DATABASE_DSN='mariadb://mnemos:pass@mariadb:3306/mnemos' \
-  ghcr.io/ncz-os/mnemos-enterprise:latest
+These exist on ARGONAS under mnemos-adjacent names but their exact
+relationship to the in-tree subsystems above has not been fully verified —
+check whether each is a live dependency, an earlier standalone predecessor
+later merged in-tree (candidate for retirement), or a genuinely separate
+service, before including/excluding it from an audit:
 
-# Hive service (separate container, runs alongside any of the above)
-docker run -p 8080:8080 -v stiphos-data:/data ghcr.io/ncz-os/mnemos-stiphos:latest
+- `charon.git` — standalone repo, has real branches; relationship to in-tree CHARON unconfirmed
+- `pantheon.git` — standalone repo; relationship to in-tree PANTHEON unconfirmed
+- `etlantis.git` — internal operations/telemetry registry rolling up APOLLO/KRONOS/archival worker health; referenced in mnemos docs only as in-tree function calls (`get_operation_health()`), not as an external service
+- `calliope.git` — used together with ETLANTIS (per operator)
+- `clio.git` — used together with ETLANTIS (per operator)
+- `knemon.git` — budgeting/tokenomics system for GRAEAE/HIVE (per operator)
+- `mpf.git` — **deprecated**, superseded by MIF (implemented in CHARON) — likely a retirement candidate, not an active dependency
 
-# pip: kernel + reasoning + routing, arm64-safe (no openvino)
-pip install 'mnemos-core[graeae,knemon,pantheon,charon]'
+## Explicitly NOT mnemos subsystems
 
-# pip: everything + enterprise drivers (amd64)
-pip install 'mnemos-core[full,enterprise]'
+Zero mentions anywhere in mnemos's own docs/deps; separate fleet tooling
+that happens to share the naming neighborhood. Do not include these in a
+"MNEMOS audit" scope:
 
-# Custom container: FROM core + only what you want
-#   FROM ghcr.io/ncz-os/mnemos-core:latest
-#   RUN pip install --no-cache-dir mnemos-graeae mnemos-charon
-```
+- `hermes-agent` — a separate interactive CLI tool (fleet-wide, not MNEMOS-specific)
+- `dashboards`, `mcp-contracts`, `mcp-stdio-rs`, `worker-hive-relay` — unconfirmed non-MNEMOS; re-verify if asked to touch them
 
----
+## When asked to do a "full MNEMOS audit"
 
-## Verification
-
-```bash
-docker exec <ctr> mnemos doctor        # lists installed extras/bundles + backend health
-curl -fsS http://localhost:5002/health # everything/core/enterprise
-curl -fsS http://localhost:8080/health # stiphos
-```
-
-`mnemos doctor` is the source of truth for what is actually installed and which
-backend is live. Routes for absent subsystems return HTTP 503 with the exact
-`pip install` command to enable them.
-
----
-
-## Hard rules
-
-- `mnemos-core` is the only pip-installable base; `mnemos`/`mnemos-os` are NOT pip packages.
-- Backend = runtime `MNEMOS_DATABASE_DSN`, never a rebuild.
-- `mnemos-enterprise` is amd64-only. Do not deploy it on arm64; use `mnemos` + Oracle-thin/Postgres/MySQL/MariaDB instead.
-- STIPHOS is a separate service/image; never expect it on port 5002 or inside the everything image.
-- On arm64, never install the `openvino` accelerator. The `full` extra does not pull it.
-- MariaDB has no extra of its own: it is wire-compatible with `aiomysql`, so
-  install the `mysql` extra and use a `mariadb://` DSN.
+1. Read this file first.
+2. Confirm the list is still accurate (repo may have been added/retired since).
+3. Audit every repo in the "real MNEMOS subsystems" table, plus this repo itself.
+4. For anything in "unconfirmed relationship," check live before deciding in/out of scope — don't silently skip or silently include.
+5. Target GitLab's current `master` as the base for mnemos core, not a possibly-stale ARGONAS mirror.
