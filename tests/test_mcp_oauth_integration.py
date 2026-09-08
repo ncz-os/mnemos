@@ -1127,3 +1127,79 @@ def test_oauth_service_rejects_missing_signing_key() -> None:
             admin_passphrase="p",
         )
 
+
+# ── Audit finding: dynamic client registration had no size, cardinality or
+# rate bound. /oauth/ is exempt from BearerAuthMiddleware and the standalone
+# MCP app has no body-size middleware, so an unauthenticated caller could POST
+# arbitrarily large registrations in a loop and grow oauth_mcp_clients
+# forever. Registration stays OPEN (RFC 7591) — it is now merely bounded.
+
+
+@pytest.mark.asyncio
+async def test_dcr_rejects_oversized_redirect_uri_array(
+    mcp_http_app: FreshApp,
+) -> None:
+    from mnemos.mcp.oauth import MAX_REDIRECT_URIS
+
+    async with _client(mcp_http_app) as client:
+        response = await client.post(
+            "/oauth/register",
+            json={"redirect_uris": [
+                f"https://client.example/cb{i}"
+                for i in range(MAX_REDIRECT_URIS + 1)
+            ]},
+        )
+    assert response.status_code == 400
+    assert "at most" in response.json()["error_description"]
+
+
+@pytest.mark.asyncio
+async def test_dcr_rejects_oversized_redirect_uri(
+    mcp_http_app: FreshApp,
+) -> None:
+    from mnemos.mcp.oauth import MAX_REDIRECT_URI_LENGTH
+
+    async with _client(mcp_http_app) as client:
+        response = await client.post(
+            "/oauth/register",
+            json={"redirect_uris": [
+                "https://client.example/" + ("x" * MAX_REDIRECT_URI_LENGTH)
+            ]},
+        )
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_dcr_rejects_oversized_body(
+    mcp_http_app: FreshApp,
+) -> None:
+    from mnemos.mcp.oauth import MAX_REGISTRATION_BODY_BYTES
+
+    async with _client(mcp_http_app) as client:
+        response = await client.post(
+            "/oauth/register",
+            content=b'{"redirect_uris": ["https://client.example/cb"], "junk": "'
+            + b"A" * (MAX_REGISTRATION_BODY_BYTES + 1)
+            + b'"}',
+            headers={"content-type": "application/json"},
+        )
+    assert response.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_dcr_is_rate_limited(
+    mcp_http_app: FreshApp,
+) -> None:
+    from mnemos.mcp.oauth import REGISTRATION_RATE_LIMIT
+
+    async with _client(mcp_http_app) as client:
+        statuses = []
+        for _ in range(REGISTRATION_RATE_LIMIT + 1):
+            response = await client.post(
+                "/oauth/register",
+                json={"redirect_uris": ["https://client.example/cb"]},
+            )
+            statuses.append(response.status_code)
+
+    assert statuses[:REGISTRATION_RATE_LIMIT] == [201] * REGISTRATION_RATE_LIMIT
+    assert statuses[-1] == 429, "registration must be rate limited"

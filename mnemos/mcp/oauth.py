@@ -11,8 +11,8 @@ import base64
 import json
 import hashlib
 import hmac
-import os
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
@@ -21,13 +21,23 @@ import jwt
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from mnemos.core.config import get_settings
-
 ISSUER_PATH = "/"
 ACCESS_TOKEN_SECONDS = 30 * 60
 REFRESH_TOKEN_SECONDS = 30 * 24 * 60 * 60
 CODE_SECONDS = 5 * 60
 ADMIN_SUBJECT = "default"
+
+# Dynamic client registration is deliberately unauthenticated (see
+# register_route). /oauth/ is also exempt from BearerAuthMiddleware in
+# mcp/http.py, and the standalone MCP Starlette app carries no body-size
+# middleware, so these bounds are the ONLY backpressure between an
+# unauthenticated caller and unbounded oauth_mcp_clients growth / request
+# memory. Open registration is a spec requirement; unbounded is not.
+MAX_REGISTRATION_BODY_BYTES = 8 * 1024
+MAX_REDIRECT_URIS = 20
+MAX_REDIRECT_URI_LENGTH = 2048
+REGISTRATION_RATE_LIMIT = 30
+REGISTRATION_RATE_WINDOW_SECONDS = 60.0
 
 
 def _now() -> datetime:
@@ -201,6 +211,29 @@ class OAuthService:
         self.store = store
         self.registration_secret = registration_secret
         self.admin_passphrase = admin_passphrase
+        # Per-caller registration timestamps for the sliding-window limiter.
+        self._registration_hits: dict[str, list[float]] = {}
+
+    def check_registration_rate_limit(self, caller: str) -> bool:
+        """Sliding-window limiter for the unauthenticated DCR endpoint.
+
+        Returns True when the caller may register. Windows that have fully
+        aged out are dropped on every call so the bookkeeping map cannot
+        itself become the unbounded structure it is guarding against.
+        """
+        cutoff = time.monotonic() - REGISTRATION_RATE_WINDOW_SECONDS
+        pruned: dict[str, list[float]] = {}
+        for key, stamps in self._registration_hits.items():
+            recent = [stamp for stamp in stamps if stamp > cutoff]
+            if recent:
+                pruned[key] = recent
+        self._registration_hits = pruned
+
+        hits = self._registration_hits.setdefault(caller, [])
+        if len(hits) >= REGISTRATION_RATE_LIMIT:
+            return False
+        hits.append(time.monotonic())
+        return True
 
     def issue_access_token(self, *, client_id: str, provider: str = "unknown",
                            now: datetime | None = None, lifetime: int = ACCESS_TOKEN_SECONDS) -> str:
@@ -225,9 +258,17 @@ class OAuthService:
         return claims
 
     async def register(self, body: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise TypeError("client metadata must be a JSON object")
         uris = body.get("redirect_uris")
         if not isinstance(uris, list) or not uris or not all(isinstance(u, str) and u for u in uris):
             raise ValueError("redirect_uris must be a non-empty array")
+        if len(uris) > MAX_REDIRECT_URIS:
+            raise ValueError(f"redirect_uris must contain at most {MAX_REDIRECT_URIS} entries")
+        if any(len(u) > MAX_REDIRECT_URI_LENGTH for u in uris):
+            raise ValueError(
+                f"each redirect_uri must be at most {MAX_REDIRECT_URI_LENGTH} characters"
+            )
         auth_method = body.get("token_endpoint_auth_method", "none")
         if auth_method not in {"none", "client_secret_post", "client_secret_basic"}:
             raise ValueError("unsupported token_endpoint_auth_method")
@@ -451,9 +492,43 @@ async def register_route(request: Request):
     # (ChatGPT included) call this endpoint automatically with no way to
     # supply an out-of-band secret, so gating registration itself breaks
     # every spec-compliant client's auto-discovery flow.
+    #
+    # Open, however, is not the same as unbounded. Nothing else rate-limits or
+    # size-limits this endpoint, and every accepted registration is persisted
+    # forever, so the body/cardinality/rate bounds below are what keep an
+    # unauthenticated caller from exhausting request memory or growing
+    # oauth_mcp_clients without limit.
     service = get_oauth_service()
+    caller = request.client.host if request.client else "unknown"
+    if not service.check_registration_rate_limit(caller):
+        return JSONResponse(
+            {"error": "invalid_client_metadata",
+             "error_description": "registration rate limit exceeded"},
+            status_code=429,
+        )
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_REGISTRATION_BODY_BYTES:
+        return JSONResponse(
+            {"error": "invalid_client_metadata",
+             "error_description": "client metadata exceeds the maximum size"},
+            status_code=413,
+        )
+    raw = await request.body()
+    if len(raw) > MAX_REGISTRATION_BODY_BYTES:
+        return JSONResponse(
+            {"error": "invalid_client_metadata",
+             "error_description": "client metadata exceeds the maximum size"},
+            status_code=413,
+        )
     try:
-        return JSONResponse(await service.register(await request.json()), status_code=201)
+        payload = json.loads(raw or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JSONResponse(
+            {"error": "invalid_client_metadata", "error_description": str(exc)},
+            status_code=400,
+        )
+    try:
+        return JSONResponse(await service.register(payload), status_code=201)
     except (ValueError, TypeError) as exc:
         return JSONResponse({"error": "invalid_client_metadata", "error_description": str(exc)}, status_code=400)
 
