@@ -663,6 +663,100 @@ async def test_dcr_issues_client_id(
     assert body["redirect_uris"] == ["https://client.example/cb"]
 
 
+@pytest.mark.asyncio
+async def test_dcr_client_secret_basic_then_token_via_authorization_header(
+    mcp_http_app: FreshApp,
+) -> None:
+    """RFC 7591 client_secret_basic: DCR issues a client_secret, and the
+    token endpoint accepts it via HTTP Basic Auth (RFC 6749 5.2.1) -- not
+    just as a form field. This is the auth method ChatGPT's connector
+    setup requests during automatic discovery."""
+    import base64
+
+    async with _client(mcp_http_app) as client:
+        reg = await client.post(
+            "/oauth/register",
+            json={"redirect_uris": ["https://client.example/cb"],
+                  "token_endpoint_auth_method": "client_secret_basic"},
+        )
+        assert reg.status_code == 201, reg.text
+        reg_body = reg.json()
+        cid, csecret = reg_body["client_id"], reg_body["client_secret"]
+
+        verifier = secrets.token_urlsafe(32)
+        get_response = await client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code", "client_id": cid,
+                "redirect_uri": "https://client.example/cb",
+                "code_challenge": _pkce(verifier),
+                "code_challenge_method": "S256", "state": "xyz",
+            },
+        )
+        assert get_response.status_code == 200, get_response.text
+        post_response = await client.post(
+            "/oauth/authorize",
+            data={
+                "response_type": "code", "client_id": cid,
+                "redirect_uri": "https://client.example/cb",
+                "code_challenge": _pkce(verifier),
+                "code_challenge_method": "S256", "state": "xyz",
+                "passphrase": mcp_http_app.admin_passphrase,
+            },
+            follow_redirects=False,
+        )
+        assert post_response.status_code in (302, 303), post_response.text
+        location = post_response.headers["location"]
+        code = location.split("code=")[1].split("&")[0]
+
+        basic = base64.b64encode(f"{cid}:{csecret}".encode()).decode()
+        token_response = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code", "code": code,
+                "redirect_uri": "https://client.example/cb",
+                "client_id": cid, "code_verifier": verifier,
+            },
+            headers={"Authorization": f"Basic {basic}"},
+        )
+        assert token_response.status_code == 200, token_response.text
+        assert "access_token" in token_response.json()
+
+        # Wrong secret via Basic auth must be rejected.
+        wrong_basic = base64.b64encode(f"{cid}:not-the-secret".encode()).decode()
+        get_response2 = await client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code", "client_id": cid,
+                "redirect_uri": "https://client.example/cb",
+                "code_challenge": _pkce(verifier),
+                "code_challenge_method": "S256", "state": "abc",
+            },
+        )
+        post_response2 = await client.post(
+            "/oauth/authorize",
+            data={
+                "response_type": "code", "client_id": cid,
+                "redirect_uri": "https://client.example/cb",
+                "code_challenge": _pkce(verifier),
+                "code_challenge_method": "S256", "state": "abc",
+                "passphrase": mcp_http_app.admin_passphrase,
+            },
+            follow_redirects=False,
+        )
+        code2 = post_response2.headers["location"].split("code=")[1].split("&")[0]
+        bad_token_response = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code", "code": code2,
+                "redirect_uri": "https://client.example/cb",
+                "client_id": cid, "code_verifier": verifier,
+            },
+            headers={"Authorization": f"Basic {wrong_basic}"},
+        )
+        assert bad_token_response.status_code == 401
+
+
 # ─── PKCE enforcement ─────────────────────────────────────────────────────
 
 

@@ -229,7 +229,7 @@ class OAuthService:
         if not isinstance(uris, list) or not uris or not all(isinstance(u, str) and u for u in uris):
             raise ValueError("redirect_uris must be a non-empty array")
         auth_method = body.get("token_endpoint_auth_method", "none")
-        if auth_method not in {"none", "client_secret_post"}:
+        if auth_method not in {"none", "client_secret_post", "client_secret_basic"}:
             raise ValueError("unsupported token_endpoint_auth_method")
         client_id = "mnemos_" + secrets.token_urlsafe(18)
         secret = secrets.token_urlsafe(32) if auth_method != "none" else None
@@ -339,7 +339,8 @@ class OAuthService:
         client = await self.store.get_client(client_id)
         if not client:
             return JSONResponse({"error": "invalid_client"}, status_code=401)
-        if client.get("token_endpoint_auth_method") == "client_secret_post" and not hmac.compare_digest(form.get("client_secret", ""), client.get("client_secret", "")):
+        auth_method = client.get("token_endpoint_auth_method")
+        if auth_method in ("client_secret_post", "client_secret_basic") and not hmac.compare_digest(form.get("client_secret", ""), client.get("client_secret", "")):
             return JSONResponse({"error": "invalid_client"}, status_code=401)
         if grant == "authorization_code":
             row = await self.store.consume_code(form.get("code", ""))
@@ -468,6 +469,19 @@ async def authorize_post_route(request: Request):
 async def token_route(request: Request):
     try:
         form = {str(k): str(v) for k, v in (await request.form()).items()}
+        # RFC 6749 5.2.1: client_secret_basic presents credentials via the
+        # Authorization header, not the form body -- decode it if present;
+        # it takes precedence over any form-supplied client_id/secret.
+        authz = request.headers.get("authorization", "")
+        if authz.lower().startswith("basic "):
+            import base64
+            try:
+                decoded = base64.b64decode(authz[6:].strip()).decode("utf-8")
+                basic_id, _, basic_secret = decoded.partition(":")
+            except (ValueError, UnicodeDecodeError):
+                return JSONResponse({"error": "invalid_client"}, status_code=401)
+            form["client_id"] = basic_id
+            form["client_secret"] = basic_secret
         return await get_oauth_service().token(form)
     except RuntimeError:
         return JSONResponse({"error": "temporarily_unavailable"}, status_code=503)
