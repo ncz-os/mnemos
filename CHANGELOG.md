@@ -57,6 +57,58 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.2.0] — 2026-09-09
+
+Security-audit release. 11 fixes across mnemos-core and the bridge/tool
+family, an OAuth 2.1 authorization server on the MCP edge, and the
+migration-replay crash-loop fix carried over from Unreleased.
+
+### Security — 11-finding audit round, mnemos-core + bridge family
+
+- **`mnemos-core`**: OAuth 2.1 MCP provisioning hardening (weak
+  signing-key rejection, dedicated OAuth database provisioning before
+  store access, MORPHEUS dead-letter handling); `judge.py` no longer
+  swallows a hot-rs size-limit `ValueError` as a benign fallback.
+- **`mnemos-bridge-anthropic` / `-openai` / `-core` / `-gemini` /
+  `-crewai`**: tool-policy gates inverted from denylist to allowlist —
+  an invented/unrecognized tool name is now rejected by default instead
+  of passing through unfiltered. `-openai` also closes a credential-drop
+  fallback path; `-core` enforces HTTPS-by-default and redacts secrets
+  from transport URLs; `-crewai`'s inversion was verified against the
+  server's exact tool contract.
+- **`mnemosctl`**: removed the `--allow-unlisted-host` bypass entirely
+  and fixed a DNS-rebinding gap in `sync-from`'s host allowlist —
+  previously a crafted redirect or DNS answer could route a
+  bearer-credentialed sync request to a non-allowlisted host.
+- **`mnemos-stiphos`**: agent identity is now cryptographically bound
+  (was pure self-attestation — any token holder could impersonate any
+  agent); job claims are an atomic compare-and-swap instead of two
+  separate transactions; endpoint authorization added; the reaper is
+  now heartbeat-aware instead of duplicate-executing live jobs.
+- **`mnemos-rs`**: credential-bearing CLI flags no longer appear in
+  process argv; closed a real bypass in the plaintext-HTTP-loopback
+  guard where an `HTTP_PROXY`/`HTTPS_PROXY` environment variable could
+  route a request the guard believed was loopback-only through an
+  ambient proxy — all HTTP client builders now disable ambient proxy
+  discovery.
+- **`mnemos-bridge-claude-connector`**: backend-URL credentials
+  (userinfo, signed-URL query params, URL fragments) no longer leak into
+  log lines or exception/error text on the proxy and OAuth-validation
+  paths.
+
+### Added — OAuth 2.1 authorization server on the MCP edge
+
+Provider-neutral OAuth 2.1: discovery, dynamic client registration,
+authorization-code + PKCE (S256), refresh tokens, bearer-JWT validation.
+Coexists with the legacy static-bearer path on the same MCP HTTP/SSE
+edge. See `docs/connectors/chatgpt-pro-developer-mode.md` (Cloudflare
+Tunnel + ngrok, including Cloudflare's Tunnel API for scripted
+auto-provisioning) and `docs/connectors/codex-cli.md` (Codex-specific
+setup, including the Developer Mode prerequisite Codex shares with
+ChatGPT's own connector registry). `AGENTS.md` now prompts the deploying
+agent to ask the operator which connectivity mode(s) — LAN stdio, the
+remote OAuth gateway, or both — they want before finishing setup.
+
 ### Fixed — schema migration replay crash-loops on a seed-data unique-violation
 
 Static seed-data migrations (e.g. `0033_subscription_plans`) are replayed
