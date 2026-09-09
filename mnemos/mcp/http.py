@@ -76,6 +76,7 @@ from mnemos.mcp.tools import (
     reset_mcp_backend_context,
     set_mcp_backend_context,
 )
+from mnemos.persistence.schema import ensure_postgres_oauth_schema
 
 # stderr logging — matches mcp_server.py convention so log shipping
 # from container stdout/stderr stays consistent.
@@ -896,34 +897,33 @@ async def _mcp_http_lifespan(_app: Starlette):
     pool = None
     settings = get_settings()
     dsn = settings.oauth.database_url.strip()
-    if dsn:
-        if not settings.oauth.issuer.strip():
-            raise RuntimeError("MNEMOS_OAUTH_ISSUER is required when MCP OAuth persistence is enabled")
-        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4)
-        store = oauth_module.PostgresOAuthStore(pool)
-        signing_key = settings.oauth.signing_key or await store.get_signing_key()
-        if not signing_key:
-            generated_key = secrets.token_urlsafe(32)
-            await store.save_signing_key(key_id="default", signing_key=generated_key)
-            signing_key = await store.get_signing_key()
-            if not signing_key:
-                await pool.close()
-                raise RuntimeError("failed to persist the MCP OAuth signing key")
-            logger.info(
-                "OAuth signing key generated and persisted to "
-                "oauth_mcp_signing_keys (key_id=default) on first boot."
-            )
-        service = oauth_module.OAuthService(
-            base_url=settings.oauth.issuer,
-            signing_key=signing_key,
-            store=store,
-            registration_secret=settings.oauth.registration_secret,
-            admin_passphrase=settings.oauth.admin_passphrase,
-        )
-        oauth_module.set_oauth_service(service)
-        logger.info("OAuth store wired to Postgres (MNEMOS_OAUTH_DATABASE_URL).")
-
     try:
+        if dsn:
+            if not settings.oauth.issuer.strip():
+                raise RuntimeError("MNEMOS_OAUTH_ISSUER is required when MCP OAuth persistence is enabled")
+            pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4)
+            await ensure_postgres_oauth_schema(pool)
+            store = oauth_module.PostgresOAuthStore(pool)
+            signing_key = settings.oauth.signing_key or await store.get_signing_key()
+            if not signing_key:
+                generated_key = secrets.token_urlsafe(32)
+                await store.save_signing_key(key_id="default", signing_key=generated_key)
+                signing_key = await store.get_signing_key()
+                if not signing_key:
+                    raise RuntimeError("failed to persist the MCP OAuth signing key")
+                logger.info(
+                    "OAuth signing key generated and persisted to "
+                    "oauth_mcp_signing_keys (key_id=default) on first boot."
+                )
+            service = oauth_module.OAuthService(
+                base_url=settings.oauth.issuer,
+                signing_key=signing_key,
+                store=store,
+                registration_secret=settings.oauth.registration_secret,
+                admin_passphrase=settings.oauth.admin_passphrase,
+            )
+            oauth_module.set_oauth_service(service)
+            logger.info("OAuth store wired to Postgres (MNEMOS_OAUTH_DATABASE_URL).")
         yield
     finally:
         oauth_module.set_oauth_service(None)

@@ -1186,6 +1186,86 @@ def test_oauth_real_sse_tools_list_over_wire(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_dedicated_oauth_database_is_provisioned_before_store_access(
+    mcp_http_app: FreshApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the MNEMOS_OAUTH_DATABASE_URL lifecycle with a mocked DSN."""
+    import asyncpg
+
+    events: list[tuple[str, str]] = []
+    persisted_key = secrets.token_urlsafe(32)
+
+    class _Connection:
+        async def execute(self, statement: str, *_args: Any) -> str:
+            events.append(("execute", statement))
+            return "OK"
+
+        async def fetchrow(self, query: str, *_args: Any) -> dict[str, str] | None:
+            events.append(("fetchrow", query))
+            if "oauth_mcp_signing_keys" in query:
+                return {"signing_key": persisted_key}
+            return None
+
+    class _Acquire:
+        async def __aenter__(self) -> _Connection:
+            return connection
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+    class _Pool:
+        closed = False
+
+        def acquire(self) -> _Acquire:
+            return _Acquire()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    connection = _Connection()
+    pool = _Pool()
+    captured_pool_args: dict[str, Any] = {}
+
+    async def _create_pool(**kwargs: Any) -> _Pool:
+        captured_pool_args.update(kwargs)
+        return pool
+
+    async def _no_drain() -> None:
+        return None
+
+    settings = types.SimpleNamespace(
+        oauth=types.SimpleNamespace(
+            database_url="postgresql://mock/oauth",
+            issuer="http://testserver",
+            signing_key="",
+            registration_secret="registration-secret",
+            admin_passphrase="admin-passphrase",
+        )
+    )
+    monkeypatch.setattr(asyncpg, "create_pool", _create_pool)
+    monkeypatch.setattr(mcp_http_app.http, "get_settings", lambda: settings)
+    monkeypatch.setattr(mcp_http_app.http, "_drain_audit_tasks_on_shutdown", _no_drain)
+
+    async with mcp_http_app.http._mcp_http_lifespan(mcp_http_app.app):
+        assert mcp_http_app.http.get_oauth_service().signing_key == persisted_key
+
+    assert captured_pool_args == {"dsn": "postgresql://mock/oauth", "min_size": 1, "max_size": 4}
+    ddl_positions = [
+        index
+        for index, (kind, statement) in enumerate(events)
+        if kind == "execute" and "CREATE TABLE IF NOT EXISTS oauth_mcp_" in statement
+    ]
+    signing_key_query_position = next(
+        index
+        for index, (kind, statement) in enumerate(events)
+        if kind == "fetchrow" and "oauth_mcp_signing_keys" in statement
+    )
+    assert len(ddl_positions) == 4
+    assert max(ddl_positions) < signing_key_query_position
+    assert pool.closed is True
+
+
+@pytest.mark.asyncio
 async def test_token_with_wrong_verifier_is_rejected(
     mcp_http_app: FreshApp,
 ) -> None:
