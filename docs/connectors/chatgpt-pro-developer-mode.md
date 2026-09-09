@@ -50,7 +50,36 @@ The MCP HTTP/SSE bridge (`mnemos serve mcp-http`) shares the exact same
 25 tool definitions as the stdio MCP server. A memory written from Claude
 Desktop is queryable from ChatGPT and vice versa.
 
-## Setup — manual path (works today)
+## Setup — OAuth 2.1 path
+
+The MCP edge now exposes OAuth 2.1 discovery, dynamic client registration,
+authorization-code + PKCE S256, refresh tokens, and bearer-JWT validation.
+Dynamic client registration is intentionally public, as required by automatic
+MCP clients; authorization still requires the admin passphrase and registration
+is bounded by request-size, redirect-count, and per-address rate limits.
+
+Configure the public issuer and durable PostgreSQL store before starting the
+edge:
+
+```bash
+export MNEMOS_OAUTH_ISSUER="https://mnemos.example.com"
+export MNEMOS_OAUTH_ADMIN_PASSPHRASE="$(openssl rand -hex 32)"
+export MNEMOS_OAUTH_DATABASE_URL="postgresql://mnemos:password@db:5432/mnemos"
+```
+
+Treat the admin passphrase as a credential: keep it out of URLs, command
+history, access logs, and checked-in environment files. The authorization UI
+submits it only in the POST body.
+
+The OAuth migration is applied by the installer and both compose profiles.
+With the PostgreSQL store configured, leave `MNEMOS_OAUTH_SIGNING_KEY` unset:
+first boot generates `secrets.token_urlsafe(32)` and persists it. For isolated
+development without PostgreSQL, generate a stable random value with
+`python -c 'import secrets; print(secrets.token_urlsafe(32))'` and set
+`MNEMOS_OAUTH_SIGNING_KEY`; OAuth clients and grants then remain in memory and
+are lost on restart.
+
+## Setup — legacy static bearer path
 
 ### 1. Bring up the MCP HTTP/SSE bridge
 
@@ -214,9 +243,9 @@ token, prints the connector config, and copies URL+token to your clipboard.
 - **TLS is the tunnel's responsibility**: `mnemos serve mcp-http` listens
   on plain HTTP. Never bind it to a public IP without the tunnel
   providing TLS termination.
-- **No OAuth on the MCP edge yet**: bearer auth only. Anyone with the token can
-  read/write as the mapped backend principal. Treat the token like an SSH
-  private key.
+- **Legacy bearer tokens remain supported**: anyone with a configured static
+  token can read/write as its mapped backend principal. OAuth JWTs and static
+  tokens pass through the same MCP authorization and audit pipeline.
 - **Connector tool list updates require reconnect**: if MNEMOS adds
   new tools (e.g., MORPHEUS slice 2 endpoints), ChatGPT may need the
   connector removed and re-added to pick them up.

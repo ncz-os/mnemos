@@ -21,7 +21,10 @@ def eligible_memory_predicate(alias: str = "m") -> str:
 
 
 def eligible_for_morpheus(alias: str = "m") -> str:
-    return eligible_memory_predicate(alias)
+    predicate = eligible_memory_predicate(alias)
+    prefix = f"{alias}." if alias else ""
+    vault_literal = VAULT_NAMESPACE.replace("'", "''")
+    return f"{predicate} AND ({prefix}namespace IS NULL OR {prefix}namespace <> '{vault_literal}')"
 
 
 def eligible_for_compression(alias: str = "m", *, reject_private_parent: bool = False) -> str:

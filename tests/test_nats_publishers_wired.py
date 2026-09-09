@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock
 
@@ -243,3 +244,64 @@ async def test_webhook_create_publishes_subscription_created(
         "source_node": NODE_NAME,
     }
     assert publish_mock.await_args.kwargs["msg_id"] == f"webhook.{webhook_id}.subscription.created"
+
+
+async def test_bulk_create_publishes_are_overlapped(
+    client,
+    auth_headers: dict[str, str],
+    current_user_override,
+    publish_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    install_fake_backend(monkeypatch)
+    state = {"in_flight": 0, "peak": 0}
+
+    async def _tracked_publish(*_args, **_kwargs):
+        state["in_flight"] += 1
+        state["peak"] = max(state["peak"], state["in_flight"])
+        try:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        finally:
+            state["in_flight"] -= 1
+
+    publish_mock.side_effect = _tracked_publish
+    response = await client.post(
+        "/v1/memories/bulk",
+        json={"memories": [{"content": f"item {i}"} for i in range(8)]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201, response.text
+    assert publish_mock.await_count == 8
+    assert state["peak"] > 1
+
+
+async def test_bulk_create_publish_failure_does_not_fail_created_rows(
+    client,
+    auth_headers: dict[str, str],
+    current_user_override,
+    publish_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    install_fake_backend(monkeypatch)
+
+    async def _sometimes_fails(_subject, payload, **_kwargs):
+        if payload["category"] == "fail-publish":
+            raise RuntimeError("synthetic NATS failure")
+
+    publish_mock.side_effect = _sometimes_fails
+    response = await client.post(
+        "/v1/memories/bulk",
+        json={
+            "memories": [
+                {"content": "first", "category": "fail-publish"},
+                {"content": "second", "category": "facts"},
+            ]
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["created"] == 2
+    assert publish_mock.await_count == 2
