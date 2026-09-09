@@ -991,18 +991,21 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
     namespace = run_row["namespace"]
     verify = _extract_verify_enabled(config)
     max_input_count = settings.extract_max_input_count
+    max_failures = settings.extract_max_failures
     async with pool.acquire() as conn:
         candidates = await conn.fetch(
             f"""
-            SELECT id, verbatim_content, owner_id, namespace
-            FROM memories
-            WHERE {eligible_for_morpheus("")}
-              AND created <= $1
-              AND triples_extracted_at IS NULL
-              AND verbatim_content IS NOT NULL
-              AND length(verbatim_content) >= $2
-              AND ($3::text IS NULL OR namespace = $3)
-            ORDER BY created, id
+            SELECT m.id, m.verbatim_content, m.owner_id, m.namespace
+            FROM memories m
+            LEFT JOIN morpheus_extract_failures failure ON failure.memory_id = m.id
+            WHERE {eligible_for_morpheus("m")}
+              AND m.created <= $1
+              AND m.triples_extracted_at IS NULL
+              AND m.verbatim_content IS NOT NULL
+              AND length(m.verbatim_content) >= $2
+              AND ($3::text IS NULL OR m.namespace = $3)
+              AND (failure.status IS NULL OR failure.status <> 'dead_letter')
+            ORDER BY m.created, m.id
             LIMIT $4
             """,
             run_row["window_ended_at"],
@@ -1031,11 +1034,61 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
             if verify and triples:
                 triples = await _verify_extracted_triples(content, triples)
         except MorpheusExtractionError as exc:
-            logger.warning(
-                "[MORPHEUS] extraction failed for memory %s; leaving it retryable: %s",
-                memory_id,
-                exc,
-            )
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    still_pending = await conn.fetchval(
+                        """
+                        SELECT id
+                        FROM memories
+                        WHERE id = $1 AND triples_extracted_at IS NULL
+                        FOR UPDATE
+                        """,
+                        memory_id,
+                    )
+                    if still_pending is None:
+                        continue
+                    failure = await conn.fetchrow(
+                        """
+                        INSERT INTO morpheus_extract_failures
+                            (memory_id, attempts, status, last_error, last_failed_at)
+                        VALUES (
+                            $1,
+                            1,
+                            CASE WHEN $2 <= 1 THEN 'dead_letter' ELSE 'retryable' END,
+                            $3,
+                            NOW()
+                        )
+                        ON CONFLICT (memory_id) DO UPDATE
+                        SET attempts = morpheus_extract_failures.attempts + 1,
+                            status = CASE
+                                WHEN morpheus_extract_failures.attempts + 1 >= $2
+                                    THEN 'dead_letter'
+                                ELSE 'retryable'
+                            END,
+                            last_error = EXCLUDED.last_error,
+                            last_failed_at = EXCLUDED.last_failed_at
+                        RETURNING attempts, status
+                        """,
+                        memory_id,
+                        max_failures,
+                        str(exc)[:2000],
+                    )
+            attempts = int(failure["attempts"])
+            if failure["status"] == "dead_letter":
+                logger.error(
+                    "[MORPHEUS] extraction dead-lettered memory %s after %d consecutive failures: %s",
+                    memory_id,
+                    attempts,
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "[MORPHEUS] extraction failed for memory %s (attempt %d/%d); leaving it retryable: %s",
+                    memory_id,
+                    attempts,
+                    max_failures,
+                    exc,
+                )
             continue
 
         async with pool.acquire() as conn:
@@ -1055,6 +1108,11 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
                 )
                 if marked_id is None:
                     continue
+
+                await conn.execute(
+                    "DELETE FROM morpheus_extract_failures WHERE memory_id = $1",
+                    memory_id,
+                )
 
                 await conn.execute(
                     """

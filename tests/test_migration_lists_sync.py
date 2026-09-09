@@ -75,6 +75,7 @@ EXPECTED_MIGRATIONS = [
     "migrations_v5_3_4_mcp_audit_log.sql",
     "migrations_v5_3_5_model_registry_capabilities_gin.sql",
     "migrations_v5_4_0_mcp_oauth.sql",
+    "migrations_v5_4_1_morpheus_extract_failures.sql",
     "0021_hive_agents.sql",
     "0032_usage_ledger.sql",
     "0033_subscription_plans.sql",
@@ -141,6 +142,7 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "migrations_v5_1_0_deletion_log_sqlite.sql",
     "migrations_v5_2_0_nats_outbox_idempotency_sqlite.sql",
     "migrations_v5_3_4_mcp_audit_log_sqlite.sql",
+    "migrations_v5_4_1_morpheus_extract_failures_sqlite.sql",
     "migrations_v6_2_audit_chain_sqlite.sql",
     "migrations_v6_2_category_decay_sqlite.sql",
     "migrations_v6_3_api_keys_last_used_sqlite.sql",
@@ -226,6 +228,14 @@ def test_mcp_oauth_migration_grants_runtime_role_least_privilege():
     assert "GRANT SELECT, INSERT, UPDATE ON oauth_mcp_authorization_codes TO mnemos_user" in oauth_sql
     assert "GRANT SELECT, INSERT, UPDATE ON oauth_mcp_tokens TO mnemos_user" in oauth_sql
     assert "GRANT SELECT, INSERT ON oauth_mcp_signing_keys TO mnemos_user" in oauth_sql
+
+
+def test_morpheus_extract_failure_migration_grants_runtime_role() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    failure_sql = (repo_root / "mnemos/db_migrations/migrations_v5_4_1_morpheus_extract_failures.sql").read_text()
+
+    assert "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mnemos_user')" in failure_sql
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON morpheus_extract_failures TO mnemos_user" in failure_sql
 
 
 def test_subscription_plan_current_limits_deletes_superseded_claude_future_rows():
@@ -625,6 +635,7 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
         assert "-f /migrations/36-session-compression-ratio-drop.sql" in text, compose_name
         assert "-f /migrations/37-session-compression-legacy-drop.sql" in text, compose_name
         assert "-f /migrations/38-sessions-consultations-namespace.sql" in text, compose_name
+        assert "-f /migrations/61b-morpheus-extract-failures.sql" in text, compose_name
         assert "-f /migrations/62-usage-ledger.sql" in text, compose_name
         assert "postgres-upgrade:\n        condition: service_completed_successfully" in text, compose_name
 

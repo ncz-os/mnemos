@@ -100,6 +100,18 @@ async def test_postgres_backend_open_provisions_oauth_tables_on_fresh_schema() -
 
 
 @pytest.mark.asyncio
+async def test_postgres_backend_open_provisions_morpheus_failure_triage_table() -> None:
+    conn = _FakePgConn(current_type="vector(1024)", index_method="hnsw")
+    backend = PostgresBackend(_FakePgPool(conn), _settings(1024))
+
+    await backend.open()
+
+    applied = "\n".join(conn.statements)
+    assert "CREATE TABLE IF NOT EXISTS morpheus_extract_failures" in applied
+    assert "CHECK (status IN ('retryable', 'dead_letter'))" in applied
+
+
+@pytest.mark.asyncio
 async def test_postgres_standup_repairs_empty_wrong_dim_column_and_index() -> None:
     conn = _FakePgConn(current_type="vector(768)", index_method="ivfflat")
 

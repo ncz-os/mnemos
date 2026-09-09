@@ -29,6 +29,7 @@ def reset_morpheus_extract_settings(monkeypatch):
     monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_MUSE", raising=False)
     monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_VERIFIER", raising=False)
     monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_MAX_INPUT_COUNT", raising=False)
+    monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_MAX_FAILURES", raising=False)
     core_config._reset_settings_for_tests()
     yield
     core_config._reset_settings_for_tests()
@@ -63,6 +64,7 @@ class _Conn:
         self.memories = {row["id"]: row for row in memories or []}
         self.kg_triples = list(kg_triples or [])
         self.extract_run_memories: list[dict] = []
+        self.extract_failures: dict[str, dict] = {}
         self.executed: list[tuple[str, tuple]] = []
         self.counter_updates: list[tuple[str, tuple]] = []
 
@@ -72,14 +74,29 @@ class _Conn:
     async def fetchrow(self, sql: str, *_args):
         if "FROM morpheus_runs" in sql:
             return self.run_row
+        compact = " ".join(sql.split())
+        if compact.startswith("INSERT INTO morpheus_extract_failures"):
+            memory_id, max_failures, last_error = _args
+            attempts = self.extract_failures.get(memory_id, {}).get("attempts", 0) + 1
+            status = "dead_letter" if attempts >= max_failures else "retryable"
+            row = {
+                "memory_id": memory_id,
+                "attempts": attempts,
+                "status": status,
+                "last_error": last_error,
+                "last_failed_at": "now",
+            }
+            self.extract_failures[memory_id] = row
+            return row
         return None
 
     async def fetch(self, sql: str, *args):
         compact = " ".join(sql.split())
-        if "SELECT id, verbatim_content, owner_id, namespace" not in compact:
+        if "SELECT m.id, m.verbatim_content, m.owner_id, m.namespace" not in compact:
             return []
-        assert "created <= $1" in compact
-        assert "ORDER BY created, id" in compact
+        assert "m.created <= $1" in compact
+        assert "ORDER BY m.created, m.id" in compact
+        assert "failure.status <> 'dead_letter'" in compact
         assert "LIMIT $4" in compact
         window_end, min_chars, namespace, limit = args
         out = []
@@ -95,6 +112,8 @@ class _Conn:
                 continue
             if row.get("triples_extracted_at") is not None:
                 continue
+            if self.extract_failures.get(row["id"], {}).get("status") == "dead_letter":
+                continue
             if content is None or len(content) < min_chars:
                 continue
             if namespace is not None and row.get("namespace") != namespace:
@@ -106,6 +125,11 @@ class _Conn:
 
     async def fetchval(self, sql: str, *args):
         compact = " ".join(sql.split())
+        if compact.startswith("SELECT id FROM memories") and compact.endswith("FOR UPDATE"):
+            row = self.memories.get(args[0])
+            if row is not None and row.get("triples_extracted_at") is None:
+                return row["id"]
+            return None
         if compact.startswith("UPDATE memories SET triples_extracted_at = NOW()"):
             memory_id, namespace = args
             row = self.memories.get(memory_id)
@@ -158,6 +182,9 @@ class _Conn:
                 }
             )
             return "INSERT 0 1"
+        if compact.startswith("DELETE FROM morpheus_extract_failures"):
+            self.extract_failures.pop(args[0], None)
+            return "DELETE 1"
         if compact.startswith("WITH deleted_extract_triples AS"):
             return self._execute_extract_rollback(args[0])
         if compact.startswith("UPDATE memories SET consolidated_into = NULL"):
@@ -389,6 +416,22 @@ async def test_provider_failure_leaves_memory_retryable(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_late_failure_does_not_recreate_state_after_concurrent_success(monkeypatch):
+    conn = _Conn(memories=[_memory("mem_concurrent")])
+
+    async def succeeds_elsewhere_then_fails(_content: str) -> list[ExtractedTriple]:
+        conn.memories["mem_concurrent"]["triples_extracted_at"] = "concurrent-success"
+        raise runner.MorpheusExtractionError("late provider failure")
+
+    monkeypatch.setattr(runner, "_extract_triples_from_prose", succeeds_elsewhere_then_fails)
+
+    await phase_extract(_Pool(conn), RUN_ID)
+
+    assert conn.extract_failures == {}
+    assert conn.memories["mem_concurrent"]["triples_extracted_at"] == "concurrent-success"
+
+
+@pytest.mark.asyncio
 async def test_rollback_run_removes_only_triples_from_that_run():
     conn = _Conn(
         memories=[
@@ -594,3 +637,35 @@ async def test_phase_extract_limit_does_not_strand_backlog_between_runs(monkeypa
         "mem_2",
         "mem_3",
     }
+
+
+@pytest.mark.asyncio
+async def test_phase_extract_dead_letters_poison_batch_then_processes_newer_rows(monkeypatch):
+    monkeypatch.setenv("MNEMOS_MORPHEUS_EXTRACT_MAX_INPUT_COUNT", "2")
+    monkeypatch.setenv("MNEMOS_MORPHEUS_EXTRACT_MAX_FAILURES", "2")
+    core_config._reset_settings_for_tests()
+    attempted: list[str] = []
+
+    async def fail_oldest(content: str) -> list[ExtractedTriple]:
+        memory_id = content.split()[0]
+        attempted.append(memory_id)
+        if memory_id in {"mem_0", "mem_1"}:
+            raise runner.MorpheusExtractionError("permanent provider failure")
+        return []
+
+    monkeypatch.setattr(runner, "_extract_triples_from_prose", fail_oldest)
+    conn = _Conn(memories=[_memory(f"mem_{i}", created_offset=i) for i in range(4)])
+    pool = _Pool(conn)
+
+    for _ in range(3):
+        await phase_extract(pool, RUN_ID)
+
+    assert attempted == ["mem_0", "mem_1", "mem_0", "mem_1", "mem_2", "mem_3"]
+    assert {memory_id: row["status"] for memory_id, row in conn.extract_failures.items()} == {
+        "mem_0": "dead_letter",
+        "mem_1": "dead_letter",
+    }
+    assert conn.memories["mem_0"]["triples_extracted_at"] is None
+    assert conn.memories["mem_1"]["triples_extracted_at"] is None
+    assert conn.memories["mem_2"]["triples_extracted_at"] == "now"
+    assert conn.memories["mem_3"]["triples_extracted_at"] == "now"

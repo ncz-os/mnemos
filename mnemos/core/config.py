@@ -577,6 +577,12 @@ class _MorpheusSettings(BaseSettings):
         le=1_000_000,
         validation_alias="MNEMOS_MORPHEUS_EXTRACT_MAX_INPUT_COUNT",
     )
+    extract_max_failures: int = Field(
+        3,
+        ge=1,
+        le=100,
+        validation_alias="MNEMOS_MORPHEUS_EXTRACT_MAX_FAILURES",
+    )
 
     @property
     def orphan_timeout_hours(self) -> str | None:
