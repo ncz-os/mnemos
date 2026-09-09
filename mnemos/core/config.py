@@ -571,6 +571,18 @@ class _MorpheusSettings(BaseSettings):
     extract_min_confidence: float = Field(0.6, validation_alias="MNEMOS_MORPHEUS_EXTRACT_MIN_CONFIDENCE")
     extract_muse: str = Field("qwen3-7b", validation_alias="MNEMOS_MORPHEUS_EXTRACT_MUSE")
     extract_verifier: str = Field("openai", validation_alias="MNEMOS_MORPHEUS_EXTRACT_VERIFIER")
+    extract_max_input_count: int = Field(
+        500,
+        ge=1,
+        le=1_000_000,
+        validation_alias="MNEMOS_MORPHEUS_EXTRACT_MAX_INPUT_COUNT",
+    )
+    extract_max_failures: int = Field(
+        3,
+        ge=1,
+        le=100,
+        validation_alias="MNEMOS_MORPHEUS_EXTRACT_MAX_FAILURES",
+    )
 
     @property
     def orphan_timeout_hours(self) -> str | None:
@@ -927,6 +939,14 @@ class _OAuthSettings(BaseSettings):
     model_config = _config_model_config()
 
     trust_proxy: bool = Field(False, validation_alias="OAUTH_TRUST_PROXY")
+    # Remote MCP authorization-server settings. ``issuer`` must be the public
+    # HTTPS MCP origin. ``database_url`` enables durable clients, codes,
+    # refresh tokens, and signing keys; otherwise ``signing_key`` is required.
+    signing_key: str = Field("", validation_alias="MNEMOS_OAUTH_SIGNING_KEY")
+    registration_secret: str = Field("", validation_alias="MNEMOS_OAUTH_REGISTRATION_SECRET")
+    admin_passphrase: str = Field("", validation_alias="MNEMOS_OAUTH_ADMIN_PASSPHRASE")
+    issuer: str = Field("", validation_alias="MNEMOS_OAUTH_ISSUER")
+    database_url: str = Field("", validation_alias="MNEMOS_OAUTH_DATABASE_URL")
 
 
 class _AuthSettings(BaseSettings):
@@ -987,6 +1007,12 @@ class _NatsSettings(BaseSettings):
     publish_timeout_seconds: float = Field(
         1.0,
         validation_alias="MNEMOS_NATS_PUBLISH_TIMEOUT",
+    )
+    bulk_publish_concurrency: int = Field(
+        16,
+        ge=1,
+        le=256,
+        validation_alias="MNEMOS_NATS_BULK_PUBLISH_CONCURRENCY",
     )
     # When set, the webhook NATS trigger uses a SHARED durable consumer
     # joined via this queue group instead of per-node durables. JetStream

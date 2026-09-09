@@ -424,6 +424,7 @@ _MIGRATION_GROUP_BY_NAME: dict[str, str] = {
     "migrations_v4_2_morpheus_extract.sql": "morpheus",
     "migrations_v5_0_consolidated_at.sql": "morpheus",
     "migrations_v5_0_morpheus_extract_run_memories.sql": "morpheus",
+    "migrations_v5_4_1_morpheus_extract_failures.sql": "morpheus",
     "migrations_v4_2_persephone.sql": "persephone",
     "migrations_v5_0_2_artemis_dedup.sql": "artemis",
     "migrations_v4_2_pantheon_routing_audit.sql": "pantheon",
@@ -629,6 +630,8 @@ def run_migrations(config: Config) -> bool:
         repo_path / "mnemos" / "db_migrations" / "migrations_v5_3_3_deletion_log_export_index.sql",
         repo_path / "mnemos" / "db_migrations" / "migrations_v5_3_4_mcp_audit_log.sql",
         repo_path / "mnemos" / "db_migrations" / "migrations_v5_3_5_model_registry_capabilities_gin.sql",
+        repo_path / "mnemos" / "db_migrations" / "migrations_v5_4_0_mcp_oauth.sql",
+        repo_path / "mnemos" / "db_migrations" / "migrations_v5_4_1_morpheus_extract_failures.sql",
         # hive_agents must be CREATEd before 0036 ALTERs it (hive/full deploys).
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0021_hive_agents.sql",
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0032_usage_ledger.sql",
