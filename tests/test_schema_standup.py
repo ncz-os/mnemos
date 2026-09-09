@@ -16,6 +16,7 @@ from mnemos.persistence.schema import (
     postgres_migration_paths,
     render_migration_sql,
 )
+from mnemos.persistence.postgres import PostgresBackend
 
 
 class _FakeSqlstateError(Exception):
@@ -80,6 +81,37 @@ async def test_postgres_standup_substitutes_embedding_dim_and_hnsw() -> None:
 
 
 @pytest.mark.asyncio
+async def test_postgres_backend_open_provisions_oauth_tables_on_fresh_schema() -> None:
+    """Exercise the real backend lifecycle, not only the path-list helper."""
+    conn = _FakePgConn(current_type="vector(1024)", index_method="hnsw")
+    backend = PostgresBackend(_FakePgPool(conn), _settings(1024))
+
+    await backend.open()
+
+    applied = "\n".join(conn.statements)
+    for table in (
+        "oauth_mcp_clients",
+        "oauth_mcp_authorization_codes",
+        "oauth_mcp_tokens",
+        "oauth_mcp_signing_keys",
+    ):
+        assert f"CREATE TABLE IF NOT EXISTS {table}" in applied
+    assert conn.statements[-1] == "SELECT 1"
+
+
+@pytest.mark.asyncio
+async def test_postgres_backend_open_provisions_morpheus_failure_triage_table() -> None:
+    conn = _FakePgConn(current_type="vector(1024)", index_method="hnsw")
+    backend = PostgresBackend(_FakePgPool(conn), _settings(1024))
+
+    await backend.open()
+
+    applied = "\n".join(conn.statements)
+    assert "CREATE TABLE IF NOT EXISTS morpheus_extract_failures" in applied
+    assert "CHECK (status IN ('retryable', 'dead_letter'))" in applied
+
+
+@pytest.mark.asyncio
 async def test_postgres_standup_repairs_empty_wrong_dim_column_and_index() -> None:
     conn = _FakePgConn(current_type="vector(768)", index_method="ivfflat")
 
@@ -101,6 +133,7 @@ def test_postgres_standup_migration_order_includes_full_numbered_surface() -> No
     assert "mnemos/db_migrations/migrations/0040_memory_compression_queue_parity.sql" in paths
     assert "mnemos/db_migrations/migrations/0044_model_registry_pricing.sql" in paths
     assert "mnemos/db_migrations/migrations/0046_graeae_soft_delete_ownership.sql" in paths
+    assert "mnemos/db_migrations/migrations_v5_4_0_mcp_oauth.sql" in paths
 
 
 def test_oracle_and_db2_standup_use_full_migration_sets_and_dim_templates() -> None:
@@ -198,15 +231,9 @@ def test_db2_unrelated_error_is_not_benign() -> None:
 
 
 def test_postgres_unique_violation_on_create_index_is_not_benign() -> None:
-    exc = _FakeSqlstateError(
-        "duplicate key value violates unique constraint", sqlstate="23505"
-    )
-    assert not _is_benign_postgres_error(
-        "CREATE UNIQUE INDEX ix_memories_owner ON memories (owner_id, namespace)", exc
-    )
-    assert not _is_benign_postgres_error(
-        "ALTER TABLE memories ADD CONSTRAINT uniq_owner UNIQUE (owner_id)", exc
-    )
+    exc = _FakeSqlstateError("duplicate key value violates unique constraint", sqlstate="23505")
+    assert not _is_benign_postgres_error("CREATE UNIQUE INDEX ix_memories_owner ON memories (owner_id, namespace)", exc)
+    assert not _is_benign_postgres_error("ALTER TABLE memories ADD CONSTRAINT uniq_owner UNIQUE (owner_id)", exc)
 
 
 def test_postgres_unique_violation_on_non_seed_insert_is_not_benign() -> None:
@@ -214,15 +241,9 @@ def test_postgres_unique_violation_on_non_seed_insert_is_not_benign() -> None:
     must NOT be silently skipped on a uniqueness violation -- a unique
     constraint on those tables is a real failure.
     """
-    exc = _FakeSqlstateError(
-        "duplicate key value violates unique constraint", sqlstate="23505"
-    )
-    assert not _is_benign_postgres_error(
-        "INSERT INTO memories (id, content, owner_id) VALUES ($1, $2, $3)", exc
-    )
-    assert not _is_benign_postgres_error(
-        "INSERT INTO api_keys (user_id, key_hash) VALUES ($1, $2)", exc
-    )
+    exc = _FakeSqlstateError("duplicate key value violates unique constraint", sqlstate="23505")
+    assert not _is_benign_postgres_error("INSERT INTO memories (id, content, owner_id) VALUES ($1, $2, $3)", exc)
+    assert not _is_benign_postgres_error("INSERT INTO api_keys (user_id, key_hash) VALUES ($1, $2)", exc)
 
 
 def test_postgres_seed_insert_other_seed_tables_is_not_benign() -> None:
@@ -230,24 +251,14 @@ def test_postgres_seed_insert_other_seed_tables_is_not_benign() -> None:
     happens to also be a seed must NOT silently bypass uniqueness
     failures -- the operator has to opt it in.
     """
-    exc = _FakeSqlstateError(
-        "duplicate key value violates unique constraint", sqlstate="23505"
-    )
-    assert not _is_benign_postgres_error(
-        "INSERT INTO some_other_seed (...) VALUES (...)", exc
-    )
+    exc = _FakeSqlstateError("duplicate key value violates unique constraint", sqlstate="23505")
+    assert not _is_benign_postgres_error("INSERT INTO some_other_seed (...) VALUES (...)", exc)
 
 
 def test_db2_unique_violation_on_create_index_is_not_benign() -> None:
-    exc = Exception(
-        "ibm_db_dbi::IntegrityError: SQL0803N ... SQLSTATE=23505 SQLCODE=-803"
-    )
-    assert not _is_benign_db2_error(
-        "CREATE UNIQUE INDEX ix_memories_owner ON memories (owner_id, namespace)", exc
-    )
-    assert not _is_benign_db2_error(
-        "ALTER TABLE memories ADD CONSTRAINT uniq_owner UNIQUE (owner_id)", exc
-    )
+    exc = Exception("ibm_db_dbi::IntegrityError: SQL0803N ... SQLSTATE=23505 SQLCODE=-803")
+    assert not _is_benign_db2_error("CREATE UNIQUE INDEX ix_memories_owner ON memories (owner_id, namespace)", exc)
+    assert not _is_benign_db2_error("ALTER TABLE memories ADD CONSTRAINT uniq_owner UNIQUE (owner_id)", exc)
 
 
 def test_oracle_unique_constraint_violation_on_non_seed_insert_is_not_benign() -> None:

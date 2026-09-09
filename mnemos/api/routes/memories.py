@@ -563,6 +563,33 @@ async def _publish_nats_with_timeout(
             logger.warning("NATS publish retry scheduling failed for %s: %s", subject, exc)
 
 
+async def _publish_bulk_created_events(events: list[dict], source_node: str) -> None:
+    """Publish bulk-create events concurrently without flooding NATS."""
+    if not events:
+        return
+    from mnemos.core.config import get_settings
+
+    semaphore = asyncio.Semaphore(get_settings().nats.bulk_publish_concurrency)
+
+    async def _publish_one(event: dict) -> None:
+        safe_ns = safe_subject_segment(event["namespace"])
+        async with semaphore:
+            try:
+                await _publish_nats_with_timeout(
+                    f"mnemos.memory.created.{safe_ns}",
+                    {**event, "source_node": source_node},
+                    msg_id=f"{event['memory_id']}.created",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "NATS bulk-create publish failed for %s: %s",
+                    event["memory_id"],
+                    exc,
+                )
+
+    await asyncio.gather(*(_publish_one(event) for event in events))
+
+
 async def _invalidate_caches_after_mutation() -> None:
     """Drop /stats + per-user search cache entries on any memory write.
 
@@ -2055,13 +2082,7 @@ async def bulk_create_memories(
     from mnemos.nats.client import get_node_name as _nats_get_node_name
 
     source_node = _nats_get_node_name()
-    for event in nats_created_events:
-        safe_ns = safe_subject_segment(event["namespace"])
-        await _publish_nats_with_timeout(
-            f"mnemos.memory.created.{safe_ns}",
-            {**event, "source_node": source_node},
-            msg_id=f"{event['memory_id']}.created",
-        )
+    await _publish_bulk_created_events(nats_created_events, source_node)
     await _invalidate_caches_after_mutation()
     return BulkCreateResponse(created=len(created_ids), memory_ids=created_ids, errors=errors)
 
