@@ -9,9 +9,9 @@ list wishlist items, speculative features, or aspirational claims.
 
 ---
 
-## Current status — v6.1.7
+## Current status — v6.2.0
 
-The 6.1 line is current. What it delivers:
+The 6.2 line is current. What it delivers:
 
 - **MIF 1.0 as the native portability format.** The CHARON adapter does a
   lossless round trip through MIF bundles (concept files plus a manifest) with
