@@ -81,6 +81,7 @@ _POSTGRES_LEGACY_MIGRATIONS: tuple[Path, ...] = (
     _DB_DIR / "migrations_v5_3_3_deletion_log_export_index.sql",
     _DB_DIR / "migrations_v5_3_4_mcp_audit_log.sql",
     _DB_DIR / "migrations_v5_3_5_model_registry_capabilities_gin.sql",
+    _DB_DIR / "migrations_v5_4_0_mcp_oauth.sql",
 )
 
 _POSTGRES_NUMBERED_DIR = _DB_DIR / "migrations"

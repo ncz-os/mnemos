@@ -22,7 +22,7 @@ from mnemos.mcp import oauth as mcp_oauth
 def _build_service(**overrides):
     base = overrides.pop("base_url", "http://testserver")
     store = overrides.pop("store", mcp_oauth.InMemoryOAuthStore())
-    signing_key = overrides.get("signing_key", "test-signing-key-do-not-ship")
+    signing_key = overrides.get("signing_key", "unit-7f2c9a4e6b8d1f3a5c7e9b2d4f6a8c0e")
     admin_passphrase = overrides.get("admin_passphrase", "test-passphrase")
     registration_secret = overrides.get("registration_secret", "test-reg-secret")
     return mcp_oauth.OAuthService(
@@ -51,11 +51,11 @@ def test_jwt_round_trip_and_expiry():
 
 
 def test_jwt_signature_is_verified():
-    service = _build_service(signing_key="real-key")
+    service = _build_service(signing_key="real-7f2c9a4e6b8d1f3a5c7e9b2d4f6a8c0e")
     token = service.issue_access_token(client_id="client-x")
     other = mcp_oauth.OAuthService(
         base_url="http://testserver",
-        signing_key="attacker-key",
+        signing_key="attacker-0e8c6a4f2d9b7e5c3a1f8d6b4e2c9a7f",
         store=mcp_oauth.InMemoryOAuthStore(),
         registration_secret="r",
         admin_passphrase="a",

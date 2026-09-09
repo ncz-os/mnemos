@@ -13,6 +13,7 @@ import json
 import os
 import secrets
 import uuid
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import asyncpg
@@ -20,6 +21,7 @@ import pytest
 from starlette.datastructures import FormData
 
 from mnemos.mcp import oauth as mcp_oauth
+from mnemos.persistence.postgres import PostgresBackend
 
 
 def _resolve_live_oauth_database_url() -> tuple[str | None, str | None]:
@@ -191,6 +193,60 @@ async def _issue_client_and_tokens(
     )
     token_payload = _decode_json_response(token_response)
     return client_id, token_payload["access_token"], token_payload["refresh_token"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_postgres_backend_open_provisions_oauth_tables_in_fresh_schema():
+    """A fresh runtime backend open must apply OAuth DDL itself."""
+    dsn, reason = _resolve_live_oauth_database_url()
+    if dsn is None:
+        pytest.skip(f"Live MNEMOS OAuth DB not available: {reason}")
+
+    admin_conn: asyncpg.Connection | None = None
+    pool: asyncpg.Pool | None = None
+    backend: PostgresBackend | None = None
+    schema = f"oauth_fresh_open_{uuid.uuid4().hex[:12]}"
+    try:
+        try:
+            admin_conn = await asyncpg.connect(dsn=dsn)
+            await admin_conn.execute(f'CREATE SCHEMA "{schema}"')
+            pool = await asyncpg.create_pool(
+                dsn=dsn,
+                min_size=1,
+                max_size=2,
+                server_settings={"search_path": f"{schema},public"},
+            )
+        except Exception as exc:  # pragma: no cover - env/network dependent
+            pytest.skip(f"MNEMOS_OAUTH_DATABASE_URL is set but not reachable: {exc}")
+
+        backend = PostgresBackend(
+            pool,
+            SimpleNamespace(database=SimpleNamespace(embedding_dim=768)),
+        )
+        await backend.open()
+        expected = {
+            "oauth_mcp_clients",
+            "oauth_mcp_authorization_codes",
+            "oauth_mcp_tokens",
+            "oauth_mcp_signing_keys",
+        }
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema=$1 AND table_name=ANY($2::text[])",
+                schema,
+                list(expected),
+            )
+        assert {row["table_name"] for row in rows} == expected
+    finally:
+        if backend is not None:
+            await backend.close()
+            pool = None
+        elif pool is not None:
+            await pool.close()
+        if admin_conn is not None:
+            await _drop_schema(admin_conn, schema)
+            await admin_conn.close()
 
 
 @pytest.mark.integration

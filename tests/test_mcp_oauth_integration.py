@@ -12,9 +12,8 @@ What this covers (positive + negative):
 * Metadata endpoints are public and return RFC-8414/9728 shapes.
 * Unauthenticated ``/sse`` is rejected with 401 ``WWW-Authenticate``.
 * Unknown bearer tokens are rejected.
-* Static ``MNEMOS_MCP_TOKEN`` continues to authenticate (Claude path)
-  by issuing a real MCP initialize + ListToolsRequest through the
-  authenticated SSE session — proving auth + tool dispatch end-to-end.
+* Static ``MNEMOS_MCP_TOKEN`` continues to authenticate through a stubbed
+  SSE session; the real SDK transport is covered separately below.
 * DCR is intentionally public for automatic MCP clients, with request-size,
   redirect-cardinality, URI-length, and per-address rate bounds.
 * PKCE enforcement: missing challenge, wrong method, wrong verifier are
@@ -28,9 +27,8 @@ What this covers (positive + negative):
 * Wrong redirect_uri at /token is rejected.
 * Empty/None admin passphrase fail-closed (constructor refuses to
   build the service).
-* The full register → authorize → token → SSE handshake → ListToolsRequest
-  flow returns the complete tool registry, proving the JWT issued by
-  /oauth/token actually authorizes the MCP tool surface.
+* A subprocess test drives register → authorize → token → real MCP SDK SSE
+  handshake → real ListToolsRequest and asserts the wire response.
 
 Test isolation: every test that needs a configured MCP HTTP app goes
 through the ``mcp_http_app`` fixture, which:
@@ -55,18 +53,31 @@ import asyncio
 import contextlib
 import importlib
 import json
+import os
 import secrets
+import socket
+import subprocess
 import sys
+import time
 import types
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import timedelta
+from pathlib import Path
 from typing import Any, Iterator
 
+import anyio
 import jwt
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Client
 from urllib.parse import parse_qs, urlparse
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+TRANSPORT_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass
@@ -89,9 +100,8 @@ class FreshApp:
 #   * runs the MCP ``app.run`` once with the inbound message and
 #     responds with a canned InitializeResult / ListToolsResult
 #     identical in shape to what the real server emits.
-# This lets us prove the bearer middleware accepted the token AND
-# that the tool registry is reachable end-to-end through the same
-# auth gate the real server uses.
+# This proves bearer middleware and session binding without claiming to
+# exercise the real SDK transport or JSON-RPC dispatcher.
 
 
 _TOOL_NAMES_SENTINEL: list[str] | None = None  # populated by stub
@@ -296,6 +306,106 @@ async def _client(fresh: FreshApp):
         base_url="http://testserver",
     ) as client:
         yield client
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", 0))
+        except PermissionError as exc:
+            pytest.skip(f"loopback bind unavailable for OAuth SSE integration: {exc}")
+        return int(sock.getsockname()[1])
+
+
+def _process_output(proc: subprocess.Popen[str]) -> str:
+    try:
+        stdout, stderr = proc.communicate(timeout=1)
+    except subprocess.TimeoutExpired:
+        return "<process still running>"
+    return f"stdout:\n{stdout}\nstderr:\n{stderr}"
+
+
+def _wait_for_http_ready(proc: subprocess.Popen[str], base_url: str) -> None:
+    deadline = time.monotonic() + TRANSPORT_TIMEOUT_SECONDS
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(f"mcp-http exited before readiness\n{_process_output(proc)}")
+        try:
+            with urllib.request.urlopen(f"{base_url}/healthz", timeout=0.5) as response:
+                if response.read() == b"ok":
+                    return
+        except (OSError, urllib.error.URLError) as exc:
+            last_error = exc
+        time.sleep(0.1)
+    raise AssertionError(f"mcp-http did not become ready: {last_error!r}")
+
+
+def _stop_process(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+
+
+def _real_oauth_access_token(base_url: str, admin_passphrase: str) -> str:
+    redirect_uri = "http://127.0.0.1/callback"
+    verifier = secrets.token_urlsafe(32)
+    with Client(base_url=base_url, timeout=5.0) as client:
+        registration = client.post("/oauth/register", json={"redirect_uris": [redirect_uri]})
+        assert registration.status_code == 201, registration.text
+        client_id = registration.json()["client_id"]
+        authorize = client.post(
+            "/oauth/authorize",
+            data={
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code_challenge": _pkce(verifier),
+                "code_challenge_method": "S256",
+                "state": "real-sdk",
+                "passphrase": admin_passphrase,
+            },
+            follow_redirects=False,
+        )
+        assert authorize.status_code == 303, authorize.text
+        code = parse_qs(urlparse(authorize.headers["location"]).query)["code"][0]
+        token = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code_verifier": verifier,
+            },
+        )
+        assert token.status_code == 200, token.text
+        return str(token.json()["access_token"])
+
+
+async def _real_sse_tool_names(base_url: str, access_token: str) -> list[str]:
+    from mcp.client.session import ClientSession
+    from mcp.client.sse import sse_client
+
+    with anyio.fail_after(TRANSPORT_TIMEOUT_SECONDS):
+        async with sse_client(
+            f"{base_url}/sse",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=2,
+            sse_read_timeout=TRANSPORT_TIMEOUT_SECONDS,
+        ) as (read_stream, write_stream):
+            async with ClientSession(
+                read_stream,
+                write_stream,
+                read_timeout_seconds=timedelta(seconds=TRANSPORT_TIMEOUT_SECONDS),
+            ) as session:
+                await session.initialize()
+                result = await session.list_tools()
+                return [tool.name for tool in result.tools]
 
 
 def _pkce(verifier: str) -> str:
@@ -974,13 +1084,13 @@ async def test_full_oauth_flow_then_jwt_authenticates_sse(
 
 
 @pytest.mark.asyncio
-async def test_oauth_jwt_authenticates_full_tool_registry(
+async def test_oauth_jwt_passes_stubbed_sse_auth_and_registry_parity(
     mcp_http_app: FreshApp,
 ) -> None:
-    """End-to-end: register → authorize → token → SSE handshake →
-    ListToolsRequest returns the full tool registry, proving the JWT
-    issued by /oauth/token actually authorizes the complete MCP tool
-    surface (not just an auth-shaped response).
+    """Narrow stub coverage for OAuth auth, session binding, and registry.
+
+    This intentionally does not exercise the real MCP SDK transport or
+    JSON-RPC dispatcher; ``test_oauth_real_sse_tools_list_over_wire`` does.
     """
     async with _client(mcp_http_app) as client:
         _cid, access, _refresh = await _authorize_and_token(
@@ -1015,6 +1125,64 @@ async def test_oauth_jwt_authenticates_full_tool_registry(
             )
         finally:
             await release()
+
+
+def test_oauth_real_sse_tools_list_over_wire(tmp_path: Path) -> None:
+    """Drive OAuth plus the real SDK SSE transport and tools/list dispatcher."""
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    admin_passphrase = "real-sse-integration-passphrase"
+    config_path = tmp_path / "mnemos-oauth-sse.toml"
+    config_path.write_text("", encoding="utf-8")
+    env = {key: os.environ[key] for key in ("HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER") if key in os.environ}
+    pythonpath = str(REPO_ROOT)
+    if os.environ.get("PYTHONPATH"):
+        pythonpath = f"{pythonpath}{os.pathsep}{os.environ['PYTHONPATH']}"
+    env.update(
+        {
+            "PYTHONPATH": pythonpath,
+            "MNEMOS_CONFIG_PATH": str(config_path),
+            "MNEMOS_BASE": "http://127.0.0.1:9",
+            "MNEMOS_OAUTH_ISSUER": base_url,
+            "MNEMOS_OAUTH_SIGNING_KEY": secrets.token_urlsafe(32),
+            "MNEMOS_OAUTH_ADMIN_PASSPHRASE": admin_passphrase,
+            "MNEMOS_OAUTH_REGISTRATION_SECRET": "unused-open-registration-secret",
+            "RATE_LIMIT_ENABLED": "false",
+            "RATE_LIMIT_STORAGE_URI": "memory://",
+        }
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "mnemos.cli.main",
+            "serve",
+            "mcp-http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_http_ready(proc, base_url)
+        access_token = _real_oauth_access_token(base_url, admin_passphrase)
+        names = anyio.run(_real_sse_tool_names, base_url, access_token)
+    except Exception as exc:
+        _stop_process(proc)
+        raise AssertionError(f"real OAuth MCP SSE flow failed: {exc}\n{_process_output(proc)}") from exc
+    finally:
+        _stop_process(proc)
+
+    from mnemos.mcp.tools import TOOL_REGISTRY
+
+    assert len(names) >= 20, f"real tools/list returned only {len(names)} tools"
+    assert set(names) == set(TOOL_REGISTRY)
 
 
 @pytest.mark.asyncio
@@ -1149,7 +1317,7 @@ def test_oauth_service_rejects_empty_passphrase() -> None:
     with pytest.raises(ValueError):
         OAuthService(
             base_url="http://testserver",
-            signing_key="k" * 32,
+            signing_key="0123456789abcdef0123456789ABCDEF",
             store=InMemoryOAuthStore(),
             registration_secret="r",
             admin_passphrase="",
@@ -1163,7 +1331,7 @@ def test_oauth_service_rejects_none_passphrase() -> None:
     with pytest.raises(ValueError):
         OAuthService(
             base_url="http://testserver",
-            signing_key="k" * 32,
+            signing_key="0123456789abcdef0123456789ABCDEF",
             store=InMemoryOAuthStore(),
             registration_secret="r",
             admin_passphrase=None,  # type: ignore[arg-type]
@@ -1181,6 +1349,88 @@ def test_oauth_service_rejects_missing_signing_key() -> None:
             registration_secret="r",
             admin_passphrase="p",
         )
+
+
+@pytest.mark.parametrize(
+    "signing_key",
+    [
+        None,
+        "x",
+        " ",
+        "a" * 31,
+        "k" * 32,
+        "this-is-a-placeholder-signing-key-do-not-use",
+        " 0123456789abcdef0123456789ABCDEF",
+    ],
+)
+def test_oauth_service_rejects_weak_or_placeholder_signing_keys(signing_key: str | None) -> None:
+    from mnemos.mcp.oauth import InMemoryOAuthStore, OAuthService
+
+    with pytest.raises(ValueError):
+        OAuthService(
+            base_url="http://testserver",
+            signing_key=signing_key,  # type: ignore[arg-type]
+            store=InMemoryOAuthStore(),
+            registration_secret="r",
+            admin_passphrase="p",
+        )
+
+
+def test_oauth_service_accepts_exactly_32_nonplaceholder_bytes() -> None:
+    from mnemos.mcp.oauth import InMemoryOAuthStore, OAuthService
+
+    service = OAuthService(
+        base_url="http://testserver",
+        signing_key="0123456789abcdef0123456789ABCDEF",
+        store=InMemoryOAuthStore(),
+        registration_secret="r",
+        admin_passphrase="p",
+    )
+
+    assert service.signing_key == "0123456789abcdef0123456789ABCDEF"
+
+
+@pytest.mark.asyncio
+async def test_authorize_and_token_share_bounded_attempt_limiter(mcp_http_app: FreshApp) -> None:
+    from mnemos.mcp.oauth import AUTH_ATTEMPT_RATE_LIMIT
+
+    bad_authorize = {
+        "response_type": "code",
+        "client_id": "unknown",
+        "redirect_uri": "https://client.example/cb",
+        "code_challenge": _pkce(secrets.token_urlsafe(32)),
+        "code_challenge_method": "S256",
+        "passphrase": "wrong",
+    }
+    async with _client(mcp_http_app) as client:
+        for _ in range(AUTH_ATTEMPT_RATE_LIMIT):
+            response = await client.post("/oauth/authorize", data=bad_authorize)
+            assert response.status_code == 403
+
+        blocked_authorize = await client.post("/oauth/authorize", data=bad_authorize)
+        blocked_token = await client.post(
+            "/oauth/token",
+            data={"grant_type": "authorization_code", "client_id": "unknown"},
+        )
+
+    assert blocked_authorize.status_code == 429
+    assert int(blocked_authorize.headers["retry-after"]) >= 1
+    assert blocked_token.status_code == 429
+    assert int(blocked_token.headers["retry-after"]) >= 1
+
+
+@pytest.mark.asyncio
+async def test_token_attempts_are_limited_before_client_lookup(mcp_http_app: FreshApp) -> None:
+    from mnemos.mcp.oauth import AUTH_ATTEMPT_RATE_LIMIT
+
+    form = {"grant_type": "authorization_code", "client_id": "unknown"}
+    async with _client(mcp_http_app) as client:
+        statuses = [
+            (await client.post("/oauth/token", data=form)).status_code for _ in range(AUTH_ATTEMPT_RATE_LIMIT + 1)
+        ]
+
+    assert statuses[:AUTH_ATTEMPT_RATE_LIMIT] == [401] * AUTH_ATTEMPT_RATE_LIMIT
+    assert statuses[-1] == 429
 
 
 # ── Audit finding: dynamic client registration had no size, cardinality or

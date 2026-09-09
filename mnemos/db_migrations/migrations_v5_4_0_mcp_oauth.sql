@@ -55,3 +55,16 @@ CREATE TABLE IF NOT EXISTS oauth_mcp_signing_keys (
     created       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     rotated_at    TIMESTAMPTZ
 );
+
+-- The installer applies migrations as the postgres superuser, while the
+-- service connects as mnemos_user (or an application login that inherits it).
+-- Match the guarded grant pattern used by the MCP audit-log migration.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mnemos_user') THEN
+        EXECUTE 'GRANT SELECT, INSERT ON oauth_mcp_clients TO mnemos_user';
+        EXECUTE 'GRANT SELECT, INSERT, UPDATE ON oauth_mcp_authorization_codes TO mnemos_user';
+        EXECUTE 'GRANT SELECT, INSERT, UPDATE ON oauth_mcp_tokens TO mnemos_user';
+        EXECUTE 'GRANT SELECT, INSERT ON oauth_mcp_signing_keys TO mnemos_user';
+    END IF;
+END $$;

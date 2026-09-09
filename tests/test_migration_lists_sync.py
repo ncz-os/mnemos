@@ -217,6 +217,17 @@ def test_usage_ledger_migration_grants_runtime_roles():
     assert "GRANT USAGE, SELECT ON SEQUENCE usage_ledger_id_seq TO mnemos;" in usage_ledger_sql
 
 
+def test_mcp_oauth_migration_grants_runtime_role_least_privilege():
+    repo_root = Path(__file__).resolve().parents[1]
+    oauth_sql = (repo_root / "mnemos/db_migrations/migrations_v5_4_0_mcp_oauth.sql").read_text()
+
+    assert "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mnemos_user')" in oauth_sql
+    assert "GRANT SELECT, INSERT ON oauth_mcp_clients TO mnemos_user" in oauth_sql
+    assert "GRANT SELECT, INSERT, UPDATE ON oauth_mcp_authorization_codes TO mnemos_user" in oauth_sql
+    assert "GRANT SELECT, INSERT, UPDATE ON oauth_mcp_tokens TO mnemos_user" in oauth_sql
+    assert "GRANT SELECT, INSERT ON oauth_mcp_signing_keys TO mnemos_user" in oauth_sql
+
+
 def test_subscription_plan_current_limits_deletes_superseded_claude_future_rows():
     repo_root = Path(__file__).resolve().parents[1]
     migration_paths = [
@@ -309,7 +320,9 @@ def test_subscription_plan_current_limits_pin_current_codex_and_claude_caps():
 
 def test_sqlite_subscription_plan_current_limits_final_state():
     repo_root = Path(__file__).resolve().parents[1]
-    migration = (repo_root / "mnemos/db_migrations/migrations_sqlite/0039_subscription_plan_current_limits.sql").read_text()
+    migration = (
+        repo_root / "mnemos/db_migrations/migrations_sqlite/0039_subscription_plan_current_limits.sql"
+    ).read_text()
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
 
@@ -386,7 +399,11 @@ def test_every_migration_list_entry_exists_on_disk():
 
     missing = []
     for name in installer_db_list:
-        migration_path = repo_root / "mnemos" / "db_migrations" / "migrations" / name if name[0].isdigit() else repo_root / "mnemos" / "db_migrations" / name
+        migration_path = (
+            repo_root / "mnemos" / "db_migrations" / "migrations" / name
+            if name[0].isdigit()
+            else repo_root / "mnemos" / "db_migrations" / name
+        )
         if not migration_path.exists():
             missing.append(name)
     assert not missing, (
@@ -398,7 +415,9 @@ def test_every_migration_list_entry_exists_on_disk():
 def test_every_sqlite_migration_list_entry_exists_on_disk():
     repo_root = Path(__file__).resolve().parents[1]
     missing = [
-        name for name in EXPECTED_SQLITE_MIGRATIONS if not (repo_root / "mnemos" / "db_migrations" / "migrations_sqlite" / name).exists()
+        name
+        for name in EXPECTED_SQLITE_MIGRATIONS
+        if not (repo_root / "mnemos" / "db_migrations" / "migrations_sqlite" / name).exists()
     ]
     assert not missing, f"SQLite migration entries reference files that don't exist: {missing}."
 
@@ -479,7 +498,8 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
             "/docker-entrypoint-initdb.d/26-webhook-retry-terminal-state.sql"
         ) in text, compose_name
         assert (
-            "./mnemos/db_migrations/migrations_v3_5_webhook_attempt_lease.sql:" "/docker-entrypoint-initdb.d/27-webhook-attempt-lease.sql"
+            "./mnemos/db_migrations/migrations_v3_5_webhook_attempt_lease.sql:"
+            "/docker-entrypoint-initdb.d/27-webhook-attempt-lease.sql"
         ) in text, compose_name
         assert (
             "./mnemos/db_migrations/migrations_v3_5_webhook_writer_revision.sql:"
@@ -526,42 +546,52 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
             "/docker-entrypoint-initdb.d/38-sessions-consultations-namespace.sql"
         ) in text, compose_name
         assert (
-            "./mnemos/db_migrations/migrations_v3_5_trigger_same_memory_parent.sql:" "/migrations/24-trigger-same-memory-parent.sql:ro"
+            "./mnemos/db_migrations/migrations_v3_5_trigger_same_memory_parent.sql:"
+            "/migrations/24-trigger-same-memory-parent.sql:ro"
         ) in text, compose_name
         assert (
-            "./mnemos/db_migrations/migrations_v3_5_rls_group_select_unix_bits.sql:" "/migrations/25-rls-group-select-unix-bits.sql:ro"
+            "./mnemos/db_migrations/migrations_v3_5_rls_group_select_unix_bits.sql:"
+            "/migrations/25-rls-group-select-unix-bits.sql:ro"
         ) in text, compose_name
         assert (
             "./mnemos/db_migrations/migrations_v3_5_webhook_retry_terminal_state.sql:"
             "/migrations/26-webhook-retry-terminal-state.sql:ro"
         ) in text, compose_name
         assert (
-            "./mnemos/db_migrations/migrations_v3_5_webhook_attempt_lease.sql:" "/migrations/27-webhook-attempt-lease.sql:ro"
+            "./mnemos/db_migrations/migrations_v3_5_webhook_attempt_lease.sql:"
+            "/migrations/27-webhook-attempt-lease.sql:ro"
         ) in text, compose_name
         assert (
-            "./mnemos/db_migrations/migrations_v3_5_webhook_writer_revision.sql:" "/migrations/28-webhook-writer-revision.sql:ro"
+            "./mnemos/db_migrations/migrations_v3_5_webhook_writer_revision.sql:"
+            "/migrations/28-webhook-writer-revision.sql:ro"
         ) in text, compose_name
         assert (
-            "./mnemos/db_migrations/migrations_v3_5_webhook_status_updated_at.sql:" "/migrations/29-webhook-status-updated-at.sql:ro"
+            "./mnemos/db_migrations/migrations_v3_5_webhook_status_updated_at.sql:"
+            "/migrations/29-webhook-status-updated-at.sql:ro"
         ) in text, compose_name
         assert (
-            "./mnemos/db_migrations/migrations_v3_5_webhook_superseded_marker.sql:" "/migrations/30-webhook-superseded-marker.sql:ro"
+            "./mnemos/db_migrations/migrations_v3_5_webhook_superseded_marker.sql:"
+            "/migrations/30-webhook-superseded-marker.sql:ro"
         ) in text, compose_name
         assert (
-            "./mnemos/db_migrations/migrations_v3_5_webhook_attempt_unique.sql:" "/migrations/31-webhook-attempt-unique.sql:ro"
+            "./mnemos/db_migrations/migrations_v3_5_webhook_attempt_unique.sql:"
+            "/migrations/31-webhook-attempt-unique.sql:ro"
         ) in text, compose_name
         assert (
-            "./mnemos/db_migrations/migrations_v3_5_webhook_succeeded_unique.sql:" "/migrations/32-webhook-succeeded-unique.sql:ro"
+            "./mnemos/db_migrations/migrations_v3_5_webhook_succeeded_unique.sql:"
+            "/migrations/32-webhook-succeeded-unique.sql:ro"
         ) in text, compose_name
         assert (
             "./mnemos/db_migrations/migrations_v3_5_webhook_succeeded_terminal_trigger.sql:"
             "/migrations/33-webhook-succeeded-terminal-trigger.sql:ro"
         ) in text, compose_name
         assert (
-            "./mnemos/db_migrations/migrations_v3_5_entities_namespace_unique.sql:" "/migrations/34-entities-namespace-unique.sql:ro"
+            "./mnemos/db_migrations/migrations_v3_5_entities_namespace_unique.sql:"
+            "/migrations/34-entities-namespace-unique.sql:ro"
         ) in text, compose_name
         assert (
-            "./mnemos/db_migrations/migrations_v3_5_state_journal_namespace.sql:" "/migrations/35-state-journal-namespace.sql:ro"
+            "./mnemos/db_migrations/migrations_v3_5_state_journal_namespace.sql:"
+            "/migrations/35-state-journal-namespace.sql:ro"
         ) in text, compose_name
         assert (
             "./mnemos/db_migrations/migrations_v3_5_session_compression_ratio_drop.sql:"
@@ -575,7 +605,9 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
             "./mnemos/db_migrations/migrations_v3_5_sessions_consultations_namespace.sql:"
             "/migrations/38-sessions-consultations-namespace.sql:ro"
         ) in text, compose_name
-        assert ("./mnemos/db_migrations/migrations/0032_usage_ledger.sql:" "/migrations/62-usage-ledger.sql:ro") in text, compose_name
+        assert ("./mnemos/db_migrations/migrations/0032_usage_ledger.sql:/migrations/62-usage-ledger.sql:ro") in text, (
+            compose_name
+        )
         assert "psql -h postgres -U mnemos_user -d mnemos" in text, compose_name
         assert "-v ON_ERROR_STOP=1" in text, compose_name
         assert "-f /migrations/24-trigger-same-memory-parent.sql" in text, compose_name
@@ -621,7 +653,7 @@ def test_v3_5_trigger_delete_branch_advances_head_to_delete_snapshot():
 
     assert "dead code" not in sql.lower()
     assert "AND mv.memory_id = mb.memory_id" in compact
-    assert ("_by, 'delete', _commit_hash, _branch, _parent_version ) " "RETURNING id INTO _new_version_id") in compact
+    assert ("_by, 'delete', _commit_hash, _branch, _parent_version ) RETURNING id INTO _new_version_id") in compact
     assert (
-        "UPDATE memory_branches SET head_version_id = _new_version_id " "WHERE memory_id = OLD.id AND name = _branch"
+        "UPDATE memory_branches SET head_version_id = _new_version_id WHERE memory_id = OLD.id AND name = _branch"
     ) in compact

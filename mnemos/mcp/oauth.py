@@ -14,6 +14,7 @@ import hmac
 import json
 import secrets
 import time
+from math import ceil
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -39,6 +40,25 @@ MAX_REDIRECT_URIS = 20
 MAX_REDIRECT_URI_LENGTH = 2048
 REGISTRATION_RATE_LIMIT = 30
 REGISTRATION_RATE_WINDOW_SECONDS = 60.0
+AUTH_ATTEMPT_RATE_LIMIT = 10
+AUTH_ATTEMPT_RATE_WINDOW_SECONDS = 60.0
+AUTH_ATTEMPT_BACKOFF_MAX_SECONDS = 60.0
+RATE_LIMIT_MAX_CALLERS = 4096
+MIN_SIGNING_KEY_BYTES = 32
+
+_OBVIOUS_SIGNING_KEY_PLACEHOLDERS = {
+    "changeme",
+    "change-me",
+    "replace-me",
+    "your-signing-key",
+    "your-secret-key",
+    "secret",
+    "password",
+    "default",
+    "test",
+    "example",
+    "this-is-a-placeholder-signing-key-do-not-use",
+}
 
 
 def _now() -> datetime:
@@ -55,6 +75,96 @@ def pkce_s256(verifier: str) -> str:
 
 def hash_refresh_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+class _SlidingWindowRateLimiter:
+    """Bounded monotonic sliding-window limiter with optional backoff."""
+
+    def __init__(
+        self,
+        *,
+        limit: int,
+        window_seconds: float,
+        max_callers: int = RATE_LIMIT_MAX_CALLERS,
+        backoff_max_seconds: float = 0.0,
+    ) -> None:
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self.max_callers = max_callers
+        self.backoff_max_seconds = backoff_max_seconds
+        self._hits: dict[str, list[float]] = {}
+        self._blocked_until: dict[str, float] = {}
+        self._violations: dict[str, int] = {}
+        self._last_seen: dict[str, float] = {}
+
+    def check(self, caller: str) -> tuple[bool, int]:
+        """Return ``(allowed, retry_after_seconds)`` for *caller*."""
+        now = time.monotonic()
+        cutoff = now - self.window_seconds
+        self._prune(cutoff, now)
+        self._make_room(caller)
+        self._last_seen[caller] = now
+
+        blocked_until = self._blocked_until.get(caller, 0.0)
+        if blocked_until > now:
+            violations = self._violations.get(caller, 0) + 1
+            self._violations[caller] = violations
+            delay = min(2 ** max(0, violations - 1), self.backoff_max_seconds)
+            if delay:
+                blocked_until = max(blocked_until, now + delay)
+                self._blocked_until[caller] = blocked_until
+            return False, max(1, ceil(blocked_until - now))
+
+        hits = self._hits.setdefault(caller, [])
+        if len(hits) >= self.limit:
+            if self.backoff_max_seconds:
+                violations = self._violations.get(caller, 0) + 1
+                self._violations[caller] = violations
+                delay = min(2 ** max(0, violations - 1), self.backoff_max_seconds)
+                self._blocked_until[caller] = now + delay
+                return False, max(1, ceil(delay))
+            retry_at = hits[0] + self.window_seconds
+            return False, max(1, ceil(retry_at - now))
+
+        hits.append(now)
+        return True, 0
+
+    def _prune(self, cutoff: float, now: float) -> None:
+        for caller in list(self._last_seen):
+            recent = [stamp for stamp in self._hits.get(caller, ()) if stamp > cutoff]
+            if recent:
+                self._hits[caller] = recent
+            else:
+                self._hits.pop(caller, None)
+            if self._blocked_until.get(caller, 0.0) <= now:
+                self._blocked_until.pop(caller, None)
+            if caller not in self._hits and caller not in self._blocked_until:
+                self._violations.pop(caller, None)
+                self._last_seen.pop(caller, None)
+
+    def _make_room(self, caller: str) -> None:
+        if caller in self._last_seen or len(self._last_seen) < self.max_callers:
+            return
+        oldest = min(self._last_seen, key=self._last_seen.__getitem__)
+        self._hits.pop(oldest, None)
+        self._blocked_until.pop(oldest, None)
+        self._violations.pop(oldest, None)
+        self._last_seen.pop(oldest, None)
+
+
+def _caller_key(request: Request, *, fallback: str = "unknown") -> str:
+    client = getattr(request, "client", None)
+    if client and client.host:
+        return f"ip:{client.host}"
+    return fallback
+
+
+def _rate_limited_response(retry_after: int) -> JSONResponse:
+    return JSONResponse(
+        {"error": "temporarily_unavailable", "error_description": "too many authorization attempts"},
+        status_code=429,
+        headers={"Retry-After": str(max(1, retry_after))},
+    )
 
 
 class InMemoryOAuthStore:
@@ -301,8 +411,15 @@ class OAuthService:
     def __init__(
         self, *, base_url: str, signing_key: str, store: Any, registration_secret: str, admin_passphrase: str
     ) -> None:
-        if not signing_key:
-            raise ValueError("OAuth signing key is not configured")
+        if not isinstance(signing_key, str):
+            raise ValueError("OAuth signing key must be a string")
+        if not signing_key or signing_key != signing_key.strip():
+            raise ValueError("OAuth signing key must not be empty or padded with whitespace")
+        if len(signing_key.encode("utf-8")) < MIN_SIGNING_KEY_BYTES:
+            raise ValueError(f"OAuth signing key must be at least {MIN_SIGNING_KEY_BYTES} bytes for HS256")
+        normalized_key = signing_key.casefold()
+        if normalized_key in _OBVIOUS_SIGNING_KEY_PLACEHOLDERS or len(set(normalized_key)) == 1:
+            raise ValueError("OAuth signing key must not be an obvious placeholder")
         # Fail-closed: an empty/None passphrase would let `passphrase=`
         # pass hmac.compare_digest (empty vs empty) and None would raise.
         if not admin_passphrase:
@@ -314,8 +431,17 @@ class OAuthService:
         self.store = store
         self.registration_secret = registration_secret
         self.admin_passphrase = admin_passphrase
-        # Per-caller registration timestamps for the sliding-window limiter.
-        self._registration_hits: dict[str, list[float]] = {}
+        self._registration_limiter = _SlidingWindowRateLimiter(
+            limit=REGISTRATION_RATE_LIMIT,
+            window_seconds=REGISTRATION_RATE_WINDOW_SECONDS,
+        )
+        # One shared bucket covers both passphrase authorization and token
+        # exchange, preventing attackers from alternating endpoints.
+        self._authorization_limiter = _SlidingWindowRateLimiter(
+            limit=AUTH_ATTEMPT_RATE_LIMIT,
+            window_seconds=AUTH_ATTEMPT_RATE_WINDOW_SECONDS,
+            backoff_max_seconds=AUTH_ATTEMPT_BACKOFF_MAX_SECONDS,
+        )
 
     def check_registration_rate_limit(self, caller: str) -> bool:
         """Sliding-window limiter for the unauthenticated DCR endpoint.
@@ -324,19 +450,12 @@ class OAuthService:
         aged out are dropped on every call so the bookkeeping map cannot
         itself become the unbounded structure it is guarding against.
         """
-        cutoff = time.monotonic() - REGISTRATION_RATE_WINDOW_SECONDS
-        pruned: dict[str, list[float]] = {}
-        for key, stamps in self._registration_hits.items():
-            recent = [stamp for stamp in stamps if stamp > cutoff]
-            if recent:
-                pruned[key] = recent
-        self._registration_hits = pruned
+        allowed, _retry_after = self._registration_limiter.check(caller)
+        return allowed
 
-        hits = self._registration_hits.setdefault(caller, [])
-        if len(hits) >= REGISTRATION_RATE_LIMIT:
-            return False
-        hits.append(time.monotonic())
-        return True
+    def check_authorization_rate_limit(self, caller: str) -> tuple[bool, int]:
+        """Throttle authorize and token attempts through one shared bucket."""
+        return self._authorization_limiter.check(caller)
 
     def issue_access_token(
         self,
@@ -470,6 +589,9 @@ class OAuthService:
         issue an authorization code. Passphrase comes from the POST body
         only; a query-string passphrase is rejected by ``authorize`` so
         it can never reach this code path via the GET route."""
+        allowed, retry_after = self.check_authorization_rate_limit(_caller_key(request))
+        if not allowed:
+            return _rate_limited_response(retry_after)
         form = await request.form()
         # ``request.form()`` returns a Starlette ``FormData`` (multi-dict
         # wrapper) with an ``.items()`` method.  Keep passphrase in
@@ -529,7 +651,11 @@ class OAuthService:
         target = urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
         return RedirectResponse(target, status_code=303)
 
-    async def token(self, form: dict[str, str]) -> JSONResponse:
+    async def token(self, form: dict[str, str], *, caller: str | None = None) -> JSONResponse:
+        caller_key = caller or f"client:{form.get('client_id', '') or 'unknown'}"
+        allowed, retry_after = self.check_authorization_rate_limit(caller_key)
+        if not allowed:
+            return _rate_limited_response(retry_after)
         grant = form.get("grant_type")
         client_id = form.get("client_id", "")
         client = await self.store.get_client(client_id)
@@ -784,6 +910,7 @@ async def token_route(request: Request):
                 return JSONResponse({"error": "invalid_client"}, status_code=401)
             form["client_id"] = basic_id
             form["client_secret"] = basic_secret
-        return await get_oauth_service().token(form)
+        caller = _caller_key(request, fallback=f"client:{form.get('client_id', '') or 'unknown'}")
+        return await get_oauth_service().token(form, caller=caller)
     except RuntimeError:
         return JSONResponse({"error": "temporarily_unavailable"}, status_code=503)

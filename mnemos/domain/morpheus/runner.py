@@ -39,6 +39,11 @@ _DEFAULT_ORPHAN_TIMEOUT_HOURS = 2.0
 _ORPHAN_TIMEOUT_ENV = "MNEMOS_MORPHEUS_ORPHAN_TIMEOUT_HOURS"
 _ORPHAN_TIMEOUT_ERROR = "orphan_timeout_sweep"
 
+
+class MorpheusExtractionError(RuntimeError):
+    """A provider or response failure that must leave a memory retryable."""
+
+
 _SWEEP_ORPHAN_RUNS_SQL = """
 WITH orphaned AS (
     SELECT id, started_at
@@ -950,7 +955,9 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
 
     The phase is opt-in via run config (`extract=true`) or
     MNEMOS_MORPHEUS_EXTRACT. Each source memory is processed at most
-    once by the `triples_extracted_at` guard. The LLM calls happen
+    once on success by the durable `triples_extracted_at` guard. Pending
+    rows are selected without the replay window's moving lower bound, so
+    a capped backlog cannot age out between runs. The LLM calls happen
     outside DB transactions; the timestamp mark and all triple inserts
     for one memory commit atomically.
     """
@@ -959,8 +966,7 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
 
     async with pool.acquire() as conn:
         run_row = await conn.fetchrow(
-            "SELECT config, namespace, window_started_at, window_ended_at "
-            "FROM morpheus_runs WHERE id=$1::uuid",
+            "SELECT config, namespace, window_started_at, window_ended_at FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
         )
     if run_row is None:
@@ -991,15 +997,14 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
             SELECT id, verbatim_content, owner_id, namespace
             FROM memories
             WHERE {eligible_for_morpheus("")}
-              AND created BETWEEN $1 AND $2
+              AND created <= $1
               AND triples_extracted_at IS NULL
               AND verbatim_content IS NOT NULL
-              AND length(verbatim_content) >= $3
-              AND ($4::text IS NULL OR namespace = $4)
-            ORDER BY created
-            LIMIT $5
+              AND length(verbatim_content) >= $2
+              AND ($3::text IS NULL OR namespace = $3)
+            ORDER BY created, id
+            LIMIT $4
             """,
-            run_row["window_started_at"],
             run_row["window_ended_at"],
             min_chars,
             namespace,
@@ -1021,9 +1026,17 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
     for row in candidates:
         memory_id = str(row["id"])
         content = str(row["verbatim_content"] or "")
-        triples = await _extract_triples_from_prose(content)
-        if verify and triples:
-            triples = await _verify_extracted_triples(content, triples)
+        try:
+            triples = await _extract_triples_from_prose(content)
+            if verify and triples:
+                triples = await _verify_extracted_triples(content, triples)
+        except MorpheusExtractionError as exc:
+            logger.warning(
+                "[MORPHEUS] extraction failed for memory %s; leaving it retryable: %s",
+                memory_id,
+                exc,
+            )
+            continue
 
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -1127,7 +1140,13 @@ async def _extract_triples_from_prose(verbatim_content: str) -> list[ExtractedTr
         task_type="kg_extraction",
         timeout=120,
     )
-    return _parse_extracted_triples(raw)
+    parsed = _json_array(raw)
+    if parsed is None:
+        raise MorpheusExtractionError("extract provider returned no valid JSON array")
+    triples = [_validated_triple(item) for item in parsed]
+    if any(triple is None for triple in triples):
+        raise MorpheusExtractionError("extract provider returned malformed triple entries")
+    return [triple for triple in triples if triple is not None]
 
 
 async def _verify_extracted_triples(
@@ -1166,7 +1185,12 @@ async def _verify_extracted_triples(
         task_type="kg_extraction_verification",
         timeout=180,
     )
-    verified_confidences = _parse_verifier_confidences(raw, len(triples))
+    parsed = _json_array(raw)
+    if not parsed:
+        raise MorpheusExtractionError("extract verifier returned no valid decisions")
+    verified_confidences = _parse_verifier_confidences(parsed, len(triples))
+    if len(verified_confidences) != len(parsed) or set(verified_confidences) != set(range(len(triples))):
+        raise MorpheusExtractionError("extract verifier returned malformed or incomplete decisions")
     out: list[ExtractedTriple] = []
     for idx, triple in enumerate(triples):
         confidence = verified_confidences.get(idx, triple.confidence)
@@ -1181,9 +1205,9 @@ async def _call_morpheus_muse(
     muse: str,
     task_type: str,
     timeout: int,
-) -> str:
+) -> str | None:
     if not is_extra_installed("graeae"):
-        return ""
+        return None
     try:
         from mnemos.domain.graeae.engine import get_graeae_engine
 
@@ -1203,7 +1227,7 @@ async def _call_morpheus_muse(
                 return str(response["response_text"]).strip()
     except Exception as exc:  # pragma: no cover - defensive around external LLMs
         logger.warning("[MORPHEUS] extract muse call failed: %s", exc)
-    return ""
+    return None
 
 
 def _morpheus_muse_selection(engine: Any, muse: str) -> Optional[dict[str, Optional[str]]]:
