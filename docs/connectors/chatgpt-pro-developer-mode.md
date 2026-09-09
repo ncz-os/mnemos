@@ -167,6 +167,41 @@ cloudflared tunnel run --url http://<mnemos-host>:5004 mnemos
 
 Resulting URL: `https://mnemos.yourdomain.com`.
 
+*API auto-provisioning (skips the interactive `cloudflared tunnel login`).*
+Cloudflare's Tunnel API can create the tunnel and its DNS record directly,
+useful for scripted/headless setup. Requires a Cloudflare API token with
+`Cloudflare Tunnel:Edit` + `DNS:Edit` on the target zone, plus your account
+and zone IDs (Cloudflare dashboard → right sidebar of any domain overview):
+
+```bash
+export CF_API_TOKEN="<cloudflare-api-token>"
+export CF_ACCOUNT_ID="<account-id>"
+export CF_ZONE_ID="<zone-id-for-yourdomain.com>"
+TUNNEL_SECRET="$(openssl rand -base64 32)"
+
+# 1. Create the tunnel
+tunnel_json=$(curl -sS -X POST \
+  "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel" \
+  -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+  --data "{\"name\":\"mnemos\",\"tunnel_secret\":\"$TUNNEL_SECRET\"}")
+TUNNEL_ID=$(echo "$tunnel_json" | jq -r '.result.id')
+
+# 2. Point mnemos.yourdomain.com at it (CNAME to <tunnel_id>.cfargotunnel.com)
+curl -sS -X POST \
+  "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
+  -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+  --data "{\"type\":\"CNAME\",\"name\":\"mnemos\",\"content\":\"${TUNNEL_ID}.cfargotunnel.com\",\"proxied\":true}"
+
+# 3. Fetch the run token and start cloudflared with it (no interactive login)
+TUNNEL_TOKEN=$(curl -sS \
+  "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/token" \
+  -H "Authorization: Bearer $CF_API_TOKEN" | jq -r '.result')
+cloudflared tunnel --url http://<mnemos-host>:5004 run --token "$TUNNEL_TOKEN"
+```
+
+Same resulting URL. Treat `CF_API_TOKEN` and `TUNNEL_SECRET` as credentials —
+same handling as `MNEMOS_OAUTH_ADMIN_PASSPHRASE` above.
+
 **Tailscale Funnel:**
 
 ```bash

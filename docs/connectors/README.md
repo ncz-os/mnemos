@@ -126,7 +126,8 @@ EXACT registry names — strip the prefix when configuring.
   with HTTP/SSE notes for `:5003`.
 - [Cursor](./cursor.md) — `~/.cursor/mcp.json` setup and restart guidance.
 - [Codex CLI](./codex-cli.md) — `codex mcp add mnemos` plus
-  `~/.codex/config.toml` for Codex `0.125.0+`.
+  `~/.codex/config.toml` for Codex `0.125.0+` (LAN stdio); OAuth 2.1 remote
+  gateway setup for Codex off-LAN, requires Developer Mode.
 - [Cline](./cline.md) — VS Code Cline MCP settings with read-only
   auto-approve guidance.
 - [Continue.dev](./continue.md) — `~/.continue/config.json` MCP server setup.
@@ -365,8 +366,13 @@ While `experimental`:
   release. The manual `mnemos serve mcp-http` + ngrok path documented in
   each connector page works today regardless.
 - Default ports (5003 for the MCP HTTP/SSE bridge) may change.
-- Bearer auth is the current baseline. Per-user token mapping exists on the
-  HTTP/SSE bridge; OAuth on the MCP edge remains later work.
+- Bearer auth remains supported as a legacy path. The MCP edge also now
+  exposes a full OAuth 2.1 authorization server — discovery, dynamic client
+  registration, authorization-code + PKCE S256, refresh tokens, bearer-JWT
+  validation — documented in
+  [ChatGPT Pro Developer Mode](./chatgpt-pro-developer-mode.md#setup--oauth-21-path)
+  and [Codex CLI](./codex-cli.md#setup--remote-oauth-21-gateway-codex-on-another-machine-or-chatgpt-desktopmobile).
+  Static tokens and OAuth JWTs pass through the same authorization/audit path.
 - The `mnemos-tunnel-setup` script's argument shape and config-file
   location (`~/.mnemos/tunnel.toml`) may change.
 
