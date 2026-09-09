@@ -1433,6 +1433,59 @@ async def test_token_attempts_are_limited_before_client_lookup(mcp_http_app: Fre
     assert statuses[-1] == 429
 
 
+def test_admin_auth_attempts_have_global_ceiling_across_callers(mcp_http_app: FreshApp) -> None:
+    from mnemos.mcp.oauth import AUTH_ATTEMPT_GLOBAL_RATE_LIMIT
+
+    admitted = [
+        mcp_http_app.service.check_authorization_rate_limit(f"ip:192.0.2.{attempt}")
+        for attempt in range(AUTH_ATTEMPT_GLOBAL_RATE_LIMIT)
+    ]
+    blocked = mcp_http_app.service.check_authorization_rate_limit("ip:198.51.100.1")
+
+    assert all(allowed for allowed, _retry_after in admitted)
+    assert blocked[0] is False
+    assert blocked[1] >= 1
+
+
+def test_rate_limiter_never_evicts_currently_blocked_callers(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mnemos.mcp import oauth as mcp_oauth
+
+    now = 1000.0
+    monkeypatch.setattr(mcp_oauth.time, "monotonic", lambda: now)
+    limiter = mcp_oauth._SlidingWindowRateLimiter(
+        limit=1,
+        window_seconds=60.0,
+        max_callers=2,
+        backoff_max_seconds=60.0,
+    )
+    for caller in ("blocked-a", "blocked-b"):
+        assert limiter.check(caller) == (True, 0)
+        assert limiter.check(caller)[0] is False
+
+    allowed, retry_after = limiter.check("new-caller")
+
+    assert allowed is False
+    assert retry_after >= 1
+    assert set(limiter._last_seen) == {"blocked-a", "blocked-b"}
+    assert set(limiter._blocked_until) == {"blocked-a", "blocked-b"}
+    assert "new-caller" not in limiter._last_seen
+
+    mixed_limiter = mcp_oauth._SlidingWindowRateLimiter(
+        limit=1,
+        window_seconds=60.0,
+        max_callers=2,
+        backoff_max_seconds=60.0,
+    )
+    assert mixed_limiter.check("blocked-oldest") == (True, 0)
+    assert mixed_limiter.check("blocked-oldest")[0] is False
+    assert mixed_limiter.check("nonblocked") == (True, 0)
+
+    assert mixed_limiter.check("replacement") == (True, 0)
+    assert "blocked-oldest" in mixed_limiter._last_seen
+    assert "blocked-oldest" in mixed_limiter._blocked_until
+    assert "nonblocked" not in mixed_limiter._last_seen
+
+
 # ── Audit finding: dynamic client registration had no size, cardinality or
 # rate bound. /oauth/ is exempt from BearerAuthMiddleware and the standalone
 # MCP app has no body-size middleware, so an unauthenticated caller could POST

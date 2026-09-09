@@ -41,6 +41,7 @@ MAX_REDIRECT_URI_LENGTH = 2048
 REGISTRATION_RATE_LIMIT = 30
 REGISTRATION_RATE_WINDOW_SECONDS = 60.0
 AUTH_ATTEMPT_RATE_LIMIT = 10
+AUTH_ATTEMPT_GLOBAL_RATE_LIMIT = 100
 AUTH_ATTEMPT_RATE_WINDOW_SECONDS = 60.0
 AUTH_ATTEMPT_BACKOFF_MAX_SECONDS = 60.0
 RATE_LIMIT_MAX_CALLERS = 4096
@@ -102,7 +103,9 @@ class _SlidingWindowRateLimiter:
         now = time.monotonic()
         cutoff = now - self.window_seconds
         self._prune(cutoff, now)
-        self._make_room(caller)
+        has_room, capacity_retry_after = self._make_room(caller, now)
+        if not has_room:
+            return False, capacity_retry_after
         self._last_seen[caller] = now
 
         blocked_until = self._blocked_until.get(caller, 0.0)
@@ -142,14 +145,23 @@ class _SlidingWindowRateLimiter:
                 self._violations.pop(caller, None)
                 self._last_seen.pop(caller, None)
 
-    def _make_room(self, caller: str) -> None:
+    def _make_room(self, caller: str, now: float) -> tuple[bool, int]:
         if caller in self._last_seen or len(self._last_seen) < self.max_callers:
-            return
-        oldest = min(self._last_seen, key=self._last_seen.__getitem__)
+            return True, 0
+        evictable = [
+            known_caller
+            for known_caller in self._last_seen
+            if self._blocked_until.get(known_caller, 0.0) <= now
+        ]
+        if not evictable:
+            retry_at = min(self._blocked_until.values())
+            return False, max(1, ceil(retry_at - now))
+        oldest = min(evictable, key=self._last_seen.__getitem__)
         self._hits.pop(oldest, None)
         self._blocked_until.pop(oldest, None)
         self._violations.pop(oldest, None)
         self._last_seen.pop(oldest, None)
+        return True, 0
 
 
 def _caller_key(request: Request, *, fallback: str = "unknown") -> str:
@@ -442,6 +454,13 @@ class OAuthService:
             window_seconds=AUTH_ATTEMPT_RATE_WINDOW_SECONDS,
             backoff_max_seconds=AUTH_ATTEMPT_BACKOFF_MAX_SECONDS,
         )
+        # The administrator passphrase is one system-wide credential, so a
+        # second bucket also caps attempts spread across many caller identities.
+        self._authorization_global_limiter = _SlidingWindowRateLimiter(
+            limit=AUTH_ATTEMPT_GLOBAL_RATE_LIMIT,
+            window_seconds=AUTH_ATTEMPT_RATE_WINDOW_SECONDS,
+            max_callers=1,
+        )
 
     def check_registration_rate_limit(self, caller: str) -> bool:
         """Sliding-window limiter for the unauthenticated DCR endpoint.
@@ -454,7 +473,10 @@ class OAuthService:
         return allowed
 
     def check_authorization_rate_limit(self, caller: str) -> tuple[bool, int]:
-        """Throttle authorize and token attempts through one shared bucket."""
+        """Throttle authorize and token attempts globally and per caller."""
+        globally_allowed, retry_after = self._authorization_global_limiter.check("admin-auth")
+        if not globally_allowed:
+            return False, retry_after
         return self._authorization_limiter.check(caller)
 
     def issue_access_token(
