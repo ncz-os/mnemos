@@ -178,3 +178,38 @@ shapes underneath it. Spot-checked against the live container:
   `get_stats`. Any of these could have moved/changed shape in the 6.x
   refactor the same way consultations did — don't assume they're fine
   because memories/kg were.
+
+## 7. Addendum — reconciliation done, quota fix applied, new issue surfaced
+
+Codex `gpt-5.6-sol` completed the reconciliation task from §5/§6. Real,
+reviewable result: **`feat/oauth-mcp-provider-agnostic-v2`** on
+`gitlab.com/ncz-os/mnemos`, based on current `master` (`8eea1723`),
+3,287 tests passed, ruff/import-linter clean, its own adversarial review
+approved. **This branch, not the original
+`feat/oauth-mcp-provider-agnostic`, is the one to review/merge.**
+Highlights: `graeae.py`/`tools/__init__.py` needed no porting at all —
+master already had both tools wired into a newer GRAEAE implementation.
+`phase_extract` bug (§3) confirmed still present on current master, fixed
+using the pattern its sibling `phase_cluster` already established. Full
+REST-surface audit of all 9 previously-unchecked tools: zero drift found,
+all matched the real 6.x contract (one route moved: `list_deletions` now
+lives in `admin.py`).
+
+Quota-storage root cause (also found by the same dispatch): NOT a Redis
+outage — Redis was healthy and reachable the whole time. Real bug:
+`RATE_LIMIT_STORAGE_URI` was unset (defaulting to `memory://`), and the
+server profile deliberately refuses process-local quota storage rather
+than run inconsistent per-process state, hence the 503, by design, just
+misconfigured. **Fix applied to production** (operator approved):
+`RATE_LIMIT_STORAGE_URI=redis://127.0.0.1:6379/1` added to
+`/etc/mnemos/mnemos-api.env` on PYTHIA, `mnemos-api.service` restarted,
+confirmed live in the container's env.
+
+**Result: the quota 503 is gone, but a NEW, previously-masked error is
+now visible**: `POST /v1/consultations` now returns
+`{"detail":"Consultation persistence failed; audit trail is required."}`
+— a different, downstream failure (consultation audit-trail persistence,
+likely Oracle-backed given `MNEMOS_PERSISTENCE_BACKEND=oracle`) that
+never got reached before because the quota check failed first. **Not
+investigated tonight** — real next-session task, root-cause this the
+same way (don't guess, find the actual code path and what's failing).
