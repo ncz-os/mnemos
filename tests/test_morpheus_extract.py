@@ -1,4 +1,5 @@
 """Tests for MORPHEUS slice 4: EXTRACT."""
+
 from __future__ import annotations
 
 import json
@@ -10,6 +11,9 @@ from mnemos.core import config as core_config
 from mnemos.domain.morpheus import runner
 from mnemos.domain.morpheus.runner import ExtractedTriple, phase_extract, rollback_run
 
+
+_WINDOW_OPEN = datetime(1970, 1, 1)
+_WINDOW_CLOSE = datetime(2999, 1, 1)
 
 RUN_ID = "00000000-0000-0000-0000-0000000000e4"
 OTHER_RUN_ID = "00000000-0000-0000-0000-0000000000f5"
@@ -24,6 +28,8 @@ def reset_morpheus_extract_settings(monkeypatch):
     monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_MIN_CONFIDENCE", raising=False)
     monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_MUSE", raising=False)
     monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_VERIFIER", raising=False)
+    monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_MAX_INPUT_COUNT", raising=False)
+    monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_MAX_FAILURES", raising=False)
     core_config._reset_settings_for_tests()
     yield
     core_config._reset_settings_for_tests()
@@ -45,16 +51,20 @@ class _Conn:
         run_namespace: str | None = "A",
         memories: list[dict] | None = None,
         kg_triples: list[dict] | None = None,
+        run_window: tuple[datetime, datetime] | None = None,
     ):
         self.run_row = {
             "config": run_config or {"extract": True},
             "namespace": run_namespace,
+            "window_started_at": run_window[0] if run_window else _WINDOW_OPEN,
+            "window_ended_at": run_window[1] if run_window else _WINDOW_CLOSE,
             "triples_extracted": 0,
             "memories_processed_for_extraction": 0,
         }
         self.memories = {row["id"]: row for row in memories or []}
         self.kg_triples = list(kg_triples or [])
         self.extract_run_memories: list[dict] = []
+        self.extract_failures: dict[str, dict] = {}
         self.executed: list[tuple[str, tuple]] = []
         self.counter_updates: list[tuple[str, tuple]] = []
 
@@ -64,13 +74,31 @@ class _Conn:
     async def fetchrow(self, sql: str, *_args):
         if "FROM morpheus_runs" in sql:
             return self.run_row
+        compact = " ".join(sql.split())
+        if compact.startswith("INSERT INTO morpheus_extract_failures"):
+            memory_id, max_failures, last_error = _args
+            attempts = self.extract_failures.get(memory_id, {}).get("attempts", 0) + 1
+            status = "dead_letter" if attempts >= max_failures else "retryable"
+            row = {
+                "memory_id": memory_id,
+                "attempts": attempts,
+                "status": status,
+                "last_error": last_error,
+                "last_failed_at": "now",
+            }
+            self.extract_failures[memory_id] = row
+            return row
         return None
 
     async def fetch(self, sql: str, *args):
         compact = " ".join(sql.split())
-        if "SELECT id, verbatim_content, owner_id, namespace" not in compact:
+        if "SELECT m.id, m.verbatim_content, m.owner_id, m.namespace" not in compact:
             return []
-        min_chars, namespace = args
+        assert "m.created <= $1" in compact
+        assert "ORDER BY m.created, m.id" in compact
+        assert "failure.status <> 'dead_letter'" in compact
+        assert "LIMIT $4" in compact
+        window_end, min_chars, namespace, limit = args
         out = []
         for row in sorted(self.memories.values(), key=lambda item: item["created"]):
             content = row.get("verbatim_content")
@@ -80,17 +108,28 @@ class _Conn:
                 continue
             if row.get("consolidated_into") is not None:
                 continue
+            if row.get("namespace") == "vault":
+                continue
             if row.get("triples_extracted_at") is not None:
+                continue
+            if self.extract_failures.get(row["id"], {}).get("status") == "dead_letter":
                 continue
             if content is None or len(content) < min_chars:
                 continue
             if namespace is not None and row.get("namespace") != namespace:
                 continue
+            if row["created"] > window_end:
+                continue
             out.append(row)
-        return out
+        return out[:limit]
 
     async def fetchval(self, sql: str, *args):
         compact = " ".join(sql.split())
+        if compact.startswith("SELECT id FROM memories") and compact.endswith("FOR UPDATE"):
+            row = self.memories.get(args[0])
+            if row is not None and row.get("triples_extracted_at") is None:
+                return row["id"]
+            return None
         if compact.startswith("UPDATE memories SET triples_extracted_at = NOW()"):
             memory_id, namespace = args
             row = self.memories.get(memory_id)
@@ -99,6 +138,8 @@ class _Conn:
             if row.get("archived_at") is not None:
                 return None
             if row.get("consolidated_into") is not None:
+                return None
+            if row.get("namespace") == "vault":
                 return None
             if row.get("triples_extracted_at") is not None:
                 return None
@@ -112,17 +153,19 @@ class _Conn:
         self.executed.append((sql, args))
         compact = " ".join(sql.split())
         if compact.startswith("INSERT INTO kg_triples"):
-            self.kg_triples.append({
-                "id": args[0],
-                "subject": args[1],
-                "predicate": args[2],
-                "object": args[3],
-                "memory_id": args[4],
-                "confidence": args[5],
-                "extracted_by_run_id": args[6],
-                "owner_id": args[7],
-                "namespace": args[8],
-            })
+            self.kg_triples.append(
+                {
+                    "id": args[0],
+                    "subject": args[1],
+                    "predicate": args[2],
+                    "object": args[3],
+                    "memory_id": args[4],
+                    "confidence": args[5],
+                    "extracted_by_run_id": args[6],
+                    "owner_id": args[7],
+                    "namespace": args[8],
+                }
+            )
             return "INSERT 0 1"
         if compact.startswith("INSERT INTO morpheus_extract_run_memories"):
             run_id, memory_id = args
@@ -131,12 +174,17 @@ class _Conn:
                 for row in self.extract_run_memories
                 if not (row["run_id"] == run_id and row["memory_id"] == memory_id)
             ]
-            self.extract_run_memories.append({
-                "run_id": run_id,
-                "memory_id": memory_id,
-                "processed_at": "now",
-            })
+            self.extract_run_memories.append(
+                {
+                    "run_id": run_id,
+                    "memory_id": memory_id,
+                    "processed_at": "now",
+                }
+            )
             return "INSERT 0 1"
+        if compact.startswith("DELETE FROM morpheus_extract_failures"):
+            self.extract_failures.pop(args[0], None)
+            return "DELETE 1"
         if compact.startswith("WITH deleted_extract_triples AS"):
             return self._execute_extract_rollback(args[0])
         if compact.startswith("UPDATE memories SET consolidated_into = NULL"):
@@ -157,19 +205,9 @@ class _Conn:
             for row in self.kg_triples
             if row.get("extracted_by_run_id") == run_id and row.get("memory_id")
         }
-        affected_memory_ids.update(
-            row["memory_id"]
-            for row in self.extract_run_memories
-            if row["run_id"] == run_id
-        )
-        self.kg_triples = [
-            row for row in self.kg_triples
-            if row.get("extracted_by_run_id") != run_id
-        ]
-        self.extract_run_memories = [
-            row for row in self.extract_run_memories
-            if row["run_id"] != run_id
-        ]
+        affected_memory_ids.update(row["memory_id"] for row in self.extract_run_memories if row["run_id"] == run_id)
+        self.kg_triples = [row for row in self.kg_triples if row.get("extracted_by_run_id") != run_id]
+        self.extract_run_memories = [row for row in self.extract_run_memories if row["run_id"] != run_id]
         reset = 0
         for memory_id in affected_memory_ids:
             row = self.memories.get(memory_id)
@@ -241,11 +279,13 @@ async def _three_triples(content: str) -> list[ExtractedTriple]:
 @pytest.mark.asyncio
 async def test_phase_extract_three_memories_three_triples_each(monkeypatch):
     monkeypatch.setattr(runner, "_extract_triples_from_prose", _three_triples)
-    conn = _Conn(memories=[
-        _memory("mem_0", created_offset=0),
-        _memory("mem_1", created_offset=1),
-        _memory("mem_2", created_offset=2),
-    ])
+    conn = _Conn(
+        memories=[
+            _memory("mem_0", created_offset=0),
+            _memory("mem_1", created_offset=1),
+            _memory("mem_2", created_offset=2),
+        ]
+    )
 
     n = await phase_extract(_Pool(conn), RUN_ID)
 
@@ -266,11 +306,13 @@ async def test_phase_extract_idempotent_on_rerun(monkeypatch):
         return await _three_triples(content)
 
     monkeypatch.setattr(runner, "_extract_triples_from_prose", fake_extract)
-    conn = _Conn(memories=[
-        _memory("mem_0", created_offset=0),
-        _memory("mem_1", created_offset=1),
-        _memory("mem_2", created_offset=2),
-    ])
+    conn = _Conn(
+        memories=[
+            _memory("mem_0", created_offset=0),
+            _memory("mem_1", created_offset=1),
+            _memory("mem_2", created_offset=2),
+        ]
+    )
     pool = _Pool(conn)
 
     first = await phase_extract(pool, RUN_ID)
@@ -292,11 +334,13 @@ async def test_phase_extract_skips_null_and_short_verbatim_content(monkeypatch):
         "_extract_triples_from_prose",
         one_triple,
     )
-    conn = _Conn(memories=[
-        _memory("null_content", verbatim_content=None, created_offset=0),
-        _memory("short_content", verbatim_content="too short", created_offset=1),
-        _memory("eligible", created_offset=2),
-    ])
+    conn = _Conn(
+        memories=[
+            _memory("null_content", verbatim_content=None, created_offset=0),
+            _memory("short_content", verbatim_content="too short", created_offset=1),
+            _memory("eligible", created_offset=2),
+        ]
+    )
 
     n = await phase_extract(_Pool(conn), RUN_ID)
 
@@ -308,18 +352,83 @@ async def test_phase_extract_skips_null_and_short_verbatim_content(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_malformed_fast_muse_json_discards_triples_but_marks_memory(monkeypatch):
-    async def malformed_json(*_args, **_kwargs) -> str:
-        return "this is not json"
+async def test_malformed_muse_json_leaves_memory_retryable(monkeypatch):
+    responses = iter(
+        [
+            "this is not json",
+            json.dumps([{"subject": "Alice", "predicate": "owns", "object": "Helios", "confidence": 0.9}]),
+        ]
+    )
 
-    monkeypatch.setattr(runner, "_call_morpheus_muse", malformed_json)
+    async def provider_response(*_args, **_kwargs) -> str:
+        return next(responses)
+
+    monkeypatch.setattr(runner, "_call_morpheus_muse", provider_response)
     conn = _Conn(memories=[_memory("mem_bad_json")])
+    pool = _Pool(conn)
+
+    first = await phase_extract(pool, RUN_ID)
+
+    assert first == 0
+    assert conn.kg_triples == []
+    assert conn.memories["mem_bad_json"]["triples_extracted_at"] is None
+    assert conn.extract_run_memories == []
+    assert conn.run_row["memories_processed_for_extraction"] == 0
+
+    second = await phase_extract(pool, RUN_ID)
+
+    assert second == 1
+    assert conn.memories["mem_bad_json"]["triples_extracted_at"] == "now"
+    assert [row["memory_id"] for row in conn.extract_run_memories] == ["mem_bad_json"]
+
+
+@pytest.mark.asyncio
+async def test_valid_empty_extraction_marks_success(monkeypatch):
+    async def valid_empty(*_args, **_kwargs) -> str:
+        return "[]"
+
+    monkeypatch.setattr(runner, "_call_morpheus_muse", valid_empty)
+    conn = _Conn(memories=[_memory("mem_no_triples")])
 
     n = await phase_extract(_Pool(conn), RUN_ID)
 
     assert n == 0
     assert conn.kg_triples == []
-    assert conn.memories["mem_bad_json"]["triples_extracted_at"] == "now"
+    assert conn.memories["mem_no_triples"]["triples_extracted_at"] == "now"
+    assert [row["memory_id"] for row in conn.extract_run_memories] == ["mem_no_triples"]
+    assert conn.run_row["memories_processed_for_extraction"] == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_leaves_memory_retryable(monkeypatch):
+    async def timed_out(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_call_morpheus_muse", timed_out)
+    conn = _Conn(memories=[_memory("mem_timeout")])
+
+    n = await phase_extract(_Pool(conn), RUN_ID)
+
+    assert n == 0
+    assert conn.memories["mem_timeout"]["triples_extracted_at"] is None
+    assert conn.extract_run_memories == []
+    assert conn.run_row["memories_processed_for_extraction"] == 0
+
+
+@pytest.mark.asyncio
+async def test_late_failure_does_not_recreate_state_after_concurrent_success(monkeypatch):
+    conn = _Conn(memories=[_memory("mem_concurrent")])
+
+    async def succeeds_elsewhere_then_fails(_content: str) -> list[ExtractedTriple]:
+        conn.memories["mem_concurrent"]["triples_extracted_at"] = "concurrent-success"
+        raise runner.MorpheusExtractionError("late provider failure")
+
+    monkeypatch.setattr(runner, "_extract_triples_from_prose", succeeds_elsewhere_then_fails)
+
+    await phase_extract(_Pool(conn), RUN_ID)
+
+    assert conn.extract_failures == {}
+    assert conn.memories["mem_concurrent"]["triples_extracted_at"] == "concurrent-success"
 
 
 @pytest.mark.asyncio
@@ -351,11 +460,13 @@ async def test_rollback_run_removes_only_triples_from_that_run():
 @pytest.mark.asyncio
 async def test_rollback_run_resets_zero_triple_processed_memories():
     conn = _Conn(memories=[_memory("mem_zero", triples_extracted_at="done")])
-    conn.extract_run_memories.append({
-        "run_id": RUN_ID,
-        "memory_id": "mem_zero",
-        "processed_at": "now",
-    })
+    conn.extract_run_memories.append(
+        {
+            "run_id": RUN_ID,
+            "memory_id": "mem_zero",
+            "processed_at": "now",
+        }
+    )
 
     deleted, run_rows = await rollback_run(_Pool(conn), RUN_ID)
 
@@ -396,16 +507,20 @@ async def test_phase_extract_is_namespace_scoped(monkeypatch):
 async def test_extract_verify_filters_below_min_confidence(monkeypatch):
     async def fake_muse(_prompt: str, *, task_type: str, **_kwargs) -> str:
         if task_type == "kg_extraction_verification":
-            return json.dumps([
-                {"index": 0, "confidence": 0.95},
-                {"index": 1, "confidence": 0.59},
-                {"index": 2, "confidence": 0.60},
-            ])
-        return json.dumps([
-            {"subject": "Alice", "predicate": "owns", "object": "Project Helios", "confidence": 0.9},
-            {"subject": "Bob", "predicate": "owns", "object": "Project Helios", "confidence": 0.9},
-            {"subject": "Helios", "predicate": "launches_in", "object": "April", "confidence": 0.9},
-        ])
+            return json.dumps(
+                [
+                    {"index": 0, "confidence": 0.95},
+                    {"index": 1, "confidence": 0.59},
+                    {"index": 2, "confidence": 0.60},
+                ]
+            )
+        return json.dumps(
+            [
+                {"subject": "Alice", "predicate": "owns", "object": "Project Helios", "confidence": 0.9},
+                {"subject": "Bob", "predicate": "owns", "object": "Project Helios", "confidence": 0.9},
+                {"subject": "Helios", "predicate": "launches_in", "object": "April", "confidence": 0.9},
+            ]
+        )
 
     monkeypatch.setattr(runner, "_call_morpheus_muse", fake_muse)
     conn = _Conn(run_config={"extract": True, "extract_verify": True}, memories=[_memory("mem_verify")])
@@ -417,6 +532,23 @@ async def test_extract_verify_filters_below_min_confidence(monkeypatch):
         ("Alice", 0.95),
         ("Helios", 0.60),
     ]
+
+
+@pytest.mark.asyncio
+async def test_malformed_verifier_response_leaves_memory_retryable(monkeypatch):
+    async def fake_muse(_prompt: str, *, task_type: str, **_kwargs) -> str:
+        if task_type == "kg_extraction_verification":
+            return "not-json"
+        return json.dumps([{"subject": "Alice", "predicate": "owns", "object": "Helios", "confidence": 0.9}])
+
+    monkeypatch.setattr(runner, "_call_morpheus_muse", fake_muse)
+    conn = _Conn(run_config={"extract": True, "extract_verify": True}, memories=[_memory("mem_verify_bad")])
+
+    n = await phase_extract(_Pool(conn), RUN_ID)
+
+    assert n == 0
+    assert conn.memories["mem_verify_bad"]["triples_extracted_at"] is None
+    assert conn.extract_run_memories == []
 
 
 @pytest.mark.asyncio
@@ -463,3 +595,77 @@ async def test_run_dream_inserts_extract_phase_after_synthesise(monkeypatch):
         "phase:commit",
         "finish",
     ]
+
+
+@pytest.mark.asyncio
+async def test_phase_extract_processes_old_backlog_but_not_future_rows(monkeypatch):
+    monkeypatch.setattr(runner, "_extract_triples_from_prose", _three_triples)
+    base = datetime(2026, 5, 2, 12, 0, 0)
+    conn = _Conn(
+        run_window=(base - timedelta(minutes=1), base + timedelta(minutes=1)),
+        memories=[
+            _memory("mem_before", created_offset=-10),
+            _memory("mem_inside"),
+            _memory("mem_after", created_offset=10),
+        ],
+    )
+
+    await phase_extract(_Pool(conn), RUN_ID)
+
+    assert {row["memory_id"] for row in conn.extract_run_memories} == {"mem_before", "mem_inside"}
+
+
+@pytest.mark.asyncio
+async def test_phase_extract_limit_does_not_strand_backlog_between_runs(monkeypatch):
+    monkeypatch.setenv("MNEMOS_MORPHEUS_EXTRACT_MAX_INPUT_COUNT", "2")
+    core_config._reset_settings_for_tests()
+    monkeypatch.setattr(runner, "_extract_triples_from_prose", _three_triples)
+    conn = _Conn(memories=[_memory(f"mem_{i}", created_offset=i) for i in range(4)])
+
+    await phase_extract(_Pool(conn), RUN_ID)
+
+    assert {row["memory_id"] for row in conn.extract_run_memories} == {"mem_0", "mem_1"}
+
+    # Advance the next replay window past the capped-out rows. The durable
+    # per-row extraction marker, not this moving lower bound, drives backlog.
+    conn.run_row["window_started_at"] = datetime(2026, 5, 3, 12, 0, 0)
+    await phase_extract(_Pool(conn), RUN_ID)
+
+    assert {row["memory_id"] for row in conn.extract_run_memories} == {
+        "mem_0",
+        "mem_1",
+        "mem_2",
+        "mem_3",
+    }
+
+
+@pytest.mark.asyncio
+async def test_phase_extract_dead_letters_poison_batch_then_processes_newer_rows(monkeypatch):
+    monkeypatch.setenv("MNEMOS_MORPHEUS_EXTRACT_MAX_INPUT_COUNT", "2")
+    monkeypatch.setenv("MNEMOS_MORPHEUS_EXTRACT_MAX_FAILURES", "2")
+    core_config._reset_settings_for_tests()
+    attempted: list[str] = []
+
+    async def fail_oldest(content: str) -> list[ExtractedTriple]:
+        memory_id = content.split()[0]
+        attempted.append(memory_id)
+        if memory_id in {"mem_0", "mem_1"}:
+            raise runner.MorpheusExtractionError("permanent provider failure")
+        return []
+
+    monkeypatch.setattr(runner, "_extract_triples_from_prose", fail_oldest)
+    conn = _Conn(memories=[_memory(f"mem_{i}", created_offset=i) for i in range(4)])
+    pool = _Pool(conn)
+
+    for _ in range(3):
+        await phase_extract(pool, RUN_ID)
+
+    assert attempted == ["mem_0", "mem_1", "mem_0", "mem_1", "mem_2", "mem_3"]
+    assert {memory_id: row["status"] for memory_id, row in conn.extract_failures.items()} == {
+        "mem_0": "dead_letter",
+        "mem_1": "dead_letter",
+    }
+    assert conn.memories["mem_0"]["triples_extracted_at"] is None
+    assert conn.memories["mem_1"]["triples_extracted_at"] is None
+    assert conn.memories["mem_2"]["triples_extracted_at"] == "now"
+    assert conn.memories["mem_3"]["triples_extracted_at"] == "now"
