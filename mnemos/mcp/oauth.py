@@ -48,6 +48,7 @@ RATE_LIMIT_MAX_CALLERS = 4096
 MIN_SIGNING_KEY_BYTES = 32
 
 _OBVIOUS_SIGNING_KEY_PLACEHOLDERS = {
+    "admin",
     "changeme",
     "change-me",
     "replace-me",
@@ -60,6 +61,14 @@ _OBVIOUS_SIGNING_KEY_PLACEHOLDERS = {
     "example",
     "this-is-a-placeholder-signing-key-do-not-use",
 }
+
+
+def _shortest_repeating_unit(value: str) -> str:
+    """Collapse a periodic string to its shortest repeating substring."""
+    if len(value) < 2:
+        return value
+    period = (value + value).find(value, 1)
+    return value[:period] if period < len(value) else value
 
 
 def _now() -> datetime:
@@ -430,8 +439,9 @@ class OAuthService:
         if len(signing_key.encode("utf-8")) < MIN_SIGNING_KEY_BYTES:
             raise ValueError(f"OAuth signing key must be at least {MIN_SIGNING_KEY_BYTES} bytes for HS256")
         normalized_key = signing_key.casefold()
-        if normalized_key in _OBVIOUS_SIGNING_KEY_PLACEHOLDERS or len(set(normalized_key)) == 1:
-            raise ValueError("OAuth signing key must not be an obvious placeholder")
+        collapsed_key = _shortest_repeating_unit(normalized_key)
+        if collapsed_key != normalized_key or collapsed_key in _OBVIOUS_SIGNING_KEY_PLACEHOLDERS:
+            raise ValueError("OAuth signing key must not be periodic or an obvious placeholder")
         # Fail-closed: an empty/None passphrase would let `passphrase=`
         # pass hmac.compare_digest (empty vs empty) and None would raise.
         if not admin_passphrase:

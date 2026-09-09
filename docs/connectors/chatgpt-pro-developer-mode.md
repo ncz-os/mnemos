@@ -72,9 +72,12 @@ history, access logs, and checked-in environment files. The authorization UI
 submits it only in the POST body.
 
 The OAuth migration is applied by the installer and both compose profiles.
-For isolated development without PostgreSQL, set
-`MNEMOS_OAUTH_SIGNING_KEY` to a stable random value; OAuth clients and grants
-then remain in memory and are lost on restart.
+With the PostgreSQL store configured, leave `MNEMOS_OAUTH_SIGNING_KEY` unset:
+first boot generates `secrets.token_urlsafe(32)` and persists it. For isolated
+development without PostgreSQL, generate a stable random value with
+`python -c 'import secrets; print(secrets.token_urlsafe(32))'` and set
+`MNEMOS_OAUTH_SIGNING_KEY`; OAuth clients and grants then remain in memory and
+are lost on restart.
 
 ## Setup — legacy static bearer path
 

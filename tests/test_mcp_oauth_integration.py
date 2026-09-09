@@ -1359,6 +1359,8 @@ def test_oauth_service_rejects_missing_signing_key() -> None:
         " ",
         "a" * 31,
         "k" * 32,
+        "ab" * 16,
+        "password" * 4,
         "this-is-a-placeholder-signing-key-do-not-use",
         " 0123456789abcdef0123456789ABCDEF",
     ],
@@ -1376,18 +1378,19 @@ def test_oauth_service_rejects_weak_or_placeholder_signing_keys(signing_key: str
         )
 
 
-def test_oauth_service_accepts_exactly_32_nonplaceholder_bytes() -> None:
+def test_oauth_service_accepts_random_32_byte_signing_key() -> None:
     from mnemos.mcp.oauth import InMemoryOAuthStore, OAuthService
 
+    signing_key = secrets.token_urlsafe(32)
     service = OAuthService(
         base_url="http://testserver",
-        signing_key="0123456789abcdef0123456789ABCDEF",
+        signing_key=signing_key,
         store=InMemoryOAuthStore(),
         registration_secret="r",
         admin_passphrase="p",
     )
 
-    assert service.signing_key == "0123456789abcdef0123456789ABCDEF"
+    assert service.signing_key == signing_key
 
 
 @pytest.mark.asyncio
