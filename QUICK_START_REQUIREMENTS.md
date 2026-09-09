@@ -1,6 +1,6 @@
 # MNEMOS Quick Start Requirements
 
-**Applies to**: current v6.2.0 release line
+**Applies to**: current v6.2.1 release line
 **TL;DR**: Python 3.11+ for package installs, or no host Python at all if you
 run the container image. Use SQLite for `edge`/`dev`, or PostgreSQL 16 for
 `server` — plus Redis only if you run more than one worker.
@@ -329,6 +329,6 @@ kill -9 <PID>
 
 ---
 
-**Version**: v6.2.0
+**Version**: v6.2.1
 **Updated**: 2026-07-10
 **Accuracy**: Production-verified

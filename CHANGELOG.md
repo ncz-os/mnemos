@@ -57,6 +57,20 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.2.1] — 2026-09-09
+
+Build-matrix fix for 6.2.0. `mnemos-core` published correctly at 6.2.0, but
+the `mnemos` (everything) and `mnemos-enterprise` images never built: all
+four overlays (`pantheon`/`knemon`/`graeae`/`charon`) pin their
+`mnemos-core` dependency to the current release *line*
+(`>=6.1,<6.2`) by design, and that pin needs bumping on every core minor —
+it was not bumped for 6.2.0, so pip's resolver rejected `mnemos-core==6.2.0`
+outright every time `Dockerfile.everything` tried to install the overlay
+wheels. Bumped all four to `>=6.2,<6.3`. The release-images workflow reads
+overlay commits from `.github/addons.lock.json` at the tag it builds — since
+tags are an immutable reproducibility contract, the fix needed a new tag
+rather than moving `v6.2.0`.
+
 ## [6.2.0] — 2026-09-09
 
 Security-audit release. 11 fixes across mnemos-core and the bridge/tool
