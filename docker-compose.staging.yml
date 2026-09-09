@@ -106,6 +106,7 @@ services:
       - ./mnemos/db_migrations/migrations_v5_3_3_deletion_log_export_index.sql:/docker-entrypoint-initdb.d/59-deletion-log-export-index.sql
       - ./mnemos/db_migrations/migrations_v5_3_4_mcp_audit_log.sql:/docker-entrypoint-initdb.d/60-mcp-audit-log.sql
       - ./mnemos/db_migrations/migrations_v5_3_5_model_registry_capabilities_gin.sql:/docker-entrypoint-initdb.d/61-model-registry-capabilities-gin.sql
+      - ./mnemos/db_migrations/migrations_v5_4_0_mcp_oauth.sql:/docker-entrypoint-initdb.d/61a-mcp-oauth.sql
       # hive_agents CREATE before 0036 ALTERs it. "61a" sorts after 61 and
       # before 62 so it runs ahead of 66-hive-agents-subscription-pools.
       - ./mnemos/db_migrations/migrations/0021_hive_agents.sql:/docker-entrypoint-initdb.d/61a-hive-agents.sql
@@ -175,6 +176,7 @@ services:
       - ./mnemos/db_migrations/migrations_v5_3_3_deletion_log_export_index.sql:/migrations/59-deletion-log-export-index.sql:ro
       - ./mnemos/db_migrations/migrations_v5_3_4_mcp_audit_log.sql:/migrations/60-mcp-audit-log.sql:ro
       - ./mnemos/db_migrations/migrations_v5_3_5_model_registry_capabilities_gin.sql:/migrations/61-model-registry-capabilities-gin.sql:ro
+      - ./mnemos/db_migrations/migrations_v5_4_0_mcp_oauth.sql:/migrations/61a-mcp-oauth.sql:ro
       - ./mnemos/db_migrations/migrations/0032_usage_ledger.sql:/migrations/62-usage-ledger.sql:ro
       - ./mnemos/db_migrations/migrations/0033_subscription_plans.sql:/migrations/63-subscription-plans.sql:ro
       - ./mnemos/db_migrations/migrations/0034_usage_ledger_session_tracking.sql:/migrations/64-usage-ledger-session-tracking.sql:ro
@@ -227,6 +229,7 @@ services:
       -f /migrations/59-deletion-log-export-index.sql
       -f /migrations/60-mcp-audit-log.sql
       -f /migrations/61-model-registry-capabilities-gin.sql
+      -f /migrations/61a-mcp-oauth.sql
       -f /migrations/62-usage-ledger.sql
       -f /migrations/63-subscription-plans.sql
       -f /migrations/64-usage-ledger-session-tracking.sql

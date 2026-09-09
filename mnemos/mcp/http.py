@@ -34,6 +34,7 @@ import hashlib
 import hmac
 import json
 import logging
+import secrets
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ from urllib.parse import parse_qs, quote
 from uuid import UUID
 
 import uvicorn
+import jwt
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -55,6 +57,15 @@ except ImportError:  # pragma: no cover - exercised only by lightweight test stu
 from starlette.routing import Mount, Route
 
 from mnemos.core.config import get_settings, mcp_nats_raw_enabled
+from mnemos.mcp.oauth import (
+    authorize_post_route,
+    authorize_route,
+    get_oauth_service,
+    metadata_authorization,
+    metadata_resource,
+    register_route,
+    token_route,
+)
 
 # Reuse the exact same Server instance + tool registrations from
 # the stdio entry point. Importing for the side effect of having
@@ -138,12 +149,20 @@ def _load_token_principals() -> dict[str, MCPClientPrincipal]:
     # this edge exposes full memory write access.
     tok = settings.mcp.token.strip()
     if not tok:
+        oauth = settings.oauth
+        oauth_ready = bool(
+            oauth.issuer.strip()
+            and oauth.admin_passphrase.strip()
+            and (oauth.signing_key.strip() or oauth.database_url.strip())
+        )
+        if oauth_ready:
+            logger.info("MCP HTTP bearer authentication configured for OAuth-only mode")
+            return {}
         _fatal_auth_config(
-            "FATAL: MNEMOS_MCP_TOKEN must be set. Refusing to expose the\n"
-            "MCP server without bearer auth. Generate a token (e.g. via\n"
-            "`openssl rand -hex 32`), set it in the environment, and\n"
-            "configure the same token in the connector caller. For\n"
-            "multi-tenant HTTP MCP, prefer MNEMOS_MCP_TOKENS.\n"
+            "FATAL: configure MNEMOS_MCP_TOKEN/MNEMOS_MCP_TOKENS or a complete\n"
+            "MCP OAuth setup (MNEMOS_OAUTH_ISSUER,\n"
+            "MNEMOS_OAUTH_ADMIN_PASSPHRASE, and either\n"
+            "MNEMOS_OAUTH_SIGNING_KEY or MNEMOS_OAUTH_DATABASE_URL).\n"
         )
     logger.warning(
         "WARNING: MCP HTTP/SSE is using one shared MNEMOS_MCP_TOKEN. "
@@ -180,6 +199,29 @@ def _match_principal(presented: str) -> MCPClientPrincipal | None:
     return matched
 
 
+def _verify_presented_token(presented: str) -> MCPClientPrincipal | None:
+    """Accept a configured static bearer or a valid OAuth-issued JWT.
+
+    Static-token matching retains the constant-time comparison used by the
+    current 6.1 line. OAuth JWTs are signature-, issuer-, audience-, expiry-,
+    subject-, and scope-validated by :class:`OAuthService`.
+    """
+    static = _match_principal(presented)
+    if static is not None:
+        return static
+    try:
+        service = get_oauth_service()
+    except RuntimeError:
+        return None
+    try:
+        claims = service.validate_access_token(presented)
+    except jwt.PyJWTError:
+        return None
+    user_id = claims.get("sub")
+    api_key = get_settings().server.api_key.strip() or None
+    return MCPClientPrincipal(user_id=user_id, api_key=api_key)
+
+
 def _principal_id(principal: MCPClientPrincipal) -> str:
     """Return the stable caller identity used to bind SSE sessions."""
     api_key_fingerprint = hashlib.sha256((principal.api_key or "").encode()).hexdigest()
@@ -195,7 +237,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     client knows what scheme to use."""
 
     async def dispatch(self, request, call_next):
-        if request.url.path in {"/health", "/healthz"}:
+        path = request.url.path
+        if (
+            path in {"/health", "/healthz"}
+            or path.startswith("/.well-known/")
+            or path.startswith("/oauth/")
+        ):
             return await call_next(request)
         auth = request.headers.get("authorization", "")
         if not auth.lower().startswith("bearer "):
@@ -205,7 +252,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": 'Bearer realm="mnemos-mcp"'},
             )
         presented = auth.split(" ", 1)[1].strip()
-        principal = _match_principal(presented)
+        principal = _verify_presented_token(presented)
         if principal is None:
             return JSONResponse(
                 {"error": "invalid bearer token"},
@@ -836,22 +883,68 @@ async def _drain_audit_tasks_on_shutdown() -> None:
 
 @asynccontextmanager
 async def _mcp_http_lifespan(_app: Starlette):
-    """Lifespan context manager wrapping the audit-drain on
-    shutdown. Replaces the pre-Starlette-1.0 `on_shutdown=[...]`
-    kwarg, which was removed in Starlette 1.0.0
-    (deprecated in 0.x). Caught by the PROTEUS fresh-install
-    barrage on 2026-05-08; a fresh install on Python 3.13 + the
-    current Starlette pin would 9-fail in test_mcp_nats_sse +
-    test_mcp_http_health + test_connector_smoke without this.
+    """Wire persistent OAuth state, then drain audit work on shutdown.
+
+    When ``MNEMOS_OAUTH_DATABASE_URL`` is configured, the OAuth service is
+    installed before requests are accepted and uses a small dedicated asyncpg
+    pool. The current 6.1 audit-drain shutdown behavior remains intact.
     """
-    yield
-    await _drain_audit_tasks_on_shutdown()
+    import asyncpg
+
+    from mnemos.mcp import oauth as oauth_module
+
+    pool = None
+    settings = get_settings()
+    dsn = settings.oauth.database_url.strip()
+    if dsn:
+        if not settings.oauth.issuer.strip():
+            raise RuntimeError("MNEMOS_OAUTH_ISSUER is required when MCP OAuth persistence is enabled")
+        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4)
+        store = oauth_module.PostgresOAuthStore(pool)
+        signing_key = settings.oauth.signing_key or await store.get_signing_key()
+        if not signing_key:
+            generated_key = secrets.token_urlsafe(32)
+            await store.save_signing_key(key_id="default", signing_key=generated_key)
+            signing_key = await store.get_signing_key()
+            if not signing_key:
+                await pool.close()
+                raise RuntimeError("failed to persist the MCP OAuth signing key")
+            logger.info(
+                "OAuth signing key generated and persisted to "
+                "oauth_mcp_signing_keys (key_id=default) on first boot."
+            )
+        service = oauth_module.OAuthService(
+            base_url=settings.oauth.issuer,
+            signing_key=signing_key,
+            store=store,
+            registration_secret=settings.oauth.registration_secret,
+            admin_passphrase=settings.oauth.admin_passphrase,
+        )
+        oauth_module.set_oauth_service(service)
+        logger.info("OAuth store wired to Postgres (MNEMOS_OAUTH_DATABASE_URL).")
+
+    try:
+        yield
+    finally:
+        oauth_module.set_oauth_service(None)
+        if pool is not None:
+            try:
+                await pool.close()
+            except Exception:
+                logger.exception("Failed to close OAuth asyncpg pool on shutdown")
+        await _drain_audit_tasks_on_shutdown()
 
 
 starlette_app = Starlette(
     routes=[
         Route("/health", endpoint=healthz),
         Route("/healthz", endpoint=healthz),
+        Route("/.well-known/oauth-authorization-server", endpoint=metadata_authorization),
+        Route("/.well-known/oauth-protected-resource", endpoint=metadata_resource),
+        Route("/oauth/authorize", endpoint=authorize_route, methods=["GET"]),
+        Route("/oauth/authorize", endpoint=authorize_post_route, methods=["POST"]),
+        Route("/oauth/token", endpoint=token_route, methods=["POST"]),
+        Route("/oauth/register", endpoint=register_route, methods=["POST"]),
         Route("/sse", endpoint=handle_sse),
         Route(NATS_SSE_PATH, endpoint=handle_nats_event_stream),
         Mount("/messages/", app=handle_post_message),

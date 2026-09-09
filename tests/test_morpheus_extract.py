@@ -11,6 +11,9 @@ from mnemos.domain.morpheus import runner
 from mnemos.domain.morpheus.runner import ExtractedTriple, phase_extract, rollback_run
 
 
+_WINDOW_OPEN = datetime(1970, 1, 1)
+_WINDOW_CLOSE = datetime(2999, 1, 1)
+
 RUN_ID = "00000000-0000-0000-0000-0000000000e4"
 OTHER_RUN_ID = "00000000-0000-0000-0000-0000000000f5"
 _DEFAULT_CONTENT = object()
@@ -24,6 +27,7 @@ def reset_morpheus_extract_settings(monkeypatch):
     monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_MIN_CONFIDENCE", raising=False)
     monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_MUSE", raising=False)
     monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_VERIFIER", raising=False)
+    monkeypatch.delenv("MNEMOS_MORPHEUS_EXTRACT_MAX_INPUT_COUNT", raising=False)
     core_config._reset_settings_for_tests()
     yield
     core_config._reset_settings_for_tests()
@@ -45,10 +49,13 @@ class _Conn:
         run_namespace: str | None = "A",
         memories: list[dict] | None = None,
         kg_triples: list[dict] | None = None,
+        run_window: tuple[datetime, datetime] | None = None,
     ):
         self.run_row = {
             "config": run_config or {"extract": True},
             "namespace": run_namespace,
+            "window_started_at": run_window[0] if run_window else _WINDOW_OPEN,
+            "window_ended_at": run_window[1] if run_window else _WINDOW_CLOSE,
             "triples_extracted": 0,
             "memories_processed_for_extraction": 0,
         }
@@ -70,7 +77,9 @@ class _Conn:
         compact = " ".join(sql.split())
         if "SELECT id, verbatim_content, owner_id, namespace" not in compact:
             return []
-        min_chars, namespace = args
+        assert "created BETWEEN $1 AND $2" in compact
+        assert "LIMIT $5" in compact
+        window_start, window_end, min_chars, namespace, limit = args
         out = []
         for row in sorted(self.memories.values(), key=lambda item: item["created"]):
             content = row.get("verbatim_content")
@@ -86,8 +95,10 @@ class _Conn:
                 continue
             if namespace is not None and row.get("namespace") != namespace:
                 continue
+            if not (window_start <= row["created"] <= window_end):
+                continue
             out.append(row)
-        return out
+        return out[:limit]
 
     async def fetchval(self, sql: str, *args):
         compact = " ".join(sql.split())
@@ -463,3 +474,33 @@ async def test_run_dream_inserts_extract_phase_after_synthesise(monkeypatch):
         "phase:commit",
         "finish",
     ]
+
+
+@pytest.mark.asyncio
+async def test_phase_extract_is_bounded_by_run_window(monkeypatch):
+    monkeypatch.setattr(runner, "_extract_triples_from_prose", _three_triples)
+    base = datetime(2026, 5, 2, 12, 0, 0)
+    conn = _Conn(
+        run_window=(base - timedelta(minutes=1), base + timedelta(minutes=1)),
+        memories=[
+            _memory("mem_before", created_offset=-10),
+            _memory("mem_inside"),
+            _memory("mem_after", created_offset=10),
+        ],
+    )
+
+    await phase_extract(_Pool(conn), RUN_ID)
+
+    assert {row["memory_id"] for row in conn.extract_run_memories} == {"mem_inside"}
+
+
+@pytest.mark.asyncio
+async def test_phase_extract_candidate_set_is_limited(monkeypatch):
+    monkeypatch.setenv("MNEMOS_MORPHEUS_EXTRACT_MAX_INPUT_COUNT", "2")
+    core_config._reset_settings_for_tests()
+    monkeypatch.setattr(runner, "_extract_triples_from_prose", _three_triples)
+    conn = _Conn(memories=[_memory(f"mem_{i}", created_offset=i) for i in range(6)])
+
+    await phase_extract(_Pool(conn), RUN_ID)
+
+    assert {row["memory_id"] for row in conn.extract_run_memories} == {"mem_0", "mem_1"}

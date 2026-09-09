@@ -959,7 +959,8 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
 
     async with pool.acquire() as conn:
         run_row = await conn.fetchrow(
-            "SELECT config, namespace FROM morpheus_runs WHERE id=$1::uuid",
+            "SELECT config, namespace, window_started_at, window_ended_at "
+            "FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
         )
     if run_row is None:
@@ -983,20 +984,35 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
 
     namespace = run_row["namespace"]
     verify = _extract_verify_enabled(config)
+    max_input_count = settings.extract_max_input_count
     async with pool.acquire() as conn:
         candidates = await conn.fetch(
             f"""
             SELECT id, verbatim_content, owner_id, namespace
             FROM memories
             WHERE {eligible_for_morpheus("")}
+              AND created BETWEEN $1 AND $2
               AND triples_extracted_at IS NULL
               AND verbatim_content IS NOT NULL
-              AND length(verbatim_content) >= $1
-              AND ($2::text IS NULL OR namespace = $2)
+              AND length(verbatim_content) >= $3
+              AND ($4::text IS NULL OR namespace = $4)
             ORDER BY created
+            LIMIT $5
             """,
+            run_row["window_started_at"],
+            run_row["window_ended_at"],
             min_chars,
             namespace,
+            max_input_count,
+        )
+
+    if len(candidates) >= max_input_count:
+        logger.warning(
+            "[MORPHEUS] run %s extracted from only the first %d candidate(s) "
+            "in the window (MNEMOS_MORPHEUS_EXTRACT_MAX_INPUT_COUNT); the "
+            "remaining backlog is picked up by subsequent runs",
+            run_id,
+            max_input_count,
         )
 
     memories_processed = 0
