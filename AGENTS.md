@@ -118,6 +118,37 @@ pip install 'mnemos-core[full,enterprise]'
 
 ---
 
+## Client connectivity (ask the operator)
+
+After the module/image/backend is deployed, ASK the operator how they want
+to connect their AI clients before finishing setup — do not silently pick
+one. Two modes, not mutually exclusive:
+
+1. **LAN / local stdio MCP bridge** — the client and MNEMOS are on the same
+   machine or LAN, no public exposure needed. Covers Claude Code, Claude
+   Desktop, Cursor, Codex CLI, and Codex desktop when it's on the same
+   network as MNEMOS. The client spawns `mnemos serve mcp-stdio` as a child
+   process; a bearer token is the only credential. See
+   [docs/connectors/README.md — "If you already have MNEMOS running locally"](docs/connectors/README.md#if-you-already-have-mnemos-running-locally-and-just-want-stdio-mcp).
+
+2. **Remote OAuth 2.1 gateway** — for ChatGPT (web/mobile/desktop) or Codex
+   away from the LAN. Requires **Developer Mode** enabled on the operator's
+   OpenAI account (ChatGPT → Settings → Connectors → Advanced → Enable
+   Developer Mode — a one-time, account-wide toggle Codex shares), a public
+   HTTPS endpoint (Cloudflare Tunnel — operator-verified with ChatGPT and
+   Codex, stable URL, API-scriptable — or ngrok, faster to try but the free
+   tier rotates the URL), and `MNEMOS_OAUTH_ISSUER` /
+   `MNEMOS_OAUTH_ADMIN_PASSPHRASE` / `MNEMOS_OAUTH_DATABASE_URL` set before
+   starting `mnemos serve mcp-http`. Full walkthrough:
+   [docs/connectors/chatgpt-pro-developer-mode.md](docs/connectors/chatgpt-pro-developer-mode.md),
+   Codex-specific notes in
+   [docs/connectors/codex-cli.md](docs/connectors/codex-cli.md).
+
+Ask which mode(s) the operator wants, then follow only the relevant guide —
+don't stand up a public tunnel for an operator who only wanted local stdio.
+
+---
+
 ## Verification
 
 ```bash
