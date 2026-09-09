@@ -317,6 +317,18 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _loopback_bind_skip_reason() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", 0))
+        except PermissionError as exc:
+            return f"loopback bind unavailable for OAuth SSE integration: {exc}"
+    return ""
+
+
+_LOOPBACK_BIND_SKIP_REASON = _loopback_bind_skip_reason()
+
+
 def _process_output(proc: subprocess.Popen[str]) -> str:
     try:
         stdout, stderr = proc.communicate(timeout=1)
@@ -1127,6 +1139,7 @@ async def test_oauth_jwt_passes_stubbed_sse_auth_and_registry_parity(
             await release()
 
 
+@pytest.mark.skipif(bool(_LOOPBACK_BIND_SKIP_REASON), reason=_LOOPBACK_BIND_SKIP_REASON)
 def test_oauth_real_sse_tools_list_over_wire(tmp_path: Path) -> None:
     """Drive OAuth plus the real SDK SSE transport and tools/list dispatcher."""
     port = _free_port()
