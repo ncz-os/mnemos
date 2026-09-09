@@ -205,6 +205,8 @@ def _judge_deterministic_score(
                 "length_ratio": float(result["length_ratio"]),
                 "composite": float(result["composite"]),
             }
+        except ValueError:
+            raise
         except Exception:
             pass
     return _judge_deterministic_score_python(reference, candidate, weights)
