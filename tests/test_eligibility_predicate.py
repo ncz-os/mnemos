@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 from mnemos.core.eligibility import (
     MEMORY_ELIGIBILITY_PREDICATE,
     eligible_for_compression,
@@ -74,8 +76,28 @@ def test_canonical_memory_eligibility_predicate_filters_universal_exclusions():
     assert MEMORY_ELIGIBILITY_PREDICATE == ("deleted_at IS NULL AND archived_at IS NULL AND consolidated_into IS NULL")
     assert _canonical_ids() == ["active", "private_parent", "vault"]
     assert eligible_for_morpheus("m") == (
-        "m.deleted_at IS NULL AND m.archived_at IS NULL AND m.consolidated_into IS NULL"
+        "m.deleted_at IS NULL AND m.archived_at IS NULL AND m.consolidated_into IS NULL "
+        "AND (m.namespace IS NULL OR m.namespace <> 'vault')"
     )
+
+
+def test_morpheus_eligibility_rejects_vault_rows():
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TABLE memories (id TEXT, deleted_at TEXT, archived_at TEXT, "
+            "consolidated_into TEXT, permission_mode INTEGER, namespace TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO memories VALUES (:id, :deleted_at, :archived_at, "
+            ":consolidated_into, :permission_mode, :namespace)",
+            ROWS,
+        )
+        selected = [
+            row[0]
+            for row in conn.execute(f"SELECT m.id FROM memories m WHERE {eligible_for_morpheus('m')} ORDER BY m.id")
+        ]
+
+    assert selected == ["active", "private_parent"]
 
 
 def test_qualify_memory_predicate_applies_alias_to_all_canonical_columns():

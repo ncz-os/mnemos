@@ -18,6 +18,7 @@ from mnemos.core.config import db2_vector_indexing_override, embedding_dim_env
 _LOG = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DB_DIR = _REPO_ROOT / "mnemos" / "db_migrations"
+_POSTGRES_OAUTH_MIGRATION = _DB_DIR / "migrations_v5_4_0_mcp_oauth.sql"
 
 _POSTGRES_LEGACY_MIGRATIONS: tuple[Path, ...] = (
     _DB_DIR / "migrations.sql",
@@ -81,6 +82,8 @@ _POSTGRES_LEGACY_MIGRATIONS: tuple[Path, ...] = (
     _DB_DIR / "migrations_v5_3_3_deletion_log_export_index.sql",
     _DB_DIR / "migrations_v5_3_4_mcp_audit_log.sql",
     _DB_DIR / "migrations_v5_3_5_model_registry_capabilities_gin.sql",
+    _POSTGRES_OAUTH_MIGRATION,
+    _DB_DIR / "migrations_v5_4_1_morpheus_extract_failures.sql",
 )
 
 _POSTGRES_NUMBERED_DIR = _DB_DIR / "migrations"
@@ -213,23 +216,35 @@ async def ensure_postgres_schema(pool: Any, settings: Any | None = None) -> None
         )
 
     async with pool.acquire() as conn:
-        for path in postgres_migration_paths():
-            sql = render_migration_sql(path, backend="postgres", embedding_dim=embedding_dim)
-            in_transaction = False
-            for statement in split_postgres_statements(sql):
-                head = _statement_head(statement).upper()
-                is_tx_control = head in {"BEGIN", "COMMIT", "ROLLBACK"}
-                await _execute_postgres_statement(
-                    conn,
-                    statement,
-                    path,
-                    in_transaction=in_transaction and not is_tx_control,
-                )
-                if head == "BEGIN":
-                    in_transaction = True
-                elif head in {"COMMIT", "ROLLBACK"}:
-                    in_transaction = False
+        await _apply_postgres_migrations(conn, postgres_migration_paths(), embedding_dim)
         await _ensure_postgres_embedding_shape(conn, embedding_dim)
+
+
+async def ensure_postgres_oauth_schema(pool: Any) -> None:
+    """Provision only the tables required by a dedicated OAuth database."""
+    async with pool.acquire() as conn:
+        # This migration has no vector placeholders; keep the dedicated OAuth
+        # database independent of core embedding configuration and pgvector.
+        await _apply_postgres_migrations(conn, [_POSTGRES_OAUTH_MIGRATION], embedding_dim=1)
+
+
+async def _apply_postgres_migrations(conn: Any, paths: list[Path], embedding_dim: int) -> None:
+    for path in paths:
+        sql = render_migration_sql(path, backend="postgres", embedding_dim=embedding_dim)
+        in_transaction = False
+        for statement in split_postgres_statements(sql):
+            head = _statement_head(statement).upper()
+            is_tx_control = head in {"BEGIN", "COMMIT", "ROLLBACK"}
+            await _execute_postgres_statement(
+                conn,
+                statement,
+                path,
+                in_transaction=in_transaction and not is_tx_control,
+            )
+            if head == "BEGIN":
+                in_transaction = True
+            elif head in {"COMMIT", "ROLLBACK"}:
+                in_transaction = False
 
 
 async def ensure_oracle_schema(pool: Any, settings: Any | None = None) -> None:
