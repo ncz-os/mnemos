@@ -17,6 +17,7 @@ python-multipart>=0.0.9
 
 # Database
 asyncpg>=0.29.0          # async API path (lifecycle.py + handlers)
+PyJWT>=2.8.0              # OAuth 2.1 MCP bearer signing and verification
 # psycopg / psycopg2 deliberately NOT here — both are LGPL-3.0.
 # mnemos's runtime closure stays on permissive licenses
 # (Apache/MIT/BSD/MPL). The installer's create-API-key path falls
