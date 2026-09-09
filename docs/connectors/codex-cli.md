@@ -60,6 +60,56 @@ Authorization = "Bearer $MNEMOS_TOKEN"
 Restart Codex after editing the TOML file. `codex exec` inherits the same
 MCP registration as interactive sessions.
 
+## Setup — remote OAuth 2.1 gateway (Codex on another machine, or ChatGPT desktop/mobile)
+
+For Codex CLI/desktop on a *different* machine from MNEMOS, or for ChatGPT's
+own desktop/mobile apps, use the same OAuth 2.1 MCP gateway documented in
+[ChatGPT Pro Developer Mode](./chatgpt-pro-developer-mode.md#setup--oauth-21-path)
+rather than the local stdio path above. Same MCP edge, same 25-tool registry,
+same underlying MNEMOS memory — the difference is transport (stdio child
+process vs. HTTPS to a public MCP endpoint) and auth (a static bearer token
+vs. a full OAuth 2.1 authorization-code + PKCE flow with dynamic client
+registration and short-lived JWTs).
+
+**Prerequisite: Developer Mode.** Registering a remote MCP server — the
+"connector"/"MCP registry" concept in both ChatGPT and Codex — requires
+Developer Mode enabled on your OpenAI account (Pro/Team/Enterprise/Edu tier):
+ChatGPT → Settings → Connectors → Advanced → Enable Developer Mode. Codex CLI
+and Codex desktop consume the same account entitlement, so this is a
+one-time, account-wide toggle, not something you configure per-client.
+
+Bring up the OAuth-enabled MCP edge and expose it publicly:
+
+```bash
+export MNEMOS_OAUTH_ISSUER="https://mnemos.example.com"
+export MNEMOS_OAUTH_ADMIN_PASSPHRASE="$(openssl rand -hex 32)"
+export MNEMOS_OAUTH_DATABASE_URL="postgresql://mnemos:password@db:5432/mnemos"
+mnemos serve mcp-http --host 0.0.0.0 --port 5004
+```
+
+Then expose port 5004 over HTTPS. Two tunnel options, operator-verified
+against real ChatGPT and Codex clients:
+
+- **Cloudflare Tunnel** (recommended — stable URL, no rotating link to
+  re-paste):
+  ```bash
+  cloudflared tunnel login
+  cloudflared tunnel create mnemos
+  cloudflared tunnel route dns mnemos mnemos.yourdomain.com
+  cloudflared tunnel run --url http://<mnemos-host>:5004 mnemos
+  ```
+- **ngrok** (faster to try, URL rotates on the free tier):
+  ```bash
+  ngrok config add-authtoken <your-ngrok-authtoken-from-dashboard>
+  ngrok http http://<mnemos-host>:5004
+  ```
+
+Register the connector: ChatGPT → Settings → Connectors → Add custom (URL =
+`https://<tunnel-url>/sse`); Codex follows the equivalent remote-MCP add flow
+in its own connector/registry UI once Developer Mode is on. See the full
+walkthrough — architecture diagram, verification curls, troubleshooting — in
+[ChatGPT Pro Developer Mode](./chatgpt-pro-developer-mode.md).
+
 ## Verification — one curl or one tool-list call that proves registration worked
 
 ```bash
