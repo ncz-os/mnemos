@@ -10,6 +10,9 @@ import asyncio
 import uuid
 from typing import Any, Dict
 
+import pytest
+
+from mnemos.domain.compression import judge as judge_module
 from mnemos.domain.compression.judge import (
     DeterministicJudge,
     JudgeScore,
@@ -116,6 +119,40 @@ def test_deterministic_judge_returns_composite_score():
     assert abs(out.fidelity - 0.58) < 1e-12
     assert out.model_id == "deterministic-fast"
     assert "bigram=" in out.reasoning
+
+
+def test_deterministic_score_propagates_hot_rs_size_limit(monkeypatch):
+    class _SizeLimitedHotRs:
+        @staticmethod
+        def judge_deterministic_score(reference, candidate, weights):  # noqa: ARG004
+            raise ValueError("input exceeds deterministic judge size limit")
+
+    def _unbounded_python_fallback(*args, **kwargs):  # noqa: ARG001
+        raise AssertionError("oversized input must not reach the Python fallback")
+
+    monkeypatch.setattr(judge_module, "_HOT_RS", _SizeLimitedHotRs())
+    monkeypatch.setattr(
+        judge_module,
+        "_judge_deterministic_score_python",
+        _unbounded_python_fallback,
+    )
+
+    oversized = "x" * 1_000_001
+    with pytest.raises(ValueError, match="size limit"):
+        judge_module._judge_deterministic_score(oversized, "candidate")
+
+
+def test_deterministic_score_falls_back_for_unrelated_hot_rs_error(monkeypatch):
+    class _UnavailableHotRs:
+        @staticmethod
+        def judge_deterministic_score(reference, candidate, weights):  # noqa: ARG004
+            raise RuntimeError("accelerator unavailable")
+
+    monkeypatch.setattr(judge_module, "_HOT_RS", _UnavailableHotRs())
+
+    assert judge_module._judge_deterministic_score("abcd", "abxd") == (
+        _judge_deterministic_score_python("abcd", "abxd")
+    )
 
 
 # ── LLMJudge HTTP paths (substituted client) ──────────────────────────────
