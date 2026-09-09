@@ -172,13 +172,19 @@ def test_no_stale_health_json_version():
 
 
 def test_no_stale_docker_image_tag():
-    """Docker `ghcr.io/mnemos-os/mnemos:<tag>` references in
+    """Docker `ghcr.io/ncz-os/mnemos:<tag>` references in
     operator/connector docs must pin to the live version. Codex
     round-1 of #193 caught a `:4.0.0` pin in
-    `docs/connectors/chatgpt-pro-developer-mode.md`."""
+    `docs/connectors/chatgpt-pro-developer-mode.md`.
+
+    The org here was `mnemos-os` until 2026-09-09, when it was found to
+    not match the real published org (`ncz-os`) -- the mismatch meant
+    this guard matched nothing and a stale `:6.1` pin in DEPLOYMENT.md
+    went undetected. Every image reference in this repo is
+    `ghcr.io/ncz-os/*`; keep this pattern pointed at the real org."""
     version = _current_version()
     pattern = re.compile(
-        r"ghcr\.io/mnemos-os/mnemos:(?P<v>[0-9.]+)"
+        r"ghcr\.io/ncz-os/mnemos:(?P<v>[0-9.]+)"
     )
     bad: list[str] = []
     operator_docs: list[Path] = [REPO / "README.md",
