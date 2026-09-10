@@ -93,7 +93,7 @@ Add to your `docker-compose.override.yml` (<pg-host> prod example):
 ```yaml
 services:
   mnemos-mcp-http:
-    image: ghcr.io/ncz-os/mnemos:6.2.1
+    image: ghcr.io/ncz-os/mnemos-enterprise:6.2.2
     pull_policy: never
     depends_on:
       - mnemos
