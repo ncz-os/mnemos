@@ -64,8 +64,11 @@ async def dispatch(
 
     from mnemos.core.lifecycle import _pool as lifecycle_pool  # noqa: WPS433
     if not lifecycle_pool:
-        logger.warning("webhook dispatcher: no DB pool - skipping event %s", resolved_event_type)
-        return []
+        from mnemos.core.lifecycle import _persistence_backend  # noqa: WPS433
+        from mnemos.persistence.base import BackendCapabilityMissing, WEBHOOKS_CAPABILITY
+
+        backend_name = type(_persistence_backend).__name__ if _persistence_backend is not None else None
+        raise BackendCapabilityMissing(WEBHOOKS_CAPABILITY, backend_name)
 
     async with lifecycle_pool.acquire() as acquired_conn:
         delivery_ids = await _dispatch_on_conn(

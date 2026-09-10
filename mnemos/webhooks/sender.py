@@ -31,8 +31,9 @@ async def _attempt_delivery(
         from mnemos.core.lifecycle import _pool as lifecycle_pool  # noqa: WPS433
         pool = lifecycle_pool
     if not pool:
-        logger.warning("webhook dispatcher: no DB pool - skipping delivery %s", delivery_id)
-        return False
+        raise RuntimeError(
+            f"webhook delivery {delivery_id} cannot run without a supported persistence handle"
+        )
 
     async with webhook_types._get_send_semaphore():
         if claimed is None:

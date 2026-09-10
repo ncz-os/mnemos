@@ -36,6 +36,7 @@ from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
 from mnemos.persistence.base import (
     AuditChainRepository,
     BranchRepository,
+    BackendCapabilityMissing,
     CompressionQueueRepository,
     CompressionRepository,
     CompressionStatsRow,
@@ -4181,6 +4182,9 @@ class SqliteBackend:
     supports_advisory_locks = False
     supports_row_level_security = False
     supports_pgvector = False
+    # The current delivery worker is asyncpg/Postgres-specific.  SQLite can
+    # append outbox rows, but advertising delivery support strands those rows.
+    supports_webhooks = False
     uses_sqlite_vec = True
     uses_fts5 = True
     # On SQLite, insert_memory writes memories.embedding but semantic_search
@@ -5198,7 +5202,7 @@ class SqliteBackend:
 
     @property
     def webhooks(self) -> WebhookRepository:
-        return self._webhooks
+        raise BackendCapabilityMissing("webhooks", type(self).__name__)
 
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:
