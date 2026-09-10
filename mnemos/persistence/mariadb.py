@@ -71,6 +71,7 @@ from mnemos.persistence.mysql import (
     _content_hash,
     _cosine_distance_python,
     _ensure_mysql_columns,
+    _ensure_mysql_oauth_schema,
     _fetch_all_dicts,
     _is_unique_violation,
     _is_vec_distance_unsupported,
@@ -81,6 +82,7 @@ from mnemos.persistence.mysql import (
     _validate_and_format_vector,
     create_mysql_pool,
     MysqlBackend,
+    MysqlOAuthRepository,
     MysqlBranchRepository,
     MysqlCompressionQueueRepository,
     MysqlCompressionRepository,
@@ -829,14 +831,15 @@ class MariadbBackend(MysqlBackend):
         self._consultations_audit_repo = MariadbConsultationAuditRepository()
         self._federation_repo = MariadbFederationRepository()
         self._state_kv_repo = MariadbStateRepository()
+        self._oauth_repo = MysqlOAuthRepository()
 
     @property
     def capabilities(self) -> set[str]:
-        return {CORE_CAPABILITY, STATE_CAPABILITY, FEDERATION_CAPABILITY}
+        return {CORE_CAPABILITY, STATE_CAPABILITY, FEDERATION_CAPABILITY, "oauth"}
 
     @property
     def capability_details(self) -> set[str]:
-        return {*MYSQL_CAPABILITY_DETAILS, KG_CAPABILITY, STATE_DETAIL_CAPABILITY}
+        return {*MYSQL_CAPABILITY_DETAILS, KG_CAPABILITY, STATE_DETAIL_CAPABILITY, "oauth"}
 
     @property
     def memories(self) -> MemoryRepository:
@@ -918,6 +921,7 @@ class MariadbBackend(MysqlBackend):
                     await cursor.execute("SELECT 1")
                     for ddl in _INIT_DDLS:
                         await cursor.execute(ddl)
+                await _ensure_mysql_oauth_schema(conn)
                 await _ensure_mysql_columns(
                     conn,
                     "memories",

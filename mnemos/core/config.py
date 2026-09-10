@@ -940,8 +940,9 @@ class _OAuthSettings(BaseSettings):
 
     trust_proxy: bool = Field(False, validation_alias="OAUTH_TRUST_PROXY")
     # Remote MCP authorization-server settings. ``issuer`` must be the public
-    # HTTPS MCP origin. ``database_url`` enables durable clients, codes,
-    # refresh tokens, and signing keys; otherwise ``signing_key`` is required.
+    # HTTPS MCP origin. Clients, codes, refresh tokens and signing keys use
+    # MNEMOS_DATABASE_DSN. Retain database_url only to reject legacy config
+    # with an actionable migration error at MCP startup.
     signing_key: str = Field("", validation_alias="MNEMOS_OAUTH_SIGNING_KEY")
     registration_secret: str = Field("", validation_alias="MNEMOS_OAUTH_REGISTRATION_SECRET")
     admin_passphrase: str = Field("", validation_alias="MNEMOS_OAUTH_ADMIN_PASSPHRASE")

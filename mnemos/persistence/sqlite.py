@@ -32,6 +32,7 @@ from mnemos.core.auth_context import UserContext
 from mnemos.core.config import embed_http_model_override, hot_rs_enabled
 from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.oauth import _mint_user_id
+from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
 from mnemos.persistence.base import (
     AuditChainRepository,
     BranchRepository,
@@ -127,6 +128,7 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v6_2_audit_chain_sqlite.sql",
     "migrations_v6_2_category_decay_sqlite.sql",
     "migrations_v6_3_api_keys_last_used_sqlite.sql",
+    "migrations_v6_3_mcp_oauth_sqlite.sql",
     "0038_oauth_sessions_consultations.sql",
     "0039_subscription_plan_current_limits.sql",
     "0043_memory_acl.sql",
@@ -2560,7 +2562,18 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
         return row["provider"] if row is not None else None
 
 
-class SqliteOAuthRepository(_SqliteRepository, OAuthRepository):
+class SqliteOAuthRepository(_SqliteRepository, MCPOAuthRepositoryMixin, OAuthRepository):
+    _mcp_lock_suffix = ""
+
+    def _mcp_timestamp(self, value: Any) -> str:
+        return oauth_utc(value).isoformat()
+
+    async def _mcp_fetch(self, tx: Transaction, sql: str, params: tuple = ()) -> Row | None:
+        return await _fetch_one(self._conn(tx), sql, params)
+
+    async def _mcp_execute(self, tx: Transaction, sql: str, params: tuple = ()) -> int:
+        return await _execute_count(self._conn(tx), sql, params)
+
     async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
         return await _fetch_all(
             self._conn(tx),
