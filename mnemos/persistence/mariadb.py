@@ -56,13 +56,11 @@ from mnemos.persistence.mysql import (
     _DDL_GRAEAE_AUDIT_LOG,
     _DDL_GRAEAE_CONSULTATIONS,
     _DDL_JOURNAL,
-    _DDL_MEMORY_ARCHIVE,
     _DDL_KG_TRIPLES,
     _DDL_MODEL_REGISTRY,
     _DDL_MODEL_REGISTRY_SYNC_LOG,
     _DDL_SESSIONS,
     _DDL_SESSION_MESSAGES,
-    _DDL_SESSION_MEMORY_INJECTIONS,
     _DDL_STATE,
     _DDL_USAGE_LEDGER,
     _DEFAULT_EMBEDDING_DIM,
@@ -139,6 +137,29 @@ CREATE TABLE IF NOT EXISTS memories (
     INDEX idx_memories_federation_remote (federation_source, federation_remote_updated),
     INDEX idx_memories_push (federation_source, federation_last_pushed_at),
     FULLTEXT INDEX idx_memories_ft (content)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+# MariaDB-specific override of mysql._DDL_MEMORY_ARCHIVE: `id` here is a FK to
+# memories.id, which this module declares `CHARACTER SET ascii` above (unlike
+# mysql.py's memories.id, which has no override and inherits the table's
+# utf8mb4_unicode_ci default). Without matching the charset explicitly here,
+# `memory_archive.id` inherits utf8mb4_unicode_ci from ITS OWN table default,
+# and MariaDB refuses the FK with errno 150 "Foreign key constraint is
+# incorrectly formed" because the two columns' character sets don't match.
+_DDL_MEMORY_ARCHIVE = """\
+CREATE TABLE IF NOT EXISTS memory_archive (
+    id VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    archived_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    archived_by VARCHAR(256) NOT NULL DEFAULT 'system:persephone',
+    compressed_content LONGBLOB NOT NULL,
+    compression_algo VARCHAR(32) NOT NULL DEFAULT 'zstd',
+    original_size_bytes BIGINT NOT NULL,
+    compressed_size_bytes BIGINT NOT NULL,
+    schema_version INT NOT NULL DEFAULT 1,
+    PRIMARY KEY (id),
+    INDEX idx_memory_archive_archived_at (archived_at),
+    CONSTRAINT fk_memory_archive_memory FOREIGN KEY (id) REFERENCES memories(id) ON DELETE RESTRICT
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
@@ -270,6 +291,26 @@ CREATE TABLE IF NOT EXISTS memory_branches (
         FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
     CONSTRAINT fk_memory_branches_head
         FOREIGN KEY (head_version_id) REFERENCES memory_versions(id) ON DELETE SET NULL
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+# MariaDB-specific override of mysql._DDL_SESSION_MEMORY_INJECTIONS: same
+# charset-mismatch class as _DDL_MEMORY_ARCHIVE above. session_id stays
+# unmodified (sessions.id is not ascii-overridden in this module, so the
+# mysql.py default already matches it); memory_id must be ascii to match
+# this module's memories.id override, or MariaDB refuses the FK with errno
+# 150.
+_DDL_SESSION_MEMORY_INJECTIONS = """\
+CREATE TABLE IF NOT EXISTS session_memory_injections (
+    id          VARCHAR(64) NOT NULL,
+    session_id  VARCHAR(64) NOT NULL,
+    memory_id   VARCHAR(64) CHARACTER SET ascii NOT NULL,
+    injected_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    deleted_at  TIMESTAMP(6) NULL,
+    PRIMARY KEY (id),
+    INDEX idx_session_memory_injections_session (session_id),
+    CONSTRAINT fk_session_memory_injections_session FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    CONSTRAINT fk_session_memory_injections_memory FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
