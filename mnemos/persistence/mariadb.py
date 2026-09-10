@@ -67,7 +67,6 @@ from mnemos.persistence.mysql import (
     _MysqlTransaction,
     _boosted_rank_supersession_sort_key,
     _content_hash,
-    _cosine_distance_python,
     _ensure_mysql_columns,
     _ensure_mysql_oauth_schema,
     _fetch_all_dicts,
@@ -633,13 +632,14 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
 
         today = datetime.now(timezone.utc).date()
         w = float(recency_weight)
-        for row in raw_rows:
-            emb_json = row.pop("embedding_json", None)
-            try:
-                emb = json.loads(emb_json) if emb_json else None
-                dist = _cosine_distance_python(query_vec, emb) if emb else 1.0
-            except (json.JSONDecodeError, ValueError, TypeError):
-                dist = 1.0
+        distances = self._cosine_rank_rows(
+            query_vec,
+            raw_rows,
+            "embedding_json",
+            extract_embedding=lambda value: json.loads(value) if value else None,
+        )
+        for row, dist in zip(raw_rows, distances):
+            row.pop("embedding_json", None)
             row["rank_score"] = dist
 
         if boost_recency:
