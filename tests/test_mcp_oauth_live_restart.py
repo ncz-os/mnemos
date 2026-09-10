@@ -1,10 +1,4 @@
-"""Live PostgreSQL persistence test for MCP OAuth service restarts.
-
-The MCP server can persist OAuth clients, authorization codes, and token
-artifacts only when `mcp/http.py` wires a real Postgres-backed
-`OAuthService`. This test validates that behavior by restarting the
-service object while keeping the same backing database tables.
-"""
+"""Live OAuth persistence, restart and replay checks across every backend."""
 
 from __future__ import annotations
 
@@ -12,102 +6,14 @@ import asyncio
 import json
 import os
 import secrets
-import uuid
-from types import SimpleNamespace
+from datetime import timedelta
 from urllib.parse import parse_qs, urlparse
 
-import asyncpg
 import pytest
 from starlette.datastructures import FormData
 
 from mnemos.mcp import oauth as mcp_oauth
-from mnemos.persistence.postgres import PostgresBackend
-
-
-def _resolve_live_oauth_database_url() -> tuple[str | None, str | None]:
-    """Resolve the live DSN, with one explicit fallback.
-
-    Preference is an explicitly set env var; if absent, read the operator
-    password file from this host and build the canonical URL.
-    """
-    dsn = os.environ.get("MNEMOS_OAUTH_DATABASE_URL", "").strip()
-    if dsn:
-        return dsn, None
-
-    pw_file = "/tmp/.mnemos_oauth_pw"
-    if not os.path.exists(pw_file):
-        return (
-            None,
-            "set MNEMOS_OAUTH_DATABASE_URL or expose /tmp/.mnemos_oauth_pw for fallback",
-        )
-
-    try:
-        with open(pw_file, "r", encoding="utf-8") as f:
-            password = f.read().strip()
-    except OSError as exc:
-        return (
-            None,
-            f"MNEMOS_OAUTH_DATABASE_URL is unset and /tmp/.mnemos_oauth_pw is not readable: {exc}",
-        )
-
-    if not password:
-        return None, "/tmp/.mnemos_oauth_pw is present but empty"
-
-    return (
-        f"postgresql://mnemos_oauth_user:{password}@127.0.0.1:5432/mnemos_oauth",
-        None,
-    )
-
-
-OAUTH_SCHEMA_SQL = """
-CREATE SCHEMA IF NOT EXISTS {schema};
-
-CREATE TABLE IF NOT EXISTS {schema}.oauth_mcp_clients (
-    client_id                    TEXT PRIMARY KEY,
-    client_secret                TEXT,
-    redirect_uris                JSONB NOT NULL,
-    token_endpoint_auth_method   TEXT NOT NULL,
-    created                      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.oauth_mcp_authorization_codes (
-    code                     TEXT PRIMARY KEY,
-    client_id                TEXT NOT NULL
-        REFERENCES {schema}.oauth_mcp_clients(client_id) ON DELETE CASCADE,
-    code_challenge           TEXT NOT NULL,
-    code_challenge_method    TEXT NOT NULL,
-    redirect_uri             TEXT NOT NULL,
-    expires_at               TIMESTAMPTZ NOT NULL,
-    used_at                  TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.oauth_mcp_tokens (
-    jti                  TEXT PRIMARY KEY,
-    refresh_token_hash   TEXT NOT NULL UNIQUE,
-    client_id            TEXT NOT NULL
-        REFERENCES {schema}.oauth_mcp_clients(client_id) ON DELETE CASCADE,
-    family_id            TEXT NOT NULL,
-    parent_jti            TEXT,
-    replaced_by_jti      TEXT,
-    expires_at           TIMESTAMPTZ NOT NULL,
-    revoked_at           TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS {schema}.oauth_mcp_signing_keys (
-    key_id        TEXT PRIMARY KEY,
-    signing_key   TEXT NOT NULL,
-    created       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    rotated_at    TIMESTAMPTZ
-);
-"""
-
-
-async def _create_schema(admin_conn: asyncpg.Connection, schema: str) -> None:
-    await admin_conn.execute(OAUTH_SCHEMA_SQL.format(schema=schema))
-
-
-async def _drop_schema(admin_conn: asyncpg.Connection, schema: str) -> None:
-    await admin_conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+from tests.oauth_backend_helpers import oauth_database as oauth_database
 
 
 class _FormPostRequest:
@@ -125,19 +31,21 @@ def _decode_json_response(response) -> dict:
     return json.loads(response.body.decode("utf-8"))
 
 
-async def _build_service_from_pool(
-    pool: asyncpg.Pool,
+async def _build_service_from_backend(
+    backend,
     *,
     admin_passphrase: str,
     registration_secret: str,
 ) -> tuple[mcp_oauth.OAuthService, str]:
-    """Build an ``OAuthService`` from a live Postgres-backed store."""
-    store = mcp_oauth.PostgresOAuthStore(pool)
+    """Build an ``OAuthService`` from the configured persistence backend."""
+    store = mcp_oauth.PersistenceOAuthStore(backend)
     signing_key = os.environ.get("MNEMOS_OAUTH_SIGNING_KEY", "").strip() or await store.get_signing_key()
 
     if not signing_key:
         signing_key = secrets.token_urlsafe(32)
         await store.save_signing_key(key_id="default", signing_key=signing_key)
+        signing_key = await store.get_signing_key()
+        assert signing_key
 
     service = mcp_oauth.OAuthService(
         base_url="http://testserver",
@@ -197,226 +105,315 @@ async def _issue_client_and_tokens(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_postgres_backend_open_provisions_oauth_tables_in_fresh_schema():
-    """A fresh runtime backend open must apply OAuth DDL itself."""
-    dsn, reason = _resolve_live_oauth_database_url()
-    if dsn is None:
-        pytest.skip(f"Live MNEMOS OAuth DB not available: {reason}")
-
-    admin_conn: asyncpg.Connection | None = None
-    pool: asyncpg.Pool | None = None
-    backend: PostgresBackend | None = None
-    schema = f"oauth_fresh_open_{uuid.uuid4().hex[:12]}"
-    try:
-        try:
-            admin_conn = await asyncpg.connect(dsn=dsn)
-            await admin_conn.execute(f'CREATE SCHEMA "{schema}"')
-            pool = await asyncpg.create_pool(
-                dsn=dsn,
-                min_size=1,
-                max_size=2,
-                server_settings={"search_path": f"{schema},public"},
-            )
-        except Exception as exc:  # pragma: no cover - env/network dependent
-            pytest.skip(f"MNEMOS_OAUTH_DATABASE_URL is set but not reachable: {exc}")
-
-        backend = PostgresBackend(
-            pool,
-            SimpleNamespace(database=SimpleNamespace(embedding_dim=768)),
-        )
-        await backend.open()
-        expected = {
-            "oauth_mcp_clients",
-            "oauth_mcp_authorization_codes",
-            "oauth_mcp_tokens",
-            "oauth_mcp_signing_keys",
-        }
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema=$1 AND table_name=ANY($2::text[])",
-                schema,
-                list(expected),
-            )
-        assert {row["table_name"] for row in rows} == expected
-    finally:
-        if backend is not None:
-            await backend.close()
-            pool = None
-        elif pool is not None:
-            await pool.close()
-        if admin_conn is not None:
-            await _drop_schema(admin_conn, schema)
-            await admin_conn.close()
+async def test_backend_open_provisions_oauth_store(oauth_database):
+    backend = await oauth_database.open()
+    store = mcp_oauth.PersistenceOAuthStore(backend)
+    await store.save_signing_key(key_id="default", signing_key=secrets.token_urlsafe(32))
+    assert await store.get_signing_key()
+    assert await store.get_client("missing-client") is None
+    assert await store.consume_code("missing-code") is None
+    assert await store.rotate_refresh("missing-hash", "missing-client", {}) == "invalid"
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_oauth_client_and_tokens_persist_across_postgres_service_restart():
-    """A process-local service restart should not lose OAuth state."""
-    dsn, reason = _resolve_live_oauth_database_url()
-    if dsn is None:
-        pytest.skip(f"Live MNEMOS OAuth DB not available: {reason}")
-
-    original_signing_key = os.environ.pop("MNEMOS_OAUTH_SIGNING_KEY", None)
-    admin_conn: asyncpg.Connection | None = None
-    pool_1: asyncpg.Pool | None = None
-    pool_2: asyncpg.Pool | None = None
-    schema = f"oauth_live_restart_{uuid.uuid4().hex[:12]}"
-
+async def test_oauth_client_and_tokens_persist_across_backend_restart(oauth_database, monkeypatch):
+    monkeypatch.delenv("MNEMOS_OAUTH_SIGNING_KEY", raising=False)
     admin_passphrase = "live-passphrase-do-not-share"
-    registration_secret = "live-registration-secret"
+    kwargs = dict(admin_passphrase=admin_passphrase, registration_secret="live-registration-secret")
+    backend = await oauth_database.open()
+    service_1, key_1 = await _build_service_from_backend(backend, **kwargs)
+    client_id, access_token, refresh_token = await _issue_client_and_tokens(
+        service_1, admin_passphrase=admin_passphrase
+    )
+    await oauth_database.close(backend)
+    backend = await oauth_database.open()
+    service_2, key_2 = await _build_service_from_backend(backend, **kwargs)
+    assert key_1 == key_2
+    assert (await service_2.store.get_client(client_id))["client_id"] == client_id
+    assert service_2.validate_access_token(access_token)["client_id"] == client_id
+    # Two independently opened backends exercise cross-connection serialization.
+    other = await oauth_database.open()
+    service_3, key_3 = await _build_service_from_backend(other, **kwargs)
+    assert key_3 == key_1
+    form = {"grant_type": "refresh_token", "client_id": client_id, "refresh_token": refresh_token}
+    responses = await asyncio.gather(service_2.token(form), service_3.token(form))
+    assert sorted(response.status_code for response in responses) == [200, 400]
+    winner = next(response for response in responses if response.status_code == 200)
+    successor = _decode_json_response(winner)["refresh_token"]
+    rejected = await service_3.token({**form, "refresh_token": successor})
+    assert rejected.status_code == 400, "replay must revoke the active successor family"
 
-    try:
-        try:
-            admin_conn = await asyncpg.connect(dsn=dsn)
-            await _create_schema(admin_conn, schema)
-        except Exception as exc:  # pragma: no cover - env/network dependent
-            pytest.skip(f"MNEMOS_OAUTH_DATABASE_URL is set but not reachable: {exc}")
 
-        search_path = f"{schema},public"
-        pool_1 = await asyncpg.create_pool(
-            dsn=dsn,
-            min_size=1,
-            max_size=2,
-            server_settings={"search_path": search_path},
-        )
-        pool_2 = await asyncpg.create_pool(
-            dsn=dsn,
-            min_size=1,
-            max_size=2,
-            server_settings={"search_path": search_path},
-        )
-
-        service_1, signing_key_1 = await _build_service_from_pool(
-            pool_1,
-            admin_passphrase=admin_passphrase,
-            registration_secret=registration_secret,
-        )
-        client_id, access_token, refresh_token = await _issue_client_and_tokens(
-            service_1,
-            admin_passphrase=admin_passphrase,
-        )
-
-        service_2, signing_key_2 = await _build_service_from_pool(
-            pool_2,
-            admin_passphrase=admin_passphrase,
-            registration_secret=registration_secret,
-        )
-
-        assert signing_key_2 == signing_key_1, (
-            "second service must reuse the table-backed signing key when no env key is set"
-        )
-
-        claims = service_2.validate_access_token(access_token)
-        assert claims["client_id"] == client_id
-
-        refresh_form = {
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_postgres_stale_ancestor_race_retains_family_lock(oauth_database):
+    if oauth_database.kind != "postgres":
+        pytest.skip("PostgreSQL-specific deterministic pg_sleep trigger")
+    backend = await oauth_database.open()
+    admin_passphrase = "live-passphrase-do-not-share"
+    service_2, _key = await _build_service_from_backend(
+        backend, admin_passphrase=admin_passphrase, registration_secret="test-registration"
+    )
+    # Race replay of a stale ancestor against rotation of the current
+    # member. A trigger holds the legitimate transaction during successor
+    # insertion, deterministically exercising family-wide serialization.
+    race_client, _race_access, ancestor = await _issue_client_and_tokens(
+        service_2,
+        admin_passphrase=admin_passphrase,
+    )
+    first_rotation = await service_2.token(
+        {
             "grant_type": "refresh_token",
-            "client_id": client_id,
-            "refresh_token": refresh_token,
+            "client_id": race_client,
+            "refresh_token": ancestor,
         }
-        first, replay = await asyncio.gather(
-            service_2.token(refresh_form),
-            service_2.token(refresh_form),
-        )
-        refresh_response = first if first.status_code == 200 else replay
-        assert sorted([first.status_code, replay.status_code]) == [200, 400]
-        refreshed_payload = _decode_json_response(refresh_response)
-        assert "access_token" in refreshed_payload
-        assert refreshed_payload["access_token"] != access_token
+    )
+    assert first_rotation.status_code == 200
+    current = _decode_json_response(first_rotation)["refresh_token"]
 
-        refreshed_claims = service_2.validate_access_token(refreshed_payload["access_token"])
-        assert refreshed_claims["client_id"] == client_id
-        successor_rejected = await service_2.token(
+    await oauth_database.admin.execute(f"""
+        CREATE OR REPLACE FUNCTION {oauth_database.schema}.pause_refresh_successor()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.parent_jti IS NOT NULL THEN
+                PERFORM pg_sleep(0.25);
+            END IF;
+            RETURN NEW;
+        END;
+        $$;
+        CREATE TRIGGER pause_refresh_successor
+        BEFORE INSERT ON {oauth_database.schema}.oauth_mcp_tokens
+        FOR EACH ROW EXECUTE FUNCTION {oauth_database.schema}.pause_refresh_successor();
+    """)
+
+    rotate_current = asyncio.create_task(
+        service_2.token(
             {
                 "grant_type": "refresh_token",
-                "client_id": client_id,
-                "refresh_token": refreshed_payload["refresh_token"],
+                "client_id": race_client,
+                "refresh_token": current,
             }
         )
-        assert successor_rejected.status_code == 400, "reuse detection must revoke the active successor token family"
-
-        # Race replay of a stale ancestor against rotation of the current
-        # member. A trigger holds the legitimate transaction during successor
-        # insertion, deterministically exercising family-wide serialization.
-        race_client, _race_access, ancestor = await _issue_client_and_tokens(
-            service_2,
-            admin_passphrase=admin_passphrase,
-        )
-        first_rotation = await service_2.token(
+    )
+    await asyncio.sleep(0.05)
+    replay_ancestor = asyncio.create_task(
+        service_2.token(
             {
                 "grant_type": "refresh_token",
                 "client_id": race_client,
                 "refresh_token": ancestor,
             }
         )
-        assert first_rotation.status_code == 200
-        current = _decode_json_response(first_rotation)["refresh_token"]
+    )
+    rotate_response, replay_response = await asyncio.gather(
+        rotate_current,
+        replay_ancestor,
+    )
+    assert rotate_response.status_code == 200
+    assert replay_response.status_code == 400
+    raced_successor = _decode_json_response(rotate_response)["refresh_token"]
+    raced_successor_rejected = await service_2.token(
+        {
+            "grant_type": "refresh_token",
+            "client_id": race_client,
+            "refresh_token": raced_successor,
+        }
+    )
+    assert raced_successor_rejected.status_code == 400, (
+        "stale-ancestor replay must revoke a concurrently inserted successor"
+    )
 
-        await admin_conn.execute(f"""
-            CREATE OR REPLACE FUNCTION {schema}.pause_refresh_successor()
-            RETURNS trigger LANGUAGE plpgsql AS $$
-            BEGIN
-                IF NEW.parent_jti IS NOT NULL THEN
-                    PERFORM pg_sleep(0.25);
-                END IF;
-                RETURN NEW;
-            END;
-            $$;
-            CREATE TRIGGER pause_refresh_successor
-            BEFORE INSERT ON {schema}.oauth_mcp_tokens
-            FOR EACH ROW EXECUTE FUNCTION {schema}.pause_refresh_successor();
-        """)
 
-        rotate_current = asyncio.create_task(
-            service_2.token(
-                {
-                    "grant_type": "refresh_token",
-                    "client_id": race_client,
-                    "refresh_token": current,
-                }
-            )
-        )
-        await asyncio.sleep(0.05)
-        replay_ancestor = asyncio.create_task(
-            service_2.token(
-                {
-                    "grant_type": "refresh_token",
-                    "client_id": race_client,
-                    "refresh_token": ancestor,
-                }
-            )
-        )
-        rotate_response, replay_response = await asyncio.gather(
-            rotate_current,
-            replay_ancestor,
-        )
-        assert rotate_response.status_code == 200
-        assert replay_response.status_code == 400
-        raced_successor = _decode_json_response(rotate_response)["refresh_token"]
-        raced_successor_rejected = await service_2.token(
-            {
-                "grant_type": "refresh_token",
-                "client_id": race_client,
-                "refresh_token": raced_successor,
-            }
-        )
-        assert raced_successor_rejected.status_code == 400, (
-            "stale-ancestor replay must revoke a concurrently inserted successor"
-        )
-    finally:
-        if pool_1 is not None:
-            await pool_1.close()
-        if pool_2 is not None:
-            await pool_2.close()
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_signing_key_first_writer_wins_across_connections(oauth_database):
+    first = mcp_oauth.PersistenceOAuthStore(await oauth_database.open())
+    second = mcp_oauth.PersistenceOAuthStore(await oauth_database.open())
+    existing = await first.get_signing_key()
+    keys = [secrets.token_urlsafe(32), secrets.token_urlsafe(32)]
+    await asyncio.gather(
+        first.save_signing_key(key_id="default", signing_key=keys[0]),
+        second.save_signing_key(key_id="default", signing_key=keys[1]),
+    )
+    winner = await first.get_signing_key()
+    assert winner in ([existing] if existing else keys)
+    assert await second.get_signing_key() == winner
 
-        if admin_conn is not None:
-            try:
-                await _drop_schema(admin_conn, schema)
-            finally:
-                await admin_conn.close()
 
-        if original_signing_key is None:
-            os.environ.pop("MNEMOS_OAUTH_SIGNING_KEY", None)
-        else:
-            os.environ["MNEMOS_OAUTH_SIGNING_KEY"] = original_signing_key
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_authorization_code_is_single_use_across_connections(oauth_database):
+    first = mcp_oauth.PersistenceOAuthStore(await oauth_database.open())
+    second = mcp_oauth.PersistenceOAuthStore(await oauth_database.open())
+    client_id = secrets.token_urlsafe(24)
+    await first.save_client(
+        {
+            "client_id": client_id,
+            "client_secret": None,
+            "redirect_uris": ["https://client.example/cb"],
+            "token_endpoint_auth_method": "none",
+        }
+    )
+    code = secrets.token_urlsafe(32)
+    await first.save_code(
+        {
+            "code": code,
+            "client_id": client_id,
+            "code_challenge": "challenge",
+            "code_challenge_method": "S256",
+            "redirect_uri": "https://client.example/cb",
+            "expires_at": mcp_oauth._now() + timedelta(minutes=5),
+            "used_at": None,
+        }
+    )
+    await oauth_database.close(first.backend)
+    await oauth_database.close(second.backend)
+    first = mcp_oauth.PersistenceOAuthStore(await oauth_database.open())
+    second = mcp_oauth.PersistenceOAuthStore(await oauth_database.open())
+    consumed = await asyncio.gather(first.consume_code(code), second.consume_code(code))
+    assert sum(row is not None for row in consumed) == 1
+    assert await first.consume_code(code) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_failed_refresh_insert_rolls_back_consumption(oauth_database):
+    store = mcp_oauth.PersistenceOAuthStore(await oauth_database.open())
+    client_id = secrets.token_urlsafe(24)
+    await store.save_client(
+        {
+            "client_id": client_id,
+            "client_secret": None,
+            "redirect_uris": ["https://client.example/cb"],
+            "token_endpoint_auth_method": "none",
+        }
+    )
+    root = {
+        "jti": secrets.token_urlsafe(24),
+        "refresh_token_hash": secrets.token_hex(32),
+        "client_id": client_id,
+        "expires_at": mcp_oauth._now() + timedelta(days=1),
+        "parent_jti": None,
+        "revoked_at": None,
+        "replaced_by_jti": None,
+    }
+    root["family_id"] = root["jti"]
+    await store.save_token(root)
+    duplicate = {**root, "refresh_token_hash": secrets.token_hex(32)}
+    with pytest.raises(Exception) as error:
+        await store.rotate_refresh(root["refresh_token_hash"], client_id, duplicate)
+    assert any(marker in str(error.value).lower() for marker in ("unique", "duplicate", "constraint", "23505"))
+    valid = {**root, "jti": secrets.token_urlsafe(24), "refresh_token_hash": secrets.token_hex(32)}
+    assert await store.rotate_refresh(root["refresh_token_hash"], client_id, valid) == "rotated"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_expired_codes_and_refresh_tokens_are_rejected(oauth_database):
+    store = mcp_oauth.PersistenceOAuthStore(await oauth_database.open())
+    client_id = secrets.token_urlsafe(24)
+    await store.save_client(
+        {
+            "client_id": client_id,
+            "client_secret": None,
+            "redirect_uris": ["https://client.example/cb"],
+            "token_endpoint_auth_method": "none",
+        }
+    )
+    expired = mcp_oauth._now() - timedelta(seconds=10)
+    code = secrets.token_urlsafe(32)
+    await store.save_code(
+        {
+            "code": code,
+            "client_id": client_id,
+            "code_challenge": "challenge",
+            "code_challenge_method": "S256",
+            "redirect_uri": "https://client.example/cb",
+            "expires_at": expired,
+            "used_at": None,
+        }
+    )
+    assert await store.consume_code(code) is None
+    root = {
+        "jti": secrets.token_urlsafe(24),
+        "refresh_token_hash": secrets.token_hex(32),
+        "client_id": client_id,
+        "expires_at": expired,
+        "parent_jti": None,
+        "revoked_at": None,
+        "replaced_by_jti": None,
+    }
+    root["family_id"] = root["jti"]
+    await store.save_token(root)
+    successor = {
+        **root,
+        "jti": secrets.token_urlsafe(24),
+        "refresh_token_hash": secrets.token_hex(32),
+        "expires_at": mcp_oauth._now() + timedelta(days=1),
+    }
+    assert await store.rotate_refresh(root["refresh_token_hash"], client_id, successor) == "invalid"
+    # A different client cannot consume an otherwise valid refresh token.
+    root = {
+        **root,
+        "jti": secrets.token_urlsafe(24),
+        "refresh_token_hash": secrets.token_hex(32),
+        "expires_at": mcp_oauth._now() + timedelta(days=1),
+    }
+    root["family_id"] = root["jti"]
+    await store.save_token(root)
+    assert await store.rotate_refresh(root["refresh_token_hash"], "wrong-client", successor) == "invalid"
+    assert await store.rotate_refresh(root["refresh_token_hash"], client_id, successor) == "rotated"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_persisted_oauth_identifiers_require_exact_matching(oauth_database):
+    """Database collation must not weaken opaque OAuth identifier matching."""
+    store = mcp_oauth.PersistenceOAuthStore(await oauth_database.open())
+    client_id = "Client-" + secrets.token_urlsafe(24)
+    await store.save_client(
+        {
+            "client_id": client_id,
+            "client_secret": None,
+            "redirect_uris": ["https://client.example/cb"],
+            "token_endpoint_auth_method": "none",
+        }
+    )
+    assert await store.get_client(client_id + " ") is None
+    assert await store.get_client(client_id.swapcase()) is None
+    assert (await store.get_client(client_id))["client_id"] == client_id
+
+    code = "Code-" + secrets.token_urlsafe(32)
+    await store.save_code(
+        {
+            "code": code,
+            "client_id": client_id,
+            "code_challenge": "challenge",
+            "code_challenge_method": "S256",
+            "redirect_uri": "https://client.example/cb",
+            "expires_at": mcp_oauth._now() + timedelta(minutes=5),
+            "used_at": None,
+        }
+    )
+    assert await store.consume_code(code + " ") is None
+    assert await store.consume_code(code.swapcase()) is None
+    assert (await store.consume_code(code))["client_id"] == client_id
+    assert await store.consume_code(code) is None
+
+    root = {
+        "jti": secrets.token_urlsafe(24),
+        "refresh_token_hash": secrets.token_hex(32),
+        "client_id": client_id,
+        "expires_at": mcp_oauth._now() + timedelta(days=1),
+        "parent_jti": None,
+        "revoked_at": None,
+        "replaced_by_jti": None,
+    }
+    root["family_id"] = root["jti"]
+    await store.save_token(root)
+    successor = {**root, "jti": secrets.token_urlsafe(24), "refresh_token_hash": secrets.token_hex(32)}
+    assert await store.rotate_refresh(root["refresh_token_hash"] + " ", client_id, successor) == "invalid"
+    assert await store.rotate_refresh(root["refresh_token_hash"], client_id + " ", successor) == "invalid"
+    assert await store.rotate_refresh(root["refresh_token_hash"], client_id.swapcase(), successor) == "invalid"
+    assert await store.rotate_refresh(root["refresh_token_hash"], client_id, successor) == "rotated"

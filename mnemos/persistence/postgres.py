@@ -32,6 +32,7 @@ from mnemos.core.visibility import (
     version_visibility_predicate as _core_version_visibility_predicate,
 )
 from mnemos.core import eligibility as _eligibility
+from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin
 from mnemos.persistence.base import (
     POSTGRES_CAPABILITY_DETAILS,
     AclRepository,
@@ -2681,7 +2682,20 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
         )
 
 
-class PostgresOAuthRepository(OAuthRepository):
+class PostgresOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
+    @staticmethod
+    def _mcp_sql(sql: str) -> str:
+        parts = sql.split("?")
+        return "".join(part + (f"${i + 1}" if i < len(parts) - 1 else "") for i, part in enumerate(parts))
+
+    async def _mcp_fetch(self, tx: Transaction, sql: str, params: tuple = ()) -> Row | None:
+        row = await _postgres_tx(tx).conn.fetchrow(self._mcp_sql(sql), *params)
+        return dict(row) if row else None
+
+    async def _mcp_execute(self, tx: Transaction, sql: str, params: tuple = ()) -> int:
+        result = await _postgres_tx(tx).conn.execute(self._mcp_sql(sql), *params)
+        return _pg_result_count(result)
+
     async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
         return await _postgres_tx(tx).conn.fetch(
             "SELECT name, display_name, kind, enabled FROM oauth_providers WHERE enabled=TRUE ORDER BY display_name"
