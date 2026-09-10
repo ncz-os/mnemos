@@ -21,9 +21,9 @@
 #   mnemos-stiphos         (mnemos-stiphos repo)   FROM core + the hive service.
 #
 # Arch notes:
-#   - llama-cpp-python is the ONLY base dep that compiles from source; it builds
-#     per-arch here (AVX on amd64, NEON on arm64). Everything else in the closure
-#     ships aarch64 wheels.
+#   - llama-cpp-python and mnemos_native_search compile from source per-arch
+#     here (AVX on amd64, NEON on arm64). Everything else in the closure ships
+#     aarch64 wheels.
 #   - No Intel OpenVINO / OpenCL ICD is baked in — that accel path is x86-only
 #     and opt-in (`pip install mnemos-core[openvino]` on the host, or a derived
 #     image). Keeping it out is what makes this base genuinely arch-neutral.
@@ -40,10 +40,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ libpq-dev curl git && \
     rm -rf /var/lib/apt/lists/*
 
+# Debian stable's Rust packages can lag the PyO3 dependency closure. Install a
+# current minimal toolchain for the native extension build only; the runtime
+# stage remains compiler-free.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 # Dependency manifests first for better layer caching.
 COPY pyproject.toml requirements.txt README.md MANIFEST.in ./
 
-RUN uv pip install --system build setuptools wheel
+RUN uv pip install --system build setuptools wheel 'maturin>=1.5,<2'
 
 # llama-cpp-python compiles from source here, and ggml defaults to
 # GGML_NATIVE=ON -- i.e. -march=native against the BUILD machine. The CI
@@ -72,6 +79,21 @@ RUN if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
     uv pip install --system -r requirements.txt 'aiosqlite>=0.20.0' 'sqlite-vec>=0.1.6'
 
 COPY . .
+
+# release-images.yml assigns amd64 and arm64 builds to native runners. Refuse
+# an emulated build here so this compiled wheel cannot silently regress to the
+# slow QEMU path if the workflow matrix changes later.
+RUN target_arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "${target_arch}" in \
+      amd64) native_arch=x86_64 ;; \
+      arm64) native_arch=aarch64 ;; \
+      *) echo "unsupported native extension architecture: ${target_arch}" >&2; exit 1 ;; \
+    esac; \
+    test "$(uname -m)" = "${native_arch}" || \
+      { echo "mnemos_native_search must build natively for ${target_arch}" >&2; exit 1; }; \
+    cd mnemos-rust-ext && \
+    maturin build --release --locked --out /wheelhouse && \
+    uv pip install --system /wheelhouse/mnemos_native_search-*.whl
 
 # Build the mnemos-core wheel (deps already resolved above; runtime reinstalls
 # it --no-deps for clean importlib.metadata without touching the closure).
