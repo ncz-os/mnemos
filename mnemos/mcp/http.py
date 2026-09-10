@@ -46,6 +46,7 @@ import uvicorn
 import jwt
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, PlainTextResponse
@@ -76,7 +77,7 @@ from mnemos.mcp.tools import (
     reset_mcp_backend_context,
     set_mcp_backend_context,
 )
-from mnemos.persistence.schema import ensure_postgres_oauth_schema
+from mnemos.persistence.base import OAuthPersistence
 
 # stderr logging — matches mcp_server.py convention so log shipping
 # from container stdout/stderr stays consistent.
@@ -151,19 +152,14 @@ def _load_token_principals() -> dict[str, MCPClientPrincipal]:
     tok = settings.mcp.token.strip()
     if not tok:
         oauth = settings.oauth
-        oauth_ready = bool(
-            oauth.issuer.strip()
-            and oauth.admin_passphrase.strip()
-            and (oauth.signing_key.strip() or oauth.database_url.strip())
-        )
+        oauth_ready = bool(oauth.issuer.strip() and oauth.admin_passphrase.strip())
         if oauth_ready:
             logger.info("MCP HTTP bearer authentication configured for OAuth-only mode")
             return {}
         _fatal_auth_config(
             "FATAL: configure MNEMOS_MCP_TOKEN/MNEMOS_MCP_TOKENS or a complete\n"
             "MCP OAuth setup (MNEMOS_OAUTH_ISSUER,\n"
-            "MNEMOS_OAUTH_ADMIN_PASSPHRASE, and either\n"
-            "MNEMOS_OAUTH_SIGNING_KEY or MNEMOS_OAUTH_DATABASE_URL).\n"
+            "MNEMOS_OAUTH_ADMIN_PASSPHRASE, and MNEMOS_DATABASE_DSN).\n"
         )
     logger.warning(
         "WARNING: MCP HTTP/SSE is using one shared MNEMOS_MCP_TOKEN. "
@@ -884,37 +880,49 @@ async def _drain_audit_tasks_on_shutdown() -> None:
 
 @asynccontextmanager
 async def _mcp_http_lifespan(_app: Starlette):
-    """Wire persistent OAuth state, then drain audit work on shutdown.
+    """Use the node's shared backend for durable OAuth state.
 
-    When ``MNEMOS_OAUTH_DATABASE_URL`` is configured, the OAuth service is
-    installed before requests are accepted and uses a small dedicated asyncpg
-    pool. The current 6.1 audit-drain shutdown behavior remains intact.
+    Embedded apps borrow an existing backend; standalone MCP apps open it
+    through the same factory as the REST lifecycle. Only owned backends are
+    closed here. OAuth initialization failures abort startup before serving.
     """
-    import asyncpg
-
     from mnemos.mcp import oauth as oauth_module
 
-    pool = None
+    owned_backend = None
+    attached_backend = None
     settings = get_settings()
-    dsn = settings.oauth.database_url.strip()
     try:
-        if dsn:
-            if not settings.oauth.issuer.strip():
-                raise RuntimeError("MNEMOS_OAUTH_ISSUER is required when MCP OAuth persistence is enabled")
-            pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4)
-            await ensure_postgres_oauth_schema(pool)
-            store = oauth_module.PostgresOAuthStore(pool)
+        if settings.oauth.database_url.strip():
+            raise RuntimeError(
+                "MNEMOS_OAUTH_DATABASE_URL has been removed. Configure "
+                "MNEMOS_DATABASE_DSN for the node's shared persistence backend "
+                "and unset MNEMOS_OAUTH_DATABASE_URL."
+            )
+        if settings.oauth.issuer.strip():
+            from mnemos.core.lifecycle import build_configured_persistence_backend, get_persistence_backend
+
+            backend = getattr(_app.state, "persistence_backend", None)
+            if backend is None:
+                try:
+                    backend = get_persistence_backend()
+                except HTTPException as exc:
+                    if exc.status_code != 503:
+                        raise
+                    _backend_type, backend = await build_configured_persistence_backend(settings)
+                    owned_backend = backend
+            if not isinstance(backend, OAuthPersistence):
+                raise RuntimeError("Configured persistence backend does not support OAuthPersistence")
+            if getattr(_app.state, "persistence_backend", None) is None:
+                attached_backend = backend
+                _app.state.persistence_backend = backend
+            store = oauth_module.PersistenceOAuthStore(backend)
             signing_key = settings.oauth.signing_key or await store.get_signing_key()
             if not signing_key:
-                generated_key = secrets.token_urlsafe(32)
-                await store.save_signing_key(key_id="default", signing_key=generated_key)
+                await store.save_signing_key(key_id="default", signing_key=secrets.token_urlsafe(32))
                 signing_key = await store.get_signing_key()
                 if not signing_key:
                     raise RuntimeError("failed to persist the MCP OAuth signing key")
-                logger.info(
-                    "OAuth signing key generated and persisted to "
-                    "oauth_mcp_signing_keys (key_id=default) on first boot."
-                )
+                logger.info("OAuth signing key persisted in the configured backend on first boot.")
             service = oauth_module.OAuthService(
                 base_url=settings.oauth.issuer,
                 signing_key=signing_key,
@@ -923,16 +931,17 @@ async def _mcp_http_lifespan(_app: Starlette):
                 admin_passphrase=settings.oauth.admin_passphrase,
             )
             oauth_module.set_oauth_service(service)
-            logger.info("OAuth store wired to Postgres (MNEMOS_OAUTH_DATABASE_URL).")
+            logger.info("OAuth store wired to %s (MNEMOS_DATABASE_DSN).", type(backend).__name__)
         yield
     finally:
         oauth_module.set_oauth_service(None)
-        if pool is not None:
-            try:
-                await pool.close()
-            except Exception:
-                logger.exception("Failed to close OAuth asyncpg pool on shutdown")
         await _drain_audit_tasks_on_shutdown()
+        try:
+            if owned_backend is not None:
+                await owned_backend.close()
+        finally:
+            if attached_backend is not None and getattr(_app.state, "persistence_backend", None) is attached_backend:
+                del _app.state.persistence_backend
 
 
 starlette_app = Starlette(

@@ -35,6 +35,7 @@ from urllib.parse import unquote, urlparse
 from mnemos.core.config import oracle_pdb_env, runtime_env_value_stripped, vector_dim_max_env
 from mnemos.core.oauth import _mint_user_id
 from mnemos.core.visibility import ACL_READ_BIT, acl_principals
+from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
 from mnemos.persistence.base import (
     AclRepository,
     AuditChainRepository,
@@ -3027,7 +3028,46 @@ class OracleConsultationAuditRepository(ConsultationAuditRepository):
             await _call(cursor.close)
 
 
-class OracleOAuthRepository(OAuthRepository):
+class OracleOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
+    _mcp_insert_key_suffix = ""
+
+    @staticmethod
+    def _mcp_bind(sql: str, params: tuple) -> tuple[str, dict[str, Any]]:
+        parts = sql.split("?")
+        bound = "".join(part + (f":p{i}" if i < len(parts) - 1 else "") for i, part in enumerate(parts))
+        return bound, {f"p{i}": value for i, value in enumerate(params)}
+
+    def _mcp_timestamp(self, value: Any) -> datetime:
+        # MCP columns are UTC TIMESTAMP without a session-timezone dependency.
+        return oauth_utc(value).replace(tzinfo=None)
+
+    async def _mcp_fetch(self, tx: Transaction, sql: str, params: tuple = ()) -> Row | None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            sql, bindings = self._mcp_bind(sql, params)
+            await _call(cursor.execute, sql, bindings)
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def _mcp_execute(self, tx: Transaction, sql: str, params: tuple = ()) -> int:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            sql, bindings = self._mcp_bind(sql, params)
+            await _call(cursor.execute, sql, bindings)
+            return int(cursor.rowcount or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def mcp_save_signing_key(self, tx: Transaction, *, key_id: str, signing_key: str) -> None:
+        try:
+            await super().mcp_save_signing_key(tx, key_id=key_id, signing_key=signing_key)
+        except Exception as exc:
+            # INSERT enforces the unique key even when two empty-store first
+            # boots race. Oracle/Db2 roll back this statement, not the transaction.
+            if not _is_unique_violation(exc):
+                raise
+
     async def list_enabled_providers(self, tx: Transaction) -> list[Row]:
         cursor = await _call(_conn_from_tx(tx).cursor)
         try:
