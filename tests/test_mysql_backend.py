@@ -10,6 +10,7 @@ from mnemos.persistence.base import (
     CONSULTATIONS_CAPABILITY,
     CORE_CAPABILITY,
     FEDERATION_CAPABILITY,
+    OAUTH_CAPABILITY,
     STATE_CAPABILITY,
     CorePersistence,
 )
@@ -72,9 +73,8 @@ async def test_mysql_backend_advertises_implemented_capabilities_and_pings():
     conn.cursor = MagicMock(return_value=_AsyncCursorContext(cursor))
     backend = MysqlBackend(_FakePool(conn), SimpleNamespace(database=SimpleNamespace(embedding_dim=3)))
 
-    # State + Federation persistence are now implemented for MySQL (were stubs);
-    # core + state + federation are served. Still a strict subset of ALL.
-    assert backend.capabilities == {CORE_CAPABILITY, STATE_CAPABILITY, FEDERATION_CAPABILITY}
+    # OAuth now shares the same backend; this remains a strict subset of ALL.
+    assert backend.capabilities == {CORE_CAPABILITY, STATE_CAPABILITY, FEDERATION_CAPABILITY, OAUTH_CAPABILITY}
     assert backend.capabilities != set(ALL_CAPABILITIES)
     assert isinstance(backend, CorePersistence)
     assert await backend.ping() is True
