@@ -9,7 +9,7 @@ list wishlist items, speculative features, or aspirational claims.
 
 ---
 
-## Current status — v6.2.2
+## Current status — v6.2.3
 
 The 6.2 line is current. What it delivers:
 
