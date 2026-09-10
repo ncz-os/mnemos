@@ -7,44 +7,55 @@
 #   • postgres (asyncpg)   — inherited from mnemos-core base deps
 #   • sqlite   (aiosqlite) — inherited from the base (default backend)
 #   • oracle   (oracledb, thin) ─┐
-#   • db2      (ibm_db)          ├─ added by the driver layer below
-#   • mysql    (aiomysql)       ─┘
-# Select via MNEMOS_PERSISTENCE_BACKEND + MNEMOS_DATABASE_DSN at run time.
+#   • mysql    (aiomysql)        ├─ added by the driver layer below, all arches
+#   • mariadb  (aiomysql)       ─┘
+#   • db2      (ibm_db)          — amd64 ONLY, see below
 #
 # Publishes: ghcr.io/ncz-os/mnemos-enterprise
-# Arch:      linux/amd64 ONLY.
+# Arch:      linux/amd64 + linux/arm64 (single multi-arch manifest, one tag —
+#            operator directive 2026-09-10: ONE image, no separate variants).
 #
-# Policy: enterprise is amd64-only by design. The Oracle thin driver is pure
-# Python (would run on arm64), but ibm_db (Db2) has no reliable arm64 wheel and
-# the enterprise big-iron audience runs x86. If IBM (Power/ppc64le, LinuxONE/
-# s390x) or Oracle (Ampere/arm64) want this on their hardware, that is a
-# sponsor-provides-the-build-and-CI-resources conversation — ibm_db / thick
-# drivers need native validation on that hardware, we will not emulate it.
+# Policy: ibm_db (Db2) has no arm64 Linux wheel and its sdist fails to build
+# there (setup.py references an undefined `arch_` name on arm64 — genuinely
+# broken upstream, not just "needs compiling"; verified 2026-09-10 on real
+# arm64 hardware, O6N). oracledb (thin mode, pure Python) and aiomysql (pure
+# Python, serves both mysql:// and mariadb:// DSNs) were ALSO verified on
+# real arm64 hardware that day — including a live query against PYTHIA's
+# production Oracle DB from an arm64 host — so there is no reason to gate
+# them to amd64 too. TARGETARCH below installs ibm_db only on amd64; arm64
+# gets every other backend. This replaces the prior amd64-only policy, which
+# assumed (incorrectly, per that verification) that Oracle needed gating for
+# the same reason Db2 does.
 #
-# Built FROM the everything image with one driver layer. Selects a backend at
-# runtime via MNEMOS_DATABASE_DSN; defaults to Oracle to match the canonical
-# PYTHIA deployment.
+# Built FROM the everything image (already multi-arch) with one driver layer.
+# Selects a backend at runtime via MNEMOS_DATABASE_DSN; defaults to Oracle to
+# match the canonical PYTHIA deployment.
 # ─────────────────────────────────────────────────────────────────────────────
 ARG MNEMOS_EVERYTHING_IMAGE=ghcr.io/ncz-os/mnemos:latest
 FROM ${MNEMOS_EVERYTHING_IMAGE}
 
 ARG MNEMOS_CORE_REF=unknown
+ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="mnemos-enterprise" \
-      org.opencontainers.image.description="MNEMOS everything image with ALL persistence backends (postgres + sqlite from base, plus Oracle / IBM Db2 / MySQL drivers); backend selected at runtime via MNEMOS_DATABASE_DSN. amd64-only." \
+      org.opencontainers.image.description="MNEMOS everything image with ALL persistence backends (postgres + sqlite from base, plus Oracle / MySQL / MariaDB drivers on every arch, and IBM Db2 on amd64 only); backend selected at runtime via MNEMOS_DATABASE_DSN." \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/ncz-os/mnemos" \
       org.mnemos.core="${MNEMOS_CORE_REF}" \
       org.mnemos.variant="enterprise"
 
 # Enterprise persistence drivers. oracledb = thin mode by default (no Instant
-# Client); ibm_db bundles the Db2 CLI driver during install; aiomysql is the
-# MySQL 9.0+ async driver. ibm_db ships prebuilt linux/amd64 wheels — this is
-# why the image is amd64-only.
+# Client), works on every arch. aiomysql is pure Python and serves both the
+# MySQL 9.0+ and MariaDB 11.x async paths, also every arch. ibm_db bundles
+# the Db2 CLI driver during install and ships prebuilt wheels for amd64 only
+# (no arm64 Linux wheel; sdist build fails there — see policy note above),
+# so it is conditional on TARGETARCH.
 RUN python -m pip install --no-cache-dir \
         'oracledb>=4.0.1' \
-        'ibm_db>=3.2.4' \
         'aiomysql>=0.2.0' && \
+    if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
+        python -m pip install --no-cache-dir 'ibm_db>=3.2.4'; \
+    fi && \
     python -m pip check
 
 # Default to Oracle; override MNEMOS_DATABASE_DSN at runtime to pick any backend.
