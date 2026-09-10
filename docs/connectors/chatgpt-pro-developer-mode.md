@@ -58,26 +58,31 @@ Dynamic client registration is intentionally public, as required by automatic
 MCP clients; authorization still requires the admin passphrase and registration
 is bounded by request-size, redirect-count, and per-address rate limits.
 
-Configure the public issuer and durable PostgreSQL store before starting the
-edge:
+Configure the public issuer and the same database DSN used by the node before
+starting the edge (SQLite shown; Oracle, Postgres, MySQL/MariaDB and Db2 also work):
 
 ```bash
 export MNEMOS_OAUTH_ISSUER="https://mnemos.example.com"
 export MNEMOS_OAUTH_ADMIN_PASSPHRASE="$(openssl rand -hex 32)"
-export MNEMOS_OAUTH_DATABASE_URL="postgresql://mnemos:password@db:5432/mnemos"
+export MNEMOS_DATABASE_DSN="sqlite:////data/mnemos.db"
 ```
 
 Treat the admin passphrase as a credential: keep it out of URLs, command
 history, access logs, and checked-in environment files. The authorization UI
 submits it only in the POST body.
 
-The OAuth migration is applied by the installer and both compose profiles.
-With the PostgreSQL store configured, leave `MNEMOS_OAUTH_SIGNING_KEY` unset:
-first boot generates `secrets.token_urlsafe(32)` and persists it. For isolated
-development without PostgreSQL, generate a stable random value with
-`python -c 'import secrets; print(secrets.token_urlsafe(32))'` and set
-`MNEMOS_OAUTH_SIGNING_KEY`; OAuth clients and grants then remain in memory and
-are lost on restart.
+Backend startup provisions OAuth tables. Leave `MNEMOS_OAUTH_SIGNING_KEY`
+unset to generate `secrets.token_urlsafe(32)` on first boot and persist it in
+that same database on every supported backend. Concurrent first boots reuse
+the first persisted key. An explicit signing key overrides the stored key.
+Clients, authorization codes and refresh tokens also survive restarts.
+
+`MNEMOS_OAUTH_DATABASE_URL` is no longer supported: unset it and configure
+`MNEMOS_DATABASE_DSN`. Startup rejects the old variable with a migration error;
+it does not silently select another database. Existing Postgres OAuth tables
+are reused when the shared DSN points to their database. If the old OAuth
+store used a separate database, its clients/tokens/key must be migrated before
+switching DSNs to preserve existing authorizations.
 
 ## Setup — legacy static bearer path
 

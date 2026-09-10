@@ -2,8 +2,8 @@
 
 This module deliberately contains no provider-specific branches.  ``provider``
 is an audit claim only; authorization is based on the registered client and
-PKCE-bound grant.  The production store is PostgreSQL, while the small
-in-memory store is useful for isolated tests and explicit development use.
+PKCE-bound grant. Durable state uses the node's shared OAuthPersistence
+capability; the in-memory store is reserved for isolated tests/development.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 import jwt
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+from mnemos.persistence.base import OAuthPersistence
 
 ISSUER_PATH = "/"
 ACCESS_TOKEN_SECONDS = 30 * 60
@@ -158,9 +160,7 @@ class _SlidingWindowRateLimiter:
         if caller in self._last_seen or len(self._last_seen) < self.max_callers:
             return True, 0
         evictable = [
-            known_caller
-            for known_caller in self._last_seen
-            if self._blocked_until.get(known_caller, 0.0) <= now
+            known_caller for known_caller in self._last_seen if self._blocked_until.get(known_caller, 0.0) <= now
         ]
         if not evictable:
             retry_at = min(self._blocked_until.values())
@@ -189,7 +189,7 @@ def _rate_limited_response(retry_after: int) -> JSONResponse:
 
 
 class InMemoryOAuthStore:
-    """A test/development store with the same operations as the PG store."""
+    """A test/development store with the same operations as the persistence adapter."""
 
     def __init__(self) -> None:
         self.clients: dict[str, dict[str, Any]] = {}
@@ -242,195 +242,59 @@ class InMemoryOAuthStore:
         return "invalid"
 
 
-class PostgresOAuthStore:
-    """Parameterized asyncpg persistence for the MCP authorization server."""
+class PersistenceOAuthStore:
+    """Adapt the shared OAuth capability to the authorization server.
 
-    def __init__(self, pool: Any) -> None:
-        self.pool = pool
+    Each operation owns one backend transaction. In particular, consuming a
+    code and rotating/revoking a refresh family remain atomic database
+    operations across processes, not process-local read/write sequences.
+    """
+
+    def __init__(self, backend: OAuthPersistence) -> None:
+        self.backend = backend
 
     async def get_signing_key(self) -> str | None:
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT signing_key FROM oauth_mcp_signing_keys WHERE key_id = $1",
-                "default",
-            )
-            return row["signing_key"] if row else None
-
-    async def save_client(self, row: dict[str, Any]) -> None:
-        redirect_uris = row["redirect_uris"]
-        if isinstance(redirect_uris, list):
-            redirect_uris = json.dumps(redirect_uris)
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """INSERT INTO oauth_mcp_clients
-                   (client_id, client_secret, redirect_uris, token_endpoint_auth_method)
-                   VALUES ($1, $2, $3, $4)""",
-                row["client_id"],
-                row.get("client_secret"),
-                redirect_uris,
-                row["token_endpoint_auth_method"],
-            )
-
-    async def get_client(self, client_id: str) -> dict[str, Any] | None:
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """SELECT client_id, client_secret, redirect_uris,
-                          token_endpoint_auth_method
-                   FROM oauth_mcp_clients WHERE client_id = $1""",
-                client_id,
-            )
-            if not row:
-                return None
-            client = dict(row)
-            # asyncpg's default json/jsonb codec returns text. Decode it here
-            # so authorization performs exact list membership, not substring
-            # membership against a serialized JSON string.
-            redirect_uris = client.get("redirect_uris")
-            if isinstance(redirect_uris, str):
-                redirect_uris = json.loads(redirect_uris)
-            if not isinstance(redirect_uris, list) or not all(isinstance(uri, str) for uri in redirect_uris):
-                raise ValueError("stored OAuth client redirect_uris is invalid")
-            client["redirect_uris"] = redirect_uris
-            return client
-
-    async def save_code(self, row: dict[str, Any]) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """INSERT INTO oauth_mcp_authorization_codes
-                   (code, client_id, code_challenge, code_challenge_method,
-                    redirect_uri, expires_at)
-                   VALUES ($1, $2, $3, $4, $5, $6)""",
-                row["code"],
-                row["client_id"],
-                row["code_challenge"],
-                row["code_challenge_method"],
-                row["redirect_uri"],
-                row["expires_at"],
-            )
-
-    async def consume_code(self, code: str) -> dict[str, Any] | None:
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """UPDATE oauth_mcp_authorization_codes
-                   SET used_at = NOW()
-                   WHERE code = $1 AND used_at IS NULL AND expires_at > NOW()
-                   RETURNING code, client_id, code_challenge, code_challenge_method,
-                             redirect_uri, expires_at""",
-                code,
-            )
-            return dict(row) if row else None
-
-    async def save_token(self, row: dict[str, Any]) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """INSERT INTO oauth_mcp_tokens
-                   (jti, refresh_token_hash, client_id, family_id, parent_jti,
-                    expires_at)
-                   VALUES ($1, $2, $3, $4, $5, $6)""",
-                row["jti"],
-                row["refresh_token_hash"],
-                row["client_id"],
-                row["family_id"],
-                row.get("parent_jti"),
-                row["expires_at"],
-            )
-
-    async def rotate_refresh(self, token_hash: str, client_id: str, successor: dict[str, Any]) -> str:
-        """Consume and replace a refresh token in one transaction.
-
-        A second use of an already-rotated token is evidence of replay. In that
-        case every still-active refresh token in the family is revoked, including
-        the successor minted by the first request.
-        """
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                presented = await conn.fetchrow(
-                    """SELECT jti, family_id
-                       FROM oauth_mcp_tokens
-                       WHERE refresh_token_hash = $1 AND client_id = $2""",
-                    token_hash,
-                    client_id,
-                )
-                if not presented:
-                    return "invalid"
-
-                # Serialize every member on the immutable root row. Locking
-                # only the presented token is insufficient: stale-ancestor
-                # replay could otherwise race current-token rotation and miss
-                # its newly inserted successor at READ COMMITTED isolation.
-                root = await conn.fetchrow(
-                    """SELECT jti FROM oauth_mcp_tokens
-                       WHERE jti = $1 FOR UPDATE""",
-                    presented["family_id"],
-                )
-                if not root:
-                    return "invalid"
-
-                current = await conn.fetchrow(
-                    """UPDATE oauth_mcp_tokens
-                       SET revoked_at = NOW()
-                       WHERE refresh_token_hash = $1 AND client_id = $2
-                         AND revoked_at IS NULL AND expires_at > NOW()
-                       RETURNING jti, family_id""",
-                    token_hash,
-                    client_id,
-                )
-                if current:
-                    successor["family_id"] = current["family_id"]
-                    successor["parent_jti"] = current["jti"]
-                    await conn.execute(
-                        """INSERT INTO oauth_mcp_tokens
-                           (jti, refresh_token_hash, client_id, family_id,
-                            parent_jti, expires_at)
-                           VALUES ($1, $2, $3, $4, $5, $6)""",
-                        successor["jti"],
-                        successor["refresh_token_hash"],
-                        successor["client_id"],
-                        successor["family_id"],
-                        successor["parent_jti"],
-                        successor["expires_at"],
-                    )
-                    await conn.execute(
-                        """UPDATE oauth_mcp_tokens SET replaced_by_jti = $1
-                           WHERE jti = $2""",
-                        successor["jti"],
-                        current["jti"],
-                    )
-                    return "rotated"
-
-                replay = await conn.fetchrow(
-                    """SELECT family_id, revoked_at, expires_at
-                       FROM oauth_mcp_tokens
-                       WHERE refresh_token_hash = $1 AND client_id = $2""",
-                    token_hash,
-                    client_id,
-                )
-                if replay and replay["revoked_at"] is not None:
-                    await conn.execute(
-                        """UPDATE oauth_mcp_tokens SET revoked_at = COALESCE(revoked_at, NOW())
-                           WHERE family_id = $1""",
-                        replay["family_id"],
-                    )
-                    return "reused"
-                return "invalid"
+        async with self.backend.transactional() as tx:
+            return await self.backend.oauth.mcp_get_signing_key(tx)
 
     async def save_signing_key(self, *, key_id: str, signing_key: str) -> None:
-        """Persist a signing key. Idempotent on (key_id); the first
-        writer wins via ``ON CONFLICT DO NOTHING`` so concurrent
-        first-boots don't clobber each other's key."""
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """INSERT INTO oauth_mcp_signing_keys (key_id, signing_key)
-                   VALUES ($1, $2)
-                   ON CONFLICT (key_id) DO NOTHING""",
-                key_id,
-                signing_key,
-            )
+        async with self.backend.transactional() as tx:
+            await self.backend.oauth.mcp_save_signing_key(tx, key_id=key_id, signing_key=signing_key)
+
+    async def save_client(self, row: dict[str, Any]) -> None:
+        async with self.backend.transactional() as tx:
+            await self.backend.oauth.mcp_save_client(tx, row)
+
+    async def get_client(self, client_id: str) -> dict[str, Any] | None:
+        async with self.backend.transactional() as tx:
+            return await self.backend.oauth.mcp_get_client(tx, client_id)
+
+    async def save_code(self, row: dict[str, Any]) -> None:
+        async with self.backend.transactional() as tx:
+            await self.backend.oauth.mcp_save_code(tx, row)
+
+    async def consume_code(self, code: str) -> dict[str, Any] | None:
+        async with self.backend.transactional() as tx:
+            return await self.backend.oauth.mcp_consume_code(tx, code)
+
+    async def save_token(self, row: dict[str, Any]) -> None:
+        async with self.backend.transactional() as tx:
+            await self.backend.oauth.mcp_save_token(tx, row)
+
+    async def rotate_refresh(self, token_hash: str, client_id: str, successor: dict[str, Any]) -> str:
+        async with self.backend.transactional() as tx:
+            return await self.backend.oauth.mcp_rotate_refresh(tx, token_hash, client_id, successor)
 
 
 class OAuthService:
     def __init__(
-        self, *, base_url: str, signing_key: str, store: Any, registration_secret: str, admin_passphrase: str
+        self,
+        *,
+        base_url: str,
+        signing_key: str,
+        store: PersistenceOAuthStore | InMemoryOAuthStore,
+        registration_secret: str,
+        admin_passphrase: str,
     ) -> None:
         if not isinstance(signing_key, str):
             raise ValueError("OAuth signing key must be a string")
@@ -779,28 +643,11 @@ def set_oauth_service(service: OAuthService | None) -> None:
 
 
 def get_oauth_service() -> OAuthService:
-    """Return the process-wide OAuth service singleton.
+    """Return the service installed by the MCP app lifespan.
 
-    The first caller resolves the signing key from, in priority order:
-
-      1. ``MNEMOS_OAUTH_SIGNING_KEY`` env / config (explicit operator override).
-      2. The persistent store (only ``PostgresOAuthStore`` exposes
-         ``get_signing_key``); on a cold start against Postgres with an
-         empty ``oauth_mcp_signing_keys`` table, the startup path
-         generates a fresh 32-byte key and persists it.
-      3. Otherwise a missing signing key is a hard error — we will not
-         silently fall back to a generated ephemeral key, because that
-         would invalidate every previously-issued refresh token on the
-         next restart.
-
-    The store passed in is whatever the caller installed via
-    ``set_oauth_service()`` at startup; if no service has been installed
-    yet, an in-memory store is used so import-time callers and the
-    bare ``mcp_http_app`` test fixture continue to work without
-    Postgres. Production deploys that want persistence set
-    ``MNEMOS_OAUTH_DATABASE_URL``; ``mcp/http.py``'s lifespan then
-    builds an asyncpg pool, a ``PostgresOAuthStore``, and calls
-    ``set_oauth_service`` before any request lands.
+    Startup uses the configured persistence backend for clients, grants and
+    a first-writer-wins signing key. An explicit signing key still permits
+    direct in-memory use by tests/development callers outside the lifespan.
     """
     global _service
     if _service is None:
@@ -816,8 +663,8 @@ def get_oauth_service() -> OAuthService:
                 "MNEMOS_OAUTH_SIGNING_KEY is not configured and no service "
                 "with a persistent signing key has been installed via "
                 "set_oauth_service(). Set MNEMOS_OAUTH_SIGNING_KEY, or "
-                "start the server with MNEMOS_OAUTH_DATABASE_URL so the "
-                "Postgres-backed store can provide it."
+                "start the server with MNEMOS_DATABASE_DSN so the "
+                "configured persistence backend can provide it."
             )
         _service = OAuthService(
             base_url=issuer,

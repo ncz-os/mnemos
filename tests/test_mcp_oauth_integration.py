@@ -28,7 +28,8 @@ What this covers (positive + negative):
 * Empty/None admin passphrase fail-closed (constructor refuses to
   build the service).
 * A subprocess test drives register → authorize → token → real MCP SDK SSE
-  handshake → real ListToolsRequest and asserts the wire response.
+  handshake → real ListToolsRequest and asserts the wire response, using
+  only a SQLite MNEMOS_DATABASE_DSN and no signing-key environment override.
 
 Test isolation: every test that needs a configured MCP HTTP app goes
 through the ``mcp_http_app`` fixture, which:
@@ -36,7 +37,9 @@ through the ``mcp_http_app`` fixture, which:
   * captures the pre-existing settings singleton and OAuth service,
   * sets the relevant environment variables,
   * rebuilds the MCP http module fresh,
-  * exposes a ``FreshApp`` namedtuple with a per-test app, signing key,
+  * opens a real SQLite backend (plus explicitly configured external engines),
+  * runs the shared-backend MCP lifespan,
+  * exposes a ``FreshApp`` dataclass with a per-test app, signing key,
     passphrase and legacy token,
   * restores the prior state on teardown — even if the test raised.
 
@@ -67,11 +70,14 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, AsyncIterator
 
 import anyio
 import jwt
 import pytest
+import pytest_asyncio
+
+from tests.oauth_backend_helpers import oauth_database as oauth_database
 from httpx import ASGITransport, AsyncClient, Client
 from urllib.parse import parse_qs, urlparse
 
@@ -212,15 +218,16 @@ def _get_stub_session_endpoint(fresh: FreshApp) -> str:
 # ─── Test fixture ────────────────────────────────────────────────────────
 
 
-@pytest.fixture
-def mcp_http_app(
+@pytest_asyncio.fixture
+async def mcp_http_app(
     monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[FreshApp]:
+    oauth_database,
+) -> AsyncIterator[FreshApp]:
     """Build a fully-configured, fully-isolated MCP HTTP app for one test.
 
     Sets env, resets the settings singleton, pops the cached
     ``mnemos.mcp.*`` modules, re-imports a fresh ``mnemos.mcp.http``
-    bound to a fresh in-memory OAuth service, and on teardown restores
+    bound to a real backend OAuth service, and on teardown restores
     the pre-test state of sys.modules, the settings singleton, and the
     OAuth service module-global.  No module-level singleton is mutated
     without a matching restore.
@@ -232,6 +239,7 @@ def mcp_http_app(
     admin_passphrase = "integration-passphrase"
     registration_secret = "integration-reg-secret"
 
+    monkeypatch.delenv("MNEMOS_OAUTH_DATABASE_URL", raising=False)
     monkeypatch.setenv("MNEMOS_MCP_TOKEN", legacy_token)
     monkeypatch.setenv("MNEMOS_OAUTH_SIGNING_KEY", signing_key)
     monkeypatch.setenv("MNEMOS_OAUTH_ADMIN_PASSPHRASE", admin_passphrase)
@@ -272,18 +280,19 @@ def mcp_http_app(
     _reset_no_run_event()
     monkeypatch.setattr(http.app, "run", _no_run, raising=True)
 
-    fresh_service = mcp_oauth.get_oauth_service()
-
+    backend = await oauth_database.open()
+    http.starlette_app.state.persistence_backend = backend
     try:
-        yield FreshApp(
-            http=http,
-            app=http.starlette_app,
-            service=fresh_service,
-            legacy_token=legacy_token,
-            signing_key=signing_key,
-            admin_passphrase=admin_passphrase,
-            registration_secret=registration_secret,
-        )
+        async with http._mcp_http_lifespan(http.starlette_app):
+            yield FreshApp(
+                http=http,
+                app=http.starlette_app,
+                service=mcp_oauth.get_oauth_service(),
+                legacy_token=legacy_token,
+                signing_key=signing_key,
+                admin_passphrase=admin_passphrase,
+                registration_secret=registration_secret,
+            )
     finally:
         for mod_name in modules_snapshot:
             sys.modules.pop(mod_name, None)
@@ -1157,7 +1166,7 @@ def test_oauth_real_sse_tools_list_over_wire(tmp_path: Path) -> None:
             "MNEMOS_CONFIG_PATH": str(config_path),
             "MNEMOS_BASE": "http://127.0.0.1:9",
             "MNEMOS_OAUTH_ISSUER": base_url,
-            "MNEMOS_OAUTH_SIGNING_KEY": secrets.token_urlsafe(32),
+            "MNEMOS_DATABASE_DSN": f"sqlite:///{tmp_path / 'oauth-sse.db'}",
             "MNEMOS_OAUTH_ADMIN_PASSPHRASE": admin_passphrase,
             "MNEMOS_OAUTH_REGISTRATION_SECRET": "unused-open-registration-secret",
             "RATE_LIMIT_ENABLED": "false",
@@ -1199,83 +1208,32 @@ def test_oauth_real_sse_tools_list_over_wire(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_dedicated_oauth_database_is_provisioned_before_store_access(
+async def test_lifespan_reuses_app_backend_and_preserves_ownership(
     mcp_http_app: FreshApp, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Exercise the MNEMOS_OAUTH_DATABASE_URL lifecycle with a mocked DSN."""
-    import asyncpg
+    from mnemos.core import lifecycle
 
-    events: list[tuple[str, str]] = []
-    persisted_key = secrets.token_urlsafe(32)
+    async def unexpected_construction(*args, **kwargs):
+        pytest.fail("must reuse app.state.persistence_backend")
 
-    class _Connection:
-        async def execute(self, statement: str, *_args: Any) -> str:
-            events.append(("execute", statement))
-            return "OK"
-
-        async def fetchrow(self, query: str, *_args: Any) -> dict[str, str] | None:
-            events.append(("fetchrow", query))
-            if "oauth_mcp_signing_keys" in query:
-                return {"signing_key": persisted_key}
-            return None
-
-    class _Acquire:
-        async def __aenter__(self) -> _Connection:
-            return connection
-
-        async def __aexit__(self, *_exc: object) -> None:
-            return None
-
-    class _Pool:
-        closed = False
-
-        def acquire(self) -> _Acquire:
-            return _Acquire()
-
-        async def close(self) -> None:
-            self.closed = True
-
-    connection = _Connection()
-    pool = _Pool()
-    captured_pool_args: dict[str, Any] = {}
-
-    async def _create_pool(**kwargs: Any) -> _Pool:
-        captured_pool_args.update(kwargs)
-        return pool
-
-    async def _no_drain() -> None:
-        return None
-
-    settings = types.SimpleNamespace(
-        oauth=types.SimpleNamespace(
-            database_url="postgresql://mock/oauth",
-            issuer="http://testserver",
-            signing_key="",
-            registration_secret="registration-secret",
-            admin_passphrase="admin-passphrase",
-        )
-    )
-    monkeypatch.setattr(asyncpg, "create_pool", _create_pool)
-    monkeypatch.setattr(mcp_http_app.http, "get_settings", lambda: settings)
-    monkeypatch.setattr(mcp_http_app.http, "_drain_audit_tasks_on_shutdown", _no_drain)
-
+    monkeypatch.setattr(lifecycle, "build_configured_persistence_backend", unexpected_construction)
+    backend = mcp_http_app.app.state.persistence_backend
     async with mcp_http_app.http._mcp_http_lifespan(mcp_http_app.app):
-        assert mcp_http_app.http.get_oauth_service().signing_key == persisted_key
+        assert mcp_http_app.http.get_oauth_service().store.backend is backend
+    # Shared backend remains usable after MCP lifespan exits.
+    store = mcp_http_app.service.store
+    assert await store.get_client("missing-client") is None
 
-    assert captured_pool_args == {"dsn": "postgresql://mock/oauth", "min_size": 1, "max_size": 4}
-    ddl_positions = [
-        index
-        for index, (kind, statement) in enumerate(events)
-        if kind == "execute" and "CREATE TABLE IF NOT EXISTS oauth_mcp_" in statement
-    ]
-    signing_key_query_position = next(
-        index
-        for index, (kind, statement) in enumerate(events)
-        if kind == "fetchrow" and "oauth_mcp_signing_keys" in statement
-    )
-    assert len(ddl_positions) == 4
-    assert max(ddl_positions) < signing_key_query_position
-    assert pool.closed is True
+
+@pytest.mark.asyncio
+async def test_removed_oauth_database_url_fails_with_migration_guidance(
+    mcp_http_app: FreshApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = types.SimpleNamespace(oauth=types.SimpleNamespace(database_url="postgresql://mock/oauth"))
+    monkeypatch.setattr(mcp_http_app.http, "get_settings", lambda: settings)
+    with pytest.raises(RuntimeError, match="MNEMOS_DATABASE_DSN"):
+        async with mcp_http_app.http._mcp_http_lifespan(mcp_http_app.app):
+            pytest.fail("deprecated separate OAuth database must fail closed")
 
 
 @pytest.mark.asyncio
