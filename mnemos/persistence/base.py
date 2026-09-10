@@ -1335,8 +1335,6 @@ class AuditChainRepository(ABC):
     agnostic. The backend only persists the bytes.
     """
 
-    supports_webhooks = True
-
     @abstractmethod
     async def get_latest_audit_entry(
         self,
@@ -2112,7 +2110,15 @@ def assert_backend_supports_layers(backend: object, active_layers: set[str]) -> 
 def capability_details_for_backend(backend: object) -> set[str]:
     details = getattr(backend, "capability_details", None)
     if details is not None:
-        return set(details)
+        out = set(details)
+        # ``webhooks`` means end-to-end delivery, not merely that the
+        # backend can append an outbox row.  Until a backend has a compatible
+        # claim/send/finalize worker it must not advertise this capability:
+        # doing so makes health/doctor report a feature whose rows will never
+        # leave the database.
+        if not getattr(backend, "supports_webhooks", False):
+            out.discard(WEBHOOKS_CAPABILITY)
+        return out
 
     legacy = set(getattr(backend, "capabilities", set()) or set())
     out: set[str] = set()
@@ -2150,6 +2156,8 @@ def capability_details_for_backend(backend: object) -> set[str]:
         out.add(LISTEN_NOTIFY_CAPABILITY)
     if getattr(backend, "supports_advisory_locks", False):
         out.add(ADVISORY_LOCKS_CAPABILITY)
+    if not getattr(backend, "supports_webhooks", False):
+        out.discard(WEBHOOKS_CAPABILITY)
     return out
 
 

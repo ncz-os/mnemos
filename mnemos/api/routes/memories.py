@@ -1834,7 +1834,7 @@ async def create_memory(
             # Same-tx outbox enqueue — preserves the v4.0 contract
             # that webhook_deliveries rows commit atomically with
             # the data write.
-            if getattr(backend, "supports_webhooks", True):
+            if getattr(backend, "supports_webhooks", False):
                 delivery_ids = await backend.webhooks.dispatch_event(
                     tx,
                     "memory.created",
@@ -2049,7 +2049,7 @@ async def bulk_create_memories(
                             metadata=item_metadata,
                             writer_id=user.user_id,
                         )
-                        if getattr(backend, "supports_webhooks", True):
+                        if getattr(backend, "supports_webhooks", False):
                             item_delivery_ids = await backend.webhooks.dispatch_event(
                                 tx,
                                 "memory.created",
@@ -2177,7 +2177,7 @@ async def update_memory(
                 metadata=_metadata_for_audit(row["metadata"]),
                 writer_id=user.user_id,
             )
-            if getattr(backend, "supports_webhooks", True):
+            if getattr(backend, "supports_webhooks", False):
                 delivery_ids = await backend.webhooks.dispatch_event(
                     tx,
                     "memory.updated",
@@ -2272,7 +2272,7 @@ async def delete_memory(
                 metadata=None,
                 writer_id=user.user_id,
             )
-            if getattr(backend, "supports_webhooks", True):
+            if getattr(backend, "supports_webhooks", False):
                 delivery_ids = await backend.webhooks.dispatch_event(
                     tx,
                     "memory.deleted",

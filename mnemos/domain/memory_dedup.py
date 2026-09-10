@@ -119,7 +119,7 @@ async def _dispatch_delete_side_effects(
     backend: Any, tx: Any, row: Any
 ) -> tuple[list[str], list[tuple[str, dict[str, Any], str]]]:
     delivery_ids: list[str] = []
-    if getattr(backend, "supports_webhooks", True):
+    if getattr(backend, "supports_webhooks", False):
         delivery_ids = await backend.webhooks.dispatch_event(
             tx,
             "memory.deleted",
