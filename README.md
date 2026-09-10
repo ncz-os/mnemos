@@ -11,7 +11,7 @@
 
 # MNEMOS + GRAEAE
 
-**MNEMOS v6.2.3 is the memory operating system for serious agentic work.** It is
+**MNEMOS v6.2.4 is the memory operating system for serious agentic work.** It is
 not just a place to put bytes: it is a runtime of named subsystems that manage
 the full lifecycle of agent memory across providers, agents, and time horizons —
 write, embed, search, compress, version, reason over, audit, federate, export,
