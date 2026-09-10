@@ -57,6 +57,26 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.2.4] — 2026-09-10
+
+- **Added**: MySQL/MariaDB's Python-side cosine-fallback search (used when
+  the database lacks native vector-distance functions -- MariaDB always,
+  MySQL Community Edition) now supports the same optional Rust acceleration
+  as SQLite and Postgres already had. New shared `HotSearchMixin`
+  (`mnemos/persistence/hot_search.py`) replaces two near-duplicate per-row
+  cosine loops in `mysql.py` and `mariadb.py`. `MNEMOS_HOT_RS_ENABLED`
+  remains default-off.
+- **Added**: `mnemos_native_search` (the in-repo PyO3 Rust extension,
+  `mnemos-rust-ext/`) is now actually built into the published image --
+  `Dockerfile.core` compiles it from source via maturin, per-architecture,
+  with a hard guard against accidental QEMU-emulated builds. Previously the
+  module existed in the repo but was never installed in any published
+  Dockerfile, so the acceleration path above had nothing to load even when
+  enabled.
+- **Removed**: dead code -- `mnemos/domain/search/native_bridge.py` had zero
+  real callers (only its own test and benchmark script referenced it).
+  `mnemos/domain/federation/native_bridge.py` is unrelated and unaffected.
+
 ## [6.2.3] — 2026-09-10
 
 - **Added**: `mnemos-enterprise` now builds for linux/amd64 AND linux/arm64
