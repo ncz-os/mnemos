@@ -412,6 +412,11 @@ def test_declared_capability_is_served(backend_name: str) -> None:
         if cap not in caps:
             continue
         for accessor, abc in pairs:
+            if accessor == "webhooks" and not getattr(backend, "supports_webhooks", False):
+                # Webhooks are an optional detailed capability within the
+                # historical coarse ``core`` surface.  A backend that cannot
+                # deliver end to end must make this accessor fail closed.
+                continue
             try:
                 value = getattr(backend, accessor)
             except Exception as exc:

@@ -952,7 +952,7 @@ async def merge_branch(
                     source_head["source_agent"],
                     memory_id,
                 )
-                if backend.supports_webhooks:
+                if getattr(backend, "supports_webhooks", False):
                     delivery_ids = await backend.webhooks.dispatch_event(
                         tx,
                         "memory.updated",

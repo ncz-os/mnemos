@@ -125,9 +125,9 @@ def require_postgres_pool_or_503(*, route_label: str = "this endpoint"):
     edge profiles from chasing a phantom outage.
 
     Returns the pool for caller use. Raises HTTPException(503) with:
-      * "endpoint requires Postgres backend ..." when the active
-        persistence backend is SQLite (the route is fundamentally
-        unsupported on this profile).
+      * "endpoint requires Postgres backend ..." when any non-Postgres
+        persistence backend is active (the route is fundamentally
+        unsupported on that backend).
       * "Database pool not available" when the backend is Postgres
         but the pool isn't (transient — startup race or pool
         terminated mid-request).
@@ -140,15 +140,14 @@ def require_postgres_pool_or_503(*, route_label: str = "this endpoint"):
     # transient outage.
     backend = _lc._persistence_backend
     backend_kind = type(backend).__name__ if backend is not None else None
-    if backend_kind and "Sqlite" in backend_kind:
+    if backend_kind and backend_kind != "PostgresBackend":
         raise HTTPException(
             status_code=503,
             detail=(
                 f"{route_label} requires the Postgres backend; "
-                f"this deployment is configured with SQLite. "
-                f"Set MNEMOS_PROFILE=server (or MNEMOS_PERSISTENCE_BACKEND="
-                f"postgres + a working PG_* / MNEMOS_DATABASE_URL) to "
-                f"enable Postgres-only routes."
+                f"this deployment is configured with {backend_kind}. "
+                f"Choose a backend that implements this route before "
+                f"enabling it."
             ),
         )
     raise HTTPException(
