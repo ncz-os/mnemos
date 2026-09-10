@@ -57,6 +57,21 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.2.3] — 2026-09-10
+
+- **Added**: `mnemos-enterprise` now builds for linux/amd64 AND linux/arm64
+  as a single multi-arch OCI manifest under one tag — not a second image,
+  standard `docker pull` platform resolution. Verified on real arm64
+  hardware (O6N) that `oracledb` (thin mode) and `aiomysql` both work,
+  including a live query against a real production Oracle database from
+  an arm64 host. Only `ibm_db` (Db2) is genuinely amd64-only (no arm64
+  Linux wheel; sdist build fails there) and is now installed conditionally
+  by architecture instead of gating the whole image to amd64.
+- **Docs**: AGENTS.md's machine-readable install guide updated to reflect
+  the above — container deploys are no longer restricted to amd64, and the
+  pip fallback path is framed as "smaller footprint / bare metal" rather
+  than "arm64-only".
+
 ## [6.2.2] — 2026-09-10
 
 - **Fixed**: MariaDB 11.8 `mnemos serve` could never complete schema

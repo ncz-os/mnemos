@@ -1,6 +1,6 @@
 # MNEMOS Deployment & Configuration Guide
 
-**Status**: v6.2.2 current.
+**Status**: v6.2.3 current.
 
 ---
 
@@ -53,7 +53,7 @@ The API will be available at `http://localhost:5002`.
 For the no-host-Python path, run the container image:
 
 ```bash
-docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:6.2.2
+docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:6.2.3
 ```
 
 ---
