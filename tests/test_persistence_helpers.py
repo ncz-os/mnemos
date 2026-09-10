@@ -345,10 +345,27 @@ def test_require_pg_pool_503_explains_sqlite_profile(monkeypatch):
     assert exc.value.status_code == 503
     detail = exc.value.detail
     assert "Postgres backend" in detail
-    assert "SQLite" in detail
-    assert "MNEMOS_PROFILE=server" in detail
+    assert "_FakeSqliteBackend" in detail
     # Custom route_label flows through.
     assert "GET /v1/journal" in detail
+
+
+def test_require_pg_pool_503_explains_enterprise_non_postgres_backend(monkeypatch):
+    from fastapi import HTTPException
+
+    from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+
+    class OracleBackend:
+        pass
+
+    monkeypatch.setattr(_lc, "_pool", None)
+    monkeypatch.setattr(_lc, "_persistence_backend", OracleBackend())
+
+    with pytest.raises(HTTPException) as exc:
+        require_postgres_pool_or_503(route_label="POST /v1/webhooks")
+    assert exc.value.status_code == 503
+    assert "POST /v1/webhooks requires the Postgres backend" in exc.value.detail
+    assert "configured with OracleBackend" in exc.value.detail
 
 
 @pytest.mark.asyncio

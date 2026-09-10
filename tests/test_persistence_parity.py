@@ -20,6 +20,7 @@ from mnemos.api.routes import memories as memories_handler
 import mnemos.core.lifecycle as lifecycle
 from mnemos.core.auth_context import UserContext
 from mnemos.persistence import (
+    BackendCapabilityMissing,
     BranchRepository,
     CompressionRepository,
     ConsultationAuditRepository,
@@ -52,6 +53,18 @@ class BackendCase:
     name: str
     backend: PersistenceBackend
     prefix: str
+
+
+def _webhook_repo_for_storage_parity(backend_case: BackendCase) -> WebhookRepository:
+    """Reach the concrete adapter for storage-only parity tests.
+
+    Non-Postgres facade access is deliberately disabled until those backends
+    have an end-to-end delivery worker.  These tests still exercise their
+    repository SQL directly so later migration work retains coverage.
+    """
+    if backend_case.name == "sqlite":
+        return backend_case.backend._webhooks
+    return backend_case.backend.webhooks
 
 
 def _backend_params() -> list[str]:
@@ -421,7 +434,11 @@ async def test_backend_exposes_all_repository_properties(backend_case: BackendCa
     assert isinstance(backend.memory_versions, VersionRepository)
     assert isinstance(backend.memory_branches, BranchRepository)
     assert isinstance(backend.compression, CompressionRepository)
-    assert isinstance(backend.webhooks, WebhookRepository)
+    if backend.supports_webhooks:
+        assert isinstance(backend.webhooks, WebhookRepository)
+    else:
+        with pytest.raises(BackendCapabilityMissing, match="webhooks"):
+            _ = backend.webhooks
     assert isinstance(backend.consultations_audit, ConsultationAuditRepository)
     assert isinstance(backend.oauth, OAuthRepository)
     assert isinstance(backend.sessions, SessionsRepository)
@@ -1314,10 +1331,11 @@ async def test_memory_context_respects_visibility(backend_case: BackendCase):
 @pytest.mark.asyncio
 async def test_webhook_outbox_commits_with_memory(backend_case: BackendCase):
     owner = f"{backend_case.prefix}-owner"
+    webhooks = _webhook_repo_for_storage_parity(backend_case)
     async with backend_case.backend.transactional() as tx:
         await _ensure_user(backend_case, tx, owner)
         subscription_id = str(uuid.uuid4())
-        await backend_case.backend.webhooks.insert_subscription(
+        await webhooks.insert_subscription(
             tx,
             subscription_id=subscription_id,
             url="https://example.com/webhook",
@@ -1327,7 +1345,7 @@ async def test_webhook_outbox_commits_with_memory(backend_case: BackendCase):
             namespace="default",
         )
         memory_id = await _insert_memory(backend_case, tx, owner_id=owner)
-        delivery_ids = await backend_case.backend.webhooks.dispatch_event(
+        delivery_ids = await webhooks.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": memory_id},
@@ -1336,7 +1354,7 @@ async def test_webhook_outbox_commits_with_memory(backend_case: BackendCase):
         )
     async with backend_case.backend.transactional() as tx:
         row = await backend_case.backend.memories.fetch_memory_by_id(tx, memory_id)
-        deliveries = await backend_case.backend.webhooks.fetch_deliveries(tx, subscription_id)
+        deliveries = await webhooks.fetch_deliveries(tx, subscription_id)
     assert row is not None
     assert len(delivery_ids) == 1
     assert len(deliveries) == 1
@@ -1346,9 +1364,10 @@ async def test_webhook_outbox_commits_with_memory(backend_case: BackendCase):
 async def test_webhook_dispatch_event_writes_claimable_writer_revision(backend_case: BackendCase):
     owner = f"{backend_case.prefix}-claim-owner"
     subscription_id = str(uuid.uuid4())
+    webhooks = _webhook_repo_for_storage_parity(backend_case)
     async with backend_case.backend.transactional() as tx:
         await _ensure_user(backend_case, tx, owner)
-        await backend_case.backend.webhooks.insert_subscription(
+        await webhooks.insert_subscription(
             tx,
             subscription_id=subscription_id,
             url="https://example.com/webhook",
@@ -1357,7 +1376,7 @@ async def test_webhook_dispatch_event_writes_claimable_writer_revision(backend_c
             owner_id=owner,
             namespace="default",
         )
-        delivery_ids = await backend_case.backend.webhooks.dispatch_event(
+        delivery_ids = await webhooks.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "claimable"},
@@ -1367,7 +1386,7 @@ async def test_webhook_dispatch_event_writes_claimable_writer_revision(backend_c
 
     assert len(delivery_ids) == 1
     async with backend_case.backend.transactional() as tx:
-        deliveries = await backend_case.backend.webhooks.fetch_deliveries(tx, subscription_id)
+        deliveries = await webhooks.fetch_deliveries(tx, subscription_id)
     assert len(deliveries) == 1
     assert deliveries[0]["writer_revision"] == webhook_types.NEW_CODE_WRITER_REVISION
 
@@ -1384,9 +1403,10 @@ async def test_webhook_dispatch_event_writes_claimable_writer_revision(backend_c
 async def test_webhook_event_filter_does_not_enqueue_unmatched_event(backend_case: BackendCase):
     owner = f"{backend_case.prefix}-owner"
     subscription_id = str(uuid.uuid4())
+    webhooks = _webhook_repo_for_storage_parity(backend_case)
     async with backend_case.backend.transactional() as tx:
         await _ensure_user(backend_case, tx, owner)
-        await backend_case.backend.webhooks.insert_subscription(
+        await webhooks.insert_subscription(
             tx,
             subscription_id=subscription_id,
             url="https://example.com/webhook",
@@ -1395,7 +1415,7 @@ async def test_webhook_event_filter_does_not_enqueue_unmatched_event(backend_cas
             owner_id=owner,
             namespace="default",
         )
-        delivery_ids = await backend_case.backend.webhooks.dispatch_event(
+        delivery_ids = await webhooks.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "nope"},
@@ -1410,9 +1430,10 @@ async def test_webhook_dispatch_namespace_filter_applies_without_owner(backend_c
     owner = f"{backend_case.prefix}-owner"
     sub_ns_a = str(uuid.uuid4())
     sub_ns_b = str(uuid.uuid4())
+    webhooks = _webhook_repo_for_storage_parity(backend_case)
     async with backend_case.backend.transactional() as tx:
         await _ensure_user(backend_case, tx, owner)
-        await backend_case.backend.webhooks.insert_subscription(
+        await webhooks.insert_subscription(
             tx,
             subscription_id=sub_ns_a,
             url="https://example.com/webhook-a",
@@ -1421,7 +1442,7 @@ async def test_webhook_dispatch_namespace_filter_applies_without_owner(backend_c
             owner_id=owner,
             namespace="ns-a",
         )
-        await backend_case.backend.webhooks.insert_subscription(
+        await webhooks.insert_subscription(
             tx,
             subscription_id=sub_ns_b,
             url="https://example.com/webhook-b",
@@ -1430,7 +1451,7 @@ async def test_webhook_dispatch_namespace_filter_applies_without_owner(backend_c
             owner_id=owner,
             namespace="ns-b",
         )
-        delivery_ids = await backend_case.backend.webhooks.dispatch_event(
+        delivery_ids = await webhooks.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "namespace-only"},
@@ -1438,8 +1459,8 @@ async def test_webhook_dispatch_namespace_filter_applies_without_owner(backend_c
             namespace="ns-a",
         )
     async with backend_case.backend.transactional() as tx:
-        deliveries_ns_a = await backend_case.backend.webhooks.fetch_deliveries(tx, sub_ns_a)
-        deliveries_ns_b = await backend_case.backend.webhooks.fetch_deliveries(tx, sub_ns_b)
+        deliveries_ns_a = await webhooks.fetch_deliveries(tx, sub_ns_a)
+        deliveries_ns_b = await webhooks.fetch_deliveries(tx, sub_ns_b)
     assert len(delivery_ids) == 1
     assert len(deliveries_ns_a) == 1
     assert deliveries_ns_b == []
@@ -1450,10 +1471,11 @@ async def test_webhook_outbox_rolls_back_with_memory(backend_case: BackendCase):
     owner = f"{backend_case.prefix}-owner"
     memory_id = f"{backend_case.prefix}-rollback-webhook"
     subscription_id = str(uuid.uuid4())
+    webhooks = _webhook_repo_for_storage_parity(backend_case)
     with pytest.raises(RuntimeError):
         async with backend_case.backend.transactional() as tx:
             await _ensure_user(backend_case, tx, owner)
-            await backend_case.backend.webhooks.insert_subscription(
+            await webhooks.insert_subscription(
                 tx,
                 subscription_id=subscription_id,
                 url="https://example.com/webhook",
@@ -1481,7 +1503,7 @@ async def test_webhook_outbox_rolls_back_with_memory(backend_case: BackendCase):
                 created=None,
                 updated=None,
             )
-            await backend_case.backend.webhooks.dispatch_event(
+            await webhooks.dispatch_event(
                 tx,
                 "memory.created",
                 {"memory_id": memory_id},
@@ -1491,7 +1513,7 @@ async def test_webhook_outbox_rolls_back_with_memory(backend_case: BackendCase):
             raise RuntimeError("rollback")
     async with backend_case.backend.transactional() as tx:
         assert await backend_case.backend.memories.fetch_memory_by_id(tx, memory_id) is None
-        assert await backend_case.backend.webhooks.fetch_deliveries(tx, subscription_id) == []
+        assert await webhooks.fetch_deliveries(tx, subscription_id) == []
 
 
 @pytest.mark.asyncio
