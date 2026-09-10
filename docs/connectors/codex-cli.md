@@ -83,7 +83,7 @@ Bring up the OAuth-enabled MCP edge and expose it publicly:
 ```bash
 export MNEMOS_OAUTH_ISSUER="https://mnemos.example.com"
 export MNEMOS_OAUTH_ADMIN_PASSPHRASE="$(openssl rand -hex 32)"
-export MNEMOS_OAUTH_DATABASE_URL="postgresql://mnemos:password@db:5432/mnemos"
+export MNEMOS_DATABASE_DSN="sqlite:////data/mnemos.db"
 mnemos serve mcp-http --host 0.0.0.0 --port 5004
 ```
 

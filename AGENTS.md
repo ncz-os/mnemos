@@ -138,7 +138,7 @@ one. Two modes, not mutually exclusive:
    HTTPS endpoint (Cloudflare Tunnel — operator-verified with ChatGPT and
    Codex, stable URL, API-scriptable — or ngrok, faster to try but the free
    tier rotates the URL), and `MNEMOS_OAUTH_ISSUER` /
-   `MNEMOS_OAUTH_ADMIN_PASSPHRASE` / `MNEMOS_OAUTH_DATABASE_URL` set before
+   `MNEMOS_OAUTH_ADMIN_PASSPHRASE` / `MNEMOS_DATABASE_DSN` set before
    starting `mnemos serve mcp-http`. Full walkthrough:
    [docs/connectors/chatgpt-pro-developer-mode.md](docs/connectors/chatgpt-pro-developer-mode.md),
    Codex-specific notes in
