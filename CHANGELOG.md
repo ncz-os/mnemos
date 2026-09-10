@@ -57,6 +57,30 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.2.2] — 2026-09-10
+
+- **Fixed**: MariaDB 11.8 `mnemos serve` could never complete schema
+  provisioning — `memory_archive` and `session_memory_injections` FK'd
+  `memories.id`, which this backend deliberately declares
+  `CHARACTER SET ascii`, but both tables were imported unmodified from the
+  shared MySQL DDL (no such override), so MariaDB refused the FK with
+  errno 150 "Foreign key constraint is incorrectly formed". Fixed by
+  giving both tables the same MariaDB-specific override already applied
+  correctly everywhere else `memories.id` is referenced.
+- **Operational** (no code change): Db2 nodes failing on
+  `CREATE VECTOR INDEX ... SQL0614N` and `/health` returning
+  `database_connected:false` were both provisioning gaps, not bugs — the
+  database must be created with `PAGESIZE 32768` (immutable after
+  creation), and `MNEMOS_DB2_DIALECT=native` must be set explicitly (the
+  `compat` default's DUAL-token translation doesn't cover the literal
+  liveness-probe SQL). See docs/db2-eap-recipe-2026-05-20.md.
+- **Infra**: `mnemos-enterprise` is now the ONLY published container image.
+  `mnemos-core`, `mnemos`, and `mnemos-stiphos` container images were
+  retired from ghcr.io/ncz-os — the `mnemos-core` **pip package** is
+  unaffected. arm64 / bare-metal / smaller-footprint installs use the pip
+  path (`pip install mnemos-core[...]`) instead of a container; see
+  AGENTS.md's decision procedure.
+
 ## [6.2.1] — 2026-09-09
 
 Build-matrix fix for 6.2.0. `mnemos-core` published correctly at 6.2.0, but
