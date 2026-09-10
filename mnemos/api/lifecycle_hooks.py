@@ -285,6 +285,15 @@ async def _webhook_nats_post_db_hook(pool: Any, settings: Any) -> None:
     Optional and additive: the polling recovery worker remains the
     durable fallback path regardless of NATS availability.
     """
+    backend = lifecycle.get_persistence_backend()
+    if not getattr(backend, "supports_webhooks", False):
+        logger.error(
+            "webhook delivery unavailable: persistence backend %s does not "
+            "support end-to-end webhook delivery; webhook workers will not start",
+            type(backend).__name__,
+        )
+        return
+
     if not service_enabled(settings, "webhook_nats_trigger"):
         logger.info("webhook nats trigger disabled by profile service manifest")
         return

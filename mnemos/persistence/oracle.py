@@ -39,6 +39,7 @@ from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
 from mnemos.persistence.base import (
     AclRepository,
     AuditChainRepository,
+    BackendCapabilityMissing,
     BranchRepository,
     CompressionQueueRepository,
     CompressionRepository,
@@ -5221,7 +5222,10 @@ class OracleBackend:
     _supports_audit_persistence = True
     _supports_state_persistence = True
     _supports_acl_persistence = True
-    supports_webhooks = True  # Oracle has a real OracleWebhookRepository (see .webhooks)
+    # Oracle can append webhook outbox rows, but the current claim/send/finalize
+    # worker is asyncpg/Postgres-specific.  Do not claim end-to-end support.
+    # Db2 inherits this fail-closed value.
+    supports_webhooks = False
 
     supports_listen_notify = False
     supports_advisory_locks = False
@@ -5978,7 +5982,7 @@ class OracleBackend:
 
     @property
     def webhooks(self) -> WebhookRepository:
-        return self._webhooks_repo
+        raise BackendCapabilityMissing("webhooks", type(self).__name__)
 
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:
