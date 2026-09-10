@@ -85,6 +85,7 @@ from mnemos.persistence.base import (
     VersionRepository,
     WebhookRepository,
 )
+from mnemos.persistence.hot_search import HotSearchMixin
 from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
 from mnemos.persistence.mysql_oauth import MysqlBrowserOAuthMixin
 from mnemos.persistence.schema import split_postgres_statements
@@ -188,16 +189,6 @@ def _validate_and_format_vector(embedding: Sequence[float]) -> str:
             raise ValueError(f"embedding[{idx}] is non-finite ({num!r}); NaN and Inf are rejected.")
         formatted.append(f"{num:.7f}")
     return "[" + ",".join(formatted) + "]"
-
-
-def _cosine_distance_python(a: list[float], b: list[float]) -> float:
-    """Pure-Python cosine distance (1 - cosine_similarity) for two vectors."""
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a < 1e-9 or norm_b < 1e-9:
-        return 1.0
-    return 1.0 - dot / (norm_a * norm_b)
 
 
 def _rank_score_sort_key(row: Row) -> float:
@@ -1099,7 +1090,7 @@ def _mysql_tx(tx: Transaction) -> _MysqlTransaction:
 # ── Memory repository ─────────────────────────────────────────────────────────
 
 
-class MysqlMemoryRepository(MemoryRepository):
+class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
     """MySQL 9.0+ implementation of the MNEMOS memory repository.
 
     Vector search uses ``VEC_DISTANCE_COSINE`` (MySQL 9.0) and requires
@@ -1653,13 +1644,14 @@ class MysqlMemoryRepository(MemoryRepository):
 
         today = datetime.now(timezone.utc).date()
         w = float(recency_weight)
-        for row in raw_rows:
-            emb_json = row.pop("embedding_json", None)
-            try:
-                emb = json.loads(emb_json) if emb_json else None
-                dist = _cosine_distance_python(query_vec, emb) if emb else 1.0
-            except (json.JSONDecodeError, ValueError, TypeError):
-                dist = 1.0
+        distances = self._cosine_rank_rows(
+            query_vec,
+            raw_rows,
+            "embedding_json",
+            extract_embedding=lambda value: json.loads(value) if value else None,
+        )
+        for row, dist in zip(raw_rows, distances):
+            row.pop("embedding_json", None)
             row["rank_score"] = dist
 
         if boost_recency:
