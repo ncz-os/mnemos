@@ -25,6 +25,7 @@ from typing import Any
 
 from mnemos.core import eligibility as _eligibility
 from mnemos.persistence.base import (
+    BackendCapabilityMissing,
     BranchRepository,
     CORE_CAPABILITY,
     CompressionQueueRepository,
@@ -908,7 +909,7 @@ class MariadbBackend(MysqlBackend):
 
     @property
     def webhooks(self) -> WebhookRepository:
-        return MariadbWebhookRepository()
+        raise BackendCapabilityMissing("webhooks", type(self).__name__)
 
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:

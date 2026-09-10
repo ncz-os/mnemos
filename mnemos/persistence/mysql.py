@@ -65,6 +65,7 @@ from mnemos.core.auth_context import UserContext
 from mnemos.core import eligibility as _eligibility
 from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
 from mnemos.persistence.base import (
+    BackendCapabilityMissing,
     BranchRepository,
     CompressionStatsRow,
     CompressionQueueRepository,
@@ -5101,7 +5102,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
 
     @property
     def webhooks(self) -> WebhookRepository:
-        return MysqlWebhookRepository()
+        raise BackendCapabilityMissing("webhooks", type(self).__name__)
 
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:
