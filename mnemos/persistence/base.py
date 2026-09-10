@@ -19,6 +19,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, AsyncContextManager, Literal, Protocol, TypeAlias, Union, runtime_checkable
 
@@ -87,6 +88,85 @@ class UsageLedgerResult:
 
     id: int
     est_cost_usd: Decimal
+
+
+WebhookDeliveryStatus: TypeAlias = Literal["pending", "retrying", "succeeded", "abandoned"]
+
+WEBHOOK_LIVE_STATUSES: frozenset[WebhookDeliveryStatus] = frozenset(("pending", "retrying"))
+WEBHOOK_TERMINAL_STATUSES: frozenset[WebhookDeliveryStatus] = frozenset(("succeeded", "abandoned"))
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookSubscriptionRecord:
+    """Backend-neutral webhook subscription returned by repository reads."""
+
+    id: str
+    url: str
+    events: tuple[str, ...]
+    description: str | None
+    owner_id: str
+    namespace: str
+    created: datetime
+    revoked: bool
+    revoked_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookDeliveryRecord:
+    """One canonical row-per-attempt webhook delivery audit record."""
+
+    id: str
+    subscription_id: str
+    event_type: str
+    payload: str
+    payload_hash: str
+    attempt_num: int
+    status: WebhookDeliveryStatus
+    response_status: int | None
+    response_body: str | None
+    error: str | None
+    scheduled_at: datetime
+    delivered_at: datetime | None
+    created: datetime
+    status_updated_at: datetime
+    superseded: bool
+    lease_token: str | None
+    lease_expires_at: datetime | None
+    writer_revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookDeliveryClaim:
+    """A claimed attempt plus the subscription data required for one HTTP send."""
+
+    delivery: WebhookDeliveryRecord
+    lease_token: str
+    lease_expires_at: datetime
+    claim_db_now: datetime
+    url: str
+    secret: str
+    subscription_revoked: bool
+    owner_id: str
+    namespace: str
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookDeliveryOutcome:
+    """Bounded HTTP result handed to atomic delivery finalization."""
+
+    succeeded: bool
+    response_status: int | None = None
+    response_body: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookFinalizationResult:
+    """Result of an ownership-fenced delivery finalization attempt."""
+
+    applied: bool
+    status: WebhookDeliveryStatus | None = None
+    successor_delivery_id: str | None = None
 
 
 @runtime_checkable
@@ -626,16 +706,105 @@ class CompressionRepository(ABC):
 
 
 class WebhookRepository(ABC):
-    """Webhook persistence surface.
+    """Canonical webhook subscription, outbox, and delivery state contract.
 
-    The v4.0 webhook outbox contract requires that every event-producing
-    write commit a ``webhook_attempts`` row in the same database
-    transaction as the triggering data write. ``enqueue_webhook_attempt``
-    is the backend-neutral entry point for that — both backends
-    implement it so handlers can preserve the transactional outbox
-    property without reaching into ``mnemos.webhooks`` from inside a
-    repository (forbidden by the persistence-no-upward-deps contract).
+    The canonical model is row-per-attempt. A chain is identified by
+    ``(subscription_id, event_type, payload_hash)`` and ``attempt_num`` is
+    one-based within that chain. ``pending`` and ``retrying`` are live;
+    ``succeeded`` and ``abandoned`` are terminal. ``superseded`` distinguishes
+    an abandoned attempt that advanced to a successor from a final failure.
+    See ``docs/WEBHOOK_PERSISTENCE_CONTRACT.md`` for the complete invariants.
+
+    New methods in sequence item 2 deliberately provide staged
+    ``NotImplementedError`` defaults rather than becoming abstract immediately.
+    That records the target interface without making the existing backend
+    repository classes uninstantiable before their implementation items land.
+    Capability advertising remains the source of truth during the transition;
+    method presence alone never means delivery is supported.
     """
+
+    async def create_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        url: str,
+        events: Sequence[str],
+        secret: str,
+        description: str | None,
+        owner_id: str,
+        namespace: str,
+    ) -> WebhookSubscriptionRecord:
+        """Create a subscription and return it without exposing ``secret``.
+
+        The caller generates ``subscription_id`` and ``secret`` so all backends
+        receive identical values. URL and event validation happens above the
+        repository boundary. The insert and returned row are part of ``tx``.
+        """
+        raise NotImplementedError("create_subscription not implemented for this backend")
+
+    async def list_subscriptions(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str | None,
+        namespace: str | None,
+        include_revoked: bool,
+        limit: int,
+    ) -> list[WebhookSubscriptionRecord]:
+        """List newest subscriptions within an optional owner/namespace scope.
+
+        ``None`` for both scope fields is the root/operator view. Implementations
+        must reject a partial scope (exactly one field ``None``) and must not
+        return secrets.
+        """
+        raise NotImplementedError("list_subscriptions not implemented for this backend")
+
+    async def get_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> WebhookSubscriptionRecord | None:
+        """Return one scoped subscription, or ``None`` when it is not visible.
+
+        Both scope fields must be present for a tenant read or absent for a
+        root/operator read; implementations reject a partial scope.
+        """
+        raise NotImplementedError("get_subscription not implemented for this backend")
+
+    async def revoke_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> bool:
+        """Soft-revoke one visible active subscription, idempotently.
+
+        Return ``True`` only when this call changed the row from active to
+        revoked. Both scope fields must be present or absent together. Delivery
+        history is never deleted.
+        """
+        raise NotImplementedError("revoke_subscription not implemented for this backend")
+
+    async def list_deliveries(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+        limit: int,
+    ) -> list[WebhookDeliveryRecord]:
+        """List newest attempts for one visible subscription, without secrets.
+
+        Both scope fields must be present or absent together.
+        """
+        raise NotImplementedError("list_deliveries not implemented for this backend")
 
     @abstractmethod
     async def dispatch_event(
@@ -647,18 +816,133 @@ class WebhookRepository(ABC):
         owner_id: str | None = None,
         namespace: str | None = None,
     ) -> list[str]:
-        """Append ``webhook_deliveries`` rows for every matching
-        subscription, inside ``tx``, and return their delivery IDs.
+        """Append one first-attempt row per matching active subscription.
 
-        Both backends must atomically commit these rows alongside the
-        triggering data write — that is the v4.0 outbox contract. The
-        delivery worker reads the queue separately and performs the
-        HTTP send; this method never dispatches over HTTP, despite the
-        legacy name. The returned IDs let callers schedule the delivery
-        attempt via ``mnemos.core.lifecycle._schedule_delivery_attempt``
-        once the outer transaction has committed.
+        The rows must commit atomically with the triggering data write. Each
+        row starts at ``attempt_num=1``, ``status='pending'``, is not
+        superseded, has no lease, and records the canonical serialized payload
+        plus its SHA-256 hex digest. This method performs no HTTP or NATS I/O;
+        nudges are post-commit orchestration. Returned IDs may be scheduled only
+        after the outer transaction commits.
         """
         ...
+
+    async def claim_delivery(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+        lease_seconds: int,
+        max_attempts: int,
+        writer_revision: int,
+    ) -> WebhookDeliveryClaim | None:
+        """Atomically lease one due, live attempt for an HTTP send.
+
+        A claim is allowed only for the requested writer revision, with no
+        unexpired competing lease, no succeeded chain peer, and no live newer
+        attempt. Expired leases are reclaimable. The returned timestamps are
+        database-clock values and must be timezone-aware UTC values.
+        """
+        raise NotImplementedError("claim_delivery not implemented for this backend")
+
+    async def claim_due_deliveries(
+        self,
+        tx: Transaction,
+        *,
+        lease_token: str,
+        limit: int,
+        lease_seconds: int,
+        max_attempts: int,
+        writer_revision: int,
+    ) -> list[WebhookDeliveryClaim]:
+        """Atomically claim up to ``limit`` due attempts for crash recovery.
+
+        Competing workers must not claim the same attempt. Backends with
+        ``SKIP LOCKED`` should use it; single-writer backends may serialize the
+        claim transaction. Ordering is oldest ``scheduled_at`` first.
+        """
+        raise NotImplementedError("claim_due_deliveries not implemented for this backend")
+
+    async def guard_delivery_claim(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+    ) -> bool:
+        """Fence a preclaimed attempt immediately before its HTTP POST.
+
+        Return ``True`` only while the token still owns an unexpired live row
+        whose chain has neither succeeded nor advanced. Otherwise converge or
+        release the row as appropriate and return ``False``.
+        """
+        raise NotImplementedError("guard_delivery_claim not implemented for this backend")
+
+    async def release_delivery_claim(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+    ) -> bool:
+        """Release an owned lease when no HTTP POST began.
+
+        This must not consume an attempt or schedule a successor. Return
+        ``True`` only when the resulting row remains live and reclaimable.
+        """
+        raise NotImplementedError("release_delivery_claim not implemented for this backend")
+
+    async def finalize_delivery(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+        outcome: WebhookDeliveryOutcome,
+        max_attempts: int,
+        backoff_schedule: Sequence[int],
+    ) -> WebhookFinalizationResult:
+        """Atomically persist an HTTP result and converge its retry chain.
+
+        A 2xx success becomes the chain's sole terminal ``succeeded`` row and
+        abandons free successors. A retryable failure abandons/supersedes the
+        owned attempt and inserts at most one ``attempt_num + 1`` successor at
+        the configured exponential-backoff time. Exhaustion or revocation ends
+        at ``abandoned`` without a successor. Failure finalization requires an
+        unexpired owned lease; success may commit after expiry when the fencing
+        token still matches, preserving a received 2xx while still converging
+        races. A stale or losing writer returns ``applied=False``.
+
+        ``max_attempts`` must be positive. The schedule must contain at least
+        ``max_attempts - 1`` positive delays; implementations validate these
+        policy inputs before mutating the chain.
+        """
+        raise NotImplementedError("finalize_delivery not implemented for this backend")
+
+    async def store_delivery_response_body(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        response_body: str,
+    ) -> bool:
+        """Attach bounded post-finalization response audit text.
+
+        Body capture intentionally follows durable status finalization so a
+        slow body cannot hold a lease. This audit-only update must never alter
+        status, retry, superseded, or lease fields.
+        """
+        raise NotImplementedError("store_delivery_response_body not implemented for this backend")
+
+    async def repair_delivery_chains(self, tx: Transaction) -> int:
+        """Terminalize unleased live attempts made obsolete by chain peers.
+
+        The idempotent sweep abandons/supersedes a live row when a newer attempt
+        exists or any chain peer succeeded. It must not steal unexpired leases.
+        Return the number of rows changed.
+        """
+        raise NotImplementedError("repair_delivery_chains not implemented for this backend")
 
 
 class ConsultationAuditRepository(ABC):
