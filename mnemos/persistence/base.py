@@ -768,6 +768,39 @@ class OAuthRepository(ABC):
     """OAuth provider, identity, and browser-session persistence."""
 
     @abstractmethod
+    async def mcp_get_signing_key(self, tx: Transaction) -> str | None: ...
+
+    @abstractmethod
+    async def mcp_save_signing_key(self, tx: Transaction, *, key_id: str, signing_key: str) -> None:
+        """Insert a signing key if absent; concurrent first boots retain the first writer."""
+
+    @abstractmethod
+    async def mcp_save_client(self, tx: Transaction, row: Row) -> None: ...
+
+    @abstractmethod
+    async def mcp_get_client(self, tx: Transaction, client_id: str) -> Row | None: ...
+
+    @abstractmethod
+    async def mcp_save_code(self, tx: Transaction, row: Row) -> None: ...
+
+    @abstractmethod
+    async def mcp_consume_code(self, tx: Transaction, code: str) -> Row | None:
+        """Atomically consume an unexpired, unused PKCE authorization code."""
+
+    @abstractmethod
+    async def mcp_save_token(self, tx: Transaction, row: Row) -> None: ...
+
+    @abstractmethod
+    async def mcp_rotate_refresh(
+        self, tx: Transaction, token_hash: str, client_id: str, successor: Row
+    ) -> str:
+        """Return rotated/invalid/reused, serializing the entire refresh family.
+
+        Reuse revokes all active descendants. Revocation and successor insertion
+        share the caller's transaction, so insertion failure rolls back both.
+        """
+
+    @abstractmethod
     async def list_enabled_providers(self, tx: Transaction) -> list[Row]: ...
 
     @abstractmethod

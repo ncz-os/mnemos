@@ -57,6 +57,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
@@ -76,6 +77,7 @@ from mnemos.persistence.base import (
     KG_CAPABILITY,
     KGRepository,
     MemoryRepository,
+    OAuthRepository,
     STATE_CAPABILITY,
     STATE_DETAIL_CAPABILITY,
     StateRepository,
@@ -83,6 +85,9 @@ from mnemos.persistence.base import (
     VersionRepository,
     WebhookRepository,
 )
+from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
+from mnemos.persistence.mysql_oauth import MysqlBrowserOAuthMixin
+from mnemos.persistence.schema import split_postgres_statements
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
@@ -984,6 +989,15 @@ _INIT_DDLS = [
     _DDL_CATEGORY_DECAY,
     _DDL_CATEGORY_DECAY_SEED,
 ]
+
+
+async def _ensure_mysql_oauth_schema(conn: Any) -> None:
+    """Provision OAuth tables on the node's existing MySQL-family connection."""
+    directory = Path(__file__).resolve().parents[1] / "db_migrations" / "migrations_mysql"
+    async with conn.cursor() as cursor:
+        for name in ("0052_oauth_repository.sql", "0053_mcp_oauth.sql"):
+            for statement in split_postgres_statements((directory / name).read_text(encoding="utf-8")):
+                await cursor.execute(statement)
 
 
 # ── Pool factory ──────────────────────────────────────────────────────────────
@@ -4687,6 +4701,39 @@ class MysqlStateRepository(StateRepository):
 # ── Backend facade ────────────────────────────────────────────────────────────
 
 
+class MysqlOAuthRepository(MysqlBrowserOAuthMixin, MCPOAuthRepositoryMixin, OAuthRepository):
+    """Native MySQL/MariaDB OAuth persistence; identifiers compare case-sensitively."""
+
+    _mcp_insert_key_suffix = " ON DUPLICATE KEY UPDATE key_id = key_id"
+    _oauth_duplicate = staticmethod(_is_unique_violation)
+
+    def _mcp_timestamp(self, value: Any) -> datetime:
+        return oauth_utc(value).replace(tzinfo=None)
+
+    async def _mcp_fetch(self, tx: Transaction, sql: str, params: tuple = ()) -> Row | None:
+        async with _mysql_tx(tx).conn.cursor() as cursor:
+            await cursor.execute(sql.replace("?", "%s"), params)
+            row = await _fetchone_dict(cursor)
+            # Opaque MCP identifiers use VARBINARY so PAD SPACE collations
+            # cannot turn an altered client/code/token into a valid credential.
+            if row is not None:
+                row = {
+                    key: value.decode("utf-8") if isinstance(value, bytes) else value
+                    for key, value in row.items()
+                }
+            return row
+
+    async def _mcp_execute(self, tx: Transaction, sql: str, params: tuple = ()) -> int:
+        async with _mysql_tx(tx).conn.cursor() as cursor:
+            await cursor.execute(sql.replace("?", "%s"), params)
+            return int(cursor.rowcount or 0)
+
+    async def _oauth_fetch_all(self, tx: Transaction, sql: str, params: tuple = ()) -> list[Row]:
+        async with _mysql_tx(tx).conn.cursor() as cursor:
+            await cursor.execute(sql.replace("?", "%s"), params)
+            return await _fetch_all_dicts(cursor)
+
+
 class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align with SqliteBackend/OracleBackend/Db2Backend/PostgresBackend bare-class pattern
     """MySQL 9.0+ persistence facade backed by an aiomysql connection pool.
 
@@ -4708,6 +4755,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     supports_mysql_vector = True  # MySQL 9.0 native VECTOR
     supports_webhooks = False
     _supports_core_persistence = True
+    _supports_oauth_persistence = True
 
     def __init__(self, pool: Any, settings: Any) -> None:
         self._pool = pool
@@ -4728,6 +4776,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         self._consultations_audit_repo = MysqlConsultationAuditRepository()
         self._federation_repo = MysqlFederationRepository()
         self._state_kv_repo = MysqlStateRepository()
+        self._oauth_repo = MysqlOAuthRepository()
 
     @property
     def settings(self) -> Any:
@@ -4739,7 +4788,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
 
     @property
     def capabilities(self) -> set[str]:
-        return {CORE_CAPABILITY, STATE_CAPABILITY, FEDERATION_CAPABILITY}
+        return {CORE_CAPABILITY, STATE_CAPABILITY, FEDERATION_CAPABILITY, "oauth"}
 
     @property
     def audit_chain(self) -> Any | None:
@@ -4765,7 +4814,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
 
     @property
     def capability_details(self) -> set[str]:
-        return {*MYSQL_CAPABILITY_DETAILS, KG_CAPABILITY, STATE_DETAIL_CAPABILITY}
+        return {*MYSQL_CAPABILITY_DETAILS, KG_CAPABILITY, STATE_DETAIL_CAPABILITY, "oauth"}
 
     async def record_usage_ledger(self, tx: Transaction, record: Any) -> Any:
         """Record model-token usage (KNEMON), mirroring the Postgres recorder.
@@ -5071,6 +5120,10 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         return self._federation_repo
 
     @property
+    def oauth(self) -> OAuthRepository:
+        return self._oauth_repo
+
+    @property
     def state_kv(self) -> StateRepository:
         return self._state_kv_repo
 
@@ -5089,6 +5142,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                     await cursor.execute("SELECT 1")
                     for ddl in _INIT_DDLS:
                         await cursor.execute(ddl)
+                await _ensure_mysql_oauth_schema(conn)
                 await _ensure_mysql_columns(
                     conn,
                     "memories",

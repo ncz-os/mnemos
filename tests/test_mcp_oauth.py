@@ -1,9 +1,8 @@
 """Unit and integration tests for the MCP OAuth 2.1 authorization server.
 
 The unit tests exercise JWT issuance/validation, PKCE enforcement, and
-the single-tenant flow against the in-memory store.  A live PG integration
-test is skipped when the host environment cannot reach Postgres, so the
-suite is stable on the bare CI runner that ``make test`` uses.
+the single-tenant flow against the in-memory store. Persistence round trips
+run against SQLite and every explicitly configured external test backend.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ import pytest
 from starlette.requests import Request
 
 from mnemos.mcp import oauth as mcp_oauth
+from tests.oauth_backend_helpers import oauth_database as oauth_database
 
 
 def _build_service(**overrides):
@@ -75,27 +75,21 @@ def test_jwt_expiry_is_actually_enforced():
         service.validate_access_token(expired)
 
 
-def test_postgres_store_decodes_jsonb_redirect_uris_for_exact_matching():
-    class _Acquire:
-        async def __aenter__(self):
-            return self
+@pytest.mark.asyncio
+async def test_persistence_store_round_trips_redirect_uris_for_exact_matching(oauth_database):
+    store = mcp_oauth.PersistenceOAuthStore(await oauth_database.open())
+    import secrets
 
-        async def __aexit__(self, *_exc):
-            return False
-
-        async def fetchrow(self, *_args):
-            return {
-                "client_id": "client-1",
-                "client_secret": None,
-                "redirect_uris": '["https://client.example/callback"]',
-                "token_endpoint_auth_method": "none",
-            }
-
-    class _Pool:
-        def acquire(self):
-            return _Acquire()
-
-    client = _run(mcp_oauth.PostgresOAuthStore(_Pool()).get_client("client-1"))
+    client_id = secrets.token_urlsafe(24)
+    await store.save_client(
+        {
+            "client_id": client_id,
+            "client_secret": None,
+            "redirect_uris": ["https://client.example/callback"],
+            "token_endpoint_auth_method": "none",
+        }
+    )
+    client = await store.get_client(client_id)
     assert client is not None
     assert client["redirect_uris"] == ["https://client.example/callback"]
     assert "https://client.example" not in client["redirect_uris"]

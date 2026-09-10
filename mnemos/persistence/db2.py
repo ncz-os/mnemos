@@ -3741,6 +3741,14 @@ class Db2StateRepository(_Db2OraCompatMixin, OracleStateRepository):
 class Db2OAuthRepository(OracleOAuthRepository):
     """Db2-native OAuth token/state persistence."""
 
+    _mcp_lock_suffix = " WITH RS USE AND KEEP UPDATE LOCKS"
+
+    @staticmethod
+    def _mcp_bind(sql: str, params: tuple) -> tuple[str, tuple]:
+        # Native Db2 uses question-mark binds; never rely on Oracle translation.
+        return sql, params
+
+
     async def register_oauth_token(
         self,
         tx: Any,
