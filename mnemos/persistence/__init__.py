@@ -60,7 +60,13 @@ from mnemos.persistence.base import (
     UsageLedgerRecord,
     UsageLedgerResult,
     VersionRepository,
+    WebhookDeliveryClaim,
+    WebhookDeliveryOutcome,
+    WebhookDeliveryRecord,
+    WebhookDeliveryStatus,
+    WebhookFinalizationResult,
     WebhookRepository,
+    WebhookSubscriptionRecord,
     capability_details_for_backend,
 )
 from mnemos.persistence.postgres import (
@@ -229,6 +235,12 @@ __all__ = [
     "UsageLedgerRecord",
     "UsageLedgerResult",
     "VersionRepository",
+    "WebhookDeliveryClaim",
+    "WebhookDeliveryOutcome",
+    "WebhookDeliveryRecord",
+    "WebhookDeliveryStatus",
+    "WebhookFinalizationResult",
     "WebhookRepository",
+    "WebhookSubscriptionRecord",
     "capability_details_for_backend",
 ]
