@@ -206,7 +206,7 @@ the Patroni/HAProxy writer endpoint, not at individual PostgreSQL nodes.
 
 ## Live deployment: pg-host primary → gpu-host standby
 
-This section is the operator runbook for the **deployed fleet** as of v6.2.4
+This section is the operator runbook for the **deployed fleet** as of v6.2.5
 The sections above describe the generic pattern; this section names the actual
 hosts, ports, slot names, and commands.
 

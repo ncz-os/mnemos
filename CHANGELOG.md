@@ -57,6 +57,30 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.2.5] — 2026-09-11
+
+- **Added**: `WebhookRepository` ABC (item 2 of the ongoing webhook/ABC fix
+  sequence) now has full 13-method concrete implementations for
+  PostgreSQL, SQLite, and MySQL/MariaDB (items 3, 4, 5). Every method
+  mirrors PostgreSQL's row-per-attempt semantics (leases, writer-revision
+  fencing, retry-chain convergence, repair) adapted for each backend's real
+  concurrency model: `SKIP LOCKED` on Postgres/MySQL/MariaDB, `BEGIN
+  IMMEDIATE` on SQLite. No production caller migration yet -- the live
+  `mnemos/webhooks/*` asyncpg code is unchanged (a later item in the
+  sequence).
+- **Fixed**: non-Postgres backends now raise `BackendCapabilityMissing` on
+  `backend.webhooks` instead of silently stranding enqueued webhook rows.
+- **Bumped add-on pin**: `graeae` overlay pinned to `84b7dd79` (was
+  `cee5b9e`), carrying a real production fix -- `/v1/consultations` was
+  unconditionally 503ing (`"Shared consultation quota storage is
+  unavailable"`) because the per-principal quota enforcement required
+  Redis, which was removed as a mnemos-core dependency. The quota now
+  persists through the existing backend-neutral `StateRepository` ABC
+  (`state_kv`) instead, serialized by each backend's native row lock
+  (`pg_advisory_xact_lock` / `SELECT ... FOR UPDATE` / `BEGIN IMMEDIATE`)
+  -- no external cache dependency. The MCP `graeae_consult` tool was never
+  affected (it bypasses this quota gate entirely).
+
 ## [6.2.4] — 2026-09-10
 
 - **Added**: MySQL/MariaDB's Python-side cosine-fallback search (used when
