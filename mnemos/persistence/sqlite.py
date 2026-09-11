@@ -18,7 +18,7 @@ import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
@@ -55,7 +55,12 @@ from mnemos.persistence.base import (
     UsageLedgerRecord,
     UsageLedgerResult,
     VersionRepository,
+    WebhookDeliveryClaim,
+    WebhookDeliveryOutcome,
+    WebhookDeliveryRecord,
+    WebhookFinalizationResult,
     WebhookRepository,
+    WebhookSubscriptionRecord,
 )
 from mnemos.persistence.types import (
     MEMORY_COLS as _MEMORY_COLS,
@@ -2407,25 +2412,143 @@ class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueReposi
 
 
 class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
-    async def insert_subscription(
+    async def create_subscription(
         self,
         tx: Transaction,
         *,
-        subscription_id: str | None = None,
+        subscription_id: str,
         url: str,
         events: Sequence[str],
-        secret: str | None = None,
-        owner_id: str = "default",
-        namespace: str = "default",
-    ) -> str:
-        subscription_id = subscription_id or str(uuid.uuid4())
+        secret: str,
+        description: str | None,
+        owner_id: str,
+        namespace: str,
+    ) -> WebhookSubscriptionRecord:
         await _execute(
             self._conn(tx),
-            "INSERT INTO webhook_subscriptions (id, url, events, secret, owner_id, namespace) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (subscription_id, url, json.dumps(list(events)), secret, owner_id, namespace),
+            "INSERT INTO webhook_subscriptions "
+            "(id, url, events, secret, description, owner_id, namespace) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (subscription_id, url, json.dumps(list(events)), secret, description, owner_id, namespace),
         )
-        return subscription_id
+        row = await _fetch_one(
+            self._conn(tx),
+            "SELECT id, url, events, description, owner_id, namespace, "
+            "created_at AS created, revoked, revoked_at "
+            "FROM webhook_subscriptions WHERE id = ?",
+            (subscription_id,),
+        )
+        if row is None:
+            raise RuntimeError("SQLite webhook subscription insert returned no row")
+        return _sqlite_webhook_subscription(row)
+
+    async def list_subscriptions(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str | None,
+        namespace: str | None,
+        include_revoked: bool,
+        limit: int,
+    ) -> list[WebhookSubscriptionRecord]:
+        _validate_webhook_scope(owner_id, namespace, "list_subscriptions")
+        conditions: list[str] = []
+        params: list[Any] = []
+        if not include_revoked:
+            conditions.append("revoked = 0")
+        if owner_id is not None:
+            conditions.extend(("owner_id = ?", "namespace = ?"))
+            params.extend((owner_id, namespace))
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(int(limit))
+        rows = await _fetch_all(
+            self._conn(tx),
+            "SELECT id, url, events, description, owner_id, namespace, "
+            "created_at AS created, revoked, revoked_at "
+            "FROM webhook_subscriptions"
+            f"{where} ORDER BY julianday(created_at) DESC, created_at DESC LIMIT ?",
+            params,
+        )
+        return [_sqlite_webhook_subscription(row) for row in rows]
+
+    async def get_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> WebhookSubscriptionRecord | None:
+        _validate_webhook_scope(owner_id, namespace, "get_subscription")
+        conditions = ["id = ?"]
+        params: list[Any] = [subscription_id]
+        if owner_id is not None:
+            conditions.extend(("owner_id = ?", "namespace = ?"))
+            params.extend((owner_id, namespace))
+        row = await _fetch_one(
+            self._conn(tx),
+            "SELECT id, url, events, description, owner_id, namespace, "
+            "created_at AS created, revoked, revoked_at "
+            "FROM webhook_subscriptions WHERE "
+            + " AND ".join(conditions),
+            params,
+        )
+        return _sqlite_webhook_subscription(row) if row is not None else None
+
+    async def revoke_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> bool:
+        _validate_webhook_scope(owner_id, namespace, "revoke_subscription")
+        conditions = ["id = ?", "revoked = 0"]
+        params: list[Any] = [subscription_id]
+        if owner_id is not None:
+            conditions.extend(("owner_id = ?", "namespace = ?"))
+            params.extend((owner_id, namespace))
+        params.append(_now_iso())
+        return (
+            await _execute_count(
+                self._conn(tx),
+                "UPDATE webhook_subscriptions SET revoked = 1, revoked_at = ? WHERE "
+                + " AND ".join(conditions),
+                (params[-1], *params[:-1]),
+            )
+            > 0
+        )
+
+    async def list_deliveries(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+        limit: int,
+    ) -> list[WebhookDeliveryRecord]:
+        _validate_webhook_scope(owner_id, namespace, "list_deliveries")
+        params: list[Any] = [subscription_id]
+        scope = ""
+        if owner_id is not None:
+            scope = " AND s.owner_id = ? AND s.namespace = ?"
+            params.extend((owner_id, namespace))
+        params.append(int(limit))
+        rows = await _fetch_all(
+            self._conn(tx),
+            "SELECT d.id, d.subscription_id, d.event_type, d.payload, d.payload_hash, "
+            "d.attempt_num, d.status, d.response_status, d.response_body, d.error, "
+            "d.scheduled_at, d.delivered_at, d.created_at AS created, "
+            "d.status_updated_at, d.superseded, d.lease_token, d.lease_expires_at, "
+            "d.writer_revision FROM webhook_deliveries d "
+            "JOIN webhook_subscriptions s ON s.id = d.subscription_id "
+            "WHERE d.subscription_id = ?"
+            f"{scope} ORDER BY julianday(d.created_at) DESC, d.created_at DESC LIMIT ?",
+            params,
+        )
+        return [_sqlite_webhook_delivery(row) for row in rows]
 
     async def dispatch_event(
         self,
@@ -2489,6 +2612,478 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
             delivery_ids.append(delivery_id)
         return delivery_ids
 
+    async def _abandon_owned(
+        self,
+        conn: Any,
+        delivery_id: str,
+        lease_token: str,
+        now: datetime,
+        error: str | None,
+        superseded: bool,
+        response_status: int | None = None,
+        response_body: str | None = None,
+        *,
+        require_unexpired: bool = False,
+        delivered_at: datetime | None = None,
+    ) -> bool:
+        """Terminalize one owned row while preserving SQLite's fence."""
+        expiry_clause = " AND julianday(lease_expires_at) >= julianday(?)" if require_unexpired else ""
+        params: list[Any] = [
+            1 if superseded else 0,
+            response_status,
+            response_body,
+            error,
+            now.isoformat(),
+            now.isoformat() if delivered_at is not None else None,
+            delivery_id,
+            lease_token,
+        ]
+        if delivered_at is None:
+            params.pop(5)
+        params.extend((now.isoformat(),) if require_unexpired else ())
+        return (
+            await _execute_count(
+                conn,
+                "UPDATE webhook_deliveries SET status = 'abandoned', superseded = ?, "
+                "response_status = ?, response_body = ?, error = ?, status_updated_at = ?, "
+                + ("delivered_at = ?, " if delivered_at is not None else "")
+                + "lease_token = NULL, lease_expires_at = NULL WHERE id = ? "
+                "AND lease_token = ? AND status IN ('pending', 'retrying') AND superseded = 0"
+                + expiry_clause,
+                tuple(params),
+            )
+            > 0
+        )
+
+    async def claim_delivery(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+        lease_seconds: int,
+        max_attempts: int,
+        writer_revision: int,
+    ) -> WebhookDeliveryClaim | None:
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        conn = self._conn(tx)
+        claim_now = await _sqlite_webhook_clock(conn)
+        lease_expires = claim_now + timedelta(seconds=lease_seconds)
+        updated = await _execute_count(
+            conn,
+            "UPDATE webhook_deliveries SET lease_token = ?, lease_expires_at = ?, "
+            "status = CASE WHEN status = 'pending' THEN 'retrying' ELSE status END, "
+            "status_updated_at = CASE WHEN status = 'pending' THEN ? ELSE status_updated_at END "
+            "WHERE id = ? AND julianday(scheduled_at) <= julianday(?) "
+            "AND attempt_num <= ? AND superseded = 0 "
+            "AND status IN ('pending', 'retrying') "
+            "AND (lease_token IS NULL OR julianday(lease_expires_at) < julianday(?)) "
+            "AND writer_revision = ? "
+            "AND (status = 'pending' OR NOT EXISTS ("
+            "SELECT 1 FROM webhook_deliveries newer WHERE "
+            "newer.subscription_id = webhook_deliveries.subscription_id "
+            "AND newer.event_type = webhook_deliveries.event_type "
+            "AND newer.payload_hash = webhook_deliveries.payload_hash "
+            "AND newer.attempt_num > webhook_deliveries.attempt_num))",
+            (
+                lease_token,
+                lease_expires.isoformat(),
+                claim_now.isoformat(),
+                delivery_id,
+                claim_now.isoformat(),
+                max_attempts,
+                claim_now.isoformat(),
+                writer_revision,
+            ),
+        )
+        if updated == 0:
+            return None
+        row = await _fetch_one(conn, _SQLITE_WEBHOOK_CLAIM_SELECT + " WHERE d.id = ?", (delivery_id,))
+        if row is None:
+            return None
+        return _sqlite_webhook_claim(row, lease_token, claim_now)
+
+    async def claim_due_deliveries(
+        self,
+        tx: Transaction,
+        *,
+        lease_token: str,
+        limit: int,
+        lease_seconds: int,
+        max_attempts: int,
+        writer_revision: int,
+    ) -> list[WebhookDeliveryClaim]:
+        if limit <= 0:
+            return []
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        conn = self._conn(tx)
+        claim_now = await _sqlite_webhook_clock(conn)
+        lease_expires = claim_now + timedelta(seconds=lease_seconds)
+        ids = await _fetch_all(
+            conn,
+            "SELECT d.id FROM webhook_deliveries d WHERE "
+            "julianday(d.scheduled_at) <= julianday(?) AND d.attempt_num <= ? "
+            "AND d.status IN ('pending', 'retrying') AND d.superseded = 0 "
+            "AND (d.lease_token IS NULL OR julianday(d.lease_expires_at) < julianday(?)) "
+            "AND d.writer_revision = ? "
+            "AND NOT EXISTS (SELECT 1 FROM webhook_deliveries peer WHERE "
+            "peer.subscription_id = d.subscription_id AND peer.event_type = d.event_type "
+            "AND peer.payload_hash = d.payload_hash AND peer.status = 'succeeded') "
+            "AND (d.status = 'pending' OR NOT EXISTS (SELECT 1 FROM webhook_deliveries newer WHERE "
+            "newer.subscription_id = d.subscription_id AND newer.event_type = d.event_type "
+            "AND newer.payload_hash = d.payload_hash AND newer.attempt_num > d.attempt_num)) "
+            "ORDER BY julianday(d.scheduled_at), julianday(d.created_at), d.id LIMIT ?",
+            (claim_now.isoformat(), max_attempts, claim_now.isoformat(), writer_revision, int(limit)),
+        )
+        claimed: list[WebhookDeliveryClaim] = []
+        for row in ids:
+            delivery_id = row["id"]
+            updated = await _execute_count(
+                conn,
+                "UPDATE webhook_deliveries SET lease_token = ?, lease_expires_at = ?, "
+                "status = CASE WHEN status = 'pending' THEN 'retrying' ELSE status END, "
+                "status_updated_at = CASE WHEN status = 'pending' THEN ? ELSE status_updated_at END "
+                "WHERE id = ? AND julianday(scheduled_at) <= julianday(?) "
+                "AND attempt_num <= ? AND superseded = 0 AND status IN ('pending', 'retrying') "
+                "AND (lease_token IS NULL OR julianday(lease_expires_at) < julianday(?)) "
+                "AND writer_revision = ?",
+                (
+                    lease_token,
+                    lease_expires.isoformat(),
+                    claim_now.isoformat(),
+                    delivery_id,
+                    claim_now.isoformat(),
+                    max_attempts,
+                    claim_now.isoformat(),
+                    writer_revision,
+                ),
+            )
+            if updated:
+                detail = await _fetch_one(
+                    conn, _SQLITE_WEBHOOK_CLAIM_SELECT + " WHERE d.id = ?", (delivery_id,)
+                )
+                if detail is not None:
+                    claimed.append(_sqlite_webhook_claim(detail, lease_token, claim_now))
+        return claimed
+
+    async def guard_delivery_claim(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+    ) -> bool:
+        conn = self._conn(tx)
+        delivery = await _fetch_one(
+            conn,
+            "SELECT id, subscription_id, event_type, payload_hash, attempt_num "
+            "FROM webhook_deliveries WHERE id = ?",
+            (delivery_id,),
+        )
+        if delivery is None:
+            return False
+        now = await _sqlite_webhook_clock(conn)
+        live = await _fetch_val(
+            conn,
+            "SELECT EXISTS (SELECT 1 FROM webhook_deliveries WHERE id = ? "
+            "AND lease_token = ? AND julianday(lease_expires_at) > julianday(?) "
+            "AND status IN ('pending', 'retrying') AND superseded = 0)",
+            (delivery_id, lease_token, now.isoformat()),
+        )
+        if not live:
+            return False
+        peer_succeeded = await _fetch_val(
+            conn,
+            "SELECT EXISTS (SELECT 1 FROM webhook_deliveries peer WHERE "
+            "peer.subscription_id = ? AND peer.event_type = ? AND peer.payload_hash = ? "
+            "AND peer.status = 'succeeded' AND peer.id <> ?)",
+            (delivery["subscription_id"], delivery["event_type"], delivery["payload_hash"], delivery_id),
+        )
+        if peer_succeeded:
+            await self._abandon_owned(conn, delivery_id, lease_token, now, "succeeded-chain-peer-before-send", True)
+            return False
+        live_successor = await _fetch_val(
+            conn,
+            "SELECT EXISTS (SELECT 1 FROM webhook_deliveries newer WHERE "
+            "newer.subscription_id = ? AND newer.event_type = ? AND newer.payload_hash = ? "
+            "AND newer.attempt_num > ? AND newer.status IN ('pending', 'retrying') "
+            "AND newer.superseded = 0)",
+            (
+                delivery["subscription_id"],
+                delivery["event_type"],
+                delivery["payload_hash"],
+                delivery["attempt_num"],
+            ),
+        )
+        if live_successor:
+            await self._abandon_owned(conn, delivery_id, lease_token, now, None, True)
+            return False
+        return True
+
+    async def release_delivery_claim(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+    ) -> bool:
+        conn = self._conn(tx)
+        updated = await _execute_count(
+            conn,
+            "UPDATE webhook_deliveries SET lease_token = NULL, lease_expires_at = NULL "
+            "WHERE id = ? AND lease_token = ?",
+            (delivery_id, lease_token),
+        )
+        if not updated:
+            return False
+        row = await _fetch_one(
+            conn,
+            "SELECT status, superseded FROM webhook_deliveries WHERE id = ?",
+            (delivery_id,),
+        )
+        return row is not None and row["status"] in ("pending", "retrying") and not row["superseded"]
+
+    async def finalize_delivery(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+        outcome: WebhookDeliveryOutcome,
+        max_attempts: int,
+        backoff_schedule: Sequence[int],
+    ) -> WebhookFinalizationResult:
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        backoff_list = list(backoff_schedule)
+        if len(backoff_list) < max_attempts - 1:
+            raise ValueError(
+                f"backoff_schedule must contain at least max_attempts-1 "
+                f"({max_attempts - 1}) entries; got {len(backoff_list)}"
+            )
+        if any(delay <= 0 for delay in backoff_list):
+            raise ValueError("backoff_schedule must contain positive delays")
+
+        conn = self._conn(tx)
+        delivery = await _fetch_one(
+            conn,
+            "SELECT d.id, d.subscription_id, d.event_type, d.payload, d.payload_hash, "
+            "d.attempt_num, d.status, s.revoked FROM webhook_deliveries d "
+            "JOIN webhook_subscriptions s ON s.id = d.subscription_id WHERE d.id = ?",
+            (delivery_id,),
+        )
+        if delivery is None:
+            return WebhookFinalizationResult(applied=False)
+        now = await _sqlite_webhook_clock(conn)
+        chain = (
+            delivery["subscription_id"],
+            delivery["event_type"],
+            delivery["payload_hash"],
+        )
+
+        if outcome.succeeded:
+            peer_succeeded = await _fetch_val(
+                conn,
+                "SELECT EXISTS (SELECT 1 FROM webhook_deliveries peer WHERE "
+                "peer.subscription_id = ? AND peer.event_type = ? AND peer.payload_hash = ? "
+                "AND peer.status = 'succeeded' AND peer.id <> ?)",
+                (*chain, delivery_id),
+            )
+            if peer_succeeded:
+                applied = await self._abandon_owned(
+                    conn, delivery_id, lease_token, now, outcome.error, True,
+                    outcome.response_status, outcome.response_body,
+                )
+                return WebhookFinalizationResult(applied=applied, status="abandoned")
+            updated = await _execute_count(
+                conn,
+                "UPDATE webhook_deliveries SET status = 'succeeded', superseded = 0, "
+                "response_status = ?, response_body = ?, error = NULL, delivered_at = ?, "
+                "status_updated_at = ?, lease_token = NULL, lease_expires_at = NULL "
+                "WHERE id = ? AND lease_token = ? AND status IN ('pending', 'retrying') "
+                "AND superseded = 0",
+                (
+                    outcome.response_status,
+                    outcome.response_body,
+                    now.isoformat(),
+                    now.isoformat(),
+                    delivery_id,
+                    lease_token,
+                ),
+            )
+            if not updated:
+                abandoned = await self._abandon_owned(
+                    conn, delivery_id, lease_token, now, outcome.error, True,
+                    outcome.response_status, outcome.response_body,
+                )
+                if abandoned:
+                    return WebhookFinalizationResult(applied=True, status="abandoned")
+                await _execute(
+                    conn,
+                    "UPDATE webhook_deliveries SET lease_token = NULL, lease_expires_at = NULL "
+                    "WHERE id = ? AND lease_token = ?",
+                    (delivery_id, lease_token),
+                )
+                return WebhookFinalizationResult(applied=False)
+            successors = await _fetch_all(
+                conn,
+                "SELECT id FROM webhook_deliveries WHERE subscription_id = ? AND event_type = ? "
+                "AND payload_hash = ? AND attempt_num > ? AND status IN ('pending', 'retrying') "
+                "AND superseded = 0 AND (lease_token IS NULL OR julianday(lease_expires_at) < julianday(?))",
+                (*chain, delivery["attempt_num"], now.isoformat()),
+            )
+            for successor in successors:
+                await _execute(
+                    conn,
+                    "UPDATE webhook_deliveries SET status = 'abandoned', superseded = 1, "
+                    "status_updated_at = ?, lease_token = NULL, lease_expires_at = NULL "
+                    "WHERE id = ? AND status IN ('pending', 'retrying') AND superseded = 0 "
+                    "AND (lease_token IS NULL OR julianday(lease_expires_at) < julianday(?))",
+                    (now.isoformat(), successor["id"], now.isoformat()),
+                )
+            return WebhookFinalizationResult(applied=True, status="succeeded")
+
+        if delivery["revoked"]:
+            applied = await self._abandon_owned(
+                conn, delivery_id, lease_token, now, "subscription revoked", False,
+                outcome.response_status, outcome.response_body, require_unexpired=True,
+                delivered_at=now,
+            )
+            return WebhookFinalizationResult(applied=applied, status="abandoned" if applied else None)
+
+        peer_succeeded = await _fetch_val(
+            conn,
+            "SELECT EXISTS (SELECT 1 FROM webhook_deliveries peer WHERE "
+            "peer.subscription_id = ? AND peer.event_type = ? AND peer.payload_hash = ? "
+            "AND peer.status = 'succeeded' AND peer.id <> ?)",
+            (*chain, delivery_id),
+        )
+        if peer_succeeded:
+            applied = await self._abandon_owned(
+                conn, delivery_id, lease_token, now, outcome.error, True,
+                outcome.response_status, outcome.response_body, require_unexpired=True,
+            )
+            return WebhookFinalizationResult(applied=applied, status="abandoned")
+
+        next_attempt = int(delivery["attempt_num"]) + 1
+        if next_attempt > max_attempts:
+            applied = await self._abandon_owned(
+                conn, delivery_id, lease_token, now, outcome.error, False,
+                outcome.response_status, outcome.response_body, require_unexpired=True,
+                delivered_at=now,
+            )
+            return WebhookFinalizationResult(applied=applied, status="abandoned" if applied else None)
+
+        successor_exists = await _fetch_val(
+            conn,
+            "SELECT EXISTS (SELECT 1 FROM webhook_deliveries newer WHERE "
+            "newer.subscription_id = ? AND newer.event_type = ? AND newer.payload_hash = ? "
+            "AND newer.attempt_num > ?)",
+            (*chain, delivery["attempt_num"]),
+        )
+        applied = await self._abandon_owned(
+            conn, delivery_id, lease_token, now, outcome.error, True,
+            outcome.response_status, outcome.response_body, require_unexpired=True,
+        )
+        if not applied:
+            return WebhookFinalizationResult(applied=False)
+        successor_id: str | None = None
+        if not successor_exists:
+            scheduled_at = now + timedelta(seconds=backoff_list[int(delivery["attempt_num"]) - 1])
+            candidate_id = str(uuid.uuid4())
+            await _execute(
+                conn,
+                "INSERT OR IGNORE INTO webhook_deliveries "
+                "(id, subscription_id, event_type, payload, payload_hash, attempt_num, "
+                "status, scheduled_at, writer_revision, status_updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (
+                    candidate_id,
+                    delivery["subscription_id"],
+                    delivery["event_type"],
+                    delivery["payload"],
+                    delivery["payload_hash"],
+                    next_attempt,
+                    scheduled_at.isoformat(),
+                    webhook_constants.NEW_CODE_WRITER_REVISION,
+                    now.isoformat(),
+                ),
+            )
+            inserted = await _fetch_val(
+                conn,
+                "SELECT id FROM webhook_deliveries WHERE subscription_id = ? AND event_type = ? "
+                "AND payload_hash = ? AND attempt_num = ? AND status IN ('pending', 'retrying') "
+                "AND superseded = 0",
+                (*chain, next_attempt),
+            )
+            successor_id = str(inserted) if inserted is not None else None
+        return WebhookFinalizationResult(
+            applied=True, status="abandoned", successor_delivery_id=successor_id
+        )
+
+    async def store_delivery_response_body(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        response_body: str,
+    ) -> bool:
+        return (
+            await _execute_count(
+                self._conn(tx),
+                "UPDATE webhook_deliveries SET response_body = ? WHERE id = ?",
+                (response_body, delivery_id),
+            )
+            > 0
+        )
+
+    async def repair_delivery_chains(self, tx: Transaction) -> int:
+        now = await _sqlite_webhook_clock(self._conn(tx))
+        return await _execute_count(
+            self._conn(tx),
+            "UPDATE webhook_deliveries AS d SET status = 'abandoned', superseded = 1, "
+            "status_updated_at = ?, lease_token = NULL, lease_expires_at = NULL "
+            "WHERE d.status IN ('pending', 'retrying') AND d.superseded = 0 "
+            "AND (d.lease_token IS NULL OR julianday(d.lease_expires_at) < julianday(?)) "
+            "AND (EXISTS (SELECT 1 FROM webhook_deliveries newer WHERE "
+            "newer.subscription_id = d.subscription_id AND newer.event_type = d.event_type "
+            "AND newer.payload_hash = d.payload_hash AND newer.attempt_num > d.attempt_num) "
+            "OR EXISTS (SELECT 1 FROM webhook_deliveries peer WHERE "
+            "peer.subscription_id = d.subscription_id AND peer.event_type = d.event_type "
+            "AND peer.payload_hash = d.payload_hash AND peer.status = 'succeeded'))",
+            (now.isoformat(), now.isoformat()),
+        )
+
+    async def insert_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str | None = None,
+        url: str,
+        events: Sequence[str],
+        secret: str | None = None,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> str:
+        subscription_id = subscription_id or str(uuid.uuid4())
+        await self.create_subscription(
+            tx,
+            subscription_id=subscription_id,
+            url=url,
+            events=events,
+            secret=secret or "",
+            description=None,
+            owner_id=owner_id,
+            namespace=namespace,
+        )
+        return subscription_id
+
     async def fetch_deliveries(self, tx: Transaction, subscription_id: str | None = None) -> list[Row]:
         if subscription_id is None:
             return await _fetch_all(self._conn(tx), "SELECT * FROM webhook_deliveries ORDER BY created_at ASC")
@@ -2497,6 +3092,115 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
             "SELECT * FROM webhook_deliveries WHERE subscription_id = ? ORDER BY created_at ASC",
             (subscription_id,),
         )
+
+
+_SQLITE_WEBHOOK_CLAIM_SELECT = (
+    "SELECT d.id, d.subscription_id, d.event_type, d.payload, d.payload_hash, "
+    "d.attempt_num, d.status, d.response_status, d.response_body, d.error, "
+    "d.scheduled_at, d.delivered_at, d.created_at AS created, d.status_updated_at, "
+    "d.superseded, d.lease_token, d.lease_expires_at, d.writer_revision, "
+    "s.url, s.secret, s.revoked, s.owner_id, s.namespace "
+    "FROM webhook_deliveries d JOIN webhook_subscriptions s ON s.id = d.subscription_id"
+)
+
+
+def _validate_webhook_scope(owner_id: str | None, namespace: str | None, method: str) -> None:
+    if (owner_id is None) != (namespace is None):
+        raise ValueError(
+            f"{method} requires both owner_id and namespace to be set, "
+            "or both to be None for a root/operator view"
+        )
+
+
+async def _sqlite_webhook_clock(conn: Any) -> datetime:
+    value = await _fetch_val(conn, "SELECT strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')")
+    return _sqlite_webhook_datetime(value)
+
+
+def _sqlite_webhook_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _sqlite_webhook_subscription(row: Any) -> WebhookSubscriptionRecord:
+    events = _json_list(row["events"])
+    return WebhookSubscriptionRecord(
+        id=str(row["id"]),
+        url=row["url"],
+        events=tuple(str(event) for event in events),
+        description=row.get("description") if isinstance(row, dict) else None,
+        owner_id=row["owner_id"],
+        namespace=row["namespace"],
+        created=_sqlite_webhook_datetime(row["created"]),
+        revoked=bool(row["revoked"]),
+        revoked_at=(
+            _sqlite_webhook_datetime(row["revoked_at"])
+            if row["revoked_at"] is not None
+            else None
+        ),
+    )
+
+
+def _sqlite_webhook_delivery(row: Any) -> WebhookDeliveryRecord:
+    status = row["status"]
+    if status not in ("pending", "retrying", "succeeded", "abandoned"):
+        raise ValueError(f"unexpected webhook_deliveries status {status!r}")
+    return WebhookDeliveryRecord(
+        id=str(row["id"]),
+        subscription_id=str(row["subscription_id"]),
+        event_type=row["event_type"],
+        payload=row["payload"],
+        payload_hash=row["payload_hash"],
+        attempt_num=int(row["attempt_num"]),
+        status=status,
+        response_status=row["response_status"],
+        response_body=row["response_body"],
+        error=row["error"],
+        scheduled_at=_sqlite_webhook_datetime(row["scheduled_at"]),
+        delivered_at=(
+            _sqlite_webhook_datetime(row["delivered_at"])
+            if row["delivered_at"] is not None
+            else None
+        ),
+        created=_sqlite_webhook_datetime(row["created"]),
+        status_updated_at=_sqlite_webhook_datetime(row["status_updated_at"]),
+        superseded=bool(row["superseded"]),
+        lease_token=str(row["lease_token"]) if row["lease_token"] is not None else None,
+        lease_expires_at=(
+            _sqlite_webhook_datetime(row["lease_expires_at"])
+            if row["lease_expires_at"] is not None
+            else None
+        ),
+        writer_revision=int(row["writer_revision"] or 0),
+    )
+
+
+def _sqlite_webhook_claim(
+    row: Any,
+    lease_token: str,
+    claim_now: datetime,
+) -> WebhookDeliveryClaim:
+    row_token = row["lease_token"]
+    if row_token is not None and str(row_token) != lease_token:
+        raise ValueError("lease_token returned by SQLite does not match caller-supplied token")
+    delivery = _sqlite_webhook_delivery(row)
+    return WebhookDeliveryClaim(
+        delivery=delivery,
+        lease_token=lease_token,
+        lease_expires_at=_sqlite_webhook_datetime(row["lease_expires_at"]),
+        claim_db_now=claim_now,
+        url=row["url"],
+        secret=row["secret"] or "",
+        subscription_revoked=bool(row["revoked"]),
+        owner_id=row["owner_id"],
+        namespace=row["namespace"],
+    )
 
 
 class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepository):
@@ -4850,6 +5554,7 @@ class SqliteBackend:
             "entities",
         ):
             await self._ensure_columns(conn, table, {"deleted_at": "deleted_at TEXT"})
+        await self._ensure_columns(conn, "webhook_subscriptions", {"description": "description TEXT"})
         # Existing databases predate chain_algo. Backfill it as sha256-v1: those
         # rows were signed by the legacy unkeyed hash, and labelling them is what
         # lets the verifier check them WITHOUT re-signing a tamper-evident log.
