@@ -1223,24 +1223,24 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
         END
     ) STORED,
     PRIMARY KEY (id),
+    -- RESTRICT not CASCADE: subscription_id feeds the STORED generated
+    -- columns above, and MySQL forbids CASCADE/SET NULL/SET DEFAULT on a
+    -- FK whose column is used in a generated-column expression (errno 1215).
+    -- Subscriptions are soft-deleted via `revoked`, never hard-deleted, so
+    -- this is a no-op in practice.
     CONSTRAINT fk_webhook_deliveries_subscription
-        FOREIGN KEY (subscription_id) REFERENCES webhook_subscriptions(id) ON DELETE CASCADE
+        FOREIGN KEY (subscription_id) REFERENCES webhook_subscriptions(id) ON DELETE RESTRICT,
+    -- Inline, not standalone CREATE INDEX IF NOT EXISTS: real MySQL 8 (as
+    -- opposed to MariaDB) doesn't support IF NOT EXISTS on CREATE INDEX at
+    -- all. CREATE TABLE IF NOT EXISTS already makes the whole table
+    -- (including these) idempotent.
+    KEY idx_webhook_deliveries_subscription (subscription_id, created),
+    KEY idx_webhook_deliveries_pending (scheduled_at),
+    KEY idx_webhook_deliveries_lease_expires_at (lease_expires_at),
+    UNIQUE KEY uq_webhook_deliveries_live_chain_attempt (live_chain_key),
+    UNIQUE KEY uq_webhook_deliveries_succeeded_chain (succeeded_chain_key)
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
-
-
-_DDL_WEBHOOK_DELIVERIES_INDEXES = (
-    "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription "
-    "ON webhook_deliveries(subscription_id, created)",
-    "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending "
-    "ON webhook_deliveries(scheduled_at)",
-    "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_lease_expires_at "
-    "ON webhook_deliveries(lease_expires_at)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_live_chain_attempt "
-    "ON webhook_deliveries(live_chain_key)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_succeeded_chain "
-    "ON webhook_deliveries(succeeded_chain_key)",
-)
 
 
 _DDL_WEBHOOK_TRIGGERS = """
@@ -1272,7 +1272,6 @@ async def _ensure_mysql_webhook_schema(conn: Any) -> None:
         for ddl in (
             _DDL_WEBHOOK_SUBSCRIPTIONS,
             _DDL_WEBHOOK_DELIVERIES,
-            *_DDL_WEBHOOK_DELIVERIES_INDEXES,
             _DDL_WEBHOOK_TRIGGERS,
         ):
             for statement in _split_mysql_statements(ddl):
@@ -3841,7 +3840,11 @@ class MysqlWebhookRepository(WebhookRepository):
               AND (
                 status = 'pending'
                 OR NOT EXISTS (
-                  SELECT 1 FROM webhook_deliveries newer
+                  -- Wrapped as a materialized derived table, not a bare
+                  -- self-reference: MySQL forbids selecting directly from
+                  -- the table being updated (errno 1093), even in a
+                  -- correlated subquery. Postgres has no such restriction.
+                  SELECT 1 FROM (SELECT * FROM webhook_deliveries) AS newer
                   WHERE newer.subscription_id = webhook_deliveries.subscription_id
                     AND newer.event_type = webhook_deliveries.event_type
                     AND newer.payload_hash = webhook_deliveries.payload_hash
@@ -4641,14 +4644,16 @@ class MysqlWebhookRepository(WebhookRepository):
                   AND (d.lease_token IS NULL OR d.lease_expires_at < NOW(6))
                   AND (
                     EXISTS (
-                      SELECT 1 FROM webhook_deliveries newer
+                      -- Materialized derived table, not a bare self-reference
+                      -- to the table being updated (errno 1093).
+                      SELECT 1 FROM (SELECT * FROM webhook_deliveries) AS newer
                       WHERE newer.subscription_id = d.subscription_id
                         AND newer.event_type = d.event_type
                         AND newer.payload_hash = d.payload_hash
                         AND newer.attempt_num > d.attempt_num
                     )
                     OR EXISTS (
-                      SELECT 1 FROM webhook_deliveries peer
+                      SELECT 1 FROM (SELECT * FROM webhook_deliveries) AS peer
                       WHERE peer.subscription_id = d.subscription_id
                         AND peer.event_type = d.event_type
                         AND peer.payload_hash = d.payload_hash

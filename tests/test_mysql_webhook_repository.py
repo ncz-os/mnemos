@@ -106,20 +106,20 @@ WEBHOOK_SCHEMA_DDL: tuple[str, ...] = (
             END
         ) STORED,
         PRIMARY KEY (id),
+        -- RESTRICT not CASCADE: subscription_id feeds the STORED generated
+        -- columns above; MySQL forbids CASCADE/SET NULL/SET DEFAULT on a FK
+        -- whose column feeds a generated-column expression (errno 1215).
         CONSTRAINT fk_webhook_deliveries_subscription
-            FOREIGN KEY (subscription_id) REFERENCES webhook_subscriptions(id) ON DELETE CASCADE
+            FOREIGN KEY (subscription_id) REFERENCES webhook_subscriptions(id) ON DELETE RESTRICT,
+        -- Inline, not standalone CREATE INDEX IF NOT EXISTS: real MySQL 8
+        -- doesn't support IF NOT EXISTS on CREATE INDEX at all.
+        KEY idx_webhook_deliveries_subscription (subscription_id, created),
+        KEY idx_webhook_deliveries_pending (scheduled_at),
+        KEY idx_webhook_deliveries_lease_expires_at (lease_expires_at),
+        UNIQUE KEY uq_webhook_deliveries_live_chain_attempt (live_chain_key),
+        UNIQUE KEY uq_webhook_deliveries_succeeded_chain (succeeded_chain_key)
     ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
-    "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription "
-    "ON webhook_deliveries(subscription_id, created)",
-    "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending "
-    "ON webhook_deliveries(scheduled_at)",
-    "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_lease_expires_at "
-    "ON webhook_deliveries(lease_expires_at)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_live_chain_attempt "
-    "ON webhook_deliveries(live_chain_key)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_succeeded_chain "
-    "ON webhook_deliveries(succeeded_chain_key)",
     """
     DROP TRIGGER IF EXISTS webhook_deliveries_set_status_updated_at
     """,

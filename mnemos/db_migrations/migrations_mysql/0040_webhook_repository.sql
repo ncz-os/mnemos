@@ -86,21 +86,24 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
         END
     ) STORED,
     PRIMARY KEY (id),
+    -- RESTRICT not CASCADE: subscription_id feeds the STORED generated
+    -- columns above, and MySQL forbids CASCADE/SET NULL/SET DEFAULT on a
+    -- FK whose column is used in a generated-column expression (errno 1215).
+    -- Subscriptions are soft-deleted via `revoked`, never hard-deleted, so
+    -- this is a no-op in practice.
     CONSTRAINT fk_webhook_deliveries_subscription
-        FOREIGN KEY (subscription_id) REFERENCES webhook_subscriptions(id) ON DELETE CASCADE
+        FOREIGN KEY (subscription_id) REFERENCES webhook_subscriptions(id) ON DELETE RESTRICT,
+    -- Inline, not standalone CREATE INDEX IF NOT EXISTS: real MySQL 8 (as
+    -- opposed to MariaDB) doesn't support IF NOT EXISTS on CREATE INDEX at
+    -- all. CREATE TABLE IF NOT EXISTS already makes the whole table
+    -- (including these) idempotent.
+    KEY idx_webhook_deliveries_subscription (subscription_id, created),
+    KEY idx_webhook_deliveries_pending (scheduled_at),
+    KEY idx_webhook_deliveries_lease_expires_at (lease_expires_at),
+    UNIQUE KEY uq_webhook_deliveries_live_chain_attempt (live_chain_key),
+    UNIQUE KEY uq_webhook_deliveries_succeeded_chain (succeeded_chain_key)
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 ;
-
-CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription
-    ON webhook_deliveries(subscription_id, created);
-CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending
-    ON webhook_deliveries(scheduled_at);
-CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_lease_expires_at
-    ON webhook_deliveries(lease_expires_at);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_live_chain_attempt
-    ON webhook_deliveries(live_chain_key);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_succeeded_chain
-    ON webhook_deliveries(succeeded_chain_key);
 
 -- status transition clock (replaces Postgres
 -- webhook_deliveries_set_status_updated_at plpgsql trigger).
