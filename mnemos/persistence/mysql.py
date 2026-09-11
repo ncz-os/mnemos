@@ -56,7 +56,7 @@ import math
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
@@ -84,8 +84,14 @@ from mnemos.persistence.base import (
     StateRepository,
     Transaction,
     VersionRepository,
+    WebhookDeliveryClaim,
+    WebhookDeliveryOutcome,
+    WebhookDeliveryRecord,
+    WebhookFinalizationResult,
     WebhookRepository,
+    WebhookSubscriptionRecord,
 )
+from mnemos.core import webhook_constants
 from mnemos.persistence.hot_search import HotSearchMixin
 from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
 from mnemos.persistence.mysql_oauth import MysqlBrowserOAuthMixin
@@ -358,10 +364,179 @@ async def _ensure_mysql_columns(conn: Any, table: str, definitions: dict[str, st
                 await cursor.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
-_MYSQL_WEBHOOKS_UNSUPPORTED = (
-    "mysql: webhooks are not supported by MysqlBackend yet; "
-    "use a backend with webhook outbox support before accessing backend.webhooks"
-)
+def _split_mysql_statements(sql: str) -> list[str]:
+    """Statement splitter that understands MySQL/MariaDB trigger bodies.
+
+    The shared ``split_postgres_statements`` helper in ``mnemos.persistence.schema``
+    only handles plpgsql ``$$ ... $$`` dollar-tag blocks; it does not understand
+    MySQL ``CREATE TRIGGER ... BEGIN ... END`` bodies, which contain their own
+    internal ``;`` separators.  Without BEGIN/END tracking, the splitter chops a
+    multi-statement trigger body in half and the engine rejects the partial
+    DDL with a syntax error.
+
+    This splitter is the same as ``_split_semicolon_statements`` plus one rule:
+    when a top-level statement opens a ``BEGIN ... END`` block, keep consuming
+    characters until the matching ``END`` closes the body at depth 0 before
+    yielding the buffer as one statement.  BEGIN keywords inside string
+    literals, line/block comments, or already-open nested BEGIN blocks do not
+    affect the open/close counter.  Composite END tokens (``END IF``, ``END
+    LOOP``, ``END CASE``, ``END WHILE``, ``END REPEAT``) never close a body.
+    """
+    statements: list[str] = []
+    buffer: list[str] = []
+    in_line_comment = False
+    in_block_comment = False
+    in_single = False
+    in_double = False
+    begin_depth = 0
+    i = 0
+    length = len(sql)
+    composite_enders = ("IF", "LOOP", "CASE", "WHILE", "REPEAT")
+
+    def _is_word_char(ch: str) -> bool:
+        return ch.isalnum() or ch == "_"
+
+    def _match_word(idx: int, word: str) -> bool:
+        end = idx + len(word)
+        if end > length:
+            return False
+        if sql[idx:end].upper() != word:
+            return False
+        prev = sql[idx - 1] if idx > 0 else ""
+        nxt_char = sql[end] if end < length else ""
+        return not _is_word_char(prev) and not _is_word_char(nxt_char)
+
+    while i < length:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < length else ""
+
+        if in_line_comment:
+            buffer.append(ch)
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            buffer.append(ch)
+            if ch == "*" and nxt == "/":
+                buffer.append(nxt)
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_single:
+            buffer.append(ch)
+            if ch == "'" and nxt == "'":
+                buffer.append(nxt)
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            buffer.append(ch)
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+
+        if ch == "-" and nxt == "-":
+            buffer.extend((ch, nxt))
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            buffer.extend((ch, nxt))
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            buffer.append(ch)
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            buffer.append(ch)
+            in_double = True
+            i += 1
+            continue
+
+        # Inside an open BEGIN block: track depth, ignore outer semicolons.
+        if begin_depth > 0:
+            if _match_word(i, "BEGIN"):
+                begin_depth += 1
+                buffer.append("BEGIN")
+                i += 5
+                continue
+            if _match_word(i, "END"):
+                # Composite END trailers (``END IF``, ``END LOOP``, ...) do
+                # NOT close the body. Only a bare ``END`` decrements depth.
+                tail_idx = i + 3
+                while tail_idx < length and sql[tail_idx] in " \t\r\n":
+                    tail_idx += 1
+                is_composite = False
+                for kw in composite_enders:
+                    if _match_word(tail_idx, kw):
+                        # Copy the full ``END <kw>`` token verbatim and step past.
+                        kw_end = tail_idx + len(kw)
+                        buffer.append(sql[i:kw_end])
+                        i = kw_end
+                        is_composite = True
+                        break
+                if is_composite:
+                    continue
+                begin_depth -= 1
+                buffer.append("END")
+                i += 3
+                if begin_depth == 0:
+                    # Consume trailing whitespace + the statement terminator.
+                    while i < length and sql[i] in " \t\r\n":
+                        buffer.append(sql[i])
+                        i += 1
+                    if i < length and sql[i] == ";":
+                        buffer.append(";")
+                        i += 1
+                    statement = "".join(buffer).strip()
+                    if statement and _has_executable_mysql_sql(statement):
+                        statements.append(statement)
+                    buffer = []
+                continue
+            buffer.append(ch)
+            i += 1
+            continue
+
+        # Top-level: detect BEGIN (opens body) vs ; (ends statement).
+        if _match_word(i, "BEGIN"):
+            begin_depth = 1
+            buffer.append("BEGIN")
+            i += 5
+            continue
+
+        if ch == ";":
+            statement = "".join(buffer).strip()
+            if statement and _has_executable_mysql_sql(statement):
+                statements.append(statement)
+            buffer = []
+            i += 1
+            continue
+
+        buffer.append(ch)
+        i += 1
+
+    tail = "".join(buffer).strip()
+    if tail and _has_executable_mysql_sql(tail):
+        statements.append(tail)
+    return statements
+
+
+def _has_executable_mysql_sql(statement: str) -> bool:
+    for line in statement.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("--"):
+            return True
+    return False
 
 
 # ── DDL ───────────────────────────────────────────────────────────────────────
@@ -989,6 +1164,118 @@ async def _ensure_mysql_oauth_schema(conn: Any) -> None:
     async with conn.cursor() as cursor:
         for name in ("0052_oauth_repository.sql", "0053_mcp_oauth.sql"):
             for statement in split_postgres_statements((directory / name).read_text(encoding="utf-8")):
+                await cursor.execute(statement)
+
+
+# ── webhook DDL (item 5) ────────────────────────────────────────────────────
+
+
+_DDL_WEBHOOK_SUBSCRIPTIONS = """
+CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+    id              VARCHAR(64)   NOT NULL DEFAULT (UUID()),
+    url             TEXT         NOT NULL,
+    events          JSON         NOT NULL,
+    secret          TEXT         NOT NULL,
+    description     TEXT         NULL,
+    owner_id        VARCHAR(256) NOT NULL DEFAULT 'default',
+    namespace       VARCHAR(256) NOT NULL DEFAULT 'default',
+    created         DATETIME(6)  NOT NULL DEFAULT NOW(6),
+    revoked         TINYINT(1)   NOT NULL DEFAULT 0,
+    revoked_at      DATETIME(6)  NULL,
+    PRIMARY KEY (id),
+    INDEX idx_webhook_subscriptions_owner (owner_id, namespace)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+
+_DDL_WEBHOOK_DELIVERIES = """
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id                VARCHAR(64)   NOT NULL DEFAULT (UUID()),
+    subscription_id   VARCHAR(64)   NOT NULL,
+    event_type        VARCHAR(256)  NOT NULL,
+    payload           LONGTEXT      NOT NULL,
+    payload_hash      VARCHAR(64)   NOT NULL,
+    attempt_num       INT           NOT NULL DEFAULT 1,
+    status            VARCHAR(32)   NOT NULL DEFAULT 'pending',
+    response_status   INT           NULL,
+    response_body     LONGTEXT      NULL,
+    error             TEXT          NULL,
+    scheduled_at      DATETIME(6)   NOT NULL DEFAULT NOW(6),
+    delivered_at      DATETIME(6)   NULL,
+    created           DATETIME(6)   NOT NULL DEFAULT NOW(6),
+    lease_token       VARCHAR(64)   NULL,
+    lease_expires_at  DATETIME(6)   NULL,
+    writer_revision   INT           NOT NULL DEFAULT 1,
+    status_updated_at DATETIME(6)   NOT NULL DEFAULT NOW(6),
+    superseded        TINYINT(1)    NOT NULL DEFAULT 0,
+    live_chain_key    VARCHAR(768)  GENERATED ALWAYS AS (
+        CASE
+            WHEN status IN ('pending', 'retrying') AND superseded = 0
+            THEN CONCAT(subscription_id, '|', event_type, '|', payload_hash, '|', attempt_num)
+            ELSE NULL
+        END
+    ) STORED,
+    succeeded_chain_key VARCHAR(768) GENERATED ALWAYS AS (
+        CASE
+            WHEN status = 'succeeded'
+            THEN CONCAT(subscription_id, '|', event_type, '|', payload_hash)
+            ELSE NULL
+        END
+    ) STORED,
+    PRIMARY KEY (id),
+    CONSTRAINT fk_webhook_deliveries_subscription
+        FOREIGN KEY (subscription_id) REFERENCES webhook_subscriptions(id) ON DELETE CASCADE
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+
+_DDL_WEBHOOK_DELIVERIES_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription "
+    "ON webhook_deliveries(subscription_id, created)",
+    "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending "
+    "ON webhook_deliveries(scheduled_at)",
+    "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_lease_expires_at "
+    "ON webhook_deliveries(lease_expires_at)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_live_chain_attempt "
+    "ON webhook_deliveries(live_chain_key)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_succeeded_chain "
+    "ON webhook_deliveries(succeeded_chain_key)",
+)
+
+
+_DDL_WEBHOOK_TRIGGERS = """
+DROP TRIGGER IF EXISTS webhook_deliveries_set_status_updated_at;
+CREATE TRIGGER webhook_deliveries_set_status_updated_at
+BEFORE UPDATE ON webhook_deliveries
+FOR EACH ROW
+  SET NEW.status_updated_at = IF(OLD.status <> NEW.status, NOW(6), OLD.status_updated_at);
+
+DROP TRIGGER IF EXISTS webhook_deliveries_enforce_succeeded_terminal;
+CREATE TRIGGER webhook_deliveries_enforce_succeeded_terminal
+BEFORE UPDATE ON webhook_deliveries
+FOR EACH ROW
+BEGIN
+  IF OLD.status = 'succeeded' AND NEW.status <> 'succeeded' THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'webhook_deliveries: cannot transition status away from succeeded';
+  END IF;
+END;
+"""
+
+
+async def _ensure_mysql_webhook_schema(conn: Any) -> None:
+    """Provision webhook_subscriptions + webhook_deliveries and their
+    triggers on first open.  Splits the SQL with ``_split_mysql_statements``
+    so the trigger ``BEGIN ... END`` body survives intact.
+    """
+    async with conn.cursor() as cursor:
+        for ddl in (
+            _DDL_WEBHOOK_SUBSCRIPTIONS,
+            _DDL_WEBHOOK_DELIVERIES,
+            *_DDL_WEBHOOK_DELIVERIES_INDEXES,
+            _DDL_WEBHOOK_TRIGGERS,
+        ):
+            for statement in _split_mysql_statements(ddl):
                 await cursor.execute(statement)
 
 
@@ -3190,6 +3477,236 @@ class MysqlCompressionQueueRepository(CompressionQueueRepository):
 
 
 class MysqlWebhookRepository(WebhookRepository):
+    """MySQL/MariaDB WebhookRepository implementation.
+
+    Implements the full 13-method ABC contract (item 5 of 12) by mirroring
+    ``PostgresWebhookRepository``'s row-per-attempt semantics.  Notable
+    dialect adaptations vs Postgres / SQLite:
+
+    * ``RETURNING`` is not available in MySQL/MariaDB UPDATE statements;
+      the repository SELECTs the affected rows separately after the
+      ``UPDATE`` rather than relying on ``RETURNING``.
+    * Partial unique indexes ``WHERE status IN (...)`` are emulated with
+      generated columns whose value is NULL for terminal rows; MySQL and
+      MariaDB unique indexes both permit multiple NULLs, so terminal rows
+      may repeat while live rows still enforce one-attempt-per-chain.
+    * ``SELECT ... FOR UPDATE SKIP LOCKED`` is supported by both MySQL
+      8.0+ and MariaDB 10.6+ on InnoDB - the recovery claim query uses
+      that primitive directly.
+    * The Postgres advisory lock ``pg_advisory_xact_lock`` is replaced
+      with a MySQL session-scoped named lock (``GET_LOCK`` /
+      ``RELEASE_LOCK``); the transaction's ``_release_named_locks`` hook
+      releases any lock acquired during finalize/guard.
+
+    The ``MysqlBackend.webhooks`` accessor is intentionally kept failing
+    closed with ``BackendCapabilityMissing``: the storage layer is now
+    consistent with the ABC, but no MySQL/MariaDB delivery worker is
+    wired up in production, and advertising delivery would strand rows.
+    The 13-method implementation is verified by the conformance gate +
+    a live MariaDB integration test (``tests/test_mysql_webhook_repository.py``).
+    """
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    async def _row_count(self, cursor: Any) -> int:
+        """Read the affected-row count from an aiomysql cursor.
+
+        aiomysql exposes ``cursor.rowcount`` as a synchronous attribute set
+        after the most recent ``execute()``; ``UPDATE ... ON DUPLICATE KEY
+        UPDATE id=id`` returns 0 for matched-but-unchanged rows and 1 for
+        a fresh insert, which is exactly what the ABC expects.
+        """
+        return int(getattr(cursor, "rowcount", 0) or 0)
+
+    @staticmethod
+    async def _db_now(conn: Any) -> datetime:
+        """Read the database clock as a tz-aware UTC ``datetime``.
+
+        MySQL ``NOW(6)`` is session-time-zone-relative; ``MysqlBackend.open``
+        pins ``SET time_zone='+00:00'`` so the value is already UTC, but we
+        still call ``astimezone(UTC)`` to defend against sessions that drift.
+        Aliased to ``db_now`` so the shared ``_fetchone_dict`` (which
+        lowercases column names) does not collide with the function name.
+        """
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT NOW(6) AS db_now")
+            row = await _fetchone_dict(cursor)
+        value = row["db_now"] if row else None
+        if not isinstance(value, datetime):
+            raise RuntimeError(
+                f"mysql: expected NOW(6) datetime from SELECT, got {value!r}"
+            )
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    # ── subscription surface ─────────────────────────────────────────────────
+
+    async def create_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        url: str,
+        events: Sequence[str],
+        secret: str,
+        description: str | None,
+        owner_id: str,
+        namespace: str,
+    ) -> WebhookSubscriptionRecord:
+        conn = _mysql_tx(tx).conn
+        events_json = json.dumps(list(events))
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO webhook_subscriptions
+                    (id, url, events, secret, description, owner_id, namespace)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    subscription_id,
+                    url,
+                    events_json,
+                    secret,
+                    description,
+                    owner_id,
+                    namespace,
+                ),
+            )
+            await cursor.execute(
+                """
+                SELECT id, url, events, description, owner_id, namespace,
+                       created, revoked, revoked_at
+                FROM webhook_subscriptions
+                WHERE id = %s
+                """,
+                (subscription_id,),
+            )
+            row = await _fetchone_dict(cursor)
+        if row is None:
+            raise RuntimeError("mysql: webhook subscription insert returned no row")
+        return _mysql_webhook_subscription(row)
+
+    async def list_subscriptions(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str | None,
+        namespace: str | None,
+        include_revoked: bool,
+        limit: int,
+    ) -> list[WebhookSubscriptionRecord]:
+        _validate_webhook_scope(owner_id, namespace, "list_subscriptions")
+        conn = _mysql_tx(tx).conn
+        conditions: list[str] = []
+        params: list[Any] = []
+        if not include_revoked:
+            conditions.append("revoked = 0")
+        if owner_id is not None:
+            conditions.append("owner_id = %s")
+            params.append(owner_id)
+            conditions.append("namespace = %s")
+            params.append(namespace)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        params.append(int(limit))
+        sql = (
+            "SELECT id, url, events, description, owner_id, namespace, "
+            "created, revoked, revoked_at "
+            "FROM webhook_subscriptions "
+            f"{where} ORDER BY created DESC LIMIT %s"
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(params))
+            rows = await _fetch_all_dicts(cursor)
+        return [_mysql_webhook_subscription(row) for row in rows]
+
+    async def get_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> WebhookSubscriptionRecord | None:
+        _validate_webhook_scope(owner_id, namespace, "get_subscription")
+        conn = _mysql_tx(tx).conn
+        conditions = ["id = %s"]
+        params: list[Any] = [subscription_id]
+        if owner_id is not None:
+            conditions.append("owner_id = %s")
+            params.append(owner_id)
+            conditions.append("namespace = %s")
+            params.append(namespace)
+        sql = (
+            "SELECT id, url, events, description, owner_id, namespace, "
+            "created, revoked, revoked_at FROM webhook_subscriptions WHERE "
+            + " AND ".join(conditions)
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(params))
+            row = await _fetchone_dict(cursor)
+        return _mysql_webhook_subscription(row) if row is not None else None
+
+    async def revoke_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> bool:
+        _validate_webhook_scope(owner_id, namespace, "revoke_subscription")
+        conn = _mysql_tx(tx).conn
+        conditions = ["id = %s", "revoked = 0"]
+        params: list[Any] = [subscription_id]
+        if owner_id is not None:
+            conditions.append("owner_id = %s")
+            params.append(owner_id)
+            conditions.append("namespace = %s")
+            params.append(namespace)
+        sql = (
+            "UPDATE webhook_subscriptions "
+            "SET revoked = 1, revoked_at = NOW(6) "
+            "WHERE " + " AND ".join(conditions)
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(params))
+            return (await self._row_count(cursor)) > 0
+
+    async def list_deliveries(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+        limit: int,
+    ) -> list[WebhookDeliveryRecord]:
+        _validate_webhook_scope(owner_id, namespace, "list_deliveries")
+        conn = _mysql_tx(tx).conn
+        params: list[Any] = [subscription_id]
+        scope = ""
+        if owner_id is not None:
+            scope = " AND s.owner_id = %s AND s.namespace = %s"
+            params.extend((owner_id, namespace))
+        params.append(int(limit))
+        sql = (
+            "SELECT d.id, d.subscription_id, d.event_type, d.payload, d.payload_hash, "
+            "d.attempt_num, d.status, d.response_status, d.response_body, d.error, "
+            "d.scheduled_at, d.delivered_at, d.created, d.status_updated_at, "
+            "d.superseded, d.lease_token, d.lease_expires_at, d.writer_revision "
+            "FROM webhook_deliveries d "
+            "JOIN webhook_subscriptions s ON s.id = d.subscription_id "
+            f"WHERE d.subscription_id = %s{scope} "
+            "ORDER BY d.created DESC LIMIT %s"
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(params))
+            rows = await _fetch_all_dicts(cursor)
+        return [_mysql_webhook_delivery(row) for row in rows]
+
+    # ── dispatch (outbox enqueue) ────────────────────────────────────────────
+
     async def dispatch_event(
         self,
         tx: Transaction,
@@ -3199,7 +3716,1140 @@ class MysqlWebhookRepository(WebhookRepository):
         owner_id: str | None = None,
         namespace: str | None = None,
     ) -> list[str]:
-        raise NotImplementedError(_MYSQL_WEBHOOKS_UNSUPPORTED)
+        conn = _mysql_tx(tx).conn
+        conditions = ["revoked = 0"]
+        params: list[Any] = []
+        if owner_id is not None:
+            conditions.append("owner_id = %s")
+            params.append(owner_id)
+        if namespace is not None:
+            conditions.append("namespace = %s")
+            params.append(namespace)
+        sql_sub = (
+            "SELECT id, url, owner_id, namespace, events FROM webhook_subscriptions WHERE "
+            + " AND ".join(conditions)
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(sql_sub, tuple(params))
+            subscriptions = await _fetch_all_dicts(cursor)
+        body = json.dumps(
+            {
+                "event": event_type,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "data": payload,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        delivery_ids: list[str] = []
+        async with conn.cursor() as cursor:
+            for sub in subscriptions:
+                # The events column is JSON; MySQL returns it as either a JSON
+                # string or (when the connection is configured to deserialize)
+                # a Python list.  Coerce to list before membership-test.
+                raw_events = sub.get("events")
+                if isinstance(raw_events, (bytes, bytearray)):
+                    raw_events = raw_events.decode("utf-8")
+                if isinstance(raw_events, str):
+                    try:
+                        sub_events = json.loads(raw_events)
+                    except (TypeError, ValueError):
+                        sub_events = []
+                elif isinstance(raw_events, list):
+                    sub_events = raw_events
+                else:
+                    sub_events = []
+                if event_type not in sub_events:
+                    continue
+                delivery_id = str(uuid.uuid4())
+                await cursor.execute(
+                    """
+                    INSERT INTO webhook_deliveries
+                      (id, subscription_id, event_type, payload, payload_hash,
+                       status, scheduled_at, writer_revision)
+                    VALUES (%s, %s, %s, %s, %s, 'pending', NOW(6), %s)
+                    """,
+                    (
+                        delivery_id,
+                        sub["id"],
+                        event_type,
+                        body,
+                        body_hash,
+                        webhook_constants.NEW_CODE_WRITER_REVISION,
+                    ),
+                )
+                from mnemos.nats.webhook_events import publish_delivery_queued
+
+                await publish_delivery_queued(
+                    delivery_id=delivery_id,
+                    subscription_id=sub["id"],
+                    event_type=event_type,
+                    url=sub["url"],
+                    payload_hash=body_hash,
+                    namespace=sub["namespace"],
+                    owner_id=sub["owner_id"],
+                )
+                delivery_ids.append(delivery_id)
+        return delivery_ids
+
+    # ── claim (one row) ──────────────────────────────────────────────────────
+
+    async def claim_delivery(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+        lease_seconds: int,
+        max_attempts: int,
+        writer_revision: int,
+    ) -> WebhookDeliveryClaim | None:
+        """Mirror of ``PostgresWebhookRepository.claim_delivery``.
+
+        MySQL/MariaDB have no ``UPDATE ... RETURNING`` so we perform the
+        conditional UPDATE first, then SELECT the row back to assemble the
+        ``WebhookDeliveryClaim`` (the live worker needs the subscription
+        URL/secret alongside the delivery row to actually POST).
+
+        The UPDATE uses ``NOW(6) + INTERVAL n SECOND`` for the lease
+        expiry so the lease clock is the database clock - same as the
+        Postgres ``clock_timestamp() + n INTERVAL`` form.
+        """
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        conn = _mysql_tx(tx).conn
+        # We can't reference NOW(6) in two places consistently without a
+        # CTE-like construct (MySQL CTEs cannot be SELECTed in UPDATE for
+        # multi-row use). Capture the current DB time once and pass it in.
+        claim_now = await self._db_now(conn)
+        update_sql = (
+            """
+            UPDATE webhook_deliveries
+            SET lease_token = %s,
+                lease_expires_at = %s + INTERVAL %s SECOND,
+                status = CASE WHEN status = 'pending' THEN 'retrying' ELSE status END
+            WHERE id = %s
+              AND scheduled_at <= %s
+              AND attempt_num <= %s
+              AND superseded = 0
+              AND status IN ('pending', 'retrying')
+              AND (lease_token IS NULL OR lease_expires_at < %s)
+              AND writer_revision = %s
+              AND (
+                status = 'pending'
+                OR NOT EXISTS (
+                  SELECT 1 FROM webhook_deliveries newer
+                  WHERE newer.subscription_id = webhook_deliveries.subscription_id
+                    AND newer.event_type = webhook_deliveries.event_type
+                    AND newer.payload_hash = webhook_deliveries.payload_hash
+                    AND newer.attempt_num > webhook_deliveries.attempt_num
+                )
+              )
+            """
+        )
+        params = (
+            lease_token,
+            claim_now,
+            int(lease_seconds),
+            delivery_id,
+            claim_now,
+            int(max_attempts),
+            claim_now,
+            int(writer_revision),
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(update_sql, params)
+            if (await self._row_count(cursor)) == 0:
+                return None
+            await cursor.execute(
+                _MYSQL_WEBHOOK_CLAIM_SELECT + " WHERE d.id = %s",
+                (delivery_id,),
+            )
+            row = await _fetchone_dict(cursor)
+        if row is None:
+            return None
+        return _mysql_webhook_claim(row, lease_token, claim_now)
+
+    # ── claim due (recovery) ─────────────────────────────────────────────────
+
+    async def claim_due_deliveries(
+        self,
+        tx: Transaction,
+        *,
+        lease_token: str,
+        limit: int,
+        lease_seconds: int,
+        max_attempts: int,
+        writer_revision: int,
+    ) -> list[WebhookDeliveryClaim]:
+        """Recovery-side batch claim.  Uses ``SELECT ... FOR UPDATE SKIP
+        LOCKED`` (MySQL 8.0+/MariaDB 10.6+ on InnoDB) inside a derived
+        table joined into the UPDATE, so competing workers can grab
+        different rows without coordination.
+        """
+        if limit <= 0:
+            return []
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        conn = _mysql_tx(tx).conn
+        claim_now = await self._db_now(conn)
+        # The ``FOR UPDATE SKIP LOCKED`` goes inside the derived table -
+        # MySQL/MariaDB accept that pattern (the subquery is the locking
+        # read; the outer UPDATE then takes row locks on the chosen ids).
+        # We also force the optimizer to materialize the derived table via
+        # ``STRAIGHT_JOIN`` so the SKIP LOCKED scope is exactly the
+        # candidate set. The inner SELECT is a self-contained subquery
+        # (it filters by the column values on its own rows); the
+        # correlated ``peer`` / ``newer`` checks reference the same
+        # ``webhook_deliveries`` table inside EXISTS clauses.
+        update_sql = (
+            """
+            UPDATE webhook_deliveries d
+            STRAIGHT_JOIN (
+                SELECT w_inner.id, w_inner.subscription_id, w_inner.event_type,
+                       w_inner.payload_hash, w_inner.attempt_num
+                FROM webhook_deliveries w_inner
+                WHERE w_inner.scheduled_at <= %s
+                  AND w_inner.attempt_num <= %s
+                  AND w_inner.status NOT IN ('succeeded', 'abandoned')
+                  AND w_inner.superseded = 0
+                  AND w_inner.status IN ('pending', 'retrying')
+                  AND (w_inner.lease_token IS NULL OR w_inner.lease_expires_at < %s)
+                  AND w_inner.writer_revision = %s
+                  AND NOT EXISTS (
+                    SELECT 1 FROM webhook_deliveries peer
+                    WHERE peer.subscription_id = w_inner.subscription_id
+                      AND peer.event_type = w_inner.event_type
+                      AND peer.payload_hash = w_inner.payload_hash
+                      AND peer.status = 'succeeded'
+                  )
+                  AND (
+                    w_inner.status = 'pending'
+                    OR NOT EXISTS (
+                      SELECT 1 FROM webhook_deliveries newer
+                      WHERE newer.subscription_id = w_inner.subscription_id
+                        AND newer.event_type = w_inner.event_type
+                        AND newer.payload_hash = w_inner.payload_hash
+                        AND newer.attempt_num > w_inner.attempt_num
+                    )
+                  )
+                ORDER BY w_inner.scheduled_at
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            ) AS cand ON cand.id = d.id
+            SET d.lease_token = %s,
+                d.lease_expires_at = %s + INTERVAL %s SECOND,
+                d.status = CASE WHEN d.status = 'pending' THEN 'retrying' ELSE d.status END
+            """
+        )
+        params = (
+            claim_now,
+            int(max_attempts),
+            claim_now,
+            int(writer_revision),
+            int(limit),
+            lease_token,
+            claim_now,
+            int(lease_seconds),
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(update_sql, params)
+            # After the UPDATE, SELECT back the rows we now own so we
+            # can build WebhookDeliveryClaim objects. The lease_token
+            # projection in the SELECT lets us sanity-check that the
+            # token we wrote round-tripped.
+            await cursor.execute(
+                _MYSQL_WEBHOOK_CLAIM_SELECT
+                + """
+                WHERE d.id IN (
+                    SELECT id FROM webhook_deliveries
+                    WHERE lease_token = %s AND lease_expires_at >= %s
+                )
+                ORDER BY d.scheduled_at
+                """,
+                (lease_token, claim_now),
+            )
+            rows = await _fetch_all_dicts(cursor)
+        return [_mysql_webhook_claim(row, lease_token, claim_now) for row in rows]
+
+    # ── guard (pre-send fence) ───────────────────────────────────────────────
+
+    async def guard_delivery_claim(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+    ) -> bool:
+        conn = _mysql_tx(tx).conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT id, subscription_id, event_type, payload_hash, attempt_num "
+                "FROM webhook_deliveries WHERE id = %s",
+                (delivery_id,),
+            )
+            delivery = await _fetchone_dict(cursor)
+            if delivery is None:
+                return False
+        # Capture the database clock once so lease comparisons across
+        # SELECT and UPDATE are consistent.
+        now = await self._db_now(conn)
+        # Acquire a chain-scoped MySQL session lock so finalize/guard serialize
+        # per (subscription, event_type, payload_hash).  The transaction's
+        # ``_release_named_locks`` hook releases it on commit/rollback.
+        lock_name = _mysql_webhook_chain_lock_name(delivery)
+        tx_obj = _mysql_tx(tx)
+        held = tx_obj.named_lock_held(lock_name)
+        if not held:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT GET_LOCK(%s, %s)", (lock_name, 10))
+                got = await cursor.fetchone()
+            got_value = got[0] if got else 0
+            if int(got_value or 0) != 1:
+                return False
+            tx_obj.hold_named_lock(lock_name)
+
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1 FROM webhook_deliveries
+                  WHERE id = %s
+                    AND lease_token = %s
+                    AND lease_expires_at > %s
+                    AND status IN ('pending', 'retrying')
+                    AND superseded = 0
+                )
+                """,
+                (delivery_id, lease_token, now),
+            )
+            row = await cursor.fetchone()
+        is_live = bool(row[0]) if row else False
+        if not is_live:
+            return False
+
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1 FROM webhook_deliveries peer
+                  WHERE peer.subscription_id = %s
+                    AND peer.event_type = %s
+                    AND peer.payload_hash = %s
+                    AND peer.status = 'succeeded'
+                    AND peer.id <> %s
+                )
+                """,
+                (
+                    delivery["subscription_id"],
+                    delivery["event_type"],
+                    delivery["payload_hash"],
+                    delivery_id,
+                ),
+            )
+            row = await cursor.fetchone()
+        peer_succeeded = bool(row[0]) if row else False
+        if peer_succeeded:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'abandoned',
+                        superseded = 1,
+                        response_status = NULL,
+                        response_body = NULL,
+                        error = 'succeeded-chain-peer-before-send',
+                        lease_token = NULL,
+                        lease_expires_at = NULL
+                    WHERE id = %s
+                      AND lease_token = %s
+                      AND lease_expires_at > %s
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                    """,
+                    (delivery_id, lease_token, now),
+                )
+            return False
+
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1 FROM webhook_deliveries newer
+                  WHERE newer.subscription_id = %s
+                    AND newer.event_type = %s
+                    AND newer.payload_hash = %s
+                    AND newer.attempt_num > %s
+                    AND newer.status IN ('pending', 'retrying')
+                    AND newer.superseded = 0
+                )
+                """,
+                (
+                    delivery["subscription_id"],
+                    delivery["event_type"],
+                    delivery["payload_hash"],
+                    delivery["attempt_num"],
+                ),
+            )
+            row = await cursor.fetchone()
+        live_successor = bool(row[0]) if row else False
+        if live_successor:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'abandoned',
+                        superseded = 1,
+                        status_updated_at = NOW(6),
+                        lease_token = NULL,
+                        lease_expires_at = NULL
+                    WHERE id = %s
+                      AND lease_token = %s
+                      AND lease_expires_at > %s
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                    """,
+                    (delivery_id, lease_token, now),
+                )
+            return False
+        return True
+
+    # ── release (pre-send cancel) ─────────────────────────────────────────────
+
+    async def release_delivery_claim(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+    ) -> bool:
+        conn = _mysql_tx(tx).conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE webhook_deliveries
+                SET lease_token = NULL,
+                    lease_expires_at = NULL
+                WHERE id = %s
+                  AND lease_token = %s
+                """,
+                (delivery_id, lease_token),
+            )
+            updated = (await self._row_count(cursor)) > 0
+            if not updated:
+                return False
+            await cursor.execute(
+                "SELECT status, superseded FROM webhook_deliveries WHERE id = %s",
+                (delivery_id,),
+            )
+            row = await _fetchone_dict(cursor)
+        if row is None:
+            return False
+        if row["status"] not in ("pending", "retrying"):
+            return False
+        if bool(row["superseded"]):
+            return False
+        return True
+
+    # ── finalize (atomic per-attempt terminalization) ─────────────────────────
+
+    async def finalize_delivery(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+        outcome: WebhookDeliveryOutcome,
+        max_attempts: int,
+        backoff_schedule: Sequence[int],
+    ) -> WebhookFinalizationResult:
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        backoff_list = list(backoff_schedule)
+        if len(backoff_list) < max_attempts - 1:
+            raise ValueError(
+                f"backoff_schedule must contain at least max_attempts-1 "
+                f"({max_attempts - 1}) entries; got {len(backoff_list)}"
+            )
+        if any(delay <= 0 for delay in backoff_list):
+            raise ValueError("backoff_schedule must contain positive delays")
+
+        conn = _mysql_tx(tx).conn
+        # Load the row under the chain lock so concurrent finalize calls
+        # serialize per (subscription, event_type, payload_hash).
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT d.id, d.subscription_id, d.event_type, d.payload,
+                       d.payload_hash, d.attempt_num, d.status,
+                       s.url, s.secret, s.revoked, s.owner_id, s.namespace
+                FROM webhook_deliveries d
+                JOIN webhook_subscriptions s ON s.id = d.subscription_id
+                WHERE d.id = %s
+                """,
+                (delivery_id,),
+            )
+            delivery = await _fetchone_dict(cursor)
+        if delivery is None:
+            return WebhookFinalizationResult(applied=False)
+        lock_name = _mysql_webhook_chain_lock_name(delivery)
+        tx_obj = _mysql_tx(tx)
+        held = tx_obj.named_lock_held(lock_name)
+        if not held:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT GET_LOCK(%s, %s)", (lock_name, 10))
+                got = await cursor.fetchone()
+            got_value = got[0] if got else 0
+            if int(got_value or 0) != 1:
+                # Same chain is currently being finalized by another
+                # worker; we lose the race and converge as no-op.
+                return WebhookFinalizationResult(applied=False)
+            tx_obj.hold_named_lock(lock_name)
+
+        # Capture the database clock once so the success / failure /
+        # exhaustion branches all compare against the same "now".
+        now = await self._db_now(conn)
+
+        # ── Success path ────────────────────────────────────────────────────
+        if outcome.succeeded:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT EXISTS (
+                      SELECT 1 FROM webhook_deliveries peer
+                      WHERE peer.subscription_id = %s
+                        AND peer.event_type = %s
+                        AND peer.payload_hash = %s
+                        AND peer.status = 'succeeded'
+                        AND peer.id <> %s
+                    )
+                    """,
+                    (
+                        delivery["subscription_id"],
+                        delivery["event_type"],
+                        delivery["payload_hash"],
+                        delivery_id,
+                    ),
+                )
+                row = await cursor.fetchone()
+            peer_succeeded = bool(row[0]) if row else False
+            if peer_succeeded:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        UPDATE webhook_deliveries
+                        SET status = 'abandoned',
+                            superseded = 1,
+                            response_status = %s,
+                            response_body = %s,
+                            error = %s,
+                            lease_token = NULL,
+                            lease_expires_at = NULL
+                        WHERE id = %s
+                          AND lease_token = %s
+                          AND status IN ('pending', 'retrying')
+                          AND superseded = 0
+                        """,
+                        (
+                            outcome.response_status,
+                            outcome.response_body,
+                            outcome.error,
+                            delivery_id,
+                            lease_token,
+                        ),
+                    )
+                    applied = (await self._row_count(cursor)) > 0
+                return WebhookFinalizationResult(applied=applied, status="abandoned")
+
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'succeeded',
+                        superseded = 0,
+                        response_status = %s,
+                        response_body = %s,
+                        error = NULL,
+                        delivered_at = NOW(6),
+                        lease_token = NULL,
+                        lease_expires_at = NULL
+                    WHERE id = %s
+                      AND lease_token = %s
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                    """,
+                    (
+                        outcome.response_status,
+                        outcome.response_body,
+                        delivery_id,
+                        lease_token,
+                    ),
+                )
+                applied = (await self._row_count(cursor)) > 0
+            if not applied:
+                # The lease/token did not match (someone else already
+                # terminalized this attempt).  Converge via the same
+                # peer-succeeded abandonment, otherwise clear the stale
+                # lease so recovery can pick it up.
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        UPDATE webhook_deliveries
+                        SET status = 'abandoned',
+                            superseded = 1,
+                            response_status = %s,
+                            response_body = %s,
+                            error = %s,
+                            lease_token = NULL,
+                            lease_expires_at = NULL
+                        WHERE id = %s
+                          AND lease_token = %s
+                          AND status IN ('pending', 'retrying')
+                          AND superseded = 0
+                        """,
+                        (
+                            outcome.response_status,
+                            outcome.response_body,
+                            outcome.error,
+                            delivery_id,
+                            lease_token,
+                        ),
+                    )
+                    abandoned = (await self._row_count(cursor)) > 0
+                if abandoned:
+                    return WebhookFinalizationResult(
+                        applied=True,
+                        status="abandoned",
+                    )
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        UPDATE webhook_deliveries
+                        SET lease_token = NULL,
+                            lease_expires_at = NULL
+                        WHERE id = %s AND lease_token = %s
+                        """,
+                        (delivery_id, lease_token),
+                    )
+                return WebhookFinalizationResult(applied=False)
+
+            # Abandon free live successors that this success makes obsolete.
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT newer.id FROM webhook_deliveries newer
+                    WHERE newer.subscription_id = %s
+                      AND newer.event_type = %s
+                      AND newer.payload_hash = %s
+                      AND newer.attempt_num > %s
+                      AND newer.status IN ('pending', 'retrying')
+                      AND newer.superseded = 0
+                      AND (newer.lease_token IS NULL OR newer.lease_expires_at < NOW(6))
+                    ORDER BY newer.attempt_num ASC
+                    """,
+                    (
+                        delivery["subscription_id"],
+                        delivery["event_type"],
+                        delivery["payload_hash"],
+                        delivery["attempt_num"],
+                    ),
+                )
+                successors = await _fetch_all_dicts(cursor)
+            for successor in successors:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        UPDATE webhook_deliveries
+                        SET status = 'abandoned',
+                            superseded = 1,
+                            status_updated_at = NOW(6),
+                            lease_token = NULL,
+                            lease_expires_at = NULL
+                        WHERE id = %s
+                          AND status IN ('pending', 'retrying')
+                          AND superseded = 0
+                          AND (lease_token IS NULL OR lease_expires_at < NOW(6))
+                        """,
+                        (successor["id"],),
+                    )
+            return WebhookFinalizationResult(applied=True, status="succeeded")
+
+        # ── Failure path ────────────────────────────────────────────────────
+        # Revoked subscription -> abandoned, no successor.
+        if delivery["revoked"]:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'abandoned',
+                        superseded = 0,
+                        error = 'subscription revoked',
+                        delivered_at = NOW(6),
+                        lease_token = NULL,
+                        lease_expires_at = NULL
+                    WHERE id = %s
+                      AND lease_token = %s
+                      AND lease_expires_at >= %s
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                    """,
+                    (delivery_id, lease_token, now),
+                )
+                applied = (await self._row_count(cursor)) > 0
+            return WebhookFinalizationResult(
+                applied=applied,
+                status="abandoned" if applied else None,
+            )
+
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1 FROM webhook_deliveries peer
+                  WHERE peer.subscription_id = %s
+                    AND peer.event_type = %s
+                    AND peer.payload_hash = %s
+                    AND peer.status = 'succeeded'
+                    AND peer.id <> %s
+                )
+                """,
+                (
+                    delivery["subscription_id"],
+                    delivery["event_type"],
+                    delivery["payload_hash"],
+                    delivery_id,
+                ),
+            )
+            row = await cursor.fetchone()
+        peer_succeeded = bool(row[0]) if row else False
+        if peer_succeeded:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'abandoned',
+                        superseded = 1,
+                        response_status = %s,
+                        response_body = %s,
+                        error = %s,
+                        lease_token = NULL,
+                        lease_expires_at = NULL
+                    WHERE id = %s
+                      AND lease_token = %s
+                      AND lease_expires_at >= %s
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                    """,
+                    (
+                        outcome.response_status,
+                        outcome.response_body,
+                        outcome.error,
+                        delivery_id,
+                        lease_token,
+                        now,
+                    ),
+                )
+                applied = (await self._row_count(cursor)) > 0
+            return WebhookFinalizationResult(applied=applied, status="abandoned")
+
+        next_attempt = int(delivery["attempt_num"]) + 1
+        if next_attempt > max_attempts:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'abandoned',
+                        superseded = 0,
+                        response_status = %s,
+                        response_body = %s,
+                        error = %s,
+                        delivered_at = NOW(6),
+                        lease_token = NULL,
+                        lease_expires_at = NULL
+                    WHERE id = %s
+                      AND lease_token = %s
+                      AND lease_expires_at >= %s
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                    """,
+                    (
+                        outcome.response_status,
+                        outcome.response_body,
+                        outcome.error,
+                        delivery_id,
+                        lease_token,
+                        now,
+                    ),
+                )
+                applied = (await self._row_count(cursor)) > 0
+            return WebhookFinalizationResult(
+                applied=applied,
+                status="abandoned" if applied else None,
+            )
+
+        # Retryable failure: terminalize owned attempt, then enqueue
+        # at most one successor at the configured backoff time.
+        backoff_seconds = backoff_list[int(delivery["attempt_num"]) - 1]
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1 FROM webhook_deliveries newer
+                  WHERE newer.subscription_id = %s
+                    AND newer.event_type = %s
+                    AND newer.payload_hash = %s
+                    AND newer.attempt_num > %s
+                )
+                """,
+                (
+                    delivery["subscription_id"],
+                    delivery["event_type"],
+                    delivery["payload_hash"],
+                    delivery["attempt_num"],
+                ),
+            )
+            row = await cursor.fetchone()
+        successor_exists = bool(row[0]) if row else False
+
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE webhook_deliveries
+                SET status = 'abandoned',
+                    superseded = 1,
+                    response_status = %s,
+                    response_body = %s,
+                    error = %s,
+                    lease_token = NULL,
+                    lease_expires_at = NULL
+                WHERE id = %s
+                  AND lease_token = %s
+                  AND lease_expires_at >= %s
+                  AND status IN ('pending', 'retrying')
+                  AND superseded = 0
+                """,
+                (
+                    outcome.response_status,
+                    outcome.response_body,
+                    outcome.error,
+                    delivery_id,
+                    lease_token,
+                    now,
+                ),
+            )
+            applied = (await self._row_count(cursor)) > 0
+        if not applied:
+            return WebhookFinalizationResult(applied=False)
+        successor_id: str | None = None
+        if not successor_exists:
+            # Compute scheduled_at via Python so the backoff is honored
+            # even when the DB clock differs from the worker clock.
+            scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
+            # Convert to naive UTC for binding to DATETIME(6) under the
+            # session UTC time_zone.
+            if scheduled_at.tzinfo is not None:
+                scheduled_at_naive = scheduled_at.astimezone(timezone.utc).replace(tzinfo=None)
+            else:
+                scheduled_at_naive = scheduled_at
+            new_id = str(uuid.uuid4())
+            # MySQL has no partial unique indexes; we emulate with the
+            # live_chain_key generated column. ``ON DUPLICATE KEY UPDATE
+            # id=id`` is the standard idiom for "insert if absent" and
+            # works here because the generated column is NULL for all
+            # terminal rows (the unique index allows multiple NULLs).
+            try:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        INSERT INTO webhook_deliveries
+                          (id, subscription_id, event_type, payload, payload_hash,
+                           attempt_num, status, scheduled_at, writer_revision)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s)
+                        """,
+                        (
+                            new_id,
+                            delivery["subscription_id"],
+                            delivery["event_type"],
+                            delivery["payload"],
+                            delivery["payload_hash"],
+                            next_attempt,
+                            scheduled_at_naive,
+                            webhook_constants.NEW_CODE_WRITER_REVISION,
+                        ),
+                    )
+                    successor_id = new_id
+            except Exception as exc:
+                # 1062 (duplicate key) means another writer raced us to
+                # insert this chain's next attempt. That's fine — the
+                # other writer's row owns the forward direction.
+                if not _is_unique_violation(exc):
+                    raise
+                successor_id = None
+        return WebhookFinalizationResult(
+            applied=True,
+            status="abandoned",
+            successor_delivery_id=successor_id,
+        )
+
+    # ── audit-only response body capture ─────────────────────────────────────
+
+    async def store_delivery_response_body(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        response_body: str,
+    ) -> bool:
+        conn = _mysql_tx(tx).conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE webhook_deliveries SET response_body = %s WHERE id = %s",
+                (response_body, delivery_id),
+            )
+            return (await self._row_count(cursor)) > 0
+
+    # ── chain repair sweep ───────────────────────────────────────────────────
+
+    async def repair_delivery_chains(self, tx: Transaction) -> int:
+        """Idempotent sweep: terminalize live attempts that have been made
+        obsolete by a newer attempt or a succeeded peer.  Mirrors the
+        Postgres ``repair_delivery_chains`` / ``repair.WEBHOOK_RETRY_
+        SUCCESSOR_REPAIR_SQL`` (repair.py:10-37) shape, adapted for
+        MySQL/MariaDB.
+
+        The ``(lease_token IS NULL OR lease_expires_at < NOW(6))`` clause
+        preserves the live-worker invariant: never steal an unexpired
+        lease; only terminalize rows that are safe to abandon.
+        """
+        conn = _mysql_tx(tx).conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE webhook_deliveries d
+                SET status = 'abandoned',
+                    superseded = 1,
+                    status_updated_at = NOW(6),
+                    lease_token = NULL,
+                    lease_expires_at = NULL
+                WHERE d.status IN ('pending', 'retrying')
+                  AND d.superseded = 0
+                  AND (d.lease_token IS NULL OR d.lease_expires_at < NOW(6))
+                  AND (
+                    EXISTS (
+                      SELECT 1 FROM webhook_deliveries newer
+                      WHERE newer.subscription_id = d.subscription_id
+                        AND newer.event_type = d.event_type
+                        AND newer.payload_hash = d.payload_hash
+                        AND newer.attempt_num > d.attempt_num
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM webhook_deliveries peer
+                      WHERE peer.subscription_id = d.subscription_id
+                        AND peer.event_type = d.event_type
+                        AND peer.payload_hash = d.payload_hash
+                        AND peer.status = 'succeeded'
+                    )
+                  )
+                """
+            )
+            return await self._row_count(cursor)
+
+    # ── legacy dispatcher support (insert_subscription / fetch_deliveries) ──
+
+    async def insert_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str | None = None,
+        url: str,
+        events: Sequence[str],
+        secret: str | None = None,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> str:
+        subscription_id = subscription_id or str(uuid.uuid4())
+        await self.create_subscription(
+            tx,
+            subscription_id=subscription_id,
+            url=url,
+            events=events,
+            secret=secret or "",
+            description=None,
+            owner_id=owner_id,
+            namespace=namespace,
+        )
+        return subscription_id
+
+    async def fetch_deliveries(self, tx: Transaction, subscription_id: str | None = None) -> list[Row]:
+        conn = _mysql_tx(tx).conn
+        if subscription_id is None:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT * FROM webhook_deliveries ORDER BY created ASC"
+                )
+                return await _fetch_all_dicts(cursor)
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT * FROM webhook_deliveries WHERE subscription_id = %s ORDER BY created ASC",
+                (subscription_id,),
+            )
+            return await _fetch_all_dicts(cursor)
+
+
+# ── row normalizers ──────────────────────────────────────────────────────────
+
+
+_MYSQL_WEBHOOK_CLAIM_SELECT = (
+    "SELECT d.id, d.subscription_id, d.event_type, d.payload, d.payload_hash, "
+    "d.attempt_num, d.status, d.response_status, d.response_body, d.error, "
+    "d.scheduled_at, d.delivered_at, d.created, d.status_updated_at, "
+    "d.superseded, d.lease_token, d.lease_expires_at, d.writer_revision, "
+    "d.lease_token AS lease_token_echo, "
+    "s.url, s.secret, s.revoked, s.owner_id, s.namespace "
+    "FROM webhook_deliveries d "
+    "JOIN webhook_subscriptions s ON s.id = d.subscription_id"
+)
+
+
+def _validate_webhook_scope(owner_id: str | None, namespace: str | None, method: str) -> None:
+    if (owner_id is None) != (namespace is None):
+        raise ValueError(
+            f"{method} requires both owner_id and namespace to be set, "
+            "or both to be None for a root/operator view"
+        )
+
+
+def _mysql_webhook_datetime(value: Any) -> datetime:
+    """Promote a MySQL DATETIME(6) value into a tz-aware UTC datetime.
+
+    MySQL DATETIME(6) is session-time-zone-relative; MysqlBackend.open
+    pins ``SET time_zone = '+00:00'`` so the value comes back as a
+    naive datetime already in UTC.  Anything else (TIMESTAMP, string
+    from a backfill, etc.) is normalized to UTC for callers.
+    """
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (bytes, bytearray)):
+        parsed = datetime.fromisoformat(value.decode("utf-8"))
+    elif isinstance(value, str):
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    else:
+        raise ValueError(f"mysql: expected datetime, got {type(value).__name__}")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _mysql_webhook_subscription(row: Any) -> WebhookSubscriptionRecord:
+    raw_events = row.get("events") if isinstance(row, dict) else None
+    if raw_events is None:
+        events: tuple[str, ...] = ()
+    elif isinstance(raw_events, (bytes, bytearray)):
+        events = tuple(json.loads(raw_events.decode("utf-8")))
+    elif isinstance(raw_events, str):
+        events = tuple(json.loads(raw_events))
+    elif isinstance(raw_events, (list, tuple)):
+        events = tuple(str(e) for e in raw_events)
+    else:
+        events = ()
+    return WebhookSubscriptionRecord(
+        id=str(row["id"]),
+        url=row["url"],
+        events=events,
+        description=row.get("description"),
+        owner_id=row["owner_id"],
+        namespace=row["namespace"],
+        created=_mysql_webhook_datetime(row["created"]),
+        revoked=bool(row["revoked"]),
+        revoked_at=(
+            _mysql_webhook_datetime(row["revoked_at"])
+            if row.get("revoked_at") is not None
+            else None
+        ),
+    )
+
+
+def _mysql_webhook_delivery(row: Any) -> WebhookDeliveryRecord:
+    status = row["status"]
+    if status not in ("pending", "retrying", "succeeded", "abandoned"):
+        raise ValueError(f"unexpected webhook_deliveries status {status!r}")
+    return WebhookDeliveryRecord(
+        id=str(row["id"]),
+        subscription_id=str(row["subscription_id"]),
+        event_type=row["event_type"],
+        payload=row["payload"],
+        payload_hash=row["payload_hash"],
+        attempt_num=int(row["attempt_num"]),
+        status=status,  # type: ignore[arg-type]
+        response_status=row.get("response_status"),
+        response_body=row.get("response_body"),
+        error=row.get("error"),
+        scheduled_at=_mysql_webhook_datetime(row["scheduled_at"]),
+        delivered_at=(
+            _mysql_webhook_datetime(row["delivered_at"])
+            if row.get("delivered_at") is not None
+            else None
+        ),
+        created=_mysql_webhook_datetime(row["created"]),
+        status_updated_at=_mysql_webhook_datetime(row["status_updated_at"]),
+        superseded=bool(row["superseded"]),
+        lease_token=str(row["lease_token"]) if row.get("lease_token") is not None else None,
+        lease_expires_at=(
+            _mysql_webhook_datetime(row["lease_expires_at"])
+            if row.get("lease_expires_at") is not None
+            else None
+        ),
+        writer_revision=int(row["writer_revision"] or 0),
+    )
+
+
+def _mysql_webhook_claim(row: Any, lease_token: str, claim_now: datetime) -> WebhookDeliveryClaim:
+    # ``claim_due_deliveries`` projects ``lease_token`` as
+    # ``lease_token_echo`` for a sanity check that the token we wrote
+    # round-tripped; ``claim_delivery`` does not because we never wrote
+    # the value via a separate RETURNING projection.  We accept both.
+    row_token = row.get("lease_token")
+    if row_token is None:
+        row_token = row.get("lease_token_echo")
+    if row_token is not None and str(row_token) != lease_token:
+        raise ValueError(
+            "mysql: lease_token returned by UPDATE does not match caller-supplied token"
+        )
+    delivery = _mysql_webhook_delivery(row)
+    return WebhookDeliveryClaim(
+        delivery=delivery,
+        lease_token=lease_token,
+        lease_expires_at=_mysql_webhook_datetime(row["lease_expires_at"]),
+        claim_db_now=claim_now,
+        url=row["url"],
+        secret=row.get("secret") or "",
+        subscription_revoked=bool(row["revoked"]),
+        owner_id=row["owner_id"],
+        namespace=row["namespace"],
+    )
+
+
+def _mysql_webhook_chain_lock_name(delivery: Any) -> str:
+    """Stable MySQL session-lock name for one webhook retry chain.
+
+    Mirrors ``webhook_chain._delivery_chain_lock_key`` semantics.  MySQL
+    named locks are scoped to the connection (``GET_LOCK`` returns the
+    same handle for the same name on the same connection), so we hash
+    the (subscription, event_type, payload_hash) triple and prefix it
+    with a deterministic, short namespace tag to keep the lock name
+    inside MySQL's 64-character limit.
+    """
+    key = (
+        f"mnemos:webhook:chain:"
+        f"{delivery['subscription_id']}:{delivery['event_type']}:{delivery['payload_hash']}"
+    )
+    # MySQL 5.7+ accepts up to 64 chars; the chain triple is well under.
+    return key[:64]
 
 
 class MysqlConsultationAuditRepository(ConsultationAuditRepository):
@@ -5136,6 +6786,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                     for ddl in _INIT_DDLS:
                         await cursor.execute(ddl)
                 await _ensure_mysql_oauth_schema(conn)
+                await _ensure_mysql_webhook_schema(conn)
                 await _ensure_mysql_columns(
                     conn,
                     "memories",
