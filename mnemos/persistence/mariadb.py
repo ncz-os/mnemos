@@ -70,6 +70,7 @@ from mnemos.persistence.mysql import (
     _content_hash,
     _ensure_mysql_columns,
     _ensure_mysql_oauth_schema,
+    _ensure_mysql_webhook_schema,
     _fetch_all_dicts,
     _is_unique_violation,
     _is_vec_distance_unsupported,
@@ -964,6 +965,7 @@ class MariadbBackend(MysqlBackend):
                     for ddl in _INIT_DDLS:
                         await cursor.execute(ddl)
                 await _ensure_mysql_oauth_schema(conn)
+                await _ensure_mysql_webhook_schema(conn)
                 await _ensure_mysql_columns(
                     conn,
                     "memories",
