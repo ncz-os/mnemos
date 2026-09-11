@@ -16,7 +16,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import asyncpg
@@ -54,7 +54,13 @@ from mnemos.persistence.base import (
     UsageLedgerRecord,
     UsageLedgerResult,
     VersionRepository,
+    WebhookDeliveryClaim,
+    WebhookDeliveryOutcome,
+    WebhookDeliveryRecord,
+    WebhookDeliveryStatus,
+    WebhookFinalizationResult,
     WebhookRepository,
+    WebhookSubscriptionRecord,
 )
 from mnemos.persistence.types import (
     MEMORY_COLS as _MEMORY_COLS,
@@ -2509,6 +2515,1082 @@ class PostgresWebhookRepository(WebhookRepository):
             "SELECT * FROM webhook_deliveries WHERE subscription_id = $1::uuid ORDER BY created ASC",
             subscription_id,
         )
+
+    # ------------------------------------------------------------------
+    # Backend-neutral WebhookRepository (item 3)
+    #
+    # Every method below mirrors the raw SQL already used by the live
+    # ``mnemos/webhooks/{lease,chain,finalize,workers,repair}.py`` modules
+    # so the ABC surface and the live worker agree on the same schema and
+    # invariants until item 7 wires the worker through the ABC.  No new
+    # behavior is introduced here.
+    # ------------------------------------------------------------------
+
+    async def create_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        url: str,
+        events: Sequence[str],
+        secret: str,
+        description: str | None,
+        owner_id: str,
+        namespace: str,
+    ) -> WebhookSubscriptionRecord:
+        row = await _postgres_tx(tx).conn.fetchrow(
+            """
+            INSERT INTO webhook_subscriptions
+              (id, url, events, secret, description, owner_id, namespace)
+            VALUES ($1::uuid, $2, $3::text[], $4, $5, $6, $7)
+            RETURNING id, url, events, description, owner_id, namespace,
+                      created, revoked, revoked_at
+            """,
+            subscription_id,
+            url,
+            list(events),
+            secret,
+            description,
+            owner_id,
+            namespace,
+        )
+        return _row_to_subscription(row)
+
+    async def list_subscriptions(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str | None,
+        namespace: str | None,
+        include_revoked: bool,
+        limit: int,
+    ) -> list[WebhookSubscriptionRecord]:
+        if (owner_id is None) != (namespace is None):
+            raise ValueError(
+                "list_subscriptions requires both owner_id and namespace to be set, "
+                "or both to be None for a root/operator view"
+            )
+        conn = _postgres_tx(tx).conn
+        conditions: list[str] = []
+        args: list[Any] = []
+        if not include_revoked:
+            conditions.append("NOT revoked")
+        if owner_id is not None:
+            args.append(owner_id)
+            conditions.append(f"owner_id = ${len(args)}")
+            assert namespace is not None  # guarded above
+            args.append(namespace)
+            conditions.append(f"namespace = ${len(args)}")
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        args.append(int(limit))
+        limit_clause = f"LIMIT ${len(args)}"
+        rows = await conn.fetch(
+            f"""
+            SELECT id, url, events, description, owner_id, namespace,
+                   created, revoked, revoked_at
+            FROM webhook_subscriptions
+            {where}
+            ORDER BY created DESC
+            {limit_clause}
+            """,
+            *args,
+        )
+        return [_row_to_subscription(row) for row in rows]
+
+    async def get_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> WebhookSubscriptionRecord | None:
+        if (owner_id is None) != (namespace is None):
+            raise ValueError(
+                "get_subscription requires both owner_id and namespace to be set, "
+                "or both to be None for a root/operator view"
+            )
+        conn = _postgres_tx(tx).conn
+        conditions = ["id = $1::uuid"]
+        args: list[Any] = [subscription_id]
+        if owner_id is not None:
+            assert namespace is not None  # guarded above
+            args.append(owner_id)
+            args.append(namespace)
+            conditions.append(f"owner_id = ${len(args) - 1}")
+            conditions.append(f"namespace = ${len(args)}")
+        row = await conn.fetchrow(
+            f"""
+            SELECT id, url, events, description, owner_id, namespace,
+                   created, revoked, revoked_at
+            FROM webhook_subscriptions
+            WHERE {" AND ".join(conditions)}
+            """,
+            *args,
+        )
+        return _row_to_subscription(row) if row is not None else None
+
+    async def revoke_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> bool:
+        if (owner_id is None) != (namespace is None):
+            raise ValueError(
+                "revoke_subscription requires both owner_id and namespace to be set, "
+                "or both to be None for a root/operator view"
+            )
+        conn = _postgres_tx(tx).conn
+        conditions = ["id = $1::uuid", "NOT revoked"]
+        args: list[Any] = [subscription_id]
+        if owner_id is not None:
+            assert namespace is not None  # guarded above
+            args.append(owner_id)
+            args.append(namespace)
+            conditions.append(f"owner_id = ${len(args) - 1}")
+            conditions.append(f"namespace = ${len(args)}")
+        row = await conn.fetchrow(
+            f"""
+            UPDATE webhook_subscriptions
+            SET revoked = TRUE,
+                revoked_at = clock_timestamp()
+            WHERE {" AND ".join(conditions)}
+            RETURNING id
+            """,
+            *args,
+        )
+        return row is not None
+
+    async def list_deliveries(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+        limit: int,
+    ) -> list[WebhookDeliveryRecord]:
+        if (owner_id is None) != (namespace is None):
+            raise ValueError(
+                "list_deliveries requires both owner_id and namespace to be set, "
+                "or both to be None for a root/operator view"
+            )
+        conn = _postgres_tx(tx).conn
+        args: list[Any] = [subscription_id]
+        scope_clause = ""
+        if owner_id is not None:
+            assert namespace is not None  # guarded above
+            args.append(owner_id)
+            args.append(namespace)
+            scope_clause = (
+                f" AND s.owner_id = ${len(args) - 1} AND s.namespace = ${len(args)}"
+            )
+        args.append(int(limit))
+        rows = await conn.fetch(
+            f"""
+            SELECT d.id, d.subscription_id, d.event_type, d.payload,
+                   d.payload_hash, d.attempt_num, d.status,
+                   d.response_status, d.response_body, d.error,
+                   d.scheduled_at, d.delivered_at, d.created,
+                   d.status_updated_at, d.superseded,
+                   d.lease_token, d.lease_expires_at, d.writer_revision
+            FROM webhook_deliveries d
+            JOIN webhook_subscriptions s ON s.id = d.subscription_id
+            WHERE d.subscription_id = $1::uuid{scope_clause}
+            ORDER BY d.created DESC
+            LIMIT ${len(args)}
+            """,
+            *args,
+        )
+        return [_row_to_delivery(row) for row in rows]
+
+    async def claim_delivery(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+        lease_seconds: int,
+        max_attempts: int,
+        writer_revision: int,
+    ) -> WebhookDeliveryClaim | None:
+        """Mirror of ``webhook_lease._claim_delivery`` (lease.py:18-101)."""
+        conn = _postgres_tx(tx).conn
+        claimed = await conn.fetchrow(
+            """
+            UPDATE webhook_deliveries d
+            SET lease_token=$2::uuid,
+                lease_expires_at=claim_clock.claim_now + ($3::int * INTERVAL '1 second'),
+                status=CASE WHEN d.status = 'pending' THEN 'retrying' ELSE d.status END
+            FROM webhook_subscriptions s,
+                 (SELECT clock_timestamp() AS claim_now) claim_clock
+            WHERE s.id = d.subscription_id
+              AND d.id=$1::uuid
+              AND d.scheduled_at <= claim_clock.claim_now
+              AND d.attempt_num <= $4
+              AND NOT d.superseded
+              AND d.status IN ('pending', 'retrying')
+              AND (d.lease_token IS NULL OR d.lease_expires_at < claim_clock.claim_now)
+              AND d.writer_revision = $5
+              AND (
+                d.status = 'pending'
+                OR (
+                  d.status = 'retrying'
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM webhook_deliveries newer
+                    WHERE newer.subscription_id = d.subscription_id
+                      AND newer.event_type = d.event_type
+                      AND newer.payload_hash = d.payload_hash
+                      AND newer.attempt_num > d.attempt_num
+                  )
+                )
+              )
+            RETURNING d.id, d.subscription_id, d.event_type, d.payload,
+                      d.payload_hash, d.attempt_num, d.status,
+                      d.lease_expires_at, claim_clock.claim_now AS claim_db_now,
+                      s.url, s.secret, s.revoked, s.owner_id, s.namespace,
+                      d.response_status, d.response_body, d.error,
+                      d.scheduled_at, d.delivered_at, d.created,
+                      d.status_updated_at, d.superseded, d.writer_revision
+            """,
+            delivery_id,
+            lease_token,
+            lease_seconds,
+            max_attempts,
+            writer_revision,
+        )
+        if claimed is None:
+            return None
+        return _row_to_claim(claimed, lease_token)
+
+    async def claim_due_deliveries(
+        self,
+        tx: Transaction,
+        *,
+        lease_token: str,
+        limit: int,
+        lease_seconds: int,
+        max_attempts: int,
+        writer_revision: int,
+    ) -> list[WebhookDeliveryClaim]:
+        """Mirror of ``workers._claim_recoverable_deliveries`` (workers.py:99-179).
+
+        ``SKIP LOCKED`` keeps competing recovery workers from claiming the
+        same row. The CTE ranks due, lease-free, non-superseded attempts
+        ordered by oldest scheduled_at first and updates the chosen rows in
+        the same statement.
+        """
+        conn = _postgres_tx(tx).conn
+        rows = await conn.fetch(
+            """
+            WITH claim_clock AS (
+              SELECT clock_timestamp() AS claim_now
+            ),
+            recoverable AS (
+              SELECT d.id
+              FROM webhook_deliveries d, claim_clock
+              WHERE d.scheduled_at <= claim_clock.claim_now
+                AND d.attempt_num <= $1
+                AND d.status NOT IN ('succeeded', 'abandoned')
+                AND NOT d.superseded
+                AND d.status IN ('pending', 'retrying')
+                AND (d.lease_token IS NULL OR d.lease_expires_at < claim_clock.claim_now)
+                AND d.writer_revision = $5
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM webhook_deliveries peer
+                  WHERE peer.subscription_id = d.subscription_id
+                    AND peer.event_type = d.event_type
+                    AND peer.payload_hash = d.payload_hash
+                    AND peer.status = 'succeeded'
+                )
+                AND (
+                  d.status = 'pending'
+                  OR (
+                    d.status = 'retrying'
+                    AND NOT EXISTS (
+                      SELECT 1
+                      FROM webhook_deliveries newer
+                      WHERE newer.subscription_id = d.subscription_id
+                        AND newer.event_type = d.event_type
+                        AND newer.payload_hash = d.payload_hash
+                        AND newer.attempt_num > d.attempt_num
+                    )
+                  )
+                )
+              ORDER BY d.scheduled_at
+              LIMIT $3
+              FOR UPDATE SKIP LOCKED
+            )
+            UPDATE webhook_deliveries d
+            SET lease_token=$2::uuid,
+                lease_expires_at=claim_clock.claim_now + ($4::int * INTERVAL '1 second'),
+                status=CASE WHEN d.status = 'pending' THEN 'retrying' ELSE d.status END
+            FROM recoverable, webhook_subscriptions s, claim_clock
+            WHERE d.id = recoverable.id
+              AND s.id = d.subscription_id
+            RETURNING d.id, d.subscription_id, d.event_type, d.payload,
+                      d.payload_hash, d.attempt_num, d.status,
+                      d.lease_expires_at, claim_clock.claim_now AS claim_db_now,
+                      $2::uuid AS lease_token,
+                      s.url, s.secret, s.revoked, s.owner_id, s.namespace,
+                      d.response_status, d.response_body, d.error,
+                      d.scheduled_at, d.delivered_at, d.created,
+                      d.status_updated_at, d.superseded, d.writer_revision
+            """,
+            max_attempts,
+            lease_token,
+            limit,
+            lease_seconds,
+            writer_revision,
+        )
+        return [_row_to_claim(row, lease_token) for row in rows]
+
+    async def guard_delivery_claim(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+    ) -> bool:
+        """Mirror of ``lease._guard_preclaimed_delivery_before_send``
+        (lease.py:104-138) plus the matching release when guards fail.
+        """
+        conn = _postgres_tx(tx).conn
+        delivery = await conn.fetchrow(
+            """
+            SELECT d.id, d.subscription_id, d.event_type, d.payload,
+                   d.payload_hash, d.attempt_num
+            FROM webhook_deliveries d
+            WHERE d.id = $1::uuid
+            """,
+            delivery_id,
+        )
+        if delivery is None:
+            return False
+        await _lock_delivery_chain(conn, delivery)
+
+        # owned & live (lease + status + not superseded)?
+        is_live = await conn.fetchval(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM webhook_deliveries
+              WHERE id=$1::uuid
+                AND lease_token=$2::uuid
+                AND lease_expires_at > clock_timestamp()
+                AND status IN ('pending', 'retrying')
+                AND NOT superseded
+            )
+            """,
+            delivery_id,
+            lease_token,
+        )
+        if not is_live:
+            return False
+
+        # any chain peer already succeeded?
+        peer_succeeded = await conn.fetchval(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM webhook_deliveries peer
+              WHERE peer.subscription_id = $1
+                AND peer.event_type = $2
+                AND peer.payload_hash = $3
+                AND peer.status = 'succeeded'
+                AND peer.id <> $4::uuid
+            )
+            """,
+            delivery["subscription_id"],
+            delivery["event_type"],
+            delivery["payload_hash"],
+            delivery_id,
+        )
+        if peer_succeeded:
+            await conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET status='abandoned',
+                    superseded=TRUE,
+                    response_status=NULL,
+                    response_body=NULL,
+                    error='succeeded-chain-peer-before-send',
+                    lease_token=NULL,
+                    lease_expires_at=NULL
+                WHERE id=$1::uuid
+                  AND lease_token=$2::uuid
+                  AND lease_expires_at > clock_timestamp()
+                  AND status IN ('pending', 'retrying')
+                  AND NOT superseded
+                """,
+                delivery_id,
+                lease_token,
+            )
+            return False
+
+        # any live newer attempt owns the forward direction?
+        live_successor = await conn.fetchval(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM webhook_deliveries newer
+              WHERE newer.subscription_id = $1
+                AND newer.event_type = $2
+                AND newer.payload_hash = $3
+                AND newer.attempt_num > $4
+                AND newer.status IN ('pending', 'retrying')
+                AND NOT newer.superseded
+            )
+            """,
+            delivery["subscription_id"],
+            delivery["event_type"],
+            delivery["payload_hash"],
+            delivery["attempt_num"],
+        )
+        if live_successor:
+            await conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET status='abandoned',
+                    superseded=TRUE,
+                    status_updated_at=clock_timestamp(),
+                    lease_token=NULL,
+                    lease_expires_at=NULL
+                WHERE id=$1::uuid
+                  AND lease_token=$2::uuid
+                  AND lease_expires_at > clock_timestamp()
+                  AND status IN ('pending', 'retrying')
+                  AND NOT superseded
+                """,
+                delivery_id,
+                lease_token,
+            )
+            return False
+
+        return True
+
+    async def release_delivery_claim(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+    ) -> bool:
+        """Mirror of ``lease._release_owned_lease_for_reclaim`` (lease.py:185-207)."""
+        conn = _postgres_tx(tx).conn
+        row = await conn.fetchrow(
+            """
+            UPDATE webhook_deliveries
+            SET lease_token=NULL,
+                lease_expires_at=NULL
+            WHERE id=$1::uuid
+              AND lease_token=$2::uuid
+            RETURNING id, status, superseded
+            """,
+            delivery_id,
+            lease_token,
+        )
+        if row is None:
+            return False
+        if row["status"] not in ("pending", "retrying"):
+            return False
+        if row["superseded"]:
+            return False
+        return True
+
+    async def finalize_delivery(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+        outcome: WebhookDeliveryOutcome,
+        max_attempts: int,
+        backoff_schedule: Sequence[int],
+    ) -> WebhookFinalizationResult:
+        """Atomic per-attempt finalization that converges the retry chain.
+
+        Mirrors ``finalize._finalize_delivery_row`` / ``_commit_successful_delivery_row``
+        with the same SQL the live ``mnemos/webhooks/`` subsystem runs
+        against the same schema. ``max_attempts`` and ``backoff_schedule``
+        are validated up front per the ABC contract.
+        """
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        backoff_list = list(backoff_schedule)
+        if len(backoff_list) < max_attempts - 1:
+            raise ValueError(
+                f"backoff_schedule must contain at least max_attempts-1 "
+                f"({max_attempts - 1}) entries; got {len(backoff_list)}"
+            )
+        if any(delay <= 0 for delay in backoff_list):
+            raise ValueError("backoff_schedule must contain positive delays")
+
+        conn = _postgres_tx(tx).conn
+
+        # Load the row under the chain lock so concurrent finalize calls
+        # serialise per (subscription, event_type, payload_hash).
+        delivery = await conn.fetchrow(
+            """
+            SELECT d.id, d.subscription_id, d.event_type, d.payload,
+                   d.payload_hash, d.attempt_num, d.status,
+                   s.url, s.secret, s.revoked, s.owner_id, s.namespace
+            FROM webhook_deliveries d
+            JOIN webhook_subscriptions s ON s.id = d.subscription_id
+            WHERE d.id = $1::uuid
+            """,
+            delivery_id,
+        )
+        if delivery is None:
+            return WebhookFinalizationResult(applied=False)
+
+        await _lock_delivery_chain(conn, delivery)
+
+        # ------- Success path (2xx) -------
+        if outcome.succeeded:
+            # Succeeded-chain unique index ensures only one canonical success
+            # row exists. A racing writer's success INSERT may have already
+            # won; converge via the same ``abandon_owned_after_peer`` path
+            # the live worker uses (finalize.py:_finalize_successful_delivery_row).
+            peer_succeeded = await conn.fetchval(
+                """
+                SELECT EXISTS (
+                  SELECT 1
+                  FROM webhook_deliveries peer
+                  WHERE peer.subscription_id = $1
+                    AND peer.event_type = $2
+                    AND peer.payload_hash = $3
+                    AND peer.status = 'succeeded'
+                    AND peer.id <> $4::uuid
+                )
+                """,
+                delivery["subscription_id"],
+                delivery["event_type"],
+                delivery["payload_hash"],
+                delivery_id,
+            )
+            if peer_succeeded:
+                row = await conn.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status='abandoned',
+                        superseded=TRUE,
+                        response_status=$3,
+                        response_body=$4,
+                        error=$5,
+                        lease_token=NULL,
+                        lease_expires_at=NULL
+                    WHERE id=$1::uuid
+                      AND lease_token=$2::uuid
+                      AND status IN ('pending', 'retrying')
+                      AND NOT superseded
+                    """,
+                    delivery_id,
+                    lease_token,
+                    outcome.response_status,
+                    outcome.response_body,
+                    outcome.error,
+                )
+                return WebhookFinalizationResult(
+                    applied=_pg_result_count(row) > 0,
+                    status="abandoned",
+                )
+
+            # Atomic success UPDATE (matches finalize._commit_successful_delivery_row
+            # UPDATE body).
+            row = await conn.fetchrow(
+                """
+                UPDATE webhook_deliveries
+                SET status='succeeded',
+                    superseded=FALSE,
+                    response_status=$3,
+                    response_body=$4,
+                    error=NULL,
+                    delivered_at=clock_timestamp(),
+                    lease_token=NULL,
+                    lease_expires_at=NULL
+                WHERE id=$1::uuid
+                  AND lease_token=$2::uuid
+                  AND status IN ('pending', 'retrying')
+                  AND NOT superseded
+                RETURNING id
+                """,
+                delivery_id,
+                lease_token,
+                outcome.response_status,
+                outcome.response_body,
+            )
+            if row is None:
+                # Lease/token mismatch (already terminal). Mirror the live
+                # worker's fallback: try to converge as a duplicate-success
+                # abandonment, otherwise clear the stale lease.
+                abandoned = await conn.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status='abandoned',
+                        superseded=TRUE,
+                        response_status=$3,
+                        response_body=$4,
+                        error=$5,
+                        lease_token=NULL,
+                        lease_expires_at=NULL
+                    WHERE id=$1::uuid
+                      AND lease_token=$2::uuid
+                      AND status IN ('pending', 'retrying')
+                      AND NOT superseded
+                    """,
+                    delivery_id,
+                    lease_token,
+                    outcome.response_status,
+                    outcome.response_body,
+                    outcome.error,
+                )
+                if _pg_result_count(abandoned) > 0:
+                    return WebhookFinalizationResult(
+                        applied=True,
+                        status="abandoned",
+                    )
+                await conn.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET lease_token=NULL,
+                        lease_expires_at=NULL
+                    WHERE id=$1::uuid
+                      AND lease_token=$2::uuid
+                    """,
+                    delivery_id,
+                    lease_token,
+                )
+                return WebhookFinalizationResult(applied=False)
+
+            # Abandon free live successors that this success makes obsolete.
+            successors = await conn.fetch(
+                """
+                SELECT newer.id
+                FROM webhook_deliveries newer
+                WHERE newer.subscription_id = $1
+                  AND newer.event_type = $2
+                  AND newer.payload_hash = $3
+                  AND newer.attempt_num > $4
+                  AND newer.status IN ('pending', 'retrying')
+                  AND NOT newer.superseded
+                  AND (newer.lease_token IS NULL OR newer.lease_expires_at < clock_timestamp())
+                ORDER BY newer.attempt_num ASC
+                """,
+                delivery["subscription_id"],
+                delivery["event_type"],
+                delivery["payload_hash"],
+                delivery["attempt_num"],
+            )
+            for successor in successors:
+                await conn.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status='abandoned',
+                        superseded=TRUE,
+                        status_updated_at=clock_timestamp(),
+                        lease_token=NULL,
+                        lease_expires_at=NULL
+                    WHERE id=$1::uuid
+                      AND status IN ('pending', 'retrying')
+                      AND NOT superseded
+                      AND (lease_token IS NULL OR lease_expires_at < clock_timestamp())
+                    """,
+                    str(successor["id"]),
+                )
+            return WebhookFinalizationResult(
+                applied=True,
+                status="succeeded",
+            )
+
+        # ------- Failure path -------
+        # Revoked subscription -> abandoned, no successor.
+        if delivery["revoked"]:
+            row = await conn.fetchrow(
+                """
+                UPDATE webhook_deliveries
+                SET status='abandoned',
+                    superseded=FALSE,
+                    error='subscription revoked',
+                    delivered_at=clock_timestamp(),
+                    lease_token=NULL,
+                    lease_expires_at=NULL
+                WHERE id=$1::uuid
+                  AND lease_token=$2::uuid
+                  AND lease_expires_at >= clock_timestamp()
+                  AND status IN ('pending', 'retrying')
+                  AND NOT superseded
+                RETURNING id
+                """,
+                delivery_id,
+                lease_token,
+            )
+            return WebhookFinalizationResult(
+                applied=row is not None,
+                status="abandoned" if row is not None else None,
+            )
+
+        # Chain already converged by another writer.
+        peer_succeeded = await conn.fetchval(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM webhook_deliveries peer
+              WHERE peer.subscription_id = $1
+                AND peer.event_type = $2
+                AND peer.payload_hash = $3
+                AND peer.status = 'succeeded'
+                AND peer.id <> $4::uuid
+            )
+            """,
+            delivery["subscription_id"],
+            delivery["event_type"],
+            delivery["payload_hash"],
+            delivery_id,
+        )
+        if peer_succeeded:
+            row = await conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET status='abandoned',
+                    superseded=TRUE,
+                    response_status=$3,
+                    response_body=$4,
+                    error=$5,
+                    lease_token=NULL,
+                    lease_expires_at=NULL
+                WHERE id=$1::uuid
+                  AND lease_token=$2::uuid
+                  AND lease_expires_at >= clock_timestamp()
+                  AND status IN ('pending', 'retrying')
+                  AND NOT superseded
+                """,
+                delivery_id,
+                lease_token,
+                outcome.response_status,
+                outcome.response_body,
+                outcome.error,
+            )
+            return WebhookFinalizationResult(
+                applied=_pg_result_count(row) > 0,
+                status="abandoned",
+            )
+
+        next_attempt = delivery["attempt_num"] + 1
+        if next_attempt > max_attempts:
+            row = await conn.fetchrow(
+                """
+                UPDATE webhook_deliveries
+                SET status='abandoned',
+                    superseded=FALSE,
+                    response_status=$3,
+                    response_body=$4,
+                    error=$5,
+                    delivered_at=clock_timestamp(),
+                    lease_token=NULL,
+                    lease_expires_at=NULL
+                WHERE id=$1::uuid
+                  AND lease_token=$2::uuid
+                  AND lease_expires_at >= clock_timestamp()
+                  AND status IN ('pending', 'retrying')
+                  AND NOT superseded
+                RETURNING id
+                """,
+                delivery_id,
+                lease_token,
+                outcome.response_status,
+                outcome.response_body,
+                outcome.error,
+            )
+            return WebhookFinalizationResult(
+                applied=row is not None,
+                status="abandoned" if row is not None else None,
+            )
+
+        # Retryable failure: terminalize owned attempt, then enqueue
+        # at most one successor at the configured backoff time.
+        backoff_seconds = backoff_list[delivery["attempt_num"] - 1]
+        successor_exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM webhook_deliveries newer
+              WHERE newer.subscription_id = $1
+                AND newer.event_type = $2
+                AND newer.payload_hash = $3
+                AND newer.attempt_num > $4
+            )
+            """,
+            delivery["subscription_id"],
+            delivery["event_type"],
+            delivery["payload_hash"],
+            delivery["attempt_num"],
+        )
+        finalized = await conn.fetchrow(
+            """
+            UPDATE webhook_deliveries
+            SET status='abandoned',
+                superseded=TRUE,
+                response_status=$3,
+                response_body=$4,
+                error=$5,
+                lease_token=NULL,
+                lease_expires_at=NULL
+            WHERE id=$1::uuid
+              AND lease_token=$2::uuid
+              AND lease_expires_at >= clock_timestamp()
+              AND status IN ('pending', 'retrying')
+              AND NOT superseded
+            RETURNING id
+            """,
+            delivery_id,
+            lease_token,
+            outcome.response_status,
+            outcome.response_body,
+            outcome.error,
+        )
+        if finalized is None:
+            return WebhookFinalizationResult(applied=False)
+
+        successor_id: str | None = None
+        if not successor_exists:
+            scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
+            inserted = await conn.fetchrow(
+                """
+                INSERT INTO webhook_deliveries
+                  (subscription_id, event_type, payload, payload_hash,
+                   attempt_num, status, scheduled_at, writer_revision)
+                VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
+                ON CONFLICT (subscription_id, event_type, payload_hash, attempt_num)
+                  WHERE status IN ('pending', 'retrying') AND NOT superseded
+                DO NOTHING
+                RETURNING id
+                """,
+                delivery["subscription_id"],
+                delivery["event_type"],
+                delivery["payload"],
+                delivery["payload_hash"],
+                next_attempt,
+                scheduled_at,
+                webhook_constants.NEW_CODE_WRITER_REVISION,
+            )
+            if inserted is not None:
+                successor_id = str(inserted["id"])
+        return WebhookFinalizationResult(
+            applied=True,
+            status="abandoned",
+            successor_delivery_id=successor_id,
+        )
+
+    async def store_delivery_response_body(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        response_body: str,
+    ) -> bool:
+        """Mirror of ``finalize._persist_response_body_for_audit`` (finalize.py:391-415)."""
+        conn = _postgres_tx(tx).conn
+        row = await conn.execute(
+            """
+            UPDATE webhook_deliveries
+            SET response_body=$2
+            WHERE id=$1::uuid
+            """,
+            delivery_id,
+            response_body,
+        )
+        return _pg_result_count(row) > 0
+
+    async def repair_delivery_chains(self, tx: Transaction) -> int:
+        """Mirror of ``repair.WEBHOOK_RETRY_SUCCESSOR_REPAIR_SQL``
+        (repair.py:10-37). Returns the number of rows changed.
+        """
+        conn = _postgres_tx(tx).conn
+        result = await conn.execute(
+            """
+            UPDATE webhook_deliveries d
+            SET status = 'abandoned',
+                superseded = TRUE,
+                status_updated_at = clock_timestamp(),
+                lease_token = NULL,
+                lease_expires_at = NULL
+            WHERE d.status IN ('pending', 'retrying')
+              AND (d.lease_token IS NULL OR d.lease_expires_at < clock_timestamp())
+              AND (
+                EXISTS (
+                  SELECT 1
+                  FROM webhook_deliveries newer
+                  WHERE newer.subscription_id = d.subscription_id
+                    AND newer.event_type = d.event_type
+                    AND newer.payload_hash = d.payload_hash
+                    AND newer.attempt_num > d.attempt_num
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM webhook_deliveries peer
+                  WHERE peer.subscription_id = d.subscription_id
+                    AND peer.event_type = d.event_type
+                    AND peer.payload_hash = d.payload_hash
+                    AND peer.status = 'succeeded'
+                )
+              )
+            """
+        )
+        return _pg_result_count(result)
+
+
+def _row_to_subscription(row: Any) -> WebhookSubscriptionRecord:
+    """Normalize a webhook_subscriptions row into a backend-neutral record."""
+    events_value = row["events"]
+    if events_value is None:
+        events: tuple[str, ...] = ()
+    else:
+        events = tuple(events_value)
+    return WebhookSubscriptionRecord(
+        id=str(row["id"]),
+        url=row["url"],
+        events=events,
+        description=row["description"],
+        owner_id=row["owner_id"],
+        namespace=row["namespace"],
+        created=_ensure_aware_utc(row["created"]),
+        revoked=bool(row["revoked"]),
+        revoked_at=_ensure_aware_utc(row["revoked_at"]) if row["revoked_at"] is not None else None,
+    )
+
+
+def _row_to_delivery(row: Any) -> WebhookDeliveryRecord:
+    """Normalize a webhook_deliveries row into a backend-neutral record."""
+    raw_status = row["status"]
+    if raw_status not in ("pending", "retrying", "succeeded", "abandoned"):
+        raise ValueError(f"unexpected webhook_deliveries status {raw_status!r}")
+    return WebhookDeliveryRecord(
+        id=str(row["id"]),
+        subscription_id=str(row["subscription_id"]),
+        event_type=row["event_type"],
+        payload=row["payload"],
+        payload_hash=row["payload_hash"],
+        attempt_num=int(row["attempt_num"]),
+        status=raw_status,  # type: ignore[arg-type]
+        response_status=row["response_status"],
+        response_body=row["response_body"],
+        error=row["error"],
+        scheduled_at=_ensure_aware_utc(row["scheduled_at"]),
+        delivered_at=_ensure_aware_utc(row["delivered_at"]) if row["delivered_at"] is not None else None,
+        created=_ensure_aware_utc(row["created"]),
+        status_updated_at=_ensure_aware_utc(row["status_updated_at"]),
+        superseded=bool(row["superseded"]),
+        lease_token=str(row["lease_token"]) if row["lease_token"] is not None else None,
+        lease_expires_at=(
+            _ensure_aware_utc(row["lease_expires_at"])
+            if row["lease_expires_at"] is not None
+            else None
+        ),
+        writer_revision=int(row["writer_revision"] or 0),
+    )
+
+
+def _row_to_claim(row: Any, lease_token: str) -> WebhookDeliveryClaim:
+    """Build a WebhookDeliveryClaim from an UPDATE...RETURNING row.
+
+    ``claim_due_deliveries`` projects ``lease_token`` into the RETURNING
+    list (so a recovery worker can verify the same token it sent
+    round-tripped). ``claim_delivery`` omits it because the caller
+    already supplied the only token in play; we fall back to the input
+    argument so both shapes work.
+    """
+    raw_status = row["status"]
+    if raw_status not in ("pending", "retrying", "succeeded", "abandoned"):
+        raise ValueError(f"unexpected webhook_deliveries status {raw_status!r}")
+    lease_expires_at = _ensure_aware_utc(row["lease_expires_at"])
+    claim_db_now = _ensure_aware_utc(row["claim_db_now"])
+    try:
+        row_lease_token = row["lease_token"]
+    except KeyError:
+        row_lease_token = None
+    if row_lease_token is None:
+        delivery_lease_token: str | None = lease_token
+    elif str(row_lease_token) != lease_token:
+        # The DB-projected lease_token (claim_due_deliveries path) must
+        # match the caller's input. Mismatch is a programming error.
+        raise ValueError(
+            "lease_token returned by UPDATE does not match caller-supplied token"
+        )
+    else:
+        delivery_lease_token = lease_token
+    return WebhookDeliveryClaim(
+        delivery=WebhookDeliveryRecord(
+            id=str(row["id"]),
+            subscription_id=str(row["subscription_id"]),
+            event_type=row["event_type"],
+            payload=row["payload"],
+            payload_hash=row["payload_hash"],
+            attempt_num=int(row["attempt_num"]),
+            status=raw_status,  # type: ignore[arg-type]
+            response_status=row["response_status"],
+            response_body=row["response_body"],
+            error=row["error"],
+            scheduled_at=_ensure_aware_utc(row["scheduled_at"]),
+            delivered_at=(
+                _ensure_aware_utc(row["delivered_at"]) if row["delivered_at"] is not None else None
+            ),
+            created=_ensure_aware_utc(row["created"]),
+            status_updated_at=_ensure_aware_utc(row["status_updated_at"]),
+            superseded=bool(row["superseded"]),
+            lease_token=delivery_lease_token,
+            lease_expires_at=lease_expires_at,
+            writer_revision=int(row["writer_revision"] or 0),
+        ),
+        lease_token=lease_token,
+        lease_expires_at=lease_expires_at,
+        claim_db_now=claim_db_now,
+        url=row["url"],
+        secret=row["secret"],
+        subscription_revoked=bool(row["revoked"]),
+        owner_id=row["owner_id"],
+        namespace=row["namespace"],
+    )
+
+
+def _ensure_aware_utc(value: datetime | None) -> datetime:
+    """Return a timezone-aware UTC datetime (asyncpg timestamptz values
+    come back aware already; legacy ``TIMESTAMP WITHOUT TIME ZONE`` rows
+    could surface naive — promote them)."""
+    if value is None:
+        raise ValueError("expected non-null timestamp")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _delivery_chain_lock_key(delivery: Any) -> int:
+    """Stable signed-int64 advisory-lock key for one webhook retry chain.
+
+    Mirror of ``webhook_chain._delivery_chain_lock_key`` (chain.py:98-111).
+    Exposed here so the ABC methods can serialize claim + finalize per
+    chain without reaching into the webhook module graph.
+    """
+    digest = hashlib.sha256(
+        (
+            "webhook-chain:"
+            f"{delivery['subscription_id']}:{delivery['event_type']}:{delivery['payload_hash']}"
+        ).encode("utf-8")
+    ).digest()[:8]
+    key = int.from_bytes(digest, "big", signed=False)
+    if key >= 2**63:
+        key -= 2**64
+    return key
+
+
+async def _lock_delivery_chain(conn: asyncpg.Connection, delivery: Any) -> None:
+    """Postgres-only transaction-scoped advisory lock per chain."""
+    await conn.execute("SELECT pg_advisory_xact_lock($1)", _delivery_chain_lock_key(delivery))
 
 
 class PostgresConsultationAuditRepository(ConsultationAuditRepository):
