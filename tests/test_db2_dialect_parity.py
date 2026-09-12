@@ -60,7 +60,7 @@ class _FixedDatetime:
 class _FakeSyncCursor:
     rowcount = 0
 
-    def __init__(self, subscriptions: list[tuple[str, str | None, str | None]], calls: list[dict[str, Any]]) -> None:
+    def __init__(self, subscriptions: list[tuple[str, str | None, str | None, str]], calls: list[dict[str, Any]]) -> None:
         self._subscriptions = subscriptions
         self._calls = calls
         self.description: tuple[tuple[str], ...] | None = None
@@ -70,11 +70,24 @@ class _FakeSyncCursor:
         params = tuple(params or ())
         self._calls.append({"sql": sql, "params": params})
         if "FROM webhook_subscriptions" in sql:
-            self.description = (("id",), ("owner_id",), ("namespace",))
+            # The post-item-7 dispatch_event SELECT pulls ``id, url,
+            # owner_id, namespace`` (Oracle) or ``id, url,
+            # COALESCE(owner_id, ...), COALESCE(namespace, ...)`` (Db2).
+            # The native DB2 path's COALESCE turns a NULL owner/namespace
+            # into the string "default" — match that on the compat path
+            # so the parity assertion ``native_ids == compat_ids`` holds
+            # for subscriptions whose owner/namespace are NULL.
+            self.description = (("id",), ("url",), ("owner_id",), ("namespace",))
             if "COALESCE" in sql.upper():
-                self._rows = [(sid, owner or "default", ns or "default") for sid, owner, ns in self._subscriptions]
+                self._rows = [
+                    (sid, url, owner or "default", ns or "default")
+                    for sid, owner, ns, url in self._subscriptions
+                ]
             else:
-                self._rows = list(self._subscriptions)
+                self._rows = [
+                    (sid, url, owner or "default", ns or "default")
+                    for sid, owner, ns, url in self._subscriptions
+                ]
         else:
             self.description = None
             self._rows = []
@@ -90,7 +103,7 @@ class _FakeSyncCursor:
 
 
 class _FakeConn:
-    def __init__(self, subscriptions: list[tuple[str, str | None, str | None]], calls: list[dict[str, Any]]) -> None:
+    def __init__(self, subscriptions: list[tuple[str, str | None, str | None, str]], calls: list[dict[str, Any]]) -> None:
         self._subscriptions = subscriptions
         self._calls = calls
 
@@ -105,8 +118,8 @@ async def _dispatch(repo: Any) -> tuple[list[str], list[dict[str, Any]]]:
     tx = SimpleNamespace(
         conn=_FakeConn(
             [
-                ("sub-1", "owner-a", "ns-a"),
-                ("sub-2", None, None),
+                ("sub-1", "owner-a", "ns-a", "https://example.test/hook-a"),
+                ("sub-2", None, None, "https://example.test/hook-b"),
             ],
             calls,
         )

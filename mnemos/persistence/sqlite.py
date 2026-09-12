@@ -56,6 +56,7 @@ from mnemos.persistence.base import (
     UsageLedgerResult,
     VersionRepository,
     WebhookDeliveryClaim,
+    WebhookDeliveryIntent,
     WebhookDeliveryOutcome,
     WebhookDeliveryRecord,
     WebhookFinalizationResult,
@@ -2558,7 +2559,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
         *,
         owner_id: str | None = None,
         namespace: str | None = None,
-    ) -> list[str]:
+    ) -> list[WebhookDeliveryIntent]:
         conn = self._conn(tx)
         conditions = ["revoked = 0"]
         params: list[Any] = []
@@ -2579,7 +2580,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
             sort_keys=True,
         )
         body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-        delivery_ids: list[str] = []
+        intents: list[WebhookDeliveryIntent] = []
         for sub in subscriptions:
             if event_type not in _json_list(sub["events"]):
                 continue
@@ -2598,19 +2599,16 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
                     webhook_constants.NEW_CODE_WRITER_REVISION,
                 ),
             )
-            from mnemos.nats.webhook_events import publish_delivery_queued
-
-            await publish_delivery_queued(
-                delivery_id=delivery_id,
-                subscription_id=sub["id"],
-                event_type=event_type,
-                url=sub["url"],
-                payload_hash=body_hash,
-                namespace=sub["namespace"],
-                owner_id=sub["owner_id"],
+            intents.append(
+                WebhookDeliveryIntent(
+                    delivery_id=delivery_id,
+                    subscription_id=str(sub["id"]),
+                    url=sub["url"],
+                    namespace=sub["namespace"],
+                    owner_id=sub["owner_id"],
+                )
             )
-            delivery_ids.append(delivery_id)
-        return delivery_ids
+        return intents
 
     async def _abandon_owned(
         self,

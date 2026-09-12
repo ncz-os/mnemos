@@ -384,13 +384,13 @@ async def test_dispatch_event_appends_first_attempt_pending_rows(repo, pg_pool, 
         )
     payload = {"memory_id": "mem-1", "kind": "create"}
     async with _tx(pg_pool) as tx:
-        delivery_ids = await repo.dispatch_event(
+        _intents = await repo.dispatch_event(
             tx,
             "memory.created",
             payload,
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)
+        delivery_ids = [intent.delivery_id for intent in _intents]
     assert len(delivery_ids) == 1
     delivery_id = delivery_ids[0]
     assert delivery_id != sub_id  # delivery ids are generated UUIDs
@@ -450,13 +450,12 @@ async def test_claim_delivery_assigns_lease_and_winner_takes_all(repo, pg_pool, 
             owner_id=user_id,
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "claim-me"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
 
     lease_seconds = 30
     async with _tx(pg_pool) as tx:
@@ -509,13 +508,12 @@ async def test_claim_delivery_rejects_stale_writer_revision(repo, pg_pool, make_
             owner_id=user_id,
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "mem"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
     async with _tx(pg_pool) as tx:
         claim = await repo.claim_delivery(
             tx,
@@ -546,22 +544,20 @@ async def test_claim_due_deliveries_skip_locked_keeps_workers_independent(
             owner_id=user_id,
             namespace="default",
         )
-        [first_id] = await repo.dispatch_event(
+        [first_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "due-0"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
         extra_ids = []
         for i in range(1, 4):
-            [did] = await repo.dispatch_event(
+            [did] = [intent.delivery_id for intent in await repo.dispatch_event(
                 tx,
                 "memory.created",
                 {"memory_id": f"due-{i}"},
                 owner_id=user_id,
-                namespace="default",
-            )
+                namespace="default",)]
             extra_ids.append(did)
     all_ids = {first_id, *extra_ids}
     assert len(all_ids) == 4
@@ -616,13 +612,12 @@ async def test_release_delivery_claim_keeps_row_live(repo, pg_pool, make_user):
             owner_id=user_id,
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "release-me"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(pg_pool) as tx:
         claim = await repo.claim_delivery(
@@ -684,13 +679,12 @@ async def test_release_delivery_claim_rejects_wrong_token(repo, pg_pool, make_us
             owner_id=user_id,
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "x"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(pg_pool) as tx:
         claim = await repo.claim_delivery(
@@ -728,13 +722,12 @@ async def test_guard_delivery_claim_returns_true_when_owned(repo, pg_pool, make_
             owner_id=user_id,
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "guard-me"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(pg_pool) as tx:
         claim = await repo.claim_delivery(
@@ -772,13 +765,12 @@ async def test_finalize_delivery_success_creates_chain_terminal(repo, pg_pool, m
             owner_id=user_id,
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "ok"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(pg_pool) as tx:
         claim = await repo.claim_delivery(
@@ -842,13 +834,12 @@ async def test_finalize_delivery_retryable_failure_schedules_successor(
             owner_id=user_id,
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "retry-me"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(pg_pool) as tx:
         claim = await repo.claim_delivery(
@@ -923,13 +914,12 @@ async def test_finalize_delivery_exhaustion_ends_abandoned_no_successor(
             owner_id=user_id,
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "exhaust"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
     # Promote the row to attempt_num=max_attempts so any failure exhausts.
     async with pg_pool.acquire() as conn:
         await conn.execute(
@@ -996,13 +986,12 @@ async def test_finalize_delivery_failure_after_lease_expired_returns_not_applied
             owner_id=user_id,
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "exp"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(pg_pool) as tx:
         claim = await repo.claim_delivery(
@@ -1068,13 +1057,12 @@ async def test_finalize_delivery_success_after_lease_expired_with_matching_token
             owner_id=user_id,
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "late-ok"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(pg_pool) as tx:
         claim = await repo.claim_delivery(
@@ -1134,13 +1122,12 @@ async def test_finalize_delivery_duplicate_success_converges_as_abandoned(
             owner_id=user_id,
             namespace="default",
         )
-        [first_id] = await repo.dispatch_event(
+        [first_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "chain-1"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
 
     # Worker A claims + succeeds attempt_num=1.
     token_a = str(uuid.uuid4())
@@ -1265,13 +1252,12 @@ async def test_store_delivery_response_body_does_not_change_status(repo, pg_pool
             owner_id=user_id,
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "body"},
             owner_id=user_id,
-            namespace="default",
-        )
+            namespace="default",)]
     body = '{"hello":"world"}'
     async with _tx(pg_pool) as tx:
         stored = await repo.store_delivery_response_body(
