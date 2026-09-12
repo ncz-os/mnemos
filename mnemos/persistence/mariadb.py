@@ -37,6 +37,7 @@ from mnemos.persistence.base import (
     KGRepository,
     MYSQL_CAPABILITY_DETAILS,
     MemoryRepository,
+    NatsDispatchLogRepository,
     STATE_CAPABILITY,
     STATE_DETAIL_CAPABILITY,
     StateRepository,
@@ -89,6 +90,7 @@ from mnemos.persistence.mysql import (
     MysqlFederationRepository,
     MysqlKGRepository,
     MysqlMemoryRepository,
+    MysqlNatsDispatchLogRepository,
     MysqlStateRepository,
     MysqlVersionRepository,
     MysqlWebhookRepository,
@@ -679,6 +681,10 @@ class MariadbConsultationAuditRepository(MysqlConsultationAuditRepository):
     pass
 
 
+class MariadbNatsDispatchLogRepository(MysqlNatsDispatchLogRepository):
+    pass
+
+
 class MariadbFederationRepository(MysqlFederationRepository):
     # MariaDB does not implement ``CAST(x AS JSON)``. Its JSON type is an
     # alias for LONGTEXT with a json_valid() CHECK, so the cast is both
@@ -852,6 +858,7 @@ class MariadbBackend(MysqlBackend):
     supports_mysql_vector = True
     supports_mariadb_vector = True
     supports_webhooks = False
+    supports_nats_dispatch_log = True  # backed by MariadbNatsDispatchLogRepository, see .nats_dispatch_log
     inline_embedding_searchable = True
     _supports_core_persistence = True
 
@@ -871,6 +878,7 @@ class MariadbBackend(MysqlBackend):
         self._memory_branches_repo = MariadbBranchRepository()
         self._compression_repo = MariadbCompressionRepository()
         self._compression_queue_repo = MariadbCompressionQueueRepository()
+        self._nats_dispatch_log_repo = MariadbNatsDispatchLogRepository()
         self._consultations_audit_repo = MariadbConsultationAuditRepository()
         self._federation_repo = MariadbFederationRepository()
         self._state_kv_repo = MariadbStateRepository()
@@ -911,6 +919,10 @@ class MariadbBackend(MysqlBackend):
     @property
     def webhooks(self) -> WebhookRepository:
         raise BackendCapabilityMissing("webhooks", type(self).__name__)
+
+    @property
+    def nats_dispatch_log(self) -> NatsDispatchLogRepository:
+        return self._nats_dispatch_log_repo
 
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:

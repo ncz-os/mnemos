@@ -48,6 +48,7 @@ from mnemos.persistence.base import (
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
+    NatsDispatchLogRepository,
     OAuthRepository,
     SessionsRepository,
     StateRepository,
@@ -4901,6 +4902,37 @@ class SqliteAuditChainRepository(_SqliteRepository, AuditChainRepository):
         return {r["memory_id"]: r for r in rows}
 
 
+class SqliteNatsDispatchLogRepository(_SqliteRepository, NatsDispatchLogRepository):
+    """SQLite impl of :class:`NatsDispatchLogRepository` (item 9/12).
+
+    Uses ``INSERT OR IGNORE INTO nats_dispatch_log ...`` and translates
+    ``cursor.rowcount`` (1 on a fresh insert, 0 on a duplicate) into
+    the bool the ABC contract demands. The migration
+    ``migrations_v5_2_0_nats_outbox_idempotency_sqlite.sql`` creates the
+    table with the canonical ``(event_id, subject)`` primary key so
+    the dedupe is race-safe under the same SQLite BEGIN IMMEDIATE
+    transaction contract used by the rest of this backend.
+    """
+
+    async def record_if_new(
+        self,
+        tx: Transaction,
+        event_id: str,
+        subject: str,
+    ) -> bool:
+        cursor = await _execute(
+            self._conn(tx),
+            "INSERT OR IGNORE INTO nats_dispatch_log (event_id, subject) VALUES (?, ?)",
+            (event_id, subject),
+        )
+        try:
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            close = getattr(cursor, "close", None)
+            if close is not None:
+                await _maybe_await(close())
+
+
 class SqliteBackend:
     """SQLite persistence facade backed by one serialized connection."""
 
@@ -4919,6 +4951,7 @@ class SqliteBackend:
     # The current delivery worker is asyncpg/Postgres-specific.  SQLite can
     # append outbox rows, but advertising delivery support strands those rows.
     supports_webhooks = False
+    supports_nats_dispatch_log = True  # backed by SqliteNatsDispatchLogRepository, see .nats_dispatch_log
     uses_sqlite_vec = True
     uses_fts5 = True
     # On SQLite, insert_memory writes memories.embedding but semantic_search
@@ -4943,6 +4976,7 @@ class SqliteBackend:
         self._compression = SqliteCompressionRepository()
         self._compression_queue = SqliteCompressionQueueRepository()
         self._webhooks = SqliteWebhookRepository()
+        self._nats_dispatch_log = SqliteNatsDispatchLogRepository()
         self._consultations_audit = SqliteConsultationAuditRepository()
         self._oauth = SqliteOAuthRepository()
         self._sessions = SqliteSessionsRepository()
@@ -5938,6 +5972,10 @@ class SqliteBackend:
     @property
     def webhooks(self) -> WebhookRepository:
         raise BackendCapabilityMissing("webhooks", type(self).__name__)
+
+    @property
+    def nats_dispatch_log(self) -> NatsDispatchLogRepository:
+        return self._nats_dispatch_log
 
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:
