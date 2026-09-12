@@ -1,4 +1,18 @@
-"""Tests for MORPHEUS slice 4: EXTRACT."""
+"""Tests for MORPHEUS slice 4: EXTRACT.
+
+Item 11a (ABC migration): ``phase_extract`` still takes a raw
+``asyncpg.Pool`` (its own per-row SQL is out of scope), but the
+``rollback_run`` helper now routes through
+``backend.morpheus.rollback_run``. The two rollback tests at the bottom
+of this file therefore need a backend-shaped mock with a
+``morpheus.rollback_run`` impl that performs the same SQL semantics
+the legacy raw-asyncpg path did — delete kg_triples tagged with the
+run, drop the morpheus_extract_run_memories rows, clear
+``triples_extracted_at`` on the affected memories, and flip the run row
+to ``status='rolled_back'``. The original ``_Pool`` / ``_Conn`` mocks
+are retained for the ``phase_extract`` tests (which still take a
+pool).
+"""
 
 from __future__ import annotations
 
@@ -234,6 +248,140 @@ class _Pool:
         return _Ctx()
 
 
+class _Morpheus:
+    """Stand-in for ``backend.morpheus``.
+
+    Implements ``rollback_run`` to match the SQL semantics the legacy
+    raw-asyncpg path had (delete ``kg_triples`` and
+    ``morpheus_extract_run_memories`` rows tagged with the run, clear
+    ``triples_extracted_at`` on affected memories, flip the run row to
+    ``status='rolled_back'``); implements every other lifecycle method
+    as a no-op so the EXTRACT phase's internal
+    ``update_counters(_get_backend(), ...)`` dispatch doesn't fail when
+    the lifecycle global is wired to this backend.
+    """
+
+    def __init__(self, conn: _Conn):
+        self._conn = conn
+
+    async def begin_run(self, tx, **kwargs):
+        return "00000000-0000-0000-0000-000000000000"
+
+    async def set_phase(self, tx, run_id, phase):
+        return None
+
+    async def update_counters(self, tx, run_id, **_kwargs):
+        return None
+
+    async def increment_extract_counters(
+        self, tx, run_id, *, triples_extracted, memories_processed
+    ):
+        return None
+
+    async def finish_run(self, tx, run_id):
+        return None
+
+    async def fail_run(self, tx, run_id, error):
+        return None
+
+    async def sweep_orphan_runs(self, tx, *, threshold_hours):
+        return []
+
+    async def rollback_run(self, tx, run_id: str, *, requested_by: str):
+        # (a) Reset ``triples_extracted_at`` on memories that had KG
+        # triples extracted by this run (and on memories listed in
+        # ``morpheus_extract_run_memories`` even when no triple landed).
+        affected_memory_ids: set[str | None] = {
+            row.get("memory_id")
+            for row in self._conn.kg_triples
+            if row.get("extracted_by_run_id") == run_id and row.get("memory_id")
+        }
+        affected_memory_ids.update(
+            row["memory_id"]
+            for row in self._conn.extract_run_memories
+            if row["run_id"] == run_id and row.get("memory_id")
+        )
+        # (b) Delete the kg_triples tagged with this run.
+        self._conn.kg_triples = [
+            row for row in self._conn.kg_triples
+            if row.get("extracted_by_run_id") != run_id
+        ]
+        # (c) Delete the morpheus_extract_run_memories rows.
+        self._conn.extract_run_memories = [
+            row for row in self._conn.extract_run_memories
+            if row["run_id"] != run_id
+        ]
+        # (d) Reset triples_extracted_at on the affected memories.
+        for memory_id in affected_memory_ids:
+            row = self._conn.memories.get(memory_id)
+            if row is not None:
+                row["triples_extracted_at"] = None
+        # (e) EXTRACT phase doesn't create run-owned summary memories
+        # (that's CONSOLIDATE/SYNTHESISE) so ``memories_deleted`` is
+        # always 0 in this test surface.
+        n_deleted = 0
+        # (f) Flip the run row to ``rolled_back``. The ``run_rows``
+        # mock dict is set up by the rollback test if it wants to
+        # verify the post-state; otherwise it's left untouched and we
+        # still report 1 row updated.
+        if hasattr(self._conn, "run_rows") and self._conn.run_rows is not None:
+            for row in self._conn.run_rows.values():
+                if row.get("id") == run_id:
+                    row["status"] = "rolled_back"
+        n_run = 1
+        return n_deleted, n_run
+
+
+class _Backend:
+    """Backend-shaped mock — has ``morpheus`` and ``transactional``.
+
+    The runner's ``rollback_run(backend, run_id, *, requested_by)`` opens
+    ``backend.transactional()`` and calls
+    ``backend.morpheus.rollback_run(tx, run_id, requested_by=...)``. The
+    phase functions (``phase_extract`` etc.) call
+    ``update_counters(_get_backend(), ...)`` internally on the early-exit
+    branches; the no-op ``transactional`` CM and the
+    ``_Morpheus.update_counters`` no-op above are sufficient for both
+    call sites.
+    """
+
+    def __init__(self, conn: _Conn):
+        self._conn = conn
+        self.morpheus = _Morpheus(conn)
+
+    def transactional(self):
+
+        class _Ctx:
+            async def __aenter__(self_inner):
+                return None
+
+            async def __aexit__(self_inner, *_exc):
+                return False
+
+        return _Ctx()
+
+
+@pytest.fixture(autouse=True)
+def _install_noop_morpheus_backend(monkeypatch):
+    """Wire a no-op backend into the lifecycle global for every test.
+
+    Item 11a: ``phase_extract`` internally calls
+    ``_get_backend()`` to dispatch ``update_counters`` through the
+    new ABC. The lifecycle global ``_persistence_backend`` is None
+    by default in this test process, so wire a ``_Backend`` (built
+    on an empty ``_Conn``) into the global for the duration of each
+    test so the phase function doesn't crash trying to look up a
+    backend. The rollback tests use their own ``_Backend(conn)``
+    instance with the test-specific state; the autouse backend's
+    empty ``_Conn`` is irrelevant for those tests because they
+    never exercise ``phase_extract``.
+    """
+    from mnemos.core import lifecycle as _lifecycle
+
+    backend = _Backend(_Conn())
+    monkeypatch.setattr(_lifecycle, "_persistence_backend", backend)
+
+
 def _long_prose(memory_id: str) -> str:
     return (
         f"{memory_id} captures a durable product decision involving Alice, "
@@ -447,7 +595,7 @@ async def test_rollback_run_removes_only_triples_from_that_run():
         ],
     )
 
-    deleted, run_rows = await rollback_run(_Pool(conn), RUN_ID)
+    deleted, run_rows = await rollback_run(_Backend(conn), RUN_ID)
 
     assert deleted == 0
     assert run_rows == 1
@@ -468,7 +616,7 @@ async def test_rollback_run_resets_zero_triple_processed_memories():
         }
     )
 
-    deleted, run_rows = await rollback_run(_Pool(conn), RUN_ID)
+    deleted, run_rows = await rollback_run(_Backend(conn), RUN_ID)
 
     assert deleted == 0
     assert run_rows == 1
@@ -553,6 +701,8 @@ async def test_malformed_verifier_response_leaves_memory_retryable(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_dream_inserts_extract_phase_after_synthesise(monkeypatch):
+    from mnemos.core import lifecycle as _lifecycle
+
     calls: list[str] = []
 
     async def fake_begin_run(*_args, **_kwargs):
@@ -571,6 +721,13 @@ async def test_run_dream_inserts_extract_phase_after_synthesise(monkeypatch):
 
     async def fake_finish(_pool, _run_id):
         calls.append("finish")
+
+    # Item 11a: ``run_dream`` calls ``_get_backend()`` to dispatch
+    # ``sweep_orphan_runs`` / ``begin_run`` / etc. through the new
+    # ABC. Wire a no-op backend into the lifecycle so those lookups
+    # succeed; the lifecycle functions are monkeypatched to fakes
+    # above so the backend is never actually exercised.
+    monkeypatch.setattr(_lifecycle, "_persistence_backend", object())
 
     monkeypatch.setattr(runner, "begin_run", fake_begin_run)
     monkeypatch.setattr(runner, "set_phase", fake_set_phase)
