@@ -3500,6 +3500,39 @@ class SqliteOAuthRepository(_SqliteRepository, MCPOAuthRepositoryMixin, OAuthRep
         )
         return row
 
+    async def gc_expired_sessions(
+        self,
+        tx: Transaction,
+        *,
+        now: Any,
+        expired_grace: timedelta,
+        revoked_grace: timedelta,
+    ) -> int:
+        """Delete oauth_sessions past their grace windows (item 13).
+
+        SQLite's ``oauth_sessions`` table tracks ``expires_at`` (TEXT) and
+        ``revoked`` (INTEGER) but does not carry a ``revoked_at`` column on
+        this canonical shape, so a revoked row has no timestamp of its own
+        to compare against ``revoked_grace``. This mirrors Postgres's
+        NULL-``revoked_at`` fallback branch exactly: a revoked row is only
+        deleted once its ``expires_at`` is stale by ``revoked_grace`` (NOT
+        immediately on ``revoked = 1`` — an unconditional immediate delete
+        would discard a just-revoked, not-yet-expired session's audit row
+        the instant it's revoked, which does not match Postgres's actual
+        behavior despite the two paths intending to be equivalent).
+        """
+        expired_seconds = int(expired_grace.total_seconds())
+        revoked_seconds = int(revoked_grace.total_seconds())
+        conn = self._conn(tx)
+        cursor = await _execute(
+            conn,
+            "DELETE FROM oauth_sessions "
+            "WHERE datetime(expires_at) < datetime('now', printf('-%d seconds', ?)) "
+            "   OR (revoked = 1 AND datetime(expires_at) < datetime('now', printf('-%d seconds', ?)))",
+            (expired_seconds, revoked_seconds),
+        )
+        return int(getattr(cursor, "rowcount", 0) or 0)
+
 
 class SqliteSessionsRepository(_SqliteRepository, SessionsRepository):
     async def create_session(
