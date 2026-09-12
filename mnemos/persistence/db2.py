@@ -20,18 +20,20 @@ References:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 import re
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 from mnemos.core.config import db2_text_search_override, db2_vector_index_override
+from mnemos.core import webhook_constants
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.oracle import (
     OracleAclRepository,
@@ -306,6 +308,22 @@ class _Db2AsyncCursor:
         self._cur = sync_cursor
         self.description = None
         self.rowcount = -1
+
+    def setinputsizes(self, *args: Any, **kwargs: Any) -> None:
+        """No-op: the oracledb-specific bind-type hints some inherited
+        OracleWebhookRepository methods pass here (e.g.
+        ``oracledb.DB_TYPE_TIMESTAMP_TZ``, used to force correct
+        TIMESTAMP WITH TIME ZONE comparison semantics against the
+        oracledb driver) are meaningless to ibm_db_dbi, which also uses
+        positional ``?`` binds after ``_adapt_oracle_to_db2`` rewrites
+        named ``:name`` binds -- a keyword-based hint couldn't apply
+        even if the type constants matched. Without this method, those
+        shared/inherited calls raise AttributeError against a real Db2
+        connection. Db2/ibm_db_dbi has NOT been verified to have the
+        same naive-datetime-vs-TIMESTAMP-comparison bug that motivated
+        the oracledb-side fix; if it does, it needs its own explicit
+        Db2-native fix here, not a translation of the Oracle one.
+        """
 
     async def execute(self, sql: str, params: dict | tuple | None = None) -> None:
         adapted_sql, adapted_params = _adapt_oracle_to_db2(sql, params)
@@ -2635,11 +2653,63 @@ class Db2CompressionRepository(_Db2OraCompatMixin, OracleCompressionRepository):
 
 
 class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
-    """Webhook dispatch repository — Db2-native ``dispatch_event`` override.
+    """Webhook dispatch repository — Db2-native overrides for three methods.
 
-    All other methods inherit verbatim from
-    :class:`OracleWebhookRepository` and rely on the cursor-layer
-    Oracle→Db2 translation in :class:`_Db2AsyncCursor.execute`.
+    Mirrors :class:`OracleWebhookRepository` for the full 13-method contract
+    (item 6 of 12). Three methods have explicit Db2-native overrides —
+    ``dispatch_event``, ``claim_delivery``, ``claim_due_deliveries`` — and
+    the other ten inherit verbatim from Oracle.
+
+    The cursor layer in :class:`_Db2AsyncCursor.execute` handles the
+    majority of Oracle→Db2 SQL-token differences transparently
+    (``SYSTIMESTAMP``→``CURRENT TIMESTAMP``, ``:name``→``?``,
+    ``TIMESTAMP WITH TIME ZONE``→``TIMESTAMP``). The places the cursor
+    layer cannot help — and the per-method overrides that handle them —
+    are documented below.
+
+    Constructs NOT auto-translated, and how each method avoids them:
+
+    * ``DBMS_LOB.INSTR(events, ?)`` (Oracle-only) vs
+      ``LOCATE(?, CAST(events AS VARCHAR(32672)))`` (Db2-native). This is
+      only in :meth:`dispatch_event` for the subscription-scan step.
+      Oracle's ``dispatch_event`` uses ``DBMS_LOB.INSTR`` to find the
+      quoted event-name token in the JSON ``events`` array; the cursor
+      layer does NOT translate ``DBMS_LOB.INSTR`` to ``LOCATE`` so we
+      write the Db2 form explicitly. Same semantic, same results, same
+      JSON-array compactness tolerance.
+
+    * ``FOR UPDATE SKIP LOCKED`` (Oracle) vs ``FOR UPDATE SKIP LOCKED
+      DATA`` (Db2). The cursor layer does NOT translate this — Db2
+      LUW requires the literal ``DATA`` keyword on the row-level
+      concurrent-claim hint. The two recovery-claim methods
+      (:meth:`claim_delivery` and :meth:`claim_due_deliveries`) compose
+      a bulk row-list claim with ``ROWNUM <= ?`` + ``FOR UPDATE SKIP
+      LOCKED DATA`` inside an inline-view subquery (the same idiom
+      Oracle uses under the hood). The other methods in the contract
+      use ``SELECT ... FOR UPDATE`` (no SKIP LOCKED) and inherit
+      verbatim.
+
+    * Oracle ``FROM DUAL`` (Db2 has no ``DUAL``). The only place this
+      appears is the ``_oracle_now`` helper, which issues
+      ``SELECT CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE) FROM dual``.
+      On Db2 ORA-compat mode (``DB2_COMPATIBILITY_VECTOR=ORA``) the
+      pseudo-table is aliased; on bare Db2 it would fail. The helper
+      catches any exception and falls back to ``datetime.now(timezone.utc)``
+      so lease accounting stays operational regardless of the
+      deployment's compatibility settings. ``repair_delivery_chains`` and
+      the success-path UPDATE inside :meth:`finalize_delivery` use
+      ``SYSTIMESTAMP`` directly in SQL (cursor-layer translated to
+      ``CURRENT TIMESTAMP``), so the DB clock drives the cross-process
+      drift-sensitive paths.
+
+    * Oracle ``RETURNING ... INTO`` (Db2 has no equivalent). None of the
+      contract methods use ``RETURNING``; all INSERTs that need the new
+      row back follow up with a targeted SELECT in the same cursor.
+      Db2 handles ``UPDATE .. WHERE id IN (..)`` natively.
+
+    The net effect: every method on the ABC contract is implemented for
+    Db2 — three via explicit Db2-native SQL, ten via cursor-layer
+    translation of the Oracle SQL.
     """
 
     async def dispatch_event(
@@ -2651,6 +2721,16 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
         owner_id: str | None = None,
         namespace: str | None = None,
     ) -> list[str]:
+        """Db2-native dispatch event.
+
+        Mirrors :class:`OracleWebhookRepository.dispatch_event` exactly:
+        same ``body = {"event", "timestamp", "data"}`` envelope, same
+        ``payload_hash = SHA-256(body)``, same ``scheduled_at =
+        SYSTIMESTAMP`` (auto-translated to ``CURRENT TIMESTAMP``).
+        The only Db2-specific divergence is the subscription-scan
+        step: ``LOCATE(?, CAST(events AS VARCHAR(32672)))`` instead of
+        ``DBMS_LOB.INSTR`` (no auto-translation of that token).
+        """
         import json
         import uuid as _uuid
 
@@ -2672,7 +2752,7 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
             sub_where.append("LOCATE(?, CAST(events AS VARCHAR(32672))) > 0")
             sub_params.append(f'"{event_type}"')
             sql_sub = (
-                "SELECT id, COALESCE(owner_id, 'default') AS owner_id, "
+                "SELECT id, url, COALESCE(owner_id, 'default') AS owner_id, "
                 "COALESCE(namespace, 'default') AS namespace "
                 "FROM webhook_subscriptions WHERE " + " AND ".join(sub_where)
             )
@@ -2681,7 +2761,13 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
             if not subs:
                 return []
 
-            payload_json = json.dumps(payload, default=str, separators=(",", ":"))
+            now_ts = datetime.now(timezone.utc)
+            body = json.dumps(
+                {"event": event_type, "timestamp": now_ts.isoformat(), "data": payload},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
             delivery_ids: list[str] = []
             for sub in subs:
                 d_id = _uuid.uuid4().hex
@@ -2689,27 +2775,247 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
                     cursor.execute,
                     """
                     INSERT INTO webhook_deliveries (
-                        id, subscription_id, event_type, payload, owner_id,
-                        namespace, state, attempt_count, next_attempt_at
+                        id, subscription_id, event_type, payload, payload_hash,
+                        attempt_num, status, scheduled_at, writer_revision
                     ) VALUES (
-                        ?, ?, ?, ?, COALESCE(CAST(? AS VARCHAR(100)), 'default'),
-                        COALESCE(CAST(? AS VARCHAR(100)), 'default'),
-                        'pending', 0, CURRENT TIMESTAMP
+                        ?, ?, ?, ?, ?,
+                        1, 'pending', CURRENT TIMESTAMP, ?
                     )
                     """,
                     (
                         d_id,
                         sub["id"],
                         event_type,
-                        payload_json,
-                        sub.get("owner_id"),
-                        sub.get("namespace"),
+                        body,
+                        body_hash,
+                        webhook_constants.NEW_CODE_WRITER_REVISION,
                     ),
                 )
                 delivery_ids.append(d_id)
             return delivery_ids
         finally:
             await _call(cursor.close)
+
+    # ── SKIP LOCKED overrides ─────────────────────────────────────────────────
+    #
+    # The cursor layer translates ``SYSTIMESTAMP``→``CURRENT TIMESTAMP``,
+    # ``TIMESTAMP WITH TIME ZONE``→``TIMESTAMP``, and ``:name``→``?`` but
+    # does NOT translate Oracle's ``FOR UPDATE SKIP LOCKED`` to Db2's
+    # ``FOR UPDATE SKIP LOCKED DATA`` (the ``DATA`` keyword is required
+    # on Db2 LUW; ORA-compat mode alone doesn't add it). The two
+    # recovery methods below use ``SKIP LOCKED`` so they get explicit
+    # Db2-native overrides; the other 10 inherited methods don't use
+    # ``SKIP LOCKED`` and inherit verbatim.
+
+    async def claim_delivery(
+        self,
+        tx: Any,
+        *,
+        delivery_id: str,
+        lease_token: str,
+        lease_seconds: int,
+        max_attempts: int,
+        writer_revision: int,
+    ) -> Any:
+        """Db2-native single-row claim.
+
+        Db2 requires ``SKIP LOCKED DATA`` (not Oracle's ``SKIP LOCKED``);
+        the cursor-layer translator does not add the ``DATA`` keyword,
+        so the override is necessary.
+        """
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        conn = _conn_from_tx(tx)
+        # Use the DB clock (via the shared, fallback-safe _oracle_now,
+        # cursor-layer-translated to CURRENT TIMESTAMP for Db2), not the
+        # app server's wall clock: computing lease_expires_at from
+        # datetime.now() here would silently drift from the DB-side
+        # CURRENT TIMESTAMP comparisons above whenever the app host and
+        # DB host clocks disagree.
+        claim_now = await self._oracle_now(conn)
+        lease_expires_at = claim_now + timedelta(seconds=lease_seconds)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT d.id, d.subscription_id, d.event_type, d.payload,
+                       d.payload_hash, d.attempt_num, d.status,
+                       d.lease_token, d.lease_expires_at, d.writer_revision
+                FROM webhook_deliveries d
+                WHERE d.id = ?
+                  AND d.scheduled_at <= CURRENT TIMESTAMP
+                  AND d.attempt_num <= ?
+                  AND d.status IN ('pending', 'retrying')
+                  AND d.superseded = 0
+                  AND (d.lease_token IS NULL OR d.lease_expires_at < CURRENT TIMESTAMP)
+                  AND d.writer_revision = ?
+                  AND (
+                    d.status = 'pending'
+                    OR NOT EXISTS (
+                      SELECT 1 FROM webhook_deliveries newer
+                      WHERE newer.subscription_id = d.subscription_id
+                        AND newer.event_type = d.event_type
+                        AND newer.payload_hash = d.payload_hash
+                        AND newer.attempt_num > d.attempt_num
+                    )
+                  )
+                FOR UPDATE SKIP LOCKED DATA
+                """,
+                (delivery_id, int(max_attempts), int(writer_revision)),
+            )
+            row = await _call(cursor.fetchone)
+            if row is None:
+                return None
+            await _call(
+                cursor.execute,
+                """
+                UPDATE webhook_deliveries
+                SET lease_token = ?,
+                    lease_expires_at = ?,
+                    status = CASE WHEN status = 'pending' THEN 'retrying' ELSE status END,
+                    status_updated_at = CASE
+                        WHEN status = 'pending' THEN CURRENT TIMESTAMP
+                        ELSE status_updated_at
+                    END
+                WHERE id = ?
+                """,
+                (lease_token, lease_expires_at, delivery_id),
+            )
+            from mnemos.persistence.oracle import (
+                _oracle_webhook_claim,
+                oracle_webhook_delivery_select_clause,
+            )
+
+            await _call(
+                cursor.execute,
+                f"{oracle_webhook_delivery_select_clause()} WHERE d.id = ?",
+                (delivery_id,),
+            )
+            full_row = await _call(cursor.fetchone)
+            # Build the row dict INSIDE the try block: cursor.description
+            # is unavailable (or stale) once the cursor is closed below.
+            d = dict(zip([c[0].lower() for c in cursor.description], full_row)) if full_row is not None else None
+        finally:
+            await _call(cursor.close)
+        if d is None:
+            return None
+        return _oracle_webhook_claim(
+            d,
+            lease_token=lease_token,
+            claim_now=claim_now,
+        )
+
+    async def claim_due_deliveries(
+        self,
+        tx: Any,
+        *,
+        lease_token: str,
+        limit: int,
+        lease_seconds: int,
+        max_attempts: int,
+        writer_revision: int,
+    ) -> list[Any]:
+        """Db2-native batch claim with ``SKIP LOCKED DATA`` and ``ROWNUM``-bounded subquery.
+
+        The Db2 ORA-compat layer accepts ``ROWNUM`` (DB2_COMPATIBILITY_VECTOR=ORA)
+        and the inline-view + ``FOR UPDATE SKIP LOCKED DATA`` shape is
+        documented Db2 LUW SQL.
+        """
+        if limit <= 0:
+            return []
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        conn = _conn_from_tx(tx)
+        # DB clock, not app-server wall clock -- see claim_delivery for why.
+        claim_now = await self._oracle_now(conn)
+        lease_expires_at = claim_now + timedelta(seconds=lease_seconds)
+        cursor = await _call(conn.cursor)
+        claimed_ids: list[str] = []
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id FROM (
+                    SELECT id FROM webhook_deliveries
+                    WHERE scheduled_at <= CURRENT TIMESTAMP
+                      AND attempt_num <= ?
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                      AND (lease_token IS NULL OR lease_expires_at < CURRENT TIMESTAMP)
+                      AND writer_revision = ?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM webhook_deliveries peer
+                        WHERE peer.subscription_id = webhook_deliveries.subscription_id
+                          AND peer.event_type = webhook_deliveries.event_type
+                          AND peer.payload_hash = webhook_deliveries.payload_hash
+                          AND peer.status = 'succeeded'
+                      )
+                      AND (
+                        status = 'pending'
+                        OR NOT EXISTS (
+                          SELECT 1 FROM webhook_deliveries newer
+                          WHERE newer.subscription_id = webhook_deliveries.subscription_id
+                            AND newer.event_type = webhook_deliveries.event_type
+                            AND newer.payload_hash = webhook_deliveries.payload_hash
+                            AND newer.attempt_num > webhook_deliveries.attempt_num
+                        )
+                      )
+                    ORDER BY scheduled_at, id
+                ) WHERE ROWNUM <= ?
+                FOR UPDATE SKIP LOCKED DATA
+                """,
+                (int(max_attempts), int(writer_revision), int(limit)),
+            )
+            id_rows = await _call(cursor.fetchall) or []
+            claimed_ids = [str(r[0]) for r in id_rows]
+            if not claimed_ids:
+                return []
+            placeholders = ",".join("?" for _ in claimed_ids)
+            await _call(
+                cursor.execute,
+                f"""
+                UPDATE webhook_deliveries
+                SET lease_token = ?,
+                    lease_expires_at = ?,
+                    status = CASE WHEN status = 'pending' THEN 'retrying' ELSE status END,
+                    status_updated_at = CASE
+                        WHEN status = 'pending' THEN CURRENT TIMESTAMP
+                        ELSE status_updated_at
+                    END
+                WHERE id IN ({placeholders})
+                """,
+                (lease_token, lease_expires_at, *claimed_ids),
+            )
+            from mnemos.persistence.oracle import (
+                _oracle_webhook_claim,
+                oracle_webhook_delivery_select_clause,
+            )
+
+            await _call(
+                cursor.execute,
+                f"""
+                {oracle_webhook_delivery_select_clause()}
+                WHERE d.id IN ({placeholders})
+                ORDER BY d.scheduled_at, d.id
+                """,
+                tuple(claimed_ids),
+            )
+            rows = await _call(cursor.fetchall) or []
+            # Build row dicts INSIDE the try block: cursor.description is
+            # unavailable (or stale) once the cursor is closed below.
+            cols = [c[0].lower() for c in cursor.description]
+            result = [
+                _oracle_webhook_claim(dict(zip(cols, r)), lease_token=lease_token, claim_now=claim_now)
+                for r in rows
+            ]
+        finally:
+            await _call(cursor.close)
+        return result
 
 
 class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAuditRepository):

@@ -28,12 +28,13 @@ import math
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 from mnemos.core.config import oracle_pdb_env, runtime_env_value_stripped, vector_dim_max_env
 from mnemos.core.oauth import _mint_user_id
+from mnemos.core import webhook_constants
 from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
 from mnemos.persistence.base import (
@@ -54,7 +55,12 @@ from mnemos.persistence.base import (
     StateRepository,
     Transaction,
     VersionRepository,
+    WebhookDeliveryClaim,
+    WebhookDeliveryOutcome,
+    WebhookDeliveryRecord,
+    WebhookFinalizationResult,
     WebhookRepository,
+    WebhookSubscriptionRecord,
 )
 from mnemos.persistence.types import Row, assemble_consultation_full
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
@@ -507,6 +513,26 @@ def _build_oracle_session_callback(settings: Any) -> Any:
                 await cur.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '. '")
             except Exception as exc:  # pragma: no cover - driver-dependent
                 _LOG.debug("ALTER SESSION SET NLS_NUMERIC_CHARACTERS failed: %s", exc)
+            # Pin session time zone to UTC. Without this, SYSTIMESTAMP (and
+            # any CAST(... AS TIMESTAMP WITH TIME ZONE) built from it) is
+            # expressed in whatever local zone the DB client/server host is
+            # in (SESSIONTIMEZONE), not DBTIMEZONE. python-oracledb also
+            # returns TIMESTAMP WITH TIME ZONE column/bind values as NAIVE
+            # Python datetimes (tzinfo dropped) -- so a naive "now" fetched
+            # under a non-UTC session, then re-bound as a comparison
+            # parameter, silently compares wall-clock times across two
+            # different implicit offsets. Confirmed on a real instance with
+            # SESSIONTIMEZONE=-04:00/DBTIMEZONE=+00:00: a delivery row
+            # scheduled a full hour in the FUTURE matched a
+            # "scheduled_at <= :claim_now" due-recovery filter. Pinning UTC
+            # here makes every SYSTIMESTAMP-derived value in this session
+            # naive-but-unambiguously-UTC, matching the convention already
+            # used by every other backend (Postgres/MySQL/SQLite are all
+            # UTC internally).
+            try:
+                await cur.execute("ALTER SESSION SET TIME_ZONE = 'UTC'")
+            except Exception as exc:  # pragma: no cover - driver-dependent
+                _LOG.debug("ALTER SESSION SET TIME_ZONE failed: %s", exc)
             if pdb_target:
                 try:
                     await cur.execute(f"ALTER SESSION SET CONTAINER = {pdb_target}")
@@ -2594,7 +2620,367 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
 
 
 class OracleWebhookRepository(WebhookRepository):
-    """Oracle webhook repo — outbox dispatch inserts delivery rows."""
+    """Oracle webhook repo — full backend-neutral ``WebhookRepository`` (item 6/12).
+
+    Implements the 13-method contract on the row-per-attempt v3.5 schema
+    shape (the same one Postgres / SQLite / MySQL already speak):
+
+    * subscriptions carry ``description`` + a JSON ``events`` array;
+    * deliveries carry ``payload_hash``, ``attempt_num``, ``status``
+      (``pending | retrying | succeeded | abandoned``),
+      ``response_status``, ``response_body``, ``delivered_at``,
+      ``scheduled_at``, ``superseded``, ``lease_token``,
+      ``lease_expires_at``, ``writer_revision``, ``status_updated_at``.
+
+    The class mirrors :class:`PostgresWebhookRepository` semantics:
+    database-clock leases (Oracle ``SYSTIMESTAMP``), writer-revision
+    fence, success-after-expiry allowance, retry-chain convergence, and
+    the chain repair sweep. Oracle-specific dialect adaptations:
+
+    * ``SELECT ... FOR UPDATE SKIP LOCKED`` is used for the recovery
+      claim. Oracle cannot combine ``FOR UPDATE`` with ``FETCH FIRST``
+      (ORA-02014) and applies ``ROWNUM`` before ``ORDER BY``; claim
+      queries therefore wrap the ordered candidate set in an inner
+      ``ROWNUM``-bounded subquery, exactly the pattern
+      :class:`OracleCompressionQueueRepository` already uses.
+    * Oracle has no ``UPDATE ... RETURNING`` (and cannot combine
+      ``UPDATE .. FROM / RETURNING``). Per-row ``SELECT ... FOR UPDATE``
+      + targeted ``UPDATE`` is used wherever Postgres would
+      ``UPDATE ... RETURNING``. Single-row scalar returns (revoke,
+      response-body capture, repair rowcount) use Oracle's
+      ``RETURNING ... INTO :bind`` form on ``UPDATE``.
+    * JSON-array event matching uses ``DBMS_LOB.INSTR(events, :ev_token)
+      > 0`` so subscription matching tolerates compact (``["x"]``) or
+      pretty-printed JSON without requiring the JSON parser (same idiom
+      the live :class:`OracleBackend.webhooks` dispatch used pre-item-6).
+
+    The ``OracleBackend.webhooks`` accessor still raises
+    ``BackendCapabilityMissing`` for now (matching the
+    Postgres/MySQL/SQLite posture where the storage layer is consistent
+    with the ABC but the delivery worker is not yet wired). Wiring the
+    delivery worker through this repository is a later item.
+    """
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _oracle_ts(dt: datetime) -> datetime:
+        """Normalize a datetime to a tz-aware UTC ``datetime`` Oracle can bind.
+
+        Oracle TIMESTAMP / TIMESTAMP WITH TIME ZONE columns accept
+        ``datetime`` objects directly via the python-oracledb thin
+        driver; the session TZ is fixed by ``OracleBackend.open`` so a
+        naive UTC datetime is sufficient.
+        """
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    async def _oracle_now(self, conn: Any) -> datetime:
+        """Read the database clock as a NAIVE datetime, implicitly UTC.
+
+        Uses ``SYSTIMESTAMP`` (the cursor-layer translator rewrites
+        this to ``CURRENT TIMESTAMP`` for Db2 automatically). The
+        ``FROM dual`` token is preserved verbatim by the translator —
+        Db2 only resolves it when ``ORA_COMPATIBILITY`` is enabled in
+        the database config; on plain-Db2 deployments this would
+        fail. We catch that failure and fall back to Python's clock,
+        which is acceptable for lease accounting (the lease is
+        consumed locally within the worker, and ``repair_delivery_chains``
+        uses DB clock directly in SQL so cross-process drift stays
+        bounded there).
+
+        Deliberately NAIVE, not tz-aware: the session time zone is
+        pinned to UTC by ``_build_oracle_session_callback``, and
+        python-oracledb returns every ``TIMESTAMP WITH TIME ZONE``
+        column/bind value as a naive Python datetime regardless (tzinfo
+        is dropped on fetch). Every other timestamp this class touches
+        (``scheduled_at``, ``lease_expires_at``, etc.) is therefore also
+        naive. Returning a tz-AWARE value here silently breaks every SQL
+        comparison/bind that mixes it with those columns — confirmed
+        live: a delivery scheduled a full hour in the future matched a
+        "due now" claim filter once ``claim_now`` carried real tzinfo
+        while the column it was compared against didn't. Public-facing
+        record construction (e.g. ``WebhookDeliveryClaim.claim_db_now``)
+        promotes this value to tz-aware UTC via
+        ``_oracle_webhook_datetime`` at the point it's returned to the
+        caller, not here.
+        """
+        cursor = await _call(conn.cursor)
+        try:
+            try:
+                await _call(
+                    cursor.execute,
+                    "SELECT CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE) FROM dual",
+                )
+                row = await _call(cursor.fetchone)
+            except Exception:
+                # Either Oracle's SYSTIMESTAMP cast failed to parse the
+                # raw value, or Db2 (without ORA_COMPATIBILITY) rejected
+                # ``FROM dual``. Fall back to the Python clock so the
+                # lease path stays operational regardless of backend.
+                return datetime.now(timezone.utc).replace(tzinfo=None)
+        finally:
+            await _call(cursor.close)
+        if not row:
+            return datetime.now(timezone.utc).replace(tzinfo=None)
+        value = row[0]
+        if value is None:
+            return datetime.now(timezone.utc).replace(tzinfo=None)
+        if not isinstance(value, datetime):
+            # python-oracledb may return a string for some driver
+            # configurations — coerce defensively.
+            text = str(value).strip()
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                value = datetime.fromisoformat(text)
+            except ValueError:
+                # Last-resort fallback: if the DB returned a TIMESTAMP
+                # string in some other NLS format the fromisoformat
+                # parser can't read, use Python's clock rather than
+                # crashing the lease path.
+                return datetime.now(timezone.utc).replace(tzinfo=None)
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
+    # ── subscription surface ─────────────────────────────────────────────────
+
+    async def create_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        url: str,
+        events: Sequence[str],
+        secret: str,
+        description: str | None,
+        owner_id: str,
+        namespace: str,
+    ) -> WebhookSubscriptionRecord:
+        import oracledb
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            events_json = json.dumps(list(events), separators=(",", ":"))
+            # Oracle has no UPDATE..RETURNING; INSERT..RETURNING..INTO is
+            # the canonical id-return idiom (used elsewhere in this file
+            # for usage_ledger, session_logs, consultation_audit). An
+            # INSERT/UPDATE with RETURNING..INTO is NOT a query -- calling
+            # cursor.fetchone() on it raises DPY-1003 ("the executed
+            # statement does not return rows"). Read the bound OUT
+            # variables directly via .getvalue() instead.
+            new_id_var = cursor.var(str)
+            created_var = cursor.var(oracledb.DB_TYPE_TIMESTAMP_TZ)
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO webhook_subscriptions (
+                    id, url, events, secret, description, owner_id, namespace
+                ) VALUES (
+                    :id, :url, :events, :secret, :description, :owner_id, :namespace
+                )
+                RETURNING id, created INTO :new_id, :new_created
+                """,
+                {
+                    "id": subscription_id,
+                    "url": url,
+                    "events": events_json,
+                    "secret": secret,
+                    "description": description,
+                    "owner_id": owner_id,
+                    "namespace": namespace,
+                    "new_id": new_id_var,
+                    "new_created": created_var,
+                },
+            )
+            returned_id = _oracle_out_scalar(new_id_var)
+            returned_created = _oracle_out_scalar(created_var)
+        finally:
+            await _call(cursor.close)
+        if returned_id is None:
+            raise RuntimeError("Oracle: webhook subscription INSERT returned no row")
+        d = {
+            "id": returned_id,
+            "url": url,
+            "description": description,
+            "owner_id": owner_id,
+            "namespace": namespace,
+            "created": returned_created,
+            "revoked": 0,
+            "revoked_at": None,
+        }
+        return _oracle_webhook_subscription(d, events_value=events_json)
+
+    async def list_subscriptions(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str | None,
+        namespace: str | None,
+        include_revoked: bool,
+        limit: int,
+    ) -> list[WebhookSubscriptionRecord]:
+        if (owner_id is None) != (namespace is None):
+            raise ValueError(
+                "list_subscriptions requires both owner_id and namespace to be set, "
+                "or both to be None for a root/operator view"
+            )
+        conn = _conn_from_tx(tx)
+        conditions: list[str] = []
+        params: dict[str, Any] = {}
+        if not include_revoked:
+            conditions.append("revoked = 0")
+        if owner_id is not None:
+            assert namespace is not None  # guarded above
+            conditions.append("owner_id = :owner_id")
+            conditions.append("namespace = :namespace")
+            params["owner_id"] = owner_id
+            params["namespace"] = namespace
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        params["limit"] = int(limit)
+        sql = (
+            "SELECT id, url, events, description, owner_id, namespace, "
+            "created AS created_at, revoked, revoked_at "
+            f"FROM webhook_subscriptions {where} "
+            "ORDER BY created DESC FETCH FIRST :limit ROWS ONLY"
+        )
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(cursor.execute, sql, params)
+            rows = await _call(cursor.fetchall) or []
+            out: list[WebhookSubscriptionRecord] = []
+            for raw in rows:
+                d = await _row_to_dict(cursor, raw)
+                out.append(_oracle_webhook_subscription(d))
+        finally:
+            await _call(cursor.close)
+        return out
+
+    async def get_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> WebhookSubscriptionRecord | None:
+        if (owner_id is None) != (namespace is None):
+            raise ValueError(
+                "get_subscription requires both owner_id and namespace to be set, "
+                "or both to be None for a root/operator view"
+            )
+        conn = _conn_from_tx(tx)
+        conditions = ["id = :id"]
+        params: dict[str, Any] = {"id": subscription_id}
+        if owner_id is not None:
+            assert namespace is not None
+            conditions.append("owner_id = :owner_id")
+            conditions.append("namespace = :namespace")
+            params["owner_id"] = owner_id
+            params["namespace"] = namespace
+        sql = (
+            "SELECT id, url, events, description, owner_id, namespace, "
+            "created AS created_at, revoked, revoked_at "
+            f"FROM webhook_subscriptions WHERE {' AND '.join(conditions)}"
+        )
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(cursor.execute, sql, params)
+            row = await _call(cursor.fetchone)
+            d = await _row_to_dict(cursor, row) if row is not None else None
+        finally:
+            await _call(cursor.close)
+        if d is None:
+            return None
+        return _oracle_webhook_subscription(d)
+
+    async def revoke_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+    ) -> bool:
+        if (owner_id is None) != (namespace is None):
+            raise ValueError(
+                "revoke_subscription requires both owner_id and namespace to be set, "
+                "or both to be None for a root/operator view"
+            )
+        conn = _conn_from_tx(tx)
+        conditions = ["id = :id", "revoked = 0"]
+        params: dict[str, Any] = {"id": subscription_id}
+        if owner_id is not None:
+            assert namespace is not None
+            conditions.append("owner_id = :owner_id")
+            conditions.append("namespace = :namespace")
+            params["owner_id"] = owner_id
+            params["namespace"] = namespace
+        cursor = await _call(conn.cursor)
+        rid_var = cursor.var(str)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                UPDATE webhook_subscriptions
+                SET revoked = 1, revoked_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
+                WHERE {' AND '.join(conditions)}
+                RETURNING id INTO :rid
+                """,
+                {**params, "rid": rid_var},
+            )
+        finally:
+            await _call(cursor.close)
+        return _oracle_out_scalar(rid_var) is not None
+
+    async def list_deliveries(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str,
+        owner_id: str | None,
+        namespace: str | None,
+        limit: int,
+    ) -> list[WebhookDeliveryRecord]:
+        if (owner_id is None) != (namespace is None):
+            raise ValueError(
+                "list_deliveries requires both owner_id and namespace to be set, "
+                "or both to be None for a root/operator view"
+            )
+        conn = _conn_from_tx(tx)
+        params: dict[str, Any] = {"subscription_id": subscription_id}
+        scope_sql = ""
+        if owner_id is not None:
+            assert namespace is not None
+            scope_sql = " AND s.owner_id = :owner_id AND s.namespace = :namespace"
+            params["owner_id"] = owner_id
+            params["namespace"] = namespace
+        params["limit"] = int(limit)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                {oracle_webhook_delivery_select_clause()}
+                WHERE d.subscription_id = :subscription_id{scope_sql}
+                ORDER BY d.created DESC
+                FETCH FIRST :limit ROWS ONLY
+                """,
+                params,
+            )
+            rows = await _call(cursor.fetchall) or []
+            # Build row dicts INSIDE the try block: _row_to_dict reads
+            # cursor.description, which raises DPY-1006 ("cursor is not
+            # open") once the cursor is closed in `finally` below.
+            result = [_oracle_webhook_delivery(await _row_to_dict(cursor, raw)) for raw in rows]
+        finally:
+            await _call(cursor.close)
+        return result
+
+    # ── dispatch (outbox enqueue) ────────────────────────────────────────────
 
     async def dispatch_event(
         self,
@@ -2605,60 +2991,1130 @@ class OracleWebhookRepository(WebhookRepository):
         owner_id: str | None = None,
         namespace: str | None = None,
     ) -> list[str]:
-        import json
-        import uuid as _uuid
-
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
-            sub_where = ["revoked = 0"]
+            sub_conditions = ["revoked = 0"]
             sub_params: dict[str, Any] = {}
             if owner_id is not None:
-                sub_where.append("owner_id = :owner_id")
+                sub_conditions.append("owner_id = :owner_id")
                 sub_params["owner_id"] = owner_id
             if namespace is not None:
-                sub_where.append("namespace = :ns")
-                sub_params["ns"] = namespace
+                sub_conditions.append("namespace = :namespace")
+                sub_params["namespace"] = namespace
             # Subscription opts in to an event by listing it in the JSON
-            # array stored in ``events``. Use DBMS_LOB.INSTR to match the
-            # quoted event-name token; tolerates either compact (``["x"]``)
-            # or pretty-printed JSON without requiring the JSON parser.
-            sub_where.append("DBMS_LOB.INSTR(events, :ev_token) > 0")
+            # array stored in ``events``. DBMS_LOB.INSTR matches the
+            # quoted event-name token; tolerates compact ("["x"]") or
+            # pretty-printed JSON without requiring the JSON parser.
+            sub_conditions.append("DBMS_LOB.INSTR(events, :ev_token) > 0")
             sub_params["ev_token"] = f'"{event_type}"'
-            sql_sub = "SELECT id, owner_id, namespace FROM webhook_subscriptions WHERE " + " AND ".join(sub_where)
+            sql_sub = (
+                "SELECT id, url, owner_id, namespace FROM webhook_subscriptions WHERE "
+                + " AND ".join(sub_conditions)
+            )
             await _call(cursor.execute, sql_sub, sub_params)
             subs = await _fetch_all_dicts(cursor)
             if not subs:
                 return []
 
-            payload_json = json.dumps(payload, default=str, separators=(",", ":"))
+            now_ts = datetime.now(timezone.utc)
+            body = json.dumps(
+                {"event": event_type, "timestamp": now_ts.isoformat(), "data": payload},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
             delivery_ids: list[str] = []
             for sub in subs:
-                d_id = _uuid.uuid4().hex
+                d_id = uuid.uuid4().hex
                 await _call(
                     cursor.execute,
                     """
                     INSERT INTO webhook_deliveries (
-                        id, subscription_id, event_type, payload, owner_id,
-                        namespace, state, attempt_count, next_attempt_at
+                        id, subscription_id, event_type, payload, payload_hash,
+                        attempt_num, status, scheduled_at, writer_revision
                     ) VALUES (
-                        :id, :sub_id, :event_type, :payload, :owner_id,
-                        :namespace, 'pending', 0, SYSTIMESTAMP
+                        :id, :sub_id, :event_type, :payload, :payload_hash,
+                        1, 'pending', CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE), :writer_rev
                     )
                     """,
                     {
                         "id": d_id,
                         "sub_id": sub["id"],
                         "event_type": event_type,
-                        "payload": payload_json,
-                        "owner_id": sub.get("owner_id") or "default",
-                        "namespace": sub.get("namespace") or "default",
+                        "payload": body,
+                        "payload_hash": body_hash,
+                        "writer_rev": webhook_constants.NEW_CODE_WRITER_REVISION,
                     },
                 )
                 delivery_ids.append(d_id)
             return delivery_ids
         finally:
             await _call(cursor.close)
+
+    # ── claim (one row) ──────────────────────────────────────────────────────
+
+    async def claim_delivery(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+        lease_seconds: int,
+        max_attempts: int,
+        writer_revision: int,
+    ) -> WebhookDeliveryClaim | None:
+        """Atomic lease for a single due attempt.
+
+        Mirrors ``PostgresWebhookRepository.claim_delivery`` but uses the
+        Oracle ``SELECT ... FOR UPDATE SKIP LOCKED`` + per-row ``UPDATE``
+        pattern because Oracle has no ``UPDATE .. RETURNING``.
+        """
+        import oracledb
+
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        conn = _conn_from_tx(tx)
+        claim_now = await self._oracle_now(conn)
+        lease_expires_at = claim_now + timedelta(seconds=lease_seconds)
+        cursor = await _call(conn.cursor)
+        try:
+            # Without an explicit bind type, oracledb infers a plain
+            # (non-tz) TIMESTAMP for a naive Python datetime, and the
+            # comparison against a TIMESTAMP WITH TIME ZONE column then
+            # silently returns wrong results (confirmed live: a delivery
+            # scheduled milliseconds in the past failed a
+            # "scheduled_at <= :claim_now" filter that plain Python
+            # datetime comparison shows as true). Force the correct type.
+            cursor.setinputsizes(claim_now=oracledb.DB_TYPE_TIMESTAMP_TZ)
+            await _call(
+                cursor.execute,
+                """
+                SELECT d.id, d.subscription_id, d.event_type, d.payload,
+                       d.payload_hash, d.attempt_num, d.status,
+                       d.lease_token, d.lease_expires_at, d.writer_revision
+                FROM webhook_deliveries d
+                WHERE d.id = :id
+                  AND d.scheduled_at <= :claim_now
+                  AND d.attempt_num <= :max_attempts
+                  AND d.status IN ('pending', 'retrying')
+                  AND d.superseded = 0
+                  AND (d.lease_token IS NULL OR d.lease_expires_at < :claim_now)
+                  AND d.writer_revision = :writer_revision
+                  AND (
+                    d.status = 'pending'
+                    OR NOT EXISTS (
+                      SELECT 1 FROM webhook_deliveries newer
+                      WHERE newer.subscription_id = d.subscription_id
+                        AND newer.event_type = d.event_type
+                        AND newer.payload_hash = d.payload_hash
+                        AND newer.attempt_num > d.attempt_num
+                    )
+                  )
+                FOR UPDATE SKIP LOCKED
+                """,
+                {
+                    "id": delivery_id,
+                    "claim_now": claim_now,
+                    "max_attempts": int(max_attempts),
+                    "writer_revision": int(writer_revision),
+                },
+            )
+            row = await _call(cursor.fetchone)
+            if row is None:
+                return None
+            cursor.setinputsizes(lease_expires_at=oracledb.DB_TYPE_TIMESTAMP_TZ)
+            await _call(
+                cursor.execute,
+                """
+                UPDATE webhook_deliveries
+                SET lease_token = :lease_token,
+                    lease_expires_at = :lease_expires_at,
+                    status = CASE WHEN status = 'pending' THEN 'retrying' ELSE status END,
+                    status_updated_at = CASE
+                        WHEN status = 'pending' THEN CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
+                        ELSE status_updated_at
+                    END
+                WHERE id = :id
+                """,
+                {
+                    "lease_token": lease_token,
+                    "lease_expires_at": lease_expires_at,
+                    "id": delivery_id,
+                },
+            )
+            await _call(
+                cursor.execute,
+                f"{oracle_webhook_delivery_select_clause()} WHERE d.id = :id",
+                {"id": delivery_id},
+            )
+            full_row = await _call(cursor.fetchone)
+            d = await _row_to_dict(cursor, full_row) if full_row is not None else None
+        finally:
+            await _call(cursor.close)
+        if d is None:
+            return None
+        return _oracle_webhook_claim(d, lease_token, claim_now)
+
+    # ── claim due (recovery) ─────────────────────────────────────────────────
+
+    async def claim_due_deliveries(
+        self,
+        tx: Transaction,
+        *,
+        lease_token: str,
+        limit: int,
+        lease_seconds: int,
+        max_attempts: int,
+        writer_revision: int,
+    ) -> list[WebhookDeliveryClaim]:
+        """Recovery-side batch claim.
+
+        Oracle cannot combine ``FOR UPDATE`` with ``FETCH FIRST``
+        (ORA-02014) and applies ``ROWNUM`` before ``ORDER BY``, so we
+        bound the candidate set with an inner ``ROWNUM`` subquery.
+
+        Oracle ALSO refuses ``FOR UPDATE`` directly against a derived
+        view containing ``ORDER BY`` (ORA-02014: "cannot select FOR
+        UPDATE from view with DISTINCT, GROUP BY, etc." -- an ordered
+        subquery is treated the same way). So the ordering/limiting
+        subquery below runs as a plain SELECT with no locking, and a
+        SEPARATE outer query applies ``FOR UPDATE SKIP LOCKED`` directly
+        against the base table via ``WHERE id IN (...)``, which Oracle
+        allows. ``SKIP LOCKED`` keeps competing recovery workers from
+        claiming the same row.
+        """
+        import oracledb
+
+        if limit <= 0:
+            return []
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        conn = _conn_from_tx(tx)
+        claim_now = await self._oracle_now(conn)
+        lease_expires_at = claim_now + timedelta(seconds=lease_seconds)
+        cursor = await _call(conn.cursor)
+        claimed_ids: list[str] = []
+        try:
+            # See claim_delivery for why this explicit bind type is
+            # required: without it, a naive Python datetime compared
+            # against a TIMESTAMP WITH TIME ZONE column silently returns
+            # wrong results.
+            cursor.setinputsizes(claim_now=oracledb.DB_TYPE_TIMESTAMP_TZ)
+            await _call(
+                cursor.execute,
+                """
+                SELECT id FROM (
+                    SELECT id FROM webhook_deliveries
+                    WHERE scheduled_at <= :claim_now
+                      AND attempt_num <= :max_attempts
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                      AND (lease_token IS NULL OR lease_expires_at < :claim_now)
+                      AND writer_revision = :writer_revision
+                      AND NOT EXISTS (
+                        SELECT 1 FROM webhook_deliveries peer
+                        WHERE peer.subscription_id = webhook_deliveries.subscription_id
+                          AND peer.event_type = webhook_deliveries.event_type
+                          AND peer.payload_hash = webhook_deliveries.payload_hash
+                          AND peer.status = 'succeeded'
+                      )
+                      AND (
+                        status = 'pending'
+                        OR NOT EXISTS (
+                          SELECT 1 FROM webhook_deliveries newer
+                          WHERE newer.subscription_id = webhook_deliveries.subscription_id
+                            AND newer.event_type = webhook_deliveries.event_type
+                            AND newer.payload_hash = webhook_deliveries.payload_hash
+                            AND newer.attempt_num > webhook_deliveries.attempt_num
+                        )
+                      )
+                    ORDER BY scheduled_at, id
+                ) WHERE ROWNUM <= :limit
+                """,
+                {
+                    "claim_now": claim_now,
+                    "max_attempts": int(max_attempts),
+                    "writer_revision": int(writer_revision),
+                    "limit": int(limit),
+                },
+            )
+            candidate_rows = await _call(cursor.fetchall) or []
+            candidate_ids = [str(r[0]) for r in candidate_rows]
+            if not candidate_ids:
+                return []
+            cand_placeholders, cand_params = _in_placeholders(candidate_ids, prefix="cand")
+            # Separate FOR UPDATE SKIP LOCKED pass directly against the base
+            # table (see docstring): Oracle refuses FOR UPDATE on the ordered
+            # derived view above, but allows it here since this SELECT's
+            # FROM is the bare table, filtered only by a plain IN-list.
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT id FROM webhook_deliveries
+                WHERE id IN ({cand_placeholders})
+                FOR UPDATE SKIP LOCKED
+                """,
+                cand_params,
+            )
+            id_rows = await _call(cursor.fetchall) or []
+            claimed_ids = [str(r[0]) for r in id_rows]
+            if not claimed_ids:
+                return []
+            placeholders, id_params = _in_placeholders(claimed_ids, prefix="did")
+            cursor.setinputsizes(lease_expires_at=oracledb.DB_TYPE_TIMESTAMP_TZ)
+            await _call(
+                cursor.execute,
+                f"""
+                UPDATE webhook_deliveries
+                SET lease_token = :lease_token,
+                    lease_expires_at = :lease_expires_at,
+                    status = CASE WHEN status = 'pending' THEN 'retrying' ELSE status END,
+                    status_updated_at = CASE
+                        WHEN status = 'pending' THEN CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
+                        ELSE status_updated_at
+                    END
+                WHERE id IN ({placeholders})
+                """,
+                {
+                    "lease_token": lease_token,
+                    "lease_expires_at": lease_expires_at,
+                    **id_params,
+                },
+            )
+            await _call(
+                cursor.execute,
+                f"""
+                {oracle_webhook_delivery_select_clause()}
+                WHERE d.id IN ({placeholders})
+                ORDER BY d.scheduled_at, d.id
+                """,
+                id_params,
+            )
+            rows = await _call(cursor.fetchall) or []
+            result = [
+                _oracle_webhook_claim(await _row_to_dict(cursor, raw), lease_token, claim_now)
+                for raw in rows
+            ]
+        finally:
+            await _call(cursor.close)
+        return result
+
+    # ── guard (pre-send fence) ───────────────────────────────────────────────
+
+    async def guard_delivery_claim(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT id, subscription_id, event_type, payload_hash, attempt_num "
+                "FROM webhook_deliveries WHERE id = :id FOR UPDATE",
+                {"id": delivery_id},
+            )
+            delivery = await _call(cursor.fetchone)
+            if delivery is None:
+                return False
+            import oracledb
+
+            now = await self._oracle_now(conn)
+            # owned & live? Explicit bind type required -- see
+            # claim_delivery for why a naive Python datetime compared
+            # against a TIMESTAMP WITH TIME ZONE column otherwise
+            # silently returns wrong results.
+            cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
+            await _call(
+                cursor.execute,
+                """
+                SELECT 1 FROM webhook_deliveries
+                WHERE id = :id AND lease_token = :lease_token
+                  AND lease_expires_at > :now
+                  AND status IN ('pending', 'retrying')
+                  AND superseded = 0
+                """,
+                {"id": delivery_id, "lease_token": lease_token, "now": now},
+            )
+            if (await _call(cursor.fetchone)) is None:
+                return False
+            # any chain peer already succeeded?
+            await _call(
+                cursor.execute,
+                """
+                SELECT 1 FROM webhook_deliveries peer
+                WHERE peer.subscription_id = :sub_id
+                  AND peer.event_type = :event_type
+                  AND peer.payload_hash = :payload_hash
+                  AND peer.status = 'succeeded'
+                  AND peer.id <> :id
+                """,
+                {
+                    "sub_id": delivery[1],
+                    "event_type": delivery[2],
+                    "payload_hash": delivery[3],
+                    "id": delivery_id,
+                },
+            )
+            if (await _call(cursor.fetchone)) is not None:
+                cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
+                await _call(
+                    cursor.execute,
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'abandoned', superseded = 1,
+                        response_status = NULL, response_body = NULL,
+                        error = 'succeeded-chain-peer-before-send',
+                        lease_token = NULL, lease_expires_at = NULL,
+                        status_updated_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
+                    WHERE id = :id AND lease_token = :lease_token
+                      AND lease_expires_at > :now
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                    """,
+                    {"id": delivery_id, "lease_token": lease_token, "now": now},
+                )
+                return False
+            # any live newer attempt?
+            await _call(
+                cursor.execute,
+                """
+                SELECT 1 FROM webhook_deliveries newer
+                WHERE newer.subscription_id = :sub_id
+                  AND newer.event_type = :event_type
+                  AND newer.payload_hash = :payload_hash
+                  AND newer.attempt_num > :attempt_num
+                  AND newer.status IN ('pending', 'retrying')
+                  AND newer.superseded = 0
+                """,
+                {
+                    "sub_id": delivery[1],
+                    "event_type": delivery[2],
+                    "payload_hash": delivery[3],
+                    "attempt_num": delivery[4],
+                },
+            )
+            if (await _call(cursor.fetchone)) is not None:
+                cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
+                await _call(
+                    cursor.execute,
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'abandoned', superseded = 1,
+                        lease_token = NULL, lease_expires_at = NULL,
+                        status_updated_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
+                    WHERE id = :id AND lease_token = :lease_token
+                      AND lease_expires_at > :now
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                    """,
+                    {"id": delivery_id, "lease_token": lease_token, "now": now},
+                )
+                return False
+            return True
+        finally:
+            await _call(cursor.close)
+
+    # ── release (pre-send cancel) ─────────────────────────────────────────────
+
+    async def release_delivery_claim(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE webhook_deliveries
+                SET lease_token = NULL, lease_expires_at = NULL
+                WHERE id = :id AND lease_token = :lease_token
+                """,
+                {"id": delivery_id, "lease_token": lease_token},
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return False
+            await _call(
+                cursor.execute,
+                "SELECT status, superseded FROM webhook_deliveries WHERE id = :id",
+                {"id": delivery_id},
+            )
+            row = await _call(cursor.fetchone)
+            d = await _row_to_dict(cursor, row) if row is not None else None
+        finally:
+            await _call(cursor.close)
+        if d is None:
+            return False
+        status = str(d.get("status") or "")
+        if status not in ("pending", "retrying"):
+            return False
+        if bool(d.get("superseded")):
+            return False
+        return True
+
+    # ── finalize (atomic per-attempt terminalization) ─────────────────────────
+
+    async def finalize_delivery(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        lease_token: str,
+        outcome: WebhookDeliveryOutcome,
+        max_attempts: int,
+        backoff_schedule: Sequence[int],
+    ) -> WebhookFinalizationResult:
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        backoff_list = list(backoff_schedule)
+        if len(backoff_list) < max_attempts - 1:
+            raise ValueError(
+                f"backoff_schedule must contain at least max_attempts-1 "
+                f"({max_attempts - 1}) entries; got {len(backoff_list)}"
+            )
+        if any(delay <= 0 for delay in backoff_list):
+            raise ValueError("backoff_schedule must contain positive delays")
+
+        import oracledb
+
+        conn = _conn_from_tx(tx)
+        now = await self._oracle_now(conn)
+        cursor = await _call(conn.cursor)
+        try:
+            # Load + chain-lock the row.
+            await _call(
+                cursor.execute,
+                """
+                SELECT d.id, d.subscription_id, d.event_type, d.payload,
+                       d.payload_hash, d.attempt_num, d.status,
+                       s.url, s.secret, s.revoked, s.owner_id, s.namespace
+                FROM webhook_deliveries d
+                JOIN webhook_subscriptions s ON s.id = d.subscription_id
+                WHERE d.id = :id FOR UPDATE
+                """,
+                {"id": delivery_id},
+            )
+            delivery = await _call(cursor.fetchone)
+            if delivery is None:
+                return WebhookFinalizationResult(applied=False)
+            delivery = await _row_to_dict(cursor, delivery)
+            attempt_num = int(delivery["attempt_num"])
+            sub_id = delivery["subscription_id"]
+            event_type = delivery["event_type"]
+            payload = delivery["payload"]
+            payload_hash = delivery["payload_hash"]
+            revoked = bool(delivery["revoked"])
+
+            # ── Success path (2xx) ────────────────────────────────────────
+            if outcome.succeeded:
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT 1 FROM webhook_deliveries peer
+                    WHERE peer.subscription_id = :sub_id
+                      AND peer.event_type = :event_type
+                      AND peer.payload_hash = :payload_hash
+                      AND peer.status = 'succeeded'
+                      AND peer.id <> :id
+                    """,
+                    {
+                        "sub_id": sub_id,
+                        "event_type": event_type,
+                        "payload_hash": payload_hash,
+                        "id": delivery_id,
+                    },
+                )
+                if (await _call(cursor.fetchone)) is not None:
+                    await _call(
+                        cursor.execute,
+                        """
+                        UPDATE webhook_deliveries
+                        SET status = 'abandoned', superseded = 1,
+                            response_status = :rstatus, response_body = :rbody, error = :err,
+                            lease_token = NULL, lease_expires_at = NULL,
+                            status_updated_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
+                        WHERE id = :id AND lease_token = :lease_token
+                          AND status IN ('pending', 'retrying')
+                          AND superseded = 0
+                        """,
+                        {
+                            "rstatus": outcome.response_status,
+                            "rbody": outcome.response_body,
+                            "err": outcome.error,
+                            "id": delivery_id,
+                            "lease_token": lease_token,
+                        },
+                    )
+                    return WebhookFinalizationResult(
+                        applied=int(getattr(cursor, "rowcount", 0) or 0) > 0,
+                        status="abandoned",
+                    )
+
+                await _call(
+                    cursor.execute,
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'succeeded', superseded = 0,
+                        response_status = :rstatus, response_body = :rbody, error = NULL,
+                        delivered_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE),
+                        lease_token = NULL, lease_expires_at = NULL,
+                        status_updated_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
+                    WHERE id = :id AND lease_token = :lease_token
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                    """,
+                    {
+                        "rstatus": outcome.response_status,
+                        "rbody": outcome.response_body,
+                        "id": delivery_id,
+                        "lease_token": lease_token,
+                    },
+                )
+                if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                    # lease/token mismatch → try the same abandonment fallback
+                    await _call(
+                        cursor.execute,
+                        """
+                        UPDATE webhook_deliveries
+                        SET status = 'abandoned', superseded = 1,
+                            response_status = :rstatus, response_body = :rbody, error = :err,
+                            lease_token = NULL, lease_expires_at = NULL,
+                            status_updated_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
+                        WHERE id = :id AND lease_token = :lease_token
+                          AND status IN ('pending', 'retrying')
+                          AND superseded = 0
+                        """,
+                        {
+                            "rstatus": outcome.response_status,
+                            "rbody": outcome.response_body,
+                            "err": outcome.error,
+                            "id": delivery_id,
+                            "lease_token": lease_token,
+                        },
+                    )
+                    if int(getattr(cursor, "rowcount", 0) or 0) > 0:
+                        return WebhookFinalizationResult(
+                            applied=True, status="abandoned",
+                        )
+                    await _call(
+                        cursor.execute,
+                        """
+                        UPDATE webhook_deliveries
+                        SET lease_token = NULL, lease_expires_at = NULL
+                        WHERE id = :id AND lease_token = :lease_token
+                        """,
+                        {"id": delivery_id, "lease_token": lease_token},
+                    )
+                    return WebhookFinalizationResult(applied=False)
+
+                # Abandon free live successors that this success makes obsolete.
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT id FROM webhook_deliveries newer
+                    WHERE newer.subscription_id = :sub_id
+                      AND newer.event_type = :event_type
+                      AND newer.payload_hash = :payload_hash
+                      AND newer.attempt_num > :attempt_num
+                      AND newer.status IN ('pending', 'retrying')
+                      AND newer.superseded = 0
+                      AND (newer.lease_token IS NULL OR newer.lease_expires_at < CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE))
+                    ORDER BY newer.attempt_num ASC, newer.id ASC
+                    """,
+                    {
+                        "sub_id": sub_id,
+                        "event_type": event_type,
+                        "payload_hash": payload_hash,
+                        "attempt_num": attempt_num,
+                    },
+                )
+                successor_rows = await _call(cursor.fetchall) or []
+                for succ in successor_rows:
+                    await _call(
+                        cursor.execute,
+                        """
+                        UPDATE webhook_deliveries
+                        SET status = 'abandoned', superseded = 1,
+                            status_updated_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE),
+                            lease_token = NULL, lease_expires_at = NULL
+                        WHERE id = :id
+                          AND status IN ('pending', 'retrying')
+                          AND superseded = 0
+                          AND (lease_token IS NULL OR lease_expires_at < CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE))
+                        """,
+                        {"id": str(succ[0])},
+                    )
+                return WebhookFinalizationResult(applied=True, status="succeeded")
+
+            # ── Failure path ────────────────────────────────────────────────
+            # Revoked subscription → abandoned, no successor.
+            # ABC contract: failure finalization requires an UNEXPIRED
+            # owned lease — the lease_expires_at > :now check enforces it.
+            if revoked:
+                cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
+                await _call(
+                    cursor.execute,
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'abandoned', superseded = 0,
+                        error = 'subscription revoked',
+                        delivered_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE),
+                        lease_token = NULL, lease_expires_at = NULL,
+                        status_updated_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
+                    WHERE id = :id AND lease_token = :lease_token
+                      AND lease_expires_at > :now
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                    """,
+                    {"id": delivery_id, "lease_token": lease_token, "now": now},
+                )
+                applied = int(getattr(cursor, "rowcount", 0) or 0) > 0
+                return WebhookFinalizationResult(
+                    applied=applied,
+                    status="abandoned" if applied else None,
+                )
+
+            # Chain already converged by another writer?
+            await _call(
+                cursor.execute,
+                """
+                SELECT 1 FROM webhook_deliveries peer
+                WHERE peer.subscription_id = :sub_id
+                  AND peer.event_type = :event_type
+                  AND peer.payload_hash = :payload_hash
+                  AND peer.status = 'succeeded'
+                  AND peer.id <> :id
+                """,
+                {
+                    "sub_id": sub_id,
+                    "event_type": event_type,
+                    "payload_hash": payload_hash,
+                    "id": delivery_id,
+                },
+            )
+            if (await _call(cursor.fetchone)) is not None:
+                cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
+                await _call(
+                    cursor.execute,
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'abandoned', superseded = 1,
+                        response_status = :rstatus, response_body = :rbody, error = :err,
+                        lease_token = NULL, lease_expires_at = NULL,
+                        status_updated_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
+                    WHERE id = :id AND lease_token = :lease_token
+                      AND lease_expires_at > :now
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                    """,
+                    {
+                        "rstatus": outcome.response_status,
+                        "rbody": outcome.response_body,
+                        "err": outcome.error,
+                        "id": delivery_id,
+                        "lease_token": lease_token,
+                        "now": now,
+                    },
+                )
+                applied = int(getattr(cursor, "rowcount", 0) or 0) > 0
+                return WebhookFinalizationResult(applied=applied, status="abandoned")
+
+            next_attempt = attempt_num + 1
+            if next_attempt > max_attempts:
+                cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
+                await _call(
+                    cursor.execute,
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'abandoned', superseded = 0,
+                        response_status = :rstatus, response_body = :rbody, error = :err,
+                        delivered_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE),
+                        lease_token = NULL, lease_expires_at = NULL,
+                        status_updated_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
+                    WHERE id = :id AND lease_token = :lease_token
+                      AND lease_expires_at > :now
+                      AND status IN ('pending', 'retrying')
+                      AND superseded = 0
+                    """,
+                    {
+                        "rstatus": outcome.response_status,
+                        "rbody": outcome.response_body,
+                        "err": outcome.error,
+                        "id": delivery_id,
+                        "lease_token": lease_token,
+                        "now": now,
+                    },
+                )
+                applied = int(getattr(cursor, "rowcount", 0) or 0) > 0
+                return WebhookFinalizationResult(
+                    applied=applied,
+                    status="abandoned" if applied else None,
+                )
+
+            # Retryable failure: terminalize owned attempt, then enqueue
+            # at most one successor at the configured backoff time.
+            backoff_seconds = backoff_list[attempt_num - 1]
+            await _call(
+                cursor.execute,
+                """
+                SELECT 1 FROM webhook_deliveries newer
+                WHERE newer.subscription_id = :sub_id
+                  AND newer.event_type = :event_type
+                  AND newer.payload_hash = :payload_hash
+                  AND newer.attempt_num > :attempt_num
+                """,
+                {
+                    "sub_id": sub_id,
+                    "event_type": event_type,
+                    "payload_hash": payload_hash,
+                    "attempt_num": attempt_num,
+                },
+            )
+            successor_exists = (await _call(cursor.fetchone)) is not None
+            cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
+            await _call(
+                cursor.execute,
+                """
+                UPDATE webhook_deliveries
+                SET status = 'abandoned', superseded = 1,
+                    response_status = :rstatus, response_body = :rbody, error = :err,
+                    lease_token = NULL, lease_expires_at = NULL,
+                    status_updated_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
+                WHERE id = :id AND lease_token = :lease_token
+                  AND lease_expires_at > :now
+                  AND status IN ('pending', 'retrying')
+                  AND superseded = 0
+                """,
+                {
+                    "rstatus": outcome.response_status,
+                    "rbody": outcome.response_body,
+                    "err": outcome.error,
+                    "id": delivery_id,
+                    "lease_token": lease_token,
+                    "now": now,
+                },
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return WebhookFinalizationResult(applied=False)
+            successor_id: str | None = None
+            if not successor_exists:
+                # Use the already-fetched DB clock (``now``), not a fresh
+                # app-server ``datetime.now()`` call -- consistent with
+                # every other clock read in this method and avoids
+                # introducing app/DB clock drift into the schedule.
+                scheduled_at = now + timedelta(seconds=backoff_seconds)
+                new_id = uuid.uuid4().hex
+                try:
+                    cursor.setinputsizes(scheduled_at=oracledb.DB_TYPE_TIMESTAMP_TZ)
+                    await _call(
+                        cursor.execute,
+                        """
+                        INSERT INTO webhook_deliveries (
+                            id, subscription_id, event_type, payload, payload_hash,
+                            attempt_num, status, scheduled_at, writer_revision
+                        ) VALUES (
+                            :id, :sub_id, :event_type, :payload, :payload_hash,
+                            :attempt_num, 'pending', :scheduled_at, :writer_rev
+                        )
+                        """,
+                        {
+                            "id": new_id,
+                            "sub_id": sub_id,
+                            "event_type": event_type,
+                            "payload": payload,
+                            "payload_hash": payload_hash,
+                            "attempt_num": next_attempt,
+                            "scheduled_at": scheduled_at,
+                            "writer_rev": webhook_constants.NEW_CODE_WRITER_REVISION,
+                        },
+                    )
+                    successor_id = new_id
+                except Exception as exc:
+                    # ORA-00001 (unique constraint): another writer raced
+                    # us. The other writer's row owns the forward
+                    # direction.
+                    if not _is_unique_violation(exc):
+                        raise
+                    successor_id = None
+            return WebhookFinalizationResult(
+                applied=True,
+                status="abandoned",
+                successor_delivery_id=successor_id,
+            )
+        finally:
+            await _call(cursor.close)
+
+    # ── audit-only response body capture ─────────────────────────────────────
+
+    async def store_delivery_response_body(
+        self,
+        tx: Transaction,
+        *,
+        delivery_id: str,
+        response_body: str,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE webhook_deliveries
+                SET response_body = :body
+                WHERE id = :id
+                """,
+                {"body": response_body, "id": delivery_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    # ── chain repair sweep ───────────────────────────────────────────────────
+
+    async def repair_delivery_chains(self, tx: Transaction) -> int:
+        """Idempotent sweep: terminalize live attempts that have been made
+        obsolete by a newer attempt or a succeeded peer.  Mirrors the
+        Postgres ``repair_delivery_chains`` shape.
+
+        The ``(lease_token IS NULL OR lease_expires_at < now)`` clause
+        preserves the live-worker invariant: never steal an unexpired
+        lease; only terminalize rows that are safe to abandon.
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE webhook_deliveries d
+                SET status = 'abandoned', superseded = 1,
+                    status_updated_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE),
+                    lease_token = NULL, lease_expires_at = NULL
+                WHERE d.status IN ('pending', 'retrying')
+                  AND d.superseded = 0
+                  AND (d.lease_token IS NULL OR d.lease_expires_at < CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE))
+                  AND (
+                    EXISTS (
+                      SELECT 1 FROM webhook_deliveries newer
+                      WHERE newer.subscription_id = d.subscription_id
+                        AND newer.event_type = d.event_type
+                        AND newer.payload_hash = d.payload_hash
+                        AND newer.attempt_num > d.attempt_num
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM webhook_deliveries peer
+                      WHERE peer.subscription_id = d.subscription_id
+                        AND peer.event_type = d.event_type
+                        AND peer.payload_hash = d.payload_hash
+                        AND peer.status = 'succeeded'
+                    )
+                  )
+                """,
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+
+# ── Oracle webhook row normalizers ─────────────────────────────────────────────
+
+
+def oracle_webhook_delivery_select_clause() -> str:
+    """SELECT clause for one canonical webhook_deliveries + subscription row.
+
+    Pulled out so claim / claim_due / guard / finalize / list_deliveries
+    can share the exact same column shape.
+    """
+    return (
+        "SELECT d.id, d.subscription_id, d.event_type, d.payload, d.payload_hash, "
+        "d.attempt_num, d.status, d.response_status, d.response_body, d.error, "
+        "d.scheduled_at, d.delivered_at, d.created AS created_at, "
+        "d.status_updated_at, d.superseded, d.lease_token, d.lease_expires_at, "
+        "d.writer_revision, "
+        "s.url, s.secret, s.revoked, s.owner_id, s.namespace "
+        "FROM webhook_deliveries d "
+        "JOIN webhook_subscriptions s ON s.id = d.subscription_id"
+    )
+
+
+def _oracle_out_scalar(var: Any) -> Any:
+    """Read a single ``RETURNING ... INTO :bind`` OUT variable's value.
+
+    ``cursor.var(...)`` OUT binds return their value as a length-1
+    list/tuple from ``.getvalue()`` for a single-row DML statement (INSERT/
+    UPDATE affecting exactly one row) -- unwrap that shape here. Never call
+    ``cursor.fetchone()`` on a RETURNING..INTO statement: it is not a
+    query and raises ``DPY-1003``.
+    """
+    value = var.getvalue()
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
+def _oracle_webhook_datetime(value: Any) -> datetime:
+    """Promote an Oracle TIMESTAMP / TIMESTAMP WITH TIME ZONE value to a
+    tz-aware UTC datetime for the canonical WebhookDeliveryRecord."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (bytes, bytearray)):
+        text = bytes(value).decode("utf-8")
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            # Oracle may return DD-MON-YY HH.MM.SS.SSSSSSS AM (NLS_TSTZ).
+            # Fall back to strptime; the session TZ is pinned UTC by
+            # OracleBackend.open so naive datetime is already UTC.
+            for fmt in (
+                "%d-%b-%y %H.%M.%S.%f",
+                "%d-%b-%y %H.%M.%S",
+                "%Y-%m-%dT%H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S",
+            ):
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                raise
+    else:
+        raise ValueError(f"Oracle: expected datetime, got {type(value).__name__}")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _oracle_webhook_json_events(value: Any) -> tuple[str, ...]:
+    """Decode an Oracle ``events`` JSON column into a tuple of event names."""
+    if value is None:
+        return ()
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value).decode("utf-8")
+    elif isinstance(value, str):
+        raw = value
+    else:
+        return ()
+    text = raw.strip()
+    if not text:
+        return ()
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(str(event) for event in parsed)
+
+
+def _oracle_webhook_subscription(
+    row: dict[str, Any], *, events_value: Any | None = None
+) -> WebhookSubscriptionRecord:
+    """Normalize a webhook_subscriptions row into a backend-neutral record."""
+    events_raw = events_value if events_value is not None else row.get("events")
+    events = _oracle_webhook_json_events(events_raw)
+    created_raw = row.get("created") or row.get("created_at")
+    return WebhookSubscriptionRecord(
+        id=str(row["id"]),
+        url=row["url"],
+        events=events,
+        description=row.get("description"),
+        owner_id=row["owner_id"],
+        namespace=row["namespace"],
+        created=_oracle_webhook_datetime(created_raw),
+        revoked=bool(row.get("revoked")),
+        revoked_at=(
+            _oracle_webhook_datetime(row["revoked_at"])
+            if row.get("revoked_at") is not None
+            else None
+        ),
+    )
+
+
+def _oracle_webhook_delivery(row: dict[str, Any]) -> WebhookDeliveryRecord:
+    status = row.get("status")
+    if status not in ("pending", "retrying", "succeeded", "abandoned"):
+        raise ValueError(f"Oracle: unexpected webhook_deliveries status {status!r}")
+    lease_token = row.get("lease_token")
+    lease_expires_at = row.get("lease_expires_at")
+    return WebhookDeliveryRecord(
+        id=str(row["id"]),
+        subscription_id=str(row["subscription_id"]),
+        event_type=row["event_type"],
+        payload=row["payload"],
+        payload_hash=row["payload_hash"],
+        attempt_num=int(row["attempt_num"]),
+        status=status,  # type: ignore[arg-type]
+        response_status=row.get("response_status"),
+        response_body=row.get("response_body"),
+        error=row.get("error"),
+        scheduled_at=_oracle_webhook_datetime(row["scheduled_at"]),
+        delivered_at=(
+            _oracle_webhook_datetime(row["delivered_at"])
+            if row.get("delivered_at") is not None
+            else None
+        ),
+        created=_oracle_webhook_datetime(row.get("created_at") or row.get("created")),
+        status_updated_at=_oracle_webhook_datetime(row["status_updated_at"]),
+        superseded=bool(row.get("superseded")),
+        lease_token=str(lease_token) if lease_token is not None else None,
+        lease_expires_at=(
+            _oracle_webhook_datetime(lease_expires_at)
+            if lease_expires_at is not None
+            else None
+        ),
+        writer_revision=int(row.get("writer_revision") or 0),
+    )
+
+
+def _oracle_webhook_claim(
+    row: dict[str, Any], lease_token: str, claim_now: datetime
+) -> WebhookDeliveryClaim:
+    """Build a ``WebhookDeliveryClaim`` from the post-claim SELECT row.
+
+    ``claim_now`` arrives naive (see ``_oracle_now`` docstring) -- promote
+    it to tz-aware UTC here, at the public-record boundary, via the same
+    ``_oracle_webhook_datetime`` normalizer every other field on this
+    record uses.
+    """
+    delivery = _oracle_webhook_delivery(row)
+    claim_now_aware = _oracle_webhook_datetime(claim_now)
+    lease_expires_at = (
+        _oracle_webhook_datetime(row["lease_expires_at"])
+        if row.get("lease_expires_at") is not None
+        else None
+    )
+    return WebhookDeliveryClaim(
+        delivery=delivery,
+        lease_token=lease_token,
+        lease_expires_at=lease_expires_at or claim_now_aware,
+        claim_db_now=claim_now_aware,
+        url=row["url"],
+        secret=row.get("secret") or "",
+        subscription_revoked=bool(row.get("revoked")),
+        owner_id=row["owner_id"],
+        namespace=row["namespace"],
+    )
 
 
 class OracleConsultationAuditRepository(ConsultationAuditRepository):
