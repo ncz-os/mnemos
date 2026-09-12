@@ -12,6 +12,7 @@ from mnemos.persistence.base import (
     WEBHOOK_LIVE_STATUSES,
     WEBHOOK_TERMINAL_STATUSES,
     WebhookDeliveryClaim,
+    WebhookDeliveryIntent,
     WebhookDeliveryOutcome,
     WebhookDeliveryRecord,
     WebhookDeliveryStatus,
@@ -48,7 +49,7 @@ class _DispatchOnlyWebhookRepository(WebhookRepository):
         *,
         owner_id: str | None = None,
         namespace: str | None = None,
-    ) -> list[str]:
+    ) -> list[WebhookDeliveryIntent]:
         return []
 
 

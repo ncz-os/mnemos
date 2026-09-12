@@ -578,13 +578,13 @@ async def test_dispatch_event_creates_pending_deliveries(repo, oracle_pool):
         )
 
     async with _tx(oracle_pool) as tx:
-        delivery_ids = await repo.dispatch_event(
+        _intents = await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "abc", "count": 7},
             owner_id="webhook_repo_dispatch_user",
-            namespace="default",
-        )
+            namespace="default",)
+        delivery_ids = [intent.delivery_id for intent in _intents]
     assert len(delivery_ids) == 1
 
     async with _tx(oracle_pool) as tx:
@@ -629,13 +629,12 @@ async def test_claim_delivery_returns_claim_and_blocks_concurrent_claim(
         )
 
     async with _tx(oracle_pool) as tx:
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "x"},
             owner_id="webhook_repo_claim_user",
-            namespace="default",
-        )
+            namespace="default",)]
 
     async with _tx(oracle_pool) as tx:
         claim = await repo.claim_delivery(
@@ -683,13 +682,12 @@ async def test_claim_due_deliveries_returns_pending_in_order(repo, oracle_pool):
         )
 
     async with _tx(oracle_pool) as tx:
-        [d_id_a] = await repo.dispatch_event(
+        [d_id_a] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "abc"},
             owner_id="webhook_repo_due_user",
-            namespace="default",
-        )
+            namespace="default",)]
 
     # dispatch_event returns one delivery per matching subscription; in
     # this test we only have one sub so we get one. Generate the other
@@ -767,13 +765,12 @@ async def test_finalize_success_marks_row_succeeded_and_returns_applied(
         )
 
     async with _tx(oracle_pool) as tx:
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "abc"},
             owner_id="webhook_repo_fin_user",
-            namespace="default",
-        )
+            namespace="default",)]
 
     async with _tx(oracle_pool) as tx:
         claim = await repo.claim_delivery(
@@ -830,13 +827,12 @@ async def test_finalize_wrong_lease_token_returns_not_applied(repo, oracle_pool)
             namespace="default",
         )
     async with _tx(oracle_pool) as tx:
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "x"},
             owner_id="webhook_repo_fin2_user",
-            namespace="default",
-        )
+            namespace="default",)]
     async with _tx(oracle_pool) as tx:
         await repo.claim_delivery(
             tx,
@@ -878,13 +874,12 @@ async def test_finalize_failure_enqueues_next_attempt_via_backoff(
             namespace="default",
         )
     async with _tx(oracle_pool) as tx:
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "x"},
             owner_id="webhook_repo_fin3_user",
-            namespace="default",
-        )
+            namespace="default",)]
 
     async with _tx(oracle_pool) as tx:
         await repo.claim_delivery(
@@ -1023,13 +1018,12 @@ async def test_store_delivery_response_body_does_not_change_status(
             namespace="default",
         )
     async with _tx(oracle_pool) as tx:
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "body"},
             owner_id="webhook_repo_body_user",
-            namespace="default",
-        )
+            namespace="default",)]
     body = '{"hello":"world"}'
     async with _tx(oracle_pool) as tx:
         stored = await repo.store_delivery_response_body(

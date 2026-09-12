@@ -56,6 +56,7 @@ from mnemos.persistence.base import (
     Transaction,
     VersionRepository,
     WebhookDeliveryClaim,
+    WebhookDeliveryIntent,
     WebhookDeliveryOutcome,
     WebhookDeliveryRecord,
     WebhookFinalizationResult,
@@ -2990,7 +2991,7 @@ class OracleWebhookRepository(WebhookRepository):
         *,
         owner_id: str | None = None,
         namespace: str | None = None,
-    ) -> list[str]:
+    ) -> list[WebhookDeliveryIntent]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
@@ -3002,10 +3003,6 @@ class OracleWebhookRepository(WebhookRepository):
             if namespace is not None:
                 sub_conditions.append("namespace = :namespace")
                 sub_params["namespace"] = namespace
-            # Subscription opts in to an event by listing it in the JSON
-            # array stored in ``events``. DBMS_LOB.INSTR matches the
-            # quoted event-name token; tolerates compact ("["x"]") or
-            # pretty-printed JSON without requiring the JSON parser.
             sub_conditions.append("DBMS_LOB.INSTR(events, :ev_token) > 0")
             sub_params["ev_token"] = f'"{event_type}"'
             sql_sub = (
@@ -3024,7 +3021,7 @@ class OracleWebhookRepository(WebhookRepository):
                 sort_keys=True,
             )
             body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-            delivery_ids: list[str] = []
+            intents: list[WebhookDeliveryIntent] = []
             for sub in subs:
                 d_id = uuid.uuid4().hex
                 await _call(
@@ -3047,8 +3044,16 @@ class OracleWebhookRepository(WebhookRepository):
                         "writer_rev": webhook_constants.NEW_CODE_WRITER_REVISION,
                     },
                 )
-                delivery_ids.append(d_id)
-            return delivery_ids
+                intents.append(
+                    WebhookDeliveryIntent(
+                        delivery_id=d_id,
+                        subscription_id=str(sub["id"]),
+                        url=sub["url"],
+                        namespace=sub["namespace"],
+                        owner_id=sub["owner_id"],
+                    )
+                )
+            return intents
         finally:
             await _call(cursor.close)
 

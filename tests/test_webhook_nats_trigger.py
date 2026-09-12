@@ -62,8 +62,8 @@ async def test_trigger_consumer_calls_attempt_delivery_on_message_receipt():
     calls = []
     tasks = []
 
-    async def attempt(delivery_id, *, pool):
-        calls.append((delivery_id, pool))
+    async def attempt(delivery_id, *, backend):
+        calls.append((delivery_id, backend))
         return True
 
     def schedule(coro):
@@ -86,7 +86,7 @@ async def test_trigger_consumer_calls_attempt_delivery_on_message_receipt():
 async def test_already_claimed_delivery_noops_gracefully():
     tasks = []
 
-    async def attempt(delivery_id, *, pool):
+    async def attempt(delivery_id, *, backend):
         return False
 
     def schedule(coro):
@@ -109,7 +109,7 @@ async def test_bad_shape_message_logs_skips_and_does_not_kill_loop(monkeypatch, 
     good_calls = []
     tasks = []
 
-    async def attempt(delivery_id, *, pool):
+    async def attempt(delivery_id, *, backend):
         good_calls.append(delivery_id)
         return True
 
@@ -168,6 +168,7 @@ async def test_subscribe_with_queue_group_uses_shared_durable():
     Round-3: durable carries a 12-char SHA-256 hash suffix for
     collision-resistance with long group names. Distinct ``_q_``
     namespace prefix isolates from legacy per-node durables."""
+    pytest.importorskip("nats", reason="nats-py required for queue-group ConsumerConfig assertions")
     js = _FakeJetStream()
 
     await trigger._subscribe(js, queue_group="webhook_pool")
