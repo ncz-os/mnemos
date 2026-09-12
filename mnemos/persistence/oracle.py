@@ -513,6 +513,26 @@ def _build_oracle_session_callback(settings: Any) -> Any:
                 await cur.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '. '")
             except Exception as exc:  # pragma: no cover - driver-dependent
                 _LOG.debug("ALTER SESSION SET NLS_NUMERIC_CHARACTERS failed: %s", exc)
+            # Pin session time zone to UTC. Without this, SYSTIMESTAMP (and
+            # any CAST(... AS TIMESTAMP WITH TIME ZONE) built from it) is
+            # expressed in whatever local zone the DB client/server host is
+            # in (SESSIONTIMEZONE), not DBTIMEZONE. python-oracledb also
+            # returns TIMESTAMP WITH TIME ZONE column/bind values as NAIVE
+            # Python datetimes (tzinfo dropped) -- so a naive "now" fetched
+            # under a non-UTC session, then re-bound as a comparison
+            # parameter, silently compares wall-clock times across two
+            # different implicit offsets. Confirmed on a real instance with
+            # SESSIONTIMEZONE=-04:00/DBTIMEZONE=+00:00: a delivery row
+            # scheduled a full hour in the FUTURE matched a
+            # "scheduled_at <= :claim_now" due-recovery filter. Pinning UTC
+            # here makes every SYSTIMESTAMP-derived value in this session
+            # naive-but-unambiguously-UTC, matching the convention already
+            # used by every other backend (Postgres/MySQL/SQLite are all
+            # UTC internally).
+            try:
+                await cur.execute("ALTER SESSION SET TIME_ZONE = 'UTC'")
+            except Exception as exc:  # pragma: no cover - driver-dependent
+                _LOG.debug("ALTER SESSION SET TIME_ZONE failed: %s", exc)
             if pdb_target:
                 try:
                     await cur.execute(f"ALTER SESSION SET CONTAINER = {pdb_target}")
@@ -2657,7 +2677,7 @@ class OracleWebhookRepository(WebhookRepository):
         return dt.astimezone(timezone.utc)
 
     async def _oracle_now(self, conn: Any) -> datetime:
-        """Read the database clock as a tz-aware UTC ``datetime``.
+        """Read the database clock as a NAIVE datetime, implicitly UTC.
 
         Uses ``SYSTIMESTAMP`` (the cursor-layer translator rewrites
         this to ``CURRENT TIMESTAMP`` for Db2 automatically). The
@@ -2669,6 +2689,22 @@ class OracleWebhookRepository(WebhookRepository):
         consumed locally within the worker, and ``repair_delivery_chains``
         uses DB clock directly in SQL so cross-process drift stays
         bounded there).
+
+        Deliberately NAIVE, not tz-aware: the session time zone is
+        pinned to UTC by ``_build_oracle_session_callback``, and
+        python-oracledb returns every ``TIMESTAMP WITH TIME ZONE``
+        column/bind value as a naive Python datetime regardless (tzinfo
+        is dropped on fetch). Every other timestamp this class touches
+        (``scheduled_at``, ``lease_expires_at``, etc.) is therefore also
+        naive. Returning a tz-AWARE value here silently breaks every SQL
+        comparison/bind that mixes it with those columns — confirmed
+        live: a delivery scheduled a full hour in the future matched a
+        "due now" claim filter once ``claim_now`` carried real tzinfo
+        while the column it was compared against didn't. Public-facing
+        record construction (e.g. ``WebhookDeliveryClaim.claim_db_now``)
+        promotes this value to tz-aware UTC via
+        ``_oracle_webhook_datetime`` at the point it's returned to the
+        caller, not here.
         """
         cursor = await _call(conn.cursor)
         try:
@@ -2683,14 +2719,14 @@ class OracleWebhookRepository(WebhookRepository):
                 # raw value, or Db2 (without ORA_COMPATIBILITY) rejected
                 # ``FROM dual``. Fall back to the Python clock so the
                 # lease path stays operational regardless of backend.
-                return datetime.now(timezone.utc)
+                return datetime.now(timezone.utc).replace(tzinfo=None)
         finally:
             await _call(cursor.close)
         if not row:
-            return datetime.now(timezone.utc)
+            return datetime.now(timezone.utc).replace(tzinfo=None)
         value = row[0]
         if value is None:
-            return datetime.now(timezone.utc)
+            return datetime.now(timezone.utc).replace(tzinfo=None)
         if not isinstance(value, datetime):
             # python-oracledb may return a string for some driver
             # configurations — coerce defensively.
@@ -2704,19 +2740,10 @@ class OracleWebhookRepository(WebhookRepository):
                 # string in some other NLS format the fromisoformat
                 # parser can't read, use Python's clock rather than
                 # crashing the lease path.
-                return datetime.now(timezone.utc)
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
-
-    @staticmethod
-    def _row_dict(cursor: Any, row: Any) -> dict[str, Any]:
-        if row is None:
-            return {}
-        if isinstance(row, dict):
-            return row
-        cols = [d[0].lower() for d in cursor.description]
-        return dict(zip(cols, row))
+                return datetime.now(timezone.utc).replace(tzinfo=None)
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
 
     # ── subscription surface ─────────────────────────────────────────────────
 
@@ -2732,14 +2759,21 @@ class OracleWebhookRepository(WebhookRepository):
         owner_id: str,
         namespace: str,
     ) -> WebhookSubscriptionRecord:
+        import oracledb
+
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
             events_json = json.dumps(list(events), separators=(",", ":"))
             # Oracle has no UPDATE..RETURNING; INSERT..RETURNING..INTO is
             # the canonical id-return idiom (used elsewhere in this file
-            # for usage_ledger, session_logs, consultation_audit).
+            # for usage_ledger, session_logs, consultation_audit). An
+            # INSERT/UPDATE with RETURNING..INTO is NOT a query -- calling
+            # cursor.fetchone() on it raises DPY-1003 ("the executed
+            # statement does not return rows"). Read the bound OUT
+            # variables directly via .getvalue() instead.
             new_id_var = cursor.var(str)
+            created_var = cursor.var(oracledb.DB_TYPE_TIMESTAMP_TZ)
             await _call(
                 cursor.execute,
                 """
@@ -2748,7 +2782,7 @@ class OracleWebhookRepository(WebhookRepository):
                 ) VALUES (
                     :id, :url, :events, :secret, :description, :owner_id, :namespace
                 )
-                RETURNING id INTO :new_id
+                RETURNING id, created INTO :new_id, :new_created
                 """,
                 {
                     "id": subscription_id,
@@ -2759,16 +2793,26 @@ class OracleWebhookRepository(WebhookRepository):
                     "owner_id": owner_id,
                     "namespace": namespace,
                     "new_id": new_id_var,
+                    "new_created": created_var,
                 },
             )
-            row = await _call(cursor.fetchone)
-            d = self._row_dict(cursor, row)
-            events_value = d.get("events")
+            returned_id = _oracle_out_scalar(new_id_var)
+            returned_created = _oracle_out_scalar(created_var)
         finally:
             await _call(cursor.close)
-        if row is None:
+        if returned_id is None:
             raise RuntimeError("Oracle: webhook subscription INSERT returned no row")
-        return _oracle_webhook_subscription(d, events_value=events_value)
+        d = {
+            "id": returned_id,
+            "url": url,
+            "description": description,
+            "owner_id": owner_id,
+            "namespace": namespace,
+            "created": returned_created,
+            "revoked": 0,
+            "revoked_at": None,
+        }
+        return _oracle_webhook_subscription(d, events_value=events_json)
 
     async def list_subscriptions(
         self,
@@ -2809,7 +2853,7 @@ class OracleWebhookRepository(WebhookRepository):
             rows = await _call(cursor.fetchall) or []
             out: list[WebhookSubscriptionRecord] = []
             for raw in rows:
-                d = self._row_dict(cursor, raw)
+                d = await _row_to_dict(cursor, raw)
                 out.append(_oracle_webhook_subscription(d))
         finally:
             await _call(cursor.close)
@@ -2846,11 +2890,12 @@ class OracleWebhookRepository(WebhookRepository):
         try:
             await _call(cursor.execute, sql, params)
             row = await _call(cursor.fetchone)
+            d = await _row_to_dict(cursor, row) if row is not None else None
         finally:
             await _call(cursor.close)
-        if row is None:
+        if d is None:
             return None
-        return _oracle_webhook_subscription(self._row_dict(cursor, row))
+        return _oracle_webhook_subscription(d)
 
     async def revoke_subscription(
         self,
@@ -2887,10 +2932,9 @@ class OracleWebhookRepository(WebhookRepository):
                 """,
                 {**params, "rid": rid_var},
             )
-            row = await _call(cursor.fetchone)
         finally:
             await _call(cursor.close)
-        return row is not None and rid_var.getvalue() and rid_var.getvalue()[0] is not None
+        return _oracle_out_scalar(rid_var) is not None
 
     async def list_deliveries(
         self,
@@ -2928,9 +2972,13 @@ class OracleWebhookRepository(WebhookRepository):
                 params,
             )
             rows = await _call(cursor.fetchall) or []
+            # Build row dicts INSIDE the try block: _row_to_dict reads
+            # cursor.description, which raises DPY-1006 ("cursor is not
+            # open") once the cursor is closed in `finally` below.
+            result = [_oracle_webhook_delivery(await _row_to_dict(cursor, raw)) for raw in rows]
         finally:
             await _call(cursor.close)
-        return [_oracle_webhook_delivery(self._row_dict(cursor, raw)) for raw in rows]
+        return result
 
     # ── dispatch (outbox enqueue) ────────────────────────────────────────────
 
@@ -3022,6 +3070,8 @@ class OracleWebhookRepository(WebhookRepository):
         Oracle ``SELECT ... FOR UPDATE SKIP LOCKED`` + per-row ``UPDATE``
         pattern because Oracle has no ``UPDATE .. RETURNING``.
         """
+        import oracledb
+
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         if max_attempts <= 0:
@@ -3031,6 +3081,14 @@ class OracleWebhookRepository(WebhookRepository):
         lease_expires_at = claim_now + timedelta(seconds=lease_seconds)
         cursor = await _call(conn.cursor)
         try:
+            # Without an explicit bind type, oracledb infers a plain
+            # (non-tz) TIMESTAMP for a naive Python datetime, and the
+            # comparison against a TIMESTAMP WITH TIME ZONE column then
+            # silently returns wrong results (confirmed live: a delivery
+            # scheduled milliseconds in the past failed a
+            # "scheduled_at <= :claim_now" filter that plain Python
+            # datetime comparison shows as true). Force the correct type.
+            cursor.setinputsizes(claim_now=oracledb.DB_TYPE_TIMESTAMP_TZ)
             await _call(
                 cursor.execute,
                 """
@@ -3067,6 +3125,7 @@ class OracleWebhookRepository(WebhookRepository):
             row = await _call(cursor.fetchone)
             if row is None:
                 return None
+            cursor.setinputsizes(lease_expires_at=oracledb.DB_TYPE_TIMESTAMP_TZ)
             await _call(
                 cursor.execute,
                 """
@@ -3092,11 +3151,12 @@ class OracleWebhookRepository(WebhookRepository):
                 {"id": delivery_id},
             )
             full_row = await _call(cursor.fetchone)
+            d = await _row_to_dict(cursor, full_row) if full_row is not None else None
         finally:
             await _call(cursor.close)
-        if full_row is None:
+        if d is None:
             return None
-        return _oracle_webhook_claim(self._row_dict(cursor, full_row), lease_token, claim_now)
+        return _oracle_webhook_claim(d, lease_token, claim_now)
 
     # ── claim due (recovery) ─────────────────────────────────────────────────
 
@@ -3114,11 +3174,20 @@ class OracleWebhookRepository(WebhookRepository):
 
         Oracle cannot combine ``FOR UPDATE`` with ``FETCH FIRST``
         (ORA-02014) and applies ``ROWNUM`` before ``ORDER BY``, so we
-        bound the candidate set with an inner ``ROWNUM`` subquery and
-        let the outer ``FOR UPDATE SKIP LOCKED`` lock exactly ``limit``
-        rows. ``SKIP LOCKED`` keeps competing recovery workers from
+        bound the candidate set with an inner ``ROWNUM`` subquery.
+
+        Oracle ALSO refuses ``FOR UPDATE`` directly against a derived
+        view containing ``ORDER BY`` (ORA-02014: "cannot select FOR
+        UPDATE from view with DISTINCT, GROUP BY, etc." -- an ordered
+        subquery is treated the same way). So the ordering/limiting
+        subquery below runs as a plain SELECT with no locking, and a
+        SEPARATE outer query applies ``FOR UPDATE SKIP LOCKED`` directly
+        against the base table via ``WHERE id IN (...)``, which Oracle
+        allows. ``SKIP LOCKED`` keeps competing recovery workers from
         claiming the same row.
         """
+        import oracledb
+
         if limit <= 0:
             return []
         if lease_seconds <= 0:
@@ -3131,6 +3200,11 @@ class OracleWebhookRepository(WebhookRepository):
         cursor = await _call(conn.cursor)
         claimed_ids: list[str] = []
         try:
+            # See claim_delivery for why this explicit bind type is
+            # required: without it, a naive Python datetime compared
+            # against a TIMESTAMP WITH TIME ZONE column silently returns
+            # wrong results.
+            cursor.setinputsizes(claim_now=oracledb.DB_TYPE_TIMESTAMP_TZ)
             await _call(
                 cursor.execute,
                 """
@@ -3161,7 +3235,6 @@ class OracleWebhookRepository(WebhookRepository):
                       )
                     ORDER BY scheduled_at, id
                 ) WHERE ROWNUM <= :limit
-                FOR UPDATE SKIP LOCKED
                 """,
                 {
                     "claim_now": claim_now,
@@ -3170,11 +3243,30 @@ class OracleWebhookRepository(WebhookRepository):
                     "limit": int(limit),
                 },
             )
+            candidate_rows = await _call(cursor.fetchall) or []
+            candidate_ids = [str(r[0]) for r in candidate_rows]
+            if not candidate_ids:
+                return []
+            cand_placeholders, cand_params = _in_placeholders(candidate_ids, prefix="cand")
+            # Separate FOR UPDATE SKIP LOCKED pass directly against the base
+            # table (see docstring): Oracle refuses FOR UPDATE on the ordered
+            # derived view above, but allows it here since this SELECT's
+            # FROM is the bare table, filtered only by a plain IN-list.
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT id FROM webhook_deliveries
+                WHERE id IN ({cand_placeholders})
+                FOR UPDATE SKIP LOCKED
+                """,
+                cand_params,
+            )
             id_rows = await _call(cursor.fetchall) or []
             claimed_ids = [str(r[0]) for r in id_rows]
             if not claimed_ids:
                 return []
             placeholders, id_params = _in_placeholders(claimed_ids, prefix="did")
+            cursor.setinputsizes(lease_expires_at=oracledb.DB_TYPE_TIMESTAMP_TZ)
             await _call(
                 cursor.execute,
                 f"""
@@ -3204,12 +3296,13 @@ class OracleWebhookRepository(WebhookRepository):
                 id_params,
             )
             rows = await _call(cursor.fetchall) or []
+            result = [
+                _oracle_webhook_claim(await _row_to_dict(cursor, raw), lease_token, claim_now)
+                for raw in rows
+            ]
         finally:
             await _call(cursor.close)
-        return [
-            _oracle_webhook_claim(self._row_dict(cursor, raw), lease_token, claim_now)
-            for raw in rows
-        ]
+        return result
 
     # ── guard (pre-send fence) ───────────────────────────────────────────────
 
@@ -3232,8 +3325,14 @@ class OracleWebhookRepository(WebhookRepository):
             delivery = await _call(cursor.fetchone)
             if delivery is None:
                 return False
+            import oracledb
+
             now = await self._oracle_now(conn)
-            # owned & live?
+            # owned & live? Explicit bind type required -- see
+            # claim_delivery for why a naive Python datetime compared
+            # against a TIMESTAMP WITH TIME ZONE column otherwise
+            # silently returns wrong results.
+            cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
             await _call(
                 cursor.execute,
                 """
@@ -3266,6 +3365,7 @@ class OracleWebhookRepository(WebhookRepository):
                 },
             )
             if (await _call(cursor.fetchone)) is not None:
+                cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
                 await _call(
                     cursor.execute,
                     """
@@ -3303,6 +3403,7 @@ class OracleWebhookRepository(WebhookRepository):
                 },
             )
             if (await _call(cursor.fetchone)) is not None:
+                cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
                 await _call(
                     cursor.execute,
                     """
@@ -3351,11 +3452,11 @@ class OracleWebhookRepository(WebhookRepository):
                 {"id": delivery_id},
             )
             row = await _call(cursor.fetchone)
+            d = await _row_to_dict(cursor, row) if row is not None else None
         finally:
             await _call(cursor.close)
-        if row is None:
+        if d is None:
             return False
-        d = self._row_dict(cursor, row)
         status = str(d.get("status") or "")
         if status not in ("pending", "retrying"):
             return False
@@ -3386,6 +3487,8 @@ class OracleWebhookRepository(WebhookRepository):
         if any(delay <= 0 for delay in backoff_list):
             raise ValueError("backoff_schedule must contain positive delays")
 
+        import oracledb
+
         conn = _conn_from_tx(tx)
         now = await self._oracle_now(conn)
         cursor = await _call(conn.cursor)
@@ -3406,7 +3509,7 @@ class OracleWebhookRepository(WebhookRepository):
             delivery = await _call(cursor.fetchone)
             if delivery is None:
                 return WebhookFinalizationResult(applied=False)
-            delivery = self._row_dict(cursor, delivery)
+            delivery = await _row_to_dict(cursor, delivery)
             attempt_num = int(delivery["attempt_num"])
             sub_id = delivery["subscription_id"]
             event_type = delivery["event_type"]
@@ -3560,6 +3663,7 @@ class OracleWebhookRepository(WebhookRepository):
             # ABC contract: failure finalization requires an UNEXPIRED
             # owned lease — the lease_expires_at > :now check enforces it.
             if revoked:
+                cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
                 await _call(
                     cursor.execute,
                     """
@@ -3601,6 +3705,7 @@ class OracleWebhookRepository(WebhookRepository):
                 },
             )
             if (await _call(cursor.fetchone)) is not None:
+                cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
                 await _call(
                     cursor.execute,
                     """
@@ -3628,6 +3733,7 @@ class OracleWebhookRepository(WebhookRepository):
 
             next_attempt = attempt_num + 1
             if next_attempt > max_attempts:
+                cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
                 await _call(
                     cursor.execute,
                     """
@@ -3677,6 +3783,7 @@ class OracleWebhookRepository(WebhookRepository):
                 },
             )
             successor_exists = (await _call(cursor.fetchone)) is not None
+            cursor.setinputsizes(now=oracledb.DB_TYPE_TIMESTAMP_TZ)
             await _call(
                 cursor.execute,
                 """
@@ -3703,9 +3810,14 @@ class OracleWebhookRepository(WebhookRepository):
                 return WebhookFinalizationResult(applied=False)
             successor_id: str | None = None
             if not successor_exists:
-                scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
+                # Use the already-fetched DB clock (``now``), not a fresh
+                # app-server ``datetime.now()`` call -- consistent with
+                # every other clock read in this method and avoids
+                # introducing app/DB clock drift into the schedule.
+                scheduled_at = now + timedelta(seconds=backoff_seconds)
                 new_id = uuid.uuid4().hex
                 try:
+                    cursor.setinputsizes(scheduled_at=oracledb.DB_TYPE_TIMESTAMP_TZ)
                     await _call(
                         cursor.execute,
                         """
@@ -3837,6 +3949,21 @@ def oracle_webhook_delivery_select_clause() -> str:
     )
 
 
+def _oracle_out_scalar(var: Any) -> Any:
+    """Read a single ``RETURNING ... INTO :bind`` OUT variable's value.
+
+    ``cursor.var(...)`` OUT binds return their value as a length-1
+    list/tuple from ``.getvalue()`` for a single-row DML statement (INSERT/
+    UPDATE affecting exactly one row) -- unwrap that shape here. Never call
+    ``cursor.fetchone()`` on a RETURNING..INTO statement: it is not a
+    query and raises ``DPY-1003``.
+    """
+    value = var.getvalue()
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
 def _oracle_webhook_datetime(value: Any) -> datetime:
     """Promote an Oracle TIMESTAMP / TIMESTAMP WITH TIME ZONE value to a
     tz-aware UTC datetime for the canonical WebhookDeliveryRecord."""
@@ -3963,8 +4090,15 @@ def _oracle_webhook_delivery(row: dict[str, Any]) -> WebhookDeliveryRecord:
 def _oracle_webhook_claim(
     row: dict[str, Any], lease_token: str, claim_now: datetime
 ) -> WebhookDeliveryClaim:
-    """Build a ``WebhookDeliveryClaim`` from the post-claim SELECT row."""
+    """Build a ``WebhookDeliveryClaim`` from the post-claim SELECT row.
+
+    ``claim_now`` arrives naive (see ``_oracle_now`` docstring) -- promote
+    it to tz-aware UTC here, at the public-record boundary, via the same
+    ``_oracle_webhook_datetime`` normalizer every other field on this
+    record uses.
+    """
     delivery = _oracle_webhook_delivery(row)
+    claim_now_aware = _oracle_webhook_datetime(claim_now)
     lease_expires_at = (
         _oracle_webhook_datetime(row["lease_expires_at"])
         if row.get("lease_expires_at") is not None
@@ -3973,8 +4107,8 @@ def _oracle_webhook_claim(
     return WebhookDeliveryClaim(
         delivery=delivery,
         lease_token=lease_token,
-        lease_expires_at=lease_expires_at or claim_now,
-        claim_db_now=claim_now,
+        lease_expires_at=lease_expires_at or claim_now_aware,
+        claim_db_now=claim_now_aware,
         url=row["url"],
         secret=row.get("secret") or "",
         subscription_revoked=bool(row.get("revoked")),

@@ -207,14 +207,35 @@ def _split_oracle_statements(sql: str) -> list[str]:
 
 
 async def _ensure_webhook_schema(pool: Any) -> None:
+    """Idempotent schema provisioning.
+
+    The fixture using this is function-scoped (one call per test), so
+    CREATE TABLE/INDEX statements hit ORA-00955 ("name is already used
+    by an existing object") on every test after the first. Oracle has
+    no ``CREATE TABLE IF NOT EXISTS`` pre-23c, so swallow ORA-00955
+    specifically (already-exists) and let any other error propagate —
+    that's the Oracle-idiomatic equivalent of IF NOT EXISTS here.
+    """
+    import oracledb as _oracledb
+
     async with pool.acquire() as conn:
         cur = conn.cursor()
         try:
+            # Each WEBHOOK_SCHEMA_DDL entry is already exactly one
+            # statement (including the two CREATE TRIGGER bodies, whose
+            # internal BEGIN...END semicolons are NOT statement
+            # separators) — do not run these through
+            # _split_oracle_statements, which mis-splits trigger bodies
+            # on their internal ``;`` and produces ORA-00900.
             for ddl in WEBHOOK_SCHEMA_DDL:
-                for statement in _split_oracle_statements(ddl):
-                    await cur.execute(statement)
+                try:
+                    await cur.execute(ddl)
+                except _oracledb.DatabaseError as exc:
+                    (error_obj,) = exc.args
+                    if getattr(error_obj, "code", None) != 955:
+                        raise
         finally:
-            await cur.close()
+            cur.close()
         await conn.commit()
 
 
@@ -252,11 +273,19 @@ def _parse_oracle_dsn(dsn: str) -> dict[str, Any]:
 
 @pytest_asyncio.fixture
 async def oracle_pool() -> AsyncIterator[Any]:
-    """Yield a python-oracledb async pool and provision the webhook schema."""
-    oracledb = pytest.importorskip("oracledb")  # noqa: F811
-    kwargs = _parse_oracle_dsn(DSN)
-    pool = await oracledb.create_pool_async(
-        min=1, max=4, getmode=oracledb.POOL_GETMODE_WAIT, **kwargs
+    """Yield a REAL production pool (mnemos.persistence.oracle.create_oracle_pool)
+    and provision the webhook schema.
+
+    Uses the actual production pool-creation helper, not an ad-hoc bare
+    pool, so this test exercises the real session_callback (NLS pinning +
+    the UTC TIME_ZONE pin) -- a bare pool silently skips both and can hide
+    real timezone-dependent bugs in the timestamp comparisons this test
+    is supposed to be verifying.
+    """
+    pytest.importorskip("oracledb")  # noqa: F811
+    from mnemos.persistence.oracle import create_oracle_pool
+
+    pool = await create_oracle_pool(DSN, min_size=1, max_size=4
     )
     await _ensure_webhook_schema(pool)
     try:
@@ -275,7 +304,7 @@ async def oracle_pool() -> AsyncIterator[Any]:
                     "WHERE owner_id LIKE 'webhook_repo_%'"
                 )
             finally:
-                await cur.close()
+                cur.close()
             await conn.commit()
         # python-oracledb's async pool exposes ``close()`` which returns
         # a coroutine that drains + closes all live connections.
@@ -297,16 +326,17 @@ async def repo(oracle_pool) -> OracleWebhookRepository:
 async def _tx(oracle_pool: Any):
     """Yield an Oracle transaction wrapped around a real pool acquire.
 
-    Uses the internal ``OracleTransaction`` from
+    Uses the internal ``_OracleTransaction`` from
     ``mnemos.persistence.oracle`` so the ``OracleWebhookRepository``
     methods get a fully-functional ``Transaction`` (with
     ``_conn_from_tx`` resolution).
     """
-    from mnemos.persistence.oracle import OracleTransaction
+    from mnemos.persistence.oracle import _OracleTransaction
 
     async with oracle_pool.acquire() as conn:
-        await conn.begin()
-        tx = OracleTransaction(conn)
+        # oracledb has no explicit conn.begin() -- a transaction starts
+        # implicitly with the first DML statement and ends at commit/rollback.
+        tx = _OracleTransaction(conn)
         try:
             yield tx
             if not tx.closed:
@@ -317,15 +347,20 @@ async def _tx(oracle_pool: Any):
             raise
 
 
-async def _direct_execute(oracle_pool: Any, sql: str, *args: Any) -> int:
-    """Run raw DML against the pool outside a fixture transaction."""
+async def _direct_execute(oracle_pool: Any, sql: str, *args: Any, **kwargs: Any) -> int:
+    """Run raw DML against the pool outside a fixture transaction.
+
+    Accepts either positional binds (for ``:1``-style SQL) or named binds
+    as kwargs (for ``:name``-style SQL, which every caller in this file
+    actually uses) -- Oracle SQL here is written with named binds.
+    """
     async with oracle_pool.acquire() as conn:
         cur = conn.cursor()
         try:
-            await cur.execute(sql, args or None)
+            await cur.execute(sql, kwargs or (args or None))
             affected = int(getattr(cur, "rowcount", 0) or 0)
         finally:
-            await cur.close()
+            cur.close()
         await conn.commit()
     return affected
 
@@ -648,13 +683,13 @@ async def test_claim_due_deliveries_returns_pending_in_order(repo, oracle_pool):
         )
 
     async with _tx(oracle_pool) as tx:
-        [d_id_a, d_id_b, d_id_c] = await repo.dispatch_event(
+        [d_id_a] = await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "abc"},
             owner_id="webhook_repo_due_user",
             namespace="default",
-        ) or []
+        )
 
     # dispatch_event returns one delivery per matching subscription; in
     # this test we only have one sub so we get one. Generate the other
@@ -870,7 +905,7 @@ async def test_finalize_failure_enqueues_next_attempt_via_backoff(
                 succeeded=False, response_status=503, error="upstream-down"
             ),
             max_attempts=3,
-            backoff_schedule=[0, 1, 5],
+            backoff_schedule=[1, 2, 5],
         )
     assert result.applied is True
     assert result.successor_delivery_id is not None

@@ -309,6 +309,22 @@ class _Db2AsyncCursor:
         self.description = None
         self.rowcount = -1
 
+    def setinputsizes(self, *args: Any, **kwargs: Any) -> None:
+        """No-op: the oracledb-specific bind-type hints some inherited
+        OracleWebhookRepository methods pass here (e.g.
+        ``oracledb.DB_TYPE_TIMESTAMP_TZ``, used to force correct
+        TIMESTAMP WITH TIME ZONE comparison semantics against the
+        oracledb driver) are meaningless to ibm_db_dbi, which also uses
+        positional ``?`` binds after ``_adapt_oracle_to_db2`` rewrites
+        named ``:name`` binds -- a keyword-based hint couldn't apply
+        even if the type constants matched. Without this method, those
+        shared/inherited calls raise AttributeError against a real Db2
+        connection. Db2/ibm_db_dbi has NOT been verified to have the
+        same naive-datetime-vs-TIMESTAMP-comparison bug that motivated
+        the oracledb-side fix; if it does, it needs its own explicit
+        Db2-native fix here, not a translation of the Oracle one.
+        """
+
     async def execute(self, sql: str, params: dict | tuple | None = None) -> None:
         adapted_sql, adapted_params = _adapt_oracle_to_db2(sql, params)
 
@@ -2812,6 +2828,14 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         conn = _conn_from_tx(tx)
+        # Use the DB clock (via the shared, fallback-safe _oracle_now,
+        # cursor-layer-translated to CURRENT TIMESTAMP for Db2), not the
+        # app server's wall clock: computing lease_expires_at from
+        # datetime.now() here would silently drift from the DB-side
+        # CURRENT TIMESTAMP comparisons above whenever the app host and
+        # DB host clocks disagree.
+        claim_now = await self._oracle_now(conn)
+        lease_expires_at = claim_now + timedelta(seconds=lease_seconds)
         cursor = await _call(conn.cursor)
         try:
             await _call(
@@ -2858,7 +2882,7 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
                     END
                 WHERE id = ?
                 """,
-                (lease_token, datetime.now(timezone.utc) + timedelta(seconds=lease_seconds), delivery_id),
+                (lease_token, lease_expires_at, delivery_id),
             )
             from mnemos.persistence.oracle import (
                 _oracle_webhook_claim,
@@ -2871,14 +2895,15 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
                 (delivery_id,),
             )
             full_row = await _call(cursor.fetchone)
+            # Build the row dict INSIDE the try block: cursor.description
+            # is unavailable (or stale) once the cursor is closed below.
+            d = dict(zip([c[0].lower() for c in cursor.description], full_row)) if full_row is not None else None
         finally:
             await _call(cursor.close)
-        if full_row is None:
+        if d is None:
             return None
-        cols = [d[0].lower() for d in cursor.description]
-        claim_now = datetime.now(timezone.utc)
         return _oracle_webhook_claim(
-            dict(zip(cols, full_row)),
+            d,
             lease_token=lease_token,
             claim_now=claim_now,
         )
@@ -2906,6 +2931,9 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         conn = _conn_from_tx(tx)
+        # DB clock, not app-server wall clock -- see claim_delivery for why.
+        claim_now = await self._oracle_now(conn)
+        lease_expires_at = claim_now + timedelta(seconds=lease_seconds)
         cursor = await _call(conn.cursor)
         claimed_ids: list[str] = []
         try:
@@ -2948,7 +2976,6 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
             if not claimed_ids:
                 return []
             placeholders = ",".join("?" for _ in claimed_ids)
-            lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
             await _call(
                 cursor.execute,
                 f"""
@@ -2979,14 +3006,16 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
                 tuple(claimed_ids),
             )
             rows = await _call(cursor.fetchall) or []
+            # Build row dicts INSIDE the try block: cursor.description is
+            # unavailable (or stale) once the cursor is closed below.
+            cols = [c[0].lower() for c in cursor.description]
+            result = [
+                _oracle_webhook_claim(dict(zip(cols, r)), lease_token=lease_token, claim_now=claim_now)
+                for r in rows
+            ]
         finally:
             await _call(cursor.close)
-        cols = [d[0].lower() for d in cursor.description]
-        claim_now = datetime.now(timezone.utc)
-        return [
-            _oracle_webhook_claim(dict(zip(cols, r)), lease_token=lease_token, claim_now=claim_now)
-            for r in rows
-        ]
+        return result
 
 
 class Db2ConsultationAuditRepository(_Db2OraCompatMixin, OracleConsultationAuditRepository):
