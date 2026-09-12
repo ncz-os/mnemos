@@ -50,6 +50,7 @@ from mnemos.persistence.base import (
     FULL_STORAGE_CAPABILITY_DETAILS,
     KGRepository,
     MemoryRepository,
+    NatsDispatchLogRepository,
     OAuthRepository,
     SessionsRepository,
     StateRepository,
@@ -6725,6 +6726,50 @@ class OracleAuditChainRepository(AuditChainRepository):
             await _call(cursor.close)
 
 
+class OracleNatsDispatchLogRepository(NatsDispatchLogRepository):
+    """Oracle impl of :class:`NatsDispatchLogRepository` (item 9/12).
+
+    Uses ``INSERT ... WHEN NOT MATCHED THEN INSERT`` is not available on
+    Oracle for a single-table idempotent dedupe; the canonical pattern
+    is a guarded INSERT that catches the unique-key violation and
+    reports the conflict as ``rowcount == 0``. We rely on the primary
+    key constraint on ``(event_id, subject)`` created by
+    ``migrations_oracle/0013_nats_dispatch_log.sql`` (item 9 retcon
+    from the legacy ``(id, subject, payload, published_at, acked_at)``
+    shape) so concurrent redeliveries cannot both insert.
+
+    The Db2 backend inherits this implementation via
+    ``Db2Backend(OracleBackend)`` and the
+    ``_Db2OraCompatMixin`` — see :class:`Db2NatsDispatchLogRepository`.
+    """
+
+    async def record_if_new(
+        self,
+        tx: Transaction,
+        event_id: str,
+        subject: str,
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            try:
+                await _call(
+                    cursor.execute,
+                    """
+                    INSERT INTO nats_dispatch_log (event_id, subject)
+                    VALUES (:event_id, :subject)
+                    """,
+                    {"event_id": event_id, "subject": subject},
+                )
+            except Exception as exc:
+                if _is_unique_violation(exc):
+                    return False
+                raise
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+
 class OracleBackend:
     """Oracle persistence facade backed by a python-oracledb async pool."""
 
@@ -6740,6 +6785,7 @@ class OracleBackend:
     # worker is asyncpg/Postgres-specific.  Do not claim end-to-end support.
     # Db2 inherits this fail-closed value.
     supports_webhooks = False
+    supports_nats_dispatch_log = True  # backed by OracleNatsDispatchLogRepository, see .nats_dispatch_log
 
     supports_listen_notify = False
     supports_advisory_locks = False
@@ -6763,6 +6809,7 @@ class OracleBackend:
         self._memory_branches_repo = OracleBranchRepository()
         self._compression_repo = OracleCompressionRepository()
         self._compression_queue_repo = OracleCompressionQueueRepository()
+        self._nats_dispatch_log_repo = OracleNatsDispatchLogRepository()
         self._webhooks_repo = OracleWebhookRepository()
         self._consultations_audit_repo = OracleConsultationAuditRepository()
         self._oauth_repo = OracleOAuthRepository()
@@ -7497,6 +7544,10 @@ class OracleBackend:
     @property
     def webhooks(self) -> WebhookRepository:
         raise BackendCapabilityMissing("webhooks", type(self).__name__)
+
+    @property
+    def nats_dispatch_log(self) -> NatsDispatchLogRepository:
+        return self._nats_dispatch_log_repo
 
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:
