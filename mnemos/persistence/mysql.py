@@ -78,6 +78,7 @@ from mnemos.persistence.base import (
     KG_CAPABILITY,
     KGRepository,
     MemoryRepository,
+    NatsDispatchLogRepository,
     OAuthRepository,
     STATE_CAPABILITY,
     STATE_DETAIL_CAPABILITY,
@@ -1129,6 +1130,17 @@ INSERT IGNORE INTO memory_category_decay (category, half_life_days, decay_kind, 
     ('(default)', 180, 'exponential', 0.1)
 """
 
+_DDL_NATS_DISPATCH_LOG = """
+CREATE TABLE IF NOT EXISTS nats_dispatch_log (
+    event_id      VARCHAR(128)   NOT NULL,
+    subject       VARCHAR(256)   NOT NULL,
+    dispatched_at DATETIME(6)    NOT NULL DEFAULT NOW(6),
+
+    PRIMARY KEY (event_id, subject)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+
 _INIT_DDLS = [
     _DDL_MEMORIES,
     _DDL_DELETION_REQUESTS,
@@ -1156,6 +1168,7 @@ _INIT_DDLS = [
     _DDL_USAGE_LEDGER,
     _DDL_CATEGORY_DECAY,
     _DDL_CATEGORY_DECAY_SEED,
+    _DDL_NATS_DISPATCH_LOG,
 ]
 
 
@@ -6418,6 +6431,40 @@ class MysqlOAuthRepository(MysqlBrowserOAuthMixin, MCPOAuthRepositoryMixin, OAut
             return await _fetch_all_dicts(cursor)
 
 
+class MysqlNatsDispatchLogRepository(NatsDispatchLogRepository):
+    """MySQL/MariaDB impl of :class:`NatsDispatchLogRepository` (item 9/12).
+
+    Uses ``INSERT IGNORE INTO nats_dispatch_log ...`` and translates
+    ``cursor.rowcount`` (1 on a fresh insert, 0 on a duplicate) into
+    the bool the ABC contract demands. The migration
+    ``migrations_mysql/0054_nats_dispatch_log.sql`` (and the MariaDB
+    mirror in ``migrations_mariadb/0054_nats_dispatch_log.sql``)
+    creates the table with the canonical ``(event_id, subject)``
+    primary key so the dedupe is race-safe against concurrent
+    redeliveries. MariaDB inherits this implementation via
+    ``MariadbBackend(MysqlBackend)``.
+
+    We deliberately use ``INSERT IGNORE`` rather than ``INSERT ... ON
+    DUPLICATE KEY UPDATE id = id`` because the latter's
+    ``rows_affected`` returns 2 on update (when the row was actually
+    changed) which would corrupt the "is this a fresh insert" check;
+    ``INSERT IGNORE`` returns 0 cleanly on duplicate.
+    """
+
+    async def record_if_new(
+        self,
+        tx: Transaction,
+        event_id: str,
+        subject: str,
+    ) -> bool:
+        async with _mysql_tx(tx).conn.cursor() as cursor:
+            await cursor.execute(
+                "INSERT IGNORE INTO nats_dispatch_log (event_id, subject) VALUES (%s, %s)",
+                (event_id, subject),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+
+
 class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align with SqliteBackend/OracleBackend/Db2Backend/PostgresBackend bare-class pattern
     """MySQL 9.0+ persistence facade backed by an aiomysql connection pool.
 
@@ -6438,6 +6485,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     supports_pgvector = False
     supports_mysql_vector = True  # MySQL 9.0 native VECTOR
     supports_webhooks = False
+    supports_nats_dispatch_log = True  # backed by MysqlNatsDispatchLogRepository, see .nats_dispatch_log
     _supports_core_persistence = True
     _supports_oauth_persistence = True
 
@@ -6457,6 +6505,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         self._memory_branches_repo = MysqlBranchRepository()
         self._compression_repo = MysqlCompressionRepository()
         self._compression_queue_repo = MysqlCompressionQueueRepository()
+        self._nats_dispatch_log_repo = MysqlNatsDispatchLogRepository()
         self._consultations_audit_repo = MysqlConsultationAuditRepository()
         self._federation_repo = MysqlFederationRepository()
         self._state_kv_repo = MysqlStateRepository()
@@ -6794,6 +6843,10 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     @property
     def webhooks(self) -> WebhookRepository:
         raise BackendCapabilityMissing("webhooks", type(self).__name__)
+
+    @property
+    def nats_dispatch_log(self) -> NatsDispatchLogRepository:
+        return self._nats_dispatch_log_repo
 
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:
