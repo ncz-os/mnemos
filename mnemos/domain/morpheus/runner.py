@@ -16,13 +16,16 @@ from dataclasses import dataclass, replace
 import json
 import logging
 import math
-from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Tuple
 from uuid import UUID, uuid4
 
-import asyncpg
-
-from mnemos.db.deletion_log import log_morpheus_run_memory_deletions
+# asyncpg is still referenced for the ``pool: asyncpg.Pool`` type hints
+# on the phase functions (``phase_replay`` / ``phase_cluster`` /
+# ``phase_consolidate`` / ``phase_synthesise`` / ``phase_extract``)
+# and ``run_dream`` — those phases are out of scope for the item 11a
+# ABC migration (brief: "Do NOT touch phase_replay/...") and continue
+# to take a raw asyncpg.Pool for their own SQL.
+import asyncpg  # noqa: F401
 import numpy as np
 
 from mnemos.core.config import get_settings, hot_rs_enabled, morpheus_orphan_timeout_hours_env
@@ -37,29 +40,42 @@ _PRE_CONSOLIDATE_PERMISSION_KEY = "pre_consolidate_permission_mode"
 _CONSOLIDATED_PERMISSION_MODE = 400
 _DEFAULT_ORPHAN_TIMEOUT_HOURS = 2.0
 _ORPHAN_TIMEOUT_ENV = "MNEMOS_MORPHEUS_ORPHAN_TIMEOUT_HOURS"
-_ORPHAN_TIMEOUT_ERROR = "orphan_timeout_sweep"
+# Item 11a: removed ``_ORPHAN_TIMEOUT_ERROR`` — the
+# ``orphan_timeout_sweep`` literal now lives inside each per-backend
+# ``MorpheusRepository._ORPHAN_TIMEOUT_ERROR`` class constant so the
+# magic value is owned by the backend that emits it.
 
 
 class MorpheusExtractionError(RuntimeError):
     """A provider or response failure that must leave a memory retryable."""
 
 
-_SWEEP_ORPHAN_RUNS_SQL = """
-WITH orphaned AS (
-    SELECT id, started_at
-    FROM morpheus_runs
-    WHERE status = 'running'
-      AND started_at < NOW() - ($1::double precision * INTERVAL '1 hour')
-    FOR UPDATE SKIP LOCKED
-)
-UPDATE morpheus_runs r
-SET status      = 'failed',
-    error       = $2,
-    finished_at = NOW()
-FROM orphaned o
-WHERE r.id = o.id
-RETURNING r.id, o.started_at
-"""
+# Item 11a: removed ``_SWEEP_ORPHAN_RUNS_SQL`` — the legacy raw-asyncpg
+# CTE-with-FOR-UPDATE-SKIP-LOCKED sweep is now owned by
+# ``PostgresMorpheusRepository._SWEEP_ORPHAN_RUNS_SQL``. The runner
+# routes through ``backend.morpheus.sweep_orphan_runs`` instead.
+
+
+def _get_backend() -> Any:
+    """Return the active persistence backend for MORPHEUS lifecycle helpers.
+
+    Item 11a of the 12-item ABC migration: the 8 runner lifecycle
+    functions (``begin_run`` / ``set_phase`` / ``update_counters`` /
+    ``finish_run`` / ``fail_run`` / ``sweep_orphan_runs`` /
+    ``rollback_run``) now route through ``backend.morpheus.*``. The
+    phase functions continue to take a ``pool`` for their own raw SQL
+    (out of scope for the ABC migration) and call these helpers via
+    this lookup so the lifecycle calls land on the right backend
+    without a phase-function signature change.
+
+    The lookup is intentionally lazy: ``lifecycle.get_persistence_backend()``
+    raises when no backend is wired, but the runner helpers call this
+    at call time (not import time) so unit tests can ``monkeypatch``
+    ``lifecycle.get_persistence_backend`` to return a backend mock.
+    """
+    from mnemos.core import lifecycle as _lc
+
+    return _lc.get_persistence_backend()
 
 # Optional Rust hot-path accelerator. Loaded lazily so the absence of
 # the wheel on a given build host does NOT break the import - the
@@ -200,6 +216,12 @@ def _orphan_timeout_hours(max_age_hours: Optional[float] = None) -> float:
 # them, with the runtime type of the metadata field already
 # normalized by the surrounding code.
 
+# Item 11a: removed the legacy raw-asyncpg ``log_morpheus_run_memory_deletions``
+# call site — the deletion-log audit insert is now part of each per-backend
+# ``MorpheusRepository.rollback_run`` impl (Postgres / SQLite / MySQL /
+# MariaDB / Oracle / Db2) so the same callable signature holds across all
+# six backends.
+
 
 def _consolidate_enabled(config: Optional[dict]) -> bool:
     configured = config.get("consolidate", False) if isinstance(config, dict) else False
@@ -225,7 +247,7 @@ class ExtractedTriple:
 
 
 async def begin_run(
-    pool: asyncpg.Pool,
+    backend: Any,
     *,
     triggered_by: str = "cron",
     window_hours: int = 168,
@@ -235,35 +257,31 @@ async def begin_run(
 ) -> str:
     """Open a new MORPHEUS run row and return its UUID as a string.
 
+    Item 11a of the 12-item ABC migration: this function now routes
+    through ``backend.morpheus.begin_run`` rather than raw asyncpg.
+    The behaviour is identical to the pre-11a path — the row opens
+    with ``status='running'`` so an inspector polling
+    ``/v1/morpheus/runs`` sees the dream in flight — and the
+    backend's ``MorpheusRepository.begin_run`` impl runs the same
+    INSERT statement on every hive backend (Postgres / SQLite /
+    MySQL / MariaDB / Oracle / Db2).
+
     Caller is responsible for advancing the row through phases via
     set_phase() and finalising via finish_run() (or fail_run() on
-    exception). The row is created with status='running' so an inspector
-    polling /v1/morpheus/runs sees the dream in flight.
-
-    `namespace`, when set, scopes the run to memories with that
-    `namespace` value. NULL = "all namespaces" (the default — matches
-    the historical behavior before per-namespace scoping).
+    exception). ``namespace``, when set, scopes the run to memories
+    with that ``namespace`` value. NULL = "all namespaces" (the
+    default — matches the historical behavior before per-namespace
+    scoping).
     """
-    window_end = datetime.now(timezone.utc)
-    window_start = window_end - timedelta(hours=window_hours)
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO morpheus_runs
-                (triggered_by, window_started_at, window_ended_at,
-                 window_hours, cluster_min_size, config, namespace)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
-            RETURNING id
-            """,
-            triggered_by,
-            window_start,
-            window_end,
-            window_hours,
-            cluster_min_size,
-            json.dumps(config or {}),
-            namespace,
+    async with backend.transactional() as tx:
+        run_id = await backend.morpheus.begin_run(
+            tx,
+            triggered_by=triggered_by,
+            window_hours=window_hours,
+            cluster_min_size=cluster_min_size,
+            config=config,
+            namespace=namespace,
         )
-    run_id = str(row["id"])
     logger.info(
         "[MORPHEUS] run %s opened (window=%dh, triggered_by=%s, namespace=%s)",
         run_id,
@@ -274,18 +292,20 @@ async def begin_run(
     return run_id
 
 
-async def set_phase(pool: asyncpg.Pool, run_id: str, phase: str) -> None:
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE morpheus_runs SET phase=$2 WHERE id=$1::uuid",
-            run_id,
-            phase,
-        )
+async def set_phase(backend: Any, run_id: str, phase: str) -> None:
+    """Stamp ``morpheus_runs.phase`` with the current phase name.
+
+    Item 11a of the 12-item ABC migration: this function routes through
+    ``backend.morpheus.set_phase``. Same behaviour as the pre-11a
+    raw-asyncpg path on every hive backend.
+    """
+    async with backend.transactional() as tx:
+        await backend.morpheus.set_phase(tx, run_id, phase)
     logger.info("[MORPHEUS] run %s → phase=%s", run_id, phase)
 
 
 async def update_counters(
-    pool: asyncpg.Pool,
+    backend: Any,
     run_id: str,
     *,
     memories_scanned: Optional[int] = None,
@@ -296,83 +316,113 @@ async def update_counters(
     triples_extracted: Optional[int] = None,
     memories_processed_for_extraction: Optional[int] = None,
 ) -> None:
-    """Bump counters as phases finish. Pass only the fields to update."""
-    sets: list[str] = []
-    args: list = []
-    if memories_scanned is not None:
-        args.append(memories_scanned)
-        sets.append(f"memories_scanned=${len(args)}")
-    if clusters_found is not None:
-        args.append(clusters_found)
-        sets.append(f"clusters_found=${len(args)}")
-    if summaries_created is not None:
-        args.append(summaries_created)
-        sets.append(f"summaries_created=${len(args)}")
-    if memories_consolidated is not None:
-        args.append(memories_consolidated)
-        sets.append(f"memories_consolidated=${len(args)}")
-    if clusters_consolidated is not None:
-        args.append(clusters_consolidated)
-        sets.append(f"clusters_consolidated=${len(args)}")
-    if triples_extracted is not None:
-        args.append(triples_extracted)
-        sets.append(f"triples_extracted=${len(args)}")
-    if memories_processed_for_extraction is not None:
-        args.append(memories_processed_for_extraction)
-        sets.append(f"memories_processed_for_extraction=${len(args)}")
-    if not sets:
-        return
-    args.append(run_id)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            f"UPDATE morpheus_runs SET {', '.join(sets)} WHERE id=${len(args)}::uuid",
-            *args,
+    """Bump counters as phases finish. Pass only the fields to update.
+
+    Item 11a of the 12-item ABC migration: this function routes through
+    ``backend.morpheus.update_counters`` with the same partial-update
+    semantic — only the kwargs explicitly passed are written.
+    """
+    async with backend.transactional() as tx:
+        await backend.morpheus.update_counters(
+            tx,
+            run_id,
+            memories_scanned=memories_scanned,
+            clusters_found=clusters_found,
+            summaries_created=summaries_created,
+            memories_consolidated=memories_consolidated,
+            clusters_consolidated=clusters_consolidated,
+            triples_extracted=triples_extracted,
+            memories_processed_for_extraction=memories_processed_for_extraction,
         )
 
 
 async def increment_extract_counters(
-    conn: asyncpg.Connection,
-    run_id: str,
+    conn_or_backend: Any,
+    run_id: str | None = None,
     *,
-    triples_extracted: int,
-    memories_processed: int,
+    triples_extracted: int | None = None,
+    memories_processed: int | None = None,
+    tx: Any | None = None,
 ) -> None:
-    """Increment extract counters as each source memory commits."""
-    await conn.execute(
-        """
-        UPDATE morpheus_runs
-        SET triples_extracted = COALESCE(triples_extracted, 0) + $2,
-            memories_processed_for_extraction =
-                COALESCE(memories_processed_for_extraction, 0) + $3
-        WHERE id = $1::uuid
-        """,
-        run_id,
-        int(triples_extracted),
-        int(memories_processed),
-    )
+    """Increment extract counters as each source memory commits.
 
+    Item 11a of the 12-item ABC migration — two call shapes:
 
-async def finish_run(pool: asyncpg.Pool, run_id: str) -> None:
-    async with pool.acquire() as conn:
+    * **ABC form** ``increment_extract_counters(backend, run_id, *,
+      triples_extracted=…, memories_processed=…)``: opens a
+      ``backend.transactional()`` block and routes through
+      ``backend.morpheus.increment_extract_counters``.
+
+    * **Legacy conn form** ``increment_extract_counters(conn, run_id,
+      *, triples_extracted=…, memories_processed=…)``: the EXTRACT
+      phase opens an ``asyncpg.Connection.transaction()`` for its
+      per-memory mutation block and needs the counter increment to
+      land inside that same transaction. The conn form keeps the
+      legacy raw-asyncpg semantics so the counter commit/rollback
+      stays atomic with the kg_triples inserts + ``triples_extracted_at``
+      stamps.
+
+    The legacy conn form is the one used by ``phase_extract`` — the
+    phase function still drives raw asyncpg (per-row tagging,
+    vector column reads — out of scope for item 11a) and we don't
+    want to break that atomicity by forcing an outer backend
+    transaction wrapper. Once phase_extract itself migrates (item
+    11b/11c), the conn form can be deleted.
+    """
+    # Legacy conn shape — ``conn_or_backend`` lacks ``.morpheus`` and the
+    # caller is inside an existing ``conn.transaction()`` block.
+    if not hasattr(conn_or_backend, "morpheus"):
+        conn = conn_or_backend
         await conn.execute(
-            "UPDATE morpheus_runs SET status='success', finished_at=now() WHERE id=$1::uuid",
+            """
+            UPDATE morpheus_runs
+               SET triples_extracted = COALESCE(triples_extracted, 0) + $2,
+                   memories_processed_for_extraction =
+                       COALESCE(memories_processed_for_extraction, 0) + $3
+             WHERE id = $1::uuid
+            """,
             run_id,
+            int(triples_extracted or 0),
+            int(memories_processed or 0),
         )
+        return
+    # ABC form.
+    backend = conn_or_backend
+    async with backend.transactional() as tx:
+        await backend.morpheus.increment_extract_counters(
+            tx,
+            run_id,
+            triples_extracted=int(triples_extracted or 0),
+            memories_processed=int(memories_processed or 0),
+        )
+
+
+async def finish_run(backend: Any, run_id: str) -> None:
+    """Mark the run ``status='success'`` and stamp ``finished_at``.
+
+    Item 11a of the 12-item ABC migration: this function routes
+    through ``backend.morpheus.finish_run``. Same behaviour as the
+    pre-11a raw-asyncpg path on every hive backend.
+    """
+    async with backend.transactional() as tx:
+        await backend.morpheus.finish_run(tx, run_id)
     logger.info("[MORPHEUS] run %s finished SUCCESS", run_id)
 
 
-async def fail_run(pool: asyncpg.Pool, run_id: str, error: str) -> None:
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE morpheus_runs SET status='failed', finished_at=now(), error=$2 WHERE id=$1::uuid",
-            run_id,
-            error[:4000],
-        )
+async def fail_run(backend: Any, run_id: str, error: str) -> None:
+    """Mark the run ``status='failed'`` and stamp ``finished_at + error``.
+
+    Item 11a of the 12-item ABC migration: this function routes
+    through ``backend.morpheus.fail_run``. Same behaviour as the
+    pre-11a raw-asyncpg path on every hive backend.
+    """
+    async with backend.transactional() as tx:
+        await backend.morpheus.fail_run(tx, run_id, error)
     logger.warning("[MORPHEUS] run %s finished FAILED: %s", run_id, error[:200])
 
 
 async def sweep_orphan_runs(
-    pool: asyncpg.Pool,
+    backend: Any,
     *,
     max_age_hours: Optional[float] = None,
 ) -> int:
@@ -381,34 +431,55 @@ async def sweep_orphan_runs(
     Mirrors the compression worker contest stale-running sweep: this is a
     best-effort reclaim path for workers or API triggers that crashed after a
     run row opened but before any terminal status was recorded.
+
+    Item 11a of the 12-item ABC migration: this function routes through
+    ``backend.morpheus.sweep_orphan_runs`` with the same
+    ``orphan_timeout_sweep`` error marker. Same semantics on every
+    hive backend — rows whose ``started_at`` is older than
+    ``threshold_hours`` ago are flipped to ``failed``.
     """
     threshold_hours = _orphan_timeout_hours(max_age_hours)
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            _SWEEP_ORPHAN_RUNS_SQL,
-            threshold_hours,
-            _ORPHAN_TIMEOUT_ERROR,
+    async with backend.transactional() as tx:
+        rows = await backend.morpheus.sweep_orphan_runs(
+            tx,
+            threshold_hours=float(threshold_hours),
         )
-
     for row in rows:
+        # ``Row`` is a backend-neutral protocol — for postgres it's
+        # asyncpg.Record (dict-like), for SQLite it's our row dict,
+        # for MySQL/Oracle/Db2 the impls return dict-shaped rows.
+        # Fall back to attribute access in case a backend returns a
+        # tuple-shaped row.
+        row_id = row.get("id") if hasattr(row, "get") else row[0]
+        row_started = (
+            row.get("started_at") if hasattr(row, "get") else row[1]
+        )
         logger.info(
             "[MORPHEUS] orphan timeout sweep marked run %s failed (started_at=%s, max_age_hours=%.2f)",
-            row["id"],
-            row["started_at"],
+            row_id,
+            row_started,
             threshold_hours,
         )
     return len(rows)
 
 
 async def rollback_run(
-    pool: asyncpg.Pool,
+    backend: Any,
     run_id: str,
     *,
     requested_by: str = "morpheus_rollback",
 ) -> Tuple[int, int]:
     """Undo every memory mutation tagged with this run and roll it back.
 
-    Returns (memories_deleted, run_rows_updated).
+    Returns ``(memories_deleted, run_rows_updated)``.
+
+    Item 11a of the 12-item ABC migration: this function routes through
+    ``backend.morpheus.rollback_run``. The full sequence (kg_triples
+    delete + memory restore + deletion-log audit + synthesised-memory
+    delete + run-row flip) runs inside the caller's transaction on
+    every hive backend; each per-backend impl decomposes the Postgres
+    multi-CTE pattern into portable sequential statements so a partial
+    rollback cannot leak.
 
     Synthesis rows are run-created and still deleted. Consolidated
     originals are restored in place from their metadata audit before
@@ -418,86 +489,13 @@ async def rollback_run(
         UUID(run_id)
     except (ValueError, TypeError):
         raise ValueError(f"invalid run_id: {run_id!r}")
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            extract_reset_result = await conn.execute(
-                """
-                WITH deleted_extract_triples AS (
-                    DELETE FROM kg_triples
-                    WHERE extracted_by_run_id=$1::uuid
-                    RETURNING memory_id
-                ), run_memories AS (
-                    DELETE FROM morpheus_extract_run_memories
-                    WHERE run_id=$1::uuid
-                    RETURNING memory_id
-                ), affected_memories AS (
-                    SELECT memory_id FROM deleted_extract_triples
-                    UNION
-                    SELECT memory_id FROM run_memories
-                )
-                UPDATE memories
-                SET triples_extracted_at = NULL
-                WHERE id IN (
-                    SELECT DISTINCT memory_id
-                    FROM affected_memories
-                    WHERE memory_id IS NOT NULL
-                )
-                """,
-                run_id,
-            )
-            n_extract_reset = _command_count(extract_reset_result)
-            restore_result = await conn.execute(
-                """
-                UPDATE memories
-                SET consolidated_into = NULL,
-                    consolidated_at = NULL,
-                    permission_mode = COALESCE(
-                        (metadata->>$2)::int,
-                        permission_mode
-                    ),
-                    metadata = COALESCE(metadata, '{}'::jsonb) - $2,
-                    morpheus_run_id = NULL
-                WHERE morpheus_run_id=$1::uuid
-                  AND deleted_at IS NULL
-                  AND COALESCE(metadata, '{}'::jsonb) ? $2
-                """,
-                run_id,
-                _PRE_CONSOLIDATE_PERMISSION_KEY,
-            )
-            n_restored = _command_count(restore_result)
-            # Per-row tagging means rollback never crosses runs.
-            await log_morpheus_run_memory_deletions(
-                conn,
-                run_id,
-                requested_by=requested_by,
-                requested_at=None,
-                request_kind="admin_purge",
-                reason=f"MORPHEUS rollback {run_id}",
-                source=["morpheus.rollback", run_id],
-            )
-            del_result = await conn.execute(
-                "DELETE FROM memories WHERE morpheus_run_id=$1::uuid "
-                "AND provenance='morpheus_local' "
-                "AND deleted_at IS NULL",
-                run_id,
-            )
-            n_deleted = _command_count(del_result)
-            run_result = await conn.execute(
-                "UPDATE morpheus_runs "
-                "SET status='rolled_back', finished_at=COALESCE(finished_at, now()) "
-                "WHERE id=$1::uuid",
-                run_id,
-            )
-            n_run = _command_count(run_result)
-    logger.warning(
-        "[MORPHEUS] run %s rolled back: %d memories deleted, "
-        "%d consolidated rows restored, %d extraction markers reset",
-        run_id,
-        n_deleted,
-        n_restored,
-        n_extract_reset,
-    )
-    return n_deleted, n_run
+    async with backend.transactional() as tx:
+        n_deleted, n_run = await backend.morpheus.rollback_run(
+            tx,
+            run_id,
+            requested_by=requested_by,
+        )
+    return int(n_deleted), int(n_run)
 
 
 # ── Phases ────────────────────────────────────────────────────────────────────
@@ -514,6 +512,13 @@ async def phase_replay(pool: asyncpg.Pool, run_id: str) -> int:
 
     When the run has `namespace` set, the scan is scoped to memories
     with that namespace; NULL means "all namespaces".
+
+    Item 11a: this phase still takes ``pool`` for its own raw SQL
+    (per-row tagging, vector column reads — out of scope for the ABC
+    migration). The counter bump at the end goes through the
+    ``backend.morpheus.update_counters`` ABC via
+    :func:`_get_backend`; tests ``monkeypatch`` ``lifecycle.
+``get_persistence_backend`` to return a backend mock.
     """
     async with pool.acquire() as conn:
         n = await conn.fetchval(
@@ -529,7 +534,7 @@ async def phase_replay(pool: asyncpg.Pool, run_id: str) -> int:
             """,
             run_id,
         )
-    await update_counters(pool, run_id, memories_scanned=int(n or 0))
+    await update_counters(_get_backend(), run_id, memories_scanned=int(n or 0))
     return int(n or 0)
 
 
@@ -561,7 +566,7 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
             run_id,
         )
         if run_row is None:
-            await update_counters(pool, run_id, clusters_found=0)
+            await update_counters(_get_backend(), run_id, clusters_found=0)
             return 0
         min_size = int(run_row["cluster_min_size"])
 
@@ -626,7 +631,7 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
                 consume(row)
 
     if rows_seen == 0:
-        await update_counters(pool, run_id, clusters_found=0)
+        await update_counters(_get_backend(), run_id, clusters_found=0)
         return 0
 
     surviving = [c for c in clusters if len(c["members"]) >= min_size]
@@ -644,7 +649,7 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
         )
 
     n_clusters = len(surviving)
-    await update_counters(pool, run_id, clusters_found=n_clusters)
+    await update_counters(_get_backend(), run_id, clusters_found=n_clusters)
     logger.info(
         "[MORPHEUS] run %s clustered %d memories into %d cluster(s) "
         "(threshold=%.2f, min_size=%d, max_input=%d, dropped %d below min)",
@@ -680,7 +685,7 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
         )
     if run_row is None:
         await update_counters(
-            pool,
+            _get_backend(),
             run_id,
             memories_consolidated=0,
             clusters_consolidated=0,
@@ -691,7 +696,7 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
     clusters = config.get("clusters", []) if isinstance(config, dict) else []
     if not clusters:
         await update_counters(
-            pool,
+            _get_backend(),
             run_id,
             memories_consolidated=0,
             clusters_consolidated=0,
@@ -825,7 +830,7 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
             clusters_consolidated += 1
 
     await update_counters(
-        pool,
+        _get_backend(),
         run_id,
         memories_consolidated=memories_consolidated,
         clusters_consolidated=clusters_consolidated,
@@ -868,12 +873,12 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
             run_id,
         )
     if config_raw is None:
-        await update_counters(pool, run_id, summaries_created=0)
+        await update_counters(_get_backend(), run_id, summaries_created=0)
         return 0
     config = _parse_run_config(config_raw)
     clusters = config.get("clusters", []) if isinstance(config, dict) else []
     if not clusters:
-        await update_counters(pool, run_id, summaries_created=0)
+        await update_counters(_get_backend(), run_id, summaries_created=0)
         return 0
 
     n_created = 0
@@ -939,7 +944,7 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
             )
         n_created += 1
 
-    await update_counters(pool, run_id, summaries_created=n_created)
+    await update_counters(_get_backend(), run_id, summaries_created=n_created)
     logger.info(
         "[MORPHEUS] run %s synthesised %d summary memor%s (mode=%s)",
         run_id,
@@ -971,7 +976,7 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
         )
     if run_row is None:
         await update_counters(
-            pool,
+            _get_backend(),
             run_id,
             triples_extracted=0,
             memories_processed_for_extraction=0,
@@ -981,7 +986,7 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
     config = _parse_run_config(run_row["config"])
     if not _extract_enabled(config):
         await update_counters(
-            pool,
+            _get_backend(),
             run_id,
             triples_extracted=0,
             memories_processed_for_extraction=0,
@@ -1488,12 +1493,12 @@ async def run_dream(
     `namespace`, when set, scopes the run to that tenant's memories.
     """
     try:
-        await sweep_orphan_runs(pool)
+        await sweep_orphan_runs(_get_backend())
     except Exception:
         logger.exception("[MORPHEUS] orphan timeout sweep failed; continuing to open run")
 
     run_id = await begin_run(
-        pool,
+        _get_backend(),
         triggered_by=triggered_by,
         window_hours=window_hours,
         cluster_min_size=cluster_min_size,
@@ -1501,21 +1506,21 @@ async def run_dream(
         namespace=namespace,
     )
     try:
-        await set_phase(pool, run_id, "replay")
+        await set_phase(_get_backend(), run_id, "replay")
         await phase_replay(pool, run_id)
-        await set_phase(pool, run_id, "cluster")
+        await set_phase(_get_backend(), run_id, "cluster")
         await phase_cluster(pool, run_id)
         if _consolidate_enabled(config):
-            await set_phase(pool, run_id, "consolidate")
+            await set_phase(_get_backend(), run_id, "consolidate")
             await phase_consolidate(pool, run_id)
-        await set_phase(pool, run_id, "synthesise")
+        await set_phase(_get_backend(), run_id, "synthesise")
         await phase_synthesise(pool, run_id)
         if _extract_enabled(config):
-            await set_phase(pool, run_id, "extract")
+            await set_phase(_get_backend(), run_id, "extract")
             await phase_extract(pool, run_id)
-        await set_phase(pool, run_id, "commit")
-        await finish_run(pool, run_id)
+        await set_phase(_get_backend(), run_id, "commit")
+        await finish_run(_get_backend(), run_id)
     except Exception as exc:
         logger.exception("[MORPHEUS] run %s failed in phase", run_id)
-        await fail_run(pool, run_id, f"{type(exc).__name__}: {exc}")
+        await fail_run(_get_backend(), run_id, f"{type(exc).__name__}: {exc}")
     return run_id

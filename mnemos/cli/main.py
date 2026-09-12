@@ -541,12 +541,24 @@ async def _memory_dedup_async(*, namespace: str | None, apply: bool) -> dict[str
 async def _sweep_morpheus_orphans_async(*, max_age_hours: int) -> int:
     from mnemos.domain.morpheus.runner import sweep_orphan_runs
 
-    pool, close_pool = await _open_cli_morpheus_pool()
+    # Item 11a: the CLI now opens the backend-neutral persistence
+    # backend (``lifecycle.get_persistence_backend()`` or a freshly
+    # built one for one-shot invocations) and passes it to the runner
+    # helper. Pre-11a opened a raw asyncpg.Pool because sweep_orphan_runs
+    # was a raw-asyncpg function; the helper now routes through
+    # ``backend.morpheus.sweep_orphan_runs`` so every backend
+    # (Postgres / SQLite / MySQL / MariaDB / Oracle / Db2) gets the
+    # canonical orphan-timeout semantics.
+    backend, close_backend = await _open_cli_persistence_backend()
     try:
-        return await sweep_orphan_runs(pool, max_age_hours=max_age_hours)
+        return await sweep_orphan_runs(backend, max_age_hours=max_age_hours)
     finally:
-        if close_pool:
-            await pool.close()
+        if close_backend:
+            # Backends opened by ``_open_cli_persistence_backend`` have
+            # an ``async def close()``; route through it if present.
+            close = getattr(backend, "close", None)
+            if close is not None:
+                await close()
 
 
 def _post_document_import(

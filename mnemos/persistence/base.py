@@ -2139,6 +2139,188 @@ class CompressionQueueRepository(ABC):
         ...
 
 
+class MorpheusRepository(ABC):
+    """v3.3 MORPHEUS run-lifecycle CRUD — backend-agnostic.
+
+    Item 11a of the 12-item ABC migration: the run-lifecycle functions
+    (``begin_run`` / ``set_phase`` / ``update_counters`` /
+    ``increment_extract_counters`` / ``finish_run`` / ``fail_run`` /
+    ``sweep_orphan_runs`` / ``rollback_run``) used to live in
+    ``mnemos/domain/morpheus/runner.py`` as raw ``asyncpg.Pool``-typed
+    module-level functions. Every hive backend (Postgres, SQLite, MySQL,
+    MariaDB, Oracle, Db2) was drifting on its ``morpheus_runs`` schema —
+    Postgres's canonical shape (split across migrations_v3_3_morpheus.sql
+    + namespace + consolidate + extract) had 19 columns; the other
+    backends were stubs or early-iteration shapes (``run_type`` /
+    ``metrics`` on Oracle/DB2; the SQLite stub even used ``status
+    DEFAULT 'pending'`` which isn't a valid value in the Postgres
+    CHECK constraint).
+
+    This ABC moves every run-lifecycle SQL operation behind the
+    persistence surface so the runner calls ``backend.morpheus.<method>
+    (tx, ...)`` instead of raw ``pool.acquire()`` and the schema is
+    canonical on every backend.
+
+    Schema reference (canonical): ``db/migrations_v3_3_morpheus.sql``
+    + ``migrations_v3_3_morpheus_namespace.sql`` +
+    ``migrations_v4_2_morpheus_consolidate.sql`` +
+    ``migrations_v4_2_morpheus_extract.sql`` (Postgres). The other
+    backends were retconned in item 11a's
+    ``0061c_morpheus_runs_parity.sql`` (Oracle/DB2) /
+    ``migrations_v6_3_morpheus_runs_parity_sqlite.sql`` /
+    ``0061c_morpheus_runs_parity_mysql.sql`` /
+    ``0061c_morpheus_runs_parity_mariadb.sql`` files.
+
+    Concurrency contract: ``sweep_orphan_runs`` and ``rollback_run``
+    open the supplied ``tx`` and the SQL inside MUST keep the entire
+    rollback in a single transaction — partial rollback (some
+    memories deleted, some triples still pointing at the run) would
+    leave the corpus inconsistent. The Postgres multi-CTE pattern is
+    decomposed into portable sequential statements on backends that
+    don't support writable CTEs feeding an UPDATE.
+
+    JSON-operator contract: ``rollback_run`` touches ``memories.metadata``
+    to delete the ``pre_consolidate_permission_mode`` key Postgres
+    wrote during the CONSOLIDATE phase. Postgres uses JSONB operators
+    (``metadata->>$1``, ``? $1``, ``COALESCE(metadata, '{}'::jsonb) - $1``);
+    each backend translates these to its own JSON dialect
+    (MySQL/MariaDB: ``JSON_EXTRACT`` / ``JSON_CONTAINS_PATH`` /
+    ``JSON_REMOVE``; SQLite: ``json_extract`` + ``json_remove``;
+    Oracle 23ai: ``JSON_VALUE`` / ``JSON_EXISTS`` +
+    ``JSON_TRANSFORM``/read-modify-write; Db2: read-modify-write
+    because Db2 has no native JSON update function in ORA-compat
+    mode). Read-modify-write is acceptable on the read-modify-write
+    fallbacks because ``rollback_run`` is an admin path, not a hot
+    loop.
+    """
+
+    @abstractmethod
+    async def begin_run(
+        self,
+        tx: Transaction,
+        *,
+        triggered_by: str,
+        window_hours: int,
+        cluster_min_size: int,
+        config: dict | None,
+        namespace: str | None,
+    ) -> str:
+        """Open a new ``morpheus_runs`` row and return its id as a string.
+
+        Caller is responsible for advancing the row through phases via
+        :meth:`set_phase` and finalising via :meth:`finish_run` (or
+        :meth:`fail_run` on exception). The row is created with
+        ``status='running'`` so an inspector polling ``/v1/morpheus/runs``
+        sees the dream in flight. ``namespace`` set scopes the run to
+        memories with that ``namespace`` value; NULL means "all namespaces"
+        (the default).
+        """
+        ...
+
+    @abstractmethod
+    async def set_phase(self, tx: Transaction, run_id: str, phase: str) -> None:
+        """Stamp ``morpheus_runs.phase`` with the current phase name."""
+        ...
+
+    @abstractmethod
+    async def update_counters(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        memories_scanned: int | None = None,
+        clusters_found: int | None = None,
+        summaries_created: int | None = None,
+        memories_consolidated: int | None = None,
+        clusters_consolidated: int | None = None,
+        triples_extracted: int | None = None,
+        memories_processed_for_extraction: int | None = None,
+    ) -> None:
+        """Bump a subset of counters on ``morpheus_runs``.
+
+        Only the kwargs explicitly passed are written — the partial-update
+        semantic matches the original ``runner.update_counters`` shape so
+        phase functions can update one counter at a time without
+        overwriting the rest.
+        """
+        ...
+
+    @abstractmethod
+    async def increment_extract_counters(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        triples_extracted: int,
+        memories_processed: int,
+    ) -> None:
+        """Increment the extract counters by the per-memory deltas.
+
+        Used by the EXTRACT phase as each source memory commits — the
+        counter accumulates rather than replacing, matching the prior
+        runner-side ``COALESCE(..., 0) + $n`` pattern.
+        """
+        ...
+
+    @abstractmethod
+    async def finish_run(self, tx: Transaction, run_id: str) -> None:
+        """Mark the run ``status='success'`` and stamp ``finished_at``."""
+        ...
+
+    @abstractmethod
+    async def fail_run(self, tx: Transaction, run_id: str, error: str) -> None:
+        """Mark the run ``status='failed'`` and stamp ``finished_at + error``."""
+        ...
+
+    @abstractmethod
+    async def sweep_orphan_runs(
+        self,
+        tx: Transaction,
+        *,
+        threshold_hours: float,
+    ) -> list[Row]:
+        """Fail ``morpheus_runs`` rows stranded in ``status='running'``.
+
+        Marks every ``running`` row whose ``started_at`` is older than
+        ``threshold_hours`` ago as ``failed`` with a synthetic
+        ``orphan_timeout_sweep`` error. Returns the list of reclaimed
+        rows with ``id`` and ``started_at`` so callers can log each
+        reclaimed run's timestamp. Mirrors the compression worker
+        contest stale-running sweep — best-effort reclaim path for
+        workers/API triggers that crashed after opening a run row but
+        before any terminal status.
+        """
+        ...
+
+    @abstractmethod
+    async def rollback_run(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        requested_by: str,
+    ) -> tuple[int, int]:
+        """Undo every memory mutation tagged with this run.
+
+        Returns ``(memories_deleted, run_rows_updated)``. Synthesised
+        rows (those with ``provenance='morpheus_local'``) are deleted;
+        consolidated originals are restored in place from the metadata
+        audit key (``pre_consolidate_permission_mode``) the CONSOLIDATE
+        phase wrote; KG triples tagged with the run are removed; the
+        ``memories.triples_extracted_at`` mark is cleared on affected
+        memories; and the ``morpheus_runs`` row is flipped to
+        ``status='rolled_back'``. The full sequence runs inside the
+        supplied ``tx`` so a partial rollback cannot leak.
+
+        ``memories.metadata`` is touched to delete the
+        ``pre_consolidate_permission_mode`` key — each backend
+        translates the Postgres JSONB operators to its own dialect
+        (MySQL ``JSON_REMOVE``, SQLite ``json_remove``, Oracle
+        ``JSON_TRANSFORM``/read-modify-write, Db2 read-modify-write).
+        """
+        ...
+
+
 CapabilityName: TypeAlias = Literal[
     "core",
     "oauth",
@@ -2368,6 +2550,24 @@ class CorePersistence(PersistenceCapabilityBase, Protocol):
 
     @property
     def compression_queue(self) -> CompressionQueueRepository: ...
+
+    @property
+    def morpheus(self) -> MorpheusRepository:
+        """v3.3 MORPHEUS run-lifecycle CRUD repository.
+
+        Item 11a of the 12-item ABC migration: the runner now routes
+        every ``begin_run`` / ``set_phase`` / ``update_counters`` /
+        ``increment_extract_counters`` / ``finish_run`` / ``fail_run``
+        / ``sweep_orphan_runs`` / ``rollback_run`` call through this
+        property so the same caller code works on Postgres, SQLite,
+        MySQL/MariaDB, Oracle, and Db2.
+
+        Default :class:`NotImplementedError` so a backend that hasn't
+        shipped this ABC yet fails loudly at first call rather than
+        silently pretending to support MORPHEUS — concrete backends
+        override this property when the implementation lands.
+        """
+        raise NotImplementedError("morpheus run-lifecycle repository is not implemented")
 
     @property
     def webhooks(self) -> WebhookRepository: ...
