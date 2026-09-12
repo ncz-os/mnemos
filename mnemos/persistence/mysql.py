@@ -3475,6 +3475,47 @@ class MysqlCompressionQueueRepository(CompressionQueueRepository):
                     )
         return len(stale_rows)
 
+    async def get_queue_stats(self, tx: Transaction) -> dict[str, int]:
+        """MySQL/MariaDB stats snapshot for the v3.5 distillation worker.
+
+        Two SELECTs inside the supplied ``tx`` (one for the queue status
+        aggregates, one for the variant count). MariaDB inherits this
+        implementation via ``MariadbCompressionQueueRepository`` —
+        identical SQL on both dialects. The dialect uses
+        ``SUM(CASE WHEN ... THEN 1 ELSE 0 END)`` to match the existing
+        ``MysqlCompressionRepository.get_stats`` aggregate style; both
+        backends also accept the ``COUNT(CASE WHEN ... THEN 1 END)``
+        pattern but the SUM form is the in-file convention here.
+        """
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+                    SUM(CASE WHEN status = 'done'    THEN 1 ELSE 0 END) AS done,
+                    SUM(CASE WHEN status = 'failed'  THEN 1 ELSE 0 END) AS failed
+                FROM memory_compression_queue
+                """
+            )
+            row = await _fetchone_dict(cursor)
+            await cursor.execute(
+                "SELECT COUNT(*) AS variants FROM memory_compressed_variants"
+            )
+            variants_row = await _fetchone_dict(cursor)
+
+        variants = (variants_row or {}).get("variants", 0)
+        return {
+            "total": int(row.get("total") or 0),
+            "pending": int(row.get("pending") or 0),
+            "running": int(row.get("running") or 0),
+            "done": int(row.get("done") or 0),
+            "failed": int(row.get("failed") or 0),
+            "variants": int(variants or 0),
+        }
+
 
 class MysqlWebhookRepository(WebhookRepository):
     """MySQL/MariaDB WebhookRepository implementation.

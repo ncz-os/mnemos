@@ -426,6 +426,12 @@ class _FakeCompressionQueueRepo:
     async def sweep_stale_compression(self, tx, **kwargs) -> int:
         return self._returns.get("sweep_stale_compression", 0)
 
+    async def get_queue_stats(self, tx) -> dict:
+        return self._returns.get(
+            "get_queue_stats",
+            {"total": 0, "pending": 0, "running": 0, "done": 0, "failed": 0, "variants": 0},
+        )
+
 
 class _FakeRepo:
     """Catch-all for repos handlers don't currently exercise."""
@@ -456,6 +462,7 @@ class FakeBackend:
         self.memories = _FakeMemoryRepo()
         self.compression = _FakeCompressionRepo()
         self.webhooks = _FakeWebhookRepo()
+        self.compression_queue = _FakeCompressionQueueRepo()
         self.kg_triples = _FakeRepo()
         self.memory_versions = _FakeRepo()
         self.memory_branches = _FakeRepo()
