@@ -9,7 +9,12 @@ Public API used by mnemos.api.routes.oauth and mnemos.api.dependencies:
   - resolve_session(conn, session_id) -> (user_id, identity_id) or None
   - revoke_session(conn, session_id) -> bool
   - revoke_all_sessions(conn, user_id) -> int
-  - gc_expired_sessions(pool) -> int
+
+The expired-session garbage-collector moved to the OAuthRepository ABC
+(mnemos.persistence.base.OAuthRepository.gc_expired_sessions) in item 13 —
+the lifecycle worker at mnemos/core/lifecycle.py now drives every backend
+through ``backend.oauth.gc_expired_sessions(tx)`` rather than the
+Postgres-only ``gc_expired_sessions(pool)`` shim that used to live here.
 
 Design notes
 ------------
@@ -340,15 +345,14 @@ async def revoke_all_sessions(conn: asyncpg.Connection, user_id: str) -> int:
         return 0
 
 
-async def gc_expired_sessions(pool: asyncpg.Pool) -> int:
-    """Delete expired/revoked-long-ago sessions. Returns rows deleted."""
-    async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM oauth_sessions "
-            "WHERE expires_at < NOW() - INTERVAL '7 days' "
-            "   OR (revoked AND revoked_at < NOW() - INTERVAL '30 days')"
-        )
-        try:
-            return int(result.split()[-1])
-        except Exception:
-            return 0
+# ── Garbage-collector moved to the OAuthRepository ABC (item 13).
+#
+# The old module-level ``gc_expired_sessions(pool: asyncpg.Pool) -> int``
+# shim is gone: every backend's persistence layer now implements
+# :meth:`OAuthRepository.gc_expired_sessions` (see
+# ``mnemos.persistence.base.OAuthRepository`` and the per-backend
+# implementations in ``postgres.py`` / ``sqlite.py`` / ``mysql_oauth.py``
+# / ``oracle.py``). The lifecycle worker schedules against the active
+# persistence backend (``_persistence_backend.oauth.gc_expired_sessions``)
+# so SQLite / MySQL / MariaDB / Oracle / Db2 deployments stop leaking
+# expired oauth_sessions rows forever.

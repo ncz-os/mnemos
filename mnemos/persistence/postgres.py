@@ -3969,6 +3969,37 @@ class PostgresOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
         )
         return row
 
+    async def gc_expired_sessions(
+        self,
+        tx: Transaction,
+        *,
+        now: Any,
+        expired_grace: timedelta,
+        revoked_grace: timedelta,
+    ) -> int:
+        """Delete oauth_sessions past their grace windows (item 13).
+
+        Matches the previous ``mnemos.core.oauth.gc_expired_sessions``:
+        expires_at < now - expired_grace (default 7d), or revoked AND
+        revoked_at < now - revoked_grace (default 30d). Revoked rows with
+        a NULL revoked_at fall through to the second branch as "revoked
+        long ago" since NULL comparisons against a timestamp treat the
+        missing value as the earliest possible date — same semantic as
+        the prior raw asyncpg path.
+        """
+        result = await _postgres_tx(tx).conn.execute(
+            "DELETE FROM oauth_sessions "
+            "WHERE expires_at < ($1::timestamptz - make_interval(secs => $2)) "
+            "   OR (revoked AND revoked_at IS NOT NULL "
+            "       AND revoked_at < ($1::timestamptz - make_interval(secs => $3))) "
+            "   OR (revoked AND revoked_at IS NULL "
+            "       AND expires_at < ($1::timestamptz - make_interval(secs => $3)))",
+            now,
+            int(expired_grace.total_seconds()),
+            int(revoked_grace.total_seconds()),
+        )
+        return _pg_result_count(result)
+
 
 class PostgresAclRepository(AclRepository):
     async def grant_acl(

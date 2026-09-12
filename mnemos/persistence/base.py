@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, AsyncContextManager, Literal, Protocol, TypeAlias, Union, runtime_checkable
 
@@ -1236,6 +1236,27 @@ class OAuthRepository(ABC):
         "current timestamp" sentinel — implementations substitute their
         native ``NOW()`` / ``CURRENT_TIMESTAMP`` / sysdate literal so
         the same caller code works on every backend.
+        """
+
+    @abstractmethod
+    async def gc_expired_sessions(
+        self,
+        tx: Transaction,
+        *,
+        now: Any,
+        expired_grace: timedelta,
+        revoked_grace: timedelta,
+    ) -> int:
+        """Garbage-collect stale ``oauth_sessions`` rows.
+
+        Deletes rows whose ``expires_at`` is older than ``now - expired_grace``
+        or whose ``revoked`` flag is set AND ``revoked_at`` is older than
+        ``now - revoked_grace`` (NULL ``revoked_at`` on a revoked row counts as
+        very old, so a row revoked without a timestamp is always eligible).
+        Returns the count of rows deleted. ``now`` is the backend's "current
+        timestamp" sentinel so implementations substitute their native
+        ``NOW()`` / ``CURRENT_TIMESTAMP`` / ``SYSTIMESTAMP`` literal and the
+        same caller code works on every backend.
         """
 
 
