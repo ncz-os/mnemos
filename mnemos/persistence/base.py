@@ -968,6 +968,66 @@ class WebhookRepository(ABC):
         raise NotImplementedError("repair_delivery_chains not implemented for this backend")
 
 
+class NatsDispatchLogRepository(ABC):
+    """Idempotent NATS dispatch-dedupe log, backend-neutral (item 9/12).
+
+    NATS delivers at-least-once. Both the v0.3 webhook outbox consumer
+    (``mnemos/workers/webhooks_dispatch_nats_consumer.py``) and the v0.3
+    federation memory upsert consumer
+    (``mnemos/workers/federation_memory_nats_consumer.py``) record a
+    ``(event_id, subject)`` row before applying side effects, so that a
+    redelivery is acknowledged as a duplicate without a second side effect.
+
+    The dedupe MUST be atomic against the side-effect write when both live in
+    the same outer transaction (the federation consumer uses ``INSERT ...
+    nats_dispatch_log`` then ``INSERT ... memories`` in one transaction).
+    That is the contract of ``record_if_new`` -- it must perform the
+    check-and-insert under the caller's transaction, so the side effect can
+    rollback the dedupe row on failure.
+
+    Table shape (all backends must implement this exactly -- see
+    ``mnemos/db_migrations/migrations_v5_2_0_nats_outbox_idempotency.sql``
+    and its SQLite / MySQL / MariaDB / Oracle / Db2 mirrors):
+
+        event_id      TEXT NOT NULL,
+        subject       TEXT NOT NULL,
+        dispatched_at <TIMESTAMPTZ-or-equivalent> NOT NULL DEFAULT <now>,
+        PRIMARY KEY (event_id, subject)
+
+    The legacy Oracle/DB2 ``(id, subject, payload, published_at, acked_at)``
+    shape is incompatible with the dedupe contract; item 9 retconned those
+    tables to match the canonical Postgres/SQLite shape.
+    """
+
+    @abstractmethod
+    async def record_if_new(
+        self,
+        tx: Transaction,
+        event_id: str,
+        subject: str,
+    ) -> bool:
+        """Atomically record ``(event_id, subject)`` and return ``True``.
+
+        Return ``True`` when this call inserted a new dedupe row -- the
+        caller is now responsible for applying the side effect.
+
+        Return ``False`` when the ``(event_id, subject)`` pair already
+        exists -- the caller MUST treat the delivery as a duplicate and
+        skip the side effect.
+
+        Implementations must:
+
+        * run the check-and-insert under the caller's ``tx`` so the side
+          effect and dedupe row commit/rollback together;
+        * rely on the canonical ``(event_id, subject)`` unique constraint,
+          not on a SELECT-then-INSERT pair, so concurrent redeliveries
+          cannot both insert;
+        * not raise on duplicate-row conflict; the semantic is a clean
+          ``False`` return.
+        """
+        ...
+
+
 class ConsultationAuditRepository(ABC):
     """OpenAI-compatible gateway and consultation audit persistence lookups."""
 
@@ -2263,6 +2323,9 @@ class CorePersistence(PersistenceCapabilityBase, Protocol):
 
     @property
     def webhooks(self) -> WebhookRepository: ...
+
+    @property
+    def nats_dispatch_log(self) -> NatsDispatchLogRepository: ...
 
     @property
     def consultations_audit(self) -> ConsultationAuditRepository: ...

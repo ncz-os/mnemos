@@ -47,6 +47,7 @@ from mnemos.persistence.base import (
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
+    NatsDispatchLogRepository,
     OAuthRepository,
     SessionsRepository,
     StateRepository,
@@ -5435,6 +5436,40 @@ class PostgresAuditChainRepository(AuditChainRepository):
         return {r["memory_id"]: dict(r) for r in rows}
 
 
+class PostgresNatsDispatchLogRepository(NatsDispatchLogRepository):
+    """Postgres impl of :class:`NatsDispatchLogRepository` (item 9/12).
+
+    Uses ``INSERT ... ON CONFLICT (event_id, subject) DO NOTHING RETURNING
+    event_id`` so the dedupe is a single round trip and relies on the
+    canonical primary-key constraint rather than a SELECT-then-INSERT
+    pair — concurrent redeliveries on the same ``(event_id, subject)``
+    pair cannot both insert.
+
+    Returns ``True`` only when the call actually inserted a new row; a
+    redelivery sees ``RETURNING`` yield ``None`` and we surface
+    ``False`` so the caller treats the delivery as a duplicate.
+    """
+
+    async def record_if_new(
+        self,
+        tx: Transaction,
+        event_id: str,
+        subject: str,
+    ) -> bool:
+        conn = _postgres_tx(tx).conn
+        row = await conn.fetchrow(
+            """
+            INSERT INTO nats_dispatch_log (event_id, subject)
+            VALUES ($1, $2)
+            ON CONFLICT (event_id, subject) DO NOTHING
+            RETURNING event_id
+            """,
+            event_id,
+            subject,
+        )
+        return row is not None
+
+
 class PostgresBackend:
     """Postgres persistence facade backed by an asyncpg pool."""
 
@@ -5452,6 +5487,7 @@ class PostgresBackend:
     supports_row_level_security = True
     supports_pgvector = True
     supports_webhooks = True  # backed by PostgresWebhookRepository, see .webhooks
+    supports_nats_dispatch_log = True  # backed by PostgresNatsDispatchLogRepository, see .nats_dispatch_log
 
     def __init__(self, pool: asyncpg.Pool, settings: Any):
         self._pool = pool
@@ -5475,6 +5511,7 @@ class PostgresBackend:
         self._compression = PostgresCompressionRepository()
         self._compression_queue = PostgresCompressionQueueRepository()
         self._webhooks = PostgresWebhookRepository()
+        self._nats_dispatch_log = PostgresNatsDispatchLogRepository()
         self._consultations_audit = PostgresConsultationAuditRepository()
         self._oauth = PostgresOAuthRepository()
         self._sessions = PostgresSessionsRepository()
@@ -5850,6 +5887,10 @@ class PostgresBackend:
     @property
     def webhooks(self) -> WebhookRepository:
         return self._webhooks
+
+    @property
+    def nats_dispatch_log(self) -> NatsDispatchLogRepository:
+        return self._nats_dispatch_log
 
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:

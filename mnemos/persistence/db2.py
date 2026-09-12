@@ -46,6 +46,7 @@ from mnemos.persistence.oracle import (
     OracleFederationRepository,
     OracleKGRepository,
     OracleMemoryRepository,
+    OracleNatsDispatchLogRepository,
     OracleOAuthRepository,
     OracleSessionsRepository,
     OracleStateRepository,
