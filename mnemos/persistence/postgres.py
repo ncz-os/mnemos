@@ -2412,6 +2412,36 @@ class PostgresCompressionQueueRepository(CompressionQueueRepository):
         rows = await _postgres_tx(tx).conn.fetch(_PG_SWEEP_STALE_SQL, int(stale_threshold_secs), int(max_attempts))
         return len(rows)
 
+    async def get_queue_stats(self, tx: Transaction) -> dict[str, int]:
+        """Postgres stats snapshot for the v3.5 distillation worker.
+
+        Two SELECTs inside the supplied ``tx`` (one for the queue status
+        aggregates, one for the variant count). Mirrors the raw-SQL
+        shape the prior log_stats() used so the values match exactly;
+        ``log_stats()`` consumes every key in the returned dict.
+        """
+        conn = _postgres_tx(tx).conn
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending,
+                COUNT(CASE WHEN status = 'running' THEN 1 END) AS running,
+                COUNT(CASE WHEN status = 'done' THEN 1 END) AS done,
+                COUNT(CASE WHEN status = 'failed' THEN 1 END) AS failed
+            FROM memory_compression_queue
+            """
+        )
+        variants = await conn.fetchval("SELECT COUNT(*) FROM memory_compressed_variants")
+        return {
+            "total": int(row["total"] or 0),
+            "pending": int(row["pending"] or 0),
+            "running": int(row["running"] or 0),
+            "done": int(row["done"] or 0),
+            "failed": int(row["failed"] or 0),
+            "variants": int(variants or 0),
+        }
+
 
 class PostgresWebhookRepository(WebhookRepository):
     async def insert_subscription(

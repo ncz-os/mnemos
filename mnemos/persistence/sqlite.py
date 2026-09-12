@@ -2411,6 +2411,38 @@ class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueReposi
             swept += 1
         return swept
 
+    async def get_queue_stats(self, tx: Transaction) -> dict[str, int]:
+        """SQLite stats snapshot for the v3.5 distillation worker.
+
+        Single round-trip pair: one SELECT aggregates the queue status
+        counts and a second SELECT grabs the variant count. SQLite is a
+        single-writer backend, so both reads inside ``tx`` see the same
+        writer-serialised snapshot. Returns the dict the ABC contract
+        promises; ``log_stats()`` consumes every key.
+        """
+        conn = self._conn(tx)
+        row = await _fetch_one(
+            conn,
+            """
+            SELECT
+                COUNT(*) AS total,
+                COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending,
+                COUNT(CASE WHEN status = 'running' THEN 1 END) AS running,
+                COUNT(CASE WHEN status = 'done' THEN 1 END) AS done,
+                COUNT(CASE WHEN status = 'failed' THEN 1 END) AS failed
+            FROM memory_compression_queue
+            """,
+        ) or {}
+        variants = await _fetch_val(conn, "SELECT COUNT(*) FROM memory_compressed_variants")
+        return {
+            "total": int(row.get("total") or 0),
+            "pending": int(row.get("pending") or 0),
+            "running": int(row.get("running") or 0),
+            "done": int(row.get("done") or 0),
+            "failed": int(row.get("failed") or 0),
+            "variants": int(variants or 0),
+        }
+
 
 class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
     async def create_subscription(
