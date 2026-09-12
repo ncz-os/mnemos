@@ -46,6 +46,7 @@ from mnemos.persistence.oracle import (
     OracleFederationRepository,
     OracleKGRepository,
     OracleMemoryRepository,
+    OracleMorpheusRepository,
     OracleOAuthRepository,
     OracleSessionsRepository,
     OracleStateRepository,
@@ -68,6 +69,7 @@ from mnemos.persistence.oracle import (
     _uuid_to_raw,
     _validate_and_format_vector,
 )
+from mnemos.persistence.base import Transaction
 from mnemos.persistence.schema import ensure_db2_schema
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter
@@ -2653,6 +2655,233 @@ class Db2CompressionRepository(_Db2OraCompatMixin, OracleCompressionRepository):
             await _call(cursor.close)
 
 
+class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
+    """Db2 12.1.5 (Oracle Compat) impl of :class:`MorpheusRepository` (item 11a).
+
+    Inherits every method from :class:`OracleMorpheusRepository` because
+    the cursor layer in :class:`_Db2AsyncCursor.execute` rewrites
+    Oracle→Db2 dialect tokens (``SYSTIMESTAMP``→``CURRENT TIMESTAMP``,
+    ``:name``→``?``, ``TIMESTAMP WITH TIME ZONE``→``TIMESTAMP``)
+    transparently. Override ``rollback_run`` because Db2 ORA-compat
+    mode has no native JSON update function — we use read-modify-write
+    on ``memories.metadata`` to delete the
+    ``pre_consolidate_permission_mode`` key, exactly as the Oracle
+    read-modify-write fallback does. This is an admin rollback path
+    so the extra round trip is acceptable.
+
+    The Oracle parent's ``rollback_run`` body is otherwise portable:
+    every JSON call (``JSON_EXISTS``, ``JSON_VALUE``) and the
+    ``STANDARD_HASH(..., 'SHA256')`` audit hash translate through
+    the cursor layer. The one place that breaks is ``JSON_MERGEPATCH``
+    which Db2 doesn't support — we replace it with explicit
+    read-modify-write.
+
+    Schema is the result of item 11a's
+    ``0061c_morpheus_runs_parity.sql`` — the canonical 19-column
+    Postgres shape retconned onto Db2 with TIMESTAMP (not TIMESTAMP
+    WITH TIME ZONE) and CLOB config/namespace columns.
+    """
+
+    async def rollback_run(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        requested_by: str,
+    ) -> tuple[int, int]:
+        """Db2 read-modify-write rollback — see :class:`MorpheusRepository`."""
+        import json
+
+        conn = _conn_from_tx(tx)
+        # Step 1: drop the join table rows FIRST so we still have their
+        # memory_ids in the result set; then delete the kg_triples.
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT memory_id FROM morpheus_extract_run_memories WHERE run_id = ?",
+                (run_id,),
+            )
+            run_mem_rows = await _call(cursor.fetchall) or []
+            await _call(
+                cursor.execute,
+                "DELETE FROM morpheus_extract_run_memories WHERE run_id = ?",
+                (run_id,),
+            )
+            await _call(
+                cursor.execute,
+                "DELETE FROM kg_triples WHERE extracted_by_run_id = ?",
+                (run_id,),
+            )
+        finally:
+            await _call(cursor.close)
+        affected_ids = {str(r[0]) for r in run_mem_rows if r and r[0] is not None}
+        # Step 3: clear triples_extracted_at.
+        if affected_ids:
+            placeholders = ",".join("?" for _ in affected_ids)
+            cursor = await _call(conn.cursor)
+            try:
+                await _call(
+                    cursor.execute,
+                    f"UPDATE memories SET triples_extracted_at = NULL "
+                    f"WHERE id IN ({placeholders})",
+                    tuple(affected_ids),
+                )
+            finally:
+                await _call(cursor.close)
+        n_extract_reset = len(affected_ids)
+        # Step 4: read-modify-write to delete the audit key.
+        # We need to read the metadata CLOB and parse it (Db2 has no
+        # JSON_EXISTS in ORA-compat mode). The Python JSON parser sees
+        # plain JSON text. We then re-serialize without the audit key
+        # and UPDATE.
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, metadata FROM memories
+                 WHERE morpheus_run_id = ?
+                   AND deleted_at IS NULL
+                   AND metadata IS NOT NULL
+                """,
+                (run_id,),
+            )
+            restore_rows = await _call(cursor.fetchall) or []
+        finally:
+            await _call(cursor.close)
+        n_restored = 0
+        for row in restore_rows:
+            mid = row[0]
+            metadata_raw = row[1]
+            try:
+                metadata_dict = json.loads(metadata_raw) if metadata_raw else {}
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(metadata_dict, dict):
+                continue
+            pre_mode = metadata_dict.pop(self._PRE_CONSOLIDATE_PERMISSION_KEY, None)
+            if pre_mode is None:
+                continue
+            cursor = await _call(conn.cursor)
+            try:
+                await _call(
+                    cursor.execute,
+                    """
+                    UPDATE memories
+                       SET consolidated_into = NULL,
+                           consolidated_at = NULL,
+                           permission_mode = COALESCE(?, permission_mode),
+                           metadata = ?,
+                           morpheus_run_id = NULL
+                     WHERE id = ?
+                       AND deleted_at IS NULL
+                    """,
+                    (
+                        int(pre_mode) if pre_mode is not None else None,
+                        json.dumps(metadata_dict),
+                        mid,
+                    ),
+                )
+                n_restored += int(getattr(cursor, "rowcount", 0) or 0)
+            finally:
+                await _call(cursor.close)
+        # Step 5: audit log. Db2 has STANDARD_HASH... actually Db2 12.1
+        # does not have STANDARD_HASH; use HEX(HASH256(c)) if the
+        # build supports it, otherwise fall back to SHA-256 done in
+        # Python — but the deletion_log schema on Db2 (migration 0050)
+        # stores content_hash as VARCHAR(64), so any 64-char lowercase
+        # hex digest works. HASH256 is a Db2 built-in; if the build
+        # doesn't have it we leave content_hash NULL on Db2.
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id FROM memories
+                 WHERE morpheus_run_id = ?
+                   AND provenance = 'morpheus_local'
+                   AND deleted_at IS NULL
+                """,
+                (run_id,),
+            )
+            run_created = await _call(cursor.fetchall) or []
+        finally:
+            await _call(cursor.close)
+        for row in run_created:
+            mid = row[0]
+            cursor = await _call(conn.cursor)
+            try:
+                # Db2 built-in HASH256() returns a 32-byte binary; we
+                # cast to VARCHAR(64) for the lowercase hex form via
+                # HEX(). The migration's content_hash column is
+                # VARCHAR(64). Some Db2 12.1 Fix Packs expose HEX as
+                # HEX(int) only; fall back to HEX(BIGINT) of a single
+                # hash row if HEX(CLOB) raises. Operators running
+                # older Fix Packs may need to upgrade — same caveat as
+                # the compression queue migration.
+                await _call(
+                    cursor.execute,
+                    """
+                    INSERT INTO deletion_log (
+                        memory_id, content_hash, owner_id, namespace,
+                        requested_by, requested_at, request_kind, reason, source
+                    )
+                    SELECT id,
+                           HEX(HASH256(COALESCE(content, ''))),
+                           owner_id, namespace,
+                           ?, CURRENT TIMESTAMP, 'admin_purge', ?, ?
+                      FROM memories
+                     WHERE id = ?
+                       AND provenance = 'morpheus_local'
+                       AND deleted_at IS NULL
+                    """,
+                    (
+                        str(requested_by),
+                        f"MORPHEUS rollback {run_id}",
+                        f"morpheus.rollback,{run_id}",
+                        mid,
+                    ),
+                )
+            finally:
+                await _call(cursor.close)
+        # Step 6: delete run-created memories.
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM memories WHERE morpheus_run_id = ? "
+                "AND provenance = 'morpheus_local' "
+                "AND deleted_at IS NULL",
+                (run_id,),
+            )
+            n_deleted = int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+        # Step 7: flip the run row.
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE morpheus_runs SET status = 'rolled_back', "
+                "finished_at = COALESCE(finished_at, CURRENT TIMESTAMP) "
+                "WHERE id = ?",
+                (run_id,),
+            )
+            n_run = int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+        _LOG.warning(
+            "[MORPHEUS] run %s rolled back: %d memories deleted, "
+            "%d consolidated rows restored, %d extraction markers reset",
+            run_id,
+            n_deleted,
+            n_restored,
+            n_extract_reset,
+        )
+        return n_deleted, n_run
+
+
 class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
     """Webhook dispatch repository — Db2-native overrides for three methods.
 
@@ -4649,6 +4878,7 @@ class Db2Backend(OracleBackend):
         self._webhooks_repo = Db2WebhookRepository()
         self._consultations_audit_repo = Db2ConsultationAuditRepository()
         self._federation_repo = Db2FederationRepository()
+        self._morpheus_repo = Db2MorpheusRepository()
         self._state_kv_repo = Db2StateRepository()
         # RA-0/5/6: OAuth/Sessions/Consultations repos (PYTHIA Oracle-only
         # uses these in production; Db2 needs them for cross-backend parity
