@@ -392,13 +392,13 @@ async def test_dispatch_event_appends_first_attempt_pending_rows(repo, mysql_poo
         )
     payload = {"memory_id": "mem-1", "kind": "create"}
     async with _tx(mysql_pool) as tx:
-        delivery_ids = await repo.dispatch_event(
+        _intents = await repo.dispatch_event(
             tx,
             "memory.created",
             payload,
             owner_id="webhook_repo_dispatch_user",
-            namespace="default",
-        )
+            namespace="default",)
+        delivery_ids = [intent.delivery_id for intent in _intents]
     assert len(delivery_ids) == 1
     delivery_id = delivery_ids[0]
     assert delivery_id != sub_id
@@ -452,13 +452,12 @@ async def test_claim_delivery_assigns_lease_and_winner_takes_all(repo, mysql_poo
             owner_id="webhook_repo_claim_user",
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "claim-me"},
             owner_id="webhook_repo_claim_user",
-            namespace="default",
-        )
+            namespace="default",)]
 
     lease_seconds = 30
     async with _tx(mysql_pool) as tx:
@@ -509,13 +508,12 @@ async def test_claim_delivery_rejects_stale_writer_revision(repo, mysql_pool):
             owner_id="webhook_repo_wrev_user",
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "mem"},
             owner_id="webhook_repo_wrev_user",
-            namespace="default",
-        )
+            namespace="default",)]
     async with _tx(mysql_pool) as tx:
         claim = await repo.claim_delivery(
             tx,
@@ -544,22 +542,20 @@ async def test_claim_due_deliveries_skip_locked_keeps_workers_independent(
             owner_id="webhook_repo_skip_user",
             namespace="default",
         )
-        [first_id] = await repo.dispatch_event(
+        [first_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "due-0"},
             owner_id="webhook_repo_skip_user",
-            namespace="default",
-        )
+            namespace="default",)]
         extra_ids = []
         for i in range(1, 4):
-            [did] = await repo.dispatch_event(
+            [did] = [intent.delivery_id for intent in await repo.dispatch_event(
                 tx,
                 "memory.created",
                 {"memory_id": f"due-{i}"},
                 owner_id="webhook_repo_skip_user",
-                namespace="default",
-            )
+                namespace="default",)]
             extra_ids.append(did)
     all_ids = {first_id, *extra_ids}
     assert len(all_ids) == 4
@@ -610,13 +606,12 @@ async def test_release_delivery_claim_keeps_row_live(repo, mysql_pool):
             owner_id="webhook_repo_release_user",
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "release-me"},
             owner_id="webhook_repo_release_user",
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(mysql_pool) as tx:
         claim = await repo.claim_delivery(
@@ -676,13 +671,12 @@ async def test_release_delivery_claim_rejects_wrong_token(repo, mysql_pool):
             owner_id="webhook_repo_relbad_user",
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "x"},
             owner_id="webhook_repo_relbad_user",
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(mysql_pool) as tx:
         claim = await repo.claim_delivery(
@@ -718,13 +712,12 @@ async def test_guard_delivery_claim_returns_true_when_owned(repo, mysql_pool):
             owner_id="webhook_repo_guard_user",
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "guard-me"},
             owner_id="webhook_repo_guard_user",
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(mysql_pool) as tx:
         claim = await repo.claim_delivery(
@@ -760,13 +753,12 @@ async def test_finalize_delivery_success_creates_chain_terminal(repo, mysql_pool
             owner_id="webhook_repo_succ_user",
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "ok"},
             owner_id="webhook_repo_succ_user",
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(mysql_pool) as tx:
         claim = await repo.claim_delivery(
@@ -828,13 +820,12 @@ async def test_finalize_delivery_retryable_failure_schedules_successor(
             owner_id="webhook_repo_retry_user",
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "retry-me"},
             owner_id="webhook_repo_retry_user",
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(mysql_pool) as tx:
         claim = await repo.claim_delivery(
@@ -892,13 +883,12 @@ async def test_finalize_delivery_failure_after_lease_expired_returns_not_applied
             owner_id="webhook_repo_expired_user",
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "exp"},
             owner_id="webhook_repo_expired_user",
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(mysql_pool) as tx:
         claim = await repo.claim_delivery(
@@ -958,13 +948,12 @@ async def test_finalize_delivery_success_after_lease_expired_with_matching_token
             owner_id="webhook_repo_latesucc_user",
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "late-ok"},
             owner_id="webhook_repo_latesucc_user",
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(mysql_pool) as tx:
         claim = await repo.claim_delivery(
@@ -1016,13 +1005,12 @@ async def test_finalize_delivery_duplicate_success_converges_as_abandoned(
             owner_id="webhook_repo_dupe_user",
             namespace="default",
         )
-        [first_id] = await repo.dispatch_event(
+        [first_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "chain-1"},
             owner_id="webhook_repo_dupe_user",
-            namespace="default",
-        )
+            namespace="default",)]
 
     token_a = str(uuid.uuid4())
     async with _tx(mysql_pool) as tx:
@@ -1134,13 +1122,12 @@ async def test_store_delivery_response_body_does_not_change_status(repo, mysql_p
             owner_id="webhook_repo_body_user",
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "body"},
             owner_id="webhook_repo_body_user",
-            namespace="default",
-        )
+            namespace="default",)]
     body = '{"hello":"world"}'
     async with _tx(mysql_pool) as tx:
         stored = await repo.store_delivery_response_body(
@@ -1257,13 +1244,12 @@ async def test_status_transition_clock_advances_only_on_real_status_changes(
             owner_id="webhook_repo_tsclock_user",
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "ts"},
             owner_id="webhook_repo_tsclock_user",
-            namespace="default",
-        )
+            namespace="default",)]
 
     async with _tx(mysql_pool) as tx:
         before = await repo.list_deliveries(
@@ -1319,13 +1305,12 @@ async def test_succeeded_terminal_trigger_blocks_status_transition_away(
             owner_id="webhook_repo_terminal_user",
             namespace="default",
         )
-        [delivery_id] = await repo.dispatch_event(
+        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "terminal"},
             owner_id="webhook_repo_terminal_user",
-            namespace="default",
-        )
+            namespace="default",)]
     token = str(uuid.uuid4())
     async with _tx(mysql_pool) as tx:
         claim = await repo.claim_delivery(
@@ -1389,13 +1374,12 @@ async def test_unique_live_chain_attempt_index_blocks_duplicate_live_rows(
             owner_id="webhook_repo_unique_user",
             namespace="default",
         )
-        [first_id] = await repo.dispatch_event(
+        [first_id] = [intent.delivery_id for intent in await repo.dispatch_event(
             tx,
             "memory.created",
             {"memory_id": "unique"},
             owner_id="webhook_repo_unique_user",
-            namespace="default",
-        )
+            namespace="default",)]
 
     # Move the first attempt into a live "retrying" status (no lease so
     # the partial unique key still computes the same value).

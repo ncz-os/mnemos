@@ -161,6 +161,27 @@ class WebhookDeliveryOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class WebhookDeliveryIntent:
+    """Per-delivery outbox row, returned from ``dispatch_event``.
+
+    Carries the routing fields ``webhooks/dispatcher`` and
+    ``webhooks/outbox`` used to publish post-commit NATS nudges — the
+    delivery row itself is in the durable outbox table; this value
+    object just lets the dispatcher avoid a second read in the same
+    call to assemble the queued-delivery payload.
+
+    NOTE: this is an in-process dataclass, not a persisted row. Adding
+    fields here changes the ABC return contract on all five backends.
+    """
+
+    delivery_id: str
+    subscription_id: str
+    url: str
+    namespace: str
+    owner_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class WebhookFinalizationResult:
     """Result of an ownership-fenced delivery finalization attempt."""
 
@@ -815,15 +836,17 @@ class WebhookRepository(ABC):
         *,
         owner_id: str | None = None,
         namespace: str | None = None,
-    ) -> list[str]:
+    ) -> list[WebhookDeliveryIntent]:
         """Append one first-attempt row per matching active subscription.
 
         The rows must commit atomically with the triggering data write. Each
         row starts at ``attempt_num=1``, ``status='pending'``, is not
         superseded, has no lease, and records the canonical serialized payload
         plus its SHA-256 hex digest. This method performs no HTTP or NATS I/O;
-        nudges are post-commit orchestration. Returned IDs may be scheduled only
-        after the outer transaction commits.
+        nudges are post-commit orchestration. The returned intents carry the
+        delivery id and the per-subscription URL / ownership fields the
+        post-commit NATS path needs to publish a queued-delivery nudge without
+        a second database round-trip.
         """
         ...
 

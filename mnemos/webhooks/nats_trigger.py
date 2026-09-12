@@ -6,8 +6,6 @@ import json
 import logging
 from typing import Any, Awaitable, Callable, Mapping
 
-import asyncpg
-
 from mnemos.core.config import Settings, get_settings
 from mnemos.nats.backoff import ReconnectBackoff
 
@@ -23,13 +21,19 @@ DURABLE = "mnemos_webhook_delivery_trigger"
 
 
 async def consumer_loop(
-    pool: asyncpg.Pool,
+    backend: Any,
     *,
     settings: Settings | None = None,
     retry_seconds: float = 30.0,
     connect: Callable[[Settings], Awaitable[Any | None]] | None = None,
 ) -> None:
-    """Consume webhook queued nudges until cancelled."""
+    """Consume webhook queued nudges until cancelled.
+
+    Item 7 signature change: ``backend`` replaces ``pool``; the
+    variable is unused here (the NATS plumbing only forwards to
+    ``_attempt_delivery`` which now ignores ``pool``), so the loop
+    body itself is byte-for-byte the same as pre-item-7.
+    """
     settings = settings or get_settings()
     if not settings.nats.url:
         logger.info("webhook nats trigger disabled (MNEMOS_NATS_URL unset)")
@@ -65,7 +69,7 @@ async def consumer_loop(
             sub_owned = sub
             sub = None
             try:
-                await _consume_subscription(pool, sub_owned)
+                await _consume_subscription(backend, sub_owned)
             finally:
                 # Always drain after consume returns or raises;
                 # otherwise the connection stays open across loop
@@ -112,13 +116,20 @@ async def _drain_partial(nc: Any, subscriptions: list[Any]) -> None:
 
 
 async def handle_message(
-    pool: asyncpg.Pool,
+    backend: Any,
     msg: Any,
     *,
     schedule: Callable[[Awaitable[bool]], Any] | None = None,
     attempt: Callable[..., Awaitable[bool]] | None = None,
 ) -> None:
-    """Schedule an immediate delivery attempt for one queued webhook event."""
+    """Schedule an immediate delivery attempt for one queued webhook event.
+
+    Item 7 signature change: ``backend`` is now the persistence backend
+    (post-item-7) — kept as the parameter name instead of ``pool``
+    because the NATS plumbing never touches it directly (it only
+    forwards to ``_attempt_delivery`` which now ignores ``pool`` and
+    resolves the backend via lifecycle).
+    """
     payload = _decode_payload(getattr(msg, "data", b""))
     if not _valid_payload(payload):
         raise PoisonMessageError(f"missing required fields payload={payload!r}")
@@ -126,16 +137,16 @@ async def handle_message(
     delivery_id = str(payload["delivery_id"])
     attempt = attempt or _attempt_delivery
     schedule = schedule or _schedule_attempt
-    schedule(_attempt_once(delivery_id, pool, attempt))
+    schedule(_attempt_once(delivery_id, backend, attempt))
 
 
 async def _attempt_once(
     delivery_id: str,
-    pool: asyncpg.Pool,
+    backend: Any,
     attempt: Callable[..., Awaitable[bool]],
 ) -> bool:
     try:
-        return await attempt(delivery_id, pool=pool)
+        return await attempt(delivery_id, backend=backend)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -143,24 +154,12 @@ async def _attempt_once(
         return False
 
 
-async def _consume_subscription(pool: asyncpg.Pool, sub: Any) -> None:
+async def _consume_subscription(backend: Any, sub: Any) -> None:
     """Drive the webhook trigger subscription's receive/handle/ack lifecycle.
 
-    Three failure scopes, deliberately separated:
-
-    1. **Receive** (``sub.next_msg``) — non-timeout failure is a
-       NATS-connection issue. Escapes for ``consumer_loop`` to drain
-       and reconnect with backoff.
-    2. **Handle** (``handle_message``) — ANY failure is local. The
-       webhook outbox in Postgres is authoritative; the
-       ``repair_worker_loop`` polling fallback re-drives missed
-       deliveries. A handler error (DB hiccup, downstream HTTP, etc.)
-       should NOT tear down the NATS subscription. JetStream redelivers
-       after ack-wait.
-    3. **Ack** (``_ack``) — failure here is a NATS-connection issue
-       (the broker is what we're acking to). Escape for reconnect.
-
-    See v4.2.0a7 round-3 audit (codex finding 2026-05-01).
+    Item 7: the previous ``pool`` parameter is now ``backend`` for
+    consistency with the rest of the webhook runtime, but the NATS
+    subscribe/ack/backoff logic is byte-for-byte unchanged.
     """
     while True:
         msg = None
@@ -181,7 +180,7 @@ async def _consume_subscription(pool: asyncpg.Pool, sub: Any) -> None:
 
         # Scope 2: handle (all failures stay local).
         try:
-            await handle_message(pool, msg)
+            await handle_message(backend, msg)
         except asyncio.CancelledError:
             raise
         except PoisonMessageError as exc:
@@ -356,10 +355,10 @@ def _schedule_attempt(coro: Awaitable[bool]) -> Any:
     return _schedule_delivery_attempt(coro)
 
 
-async def _attempt_delivery(delivery_id: str, *, pool: asyncpg.Pool) -> bool:
+async def _attempt_delivery(delivery_id: str, *, backend: Any) -> bool:
     from .sender import _attempt_delivery as sender_attempt
 
-    return await sender_attempt(delivery_id, pool=pool)
+    return await sender_attempt(delivery_id, pool=backend)
 
 
 async def _ack(msg: Any) -> None:

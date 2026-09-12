@@ -6,17 +6,21 @@ way to satisfy corpus-review-2026-04-29 finding #2: domain writes
 must NEVER commit without their corresponding event row, and
 event rows must NEVER fire on rolled-back data.
 
-Round-47 closed the document_import side of that finding;
-round-49 surfaced partial/full failure via HTTP status; round-50
-prevented the batch top-level status from conflating client-error
-4xx with retryable-gateway 502.
+After item 7 (webhook runtime ABC migration), the call shape moved
+from ``dispatch(event, payload, *, conn=conn)`` to
+``dispatch(event, payload, *, tx=...)``: the contract that the delivery
+row joins the caller's transaction is unchanged, just expressed via the
+backend-neutral Transaction Protocol instead of a raw asyncpg
+connection. The legacy ``conn=conn`` keyword is preserved as a
+back-compat alias (forwarded to ``tx=``) so tests and call sites that
+have not yet migrated keep passing without re-introducing the raw
+asyncpg path.
 
 This file pins the invariant statically: every call site of
 ``mnemos.webhooks.dispatcher.dispatch`` (aliased as
-``_dispatch_webhook`` at most call sites) MUST pass ``conn=conn``
-so the delivery row joins the caller's transaction. AST-walk
-catches the pattern across both literal and aliased imports;
-catches a future addition that introduces a non-transactional
+``_dispatch_webhook`` at most call sites) MUST pass a transactional
+handle. AST-walk catches the pattern across both literal and aliased
+imports; catches a future addition that introduces a non-transactional
 call before code review does.
 
 Allow-list: the dispatcher module ITSELF imports ``dispatch`` as
@@ -38,8 +42,6 @@ MNEMOS_ROOT = REPO_ROOT / "mnemos"
 EXEMPT_FILES = {
     "mnemos/webhooks/dispatcher.py",
     "mnemos/webhooks/__init__.py",
-    "mnemos/webhooks/outbox.py",
-    "mnemos/webhooks/repair.py",
 }
 
 
@@ -75,23 +77,23 @@ def _calls_with_local_aliases(tree: ast.AST) -> dict[str, list[ast.Call]]:
         if isinstance(func, ast.Name) and func.id in aliases:
             calls.setdefault(func.id, []).append(node)
         elif isinstance(func, ast.Attribute):
-            # Attribute access like ``dispatcher.dispatch(...)`` —
-            # surface those too.
             if func.attr == "dispatch":
                 calls.setdefault("dispatch", []).append(node)
     return calls
 
 
-def test_every_dispatch_call_passes_conn():
+def test_every_dispatch_call_passes_a_transactional_handle():
     """Every call to ``mnemos.webhooks.dispatcher.dispatch`` (or
-    its locally-aliased import) must include a ``conn=`` keyword
-    argument so the webhook_deliveries INSERT joins the caller's
-    transaction.
+    its locally-aliased import) must include a ``tx=`` (post item-7)
+    or legacy ``conn=`` keyword argument so the webhook_deliveries
+    INSERT joins the caller's transaction.
 
-    A call without ``conn=`` writes the delivery row on a fresh
-    connection AFTER the caller's data has committed — failures
-    in that fresh-connection acquire lose the event entirely
-    (corpus-review-2026-04-29 #2).
+    A call without one writes the delivery row on a freshly-acquired
+    backend transaction. That is the expected path for non-transactional
+    callers (the no-arg path opens its own backend.transactional() and
+    schedules the send task post-commit). For callers that DO need
+    atomicity with their own writes, this test catches a forgotten
+    transactional handle.
     """
     failures: list[tuple[str, int, str]] = []
 
@@ -109,20 +111,22 @@ def test_every_dispatch_call_passes_conn():
                 kwarg_names = {
                     kw.arg for kw in call.keywords if kw.arg is not None
                 }
-                if "conn" not in kwarg_names:
+                has_handle = "tx" in kwarg_names or "conn" in kwarg_names
+                if not has_handle:
                     failures.append(
                         (rel, call.lineno, alias)
                     )
 
     assert not failures, (
         "non-transactional webhook dispatch detected (every call to "
-        "mnemos.webhooks.dispatcher.dispatch MUST pass conn=conn so the "
-        "delivery row joins the caller's transaction):\n"
+        "mnemos.webhooks.dispatcher.dispatch MUST pass tx=<transaction> "
+        "or legacy conn= so the delivery row joins the caller's "
+        "transaction when one is open):\n"
         + "\n".join(
             f"  {rel}:{lineno}  → {alias}(...)"
             for (rel, lineno, alias) in failures
         )
-        + "\n\nFix: pass ``conn=conn`` from inside the data transaction; "
+        + "\n\nFix: pass ``tx=tx`` from inside the data transaction; "
         "schedule the send task after commit via "
         "``_schedule_delivery_attempt(_attempt_delivery(delivery_id))``."
     )
@@ -145,11 +149,9 @@ def test_known_call_sites_present():
         for alias, calls in _calls_with_local_aliases(tree).items():
             for _call in calls:
                 found.append(rel)
-                break  # one mention is enough
+                break
             break
 
-    # We expect at least 1 call site (memories.py + document_import.py)
-    # in the production tree.
     assert len(found) >= 1, (
         "AST scanner found zero dispatcher.dispatch call sites — the "
         "invariant test cannot detect regressions if it can't find any "
@@ -158,57 +160,54 @@ def test_known_call_sites_present():
 
 
 @pytest.mark.parametrize(
-    "snippet,should_pass",
+    ("snippet", "should_pass"),
     [
-        # Canonical transactional call site.
+        (
+            "from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook\n"
+            "async def f(tx):\n"
+            "    await _dispatch_webhook('memory.created', {}, tx=tx)\n",
+            True,
+        ),
+        (
+            "from mnemos.webhooks.dispatcher import dispatch\n"
+            "async def f(tx):\n"
+            "    await dispatch('e', {}, tx=tx)\n",
+            True,
+        ),
         (
             "from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook\n"
             "async def f(conn):\n"
             "    await _dispatch_webhook('memory.created', {}, conn=conn)\n",
             True,
         ),
-        # Bare ``conn`` keyword without the alias also accepted.
-        (
-            "from mnemos.webhooks.dispatcher import dispatch\n"
-            "async def f(conn):\n"
-            "    await dispatch('e', {}, conn=conn)\n",
-            True,
-        ),
-        # Non-transactional call — bug we're guarding against.
         (
             "from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook\n"
             "async def f():\n"
             "    await _dispatch_webhook('memory.created', {})\n",
             False,
         ),
-        # Attribute-access ``dispatcher.dispatch`` shape.
         (
             "from mnemos.webhooks import dispatcher\n"
-            "async def f(conn):\n"
-            "    await dispatcher.dispatch('e', {}, conn=conn)\n",
+            "async def f(tx):\n"
+            "    await dispatcher.dispatch('e', {}, tx=tx)\n",
             True,
         ),
     ],
 )
 def test_scanner_classifies_canonical_shapes(snippet, should_pass, tmp_path):
-    """Negative + positive fixtures for the AST scanner. Each
-    snippet stands in for a call-site shape; the scanner should
-    correctly admit transactional patterns and reject non-
-    transactional ones."""
+    """Negative + positive fixtures for the AST scanner."""
     fake_module = tmp_path / "fake.py"
     fake_module.write_text(snippet)
     tree = ast.parse(snippet)
     aliases = _calls_with_local_aliases(tree)
 
-    # Every call discovered must (or must not) have ``conn=`` per
-    # the should_pass parametrize.
     for _alias, calls in aliases.items():
         for call in calls:
             kwarg_names = {
                 kw.arg for kw in call.keywords if kw.arg is not None
             }
-            has_conn = "conn" in kwarg_names
+            has_handle = "tx" in kwarg_names or "conn" in kwarg_names
             if should_pass:
-                assert has_conn, f"transactional snippet missing conn=: {snippet!r}"
+                assert has_handle, f"transactional snippet missing tx=/conn=: {snippet!r}"
             else:
-                assert not has_conn, f"non-transactional snippet should fail: {snippet!r}"
+                assert not has_handle, f"non-transactional snippet should fail: {snippet!r}"
