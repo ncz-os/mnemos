@@ -12,6 +12,16 @@ These tests cover:
     threshold, min_size filter, config persistence.
   - phase_synthesise against a mocked pool — INSERT shape,
     source_memories tagging, rollback safety contract.
+
+Item 11a (ABC migration): ``phase_cluster`` and ``phase_synthesise``
+now internally dispatch their final ``update_counters`` call through
+``_get_backend()`` → ``backend.morpheus.update_counters``. The lifecycle
+global ``_persistence_backend`` is None by default in this test
+process, so the autouse ``_install_noop_morpheus_backend`` fixture
+below wires a no-op backend into the lifecycle for every test. The
+phase tests still drive the ``asyncpg.Pool``-shaped mock
+(``_MockPool``) for their own SQL — the backend is only consulted
+for the lifecycle counter bump.
 """
 from __future__ import annotations
 
@@ -173,6 +183,78 @@ class _MockPool:
                 return False
 
         return _Ctx()
+
+
+class _MorpheusNoOp:
+    """No-op ``backend.morpheus`` for the slice-2 phase tests.
+
+    Item 11a: ``phase_cluster`` and ``phase_synthesise`` dispatch their
+    final ``update_counters`` through ``backend.morpheus.update_counters``.
+    The phase tests don't assert on that counter bump, so a no-op
+    suffices.
+    """
+
+    async def begin_run(self, tx, **kwargs):
+        return "00000000-0000-0000-0000-000000000000"
+
+    async def set_phase(self, tx, run_id, phase):
+        return None
+
+    async def update_counters(self, tx, run_id, **_kwargs):
+        return None
+
+    async def increment_extract_counters(
+        self, tx, run_id, *, triples_extracted, memories_processed
+    ):
+        return None
+
+    async def finish_run(self, tx, run_id):
+        return None
+
+    async def fail_run(self, tx, run_id, error):
+        return None
+
+    async def sweep_orphan_runs(self, tx, *, threshold_hours):
+        return []
+
+    async def rollback_run(self, tx, run_id, *, requested_by):
+        return 0, 1
+
+
+class _BackendNoOp:
+    """No-op backend — has ``morpheus`` and ``transactional``."""
+
+    def __init__(self):
+        self.morpheus = _MorpheusNoOp()
+
+    def transactional(self):
+
+        class _Ctx:
+            async def __aenter__(self_inner):
+                return None
+
+            async def __aexit__(self_inner, *_exc):
+                return False
+
+        return _Ctx()
+
+
+@pytest.fixture(autouse=True)
+def _install_noop_morpheus_backend(monkeypatch):
+    """Wire a no-op backend into the lifecycle global for every test.
+
+    Item 11a: ``phase_cluster`` / ``phase_synthesise`` internally call
+    ``_get_backend()`` to dispatch ``update_counters`` through the new
+    ABC. The lifecycle global ``_persistence_backend`` is None by
+    default in this test process, so wire a no-op backend for the
+    duration of each test so the phase functions don't crash trying
+    to look up a backend. The phase tests still drive ``_MockPool``
+    for their own SQL — the backend is only consulted for the
+    lifecycle counter bump.
+    """
+    from mnemos.core import lifecycle as _lifecycle
+
+    monkeypatch.setattr(_lifecycle, "_persistence_backend", _BackendNoOp())
 
 
 def _row(memory_id: str, vec: list[float]) -> dict[str, Any]:

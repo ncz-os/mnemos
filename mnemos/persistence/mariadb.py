@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from mnemos.core import eligibility as _eligibility
@@ -37,6 +37,7 @@ from mnemos.persistence.base import (
     KGRepository,
     MYSQL_CAPABILITY_DETAILS,
     MemoryRepository,
+    MorpheusRepository,
     NatsDispatchLogRepository,
     STATE_CAPABILITY,
     STATE_DETAIL_CAPABILITY,
@@ -90,6 +91,7 @@ from mnemos.persistence.mysql import (
     MysqlFederationRepository,
     MysqlKGRepository,
     MysqlMemoryRepository,
+    MysqlMorpheusRepository,
     MysqlNatsDispatchLogRepository,
     MysqlStateRepository,
     MysqlVersionRepository,
@@ -317,6 +319,67 @@ CREATE TABLE IF NOT EXISTS session_memory_injections (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
+
+# MORPHEUS run-lifecycle (item 11a): canonical 19-column ``morpheus_runs``
+# table for MariaDB 11.7+. Mirrors the MySQL form but uses LONGTEXT +
+# ``json_valid()`` CHECK for ``config`` since MariaDB has no native
+# JSON column type. See ``migrations_mariadb/0061c_morpheus_runs.sql``
+# for the migration-file mirror.
+_DDL_MORPHEUS_RUNS = """
+CREATE TABLE IF NOT EXISTS morpheus_runs (
+    id                  CHAR(36)        NOT NULL DEFAULT (UUID()),
+    started_at          DATETIME(6)     NOT NULL DEFAULT NOW(6),
+    finished_at         DATETIME(6)         NULL,
+    status              VARCHAR(16)     NOT NULL DEFAULT 'running',
+    phase               VARCHAR(64)         NULL,
+    triggered_by        VARCHAR(32)     NOT NULL DEFAULT 'cron',
+
+    window_started_at   DATETIME(6)         NULL,
+    window_ended_at     DATETIME(6)         NULL,
+    window_hours        INT             NOT NULL DEFAULT 168,
+    cluster_min_size    INT             NOT NULL DEFAULT 3,
+
+    memories_scanned    INT             NOT NULL DEFAULT 0,
+    clusters_found      INT             NOT NULL DEFAULT 0,
+    summaries_created   INT             NOT NULL DEFAULT 0,
+
+    memories_consolidated    INT         NOT NULL DEFAULT 0,
+    clusters_consolidated    INT         NOT NULL DEFAULT 0,
+
+    triples_extracted               INT    NOT NULL DEFAULT 0,
+    memories_processed_for_extraction INT   NOT NULL DEFAULT 0,
+
+    error               TEXT                NULL,
+    config              LONGTEXT            NULL,
+    namespace           VARCHAR(256)        NULL,
+
+    PRIMARY KEY (id),
+    CONSTRAINT morpheus_runs_status_check
+        CHECK (status IN ('running','success','failed','rolled_back')),
+    CONSTRAINT morpheus_runs_triggered_by_check
+        CHECK (triggered_by IN ('cron','manual','api')),
+    CONSTRAINT morpheus_runs_config_is_json
+        CHECK (config IS NULL OR JSON_VALID(config)),
+
+    KEY idx_morpheus_runs_status (status),
+    KEY idx_morpheus_runs_started (started_at DESC),
+    KEY idx_morpheus_runs_namespace (namespace)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+
+# MORPHEUS EXTRACT processed-memory sidecar (item 11a).
+_DDL_MORPHEUS_EXTRACT_RUN_MEMORIES = """
+CREATE TABLE IF NOT EXISTS morpheus_extract_run_memories (
+    run_id        CHAR(36)        NOT NULL,
+    memory_id     VARCHAR(64)     NOT NULL,
+    processed_at  DATETIME(6)     NOT NULL DEFAULT NOW(6),
+    PRIMARY KEY (run_id, memory_id),
+    KEY idx_morpheus_extract_run_memories_memory (memory_id, processed_at DESC)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+
 _INIT_DDLS = [
     _DDL_MEMORIES,
     _DDL_DELETION_REQUESTS,
@@ -345,6 +408,8 @@ _INIT_DDLS = [
     _DDL_USAGE_LEDGER,
     _DDL_CATEGORY_DECAY,
     _DDL_CATEGORY_DECAY_SEED,
+    _DDL_MORPHEUS_RUNS,
+    _DDL_MORPHEUS_EXTRACT_RUN_MEMORIES,
 ]
 
 
@@ -673,6 +738,71 @@ class MariadbCompressionQueueRepository(MysqlCompressionQueueRepository):
     pass
 
 
+class MariadbMorpheusRepository(MysqlMorpheusRepository):
+    """MariaDB inherits MySQL's MORPHEUS repository.
+
+    MariaDB has no native JSON CAST (``CAST(... AS JSON)`` is
+    MySQL-specific). The ``config`` column on MariaDB is LONGTEXT
+    with a ``json_valid()`` CHECK, so the MySQL impl's
+    ``CAST(%s AS JSON)`` form would fail. We override ``begin_run``
+    to pass the JSON text directly — MariaDB stores it as LONGTEXT
+    but treats it as JSON via the CHECK constraint at insert time.
+
+    All other MySQL impl methods (``update_counters``, ``set_phase``,
+    etc.) round-trip unchanged because ``UPDATE`` paths don't touch
+    the JSON CAST.
+    """
+
+    async def begin_run(
+        self,
+        tx: Transaction,
+        *,
+        triggered_by: str,
+        window_hours: int,
+        cluster_min_size: int,
+        config: dict | None,
+        namespace: str | None,
+    ) -> str:
+        conn = tx.conn
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        window_start = now - timedelta(hours=int(window_hours))
+        config_json = json.dumps(config or {})
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO morpheus_runs
+                    (triggered_by, started_at, window_started_at, window_ended_at,
+                     window_hours, cluster_min_size, config, namespace, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'running')
+                """,
+                (
+                    triggered_by,
+                    now,
+                    window_start,
+                    now,
+                    int(window_hours),
+                    int(cluster_min_size),
+                    config_json,
+                    namespace,
+                ),
+            )
+            await cursor.execute(
+                """
+                SELECT id FROM morpheus_runs
+                 WHERE triggered_by = %s
+                   AND started_at = %s
+                   AND window_hours = %s
+                 ORDER BY started_at DESC
+                 LIMIT 1
+                """,
+                (triggered_by, now, int(window_hours)),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("MariaDB begin_run: failed to fetch inserted row id")
+        return str(row[0])
+
+
 class MariadbWebhookRepository(MysqlWebhookRepository):
     pass
 
@@ -878,6 +1008,7 @@ class MariadbBackend(MysqlBackend):
         self._memory_branches_repo = MariadbBranchRepository()
         self._compression_repo = MariadbCompressionRepository()
         self._compression_queue_repo = MariadbCompressionQueueRepository()
+        self._morpheus_repo = MariadbMorpheusRepository()
         self._nats_dispatch_log_repo = MariadbNatsDispatchLogRepository()
         self._consultations_audit_repo = MariadbConsultationAuditRepository()
         self._federation_repo = MariadbFederationRepository()
@@ -915,6 +1046,10 @@ class MariadbBackend(MysqlBackend):
     @property
     def compression_queue(self) -> CompressionQueueRepository:
         return self._compression_queue_repo
+
+    @property
+    def morpheus(self) -> MorpheusRepository:
+        return self._morpheus_repo
 
     @property
     def webhooks(self) -> WebhookRepository:

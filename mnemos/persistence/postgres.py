@@ -47,6 +47,7 @@ from mnemos.persistence.base import (
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
+    MorpheusRepository,
     NatsDispatchLogRepository,
     OAuthRepository,
     SessionsRepository,
@@ -5497,6 +5498,295 @@ class PostgresAuditChainRepository(AuditChainRepository):
         return {r["memory_id"]: dict(r) for r in rows}
 
 
+class PostgresMorpheusRepository(MorpheusRepository):
+    """Postgres impl of :class:`MorpheusRepository` (item 11a).
+
+    Wraps the canonical v3.3 ``morpheus_runs`` SQL behind the ABC with
+    no behaviour change versus the prior raw-asyncpg path in
+    ``mnemos/domain/morpheus/runner.py``. Schema is the canonical
+    Postgres shape from ``db/migrations_v3_3_morpheus.sql`` +
+    namespace/consolidate/extract migrations (19 columns total).
+
+    The ``sweep_orphan_runs`` CTE-with-FOR-UPDATE-SKIP-LOCKED claim and
+    the multi-CTE ``rollback_run`` body both run inside the caller-
+    supplied ``tx`` so a partial rollback cannot leak across the
+    caller's transaction boundary.
+    """
+
+    _SWEEP_ORPHAN_RUNS_SQL = """
+        WITH orphaned AS (
+            SELECT id, started_at
+            FROM morpheus_runs
+            WHERE status = 'running'
+              AND started_at < NOW() - ($1::double precision * INTERVAL '1 hour')
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE morpheus_runs r
+        SET status      = 'failed',
+            error       = $2,
+            finished_at = NOW()
+        FROM orphaned o
+        WHERE r.id = o.id
+        RETURNING r.id, o.started_at
+    """
+
+    _ORPHAN_TIMEOUT_ERROR = "orphan_timeout_sweep"
+
+    async def begin_run(
+        self,
+        tx: Transaction,
+        *,
+        triggered_by: str,
+        window_hours: int,
+        cluster_min_size: int,
+        config: dict | None,
+        namespace: str | None,
+    ) -> str:
+        conn = _postgres_tx(tx).conn
+        window_end = datetime.now(timezone.utc)
+        window_start = window_end - timedelta(hours=window_hours)
+        row = await conn.fetchrow(
+            """
+            INSERT INTO morpheus_runs
+                (triggered_by, window_started_at, window_ended_at,
+                 window_hours, cluster_min_size, config, namespace)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+            RETURNING id
+            """,
+            triggered_by,
+            window_start,
+            window_end,
+            int(window_hours),
+            int(cluster_min_size),
+            json.dumps(config or {}),
+            namespace,
+        )
+        return str(row["id"])
+
+    async def set_phase(self, tx: Transaction, run_id: str, phase: str) -> None:
+        await _postgres_tx(tx).conn.execute(
+            "UPDATE morpheus_runs SET phase = $2 WHERE id = $1::uuid",
+            run_id,
+            phase,
+        )
+
+    async def update_counters(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        memories_scanned: int | None = None,
+        clusters_found: int | None = None,
+        summaries_created: int | None = None,
+        memories_consolidated: int | None = None,
+        clusters_consolidated: int | None = None,
+        triples_extracted: int | None = None,
+        memories_processed_for_extraction: int | None = None,
+    ) -> None:
+        sets: list[str] = []
+        args: list[Any] = []
+        counter_map = (
+            ("memories_scanned", memories_scanned),
+            ("clusters_found", clusters_found),
+            ("summaries_created", summaries_created),
+            ("memories_consolidated", memories_consolidated),
+            ("clusters_consolidated", clusters_consolidated),
+            ("triples_extracted", triples_extracted),
+            ("memories_processed_for_extraction", memories_processed_for_extraction),
+        )
+        for column, value in counter_map:
+            if value is not None:
+                args.append(int(value))
+                sets.append(f"{column} = ${len(args)}")
+        if not sets:
+            return
+        args.append(run_id)
+        await _postgres_tx(tx).conn.execute(
+            f"UPDATE morpheus_runs SET {', '.join(sets)} WHERE id = ${len(args)}::uuid",
+            *args,
+        )
+
+    async def increment_extract_counters(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        triples_extracted: int,
+        memories_processed: int,
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            UPDATE morpheus_runs
+            SET triples_extracted = COALESCE(triples_extracted, 0) + $2,
+                memories_processed_for_extraction =
+                    COALESCE(memories_processed_for_extraction, 0) + $3
+            WHERE id = $1::uuid
+            """,
+            run_id,
+            int(triples_extracted),
+            int(memories_processed),
+        )
+
+    async def finish_run(self, tx: Transaction, run_id: str) -> None:
+        await _postgres_tx(tx).conn.execute(
+            "UPDATE morpheus_runs SET status = 'success', finished_at = now() "
+            "WHERE id = $1::uuid",
+            run_id,
+        )
+
+    async def fail_run(self, tx: Transaction, run_id: str, error: str) -> None:
+        await _postgres_tx(tx).conn.execute(
+            "UPDATE morpheus_runs SET status = 'failed', finished_at = now(), "
+            "error = $2 WHERE id = $1::uuid",
+            run_id,
+            str(error)[:4000],
+        )
+
+    async def sweep_orphan_runs(
+        self,
+        tx: Transaction,
+        *,
+        threshold_hours: float,
+    ) -> list[Row]:
+        rows = await _postgres_tx(tx).conn.fetch(
+            self._SWEEP_ORPHAN_RUNS_SQL,
+            float(threshold_hours),
+            self._ORPHAN_TIMEOUT_ERROR,
+        )
+        # asyncpg's Record supports both ``r["id"]`` and ``r["started_at"]``
+        # via the same Row protocol the rest of the persistence layer uses.
+        return [r for r in rows]
+
+    async def rollback_run(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        requested_by: str,
+    ) -> tuple[int, int]:
+        """Undo every memory mutation tagged with this run.
+
+        Uses the multi-CTE pattern from the original
+        ``runner.rollback_run`` so a single statement resets the
+        ``triples_extracted_at`` mark on every memory touched by this
+        run's extract output (kg_triples + morpheus_extract_run_memories
+        join), restores consolidated originals from the metadata
+        audit key, deletes run-created synthesised memories, and
+        flips the run row to ``rolled_back`` — all inside the supplied
+        ``tx``.
+
+        The audit-log write that the original runner did via
+        ``log_morpheus_run_memory_deletions`` is preserved here as a
+        separate ``INSERT`` so the same callable signature holds;
+        audit + rollback commit or fail together inside the caller's
+        transaction.
+        """
+        conn = _postgres_tx(tx).conn
+        extract_reset = await conn.execute(
+            """
+            WITH deleted_extract_triples AS (
+                DELETE FROM kg_triples
+                WHERE extracted_by_run_id = $1::uuid
+                RETURNING memory_id
+            ), run_memories AS (
+                DELETE FROM morpheus_extract_run_memories
+                WHERE run_id = $1::uuid
+                RETURNING memory_id
+            ), affected_memories AS (
+                SELECT memory_id FROM deleted_extract_triples
+                UNION
+                SELECT memory_id FROM run_memories
+            )
+            UPDATE memories
+            SET triples_extracted_at = NULL
+            WHERE id IN (
+                SELECT DISTINCT memory_id
+                FROM affected_memories
+                WHERE memory_id IS NOT NULL
+            )
+            """,
+            run_id,
+        )
+        # _PRE_CONSOLIDATE_PERMISSION_KEY ("pre_consolidate_permission_mode")
+        # — fixed string, matches the runner-side constant. Inline here to
+        # keep the JSONB operators + key constant in one place.
+        _PRE_CONSOLIDATE_PERMISSION_KEY = "pre_consolidate_permission_mode"
+        restore = await conn.execute(
+            """
+            UPDATE memories
+            SET consolidated_into = NULL,
+                consolidated_at = NULL,
+                permission_mode = COALESCE(
+                    (metadata->>$2)::int,
+                    permission_mode
+                ),
+                metadata = COALESCE(metadata, '{}'::jsonb) - $2,
+                morpheus_run_id = NULL
+            WHERE morpheus_run_id = $1::uuid
+              AND deleted_at IS NULL
+              AND COALESCE(metadata, '{}'::jsonb) ? $2
+            """,
+            run_id,
+            _PRE_CONSOLIDATE_PERMISSION_KEY,
+        )
+        # Audit-log the run-created memories the rollback is about to
+        # delete (matches the original runner behaviour — same row
+        # pattern as mnemos/db/deletion_log.py). Keeping this inline
+        # rather than calling the module-level helper because the
+        # original SQL uses Postgres-specific ::uuid and ::timestamptz
+        # casts that other backends can't round-trip.
+        await conn.execute(
+            """
+            INSERT INTO deletion_log (
+                memory_id, content_hash, owner_id, namespace,
+                requested_by, requested_at, request_kind, reason, source
+            )
+            SELECT
+                id,
+                encode(digest(COALESCE(content, ''), 'sha256'), 'hex'),
+                owner_id,
+                namespace,
+                $2,
+                NOW(),
+                'admin_purge',
+                $3,
+                ARRAY['morpheus.rollback', $1::text]
+              FROM memories
+             WHERE morpheus_run_id = $1::uuid
+               AND provenance = 'morpheus_local'
+               AND deleted_at IS NULL
+            """,
+            run_id,
+            str(requested_by),
+            f"MORPHEUS rollback {run_id}",
+        )
+        del_result = await conn.execute(
+            "DELETE FROM memories WHERE morpheus_run_id = $1::uuid "
+            "AND provenance = 'morpheus_local' "
+            "AND deleted_at IS NULL",
+            run_id,
+        )
+        run_result = await conn.execute(
+            "UPDATE morpheus_runs "
+            "SET status = 'rolled_back', finished_at = COALESCE(finished_at, now()) "
+            "WHERE id = $1::uuid",
+            run_id,
+        )
+        n_restored = _pg_result_count(restore)
+        n_deleted = _pg_result_count(del_result)
+        n_run = _pg_result_count(run_result)
+        n_extract_reset = _pg_result_count(extract_reset)
+        logger.warning(
+            "[MORPHEUS] run %s rolled back: %d memories deleted, "
+            "%d consolidated rows restored, %d extraction markers reset",
+            run_id,
+            n_deleted,
+            n_restored,
+            n_extract_reset,
+        )
+        return n_deleted, n_run
+
+
 class PostgresNatsDispatchLogRepository(NatsDispatchLogRepository):
     """Postgres impl of :class:`NatsDispatchLogRepository` (item 9/12).
 
@@ -5571,6 +5861,7 @@ class PostgresBackend:
         self._memory_branches = PostgresBranchRepository()
         self._compression = PostgresCompressionRepository()
         self._compression_queue = PostgresCompressionQueueRepository()
+        self._morpheus = PostgresMorpheusRepository()
         self._webhooks = PostgresWebhookRepository()
         self._nats_dispatch_log = PostgresNatsDispatchLogRepository()
         self._consultations_audit = PostgresConsultationAuditRepository()
@@ -5944,6 +6235,10 @@ class PostgresBackend:
     @property
     def compression_queue(self) -> CompressionQueueRepository:
         return self._compression_queue
+
+    @property
+    def morpheus(self) -> MorpheusRepository:
+        return self._morpheus
 
     @property
     def webhooks(self) -> WebhookRepository:

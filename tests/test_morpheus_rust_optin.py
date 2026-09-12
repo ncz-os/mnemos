@@ -5,6 +5,13 @@ MNEMOS_HOT_RS_ENABLED=1 and mnemos_hot is importable, the row-vs-cluster
 scoring step dispatches through cosine_batch. These tests use a fake
 mnemos_hot module so they pin the opt-in dispatch without requiring a
 local Rust wheel.
+
+Item 11a (ABC migration): the ``test_phase_cluster_dispatches_*`` test
+calls ``phase_cluster`` which internally calls ``_get_backend()`` to
+dispatch ``update_counters`` through the new ABC. The autouse
+``_install_noop_morpheus_backend`` fixture below wires a no-op backend
+into the lifecycle global so the phase_cluster happy-path call to
+``update_counters`` doesn't crash trying to look up a backend.
 """
 from __future__ import annotations
 
@@ -159,6 +166,69 @@ class _MockPool:
 
 def _row(memory_id: str, vec: list[float]) -> dict[str, Any]:
     return {"id": memory_id, "embedding": json.dumps(vec)}
+
+
+class _MorpheusNoOp:
+    """No-op ``backend.morpheus`` — every lifecycle method is a no-op."""
+
+    async def begin_run(self, tx, **kwargs):
+        return "00000000-0000-0000-0000-000000000000"
+
+    async def set_phase(self, tx, run_id, phase):
+        return None
+
+    async def update_counters(self, tx, run_id, **_kwargs):
+        return None
+
+    async def increment_extract_counters(
+        self, tx, run_id, *, triples_extracted, memories_processed
+    ):
+        return None
+
+    async def finish_run(self, tx, run_id):
+        return None
+
+    async def fail_run(self, tx, run_id, error):
+        return None
+
+    async def sweep_orphan_runs(self, tx, *, threshold_hours):
+        return []
+
+    async def rollback_run(self, tx, run_id, *, requested_by):
+        return 0, 1
+
+
+class _BackendNoOp:
+    """No-op backend — has ``morpheus`` and ``transactional``."""
+
+    def __init__(self):
+        self.morpheus = _MorpheusNoOp()
+
+    def transactional(self):
+
+        class _Ctx:
+            async def __aenter__(self_inner):
+                return None
+
+            async def __aexit__(self_inner, *_exc):
+                return False
+
+        return _Ctx()
+
+
+@pytest.fixture(autouse=True)
+def _install_noop_morpheus_backend(monkeypatch):
+    """Wire a no-op backend into the lifecycle global for every test.
+
+    Item 11a: ``phase_cluster`` internally calls ``_get_backend()`` to
+    dispatch ``update_counters`` through the new ABC. The lifecycle
+    global ``_persistence_backend`` is None by default in this test
+    process, so wire a no-op backend for the duration of each test so
+    the phase function doesn't crash trying to look up a backend.
+    """
+    from mnemos.core import lifecycle as _lifecycle
+
+    monkeypatch.setattr(_lifecycle, "_persistence_backend", _BackendNoOp())
 
 
 @pytest.mark.asyncio
