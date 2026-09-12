@@ -2030,6 +2030,33 @@ class CompressionQueueRepository(ABC):
         """
         ...
 
+    @abstractmethod
+    async def get_queue_stats(self, tx: Transaction) -> dict[str, int]:
+        """Return the v3.5 stats snapshot the distillation worker logs.
+
+        Returns a backend-neutral dict with exactly these keys
+        (callers / log format depend on the exact names — don't drop
+        or rename any):
+
+        * ``total`` — total rows in ``memory_compression_queue``.
+        * ``pending`` — rows whose ``status = 'pending'``.
+        * ``running`` — rows whose ``status = 'running'``.
+        * ``done`` — rows whose ``status = 'done'``.
+        * ``failed`` — rows whose ``status = 'failed'``.
+        * ``variants`` — total rows in ``memory_compressed_variants``.
+
+        Implementations MUST compute the status counts and the variant
+        count in a single round-trip pair (or one query that joins
+        both counts) — the distillation worker calls this every
+        ``CHECK_INTERVAL`` (30s) and the prior raw-SQL path issued
+        two round-trips per call. Backends without ``FOR UPDATE`` /
+        row-locking concerns (SQLite) may compute both counts in a
+        single SELECT against two tables; backends that need a
+        transaction wrapper for atomicity (Postgres, Oracle, MySQL)
+        can issue two SELECTs inside the supplied ``tx``.
+        """
+        ...
+
 
 CapabilityName: TypeAlias = Literal[
     "core",
