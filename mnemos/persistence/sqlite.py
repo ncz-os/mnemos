@@ -48,6 +48,7 @@ from mnemos.persistence.base import (
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
+    MorpheusRepository,
     NatsDispatchLogRepository,
     OAuthRepository,
     SessionsRepository,
@@ -137,6 +138,7 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v6_2_category_decay_sqlite.sql",
     "migrations_v6_3_api_keys_last_used_sqlite.sql",
     "migrations_v6_3_mcp_oauth_sqlite.sql",
+    "migrations_v6_3_morpheus_runs_parity_sqlite.sql",  # item 11/11a: morpheus_runs canonical shape
     "0038_oauth_sessions_consultations.sql",
     "0039_subscription_plan_current_limits.sql",
     "0043_memory_acl.sql",
@@ -2205,6 +2207,354 @@ class SqliteCompressionRepository(_SqliteRepository, CompressionRepository):
             average_compression_ratio=float(avg_ratio) if avg_ratio is not None else None,
             unreviewed_compressions=int(unreviewed or 0),
         )
+
+
+class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
+    """SQLite impl of :class:`MorpheusRepository` (item 11a).
+
+    SQLite's pre-11a ``morpheus_runs`` was a stub table with 8 columns
+    versus Postgres's canonical 19. Item 11a's
+    ``migrations_v6_3_morpheus_runs_parity_sqlite.sql`` adds the
+    missing columns + fixes ``namespace`` NULL semantic + aligns the
+    ``status`` default; this ABC impl reads/writes the canonical
+    shape uniformly.
+
+    SQLite uses ``BEGIN IMMEDIATE`` (single-writer) via
+    ``SqliteBackend.transactional()``, so all 8 methods are already
+    serialised against peers — no ``FOR UPDATE SKIP LOCKED`` claim is
+    required for ``sweep_orphan_runs``. ``rollback_run`` decomposes
+    the Postgres multi-CTE pattern into portable sequential statements
+    inside the supplied ``tx`` (SQLite's UPDATE ... FROM supports a
+    CTE but it's brittle across versions, and the multi-table DELETE
+    is cleaner as separate statements in a single transaction).
+
+    JSON operators on ``memories.metadata`` use SQLite's JSON1
+    extension (``json_extract``, ``json_remove``, ``json_type``) —
+    SQLite ≥3.35 ships ``json_remove`` and is the minimum the
+    backend already enforces (``_check_sqlite_version``).
+    """
+
+    _ORPHAN_TIMEOUT_ERROR = "orphan_timeout_sweep"
+    _PRE_CONSOLIDATE_PERMISSION_KEY = "pre_consolidate_permission_mode"
+
+    async def begin_run(
+        self,
+        tx: Transaction,
+        *,
+        triggered_by: str,
+        window_hours: int,
+        cluster_min_size: int,
+        config: dict | None,
+        namespace: str | None,
+    ) -> str:
+        conn = self._conn(tx)
+        # SQLite stores datetimes as ISO-8601 strings; ``CURRENT_TIMESTAMP``
+        # returns the local UTC offset as "YYYY-MM-DD HH:MM:SS" which is
+        # fine for the comparator columns. Compute the window in Python
+        # so we control the exact arithmetic — the runner uses UTC
+        # throughout.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        window_start = now - timedelta(hours=int(window_hours))
+        row = await _fetch_one(
+            conn,
+            """
+            INSERT INTO morpheus_runs
+                (triggered_by, started_at, window_started_at, window_ended_at,
+                 window_hours, cluster_min_size, config, namespace, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running')
+            RETURNING id
+            """,
+            (
+                triggered_by,
+                now.isoformat(sep=" "),
+                window_start.isoformat(sep=" "),
+                now.isoformat(sep=" "),
+                int(window_hours),
+                int(cluster_min_size),
+                json.dumps(config or {}),
+                namespace,
+            ),
+        )
+        if row is None or "id" not in row:
+            raise RuntimeError("SQLite begin_run: missing RETURNING id")
+        return str(row["id"])
+
+    async def set_phase(self, tx: Transaction, run_id: str, phase: str) -> None:
+        await _execute(
+            self._conn(tx),
+            "UPDATE morpheus_runs SET phase = ? WHERE id = ?",
+            (phase, run_id),
+        )
+
+    async def update_counters(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        memories_scanned: int | None = None,
+        clusters_found: int | None = None,
+        summaries_created: int | None = None,
+        memories_consolidated: int | None = None,
+        clusters_consolidated: int | None = None,
+        triples_extracted: int | None = None,
+        memories_processed_for_extraction: int | None = None,
+    ) -> None:
+        sets: list[str] = []
+        args: list[Any] = []
+        counter_map = (
+            ("memories_scanned", memories_scanned),
+            ("clusters_found", clusters_found),
+            ("summaries_created", summaries_created),
+            ("memories_consolidated", memories_consolidated),
+            ("clusters_consolidated", clusters_consolidated),
+            ("triples_extracted", triples_extracted),
+            ("memories_processed_for_extraction", memories_processed_for_extraction),
+        )
+        for column, value in counter_map:
+            if value is not None:
+                args.append(int(value))
+                sets.append(f"{column} = ?")
+        if not sets:
+            return
+        args.append(run_id)
+        await _execute(
+            self._conn(tx),
+            f"UPDATE morpheus_runs SET {', '.join(sets)} WHERE id = ?",
+            tuple(args),
+        )
+
+    async def increment_extract_counters(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        triples_extracted: int,
+        memories_processed: int,
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            """
+            UPDATE morpheus_runs
+               SET triples_extracted = COALESCE(triples_extracted, 0) + ?,
+                   memories_processed_for_extraction =
+                       COALESCE(memories_processed_for_extraction, 0) + ?
+             WHERE id = ?
+            """,
+            (int(triples_extracted), int(memories_processed), run_id),
+        )
+
+    async def finish_run(self, tx: Transaction, run_id: str) -> None:
+        await _execute(
+            self._conn(tx),
+            "UPDATE morpheus_runs SET status = 'success', "
+            "finished_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (run_id,),
+        )
+
+    async def fail_run(self, tx: Transaction, run_id: str, error: str) -> None:
+        await _execute(
+            self._conn(tx),
+            "UPDATE morpheus_runs SET status = 'failed', "
+            "finished_at = CURRENT_TIMESTAMP, error = ? WHERE id = ?",
+            (str(error)[:4000], run_id),
+        )
+
+    async def sweep_orphan_runs(
+        self,
+        tx: Transaction,
+        *,
+        threshold_hours: float,
+    ) -> list[Row]:
+        # SQLite stores datetimes as text; ``datetime(started_at, '-N hours')``
+        # does the cutoff comparison natively. SQLite's single-writer
+        # ``BEGIN IMMEDIATE`` (taken by ``SqliteBackend.transactional()``)
+        # is the row-lock analogue — concurrent sweepers serialise on the
+        # write lock rather than SKIP-LOCKED.
+        conn = self._conn(tx)
+        rows = await _fetch_all(
+            conn,
+            """
+            UPDATE morpheus_runs
+               SET status      = 'failed',
+                   error       = ?,
+                   finished_at = CURRENT_TIMESTAMP
+             WHERE status = 'running'
+               AND datetime(started_at) < datetime('now', ?)
+            RETURNING id, started_at
+            """,
+            (
+                self._ORPHAN_TIMEOUT_ERROR,
+                f"-{float(threshold_hours)} hours",
+            ),
+        )
+        return list(rows)
+
+    async def rollback_run(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        requested_by: str,
+    ) -> tuple[int, int]:
+        """SQLite impl of MORPHEUS rollback — see :class:`MorpheusRepository`.
+
+        Decomposes the Postgres multi-CTE pattern into portable
+        sequential statements inside the supplied ``tx``:
+
+        1. Delete ``kg_triples`` tagged with this run and collect the
+           affected ``memory_id`` set.
+        2. Delete ``morpheus_extract_run_memories`` rows.
+        3. Clear ``memories.triples_extracted_at`` on the union.
+        4. Restore consolidated originals from the metadata audit
+           key (``pre_consolidate_permission_mode``) using SQLite's
+           ``json_extract`` + ``json_remove``.
+        5. Insert deletion-log audit rows for the run-created memories.
+        6. ``DELETE`` run-created synthesised memories.
+        7. Flip ``morpheus_runs.status = 'rolled_back'``.
+
+        Every step runs inside the same ``tx`` so a partial rollback
+        cannot leak.
+        """
+        conn = self._conn(tx)
+        # Step 1: delete kg_triples tagged with this run; collect memory_ids
+        # before the DELETE so we can clear triples_extracted_at next.
+        deleted_triples = await _fetch_all(
+            conn,
+            "DELETE FROM kg_triples WHERE extracted_by_run_id = ? "
+            "RETURNING memory_id",
+            (run_id,),
+        )
+        # Step 2: drop the run_memories join table rows.
+        run_memories = await _fetch_all(
+            conn,
+            "DELETE FROM morpheus_extract_run_memories WHERE run_id = ? "
+            "RETURNING memory_id",
+            (run_id,),
+        )
+        affected_ids: set[str] = set()
+        for row in deleted_triples + run_memories:
+            mid = row["memory_id"] if isinstance(row, dict) else row[0]
+            if mid is not None:
+                affected_ids.add(str(mid))
+        # Step 3: clear the triples_extracted_at marker on every affected
+        # memory.
+        if affected_ids:
+            placeholders = ",".join("?" for _ in affected_ids)
+            await _execute(
+                conn,
+                f"UPDATE memories SET triples_extracted_at = NULL "
+                f"WHERE id IN ({placeholders})",
+                tuple(affected_ids),
+            )
+        # Step 4: restore consolidated originals from the metadata audit
+        # key. SQLite's JSON1 extension supports ``json_remove`` which
+        # deletes a top-level key from a JSON object; ``json_extract``
+        # pulls the value as text (we coerce to integer for the
+        # permission_mode recovery). Rows without the audit key are
+        # skipped by the ``json_type`` check.
+        n_extract_reset = len(affected_ids)
+        await _execute(
+            conn,
+            """
+            UPDATE memories
+               SET consolidated_into = NULL,
+                   consolidated_at = NULL,
+                   permission_mode = COALESCE(
+                       CAST(json_extract(metadata, '$."' || ? || '"') AS INTEGER),
+                       permission_mode
+                   ),
+                   metadata = CASE
+                       WHEN json_type(metadata, '$."' || ? || '"') IS NOT NULL
+                           THEN json_remove(metadata, '$."' || ? || '"')
+                       ELSE metadata
+                   END,
+                   morpheus_run_id = NULL
+             WHERE morpheus_run_id = ?
+               AND deleted_at IS NULL
+               AND json_type(metadata, '$."' || ? || '"') IS NOT NULL
+            """,
+            (
+                self._PRE_CONSOLIDATE_PERMISSION_KEY,
+                self._PRE_CONSOLIDATE_PERMISSION_KEY,
+                self._PRE_CONSOLIDATE_PERMISSION_KEY,
+                run_id,
+                self._PRE_CONSOLIDATE_PERMISSION_KEY,
+            ),
+        )
+        # Step 5: audit-log the run-created memories about to be deleted.
+        # SQLite's hex+length for SHA-256 (no ``encode(digest(...))`` UDF
+        # like Postgres), so we use the lower(hex(...)) emulation that
+        # mnemos_cosine_similarity's sibling functions use — but the
+        # simplest portable substitute is sha256 via SQLite's hex builtin
+        # + the ``mnemos_content_sha256`` UDF registered in
+        # ``_register_functions``. That UDF returns the lowercase hex
+        # digest, matching the Postgres ``encode(...,'hex')`` result.
+        run_created = await _fetch_all(
+            conn,
+            "SELECT id, owner_id, namespace FROM memories "
+            "WHERE morpheus_run_id = ? "
+            "  AND provenance = 'morpheus_local' "
+            "  AND deleted_at IS NULL",
+            (run_id,),
+        )
+        if run_created:
+            for row in run_created:
+                if isinstance(row, dict):
+                    mid, _owner_id, _namespace = (
+                        row["id"],
+                        row["owner_id"],
+                        row["namespace"],
+                    )
+                else:
+                    mid, _owner_id, _namespace = row[0], row[1], row[2]
+                await _execute(
+                    conn,
+                    """
+                    INSERT INTO deletion_log (
+                        memory_id, content_hash, owner_id, namespace,
+                        requested_by, requested_at, request_kind, reason, source
+                    )
+                    SELECT id,
+                           mnemos_content_sha256(COALESCE(content, '')),
+                           owner_id, namespace,
+                           ?, CURRENT_TIMESTAMP, 'admin_purge', ?,
+                           ?
+                      FROM memories
+                     WHERE id = ?
+                       AND provenance = 'morpheus_local'
+                       AND deleted_at IS NULL
+                    """,
+                    (
+                        str(requested_by),
+                        f"MORPHEUS rollback {run_id}",
+                        f"morpheus.rollback,{run_id}",
+                        mid,
+                    ),
+                )
+        # Step 6: delete the run-created memories.
+        n_deleted = await _execute_count(
+            conn,
+            "DELETE FROM memories WHERE morpheus_run_id = ? "
+            "AND provenance = 'morpheus_local' "
+            "AND deleted_at IS NULL",
+            (run_id,),
+        )
+        # Step 7: flip the run row.
+        n_run = await _execute_count(
+            conn,
+            "UPDATE morpheus_runs SET status = 'rolled_back', "
+            "finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP) "
+            "WHERE id = ?",
+            (run_id,),
+        )
+        logger.warning(
+            "[MORPHEUS] run %s rolled back: %d memories deleted, "
+            "%d extract markers reset",
+            run_id,
+            n_deleted,
+            n_extract_reset,
+        )
+        return n_deleted, n_run
 
 
 class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueRepository):
@@ -5008,6 +5358,7 @@ class SqliteBackend:
         self._memory_branches = SqliteBranchRepository()
         self._compression = SqliteCompressionRepository()
         self._compression_queue = SqliteCompressionQueueRepository()
+        self._morpheus = SqliteMorpheusRepository()
         self._webhooks = SqliteWebhookRepository()
         self._nats_dispatch_log = SqliteNatsDispatchLogRepository()
         self._consultations_audit = SqliteConsultationAuditRepository()
@@ -5620,6 +5971,34 @@ class SqliteBackend:
             migration_path = migrations_dir / migration_name
             if not migration_path.exists():
                 continue
+            # Item 11/11a: idempotency marker — destructive migrations
+            # (e.g. ``migrations_v6_3_morpheus_runs_parity_sqlite.sql``
+            # with its RENAME COLUMN + DROP COLUMN body) need a
+            # once-per-DB gate so they don't re-fire on every open().
+            # The migration body inserts a row into ``schema_marker``
+            # with key = filename and applied = 1 at the end. We skip
+            # the file when that row is already present. Pre-marker
+            # migrations don't participate — the swallow below keeps
+            # them idempotent against duplicate columns / objects.
+            marker_key = migration_name
+            try:
+                already_applied = await _fetch_val(
+                    conn,
+                    "SELECT 1 FROM schema_marker WHERE name = ? AND applied = 1",
+                    (marker_key,),
+                )
+            except sqlite3.OperationalError:
+                # schema_marker table doesn't exist yet — this is the
+                # first time we've seen the marker machinery. The
+                # migration itself will create it if it's the new
+                # parity migration. Pre-marker migrations don't care.
+                already_applied = None
+            if already_applied:
+                logger.debug(
+                    "sqlite migration %s: schema_marker shows applied=1, skipping",
+                    migration_name,
+                )
+                continue
             try:
                 await _executescript(conn, migration_path.read_text())
             except sqlite3.OperationalError as exc:
@@ -6001,6 +6380,10 @@ class SqliteBackend:
     @property
     def compression_queue(self) -> CompressionQueueRepository:
         return self._compression_queue
+
+    @property
+    def morpheus(self) -> MorpheusRepository:
+        return self._morpheus
 
     @property
     def webhooks(self) -> WebhookRepository:

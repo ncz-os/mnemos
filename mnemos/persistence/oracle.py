@@ -50,6 +50,7 @@ from mnemos.persistence.base import (
     FULL_STORAGE_CAPABILITY_DETAILS,
     KGRepository,
     MemoryRepository,
+    MorpheusRepository,
     NatsDispatchLogRepository,
     OAuthRepository,
     SessionsRepository,
@@ -2340,6 +2341,444 @@ class OracleCompressionRepository(CompressionRepository):
             return await _fetch_all_dicts(cursor)
         finally:
             await _call(cursor.close)
+
+
+class OracleMorpheusRepository(MorpheusRepository):
+    """Oracle 23ai impl of :class:`MorpheusRepository` (item 11a).
+
+    Schema is the result of item 11a's
+    ``0061c_morpheus_runs_parity.sql`` — the canonical 19-column
+    Postgres shape retconned onto Oracle (dropping the legacy
+    ``run_type`` / ``metrics`` columns, adding the v3.3 + namespace +
+    consolidate + extract columns, CHECK-constrained ``status`` /
+    ``triggered_by``).
+
+    Notable dialect differences vs. the Postgres ABC:
+
+    * **id generation**: ``id`` is ``VARCHAR2(36)`` — the Python
+      repository layer generates the UUID on ``begin_run`` via
+      ``uuid.uuid4()`` (Oracle has no ``gen_random_uuid()`` builtin
+      in the same way Postgres does; we keep parity with Postgres by
+      generating client-side).
+    * **JSON operators**: ``memories.metadata`` is a ``CLOB`` with a
+      ``CHECK (metadata IS JSON)`` constraint on Oracle 23ai — the
+      repository uses ``JSON_VALUE`` / ``JSON_EXISTS`` for
+      extraction/check and ``JSON_TRANSFORM`` (or read-modify-write
+      fallback) for key deletion.
+    * **Multi-CTE UPDATE**: Oracle supports multi-CTE UPDATE since
+      12c but not the writable CTE-feeding-UPDATE pattern Postgres
+      uses; we decompose ``rollback_run`` into portable sequential
+      statements inside the supplied ``tx``.
+    """
+
+    _ORPHAN_TIMEOUT_ERROR = "orphan_timeout_sweep"
+    _PRE_CONSOLIDATE_PERMISSION_KEY = "pre_consolidate_permission_mode"
+
+    async def begin_run(
+        self,
+        tx: Transaction,
+        *,
+        triggered_by: str,
+        window_hours: int,
+        cluster_min_size: int,
+        config: dict | None,
+        namespace: str | None,
+    ) -> str:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            window_start = now - timedelta(hours=int(window_hours))
+            run_id = str(uuid.uuid4())
+            config_json = json.dumps(config or {})
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO morpheus_runs (
+                    id, triggered_by, started_at, window_started_at, window_ended_at,
+                    window_hours, cluster_min_size, config, namespace, status
+                ) VALUES (
+                    :id, :triggered_by, :started_at, :window_started_at, :window_ended_at,
+                    :window_hours, :cluster_min_size,
+                    :config, :namespace, 'running'
+                )
+                """,
+                {
+                    "id": run_id,
+                    "triggered_by": triggered_by,
+                    "started_at": now,
+                    "window_started_at": window_start,
+                    "window_ended_at": now,
+                    "window_hours": int(window_hours),
+                    "cluster_min_size": int(cluster_min_size),
+                    "config": config_json,
+                    "namespace": namespace,
+                },
+            )
+            return run_id
+        finally:
+            await _call(cursor.close)
+
+    async def set_phase(self, tx: Transaction, run_id: str, phase: str) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE morpheus_runs SET phase = :phase WHERE id = :id",
+                {"phase": phase, "id": run_id},
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def update_counters(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        memories_scanned: int | None = None,
+        clusters_found: int | None = None,
+        summaries_created: int | None = None,
+        memories_consolidated: int | None = None,
+        clusters_consolidated: int | None = None,
+        triples_extracted: int | None = None,
+        memories_processed_for_extraction: int | None = None,
+    ) -> None:
+        sets: list[str] = []
+        binds: dict[str, Any] = {"id": run_id}
+        counter_map = (
+            ("memories_scanned", memories_scanned),
+            ("clusters_found", clusters_found),
+            ("summaries_created", summaries_created),
+            ("memories_consolidated", memories_consolidated),
+            ("clusters_consolidated", clusters_consolidated),
+            ("triples_extracted", triples_extracted),
+            ("memories_processed_for_extraction", memories_processed_for_extraction),
+        )
+        for column, value in counter_map:
+            if value is not None:
+                bind_key = f"v_{column}"
+                sets.append(f"{column} = :{bind_key}")
+                binds[bind_key] = int(value)
+        if not sets:
+            return
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"UPDATE morpheus_runs SET {', '.join(sets)} WHERE id = :id",
+                binds,
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def increment_extract_counters(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        triples_extracted: int,
+        memories_processed: int,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE morpheus_runs
+                   SET triples_extracted = COALESCE(triples_extracted, 0) + :te,
+                       memories_processed_for_extraction =
+                           COALESCE(memories_processed_for_extraction, 0) + :mp
+                 WHERE id = :id
+                """,
+                {
+                    "te": int(triples_extracted),
+                    "mp": int(memories_processed),
+                    "id": run_id,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def finish_run(self, tx: Transaction, run_id: str) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE morpheus_runs SET status = 'success', "
+                "finished_at = SYSTIMESTAMP WHERE id = :id",
+                {"id": run_id},
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def fail_run(self, tx: Transaction, run_id: str, error: str) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE morpheus_runs SET status = 'failed', "
+                "finished_at = SYSTIMESTAMP, error = :err WHERE id = :id",
+                {"err": str(error)[:4000], "id": run_id},
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def sweep_orphan_runs(
+        self,
+        tx: Transaction,
+        *,
+        threshold_hours: float,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            # Oracle has no UPDATE...RETURNING; emulate via SELECT after
+            # UPDATE inside the same tx (single-writer guarantees no race).
+            await _call(
+                cursor.execute,
+                """
+                UPDATE morpheus_runs
+                   SET status = 'failed',
+                       error = :err,
+                       finished_at = SYSTIMESTAMP
+                 WHERE status = 'running'
+                   AND started_at < (SYSTIMESTAMP - NUMTODSINTERVAL(:hours, 'HOUR'))
+                """,
+                {"err": self._ORPHAN_TIMEOUT_ERROR, "hours": float(threshold_hours)},
+            )
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, started_at FROM morpheus_runs
+                 WHERE status = 'failed'
+                   AND error = :err
+                   AND finished_at >= SYSTIMESTAMP - NUMTODSINTERVAL(:hours, 'HOUR')
+                """,
+                {"err": self._ORPHAN_TIMEOUT_ERROR, "hours": float(threshold_hours)},
+            )
+            rows = await _call(cursor.fetchall) or []
+            return [{"id": r[0], "started_at": r[1]} for r in rows]
+        finally:
+            await _call(cursor.close)
+
+    async def rollback_run(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        requested_by: str,
+    ) -> tuple[int, int]:
+        """Oracle impl of MORPHEUS rollback — see :class:`MorpheusRepository`."""
+        conn = _conn_from_tx(tx)
+        # Step 1: delete kg_triples tagged with this run; collect memory_ids
+        # from morpheus_extract_run_memories first (the order matters —
+        # once we delete the join table the memory_ids are gone).
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT memory_id FROM morpheus_extract_run_memories WHERE run_id = :id",
+                {"id": run_id},
+            )
+            run_mem_rows = await _call(cursor.fetchall) or []
+            await _call(
+                cursor.execute,
+                "DELETE FROM morpheus_extract_run_memories WHERE run_id = :id",
+                {"id": run_id},
+            )
+            await _call(
+                cursor.execute,
+                "DELETE FROM kg_triples WHERE extracted_by_run_id = :id",
+                {"id": run_id},
+            )
+        finally:
+            await _call(cursor.close)
+        affected_ids = {str(r[0]) for r in run_mem_rows if r and r[0] is not None}
+        # Step 3: clear triples_extracted_at on affected memories.
+        if affected_ids:
+            binds = {f"m{i}": mid for i, mid in enumerate(affected_ids)}
+            placeholders = ",".join(f":m{i}" for i in range(len(affected_ids)))
+            cursor = await _call(conn.cursor)
+            try:
+                await _call(
+                    cursor.execute,
+                    f"UPDATE memories SET triples_extracted_at = NULL "
+                    f"WHERE id IN ({placeholders})",
+                    binds,
+                )
+            finally:
+                await _call(cursor.close)
+        n_extract_reset = len(affected_ids)
+        # Step 4: restore consolidated originals from the metadata audit key.
+        # Oracle 23ai supports JSON_TRANSFORM but only in PL/SQL or in the
+        # JSON data-guide update syntax — neither is clean here. Fall back
+        # to read-modify-write: SELECT id, metadata WHERE JSON_EXISTS, then
+        # UPDATE id=:id SET metadata = JSON_MERGEPATCH(...). The admin
+        # rollback is not a hot path so the read-modify-write pattern is
+        # acceptable as long as both writes live inside the same tx.
+        cursor = await _call(conn.cursor)
+        try:
+            # JSON_EXISTS's path expression MUST be a literal — Oracle
+            # rejects a bind variable there with ORA-40454 ("path
+            # expression not a literal"). _PRE_CONSOLIDATE_PERMISSION_KEY
+            # is a fixed class constant (never user input), so inlining
+            # it directly into the SQL text is safe.
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT id, metadata FROM memories
+                 WHERE morpheus_run_id = :rid
+                   AND deleted_at IS NULL
+                   AND JSON_EXISTS(metadata, '$.{self._PRE_CONSOLIDATE_PERMISSION_KEY}')
+                """,
+                {"rid": run_id},
+            )
+            restore_rows = await _call(cursor.fetchall) or []
+        finally:
+            await _call(cursor.close)
+        n_restored = 0
+        for row in restore_rows:
+            mid = row[0]
+            metadata_raw = await _materialize_value(row[1])
+            # Reconstruct the metadata as a Python dict minus the audit key.
+            try:
+                metadata_dict = json.loads(metadata_raw) if metadata_raw else {}
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(metadata_dict, dict):
+                continue
+            pre_mode = metadata_dict.pop(self._PRE_CONSOLIDATE_PERMISSION_KEY, None)
+            if pre_mode is None:
+                continue
+            cursor = await _call(conn.cursor)
+            try:
+                import oracledb
+
+                # oracledb's default bind-type inference for a Python str
+                # picks CHAR/VARCHAR2, which mismatches the CLOB
+                # ``metadata`` column (ORA-00932) — force it explicitly,
+                # same pattern as the other CLOB binds in this file.
+                cursor.setinputsizes(new_meta=oracledb.DB_TYPE_CLOB)
+                await _call(
+                    cursor.execute,
+                    """
+                    UPDATE memories
+                       SET consolidated_into = NULL,
+                           consolidated_at = NULL,
+                           permission_mode = COALESCE(:pre_mode, permission_mode),
+                           metadata = :new_meta,
+                           morpheus_run_id = NULL
+                     WHERE id = :id
+                       AND deleted_at IS NULL
+                    """,
+                    {
+                        "pre_mode": int(pre_mode) if pre_mode is not None else None,
+                        "new_meta": json.dumps(metadata_dict),
+                        "id": mid,
+                    },
+                )
+                n_restored += int(getattr(cursor, "rowcount", 0) or 0)
+            finally:
+                await _call(cursor.close)
+        # Step 5: audit-log the run-created memories about to be deleted.
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, owner_id, namespace
+                  FROM memories
+                 WHERE morpheus_run_id = :rid
+                   AND provenance = 'morpheus_local'
+                   AND deleted_at IS NULL
+                """,
+                {"rid": run_id},
+            )
+            run_created = await _call(cursor.fetchall) or []
+        finally:
+            await _call(cursor.close)
+        for row in run_created:
+            mid, _owner_id, _namespace = row[0], row[1], row[2]
+            cursor = await _call(conn.cursor)
+            try:
+                # STANDARD_HASH rejects a CLOB argument outright
+                # (ORA-00902) on this Oracle version — confirmed live,
+                # not just an assumption; a pre-existing, unrelated
+                # occurrence of the same bug (backfill_missing_content_hashes)
+                # has the identical defect and is out of this item's
+                # scope to fix. DBMS_LOB.SUBSTR materializes a VARCHAR2
+                # prefix (capped at Oracle's 4000-byte VARCHAR2 limit)
+                # that STANDARD_HASH accepts; the audit hash is a
+                # first-4000-bytes fingerprint rather than a full-content
+                # hash for memories longer than that, which is an
+                # acceptable admin-audit-trail tradeoff.
+                await _call(
+                    cursor.execute,
+                    """
+                    INSERT INTO deletion_log (
+                        memory_id, content_hash, owner_id, namespace,
+                        requested_by, requested_at, request_kind, reason, source
+                    )
+                    SELECT id,
+                           LOWER(RAWTOHEX(STANDARD_HASH(
+                               DBMS_LOB.SUBSTR(content, 4000, 1), 'SHA256'
+                           ))),
+                           owner_id, namespace,
+                           :req_by, SYSTIMESTAMP, 'admin_purge', :reason, :source
+                      FROM memories
+                     WHERE id = :mid
+                       AND provenance = 'morpheus_local'
+                       AND deleted_at IS NULL
+                    """,
+                    {
+                        "req_by": str(requested_by),
+                        "reason": f"MORPHEUS rollback {run_id}",
+                        "source": f"morpheus.rollback,{run_id}",
+                        "mid": mid,
+                    },
+                )
+            finally:
+                await _call(cursor.close)
+        # Step 6: delete run-created memories.
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM memories WHERE morpheus_run_id = :rid "
+                "AND provenance = 'morpheus_local' "
+                "AND deleted_at IS NULL",
+                {"rid": run_id},
+            )
+            n_deleted = int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+        # Step 7: flip the run row.
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE morpheus_runs SET status = 'rolled_back', "
+                "finished_at = COALESCE(finished_at, SYSTIMESTAMP) "
+                "WHERE id = :id",
+                {"id": run_id},
+            )
+            n_run = int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+        _LOG.warning(
+            "[MORPHEUS] run %s rolled back: %d memories deleted, "
+            "%d consolidated rows restored, %d extraction markers reset",
+            run_id,
+            n_deleted,
+            n_restored,
+            n_extract_reset,
+        )
+        return n_deleted, n_run
 
 
 class OracleCompressionQueueRepository(CompressionQueueRepository):
@@ -6848,6 +7287,7 @@ class OracleBackend:
         self._memory_branches_repo = OracleBranchRepository()
         self._compression_repo = OracleCompressionRepository()
         self._compression_queue_repo = OracleCompressionQueueRepository()
+        self._morpheus_repo = OracleMorpheusRepository()
         self._nats_dispatch_log_repo = OracleNatsDispatchLogRepository()
         self._webhooks_repo = OracleWebhookRepository()
         self._consultations_audit_repo = OracleConsultationAuditRepository()
@@ -7579,6 +8019,10 @@ class OracleBackend:
     @property
     def compression_queue(self) -> CompressionQueueRepository:
         return self._compression_queue_repo
+
+    @property
+    def morpheus(self) -> MorpheusRepository:
+        return self._morpheus_repo
 
     @property
     def webhooks(self) -> WebhookRepository:

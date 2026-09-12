@@ -1,4 +1,19 @@
-"""Tests for MORPHEUS slice 3: CONSOLIDATE."""
+"""Tests for MORPHEUS slice 3: CONSOLIDATE.
+
+Item 11a (ABC migration): ``phase_consolidate`` and ``phase_synthesise``
+still take a raw ``asyncpg.Pool`` (their own per-row SQL is out of
+scope), but the ``rollback_run`` helper now routes through
+``backend.morpheus.rollback_run``. The single rollback test at the
+bottom of this file therefore needs a backend-shaped mock with a
+``morpheus.rollback_run`` impl that performs the same SQL semantics
+the legacy raw-asyncpg path did — restore consolidated originals from
+their ``pre_consolidate_permission_mode`` metadata audit key, delete
+the synthesised run-created memories, and flip the run row to
+``status='rolled_back'``. The original ``_Pool`` / ``_Conn`` mocks are
+retained for the phase tests (which still take a pool) and the
+rollback impl delegates to the same in-memory helpers those mocks
+already expose.
+"""
 from __future__ import annotations
 
 import json
@@ -208,6 +223,129 @@ class _Pool:
         return _Ctx()
 
 
+class _Morpheus:
+    """Stand-in for ``backend.morpheus``.
+
+    The CONSOLIDATE rollback must: (a) restore consolidated originals
+    in place from the ``pre_consolidate_permission_mode`` metadata
+    audit key, (b) delete the synthesised run-created memories
+    (``provenance='morpheus_local'``), and (c) flip the run row to
+    ``status='rolled_back'``. Returns
+    ``(memories_deleted, run_rows_updated)`` to match the
+    ``MorpheusRepository.rollback_run`` ABC contract.
+
+    The legacy raw-asyncpg rollback body decomposed into two
+    ``UPDATE`` / ``DELETE`` statements; we delegate to the same
+    ``_Conn._execute_restore`` / ``_Conn._execute_delete_run_rows``
+    helpers the phase tests already drive through ``conn.execute()``.
+    The other lifecycle methods are no-ops so the CONSOLIDATE /
+    SYNTHESISE phases' internal ``update_counters(_get_backend(), ...)``
+    dispatch doesn't fail when the lifecycle global is wired to this
+    backend.
+    """
+
+    def __init__(self, conn: _Conn):
+        self._conn = conn
+
+    async def begin_run(self, tx, **kwargs):
+        return "00000000-0000-0000-0000-000000000000"
+
+    async def set_phase(self, tx, run_id, phase):
+        return None
+
+    async def update_counters(self, tx, run_id, **_kwargs):
+        return None
+
+    async def increment_extract_counters(
+        self, tx, run_id, *, triples_extracted, memories_processed
+    ):
+        return None
+
+    async def finish_run(self, tx, run_id):
+        return None
+
+    async def fail_run(self, tx, run_id, error):
+        return None
+
+    async def sweep_orphan_runs(self, tx, *, threshold_hours):
+        return []
+
+    async def rollback_run(self, tx, run_id: str, *, requested_by: str):
+        # (a) Restore consolidated originals in place from the
+        # ``pre_consolidate_permission_mode`` metadata audit key the
+        # CONSOLIDATE phase wrote. The update emits a ``UPDATE N``
+        # status string but we don't need the count here.
+        self._conn._execute_restore(run_id, "pre_consolidate_permission_mode")
+        # (b) Delete the synthesised run-created memories.
+        delete_status = self._conn._execute_delete_run_rows(run_id)
+        # The status string is ``"DELETE <n>"`` — parse the count so
+        # the test sees ``(memories_deleted, run_rows_updated)``.
+        try:
+            n_deleted = int(delete_status.split(" ", 1)[1])
+        except (IndexError, ValueError):
+            n_deleted = 0
+        # (c) Flip the run row to ``rolled_back``. The runner asserts
+        # ``run_rows == 1``; the rollback SQL updates exactly one row
+        # by ``id=$1::uuid`` in real Postgres so the count is 1 here
+        # too.
+        if hasattr(self._conn, "run_rows") and self._conn.run_rows is not None:
+            for row in self._conn.run_rows.values():
+                if row.get("id") == run_id:
+                    row["status"] = "rolled_back"
+        n_run = 1
+        return n_deleted, n_run
+
+
+class _Backend:
+    """Backend-shaped mock — has ``morpheus`` and ``transactional``.
+
+    The runner's ``rollback_run(backend, run_id, *, requested_by)`` opens
+    ``backend.transactional()`` and calls
+    ``backend.morpheus.rollback_run(tx, run_id, requested_by=...)``. The
+    CONSOLIDATE / SYNTHESISE phases call
+    ``update_counters(_get_backend(), ...)`` internally on the early-exit
+    branches; the no-op ``transactional`` CM and the
+    ``_Morpheus.update_counters`` no-op above are sufficient for both
+    call sites.
+    """
+
+    def __init__(self, conn: _Conn):
+        self._conn = conn
+        self.morpheus = _Morpheus(conn)
+
+    def transactional(self):
+
+        class _Ctx:
+            async def __aenter__(self_inner):
+                return None
+
+            async def __aexit__(self_inner, *_exc):
+                return False
+
+        return _Ctx()
+
+
+@pytest.fixture(autouse=True)
+def _install_noop_morpheus_backend(monkeypatch):
+    """Wire a no-op backend into the lifecycle global for every test.
+
+    Item 11a: ``phase_consolidate`` / ``phase_synthesise`` internally
+    call ``_get_backend()`` to dispatch ``update_counters`` through the
+    new ABC. The lifecycle global ``_persistence_backend`` is None by
+    default in this test process, so wire a ``_Backend`` (built on an
+    empty ``_Conn``) into the global for the duration of each test so
+    the phase functions don't crash trying to look up a backend. The
+    rollback test uses its own ``_Backend(conn)`` instance with the
+    test-specific state; the autouse backend's empty ``_Conn`` is
+    irrelevant for that test because it never exercises phase
+    functions.
+    """
+    from mnemos.core import lifecycle as _lifecycle
+
+    backend = _Backend(_Conn())
+    monkeypatch.setattr(_lifecycle, "_persistence_backend", backend)
+
+
 def _run_row(member_ids: list[str], *, cluster_min_size: int = 3, namespace: str | None = "A") -> dict:
     return {
         "config": {"clusters": [{"cluster_id": 0, "member_memory_ids": member_ids}]},
@@ -331,7 +469,7 @@ async def test_rollback_restores_consolidated_rows_and_deletes_run_inserts():
     summary["provenance"] = "morpheus_local"
     conn = _Conn(memories=[original, summary])
 
-    deleted, run_rows = await rollback_run(_Pool(conn), RUN_ID)
+    deleted, run_rows = await rollback_run(_Backend(conn), RUN_ID)
 
     assert deleted == 1
     assert run_rows == 1
@@ -422,6 +560,8 @@ def test_version_trigger_covers_consolidate_update_columns():
 
 @pytest.mark.asyncio
 async def test_run_dream_inserts_consolidate_phase_when_enabled(monkeypatch):
+    from mnemos.core import lifecycle as _lifecycle
+
     calls: list[str] = []
 
     async def fake_begin_run(*_args, **_kwargs):
@@ -440,6 +580,14 @@ async def test_run_dream_inserts_consolidate_phase_when_enabled(monkeypatch):
 
     async def fake_finish(_pool, _run_id):
         calls.append("finish")
+
+    # Item 11a: ``run_dream`` calls ``_get_backend()`` to dispatch
+    # ``sweep_orphan_runs`` / ``begin_run`` / ``set_phase`` /
+    # ``finish_run`` through the new ABC. Wire a no-op backend into
+    # the lifecycle so those lookups succeed; the lifecycle functions
+    # are monkeypatched to fakes above so the backend is never
+    # actually exercised.
+    monkeypatch.setattr(_lifecycle, "_persistence_backend", object())
 
     monkeypatch.setattr(runner, "begin_run", fake_begin_run)
     monkeypatch.setattr(runner, "set_phase", fake_set_phase)
