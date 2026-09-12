@@ -990,25 +990,40 @@ async def lifespan(app):
         logger.info("Background distillation worker disabled")
         _worker_status["distillation_worker"] = "disabled"
 
-    # OAuth expired-session GC worker (v3.0.0)
-    if _pool:
+    # OAuth expired-session GC worker (v3.0.0, item 13: backend-neutral via OAuthRepository)
+    if _persistence_backend is not None:
         import asyncio as _asyncio
+        from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
 
-        async def _oauth_gc_loop():
-            from mnemos.core.oauth import gc_expired_sessions
+        from mnemos.persistence.base import OAUTH_CAPABILITY
 
-            while True:
-                try:
-                    await _asyncio.sleep(3600)  # hourly
-                    deleted = await gc_expired_sessions(_pool)
-                    if deleted:
-                        logger.info(f"oauth gc: deleted {deleted} expired sessions")
-                except _asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("oauth gc iteration failed")
+        _oauth_repo = _persistence_backend.oauth
+        if OAUTH_CAPABILITY not in _persistence_backend.capabilities:
+            logger.info("OAuth persistence capability unavailable; oauth gc worker skipped")
+        else:
+            _expired_grace = _timedelta(days=7)
+            _revoked_grace = _timedelta(days=30)
 
-        _schedule_worker(_oauth_gc_loop())
+            async def _oauth_gc_loop():
+                while True:
+                    try:
+                        await _asyncio.sleep(3600)  # hourly
+                        now = _datetime.now(_timezone.utc)
+                        async with _persistence_backend.transactional() as tx:
+                            deleted = await _oauth_repo.gc_expired_sessions(
+                                tx,
+                                now=now,
+                                expired_grace=_expired_grace,
+                                revoked_grace=_revoked_grace,
+                            )
+                        if deleted:
+                            logger.info(f"oauth gc: deleted {deleted} expired sessions")
+                    except _asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("oauth gc iteration failed")
+
+            _schedule_worker(_oauth_gc_loop())
 
     # NATS JetStream connection (v4.2 MQ substrate). Optional — if
     # MNEMOS_NATS_URL is unset, this is a no-op. Failures are logged

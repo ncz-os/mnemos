@@ -4860,6 +4860,45 @@ class OracleOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
         finally:
             await _call(cursor.close)
 
+    async def gc_expired_sessions(
+        self,
+        tx: Transaction,
+        *,
+        now: Any,
+        expired_grace: timedelta,
+        revoked_grace: timedelta,
+    ) -> int:
+        """Delete oauth_sessions past their grace windows (item 13).
+
+        Matches the original Postgres path: expires_at < now - expired_grace
+        OR (revoked AND revoked_at < now - revoked_grace) OR (revoked AND
+        revoked_at IS NULL AND expires_at < now - revoked_grace). Oracle
+        stores ``revoked`` as NUMBER(1) (0/1) and ``expires_at`` /
+        ``revoked_at`` as TIMESTAMP WITH TIME ZONE; bound parameters
+        substitute SYSTIMESTAMP, NUMTODSINTERVAL-style math, and the
+        caller-supplied ``now`` so the same code path works on Oracle
+        23ai and Db2 12.1.5 (Db2 OAuth inherits from this method).
+        """
+        _ = now  # Oracle uses SYSTIMESTAMP directly; accepted for ABC parity
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM oauth_sessions "
+                "WHERE expires_at < SYSTIMESTAMP - NUMTODSINTERVAL(:expired_seconds, 'SECOND') "
+                "   OR (revoked = 1 AND revoked_at IS NOT NULL "
+                "       AND revoked_at < SYSTIMESTAMP - NUMTODSINTERVAL(:revoked_seconds, 'SECOND')) "
+                "   OR (revoked = 1 AND revoked_at IS NULL "
+                "       AND expires_at < SYSTIMESTAMP - NUMTODSINTERVAL(:revoked_seconds, 'SECOND'))",
+                {
+                    "expired_seconds": int(expired_grace.total_seconds()),
+                    "revoked_seconds": int(revoked_grace.total_seconds()),
+                },
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
 
 class OracleAclRepository(AclRepository):
     """Oracle per-principal memory ACL grants.
