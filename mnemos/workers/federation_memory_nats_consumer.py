@@ -1,4 +1,24 @@
-"""NATS v0.3 consumer for federation memory upserts."""
+"""NATS v0.3 consumer for federation memory upserts (items 7 and 9).
+
+Item 7 type-only migration: the ``pool: asyncpg.Pool`` parameter on
+``run_configured_consumers`` / ``consumer_loop`` / ``_consume_subscription``
+is renamed ``pool: Any`` because nothing in this module touches a raw
+asyncpg pool directly anymore — the only direct DB-touching operation
+(``_store_memory_upsert``'s dedupe INSERT) was item-9'd onto the
+``NatsDispatchLogRepository.record_if_new`` ABC, which needs the
+backend, not the pool. The fallback ``PostgresBackend(pool,
+settings=None)`` keeps the legacy call sites working.
+
+Item 9 backend-neutral dedupe: ``_store_memory_upsert`` previously ran
+a raw ``asyncpg.fetchrow`` against ``nats_dispatch_log`` inside an
+open ``backend.transactional()`` block, using the private
+``_postgres_tx`` helper from ``mnemos.persistence.postgres``. Item 9
+moves the dedupe onto the new ``NatsDispatchLogRepository.record_if_new``
+ABC (``backend.nats_dispatch_log``) and deletes the private helper
+import — each backend now uses its native INSERT … ON CONFLICT /
+INSERT IGNORE / unique-violation-catch semantics under the same
+``(event_id, subject)`` primary-key constraint.
+"""
 
 from __future__ import annotations
 
@@ -199,7 +219,7 @@ async def handle_message(
 
 
 async def _store_memory_upsert(
-    pool: asyncpg.Pool,
+    pool: Any,
     peer: FederationMemoryPeer,
     memory: dict[str, Any],
     *,
@@ -207,8 +227,26 @@ async def _store_memory_upsert(
     subject: str,
     already_recorded: bool = False,
 ) -> None:
+    """Persist one federation memory upsert through the backend ABC.
+
+    Item 9: the dedupe INSERT against ``nats_dispatch_log`` was a raw
+    ``asyncpg.fetchrow`` inside the open ``backend.transactional()``
+    block, using the *private* ``_postgres_tx`` helper from
+    ``mnemos.persistence.postgres`` to unwrap the connection from
+    the backend-neutral tx. That helper is no longer needed — the
+    dedupe moved onto the new ``NatsDispatchLogRepository.record_if_new``
+    ABC (``backend.nats_dispatch_log``) so we just call the ABC method
+    and let each backend use its native INSERT … ON CONFLICT /
+    INSERT IGNORE / unique-violation-catch semantics.
+
+    The dedupe MUST happen inside the same transaction as the memory
+    upsert that follows it — a duplicate redelivery has to roll back
+    its dedupe row when the side-effect write fails. ``record_if_new``
+    takes the caller's ``tx`` parameter precisely for this guarantee,
+    so the side-effect commit/rollback semantics are preserved.
+    """
     import mnemos.core.lifecycle as lifecycle
-    from mnemos.persistence.postgres import PostgresBackend, _postgres_tx
+    from mnemos.persistence.postgres import PostgresBackend
 
     try:
         backend = lifecycle.get_persistence_backend()
@@ -217,17 +255,8 @@ async def _store_memory_upsert(
 
     async with backend.transactional() as tx:
         if not already_recorded:
-            row = await _postgres_tx(tx).conn.fetchrow(
-                """
-                INSERT INTO nats_dispatch_log (event_id, subject)
-                VALUES ($1, $2)
-                ON CONFLICT (event_id, subject) DO NOTHING
-                RETURNING event_id
-                """,
-                event_id,
-                subject,
-            )
-            if row is None:
+            inserted = await backend.nats_dispatch_log.record_if_new(tx, event_id, subject)
+            if not inserted:
                 logger.debug("federation memory nats duplicate event_id=%s subject=%s", event_id, subject)
                 return
         await _store_memories(backend.federation, tx, peer.name, [memory])
@@ -482,6 +511,7 @@ async def main() -> None:
 
     from mnemos.core.config import PG_CONFIG as _PG_CONFIG
     from mnemos.core.pool import wrap_pool_with_timeout
+    from mnemos.persistence.postgres import PostgresBackend
 
     raw_pool = await _asyncpg.create_pool(
         min_size=1,
@@ -494,8 +524,13 @@ async def main() -> None:
         port=_PG_CONFIG["port"],
     )
     pool = wrap_pool_with_timeout(raw_pool)
+    # Item 9: the dedupe moved onto the backend-neutral
+    # NatsDispatchLogRepository ABC, so the consumer needs a real
+    # backend (not a raw asyncpg pool) to resolve
+    # backend.transactional() and backend.nats_dispatch_log.
+    backend = PostgresBackend(pool, settings=None)
     try:
-        await run_configured_consumers(pool)
+        await run_configured_consumers(backend)
     finally:
         await pool.close()
 
