@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from mnemos.persistence.base import Transaction
@@ -186,3 +186,39 @@ class MysqlBrowserOAuthMixin:
         )
         row["expires_at"] = oauth_utc(row["expires_at"])
         return row
+
+    async def gc_expired_sessions(
+        self,
+        tx: Transaction,
+        *,
+        now: Any,
+        expired_grace: timedelta,
+        revoked_grace: timedelta,
+    ) -> int:
+        """Delete oauth_sessions past their grace windows (item 13).
+
+        Mirrors the original Postgres semantics: expires_at < now - expired_grace
+        OR (revoked AND revoked_at < now - revoked_grace) OR (revoked AND
+        revoked_at IS NULL AND expires_at < now - revoked_grace — treat a NULL
+        revoked_at as "revoked long ago"). MySQL stores ``revoked`` as
+        TINYINT(1) and ``revoked_at`` as DATETIME(6) on the canonical
+        migrations; pass ``?`` placeholders that ``MysqlOAuthRepository``
+        rewrites to ``%s``.
+        """
+        now_ts = self._mcp_timestamp(now)
+        expired_cutoff = "DATE_SUB(?, INTERVAL ? SECOND)"
+        revoked_cutoff = "DATE_SUB(?, INTERVAL ? SECOND)"
+        sql = (
+            "DELETE FROM oauth_sessions "
+            f"WHERE expires_at < {expired_cutoff} "
+            f"   OR (revoked = 1 AND revoked_at IS NOT NULL AND revoked_at < {revoked_cutoff}) "
+            f"   OR (revoked = 1 AND revoked_at IS NULL AND expires_at < {revoked_cutoff})"
+        )
+        return await self._mcp_execute(
+            tx,
+            sql,
+            (
+                now_ts, int(expired_grace.total_seconds()),
+                now_ts, int(revoked_grace.total_seconds()),
+            ),
+        )
