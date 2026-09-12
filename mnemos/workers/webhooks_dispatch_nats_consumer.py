@@ -1,4 +1,4 @@
-"""NATS v0.3 consumer for webhook outbox dispatch nudges (item 7).
+"""NATS v0.3 consumer for webhook outbox dispatch nudges (items 7 and 9).
 
 Item 7 type-only migration: the ``pool: asyncpg.Pool`` parameter on
 ``consumer_loop`` / ``handle_message`` / ``_consume_subscription`` is
@@ -6,6 +6,15 @@ renamed ``backend: Any`` because nothing in this module touches the
 backend directly — it only forwards NATS nudges into the sender's
 ``_attempt_delivery``, which now ignores the ``pool=`` argument and
 resolves the persistence backend via lifecycle.
+
+Item 9 backend-neutral dedupe: ``_record_dispatch_once`` was a raw
+``asyncpg.pool.acquire()`` round trip against the
+``nats_dispatch_log`` table that was explicitly left out of item 7's
+scope. Item 9 moved it onto the new
+``NatsDispatchLogRepository.record_if_new`` ABC; the wrapper now
+opens a real ``backend.transactional()`` and calls the ABC method,
+so it works on every backend (Postgres / SQLite / MySQL / MariaDB /
+Oracle / Db2).
 
 The NATS subscribe/ack/backoff logic is byte-for-byte unchanged.
 """
@@ -118,10 +127,12 @@ async def handle_message(
 
     Item 7 signature change: ``pool`` is renamed ``backend`` because
     the only direct DB-touching operation here — the
-    ``nats_dispatch_log`` table — remains a raw ``asyncpg.pool``
-    call inside ``_record_dispatch_once`` (out of scope; the NATS
-    consumer's dispatch dedupe is not part of the webhook ABC).
-    Tests that need to mock this function can keep using
+    ``nats_dispatch_log`` table — was originally raw ``asyncpg.pool``
+    access in ``_record_dispatch_once``. Item 9 moved that dedupe onto
+    the backend-neutral ``NatsDispatchLogRepository.record_if_new``
+    ABC (``backend.nats_dispatch_log``), so ``_record_dispatch_once``
+    now opens a real ``backend.transactional()`` and calls the ABC
+    method. Tests that need to mock this function can keep using
     ``record_dispatch`` overrides.
     """
     subject = str(getattr(msg, "subject", ""))
@@ -186,26 +197,20 @@ async def _consume_subscription(backend: Any, sub: Any) -> None:
 
 
 async def _record_dispatch_once(backend: Any, event_id: str, subject: str) -> bool:
-    """Persist a NATS dedupe row against the raw pool.
+    """Persist a NATS dedupe row against the backend's transaction.
 
-    Item 7: this function still uses ``asyncpg``-shaped access because
-    it writes to ``nats_dispatch_log``, which is not part of the
-    webhook ABC. Concrete NATS consumer entry points keep an
-    asyncpg-shaped handle around for this one raw write; everything
-    else routes through the backend.
+    Item 9: the dedupe moved onto the backend-neutral
+    ``NatsDispatchLogRepository.record_if_new`` ABC; the per-call
+    ``backend.acquire()`` round-trip that used to drive the raw
+    ``asyncpg`` INSERT here is replaced with one round trip through
+    ``backend.transactional()`` + ``backend.nats_dispatch_log.record_if_new``.
+    On every backend (Postgres / SQLite / MySQL / MariaDB / Oracle / Db2)
+    the dedupe primitive is the canonical ``(event_id, subject)``
+    primary key on ``nats_dispatch_log`` -- the migration file is
+    the same shape across all five backends.
     """
-    async with backend.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO nats_dispatch_log (event_id, subject)
-            VALUES ($1, $2)
-            ON CONFLICT (event_id, subject) DO NOTHING
-            RETURNING event_id
-            """,
-            event_id,
-            subject,
-        )
-    return row is not None
+    async with backend.transactional() as tx:
+        return await backend.nats_dispatch_log.record_if_new(tx, event_id, subject)
 
 
 async def _attempt_once(
@@ -346,6 +351,7 @@ async def main() -> None:
 
     from mnemos.core.config import PG_CONFIG as _PG_CONFIG
     from mnemos.core.pool import wrap_pool_with_timeout
+    from mnemos.persistence.postgres import PostgresBackend
 
     raw_pool = await _asyncpg.create_pool(
         min_size=1,
@@ -358,8 +364,13 @@ async def main() -> None:
         port=_PG_CONFIG["port"],
     )
     pool = wrap_pool_with_timeout(raw_pool)
+    # Item 9: the dedupe moved onto the backend-neutral
+    # NatsDispatchLogRepository ABC, so the consumer needs a real
+    # backend (not a raw asyncpg pool) to resolve
+    # backend.transactional() and backend.nats_dispatch_log.
+    backend = PostgresBackend(pool, settings=None)
     try:
-        await consumer_loop(pool)
+        await consumer_loop(backend)
     finally:
         await pool.close()
 
