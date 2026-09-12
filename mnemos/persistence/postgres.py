@@ -55,6 +55,7 @@ from mnemos.persistence.base import (
     UsageLedgerResult,
     VersionRepository,
     WebhookDeliveryClaim,
+    WebhookDeliveryIntent,
     WebhookDeliveryOutcome,
     WebhookDeliveryRecord,
     WebhookFinalizationResult,
@@ -2447,7 +2448,7 @@ class PostgresWebhookRepository(WebhookRepository):
         *,
         owner_id: str | None = None,
         namespace: str | None = None,
-    ) -> list[str]:
+    ) -> list[WebhookDeliveryIntent]:
         conn = _postgres_tx(tx).conn
         query = """
             SELECT id, url, owner_id, namespace
@@ -2468,7 +2469,7 @@ class PostgresWebhookRepository(WebhookRepository):
             sort_keys=True,
         )
         body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-        delivery_ids: list[str] = []
+        intents: list[WebhookDeliveryIntent] = []
         for sub in subscriptions:
             delivery_id = str(uuid.uuid4())
             await conn.execute(
@@ -2484,28 +2485,16 @@ class PostgresWebhookRepository(WebhookRepository):
                 body_hash,
                 webhook_constants.NEW_CODE_WRITER_REVISION,
             )
-            from mnemos.nats.webhook_events import publish_delivery_queued
-
-            await publish_delivery_queued(
-                delivery_id=delivery_id,
-                subscription_id=sub["id"],
-                event_type=event_type,
-                url=sub["url"],
-                payload_hash=body_hash,
-                namespace=sub["namespace"],
-                owner_id=sub["owner_id"],
+            intents.append(
+                WebhookDeliveryIntent(
+                    delivery_id=delivery_id,
+                    subscription_id=str(sub["id"]),
+                    url=sub["url"],
+                    namespace=sub["namespace"],
+                    owner_id=sub["owner_id"],
+                )
             )
-            await persistence_nats_events.publish_webhook_outbox_insert(
-                delivery_id=delivery_id,
-                subscription_id=sub["id"],
-                event_type=event_type,
-                url=sub["url"],
-                payload_hash=body_hash,
-                namespace=sub["namespace"],
-                owner_id=sub["owner_id"],
-            )
-            delivery_ids.append(delivery_id)
-        return delivery_ids
+        return intents
 
     async def fetch_deliveries(self, tx: Transaction, subscription_id: str | None = None) -> list[Row]:
         if subscription_id is None:

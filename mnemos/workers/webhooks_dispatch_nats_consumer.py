@@ -1,4 +1,14 @@
-"""NATS v0.3 consumer for webhook outbox dispatch nudges."""
+"""NATS v0.3 consumer for webhook outbox dispatch nudges (item 7).
+
+Item 7 type-only migration: the ``pool: asyncpg.Pool`` parameter on
+``consumer_loop`` / ``handle_message`` / ``_consume_subscription`` is
+renamed ``backend: Any`` because nothing in this module touches the
+backend directly — it only forwards NATS nudges into the sender's
+``_attempt_delivery``, which now ignores the ``pool=`` argument and
+resolves the persistence backend via lifecycle.
+
+The NATS subscribe/ack/backoff logic is byte-for-byte unchanged.
+"""
 
 from __future__ import annotations
 
@@ -8,8 +18,6 @@ import json
 import logging
 import re
 from typing import Any, Awaitable, Callable, Mapping
-
-import asyncpg
 
 from mnemos.core.config import Settings, get_settings, nats_webhooks_enabled
 from mnemos.core.extras import is_extra_installed
@@ -34,13 +42,19 @@ def _enabled() -> bool:
 
 
 async def consumer_loop(
-    pool: asyncpg.Pool,
+    backend: Any,
     *,
     settings: Settings | None = None,
     retry_seconds: float = 30.0,
     connect: Callable[[Settings], Awaitable[Any | None]] | None = None,
 ) -> None:
-    """Consume v0.3 webhook outbox events until cancelled."""
+    """Consume v0.3 webhook outbox events until cancelled.
+
+    Item 7: the previous ``pool: asyncpg.Pool`` parameter is renamed
+    ``backend: Any``; the rest of the loop (subscribe / receive /
+    handle / ack / drain) is byte-for-byte the same as pre-item-7
+    because the migration only renames the threading parameter.
+    """
     settings = settings or get_settings()
     if not _enabled():
         logger.info("webhooks outbox nats consumer disabled")
@@ -73,7 +87,7 @@ async def consumer_loop(
             sub_owned = sub
             sub = None
             try:
-                await _consume_subscription(pool, sub_owned)
+                await _consume_subscription(backend, sub_owned)
             finally:
                 await _drain_partial(nc, [sub_owned])
                 nc = None
@@ -93,14 +107,23 @@ async def consumer_loop(
 
 
 async def handle_message(
-    pool: asyncpg.Pool,
+    backend: Any,
     msg: Any,
     *,
     schedule: Callable[[Awaitable[bool]], Any] | None = None,
     attempt: Callable[..., Awaitable[bool]] | None = None,
-    record_dispatch: Callable[[asyncpg.Pool, str, str], Awaitable[bool]] | None = None,
+    record_dispatch: Callable[..., Awaitable[bool]] | None = None,
 ) -> None:
-    """Record and schedule one webhook outbox event."""
+    """Record and schedule one webhook outbox event.
+
+    Item 7 signature change: ``pool`` is renamed ``backend`` because
+    the only direct DB-touching operation here — the
+    ``nats_dispatch_log`` table — remains a raw ``asyncpg.pool``
+    call inside ``_record_dispatch_once`` (out of scope; the NATS
+    consumer's dispatch dedupe is not part of the webhook ABC).
+    Tests that need to mock this function can keep using
+    ``record_dispatch`` overrides.
+    """
     subject = str(getattr(msg, "subject", ""))
     payload = _decode_payload(getattr(msg, "data", b""))
     if not _valid_payload(payload):
@@ -111,17 +134,17 @@ async def handle_message(
 
     event_id = str(payload.get("event_id") or payload["delivery_id"])
     recorder = record_dispatch or _record_dispatch_once
-    if not await recorder(pool, event_id, subject):
+    if not await recorder(backend, event_id, subject):
         logger.debug("webhooks outbox duplicate event_id=%s subject=%s", event_id, subject)
         return
 
     delivery_id = str(payload["delivery_id"])
     attempt = attempt or _attempt_delivery
     schedule = schedule or _schedule_attempt
-    schedule(_attempt_once(delivery_id, pool, attempt))
+    schedule(_attempt_once(delivery_id, backend, attempt))
 
 
-async def _consume_subscription(pool: asyncpg.Pool, sub: Any) -> None:
+async def _consume_subscription(backend: Any, sub: Any) -> None:
     while True:
         msg = None
         try:
@@ -135,7 +158,7 @@ async def _consume_subscription(pool: asyncpg.Pool, sub: Any) -> None:
             raise
 
         try:
-            await handle_message(pool, msg)
+            await handle_message(backend, msg)
         except asyncio.CancelledError:
             raise
         except PoisonMessageError as exc:
@@ -162,8 +185,16 @@ async def _consume_subscription(pool: asyncpg.Pool, sub: Any) -> None:
             raise
 
 
-async def _record_dispatch_once(pool: asyncpg.Pool, event_id: str, subject: str) -> bool:
-    async with pool.acquire() as conn:
+async def _record_dispatch_once(backend: Any, event_id: str, subject: str) -> bool:
+    """Persist a NATS dedupe row against the raw pool.
+
+    Item 7: this function still uses ``asyncpg``-shaped access because
+    it writes to ``nats_dispatch_log``, which is not part of the
+    webhook ABC. Concrete NATS consumer entry points keep an
+    asyncpg-shaped handle around for this one raw write; everything
+    else routes through the backend.
+    """
+    async with backend.acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO nats_dispatch_log (event_id, subject)
@@ -179,11 +210,11 @@ async def _record_dispatch_once(pool: asyncpg.Pool, event_id: str, subject: str)
 
 async def _attempt_once(
     delivery_id: str,
-    pool: asyncpg.Pool,
+    backend: Any,
     attempt: Callable[..., Awaitable[bool]],
 ) -> bool:
     try:
-        return await attempt(delivery_id, pool=pool)
+        return await attempt(delivery_id, backend=backend)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -197,10 +228,10 @@ def _schedule_attempt(coro: Awaitable[bool]) -> Any:
     return _schedule_delivery_attempt(coro)
 
 
-async def _attempt_delivery(delivery_id: str, *, pool: asyncpg.Pool) -> bool:
+async def _attempt_delivery(delivery_id: str, *, backend: Any) -> bool:
     from mnemos.webhooks.sender import _attempt_delivery as sender_attempt
 
-    return await sender_attempt(delivery_id, pool=pool)
+    return await sender_attempt(delivery_id, pool=backend)
 
 
 async def _connect(settings: Settings):

@@ -85,6 +85,7 @@ from mnemos.persistence.base import (
     Transaction,
     VersionRepository,
     WebhookDeliveryClaim,
+    WebhookDeliveryIntent,
     WebhookDeliveryOutcome,
     WebhookDeliveryRecord,
     WebhookFinalizationResult,
@@ -3714,7 +3715,7 @@ class MysqlWebhookRepository(WebhookRepository):
         *,
         owner_id: str | None = None,
         namespace: str | None = None,
-    ) -> list[str]:
+    ) -> list[WebhookDeliveryIntent]:
         conn = _mysql_tx(tx).conn
         conditions = ["revoked = 0"]
         params: list[Any] = []
@@ -3741,12 +3742,9 @@ class MysqlWebhookRepository(WebhookRepository):
             sort_keys=True,
         )
         body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-        delivery_ids: list[str] = []
+        intents: list[WebhookDeliveryIntent] = []
         async with conn.cursor() as cursor:
             for sub in subscriptions:
-                # The events column is JSON; MySQL returns it as either a JSON
-                # string or (when the connection is configured to deserialize)
-                # a Python list.  Coerce to list before membership-test.
                 raw_events = sub.get("events")
                 if isinstance(raw_events, (bytes, bytearray)):
                     raw_events = raw_events.decode("utf-8")
@@ -3778,19 +3776,16 @@ class MysqlWebhookRepository(WebhookRepository):
                         webhook_constants.NEW_CODE_WRITER_REVISION,
                     ),
                 )
-                from mnemos.nats.webhook_events import publish_delivery_queued
-
-                await publish_delivery_queued(
-                    delivery_id=delivery_id,
-                    subscription_id=sub["id"],
-                    event_type=event_type,
-                    url=sub["url"],
-                    payload_hash=body_hash,
-                    namespace=sub["namespace"],
-                    owner_id=sub["owner_id"],
+                intents.append(
+                    WebhookDeliveryIntent(
+                        delivery_id=delivery_id,
+                        subscription_id=str(sub["id"]),
+                        url=sub["url"],
+                        namespace=sub["namespace"],
+                        owner_id=sub["owner_id"],
+                    )
                 )
-                delivery_ids.append(delivery_id)
-        return delivery_ids
+        return intents
 
     # ── claim (one row) ──────────────────────────────────────────────────────
 
